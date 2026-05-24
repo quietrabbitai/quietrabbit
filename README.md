@@ -71,7 +71,7 @@ No GPU: runs on CPU — slower but fully private and functional
 | Path | What it does |
 |---|---|
 | ✍️ Writing Assistant | Business writing, personal correspondence, any format |
-| product research... | Requirements ₒ research → pricing and where to buy |
+| 🛍️ Research & Buy | Requirements research → pricing and where to buy |
 | Job Match | Analyze a posting, match your resume, draft a cover letter |
 | Tech Support | Computer and homelab troubleshooting, step-by-step |
 | Quick Draft | Fast single-stage output — no specialists, no friction |
