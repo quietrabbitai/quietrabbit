@@ -57,7 +57,7 @@ docker compose up
 ```
 
 That's the install. Quiet Rabbit detects your hardware, recommends a model configuration,
-and guides you through setup with an interactive conversation — ino technical expertise required,
+and guides you through setup with an interactive conversation — no technical expertise required,
 no manual configuration.
 
 Requires: Docker Desktop (Windows, Mac, Linux)
