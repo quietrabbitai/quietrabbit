@@ -33,7 +33,7 @@ Quiet Rabbit will:
 **Requirements (coming Phase 1):**
 - Docker Desktop (Windows, Mac, or Linux)
 - 8GB RAM minimum (16GB recommended)
-- GPU optional — NVIDIA yNVIDIA and AMD supported, CPU fallback always available
+- GPU optional — NVIDIA and AMD supported, CPU fallback always available
 - ~10GB disk space for models and data
 
 ---
@@ -55,5 +55,5 @@ Every external service interaction asks before acting.
 ## Questions or Issues
 
 - GitHub: https://github.com/quietrabbitai/quietrabbit
-- Website: https://quietrabbit.ai **(coming soon)**
+- Website: https://quietrabbit.ai
 - Contact: quietrabbit.ai@gmail.com
