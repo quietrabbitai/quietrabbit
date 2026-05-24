@@ -4,7 +4,7 @@
 
 Quiet Rabbit is a self-hosted personal AI platform that keeps every part of your life
 exactly where it belongs — organized into separate spaces, each with its own context,
-privacy settings, and team of AI specialists. Nothing bleeds between them.
+privacy settings, and team of AI specialists. Each space stays completely separate.
 
 It runs on your own hardware. Installs with one command. Gets smarter the more you use it.
 And it never needs you to become an AI expert to get value from it.
@@ -52,13 +52,13 @@ approval before anything changes.
 
 ## Getting Started
 
+Guided setup gets everything running — Quiet Rabbit detects your hardware, recommends a
+model configuration, and walks you through first-time setup interactively. No manual
+configuration required.
+
 ```bash
 docker compose up
 ```
-
-That's the install. Quiet Rabbit detects your hardware, recommends a model configuration,
-and guides you through setup with an interactive conversation — ino technical expertise required,
-no manual configuration.
 
 Requires: Docker Desktop (Windows, Mac, Linux)
 GPU acceleration: automatic if available (NVIDIA or AMD)
@@ -71,11 +71,11 @@ No GPU: runs on CPU — slower but fully private and functional
 | Path | What it does |
 |---|---|
 | ✍️ Writing Assistant | Business writing, personal correspondence, any format |
-| product research... | Requirements ₒ research → pricing and where to buy |
-| Job Match | Analyze a posting, match your resume, draft a cover letter |
-| Tech Support | Computer and homelab troubleshooting, step-by-step |
-| Quick Draft | Fast single-stage output — no specialists, no friction |
-| Life Transitions | College, moves, and major life planning |
+| 🛍️ Research & Buy | Requirements → research → pricing and where to buy |
+| 💼 Job Match | Analyze a posting, match your resume, draft a cover letter |
+| 🖥️ Tech Support | Computer and homelab troubleshooting, step-by-step |
+| ⚡ Quick Draft | Fast single-stage output — no specialists, no friction |
+| 🎓 Life Transitions | College, moves, and major life planning |
 
 ---
 
@@ -122,7 +122,7 @@ Not ready for public use yet. Watch this repo for updates.
 
 ## Links
 
-- Website: https://quietrabbit.ai **(coming soon)**
+- Website: https://quietrabbit.ai
 - GitHub: https://github.com/quietrabbitai/quietrabbit
-- Community: https://github.com/quietrabbitai/community **(coming Phase 2)**
+- Community: https://github.com/quietrabbitai/community *(coming Phase 2)*
 - Contact: quietrabbit.ai@gmail.com
