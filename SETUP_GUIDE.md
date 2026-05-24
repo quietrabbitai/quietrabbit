@@ -28,7 +28,7 @@ Quiet Rabbit will:
 - Detect your hardware automatically
 - Recommend a model configuration based on what it finds
 - Guide you through first-time setup interactively
-- Run fully on your own hardware — ino data leaves your machine by default
+- Run fully on your own hardware — no data leaves your machine by default
 
 **Requirements (coming Phase 1):**
 - Docker Desktop (Windows, Mac, or Linux)
