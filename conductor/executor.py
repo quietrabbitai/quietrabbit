@@ -142,6 +142,7 @@ class StepContext:
     floor_consent_preference: str | None = None  # "modified" | "local" | None
     next_execution_tier: int | None = None
     retry_count: int = 0
+    life_context: str = ""  # rendered Memory Broker output — injected at Phase 3
 
 
 class StepExecutor:
@@ -507,7 +508,7 @@ class StepExecutor:
             "user_input": ctx.user_input,
             "previous_output": ctx.task_track.last_output() or "",
             "focus_context": ctx.focus_id,
-            "life_context": "",
+            "life_context": ctx.life_context,
             "voice_profile": _format_voice_profile(ctx.personal_track.voice_profile),
         }
         return self._render_template(ctx.step.prompt_template, tokens, ctx)
@@ -525,7 +526,7 @@ class StepExecutor:
             "user_input": ctx.user_input,
             "previous_output": ctx.task_track.last_output() or "",
             "focus_context": ctx.focus_id,
-            "life_context": "",
+            "life_context": ctx.life_context,
             "voice_profile": _format_voice_profile(ctx.personal_track.voice_profile),
         }
         return self._render_template(ctx.step.prompt_template, tokens, ctx)

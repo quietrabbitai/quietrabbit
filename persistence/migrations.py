@@ -335,3 +335,58 @@ def migrate_scores_db() -> int:
         return run_migrations(conn, prefix="scores")
     finally:
         conn.close()
+
+
+def migrate_domain_context_db(
+    user_id: str, life_id: str, focus_id: str, key_hex: str
+) -> int:
+    """
+    Migrate a focus's domain_context.db (encrypted).
+    Path resolved via topic_store.get_domain_context_path() — single canonical source.
+    Directory created by ensure_focus_dirs() before this is called —
+    mkdir here as a safety net for direct calls.
+    Part of Phase B data model extension (D6-226+).
+    """
+    from persistence.topic_store import get_domain_context_path
+    db_path = get_domain_context_path(user_id, life_id, focus_id)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = _open_raw(db_path)
+    try:
+        return run_migrations(conn, prefix="domain_context", key_hex=key_hex)
+    finally:
+        conn.close()
+
+
+def migrate_plan_state_db(
+    user_id: str, life_id: str, focus_id: str, topic_id: str, key_hex: str
+) -> int:
+    """
+    Migrate a topic's plan_state.db (encrypted).
+    Path resolved via topic_store.get_plan_state_path() — single canonical source.
+    Directory created by ensure_focus_dirs() before this is called —
+    mkdir here as a safety net for direct calls.
+    Part of Phase B data model extension (D6-226+).
+    """
+    from persistence.topic_store import get_plan_state_path
+    db_path = get_plan_state_path(user_id, life_id, focus_id, topic_id)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = _open_raw(db_path)
+    try:
+        return run_migrations(conn, prefix="plan_state", key_hex=key_hex)
+    finally:
+        conn.close()
+
+
+def migrate_focus_storage(
+    user_id: str, life_id: str, focus_id: str, topic_id: str, key_hex: str
+) -> tuple[int, int]:
+    """
+    Convenience helper — migrate both focus-level databases in one call.
+    Runs domain_context_db migration then plan_state_db migration.
+    Returns (domain_context_migrations_applied, plan_state_migrations_applied).
+    Called by lifecycle at Phase 3 INITIALIZE when a topic is active.
+    Part of Phase B data model extension (D6-226+).
+    """
+    dc = migrate_domain_context_db(user_id, life_id, focus_id, key_hex)
+    ps = migrate_plan_state_db(user_id, life_id, focus_id, topic_id, key_hex)
+    return dc, ps

@@ -10,19 +10,19 @@ class QRAPIError(Exception):
     """
     Base class for all QR errors.
     plain_language: user-facing message — must pass the Plain Language Rule.
-    step_id / path_id: optional context for diagnostics export.
+    step_id / focus_id: optional context for diagnostics export.
     """
 
     def __init__(
         self,
         plain_language: str,
         step_id: str | None = None,
-        path_id: str | None = None,
+        focus_id: str | None = None,
         **kwargs,
     ):
         self.plain_language = plain_language
         self.step_id = step_id
-        self.path_id = path_id
+        self.focus_id = focus_id
         super().__init__(plain_language)
 
 
@@ -110,7 +110,7 @@ class FloorConsentRequiredError(QRAPIError):
     the user's consent choice.
 
     User-facing notification (approved UX copy):
-    'To maintain privacy while using [Path Name], Quiet Rabbit modified
+    'To maintain privacy while using [Focus Name], Quiet Rabbit modified
     the following fields for external use: ...'
     Choices: [Continue — use modified values] [Use original values locally] [Cancel]
 
@@ -118,20 +118,20 @@ class FloorConsentRequiredError(QRAPIError):
         of floor clamping (raw_abstraction vs abstraction_tier).
     approved_fields: {field_name: abstracted_value} — what would be sent
         if the user chooses 'Continue'. Shown to user for transparency.
-    path_display_name: human-readable path name for the UX copy.
+    focus_display_name: human-readable focus name for the UX copy.
     """
 
     def __init__(
         self,
         floor_clamped_fields: list[str],
         approved_fields: dict[str, str],
-        path_display_name: str,
+        focus_display_name: str,
         plain_language: str,
         **kwargs,
     ):
         self.floor_clamped_fields = floor_clamped_fields
         self.approved_fields = approved_fields
-        self.path_display_name = path_display_name
+        self.focus_display_name = focus_display_name
         super().__init__(plain_language, **kwargs)
 
 

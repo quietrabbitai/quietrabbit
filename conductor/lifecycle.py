@@ -52,6 +52,17 @@
 #   open_personal_db / open_outputs_db: space_id → life_id param
 #   demote_interrupted_runs: focus_runs table
 
+# Phase B — Memory Broker integration (D6-226+):
+#   FocusRun gains topic_id and is_quick_ask parameters.
+#   Phase 3 INITIALIZE: Memory Broker called after PersonalTrack sealed.
+#     Broker always runs — topic_id=None means Tier B skipped, not broker skipped.
+#     ContextSlice rendered to _life_context_rendered string immediately.
+#     slice_.clear() called — rendered string only is retained for session.
+#   _write_focus_run_record(): topic_id and is_quick_ask written on INSERT.
+#   _execute_step(): passes _life_context_rendered as life_context to StepContext.
+#   Phase 5 OUTPUT: run_history entry written after save_output().
+#   Phase 7 CLEANUP: _life_context_rendered cleared.
+
 from __future__ import annotations
 
 import hashlib
@@ -117,6 +128,8 @@ class FocusRun:
         user_input: str = "",
         is_fast_lane: bool = False,
         key_hex: str | None = None,
+        topic_id: str | None = None,
+        is_quick_ask: bool = False,
     ):
         self.user_id = user_id
         self.life_id = life_id
@@ -125,6 +138,8 @@ class FocusRun:
         self.user_input = user_input
         self.is_fast_lane = is_fast_lane
         self.key_hex = key_hex
+        self.topic_id = topic_id
+        self.is_quick_ask = is_quick_ask
 
         self.focus_run_id: str | None = None
         self.focus_def: FocusDefinition | None = None
@@ -138,6 +153,7 @@ class FocusRun:
         self._output_id: str | None = None
         self._current_step_index: int = 0
         self._checkpointing_suspended: bool = False
+        self._life_context_rendered: str = ""
 
     # =========================================================================
     # Phase 1 — LOAD
@@ -247,10 +263,13 @@ class FocusRun:
             else:
                 db.execute(
                     """INSERT INTO focus_runs
-                       (id, focus_id, status, is_fast_lane, started_at, notes)
-                       VALUES (?, ?, ?, ?, ?, ?)""",
+                       (id, focus_id, status, is_fast_lane, is_quick_ask,
+                        topic_id, started_at, notes)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                     [self.focus_run_id, self.focus_id, status,
-                     1 if self.is_fast_lane else 0, now(), "{}"],
+                     1 if self.is_fast_lane else 0,
+                     1 if self.is_quick_ask else 0,
+                     self.topic_id, now(), "{}"],
                 )
 
     # =========================================================================
@@ -267,7 +286,58 @@ class FocusRun:
         self.privacy_gateway = PrivacyGateway(
             self.user_id, self.life_id, self.key_hex
         )
+        self._life_context_rendered = self._assemble_life_context()
         self._write_focus_run_record(status="running")
+
+    def _assemble_life_context(self) -> str:
+        """
+        Call Memory Broker to assemble context slice for this session.
+        Broker always runs — topic_id=None means Tier B skipped, not broker skipped.
+        Unnamed runs still load Domain Context standing summary (Tier A).
+        ContextSlice rendered to string immediately, then cleared.
+        Only the rendered string is retained for the session — not raw blocks.
+
+        execution_tier: uses _life_max_permitted_tier (run ceiling) so the
+        Retrieval Eligibility Check admits all blocks the run could access.
+
+        Failure handling: non-fatal for Quick Ask and unnamed runs (no active
+        topic context to lose). WARNING logged for topic-active sessions where
+        failure means Domain Context and Plan State are silently absent.
+        """
+        try:
+            from conductor.memory_broker import MemoryBroker
+            broker = MemoryBroker()
+            model_context_window = int(
+                __import__("os").environ.get("QR_DEFAULT_CONTEXT_WINDOW", "8192")
+            )
+            slice_ = broker.assemble_context(
+                user_id=self.user_id,
+                life_id=self.life_id,
+                focus_id=self.focus_id,
+                topic_id=self.topic_id,
+                key_hex=self.key_hex,
+                execution_tier=self._life_max_permitted_tier,
+                model_context_window=model_context_window,
+                is_quick_ask=self.is_quick_ask,
+            )
+            rendered = slice_.render()
+            slice_.clear()
+            return rendered
+        except Exception as e:
+            if self.topic_id is not None:
+                log.warning(
+                    "memory_broker: context assembly FAILED for topic-active session — "
+                    "Domain Context and Plan State unavailable for this run. "
+                    "focus=%s topic=%s error=%s",
+                    self.focus_id, self.topic_id, e,
+                )
+            else:
+                log.debug(
+                    "memory_broker: context assembly failed (no active topic) — "
+                    "continuing with empty life_context. focus=%s error=%s",
+                    self.focus_id, e,
+                )
+            return ""
 
     def _build_personal_track(self) -> PersonalTrack:
         from persistence.personal_store import load_personal_track
@@ -446,6 +516,7 @@ class FocusRun:
             floor_consent_preference=floor_consent_preference,
             next_execution_tier=next_execution_tier,
             retry_count=0,
+            life_context=self._life_context_rendered,
         )
         return StepExecutor().execute(ctx)
 
@@ -556,6 +627,7 @@ class FocusRun:
         )
         self._output_id = output_id
         self._purge_snapshots()
+        self._write_run_history(output_id=output_id, output_type=self.focus_def.output_type)
         self._write_focus_run_record(status="awaiting_feedback")
         return RunResult(
             focus_run_id=self.focus_run_id,
@@ -580,6 +652,32 @@ class FocusRun:
         except Exception:
             pass
 
+    def _write_run_history(self, output_id: str, output_type: str) -> None:
+        """
+        Write a run_history entry after output is saved.
+        Non-fatal — run_history is a discovery index, not critical path.
+        Quick Ask invariant: promote_window_expires_at is NULL (enforced in topic_store).
+        """
+        try:
+            from persistence.topic_store import create_run_history_entry
+            create_run_history_entry(
+                user_id=self.user_id,
+                life_id=self.life_id,
+                key_hex=self.key_hex,
+                focus_run_id=self.focus_run_id,
+                focus_id=self.focus_id,
+                is_quick_ask=self.is_quick_ask,
+                topic_id=self.topic_id,
+                output_id=output_id,
+                output_type=output_type,
+            )
+        except Exception as e:
+            log.warning(
+                "lifecycle: run_history write failed (non-fatal) — "
+                "focus=%s focus_run_id=%s error=%s",
+                self.focus_id, self.focus_run_id, e,
+            )
+
     # =========================================================================
     # Phase 7 — CLEANUP
     # =========================================================================
@@ -589,6 +687,7 @@ class FocusRun:
         self.task_track = None
         self.shared_state = None
         self.privacy_gateway = None
+        self._life_context_rendered = ""
         if final_status in ("complete", "cancelled", "failed"):
             self._purge_snapshots()
         self._write_focus_run_record(status=final_status)
