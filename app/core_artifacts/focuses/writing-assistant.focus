@@ -1,0 +1,117 @@
+# app/core_artifacts/focuses/writing-assistant.focus
+# Writing Assistant — multi-step Tier 2 focus. Layer 6.
+#
+# Step sequence (Privacy Sandwich — Tier 1 -> Tier 2 -> Tier 1):
+#   1. voice_analysis  (Tier 1) — understand the request in context of
+#      voice profile. Local model. No external call.
+#   2. draft_writing   (Tier 2) — produce the draft via Groq provider.
+#      Gate1 fires with abstraction_tier >= 2 (floor guaranteed by lifecycle).
+#      Floor Consent Gate may pause here if life_privacy_default_tier < 2.
+#      Step 8 reads from step_disclosure_buffer ONLY — never PersonalTrack.
+#   3. voice_transform (Tier 1) — apply voice profile to refine tone/style.
+#      Local model. No external call. Uses draft_output from step 2.
+#
+# Gate3 behaviour:
+#   After step 1 completes, Gate3 evaluates whether its output
+#   (voice_analysis_output) may be promoted to the upcoming Tier 2 step.
+#   After step 2 completes, Gate3 evaluates promotion back down to Tier 1
+#   (target=1 < execution=2: no escalation, Gate3 is a no-op).
+#
+# Voice profile exemption (ADR-012 Amendment 3, Option A):
+#   Voice profile (tone, formality, length_preference, etc.) is
+#   general-sensitivity behavioral metadata — exempt from Gate1 abstraction.
+#   Injected directly into prompt templates, not via disclosure buffer.
+#
+# Field requirements:
+#   voice_analysis:  voice_profile (general) — recommended
+#   draft_writing:   job_title, employer, location_city (personal/general) — optional
+#                    Fields are abstracted at Tier 2 (summarize policy).
+#                    Prompt degrades gracefully if fields absent or withheld.
+#   voice_transform: voice_profile only — no personal fields needed
+#
+# Prompt authoring rule: do not use {token_name} for any string not intended
+# as a Conductor token — str.replace() substitution will mangle it.
+# Unresolved tokens are stripped with a log.debug() at runtime.
+
+focus_id: writing-assistant
+display_name: Writing Assistant
+description: >
+  Craft polished writing for any purpose. Your voice, your context,
+  your words — refined for clarity and impact.
+version: "1.0"
+output_type: general
+max_routing_tier: 2
+life_affinity: []
+suggest_in_focuses: []
+
+steps:
+  - step_id: voice_analysis
+    display_name: Understanding your style...
+    guide_id: writing-voice
+    task_type: quick_response
+    routing_tier: 1
+    step_type: generate
+    output_var: voice_analysis_output
+    prompt_template: >
+      You are helping prepare a writing request. Analyse the user's
+      request and identify: the purpose, the intended audience, the
+      desired tone, and the key points to cover.
+
+      Do not write the draft yet. Only analyse the request.
+
+      Voice preferences: {voice_profile}
+      Request: {user_input}
+    field_requirements:
+      voice_profile: recommended
+    options_override:
+      temperature: 0.3
+      num_predict: 256
+
+  - step_id: draft_writing
+    display_name: Writing your draft...
+    guide_id: writing-voice
+    task_type: creative_writing
+    routing_tier: 2
+    step_type: generate
+    output_var: draft_output
+    prompt_template: >
+      Write a polished draft based on the following request and analysis.
+      Adapt naturally to the user's context without mentioning it directly.
+      Be clear, purposeful, and well-structured.
+
+      Request: {user_input}
+
+      Analysis: {voice_analysis_output}
+
+      Context (use naturally if present, ignore if empty):
+        Role: {job_title}
+        Organisation: {employer}
+        Location: {location_city}
+
+      Voice preferences: {voice_profile}
+    field_requirements:
+      job_title: optional
+      employer: optional
+      location_city: optional
+    options_override:
+      temperature: 0.5
+      num_predict: 1024
+
+  - step_id: voice_transform
+    display_name: Refining your voice...
+    guide_id: writing-voice
+    task_type: quick_response
+    routing_tier: 1
+    step_type: voice_transform
+    output_var: final_output
+    prompt_template: >
+      Refine the following draft to better match the user's voice and preferences.
+      Preserve all content and meaning. Adjust tone, phrasing, and rhythm only.
+
+      Voice preferences: {voice_profile}
+      Draft: {draft_output}
+    field_requirements:
+      voice_profile: recommended
+    options_override:
+      temperature: 0.3
+      num_predict: 1024

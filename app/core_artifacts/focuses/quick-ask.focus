@@ -1,0 +1,41 @@
+# app/core_artifacts/focuses/quick-ask.focus
+# Quick Ask — single-step Tier 1 focus for Layer 3 verification.
+# No personal fields. No PG gates. Proves full Conductor pipeline.
+# Milestone: produces coherent output in outputs.db.
+#
+# guide_id: quick-ask-guide
+#   Not registered in artifact_versions at Layer 3.
+#   _load_guide_versions() returns {} — no crash, empty manifest versions.
+#   Register in artifact_versions when Personal Specialist layer activates (Layer 5).
+
+focus_id: quick-ask
+display_name: Quick Ask
+description: >
+  Turn a short idea or prompt into a polished draft, ready to use
+  or refine further.
+version: "1.0"
+output_type: quick_ask
+max_routing_tier: 1
+life_affinity: []
+suggest_in_focuses:
+  - writing-assistant
+  - job-match
+  - research-and-buy
+
+steps:
+  - step_id: draft
+    display_name: Writing draft...
+    guide_id: quick-ask-guide
+    task_type: creative_writing
+    routing_tier: 1
+    step_type: generate
+    output_var: draft_output
+    prompt_template: >
+      Write a clear, well-structured draft based on the following request.
+      Be direct and useful. Do not add unnecessary preamble.
+
+      Request: {user_input}
+    field_requirements: {}
+    options_override:
+      temperature: 0.4
+      num_predict: 512

@@ -1,0 +1,106 @@
+# app/core_artifacts/guides/writing-voice.guide
+# Writing Voice Guide — Layer 6 focus guide.
+# Declared in writing-assistant.focus steps.
+# Instantiated during Phase 3 INITIALIZE when writing-assistant.focus loads.
+# Type: guide (community-shareable Focus specialist).
+#
+# Role: provides voice and style context for writing tasks.
+# Reads voice_profiles table entries for this user/life.
+# All approved voice profile attributes are general-sensitivity behavioral
+# metadata — exempt from Gate1 abstraction (Option A, ADR-012 Amendment 3).
+# Voice profile is injected via {voice_profile} token into prompt templates.
+# NOT routed through step_disclosure_buffer — style guidance, not personal data.
+#
+# This file is a role definition and system contract only.
+# No executable logic. No runtime policy enforcement here.
+# Runtime: voice profile loaded from personal.db during Phase 3 INITIALIZE
+# via load_personal_track() -> _resolve_voice_profile().
+
+guide_id: writing-voice
+display_name: Writing Voice
+version: "1.0"
+layer: 6
+always_active: false
+declared_in_focuses:
+  - writing-assistant
+
+description: >
+  Your writing style, captured and applied. The Writing Voice guide
+  shapes how Quiet Rabbit writes for you — matching your tone, formality,
+  and rhythm across every draft.
+
+# Lifecycle contract
+lifecycle:
+  instantiation: phase_3_initialize
+  scope: focus_run
+  cardinality: per_focus_run
+
+# Voice profile attributes managed by this guide.
+# INFORMATIONAL ONLY — runtime loading is from voice_profiles table.
+# All listed attributes are general-sensitivity behavioral metadata.
+voice_attributes_reference:
+  - tone              # warm / balanced / direct / formal
+  - formality         # casual / moderate / formal
+  - directness        # direct / balanced / diplomatic
+  - length_preference # concise / detailed
+  - pacing            # quick / medium / deliberate
+
+# Voice profile exemption from Gate1 abstraction (ADR-012 Amendment 3, Option A).
+# Basis: attributes are behavioral descriptors with no PII risk.
+# Runtime enforcement: ALLOWED_VOICE_ATTRIBUTES frozenset in conductor/executor.py.
+#   Unknown attributes are excluded and logged — never silently injected.
+#   This file documents the contract; executor.py enforces it.
+# Layer 8: Security Checker validates no attribute value contains personal data.
+# Expanding allowed_attributes requires ADR amendment + Security Checker update.
+voice_profile_exemption:
+  basis: general_sensitivity_behavioral_metadata
+  allowed_attributes:
+    - tone
+    - formality
+    - directness
+    - length_preference
+    - pacing
+  enforcement: conductor/executor.py::ALLOWED_VOICE_ATTRIBUTES
+  layer_8_check: Security Checker validates no attribute value contains PII
+
+# Guide-defaults voice profile — precedence level 2.
+# runtime_active: false — these are documentary only.
+# No registration code reads this today. Layer 7/8 focus registration
+# may write these to voice_profiles table with precedence=2.
+# User's global (3), life (4), and writing_context (5) preferences
+# all override these defaults.
+voice_profile_guide_defaults:
+  runtime_active: false
+  precedence: 2
+  attributes:
+    tone: balanced
+    formality: moderate
+    directness: direct
+    length_preference: concise
+    pacing: medium
+
+# Field requirements reference — DOCUMENTATION ONLY.
+# Single source of truth is writing-assistant.focus field_requirements.
+# This section documents which personal fields the guide benefits from
+# for human readers and future Security Checker validation.
+field_requirements_reference:
+  _note: "runtime source of truth is writing-assistant.focus"
+  voice_analysis:
+    voice_profile: recommended
+  draft_writing:
+    job_title: optional
+    employer: optional
+    location_city: optional
+  voice_transform:
+    voice_profile: recommended
+
+# Abstraction policy reference — DOCUMENTATION ONLY.
+# Runtime source: personal_fields.abstraction_tier2/3 columns in personal.db.
+abstraction_policy_reference:
+  runtime_source: field_level_only
+  personal:
+    tier2: summarize
+    tier3: omit
+  general:
+    tier2: pass
+    tier3: summarize

@@ -1,0 +1,103 @@
+# app/core_artifacts/operators/personal-specialist.operator
+# Personal Specialist — Layer 1 system operator.
+# Always active. Never declared in .focus files — instantiated automatically
+# during Phase 3 INITIALIZE for every focus run.
+# Type: operator (system-only, never community-shareable).
+#
+# This file is a role definition and system contract only.
+# No executable logic. No runtime policy enforcement here.
+# Runtime field loading is dynamic from personal.db by source_id.
+# Abstraction policies are enforced by PrivacyGateway (conductor/privacy.py).
+# Export ceiling is enforced by personal_store.py (EXPORT_SENSITIVITY_CEILING = 2).
+
+operator_id: personal-specialist
+display_name: Personal Specialist
+version: "1.0"
+layer: 1
+always_active: true
+declared_in_focuses: false
+
+description: >
+  Manages your personal context — the information Quiet Rabbit uses to make
+  its output feel relevant to your situation, without ever narrating it back
+  to you or sharing it beyond the boundaries you set.
+
+# Lifecycle contract
+lifecycle:
+  instantiation: phase_3_initialize
+  scope: focus_run
+  cardinality: per_focus_run
+
+# Field categories this operator manages.
+# INFORMATIONAL ONLY — does not restrict runtime loading.
+# Runtime: all fields in personal.db with this source_id are loaded
+# during Phase 3 INITIALIZE regardless of category.
+field_categories_reference:
+  - identity        # name, preferred name, pronouns
+  - location        # city, country, timezone
+  - work            # employer, job title, industry, years experience
+  - communication   # preferred tone, formality, directness
+  - life_context    # household size, life stage, relevant situation
+  - health          # conditions, medications, dietary restrictions
+  - finance         # income range, financial goals, obligations
+
+# Abstraction policy reference — DOCUMENTATION ONLY.
+# Runtime source of truth: abstraction_tier2 / abstraction_tier3 columns
+# in personal.db (personal_fields table). Schema enforces valid values via
+# CHECK constraint with DEFAULT 'pass'. These entries document the
+# recommended defaults for field-level configuration, not runtime fallbacks.
+abstraction_policy_reference:
+  runtime_source: field_level_only
+  general:
+    tier2: pass
+    tier3: summarize
+  personal:
+    tier2: summarize
+    tier3: omit
+  medical:
+    tier2: not_permitted
+    tier3: not_permitted
+  financial:
+    tier2: not_permitted
+    tier3: not_permitted
+
+# Abstraction policy semantics (for Security Checker and human reference):
+#   pass:          value passes through to disclosure buffer as-is
+#   omit:          field excluded entirely from disclosure buffer
+#   summarize:     replaced with category label ("a salary amount")
+#   range_only:    numeric -> +/-20% bracket ("60k-70k")
+#   not_permitted: hard block -> PrivacyGateBlockedError (handled as F4)
+
+# Field sensitivity levels:
+#   general:   severity 1 -- name, location, language preferences
+#   personal:  severity 2 -- job title, employer, life situation
+#   medical:   severity 3 -- health conditions, medications, allergies
+#   financial: severity 4 -- salary, accounts, financial obligations
+
+# Export policy (D5-080).
+# Enforced by: personal_store.py constant EXPORT_SENSITIVITY_CEILING = 2
+# Fields with sensitivity_severity > 2 (medical, financial) are never
+# exported. This is a system invariant, not a user preference.
+# No override mechanism exists in Release 1.
+export_policy:
+  max_sensitivity_severity: 2
+  enforced_by: personal_store.EXPORT_SENSITIVITY_CEILING
+
+# Voice profile
+# Precedence levels (ascending -- higher number wins by overwriting lower):
+#   1 = model_baseline      (this file -- lowest authority)
+#   2 = guide_defaults      (focus-level tone guidance)
+#   3 = global              (user preference across all lives)
+#   4 = life                (life-specific override)
+#   5 = writing_context     (step-level override -- highest authority)
+voice_profile_resolution: overwrite_by_precedence
+
+# Baseline voice profile -- precedence level 1 (lowest).
+# Written to voice_profiles table with precedence=1 during CLI interview.
+# All higher-precedence entries in personal.db override these values.
+voice_profile_baseline:
+  tone: neutral
+  formality: moderate
+  directness: balanced
+  length_preference: concise
+  pacing: medium

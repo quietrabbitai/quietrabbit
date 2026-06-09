@@ -1,0 +1,39 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+.env.development
+.env.local
+
+# Database files (never commit user data)
+*.db
+*.db-shm
+*.db-wal
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# QR data (never commit user data or outputs)
+quietrabbit-data/
+
+# Taxonomy manifest (build artifact — regenerate with scripts/generate_manifest.py)
+app/taxonomy/manifest.yaml

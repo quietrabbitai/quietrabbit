@@ -1,0 +1,6 @@
+# Routing table taxonomy — stub for Layer 0.
+# Full content: Layer 1.
+version: "1.0"
+tier1: {}
+tier2: {}
+tier3: {}

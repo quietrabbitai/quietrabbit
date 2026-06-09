@@ -1,0 +1,29 @@
+# Quiet Rabbit — Python Dependencies
+# sqlcipher3-binary replaces pysqlcipher3 (unmaintained, incompatible with Python 3.13+)
+# CrewAI and litellm excluded — Conductor is a custom orchestration engine.
+# See IDEA_DECISIONS_4.md D4-013, D4-017.
+
+# Database — SQLCipher encrypted SQLite
+sqlcipher3-binary
+
+# Web framework
+Flask
+Flask-Login
+Flask-Session
+
+# Configuration
+python-dotenv
+
+# Taxonomy and config files
+PyYAML
+
+# HTTP client (Ollama + Tier 2 providers)
+requests
+
+# Cryptography (Layer 8 — auth, key derivation, recovery keys)
+bcrypt
+cryptography
+mnemonic
+
+# System keychain (Layer 8 — single-user install key)
+keyring

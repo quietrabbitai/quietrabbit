@@ -1,0 +1,67 @@
+services:
+  qr-conductor:
+    build: .
+    container_name: qr-conductor
+    restart: unless-stopped
+    ports:
+      - "5000:3000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ${QR_LOCAL_DATA:-./quietrabbit-data}:/data/quietrabbit
+    environment:
+      - QR_DATA_ROOT=/data/quietrabbit
+      - QR_ENV=${QR_ENV:-production}
+      - QR_NETWORK_STORAGE=${QR_NETWORK_STORAGE:-false}
+      - QR_ALLOW_HTTP=${QR_ALLOW_HTTP:-true}
+      - OLLAMA_HOST=${OLLAMA_HOST:-host.docker.internal}
+      - OLLAMA_PORT=${OLLAMA_PORT:-11434}
+      - MAX_CONCURRENT_INFERENCE=1
+      - QR_STARTUP_INTEGRITY_CHECK=${QR_STARTUP_INTEGRITY_CHECK:-true}
+      - QR_FALLBACK_ON_INTEGRITY_FAIL=${QR_FALLBACK_ON_INTEGRITY_FAIL:-true}
+      - QR_LOOP_DETECTION_THRESHOLD=${QR_LOOP_DETECTION_THRESHOLD:-3}
+      - QR_CONTEXT_WARNING_THRESHOLD=${QR_CONTEXT_WARNING_THRESHOLD:-0.75}
+      - QR_QUALITY_FLOOR=${QR_QUALITY_FLOOR:-0.55}
+      - QR_INTERRUPT_THRESHOLD_MINUTES=${QR_INTERRUPT_THRESHOLD_MINUTES:-5}
+      - QR_MAX_CONCURRENT_PATHS=${QR_MAX_CONCURRENT_PATHS:-3}
+      - QR_CHECKPOINT_EVERY_N_STEPS=${QR_CHECKPOINT_EVERY_N_STEPS:-3}
+      - QR_DEV_KEY_HEX=${QR_DEV_KEY_HEX}
+      - GROQ_API_KEY=${GROQ_API_KEY}
+
+      - SQLITE_TMPDIR=/tmp
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - quietrabbit-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+networks:
+  quietrabbit-net:
+    driver: bridge
+
+# -- Topology A (single machine, Ollama running locally) ------------------
+#   No .env needed. Data stored in ./quietrabbit-data.
+#   Ollama must be running on the host at port 11434.
+#   docker compose up -d
+#
+# -- Topology B (separate inference machine) ------------------------------
+#   OLLAMA_HOST=192.168.x.x
+#
+# -- Topology C (NAS / network storage) -----------------------------------
+#   OLLAMA_HOST=192.168.x.x
+#   QR_LOCAL_DATA=/mnt/your/nas/path
+#   QR_NETWORK_STORAGE=true
+#
+# -- Dev (Garuda + LXC + NAS) ---------------------------------------------
+#   OLLAMA_HOST=192.168.88.26
+#   QR_LOCAL_DATA=/mnt/NAS/QuietRabbitData
+#   QR_ENV=development
+#   QR_NETWORK_STORAGE=true
