@@ -185,31 +185,95 @@ class FocusRun:
         raise FileNotFoundError(f"Focus file not found: {self.focus_id}.focus")
 
     def _parse_focus_definition(self, raw: dict) -> FocusDefinition:
+        # Conductor-brief uses "id" at top level; legacy used "focus_id".
+        # Conductor-brief is the primary format — "id" takes precedence.
+        focus_id = raw.get("id") or raw.get("focus_id") or ""
+
+        # Conductor-brief declares guides at focus level, not per step.
+        # COMPATIBILITY: StepDefinition still requires a guide_id per step.
+        # First entry in the focus-level guides list is inherited by all steps
+        # that do not declare their own guide_id. This is a temporary shim —
+        # when multi-guide Focuses exist, per-step guide_id will be required.
+        focus_level_guides: list[str] = raw.get("guides", [])
+        default_guide_id = focus_level_guides[0] if focus_level_guides else "quick-ask-guide"
+
+        # Conductor-brief uses output_types (list); legacy used output_type (str).
+        # COMPATIBILITY: FocusDefinition currently holds a single output_type.
+        # First entry used until FocusDefinition supports plural output_types.
+        output_types_list: list[str] = raw.get("output_types", [])
+        output_type: str = (
+            output_types_list[0]
+            if output_types_list
+            else raw.get("output_type", "general")
+        )
+
+        # suggest_in_focuses: fall back to legacy suggest_in_paths if absent.
+        # Phase A rename retired suggest_in_paths — fallback handles any
+        # artifacts that predate the rename.
+        suggest_in_focuses: list[str] = (
+            raw.get("suggest_in_focuses")
+            or raw.get("suggest_in_paths")
+            or []
+        )
+
+        raw_steps = raw.get("steps", {})
+
+        # Conductor-brief: steps is a dict keyed by step_id — PRIMARY format.
+        # Legacy: steps is a list of dicts with explicit step_id keys.
+        # List format retained as compatibility code; no new Focuses use it.
+        if isinstance(raw_steps, dict):
+            step_items = list(raw_steps.items())
+        else:
+            step_items = [(s["step_id"], s) for s in raw_steps]
+
         steps = []
-        for raw_step in raw.get("steps", []):
+        for step_id_key, raw_step in step_items:
+            if not isinstance(raw_step, dict):
+                raise ValueError(
+                    f"Focus '{focus_id}': step '{step_id_key}' must be a mapping, "
+                    f"got {type(raw_step).__name__}."
+                )
+
+            # In conductor-brief, the dict key is authoritative as step_id.
+            # In legacy list format, step_id comes from within the dict.
+            step_id = step_id_key if isinstance(raw_steps, dict) else raw_step["step_id"]
+
+            # field_requirements: conductor-brief uses list of {name, scope} dicts.
+            # Legacy uses a flat {name: scope} dict.
+            raw_fr = raw_step.get("field_requirements", {})
+            if isinstance(raw_fr, list):
+                field_requirements = {
+                    entry["name"]: entry["scope"]
+                    for entry in raw_fr
+                    if isinstance(entry, dict) and "name" in entry and "scope" in entry
+                }
+            else:
+                field_requirements = dict(raw_fr) if raw_fr else {}
+
             step = StepDefinition(
-                step_id=raw_step["step_id"],
-                display_name=raw_step.get("display_name", raw_step["step_id"]),
-                guide_id=raw_step["guide_id"],
-                task_type=raw_step["task_type"],
+                step_id=step_id,
+                display_name=raw_step.get("display_name", step_id),
+                guide_id=raw_step.get("guide_id", default_guide_id),
+                task_type=raw_step.get("task_type", "general"),
                 routing_tier=raw_step.get("routing_tier", 1),
                 step_type=raw_step.get("step_type", "generate"),
                 output_var=raw_step.get("output_var"),
                 prompt_template=raw_step.get("prompt_template", ""),
-                field_requirements=raw_step.get("field_requirements", {}),
+                field_requirements=field_requirements,
                 options_override=raw_step.get("options_override", {}),
             )
             steps.append(step)
+
         return FocusDefinition(
-            focus_id=raw["focus_id"],
-            display_name=raw["display_name"],
+            focus_id=focus_id,
+            display_name=raw.get("display_name", focus_id),
             description=raw.get("description", ""),
-            version=raw.get("version", "1.0"),
+            version=str(raw.get("version", "1.0")),
             life_affinity=raw.get("life_affinity", []),
             max_routing_tier=raw.get("max_routing_tier", 1),
             steps=steps,
-            output_type=raw.get("output_type", "general"),
-            suggest_in_focuses=raw.get("suggest_in_focuses", []),
+            output_type=output_type,
+            suggest_in_focuses=suggest_in_focuses,
             multi_source_validation=raw.get("multi_source_validation", False),
         )
 
