@@ -65,10 +65,15 @@ if _DEV_MODE and not _DEV_KEY_HEX:
 
 _SUBMIT_FORM = """<!DOCTYPE html>
 <html>
-<head><title>Quiet Rabbit — Quick Ask</title></head>
+<head><title>Quiet Rabbit — Dev Smoke Test</title></head>
 <body>
-<h2>Quick Ask — smoke test</h2>
+<h2>Quiet Rabbit — Dev Smoke Test</h2>
 <form method="POST" action="/run">
+  <label for="focus_id">Focus:</label><br>
+  <select name="focus_id" id="focus_id">
+    <option value="quick-ask">Quick Ask</option>
+    <option value="research-and-buy">Research &amp; Buy</option>
+  </select><br><br>
   <textarea name="prompt" rows="6" cols="60"
     placeholder="Type your prompt here..."></textarea><br><br>
   <input type="submit" value="Run">
