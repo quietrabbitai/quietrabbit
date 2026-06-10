@@ -1,73 +1,93 @@
+# app/core_artifacts/focuses/research-and-buy.focus
+# Research & Buy — three-step conductor-brief Focus.
+# Pattern: Tier 1 requirements capture → Tier 2 research → Tier 2 recommendation.
+# Privacy Sandwich: Gate3 fires at Tier 1→2 boundary before research step.
+# Personal fields: location_city (recommended) — no sensitive fields used.
+# Budget and other constraints flow naturally through {user_input}.
+# guide_id resolved from focus-level guides list at load time (per parser shim).
+
 id: research-and-buy
 display_name: Research & Buy
+description: >
+  Research a purchase decision from first requirements to final recommendation.
+  Surfaces trade-offs, not just a top pick.
 version: "1.0"
 life_affinity: []
 max_routing_tier: 2
-
 guides:
   - research-analysis
 
+output_types:
+  - research_summary
+suggest_in_focuses: []
+
 brief:
   intent: >
-    Help the user research a purchase decision — from requirements gathering
-    through options research to a clear, reasoned recommendation.
+    Help the user define what they need, research available options,
+    and arrive at a clear recommendation with reasoning.
   constraints:
-    - Never recommend a specific retailer without the user asking
-    - Always surface trade-offs, not just the top pick
-    - Do not assert budget limits the user has not stated
-    - If requirements are unclear, clarify before researching
+    - Never recommend a specific retailer unless the user explicitly asks
+    - Always surface trade-offs, not just a single top pick
+    - Do not fabricate product specifications or prices
 
 steps:
   requirements_capture:
     display_name: "Understanding what you need"
+    task_type: general
     routing_tier: 1
+    step_type: generate
+    output_var: requirements
+    prompt_template: >
+      {voice_profile}
+      The user wants help researching a purchase. Based on their request,
+      produce a concise requirements summary covering: what they need,
+      key constraints (budget, use case, preferences), and any assumptions
+      made where information was not provided.
+
+      User request: {user_input}
+      Location: {location_city}
     field_requirements:
       - name: location_city
         scope: recommended
-      - name: budget_range
-        scope: optional
-    prompt_template: |
-      {voice_profile}
-      The user wants help making a purchase decision.
-      User input: {user_input}
-      Location context (if relevant): {location_city}
-
-      Help the user define clear requirements: what they need,
-      what matters most to them, and any constraints. Ask
-      clarifying questions if the goal is ambiguous.
-    output_var: requirements
+    options_override:
+      temperature: 0.3
+      num_predict: 512
 
   research:
     display_name: "Researching options"
+    task_type: research
     routing_tier: 2
-    field_requirements:
-      - name: location_city
-        scope: recommended
-    prompt_template: |
-      Requirements: {requirements}
-      Location context (if relevant): {location_city}
+    step_type: generate
+    output_var: research_results
+    prompt_template: >
+      {voice_profile}
+      Based on the following requirements, research the available options.
+      For each viable option surface: key strengths, weaknesses, and
+      who it is best suited for. Do not recommend a specific retailer.
 
-      Research available options that meet these requirements.
-      For each option surface: key strengths, key weaknesses,
-      and trade-offs relative to the others. Do not recommend
-      a specific retailer unless the user has asked.
-    output_var: research_summary
+      Requirements: {requirements}
+      {life_context}
+    field_requirements: []
+    options_override:
+      temperature: 0.4
+      num_predict: 1024
 
   recommendation:
     display_name: "Building your recommendation"
+    task_type: general
     routing_tier: 2
-    field_requirements: []
-    prompt_template: |
+    step_type: generate
+    output_var: research_summary
+    prompt_template: >
+      {voice_profile}
+      Based on the research below, produce a recommendation that explains
+      the strongest option and the specific reasons it fits the requirements.
+      Then explain the situations where each alternative would be a better
+      choice. Be direct. Do not hedge unnecessarily.
+
       Requirements: {requirements}
-      Research: {research_summary}
-
-      Synthesise a clear recommendation with reasoning.
-      State the top pick, why it best fits the stated requirements,
-      and what the user gives up by choosing it over the alternatives.
-    output_var: recommendation
-
-output_types:
-  - research_summary
-  - recommendation
-
-suggest_in_focuses: []
+      Research: {research_results}
+    field_requirements: []
+    options_override:
+      temperature: 0.3
+      num_predict: 768
