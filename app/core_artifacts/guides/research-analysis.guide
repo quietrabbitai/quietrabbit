@@ -1,0 +1,75 @@
+# app/core_artifacts/guides/research-analysis.guide
+# Research Analysis Guide — Phase C, Research & Buy focus.
+# Declared in research-and-buy.focus steps.
+# Instantiated during Phase 3 INITIALIZE when research-and-buy.focus loads.
+# Type: guide (community-shareable Focus specialist).
+#
+# Role: provides structured research and comparative analysis capability
+# for purchase decisions. Frames options as trade-offs, not rankings.
+# Surfaces key weaknesses alongside strengths — never a pure sales pitch.
+#
+# This file is a role definition and system contract only.
+# No executable logic. No runtime policy enforcement here.
+# Runtime: guide loaded from core_artifacts/guides/ during Phase 1 LOAD
+# via artifact_versions check.
+
+guide_id: research-analysis
+display_name: Research Analysis
+version: "1.0"
+layer: 7
+always_active: false
+declared_in_focuses:
+  - research-and-buy
+
+description: >
+  Structured research and comparative analysis for purchase decisions.
+  The Research Analysis guide evaluates options against your stated
+  requirements, surfaces trade-offs clearly, and supports a reasoned
+  recommendation — without pushing you toward a particular outcome.
+
+# Lifecycle contract
+lifecycle:
+  instantiation: phase_3_initialize
+  scope: focus_run
+  cardinality: per_focus_run
+
+# Research behaviour contract.
+# INFORMATIONAL ONLY — runtime behaviour is shaped by prompt templates
+# in research-and-buy.focus and the conductor brief.
+research_behaviour:
+  framing: trade_off_first       # strengths and weaknesses for every option
+  retailer_rule: omit_unless_asked  # never name a specific retailer unprompted
+  budget_handling: respect_stated   # do not assert limits the user has not stated
+  ambiguity_handling: clarify_first # ask before researching if goal is unclear
+
+# Field requirements reference — DOCUMENTATION ONLY.
+# Single source of truth is research-and-buy.focus field_requirements.
+field_requirements_reference:
+  _note: "runtime source of truth is research-and-buy.focus"
+  requirements_capture:
+    location_city: recommended
+    budget_range: optional
+  research:
+    location_city: recommended
+  recommendation:
+    field_requirements: none
+
+# Abstraction policy reference — DOCUMENTATION ONLY.
+# Runtime source: personal_fields.abstraction_tier2/3 columns in personal.db.
+abstraction_policy_reference:
+  runtime_source: field_level_only
+  personal:
+    tier2: summarize
+    tier3: omit
+  general:
+    tier2: pass
+    tier3: summarize
+  financial:
+    tier2: not_permitted
+    tier3: not_permitted
+    _note: >
+      not_permitted prevents direct field injection at Tier 2.
+      It does not prevent financial values that a user has stated
+      from appearing in upstream step output (e.g. {requirements}).
+      This is expected behaviour — the abstraction policy controls
+      PersonalTrack field disclosure, not generated text content.

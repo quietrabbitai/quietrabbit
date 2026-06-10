@@ -1,0 +1,73 @@
+id: research-and-buy
+display_name: Research & Buy
+version: "1.0"
+life_affinity: []
+max_routing_tier: 2
+
+guides:
+  - research-analysis
+
+brief:
+  intent: >
+    Help the user research a purchase decision — from requirements gathering
+    through options research to a clear, reasoned recommendation.
+  constraints:
+    - Never recommend a specific retailer without the user asking
+    - Always surface trade-offs, not just the top pick
+    - Do not assert budget limits the user has not stated
+    - If requirements are unclear, clarify before researching
+
+steps:
+  requirements_capture:
+    display_name: "Understanding what you need"
+    routing_tier: 1
+    field_requirements:
+      - name: location_city
+        scope: recommended
+      - name: budget_range
+        scope: optional
+    prompt_template: |
+      {voice_profile}
+      The user wants help making a purchase decision.
+      User input: {user_input}
+      Location context (if relevant): {location_city}
+
+      Help the user define clear requirements: what they need,
+      what matters most to them, and any constraints. Ask
+      clarifying questions if the goal is ambiguous.
+    output_var: requirements
+
+  research:
+    display_name: "Researching options"
+    routing_tier: 2
+    field_requirements:
+      - name: location_city
+        scope: recommended
+    prompt_template: |
+      Requirements: {requirements}
+      Location context (if relevant): {location_city}
+
+      Research available options that meet these requirements.
+      For each option surface: key strengths, key weaknesses,
+      and trade-offs relative to the others. Do not recommend
+      a specific retailer unless the user has asked.
+    output_var: research_summary
+
+  recommendation:
+    display_name: "Building your recommendation"
+    routing_tier: 2
+    field_requirements: []
+    prompt_template: |
+      Requirements: {requirements}
+      Research: {research_summary}
+
+      Synthesise a clear recommendation with reasoning.
+      State the top pick, why it best fits the stated requirements,
+      and what the user gives up by choosing it over the alternatives.
+    output_var: recommendation
+
+output_types:
+  - research_summary
+  - recommendation
+
+suggest_in_focuses: []
