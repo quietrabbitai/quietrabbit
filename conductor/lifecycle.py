@@ -698,7 +698,7 @@ class FocusRun:
         output_id = str(uuid.uuid4())
         save_output(
             user_id=self.user_id,
-            life_id=self.persona_id,
+            persona_id=self.persona_id,
             key_hex=self.key_hex,
             focus_run_id=self.focus_run_id,
             output_type=self.focus_def.output_type,
@@ -743,7 +743,7 @@ class FocusRun:
             from persistence.topic_store import create_run_history_entry
             create_run_history_entry(
                 user_id=self.user_id,
-                life_id=self.persona_id,
+                persona_id=self.persona_id,
                 key_hex=self.key_hex,
                 focus_run_id=self.focus_run_id,
                 focus_id=self.focus_id,
