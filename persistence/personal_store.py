@@ -46,6 +46,8 @@
 #   stored_persona_id local variable (was stored_life_id) in voice profile writes
 #   Cleanup flagged for Chat-PM: voice profile NULL matching semantics,
 #   GLOBAL_VOICE_PRECEDENCE constant (ChatGPT review items 1-4)
+# Updated D6-307: GLOBAL_VOICE_PRECEDENCE = 3 constant added; magic number
+#   replaced in write and delete paths; NULL=global semantics verified consistent
 
 from __future__ import annotations
 
@@ -88,6 +90,10 @@ INSTANCE_SCOPE_MAX_SEVERITY = 2
 
 # Voice profile value validation (D5-151).
 VOICE_VALUE_MAX_WORDS = 12
+
+# Precedence level at which voice profile entries are globally scoped.
+# Global entries apply across all Personas (persona_id = NULL).
+GLOBAL_VOICE_PRECEDENCE = 3
 
 _VOICE_VALUE_PII_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r'\S+@\S+\.\S+'), "email address"),
@@ -541,9 +547,10 @@ def save_voice_profile_entry(
             f"Voice profile precedence must be 1-5, got {precedence}."
         )
 
-    # Global entries (precedence 3) store NULL persona_id to match query
-    # in _resolve_voice_profile: "WHERE persona_id = ? OR persona_id IS NULL"
-    stored_persona_id = None if precedence == 3 else persona_id
+    # Global entries (precedence GLOBAL_VOICE_PRECEDENCE) store NULL persona_id
+    # to match query in _resolve_voice_profile:
+    # "WHERE persona_id = ? OR persona_id IS NULL"
+    stored_persona_id = None if precedence == GLOBAL_VOICE_PRECEDENCE else persona_id
     metadata_json = json.dumps(extra_metadata or {})
     timestamp = now()
 
@@ -596,7 +603,7 @@ def delete_voice_profile_entry(
     Delete a voice profile entry by attribute + precedence.
     Returns True if found and deleted, False if not found.
     """
-    stored_persona_id = None if precedence == 3 else persona_id
+    stored_persona_id = None if precedence == GLOBAL_VOICE_PRECEDENCE else persona_id
 
     with open_personal_db(user_id, persona_id, key_hex) as db:
         existing = db.execute(

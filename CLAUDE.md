@@ -64,6 +64,22 @@ Dev venv: ~/.venvs/quietrabbit/ (Garuda local — NAS has noexec, .so files won'
 Verify sqlcipher3: python -c "from sqlcipher3 import dbapi2 as sqlite3; print('OK')"
 Claude Code: always launch from /mnt/NAS/QuietRabbitMirror/06_GitRepos/quietrabbit-core/
 
+## LXC Sync Workflow (D6-308)
+After any `git push` on Garuda, manually run `git pull` on LXC ai-conductor
+before rebuilding. The vault post-commit hook fires only on vault commits —
+it does NOT fire on code repo pushes. The LXC mirror is not auto-updated.
+
+Canonical deploy sequence after a code push:
+  1. On Garuda:   git push
+  2. On LXC (via Proxmox browser console):
+       cd /mnt/NAS/QuietRabbitMirror/06_GitRepos/quietrabbit-core
+       git pull
+       docker compose down
+       docker compose build --no-cache
+       docker compose up -d
+  Use `docker compose down && docker compose up -d` (no --no-cache) for
+  artifact/config-only changes (.focus, .guide, .yaml, .sql — no .py changes).
+
 ## Naming Architecture (Phase A rename — D6-224, D6-225)
 All legacy terms retired. Use only the new terms below.
 

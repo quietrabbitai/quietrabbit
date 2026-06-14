@@ -40,6 +40,7 @@
 #   LIFE_ID / QR_INTERVIEW_LIFE_ID → PERSONA_ID / QR_INTERVIEW_PERSONA_ID
 #   All call site parameters: life_id= → persona_id=
 #   migrate_personal_db: life_id param → persona_id param
+# Updated D6-306: migrate_outputs_db now called alongside migrate_personal_db on init
 
 import os
 import sys
@@ -51,8 +52,9 @@ from persistence.personal_store import (
     list_personal_fields,
     save_personal_field,
     save_voice_profile_entry,
+    GLOBAL_VOICE_PRECEDENCE,
 )
-from persistence.migrations import migrate_personal_db
+from persistence.migrations import migrate_outputs_db, migrate_personal_db
 
 # -- Dev mode constants -------------------------------------------------------
 
@@ -133,10 +135,13 @@ def run_interview() -> None:
 
     print("  Initialising personal database...")
     try:
+        # Initialize identity store first, then outputs store (dependent order)
         migrate_personal_db(USER_ID, PERSONA_ID, KEY_HEX)
-        print("  +  personal.db ready\n")
+        print("  +  personal.db ready")
+        migrate_outputs_db(USER_ID, PERSONA_ID, KEY_HEX)
+        print("  +  outputs.db ready\n")
     except Exception as e:
-        print(f"\nERROR: Could not initialise personal.db: {e}")
+        print(f"\nERROR: Could not initialise databases: {e}")
         sys.exit(1)
 
     try:
@@ -249,7 +254,7 @@ def run_interview() -> None:
                 key_hex=KEY_HEX,
                 attribute=attribute,
                 value=value,
-                precedence=3,
+                precedence=GLOBAL_VOICE_PRECEDENCE,
                 source_id=SOURCE_ID,
             )
         print(
