@@ -38,6 +38,14 @@
 #   space_id → life_id throughout
 #   specialist_id column → source_id throughout
 #   path_run_id → focus_run_id in disclosure_log queries
+#
+# Updated as part of Phase C Persona model migration (D6-298):
+#   persona_id → persona_id throughout (was life_id)
+#   open_personal_db path: lives/{life_id} → personas/{persona_id}
+#   SQL: life_id column → persona_id in voice_profiles queries and INSERT
+#   stored_persona_id local variable (was stored_life_id) in voice profile writes
+#   Cleanup flagged for Chat-PM: voice profile NULL matching semantics,
+#   GLOBAL_VOICE_PRECEDENCE constant (ChatGPT review items 1-4)
 
 from __future__ import annotations
 
@@ -98,7 +106,7 @@ _VOICE_VALUE_REJECTION_MSG = (
 
 def load_personal_track(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     key_hex: str,
 ) -> PersonalTrack:
     """
@@ -112,7 +120,7 @@ def load_personal_track(
     """
     data_root = get_data_root()
     db_path = (
-        data_root / "users" / user_id / "lives" / life_id / "personal.db"
+        data_root / "users" / user_id / "personas" / persona_id / "personal.db"
     )
 
     if not db_path.exists():
@@ -129,7 +137,7 @@ def load_personal_track(
     track = PersonalTrack()
 
     try:
-        with open_personal_db(user_id, life_id, key_hex) as db:
+        with open_personal_db(user_id, persona_id, key_hex) as db:
             rows = db.execute(
                 "SELECT field_name, field_value, sensitivity, "
                 "sensitivity_severity, source_id, "
@@ -148,7 +156,7 @@ def load_personal_track(
                     abstraction_tier3=row["abstraction_tier3"],
                 ))
 
-            profile = _resolve_voice_profile(db, life_id)
+            profile = _resolve_voice_profile(db, persona_id)
             track.set_voice_profile(profile)
             track.set_life_context({})
 
@@ -174,18 +182,18 @@ def load_personal_track(
 
 def load_voice_profile(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     key_hex: str,
 ) -> dict[str, str]:
     """
     Assemble voice profile for a life, resolving all five precedence levels.
     Returns {attribute: value} with highest-precedence values winning.
     """
-    with open_personal_db(user_id, life_id, key_hex) as db:
-        return _resolve_voice_profile(db, life_id)
+    with open_personal_db(user_id, persona_id, key_hex) as db:
+        return _resolve_voice_profile(db, persona_id)
 
 
-def _resolve_voice_profile(db, life_id: str) -> dict[str, str]:
+def _resolve_voice_profile(db, persona_id: str) -> dict[str, str]:
     """
     Internal: resolve voice profile from an open personal.db connection.
 
@@ -193,15 +201,15 @@ def _resolve_voice_profile(db, life_id: str) -> dict[str, str]:
     ORDER BY precedence ASC — lower-precedence rows processed first,
     higher-precedence rows overwrite them for the same attribute key.
 
-    Global entries (precedence 3, life_id IS NULL) are shared across all lives.
+    Global entries (precedence 3, persona_id IS NULL) are shared across all lives.
     Precedence 5 (writing_context) applied at Step 8 by StepExecutor —
     not loaded at Phase 3 INITIALIZE.
     """
     rows = db.execute(
         "SELECT attribute, value, precedence FROM voice_profiles "
-        "WHERE life_id = ? OR life_id IS NULL "
+        "WHERE persona_id = ? OR persona_id IS NULL "
         "ORDER BY precedence ASC",
-        [life_id]
+        [persona_id]
     ).fetchall()
 
     profile: dict[str, str] = {}
@@ -214,7 +222,7 @@ def _resolve_voice_profile(db, life_id: str) -> dict[str, str]:
 
 def get_personal_field(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     key_hex: str,
     field_name: str,
 ) -> PersonalField | None:
@@ -222,7 +230,7 @@ def get_personal_field(
     Load a single personal field by name.
     Returns None if not found.
     """
-    with open_personal_db(user_id, life_id, key_hex) as db:
+    with open_personal_db(user_id, persona_id, key_hex) as db:
         row = db.execute(
             "SELECT field_name, field_value, sensitivity, sensitivity_severity, "
             "source_id, abstraction_tier2, abstraction_tier3 "
@@ -246,7 +254,7 @@ def get_personal_field(
 
 def list_personal_fields(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     key_hex: str,
     source_id: str | None = None,
     sensitivity: str | None = None,
@@ -272,7 +280,7 @@ def list_personal_fields(
 
     query += " ORDER BY field_name"
 
-    with open_personal_db(user_id, life_id, key_hex) as db:
+    with open_personal_db(user_id, persona_id, key_hex) as db:
         rows = db.execute(query, params).fetchall()
 
     return [
@@ -293,7 +301,7 @@ def list_personal_fields(
 
 def save_personal_field(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     key_hex: str,
     field_name: str,
     field_value: str,
@@ -342,7 +350,7 @@ def save_personal_field(
     metadata_json = json.dumps(extra_metadata or {})
     timestamp = now()
 
-    with open_personal_db(user_id, life_id, key_hex) as db:
+    with open_personal_db(user_id, persona_id, key_hex) as db:
         existing = db.execute(
             "SELECT id FROM personal_fields WHERE field_name = ?",
             [field_name]
@@ -387,7 +395,7 @@ def save_personal_field(
 
 def delete_personal_field(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     key_hex: str,
     field_name: str,
 ) -> bool:
@@ -396,7 +404,7 @@ def delete_personal_field(
     Deletion sequence: zero field_value first -> then delete record.
     Returns True if found and deleted, False if field_name not found.
     """
-    with open_personal_db(user_id, life_id, key_hex) as db:
+    with open_personal_db(user_id, persona_id, key_hex) as db:
         existing = db.execute(
             "SELECT id FROM personal_fields WHERE field_name = ?",
             [field_name]
@@ -425,7 +433,7 @@ def delete_personal_field(
 
 def export_personal_fields(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     key_hex: str,
     source_id: str | None = None,
 ) -> list[dict]:
@@ -452,7 +460,7 @@ def export_personal_fields(
 
     query += "ORDER BY field_name"
 
-    with open_personal_db(user_id, life_id, key_hex) as db:
+    with open_personal_db(user_id, persona_id, key_hex) as db:
         rows = db.execute(query, params).fetchall()
 
     return [
@@ -507,7 +515,7 @@ def _validate_voice_profile_value(attribute: str, value: str) -> None:
 
 def save_voice_profile_entry(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     key_hex: str,
     attribute: str,
     value: str,
@@ -519,12 +527,12 @@ def save_voice_profile_entry(
     Write a voice profile entry at the specified precedence level.
     Precedence: 1=model_baseline (lowest) -> 5=writing_context (highest).
 
-    space_id storage rule renamed to life_id storage rule:
-        precedence 3 (global): stored with life_id=NULL.
-        all other precedences: stored with life_id=this life.
+    space_id storage rule renamed to persona_id storage rule:
+        precedence 3 (global): stored with persona_id=NULL.
+        all other precedences: stored with persona_id=this life.
 
     Returns entry id (UUID). Upserts on composite key:
-        (stored_life_id, source_id, precedence, attribute).
+        (stored_persona_id, source_id, precedence, attribute).
     """
     _validate_voice_profile_value(attribute, value)
 
@@ -533,20 +541,20 @@ def save_voice_profile_entry(
             f"Voice profile precedence must be 1-5, got {precedence}."
         )
 
-    # Global entries (precedence 3) store NULL life_id to match query
-    # in _resolve_voice_profile: "WHERE life_id = ? OR life_id IS NULL"
-    stored_life_id = None if precedence == 3 else life_id
+    # Global entries (precedence 3) store NULL persona_id to match query
+    # in _resolve_voice_profile: "WHERE persona_id = ? OR persona_id IS NULL"
+    stored_persona_id = None if precedence == 3 else persona_id
     metadata_json = json.dumps(extra_metadata or {})
     timestamp = now()
 
-    with open_personal_db(user_id, life_id, key_hex) as db:
+    with open_personal_db(user_id, persona_id, key_hex) as db:
         existing = db.execute(
             "SELECT id FROM voice_profiles "
-            "WHERE (life_id = ? OR (life_id IS NULL AND ? IS NULL)) "
+            "WHERE (persona_id = ? OR (persona_id IS NULL AND ? IS NULL)) "
             "AND (source_id = ? OR (source_id IS NULL AND ? IS NULL)) "
             "AND precedence = ? AND attribute = ?",
             [
-                stored_life_id, stored_life_id,
+                stored_persona_id, stored_persona_id,
                 source_id, source_id,
                 precedence, attribute,
             ]
@@ -563,11 +571,11 @@ def save_voice_profile_entry(
             entry_id = str(uuid.uuid4())
             db.execute(
                 """INSERT INTO voice_profiles
-                   (id, life_id, source_id, precedence,
+                   (id, persona_id, source_id, precedence,
                     attribute, value, created_at, updated_at, extra_metadata)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [
-                    entry_id, stored_life_id, source_id,
+                    entry_id, stored_persona_id, source_id,
                     precedence, attribute, value,
                     timestamp, timestamp, metadata_json,
                 ]
@@ -578,7 +586,7 @@ def save_voice_profile_entry(
 
 def delete_voice_profile_entry(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     key_hex: str,
     attribute: str,
     precedence: int,
@@ -588,16 +596,16 @@ def delete_voice_profile_entry(
     Delete a voice profile entry by attribute + precedence.
     Returns True if found and deleted, False if not found.
     """
-    stored_life_id = None if precedence == 3 else life_id
+    stored_persona_id = None if precedence == 3 else persona_id
 
-    with open_personal_db(user_id, life_id, key_hex) as db:
+    with open_personal_db(user_id, persona_id, key_hex) as db:
         existing = db.execute(
             "SELECT id FROM voice_profiles "
-            "WHERE (life_id = ? OR (life_id IS NULL AND ? IS NULL)) "
+            "WHERE (persona_id = ? OR (persona_id IS NULL AND ? IS NULL)) "
             "AND (source_id = ? OR (source_id IS NULL AND ? IS NULL)) "
             "AND precedence = ? AND attribute = ?",
             [
-                stored_life_id, stored_life_id,
+                stored_persona_id, stored_persona_id,
                 source_id, source_id,
                 precedence, attribute,
             ]

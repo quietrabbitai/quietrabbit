@@ -1,7 +1,7 @@
 # persistence/domain_context_store.py
 # Domain Context CRUD for domain_context.db.
 # Per-user, per-life, per-focus encrypted database.
-# Path: /users/{user_id}/lives/{life_id}/focuses/{focus_id}/domain_context.db
+# Path: /users/{user_id}/personas/{persona_id}/focuses/{focus_id}/domain_context.db
 #
 # Extraction authority invariant (ADR-013 Section 6.6):
 #   The generalisation pass is the ONLY mechanism that writes Domain Context.
@@ -30,6 +30,11 @@
 #   Never leave connections open idling over NAS.
 #
 # Part of Phase B data model extension (D6-226+).
+#
+# Updated as part of Phase C Persona model migration (D6-298):
+#   life_id → persona_id in all function signatures
+#   Path: lives/{life_id} → personas/{persona_id}
+#   No SQL column changes -- domain_context schema has no life_id column
 
 from __future__ import annotations
 
@@ -133,7 +138,7 @@ def _open_domain_context_db(db_path: Path):
 
 def ensure_domain_context_db(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     focus_id: str,
     key_hex: str,
 ) -> Path:
@@ -143,9 +148,9 @@ def ensure_domain_context_db(
     Returns the database path.
     """
     from persistence.migrations import migrate_domain_context_db
-    ensure_focus_dirs(user_id, life_id, focus_id)
-    db_path = get_domain_context_path(user_id, life_id, focus_id)
-    migrate_domain_context_db(user_id, life_id, focus_id, key_hex)
+    ensure_focus_dirs(user_id, persona_id, focus_id)
+    db_path = get_domain_context_path(user_id, persona_id, focus_id)
+    migrate_domain_context_db(user_id, persona_id, focus_id, key_hex)
     return db_path
 
 
@@ -153,7 +158,7 @@ def ensure_domain_context_db(
 
 def get_eligible_blocks(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     focus_id: str,
     key_hex: str,
     execution_tier: int,
@@ -167,7 +172,7 @@ def get_eligible_blocks(
     structural access control only, not privacy policy.
     max_tokens: if provided, stops accumulating after budget is reached.
     """
-    db_path = get_domain_context_path(user_id, life_id, focus_id)
+    db_path = get_domain_context_path(user_id, persona_id, focus_id)
     if not db_path.exists():
         return []
 
@@ -205,7 +210,7 @@ def get_eligible_blocks(
 
 def get_standing_summary(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     focus_id: str,
     key_hex: str,
 ) -> StandingSummary | None:
@@ -216,7 +221,7 @@ def get_standing_summary(
     Memory Broker reads this for Tier A always-loaded retrieval.
     Standing summary is a derived artifact — never authoritative.
     """
-    db_path = get_domain_context_path(user_id, life_id, focus_id)
+    db_path = get_domain_context_path(user_id, persona_id, focus_id)
     if not db_path.exists():
         return None
 
@@ -239,12 +244,12 @@ def get_standing_summary(
 
 def list_pending_extractions(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     focus_id: str,
     key_hex: str,
 ) -> list[PendingExtraction]:
     """List all pending_review extraction cards for user review."""
-    db_path = get_domain_context_path(user_id, life_id, focus_id)
+    db_path = get_domain_context_path(user_id, persona_id, focus_id)
     if not db_path.exists():
         return []
 
@@ -275,7 +280,7 @@ def list_pending_extractions(
 
 def write_pending_extraction(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     focus_id: str,
     key_hex: str,
     source_topic_id: str,
@@ -290,7 +295,7 @@ def write_pending_extraction(
     provenance_log is retained permanently (audit trail).
     """
     entry_id = str(uuid.uuid4())
-    db_path = get_domain_context_path(user_id, life_id, focus_id)
+    db_path = get_domain_context_path(user_id, persona_id, focus_id)
 
     with _open_domain_context_db(db_path) as db:
         db.execute(
@@ -306,7 +311,7 @@ def write_pending_extraction(
 
 def write_approved_extraction(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     focus_id: str,
     key_hex: str,
     pending_id: str,
@@ -335,7 +340,7 @@ def write_approved_extraction(
     provenance_id = str(uuid.uuid4())
     block_id = str(uuid.uuid4())
     tags_json = json.dumps(relevance_tags or [])
-    db_path = get_domain_context_path(user_id, life_id, focus_id)
+    db_path = get_domain_context_path(user_id, persona_id, focus_id)
 
     with _open_domain_context_db(db_path) as db:
         # Step 1: insert provenance_log with approved_block_id = NULL
@@ -389,7 +394,7 @@ def write_approved_extraction(
 
 def discard_pending_extraction(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     focus_id: str,
     key_hex: str,
     pending_id: str,
@@ -404,7 +409,7 @@ def discard_pending_extraction(
     """
     timestamp = now()
     provenance_id = str(uuid.uuid4())
-    db_path = get_domain_context_path(user_id, life_id, focus_id)
+    db_path = get_domain_context_path(user_id, persona_id, focus_id)
 
     with _open_domain_context_db(db_path) as db:
         db.execute(
@@ -424,7 +429,7 @@ def discard_pending_extraction(
 
 def revoke_block(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     focus_id: str,
     key_hex: str,
     block_id: str,
@@ -440,7 +445,7 @@ def revoke_block(
     Returns True if found and revoked, False if not found or already revoked.
     """
     timestamp = now()
-    db_path = get_domain_context_path(user_id, life_id, focus_id)
+    db_path = get_domain_context_path(user_id, persona_id, focus_id)
     if not db_path.exists():
         return False
 
@@ -462,7 +467,7 @@ def revoke_block(
 
 def regenerate_standing_summary(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     focus_id: str,
     key_hex: str,
     max_tokens: int = 2048,
@@ -475,7 +480,7 @@ def regenerate_standing_summary(
     Standing summary is a derived artifact — never authoritative.
     Returns the new StandingSummary.
     """
-    db_path = get_domain_context_path(user_id, life_id, focus_id)
+    db_path = get_domain_context_path(user_id, persona_id, focus_id)
     timestamp = now()
 
     with _open_domain_context_db(db_path) as db:

@@ -6,7 +6,7 @@
 #      voice profile. Local model. No external call.
 #   2. draft_writing   (Tier 2) — produce the draft via Groq provider.
 #      Gate1 fires with abstraction_tier >= 2 (floor guaranteed by lifecycle).
-#      Floor Consent Gate may pause here if life_privacy_default_tier < 2.
+#      Floor Consent Gate may pause here if focus_settings.privacy_tier < 2.
 #      Step 8 reads from step_disclosure_buffer ONLY — never PersonalTrack.
 #   3. voice_transform (Tier 1) — apply voice profile to refine tone/style.
 #      Local model. No external call. Uses draft_output from step 2.
@@ -41,7 +41,6 @@ description: >
 version: "1.0"
 output_type: general
 max_routing_tier: 2
-life_affinity: []
 suggest_in_focuses: []
 
 steps:

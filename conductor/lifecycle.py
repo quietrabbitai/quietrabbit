@@ -19,14 +19,14 @@
 # - next_routing_tier RENAMED to next_execution_tier (ADR-012 naming fix)
 # - Removes: focus_max_routing_tier, life_privacy_default_tier from StepContext
 # - Removes: resolved_tier, effective_tier from StepContext construction
-# - floor_consent_preference: read from lives.extra_metadata in shared.db
+# - floor_consent_preference: read from personas.extra_metadata in shared.db
 #   via open_instance_db(). Scoped consent record validated before honoring.
 #   "modified" → executor bypasses Floor Consent Gate + writes audit event.
 #   Non-fatal if read fails — gate fires normally.
 # - _handle_step_failure(): await_floor_consent added to awaiting_user group
 #
 # D5-152 (floor consent preference scoping):
-# Consent record stored in lives.extra_metadata in shared.db (not outputs.db).
+# Consent record stored in personas.extra_metadata in shared.db (not outputs.db).
 # Schema: {"mode": "modified", "abstraction_tier": N,
 #           "consent_timestamp": "...", "consent_version": "1"}
 # Validation: consent honored if mode=="modified" and stored abstraction_tier
@@ -56,12 +56,24 @@
 #   FocusRun gains topic_id and is_quick_ask parameters.
 #   Phase 3 INITIALIZE: Memory Broker called after PersonalTrack sealed.
 #     Broker always runs — topic_id=None means Tier B skipped, not broker skipped.
-#     ContextSlice rendered to _life_context_rendered string immediately.
+#     ContextSlice rendered to _persona_context_rendered string immediately.
 #     slice_.clear() called — rendered string only is retained for session.
 #   _write_focus_run_record(): topic_id and is_quick_ask written on INSERT.
-#   _execute_step(): passes _life_context_rendered as life_context to StepContext.
+#   _execute_step(): passes _persona_context_rendered as life_context to StepContext.
 #   Phase 5 OUTPUT: run_history entry written after save_output().
-#   Phase 7 CLEANUP: _life_context_rendered cleared.
+#   Phase 7 CLEANUP: _persona_context_rendered cleared.
+# Phase C -- Persona model migration (D6-298):
+#   FocusRun.__init__: life_id -> persona_id
+#   _get_life_tiers() -> _get_focus_tier_ceiling():
+#     reads focus_settings_store.get_focus_settings(persona_id, focus_id)
+#     returns (max_permitted_tier, privacy_tier) from focus_settings row
+#   AUTHORIZE: asserts focus_settings row exists -- hard error if missing (D6-303)
+#   All open_outputs_db / open_personal_db: life_id -> persona_id
+#   PrivacyGateway constructor: life_id -> persona_id
+#   _assemble_life_context() -> _assemble_persona_context()
+#   demote_interrupted_runs(): life_id -> persona_id
+#   FocusDefinition: life_affinity field dropped (D6-300)
+#   D5-152: floor_consent_preference now in personas.extra_metadata
 
 from __future__ import annotations
 
@@ -96,7 +108,6 @@ class FocusDefinition:
     display_name: str
     description: str
     version: str
-    life_affinity: list[str]
     max_routing_tier: int
     steps: list[StepDefinition]
     output_type: str
@@ -122,7 +133,7 @@ class FocusRun:
     def __init__(
         self,
         user_id: str,
-        life_id: str,
+        persona_id: str,
         focus_id: str,
         scheduler: ConductorScheduler,
         user_input: str = "",
@@ -132,7 +143,7 @@ class FocusRun:
         is_quick_ask: bool = False,
     ):
         self.user_id = user_id
-        self.life_id = life_id
+        self.persona_id = persona_id
         self.focus_id = focus_id
         self.scheduler = scheduler
         self.user_input = user_input
@@ -148,12 +159,12 @@ class FocusRun:
         self.shared_state: SharedStateTrack | None = None
         self.failure_handler: FailureHandler | None = None
         self.privacy_gateway: PrivacyGateway | None = None
-        self._life_max_permitted_tier: int = 1
-        self._life_privacy_default_tier: int = 1
+        self._focus_max_permitted_tier: int = 1
+        self._focus_privacy_tier: int = 1
         self._output_id: str | None = None
         self._current_step_index: int = 0
         self._checkpointing_suspended: bool = False
-        self._life_context_rendered: str = ""
+        self._persona_context_rendered: str = ""
 
     # =========================================================================
     # Phase 1 — LOAD
@@ -269,7 +280,6 @@ class FocusRun:
             display_name=raw.get("display_name", focus_id),
             description=raw.get("description", ""),
             version=str(raw.get("version", "1.0")),
-            life_affinity=raw.get("life_affinity", []),
             max_routing_tier=raw.get("max_routing_tier", 1),
             steps=steps,
             output_type=output_type,
@@ -288,34 +298,41 @@ class FocusRun:
             raise PersonalDBDecryptionError(
                 plain_language="Your session has expired. Please log in again."
             )
-        self._life_max_permitted_tier, self._life_privacy_default_tier = (
-            self._get_life_tiers()
+        self._focus_max_permitted_tier, self._focus_privacy_tier = (
+            self._get_focus_tier_ceiling()
         )
         for step in self.focus_def.steps:
-            if step.routing_tier > self._life_max_permitted_tier:
+            if step.routing_tier > self._focus_max_permitted_tier:
                 raise PermissionError(
                     f"Step '{step.step_id}' requires tier {step.routing_tier} "
-                    f"but life ceiling is {self._life_max_permitted_tier}."
+                    f"but focus ceiling is {self._focus_max_permitted_tier}."
                 )
         self.failure_handler = FailureHandler(
-            space_max_permitted_tier=self._life_max_permitted_tier
+            space_max_permitted_tier=self._focus_max_permitted_tier
         )
         self.focus_run_id = str(uuid.uuid4())
         self._write_focus_run_record(status="initializing")
 
-    def _get_life_tiers(self) -> tuple[int, int]:
-        from persistence.life_store import get_life_for_user
-        life = get_life_for_user(self.user_id, self.life_id)
-        if not life:
+    def _get_focus_tier_ceiling(self) -> tuple[int, int]:
+        from persistence.persona_store import get_persona_for_user
+        from persistence.focus_settings_store import get_focus_settings
+        persona = get_persona_for_user(self.user_id, self.persona_id)
+        if not persona:
             raise LookupError(
-                f"Life '{self.life_id}' not found for user '{self.user_id}'."
+                f"Persona '{self.persona_id}' not found for user '{self.user_id}'."
             )
-        return life.max_permitted_tier, life.life_privacy_default_tier
+        focus_settings = get_focus_settings(self.persona_id, self.focus_id)
+        if not focus_settings:
+            raise LookupError(
+                f"Focus settings not found for persona='{self.persona_id}' "
+                f"focus='{self.focus_id}'. Configure this Focus before running."
+            )
+        return focus_settings.max_permitted_tier, focus_settings.privacy_tier
 
     def _write_focus_run_record(self, status: str) -> None:
         assert self.focus_run_id is not None
         assert self.key_hex is not None
-        with open_outputs_db(self.user_id, self.life_id, self.key_hex) as db:
+        with open_outputs_db(self.user_id, self.persona_id, self.key_hex) as db:
             existing = db.execute(
                 "SELECT id FROM focus_runs WHERE id = ?", [self.focus_run_id]
             ).fetchone()
@@ -348,12 +365,12 @@ class FocusRun:
         self.task_track = TaskTrack()
         self.shared_state = SharedStateTrack()
         self.privacy_gateway = PrivacyGateway(
-            self.user_id, self.life_id, self.key_hex
+            self.user_id, self.persona_id, self.key_hex
         )
-        self._life_context_rendered = self._assemble_life_context()
+        self._persona_context_rendered = self._assemble_persona_context()
         self._write_focus_run_record(status="running")
 
-    def _assemble_life_context(self) -> str:
+    def _assemble_persona_context(self) -> str:
         """
         Call Memory Broker to assemble context slice for this session.
         Broker always runs — topic_id=None means Tier B skipped, not broker skipped.
@@ -361,7 +378,7 @@ class FocusRun:
         ContextSlice rendered to string immediately, then cleared.
         Only the rendered string is retained for the session — not raw blocks.
 
-        execution_tier: uses _life_max_permitted_tier (run ceiling) so the
+        execution_tier: uses _focus_max_permitted_tier (run ceiling) so the
         Retrieval Eligibility Check admits all blocks the run could access.
 
         Failure handling: non-fatal for Quick Ask and unnamed runs (no active
@@ -376,11 +393,11 @@ class FocusRun:
             )
             slice_ = broker.assemble_context(
                 user_id=self.user_id,
-                life_id=self.life_id,
+                persona_id=self.persona_id,
                 focus_id=self.focus_id,
                 topic_id=self.topic_id,
                 key_hex=self.key_hex,
-                execution_tier=self._life_max_permitted_tier,
+                execution_tier=self._focus_max_permitted_tier,
                 model_context_window=model_context_window,
                 is_quick_ask=self.is_quick_ask,
             )
@@ -398,14 +415,14 @@ class FocusRun:
             else:
                 log.debug(
                     "memory_broker: context assembly failed (no active topic) — "
-                    "continuing with empty life_context. focus=%s error=%s",
+                    "continuing with empty persona_context. focus=%s error=%s",
                     self.focus_id, e,
                 )
             return ""
 
     def _build_personal_track(self) -> PersonalTrack:
         from persistence.personal_store import load_personal_track
-        track = load_personal_track(self.user_id, self.life_id, self.key_hex)
+        track = load_personal_track(self.user_id, self.persona_id, self.key_hex)
         guide_ids = list({step.guide_id for step in self.focus_def.steps})
         versions = self._load_guide_versions(guide_ids)
         versions.update(self._load_operator_versions())
@@ -507,22 +524,22 @@ class FocusRun:
 
         # Axis 1: execution_tier
         execution_tier = min(
-            self._life_max_permitted_tier,
+            self._focus_max_permitted_tier,
             self.focus_def.max_routing_tier,
             step.routing_tier,
         )
 
         # Axis 2: abstraction_tier with floor clamping
-        raw_abstraction = min(self._life_privacy_default_tier, execution_tier)
+        raw_abstraction = min(self._focus_privacy_tier, execution_tier)
         abstraction_tier = (
             max(2, raw_abstraction) if execution_tier > 1 else raw_abstraction
         )
 
         log.debug(
             "step=%s execution_tier=%d abstraction_tier=%d "
-            "raw_abstraction=%d life_privacy_default=%d",
+            "raw_abstraction=%d focus_privacy_tier=%d",
             step.step_id, execution_tier, abstraction_tier,
-            raw_abstraction, self._life_privacy_default_tier,
+            raw_abstraction, self._focus_privacy_tier,
         )
 
         # Gate3 look-ahead
@@ -531,7 +548,7 @@ class FocusRun:
         if step_index + 1 < len(steps):
             next_step = steps[step_index + 1]
             next_execution_tier = min(
-                self._life_max_permitted_tier,
+                self._focus_max_permitted_tier,
                 self.focus_def.max_routing_tier,
                 next_step.routing_tier,
             )
@@ -542,8 +559,8 @@ class FocusRun:
         try:
             with open_instance_db() as db:
                 row = db.execute(
-                    "SELECT extra_metadata FROM lives WHERE id = ?",
-                    [self.life_id]
+                    "SELECT extra_metadata FROM personas WHERE id = ?",
+                    [self.persona_id]
                 ).fetchone()
                 if row:
                     meta = json.loads(row["extra_metadata"] or "{}")
@@ -573,14 +590,14 @@ class FocusRun:
             failure_handler=self.failure_handler,
             privacy_gateway=self.privacy_gateway,
             scheduler=self.scheduler,
-            space_max_permitted_tier=self._life_max_permitted_tier,
+            space_max_permitted_tier=self._focus_max_permitted_tier,
             execution_tier=execution_tier,
             abstraction_tier=abstraction_tier,
             raw_abstraction=raw_abstraction,
             floor_consent_preference=floor_consent_preference,
             next_execution_tier=next_execution_tier,
             retry_count=0,
-            life_context=self._life_context_rendered,
+            life_context=self._persona_context_rendered,
         )
         return StepExecutor().execute(ctx)
 
@@ -600,7 +617,7 @@ class FocusRun:
 
     def _get_current_status(self) -> str:
         try:
-            with open_outputs_db(self.user_id, self.life_id, self.key_hex) as db:
+            with open_outputs_db(self.user_id, self.persona_id, self.key_hex) as db:
                 row = db.execute(
                     "SELECT status FROM focus_runs WHERE id = ?",
                     [self.focus_run_id]
@@ -647,7 +664,7 @@ class FocusRun:
             (task_json + shared_json + manifest_json).encode()
         ).hexdigest()
         try:
-            with open_outputs_db(self.user_id, self.life_id, self.key_hex) as db:
+            with open_outputs_db(self.user_id, self.persona_id, self.key_hex) as db:
                 db.execute(
                     """INSERT INTO focus_run_snapshots
                        (id, focus_run_id, step_id, phase, task_track_json,
@@ -681,7 +698,7 @@ class FocusRun:
         output_id = str(uuid.uuid4())
         save_output(
             user_id=self.user_id,
-            life_id=self.life_id,
+            life_id=self.persona_id,
             key_hex=self.key_hex,
             focus_run_id=self.focus_run_id,
             output_type=self.focus_def.output_type,
@@ -708,7 +725,7 @@ class FocusRun:
 
     def _purge_snapshots(self) -> None:
         try:
-            with open_outputs_db(self.user_id, self.life_id, self.key_hex) as db:
+            with open_outputs_db(self.user_id, self.persona_id, self.key_hex) as db:
                 db.execute(
                     "DELETE FROM focus_run_snapshots WHERE focus_run_id = ?",
                     [self.focus_run_id]
@@ -726,7 +743,7 @@ class FocusRun:
             from persistence.topic_store import create_run_history_entry
             create_run_history_entry(
                 user_id=self.user_id,
-                life_id=self.life_id,
+                life_id=self.persona_id,
                 key_hex=self.key_hex,
                 focus_run_id=self.focus_run_id,
                 focus_id=self.focus_id,
@@ -751,7 +768,7 @@ class FocusRun:
         self.task_track = None
         self.shared_state = None
         self.privacy_gateway = None
-        self._life_context_rendered = ""
+        self._persona_context_rendered = ""
         if final_status in ("complete", "cancelled", "failed"):
             self._purge_snapshots()
         self._write_focus_run_record(status=final_status)
@@ -811,10 +828,10 @@ class FocusRun:
             raise
 
 
-def demote_interrupted_runs(user_id: str, life_id: str, key_hex: str) -> int:
+def demote_interrupted_runs(user_id: str, persona_id: str, key_hex: str) -> int:
     import os
     threshold_minutes = int(os.environ.get("QR_INTERRUPT_THRESHOLD_MINUTES", "5"))
-    with open_outputs_db(user_id, life_id, key_hex) as db:
+    with open_outputs_db(user_id, persona_id, key_hex) as db:
         result = db.execute(
             """UPDATE focus_runs SET status = 'paused'
                WHERE status IN ('running', 'initializing')

@@ -17,6 +17,9 @@
 #   space_id → life_id
 #   path_run_id → focus_run_id
 #   path_runs table → focus_runs table
+#
+# Updated as part of Phase C Persona model migration (D6-298):
+#   life_id → persona_id in all function signatures and open_outputs_db calls
 
 from __future__ import annotations
 
@@ -59,7 +62,7 @@ def _row_to_output_record(row) -> OutputRecord:
 
 def save_output(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     key_hex: str,
     focus_run_id: str,
     output_type: str,
@@ -77,7 +80,7 @@ def save_output(
             f"Must be one of: {sorted(_VALID_SENSITIVITY)}"
         )
     oid = output_id or str(uuid.uuid4())
-    with open_outputs_db(user_id, life_id, key_hex) as db:
+    with open_outputs_db(user_id, persona_id, key_hex) as db:
         db.execute(
             """INSERT INTO outputs
                (id, path_run_id, output_type, content, sensitivity,
@@ -90,7 +93,7 @@ def save_output(
 
 def get_output(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     key_hex: str,
     output_id: str,
 ) -> OutputRecord | None:
@@ -98,7 +101,7 @@ def get_output(
     Fetch a single active output by id.
     Returns None if not found or not active.
     """
-    with open_outputs_db(user_id, life_id, key_hex) as db:
+    with open_outputs_db(user_id, persona_id, key_hex) as db:
         row = db.execute(
             """SELECT id, path_run_id, output_type, content,
                       sensitivity, status, created_at, updated_at
@@ -111,7 +114,7 @@ def get_output(
 
 def get_output_for_run(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     key_hex: str,
     focus_run_id: str,
 ) -> OutputRecord | None:
@@ -120,7 +123,7 @@ def get_output_for_run(
     Returns None if no active output exists.
     Used by UI output display endpoint (/output/<focus_run_id>).
     """
-    with open_outputs_db(user_id, life_id, key_hex) as db:
+    with open_outputs_db(user_id, persona_id, key_hex) as db:
         row = db.execute(
             """SELECT id, path_run_id, output_type, content,
                       sensitivity, status, created_at, updated_at
@@ -135,7 +138,7 @@ def get_output_for_run(
 
 def get_focus_run_status(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     key_hex: str,
     focus_run_id: str,
 ) -> str | None:
@@ -148,7 +151,7 @@ def get_focus_run_status(
     exception — the UI polling endpoint needs run status without importing
     lifecycle machinery. Revisit when a service layer is introduced in Layer 8+.
     """
-    with open_outputs_db(user_id, life_id, key_hex) as db:
+    with open_outputs_db(user_id, persona_id, key_hex) as db:
         row = db.execute(
             "SELECT status FROM focus_runs WHERE id = ?",
             [focus_run_id],
@@ -158,7 +161,7 @@ def get_focus_run_status(
 
 def delete_output(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     key_hex: str,
     output_id: str,
 ) -> None:

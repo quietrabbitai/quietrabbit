@@ -1,7 +1,7 @@
 # persistence/plan_state_store.py
 # Plan State CRUD for plan_state.db.
-# Per-user, per-life, per-focus, per-topic encrypted database.
-# Path: /users/{user_id}/lives/{life_id}/focuses/{focus_id}/topics/{topic_id}/plan_state.db
+# Per-user, per-persona, per-focus, per-topic encrypted database.
+# Path: /users/{user_id}/personas/{persona_id}/focuses/{focus_id}/topics/{topic_id}/plan_state.db
 #
 # Source of truth declaration (ADR-013 Section 8.9):
 #   outputs.db topics table = authoritative source of truth for topic metadata.
@@ -30,6 +30,12 @@
 #   NEVER automatically closes or consolidates — user controls response.
 #
 # Part of Phase B data model extension (D6-226+).
+#
+# Updated as part of Phase C Persona model migration (D6-298):
+#   life_id → persona_id in all function signatures
+#   TopicHeader.life_id → persona_id field
+#   SQL: life_id column → persona_id in topic_header SELECT and INSERT
+#   Path: lives/{life_id} → personas/{persona_id}
 
 from __future__ import annotations
 
@@ -108,7 +114,7 @@ class TopicHeader:
     """
     topic_id: str
     focus_id: str
-    life_id: str
+    persona_id: str
     placeholder_name: str
     lifecycle_state: str
     session_count: int
@@ -142,7 +148,7 @@ def _open_plan_state_db(db_path: Path):
 
 def ensure_plan_state_db(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     focus_id: str,
     topic_id: str,
     key_hex: str,
@@ -153,9 +159,9 @@ def ensure_plan_state_db(
     Returns the database path.
     """
     from persistence.migrations import migrate_plan_state_db
-    ensure_focus_dirs(user_id, life_id, focus_id, topic_id)
-    db_path = get_plan_state_path(user_id, life_id, focus_id, topic_id)
-    migrate_plan_state_db(user_id, life_id, focus_id, topic_id, key_hex)
+    ensure_focus_dirs(user_id, persona_id, focus_id, topic_id)
+    db_path = get_plan_state_path(user_id, persona_id, focus_id, topic_id)
+    migrate_plan_state_db(user_id, persona_id, focus_id, topic_id, key_hex)
     return db_path
 
 
@@ -163,7 +169,7 @@ def ensure_plan_state_db(
 
 def get_topic_header(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     focus_id: str,
     topic_id: str,
     key_hex: str,
@@ -173,13 +179,13 @@ def get_topic_header(
     Returns None if plan_state.db does not exist.
     Source of truth is outputs.db — this is a cache copy only.
     """
-    db_path = get_plan_state_path(user_id, life_id, focus_id, topic_id)
+    db_path = get_plan_state_path(user_id, persona_id, focus_id, topic_id)
     if not db_path.exists():
         return None
 
     with _open_plan_state_db(db_path) as db:
         row = db.execute(
-            "SELECT topic_id, focus_id, life_id, name, placeholder_name, "
+            "SELECT topic_id, focus_id, persona_id, name, placeholder_name, "
             "lifecycle_state, current_phase, session_count, created_at, updated_at "
             "FROM topic_header WHERE id = 1"
         ).fetchone()
@@ -189,7 +195,7 @@ def get_topic_header(
     return TopicHeader(
         topic_id=row["topic_id"],
         focus_id=row["focus_id"],
-        life_id=row["life_id"],
+        persona_id=row["persona_id"],
         name=row["name"],
         placeholder_name=row["placeholder_name"],
         lifecycle_state=row["lifecycle_state"],
@@ -202,7 +208,7 @@ def get_topic_header(
 
 def initialise_topic_header(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     focus_id: str,
     topic_id: str,
     key_hex: str,
@@ -214,22 +220,22 @@ def initialise_topic_header(
     Uses INSERT OR IGNORE — safe to call multiple times.
     """
     timestamp = now()
-    db_path = get_plan_state_path(user_id, life_id, focus_id, topic_id)
+    db_path = get_plan_state_path(user_id, persona_id, focus_id, topic_id)
 
     with _open_plan_state_db(db_path) as db:
         db.execute(
             """INSERT OR IGNORE INTO topic_header
-               (id, topic_id, focus_id, life_id, name, placeholder_name,
+               (id, topic_id, focus_id, persona_id, name, placeholder_name,
                 lifecycle_state, session_count, created_at, updated_at)
                VALUES (1, ?, ?, ?, ?, ?, 'active', 0, ?, ?)""",
-            [topic_id, focus_id, life_id, name, placeholder_name,
+            [topic_id, focus_id, persona_id, name, placeholder_name,
              timestamp, timestamp]
         )
 
 
 def update_topic_header(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     focus_id: str,
     topic_id: str,
     key_hex: str,
@@ -243,7 +249,7 @@ def update_topic_header(
     Called by Phase 5A and Reconciliation Boot Check.
     Source of truth is outputs.db — this mirrors it.
     """
-    db_path = get_plan_state_path(user_id, life_id, focus_id, topic_id)
+    db_path = get_plan_state_path(user_id, persona_id, focus_id, topic_id)
     if not db_path.exists():
         return
 
@@ -278,7 +284,7 @@ def update_topic_header(
 
 def get_eligible_blocks(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     focus_id: str,
     topic_id: str,
     key_hex: str,
@@ -294,7 +300,7 @@ def get_eligible_blocks(
     block_types: if provided, filters to specified types only.
     max_tokens: if provided, stops accumulating after budget is reached.
     """
-    db_path = get_plan_state_path(user_id, life_id, focus_id, topic_id)
+    db_path = get_plan_state_path(user_id, persona_id, focus_id, topic_id)
     if not db_path.exists():
         return []
 
@@ -337,7 +343,7 @@ def get_eligible_blocks(
 
 def get_sensitivity_ceiling(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     focus_id: str,
     topic_id: str,
     key_hex: str,
@@ -354,7 +360,7 @@ def get_sensitivity_ceiling(
         return "standard"
 
     preset_rank = {"standard": 0, "sensitive": 1, "private": 2, "locked": 3}
-    db_path = get_plan_state_path(user_id, life_id, focus_id, topic_id)
+    db_path = get_plan_state_path(user_id, persona_id, focus_id, topic_id)
     if not db_path.exists():
         return "standard"
 
@@ -378,7 +384,7 @@ def get_sensitivity_ceiling(
 
 def write_block(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     focus_id: str,
     topic_id: str,
     key_hex: str,
@@ -404,7 +410,7 @@ def write_block(
     ceiling of referenced blocks if that ceiling is higher.
     Sensitive data cannot be laundered through iterative summarisation.
     """
-    db_path = get_plan_state_path(user_id, life_id, focus_id, topic_id)
+    db_path = get_plan_state_path(user_id, persona_id, focus_id, topic_id)
     block_id = str(uuid.uuid4())
     timestamp = now()
     tags_json = json.dumps(relevance_tags or [])
@@ -413,7 +419,7 @@ def write_block(
     # Sensitivity inheritance from dependency_refs lineage.
     if dependency_refs:
         inherited = get_sensitivity_ceiling(
-            user_id, life_id, focus_id, topic_id, key_hex, dependency_refs
+            user_id, persona_id, focus_id, topic_id, key_hex, dependency_refs
         )
         preset_rank = {"standard": 0, "sensitive": 1, "private": 2, "locked": 3}
         current_rank = preset_rank.get(sensitivity_preset or "standard", 0)
@@ -443,7 +449,7 @@ def write_block(
 
 def archive_all_blocks(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     focus_id: str,
     topic_id: str,
     key_hex: str,
@@ -454,7 +460,7 @@ def archive_all_blocks(
     Returns count of archived blocks.
     """
     timestamp = now()
-    db_path = get_plan_state_path(user_id, life_id, focus_id, topic_id)
+    db_path = get_plan_state_path(user_id, persona_id, focus_id, topic_id)
     if not db_path.exists():
         return 0
 
@@ -471,7 +477,7 @@ def archive_all_blocks(
 
 def create_handoff_token(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     focus_id: str,
     topic_id: str,
     key_hex: str,
@@ -488,7 +494,7 @@ def create_handoff_token(
     Returns the token id.
     """
     token_id = str(uuid.uuid4())
-    db_path = get_plan_state_path(user_id, life_id, focus_id, topic_id)
+    db_path = get_plan_state_path(user_id, persona_id, focus_id, topic_id)
     schema_json = json.dumps(expected_return_schema or {})
 
     with _open_plan_state_db(db_path) as db:
@@ -505,7 +511,7 @@ def create_handoff_token(
 
 def consume_handoff_token(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     focus_id: str,
     topic_id: str,
     key_hex: str,
@@ -515,7 +521,7 @@ def consume_handoff_token(
     Mark a handoff token as consumed after a valid return result.
     Returns True if found and consumed, False if not found or already consumed.
     """
-    db_path = get_plan_state_path(user_id, life_id, focus_id, topic_id)
+    db_path = get_plan_state_path(user_id, persona_id, focus_id, topic_id)
     if not db_path.exists():
         return False
 
@@ -530,7 +536,7 @@ def consume_handoff_token(
 
 def expire_overdue_handoff_tokens(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     focus_id: str,
     topic_id: str,
     key_hex: str,
@@ -542,7 +548,7 @@ def expire_overdue_handoff_tokens(
     Boot Check then transitions topic to paused, reason: dependency_timeout.
     Dashboard shows: "External update timed out — retry or resume manually."
     """
-    db_path = get_plan_state_path(user_id, life_id, focus_id, topic_id)
+    db_path = get_plan_state_path(user_id, persona_id, focus_id, topic_id)
     if not db_path.exists():
         return 0
 
@@ -561,7 +567,7 @@ def expire_overdue_handoff_tokens(
 
 def get_state_ceiling_status(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     focus_id: str,
     topic_id: str,
     key_hex: str,
@@ -571,7 +577,7 @@ def get_state_ceiling_status(
     Returns None if plan_state.db does not exist.
     System NEVER automatically closes or consolidates — user controls response.
     """
-    db_path = get_plan_state_path(user_id, life_id, focus_id, topic_id)
+    db_path = get_plan_state_path(user_id, persona_id, focus_id, topic_id)
     if not db_path.exists():
         return None
 
@@ -594,13 +600,13 @@ def get_state_ceiling_status(
 
 def record_ceiling_notification_sent(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     focus_id: str,
     topic_id: str,
     key_hex: str,
 ) -> None:
     """Record that the soft ceiling consolidation prompt was surfaced to the user."""
-    db_path = get_plan_state_path(user_id, life_id, focus_id, topic_id)
+    db_path = get_plan_state_path(user_id, persona_id, focus_id, topic_id)
     if not db_path.exists():
         return
     with _open_plan_state_db(db_path) as db:
@@ -613,14 +619,14 @@ def record_ceiling_notification_sent(
 
 def record_ceiling_user_response(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     focus_id: str,
     topic_id: str,
     key_hex: str,
     response: Literal["consolidate", "continue"],
 ) -> None:
     """Record the user's response to the soft ceiling consolidation prompt."""
-    db_path = get_plan_state_path(user_id, life_id, focus_id, topic_id)
+    db_path = get_plan_state_path(user_id, persona_id, focus_id, topic_id)
     if not db_path.exists():
         return
     with _open_plan_state_db(db_path) as db:

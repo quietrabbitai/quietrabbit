@@ -12,15 +12,15 @@
 # display output. No styling. Sole purpose: prove end-to-end pipeline works.
 #
 # D5-152 (floor consent preference scoping):
-# floor_consent_preference stored as scoped dict in lives.extra_metadata in
-# shared.db (open_instance_db) — NOT outputs.db (no lives table there).
+# floor_consent_preference stored as scoped dict in personas.extra_metadata in
+# shared.db (open_instance_db) — NOT outputs.db (no personas table there).
 # Consent binds to abstraction_tier, not focus_id or provider_id.
 # Schema: {"mode": "modified", "abstraction_tier": N,
 #           "consent_timestamp": "...", "consent_version": "1"}
 # lifecycle._execute_step() validates abstraction_tier match before honoring.
 #
 # Updated as part of Phase A codebase rename (D6-224, D6-225):
-#   _DEV_SPACE_ID → _DEV_LIFE_ID, "dev-space" → "dev-life"
+#   _DEV_SPACE_ID → _DEV_PERSONA_ID, "dev-space" → "dev-life"
 #   QR_INTERVIEW_SPACE_ID → QR_INTERVIEW_LIFE_ID env var
 #   PathRun → FocusRun import
 #   path_run_id → focus_run_id in routes and HTML
@@ -30,6 +30,12 @@
 #   get_output_for_run signature updated (life_id param)
 #   open_personal_db / open_outputs_db: space_id → life_id
 #   Quick Draft → Quick Ask in UI text
+# Updated as part of Phase C Persona model migration (D6-298):
+#   _DEV_LIFE_ID → _DEV_PERSONA_ID
+#   FocusRun, output_store, consent calls: life_id → persona_id
+#   disclosure_log INSERT: life_id column → persona_id
+#   Floor consent: FROM lives / UPDATE lives → personas
+#   D5-152: lives.extra_metadata → personas.extra_metadata
 
 from __future__ import annotations
 
@@ -47,7 +53,7 @@ from conductor.concurrency import ConductorScheduler, PathPriority
 
 _DEV_MODE = os.environ.get("QR_ENV", "production") == "development"
 _DEV_USER_ID = "dev-user"
-_DEV_LIFE_ID = "dev-life"
+_DEV_PERSONA_ID = "dev-life"
 
 _DEV_KEY_HEX = os.environ.get("QR_DEV_KEY_HEX", "")
 if _DEV_MODE and not _DEV_KEY_HEX:
@@ -117,7 +123,7 @@ Quiet Rabbit modified the following fields for external use:</p>
   <p>
     <label>
       <input type="checkbox" name="remember" value="1">
-      Remember my choice for this life
+      Remember my choice for this Persona
     </label>
   </p>
   <button name="choice" value="continue">Continue &mdash; use modified values</button>
@@ -230,7 +236,7 @@ def create_app() -> Flask:
 
         run = FocusRun(
             user_id=_DEV_USER_ID,
-            life_id=_DEV_LIFE_ID,
+            persona_id=_DEV_PERSONA_ID,
             focus_id=focus_id,
             scheduler=scheduler,
             user_input=prompt,
@@ -291,7 +297,7 @@ def create_app() -> Flask:
 
         status = get_focus_run_status(
             user_id=_DEV_USER_ID,
-            life_id=_DEV_LIFE_ID,
+            persona_id=_DEV_PERSONA_ID,
             key_hex=_DEV_KEY_HEX,
             focus_run_id=focus_run_id,
         )
@@ -315,7 +321,7 @@ def create_app() -> Flask:
 
         status = get_focus_run_status(
             user_id=_DEV_USER_ID,
-            life_id=_DEV_LIFE_ID,
+            persona_id=_DEV_PERSONA_ID,
             key_hex=_DEV_KEY_HEX,
             focus_run_id=focus_run_id,
         )
@@ -324,7 +330,7 @@ def create_app() -> Flask:
 
         output = get_output_for_run(
             user_id=_DEV_USER_ID,
-            life_id=_DEV_LIFE_ID,
+            persona_id=_DEV_PERSONA_ID,
             key_hex=_DEV_KEY_HEX,
             focus_run_id=focus_run_id,
         )
@@ -360,7 +366,7 @@ def create_app() -> Flask:
         from providers.utils import open_outputs_db
 
         try:
-            with open_outputs_db(_DEV_USER_ID, _DEV_LIFE_ID, _DEV_KEY_HEX) as db:
+            with open_outputs_db(_DEV_USER_ID, _DEV_PERSONA_ID, _DEV_KEY_HEX) as db:
                 row = db.execute(
                     "SELECT status, notes FROM focus_runs WHERE id = ?",
                     [focus_run_id]
@@ -404,7 +410,7 @@ def create_app() -> Flask:
         Handle the user's Floor Consent Gate decision.
 
         choice=continue: if remember checked, persist scoped consent to
-          lives.extra_metadata in shared.db (open_instance_db).
+          personas.extra_metadata in shared.db (open_instance_db).
           Consent schema (D5-152):
             {"mode": "modified", "abstraction_tier": N,
              "consent_timestamp": "...", "consent_version": "1"}
@@ -428,7 +434,7 @@ def create_app() -> Flask:
         remember = request.form.get("remember") == "1"
 
         try:
-            with open_outputs_db(_DEV_USER_ID, _DEV_LIFE_ID, _DEV_KEY_HEX) as db:
+            with open_outputs_db(_DEV_USER_ID, _DEV_PERSONA_ID, _DEV_KEY_HEX) as db:
                 row = db.execute(
                     "SELECT status, notes FROM focus_runs WHERE id = ?",
                     [focus_run_id]
@@ -486,10 +492,10 @@ def create_app() -> Flask:
 
         # Write consent event to disclosure_log
         try:
-            with open_personal_db(_DEV_USER_ID, _DEV_LIFE_ID, _DEV_KEY_HEX) as db:
+            with open_personal_db(_DEV_USER_ID, _DEV_PERSONA_ID, _DEV_KEY_HEX) as db:
                 db.execute(
                     """INSERT INTO disclosure_log
-                       (id, user_id, life_id, focus_run_id, step_id,
+                       (id, user_id, persona_id, focus_run_id, step_id,
                         routing_tier, execution_tier, abstraction_tier,
                         provider, fields_shared, fields_abstracted,
                         fields_withheld, override_declined, declined_at,
@@ -497,7 +503,7 @@ def create_app() -> Flask:
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     [
                         str(uuid.uuid4()),
-                        _DEV_USER_ID, _DEV_LIFE_ID, focus_run_id, step_id,
+                        _DEV_USER_ID, _DEV_PERSONA_ID, focus_run_id, step_id,
                         execution_tier, execution_tier, abstraction_tier,
                         None, "[]", "{}", "[]",
                         1 if choice != "continue" else 0,
@@ -512,7 +518,7 @@ def create_app() -> Flask:
         # Update run status in outputs.db
         try:
             notes["floor_consent_preference"] = consent_record
-            with open_outputs_db(_DEV_USER_ID, _DEV_LIFE_ID, _DEV_KEY_HEX) as db:
+            with open_outputs_db(_DEV_USER_ID, _DEV_PERSONA_ID, _DEV_KEY_HEX) as db:
                 db.execute(
                     "UPDATE focus_runs SET status = ?, notes = ? WHERE id = ?",
                     [new_status, json.dumps(notes), focus_run_id],
@@ -525,8 +531,8 @@ def create_app() -> Flask:
             try:
                 with open_instance_db() as db:
                     life_row = db.execute(
-                        "SELECT extra_metadata FROM lives WHERE id = ?",
-                        [_DEV_LIFE_ID]
+                        "SELECT extra_metadata FROM personas WHERE id = ?",
+                        [_DEV_PERSONA_ID]
                     ).fetchone()
                     if life_row:
                         life_meta = json.loads(
@@ -534,8 +540,8 @@ def create_app() -> Flask:
                         )
                         life_meta["floor_consent_preference"] = consent_record
                         db.execute(
-                            "UPDATE lives SET extra_metadata = ? WHERE id = ?",
-                            [json.dumps(life_meta), _DEV_LIFE_ID],
+                            "UPDATE personas SET extra_metadata = ? WHERE id = ?",
+                            [json.dumps(life_meta), _DEV_PERSONA_ID],
                         )
             except Exception:
                 pass  # non-fatal — run notes serve as fallback for this run

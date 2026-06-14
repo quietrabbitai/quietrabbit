@@ -12,7 +12,6 @@ description: >
   Research a purchase decision from first requirements to final recommendation.
   Surfaces trade-offs, not just a top pick.
 version: "1.0"
-life_affinity: []
 max_routing_tier: 2
 guides:
   - research-analysis

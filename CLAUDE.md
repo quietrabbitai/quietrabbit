@@ -90,6 +90,30 @@ Dev constants (routes.py, interview.py):
   _DEV_SPACE_ID = "dev-space"  →  _DEV_LIFE_ID = "dev-life"
   QR_INTERVIEW_SPACE_ID        →  QR_INTERVIEW_LIFE_ID
   SOURCE_ID = "personal-specialist"  (was SPECIALIST_ID)
+## Naming Architecture (Phase C rename — D6-298)
+All Life terms retired. Use only the new terms below.
+
+| Old term (Phase A)      | New term (Phase C)          | Notes                                         |
+|-------------------------|-----------------------------|-----------------------------------------------|
+| Life                    | Persona                     | DB table: personas                            |
+| life_id                 | persona_id                  | Column and parameter name                     |
+| user_lives              | user_personas               | Join table in shared.db                       |
+| lives/ (path)           | personas/ (path)            | Filesystem segment                            |
+| _DEV_LIFE_ID            | _DEV_PERSONA_ID             | Dev constant (value stays "dev-life")         |
+| QR_INTERVIEW_LIFE_ID    | QR_INTERVIEW_PERSONA_ID     | Env var in interview.py                       |
+| life_affinity           | (removed)                   | Dropped from FocusDefinition (D6-300)         |
+| life_store.py           | persona_store.py            | New file written (Task 6); life_store.py      |
+|                         |                             | still on disk as dead code, not yet deleted   |
+| (new)                   | focus_settings              | Per-Focus tier + behavior config (D6-299)     |
+
+New stores (Phase C):
+  persistence/persona_store.py         -- Persona CRUD (replaces life_store.py)
+  persistence/focus_settings_store.py  -- Focus-level settings (new, D6-299)
+
+Dev constants (routes.py, interview.py):
+  _DEV_LIFE_ID = "dev-life"     ->  _DEV_PERSONA_ID (value stays "dev-life")
+  QR_INTERVIEW_LIFE_ID          ->  QR_INTERVIEW_PERSONA_ID
+
 
 ## Phase 1 Focuses (8 confirmed)
 1. Writing Assistant  2. Research & Buy  3. Job Match  4. Tech Support
@@ -100,11 +124,15 @@ Quick Ask: full focus (Layer 3), output_type=quick_ask,
 Layer 7 build order: Travel after Job Match and Research & Buy.
 
 ## Key Architectural Decisions
-- execution_tier = min(life_max_permitted_tier, focus_max_routing_tier, step.routing_tier)
-  raw_abstraction = min(life_privacy_default_tier, execution_tier)
+- execution_tier = min(focus_settings.max_permitted_tier, focus_def.max_routing_tier, step.routing_tier)
+  raw_abstraction = min(focus_settings.privacy_tier, execution_tier)
   abstraction_tier = max(2, raw_abstraction) if execution_tier > 1 else raw_abstraction
-  life_max_permitted_tier is the hard ceiling. life_privacy_default_tier is preference.
-  Never conflate them — they are distinct concepts.
+  focus_settings.max_permitted_tier is the hard ceiling (moved from Persona to Focus per D6-297).
+  focus_settings.privacy_tier is user preference. Never conflate them.
+  privacy_tier may reduce abstraction. It must never increase routing authority.
+  focus_settings row must exist before AUTHORIZE executes. Creation is the
+  responsibility of Focus creation flows. Missing row is a system error,
+  not a recoverable condition (D6-303).
 - PersonalTrack NEVER serialized to focus_run_snapshots — re-fetched fresh on resume
 - Step 6: PG_GATE_1 writes approved/abstracted fields to step_disclosure_buffer
   Step 8: reads from step_disclosure_buffer for Tier 2+ (NEVER from PersonalTrack)
@@ -150,7 +178,8 @@ Save validation records to /mnt/NAS/QuietRabbitMirror/05_AI_Validation/
   ALLOWED_VOICE_ATTRIBUTES protects keys. Values are NOT protected — validate both.
   Plain-language warning required at point of input, not just a log entry.
 - Floor consent preference must be scoped: abstraction_tier + consent_timestamp. (D5-152)
-  Never store as life-wide blanket consent. Future focuses/providers require fresh consent.
+  Never store as Persona-wide blanket consent. Future focuses/providers require fresh consent.
+  Stored in personas.extra_metadata in shared.db (open_instance_db) -- not outputs.db.
 - not_permitted enforces at Tier 2+ only. Raw values permitted at Tier 1. (D5-093, ADR-012 Amendment 1)
   ARCHITECTURE.md not_permitted section is stale — ADR-012 is authoritative on this.
 

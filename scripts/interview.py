@@ -32,10 +32,14 @@
 #   financial: tier2=not_permitted, tier3=not_permitted
 #
 # Updated as part of Phase A codebase rename (D6-224, D6-225):
-#   SPACE_ID / QR_INTERVIEW_SPACE_ID → LIFE_ID / QR_INTERVIEW_LIFE_ID
+#   SPACE_ID / QR_INTERVIEW_SPACE_ID → PERSONA_ID / QR_INTERVIEW_PERSONA_ID
 #   specialist_id → source_id in save_personal_field and save_voice_profile_entry
 #   SPECIALIST_ID → SOURCE_ID constant
 #   migrate_personal_db: space_id → life_id param
+# Updated as part of Phase C Persona model migration (D6-298):
+#   LIFE_ID / QR_INTERVIEW_LIFE_ID → PERSONA_ID / QR_INTERVIEW_PERSONA_ID
+#   All call site parameters: life_id= → persona_id=
+#   migrate_personal_db: life_id param → persona_id param
 
 import os
 import sys
@@ -53,7 +57,7 @@ from persistence.migrations import migrate_personal_db
 # -- Dev mode constants -------------------------------------------------------
 
 USER_ID = os.environ.get("QR_INTERVIEW_USER_ID", "dev-user")
-LIFE_ID = os.environ.get("QR_INTERVIEW_LIFE_ID", "dev-life")
+PERSONA_ID = os.environ.get("QR_INTERVIEW_PERSONA_ID", "dev-life")
 
 KEY_HEX = (os.environ.get("QR_DEV_KEY_HEX") or "").strip()
 
@@ -95,7 +99,7 @@ def write_field(
         return
     save_personal_field(
         user_id=USER_ID,
-        life_id=LIFE_ID,
+        persona_id=PERSONA_ID,
         key_hex=KEY_HEX,
         field_name=field_name,
         field_value=field_value,
@@ -124,12 +128,12 @@ def run_interview() -> None:
     print("  Quiet Rabbit -- Personal Specialist Setup")
     print("  Layer 5 CLI Interview")
     print("=" * 52)
-    print(f"\n  Writing to: {USER_ID} / {LIFE_ID}")
+    print(f"\n  Writing to: {USER_ID} / {PERSONA_ID}")
     print("  Press Ctrl+C at any time to cancel.\n")
 
     print("  Initialising personal database...")
     try:
-        migrate_personal_db(USER_ID, LIFE_ID, KEY_HEX)
+        migrate_personal_db(USER_ID, PERSONA_ID, KEY_HEX)
         print("  +  personal.db ready\n")
     except Exception as e:
         print(f"\nERROR: Could not initialise personal.db: {e}")
@@ -207,7 +211,7 @@ def run_interview() -> None:
         section("Communication preferences -- voice profile")
         print("  These shape how Quiet Rabbit writes for you.")
         print("  Stored in voice_profiles (NOT personal_fields) at precedence 3")
-        print("  (global -- applies across all lives). Gate1 does not process these.\n")
+        print("  (global -- applies across all personas). Gate1 does not process these.\n")
 
         tone = (
             prompt(
@@ -241,7 +245,7 @@ def run_interview() -> None:
         ]:
             save_voice_profile_entry(
                 user_id=USER_ID,
-                life_id=LIFE_ID,
+                persona_id=PERSONA_ID,
                 key_hex=KEY_HEX,
                 attribute=attribute,
                 value=value,
@@ -296,7 +300,7 @@ def run_interview() -> None:
 
         fields = list_personal_fields(
             user_id=USER_ID,
-            life_id=LIFE_ID,
+            persona_id=PERSONA_ID,
             key_hex=KEY_HEX,
         )
 

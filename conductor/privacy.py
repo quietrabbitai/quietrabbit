@@ -39,6 +39,12 @@
 #   path_run_id → focus_run_id in disclosure_log INSERT
 #   space_id column → life_id column in disclosure_log INSERT
 #   open_personal_db signature updated (life_id parameter)
+#
+# Updated as part of Phase C Persona model migration (D6-298):
+#   life_id → persona_id on PrivacyGateway.__init__
+#   self.life_id → self.persona_id
+#   life_id column → persona_id column in disclosure_log INSERT
+#   open_personal_db: life_id → persona_id parameter
 
 from __future__ import annotations
 
@@ -187,16 +193,19 @@ class PrivacyGateway:
     """
     Rules-based Privacy Guardian.
     Constructed once per FocusRun in lifecycle.py Phase 3 INITIALIZE.
-    Holds user_id, life_id, key_hex for disclosure_log writes.
+    Holds user_id, persona_id, key_hex for disclosure_log writes.
+    Runs Gate1 (field approval), Gate2 (response scan), Gate3 (content
+    promotion), Gate4 (Tier 3 boundary) and writes the permanent
+    disclosure_log audit trail on every gate invocation.
 
     All gate invocations append to disclosure_log — NEVER deleted.
     Tier 1 write failures: non-fatal (process counter + instance deque).
     Tier 2+ write failures: FATAL — DisclosureLogWriteError raised.
     """
 
-    def __init__(self, user_id: str, life_id: str, key_hex: str) -> None:
+    def __init__(self, user_id: str, persona_id: str, key_hex: str) -> None:
         self.user_id = user_id
-        self.life_id = life_id
+        self.persona_id = persona_id
         self.key_hex = key_hex
         self._disclosure_log_failures: deque[str] = deque(maxlen=32)
 
@@ -367,7 +376,7 @@ class PrivacyGateway:
                 blocked=True,
                 plain_language=(
                     "This content can't be shared with a higher-tier service "
-                    "from this life. [Change life settings] [Use local only]"
+                    "from this Focus. [Change Focus settings] [Use local only]"
                 ),
             )
 
@@ -482,11 +491,11 @@ class PrivacyGateway:
         log_id = str(uuid.uuid4())
         try:
             with open_personal_db(
-                self.user_id, self.life_id, self.key_hex
+                self.user_id, self.persona_id, self.key_hex
             ) as db:
                 db.execute(
                     """INSERT INTO disclosure_log
-                       (id, user_id, life_id, focus_run_id, step_id,
+                       (id, user_id, persona_id, focus_run_id, step_id,
                         routing_tier, execution_tier, abstraction_tier,
                         provider, fields_shared, fields_abstracted,
                         fields_withheld, override_declined, declined_at,
@@ -495,7 +504,7 @@ class PrivacyGateway:
                     [
                         log_id,
                         self.user_id,
-                        self.life_id,
+                        self.persona_id,
                         focus_run_id,
                         step_id,
                         execution_tier,    # routing_tier = execution_tier (ADR-012)

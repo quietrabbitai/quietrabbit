@@ -26,9 +26,10 @@
 #   Distinct from Gate1 — structural access control only, not privacy policy.
 #   Gate1 remains the single abstraction authority.
 #
-# Isolation invariant (ADR-013 Section 8.9):
-#   Context hard-locked to (life_id, focus_id, topic_id).
-#   No cross-topic, cross-focus, or cross-life access.
+# Isolation invariant (ADR-013 Section 8.9, D6-301):
+#   Privacy isolation scoped to (focus_id, topic_id).
+#   Storage resolution additionally requires persona_id.
+#   Persona is not a privacy boundary -- Focus is the privacy container (D6-291).
 #   Non-empty string assertions applied before any retrieval — fail closed.
 #
 # Quick Ask invariant (ADR-013 Section 9.7):
@@ -46,6 +47,12 @@
 #   QR_NETWORK_STORAGE=true uses journal_mode=DELETE via open_db() wrapper.
 #
 # Part of Phase B data model extension (D6-226+).
+#
+# Updated as part of Phase C Persona model migration (D6-298, D6-301):
+#   life_id -> persona_id in all function signatures
+#   Isolation invariant: (life_id, focus_id, topic_id) -> (focus_id, topic_id)
+#   persona_id assertion retained: required for storage path resolution
+#   Wording clarified: Persona is not a privacy boundary, Focus is
 
 from __future__ import annotations
 
@@ -141,7 +148,7 @@ class ContextSlice:
     def render(self) -> str:
         """
         Serialise retrieved block contents into a prompt-injectable string.
-        Called by lifecycle to populate life_context in prompt assembly.
+        Called by lifecycle to populate persona_context in prompt assembly.
         Blocks ordered: Tier A first (standing summary), then Tier B by source.
         Empty string returned if no blocks retrieved — graceful degradation.
         Conductor calls this — never joins block contents manually.
@@ -200,15 +207,17 @@ class MemoryBroker:
     Stateless — safe to instantiate per FocusRun in lifecycle Phase 3.
     Conductor never imports domain_context_store or plan_state_store directly.
 
-    Isolation invariant: all reads scoped to (life_id, focus_id, topic_id).
-    No cross-topic, cross-focus, or cross-life access.
+    Privacy isolation scoped to (focus_id, topic_id) per D6-301.
+    Storage resolution additionally requires persona_id.
+    Persona is not an isolation boundary — Focus is the privacy container.
+    No cross-topic or cross-focus access.
     Non-empty string assertions applied before retrieval — fail closed.
     """
 
     def assemble_context(
         self,
         user_id: str,
-        life_id: str,
+        persona_id: str,
         focus_id: str,
         topic_id: str | None,
         key_hex: str,
@@ -240,9 +249,11 @@ class MemoryBroker:
             Tier B skipped — no active topic.
         """
         # Isolation assertions — fail closed before any retrieval.
-        assert user_id, "MemoryBroker: user_id must be non-empty"
-        assert life_id, "MemoryBroker: life_id must be non-empty"
-        assert focus_id, "MemoryBroker: focus_id must be non-empty"
+        assert user_id,    "MemoryBroker: user_id must be non-empty"
+        assert persona_id, "MemoryBroker: persona_id must be non-empty"
+        # persona_id required for storage path resolution -- not a privacy boundary.
+        # Privacy isolation is scoped to (focus_id, topic_id) per D6-301.
+        assert focus_id,   "MemoryBroker: focus_id must be non-empty"
 
         timestamp = now()
         slice_ = ContextSlice(
@@ -273,7 +284,7 @@ class MemoryBroker:
         tier_a_used = self._load_tier_a(
             slice_=slice_,
             user_id=user_id,
-            life_id=life_id,
+            persona_id=persona_id,
             focus_id=focus_id,
             key_hex=key_hex,
             tier_a_ceiling=_tier_a_ceiling,
@@ -288,7 +299,7 @@ class MemoryBroker:
             self._load_tier_b(
                 slice_=slice_,
                 user_id=user_id,
-                life_id=life_id,
+                persona_id=persona_id,
                 focus_id=focus_id,
                 topic_id=topic_id,
                 key_hex=key_hex,
@@ -319,7 +330,7 @@ class MemoryBroker:
         self,
         slice_: ContextSlice,
         user_id: str,
-        life_id: str,
+        persona_id: str,
         focus_id: str,
         key_hex: str,
         tier_a_ceiling: int,
@@ -335,7 +346,7 @@ class MemoryBroker:
         except ImportError:
             return 0
 
-        summary = get_standing_summary(user_id, life_id, focus_id, key_hex)
+        summary = get_standing_summary(user_id, persona_id, focus_id, key_hex)
         if summary is None or not summary.content:
             log.debug(
                 "memory_broker: no standing summary for focus=%s "
@@ -377,7 +388,7 @@ class MemoryBroker:
         self,
         slice_: ContextSlice,
         user_id: str,
-        life_id: str,
+        persona_id: str,
         focus_id: str,
         topic_id: str,
         key_hex: str,
@@ -397,7 +408,7 @@ class MemoryBroker:
             )
             dc_blocks_available = get_dc_blocks(
                 user_id=user_id,
-                life_id=life_id,
+                persona_id=persona_id,
                 focus_id=focus_id,
                 key_hex=key_hex,
                 execution_tier=execution_tier,
@@ -412,7 +423,7 @@ class MemoryBroker:
             )
             ps_blocks_available = get_ps_blocks(
                 user_id=user_id,
-                life_id=life_id,
+                persona_id=persona_id,
                 focus_id=focus_id,
                 topic_id=topic_id,
                 key_hex=key_hex,
@@ -487,7 +498,7 @@ class MemoryBroker:
     def retrieve_additional_context(
         self,
         user_id: str,
-        life_id: str,
+        persona_id: str,
         focus_id: str,
         topic_id: str,
         key_hex: str,

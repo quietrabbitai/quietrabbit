@@ -15,7 +15,6 @@ description: >
   Turn a short idea or prompt into a polished draft, ready to use
   or refine further.
 version: "1.0"
-life_affinity: []
 max_routing_tier: 1
 guides:
   - quick-ask-guide

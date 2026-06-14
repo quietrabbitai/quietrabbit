@@ -12,8 +12,10 @@
 # connection open (SQLCipher requirement). Journal mode is set AFTER key.
 # Never use open_db() for encrypted databases.
 #
-# Path construction: /users/{user_id}/lives/{life_id}/
+# Path construction: /users/{user_id}/personas/{persona_id}/
 # Updated as part of Phase A codebase rename (D6-224, D6-225).
+# Updated as part of Phase C Persona model migration (D6-298):
+#   open_personal_db and open_outputs_db: lives/{life_id} -> personas/{persona_id}
 
 from __future__ import annotations
 
@@ -106,14 +108,14 @@ def open_integration_keys_db(user_id: str, key_hex: str):
 
 
 @contextmanager
-def open_personal_db(user_id: str, life_id: str, key_hex: str):
+def open_personal_db(user_id: str, persona_id: str, key_hex: str):
     """
     Context manager for a user's personal.db (encrypted).
     PRAGMA key applied first, then journal mode.
-    Path: /users/{user_id}/lives/{life_id}/personal.db
+    Path: /users/{user_id}/personas/{persona_id}/personal.db
     """
     path = (
-        get_data_root() / "users" / user_id / "lives" / life_id / "personal.db"
+        get_data_root() / "users" / user_id / "personas" / persona_id / "personal.db"
     )
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
@@ -130,14 +132,14 @@ def open_personal_db(user_id: str, life_id: str, key_hex: str):
 
 
 @contextmanager
-def open_outputs_db(user_id: str, life_id: str, key_hex: str):
+def open_outputs_db(user_id: str, persona_id: str, key_hex: str):
     """
     Context manager for a user's outputs.db (encrypted).
     PRAGMA key applied first, then journal mode.
-    Path: /users/{user_id}/lives/{life_id}/outputs.db
+    Path: /users/{user_id}/personas/{persona_id}/outputs.db
     """
     path = (
-        get_data_root() / "users" / user_id / "lives" / life_id / "outputs.db"
+        get_data_root() / "users" / user_id / "personas" / persona_id / "outputs.db"
     )
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row

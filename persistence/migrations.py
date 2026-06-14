@@ -21,10 +21,10 @@
 # will be split incorrectly.
 #
 # Updated as part of Phase A codebase rename (D6-224, D6-225):
-#   spaces/ → lives/ in path construction
-#   space_id → life_id in function signatures
-#   community_artifacts/paths/ → focuses/
-#   community_artifacts/specialists/ → guides/ and operators/
+#   spaces/ → lives/ in path construction, space_id → life_id in signatures
+# Updated as part of Phase C Persona model migration (D6-298):
+#   lives/ → personas/ in path construction, life_id → persona_id in signatures
+# Current convention: /users/{user_id}/personas/{persona_id}/
 
 from __future__ import annotations
 
@@ -285,11 +285,11 @@ def migrate_shared_db() -> int:
         conn.close()
 
 
-def migrate_personal_db(user_id: str, life_id: str, key_hex: str) -> int:
+def migrate_personal_db(user_id: str, persona_id: str, key_hex: str) -> int:
     """Migrate a user's personal.db (encrypted)."""
     data_root = get_data_root()
     db_path = (
-        data_root / "users" / user_id / "lives" / life_id / "personal.db"
+        data_root / "users" / user_id / "personas" / persona_id / "personal.db"
     )
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = _open_raw(db_path)
@@ -299,11 +299,11 @@ def migrate_personal_db(user_id: str, life_id: str, key_hex: str) -> int:
         conn.close()
 
 
-def migrate_outputs_db(user_id: str, life_id: str, key_hex: str) -> int:
+def migrate_outputs_db(user_id: str, persona_id: str, key_hex: str) -> int:
     """Migrate a user's outputs.db (encrypted)."""
     data_root = get_data_root()
     db_path = (
-        data_root / "users" / user_id / "lives" / life_id / "outputs.db"
+        data_root / "users" / user_id / "personas" / persona_id / "outputs.db"
     )
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = _open_raw(db_path)
@@ -338,7 +338,7 @@ def migrate_scores_db() -> int:
 
 
 def migrate_domain_context_db(
-    user_id: str, life_id: str, focus_id: str, key_hex: str
+    user_id: str, persona_id: str, focus_id: str, key_hex: str
 ) -> int:
     """
     Migrate a focus's domain_context.db (encrypted).
@@ -348,7 +348,7 @@ def migrate_domain_context_db(
     Part of Phase B data model extension (D6-226+).
     """
     from persistence.topic_store import get_domain_context_path
-    db_path = get_domain_context_path(user_id, life_id, focus_id)
+    db_path = get_domain_context_path(user_id, persona_id, focus_id)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = _open_raw(db_path)
     try:
@@ -358,7 +358,7 @@ def migrate_domain_context_db(
 
 
 def migrate_plan_state_db(
-    user_id: str, life_id: str, focus_id: str, topic_id: str, key_hex: str
+    user_id: str, persona_id: str, focus_id: str, topic_id: str, key_hex: str
 ) -> int:
     """
     Migrate a topic's plan_state.db (encrypted).
@@ -368,7 +368,7 @@ def migrate_plan_state_db(
     Part of Phase B data model extension (D6-226+).
     """
     from persistence.topic_store import get_plan_state_path
-    db_path = get_plan_state_path(user_id, life_id, focus_id, topic_id)
+    db_path = get_plan_state_path(user_id, persona_id, focus_id, topic_id)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = _open_raw(db_path)
     try:
@@ -378,15 +378,14 @@ def migrate_plan_state_db(
 
 
 def migrate_focus_storage(
-    user_id: str, life_id: str, focus_id: str, topic_id: str, key_hex: str
+    user_id: str, persona_id: str, focus_id: str, topic_id: str, key_hex: str
 ) -> tuple[int, int]:
     """
     Convenience helper — migrate both focus-level databases in one call.
     Runs domain_context_db migration then plan_state_db migration.
     Returns (domain_context_migrations_applied, plan_state_migrations_applied).
-    Called by lifecycle at Phase 3 INITIALIZE when a topic is active.
     Part of Phase B data model extension (D6-226+).
     """
-    dc = migrate_domain_context_db(user_id, life_id, focus_id, key_hex)
-    ps = migrate_plan_state_db(user_id, life_id, focus_id, topic_id, key_hex)
+    dc = migrate_domain_context_db(user_id, persona_id, focus_id, key_hex)
+    ps = migrate_plan_state_db(user_id, persona_id, focus_id, topic_id, key_hex)
     return dc, ps

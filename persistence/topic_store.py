@@ -27,6 +27,13 @@
 # Revisit directory structure assumptions if this grows significantly.
 #
 # Part of Phase B data model extension (D6-226+).
+#
+# Updated as part of Phase C Persona model migration (D6-298):
+#   life_id → persona_id throughout
+#   Path: lives/{life_id} → personas/{persona_id} in all path functions
+#   SQL: life_id column → persona_id in topics, run_history,
+#        classification_preferences, topic_index
+#   Topic/ClassificationPreference dataclasses: life_id → persona_id field
 
 from __future__ import annotations
 
@@ -54,7 +61,7 @@ LIFECYCLE_STATES = Literal["active", "paused", "awaiting", "complete", "closed"]
 
 def ensure_focus_dirs(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     focus_id: str,
     topic_id: str | None = None,
 ) -> tuple[Path, Path | None]:
@@ -68,12 +75,12 @@ def ensure_focus_dirs(
         topic_dir is None if topic_id is not provided.
 
     Directory structure:
-        users/{user_id}/lives/{life_id}/focuses/{focus_id}/
-        users/{user_id}/lives/{life_id}/focuses/{focus_id}/topics/{topic_id}/
+        users/{user_id}/lives/{persona_id}/focuses/{focus_id}/
+        users/{user_id}/lives/{persona_id}/focuses/{focus_id}/topics/{topic_id}/
     """
     data_root = get_data_root()
     focus_dir = (
-        data_root / "users" / user_id / "lives" / life_id
+        data_root / "users" / user_id / "personas" / persona_id
         / "focuses" / focus_id
     )
     focus_dir.mkdir(parents=True, exist_ok=True)
@@ -87,23 +94,23 @@ def ensure_focus_dirs(
 
 
 def get_domain_context_path(
-    user_id: str, life_id: str, focus_id: str
+    user_id: str, persona_id: str, focus_id: str
 ) -> Path:
     """Return the expected path for a focus's domain_context.db."""
     data_root = get_data_root()
     return (
-        data_root / "users" / user_id / "lives" / life_id
+        data_root / "users" / user_id / "personas" / persona_id
         / "focuses" / focus_id / "domain_context.db"
     )
 
 
 def get_plan_state_path(
-    user_id: str, life_id: str, focus_id: str, topic_id: str
+    user_id: str, persona_id: str, focus_id: str, topic_id: str
 ) -> Path:
     """Return the expected path for a topic's plan_state.db."""
     data_root = get_data_root()
     return (
-        data_root / "users" / user_id / "lives" / life_id
+        data_root / "users" / user_id / "personas" / persona_id
         / "focuses" / focus_id / "topics" / topic_id / "plan_state.db"
     )
 
@@ -116,7 +123,7 @@ class Topic:
     id: str
     focus_id: str
     user_id: str
-    life_id: str
+    persona_id: str
     lifecycle_state: str
     placeholder_name: str
     created_at: str
@@ -144,7 +151,7 @@ class Topic:
             id=row["id"],
             focus_id=row["focus_id"],
             user_id=row["user_id"],
-            life_id=row["life_id"],
+            persona_id=row["persona_id"],
             lifecycle_state=row["lifecycle_state"],
             placeholder_name=row["placeholder_name"],
             created_at=row["created_at"],
@@ -161,7 +168,7 @@ class ClassificationPreference:
     """Runtime representation of a classification_preferences row."""
     id: str
     focus_id: str
-    life_id: str
+    persona_id: str
     content_type: str
     visibility_scope: str
     transformation: str
@@ -177,7 +184,7 @@ class ClassificationPreference:
         return cls(
             id=row["id"],
             focus_id=row["focus_id"],
-            life_id=row["life_id"],
+            persona_id=row["persona_id"],
             content_type=row["content_type"],
             visibility_scope=row["visibility_scope"],
             transformation=row["transformation"],
@@ -194,7 +201,7 @@ class ClassificationPreference:
 
 def create_topic(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     key_hex: str,
     focus_id: str,
     name: str | None = None,
@@ -209,15 +216,15 @@ def create_topic(
     topic_id = str(uuid.uuid4())
     timestamp = now()
     ph_name = placeholder_name or f"{focus_id} — {timestamp[:10]} {timestamp[11:16]}"
-    plan_state_path = str(get_plan_state_path(user_id, life_id, focus_id, topic_id))
+    plan_state_path = str(get_plan_state_path(user_id, persona_id, focus_id, topic_id))
 
-    with open_outputs_db(user_id, life_id, key_hex) as db:
+    with open_outputs_db(user_id, persona_id, key_hex) as db:
         db.execute(
             """INSERT INTO topics
-               (id, focus_id, user_id, life_id, name, placeholder_name,
+               (id, focus_id, user_id, persona_id, name, placeholder_name,
                 lifecycle_state, created_at, updated_at, extra_metadata)
                VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, '{}')""",
-            [topic_id, focus_id, user_id, life_id, name, ph_name,
+            [topic_id, focus_id, user_id, persona_id, name, ph_name,
              timestamp, timestamp]
         )
         # Register plan_state.db path in discovery index.
@@ -232,7 +239,7 @@ def create_topic(
 
     _mirror_topic_index(
         topic_id=topic_id,
-        life_id=life_id,
+        persona_id=persona_id,
         focus_id=focus_id,
         display_name=name or ph_name,
         lifecycle_state="active",
@@ -245,7 +252,7 @@ def create_topic(
         id=topic_id,
         focus_id=focus_id,
         user_id=user_id,
-        life_id=life_id,
+        persona_id=persona_id,
         name=name,
         placeholder_name=ph_name,
         lifecycle_state="active",
@@ -256,14 +263,14 @@ def create_topic(
 
 def get_topic(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     key_hex: str,
     topic_id: str,
 ) -> Topic | None:
     """Fetch a topic by id. Returns None if not found."""
-    with open_outputs_db(user_id, life_id, key_hex) as db:
+    with open_outputs_db(user_id, persona_id, key_hex) as db:
         row = db.execute(
-            """SELECT id, focus_id, user_id, life_id, name, placeholder_name,
+            """SELECT id, focus_id, user_id, persona_id, name, placeholder_name,
                       lifecycle_state, dormant_since, created_at, updated_at,
                       closed_at, extra_metadata
                FROM topics WHERE id = ?""",
@@ -274,7 +281,7 @@ def get_topic(
 
 def list_topics(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     key_hex: str,
     focus_id: str | None = None,
     lifecycle_state: str | None = None,
@@ -284,7 +291,7 @@ def list_topics(
     Ordered by updated_at DESC (most recently active first).
     """
     query = (
-        "SELECT id, focus_id, user_id, life_id, name, placeholder_name, "
+        "SELECT id, focus_id, user_id, persona_id, name, placeholder_name, "
         "lifecycle_state, dormant_since, created_at, updated_at, "
         "closed_at, extra_metadata FROM topics WHERE 1=1"
     )
@@ -297,14 +304,14 @@ def list_topics(
         params.append(lifecycle_state)
     query += " ORDER BY updated_at DESC"
 
-    with open_outputs_db(user_id, life_id, key_hex) as db:
+    with open_outputs_db(user_id, persona_id, key_hex) as db:
         rows = db.execute(query, params).fetchall()
     return [Topic.from_row(row) for row in rows]
 
 
 def update_topic_state(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     key_hex: str,
     topic_id: str,
     lifecycle_state: str,
@@ -323,7 +330,7 @@ def update_topic_state(
     timestamp = now()
     closed_at = timestamp if lifecycle_state in ("complete", "closed") else None
 
-    with open_outputs_db(user_id, life_id, key_hex) as db:
+    with open_outputs_db(user_id, persona_id, key_hex) as db:
         result = db.execute(
             """UPDATE topics SET lifecycle_state = ?, dormant_since = ?,
                closed_at = ?, updated_at = ? WHERE id = ?""",
@@ -338,7 +345,7 @@ def update_topic_state(
 
 def name_topic(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     key_hex: str,
     topic_id: str,
     name: str,
@@ -349,7 +356,7 @@ def name_topic(
     Returns True if found and updated.
     """
     timestamp = now()
-    with open_outputs_db(user_id, life_id, key_hex) as db:
+    with open_outputs_db(user_id, persona_id, key_hex) as db:
         result = db.execute(
             "UPDATE topics SET name = ?, updated_at = ? WHERE id = ?",
             [name, timestamp, topic_id]
@@ -362,7 +369,7 @@ def name_topic(
 
 def increment_topic_session_count(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     key_hex: str,
     topic_id: str,
 ) -> int:
@@ -390,7 +397,7 @@ def increment_topic_session_count(
 
 def get_plan_state_db_path(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     key_hex: str,
     topic_id: str,
 ) -> str | None:
@@ -400,7 +407,7 @@ def get_plan_state_db_path(
     Boot Check uses this as primary lookup — filesystem scan is orphan fallback only.
     topic_storage_locations is a discovery index, not authoritative source of truth.
     """
-    with open_outputs_db(user_id, life_id, key_hex) as db:
+    with open_outputs_db(user_id, persona_id, key_hex) as db:
         row = db.execute(
             "SELECT db_path FROM topic_storage_locations WHERE topic_id = ?",
             [topic_id]
@@ -410,12 +417,12 @@ def get_plan_state_db_path(
 
 def mark_storage_location_verified(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     key_hex: str,
     topic_id: str,
 ) -> None:
     """Mark a topic's plan_state.db as verified at current time."""
-    with open_outputs_db(user_id, life_id, key_hex) as db:
+    with open_outputs_db(user_id, persona_id, key_hex) as db:
         db.execute(
             "UPDATE topic_storage_locations SET verified_at = ?, orphaned = 0 "
             "WHERE topic_id = ?",
@@ -425,7 +432,7 @@ def mark_storage_location_verified(
 
 def mark_storage_location_orphaned(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     key_hex: str,
     topic_id: str,
 ) -> None:
@@ -434,7 +441,7 @@ def mark_storage_location_orphaned(
     Boot Check never auto-deletes — surfaces as Life dashboard notification.
     User action required to resolve.
     """
-    with open_outputs_db(user_id, life_id, key_hex) as db:
+    with open_outputs_db(user_id, persona_id, key_hex) as db:
         db.execute(
             "UPDATE topic_storage_locations SET orphaned = 1, verified_at = ? "
             "WHERE topic_id = ?",
@@ -446,7 +453,7 @@ def mark_storage_location_orphaned(
 
 def create_run_history_entry(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     key_hex: str,
     focus_run_id: str,
     focus_id: str,
@@ -473,14 +480,14 @@ def create_run_history_entry(
         expiry = datetime.now(timezone.utc) + timedelta(days=RUN_HISTORY_RETENTION_DAYS)
         promote_expires = expiry.isoformat()
 
-    with open_outputs_db(user_id, life_id, key_hex) as db:
+    with open_outputs_db(user_id, persona_id, key_hex) as db:
         db.execute(
             """INSERT INTO run_history
-               (id, focus_run_id, focus_id, life_id, topic_id,
+               (id, focus_run_id, focus_id, persona_id, topic_id,
                 output_id, output_type, is_quick_ask,
                 promote_window_expires_at, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            [entry_id, focus_run_id, focus_id, life_id, topic_id,
+            [entry_id, focus_run_id, focus_id, persona_id, topic_id,
              output_id, output_type, 1 if is_quick_ask else 0,
              promote_expires, timestamp]
         )
@@ -489,7 +496,7 @@ def create_run_history_entry(
 
 def nullify_run_history_output(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     key_hex: str,
     output_id: str,
 ) -> None:
@@ -497,7 +504,7 @@ def nullify_run_history_output(
     Set output_id to NULL in run_history when a Library output is deleted.
     Entry retained for audit unless user explicitly purges.
     """
-    with open_outputs_db(user_id, life_id, key_hex) as db:
+    with open_outputs_db(user_id, persona_id, key_hex) as db:
         db.execute(
             "UPDATE run_history SET output_id = NULL WHERE output_id = ?",
             [output_id]
@@ -506,7 +513,7 @@ def nullify_run_history_output(
 
 def list_promotable_runs(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     key_hex: str,
     focus_id: str | None = None,
 ) -> list[dict]:
@@ -527,7 +534,7 @@ def list_promotable_runs(
         params.append(focus_id)
     query += "ORDER BY created_at DESC"
 
-    with open_outputs_db(user_id, life_id, key_hex) as db:
+    with open_outputs_db(user_id, persona_id, key_hex) as db:
         rows = db.execute(query, params).fetchall()
     return [dict(row) for row in rows]
 
@@ -536,7 +543,7 @@ def list_promotable_runs(
 
 def get_classification_preference(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     key_hex: str,
     focus_id: str,
     content_type: str,
@@ -546,21 +553,21 @@ def get_classification_preference(
     Returns None if no preference established — Mode 2 should fire.
     Mode 1 reads from this table.
     """
-    with open_outputs_db(user_id, life_id, key_hex) as db:
+    with open_outputs_db(user_id, persona_id, key_hex) as db:
         row = db.execute(
-            """SELECT id, focus_id, life_id, content_type, visibility_scope,
+            """SELECT id, focus_id, persona_id, content_type, visibility_scope,
                       transformation, sensitivity_preset, user_calibrated,
                       confidence, last_applied_at, created_at, updated_at
                FROM classification_preferences
-               WHERE focus_id = ? AND life_id = ? AND content_type = ?""",
-            [focus_id, life_id, content_type]
+               WHERE focus_id = ? AND persona_id = ? AND content_type = ?""",
+            [focus_id, persona_id, content_type]
         ).fetchone()
     return ClassificationPreference.from_row(row) if row else None
 
 
 def upsert_classification_preference(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     key_hex: str,
     focus_id: str,
     content_type: str,
@@ -585,11 +592,11 @@ def upsert_classification_preference(
     timestamp = now()
     pref_id = str(uuid.uuid4())
 
-    with open_outputs_db(user_id, life_id, key_hex) as db:
+    with open_outputs_db(user_id, persona_id, key_hex) as db:
         existing = db.execute(
             "SELECT id FROM classification_preferences "
-            "WHERE focus_id = ? AND life_id = ? AND content_type = ?",
-            [focus_id, life_id, content_type]
+            "WHERE focus_id = ? AND persona_id = ? AND content_type = ?",
+            [focus_id, persona_id, content_type]
         ).fetchone()
 
         if existing:
@@ -606,11 +613,11 @@ def upsert_classification_preference(
         else:
             db.execute(
                 """INSERT INTO classification_preferences
-                   (id, focus_id, life_id, content_type, visibility_scope,
+                   (id, focus_id, persona_id, content_type, visibility_scope,
                     transformation, sensitivity_preset, user_calibrated,
                     confidence, created_at, updated_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                [pref_id, focus_id, life_id, content_type, visibility_scope,
+                [pref_id, focus_id, persona_id, content_type, visibility_scope,
                  transformation, sensitivity_preset,
                  1 if user_calibrated else 0, confidence, timestamp, timestamp]
             )
@@ -619,17 +626,17 @@ def upsert_classification_preference(
 
 def record_preference_applied(
     user_id: str,
-    life_id: str,
+    persona_id: str,
     key_hex: str,
     focus_id: str,
     content_type: str,
 ) -> None:
     """Update last_applied_at timestamp when a Mode 1 preference is used."""
-    with open_outputs_db(user_id, life_id, key_hex) as db:
+    with open_outputs_db(user_id, persona_id, key_hex) as db:
         db.execute(
             """UPDATE classification_preferences SET last_applied_at = ?
-               WHERE focus_id = ? AND life_id = ? AND content_type = ?""",
-            [now(), focus_id, life_id, content_type]
+               WHERE focus_id = ? AND persona_id = ? AND content_type = ?""",
+            [now(), focus_id, persona_id, content_type]
         )
 
 
@@ -637,7 +644,7 @@ def record_preference_applied(
 
 def _mirror_topic_index(
     topic_id: str,
-    life_id: str,
+    persona_id: str,
     focus_id: str,
     display_name: str,
     lifecycle_state: str,
@@ -655,11 +662,11 @@ def _mirror_topic_index(
         with open_instance_db() as db:
             db.execute(
                 """INSERT OR REPLACE INTO topic_index
-                   (topic_id, life_id, focus_id, display_name, lifecycle_state,
+                   (topic_id, persona_id, focus_id, display_name, lifecycle_state,
                     last_active_at, session_count, content_summary,
                     created_at, updated_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)""",
-                [topic_id, life_id, focus_id, display_name, lifecycle_state,
+                [topic_id, persona_id, focus_id, display_name, lifecycle_state,
                  last_active_at, session_count, created_at, created_at]
             )
     except Exception:
