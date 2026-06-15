@@ -93,6 +93,7 @@ def open_integration_keys_db(user_id: str, key_hex: str):
     key_hex: master key hex string from InMemoryKeyRegistry.
     """
     path = get_data_root() / "users" / user_id / "integration_keys.db"
+    path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     conn.execute(f"PRAGMA key = \"x'{key_hex}'\"")   # key FIRST
@@ -117,6 +118,7 @@ def open_personal_db(user_id: str, persona_id: str, key_hex: str):
     path = (
         get_data_root() / "users" / user_id / "personas" / persona_id / "personal.db"
     )
+    path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     conn.execute(f"PRAGMA key = \"x'{key_hex}'\"")
@@ -141,6 +143,7 @@ def open_outputs_db(user_id: str, persona_id: str, key_hex: str):
     path = (
         get_data_root() / "users" / user_id / "personas" / persona_id / "outputs.db"
     )
+    path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     conn.execute(f"PRAGMA key = \"x'{key_hex}'\"")
