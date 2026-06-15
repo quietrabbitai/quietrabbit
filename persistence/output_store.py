@@ -50,7 +50,7 @@ def _row_to_output_record(row) -> OutputRecord:
     """Map a sqlite3.Row from the outputs table to an OutputRecord."""
     return OutputRecord(
         id=row["id"],
-        focus_run_id=row["path_run_id"],  # column still named path_run_id in outputs table
+        focus_run_id=row["focus_run_id"],
         output_type=row["output_type"],
         content=row["content"],
         sensitivity=row["sensitivity"],
@@ -83,7 +83,7 @@ def save_output(
     with open_outputs_db(user_id, persona_id, key_hex) as db:
         db.execute(
             """INSERT INTO outputs
-               (id, path_run_id, output_type, content, sensitivity,
+               (id, focus_run_id, output_type, content, sensitivity,
                 status, created_at, updated_at)
                VALUES (?, ?, ?, ?, ?, 'active', ?, ?)""",
             [oid, focus_run_id, output_type, content, sensitivity, now(), now()],
@@ -103,7 +103,7 @@ def get_output(
     """
     with open_outputs_db(user_id, persona_id, key_hex) as db:
         row = db.execute(
-            """SELECT id, path_run_id, output_type, content,
+            """SELECT id, focus_run_id, output_type, content,
                       sensitivity, status, created_at, updated_at
                FROM outputs
                WHERE id = ? AND status = 'active'""",
@@ -125,10 +125,10 @@ def get_output_for_run(
     """
     with open_outputs_db(user_id, persona_id, key_hex) as db:
         row = db.execute(
-            """SELECT id, path_run_id, output_type, content,
+            """SELECT id, focus_run_id, output_type, content,
                       sensitivity, status, created_at, updated_at
                FROM outputs
-               WHERE path_run_id = ? AND status = 'active'
+               WHERE focus_run_id = ? AND status = 'active'
                ORDER BY created_at DESC
                LIMIT 1""",
             [focus_run_id],
