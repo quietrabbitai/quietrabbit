@@ -62,9 +62,8 @@ from typing import Literal
 from conductor.context import PersonalField, PersonalTrack
 from providers.errors import (
     PersonalDBDecryptionError,
-    PersonalDBNotFoundError,
 )
-from providers.utils import get_data_root, now, open_personal_db
+from providers.utils import now, open_personal_db
 
 log = logging.getLogger(__name__)
 
@@ -116,25 +115,15 @@ def load_personal_track(
     key_hex: str,
 ) -> PersonalTrack:
     """
-    Load all personal fields and voice profile for a user+life.
+    Load all personal fields and voice profile for a user+persona.
     Returns an UNSEALED PersonalTrack — caller (lifecycle.py) seals it.
     Called during Phase 3 INITIALIZE.
+    On first use (fresh install), open_personal_db auto-migrates the schema
+    so an empty but valid PersonalTrack is returned rather than an error.
 
     Raises:
-        PersonalDBNotFoundError: personal.db does not exist.
         PersonalDBDecryptionError: SQLCipher key rejected or file corrupt.
     """
-    data_root = get_data_root()
-    db_path = (
-        data_root / "users" / user_id / "personas" / persona_id / "personal.db"
-    )
-
-    if not db_path.exists():
-        raise PersonalDBNotFoundError(
-            plain_language=(
-                "Quiet Rabbit couldn't find your personal information. [Get help]"
-            )
-        )
     if not key_hex:
         raise PersonalDBDecryptionError(
             plain_language="Your session has expired. Please log in again."
@@ -166,7 +155,7 @@ def load_personal_track(
             track.set_voice_profile(profile)
             track.set_life_context({})
 
-    except (PersonalDBNotFoundError, PersonalDBDecryptionError):
+    except PersonalDBDecryptionError:
         raise
     except Exception as e:
         if (
