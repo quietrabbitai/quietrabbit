@@ -65,6 +65,34 @@ def get_applied_version(conn) -> int:
         return 0
 
 
+def schema_version_exists(db_path: Path, key_hex: str | None = None) -> bool:
+    """
+    Return True if the schema_version table exists in the database at db_path.
+
+    Used by DB openers to detect fresh (uninitialized) databases before
+    running auto-migration. Opens and closes its own short-lived connection
+    so the caller connection is always opened against the final schema.
+
+    Returns False if the file does not exist (fast path — no connection opened).
+    Returns False on any connection or query error (treated as uninitialised).
+    """
+    if not db_path.exists():
+        return False
+    conn = _open_raw(db_path)
+    try:
+        if key_hex:
+            conn.execute(f"PRAGMA key = \"x'{key_hex}'\"")
+        row = conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='schema_version'"
+        ).fetchone()
+        return row is not None
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
 def _bootstrap_lock_table(conn) -> None:
     """
     Create migration_lock and seed row atomically.

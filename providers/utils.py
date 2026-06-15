@@ -114,11 +114,23 @@ def open_personal_db(user_id: str, persona_id: str, key_hex: str):
     Context manager for a user's personal.db (encrypted).
     PRAGMA key applied first, then journal mode.
     Path: /users/{user_id}/personas/{persona_id}/personal.db
+
+    Auto-migrates on first open: if schema_version table is absent the full
+    migration chain runs before the caller connection is opened, so the caller
+    always sees a fully initialised schema.
+    Lazy import of persistence.migrations avoids circular dependency
+    (migrations.py imports from providers.utils at module level).
     """
     path = (
         get_data_root() / "users" / user_id / "personas" / persona_id / "personal.db"
     )
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Auto-migrate before opening caller connection.
+    # schema_version_exists uses sqlite_master — precise fresh-DB detection.
+    # Migration completes and closes its own connection; caller conn opens after.
+    from persistence.migrations import schema_version_exists, migrate_personal_db
+    if not schema_version_exists(path, key_hex):
+        migrate_personal_db(user_id, persona_id, key_hex)
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     conn.execute(f"PRAGMA key = \"x'{key_hex}'\"")
@@ -139,11 +151,23 @@ def open_outputs_db(user_id: str, persona_id: str, key_hex: str):
     Context manager for a user's outputs.db (encrypted).
     PRAGMA key applied first, then journal mode.
     Path: /users/{user_id}/personas/{persona_id}/outputs.db
+
+    Auto-migrates on first open: if schema_version table is absent the full
+    migration chain runs before the caller connection is opened, so the caller
+    always sees a fully initialised schema.
+    Lazy import of persistence.migrations avoids circular dependency
+    (migrations.py imports from providers.utils at module level).
     """
     path = (
         get_data_root() / "users" / user_id / "personas" / persona_id / "outputs.db"
     )
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Auto-migrate before opening caller connection.
+    # schema_version_exists uses sqlite_master — precise fresh-DB detection.
+    # Migration completes and closes its own connection; caller conn opens after.
+    from persistence.migrations import schema_version_exists, migrate_outputs_db
+    if not schema_version_exists(path, key_hex):
+        migrate_outputs_db(user_id, persona_id, key_hex)
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     conn.execute(f"PRAGMA key = \"x'{key_hex}'\"")
