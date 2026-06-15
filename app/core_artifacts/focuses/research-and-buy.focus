@@ -65,7 +65,7 @@ steps:
       who it is best suited for. Do not recommend a specific retailer.
 
       Requirements: {requirements}
-      {life_context}
+      {persona_context}
     field_requirements: []
     options_override:
       temperature: 0.4

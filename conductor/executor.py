@@ -36,7 +36,7 @@
 #   StepContext: path_id → focus_id, path_run_id → focus_run_id,
 #     space_max_permitted_tier retained (still the correct semantic)
 #   All gate calls: path_run_id → focus_run_id
-#   Prompt tokens: path_context → focus_context, space_context → life_context
+#   Prompt tokens: path_context → focus_context, space_context → life_context → persona_context (D6-323)
 #   guide_id replaces specialist_id in StepDefinition (via tokens.py)
 
 from __future__ import annotations
@@ -142,7 +142,7 @@ class StepContext:
     floor_consent_preference: str | None = None  # "modified" | "local" | None
     next_execution_tier: int | None = None
     retry_count: int = 0
-    life_context: str = ""  # rendered Memory Broker output — injected at Phase 3
+    persona_context: str = ""  # rendered Memory Broker output — injected at Phase 3
 
 
 class StepExecutor:
@@ -508,7 +508,7 @@ class StepExecutor:
             "user_input": ctx.user_input,
             "previous_output": ctx.task_track.last_output() or "",
             "focus_context": ctx.focus_id,
-            "life_context": ctx.life_context,
+            "persona_context": ctx.persona_context,
             "voice_profile": _format_voice_profile(ctx.personal_track.voice_profile),
         }
         return self._render_template(ctx.step.prompt_template, tokens, ctx)
@@ -526,7 +526,7 @@ class StepExecutor:
             "user_input": ctx.user_input,
             "previous_output": ctx.task_track.last_output() or "",
             "focus_context": ctx.focus_id,
-            "life_context": ctx.life_context,
+            "persona_context": ctx.persona_context,
             "voice_profile": _format_voice_profile(ctx.personal_track.voice_profile),
         }
         return self._render_template(ctx.step.prompt_template, tokens, ctx)

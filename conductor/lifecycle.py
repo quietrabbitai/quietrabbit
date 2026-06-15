@@ -59,7 +59,7 @@
 #     ContextSlice rendered to _persona_context_rendered string immediately.
 #     slice_.clear() called — rendered string only is retained for session.
 #   _write_focus_run_record(): topic_id and is_quick_ask written on INSERT.
-#   _execute_step(): passes _persona_context_rendered as life_context to StepContext.
+#   _execute_step(): passes _persona_context_rendered as persona_context to StepContext.
 #   Phase 5 OUTPUT: run_history entry written after save_output().
 #   Phase 7 CLEANUP: _persona_context_rendered cleared.
 # Phase C -- Persona model migration (D6-298):
@@ -597,7 +597,7 @@ class FocusRun:
             floor_consent_preference=floor_consent_preference,
             next_execution_tier=next_execution_tier,
             retry_count=0,
-            life_context=self._persona_context_rendered,
+            persona_context=self._persona_context_rendered,
         )
         return StepExecutor().execute(ctx)
 

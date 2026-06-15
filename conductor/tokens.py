@@ -10,6 +10,8 @@
 # Updated as part of Phase A codebase rename (D6-224, D6-225):
 #   path_context → focus_context
 #   space_context → life_context
+# Updated as part of Phase C Persona migration (D6-298, D6-323):
+#   life_context → persona_context
 
 from __future__ import annotations
 
@@ -23,7 +25,7 @@ from typing import Literal, Mapping
 # Defined as frozenset — immutable, hashable, O(1) lookup.
 SYSTEM_TOKENS: frozenset[str] = frozenset({
     "user_input",       # the user's current request
-    "life_context",     # life-level shared context
+    "persona_context",  # persona-level shared context
     "voice_profile",    # assembled voice profile for this step
     "previous_output",  # output_var from the immediately preceding step
     "focus_context",    # focus-level metadata (name, description)

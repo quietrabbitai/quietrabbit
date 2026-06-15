@@ -101,6 +101,7 @@ All legacy terms retired. Use only the new terms below.
 | PathDefinition   | FocusDefinition  | conductor/lifecycle.py             |
 | path_context     | focus_context    | SYSTEM_TOKENS in tokens.py         |
 | space_context    | life_context     | SYSTEM_TOKENS in tokens.py         |
+| life_context     | persona_context  | SYSTEM_TOKENS in tokens.py (D6-323)|
 
 Dev constants (routes.py, interview.py):
   _DEV_SPACE_ID = "dev-space"  →  _DEV_LIFE_ID = "dev-life"
