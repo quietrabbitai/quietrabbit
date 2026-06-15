@@ -79,6 +79,7 @@ _SUBMIT_FORM = """<!DOCTYPE html>
   <select name="focus_id" id="focus_id">
     <option value="quick-ask">Quick Ask</option>
     <option value="research-and-buy">Research &amp; Buy</option>
+    <option value="role-assessment">Role Assessment</option>
   </select><br><br>
   <textarea name="prompt" rows="6" cols="60"
     placeholder="Type your prompt here..."></textarea><br><br>

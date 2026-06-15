@@ -1,0 +1,170 @@
+# app/core_artifacts/focuses/role-assessment.focus
+# Role Assessment — four-step conductor-brief Focus.
+# Pattern: Tier 1 JD intake → Tier 2 fit analysis → Tier 2 salary research
+#          → Tier 2 disposition.
+# Privacy Sandwich: Gate3 fires at Tier 1→2 boundary before fit_analysis.
+# Personal fields: employer, industry, job_title (all summarize at Tier 2).
+# income_range is not_permitted at Tier 2 — not declared here; withheld
+#   non-blocking per D6-162. Salary research step produces general market-rate
+#   output (role + industry + location) without a user salary range.
+# Resume: Static Asset in Library. Referenced in brief; not captured in the
+#   interview and not injected into prompts. Model is told the asset exists
+#   but does not receive its content during this session.
+# Default seed: Job Hunting Persona, Organized profile (bidirectional,
+#   persona_visible, yellow) — set in focus_settings, not a Focus constraint.
+#   This Focus is Persona-agnostic; any Persona can use it via focus_settings.
+# Output type: role_assessment.
+# guide_id: role-assessment-analyst (declared below).
+
+id: role-assessment
+display_name: Role Assessment
+description: >
+  Evaluate a job description against your professional context and decide
+  whether to apply, reach out, or move on. Surfaces fit gaps, market salary
+  data by role and location, and a clear next-step recommendation.
+version: "1.0"
+max_routing_tier: 2
+guides:
+  - role-assessment-analyst
+
+output_types:
+  - role_assessment
+suggest_in_focuses: []
+
+brief:
+  intent: >
+    Take a job description from the user, analyse fit against their professional
+    context, research market salary for the role without relying on the user's
+    stated range, and produce a clear disposition: apply, reach out first, or
+    skip — with specific reasoning for each.
+  constraints:
+    - Do not fabricate job details not present in the job description
+    - Salary research must use market data only — no user salary range is
+      available and none should be assumed or invented
+    - Resume exists as a Library asset and is noted as context but its
+      contents are not available in this session — do not reference specific
+      resume content
+    - Disposition must always include specific reasoning, not a generic
+      recommendation
+    - Cover letter and resume tailoring are out of scope for this Focus
+
+steps:
+  jd_intake:
+    display_name: "Reading the job description"
+    task_type: general
+    routing_tier: 1
+    step_type: generate
+    output_var: jd_summary
+    prompt_template: >
+      {voice_profile}
+      The user wants to evaluate a job opportunity. Extract and summarise
+      the following from the job description they provide:
+      - Role title and level
+      - Company name (if present)
+      - Location or remote status
+      - Core responsibilities (3–5 bullet points)
+      - Required qualifications (must-have)
+      - Preferred qualifications (nice-to-have)
+      - Any notable culture or team signals
+      - Compensation range if stated (or note if absent)
+
+      Note: The user has a resume on file in their Library. Its contents are
+      not available in this session and will not factor into this summary.
+
+      User's current professional context:
+      Employer: {employer}
+      Industry: {industry}
+      Job title: {job_title}
+
+      Job description: {user_input}
+    field_requirements:
+      - name: employer
+        scope: recommended
+      - name: industry
+        scope: recommended
+      - name: job_title
+        scope: recommended
+    options_override:
+      temperature: 0.2
+      num_predict: 512
+
+  fit_analysis:
+    display_name: "Analysing fit"
+    task_type: research
+    routing_tier: 2
+    step_type: generate
+    output_var: fit_analysis
+    prompt_template: >
+      {voice_profile}
+      Based on the job summary and the user's professional context below,
+      analyse fit. The user's resume is not available in this session —
+      base the analysis on their current role, industry, and any context
+      provided. Structure the output as:
+      1. Strengths — where the user's professional context aligns well
+         with the role requirements
+      2. Gaps — requirements the user may not meet, with a realistic
+         assessment of whether each gap is a dealbreaker, bridgeable,
+         or minor
+      3. Signals — anything notable about the role, company, or posting
+         that the user should factor into their decision (positive or
+         cautionary)
+
+      Job summary: {jd_summary}
+      {persona_context}
+    field_requirements: []
+    options_override:
+      temperature: 0.4
+      num_predict: 768
+
+  salary_research:
+    display_name: "Researching salary"
+    task_type: research
+    routing_tier: 2
+    step_type: generate
+    output_var: salary_context
+    prompt_template: >
+      {voice_profile}
+      Research the market salary range for this role. No salary preference
+      from the user is available — produce general market-rate data only.
+      Base research on: role title, seniority level, industry, and location
+      (if present in the job summary).
+
+      Structure the output as:
+      - Typical market range (low / mid / high) for this role and location
+      - Key factors that push compensation up or down for this role type
+      - Whether the stated compensation range (if any) is competitive,
+        low, high, or undisclosed
+
+      Job summary: {jd_summary}
+    field_requirements: []
+    options_override:
+      temperature: 0.3
+      num_predict: 512
+
+  disposition:
+    display_name: "Your next step"
+    task_type: general
+    routing_tier: 2
+    step_type: generate
+    output_var: role_assessment
+    prompt_template: >
+      {voice_profile}
+      Based on the fit analysis and salary context, produce a clear
+      disposition with specific reasoning. Choose one of:
+      - Apply — recommend applying directly; explain why the fit is strong
+        enough and the opportunity is worth pursuing
+      - Reach out first — recommend a warm contact or informational
+        conversation before applying; explain what information would make
+        the decision clearer
+      - Skip — recommend passing; explain the specific reasons the role is
+        not a good fit or the opportunity is not worth the effort
+
+      Then provide 2–3 specific next steps the user should take based on
+      the disposition.
+
+      Fit analysis: {fit_analysis}
+      Salary context: {salary_context}
+    field_requirements: []
+    options_override:
+      temperature: 0.3
+      num_predict: 512

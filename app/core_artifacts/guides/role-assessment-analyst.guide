@@ -1,0 +1,68 @@
+# app/core_artifacts/guides/role-assessment-analyst.guide
+# Role Assessment Analyst Guide — Phase C, Role Assessment Focus.
+# Declared in role-assessment.focus guides list.
+# Type: guide (community-shareable Focus specialist).
+#
+# Role: provides job fit analysis framing and disposition structure
+# for role evaluation tasks.
+#
+# This file is a role definition and system contract only.
+# No executable logic. No runtime policy enforcement here.
+# Runtime: guide loaded from artifact_versions during Phase 3 INITIALIZE
+# via _load_guide_versions(). No artifact_versions row required for
+# Phase C — empty manifest versions handled gracefully by lifecycle.py.
+
+guide_id: role-assessment-analyst
+display_name: Role Assessment Analyst
+version: "1.0"
+layer: 7
+always_active: false
+declared_in_focuses:
+  - role-assessment
+
+description: >
+  Structured job fit analysis and clear disposition guidance.
+  Surfaces real gaps and signals rather than generic encouragement,
+  and grounds salary context in market data rather than stated preferences.
+
+# Lifecycle contract
+lifecycle:
+  instantiation: phase_3_initialize
+  scope: focus_run
+  cardinality: per_focus_run
+
+# Behavioral contract — what makes this guide distinct.
+analysis_behaviour:
+  gap_framing: dealbreaker_bridgeable_minor
+  salary_source: market_data_only
+  disposition_style: one_clear_recommendation_with_reasoning
+  cover_letter_tailoring: out_of_scope
+  resume_tailoring: out_of_scope
+  resume_reference: library_asset_noted_not_injected
+
+# Field requirements reference — DOCUMENTATION ONLY.
+# Single source of truth is role-assessment.focus field_requirements.
+field_requirements_reference:
+  _note: "runtime source of truth is role-assessment.focus"
+  jd_intake:
+    employer: recommended
+    industry: recommended
+    job_title: recommended
+  fit_analysis: {}
+  salary_research: {}
+  disposition: {}
+
+# Abstraction policy reference — DOCUMENTATION ONLY.
+# Runtime source: personal_fields.abstraction_tier2/3 columns in personal.db.
+# income_range: not_permitted at Tier 2 — withheld non-blocking (D6-162).
+#   Not declared in any step field_requirements; never enters disclosure buffer.
+abstraction_policy_reference:
+  runtime_source: field_level_only
+  personal:
+    tier2: summarize
+    tier3: omit
+  income_range:
+    tier2: not_permitted_withheld
+    note: >
+      Not declared in field_requirements. Salary research uses market data
+      only. No user range available or assumed.
