@@ -56,7 +56,7 @@ from providers.errors import (
     OllamaUnavailableError,
     ContextWindowExceededError, TierBoundaryViolationError,
     InboundContaminationError, ContentPromotionBlockedError,
-    DisclosureLogWriteError,
+    DisclosureLogWriteError, VoiceProfileContaminationError,
 )
 from providers.groq import GroqProvider
 from providers.ollama_client import generate, check_context_window
@@ -72,6 +72,12 @@ _groq_provider = GroqProvider()
 
 # Token pattern for prompt template scanning — matches {snake_case_name}.
 _TOKEN_PATTERN = re.compile(r"\{([a-z_][a-z0-9_]*)\}")
+
+# PII detection patterns for voice profile value scanning.
+# These are policy-level constants — update here when detection rules change.
+_VP_EMAIL_RE = re.compile(r"\S+@\S+\.\S+")
+_VP_DIGIT_RE = re.compile(r"\d{7,}")
+_VP_MIN_FIELD_LENGTH = 8  # minimum personal field value length for word-boundary match
 
 
 # -- Voice profile allowlist --------------------------------------------------
@@ -157,7 +163,7 @@ class StepExecutor:
         while True:
             try:
                 result = self._execute_once(current_ctx)
-            except DisclosureLogWriteError as e:
+            except (DisclosureLogWriteError, VoiceProfileContaminationError) as e:
                 return current_ctx.failure_handler.handle(
                     e,
                     step_id=current_ctx.step.step_id,
@@ -509,7 +515,7 @@ class StepExecutor:
             "previous_output": ctx.task_track.last_output() or "",
             "focus_context": ctx.focus_id,
             "persona_context": ctx.persona_context,
-            "voice_profile": _format_voice_profile(ctx.personal_track.voice_profile),
+            "voice_profile": _format_voice_profile(self._scan_voice_profile(ctx)),
         }
         return self._render_template(ctx.step.prompt_template, tokens, ctx)
 
@@ -527,9 +533,94 @@ class StepExecutor:
             "previous_output": ctx.task_track.last_output() or "",
             "focus_context": ctx.focus_id,
             "persona_context": ctx.persona_context,
-            "voice_profile": _format_voice_profile(ctx.personal_track.voice_profile),
+            "voice_profile": _format_voice_profile(self._scan_voice_profile(ctx)),
         }
         return self._render_template(ctx.step.prompt_template, tokens, ctx)
+
+    def _scan_voice_profile(self, ctx: StepContext) -> dict[str, str]:
+        """
+        Scan voice profile values for likely personal information before
+        prompt assembly. Called by both render methods before
+        _format_voice_profile().
+
+        Detection signals (three rules):
+          1. personal_field_match — value contains a PersonalTrack field value
+             as a whole word (word-boundary match, case-insensitive).
+             Only field values of _VP_MIN_FIELD_LENGTH+ characters are tested
+             to avoid false positives from short common words.
+          2. email_pattern — value matches _VP_EMAIL_RE.
+          3. digit_dense — value contains 7+ consecutive digits (_VP_DIGIT_RE).
+
+        Tier 1: contaminated attributes stripped, execution continues.
+          Audit event written via record_voice_profile_contamination().
+        Tier 2+: VoiceProfileContaminationError raised on first match.
+          Audit event written before raise.
+
+        This is secondary containment. Write-time validation in
+        personal_store.py is the required primary prevention (D6-326).
+
+        Returns a cleaned dict with contaminated attributes removed.
+        At Tier 2+, raises before returning.
+        """
+        personal_values: list[str] = [
+            pf.field_value
+            for pf in ctx.personal_track.fields.values()
+            if len(pf.field_value) >= _VP_MIN_FIELD_LENGTH
+        ]
+
+        cleaned: dict[str, str] = {}
+
+        for attr, value in ctx.personal_track.voice_profile.items():
+            if attr not in ALLOWED_VOICE_ATTRIBUTES:
+                continue  # unknown attrs excluded by _format_voice_profile
+
+            contamination_type: str | None = None
+
+            for pv in personal_values:
+                if re.search(
+                    r"\b" + re.escape(pv) + r"\b", value, re.IGNORECASE
+                ):
+                    contamination_type = "personal_field_match"
+                    break
+
+            if contamination_type is None:
+                if _VP_EMAIL_RE.search(value):
+                    contamination_type = "email_pattern"
+                elif _VP_DIGIT_RE.search(value):
+                    contamination_type = "digit_dense"
+
+            if contamination_type is not None:
+                log.warning(
+                    "Voice profile contamination detected: attr=%s type=%s "
+                    "tier=%d focus=%s step=%s",
+                    attr, contamination_type,
+                    ctx.execution_tier, ctx.focus_id, ctx.step.step_id,
+                )
+                ctx.privacy_gateway.record_voice_profile_contamination(
+                    step_id=ctx.step.step_id,
+                    focus_run_id=ctx.focus_run_id,
+                    execution_tier=ctx.execution_tier,
+                    abstraction_tier=ctx.abstraction_tier,
+                    attribute_name=attr,
+                )
+                if ctx.execution_tier >= 2:
+                    raise VoiceProfileContaminationError(
+                        attribute_name=attr,
+                        contamination_type=contamination_type,
+                        execution_tier=ctx.execution_tier,
+                        plain_language=(
+                            "One of your communication style settings appears to "
+                            "contain personal information. Quiet Rabbit stopped "
+                            "this request before sending it outside your device. "
+                            "Review your voice profile settings and remove personal "
+                            "details before trying again."
+                        ),
+                    )
+                # Tier 1: strip and continue
+            else:
+                cleaned[attr] = value
+
+        return cleaned
 
     # -- Model selection and options ------------------------------------------
 

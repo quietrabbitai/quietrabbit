@@ -461,6 +461,37 @@ class PrivacyGateway:
             plain_language=plain_language,
         )
 
+    # -- Voice profile contamination audit ------------------------------------
+
+    def record_voice_profile_contamination(
+        self,
+        step_id: str,
+        focus_run_id: str,
+        execution_tier: int,
+        abstraction_tier: int,
+        attribute_name: str,
+    ) -> None:
+        """
+        Write a disclosure log audit event for a voice profile contamination
+        detection. Called by StepExecutor._scan_voice_profile().
+
+        attribute_name: the offending key — never the value.
+        Non-fatal at Tier 1 (consistent with _write_disclosure_log policy).
+        FATAL at Tier 2+ via DisclosureLogWriteError.
+        """
+        self._write_disclosure_log(
+            step_id=step_id,
+            focus_run_id=focus_run_id,
+            execution_tier=execution_tier,
+            abstraction_tier=abstraction_tier,
+            provider=None,
+            fields_shared=[],
+            fields_abstracted={},
+            fields_withheld=[attribute_name],
+            override_declined=False,
+            event_type="voice_profile_contamination_detected",
+        )
+
     # -- Disclosure log writer ------------------------------------------------
 
     def _write_disclosure_log(

@@ -135,6 +135,42 @@ class FloorConsentRequiredError(QRAPIError):
         super().__init__(plain_language, **kwargs)
 
 
+class VoiceProfileContaminationError(QRAPIError):
+    """
+    Voice profile value scan detected likely personal information before
+    prompt assembly.
+
+    Raised at Tier 2+ when a scan detects that a voice profile attribute
+    value may contain personal information. At Tier 1, contaminated
+    attributes are stripped and execution continues — this error is only
+    raised at Tier 2+.
+
+    This is secondary containment. Primary prevention is write-time
+    validation in personal_store.py (not yet implemented — D6-326).
+
+    NOTE: If a PrivacyViolationError intermediate base class is introduced
+    in future, this error should migrate to it (flagged by ChatGPT review).
+
+    attribute_name: the offending attribute key — never the value.
+    contamination_type: classification of the detection signal
+        ('personal_field_match' | 'email_pattern' | 'digit_dense').
+    execution_tier: the tier at which contamination was detected.
+    """
+
+    def __init__(
+        self,
+        attribute_name: str,
+        contamination_type: str,
+        execution_tier: int,
+        plain_language: str,
+        **kwargs,
+    ):
+        self.attribute_name = attribute_name
+        self.contamination_type = contamination_type
+        self.execution_tier = execution_tier
+        super().__init__(plain_language, **kwargs)
+
+
 # -- F5: Security Checker flag ------------------------------------------------
 
 class SecurityCheckerFlagError(QRAPIError):
