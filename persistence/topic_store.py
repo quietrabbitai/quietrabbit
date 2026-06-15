@@ -75,8 +75,8 @@ def ensure_focus_dirs(
         topic_dir is None if topic_id is not provided.
 
     Directory structure:
-        users/{user_id}/lives/{persona_id}/focuses/{focus_id}/
-        users/{user_id}/lives/{persona_id}/focuses/{focus_id}/topics/{topic_id}/
+        users/{user_id}/personas/{persona_id}/focuses/{focus_id}/
+        users/{user_id}/personas/{persona_id}/focuses/{focus_id}/topics/{topic_id}/
     """
     data_root = get_data_root()
     focus_dir = (
