@@ -33,20 +33,22 @@
 # as a Conductor token — str.replace() substitution will mangle it.
 # Unresolved tokens are stripped with a log.debug() at runtime.
 
-focus_id: writing-assistant
+id: writing-assistant
 display_name: Writing Assistant
 description: >
   Craft polished writing for any purpose. Your voice, your context,
   your words — refined for clarity and impact.
 version: "1.0"
-output_type: general
+output_types:
+  - general
 max_routing_tier: 2
+guides:
+  - writing-voice
 suggest_in_focuses: []
 
 steps:
-  - step_id: voice_analysis
+  voice_analysis:
     display_name: Understanding your style...
-    guide_id: writing-voice
     task_type: quick_response
     routing_tier: 1
     step_type: generate
@@ -61,14 +63,14 @@ steps:
       Voice preferences: {voice_profile}
       Request: {user_input}
     field_requirements:
-      voice_profile: recommended
+      - name: voice_profile
+        scope: recommended
     options_override:
       temperature: 0.3
       num_predict: 256
 
-  - step_id: draft_writing
+  draft_writing:
     display_name: Writing your draft...
-    guide_id: writing-voice
     task_type: creative_writing
     routing_tier: 2
     step_type: generate
@@ -89,16 +91,18 @@ steps:
 
       Voice preferences: {voice_profile}
     field_requirements:
-      job_title: optional
-      employer: optional
-      location_city: optional
+      - name: job_title
+        scope: optional
+      - name: employer
+        scope: optional
+      - name: location_city
+        scope: optional
     options_override:
       temperature: 0.5
       num_predict: 1024
 
-  - step_id: voice_transform
+  voice_transform:
     display_name: Refining your voice...
-    guide_id: writing-voice
     task_type: quick_response
     routing_tier: 1
     step_type: voice_transform
@@ -110,7 +114,8 @@ steps:
       Voice preferences: {voice_profile}
       Draft: {draft_output}
     field_requirements:
-      voice_profile: recommended
+      - name: voice_profile
+        scope: recommended
     options_override:
       temperature: 0.3
       num_predict: 1024
