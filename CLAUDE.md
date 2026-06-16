@@ -215,3 +215,90 @@ JSON examples or code blocks with literal braces matching a token name will be m
 - Token estimation: 20% safety buffer when task_type is 'code' or 'research'
 - PG_GATE_2 latency: full response classified before any display to user
 - Ollama NDJSON stream: parse final line for {"status":"success"} before confirming
+
+## Rust/Tauri Architecture (rust-migration branch)
+
+### Branch rule (standing)
+ALL Rust work commits to `rust-migration` branch, never main.
+Python-only fixes (oracle correctness bugs only) commit to main,
+then cherry-pick to rust-migration if they affect gate behavior.
+No Rust code on main until migration is complete and Python is deleted.
+Verify branch before every commit: `git branch --show-current`
+must show rust-migration for any Rust session.
+
+### Python freeze rule (standing)
+No Python source changes during migration except critical correctness bugs
+(gate logic errors, data corruption, security issues). Cosmetic fixes,
+cleanup, and non-critical improvements are deferred until after migration.
+Any permitted Python fix requires re-extracting golden vectors for all
+affected gate paths before Rust porting of those paths continues.
+Chat-PM must approve any Python change during migration before it is made.
+
+### Project structure
+src-tauri/ lives at repo root (Option A — D6-339).
+  src-tauri/Cargo.toml       — package manifest + dependencies
+  src-tauri/build.rs         — required Tauri build script
+  src-tauri/tauri.conf.json  — Tauri v2 app config
+  src-tauri/src/main.rs      — async entry point (#[tokio::main])
+  src-tauri/src/lib.rs       — library root; mod declarations go here
+  src-tauri/icons/           — app icons (placeholder until branding pass)
+Rust dev runs locally on Garuda via cargo — NOT in Docker.
+Docker is Python/Flask only and will be retired when migration is complete.
+
+### Async runtime (D6-341)
+Tokio async runtime. All Conductor modules are async.
+Entry point: #[tokio::main] in main.rs.
+IPC command handlers: #[tauri::command] async fn.
+Do not block the async executor — use tokio::task::spawn_blocking for
+any synchronous I/O that cannot be made async.
+
+### Actor model (D6-342)
+Track ownership follows the actor model: FocusRun owns its tracks
+(PersonalTrack, TaskTrack, SharedStateTrack) and communicates by message passing.
+Do not share tracks across actors via Arc<Mutex<…>> — this was the Python
+borrow-checker workaround and does not carry over.
+Tauri app handle is wired into the Conductor actor at startup for push events.
+
+### SQLCipher + sqlx connection pattern
+sqlx with SQLCipher-linked libsqlite3-sys. Not the bundled vanilla SQLite.
+PRAGMA key MUST be set before PRAGMA journal_mode on every connection.
+Enforce via sqlx after_connect hook — not inline at call sites.
+Connection topology: open single connections on demand per DB file.
+Do not use a keyed pool — QR has many small per-scope encrypted DBs
+(shared.db, per-persona personal.db + outputs.db, per-focus domain_context.db,
+per-topic plan_state.db). Pool model does not fit this topology.
+SQLCipher linkage: SQLX_SQLITE_USE_SYSTEM_LIBRARY=1 + system libsqlcipher.
+Verify linkage before first persistence module is ported.
+
+### Tauri IPC command conventions
+37 typed IPC commands defined in HANDOFF_IPC_SURFACE.md.
+4 are push events (tauri::Emitter::emit) — not request-response.
+All command structs derive Serialize, Deserialize, specta::Type.
+TypeScript types generated via tauri-specta (2.0.0-rc.25) + specta-typescript.
+Run type export after any command struct change — do not allow frontend/backend drift.
+get_personal_fields: enforce abstraction at the command boundary.
+Raw PersonalTrack values never cross into IPC response layer.
+Tauri event listeners must be explicitly detached on SPA view unmount.
+
+### Golden-vector verification requirement
+Privacy gates (Gate1–4) must be verified against the running Python oracle
+before the Rust port is considered correct.
+Extract (field, abstraction_tier, raw_abstraction, execution_tier) → output
+tables across every policy × tier combo + edge cases.
+Rust output must match Python oracle bit-identically.
+Port gates FIRST and freeze as the verification anchor before porting anything else.
+Same requirement applies to: tier math, voice-profile scanner, prompt token
+renderer, migration statement parser.
+
+### Python oracle note
+Python files are oracle only during migration — do not modify.
+The Python codebase is the ground truth for gate behavior.
+Any Python change requires Chat-PM approval + golden vector re-extraction
+for all affected gate paths before Rust porting of those paths continues.
+
+### Cargo conventions
+Edition: 2021. One Cargo.toml at src-tauri/ — no workspace yet.
+Feature flags: add features explicitly when a module first uses them.
+Do not leave unused features enabled — they inflate compile time.
+thiserror for all error types. No anyhow in library code (only in main.rs if needed).
+indexmap (not HashMap) wherever gate policy dispatch requires insertion-order determinism.
