@@ -1,0 +1,1794 @@
+{
+  "apply_abstraction_valid": [
+    {
+      "label": "valid::pass::general::tier1",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "general",
+      "policy_t2": "pass",
+      "policy_t3": "pass",
+      "tier": 1,
+      "output": "TestValue123"
+    },
+    {
+      "label": "valid::pass::general::tier2",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "general",
+      "policy_t2": "pass",
+      "policy_t3": "pass",
+      "tier": 2,
+      "output": "TestValue123"
+    },
+    {
+      "label": "valid::pass::general::tier3",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "general",
+      "policy_t2": "pass",
+      "policy_t3": "pass",
+      "tier": 3,
+      "output": "TestValue123"
+    },
+    {
+      "label": "valid::pass::personal::tier1",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "personal",
+      "policy_t2": "pass",
+      "policy_t3": "pass",
+      "tier": 1,
+      "output": "TestValue123"
+    },
+    {
+      "label": "valid::pass::personal::tier2",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "personal",
+      "policy_t2": "pass",
+      "policy_t3": "pass",
+      "tier": 2,
+      "output": "TestValue123"
+    },
+    {
+      "label": "valid::pass::personal::tier3",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "personal",
+      "policy_t2": "pass",
+      "policy_t3": "pass",
+      "tier": 3,
+      "output": "TestValue123"
+    },
+    {
+      "label": "valid::pass::medical::tier1",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "medical",
+      "policy_t2": "pass",
+      "policy_t3": "pass",
+      "tier": 1,
+      "output": "TestValue123"
+    },
+    {
+      "label": "valid::pass::medical::tier2",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "medical",
+      "policy_t2": "pass",
+      "policy_t3": "pass",
+      "tier": 2,
+      "output": "TestValue123"
+    },
+    {
+      "label": "valid::pass::medical::tier3",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "medical",
+      "policy_t2": "pass",
+      "policy_t3": "pass",
+      "tier": 3,
+      "output": "TestValue123"
+    },
+    {
+      "label": "valid::pass::financial::tier1",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "financial",
+      "policy_t2": "pass",
+      "policy_t3": "pass",
+      "tier": 1,
+      "output": "TestValue123"
+    },
+    {
+      "label": "valid::pass::financial::tier2",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "financial",
+      "policy_t2": "pass",
+      "policy_t3": "pass",
+      "tier": 2,
+      "output": "TestValue123"
+    },
+    {
+      "label": "valid::pass::financial::tier3",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "financial",
+      "policy_t2": "pass",
+      "policy_t3": "pass",
+      "tier": 3,
+      "output": "TestValue123"
+    },
+    {
+      "label": "valid::omit::general::tier1",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "general",
+      "policy_t2": "omit",
+      "policy_t3": "omit",
+      "tier": 1,
+      "output": "TestValue123"
+    },
+    {
+      "label": "valid::omit::general::tier2",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "general",
+      "policy_t2": "omit",
+      "policy_t3": "omit",
+      "tier": 2,
+      "output": null
+    },
+    {
+      "label": "valid::omit::general::tier3",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "general",
+      "policy_t2": "omit",
+      "policy_t3": "omit",
+      "tier": 3,
+      "output": null
+    },
+    {
+      "label": "valid::omit::personal::tier1",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "personal",
+      "policy_t2": "omit",
+      "policy_t3": "omit",
+      "tier": 1,
+      "output": "TestValue123"
+    },
+    {
+      "label": "valid::omit::personal::tier2",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "personal",
+      "policy_t2": "omit",
+      "policy_t3": "omit",
+      "tier": 2,
+      "output": null
+    },
+    {
+      "label": "valid::omit::personal::tier3",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "personal",
+      "policy_t2": "omit",
+      "policy_t3": "omit",
+      "tier": 3,
+      "output": null
+    },
+    {
+      "label": "valid::omit::medical::tier1",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "medical",
+      "policy_t2": "omit",
+      "policy_t3": "omit",
+      "tier": 1,
+      "output": "TestValue123"
+    },
+    {
+      "label": "valid::omit::medical::tier2",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "medical",
+      "policy_t2": "omit",
+      "policy_t3": "omit",
+      "tier": 2,
+      "output": null
+    },
+    {
+      "label": "valid::omit::medical::tier3",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "medical",
+      "policy_t2": "omit",
+      "policy_t3": "omit",
+      "tier": 3,
+      "output": null
+    },
+    {
+      "label": "valid::omit::financial::tier1",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "financial",
+      "policy_t2": "omit",
+      "policy_t3": "omit",
+      "tier": 1,
+      "output": "TestValue123"
+    },
+    {
+      "label": "valid::omit::financial::tier2",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "financial",
+      "policy_t2": "omit",
+      "policy_t3": "omit",
+      "tier": 2,
+      "output": null
+    },
+    {
+      "label": "valid::omit::financial::tier3",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "financial",
+      "policy_t2": "omit",
+      "policy_t3": "omit",
+      "tier": 3,
+      "output": null
+    },
+    {
+      "label": "valid::not_permitted::general::tier1",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "general",
+      "policy_t2": "not_permitted",
+      "policy_t3": "not_permitted",
+      "tier": 1,
+      "output": "TestValue123"
+    },
+    {
+      "label": "valid::not_permitted::general::tier2",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "general",
+      "policy_t2": "not_permitted",
+      "policy_t3": "not_permitted",
+      "tier": 2,
+      "output": null
+    },
+    {
+      "label": "valid::not_permitted::general::tier3",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "general",
+      "policy_t2": "not_permitted",
+      "policy_t3": "not_permitted",
+      "tier": 3,
+      "output": null
+    },
+    {
+      "label": "valid::not_permitted::personal::tier1",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "personal",
+      "policy_t2": "not_permitted",
+      "policy_t3": "not_permitted",
+      "tier": 1,
+      "output": "TestValue123"
+    },
+    {
+      "label": "valid::not_permitted::personal::tier2",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "personal",
+      "policy_t2": "not_permitted",
+      "policy_t3": "not_permitted",
+      "tier": 2,
+      "output": null
+    },
+    {
+      "label": "valid::not_permitted::personal::tier3",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "personal",
+      "policy_t2": "not_permitted",
+      "policy_t3": "not_permitted",
+      "tier": 3,
+      "output": null
+    },
+    {
+      "label": "valid::not_permitted::medical::tier1",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "medical",
+      "policy_t2": "not_permitted",
+      "policy_t3": "not_permitted",
+      "tier": 1,
+      "output": "TestValue123"
+    },
+    {
+      "label": "valid::not_permitted::medical::tier2",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "medical",
+      "policy_t2": "not_permitted",
+      "policy_t3": "not_permitted",
+      "tier": 2,
+      "output": null
+    },
+    {
+      "label": "valid::not_permitted::medical::tier3",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "medical",
+      "policy_t2": "not_permitted",
+      "policy_t3": "not_permitted",
+      "tier": 3,
+      "output": null
+    },
+    {
+      "label": "valid::not_permitted::financial::tier1",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "financial",
+      "policy_t2": "not_permitted",
+      "policy_t3": "not_permitted",
+      "tier": 1,
+      "output": "TestValue123"
+    },
+    {
+      "label": "valid::not_permitted::financial::tier2",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "financial",
+      "policy_t2": "not_permitted",
+      "policy_t3": "not_permitted",
+      "tier": 2,
+      "output": null
+    },
+    {
+      "label": "valid::not_permitted::financial::tier3",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "financial",
+      "policy_t2": "not_permitted",
+      "policy_t3": "not_permitted",
+      "tier": 3,
+      "output": null
+    },
+    {
+      "label": "valid::summarize::general::tier1",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "general",
+      "policy_t2": "summarize",
+      "policy_t3": "summarize",
+      "tier": 1,
+      "output": "TestValue123"
+    },
+    {
+      "label": "valid::summarize::general::tier2",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "general",
+      "policy_t2": "summarize",
+      "policy_t3": "summarize",
+      "tier": 2,
+      "output": "a test field"
+    },
+    {
+      "label": "valid::summarize::general::tier3",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "general",
+      "policy_t2": "summarize",
+      "policy_t3": "summarize",
+      "tier": 3,
+      "output": "a test field"
+    },
+    {
+      "label": "valid::summarize::personal::tier1",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "personal",
+      "policy_t2": "summarize",
+      "policy_t3": "summarize",
+      "tier": 1,
+      "output": "TestValue123"
+    },
+    {
+      "label": "valid::summarize::personal::tier2",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "personal",
+      "policy_t2": "summarize",
+      "policy_t3": "summarize",
+      "tier": 2,
+      "output": "personal test field information"
+    },
+    {
+      "label": "valid::summarize::personal::tier3",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "personal",
+      "policy_t2": "summarize",
+      "policy_t3": "summarize",
+      "tier": 3,
+      "output": "personal test field information"
+    },
+    {
+      "label": "valid::summarize::medical::tier1",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "medical",
+      "policy_t2": "summarize",
+      "policy_t3": "summarize",
+      "tier": 1,
+      "output": "TestValue123"
+    },
+    {
+      "label": "valid::summarize::medical::tier2",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "medical",
+      "policy_t2": "summarize",
+      "policy_t3": "summarize",
+      "tier": 2,
+      "output": "medical information"
+    },
+    {
+      "label": "valid::summarize::medical::tier3",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "medical",
+      "policy_t2": "summarize",
+      "policy_t3": "summarize",
+      "tier": 3,
+      "output": "medical information"
+    },
+    {
+      "label": "valid::summarize::financial::tier1",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "financial",
+      "policy_t2": "summarize",
+      "policy_t3": "summarize",
+      "tier": 1,
+      "output": "TestValue123"
+    },
+    {
+      "label": "valid::summarize::financial::tier2",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "financial",
+      "policy_t2": "summarize",
+      "policy_t3": "summarize",
+      "tier": 2,
+      "output": "financial information"
+    },
+    {
+      "label": "valid::summarize::financial::tier3",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "financial",
+      "policy_t2": "summarize",
+      "policy_t3": "summarize",
+      "tier": 3,
+      "output": "financial information"
+    },
+    {
+      "label": "valid::range_only::general::tier1",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "general",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 1,
+      "output": "TestValue123"
+    },
+    {
+      "label": "valid::range_only::general::tier2",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "general",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 2,
+      "output": "a test field"
+    },
+    {
+      "label": "valid::range_only::general::tier3",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "general",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 3,
+      "output": "a test field"
+    },
+    {
+      "label": "valid::range_only::personal::tier1",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "personal",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 1,
+      "output": "TestValue123"
+    },
+    {
+      "label": "valid::range_only::personal::tier2",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "personal",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 2,
+      "output": "a test field"
+    },
+    {
+      "label": "valid::range_only::personal::tier3",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "personal",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 3,
+      "output": "a test field"
+    },
+    {
+      "label": "valid::range_only::medical::tier1",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "medical",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 1,
+      "output": "TestValue123"
+    },
+    {
+      "label": "valid::range_only::medical::tier2",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "medical",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 2,
+      "output": "a test field"
+    },
+    {
+      "label": "valid::range_only::medical::tier3",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "medical",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 3,
+      "output": "a test field"
+    },
+    {
+      "label": "valid::range_only::financial::tier1",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 1,
+      "output": "TestValue123"
+    },
+    {
+      "label": "valid::range_only::financial::tier2",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 2,
+      "output": "a test field"
+    },
+    {
+      "label": "valid::range_only::financial::tier3",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 3,
+      "output": "a test field"
+    },
+    {
+      "label": "valid::summarize_label::general::tier2",
+      "field_name": "my_field",
+      "field_value": "anything",
+      "sensitivity": "general",
+      "policy_t2": "summarize",
+      "policy_t3": "summarize",
+      "tier": 2,
+      "output": "a my field"
+    },
+    {
+      "label": "valid::summarize_label::general::tier3",
+      "field_name": "my_field",
+      "field_value": "anything",
+      "sensitivity": "general",
+      "policy_t2": "summarize",
+      "policy_t3": "summarize",
+      "tier": 3,
+      "output": "a my field"
+    },
+    {
+      "label": "valid::summarize_label::personal::tier2",
+      "field_name": "my_field",
+      "field_value": "anything",
+      "sensitivity": "personal",
+      "policy_t2": "summarize",
+      "policy_t3": "summarize",
+      "tier": 2,
+      "output": "personal my field information"
+    },
+    {
+      "label": "valid::summarize_label::personal::tier3",
+      "field_name": "my_field",
+      "field_value": "anything",
+      "sensitivity": "personal",
+      "policy_t2": "summarize",
+      "policy_t3": "summarize",
+      "tier": 3,
+      "output": "personal my field information"
+    },
+    {
+      "label": "valid::summarize_label::medical::tier2",
+      "field_name": "my_field",
+      "field_value": "anything",
+      "sensitivity": "medical",
+      "policy_t2": "summarize",
+      "policy_t3": "summarize",
+      "tier": 2,
+      "output": "medical information"
+    },
+    {
+      "label": "valid::summarize_label::medical::tier3",
+      "field_name": "my_field",
+      "field_value": "anything",
+      "sensitivity": "medical",
+      "policy_t2": "summarize",
+      "policy_t3": "summarize",
+      "tier": 3,
+      "output": "medical information"
+    },
+    {
+      "label": "valid::summarize_label::financial::tier2",
+      "field_name": "my_field",
+      "field_value": "anything",
+      "sensitivity": "financial",
+      "policy_t2": "summarize",
+      "policy_t3": "summarize",
+      "tier": 2,
+      "output": "financial information"
+    },
+    {
+      "label": "valid::summarize_label::financial::tier3",
+      "field_name": "my_field",
+      "field_value": "anything",
+      "sensitivity": "financial",
+      "policy_t2": "summarize",
+      "policy_t3": "summarize",
+      "tier": 3,
+      "output": "financial information"
+    },
+    {
+      "label": "valid::range_only::integer_5000::tier2",
+      "field_name": "income",
+      "field_value": "5000",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 2,
+      "output": "0k-10k"
+    },
+    {
+      "label": "valid::range_only::integer_5000::tier3",
+      "field_name": "income",
+      "field_value": "5000",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 3,
+      "output": "0k-10k"
+    },
+    {
+      "label": "valid::range_only::integer_4999::tier2",
+      "field_name": "income",
+      "field_value": "4999",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 2,
+      "output": "0k-10k"
+    },
+    {
+      "label": "valid::range_only::integer_4999::tier3",
+      "field_name": "income",
+      "field_value": "4999",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 3,
+      "output": "0k-10k"
+    },
+    {
+      "label": "valid::range_only::integer_5001::tier2",
+      "field_name": "income",
+      "field_value": "5001",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 2,
+      "output": "0k-10k"
+    },
+    {
+      "label": "valid::range_only::integer_5001::tier3",
+      "field_name": "income",
+      "field_value": "5001",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 3,
+      "output": "0k-10k"
+    },
+    {
+      "label": "valid::range_only::integer_999::tier2",
+      "field_name": "income",
+      "field_value": "999",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 2,
+      "output": "0-5000"
+    },
+    {
+      "label": "valid::range_only::integer_999::tier3",
+      "field_name": "income",
+      "field_value": "999",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 3,
+      "output": "0-5000"
+    },
+    {
+      "label": "valid::range_only::integer_1000::tier2",
+      "field_name": "income",
+      "field_value": "1000",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 2,
+      "output": "0k-5k"
+    },
+    {
+      "label": "valid::range_only::integer_1000::tier3",
+      "field_name": "income",
+      "field_value": "1000",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 3,
+      "output": "0k-5k"
+    },
+    {
+      "label": "valid::range_only::integer_1::tier2",
+      "field_name": "income",
+      "field_value": "1",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 2,
+      "output": "0-5000"
+    },
+    {
+      "label": "valid::range_only::integer_1::tier3",
+      "field_name": "income",
+      "field_value": "1",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 3,
+      "output": "0-5000"
+    },
+    {
+      "label": "valid::range_only::integer_0::tier2",
+      "field_name": "income",
+      "field_value": "0",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 2,
+      "output": "0-5000"
+    },
+    {
+      "label": "valid::range_only::integer_0::tier3",
+      "field_name": "income",
+      "field_value": "0",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 3,
+      "output": "0-5000"
+    },
+    {
+      "label": "valid::range_only::negative::tier2",
+      "field_name": "income",
+      "field_value": "-1000",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 2,
+      "output": "0-0"
+    },
+    {
+      "label": "valid::range_only::negative::tier3",
+      "field_name": "income",
+      "field_value": "-1000",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 3,
+      "output": "0-0"
+    },
+    {
+      "label": "valid::range_only::decimal_4999_9::tier2",
+      "field_name": "income",
+      "field_value": "4999.9",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 2,
+      "output": "0k-10k"
+    },
+    {
+      "label": "valid::range_only::decimal_4999_9::tier3",
+      "field_name": "income",
+      "field_value": "4999.9",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 3,
+      "output": "0k-10k"
+    },
+    {
+      "label": "valid::range_only::decimal_5000_1::tier2",
+      "field_name": "income",
+      "field_value": "5000.1",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 2,
+      "output": "0k-10k"
+    },
+    {
+      "label": "valid::range_only::decimal_5000_1::tier3",
+      "field_name": "income",
+      "field_value": "5000.1",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 3,
+      "output": "0k-10k"
+    },
+    {
+      "label": "valid::range_only::decimal_0_5::tier2",
+      "field_name": "income",
+      "field_value": "0.5",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 2,
+      "output": "0-5000"
+    },
+    {
+      "label": "valid::range_only::decimal_0_5::tier3",
+      "field_name": "income",
+      "field_value": "0.5",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 3,
+      "output": "0-5000"
+    },
+    {
+      "label": "valid::range_only::large_100000::tier2",
+      "field_name": "income",
+      "field_value": "100000",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 2,
+      "output": "80k-125k"
+    },
+    {
+      "label": "valid::range_only::large_100000::tier3",
+      "field_name": "income",
+      "field_value": "100000",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 3,
+      "output": "80k-125k"
+    },
+    {
+      "label": "valid::range_only::large_99999::tier2",
+      "field_name": "income",
+      "field_value": "99999",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 2,
+      "output": "75k-120k"
+    },
+    {
+      "label": "valid::range_only::large_99999::tier3",
+      "field_name": "income",
+      "field_value": "99999",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 3,
+      "output": "75k-120k"
+    },
+    {
+      "label": "valid::range_only::commas::tier2",
+      "field_name": "income",
+      "field_value": "50,000",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 2,
+      "output": "40k-65k"
+    },
+    {
+      "label": "valid::range_only::commas::tier3",
+      "field_name": "income",
+      "field_value": "50,000",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 3,
+      "output": "40k-65k"
+    },
+    {
+      "label": "valid::range_only::currency_usd::tier2",
+      "field_name": "income",
+      "field_value": "$50000",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 2,
+      "output": "$40k-$65k"
+    },
+    {
+      "label": "valid::range_only::currency_usd::tier3",
+      "field_name": "income",
+      "field_value": "$50000",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 3,
+      "output": "$40k-$65k"
+    },
+    {
+      "label": "valid::range_only::currency_gbp::tier2",
+      "field_name": "income",
+      "field_value": "£50000",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 2,
+      "output": "£40k-£65k"
+    },
+    {
+      "label": "valid::range_only::currency_gbp::tier3",
+      "field_name": "income",
+      "field_value": "£50000",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 3,
+      "output": "£40k-£65k"
+    },
+    {
+      "label": "valid::range_only::currency_comma_usd::tier2",
+      "field_name": "income",
+      "field_value": "$50,000",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 2,
+      "output": "$40k-$65k"
+    },
+    {
+      "label": "valid::range_only::currency_comma_usd::tier3",
+      "field_name": "income",
+      "field_value": "$50,000",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 3,
+      "output": "$40k-$65k"
+    },
+    {
+      "label": "valid::range_only::whitespace::tier2",
+      "field_name": "income",
+      "field_value": "  5000  ",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 2,
+      "output": "0k-10k"
+    },
+    {
+      "label": "valid::range_only::whitespace::tier3",
+      "field_name": "income",
+      "field_value": "  5000  ",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 3,
+      "output": "0k-10k"
+    },
+    {
+      "label": "valid::range_only::non_numeric::tier2",
+      "field_name": "income",
+      "field_value": "unknown",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 2,
+      "output": "a income"
+    },
+    {
+      "label": "valid::range_only::non_numeric::tier3",
+      "field_name": "income",
+      "field_value": "unknown",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 3,
+      "output": "a income"
+    },
+    {
+      "label": "valid::range_only::empty_string::tier2",
+      "field_name": "income",
+      "field_value": "",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 2,
+      "output": "a income"
+    },
+    {
+      "label": "valid::range_only::empty_string::tier3",
+      "field_name": "income",
+      "field_value": "",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 3,
+      "output": "a income"
+    },
+    {
+      "label": "valid::range_only::boundary_6250::tier2",
+      "field_name": "income",
+      "field_value": "6250",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 2,
+      "output": "5k-10k"
+    },
+    {
+      "label": "valid::range_only::boundary_6250::tier3",
+      "field_name": "income",
+      "field_value": "6250",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 3,
+      "output": "5k-10k"
+    },
+    {
+      "label": "valid::range_only::boundary_6251::tier2",
+      "field_name": "income",
+      "field_value": "6251",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 2,
+      "output": "5k-10k"
+    },
+    {
+      "label": "valid::range_only::boundary_6251::tier3",
+      "field_name": "income",
+      "field_value": "6251",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 3,
+      "output": "5k-10k"
+    },
+    {
+      "label": "valid::range_only::boundary_4999_5::tier2",
+      "field_name": "income",
+      "field_value": "4999.5",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 2,
+      "output": "0k-10k"
+    },
+    {
+      "label": "valid::range_only::boundary_4999_5::tier3",
+      "field_name": "income",
+      "field_value": "4999.5",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 3,
+      "output": "0k-10k"
+    },
+    {
+      "label": "valid::range_only::boundary_5000_5::tier2",
+      "field_name": "income",
+      "field_value": "5000.5",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 2,
+      "output": "0k-10k"
+    },
+    {
+      "label": "valid::range_only::boundary_5000_5::tier3",
+      "field_name": "income",
+      "field_value": "5000.5",
+      "sensitivity": "financial",
+      "policy_t2": "range_only",
+      "policy_t3": "range_only",
+      "tier": 3,
+      "output": "0k-10k"
+    }
+  ],
+  "apply_abstraction_invalid": [
+    {
+      "label": "invalid::unknown_policy::tier1",
+      "note": "invariant-violation: policy string not in allowed set",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "policy_injected": "unknown_policy",
+      "tier": 1,
+      "output": "TestValue123"
+    },
+    {
+      "label": "invalid::unknown_policy::tier2",
+      "note": "invariant-violation: policy string not in allowed set",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "policy_injected": "unknown_policy",
+      "tier": 2,
+      "output": null
+    },
+    {
+      "label": "invalid::unknown_policy::tier3",
+      "note": "invariant-violation: policy string not in allowed set",
+      "field_name": "test_field",
+      "field_value": "TestValue123",
+      "policy_injected": "unknown_policy",
+      "tier": 3,
+      "output": null
+    }
+  ],
+  "gate1": [
+    {
+      "approved_fields": [],
+      "withheld_fields": [],
+      "fields_shared": [],
+      "floor_clamped_fields": [],
+      "blocked": false,
+      "disclosure_log_id_set": true,
+      "disclosure_log_row_written": true,
+      "label": "gate1::empty_track::tier1",
+      "abstraction_tier": 1,
+      "raw_abstraction": 1,
+      "execution_tier": 1
+    },
+    {
+      "approved_fields": [],
+      "withheld_fields": [],
+      "fields_shared": [],
+      "floor_clamped_fields": [],
+      "blocked": false,
+      "disclosure_log_id_set": true,
+      "disclosure_log_row_written": true,
+      "label": "gate1::empty_track::tier2",
+      "abstraction_tier": 2,
+      "raw_abstraction": 2,
+      "execution_tier": 2
+    },
+    {
+      "approved_fields": [
+        [
+          "name",
+          "Alice"
+        ],
+        [
+          "city",
+          "London"
+        ]
+      ],
+      "withheld_fields": [],
+      "fields_shared": [
+        "name",
+        "city"
+      ],
+      "floor_clamped_fields": [],
+      "blocked": false,
+      "disclosure_log_id_set": true,
+      "disclosure_log_row_written": true,
+      "label": "gate1::all_pass::tier1",
+      "abstraction_tier": 1,
+      "raw_abstraction": 1,
+      "execution_tier": 1
+    },
+    {
+      "approved_fields": [
+        [
+          "name",
+          "Alice"
+        ],
+        [
+          "city",
+          "London"
+        ]
+      ],
+      "withheld_fields": [],
+      "fields_shared": [
+        "name",
+        "city"
+      ],
+      "floor_clamped_fields": [],
+      "blocked": false,
+      "disclosure_log_id_set": true,
+      "disclosure_log_row_written": true,
+      "label": "gate1::all_pass::tier2",
+      "abstraction_tier": 2,
+      "raw_abstraction": 2,
+      "execution_tier": 2
+    },
+    {
+      "approved_fields": [
+        [
+          "name",
+          "Alice"
+        ],
+        [
+          "city",
+          "London"
+        ]
+      ],
+      "withheld_fields": [],
+      "fields_shared": [
+        "name",
+        "city"
+      ],
+      "floor_clamped_fields": [],
+      "blocked": false,
+      "disclosure_log_id_set": true,
+      "disclosure_log_row_written": true,
+      "label": "gate1::all_pass::tier3",
+      "abstraction_tier": 3,
+      "raw_abstraction": 3,
+      "execution_tier": 3
+    },
+    {
+      "approved_fields": [],
+      "withheld_fields": [
+        "secret"
+      ],
+      "fields_shared": [],
+      "floor_clamped_fields": [],
+      "blocked": false,
+      "disclosure_log_id_set": true,
+      "disclosure_log_row_written": true,
+      "label": "gate1::all_omit::tier2",
+      "abstraction_tier": 2,
+      "raw_abstraction": 2,
+      "execution_tier": 2
+    },
+    {
+      "approved_fields": [],
+      "withheld_fields": [
+        "ssn"
+      ],
+      "fields_shared": [],
+      "floor_clamped_fields": [],
+      "blocked": false,
+      "disclosure_log_id_set": true,
+      "disclosure_log_row_written": true,
+      "label": "gate1::not_permitted::tier2",
+      "abstraction_tier": 2,
+      "raw_abstraction": 2,
+      "execution_tier": 2
+    },
+    {
+      "approved_fields": [
+        [
+          "x",
+          "a x"
+        ]
+      ],
+      "withheld_fields": [],
+      "fields_shared": [],
+      "floor_clamped_fields": [],
+      "blocked": false,
+      "disclosure_log_id_set": true,
+      "disclosure_log_row_written": true,
+      "label": "gate1::summarize::general::tier2",
+      "abstraction_tier": 2,
+      "raw_abstraction": 2,
+      "execution_tier": 2
+    },
+    {
+      "approved_fields": [
+        [
+          "x",
+          "personal x information"
+        ]
+      ],
+      "withheld_fields": [],
+      "fields_shared": [],
+      "floor_clamped_fields": [],
+      "blocked": false,
+      "disclosure_log_id_set": true,
+      "disclosure_log_row_written": true,
+      "label": "gate1::summarize::personal::tier2",
+      "abstraction_tier": 2,
+      "raw_abstraction": 2,
+      "execution_tier": 2
+    },
+    {
+      "approved_fields": [
+        [
+          "x",
+          "medical information"
+        ]
+      ],
+      "withheld_fields": [],
+      "fields_shared": [],
+      "floor_clamped_fields": [],
+      "blocked": false,
+      "disclosure_log_id_set": true,
+      "disclosure_log_row_written": true,
+      "label": "gate1::summarize::medical::tier2",
+      "abstraction_tier": 2,
+      "raw_abstraction": 2,
+      "execution_tier": 2
+    },
+    {
+      "approved_fields": [
+        [
+          "x",
+          "financial information"
+        ]
+      ],
+      "withheld_fields": [],
+      "fields_shared": [],
+      "floor_clamped_fields": [],
+      "blocked": false,
+      "disclosure_log_id_set": true,
+      "disclosure_log_row_written": true,
+      "label": "gate1::summarize::financial::tier2",
+      "abstraction_tier": 2,
+      "raw_abstraction": 2,
+      "execution_tier": 2
+    },
+    {
+      "approved_fields": [
+        [
+          "income",
+          "40k-65k"
+        ]
+      ],
+      "withheld_fields": [],
+      "fields_shared": [],
+      "floor_clamped_fields": [],
+      "blocked": false,
+      "disclosure_log_id_set": true,
+      "disclosure_log_row_written": true,
+      "label": "gate1::range_only::50000::tier2",
+      "abstraction_tier": 2,
+      "raw_abstraction": 2,
+      "execution_tier": 2
+    },
+    {
+      "approved_fields": [
+        [
+          "alpha",
+          "AAA"
+        ],
+        [
+          "delta",
+          "financial information"
+        ],
+        [
+          "epsilon",
+          "40k-65k"
+        ],
+        [
+          "zeta",
+          "ZZZ"
+        ]
+      ],
+      "withheld_fields": [
+        "beta",
+        "gamma"
+      ],
+      "fields_shared": [
+        "alpha",
+        "zeta"
+      ],
+      "floor_clamped_fields": [],
+      "blocked": false,
+      "disclosure_log_id_set": true,
+      "disclosure_log_row_written": true,
+      "label": "gate1::ordering_stress::tier2",
+      "abstraction_tier": 2,
+      "raw_abstraction": 2,
+      "execution_tier": 2
+    },
+    {
+      "approved_fields": [
+        [
+          "a",
+          "AAA"
+        ],
+        [
+          "c",
+          "CCC"
+        ],
+        [
+          "e",
+          "EEE"
+        ]
+      ],
+      "withheld_fields": [
+        "b",
+        "d"
+      ],
+      "fields_shared": [
+        "a",
+        "c",
+        "e"
+      ],
+      "floor_clamped_fields": [],
+      "blocked": false,
+      "disclosure_log_id_set": true,
+      "disclosure_log_row_written": true,
+      "label": "gate1::ordering_interleaved_omits::tier2",
+      "abstraction_tier": 2,
+      "raw_abstraction": 2,
+      "execution_tier": 2
+    },
+    {
+      "approved_fields": [
+        [
+          "passval",
+          "RawPassVal"
+        ],
+        [
+          "sumval",
+          "40k-65k"
+        ]
+      ],
+      "withheld_fields": [],
+      "fields_shared": [
+        "passval"
+      ],
+      "floor_clamped_fields": [],
+      "blocked": false,
+      "disclosure_log_id_set": true,
+      "disclosure_log_row_written": true,
+      "label": "gate1::fields_shared_accuracy::tier2",
+      "abstraction_tier": 2,
+      "raw_abstraction": 2,
+      "execution_tier": 2
+    },
+    {
+      "approved_fields": [
+        [
+          "fc_field",
+          "TestVal"
+        ]
+      ],
+      "withheld_fields": [],
+      "fields_shared": [
+        "fc_field"
+      ],
+      "floor_clamped_fields": [],
+      "blocked": false,
+      "disclosure_log_id_set": true,
+      "disclosure_log_row_written": true,
+      "label": "gate1::floor_clamp::raw1_eff2::pass",
+      "abstraction_tier": 2,
+      "raw_abstraction": 1,
+      "execution_tier": 2
+    },
+    {
+      "approved_fields": [],
+      "withheld_fields": [
+        "fc_field"
+      ],
+      "fields_shared": [],
+      "floor_clamped_fields": [
+        "fc_field"
+      ],
+      "blocked": false,
+      "disclosure_log_id_set": true,
+      "disclosure_log_row_written": true,
+      "label": "gate1::floor_clamp::raw1_eff2::omit",
+      "abstraction_tier": 2,
+      "raw_abstraction": 1,
+      "execution_tier": 2
+    },
+    {
+      "approved_fields": [],
+      "withheld_fields": [
+        "fc_field"
+      ],
+      "fields_shared": [],
+      "floor_clamped_fields": [
+        "fc_field"
+      ],
+      "blocked": false,
+      "disclosure_log_id_set": true,
+      "disclosure_log_row_written": true,
+      "label": "gate1::floor_clamp::raw1_eff2::not_permitted",
+      "abstraction_tier": 2,
+      "raw_abstraction": 1,
+      "execution_tier": 2
+    },
+    {
+      "approved_fields": [
+        [
+          "fc_field",
+          "personal fc field information"
+        ]
+      ],
+      "withheld_fields": [],
+      "fields_shared": [],
+      "floor_clamped_fields": [
+        "fc_field"
+      ],
+      "blocked": false,
+      "disclosure_log_id_set": true,
+      "disclosure_log_row_written": true,
+      "label": "gate1::floor_clamp::raw1_eff2::summarize",
+      "abstraction_tier": 2,
+      "raw_abstraction": 1,
+      "execution_tier": 2
+    },
+    {
+      "approved_fields": [
+        [
+          "fc_field",
+          "40k-65k"
+        ]
+      ],
+      "withheld_fields": [],
+      "fields_shared": [],
+      "floor_clamped_fields": [
+        "fc_field"
+      ],
+      "blocked": false,
+      "disclosure_log_id_set": true,
+      "disclosure_log_row_written": true,
+      "label": "gate1::floor_clamp::raw1_eff2::range_only",
+      "abstraction_tier": 2,
+      "raw_abstraction": 1,
+      "execution_tier": 2
+    },
+    {
+      "approved_fields": [
+        [
+          "fc_field",
+          "TestVal"
+        ]
+      ],
+      "withheld_fields": [],
+      "fields_shared": [
+        "fc_field"
+      ],
+      "floor_clamped_fields": [],
+      "blocked": false,
+      "disclosure_log_id_set": true,
+      "disclosure_log_row_written": true,
+      "label": "gate1::floor_clamp::raw1_eff3::pass",
+      "abstraction_tier": 3,
+      "raw_abstraction": 1,
+      "execution_tier": 3
+    },
+    {
+      "approved_fields": [],
+      "withheld_fields": [
+        "fc_field"
+      ],
+      "fields_shared": [],
+      "floor_clamped_fields": [
+        "fc_field"
+      ],
+      "blocked": false,
+      "disclosure_log_id_set": true,
+      "disclosure_log_row_written": true,
+      "label": "gate1::floor_clamp::raw1_eff3::omit",
+      "abstraction_tier": 3,
+      "raw_abstraction": 1,
+      "execution_tier": 3
+    },
+    {
+      "approved_fields": [],
+      "withheld_fields": [
+        "fc_field"
+      ],
+      "fields_shared": [],
+      "floor_clamped_fields": [
+        "fc_field"
+      ],
+      "blocked": false,
+      "disclosure_log_id_set": true,
+      "disclosure_log_row_written": true,
+      "label": "gate1::floor_clamp::raw1_eff3::not_permitted",
+      "abstraction_tier": 3,
+      "raw_abstraction": 1,
+      "execution_tier": 3
+    },
+    {
+      "approved_fields": [
+        [
+          "fc_field",
+          "personal fc field information"
+        ]
+      ],
+      "withheld_fields": [],
+      "fields_shared": [],
+      "floor_clamped_fields": [
+        "fc_field"
+      ],
+      "blocked": false,
+      "disclosure_log_id_set": true,
+      "disclosure_log_row_written": true,
+      "label": "gate1::floor_clamp::raw1_eff3::summarize",
+      "abstraction_tier": 3,
+      "raw_abstraction": 1,
+      "execution_tier": 3
+    },
+    {
+      "approved_fields": [
+        [
+          "fc_field",
+          "40k-65k"
+        ]
+      ],
+      "withheld_fields": [],
+      "fields_shared": [],
+      "floor_clamped_fields": [
+        "fc_field"
+      ],
+      "blocked": false,
+      "disclosure_log_id_set": true,
+      "disclosure_log_row_written": true,
+      "label": "gate1::floor_clamp::raw1_eff3::range_only",
+      "abstraction_tier": 3,
+      "raw_abstraction": 1,
+      "execution_tier": 3
+    },
+    {
+      "approved_fields": [
+        [
+          "fc_field",
+          "TestVal"
+        ]
+      ],
+      "withheld_fields": [],
+      "fields_shared": [
+        "fc_field"
+      ],
+      "floor_clamped_fields": [],
+      "blocked": false,
+      "disclosure_log_id_set": true,
+      "disclosure_log_row_written": true,
+      "label": "gate1::floor_clamp::raw2_eff3::pass",
+      "abstraction_tier": 3,
+      "raw_abstraction": 2,
+      "execution_tier": 3
+    },
+    {
+      "approved_fields": [],
+      "withheld_fields": [
+        "fc_field"
+      ],
+      "fields_shared": [],
+      "floor_clamped_fields": [],
+      "blocked": false,
+      "disclosure_log_id_set": true,
+      "disclosure_log_row_written": true,
+      "label": "gate1::floor_clamp::raw2_eff3::omit",
+      "abstraction_tier": 3,
+      "raw_abstraction": 2,
+      "execution_tier": 3
+    },
+    {
+      "approved_fields": [],
+      "withheld_fields": [
+        "fc_field"
+      ],
+      "fields_shared": [],
+      "floor_clamped_fields": [],
+      "blocked": false,
+      "disclosure_log_id_set": true,
+      "disclosure_log_row_written": true,
+      "label": "gate1::floor_clamp::raw2_eff3::not_permitted",
+      "abstraction_tier": 3,
+      "raw_abstraction": 2,
+      "execution_tier": 3
+    },
+    {
+      "approved_fields": [
+        [
+          "fc_field",
+          "personal fc field information"
+        ]
+      ],
+      "withheld_fields": [],
+      "fields_shared": [],
+      "floor_clamped_fields": [],
+      "blocked": false,
+      "disclosure_log_id_set": true,
+      "disclosure_log_row_written": true,
+      "label": "gate1::floor_clamp::raw2_eff3::summarize",
+      "abstraction_tier": 3,
+      "raw_abstraction": 2,
+      "execution_tier": 3
+    },
+    {
+      "approved_fields": [
+        [
+          "fc_field",
+          "40k-65k"
+        ]
+      ],
+      "withheld_fields": [],
+      "fields_shared": [],
+      "floor_clamped_fields": [],
+      "blocked": false,
+      "disclosure_log_id_set": true,
+      "disclosure_log_row_written": true,
+      "label": "gate1::floor_clamp::raw2_eff3::range_only",
+      "abstraction_tier": 3,
+      "raw_abstraction": 2,
+      "execution_tier": 3
+    },
+    {
+      "label": "gate1::disclosure_log_failure::tier1_nonfatal",
+      "execution_tier": 1,
+      "outcome": "nonfatal_continue"
+    },
+    {
+      "label": "gate1::disclosure_log_failure::tier2_fatal",
+      "execution_tier": 2,
+      "outcome": "raised_DisclosureLogWriteError",
+      "plain_language_present": true
+    }
+  ]
+}
