@@ -28,6 +28,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # Networking & Errors
 reqwest = { version = "0.12", features = ["json"] }
 thiserror = "1"
+async-trait = "0.1"
 
 # IPC Type Contract
 tauri-specta = { version = "2.0.0-rc.25", features = ["derive", "typescript"] }

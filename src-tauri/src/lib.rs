@@ -1,2 +1,4 @@
-// Quiet Rabbit — library root
-// All Conductor modules will be declared here as they are ported.
+// src-tauri/src/lib.rs
+// Quiet Rabbit -- library root.
+
+pub mod conductor;
