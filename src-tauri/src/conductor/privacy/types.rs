@@ -1,6 +1,7 @@
 // src-tauri/src/conductor/privacy/types.rs
 
 use indexmap::IndexMap;
+use serde::Deserialize;
 
 // -- AbstractionPolicy --------------------------------------------------------
 
@@ -18,9 +19,23 @@ pub enum AbstractionPolicy {
     Unknown(String),
 }
 
+impl AbstractionPolicy {
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "pass"          => Self::Pass,
+            "omit"          => Self::Omit,
+            "summarize"     => Self::Summarize,
+            "range_only"    => Self::RangeOnly,
+            "not_permitted" => Self::NotPermitted,
+            other           => Self::Unknown(other.to_string()),
+        }
+    }
+}
+
 // -- Sensitivity --------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Sensitivity {
     General,
     Personal,
@@ -50,7 +65,7 @@ impl Sensitivity {
 
 // -- PersonalField ------------------------------------------------------------
 // Mirrors Python's PersonalField dataclass.
-// field_value is decrypted plaintext — never logged, never serialised.
+// field_value is decrypted plaintext -- never logged, never serialised.
 
 #[derive(Debug, Clone)]
 pub struct PersonalField {
@@ -65,7 +80,7 @@ pub struct PersonalField {
 
 // -- PersonalTrack ------------------------------------------------------------
 // Mirrors Python's PersonalTrack. Sealed after INITIALIZE phase.
-// IndexMap preserves insertion order — required for approved_fields
+// IndexMap preserves insertion order -- required for approved_fields
 // ordering parity with Python (dict preserves insertion order, 3.7+).
 
 #[derive(Debug, Default)]
@@ -124,8 +139,8 @@ pub struct Gate2Result {
 
 #[derive(Debug)]
 pub struct Gate3Result {
-    pub approved:      bool,
-    pub blocked:       bool,
+    pub approved:       bool,
+    pub blocked:        bool,
     pub plain_language: Option<String>,
 }
 

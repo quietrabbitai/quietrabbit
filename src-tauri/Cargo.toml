@@ -33,3 +33,7 @@ async-trait = "0.1"
 # IPC Type Contract
 tauri-specta = { version = "2.0.0-rc.25", features = ["derive", "typescript"] }
 specta-typescript = "0.0.12"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+unicode-normalization = "0.1"
