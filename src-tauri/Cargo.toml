@@ -9,6 +9,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+pkg-config = "0.3"
 
 [dependencies]
 # Framework & Runtime
@@ -22,6 +23,10 @@ serde_yaml = "0.9"
 
 # Database
 sqlx = { version = "0.8", features = ["runtime-tokio-native-tls", "sqlite"] }
+# Enable the sqlcipher feature on libsqlite3-sys so the unified dependency
+# links against SQLCipher rather than standard SQLite. Feature unification
+# requires a single resolved libsqlite3-sys instance — verified: v0.30.1 only.
+libsqlite3-sys = { version = "0.30.1", features = ["sqlcipher"] }
 indexmap = { version = "2", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
@@ -37,3 +42,4 @@ specta-typescript = "0.0.12"
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 unicode-normalization = "0.1"
+tempfile = "3"
