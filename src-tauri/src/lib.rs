@@ -2,3 +2,4 @@
 // Quiet Rabbit -- library root.
 
 pub mod conductor;
+pub mod persistence;
