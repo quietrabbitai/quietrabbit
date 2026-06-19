@@ -198,18 +198,18 @@ pub async fn load_personal_track(
             abstraction_tier2: row.try_get("abstraction_tier2")?,
             abstraction_tier3: row.try_get("abstraction_tier3")?,
         };
-        track.add_field(field).map_err(PersonalStoreError::Validation)?;
+        track.add_field(field).map_err(|e| PersonalStoreError::Validation(e.to_string()))?;
     }
 
     let profile = resolve_voice_profile_conn(&mut conn, persona_id).await?;
     track
         .set_voice_profile(profile)
-        .map_err(PersonalStoreError::Validation)?;
+        .map_err(|e| PersonalStoreError::Validation(e.to_string()))?;
 
     // life_context is empty at INITIALIZE — legacy name retained per standing rule.
     track
         .set_life_context(indexmap::IndexMap::new())
-        .map_err(PersonalStoreError::Validation)?;
+        .map_err(|e| PersonalStoreError::Validation(e.to_string()))?;
 
     Ok(track)
 }
