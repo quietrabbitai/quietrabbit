@@ -3,3 +3,4 @@
 
 pub mod conductor;
 pub mod persistence;
+pub mod providers;
