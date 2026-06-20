@@ -130,6 +130,12 @@ pub enum ConductorError {
     // F_SYSTEM — startup: platform keychain backend is insecure (plaintext store)
     #[error("{plain_language}")]
     InsecureKeychain { plain_language: String },
+
+    // F_SYSTEM — migration boundary: feature not yet implemented in this phase.
+    // Scope: migration scaffold only. Must not be used as a generic fallback.
+    // Wire real implementation before this variant's call sites ship.
+    #[error("{plain_language}")]
+    NotImplemented { plain_language: String },
 }
 
 impl ConductorError {
@@ -164,7 +170,8 @@ impl ConductorError {
             | Self::VoiceProfileContamination { plain_language }
             | Self::MissingTier2Config { plain_language }
             | Self::TierBoundaryViolation { plain_language }
-            | Self::InsecureKeychain { plain_language } => plain_language.as_str(),
+            | Self::InsecureKeychain { plain_language }
+            | Self::NotImplemented { plain_language } => plain_language.as_str(),
         }
     }
 }
@@ -513,6 +520,18 @@ impl FailureHandler {
 
             // F_SYSTEM — insecure keychain at startup
             ConductorError::InsecureKeychain { .. } => FailureResult {
+                action: FailureAction::Stop,
+                failure_mode: Some("F_SYSTEM".to_owned()),
+                plain_language: msg,
+                is_recoverable: false,
+                severity: FailureSeverity::Stop,
+                step_id: sid,
+                focus_id: fid,
+                metadata: None,
+            },
+
+            // F_SYSTEM — migration boundary: not yet implemented
+            ConductorError::NotImplemented { .. } => FailureResult {
                 action: FailureAction::Stop,
                 failure_mode: Some("F_SYSTEM".to_owned()),
                 plain_language: msg,
