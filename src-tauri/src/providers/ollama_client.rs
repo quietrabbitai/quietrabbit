@@ -576,8 +576,7 @@ mod tests {
     #[test]
     fn estimate_buffer_for_prose_task() {
         // "prose" is in BUFFERED_TASK_TYPES — gets 20% buffer
-        let base = 400usize / 4; // 100
-        let expected = (100f64 * 1.20) as u32; // 120
+        let expected = ((400usize / 4) as f64 * 1.20) as u32; // 120
         assert_eq!(estimate_token_count(&"a".repeat(400), "prose"), expected);
     }
 
