@@ -104,6 +104,15 @@ pub enum ConductorError {
     #[error("{plain_language}")]
     Provider { plain_language: String },          // generic provider error
 
+    // F4 subtype — voice profile contamination detected at Tier 2+
+    // Secondary containment: primary prevention is write-time validation.
+    #[error("{plain_language}")]
+    VoiceProfileContamination { plain_language: String },
+
+    // F10 subtype — no Tier 2 provider configured (install interview not completed)
+    #[error("{plain_language}")]
+    MissingTier2Config { plain_language: String },
+
     // F_SYSTEM — fatal: integrity, audit, misconfiguration
     #[error("{plain_language}")]
     TaxonomyIntegrity { plain_language: String },
@@ -113,6 +122,14 @@ pub enum ConductorError {
     DisclosureLogWrite { plain_language: String },
     #[error("{plain_language}")]
     UnknownProvider { plain_language: String },
+
+    // F_SYSTEM — Step 3 ceiling violation: routing_tier > space_max_permitted_tier
+    #[error("{plain_language}")]
+    TierBoundaryViolation { plain_language: String },
+
+    // F_SYSTEM — startup: platform keychain backend is insecure (plaintext store)
+    #[error("{plain_language}")]
+    InsecureKeychain { plain_language: String },
 }
 
 impl ConductorError {
@@ -143,7 +160,11 @@ impl ConductorError {
             | Self::TaxonomyIntegrity { plain_language }
             | Self::DatabaseMigration { plain_language }
             | Self::DisclosureLogWrite { plain_language }
-            | Self::UnknownProvider { plain_language } => plain_language.as_str(),
+            | Self::UnknownProvider { plain_language }
+            | Self::VoiceProfileContamination { plain_language }
+            | Self::MissingTier2Config { plain_language }
+            | Self::TierBoundaryViolation { plain_language }
+            | Self::InsecureKeychain { plain_language } => plain_language.as_str(),
         }
     }
 }
@@ -449,6 +470,54 @@ impl FailureHandler {
                 plain_language: msg,
                 is_recoverable: true,
                 severity: FailureSeverity::Require,
+                step_id: sid,
+                focus_id: fid,
+                metadata: None,
+            },
+
+            // F4 subtype — voice profile contamination (Tier 2+ only, non-recoverable)
+            ConductorError::VoiceProfileContamination { .. } => FailureResult {
+                action: FailureAction::Stop,
+                failure_mode: Some("F4".to_owned()),
+                plain_language: msg,
+                is_recoverable: false,
+                severity: FailureSeverity::Stop,
+                step_id: sid,
+                focus_id: fid,
+                metadata: None,
+            },
+
+            // F10 subtype — no Tier 2 provider configured
+            ConductorError::MissingTier2Config { .. } => FailureResult {
+                action: FailureAction::AwaitUser,
+                failure_mode: Some("F10".to_owned()),
+                plain_language: msg,
+                is_recoverable: true,
+                severity: FailureSeverity::Require,
+                step_id: sid,
+                focus_id: fid,
+                metadata: None,
+            },
+
+            // F_SYSTEM — tier boundary violation (Step 3)
+            ConductorError::TierBoundaryViolation { .. } => FailureResult {
+                action: FailureAction::Stop,
+                failure_mode: Some("F_SYSTEM".to_owned()),
+                plain_language: msg,
+                is_recoverable: false,
+                severity: FailureSeverity::Stop,
+                step_id: sid,
+                focus_id: fid,
+                metadata: None,
+            },
+
+            // F_SYSTEM — insecure keychain at startup
+            ConductorError::InsecureKeychain { .. } => FailureResult {
+                action: FailureAction::Stop,
+                failure_mode: Some("F_SYSTEM".to_owned()),
+                plain_language: msg,
+                is_recoverable: false,
+                severity: FailureSeverity::Stop,
                 step_id: sid,
                 focus_id: fid,
                 metadata: None,
@@ -936,5 +1005,65 @@ mod tests {
         );
         assert_eq!(r.step_id.as_deref(), Some("step-42"));
         assert_eq!(r.focus_id.as_deref(), Some("focus-7"));
+    }
+
+    // -- New variants --------------------------------------------------------
+
+    #[test]
+    fn f4_voice_profile_contamination_stops() {
+        let h = handler(2);
+        let r = h.handle(
+            &err(ConductorError::VoiceProfileContamination {
+                plain_language: "pii detected in voice profile".to_owned(),
+            }),
+            None, None, 0,
+        );
+        assert_eq!(r.action, FailureAction::Stop);
+        assert_eq!(r.failure_mode.as_deref(), Some("F4"));
+        assert!(!r.is_recoverable);
+        assert_eq!(r.severity, FailureSeverity::Stop);
+    }
+
+    #[test]
+    fn f10_missing_tier2_config_awaits_user() {
+        let h = handler(1);
+        let r = h.handle(
+            &err(ConductorError::MissingTier2Config {
+                plain_language: "no external provider configured".to_owned(),
+            }),
+            None, None, 0,
+        );
+        assert_eq!(r.action, FailureAction::AwaitUser);
+        assert_eq!(r.failure_mode.as_deref(), Some("F10"));
+        assert!(r.is_recoverable);
+        assert_eq!(r.severity, FailureSeverity::Require);
+    }
+
+    #[test]
+    fn f_system_tier_boundary_violation_stops() {
+        let h = handler(1);
+        let r = h.handle(
+            &err(ConductorError::TierBoundaryViolation {
+                plain_language: "step requires tier 2, life permits tier 1".to_owned(),
+            }),
+            None, None, 0,
+        );
+        assert_eq!(r.action, FailureAction::Stop);
+        assert_eq!(r.failure_mode.as_deref(), Some("F_SYSTEM"));
+        assert!(!r.is_recoverable);
+    }
+
+    #[test]
+    fn f_system_insecure_keychain_stops() {
+        let h = handler(1);
+        let r = h.handle(
+            &err(ConductorError::InsecureKeychain {
+                plain_language: "platform keychain is plaintext".to_owned(),
+            }),
+            None, None, 0,
+        );
+        assert_eq!(r.action, FailureAction::Stop);
+        assert_eq!(r.failure_mode.as_deref(), Some("F_SYSTEM"));
+        assert!(!r.is_recoverable);
     }
 }
