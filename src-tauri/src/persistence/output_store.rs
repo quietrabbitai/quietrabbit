@@ -143,6 +143,7 @@ fn row_to_output_record(r: &sqlx::sqlite::SqliteRow) -> Result<OutputRecord, sql
 ///
 /// sensitivity_severity is a GENERATED ALWAYS column in the outputs table —
 /// omitted from INSERT; SQLite computes it automatically.
+#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
 pub async fn save_output(
     user_id: &str,
     persona_id: &str,
@@ -288,6 +289,7 @@ pub async fn get_focus_run_status(
 ///   1. Zero content:  UPDATE outputs SET content = '' WHERE id = ?
 ///   2. FTS5 update:   handled by COALESCE trigger in schema
 ///   3. Mark deleted:  UPDATE outputs SET status = 'deleted', deleted_at = ? WHERE id = ?
+///
 /// Row is never deleted — audit record preserved permanently.
 pub async fn delete_output(
     _user_id: &str,

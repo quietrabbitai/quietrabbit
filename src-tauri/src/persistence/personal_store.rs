@@ -340,6 +340,7 @@ pub async fn list_personal_fields(
 /// solve this cleanly. Flag to Chat-PM for a future personal_fields migration.
 ///
 /// sensitivity_severity is a GENERATED ALWAYS column — omitted from UPDATE.
+#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
 pub async fn save_personal_field(
     user_id: &str,
     persona_id: &str,
@@ -657,6 +658,7 @@ fn validate_voice_profile_value(
 /// Write a voice profile entry at the specified precedence level.
 /// VOICE_PRECEDENCE_GLOBAL (3) entries store persona_id = NULL.
 /// Upserts on composite key: (stored_persona_id, source_id, precedence, attribute).
+#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
 pub async fn save_voice_profile_entry(
     user_id: &str,
     persona_id: &str,
@@ -792,6 +794,7 @@ pub async fn delete_voice_profile_entry(
 
 /// Write a disclosure log entry. NEVER deleted — permanent audit trail (D6-198).
 /// Returns the new entry id.
+#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
 pub async fn write_disclosure_log(
     user_id: &str,
     persona_id: &str,

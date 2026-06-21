@@ -324,6 +324,7 @@ pub async fn initialise_topic_header(
 /// Called by Phase 5A and Reconciliation Boot Check.
 /// Source of truth is outputs.db -- this mirrors it.
 /// Any combination of fields may be updated per call; all on one connection.
+#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
 pub async fn update_topic_header(
     user_id: &str,
     persona_id: &str,
@@ -397,6 +398,7 @@ pub async fn update_topic_header(
 /// block_types: if provided, filters to specified types only.
 /// max_tokens: stops accumulating when budget is reached. Non-fitting blocks
 /// are skipped but remaining blocks are still checked -- intentional Python parity.
+#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
 pub async fn get_eligible_blocks(
     user_id: &str,
     persona_id: &str,
@@ -564,6 +566,7 @@ pub async fn get_sensitivity_ceiling(
 /// PHASE 1 NOTE: write_block opens two connections total when dependency_refs
 /// is non-empty: one for get_sensitivity_ceiling, one for INSERT+UPDATE.
 /// SQLCipher PBKDF2 runs on each open. Target for shared connection in Layer 8+.
+#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
 pub async fn write_block(
     user_id: &str,
     persona_id: &str,
@@ -705,6 +708,7 @@ pub async fn archive_all_blocks(
 /// Awaiting invariant: topic_id must be non-null -- enforced by callers.
 /// Cross-db FK: topic_id references topics.id in outputs.db -- app-enforced.
 /// Returns the token id.
+#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
 pub async fn create_handoff_token(
     user_id: &str,
     persona_id: &str,
@@ -769,7 +773,7 @@ pub async fn consume_handoff_token(
         "UPDATE handoff_tokens SET consumed_at = ?
          WHERE id = ? AND consumed_at IS NULL AND expired_at IS NULL",
     )
-    .bind(&crate::providers::utils::now())
+    .bind(crate::providers::utils::now())
     .bind(token_id)
     .execute(&mut conn)
     .await?;
@@ -867,7 +871,7 @@ pub async fn record_ceiling_notification_sent(
         "UPDATE state_ceiling_status
          SET notification_sent_at = ?, user_response = NULL WHERE id = 1",
     )
-    .bind(&crate::providers::utils::now())
+    .bind(crate::providers::utils::now())
     .execute(&mut conn)
     .await?;
 

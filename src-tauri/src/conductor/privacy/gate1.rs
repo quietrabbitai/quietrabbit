@@ -24,6 +24,7 @@ use super::{
     types::{Gate1Result, PersonalTrack},
 };
 
+#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
 pub async fn gate1<L: DisclosureLogger>(
     logger: &L,
     step_id: &str,

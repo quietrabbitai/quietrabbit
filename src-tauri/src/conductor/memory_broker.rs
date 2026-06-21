@@ -305,6 +305,7 @@ impl MemoryBroker {
     /// topic_id=None and not is_quick_ask → unnamed run.
     ///   Tier A (standing summary) loaded if domain_context.db exists.
     ///   Tier B skipped — no active topic.
+    #[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
     pub async fn assemble_context(
         &self,
         user_id: &str,
@@ -485,6 +486,7 @@ impl MemoryBroker {
     /// blocks consume whatever remains. No hard 50/50 partition.
     /// Retrieval Eligibility Check applied by each store's get_eligible_blocks().
     /// Store errors are logged as warnings and treated as empty (graceful degradation).
+    #[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
     async fn load_tier_b(
         &self,
         slice: &mut ContextSlice,
@@ -598,6 +600,7 @@ impl MemoryBroker {
     /// Tier C blocks are task-scoped and discarded after task completion
     /// unless promoted to Plan State (ADR-013 Section 5.3).
     #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
     pub fn retrieve_additional_context(
         &self,
         _user_id: &str,

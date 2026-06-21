@@ -185,6 +185,7 @@ impl StepExecutor {
     /// await_floor_consent exits immediately — never retried.
     ///
     /// Python oracle: StepExecutor.execute()
+    #[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
     pub async fn execute(
         &self,
         ctx: StepContext,

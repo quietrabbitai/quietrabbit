@@ -30,6 +30,7 @@ use super::{
 
 const MIN_MATCH_LENGTH: usize = 4;
 
+#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
 pub async fn gate2<L: DisclosureLogger>(
     logger: &L,
     step_id: &str,

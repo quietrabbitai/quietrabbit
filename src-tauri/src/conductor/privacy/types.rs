@@ -20,6 +20,7 @@ pub enum AbstractionPolicy {
 }
 
 impl AbstractionPolicy {
+    #[allow(clippy::should_implement_trait)] // Returns Self not Result; cannot impl std::str::FromStr.
     pub fn from_str(s: &str) -> Self {
         match s {
             "pass"          => Self::Pass,

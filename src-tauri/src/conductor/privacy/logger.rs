@@ -61,6 +61,7 @@ pub struct TestLogger {
 }
 
 impl TestLogger {
+    #[allow(clippy::new_without_default)] // Test helper; Default not meaningful.
     pub fn new() -> Self {
         Self { writes: Mutex::new(Vec::new()) }
     }
@@ -93,8 +94,7 @@ pub struct FailLogger;
 #[async_trait]
 impl DisclosureLogger for FailLogger {
     async fn write(&self, _entry: DisclosureLogEntry) -> Result<String, DisclosureLogWriteError> {
-        Err(DisclosureLogWriteError::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        Err(DisclosureLogWriteError::new(std::io::Error::other(
             "file is not a database",
         )))
     }

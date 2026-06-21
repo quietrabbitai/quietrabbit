@@ -299,7 +299,7 @@ async fn acquire_lock(conn: &mut SqliteConnection) -> Result<bool, MigrationErro
         "UPDATE migration_lock SET locked_at = ?, locked_by = ? \
          WHERE id = 1 AND locked_at IS NULL AND locked_by IS NULL",
     )
-    .bind(&now())
+    .bind(now())
     .bind(&pid)
     .execute(&mut *conn)
     .await?;

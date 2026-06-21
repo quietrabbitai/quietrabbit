@@ -17,6 +17,7 @@ use super::{
     types::Gate3Result,
 };
 
+#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
 pub async fn gate3<L: DisclosureLogger>(
     logger: &L,
     step_id: &str,

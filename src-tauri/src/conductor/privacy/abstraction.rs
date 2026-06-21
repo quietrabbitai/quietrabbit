@@ -87,9 +87,7 @@ fn apply_range_only(field_value: &str, field_name: &str) -> String {
 
     let cleaned = field_value
         .trim()
-        .replace(',', "")
-        .replace('\u{00a3}', "")
-        .replace('$', "");
+        .replace([',', '\u{00a3}', '$'], "");
 
     let numeric: f64 = match cleaned.parse::<f64>() {
         Ok(n)  => n,

@@ -251,6 +251,7 @@ pub async fn list_focus_settings_for_persona(
 /// Returns Err(Validation) on invalid field values.
 /// Duplicate PK propagates as Database error — duplicate is an application
 /// logic error (AUTHORIZE assertion catches missing rows first).
+#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
 pub async fn create_focus_settings(
     persona_id: &str,
     focus_id: &str,
@@ -323,6 +324,7 @@ pub async fn create_focus_settings(
 ///
 /// Returns Err(NotFound) if row not found.
 /// Returns Err(Validation) on invalid field values.
+#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
 pub async fn update_focus_settings(
     persona_id: &str,
     focus_id: &str,

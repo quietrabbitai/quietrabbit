@@ -17,7 +17,7 @@
 // key_hex/user_id/persona_id via IPC: intentional for Release 1 (no auth
 //   layer yet). Layer 8 will move session key management into tauri::State.
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use specta::Type;
 
 use crate::persistence::output_store;

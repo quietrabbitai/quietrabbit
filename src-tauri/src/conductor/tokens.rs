@@ -54,18 +54,13 @@ pub fn is_system_token(name: &str) -> bool {
 ///
 /// Using an enum means invalid step_type values are impossible to construct —
 /// the Python validate_step() string check is eliminated at the type level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum StepType {
+    #[default]
     Generate,
     VoiceTransform,
     PostProcess,
-}
-
-impl Default for StepType {
-    fn default() -> Self {
-        Self::Generate
-    }
 }
 
 impl FromStr for StepType {

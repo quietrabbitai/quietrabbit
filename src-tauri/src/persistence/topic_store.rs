@@ -548,7 +548,7 @@ pub async fn mark_storage_location_verified(
         "UPDATE topic_storage_locations SET verified_at = ?, orphaned = 0
          WHERE topic_id = ?",
     )
-    .bind(&crate::providers::utils::now()).bind(topic_id)
+    .bind(crate::providers::utils::now()).bind(topic_id)
     .execute(&mut conn).await?;
     Ok(())
 }
@@ -566,7 +566,7 @@ pub async fn mark_storage_location_orphaned(
         "UPDATE topic_storage_locations SET orphaned = 1, verified_at = ?
          WHERE topic_id = ?",
     )
-    .bind(&crate::providers::utils::now()).bind(topic_id)
+    .bind(crate::providers::utils::now()).bind(topic_id)
     .execute(&mut conn).await?;
     Ok(())
 }
@@ -582,6 +582,7 @@ pub async fn mark_storage_location_orphaned(
 /// 90-day promote window applies only to unnamed non-Quick Ask runs.
 ///
 /// Returns the run_history entry id.
+#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
 pub async fn create_run_history_entry(
     user_id: &str,
     persona_id: &str,
@@ -719,6 +720,7 @@ pub async fn get_classification_preference(
 ///   sensitive = anonymous_tier2  + anonymize_ok
 ///   private   = tier_1_only      + generalize_ok
 ///   locked    = tier_1_only      + no_generalize
+#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
 pub async fn upsert_classification_preference(
     user_id: &str,
     persona_id: &str,
@@ -790,7 +792,7 @@ pub async fn record_preference_applied(
         "UPDATE classification_preferences SET last_applied_at = ?
          WHERE focus_id = ? AND persona_id = ? AND content_type = ?",
     )
-    .bind(&crate::providers::utils::now()).bind(focus_id).bind(persona_id).bind(content_type)
+    .bind(crate::providers::utils::now()).bind(focus_id).bind(persona_id).bind(content_type)
     .execute(&mut conn).await?;
     Ok(())
 }
@@ -801,6 +803,7 @@ pub async fn record_preference_applied(
 
 /// Write or update the topic_index row in shared.db.
 /// Non-fatal if shared.db write fails -- outputs.db is authoritative.
+#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
 async fn mirror_topic_index(
     topic_id: &str,
     persona_id: &str,

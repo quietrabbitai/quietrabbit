@@ -44,19 +44,14 @@ pub enum ChatRole {
     Assistant,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum CompletionStatus {
+    #[default]
     Complete,
     /// Only used in Release 2.
     Streaming,
     Cancelled,
-}
-
-impl Default for CompletionStatus {
-    fn default() -> Self {
-        Self::Complete
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]

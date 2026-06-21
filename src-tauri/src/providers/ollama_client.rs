@@ -86,6 +86,12 @@ pub struct OllamaClient {
     modelfile_client: Client,
 }
 
+impl Default for OllamaClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OllamaClient {
     pub fn new() -> Self {
         Self {
@@ -455,8 +461,7 @@ impl OllamaClient {
         // HTTP 200 alone does not mean the model was created successfully.
         let success = body
             .lines()
-            .filter(|l| !l.trim().is_empty())
-            .last()
+            .rfind(|l| !l.trim().is_empty())
             .and_then(|line| serde_json::from_str::<Value>(line).ok())
             .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(|s| s == "success"))
             .unwrap_or(false);

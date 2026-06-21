@@ -161,7 +161,8 @@ struct RawFocusFile {
     suggest_in_focuses: Option<Vec<String>>,
     multi_source_validation: Option<bool>,
     steps: Option<IndexMap<String, RawStep>>,     // IndexMap preserves YAML dict order
-    brief: Option<serde_yaml::Value>,             // D6-343: parsed but never wired
+    #[allow(dead_code)] // D6-343: parsed for forward compat, not wired in Release 1.
+    brief: Option<serde_yaml::Value>,
 }
 
 #[derive(Deserialize)]
@@ -434,6 +435,7 @@ pub struct FocusRun {
 }
 
 impl FocusRun {
+    #[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
     pub fn new(
         user_id: String,
         persona_id: String,

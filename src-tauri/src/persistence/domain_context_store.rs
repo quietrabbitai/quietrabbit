@@ -383,6 +383,7 @@ pub async fn list_pending_extractions(
 
 /// Write a Phase 5B generalisation pass output to pending_extractions staging.
 /// Returns the pending extraction id.
+#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
 pub async fn write_pending_extraction(
     user_id: &str,
     persona_id: &str,
@@ -427,6 +428,7 @@ pub async fn write_pending_extraction(
 ///   5. UPDATE standing_summary invalidated_at
 ///
 /// Returns the new domain_context_blocks.id.
+#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
 pub async fn write_approved_extraction(
     user_id: &str,
     persona_id: &str,
@@ -546,6 +548,7 @@ pub async fn write_approved_extraction(
 /// Mark a pending extraction as discarded and write provenance record.
 /// pending_extractions row marked discarded (purged later).
 /// provenance_log entry written and retained permanently (D6-198).
+#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
 pub async fn discard_pending_extraction(
     user_id: &str,
     persona_id: &str,
