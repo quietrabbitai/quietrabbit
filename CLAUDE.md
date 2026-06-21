@@ -22,14 +22,12 @@ When in doubt: stop and ask rather than invent.
 - Privacy-first: no data leaves local without explicit user consent
 - Self-hosted: runs entirely on user hardware
 - No telemetry: QR never sends usage data anywhere
-- sqlcipher3 (Charles Leifer) required: standard sqlite3 ignores PRAGMA key/rekey silently.
-  pysqlcipher3 is unmaintained and incompatible with Python 3.13+.
-  Import: `from sqlcipher3 import dbapi2 as sqlite3`
-  Dockerfile: `sqlcipher3-binary` in requirements.txt
-  Verified: SQLCipher 4.12.0 community
-- Master key never persisted to session store: keys live only in
-  InMemoryKeyRegistry keyed by session_id. Flask session contains
-  session_id only. Never master_key_hex.
+- SQLCipher required: system libsqlcipher.so at /usr/lib/ on Garuda.
+  Linked via libsqlite3-sys feature flag. PRAGMA key fires before journal_mode
+  via SqliteConnectOptions::pragma() insertion order — enforced in every opener.
+  Never use sqlx::query!() macros — no static DATABASE_URL in many-small-encrypted-DB topology.
+- Master key never persisted: keys live only in Rust AppState/KeyRegistry for the
+  duration of the session. Never written to disk, never in IPC responses.
 - Tier 2 = user choice: Mistral (EU/GDPR, paid) or Groq (US, free tier).
   Honest trade-off framing. No prescribed default.
 - Silent operator: personal context informs output, never narrated.
@@ -38,47 +36,31 @@ When in doubt: stop and ask rather than invent.
   No silent changes.
 
 ## Dev Environment
-Repo root (Claude Code runs here, on Garuda):
-  /mnt/NAS/QuietRabbitMirror/06_GitRepos/quietrabbit-core/
+Repo root:
+  /home/kulaga/QuietRabbit/06_GitRepos/quietrabbit-core/
 
-NAS paths as seen from Garuda:
-  Project vault:  /mnt/NAS/QuietRabbitMirror/
-  QR data:        /mnt/NAS/QuietRabbitData/  <- config, outputs, open-webui
-  NAS on Proxmox: /mnt/pve/NAS/QuietRabbitMirror/  (different mount, same NAS)
+NAS paths:
+  Garuda:   /mnt/NAS/QuietRabbitMirror/
+  Proxmox:  /mnt/pve/NAS/QuietRabbitMirror/
+  LXC:      /mnt/NAS/QuietRabbitMirror/
 
 Services:
   Ollama API:  http://192.168.88.26:11434  (Garuda, ethernet)
-  QR App LXC:  http://192.168.88.95:3000
-  Portainer:   https://192.168.88.95:9443
 
-Docker volume mapping (in docker-compose.yml):
-  QR_DATA_ROOT inside container = /data/quietrabbit
-  Maps to NAS path via QR_LOCAL_DATA env var in .env
+Rust dev runs locally on Garuda via cargo.
+Docker and the LXC container are retired — do not reference them.
 
-Environment flags:
-  QR_NETWORK_STORAGE=true  (NAS mount — rollback journal, not WAL)
-  QR_ENV=development       <- NEVER in production (logs personal field values)
+Key commands:
+  cargo build                                          — compile check
+  cargo test 2>&1 | grep -E "^error|test result"      — test summary
+  git branch --show-current                            — verify branch before commit
+  git log --oneline rust-migration | head -10          — commit verification
 
-Dev venv: ~/.venvs/quietrabbit/ (Garuda local — NAS has noexec, .so files won't run)
-  Activate: source ~/.venvs/quietrabbit/bin/activate.fish
-Verify sqlcipher3: python -c "from sqlcipher3 import dbapi2 as sqlite3; print('OK')"
-Claude Code: always launch from /mnt/NAS/QuietRabbitMirror/06_GitRepos/quietrabbit-core/
-
-## LXC Sync Workflow (D6-308)
-After any `git push` on Garuda, manually run `git pull` on LXC ai-conductor
-before rebuilding. The vault post-commit hook fires only on vault commits —
-it does NOT fire on code repo pushes. The LXC mirror is not auto-updated.
-
-Canonical deploy sequence after a code push:
-  1. On Garuda:   git push
-  2. On LXC (via Proxmox browser console):
-       cd /mnt/NAS/QuietRabbitMirror/06_GitRepos/quietrabbit-core
-       git pull
-       docker compose down
-       docker compose build --no-cache
-       docker compose up -d
-  Use `docker compose down && docker compose up -d` (no --no-cache) for
-  artifact/config-only changes (.focus, .guide, .yaml, .sql — no .py changes).
+## Ollama (D6-353)
+QR checks for a running Ollama instance at 127.0.0.1:11434 on startup.
+If found, uses it. If not, starts the bundled Ollama sidecar.
+No duplicate model downloads. No contention between instances.
+Dev: Ollama runs on Garuda at http://192.168.88.26:11434 — already running, always detected.
 
 ## Naming Architecture (Phase A rename — D6-224, D6-225)
 All legacy terms retired. Use only the new terms below.
@@ -187,10 +169,7 @@ Save validation records to /mnt/NAS/QuietRabbitMirror/05_AI_Validation/
 ## Critical Bug Patterns (found in integration review — do not repeat)
 - PRAGMA key must be set BEFORE journal_mode in encrypted openers. open_db() is for unencrypted only.
 - Never use executescript() in migrations — implicit COMMIT breaks SAVEPOINT atomicity. Use individual execute() calls.
-- Always use open_db() wrapper — never raw sqlite3. Raw sqlite3 sets wrong journal mode on NAS.
-- TaskStep.content = model output ONLY. Never prompt-expanded personal context. StepExecutor must enforce this. (D5-040)
 - _bootstrap_lock_table() before acquire_lock() in run_migrations(). Wrapped in SAVEPOINT. (D5-056, D5-062)
-- Fail fast at module load if QR_ENV=development and QR_DEV_KEY_HEX not set. (D5-063)
 - Voice profile VALUES must be validated at write time — reject + warn if PII detected. (D5-151)
   ALLOWED_VOICE_ATTRIBUTES protects keys. Values are NOT protected — validate both.
   Plain-language warning required at point of input, not just a log entry.
@@ -291,10 +270,8 @@ Same requirement applies to: tier math, voice-profile scanner, prompt token
 renderer, migration statement parser.
 
 ### Python oracle note
-Python files are oracle only during migration — do not modify.
-The Python codebase is the ground truth for gate behavior.
-Any Python change requires Chat-PM approval + golden vector re-extraction
-for all affected gate paths before Rust porting of those paths continues.
+Python backend has been retired (16l). The golden vectors in
+src-tauri/tests/golden/ are the permanent behavioral reference for Gate1–4.
 
 ### Cargo conventions
 Edition: 2021. One Cargo.toml at src-tauri/ — no workspace yet.

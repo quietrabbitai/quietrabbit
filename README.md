@@ -53,17 +53,14 @@ answer. Start a Quick Ask, or create a Topic to track it.
 
 ## Getting Started
 
-Guided setup gets everything running — Quiet Rabbit detects your hardware, recommends a
-model configuration, and walks you through first-time setup interactively. No manual
-configuration required.
+Quiet Rabbit is a desktop application — download, install, and the interactive
+onboarding handles the rest. No Docker, no server setup, no technical expertise required.
 
-```bash
-docker compose up
-```
+Ollama is included. If you already have Ollama running, Quiet Rabbit uses it automatically.
+If not, it starts its own — no duplicate downloads, no conflicts.
 
-Requires: Docker Desktop (Windows, Mac, Linux)
-GPU acceleration: automatic if available (NVIDIA or AMD)
-No GPU: runs on CPU — slower but fully private and functional
+*The installer is not yet available. Phase 1 is in active development — watch
+this repo or https://quietrabbit.ai for updates.*
 
 ---
 
@@ -84,7 +81,7 @@ No GPU: runs on CPU — slower but fully private and functional
 
 ## Privacy Model
 
-- **Local inference by default** — Ollama runs on your hardware, included in the install
+- **Local inference by default** — Ollama runs on your hardware, bundled in the install
 - **Three-tier routing** — Local Ollama → configurable API (Mistral/Groq) → Cloud review (your choice)
 - **Sensitive Personas stay local** — Medical, Legal, Finance never leave your device
 - **No telemetry** — Quiet Rabbit never sends usage data anywhere
@@ -116,7 +113,8 @@ See LICENSE for full terms.
 
 ## Status
 
-Phase 1 in active development — Docker install, web UI, full Focus library.
+Phase 1 in active development — desktop app (Tauri/Rust), native Ollama integration,
+full Focus library.
 
 Not ready for public use yet. Watch this repo for updates.
 

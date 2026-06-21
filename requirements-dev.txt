@@ -1,7 +1,0 @@
-# Quiet Rabbit — Development Dependencies
-# Not installed in production Docker image.
-
--r requirements.txt
-
-pytest
-pytest-cov
