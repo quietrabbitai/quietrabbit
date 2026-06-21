@@ -1,0 +1,8 @@
+#!/bin/sh
+# Quiet Rabbit — Ollama sidecar stub (D6-353)
+# This file exists to satisfy Tauri's build-time externalBin validation.
+# Replace with the real Ollama binary during the build pipeline pass.
+# In development, system Ollama is detected first — this stub is never invoked.
+echo "Quiet Rabbit: bundled Ollama placeholder." >&2
+echo "Replace this file with the real Ollama binary during packaging." >&2
+exit 1

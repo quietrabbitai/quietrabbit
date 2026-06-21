@@ -4,6 +4,9 @@
 // Commands: get_health, get_capability_profile.
 //
 // get_health: checks Ollama availability and returns provider health status.
+//   ollama_source: "system" | "sidecar" | "unavailable" — written during app
+//   setup by OllamaSidecar::ensure_available(); read from RwLock<OllamaSource>.
+//   Returns "unavailable" during the brief startup detection window.
 //   Tier 2 configured status is a stub (integration_keys store not yet ported).
 // get_capability_profile: returns installed models and benchmark status.
 //   recommended_routing omitted -- evaluation/scores DB not yet ported.
@@ -12,7 +15,9 @@
 
 use serde::Serialize;
 use specta::Type;
+use tokio::sync::RwLock;
 
+use crate::ollama_sidecar::OllamaSource;
 use crate::providers::ollama_client::OllamaClient;
 use crate::providers::types::{ProviderHealth, ProviderStatus};
 
@@ -23,6 +28,10 @@ use crate::providers::types::{ProviderHealth, ProviderStatus};
 #[derive(Debug, Serialize, Type)]
 pub struct HealthResponse {
     pub ollama: ProviderHealth,
+    /// "system" | "sidecar" | "unavailable".
+    /// Set during app setup by OllamaSidecar::ensure_available().
+    /// "unavailable" is returned during the brief startup detection window.
+    pub ollama_source: String,
     /// Always false until integration_keys store is ported (Group 9 stub).
     pub tier2_configured: bool,
 }
@@ -43,12 +52,15 @@ pub struct CapabilityProfileResponse {
 #[tauri::command]
 pub async fn get_health(
     client: tauri::State<'_, OllamaClient>,
+    ollama_source: tauri::State<'_, RwLock<OllamaSource>>,
 ) -> Result<HealthResponse, String> {
     let ollama = client.check_health().await;
+    let source = ollama_source.read().await.as_str().to_owned();
 
     Ok(HealthResponse {
         ollama,
-        tier2_configured: false, // STUB: integration_keys store not yet ported
+        ollama_source: source,
+        tier2_configured: false,
     })
 }
 

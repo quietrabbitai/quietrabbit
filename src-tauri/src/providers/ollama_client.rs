@@ -48,7 +48,7 @@ const BUFFERED_TASK_TYPES: &[&str] = &["code", "research", "creative_writing", "
 /// This matches Python oracle: `f"http://{host}:{port}"`.
 fn base_url() -> String {
     let host = std::env::var("OLLAMA_HOST")
-        .unwrap_or_else(|_| "host.docker.internal".to_owned());
+        .unwrap_or_else(|_| "127.0.0.1".to_owned());
     let port = std::env::var("OLLAMA_PORT")
         .unwrap_or_else(|_| "11434".to_owned());
     format!("http://{}:{}", host, port)

@@ -2,8 +2,12 @@
 
 use std::sync::Arc;
 
+use tauri::Manager;
+use tokio::sync::{Mutex, RwLock};
+
 use quietrabbit_lib::commands;
 use quietrabbit_lib::conductor::concurrency::ConductorScheduler;
+use quietrabbit_lib::ollama_sidecar::{OllamaSidecar, OllamaSource};
 use quietrabbit_lib::providers::ollama_client::OllamaClient;
 
 #[tokio::main]
@@ -17,6 +21,54 @@ async fn main() {
     tauri::Builder::default()
         .manage(scheduler)
         .manage(ollama_client)
+        // OllamaSource: initialized to Unavailable; the setup task writes the
+        // real value after detect-first completes. get_health() reads via
+        // read lock — zero contention after the first ~2 s of startup.
+        .manage(RwLock::new(OllamaSource::Unavailable))
+        // OllamaSidecar: holds the child process if a sidecar was started.
+        // Mutex required because tokio::process::Child is not Sync.
+        // Lock is held across ensure_available() (~0–7 s at startup only).
+        .manage(Mutex::new(OllamaSidecar::new()))
+        .setup(|app| {
+            // Detection runs in a spawned task — setup() is synchronous.
+            // OllamaSource stays Unavailable until detection completes
+            // (typically < 2 s on Garuda where system Ollama is running).
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let resource_dir = match handle.path().resource_dir() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        log::warn!("main: could not resolve resource_dir: {e}");
+                        return;
+                    }
+                };
+
+                let source = {
+                    let sidecar_state = handle.state::<Mutex<OllamaSidecar>>();
+                    let mut sidecar = sidecar_state.lock().await;
+                    sidecar.ensure_available(&resource_dir).await
+                };
+
+                let source_state = handle.state::<RwLock<OllamaSource>>();
+                *source_state.write().await = source;
+            });
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                // Stop the sidecar on window close. kill_on_drop(true) is the
+                // crash-exit safety net; this provides the graceful path with
+                // logging. Spawned without await — window closes immediately.
+                // TODO: handle RunEvent::Exit for headless/multi-window support.
+                log::info!("main: window close requested — stopping Ollama sidecar");
+                let handle = window.app_handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let sidecar_state = handle.state::<Mutex<OllamaSidecar>>();
+                    let mut sidecar = sidecar_state.lock().await;
+                    sidecar.stop().await;
+                });
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             // Group 1 -- Focus execution
             commands::execution::submit_focus_run,
