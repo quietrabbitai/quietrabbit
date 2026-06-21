@@ -66,6 +66,8 @@ pub enum OutputStoreError {
     Validation(String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("Run not found: {0}")]
+    RunNotFound(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -296,4 +298,111 @@ pub async fn delete_output(
     unimplemented!(
         "delete_output: full zero-then-delete sequence implemented in Layer 5+"
     )
+}
+
+// ---------------------------------------------------------------------------
+// Consent decisions (D6-352)
+// ---------------------------------------------------------------------------
+
+/// Mark a focus run as cancelled.
+/// No-op if the run is already in a terminal state (complete/cancelled/failed).
+/// Returns RunNotFound if run_id does not exist in this outputs.db.
+pub async fn cancel_focus_run(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    run_id: &str,
+) -> Result<(), OutputStoreError> {
+    let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
+
+    // Check whether the run exists at all.
+    let exists: bool = sqlx::query(
+        "SELECT 1 FROM focus_runs WHERE id = ? LIMIT 1",
+    )
+    .bind(run_id)
+    .fetch_optional(&mut conn)
+    .await?
+    .is_some();
+
+    if !exists {
+        return Err(OutputStoreError::RunNotFound(run_id.to_string()));
+    }
+
+    // Update only if not already terminal — no-op on complete/cancelled/failed.
+    sqlx::query(
+        "UPDATE focus_runs SET status = 'cancelled'
+         WHERE id = ? AND status NOT IN ('complete','cancelled','failed')",
+    )
+    .bind(run_id)
+    .execute(&mut conn)
+    .await?;
+
+    Ok(())
+}
+
+/// Record a Gate 3 consent decision for a paused focus run (D6-352).
+/// decision: "approved" | "declined"
+/// Validated by consent_decisions CHECK constraint in outputs_006.sql.
+pub async fn write_consent_decision(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    run_id: &str,
+    decision: &str,
+) -> Result<(), OutputStoreError> {
+    let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = crate::providers::utils::now();
+
+    sqlx::query(
+        "INSERT INTO consent_decisions
+             (id, focus_run_id, decision_type, decision,
+              abstraction_tier, save_preference, created_at)
+         VALUES (?, ?, 'gate3', ?, NULL, NULL, ?)",
+    )
+    .bind(&id)
+    .bind(run_id)
+    .bind(decision)
+    .bind(&now)
+    .execute(&mut conn)
+    .await?;
+
+    Ok(())
+}
+
+/// Record a floor consent decision for a paused focus run (D6-352).
+/// decision: "proceed" | "cancel"
+/// save_preference: if true, caller writes floor_consent_preference to
+///   personas.extra_metadata in shared.db (D5-152) — not done here.
+/// Validated by consent_decisions CHECK constraint in outputs_006.sql.
+pub async fn write_floor_consent_decision(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    run_id: &str,
+    abstraction_tier: i32,
+    decision: &str,
+    save_preference: bool,
+) -> Result<(), OutputStoreError> {
+    let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = crate::providers::utils::now();
+    let save_pref_val = if save_preference { 1i32 } else { 0i32 };
+
+    sqlx::query(
+        "INSERT INTO consent_decisions
+             (id, focus_run_id, decision_type, decision,
+              abstraction_tier, save_preference, created_at)
+         VALUES (?, ?, 'floor', ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(run_id)
+    .bind(decision)
+    .bind(abstraction_tier)
+    .bind(save_pref_val)
+    .bind(&now)
+    .execute(&mut conn)
+    .await?;
+
+    Ok(())
 }
