@@ -37,3 +37,4 @@ quietrabbit-data/
 
 # Taxonomy manifest (build artifact — regenerate with scripts/generate_manifest.py)
 app/taxonomy/manifest.yaml
+src-tauri/target/

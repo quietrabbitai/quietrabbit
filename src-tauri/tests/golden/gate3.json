@@ -1,0 +1,142 @@
+[
+  {
+    "approved": false,
+    "blocked": true,
+    "plain_language": "This content can't be shared with a higher-tier service from this Focus. [Change Focus settings] [Use local only]",
+    "event_type": "gate3_tier_ceiling_block",
+    "label": "gate3::ceiling_block::t2_max1",
+    "content_sensitivity_severity": 1,
+    "target_tier": 2,
+    "space_max_permitted_tier": 1
+  },
+  {
+    "approved": false,
+    "blocked": true,
+    "plain_language": "This content can't be shared with a higher-tier service from this Focus. [Change Focus settings] [Use local only]",
+    "event_type": "gate3_tier_ceiling_block",
+    "label": "gate3::ceiling_block::t3_max2",
+    "content_sensitivity_severity": 1,
+    "target_tier": 3,
+    "space_max_permitted_tier": 2
+  },
+  {
+    "approved": false,
+    "blocked": true,
+    "plain_language": "This content can't be shared with a higher-tier service from this Focus. [Change Focus settings] [Use local only]",
+    "event_type": "gate3_tier_ceiling_block",
+    "label": "gate3::ceiling_block::t3_max1",
+    "content_sensitivity_severity": 1,
+    "target_tier": 3,
+    "space_max_permitted_tier": 1
+  },
+  {
+    "approved": false,
+    "blocked": true,
+    "plain_language": "This content contains medical or financial information and can't be shared with external services. [Use local only] [Get help]",
+    "event_type": "gate3_sensitivity_block",
+    "label": "gate3::sensitivity_block::sev3_t2",
+    "content_sensitivity_severity": 3,
+    "target_tier": 2,
+    "space_max_permitted_tier": 3
+  },
+  {
+    "approved": false,
+    "blocked": true,
+    "plain_language": "This content contains medical or financial information and can't be shared with external services. [Use local only] [Get help]",
+    "event_type": "gate3_sensitivity_block",
+    "label": "gate3::sensitivity_block::sev4_t2",
+    "content_sensitivity_severity": 4,
+    "target_tier": 2,
+    "space_max_permitted_tier": 3
+  },
+  {
+    "approved": false,
+    "blocked": true,
+    "plain_language": "This content contains medical or financial information and can't be shared with external services. [Use local only] [Get help]",
+    "event_type": "gate3_sensitivity_block",
+    "label": "gate3::sensitivity_block::sev3_t3",
+    "content_sensitivity_severity": 3,
+    "target_tier": 3,
+    "space_max_permitted_tier": 3
+  },
+  {
+    "approved": false,
+    "blocked": true,
+    "plain_language": "This content contains medical or financial information and can't be shared with external services. [Use local only] [Get help]",
+    "event_type": "gate3_sensitivity_block",
+    "label": "gate3::sensitivity_block::sev4_t3",
+    "content_sensitivity_severity": 4,
+    "target_tier": 3,
+    "space_max_permitted_tier": 3
+  },
+  {
+    "approved": true,
+    "blocked": false,
+    "plain_language": null,
+    "event_type": "gate3_promotion_approved",
+    "label": "gate3::approved::sev2_t2",
+    "content_sensitivity_severity": 2,
+    "target_tier": 2,
+    "space_max_permitted_tier": 3
+  },
+  {
+    "approved": true,
+    "blocked": false,
+    "plain_language": null,
+    "event_type": "gate3_promotion_approved",
+    "label": "gate3::approved::sev3_t1",
+    "content_sensitivity_severity": 3,
+    "target_tier": 1,
+    "space_max_permitted_tier": 3
+  },
+  {
+    "approved": true,
+    "blocked": false,
+    "plain_language": null,
+    "event_type": "gate3_promotion_approved",
+    "label": "gate3::approved::sev1_t2",
+    "content_sensitivity_severity": 1,
+    "target_tier": 2,
+    "space_max_permitted_tier": 3
+  },
+  {
+    "approved": true,
+    "blocked": false,
+    "plain_language": null,
+    "event_type": "gate3_promotion_approved",
+    "label": "gate3::approved::sev2_t3",
+    "content_sensitivity_severity": 2,
+    "target_tier": 3,
+    "space_max_permitted_tier": 3
+  },
+  {
+    "approved": false,
+    "blocked": true,
+    "plain_language": "This content can't be shared with a higher-tier service from this Focus. [Change Focus settings] [Use local only]",
+    "event_type": "gate3_tier_ceiling_block",
+    "label": "gate3::ceiling_beats_sensitivity",
+    "content_sensitivity_severity": 3,
+    "target_tier": 3,
+    "space_max_permitted_tier": 2
+  },
+  {
+    "approved": true,
+    "blocked": false,
+    "plain_language": null,
+    "event_type": "gate3_promotion_approved",
+    "label": "gate3::at_ceiling_not_blocked::sev1",
+    "content_sensitivity_severity": 1,
+    "target_tier": 2,
+    "space_max_permitted_tier": 2
+  },
+  {
+    "approved": true,
+    "blocked": false,
+    "plain_language": null,
+    "event_type": "gate3_promotion_approved",
+    "label": "gate3::at_ceiling_not_blocked::sev2",
+    "content_sensitivity_severity": 2,
+    "target_tier": 2,
+    "space_max_permitted_tier": 2
+  }
+]

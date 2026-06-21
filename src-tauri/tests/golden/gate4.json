@@ -1,0 +1,58 @@
+[
+  {
+    "content_approved": true,
+    "clipboard_blocked": false,
+    "plain_language": null,
+    "label": "gate4::not_blocked::sev1",
+    "content_sensitivity_severity": 1
+  },
+  {
+    "content_approved": true,
+    "clipboard_blocked": false,
+    "plain_language": null,
+    "label": "gate4::not_blocked::sev2",
+    "content_sensitivity_severity": 2
+  },
+  {
+    "content_approved": true,
+    "clipboard_blocked": true,
+    "plain_language": "This content contains sensitive information and must be copied manually — it can't be sent to your clipboard automatically.",
+    "label": "gate4::blocked::sev3",
+    "content_sensitivity_severity": 3
+  },
+  {
+    "content_approved": true,
+    "clipboard_blocked": true,
+    "plain_language": "This content contains sensitive information and must be copied manually — it can't be sent to your clipboard automatically.",
+    "label": "gate4::blocked::sev4",
+    "content_sensitivity_severity": 4
+  },
+  {
+    "content_approved": true,
+    "clipboard_blocked": false,
+    "plain_language": null,
+    "label": "gate4::boundary_exact_max",
+    "content_sensitivity_severity": 2
+  },
+  {
+    "content_approved": true,
+    "clipboard_blocked": true,
+    "plain_language": "This content contains sensitive information and must be copied manually — it can't be sent to your clipboard automatically.",
+    "label": "gate4::boundary_one_over_max",
+    "content_sensitivity_severity": 3
+  },
+  {
+    "content_approved": true,
+    "clipboard_blocked": true,
+    "plain_language": "This content contains sensitive information and must be copied manually — it can't be sent to your clipboard automatically.",
+    "label": "gate4::content_always_approved_sev3",
+    "content_sensitivity_severity": 3
+  },
+  {
+    "content_approved": true,
+    "clipboard_blocked": true,
+    "plain_language": "This content contains sensitive information and must be copied manually — it can't be sent to your clipboard automatically.",
+    "label": "gate4::content_always_approved_sev4",
+    "content_sensitivity_severity": 4
+  }
+]

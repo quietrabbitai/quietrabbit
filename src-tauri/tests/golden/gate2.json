@@ -1,0 +1,208 @@
+[
+  {
+    "flagged": false,
+    "matched_field_names": [],
+    "label": "gate2::no_match",
+    "response_snippet": "The weather is nice today."
+  },
+  {
+    "flagged": true,
+    "matched_field_names": [
+      "name"
+    ],
+    "label": "gate2::exact_match_ascii",
+    "response_snippet": "Hello Alice, how are you?"
+  },
+  {
+    "flagged": true,
+    "matched_field_names": [
+      "name"
+    ],
+    "label": "gate2::case_insensitive_ascii",
+    "response_snippet": "hello alice, how are you?"
+  },
+  {
+    "flagged": false,
+    "matched_field_names": [],
+    "label": "gate2::below_min_length_3",
+    "response_snippet": "The code is ABC here."
+  },
+  {
+    "flagged": true,
+    "matched_field_names": [
+      "code"
+    ],
+    "label": "gate2::at_min_length_match",
+    "response_snippet": "The code is ABCD here."
+  },
+  {
+    "flagged": false,
+    "matched_field_names": [],
+    "label": "gate2::at_min_length_no_match",
+    "response_snippet": "The code is EFGH here."
+  },
+  {
+    "flagged": true,
+    "matched_field_names": [
+      "private_field"
+    ],
+    "label": "gate2::fields_shared_exclusion",
+    "response_snippet": "Alice is here and Secret99 too."
+  },
+  {
+    "flagged": true,
+    "matched_field_names": [
+      "shared_field",
+      "private_field"
+    ],
+    "label": "gate2::fields_shared_none_excluded",
+    "response_snippet": "Alice is here and Secret99 too."
+  },
+  {
+    "flagged": true,
+    "matched_field_names": [
+      "shared_field",
+      "private_field"
+    ],
+    "label": "gate2::fields_shared_null_compat",
+    "response_snippet": "Alice is here and Secret99 too."
+  },
+  {
+    "flagged": true,
+    "matched_field_names": [
+      "city"
+    ],
+    "label": "gate2::unicode_turkish_upper_I_exact",
+    "response_snippet": "Visit İstanbul today."
+  },
+  {
+    "flagged": false,
+    "matched_field_names": [],
+    "label": "gate2::unicode_turkish_lower_i_folded",
+    "response_snippet": "visit istanbul today."
+  },
+  {
+    "flagged": false,
+    "matched_field_names": [],
+    "label": "gate2::unicode_turkish_dotless_i",
+    "response_snippet": "visit ıstanbul today."
+  },
+  {
+    "flagged": true,
+    "matched_field_names": [
+      "street"
+    ],
+    "label": "gate2::unicode_german_exact",
+    "response_snippet": "Lives on Straße now."
+  },
+  {
+    "flagged": true,
+    "matched_field_names": [
+      "street"
+    ],
+    "label": "gate2::unicode_german_lower",
+    "response_snippet": "lives on straße now."
+  },
+  {
+    "flagged": false,
+    "matched_field_names": [],
+    "label": "gate2::unicode_german_ss_upper",
+    "response_snippet": "LIVES ON STRASSE NOW."
+  },
+  {
+    "flagged": true,
+    "matched_field_names": [
+      "place"
+    ],
+    "label": "gate2::unicode_nfc_field_nfc_response",
+    "response_snippet": "We visited café."
+  },
+  {
+    "flagged": false,
+    "matched_field_names": [],
+    "label": "gate2::unicode_nfd_field_nfc_response",
+    "response_snippet": "We visited café."
+  },
+  {
+    "flagged": false,
+    "matched_field_names": [],
+    "label": "gate2::unicode_nfc_field_nfd_response",
+    "response_snippet": "We visited café."
+  },
+  {
+    "flagged": true,
+    "matched_field_names": [
+      "place"
+    ],
+    "label": "gate2::unicode_nfd_field_nfd_response",
+    "response_snippet": "We visited café."
+  },
+  {
+    "flagged": true,
+    "matched_field_names": [
+      "name"
+    ],
+    "label": "gate2::overlap_value_repeated",
+    "response_snippet": "AliceAlice is the name."
+  },
+  {
+    "flagged": true,
+    "matched_field_names": [
+      "short",
+      "long"
+    ],
+    "label": "gate2::overlap_substring_of_longer",
+    "response_snippet": "Alice Smith was here."
+  },
+  {
+    "flagged": true,
+    "matched_field_names": [
+      "short"
+    ],
+    "label": "gate2::overlap_only_short_present",
+    "response_snippet": "Alice was here."
+  },
+  {
+    "flagged": false,
+    "matched_field_names": [],
+    "label": "gate2::duplicate_values_match",
+    "response_snippet": "Bob is mentioned."
+  },
+  {
+    "flagged": false,
+    "matched_field_names": [],
+    "label": "gate2::duplicate_values_no_match",
+    "response_snippet": "Nobody mentioned."
+  },
+  {
+    "flagged": true,
+    "matched_field_names": [
+      "first"
+    ],
+    "label": "gate2::multi_field_partial_match",
+    "response_snippet": "Alice was here."
+  },
+  {
+    "flagged": true,
+    "matched_field_names": [
+      "first",
+      "third"
+    ],
+    "label": "gate2::multi_field_all_match",
+    "response_snippet": "Alice and Bob and Charlie."
+  },
+  {
+    "flagged": false,
+    "matched_field_names": [],
+    "label": "gate2::multi_field_no_match",
+    "response_snippet": "Nobody mentioned."
+  },
+  {
+    "flagged": true,
+    "matched_field_names": [
+      "name"
+    ],
+    "label": "gate2::disclosure_log_on_flag_tier2",
+    "response_snippet": "Hello Alice."
+  }
+]
