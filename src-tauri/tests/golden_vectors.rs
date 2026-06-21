@@ -575,6 +575,39 @@ async fn test_gate2() {
 }
 
 // ---------------------------------------------------------------------------
+// Test: gate2 T1 disclosure log failure is non-fatal; T2+ is fatal
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_gate2_t1_log_failure_nonfatal() {
+    // Response contains "Alice" -> triggers flagged=true -> logger.write() called.
+    let response = "Hello Alice.";
+
+    // T1: log failure must be swallowed — gate returns Ok with correct result.
+    let trk = track(vec![field("name", "Alice", "personal", "pass", "pass")]);
+    let result = gate2(
+        &FailLogger, "step-t1-fail", "run-t1-fail",
+        response, &trk, 1, None, None,
+    ).await;
+    assert!(result.is_ok(),
+        "T1 log failure must be non-fatal: got {:?}", result.err());
+    let r = result.unwrap();
+    assert!(r.flagged,
+        "T1: result must still be flagged despite log failure");
+    assert_eq!(r.matched_field_names, vec!["name".to_string()],
+        "T1: matched_field_names must be populated despite log failure");
+
+    // T2+: log failure must propagate — gate returns Err.
+    let trk2 = track(vec![field("name", "Alice", "personal", "pass", "pass")]);
+    let result2 = gate2(
+        &FailLogger, "step-t2-fail", "run-t2-fail",
+        response, &trk2, 2, None, None,
+    ).await;
+    assert!(result2.is_err(),
+        "T2+ log failure must be fatal: got Ok({:?})", result2.ok());
+}
+
+// ---------------------------------------------------------------------------
 // Test: gate3 (inputs fully in fixture)
 // ---------------------------------------------------------------------------
 

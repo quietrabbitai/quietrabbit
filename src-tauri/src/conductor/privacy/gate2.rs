@@ -17,8 +17,9 @@
 //   Using chars().count() is the correct Rust equivalent.
 //
 // Disclosure log written ONLY when flagged=true (mirrors Python).
-// gate2 always runs at execution_tier >= 1; disclosure write is always fatal
-// if it fails (gate2 is only called when a response exists -- tier 2+ context).
+// Fatality split (matches gate1): T1 log write failure is non-fatal (swallow,
+// continue). T2+ log write failure is fatal (halt execution). The split lives
+// here in the gate function, not in the logger implementation.
 
 use indexmap::IndexMap;
 
@@ -73,8 +74,9 @@ pub async fn gate2<L: DisclosureLogger>(
     let flagged = !matched.is_empty();
 
     // Disclosure log written only on flagged result.
+    // Fatality split: T1 non-fatal (swallow), T2+ fatal (propagate).
     if flagged {
-        logger
+        let write_result = logger
             .write(DisclosureLogEntry {
                 step_id:           step_id.to_string(),
                 focus_run_id:      focus_run_id.to_string(),
@@ -87,7 +89,13 @@ pub async fn gate2<L: DisclosureLogger>(
                 override_declined: false,
                 event_type:        "gate2_contamination_detected".to_string(),
             })
-            .await?;
+            .await;
+        if let Err(e) = write_result {
+            if execution_tier > 1 {
+                return Err(e);   // FATAL at tier 2+
+            }
+            // Non-fatal at tier 1: swallow, continue.
+        }
     }
 
     Ok(Gate2Result {
