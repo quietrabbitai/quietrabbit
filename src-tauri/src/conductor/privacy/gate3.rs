@@ -53,6 +53,7 @@ pub async fn gate3<L: DisclosureLogger>(
                  from this Focus. [Change Focus settings] [Use local only]"
                     .to_string(),
             ),
+            ..Gate3Result::default()
         });
     }
 
@@ -82,6 +83,7 @@ pub async fn gate3<L: DisclosureLogger>(
                  [Use local only] [Get help]"
                     .to_string(),
             ),
+            ..Gate3Result::default()
         });
     }
 
@@ -105,5 +107,6 @@ pub async fn gate3<L: DisclosureLogger>(
         approved:      true,
         blocked:       false,
         plain_language: None,
+        ..Gate3Result::default()
     })
 }

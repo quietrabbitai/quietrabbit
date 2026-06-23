@@ -1,7 +1,7 @@
 // src-tauri/src/conductor/privacy/types.rs
 
 use indexmap::IndexMap;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 // -- AbstractionPolicy --------------------------------------------------------
 
@@ -138,11 +138,19 @@ pub struct Gate2Result {
     pub matched_field_names: Vec<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Gate3Result {
-    pub approved:       bool,
-    pub blocked:        bool,
-    pub plain_language: Option<String>,
+    pub approved:        bool,
+    pub blocked:         bool,
+    pub plain_language:  Option<String>,
+    /// Privacy Filter identified spans and emitted consent_request event.
+    /// Execution is paused — waiting for per-element user decision.
+    /// When true: approved=false, blocked=false.
+    pub pending_consent: bool,
+    /// Privacy Filter call exceeded the timeout window.
+    /// gate_timeout event written to disclosure_log before returning.
+    /// When true: approved=false, blocked=true.
+    pub timeout:         bool,
 }
 
 #[derive(Debug)]
@@ -153,3 +161,99 @@ pub struct Gate4Result {
 }
 
 pub const CLIPBOARD_MAX_SENSITIVITY_SEVERITY: u8 = 2;
+
+// -- Privacy Guardian Gate 3 IPC types ----------------------------------------
+//
+// These types cross the Tauri IPC boundary and must derive Serialize,
+// Deserialize, and specta::Type as appropriate.
+//
+// ConsentRequestPayload / ConsentSpanItem / ReviewTier: emitted as the
+// consent_request push event payload (Serialize + specta::Type).
+//
+// ElementDecision: received from the frontend per-element return command
+// (Deserialize + specta::Type).
+
+/// Review tier assigned by gate3 based on confidence scores, sensitivity, and
+/// target execution tier. Determines the visual weight of the consent modal.
+/// Serialises as "easy" | "medium" | "high".
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "lowercase")]
+pub enum ReviewTier {
+    /// High-confidence structural PII (score >= 0.90). Minimal friction.
+    Easy,
+    /// Moderate confidence or contextual content (score >= 0.70).
+    Medium,
+    /// Low confidence, Medical-mapped category, or Tier 3 target.
+    /// Err toward High when uncertain (D6-362).
+    High,
+}
+
+/// A single identified span within the consent_request payload.
+/// One item per entity returned by the Privacy Filter.
+#[derive(Debug, Clone, Serialize, specta::Type)]
+pub struct ConsentSpanItem {
+    /// Unique ID within this gate invocation. Used to correlate ElementDecision
+    /// responses from the frontend back to the original span.
+    pub span_id:       String,
+    /// Raw category label from the Privacy Filter (e.g. "private_person").
+    pub category:      String,
+    /// Human-readable label for display (e.g. "Person name").
+    /// Derived from the QR taxonomy mapping in gate3.rs.
+    pub user_label:    String,
+    /// The original text identified by the Privacy Filter.
+    pub original_text: String,
+    /// Pre-populated generalization suggestion (e.g. "[person]").
+    /// None if no rule matches — frontend renders an editable placeholder.
+    pub suggestion:    Option<String>,
+    /// Byte offset of the span start in the original content text (inclusive).
+    /// Slicing must use byte indexing: &text[start_byte..end_byte].
+    pub start_byte:    usize,
+    /// Byte offset of the span end in the original content text (exclusive).
+    pub end_byte:      usize,
+    /// Confidence score from the Privacy Filter in [0.0, 1.0].
+    pub score:         f32,
+}
+
+/// Full payload for the consent_request push event emitted by gate3.
+/// Received by the frontend to populate the Privacy Guardian modal.
+#[derive(Debug, Clone, Serialize, specta::Type)]
+pub struct ConsentRequestPayload {
+    /// ID of the paused FocusRun — used by the frontend to route the
+    /// per-element return command back to the correct run.
+    pub focus_run_id: String,
+    /// Display name of the Focus being executed (shown in the modal header).
+    pub focus_name:   String,
+    /// Review tier for the modal. Controls visual weight and friction level.
+    pub review_tier:  ReviewTier,
+    /// Identified spans. May be empty — see gate3.rs zero-span handling.
+    pub spans:        Vec<ConsentSpanItem>,
+}
+
+/// The user's decision type for a single identified span.
+/// Deserialises from "generalize" | "keep_private" | "release_original".
+#[derive(Debug, Clone, Deserialize, specta::Type)]
+#[serde(rename_all = "snake_case")]
+pub enum ElementDecisionKind {
+    /// Replace the identified span with the generalisation suggestion.
+    Generalize,
+    /// Remove the span from content entirely before sending.
+    KeepPrivate,
+    /// Send the original identified text as-is.
+    ReleaseOriginal,
+}
+
+/// Per-element decision returned from the frontend after the user reviews
+/// the Privacy Guardian modal. One ElementDecision per ConsentSpanItem.
+#[derive(Debug, Deserialize, specta::Type)]
+pub struct ElementDecision {
+    /// Matches ConsentSpanItem.span_id for this decision.
+    pub span_id:            String,
+    /// The user's choice for this span.
+    pub decision:           ElementDecisionKind,
+    /// The suggestion text that was displayed to the user (original, unedited).
+    /// Required per IPC flag: per-element return must include original suggestion.
+    pub suggestion_text:    Option<String>,
+    /// The text the user actually entered, if they edited the suggestion.
+    /// None if the user accepted the suggestion without modification.
+    pub user_modified_text: Option<String>,
+}
