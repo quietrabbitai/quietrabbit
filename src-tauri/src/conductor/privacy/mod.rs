@@ -7,6 +7,7 @@ pub mod gate2;
 pub mod gate3;
 pub mod gate4;
 pub mod logger;
+pub mod privacy_filter;
 pub mod types;
 
 // PrivacyGateway<L: DisclosureLogger> -- mirrors Python's PrivacyGateway class.
