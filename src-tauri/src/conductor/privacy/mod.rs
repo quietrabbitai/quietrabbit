@@ -82,21 +82,27 @@ impl<L: DisclosureLogger> PrivacyGateway<L> {
         &self,
         step_id: &str,
         focus_run_id: &str,
+        focus_name: &str,
         content_key: &str,
+        content_text: &str,
         content_sensitivity_severity: u8,
         target_tier: u8,
         space_max_permitted_tier: u8,
         execution_tier: u8,
+        app_handle: Option<&tauri::AppHandle<tauri::Wry>>,
     ) -> Result<Gate3Result, DisclosureLogWriteError> {
         gate3::gate3(
             &self.logger,
             step_id,
             focus_run_id,
+            focus_name,
             content_key,
+            content_text,
             content_sensitivity_severity,
             target_tier,
             space_max_permitted_tier,
             execution_tier,
+            app_handle,
         )
         .await
     }

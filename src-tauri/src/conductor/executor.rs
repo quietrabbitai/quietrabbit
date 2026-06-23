@@ -154,6 +154,8 @@ pub struct StepContext {
     pub floor_consent_preference: Option<String>,  // "modified" | "local" | None
     pub next_execution_tier: Option<u8>,
     pub retry_count: u32,
+    /// Display name of the Focus, passed to gate3 for the consent modal header.
+    pub focus_name: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +197,7 @@ impl StepExecutor {
         failure_handler: &FailureHandler,
         privacy_gateway: &PrivacyGateway<NoopLogger>,
         scheduler: &Arc<ConductorScheduler>,
+        app_handle: Option<&tauri::AppHandle<tauri::Wry>>,
     ) -> Option<FailureResult> {
         let mut retry_count = 0u32;
 
@@ -209,6 +212,7 @@ impl StepExecutor {
                     failure_handler,
                     privacy_gateway,
                     scheduler,
+                    app_handle,
                 )
                 .await
             {
@@ -264,6 +268,7 @@ impl StepExecutor {
         failure_handler: &FailureHandler,
         privacy_gateway: &PrivacyGateway<NoopLogger>,
         scheduler: &Arc<ConductorScheduler>,
+        app_handle: Option<&tauri::AppHandle<tauri::Wry>>,
     ) -> Result<Option<FailureResult>, ConductorError> {
         let execution_tier  = ctx.execution_tier;
         let abstraction_tier = ctx.abstraction_tier;
@@ -615,11 +620,14 @@ impl StepExecutor {
                     .gate3(
                         &ctx.step.step_id,
                         &ctx.focus_run_id,
+                        &ctx.focus_name,
                         content_key,
+                        &response.content,
                         step_sensitivity as u8,
                         next_tier,
                         ctx.space_max_permitted_tier,
                         execution_tier,
+                        app_handle,
                     )
                     .await
                     .map_err(|e| ConductorError::DisclosureLogWrite {
@@ -639,6 +647,21 @@ impl StepExecutor {
                         Some(&ctx.focus_id),
                         retry_count,
                     )));
+                }
+
+                if g3.pending_consent {
+                    return Ok(Some(FailureResult {
+                        action:         FailureAction::AwaitConsent,
+                        failure_mode:   None,
+                        plain_language: "Quiet Rabbit identified personal information in this \
+                                         content. Please review before it leaves your device."
+                            .to_owned(),
+                        is_recoverable: true,
+                        severity:       FailureSeverity::Pause,
+                        step_id:        Some(ctx.step.step_id.clone()),
+                        focus_id:       Some(ctx.focus_id.clone()),
+                        metadata:       None,
+                    }));
                 }
 
                 if g3.approved {
@@ -1458,6 +1481,7 @@ mod tests {
             space_max_permitted_tier: 2, execution_tier: 2,
             abstraction_tier: 2, raw_abstraction: 1,
             floor_consent_preference: None, next_execution_tier: None, retry_count: 0,
+            focus_name: "test".to_owned(),
         };
         let mut projected = HashMap::new();
         projected.insert("name".to_owned(), "Alice (abstracted)".to_owned());
@@ -1490,6 +1514,7 @@ mod tests {
             space_max_permitted_tier: 1, execution_tier: 1,
             abstraction_tier: 1, raw_abstraction: 1,
             floor_consent_preference: None, next_execution_tier: None, retry_count: 0,
+            focus_name: "test".to_owned(),
         };
         assert_eq!(compute_step_sensitivity(&ctx, &pt, &HashMap::new(), 1), 2);
     }
@@ -1512,6 +1537,7 @@ mod tests {
             space_max_permitted_tier: 1, execution_tier: 1,
             abstraction_tier: 1, raw_abstraction: 1,
             floor_consent_preference: None, next_execution_tier: None, retry_count: 0,
+            focus_name: "test".to_owned(),
         };
         assert_eq!(compute_step_sensitivity(&ctx, &pt, &HashMap::new(), 1), 1);
     }

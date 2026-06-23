@@ -630,7 +630,8 @@ async fn test_gate3() {
         let logger = TestLogger::new();
         let result = gate3(
             &logger, &format!("step-{label}"), &format!("run-{label}"),
-            "test_content_key", severity, target_tier, space_max, execution_tier,
+            "Test Focus", "test_content_key", "test content",
+            severity, target_tier, space_max, execution_tier, None,
         ).await.unwrap_or_else(|e| panic!("{label}: gate3 returned Err: {e}"));
 
         assert_eq!(result.approved, expected_approved,

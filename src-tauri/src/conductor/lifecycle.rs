@@ -1012,6 +1012,11 @@ impl FocusRun {
             floor_consent_preference,
             next_execution_tier,
             retry_count: 0,
+            focus_name: self
+                .focus_def
+                .as_ref()
+                .map(|d| d.display_name.clone())
+                .unwrap_or_default(),
         };
 
         // Borrow distinct fields of self simultaneously — Rust borrow checker allows
@@ -1031,6 +1036,7 @@ impl FocusRun {
                 failure_handler,
                 privacy_gateway,
                 &scheduler,
+                self.app_handle.as_ref(),
             )
             .await)
     }
@@ -1051,6 +1057,7 @@ impl FocusRun {
                 | FailureAction::OfferTier2
                 | FailureAction::OfferCompact
                 | FailureAction::AwaitFloorConsent
+                | FailureAction::AwaitConsent
         ) {
             let _ = self.write_focus_run_record("awaiting_user").await;
             self.emit_status("awaiting_user", None);
