@@ -193,6 +193,10 @@ pub enum FailureAction {
     Degrade,
     HoldForGate,
     AwaitFloorConsent,
+    /// Privacy Guardian gate3 has fired and emitted consent_request event.
+    /// Run is paused awaiting per-element user decisions from the frontend.
+    /// Distinct from AwaitFloorConsent — resolved via submit_element_consent_decision.
+    AwaitConsent,
 }
 
 // ---------------------------------------------------------------------------
