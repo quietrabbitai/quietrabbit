@@ -82,6 +82,8 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/outputs_004.sql") },
     SchemaFile { prefix: "outputs", version: 5,
         sql: include_str!("../../schema/outputs_005.sql") },
+    SchemaFile { prefix: "outputs", version: 6,
+        sql: include_str!("../../schema/outputs_006.sql") },
     SchemaFile { prefix: "personal", version: 1,
         sql: include_str!("../../schema/personal_001.sql") },
     SchemaFile { prefix: "personal", version: 2,
