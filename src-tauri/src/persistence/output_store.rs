@@ -408,3 +408,62 @@ pub async fn write_floor_consent_decision(
 
     Ok(())
 }
+
+/// Record per-element Privacy Guardian consent decisions for a paused focus run.
+///
+/// decisions_json: JSON-serialized Vec<ElementDecision> from the Privacy Guardian
+///   modal. The caller (consent.rs) is responsible for serialization.
+///   Expected JSON shape per element:
+///     { "span_id": string, "decision": "Generalize"|"KeepPrivate"|"ReleaseOriginal",
+///       "suggestion_text": string|null, "user_modified_text": string|null }
+///
+/// BLOCKED PENDING MIGRATION: 'element_consent' decision_type requires
+/// outputs_007 (CHECK constraint extension via table recreation in SQLite).
+/// Until outputs_007 runs, this function returns Err immediately -- no DB
+/// connection is opened. See outputs_006.sql for the planned constraint extension.
+pub async fn write_element_consent_decisions(
+    _user_id: &str,
+    _persona_id: &str,
+    _key_hex: &str,
+    _run_id: &str,
+    _decisions_json: &str,
+) -> Result<(), OutputStoreError> {
+    // Hard return before any DB access -- guard is structural by position.
+    Err(OutputStoreError::Validation(
+        "decision_type 'element_consent' is not yet supported by the database schema \
+         -- outputs_007 migration required to extend the consent_decisions \
+         CHECK constraint."
+            .to_owned(),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn write_element_consent_decisions_returns_err_pending_migration() {
+        let result = write_element_consent_decisions(
+            "user1", "persona1", "deadbeef", "run-123", "[]",
+        )
+        .await;
+
+        match result.unwrap_err() {
+            OutputStoreError::Validation(msg) => {
+                assert!(
+                    msg.contains("element_consent"),
+                    "error must name the decision type: {msg}"
+                );
+                assert!(
+                    msg.contains("outputs_007"),
+                    "error must cite the required migration: {msg}"
+                );
+            }
+            other => panic!("expected Validation variant, got: {other:?}"),
+        }
+    }
+}
