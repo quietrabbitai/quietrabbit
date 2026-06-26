@@ -78,6 +78,7 @@ async fn main() {
             // Group 2 -- Consent and privacy gates
             commands::consent::submit_consent_decision,
             commands::consent::submit_floor_consent_decision,
+            commands::consent::submit_element_consent_decision,
             // Group 3 -- Onboarding
             commands::onboarding::get_onboarding_focus_suggestions,
             commands::onboarding::submit_onboarding_persona_selection,

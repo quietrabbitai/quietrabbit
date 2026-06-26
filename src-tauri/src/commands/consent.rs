@@ -1,7 +1,8 @@
 // src-tauri/src/commands/consent.rs
 //
 // Group 2 — Consent and privacy gates.
-// Commands: submit_consent_decision, submit_floor_consent_decision.
+// Commands: submit_consent_decision, submit_floor_consent_decision,
+//           submit_element_consent_decision.
 //
 // submit_consent_decision: records a Gate 3 cross-tier promotion decision.
 //   The frontend receives a consent_request push event, presents the UI,
@@ -17,8 +18,14 @@
 //   personas.extra_metadata in shared.db (D5-152 scoped consent record).
 //   Writes to consent_decisions table via write_floor_consent_decision() (D6-352).
 //
-// Both commands are fire-and-respond: the lifecycle checks the consent_decisions
-// table when the run is resumed. No direct signalling into the background task.
+// submit_element_consent_decision: records per-element Privacy Guardian decisions
+//   (D6-362). The frontend serializes Vec<ElementDecision> to JSON and passes it
+//   as decisions_json — the IPC boundary carries a plain String, keeping the
+//   command layer free of Conductor type imports.
+//   BLOCKED until outputs_007 migration (CHECK constraint extension). Returns Err.
+//
+// All commands are fire-and-respond: lifecycle checks consent_decisions when
+// the run is resumed. No direct signalling into the background task.
 
 use serde::Deserialize;
 use specta::Type;
@@ -53,6 +60,21 @@ pub struct SubmitFloorConsentDecisionRequest {
     pub decision: String,
     /// If true, saves as standing floor consent preference (D5-152).
     pub save_preference: bool,
+}
+
+#[derive(Debug, Deserialize, Type)]
+pub struct SubmitElementConsentDecisionRequest {
+    pub run_id:         String,
+    pub user_id:        String,
+    pub persona_id:     String,
+    pub key_hex:        String,
+    /// JSON-serialized Vec<ElementDecision> produced by the frontend.
+    /// Expected shape per element:
+    ///   { "span_id": string, "decision": "generalize"|"keep_private"|"release_original",
+    ///     "suggestion_text": string|null, "user_modified_text": string|null }
+    /// The command layer does not deserialize this — it is passed through to
+    /// write_element_consent_decisions() as-is (D6-362 IPC boundary rule).
+    pub decisions_json: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -105,6 +127,21 @@ pub async fn submit_floor_consent_decision(
     Ok(())
 }
 
+#[tauri::command]
+pub async fn submit_element_consent_decision(
+    request: SubmitElementConsentDecisionRequest,
+) -> Result<(), String> {
+    output_store::write_element_consent_decisions(
+        &request.user_id,
+        &request.persona_id,
+        &request.key_hex,
+        &request.run_id,
+        &request.decisions_json,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -114,6 +151,10 @@ pub async fn submit_floor_consent_decision(
 ///   {"mode": "modified", "abstraction_tier": N,
 ///    "consent_timestamp": "...", "consent_version": "1"}
 /// shared.db is unencrypted (instance-level, not per-persona encrypted).
+///
+/// extra_metadata is fetched as Option<String> — the column may be NULL for
+/// newly created personas. A NULL or malformed value is treated as an empty
+/// object so the preference write proceeds without data loss.
 async fn write_floor_consent_preference(
     persona_id: &str,
     abstraction_tier: i32,
@@ -131,8 +172,8 @@ async fn write_floor_consent_preference(
         "consent_version": "1"
     });
 
-    // Merge into existing extra_metadata rather than overwriting the whole field.
-    let existing_json: String = sqlx::query(
+    // Fetch as Option<String> — NULL extra_metadata is valid for new personas.
+    let existing_json: Option<String> = sqlx::query(
         "SELECT extra_metadata FROM personas WHERE id = ?",
     )
     .bind(persona_id)
@@ -140,8 +181,12 @@ async fn write_floor_consent_preference(
     .await?
     .try_get("extra_metadata")?;
 
-    let mut meta: serde_json::Value =
-        serde_json::from_str(&existing_json).unwrap_or(serde_json::json!({}));
+    // Merge into existing metadata rather than overwriting the whole field.
+    // Falls back to empty object if the column is NULL or contains invalid JSON.
+    let mut meta: serde_json::Value = existing_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
 
     meta["floor_consent_preference"] = preference;
 
