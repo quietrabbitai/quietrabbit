@@ -2809,6 +2809,7 @@ dependencies = [
  "chrono",
  "gethostname",
  "indexmap 2.14.0",
+ "libc",
  "libsqlite3-sys",
  "log",
  "pkg-config",

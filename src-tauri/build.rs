@@ -20,8 +20,13 @@ fn main() {
     //   cmake --preset release-portable
     //   cmake --build --preset release-portable -j
     //
-    // Then point PRIVACY_FILTER_LIB_DIR at the directory containing libpf.a:
-    //   export PRIVACY_FILTER_LIB_DIR=/path/to/privacy-filter.cpp/build/release-portable/lib
+    // Then point PRIVACY_FILTER_LIB_DIR at the build root:
+    //   export PRIVACY_FILTER_LIB_DIR=/path/to/privacy-filter.cpp/build/release-portable
+    //
+    // Layout expected under PRIVACY_FILTER_LIB_DIR:
+    //   libpf.a                  — static archive (linked directly)
+    //   ggml/src/libggml-base.so — ggml base (ggml_init, ggml_new_tensor, etc.)
+    //   ggml/src/libggml.so      — ggml backend registry (ggml_backend_load_all, etc.)
     //
     // If unset: Privacy Filter FFI is compiled out (cfg flag absent) and gate3
     // uses the pre-filter sensitivity-based block. Acceptable for dev/test builds.
@@ -41,6 +46,12 @@ fn main() {
         println!("cargo:rustc-cfg=privacy_filter_available");
         println!("cargo:rustc-link-search=native={lib_dir}");
         println!("cargo:rustc-link-lib=static={lib_name}");
+        // ggml libs live in ggml/src/ under the build root.
+        // ggml-base: ggml_init, ggml_new_tensor, ggml_get_name, etc.
+        // ggml:      ggml_backend_load_all, ggml_backend_dev_count, etc.
+        println!("cargo:rustc-link-search=native={lib_dir}/ggml/src");
+        println!("cargo:rustc-link-lib=dylib=ggml-base");
+        println!("cargo:rustc-link-lib=dylib=ggml");
 
         // C++ standard library — required by the C++ runtime inside libpf.
         // Use CARGO_CFG_TARGET_OS (target, not host) to emit the right lib name.

@@ -21,7 +21,8 @@
 //   cd privacy-filter.cpp
 //   cmake --preset release-portable
 //   cmake --build --preset release-portable -j
-//   export PRIVACY_FILTER_LIB_DIR=<path>/build/release-portable/lib
+//   export PRIVACY_FILTER_LIB_DIR=<path>/build/release-portable
+//                                          ^^^^ build root, not lib/
 
 // ---------------------------------------------------------------------------
 // Shared types (always compiled — stub and live paths share the same API)
@@ -44,8 +45,10 @@ pub struct PfEntityDecoded {
     ///   "account_number" | "secret"
     /// Empty string if the label pointer was null (defensive; should not occur).
     pub label: String,
-    /// The text slice identified by the filter, extracted using byte offsets.
-    /// Uses from_utf8_lossy — recovers partial text if offsets land mid-character.
+    /// Extracted from the original text using byte offsets returned by the
+    /// privacy-filter.cpp library. Offsets are clamped to valid byte range
+    /// before slicing; assumes the library returns valid UTF-8 boundaries
+    /// (from_utf8_lossy replaces any invalid bytes rather than panicking).
     pub span_text: String,
 }
 
@@ -62,8 +65,8 @@ mod inner {
     use super::PfEntityDecoded;
 
     // ABI version this wrapper was written against.
-    // Verify this constant matches PF_ABI_VERSION in pf.h when updating the
-    // library. Initialisation fails if pf_abi_version() returns a different value.
+    // Matches PF_ABI_VERSION in pf.h. Initialisation fails if the runtime
+    // library returns a different value from pf_abi_version().
     const EXPECTED_PF_ABI_VERSION: u32 = 1;
 
     // -- Opaque C context type -----------------------------------------------
@@ -78,57 +81,64 @@ mod inner {
     }
 
     // -- C entity span struct (repr C, must match pf.h layout) ---------------
+    // pf.h: typedef struct { int32_t start; int32_t end; float score; const char* label; } pf_entity;
     #[repr(C)]
     pub struct PfEntity {
-        pub start: libc::size_t,        // byte offset, inclusive
-        pub end:   libc::size_t,        // byte offset, exclusive
-        pub score: libc::c_float,       // confidence in [0.0, 1.0]
-        pub label: *const libc::c_char, // static string owned by the library
+        pub start: i32,                 // int32_t — byte offset, inclusive
+        pub end:   i32,                 // int32_t — byte offset, exclusive
+        pub score: libc::c_float,       // float   — confidence in [0.0, 1.0]
+        pub label: *const libc::c_char, // const char* — ctx-owned, valid until pf_free
     }
 
-    // -- extern "C" declarations (pf.h) --------------------------------------
+    // -- extern "C" declarations matching pf.h exactly -----------------------
     extern "C" {
-        /// Returns the library ABI version. Compared against EXPECTED_PF_ABI_VERSION.
-        pub fn pf_abi_version() -> libc::c_uint;
+        /// Returns the library ABI version (int in pf.h).
+        /// Compare as u32 against EXPECTED_PF_ABI_VERSION.
+        pub fn pf_abi_version() -> libc::c_int;
 
         /// Initialise a Privacy Filter context.
-        /// model_path: path to the GGUF model file (UTF-8, null-terminated).
-        /// device:     NULL or "cpu" | "gpu" | "cuda" | "vulkan" (optionally ":N").
-        /// n_threads:  <= 0 selects a default (CPU only).
+        /// gguf_path: path to the GGUF model file (UTF-8, null-terminated).
+        /// device:    NULL or "cpu" | "gpu" | "cuda" | "vulkan" (optionally ":N").
+        /// n_threads: <= 0 selects a default (CPU only).
         /// Returns NULL on failure; call pf_last_error for the reason.
-        pub fn pf_init(
-            model_path: *const libc::c_char,
-            device:     *const libc::c_char,
-            n_threads:  libc::c_int,
+        pub fn pf_load(
+            gguf_path: *const libc::c_char,
+            device:    *const libc::c_char,
+            n_threads: libc::c_int,
         ) -> *mut PfCtx;
 
-        /// Free a context created by pf_init.
+        /// Free a context created by pf_load.
         pub fn pf_free(ctx: *mut PfCtx);
 
         /// Return the last error string for ctx, or NULL if none.
-        /// The pointer is valid until the next pf_* call on this ctx.
-        pub fn pf_last_error(ctx: *mut PfCtx) -> *const libc::c_char;
+        /// Takes const pointer — ctx is not mutated. Pointer valid until next
+        /// pf_* call on this ctx.
+        pub fn pf_last_error(ctx: *const PfCtx) -> *const libc::c_char;
 
         /// Set the token window size (default 4096). Must be > 2048 to window.
         /// Longer inputs run as overlapping halo windows automatically.
         #[allow(dead_code)]
-        pub fn pf_set_window(ctx: *mut PfCtx, max_forward_tokens: libc::c_int);
+        pub fn pf_set_window(ctx: *mut PfCtx, max_forward_tokens: i32);
 
         /// Classify text and return entity spans as a malloc'd array.
+        /// text:      UTF-8 input, not required to be null-terminated (len provided).
+        /// len:       byte length of text.
         /// threshold: spans scoring below this value are dropped.
-        /// *out:      set to the allocated array on success; free with pf_entities_free.
-        /// *n:        set to the number of entities.
+        /// out:       set to the allocated array on success.
+        /// n_out:     set to the number of entities.
         /// Returns 0 on success, non-zero on error.
         pub fn pf_classify(
             ctx:       *mut PfCtx,
             text:      *const libc::c_char,
+            len:       libc::size_t,
             threshold: libc::c_float,
             out:       *mut *mut PfEntity,
-            n:         *mut libc::size_t,
+            n_out:     *mut libc::size_t,
         ) -> libc::c_int;
 
-        /// Free the entity array allocated by pf_classify. NULL-safe.
-        pub fn pf_entities_free(entities: *mut PfEntity);
+        /// Free the entity array allocated by pf_classify.
+        /// Requires both pointer and count (NULL-safe per pf.h).
+        pub fn pf_entities_free(ents: *mut PfEntity, n: libc::size_t);
     }
 
     // -- Safe Rust wrapper ---------------------------------------------------
@@ -140,7 +150,7 @@ mod inner {
 
     impl Drop for PrivacyFilter {
         fn drop(&mut self) {
-            // Safety: ctx was returned by pf_init and has not been freed.
+            // Safety: ctx was returned by pf_load and has not been freed.
             unsafe { pf_free(self.ctx); }
         }
     }
@@ -152,9 +162,9 @@ mod inner {
     // -- Global singleton ----------------------------------------------------
     //
     // OnceLock<Option<Mutex<...>>>:
-    //   Some(mutex)       = filter available and ready
-    //   None              = initialisation was attempted and failed (permanent
-    //                       until process restart — intentional for Release 1)
+    //   Some(mutex) = filter available and ready
+    //   None        = initialisation attempted and failed (permanent until
+    //                 process restart — intentional for Release 1)
     static PF_INSTANCE: OnceLock<Option<Mutex<PrivacyFilter>>> = OnceLock::new();
 
     fn model_path_cstring() -> Option<CString> {
@@ -173,10 +183,9 @@ mod inner {
     fn get_or_init() -> Option<&'static Mutex<PrivacyFilter>> {
         PF_INSTANCE
             .get_or_init(|| {
-                // ABI check — fail before attempting model load if the library
-                // version this wrapper was written against no longer matches.
+                // ABI check — fail before model load if library version changed.
                 // Safety: pf_abi_version() has no preconditions.
-                let abi = unsafe { pf_abi_version() };
+                let abi = unsafe { pf_abi_version() } as u32;
                 if abi != EXPECTED_PF_ABI_VERSION {
                     log::error!(
                         "privacy_filter: ABI mismatch — expected {EXPECTED_PF_ABI_VERSION}, \
@@ -197,7 +206,7 @@ mod inner {
 
                 // Safety: model_path is a valid null-terminated C string.
                 let ctx = unsafe {
-                    pf_init(
+                    pf_load(
                         model_path.as_ptr(),
                         std::ptr::null(), // device: NULL → library default (cpu)
                         0,               // n_threads: 0 → library default
@@ -206,7 +215,7 @@ mod inner {
 
                 if ctx.is_null() {
                     log::warn!(
-                        "privacy_filter: pf_init returned null — \
+                        "privacy_filter: pf_load returned null — \
                          model missing or path incorrect"
                     );
                     return None;
@@ -247,19 +256,24 @@ mod inner {
             .lock()
             .map_err(|e| format!("Privacy Filter mutex poisoned: {e}"))?;
 
+        // pf_classify does not require null termination (takes explicit len),
+        // but CString is still used to satisfy *const c_char type. The byte
+        // slice length is passed separately.
         let c_text = CString::new(text)
             .map_err(|e| format!("text contains interior null byte: {e}"))?;
+        let text_len = text.len();
 
         let mut out_ptr: *mut PfEntity = std::ptr::null_mut();
         let mut n: libc::size_t = 0;
 
         // Safety: ctx is valid (initialised in get_or_init, freed only on Drop).
-        // c_text is a valid null-terminated string. out_ptr and n are valid
-        // stack locations for the output parameters.
+        // c_text is a valid C string; text_len matches the original str length.
+        // out_ptr and n are valid stack locations for the output parameters.
         let rc = unsafe {
             pf_classify(
                 guard.ctx,
                 c_text.as_ptr(),
+                text_len as libc::size_t,
                 threshold as libc::c_float,
                 &mut out_ptr,
                 &mut n,
@@ -268,7 +282,8 @@ mod inner {
 
         if rc != 0 {
             let reason = unsafe {
-                let p = pf_last_error(guard.ctx);
+                // pf_last_error takes *const PfCtx.
+                let p = pf_last_error(guard.ctx as *const PfCtx);
                 if p.is_null() {
                     "unknown error (pf_last_error returned null)".to_owned()
                 } else {
@@ -279,8 +294,7 @@ mod inner {
         }
 
         // Decode all spans into owned Rust values before freeing the C buffer.
-        // label pointers inside PfEntity are static strings in the library —
-        // we copy them to produce fully owned PfEntityDecoded values.
+        // label pointers inside PfEntity are ctx-owned strings — copy them now.
         let entities: Vec<PfEntityDecoded> = if out_ptr.is_null() || n == 0 {
             Vec::new()
         } else {
@@ -298,13 +312,10 @@ mod inner {
                     }
                 };
 
-                // Clamp byte offsets to valid range before slicing.
-                let start = (e.start as usize).min(text_bytes.len());
-                let end   = (e.end   as usize).min(text_bytes.len());
+                // i32 offsets — clamp to valid byte range before slicing.
+                let start = (e.start.max(0) as usize).min(text_bytes.len());
+                let end   = (e.end.max(0)   as usize).min(text_bytes.len());
 
-                // from_utf8_lossy recovers partial text if the C library returns
-                // offsets that land mid-UTF-8 character (replaces invalid bytes
-                // with U+FFFD rather than discarding the span entirely).
                 let span_text = String::from_utf8_lossy(&text_bytes[start..end])
                     .into_owned();
 
@@ -318,10 +329,10 @@ mod inner {
             }).collect()
         };
 
-        // Free the C-allocated array. pf_entities_free is NULL-safe per docs,
-        // but we guard here for explicitness.
+        // Free the C-allocated array. pf_entities_free requires both pointer
+        // and count (matches pf.h signature).
         if !out_ptr.is_null() {
-            unsafe { pf_entities_free(out_ptr); }
+            unsafe { pf_entities_free(out_ptr, n); }
         }
 
         Ok(entities)
