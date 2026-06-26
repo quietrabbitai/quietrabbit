@@ -14,7 +14,7 @@
 //
 // Model path resolution (in order):
 //   1. QR_PRIVACY_FILTER_MODEL environment variable
-//   2. ~/.local/share/quietrabbit/models/privacy-filter-q8_0.gguf
+//   2. ~/.local/share/quietrabbit/models/privacy-filter-q8.gguf
 //
 // Build setup (one-time on Garuda):
 //   git clone https://github.com/localai-org/privacy-filter.cpp
@@ -175,7 +175,7 @@ mod inner {
         // 2. XDG-aligned default in user data directory.
         let home = std::env::var("HOME").ok()?;
         let path = format!(
-            "{home}/.local/share/quietrabbit/models/privacy-filter-q8_0.gguf"
+            "{home}/.local/share/quietrabbit/models/privacy-filter-q8.gguf"
         );
         CString::new(path).ok()
     }
