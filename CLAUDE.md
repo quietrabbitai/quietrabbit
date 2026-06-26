@@ -195,23 +195,12 @@ JSON examples or code blocks with literal braces matching a token name will be m
 - PG_GATE_2 latency: full response classified before any display to user
 - Ollama NDJSON stream: parse final line for {"status":"success"} before confirming
 
-## Rust/Tauri Architecture (rust-migration branch)
+## Rust/Tauri Architecture
 
 ### Branch rule (standing)
-ALL Rust work commits to `rust-migration` branch, never main.
-Python-only fixes (oracle correctness bugs only) commit to main,
-then cherry-pick to rust-migration if they affect gate behavior.
-No Rust code on main until migration is complete and Python is deleted.
-Verify branch before every commit: `git branch --show-current`
-must show rust-migration for any Rust session.
-
-### Python freeze rule (standing)
-No Python source changes during migration except critical correctness bugs
-(gate logic errors, data corruption, security issues). Cosmetic fixes,
-cleanup, and non-critical improvements are deferred until after migration.
-Any permitted Python fix requires re-extracting golden vectors for all
-affected gate paths before Rust porting of those paths continues.
-Chat-PM must approve any Python change during migration before it is made.
+Migration complete (D6-339, June 21 2026). ALL commits → main. Only branch: main.
+The rust-migration branch is retired — do not use it.
+Verify before every commit: `git branch --show-current` must show main.
 
 ### Project structure
 src-tauri/ lives at repo root (Option A — D6-339).
@@ -221,8 +210,7 @@ src-tauri/ lives at repo root (Option A — D6-339).
   src-tauri/src/main.rs      — async entry point (#[tokio::main])
   src-tauri/src/lib.rs       — library root; mod declarations go here
   src-tauri/icons/           — app icons (placeholder until branding pass)
-Rust dev runs locally on Garuda via cargo — NOT in Docker.
-Docker is Python/Flask only and will be retired when migration is complete.
+Rust dev runs locally on Garuda via cargo. Python backend retired (commit a27a2b1).
 
 ### Async runtime (D6-341)
 Tokio async runtime. All Conductor modules are async.
