@@ -11,7 +11,17 @@
 //   Returns "not_found" if the run has not yet produced output.
 // cancel_run: writes status='cancelled' to focus_runs via cancel_focus_run()
 //   (D6-352). No-op if already terminal. Returns RunNotFound if run unknown.
-// resume_run: STUB — snapshot replay not yet wired. Returns not_implemented.
+// resume_run: routes by focus_run status. For awaiting_extract_confirm:
+//   crash-recovery replay, then re-emit if pending > 0, or not_implemented
+//   if pending == 0 (output() is owned by submit_extract_confirm, not here).
+//   Other statuses: returns not_implemented (stub unchanged).
+//
+// Lifecycle ownership for awaiting_extract_confirm (item 20):
+//   resume_run() = crash recovery + UI rehydration only.
+//   The transition awaiting_extract_confirm -> output() -> complete is owned
+//   by submit_extract_confirm (commands/consent.rs) while the original FocusRun
+//   actor is still resident. resume_run() never calls output().
+//   Full snapshot replay for resume_run() is deferred post-Release-1.
 //
 // is_fast_lane: always false at IPC boundary (Phase 2 "Promote to Focus"
 //   pre-population per CLAUDE.md). Oracle default: False.
@@ -56,6 +66,14 @@ pub struct GetRunOutputResponse {
     pub sensitivity: String,
 }
 
+#[derive(Debug, Deserialize, Type)]
+pub struct ResumeRunRequest {
+    pub run_id: String,
+    pub user_id: String,
+    pub persona_id: String,
+    pub key_hex: String,
+}
+
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
@@ -93,7 +111,7 @@ pub async fn submit_focus_run(
         .ok_or_else(|| "run_id not set after authorize".to_string())?;
 
     // Spawn execute_full() in the background. Failures are logged and surfaced
-    // as push events inside execute_full() — they do not panic.
+    // as push events inside execute_full() -- they do not panic.
     tokio::spawn(async move {
         let _result = run.execute_full().await;
     });
@@ -132,8 +150,124 @@ pub async fn cancel_run(
         .map_err(|e| e.to_string())
 }
 
-/// STUB — resume requires snapshot replay, not yet wired.
+/// Resume a paused focus run.
+///
+/// awaiting_extract_confirm routing:
+///   1. Crash-recovery replay: rows with status='confirmed' AND persisted_at IS NULL
+///      -> replay persist_confirmed_field() + set_persisted_at() using persisted
+///      sensitivity (never recomputed -- see load_unrecovered_rows() doc).
+///   2. If pending > 0: re-emit extract_confirm_request push event and return.
+///   3. If pending == 0: all candidates decided. output() is called by
+///      submit_extract_confirm once the user submits decisions -- not from here.
+///      Full snapshot replay for this path is deferred post-Release-1.
+///
+/// Other statuses: returns not_implemented (stub behaviour unchanged).
 #[tauri::command]
-pub async fn resume_run(_run_id: String) -> Result<String, String> {
+pub async fn resume_run(
+    app_handle: tauri::AppHandle,
+    _scheduler: tauri::State<'_, Arc<ConductorScheduler>>,
+    request: ResumeRunRequest,
+) -> Result<String, String> {
+    use crate::conductor::extract;
+    use crate::conductor::privacy::types::ExtractedCandidate as IpcCandidate;
+    use crate::persistence::output_store::get_focus_run_status;
+    use tauri::Emitter;
+
+    let status = get_focus_run_status(
+        &request.user_id,
+        &request.persona_id,
+        &request.key_hex,
+        &request.run_id,
+    )
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| "not_found".to_string())?;
+
+    if status != "awaiting_extract_confirm" {
+        return Err("not_implemented".to_string());
+    }
+
+    // Step 1: crash-recovery replay.
+    // Sensitivity read from persisted state -- never recomputed.
+    let unrecovered = extract::load_unrecovered_rows(
+        &request.user_id,
+        &request.persona_id,
+        &request.key_hex,
+        &request.run_id,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    for (candidate_id, field_name, confirmed_value, sensitivity) in unrecovered {
+        extract::persist_confirmed_field(
+            &request.user_id,
+            &request.persona_id,
+            &request.key_hex,
+            &field_name,
+            &confirmed_value,
+            &sensitivity,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+        extract::set_persisted_at(
+            &request.user_id,
+            &request.persona_id,
+            &request.key_hex,
+            candidate_id,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+
+    // Step 2: check pending count.
+    let pending = extract::count_pending(
+        &request.user_id,
+        &request.persona_id,
+        &request.key_hex,
+        &request.run_id,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if pending > 0 {
+        // Re-emit extract_confirm_request with current pending candidates.
+        let candidates = extract::load_pending_candidates(
+            &request.user_id,
+            &request.persona_id,
+            &request.key_hex,
+            &request.run_id,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+        let ipc_candidates: Vec<IpcCandidate> = candidates
+            .into_iter()
+            .map(|c| IpcCandidate {
+                candidate_id: c.id,
+                field_name: c.field_name,
+                extracted_value: c.extracted_value,
+                sensitivity: c.sensitivity,
+                reason: c.reason,
+                confidence: c.confidence,
+                warn_flag: c.warn_flag,
+            })
+            .collect();
+
+        let payload = serde_json::json!({
+            "run_id": request.run_id,
+            "candidates": serde_json::to_value(&ipc_candidates)
+                .unwrap_or(serde_json::json!([])),
+        });
+        if let Err(e) = app_handle.emit("extract_confirm_request", &payload) {
+            log::warn!("resume_run: emit extract_confirm_request failed: {e}");
+        }
+        return Ok(request.run_id);
+    }
+
+    // Step 3: pending == 0. All candidates decided.
+    // output() transition is owned by submit_extract_confirm while the original
+    // FocusRun actor is still resident. Snapshot replay for resume_run() on this
+    // path is deferred post-Release-1.
     Err("not_implemented".to_string())
 }

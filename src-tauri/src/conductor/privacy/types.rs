@@ -257,3 +257,53 @@ pub struct ElementDecision {
     /// None if the user accepted the suggestion without modification.
     pub user_modified_text: Option<String>,
 }
+
+// -- Extract-and-confirm IPC types --------------------------------------------
+//
+// These types cross the Tauri IPC boundary for the extract-and-confirm flow
+// (item 20). Both derive specta::Type for TypeScript generation.
+//
+// ExtractedCandidate: emitted in the extract_confirm_request push event payload.
+// ExtractConfirmDecision: received per candidate in submit_extract_confirm.
+
+/// A single extraction candidate surfaced to the frontend for confirmation.
+/// Emitted as part of the extract_confirm_request push event payload.
+/// candidate_id is i64 (INTEGER PRIMARY KEY in extract_confirm_candidates).
+#[derive(Debug, Clone, Serialize, specta::Type)]
+pub struct ExtractedCandidate {
+    /// Row id in extract_confirm_candidates. i64 matches INTEGER PRIMARY KEY.
+    pub candidate_id:    i64,
+    pub field_name:      String,
+    pub extracted_value: String,
+    /// Sensitivity tier: "medical" | "financial" | "personal".
+    pub sensitivity:     String,
+    /// One sentence explaining why this fact was extracted.
+    pub reason:          Option<String>,
+    /// Confidence in [0.6, 1.0] -- values below 0.6 are suppressed pre-persist.
+    pub confidence:      f64,
+    /// True when confidence is in the 0.6-0.8 warn band.
+    /// Frontend should surface a lower-confidence indicator for these candidates.
+    pub warn_flag:       bool,
+}
+
+/// The user's decision for a single extraction candidate.
+/// Received from the frontend via submit_extract_confirm.
+///
+/// confirmed_value must be Some(String) when confirmed == true.
+/// Violation of this invariant is treated as a command validation error:
+/// submit_extract_confirm rejects the entire call before any DB mutation.
+///
+/// extracted_value is included for audit provenance -- preserved alongside
+/// confirmed_value so the original extraction is never lost even when the
+/// user edits before confirming.
+#[derive(Debug, Clone, Deserialize, specta::Type)]
+pub struct ExtractConfirmDecision {
+    /// Matches ExtractedCandidate.candidate_id.
+    pub candidate_id:    i64,
+    /// True if the user accepted this candidate for storage.
+    pub confirmed:       bool,
+    /// The original extracted value (audit provenance -- always required).
+    pub extracted_value: String,
+    /// The value the user accepted, possibly edited. Must be Some when confirmed == true.
+    pub confirmed_value: Option<String>,
+}

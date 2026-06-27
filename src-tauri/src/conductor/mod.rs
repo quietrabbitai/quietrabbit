@@ -2,6 +2,7 @@
 
 pub mod concurrency;
 pub mod executor;
+pub mod extract;
 pub mod failure;
 pub mod lifecycle;
 pub mod memory_broker;

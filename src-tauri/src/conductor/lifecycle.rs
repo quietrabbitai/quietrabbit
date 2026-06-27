@@ -1380,6 +1380,141 @@ impl FocusRun {
             return Ok(early_result);
         }
 
+        // Phase 4 complete. Run extraction pass before Phase 5 OUTPUT.
+        // extract_candidates() is fail-open: parse/model errors return empty vec.
+        // If candidates found: persist, emit push event, park as awaiting_extract_confirm.
+        // If no candidates: proceed directly to output().
+        let step_outputs: Vec<(String, String)> = self
+            .task_track
+            .as_ref()
+            .map(|tt| {
+                tt.steps()
+                    .iter()
+                    .map(|s| (s.step_id.clone(), s.content.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Build excluded fields: focus field_requirements + existing personal.db field names.
+        // Field names only — values never leave the PersonalTrack boundary.
+        // Deduplicated via HashSet to avoid redundant model prompt context.
+        let excluded_fields: Vec<String> = {
+            use std::collections::HashSet;
+            use crate::persistence::personal_store::list_personal_fields;
+
+            let key_hex = self.key_hex.as_deref().ok_or(LifecycleError::NoKey)?;
+
+            let focus_fields: Vec<String> = self
+                .focus_def
+                .as_ref()
+                .map(|fd| {
+                    fd.steps
+                        .iter()
+                        .flat_map(|s| s.field_requirements.keys().cloned())
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let existing: Vec<String> = list_personal_fields(
+                &self.user_id,
+                &self.persona_id,
+                key_hex,
+                None,
+                None,
+            )
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|f| f.field_name)
+            .collect();
+
+            focus_fields
+                .into_iter()
+                .chain(existing)
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect()
+        };
+
+        let ollama = crate::providers::ollama_client::OllamaClient::new();
+        let candidates =
+            crate::conductor::extract::extract_candidates(&step_outputs, &excluded_fields, &ollama)
+                .await;
+
+        if !candidates.is_empty() {
+            // Invariant: focus_run_id must be set by AUTHORIZE before we reach here.
+            let focus_run_id = self
+                .focus_run_id
+                .clone()
+                .ok_or_else(|| LifecycleError::ValidationFailed(
+                    "focus_run_id missing during extraction pass".to_owned(),
+                ))?;
+            let key_hex = self
+                .key_hex
+                .clone()
+                .ok_or(LifecycleError::NoKey)?;
+
+            // Persist candidates to outputs.db.
+            // INVARIANT: persist_candidates() returns ids in the same order as
+            // the input candidates slice. zip() below relies on this ordering.
+            // If persist_candidates() is ever refactored to batch or reorder,
+            // update it to return Vec<(i64, ExtractCandidate)> instead.
+            let persisted_ids = crate::conductor::extract::persist_candidates(
+                &self.user_id,
+                &self.persona_id,
+                &key_hex,
+                &focus_run_id,
+                &candidates,
+            )
+            .await
+            .map_err(LifecycleError::Database)?;
+
+            // Build IPC payload and emit push event.
+            use crate::conductor::privacy::types::ExtractedCandidate as IpcCandidate;
+            let ipc_candidates: Vec<IpcCandidate> = candidates
+                .iter()
+                .zip(persisted_ids.iter())
+                .map(|(c, &id)| IpcCandidate {
+                    candidate_id: id,
+                    field_name: c.field_name.clone(),
+                    extracted_value: c.extracted_value.clone(),
+                    sensitivity: c.sensitivity.clone(),
+                    reason: c.reason.clone(),
+                    confidence: c.confidence,
+                    warn_flag: c.warn_flag,
+                })
+                .collect();
+
+            if let Some(handle) = &self.app_handle {
+                use tauri::Emitter;
+                let payload = serde_json::json!({
+                    "run_id": focus_run_id,
+                    "focus_id": self.focus_id,
+                    "candidates": serde_json::to_value(&ipc_candidates)
+                        .unwrap_or(serde_json::json!([])),
+                });
+                if let Err(e) = handle.emit("extract_confirm_request", &payload) {
+                    log::warn!("lifecycle: emit extract_confirm_request failed: {e}");
+                }
+            }
+
+            // Park the run — frontend must call submit_extract_confirm to resume.
+            // cleanup("awaiting_extract_confirm") releases tracks without purging
+            // snapshots — run remains resumable. See cleanup() for purge policy.
+            self.write_focus_run_record("awaiting_extract_confirm").await?;
+            self.emit_status("awaiting_extract_confirm", None);
+            self.cleanup("awaiting_extract_confirm").await;
+
+            return Ok(RunResult {
+                focus_run_id,
+                status: "awaiting_extract_confirm".to_owned(),
+                output_id: None,
+                output_content: None,
+                failure: None,
+            });
+        }
+
+        // No candidates — proceed directly to Phase 5 OUTPUT.
         let result = self.output().await?;
         self.cleanup("complete").await;
         Ok(result)
