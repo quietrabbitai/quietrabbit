@@ -677,6 +677,52 @@ pub async fn count_pending(
 }
 
 // ---------------------------------------------------------------------------
+// CandidateFields
+// ---------------------------------------------------------------------------
+
+/// Typed return from get_candidate_fields().
+/// Avoids tuple field-order bugs at call sites in submit_extract_confirm.
+pub struct CandidateFields {
+    pub field_name:  String,
+    pub sensitivity: String,
+}
+
+// ---------------------------------------------------------------------------
+// get_candidate_fields
+// ---------------------------------------------------------------------------
+
+/// Fetch field_name and sensitivity for a candidate by id.
+/// Used by submit_extract_confirm to source these values from the DB rather
+/// than trusting the frontend -- prevents a caller from substituting a
+/// different field_name or downgrading the sensitivity classification.
+/// Returns None if the candidate row does not exist.
+pub async fn get_candidate_fields(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    candidate_id: i64,
+) -> Result<Option<CandidateFields>, sqlx::Error> {
+    let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
+
+    let row = sqlx::query(
+        "SELECT field_name, sensitivity
+         FROM extract_confirm_candidates
+         WHERE id = ?",
+    )
+    .bind(candidate_id)
+    .fetch_optional(&mut conn)
+    .await?;
+
+    match row {
+        None => Ok(None),
+        Some(r) => Ok(Some(CandidateFields {
+            field_name:  r.try_get("field_name")?,
+            sensitivity: r.try_get("sensitivity")?,
+        })),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

@@ -342,6 +342,27 @@ pub async fn cancel_focus_run(
     Ok(())
 }
 
+/// Update focus_runs.status to an arbitrary value.
+/// Used by submit_extract_confirm to set status='complete' after all
+/// candidate decisions are written and verified.
+pub async fn set_focus_run_status(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    focus_run_id: &str,
+    status: &str,
+) -> Result<(), OutputStoreError> {
+    let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
+
+    sqlx::query("UPDATE focus_runs SET status = ? WHERE id = ?")
+        .bind(status)
+        .bind(focus_run_id)
+        .execute(&mut conn)
+        .await?;
+
+    Ok(())
+}
+
 /// Record a Gate 3 consent decision for a paused focus run (D6-352).
 /// decision: "approved" | "declined"
 /// Validated by consent_decisions CHECK constraint in outputs_006.sql.

@@ -1380,10 +1380,9 @@ impl FocusRun {
             return Ok(early_result);
         }
 
-        // Phase 4 complete. Run extraction pass before Phase 5 OUTPUT.
-        // extract_candidates() is fail-open: parse/model errors return empty vec.
-        // If candidates found: persist, emit push event, park as awaiting_extract_confirm.
-        // If no candidates: proceed directly to output().
+        // Capture step outputs while task_track is still live.
+        // cleanup() later releases task_track, so extraction input
+        // must be captured before output() completes.
         let step_outputs: Vec<(String, String)> = self
             .task_track
             .as_ref()
@@ -1395,8 +1394,15 @@ impl FocusRun {
             })
             .unwrap_or_default();
 
+        // Phase 5 OUTPUT -- runs unconditionally before the extract pass.
+        // output() saves content, writes run_history, and sets status='awaiting_feedback'.
+        // If candidates found below, cleanup("awaiting_extract_confirm") overwrites that.
+        // If no candidates, cleanup("complete") overwrites to 'complete'.
+        // Either way, output content is correctly saved before parking or completion.
+        let output_result = self.output().await?;
+
         // Build excluded fields: focus field_requirements + existing personal.db field names.
-        // Field names only — values never leave the PersonalTrack boundary.
+        // Field names only -- values never leave the PersonalTrack boundary.
         // Deduplicated via HashSet to avoid redundant model prompt context.
         let excluded_fields: Vec<String> = {
             use std::collections::HashSet;
@@ -1498,26 +1504,26 @@ impl FocusRun {
                 }
             }
 
-            // Park the run — frontend must call submit_extract_confirm to resume.
-            // cleanup("awaiting_extract_confirm") releases tracks without purging
-            // snapshots — run remains resumable. See cleanup() for purge policy.
-            self.write_focus_run_record("awaiting_extract_confirm").await?;
-            self.emit_status("awaiting_extract_confirm", None);
+            // Park the run -- frontend must call submit_extract_confirm to resume.
+            // cleanup("awaiting_extract_confirm") overwrites 'awaiting_feedback' to
+            // 'awaiting_extract_confirm', releases tracks, and preserves snapshots
+            // (not in the purge set). Output content and run_history already saved.
+            // submit_extract_confirm will set status='complete' when decisions are written.
             self.cleanup("awaiting_extract_confirm").await;
 
             return Ok(RunResult {
                 focus_run_id,
                 status: "awaiting_extract_confirm".to_owned(),
-                output_id: None,
-                output_content: None,
+                output_id: output_result.output_id,
+                output_content: output_result.output_content,
                 failure: None,
             });
         }
 
-        // No candidates — proceed directly to Phase 5 OUTPUT.
-        let result = self.output().await?;
+        // No candidates -- output already saved. cleanup("complete") overwrites
+        // 'awaiting_feedback' to 'complete' and purges snapshots.
         self.cleanup("complete").await;
-        Ok(result)
+        Ok(output_result)
     }
 }
 

@@ -2,7 +2,7 @@
 //
 // Group 2 — Consent and privacy gates.
 // Commands: submit_consent_decision, submit_floor_consent_decision,
-//           submit_element_consent_decision.
+//           submit_element_consent_decision, submit_extract_confirm.
 //
 // submit_consent_decision: records a Gate 3 cross-tier promotion decision.
 //   The frontend receives a consent_request push event, presents the UI,
@@ -20,9 +20,13 @@
 //
 // submit_element_consent_decision: records per-element Privacy Guardian decisions
 //   (D6-362). The frontend serializes Vec<ElementDecision> to JSON and passes it
-//   as decisions_json — the IPC boundary carries a plain String, keeping the
+//   as decisions_json -- the IPC boundary carries a plain String, keeping the
 //   command layer free of Conductor type imports.
 //   BLOCKED until outputs_007 migration (CHECK constraint extension). Returns Err.
+//
+// submit_extract_confirm: processes user decisions for extracted personal field
+//   candidates (item 20). Validates, writes confirmed fields to personal.db,
+//   marks candidates decided, then sets status='complete'.
 //
 // All commands are fire-and-respond: lifecycle checks consent_decisions when
 // the run is resumed. No direct signalling into the background task.
@@ -32,7 +36,10 @@ use specta::Type;
 use sqlx::ConnectOptions;
 use sqlx::Row;
 
+use crate::conductor::extract;
+use crate::conductor::privacy::types::ExtractConfirmDecision;
 use crate::persistence::output_store;
+use crate::persistence::output_store::{get_focus_run_status, set_focus_run_status};
 use crate::providers::utils::{connect_options_unencrypted, db_path_shared, now};
 
 // ---------------------------------------------------------------------------
@@ -72,8 +79,22 @@ pub struct SubmitElementConsentDecisionRequest {
     /// Expected shape per element:
     ///   { "span_id": string, "decision": "generalize"|"keep_private"|"release_original",
     ///     "suggestion_text": string|null, "user_modified_text": string|null }
-    /// The command layer does not deserialize this — it is passed through to
+    /// The command layer does not deserialize this -- it is passed through to
     /// write_element_consent_decisions() as-is (D6-362 IPC boundary rule).
+    pub decisions_json: String,
+}
+
+#[derive(Debug, Deserialize, Type)]
+pub struct SubmitExtractConfirmRequest {
+    pub run_id:         String,
+    pub user_id:        String,
+    pub persona_id:     String,
+    pub key_hex:        String,
+    /// JSON-serialized Vec<ExtractConfirmDecision>.
+    /// Shape per element:
+    ///   { "candidate_id": i64, "confirmed": bool,
+    ///     "extracted_value": string, "confirmed_value": string|null }
+    /// confirmed_value must be non-null when confirmed==true.
     pub decisions_json: String,
 }
 
@@ -114,7 +135,7 @@ pub async fn submit_floor_consent_decision(
     .map_err(|e| e.to_string())?;
 
     // If user chose to save, write standing preference to personas.extra_metadata
-    // in shared.db (D5-152). Scoped to abstraction_tier — not a blanket consent.
+    // in shared.db (D5-152). Scoped to abstraction_tier -- not a blanket consent.
     if request.save_preference && request.decision == "proceed" {
         write_floor_consent_preference(
             &request.persona_id,
@@ -142,6 +163,221 @@ pub async fn submit_element_consent_decision(
     .map_err(|e| e.to_string())
 }
 
+/// Process user decisions for extract-and-confirm candidates (item 20).
+///
+/// Validation: confirmed==true with confirmed_value==None rejects entire call
+/// before any DB mutation (IPC contract violation).
+///
+/// Processing set: pending candidates + confirmed-but-unpersisted (crash-recovery
+/// targets). Both are included so retries can complete interrupted work.
+///
+/// Write sequence per confirmed pending candidate:
+///   1. get_candidate_fields()    -> read field_name + sensitivity from outputs.db
+///   2. persist_confirmed_field() -> COMMIT personal.db (idempotent upsert)
+///   3. mark_candidate_decided()  -> COMMIT outputs.db (sets confirmed_at)
+///   4. set_persisted_at()        -> COMMIT outputs.db
+///
+/// Ordering rationale: personal.db write first so that on retry, if step 3/4
+/// failed, we re-attempt an idempotent upsert rather than leaving candidate
+/// marked decided with no persisted field.
+///
+/// After all decisions: verify no confirmed-but-unpersisted rows remain,
+/// then set focus_runs.status='complete' and emit run_status_update.
+#[tauri::command]
+pub async fn submit_extract_confirm(
+    app_handle: tauri::AppHandle,
+    request: SubmitExtractConfirmRequest,
+) -> Result<(), String> {
+    use tauri::Emitter;
+
+    // Verify run is in the expected state.
+    let status = get_focus_run_status(
+        &request.user_id,
+        &request.persona_id,
+        &request.key_hex,
+        &request.run_id,
+    )
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| "not_found".to_string())?;
+
+    if status != "awaiting_extract_confirm" {
+        return Err(format!(
+            "run {} is not awaiting_extract_confirm (status: {})",
+            request.run_id, status
+        ));
+    }
+
+    // Deserialize decisions.
+    let decisions: Vec<ExtractConfirmDecision> =
+        serde_json::from_str(&request.decisions_json)
+            .map_err(|e| format!("decisions_json parse error: {e}"))?;
+
+    // Validation pass: reject entire call before any DB mutation.
+    for d in &decisions {
+        if d.confirmed && d.confirmed_value.is_none() {
+            return Err(format!(
+                "candidate {} has confirmed=true but confirmed_value is None \
+                 -- call rejected (IPC contract violation)",
+                d.candidate_id
+            ));
+        }
+    }
+
+    // Build processing set: pending candidates + confirmed-but-unpersisted
+    // (crash-recovery targets). Both need work; idempotency handles safe retry.
+    let pending_candidates = extract::load_pending_candidates(
+        &request.user_id,
+        &request.persona_id,
+        &request.key_hex,
+        &request.run_id,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let unrecovered_before = extract::load_unrecovered_rows(
+        &request.user_id,
+        &request.persona_id,
+        &request.key_hex,
+        &request.run_id,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut needs_work_ids: std::collections::HashSet<i64> =
+        pending_candidates.iter().map(|c| c.id).collect();
+    // Also include confirmed-but-unpersisted so retries can complete them.
+    for (candidate_id, _, _, _) in &unrecovered_before {
+        needs_work_ids.insert(*candidate_id);
+    }
+
+    // Write sequence for each decision.
+    for d in &decisions {
+        if !needs_work_ids.contains(&d.candidate_id) {
+            log::debug!(
+                "submit_extract_confirm: candidate {} already complete, skipping",
+                d.candidate_id
+            );
+            continue;
+        }
+
+        if d.confirmed {
+            // Step 1: read field_name + sensitivity from DB (never trust frontend).
+            let fields = extract::get_candidate_fields(
+                &request.user_id,
+                &request.persona_id,
+                &request.key_hex,
+                d.candidate_id,
+            )
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!(
+                "candidate {} not found during confirmation",
+                d.candidate_id
+            ))?;
+
+            // Step 2: write to personal.db first (idempotent upsert).
+            // Ordered before mark_decided so retry after step 3/4 failure
+            // re-attempts an idempotent upsert, not a ghost decided state.
+            extract::persist_confirmed_field(
+                &request.user_id,
+                &request.persona_id,
+                &request.key_hex,
+                &fields.field_name,
+                d.confirmed_value
+                    .as_deref()
+                    .ok_or_else(|| format!(
+                        "candidate {} confirmed_value is None after validation \
+                         -- invariant violated",
+                        d.candidate_id
+                    ))?,
+                &fields.sensitivity,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+
+            // Step 3: mark decided in outputs.db.
+            extract::mark_candidate_decided(
+                &request.user_id,
+                &request.persona_id,
+                &request.key_hex,
+                d.candidate_id,
+                true,
+                d.confirmed_value.as_deref(),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+
+            // Step 4: mark persisted in outputs.db.
+            extract::set_persisted_at(
+                &request.user_id,
+                &request.persona_id,
+                &request.key_hex,
+                d.candidate_id,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        } else {
+            // Declined: mark decided only, no personal.db write.
+            extract::mark_candidate_decided(
+                &request.user_id,
+                &request.persona_id,
+                &request.key_hex,
+                d.candidate_id,
+                false,
+                None,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+    }
+
+    // Post-loop guard: verify no confirmed-but-unpersisted rows remain.
+    // If any exist, a step 3/4 failure occurred. Return Err so frontend can
+    // retry -- status stays awaiting_extract_confirm.
+    let unrecovered_after = extract::load_unrecovered_rows(
+        &request.user_id,
+        &request.persona_id,
+        &request.key_hex,
+        &request.run_id,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if !unrecovered_after.is_empty() {
+        return Err(format!(
+            "submit_extract_confirm: {} candidate(s) confirmed but not persisted \
+             -- retry required",
+            unrecovered_after.len()
+        ));
+    }
+
+    // All decisions written and verified. Set run status to complete.
+    set_focus_run_status(
+        &request.user_id,
+        &request.persona_id,
+        &request.key_hex,
+        &request.run_id,
+        "complete",
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // Emit run_status_update so frontend knows the run is done.
+    let payload = serde_json::json!({
+        "focus_run_id": request.run_id,
+        "status": "complete",
+        "current_step": 0,
+        "total_steps": 0,
+        "step_display_name": serde_json::Value::Null,
+    });
+    if let Err(e) = app_handle.emit("run-status-update", &payload) {
+        log::warn!("submit_extract_confirm: emit run-status-update failed: {e}");
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -152,7 +388,7 @@ pub async fn submit_element_consent_decision(
 ///    "consent_timestamp": "...", "consent_version": "1"}
 /// shared.db is unencrypted (instance-level, not per-persona encrypted).
 ///
-/// extra_metadata is fetched as Option<String> — the column may be NULL for
+/// extra_metadata is fetched as Option<String> -- the column may be NULL for
 /// newly created personas. A NULL or malformed value is treated as an empty
 /// object so the preference write proceeds without data loss.
 async fn write_floor_consent_preference(
@@ -172,7 +408,7 @@ async fn write_floor_consent_preference(
         "consent_version": "1"
     });
 
-    // Fetch as Option<String> — NULL extra_metadata is valid for new personas.
+    // Fetch as Option<String> -- NULL extra_metadata is valid for new personas.
     let existing_json: Option<String> = sqlx::query(
         "SELECT extra_metadata FROM personas WHERE id = ?",
     )

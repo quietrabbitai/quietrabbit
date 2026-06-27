@@ -79,6 +79,7 @@ async fn main() {
             commands::consent::submit_consent_decision,
             commands::consent::submit_floor_consent_decision,
             commands::consent::submit_element_consent_decision,
+            commands::consent::submit_extract_confirm,
             // Group 3 -- Onboarding
             commands::onboarding::get_onboarding_focus_suggestions,
             commands::onboarding::submit_onboarding_persona_selection,
