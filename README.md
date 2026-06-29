@@ -66,16 +66,9 @@ this repo or https://quietrabbit.ai for updates.*
 
 ## Built-in Focuses
 
-| Focus | What it does |
-|---|---|
-| ✍️ Writing Assistant | Business writing, personal correspondence, any format |
-| 🛍️ Research & Buy | Requirements → research → pricing and where to buy |
-| 💼 Job Match | Analyze a posting, match your resume, draft a cover letter |
-| 🖥️ Tech Support | Computer and homelab troubleshooting, step-by-step |
-| 🍳 Cooking | Recipe research, meal planning, nutrition |
-| ✈️ Travel & Vacation | Trip research, itinerary, packing guidance |
-| 💰 Personal Finance | Budgeting, spending analysis — local only, always private |
-| ⚡ Quick Ask | Fast single-stage output — no friction, no tracking |
+Quiet Rabbit ships with a set of built-in Focuses covering everyday pursuits — writing, research, cooking, travel, reading, and more. Each one runs structured, context-aware workflows that improve the more you use them.
+
+The full Focus list will be published when the first release is ready.
 
 ---
 
@@ -93,7 +86,6 @@ this repo or https://quietrabbit.ai for updates.*
 
 Quiet Rabbit is built around one idea: your AI should fit your life, not the other way around.
 
-- Simple to start — one command, guided setup, no expertise required
 - Built to grow — Focuses, Guides, and Personas expand at your pace
 - Always yours — your hardware, your data, your control
 - Self-improving — surfaces suggestions, never acts without your approval
