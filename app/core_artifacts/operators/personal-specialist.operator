@@ -1,18 +1,20 @@
 # app/core_artifacts/operators/personal-specialist.operator
-# Personal Specialist — Layer 1 system operator.
+# Personal Context Operator — Layer 1 system operator.
 # Always active. Never declared in .focus files — instantiated automatically
 # during Phase 3 INITIALIZE for every focus run.
 # Type: operator (system-only, never community-shareable).
+# Updated: June 28, 2026 — terminology updated (D6-289–D6-303).
 #
 # This file is a role definition and system contract only.
 # No executable logic. No runtime policy enforcement here.
 # Runtime field loading is dynamic from personal.db by source_id.
-# Abstraction policies are enforced by PrivacyGateway (conductor/privacy.py).
-# Export ceiling is enforced by personal_store.py (EXPORT_SENSITIVITY_CEILING = 2).
+# Abstraction policies are enforced by the Privacy Guardian (conductor/privacy.rs).
+# Export ceiling enforced by personal_store.rs.
+# User-facing name: "What QR knows about you" — never "Personal Specialist".
 
 operator_id: personal-specialist
-display_name: Personal Specialist
-version: "1.0"
+display_name: "What QR knows about you"
+version: "1.1"
 layer: 1
 always_active: true
 declared_in_focuses: false
@@ -37,7 +39,7 @@ field_categories_reference:
   - location        # city, country, timezone
   - work            # employer, job title, industry, years experience
   - communication   # preferred tone, formality, directness
-  - life_context    # household size, life stage, relevant situation
+  - persona_context # household size, life stage, relevant situation
   - health          # conditions, medications, dietary restrictions
   - finance         # income range, financial goals, obligations
 
@@ -75,7 +77,7 @@ abstraction_policy_reference:
 #   financial: severity 4 -- salary, accounts, financial obligations
 
 # Export policy (D5-080).
-# Enforced by: personal_store.py constant EXPORT_SENSITIVITY_CEILING = 2
+# Enforced by: personal_store.rs EXPORT_SENSITIVITY_CEILING = 2
 # Fields with sensitivity_severity > 2 (medical, financial) are never
 # exported. This is a system invariant, not a user preference.
 # No override mechanism exists in Release 1.
@@ -87,13 +89,13 @@ export_policy:
 # Precedence levels (ascending -- higher number wins by overwriting lower):
 #   1 = model_baseline      (this file -- lowest authority)
 #   2 = guide_defaults      (focus-level tone guidance)
-#   3 = global              (user preference across all lives)
-#   4 = life                (life-specific override)
+#   3 = global              (user preference across all personas)
+#   4 = persona             (persona-specific override)
 #   5 = writing_context     (step-level override -- highest authority)
 voice_profile_resolution: overwrite_by_precedence
 
 # Baseline voice profile -- precedence level 1 (lowest).
-# Written to voice_profiles table with precedence=1 during CLI interview.
+# Written to voice_profiles table with precedence=1 during onboarding.
 # All higher-precedence entries in personal.db override these values.
 voice_profile_baseline:
   tone: neutral
