@@ -216,3 +216,8 @@ Port gates FIRST before anything else.
 Edition: 2021. One Cargo.toml at src-tauri/.
 thiserror for all error types.
 indexmap (not HashMap) wherever gate policy dispatch requires insertion-order determinism.
+
+### Secrets (relocated from Chat-PM standing rule 50, D6-529)
+API keys and credentials are NEVER hardcoded in source or committed files.
+Values live in .env only (gitignored). This applies to every session touching
+this repo, human or AI.
