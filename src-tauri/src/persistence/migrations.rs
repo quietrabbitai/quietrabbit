@@ -100,6 +100,8 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/personal_004.sql") },
     SchemaFile { prefix: "personal", version: 6,
         sql: include_str!("../../schema/personal_006.sql") },
+    SchemaFile { prefix: "personal", version: 7,
+        sql: include_str!("../../schema/personal_007.sql") },
     SchemaFile { prefix: "plan_state", version: 1,
         sql: include_str!("../../schema/plan_state_001.sql") },
     SchemaFile { prefix: "plan_state", version: 2,
@@ -436,10 +438,20 @@ async fn run_pending(
 
             // Record the applied version inside the SAVEPOINT so that schema
             // content and tracking record commit or rollback atomically.
-            sqlx::query("INSERT INTO schema_version (version) VALUES (?)")
-                .bind(version as i64)
-                .execute(&mut *conn)
-                .await?;
+            // OR IGNORE: each schema file's own trailing INSERT (see
+            // SCHEMA AUTHORING convention) already seeds this row with a
+            // real applied_at/description; this bookkeeping insert is a
+            // fallback for the rare file that omits its own seed row, and
+            // must not fail with NOT NULL when the file already inserted it.
+            sqlx::query(
+                "INSERT OR IGNORE INTO schema_version (version, applied_at, description) \
+                 VALUES (?, ?, ?)",
+            )
+            .bind(version as i64)
+            .bind(now())
+            .bind(format!("{prefix} v{version}"))
+            .execute(&mut *conn)
+            .await?;
 
             sqlx::query(&format!("RELEASE {savepoint}"))
                 .execute(&mut *conn)
