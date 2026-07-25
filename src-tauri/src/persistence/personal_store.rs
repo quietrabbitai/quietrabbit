@@ -550,6 +550,165 @@ pub async fn delete_personal_field(
 }
 
 // ---------------------------------------------------------------------------
+// Entity facts (write) — Cross-Persona Data Provenance
+// decisions.id=546, items.id=27. Schema: personal_001.sql (entity_facts,
+// consolidated 2026-07-24 from the entity-model migration + provenance
+// columns, items.id=169).
+// ---------------------------------------------------------------------------
+
+/// Insert a new entity_facts row with mandatory, immutable provenance.
+///
+/// Facts are immutable — this ALWAYS inserts a new row; it never updates an
+/// existing one. If an active fact already exists for this (entity_id,
+/// field_name) — or this singleton field_name when entity_id is None — the
+/// prior active row is superseded by setting its valid_until to this write's
+/// timestamp before the new row is inserted, preserving history rather than
+/// overwriting it. This matches the partial-unique-index design in
+/// personal_001.sql (one active row per entity+field, WHERE valid_until IS NULL)
+/// and requires no schema change.
+///
+/// source_persona_id is REQUIRED — the DB-level trigger
+/// trg_entity_facts_provenance_required rejects any insert where it's NULL,
+/// but validation happens here first for a clean application-layer error
+/// instead of a raw SQL trigger abort surfacing to the caller.
+///
+/// cross_persona_export / origin_persona_id: cross_persona_export defaults
+/// to false (0) for native/forked facts. When true, origin_persona_id is
+/// required (mirrors the DB CHECK constraint: origin_persona_id IS NULL OR
+/// cross_persona_export = 1). This function does NOT implement the
+/// per-session re-confirmation UI or the context-assembly enforcement in
+/// decisions.id=424 — those are separate, not yet built (see items.id=27
+/// remaining scope, flagged in the Chat-DEV handoff).
+///
+/// Immutability after insert (source_persona_id, cross_persona_export,
+/// origin_persona_id) is enforced by trg_entity_facts_provenance_immutable
+/// at the DB level — no application-layer UPDATE path for these three
+/// fields exists or should be added.
+///
+/// Atomic: SAVEPOINT wraps the supersede-then-insert sequence.
+#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
+pub async fn create_entity_fact_with_provenance(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    entity_id: Option<&str>,
+    field_name: &str,
+    field_value: &str,
+    sensitivity: &str,
+    source: &str,
+    source_persona_id: &str,
+    cross_persona_export: bool,
+    origin_persona_id: Option<&str>,
+    extra_metadata: Option<serde_json::Value>,
+) -> Result<String, PersonalStoreError> {
+    if !matches!(sensitivity, "general" | "personal" | "medical" | "financial") {
+        return Err(PersonalStoreError::Validation(format!(
+            "Unknown sensitivity '{sensitivity}'. \
+             Must be general, personal, medical, or financial."
+        )));
+    }
+
+    if source_persona_id.is_empty() {
+        return Err(PersonalStoreError::Validation(
+            "source_persona_id is required for every entity_facts write \
+             (decisions.id=546)."
+                .to_owned(),
+        ));
+    }
+
+    if cross_persona_export && origin_persona_id.is_none() {
+        return Err(PersonalStoreError::Validation(
+            "origin_persona_id is required when cross_persona_export is true \
+             (decisions.id=546)."
+                .to_owned(),
+        ));
+    }
+    if !cross_persona_export && origin_persona_id.is_some() {
+        return Err(PersonalStoreError::Validation(
+            "origin_persona_id must be omitted when cross_persona_export is false \
+             (decisions.id=546)."
+                .to_owned(),
+        ));
+    }
+
+    let metadata_json = serde_json::to_string(&extra_metadata.unwrap_or_default())
+        .unwrap_or_else(|_| "{}".to_owned());
+    let timestamp = crate::providers::utils::now();
+    let cross_persona_export_flag: i32 = if cross_persona_export { 1 } else { 0 };
+    let mut conn = open_personal_db(user_id, persona_id, key_hex).await?;
+
+    sqlx::query("SAVEPOINT create_entity_fact_with_provenance")
+        .execute(&mut conn)
+        .await?;
+
+    let step: Result<String, sqlx::Error> = async {
+        // Supersede any existing active fact for this entity+field (or
+        // singleton field_name when entity_id is None) — facts are
+        // immutable, so history is preserved via valid_until rather than
+        // overwritten.
+        sqlx::query(
+            "UPDATE entity_facts SET valid_until = ?
+             WHERE field_name = ? AND valid_until IS NULL
+             AND (entity_id = ? OR (entity_id IS NULL AND ? IS NULL))",
+        )
+        .bind(&timestamp)
+        .bind(field_name)
+        .bind(entity_id)
+        .bind(entity_id)
+        .execute(&mut conn)
+        .await?;
+
+        let new_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO entity_facts
+             (id, entity_id, field_name, field_value, sensitivity, source,
+              created_at, extra_metadata,
+              source_persona_id, cross_persona_export, origin_persona_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&new_id)
+        .bind(entity_id)
+        .bind(field_name)
+        .bind(field_value)
+        .bind(sensitivity)
+        .bind(source)
+        .bind(&timestamp)
+        .bind(&metadata_json)
+        .bind(source_persona_id)
+        .bind(cross_persona_export_flag)
+        .bind(origin_persona_id)
+        .execute(&mut conn)
+        .await?;
+
+        Ok(new_id)
+    }
+    .await;
+
+    match step {
+        Ok(id) => {
+            sqlx::query("RELEASE create_entity_fact_with_provenance")
+                .execute(&mut conn)
+                .await?;
+            Ok(id)
+        }
+        Err(e) => {
+            if let Err(rollback_err) = sqlx::query("ROLLBACK TO create_entity_fact_with_provenance")
+                .execute(&mut conn)
+                .await
+            {
+                log::error!(
+                    "Savepoint rollback failed in create_entity_fact_with_provenance: {rollback_err}"
+                );
+            }
+            let _ = sqlx::query("RELEASE create_entity_fact_with_provenance")
+                .execute(&mut conn)
+                .await;
+            Err(PersonalStoreError::Database(e))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Export
 // ---------------------------------------------------------------------------
 

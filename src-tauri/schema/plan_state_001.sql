@@ -1,11 +1,19 @@
 -- persistence/schema/plan_state_001.sql
--- Initial schema for plan_state.db.
--- Per-user, per-life, per-focus, per-topic encrypted database.
--- Path: /users/{user_id}/lives/{life_id}/focuses/{focus_id}/topics/{topic_id}/plan_state.db
+-- Schema for plan_state.db.
+-- Per-user, per-persona, per-focus, per-topic encrypted database.
+-- Path: /users/{user_id}/personas/{persona_id}/focuses/{focus_id}/topics/{topic_id}/plan_state.db
 -- Stores state for exactly ONE named topic pursuit.
 -- Does not carry forward when topic closes — archived or discarded per user choice.
 -- Encrypted with SQLCipher using user master key.
 -- Part of Phase B data model extension (D6-226+).
+--
+-- CONSOLIDATION NOTE (items.id=169, 2026-07-24): this file replaces the prior
+-- two-migration chain (plan_state_001 initial schema + plan_state_002 Persona
+-- rename life_id->persona_id, D6-298). Pre-release, zero shipped users --
+-- consolidated to the final column names directly rather than replaying the
+-- rename. No design history lost: both migrations were pure-rename churn,
+-- not feature content. Chat-DEV, decisions per Chat-PM/Jason adjudication
+-- of Chat-DEV handoff id=99.
 --
 -- Source of truth declaration:
 --   outputs.db topics table = authoritative source of truth for topic metadata.
@@ -51,7 +59,7 @@ CREATE TABLE IF NOT EXISTS topic_header (
     id                  INTEGER PRIMARY KEY CHECK (id = 1),
     topic_id            TEXT NOT NULL,
     focus_id            TEXT NOT NULL,
-    life_id             TEXT NOT NULL,
+    persona_id          TEXT NOT NULL,
     name                TEXT,
     placeholder_name    TEXT NOT NULL,
     lifecycle_state     TEXT NOT NULL DEFAULT 'active',
@@ -180,4 +188,4 @@ VALUES (1, 0, 32000);
 
 INSERT OR IGNORE INTO schema_version (version, applied_at, description)
 VALUES (1, datetime('now'),
-    'Initial plan_state.db schema: topic_header, plan_state_blocks, handoff_tokens, state_ceiling_status');
+    'plan_state.db schema (consolidated 2026-07-24, items.id=169): topic_header, plan_state_blocks, handoff_tokens, state_ceiling_status');
