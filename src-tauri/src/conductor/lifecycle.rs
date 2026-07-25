@@ -123,6 +123,17 @@ pub enum LifecycleError {
     #[error("Database migration: {0}")]
     DatabaseMigration(String),
 
+    // Cross-Persona Data Provenance (decisions.id=546, items.id=27).
+    // Raised when an entity_facts row has source_persona_id != current
+    // persona_id but cross_persona_export = false. Per decisions.id=546:
+    // "flagged as a system integrity error, not a user-facing privacy
+    // warning, since correct fact-model behavior should make this case
+    // unreachable." Distinct from PrivacyGateBlocked (ConductorError) —
+    // that variant is for normal Gate1-4 policy blocks; this is a fact-model
+    // corruption signal, fires at Phase 3 INITIALIZE before any step runs.
+    #[error("Provenance integrity violation: {0}")]
+    ProvenanceIntegrityViolation(String),
+
     // Infrastructure
     #[error("Database: {0}")]
     Database(#[from] sqlx::Error),
@@ -738,12 +749,25 @@ impl FocusRun {
     /// Returns an UNSEALED track — initialize() seals it immediately after.
     /// Python oracle: FocusRun._build_personal_track()
     async fn build_personal_track(&self) -> Result<PersonalTrack, LifecycleError> {
-        use crate::persistence::personal_store::load_personal_track;
+        use crate::persistence::personal_store::{
+            load_entity_facts_for_context, load_personal_track,
+        };
 
         let key_hex = self.key_hex.as_deref().unwrap_or("");
         let mut track = load_personal_track(&self.user_id, &self.persona_id, key_hex)
             .await
             .map_err(|e| LifecycleError::PersonalStore(e.to_string()))?;
+
+        // Cross-Persona Data Provenance read path (decisions.id=546, items.id=27).
+        // Loads entity_facts rows into the track for the decisions.id=424
+        // enforcement check — that check is NOT implemented yet (separate,
+        // not-yet-built scope). This call only makes the data available.
+        let entity_facts = load_entity_facts_for_context(&self.user_id, &self.persona_id, key_hex)
+            .await
+            .map_err(|e| LifecycleError::PersonalStore(e.to_string()))?;
+        for fact in entity_facts {
+            self.apply_entity_fact_provenance_check(&mut track, fact)?;
+        }
 
         let focus_def = self.focus_def.as_ref()
             .expect("build_personal_track() requires focus_def");
@@ -761,6 +785,72 @@ impl FocusRun {
             .map_err(|e| LifecycleError::PersonalStore(e.to_string()))?;
 
         Ok(track)
+    }
+
+    /// Apply the decisions.id=424 provenance check to a single entity_facts
+    /// row before it enters PersonalTrack. decisions.id=546 exact spec:
+    ///
+    ///   - same-Persona facts (source_persona_id == this run's persona_id)
+    ///     include normally.
+    ///   - cross_persona_export=true facts require an explicit per-session
+    ///     confirmation before entering assembled context, no persisted
+    ///     consent. NOT IMPLEMENTED — see below.
+    ///   - any fact with mismatched source_persona_id and
+    ///     cross_persona_export=false is a hard block, flagged as a system
+    ///     integrity error ("correct fact-model behavior should make this
+    ///     case unreachable") — not a user-facing privacy warning.
+    ///
+    /// SCOPE NOTE (items.id=27, this pass): only the same-Persona include
+    /// and integrity hard-block cases are implemented. The cross-Persona
+    /// confirmation case is a named, explicit gap — it requires either an
+    /// INITIALIZE-phase pause/resume mechanism (mirroring the Tier 3
+    /// awaiting_user pattern in execute(), but firing before any step
+    /// runs) or a pre-Focus-start IPC confirmation flow outside FocusRun
+    /// entirely. Both are frontend/IPC-adjacent design decisions outside
+    /// Conductor engine implementation's remit (see role description: "No
+    /// architectural improvisation"). Until that design is made, any fact
+    /// hitting this branch is treated the same as the integrity-violation
+    /// case — a hard block, NOT a silent include — because silently
+    /// including a cross-Persona fact without confirmation would violate
+    /// decisions.id=546 more seriously than refusing to run. The Focus
+    /// simply cannot use this fact yet; failing loud is the safe default.
+    fn apply_entity_fact_provenance_check(
+        &self,
+        track: &mut PersonalTrack,
+        fact: crate::conductor::types::EntityFact,
+    ) -> Result<(), LifecycleError> {
+        if fact.source_persona_id == self.persona_id {
+            // Same-Persona — include normally.
+            track
+                .add_entity_fact(fact)
+                .map_err(|e| LifecycleError::PersonalStore(e.to_string()))?;
+            return Ok(());
+        }
+
+        if fact.cross_persona_export {
+            // Cross-Persona, user-approved export — but the per-session
+            // confirmation UX this requires is not yet built (see doc
+            // comment above). Fail loud rather than silently include or
+            // silently drop.
+            return Err(LifecycleError::ProvenanceIntegrityViolation(format!(
+                "entity_facts row (field='{}', origin_persona_id={:?}) requires \
+                 cross-Persona per-session confirmation (decisions.id=546) — \
+                 confirmation mechanism not yet implemented (items.id=27 scope \
+                 gap). Refusing to silently include or silently drop.",
+                fact.field_name, fact.origin_persona_id,
+            )));
+        }
+
+        // source_persona_id != persona_id AND cross_persona_export = false.
+        // Per decisions.id=546: "should be unreachable" if the fact model
+        // is correct. Hard block, flagged as a system integrity error.
+        Err(LifecycleError::ProvenanceIntegrityViolation(format!(
+            "entity_facts row (field='{}', source_persona_id='{}') does not \
+             belong to this run's persona ('{}') and cross_persona_export is \
+             false — decisions.id=546 integrity violation. This case should \
+             be unreachable under correct fact-model behavior.",
+            fact.field_name, fact.source_persona_id, self.persona_id,
+        )))
     }
 
     /// Load artifact versions for guide IDs declared in this focus's steps.
@@ -1748,5 +1838,102 @@ mod tests {
         let abstraction = if execution_tier > 1 { raw.max(2) } else { raw };
         assert_eq!(raw, 2);
         assert_eq!(abstraction, 2);
+    }
+
+    // -------------------------------------------------------------------------
+    // apply_entity_fact_provenance_check (decisions.id=546, decisions.id=424,
+    // items.id=27)
+    // -------------------------------------------------------------------------
+
+    fn run_with_persona(persona_id: &str) -> FocusRun {
+        let scheduler = Arc::new(ConductorScheduler::new());
+        FocusRun::new(
+            "u".to_owned(), persona_id.to_owned(), "f".to_owned(),
+            scheduler, "".to_owned(), false, None, None, false, None,
+        )
+    }
+
+    fn make_fact(
+        source_persona_id: &str,
+        cross_persona_export: bool,
+        origin_persona_id: Option<&str>,
+    ) -> crate::conductor::types::EntityFact {
+        crate::conductor::types::EntityFact {
+            entity_id: None,
+            field_name: "gpa".to_owned(),
+            field_value: "3.8".to_owned(),
+            sensitivity: "personal".to_owned(),
+            sensitivity_severity: 2,
+            source_persona_id: source_persona_id.to_owned(),
+            cross_persona_export,
+            origin_persona_id: origin_persona_id.map(|s| s.to_owned()),
+        }
+    }
+
+    #[test]
+    fn provenance_same_persona_includes_normally() {
+        let run = run_with_persona("persona-student");
+        let mut track = PersonalTrack::new();
+        let fact = make_fact("persona-student", false, None);
+
+        let result = run.apply_entity_fact_provenance_check(&mut track, fact);
+
+        assert!(result.is_ok());
+        assert_eq!(track.entity_facts().len(), 1);
+    }
+
+    #[test]
+    fn provenance_mismatched_persona_no_export_is_hard_block() {
+        let run = run_with_persona("persona-work");
+        let mut track = PersonalTrack::new();
+        // source_persona_id != run persona, cross_persona_export = false —
+        // the "should be unreachable" integrity-violation case.
+        let fact = make_fact("persona-student", false, None);
+
+        let result = run.apply_entity_fact_provenance_check(&mut track, fact);
+
+        assert!(result.is_err());
+        assert_eq!(track.entity_facts().len(), 0);
+        match result.unwrap_err() {
+            LifecycleError::ProvenanceIntegrityViolation(msg) => {
+                assert!(msg.contains("integrity violation"));
+            }
+            other => panic!("expected ProvenanceIntegrityViolation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provenance_cross_persona_export_true_is_blocked_pending_confirmation_ux() {
+        let run = run_with_persona("persona-work");
+        let mut track = PersonalTrack::new();
+        // Legitimate user-approved export, but no confirmation UX exists
+        // yet (items.id=27 scope gap, this pass) — must fail loud, not
+        // silently include or silently drop.
+        let fact = make_fact("persona-student", true, Some("persona-student"));
+
+        let result = run.apply_entity_fact_provenance_check(&mut track, fact);
+
+        assert!(result.is_err());
+        assert_eq!(track.entity_facts().len(), 0);
+        match result.unwrap_err() {
+            LifecycleError::ProvenanceIntegrityViolation(msg) => {
+                assert!(msg.contains("per-session confirmation"));
+            }
+            other => panic!("expected ProvenanceIntegrityViolation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provenance_check_does_not_affect_personal_fields() {
+        // The provenance check operates on entity_facts only — must never
+        // touch track.fields() (the separate personal_fields store).
+        let run = run_with_persona("persona-student");
+        let mut track = PersonalTrack::new();
+        let fact = make_fact("persona-student", false, None);
+
+        run.apply_entity_fact_provenance_check(&mut track, fact).unwrap();
+
+        assert_eq!(track.fields().len(), 0);
+        assert_eq!(track.entity_facts().len(), 1);
     }
 }

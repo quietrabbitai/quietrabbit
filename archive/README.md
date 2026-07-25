@@ -87,3 +87,24 @@ the Rust evaluation and conductor layers.
 Needed when: routing and capability profile are formally ported in Layer 7+.
 These files are the authoritative domain definitions and should be the source of
 truth when a Rust taxonomy loader is introduced.
+
+## persistence/ (directory)
+
+The pre-consolidation, multi-file SQL migration chain for every database:
+domain_context, keys, outputs (6 files), personal (4 files), plan_state (2 files),
+scores, and shared (5 files) — 19 files total, one per migration step in the
+original chain (e.g. personal_001 initial schema, personal_002 ADR-012 columns,
+personal_003 Phase A rename, personal_004 Persona migration, and so on).
+
+Superseded by: src-tauri/schema/ — one consolidated file per database (7 files),
+each folding its full migration history into final naming and current structure.
+The consolidation was completed items.id=169 (2026-07-24). src-tauri/schema/ is
+the sole schema source compiled into the binary: migrations.rs embeds these files
+at compile time via include_str!() from src-tauri/schema/ — confirmed no code
+path anywhere references persistence/schema/ under its old location.
+
+Moved to archive: 2026-07-25, Chat-DEV, on Jason's approval, discovered as a
+stale duplicate while investigating items.id=27's context-assembly read path.
+Pre-release, zero shipped users — the individual migration steps this chain
+represents have no standalone historical value beyond what src-tauri/schema/'s
+consolidated files and their own header comments already document.

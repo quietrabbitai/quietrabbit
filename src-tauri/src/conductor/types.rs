@@ -83,6 +83,54 @@ impl PersonalField {
 }
 
 // ---------------------------------------------------------------------------
+// EntityFact
+// ---------------------------------------------------------------------------
+
+/// A single entity_facts row loaded from personal.db for this run.
+/// Cross-Persona Data Provenance (decisions.id=546, items.id=27).
+///
+/// field_value is the decrypted value — held in memory only,
+/// never written to snapshots or logs. Mirrors PersonalField's
+/// #[serde(skip)] treatment.
+///
+/// source_persona_id / cross_persona_export / origin_persona_id are
+/// immutable at the DB layer (trg_entity_facts_provenance_immutable,
+/// personal_001.sql) — this struct is a read-only snapshot of that state,
+/// not a mutation surface. The decisions.id=424 context-assembly
+/// enforcement check (same-Persona facts include normally,
+/// cross_persona_export=true facts require per-session confirmation,
+/// mismatched source_persona_id/cross_persona_export=false is a hard
+/// block) is NOT implemented here — this struct only carries the data
+/// the enforcement check will read. See items.id=27 remaining scope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntityFact {
+    pub entity_id: Option<String>,
+    pub field_name: String,
+    #[serde(skip)]
+    pub field_value: String,        // decrypted — never serialized
+    pub sensitivity: String,
+    pub sensitivity_severity: i32,
+    pub source_persona_id: String,
+    pub cross_persona_export: bool,
+    pub origin_persona_id: Option<String>,
+}
+
+impl EntityFact {
+    /// SHA-256 of "entity_id:field_name:field_value" (entity_id empty string
+    /// when None). Mirrors PersonalField::compute_content_hash — colon
+    /// delimiter, same manifest-hash purpose. entity_id included because
+    /// (entity_id, field_name) — not field_name alone — is the fact's
+    /// identity per the partial-unique-index design in personal_001.sql.
+    pub fn compute_content_hash(&self) -> String {
+        let entity_part = self.entity_id.as_deref().unwrap_or("");
+        let payload = format!("{}:{}:{}", entity_part, self.field_name, self.field_value);
+        let mut hasher = Sha256::new();
+        hasher.update(payload.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PersonalTrack
 // ---------------------------------------------------------------------------
 
@@ -102,6 +150,13 @@ impl PersonalField {
 #[derive(Debug)]
 pub struct PersonalTrack {
     fields: IndexMap<String, PersonalField>,
+    /// entity_facts rows, keyed by "entity_id:field_name" (entity_id empty
+    /// string when None) — mirrors the (entity_id, field_name) identity used
+    /// by personal_001.sql's partial unique indexes. NOT merged into `fields`:
+    /// EntityFact carries provenance columns PersonalField has no room for,
+    /// and the decisions.id=424 enforcement check (not yet implemented) needs
+    /// to read them distinctly. Populated at INITIALIZE, read-only after seal.
+    entity_facts: IndexMap<String, EntityFact>,
     voice_profile: IndexMap<String, String>,
     life_context: IndexMap<String, String>,       // legacy name — D6-323, do not rename
     source_versions: IndexMap<String, String>,
@@ -112,6 +167,7 @@ impl PersonalTrack {
     pub fn new() -> Self {
         Self {
             fields: IndexMap::new(),
+            entity_facts: IndexMap::new(),
             voice_profile: IndexMap::new(),
             life_context: IndexMap::new(),
             source_versions: IndexMap::new(),
@@ -126,6 +182,18 @@ impl PersonalTrack {
             return Err(TrackError::SealedTrack);
         }
         self.fields.insert(f.field_name.clone(), f);
+        Ok(())
+    }
+
+    /// Add an entity_facts row. Key is "entity_id:field_name" (empty string
+    /// for singleton facts where entity_id is None) — matches the
+    /// (entity_id, field_name) uniqueness the DB schema enforces.
+    pub fn add_entity_fact(&mut self, f: EntityFact) -> Result<(), TrackError> {
+        if self.sealed {
+            return Err(TrackError::SealedTrack);
+        }
+        let key = format!("{}:{}", f.entity_id.as_deref().unwrap_or(""), f.field_name);
+        self.entity_facts.insert(key, f);
         Ok(())
     }
 
@@ -171,6 +239,13 @@ impl PersonalTrack {
 
     pub fn fields(&self) -> &IndexMap<String, PersonalField> {
         &self.fields
+    }
+
+    /// entity_facts rows, keyed by "entity_id:field_name". Read-only.
+    /// decisions.id=424 enforcement (not yet implemented) will iterate this
+    /// during context assembly.
+    pub fn entity_facts(&self) -> &IndexMap<String, EntityFact> {
+        &self.entity_facts
     }
 
     pub fn voice_profile(&self) -> &IndexMap<String, String> {
@@ -583,6 +658,165 @@ mod tests {
         let results = track.fields_for_source("personal-specialist");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].field_name, "city");
+    }
+
+    // -- EntityFact ------------------------------------------------------------
+
+    fn make_entity_fact(
+        entity_id: Option<&str>,
+        field_name: &str,
+        value: &str,
+        severity: i32,
+        source_persona_id: &str,
+    ) -> EntityFact {
+        EntityFact {
+            entity_id: entity_id.map(|s| s.to_owned()),
+            field_name: field_name.to_owned(),
+            field_value: value.to_owned(),
+            sensitivity: "personal".to_owned(),
+            sensitivity_severity: severity,
+            source_persona_id: source_persona_id.to_owned(),
+            cross_persona_export: false,
+            origin_persona_id: None,
+        }
+    }
+
+    #[test]
+    fn entity_fact_compute_content_hash_deterministic() {
+        let f = make_entity_fact(Some("ent-1"), "name", "Robert", 2, "persona-a");
+        assert_eq!(f.compute_content_hash(), f.compute_content_hash());
+    }
+
+    #[test]
+    fn entity_fact_compute_content_hash_changes_with_value() {
+        let f1 = make_entity_fact(Some("ent-1"), "name", "Robert", 2, "persona-a");
+        let f2 = make_entity_fact(Some("ent-1"), "name", "Bob", 2, "persona-a");
+        assert_ne!(f1.compute_content_hash(), f2.compute_content_hash());
+    }
+
+    #[test]
+    fn entity_fact_compute_content_hash_changes_with_entity_id() {
+        // Same field_name+value under a different entity_id must hash
+        // differently — (entity_id, field_name) is the fact's identity,
+        // not field_name alone.
+        let f1 = make_entity_fact(Some("ent-1"), "name", "Robert", 2, "persona-a");
+        let f2 = make_entity_fact(Some("ent-2"), "name", "Robert", 2, "persona-a");
+        assert_ne!(f1.compute_content_hash(), f2.compute_content_hash());
+    }
+
+    #[test]
+    fn entity_fact_compute_content_hash_singleton_vs_entity_scoped() {
+        // A singleton (entity_id=None) must not collide with an
+        // entity-scoped fact of the same field_name+value.
+        let singleton = make_entity_fact(None, "name", "Robert", 2, "persona-a");
+        let scoped = make_entity_fact(Some("ent-1"), "name", "Robert", 2, "persona-a");
+        assert_ne!(singleton.compute_content_hash(), scoped.compute_content_hash());
+    }
+
+    // -- PersonalTrack.entity_facts ---------------------------------------------
+
+    #[test]
+    fn personal_track_add_entity_fact_and_seal() {
+        let mut track = PersonalTrack::new();
+        track
+            .add_entity_fact(make_entity_fact(Some("ent-1"), "name", "Robert", 2, "persona-a"))
+            .unwrap();
+        assert!(!track.is_sealed());
+        track.seal();
+        assert!(track.is_sealed());
+    }
+
+    #[test]
+    fn personal_track_sealed_rejects_add_entity_fact() {
+        let mut track = PersonalTrack::new();
+        track.seal();
+        let err = track
+            .add_entity_fact(make_entity_fact(Some("ent-1"), "name", "Robert", 2, "persona-a"))
+            .unwrap_err();
+        assert!(err.to_string().contains("sealed"));
+    }
+
+    #[test]
+    fn personal_track_entity_facts_accessor_returns_added_fact() {
+        let mut track = PersonalTrack::new();
+        track
+            .add_entity_fact(make_entity_fact(Some("ent-1"), "name", "Robert", 2, "persona-a"))
+            .unwrap();
+        assert_eq!(track.entity_facts().len(), 1);
+        let key = "ent-1:name";
+        let f = track.entity_facts().get(key).unwrap();
+        assert_eq!(f.field_value, "Robert");
+        assert_eq!(f.source_persona_id, "persona-a");
+    }
+
+    #[test]
+    fn personal_track_entity_facts_singleton_key_has_empty_entity_prefix() {
+        let mut track = PersonalTrack::new();
+        track
+            .add_entity_fact(make_entity_fact(None, "life_stage", "retired", 1, "persona-a"))
+            .unwrap();
+        assert!(track.entity_facts().contains_key(":life_stage"));
+    }
+
+    #[test]
+    fn personal_track_entity_facts_distinct_entities_same_field_name_coexist() {
+        // (entity_id, field_name) is the identity — two different entities
+        // can share the same field_name without colliding.
+        let mut track = PersonalTrack::new();
+        track
+            .add_entity_fact(make_entity_fact(Some("ent-1"), "name", "Robert", 2, "persona-a"))
+            .unwrap();
+        track
+            .add_entity_fact(make_entity_fact(Some("ent-2"), "name", "Susan", 2, "persona-a"))
+            .unwrap();
+        assert_eq!(track.entity_facts().len(), 2);
+    }
+
+    #[test]
+    fn personal_track_entity_facts_same_key_overwrites() {
+        // Matches PersonalTrack.add_field's overwrite-on-same-key semantics
+        // (IndexMap::insert) — a second insert for the same (entity_id,
+        // field_name) replaces the prior entry rather than duplicating it.
+        let mut track = PersonalTrack::new();
+        track
+            .add_entity_fact(make_entity_fact(Some("ent-1"), "name", "Robert", 2, "persona-a"))
+            .unwrap();
+        track
+            .add_entity_fact(make_entity_fact(Some("ent-1"), "name", "Bob", 2, "persona-a"))
+            .unwrap();
+        assert_eq!(track.entity_facts().len(), 1);
+        assert_eq!(
+            track.entity_facts().get("ent-1:name").unwrap().field_value,
+            "Bob"
+        );
+    }
+
+    #[test]
+    fn personal_track_entity_facts_independent_of_personal_fields() {
+        // entity_facts and fields are separate stores — adding to one must
+        // not populate or affect the other.
+        let mut track = PersonalTrack::new();
+        track.add_field(make_field("city", "Portland", 2)).unwrap();
+        track
+            .add_entity_fact(make_entity_fact(Some("ent-1"), "name", "Robert", 2, "persona-a"))
+            .unwrap();
+        assert_eq!(track.fields().len(), 1);
+        assert_eq!(track.entity_facts().len(), 1);
+        assert!(track.get_field("name").is_none());
+    }
+
+    #[test]
+    fn personal_track_entity_facts_provenance_round_trip() {
+        let mut track = PersonalTrack::new();
+        let mut fact = make_entity_fact(Some("ent-1"), "diagnosis", "confidential", 3, "persona-medical");
+        fact.cross_persona_export = true;
+        fact.origin_persona_id = Some("persona-medical".to_owned());
+        track.add_entity_fact(fact).unwrap();
+
+        let stored = track.entity_facts().get("ent-1:diagnosis").unwrap();
+        assert_eq!(stored.source_persona_id, "persona-medical");
+        assert!(stored.cross_persona_export);
+        assert_eq!(stored.origin_persona_id.as_deref(), Some("persona-medical"));
     }
 
     // -- PersonalContextManifest ---------------------------------------------

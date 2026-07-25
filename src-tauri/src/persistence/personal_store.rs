@@ -39,7 +39,9 @@ use sqlx::Row;
 use sqlx::SqliteConnection;
 use thiserror::Error;
 
-use crate::conductor::types::{PersonalDBDecryptionError, PersonalField, PersonalTrack};
+use crate::conductor::types::{
+    EntityFact, PersonalDBDecryptionError, PersonalField, PersonalTrack,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -706,6 +708,64 @@ pub async fn create_entity_fact_with_provenance(
             Err(PersonalStoreError::Database(e))
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Entity facts (read) — Cross-Persona Data Provenance
+// decisions.id=546, items.id=27. Read path for context assembly. This
+// function loads EntityFact rows for PersonalTrack — it does NOT implement
+// the decisions.id=424 enforcement check (same-Persona facts include
+// normally, cross_persona_export=true facts require per-session
+// confirmation, mismatched source_persona_id/cross_persona_export=false is
+// a hard block flagged as a system integrity error). That check runs on
+// the data this function returns; it is separate, not-yet-built scope.
+// ---------------------------------------------------------------------------
+
+/// Load all active entity_facts rows (valid_until IS NULL) for a
+/// user+persona. Returns rows in an unspecified order — caller (lifecycle,
+/// via PersonalTrack::add_entity_fact) is responsible for ordering if
+/// order-sensitive presentation is ever needed; none of R1's consumers are.
+///
+/// Called during Phase 3 INITIALIZE, alongside load_personal_track().
+/// Mirrors load_personal_track()'s decryption-key and row-mapping pattern.
+pub async fn load_entity_facts_for_context(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+) -> Result<Vec<EntityFact>, PersonalStoreError> {
+    if key_hex.is_empty() {
+        return Err(PersonalStoreError::Decryption(PersonalDBDecryptionError {
+            plain_language: "Your session has expired. Please log in again.".to_owned(),
+        }));
+    }
+
+    let mut conn = open_personal_db(user_id, persona_id, key_hex).await?;
+
+    let rows = sqlx::query(
+        "SELECT entity_id, field_name, field_value, sensitivity, sensitivity_severity,
+         source_persona_id, cross_persona_export, origin_persona_id
+         FROM entity_facts WHERE valid_until IS NULL
+         ORDER BY field_name",
+    )
+    .fetch_all(&mut conn)
+    .await?;
+
+    let mut facts = Vec::with_capacity(rows.len());
+    for row in rows {
+        let cross_persona_export: i64 = row.try_get("cross_persona_export")?;
+        facts.push(EntityFact {
+            entity_id: row.try_get("entity_id")?,
+            field_name: row.try_get("field_name")?,
+            field_value: row.try_get("field_value")?,
+            sensitivity: row.try_get("sensitivity")?,
+            sensitivity_severity: row.try_get::<i64, _>("sensitivity_severity")? as i32,
+            source_persona_id: row.try_get("source_persona_id")?,
+            cross_persona_export: cross_persona_export != 0,
+            origin_persona_id: row.try_get("origin_persona_id")?,
+        });
+    }
+
+    Ok(facts)
 }
 
 // ---------------------------------------------------------------------------
