@@ -87,6 +87,7 @@ pub struct UpdateFocusSettingsRequest {
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
+#[specta::specta]
 pub async fn list_personas(user_id: String) -> Result<Vec<PersonaInfo>, String> {
     let personas = persona_store::list_personas_for_user(&user_id)
         .await
@@ -104,6 +105,7 @@ pub async fn list_personas(user_id: String) -> Result<Vec<PersonaInfo>, String> 
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn create_persona(
     request: CreatePersonaRequest,
 ) -> Result<CreatePersonaResponse, String> {
@@ -133,6 +135,7 @@ pub async fn create_persona(
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn list_focuses(persona_id: String) -> Result<Vec<FocusInfo>, String> {
     let settings = focus_settings_store::list_focus_settings_for_persona(&persona_id)
         .await
@@ -155,6 +158,7 @@ pub async fn list_focuses(persona_id: String) -> Result<Vec<FocusInfo>, String> 
 /// get_focus_settings takes both persona_id and focus_id — the store key is
 /// composite. The IPC spec lists focus_id only (higher-level abstraction).
 #[tauri::command]
+#[specta::specta]
 pub async fn get_focus_settings(
     persona_id: String,
     focus_id: String,
@@ -176,6 +180,7 @@ pub async fn get_focus_settings(
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn update_focus_settings(
     request: UpdateFocusSettingsRequest,
 ) -> Result<FocusInfo, String> {

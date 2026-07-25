@@ -7,16 +7,18 @@
 // Unblocked post-migration when the Focus Builder Conductor layer is built.
 
 #[tauri::command]
+#[specta::specta]
 pub async fn get_focus_builder_session(
     _focus_id: Option<String>,
-) -> Result<serde_json::Value, String> {
+) -> Result<crate::commands::NotImplementedPlaceholder, String> {
     Err("not_implemented".to_string())
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn submit_focus_builder_step(
     _session_id: String,
-    _input: serde_json::Value,
-) -> Result<serde_json::Value, String> {
+    _input: crate::commands::NotImplementedPlaceholder,
+) -> Result<crate::commands::NotImplementedPlaceholder, String> {
     Err("not_implemented".to_string())
 }

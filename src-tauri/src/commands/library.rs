@@ -43,6 +43,7 @@ pub struct OutputInfo {
 
 /// STUB -- list_outputs requires a list function in output_store (not yet added).
 #[tauri::command]
+#[specta::specta]
 pub async fn list_outputs(
     _focus_id: Option<String>,
     _topic_id: Option<String>,
@@ -52,6 +53,7 @@ pub async fn list_outputs(
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn get_output(
     output_id: String,
     user_id: String,
@@ -76,6 +78,7 @@ pub async fn get_output(
 
 /// STUB -- full zero-then-delete sequence deferred to Layer 5+.
 #[tauri::command]
+#[specta::specta]
 pub async fn delete_output(
     _output_id: String,
     _deep_purge: Option<bool>,

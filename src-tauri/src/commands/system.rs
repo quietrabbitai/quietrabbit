@@ -50,6 +50,7 @@ pub struct CapabilityProfileResponse {
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
+#[specta::specta]
 pub async fn get_health(
     client: tauri::State<'_, OllamaClient>,
     ollama_source: tauri::State<'_, RwLock<OllamaSource>>,
@@ -65,6 +66,7 @@ pub async fn get_health(
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn get_capability_profile(
     client: tauri::State<'_, OllamaClient>,
 ) -> Result<CapabilityProfileResponse, String> {

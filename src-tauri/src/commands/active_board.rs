@@ -73,6 +73,7 @@ pub struct UpdateTopicStateRequest {
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
+#[specta::specta]
 pub async fn get_active_board(
     user_id: String,
     persona_id: String,
@@ -90,6 +91,7 @@ pub async fn get_active_board(
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn get_topic_list(
     focus_id: String,
     user_id: String,
@@ -105,6 +107,7 @@ pub async fn get_topic_list(
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn update_topic_state(
     request: UpdateTopicStateRequest,
 ) -> Result<(), String> {

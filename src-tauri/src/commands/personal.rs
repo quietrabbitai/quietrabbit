@@ -64,6 +64,7 @@ pub struct VoiceProfileInfo {
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
+#[specta::specta]
 pub async fn get_personal_fields(
     persona_id: String,
     user_id: String,
@@ -87,6 +88,7 @@ pub async fn get_personal_fields(
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn update_personal_field(
     request: UpdatePersonalFieldRequest,
 ) -> Result<PersonalFieldInfo, String> {
@@ -129,6 +131,7 @@ pub async fn update_personal_field(
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn get_voice_profile(
     persona_id: String,
     user_id: String,

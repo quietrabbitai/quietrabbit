@@ -9,11 +9,13 @@
 // api_key must NEVER be returned to the frontend (write-only per IPC surface spec).
 
 #[tauri::command]
-pub async fn get_tier2_config() -> Result<serde_json::Value, String> {
+#[specta::specta]
+pub async fn get_tier2_config() -> Result<crate::commands::NotImplementedPlaceholder, String> {
     Err("not_implemented".to_string())
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn set_tier2_provider(
     _provider: String,
     _api_key: String,

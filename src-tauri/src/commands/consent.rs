@@ -147,6 +147,7 @@ pub struct PendingCrossPersonaFact {
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
+#[specta::specta]
 pub async fn submit_consent_decision(
     request: SubmitConsentDecisionRequest,
 ) -> Result<(), String> {
@@ -162,6 +163,7 @@ pub async fn submit_consent_decision(
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn submit_floor_consent_decision(
     request: SubmitFloorConsentDecisionRequest,
 ) -> Result<(), String> {
@@ -193,6 +195,7 @@ pub async fn submit_floor_consent_decision(
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn submit_element_consent_decision(
     request: SubmitElementConsentDecisionRequest,
 ) -> Result<(), String> {
@@ -228,6 +231,7 @@ pub async fn submit_element_consent_decision(
 /// After all decisions: verify no confirmed-but-unpersisted rows remain,
 /// then set focus_runs.status='complete' and emit run_status_update.
 #[tauri::command]
+#[specta::specta]
 pub async fn submit_extract_confirm(
     app_handle: tauri::AppHandle,
     request: SubmitExtractConfirmRequest,
@@ -435,6 +439,7 @@ pub async fn submit_extract_confirm(
 /// hard block (Jason, this session: declining one fact should not block
 /// the whole run).
 #[tauri::command]
+#[specta::specta]
 pub async fn get_pending_cross_persona_confirmations(
     request: GetPendingCrossPersonaConfirmationsRequest,
 ) -> Result<Vec<PendingCrossPersonaFact>, String> {

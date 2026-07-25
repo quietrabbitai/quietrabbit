@@ -87,6 +87,7 @@ pub struct ResumeRunRequest {
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
+#[specta::specta]
 pub async fn submit_focus_run(
     app_handle: tauri::AppHandle,
     scheduler: tauri::State<'_, Arc<ConductorScheduler>>,
@@ -131,6 +132,7 @@ pub async fn submit_focus_run(
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn get_run_output(
     run_id: String,
     user_id: String,
@@ -150,6 +152,7 @@ pub async fn get_run_output(
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn cancel_run(
     run_id: String,
     user_id: String,
@@ -174,6 +177,7 @@ pub async fn cancel_run(
 ///
 /// Other statuses: returns not_implemented (stub behaviour unchanged).
 #[tauri::command]
+#[specta::specta]
 pub async fn resume_run(
     app_handle: tauri::AppHandle,
     _scheduler: tauri::State<'_, Arc<ConductorScheduler>>,

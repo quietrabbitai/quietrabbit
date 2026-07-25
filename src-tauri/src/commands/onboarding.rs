@@ -10,13 +10,15 @@
 // Each returns "not_implemented" until the onboarding layer is built.
 
 #[tauri::command]
+#[specta::specta]
 pub async fn get_onboarding_focus_suggestions(
     _personas: Vec<String>,
-) -> Result<serde_json::Value, String> {
+) -> Result<crate::commands::NotImplementedPlaceholder, String> {
     Err("not_implemented".to_string())
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn submit_onboarding_persona_selection(
     _personas: Vec<String>,
 ) -> Result<Vec<String>, String> {
@@ -24,8 +26,9 @@ pub async fn submit_onboarding_persona_selection(
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn submit_onboarding_focus_selection(
-    _focus_selections: Vec<serde_json::Value>,
+    _focus_selections: Vec<crate::commands::NotImplementedPlaceholder>,
 ) -> Result<Vec<String>, String> {
     Err("not_implemented".to_string())
 }

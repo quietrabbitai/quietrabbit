@@ -11,17 +11,20 @@
 //   display only. Mnemonic is never stored (Section 8.6).
 
 #[tauri::command]
+#[specta::specta]
 pub async fn login(_password: String) -> Result<(), String> {
     Err("not_implemented".to_string())
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn logout() -> Result<(), String> {
     Err("not_implemented".to_string())
 }
 
 /// One-time display only — mnemonic is never stored (Section 8.6).
 #[tauri::command]
+#[specta::specta]
 pub async fn get_recovery_key_display() -> Result<String, String> {
     Err("not_implemented".to_string())
 }

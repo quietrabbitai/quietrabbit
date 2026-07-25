@@ -7,6 +7,7 @@
 // notification_available push event fires from the Optimizer layer (post-migration).
 
 #[tauri::command]
+#[specta::specta]
 pub async fn dismiss_notification(_notification_id: String) -> Result<(), String> {
     Err("not_implemented".to_string())
 }

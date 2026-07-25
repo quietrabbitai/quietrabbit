@@ -3,6 +3,7 @@
 
 pub mod commands;
 pub mod conductor;
+pub mod ipc;
 pub mod ollama_sidecar;
 pub mod persistence;
 pub mod providers;
