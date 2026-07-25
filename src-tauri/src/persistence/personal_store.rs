@@ -742,7 +742,7 @@ pub async fn load_entity_facts_for_context(
     let mut conn = open_personal_db(user_id, persona_id, key_hex).await?;
 
     let rows = sqlx::query(
-        "SELECT entity_id, field_name, field_value, sensitivity, sensitivity_severity,
+        "SELECT id, entity_id, field_name, field_value, sensitivity, sensitivity_severity,
          source_persona_id, cross_persona_export, origin_persona_id
          FROM entity_facts WHERE valid_until IS NULL
          ORDER BY field_name",
@@ -754,6 +754,59 @@ pub async fn load_entity_facts_for_context(
     for row in rows {
         let cross_persona_export: i64 = row.try_get("cross_persona_export")?;
         facts.push(EntityFact {
+            id: row.try_get("id")?,
+            entity_id: row.try_get("entity_id")?,
+            field_name: row.try_get("field_name")?,
+            field_value: row.try_get("field_value")?,
+            sensitivity: row.try_get("sensitivity")?,
+            sensitivity_severity: row.try_get::<i64, _>("sensitivity_severity")? as i32,
+            source_persona_id: row.try_get("source_persona_id")?,
+            cross_persona_export: cross_persona_export != 0,
+            origin_persona_id: row.try_get("origin_persona_id")?,
+        });
+    }
+
+    Ok(facts)
+}
+
+/// Load active (valid_until IS NULL) entity_facts rows with
+/// cross_persona_export = 1 for a user+persona — the set of facts that
+/// require per-session user confirmation before a Focus run may include
+/// them (decisions.id=546, decisions.id=639, items.id=27).
+///
+/// Called by the pre-Focus-start IPC query
+/// (commands::consent::get_pending_cross_persona_confirmations), entirely
+/// outside FocusRun — decisions.id=639's design keeps this check ahead of
+/// FocusRun::new(), not inside Conductor's INITIALIZE phase. Mirrors
+/// load_entity_facts_for_context()'s decryption-key and row-mapping
+/// pattern; a strict subset of the same rows.
+pub async fn list_pending_cross_persona_exports(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+) -> Result<Vec<EntityFact>, PersonalStoreError> {
+    if key_hex.is_empty() {
+        return Err(PersonalStoreError::Decryption(PersonalDBDecryptionError {
+            plain_language: "Your session has expired. Please log in again.".to_owned(),
+        }));
+    }
+
+    let mut conn = open_personal_db(user_id, persona_id, key_hex).await?;
+
+    let rows = sqlx::query(
+        "SELECT id, entity_id, field_name, field_value, sensitivity, sensitivity_severity,
+         source_persona_id, cross_persona_export, origin_persona_id
+         FROM entity_facts WHERE valid_until IS NULL AND cross_persona_export = 1
+         ORDER BY field_name",
+    )
+    .fetch_all(&mut conn)
+    .await?;
+
+    let mut facts = Vec::with_capacity(rows.len());
+    for row in rows {
+        let cross_persona_export: i64 = row.try_get("cross_persona_export")?;
+        facts.push(EntityFact {
+            id: row.try_get("id")?,
             entity_id: row.try_get("entity_id")?,
             field_name: row.try_get("field_name")?,
             field_value: row.try_get("field_value")?,

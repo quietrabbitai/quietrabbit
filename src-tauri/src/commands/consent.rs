@@ -28,10 +28,27 @@
 //   candidates (item 20). Validates, writes confirmed fields to personal.db,
 //   marks candidates decided, then sets status='complete'.
 //
+// get_pending_cross_persona_confirmations: pre-Focus-start query for the
+//   Cross-Persona Data Provenance confirmation flow (decisions.id=546,
+//   decisions.id=639, items.id=27). Called by the frontend BEFORE
+//   FocusRun::new() -- entirely outside FocusRun/Conductor, per decisions.id=639's
+//   explicit rejection of new pause/resume machinery inside the engine for what
+//   is fundamentally a pre-run gate. Returns the persona's pending
+//   cross_persona_export=true facts (IPC-safe projection -- field_value is
+//   never included, mirrors commands/personal.rs's no-raw-values convention).
+//   The frontend shows a confirmation UI, then passes the user's confirmed
+//   fact IDs to submit_focus_run's confirmed_cross_persona_fact_ids field.
+//   This decision is per-session and NOT persisted to any table (decisions.id=546:
+//   "per-session, non-persisted") -- there is no submit_ command here writing
+//   a decision record, unlike the other consent commands in this file.
+//
 // All commands are fire-and-respond: lifecycle checks consent_decisions when
 // the run is resumed. No direct signalling into the background task.
+// (get_pending_cross_persona_confirmations is a plain read query -- no
+// consent_decisions write, since the decision it informs is carried as data
+// into submit_focus_run's request rather than persisted.)
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use specta::Type;
 use sqlx::ConnectOptions;
 use sqlx::Row;
@@ -40,6 +57,7 @@ use crate::conductor::extract;
 use crate::conductor::privacy::types::ExtractConfirmDecision;
 use crate::persistence::output_store;
 use crate::persistence::output_store::{get_focus_run_status, set_focus_run_status};
+use crate::persistence::personal_store;
 use crate::providers::utils::{connect_options_unencrypted, db_path_shared, now};
 
 // ---------------------------------------------------------------------------
@@ -96,6 +114,32 @@ pub struct SubmitExtractConfirmRequest {
     ///     "extracted_value": string, "confirmed_value": string|null }
     /// confirmed_value must be non-null when confirmed==true.
     pub decisions_json: String,
+}
+
+#[derive(Debug, Deserialize, Type)]
+pub struct GetPendingCrossPersonaConfirmationsRequest {
+    pub user_id: String,
+    pub persona_id: String,
+    pub key_hex: String,
+}
+
+/// IPC-safe projection of an entity_facts row pending cross-Persona
+/// confirmation (decisions.id=546, decisions.id=639, items.id=27).
+/// field_value is intentionally absent -- mirrors PersonalFieldInfo's
+/// no-raw-values convention in commands/personal.rs.
+#[derive(Debug, Serialize, Type)]
+pub struct PendingCrossPersonaFact {
+    /// entity_facts.id -- pass this back in
+    /// SubmitFocusRunRequest.confirmed_cross_persona_fact_ids for any fact
+    /// the user approves.
+    pub fact_id: String,
+    pub entity_id: Option<String>,
+    pub field_name: String,
+    pub sensitivity: String,
+    /// The Persona instance this fact originated in (decisions.id=546).
+    /// Always Some for a row with cross_persona_export=true -- the DB CHECK
+    /// constraint on entity_facts (personal_001.sql) guarantees this.
+    pub origin_persona_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -376,6 +420,42 @@ pub async fn submit_extract_confirm(
     }
 
     Ok(())
+}
+
+/// Pre-Focus-start query: which cross_persona_export=true entity_facts rows
+/// exist for this persona and require per-session confirmation before a
+/// Focus run may include them (decisions.id=546, decisions.id=639, items.id=27).
+///
+/// Called by the frontend BEFORE FocusRun::new() is constructed. Read-only --
+/// this command does not write a decision anywhere. The frontend shows a
+/// confirmation UI for the returned facts, then passes the fact_ids the user
+/// approved into SubmitFocusRunRequest.confirmed_cross_persona_fact_ids.
+/// Facts not included there are treated as declined by
+/// apply_entity_fact_provenance_check() -- omitted from context, not a
+/// hard block (Jason, this session: declining one fact should not block
+/// the whole run).
+#[tauri::command]
+pub async fn get_pending_cross_persona_confirmations(
+    request: GetPendingCrossPersonaConfirmationsRequest,
+) -> Result<Vec<PendingCrossPersonaFact>, String> {
+    let facts = personal_store::list_pending_cross_persona_exports(
+        &request.user_id,
+        &request.persona_id,
+        &request.key_hex,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(facts
+        .into_iter()
+        .map(|f| PendingCrossPersonaFact {
+            fact_id: f.id,
+            entity_id: f.entity_id,
+            field_name: f.field_name,
+            sensitivity: f.sensitivity,
+            origin_persona_id: f.origin_persona_id,
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------

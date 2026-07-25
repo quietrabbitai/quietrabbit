@@ -414,6 +414,17 @@ pub struct FocusRun {
     pub topic_id: Option<String>,
     pub is_quick_ask: bool,
 
+    // Cross-Persona Data Provenance: entity_facts.id values the user confirmed
+    // via the pre-Focus-start IPC flow (decisions.id=546, decisions.id=639,
+    // items.id=27). Populated by the frontend calling
+    // get_pending_cross_persona_confirmations() BEFORE constructing this
+    // FocusRun, then passed straight through here -- never mutated once the
+    // run starts, matching decisions.id=546's "per-session, non-persisted"
+    // confirmation. Any cross_persona_export=true fact whose id is not in
+    // this set is treated as declined (omitted, not hard-blocked -- Jason,
+    // items.id=27 session 2026-07-25).
+    pub confirmed_cross_persona_fact_ids: std::collections::HashSet<String>,
+
     // Tauri AppHandle for push events — None in tests, Some in production (D6-345)
     pub app_handle: Option<tauri::AppHandle<tauri::Wry>>,
 
@@ -457,6 +468,7 @@ impl FocusRun {
         key_hex: Option<String>,
         topic_id: Option<String>,
         is_quick_ask: bool,
+        confirmed_cross_persona_fact_ids: std::collections::HashSet<String>,
         app_handle: Option<tauri::AppHandle<tauri::Wry>>,
     ) -> Self {
         Self {
@@ -469,6 +481,7 @@ impl FocusRun {
             key_hex,
             topic_id,
             is_quick_ask,
+            confirmed_cross_persona_fact_ids,
             app_handle,
             focus_run_id: None,
             focus_def: None,
@@ -759,9 +772,12 @@ impl FocusRun {
             .map_err(|e| LifecycleError::PersonalStore(e.to_string()))?;
 
         // Cross-Persona Data Provenance read path (decisions.id=546, items.id=27).
-        // Loads entity_facts rows into the track for the decisions.id=424
-        // enforcement check — that check is NOT implemented yet (separate,
-        // not-yet-built scope). This call only makes the data available.
+        // Loads entity_facts rows and runs the decisions.id=424 enforcement
+        // check on each (apply_entity_fact_provenance_check) — same-Persona
+        // facts include, cross-Persona facts include only if their id is in
+        // self.confirmed_cross_persona_fact_ids (decisions.id=639's
+        // pre-Focus-start IPC confirmation, resolved before this FocusRun
+        // was even constructed), mismatched provenance hard-blocks.
         let entity_facts = load_entity_facts_for_context(&self.user_id, &self.persona_id, key_hex)
             .await
             .map_err(|e| LifecycleError::PersonalStore(e.to_string()))?;
@@ -794,26 +810,28 @@ impl FocusRun {
     ///     include normally.
     ///   - cross_persona_export=true facts require an explicit per-session
     ///     confirmation before entering assembled context, no persisted
-    ///     consent. NOT IMPLEMENTED — see below.
+    ///     consent.
     ///   - any fact with mismatched source_persona_id and
     ///     cross_persona_export=false is a hard block, flagged as a system
     ///     integrity error ("correct fact-model behavior should make this
     ///     case unreachable") — not a user-facing privacy warning.
     ///
-    /// SCOPE NOTE (items.id=27, this pass): only the same-Persona include
-    /// and integrity hard-block cases are implemented. The cross-Persona
-    /// confirmation case is a named, explicit gap — it requires either an
-    /// INITIALIZE-phase pause/resume mechanism (mirroring the Tier 3
-    /// awaiting_user pattern in execute(), but firing before any step
-    /// runs) or a pre-Focus-start IPC confirmation flow outside FocusRun
-    /// entirely. Both are frontend/IPC-adjacent design decisions outside
-    /// Conductor engine implementation's remit (see role description: "No
-    /// architectural improvisation"). Until that design is made, any fact
-    /// hitting this branch is treated the same as the integrity-violation
-    /// case — a hard block, NOT a silent include — because silently
-    /// including a cross-Persona fact without confirmation would violate
-    /// decisions.id=546 more seriously than refusing to run. The Focus
-    /// simply cannot use this fact yet; failing loud is the safe default.
+    /// Cross-Persona confirmation (decisions.id=639, items.id=27): the
+    /// confirmation itself happens BEFORE this function ever runs, via a
+    /// pre-Focus-start IPC flow entirely outside FocusRun (frontend calls
+    /// commands::consent::get_pending_cross_persona_confirmations(), shows
+    /// a confirmation UI, then passes the approved fact_ids into
+    /// SubmitFocusRunRequest.confirmed_cross_persona_fact_ids, which becomes
+    /// self.confirmed_cross_persona_fact_ids). This function only consults
+    /// that already-decided set — it does not pause, prompt, or wait.
+    ///   - fact.id present in confirmed_cross_persona_fact_ids: user
+    ///     approved this specific export this session — include.
+    ///   - fact.id absent: either the user declined it, or it was never
+    ///     presented (e.g. created between the pre-run query and this
+    ///     read — decisions.id=639's documented, accepted race window).
+    ///     Either way: OMIT from context, do NOT hard-block the run (Jason,
+    ///     items.id=27 session 2026-07-25 — declining one fact should not
+    ///     prevent the Focus from running on its other, permitted facts).
     fn apply_entity_fact_provenance_check(
         &self,
         track: &mut PersonalTrack,
@@ -828,17 +846,23 @@ impl FocusRun {
         }
 
         if fact.cross_persona_export {
-            // Cross-Persona, user-approved export — but the per-session
-            // confirmation UX this requires is not yet built (see doc
-            // comment above). Fail loud rather than silently include or
-            // silently drop.
-            return Err(LifecycleError::ProvenanceIntegrityViolation(format!(
-                "entity_facts row (field='{}', origin_persona_id={:?}) requires \
-                 cross-Persona per-session confirmation (decisions.id=546) — \
-                 confirmation mechanism not yet implemented (items.id=27 scope \
-                 gap). Refusing to silently include or silently drop.",
-                fact.field_name, fact.origin_persona_id,
-            )));
+            if self.confirmed_cross_persona_fact_ids.contains(&fact.id) {
+                // User confirmed this export via the pre-Focus-start IPC
+                // flow (decisions.id=639) — include.
+                track
+                    .add_entity_fact(fact)
+                    .map_err(|e| LifecycleError::PersonalStore(e.to_string()))?;
+                return Ok(());
+            }
+            // Not in the confirmed set — declined (or not yet presented).
+            // Omit from context; do not block the run over one fact.
+            log::info!(
+                "lifecycle: entity_facts row (id='{}', field='{}', \
+                 origin_persona_id={:?}) omitted from context — not present \
+                 in confirmed_cross_persona_fact_ids (decisions.id=639).",
+                fact.id, fact.field_name, fact.origin_persona_id,
+            );
+            return Ok(());
         }
 
         // source_persona_id != persona_id AND cross_persona_export = false.
@@ -1772,7 +1796,8 @@ mod tests {
         let scheduler = Arc::new(ConductorScheduler::new());
         let mut run = FocusRun::new(
             "u".to_owned(), "p".to_owned(), "f".to_owned(),
-            scheduler, "".to_owned(), false, None, None, false, None,
+            scheduler, "".to_owned(), false, None, None, false,
+            std::collections::HashSet::new(), None,
         );
         let mut tt = TaskTrack::new();
         tt.add_step(TaskStep {
@@ -1801,7 +1826,8 @@ mod tests {
         let scheduler = Arc::new(ConductorScheduler::new());
         let run = FocusRun::new(
             "u".to_owned(), "p".to_owned(), "f".to_owned(),
-            scheduler, "".to_owned(), false, None, None, false, None,
+            scheduler, "".to_owned(), false, None, None, false,
+            std::collections::HashSet::new(), None,
         );
         assert_eq!(run.output_sensitivity(), "general");
     }
@@ -1846,19 +1872,29 @@ mod tests {
     // -------------------------------------------------------------------------
 
     fn run_with_persona(persona_id: &str) -> FocusRun {
+        run_with_persona_and_confirmed(persona_id, std::collections::HashSet::new())
+    }
+
+    fn run_with_persona_and_confirmed(
+        persona_id: &str,
+        confirmed_cross_persona_fact_ids: std::collections::HashSet<String>,
+    ) -> FocusRun {
         let scheduler = Arc::new(ConductorScheduler::new());
         FocusRun::new(
             "u".to_owned(), persona_id.to_owned(), "f".to_owned(),
-            scheduler, "".to_owned(), false, None, None, false, None,
+            scheduler, "".to_owned(), false, None, None, false,
+            confirmed_cross_persona_fact_ids, None,
         )
     }
 
     fn make_fact(
+        id: &str,
         source_persona_id: &str,
         cross_persona_export: bool,
         origin_persona_id: Option<&str>,
     ) -> crate::conductor::types::EntityFact {
         crate::conductor::types::EntityFact {
+            id: id.to_owned(),
             entity_id: None,
             field_name: "gpa".to_owned(),
             field_value: "3.8".to_owned(),
@@ -1874,7 +1910,7 @@ mod tests {
     fn provenance_same_persona_includes_normally() {
         let run = run_with_persona("persona-student");
         let mut track = PersonalTrack::new();
-        let fact = make_fact("persona-student", false, None);
+        let fact = make_fact("fact-1", "persona-student", false, None);
 
         let result = run.apply_entity_fact_provenance_check(&mut track, fact);
 
@@ -1888,7 +1924,7 @@ mod tests {
         let mut track = PersonalTrack::new();
         // source_persona_id != run persona, cross_persona_export = false —
         // the "should be unreachable" integrity-violation case.
-        let fact = make_fact("persona-student", false, None);
+        let fact = make_fact("fact-1", "persona-student", false, None);
 
         let result = run.apply_entity_fact_provenance_check(&mut track, fact);
 
@@ -1903,24 +1939,50 @@ mod tests {
     }
 
     #[test]
-    fn provenance_cross_persona_export_true_is_blocked_pending_confirmation_ux() {
-        let run = run_with_persona("persona-work");
+    fn provenance_cross_persona_export_confirmed_includes() {
+        // decisions.id=639: fact.id present in confirmed_cross_persona_fact_ids
+        // (the pre-Focus-start IPC confirmation result) — include.
+        let mut confirmed = std::collections::HashSet::new();
+        confirmed.insert("fact-1".to_owned());
+        let run = run_with_persona_and_confirmed("persona-work", confirmed);
         let mut track = PersonalTrack::new();
-        // Legitimate user-approved export, but no confirmation UX exists
-        // yet (items.id=27 scope gap, this pass) — must fail loud, not
-        // silently include or silently drop.
-        let fact = make_fact("persona-student", true, Some("persona-student"));
+        let fact = make_fact("fact-1", "persona-student", true, Some("persona-student"));
 
         let result = run.apply_entity_fact_provenance_check(&mut track, fact);
 
-        assert!(result.is_err());
+        assert!(result.is_ok());
+        assert_eq!(track.entity_facts().len(), 1);
+    }
+
+    #[test]
+    fn provenance_cross_persona_export_declined_omits_not_blocks() {
+        // decisions.id=639 + Jason (items.id=27 session 2026-07-25): fact.id
+        // NOT in confirmed_cross_persona_fact_ids — declined (or never
+        // presented). Must OMIT from context, not hard-block the run.
+        let run = run_with_persona("persona-work"); // empty confirmed set
+        let mut track = PersonalTrack::new();
+        let fact = make_fact("fact-1", "persona-student", true, Some("persona-student"));
+
+        let result = run.apply_entity_fact_provenance_check(&mut track, fact);
+
+        assert!(result.is_ok(), "declined cross-Persona fact must not error the run");
+        assert_eq!(track.entity_facts().len(), 0, "declined fact must be omitted, not included");
+    }
+
+    #[test]
+    fn provenance_cross_persona_export_confirmed_id_only_matches_exact_fact() {
+        // A confirmed id for a DIFFERENT fact must not accidentally confirm
+        // this one — confirmation is per-fact-id, not persona-wide.
+        let mut confirmed = std::collections::HashSet::new();
+        confirmed.insert("some-other-fact".to_owned());
+        let run = run_with_persona_and_confirmed("persona-work", confirmed);
+        let mut track = PersonalTrack::new();
+        let fact = make_fact("fact-1", "persona-student", true, Some("persona-student"));
+
+        let result = run.apply_entity_fact_provenance_check(&mut track, fact);
+
+        assert!(result.is_ok());
         assert_eq!(track.entity_facts().len(), 0);
-        match result.unwrap_err() {
-            LifecycleError::ProvenanceIntegrityViolation(msg) => {
-                assert!(msg.contains("per-session confirmation"));
-            }
-            other => panic!("expected ProvenanceIntegrityViolation, got {other:?}"),
-        }
     }
 
     #[test]
@@ -1929,7 +1991,7 @@ mod tests {
         // touch track.fields() (the separate personal_fields store).
         let run = run_with_persona("persona-student");
         let mut track = PersonalTrack::new();
-        let fact = make_fact("persona-student", false, None);
+        let fact = make_fact("fact-1", "persona-student", false, None);
 
         run.apply_entity_fact_provenance_check(&mut track, fact).unwrap();
 

@@ -98,12 +98,18 @@ impl PersonalField {
 /// personal_001.sql) — this struct is a read-only snapshot of that state,
 /// not a mutation surface. The decisions.id=424 context-assembly
 /// enforcement check (same-Persona facts include normally,
-/// cross_persona_export=true facts require per-session confirmation,
-/// mismatched source_persona_id/cross_persona_export=false is a hard
-/// block) is NOT implemented here — this struct only carries the data
-/// the enforcement check will read. See items.id=27 remaining scope.
+/// cross_persona_export=true facts require per-session confirmation via
+/// decisions.id=639's pre-Focus-start IPC flow, mismatched
+/// source_persona_id/cross_persona_export=false is a hard block) is
+/// implemented in lifecycle.rs::apply_entity_fact_provenance_check().
+/// This struct only carries the data that check reads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntityFact {
+    /// entity_facts.id (TEXT PRIMARY KEY, personal_001.sql). Stable identifier
+    /// used by the pre-Focus-start cross-Persona confirmation IPC flow
+    /// (decisions.id=639, items.id=27) to reference a specific fact in the
+    /// user's confirm/decline answer.
+    pub id: String,
     pub entity_id: Option<String>,
     pub field_name: String,
     #[serde(skip)]
@@ -670,6 +676,7 @@ mod tests {
         source_persona_id: &str,
     ) -> EntityFact {
         EntityFact {
+            id: "test-fact-id".to_owned(),
             entity_id: entity_id.map(|s| s.to_owned()),
             field_name: field_name.to_owned(),
             field_value: value.to_owned(),

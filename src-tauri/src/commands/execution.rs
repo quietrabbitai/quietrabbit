@@ -52,6 +52,14 @@ pub struct SubmitFocusRunRequest {
     pub persona_id: String,
     pub key_hex: String,
     pub topic_id: Option<String>,
+    /// entity_facts.id values the user approved via the pre-Focus-start
+    /// cross-Persona confirmation flow (decisions.id=546, decisions.id=639,
+    /// items.id=27) -- obtained by calling
+    /// commands::consent::get_pending_cross_persona_confirmations() before
+    /// this command. Any cross_persona_export=true fact whose id is absent
+    /// here is omitted from context, not blocked (declined-or-unasked case).
+    /// Empty vec is valid -- most runs have no pending cross-Persona facts.
+    pub confirmed_cross_persona_fact_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Type)]
@@ -86,6 +94,8 @@ pub async fn submit_focus_run(
 ) -> Result<SubmitFocusRunResponse, String> {
     let is_quick_ask = request.focus_id == "quick-ask";
     let scheduler = Arc::clone(&*scheduler);
+    let confirmed_cross_persona_fact_ids: std::collections::HashSet<String> =
+        request.confirmed_cross_persona_fact_ids.into_iter().collect();
 
     let mut run = FocusRun::new(
         request.user_id,
@@ -97,6 +107,7 @@ pub async fn submit_focus_run(
         Some(request.key_hex),
         request.topic_id,
         is_quick_ask,
+        confirmed_cross_persona_fact_ids,
         Some(app_handle),
     );
 
