@@ -782,7 +782,7 @@ impl FocusRun {
             .await
             .map_err(|e| LifecycleError::PersonalStore(e.to_string()))?;
         for fact in entity_facts {
-            self.apply_entity_fact_provenance_check(&mut track, fact)?;
+            self.apply_entity_fact_provenance_check(&mut track, fact).await?;
         }
 
         let focus_def = self.focus_def.as_ref()
@@ -832,7 +832,7 @@ impl FocusRun {
     ///     Either way: OMIT from context, do NOT hard-block the run (Jason,
     ///     items.id=27 session 2026-07-25 — declining one fact should not
     ///     prevent the Focus from running on its other, permitted facts).
-    fn apply_entity_fact_provenance_check(
+    async fn apply_entity_fact_provenance_check(
         &self,
         track: &mut PersonalTrack,
         fact: crate::conductor::types::EntityFact,
@@ -856,7 +856,69 @@ impl FocusRun {
             }
             // Not in the confirmed set — declined (or not yet presented).
             // Omit from context; do not block the run over one fact.
-            log::info!(
+            //
+            // items.id=27 (Jason, 2026-07-25): the omission must be
+            // discoverable from the run itself, not only from a log file.
+            // Recorded as a disclosure-log entry — the same home gate3 uses
+            // for withheld content, and the record R1's privacy audit view
+            // (decisions.id=620) is expected to read. gate3's
+            // write-before-surface ordering is followed: audit entry first,
+            // then the operator-facing warn.
+            //
+            // KNOWN LIMITATIONS, both accepted deliberately:
+            //   1. Production is wired PrivacyGateway<NoopLogger> (migration
+            //      scaffold — see this struct's doc comment), so this entry
+            //      is discarded until the concrete logger is wired. It is
+            //      written now so the audit view inherits it for free at
+            //      that point, with no revisit here.
+            //   2. This write is NOT unit-tested. FocusRun.privacy_gateway
+            //      is typed Option<PrivacyGateway<NoopLogger>>, concrete
+            //      rather than generic over L: DisclosureLogger, so a
+            //      TestLogger cannot be injected to assert the entry shape.
+            //      Genericizing FocusRun over L would touch every
+            //      construction site and was out of scope. The tests below
+            //      cover the omit BEHAVIOUR only.
+            //
+            // No emit() here on purpose: nothing listens yet, and naming an
+            // event now would prejudge decisions.id=639's still-unbuilt
+            // frontend confirmation flow.
+            if let Some(gateway) = self.privacy_gateway.as_ref() {
+                use crate::conductor::privacy::logger::{DisclosureLogEntry, DisclosureLogger};
+                let entry = DisclosureLogEntry {
+                    step_id: "initialize".to_string(),
+                    focus_run_id: self.focus_run_id.clone().unwrap_or_default(),
+                    // Local context assembly — no external call.
+                    execution_tier: 1,
+                    abstraction_tier: None,
+                    provider: None,
+                    fields_shared: vec![],
+                    fields_abstracted: IndexMap::new(),
+                    // Identifier only, never field_value. entity_id is
+                    // Option; empty-string-when-None matches
+                    // EntityFact::compute_content_hash()'s existing
+                    // convention for the same "entity_id:field_name" key.
+                    fields_withheld: vec![format!(
+                        "{}:{}",
+                        fact.entity_id.as_deref().unwrap_or(""),
+                        fact.field_name
+                    )],
+                    override_declined: false,
+                    event_type: "provenance_cross_persona_omitted".to_string(),
+                };
+                // Non-fatal at execution_tier 1, matching the gates' own
+                // fatality split. The fact is omitted either way; a failed
+                // audit write must not become a second failure on top of it.
+                if let Err(e) = gateway.logger.write(entry).await {
+                    log::warn!(
+                        "lifecycle: disclosure-log write failed for omitted \
+                         cross-Persona entity_facts row (id='{}'): {e} — \
+                         fact still omitted from context.",
+                        fact.id,
+                    );
+                }
+            }
+
+            log::warn!(
                 "lifecycle: entity_facts row (id='{}', field='{}', \
                  origin_persona_id={:?}) omitted from context — not present \
                  in confirmed_cross_persona_fact_ids (decisions.id=639).",
@@ -1906,27 +1968,27 @@ mod tests {
         }
     }
 
-    #[test]
-    fn provenance_same_persona_includes_normally() {
+    #[tokio::test]
+    async fn provenance_same_persona_includes_normally() {
         let run = run_with_persona("persona-student");
         let mut track = PersonalTrack::new();
         let fact = make_fact("fact-1", "persona-student", false, None);
 
-        let result = run.apply_entity_fact_provenance_check(&mut track, fact);
+        let result = run.apply_entity_fact_provenance_check(&mut track, fact).await;
 
         assert!(result.is_ok());
         assert_eq!(track.entity_facts().len(), 1);
     }
 
-    #[test]
-    fn provenance_mismatched_persona_no_export_is_hard_block() {
+    #[tokio::test]
+    async fn provenance_mismatched_persona_no_export_is_hard_block() {
         let run = run_with_persona("persona-work");
         let mut track = PersonalTrack::new();
         // source_persona_id != run persona, cross_persona_export = false —
         // the "should be unreachable" integrity-violation case.
         let fact = make_fact("fact-1", "persona-student", false, None);
 
-        let result = run.apply_entity_fact_provenance_check(&mut track, fact);
+        let result = run.apply_entity_fact_provenance_check(&mut track, fact).await;
 
         assert!(result.is_err());
         assert_eq!(track.entity_facts().len(), 0);
@@ -1938,8 +2000,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn provenance_cross_persona_export_confirmed_includes() {
+    #[tokio::test]
+    async fn provenance_cross_persona_export_confirmed_includes() {
         // decisions.id=639: fact.id present in confirmed_cross_persona_fact_ids
         // (the pre-Focus-start IPC confirmation result) — include.
         let mut confirmed = std::collections::HashSet::new();
@@ -1948,14 +2010,14 @@ mod tests {
         let mut track = PersonalTrack::new();
         let fact = make_fact("fact-1", "persona-student", true, Some("persona-student"));
 
-        let result = run.apply_entity_fact_provenance_check(&mut track, fact);
+        let result = run.apply_entity_fact_provenance_check(&mut track, fact).await;
 
         assert!(result.is_ok());
         assert_eq!(track.entity_facts().len(), 1);
     }
 
-    #[test]
-    fn provenance_cross_persona_export_declined_omits_not_blocks() {
+    #[tokio::test]
+    async fn provenance_cross_persona_export_declined_omits_not_blocks() {
         // decisions.id=639 + Jason (items.id=27 session 2026-07-25): fact.id
         // NOT in confirmed_cross_persona_fact_ids — declined (or never
         // presented). Must OMIT from context, not hard-block the run.
@@ -1963,14 +2025,14 @@ mod tests {
         let mut track = PersonalTrack::new();
         let fact = make_fact("fact-1", "persona-student", true, Some("persona-student"));
 
-        let result = run.apply_entity_fact_provenance_check(&mut track, fact);
+        let result = run.apply_entity_fact_provenance_check(&mut track, fact).await;
 
         assert!(result.is_ok(), "declined cross-Persona fact must not error the run");
         assert_eq!(track.entity_facts().len(), 0, "declined fact must be omitted, not included");
     }
 
-    #[test]
-    fn provenance_cross_persona_export_confirmed_id_only_matches_exact_fact() {
+    #[tokio::test]
+    async fn provenance_cross_persona_export_confirmed_id_only_matches_exact_fact() {
         // A confirmed id for a DIFFERENT fact must not accidentally confirm
         // this one — confirmation is per-fact-id, not persona-wide.
         let mut confirmed = std::collections::HashSet::new();
@@ -1979,21 +2041,21 @@ mod tests {
         let mut track = PersonalTrack::new();
         let fact = make_fact("fact-1", "persona-student", true, Some("persona-student"));
 
-        let result = run.apply_entity_fact_provenance_check(&mut track, fact);
+        let result = run.apply_entity_fact_provenance_check(&mut track, fact).await;
 
         assert!(result.is_ok());
         assert_eq!(track.entity_facts().len(), 0);
     }
 
-    #[test]
-    fn provenance_check_does_not_affect_personal_fields() {
+    #[tokio::test]
+    async fn provenance_check_does_not_affect_personal_fields() {
         // The provenance check operates on entity_facts only — must never
         // touch track.fields() (the separate personal_fields store).
         let run = run_with_persona("persona-student");
         let mut track = PersonalTrack::new();
         let fact = make_fact("fact-1", "persona-student", false, None);
 
-        run.apply_entity_fact_provenance_check(&mut track, fact).unwrap();
+        run.apply_entity_fact_provenance_check(&mut track, fact).await.unwrap();
 
         assert_eq!(track.fields().len(), 0);
         assert_eq!(track.entity_facts().len(), 1);
