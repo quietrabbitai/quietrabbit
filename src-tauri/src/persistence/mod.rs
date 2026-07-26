@@ -2,6 +2,7 @@
 
 pub mod domain_context_store;
 pub mod dedup_store;
+pub mod disclosure_log_store;
 pub mod entity_store;
 pub mod focus_settings_store;
 pub mod migrations;
