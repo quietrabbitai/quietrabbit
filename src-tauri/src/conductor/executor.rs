@@ -69,7 +69,7 @@ use crate::conductor::privacy::logger::{DisclosureLogEntry, DisclosureLogger};
 use crate::conductor::privacy::types::{
     AbstractionPolicy, PersonalField as GateField, PersonalTrack as GateTrack, Sensitivity,
 };
-use crate::conductor::privacy::{logger::NoopLogger, PrivacyGateway};
+use crate::conductor::privacy::PrivacyGateway;
 use crate::conductor::tokens::StepDefinition;
 use crate::conductor::types::{PersonalTrack, SharedStateTrack, TaskStep, TaskTrack};
 use crate::providers::groq::GroqProvider;
@@ -188,14 +188,14 @@ impl StepExecutor {
     ///
     /// Python oracle: StepExecutor.execute()
     #[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
-    pub async fn execute(
+    pub async fn execute<L: DisclosureLogger>(
         &self,
         ctx: StepContext,
         personal_track: &PersonalTrack,
         task_track: &mut TaskTrack,
         shared_state: &mut SharedStateTrack,
         failure_handler: &FailureHandler,
-        privacy_gateway: &PrivacyGateway<NoopLogger>,
+        privacy_gateway: &PrivacyGateway<L>,
         scheduler: &Arc<ConductorScheduler>,
         app_handle: Option<&tauri::AppHandle<tauri::Wry>>,
     ) -> Option<FailureResult> {
@@ -258,7 +258,7 @@ impl StepExecutor {
     ///
     /// Python oracle: StepExecutor._execute_once()
     #[allow(clippy::too_many_arguments)]
-    async fn execute_once(
+    async fn execute_once<L: DisclosureLogger>(
         &self,
         ctx: &StepContext,
         retry_count: u32,
@@ -266,7 +266,7 @@ impl StepExecutor {
         task_track: &mut TaskTrack,
         shared_state: &mut SharedStateTrack,
         failure_handler: &FailureHandler,
-        privacy_gateway: &PrivacyGateway<NoopLogger>,
+        privacy_gateway: &PrivacyGateway<L>,
         scheduler: &Arc<ConductorScheduler>,
         app_handle: Option<&tauri::AppHandle<tauri::Wry>>,
     ) -> Result<Option<FailureResult>, ConductorError> {
@@ -776,10 +776,10 @@ fn render_prompt_with_disclosure(
 /// Returns Ok(cleaned_map) — only ALLOWED_VOICE_ATTRIBUTES present.
 ///
 /// Python oracle: StepExecutor._scan_voice_profile()
-async fn scan_voice_profile(
+async fn scan_voice_profile<L: DisclosureLogger>(
     ctx: &StepContext,
     personal_track: &PersonalTrack,
-    privacy_gateway: &PrivacyGateway<NoopLogger>,
+    privacy_gateway: &PrivacyGateway<L>,
 ) -> Result<HashMap<String, String>, ConductorError> {
     // Collect field values long enough to test (avoids short-word false positives).
     let personal_values: Vec<String> = personal_track

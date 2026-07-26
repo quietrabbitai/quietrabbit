@@ -98,7 +98,13 @@ pub async fn submit_focus_run(
     let confirmed_cross_persona_fact_ids: std::collections::HashSet<String> =
         request.confirmed_cross_persona_fact_ids.into_iter().collect();
 
-    let mut run = FocusRun::new(
+    // Default type param (FocusRun<L = SqliteDisclosureLogger>) does not
+    // resolve through full inference at a plain `let` binding -- explicit
+    // annotation needed here (items.id=173). Production always wants the
+    // concrete, disclosure_log-table-backed logger, so this IS the default;
+    // the annotation exists to satisfy the type checker, not to make a
+    // different choice than what the default already expresses.
+    let mut run: FocusRun = FocusRun::new(
         request.user_id,
         request.persona_id,
         request.focus_id,

@@ -36,10 +36,16 @@
 //   ConductorScheduler are passed as separate parameters to StepExecutor::execute().
 //   See executor.rs for the full function signature.
 //
-// Privacy gateway (migration scaffold):
-//   FocusRun holds Option<PrivacyGateway<NoopLogger>> for this migration phase.
-//   NoopLogger always succeeds; gates enforce policy without persisting audit events.
-//   Concrete logger wired in Layer 8 when disclosure_log DB writes are threaded through.
+// Privacy gateway:
+//   FocusRun<L: DisclosureLogger = SqliteDisclosureLogger> is generic over
+//   its disclosure logger (items.id=173, "Layer 8"). Production
+//   construction (initialize(), Phase 3) wires SqliteDisclosureLogger,
+//   which persists every disclosure-log entry to the disclosure_log table
+//   in personal.db. Tests can instantiate FocusRun<TestLogger> or
+//   FocusRun<NoopLogger> explicitly to inject the DisclosureLogger they
+//   need. Default type param means every pre-existing FocusRun::new(...)
+//   call site (commands/execution.rs, this file's own test helpers) keeps
+//   compiling unchanged and now gets the concrete logger for free.
 //
 // serde_yaml replaces Python hand-parser:
 //   FocusDefinition populated via intermediate RawFocusFile deserialization.
@@ -78,11 +84,12 @@ use crate::conductor::failure::{
     ConductorError, FailureAction, FailureHandler, FailureResult, FailureSeverity,
 };
 use crate::conductor::memory_broker::MemoryBroker;
-use crate::conductor::privacy::{logger::NoopLogger, PrivacyGateway};
+use crate::conductor::privacy::{logger::DisclosureLoggerForRun, PrivacyGateway};
 use crate::conductor::tokens::{validate_step, FieldRequirement, StepDefinition, StepType};
 use crate::conductor::types::{
     PersonalContextManifest, PersonalTrack, SharedStateTrack, TaskTrack,
 };
+use crate::persistence::disclosure_log_store::SqliteDisclosureLogger;
 use crate::providers::utils::{
     connect_options_encrypted, connect_options_unencrypted, db_path_outputs, db_path_shared, now,
 };
@@ -399,10 +406,12 @@ async fn open_instance_db() -> Result<SqliteConnection, LifecycleError> {
 ///   When Some: emits run_status_update push events at step boundaries (D6-345).
 ///   When None: emit is a silent no-op; step progress is logged via log::debug.
 ///
-/// privacy_gateway: PrivacyGateway<NoopLogger> — migration scaffold.
-///   NoopLogger always succeeds; gates enforce all policy without DB writes.
-///   Concrete logger wired in Layer 8 when disclosure_log persistence is ready.
-pub struct FocusRun {
+/// privacy_gateway: PrivacyGateway<L> — L defaults to SqliteDisclosureLogger.
+///   Production gets the concrete, disclosure_log-table-backed logger by
+///   default (items.id=173). Tests inject FocusRun<TestLogger> or
+///   FocusRun<NoopLogger> explicitly. See the module doc comment's
+///   "Privacy gateway" section for the full rationale.
+pub struct FocusRun<L: DisclosureLoggerForRun = SqliteDisclosureLogger> {
     // Constructor parameters
     pub user_id: String,
     pub persona_id: String,
@@ -435,7 +444,7 @@ pub struct FocusRun {
     pub task_track: Option<TaskTrack>,
     pub shared_state: Option<SharedStateTrack>,
     pub failure_handler: Option<FailureHandler>,
-    pub privacy_gateway: Option<PrivacyGateway<NoopLogger>>,
+    pub privacy_gateway: Option<PrivacyGateway<L>>,
 
     // Tier configuration (set at AUTHORIZE, used throughout EXECUTE)
     _focus_max_permitted_tier: u8,
@@ -456,7 +465,7 @@ pub struct FocusRun {
     _persona_context_rendered: String,
 }
 
-impl FocusRun {
+impl<L: DisclosureLoggerForRun> FocusRun<L> {
     #[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
     pub fn new(
         user_id: String,
@@ -716,7 +725,11 @@ impl FocusRun {
         self.personal_track = Some(personal_track);
         self.task_track = Some(TaskTrack::new());
         self.shared_state = Some(SharedStateTrack::new());
-        self.privacy_gateway = Some(PrivacyGateway::new(NoopLogger));
+        self.privacy_gateway = Some(PrivacyGateway::new(L::for_run(
+            &self.user_id,
+            &self.persona_id,
+            self.key_hex.as_deref().unwrap_or(""),
+        )));
         self._persona_context_rendered = self.assemble_persona_context().await;
         self.write_focus_run_record("running").await?;
         self.emit_status("running", None);
@@ -865,25 +878,21 @@ impl FocusRun {
             // write-before-surface ordering is followed: audit entry first,
             // then the operator-facing warn.
             //
-            // KNOWN LIMITATIONS, both accepted deliberately:
-            //   1. Production is wired PrivacyGateway<NoopLogger> (migration
-            //      scaffold — see this struct's doc comment), so this entry
-            //      is discarded until the concrete logger is wired. It is
-            //      written now so the audit view inherits it for free at
-            //      that point, with no revisit here.
-            //   2. This write is NOT unit-tested. FocusRun.privacy_gateway
-            //      is typed Option<PrivacyGateway<NoopLogger>>, concrete
-            //      rather than generic over L: DisclosureLogger, so a
-            //      TestLogger cannot be injected to assert the entry shape.
-            //      Genericizing FocusRun over L would touch every
-            //      construction site and was out of scope. The tests below
-            //      cover the omit BEHAVIOUR only.
+            // RESOLVED (items.id=173, "Layer 8"): this entry was previously
+            // discarded because production was wired PrivacyGateway<NoopLogger>,
+            // and previously untestable because FocusRun was typed concrete
+            // rather than generic over L: DisclosureLogger. Both are now
+            // fixed — FocusRun<L: DisclosureLoggerForRun = SqliteDisclosureLogger>
+            // persists this entry to the disclosure_log table by default in
+            // production, and FocusRun<TestLogger> can inject a TestLogger
+            // to assert the entry shape directly. See the module doc
+            // comment's "Privacy gateway" section.
             //
             // No emit() here on purpose: nothing listens yet, and naming an
             // event now would prejudge decisions.id=639's still-unbuilt
             // frontend confirmation flow.
             if let Some(gateway) = self.privacy_gateway.as_ref() {
-                use crate::conductor::privacy::logger::{DisclosureLogEntry, DisclosureLogger};
+                use crate::conductor::privacy::logger::DisclosureLogEntry;
                 let entry = DisclosureLogEntry {
                     step_id: "initialize".to_string(),
                     focus_run_id: self.focus_run_id.clone().unwrap_or_default(),
@@ -1886,7 +1895,7 @@ mod tests {
     #[test]
     fn output_sensitivity_no_track_defaults_general() {
         let scheduler = Arc::new(ConductorScheduler::new());
-        let run = FocusRun::new(
+        let run: FocusRun = FocusRun::new(
             "u".to_owned(), "p".to_owned(), "f".to_owned(),
             scheduler, "".to_owned(), false, None, None, false,
             std::collections::HashSet::new(), None,
@@ -2059,5 +2068,86 @@ mod tests {
 
         assert_eq!(track.fields().len(), 0);
         assert_eq!(track.entity_facts().len(), 1);
+    }
+
+    // -------------------------------------------------------------------------
+    // Disclosure-log write path (items.id=173, "Layer 8") — previously
+    // untestable per the KNOWN LIMITATIONS note this genericization removed.
+    // FocusRun<TestLogger> injects a TestLogger so the entry shape written
+    // by the cross-Persona omission path (above) can be asserted directly,
+    // rather than only the omit BEHAVIOUR (track.entity_facts().len()).
+    // -------------------------------------------------------------------------
+
+    fn run_with_persona_and_test_logger(
+        persona_id: &str,
+    ) -> FocusRun<crate::conductor::privacy::logger::TestLogger> {
+        let scheduler = Arc::new(ConductorScheduler::new());
+        let mut run: FocusRun<crate::conductor::privacy::logger::TestLogger> = FocusRun::new(
+            "u".to_owned(), persona_id.to_owned(), "f".to_owned(),
+            scheduler, "".to_owned(), false, None, None, false,
+            std::collections::HashSet::new(), None,
+        );
+        // apply_entity_fact_provenance_check only writes when
+        // self.privacy_gateway is Some (see its `if let Some(gateway)`
+        // guard) — these fixtures never call initialize() (Phase 3), so the
+        // gateway must be constructed directly here, matching initialize()'s
+        // own L::for_run(...) call for parity with production wiring.
+        use crate::conductor::privacy::logger::DisclosureLoggerForRun;
+        use crate::conductor::privacy::PrivacyGateway;
+        run.privacy_gateway = Some(PrivacyGateway::new(
+            crate::conductor::privacy::logger::TestLogger::for_run("u", persona_id, ""),
+        ));
+        run
+    }
+
+    #[tokio::test]
+    async fn provenance_declined_cross_persona_fact_writes_disclosure_log_entry() {
+        let run = run_with_persona_and_test_logger("persona-work");
+        let mut track = PersonalTrack::new();
+        let fact = make_fact("fact-1", "persona-student", true, Some("persona-student"));
+
+        run.apply_entity_fact_provenance_check(&mut track, fact).await.unwrap();
+
+        let logger = &run.privacy_gateway.as_ref().unwrap().logger;
+        assert_eq!(logger.entry_count(), 1, "the decline must produce exactly one disclosure-log entry");
+        let entry = &logger.entries()[0];
+        assert_eq!(entry.step_id, "initialize");
+        // Key format is "entity_id:field_name" (compute_content_hash's own
+        // convention, per the surrounding source comment) — NOT the fact's
+        // own id. make_fact() gives this fact entity_id=None and
+        // field_name="gpa", so the withheld key is ":gpa".
+        assert_eq!(
+            entry.fields_withheld,
+            vec![":gpa".to_owned()],
+            "withheld entry must be keyed entity_id:field_name"
+        );
+    }
+
+    #[tokio::test]
+    async fn provenance_confirmed_cross_persona_fact_writes_no_disclosure_log_entry() {
+        // The confirmed (included) path does not go through the omission
+        // branch at all — only a decline produces a disclosure-log entry
+        // here. Confirms the write path is decline-specific, not fired on
+        // every provenance check.
+        let mut confirmed = std::collections::HashSet::new();
+        confirmed.insert("fact-1".to_owned());
+        let scheduler = Arc::new(ConductorScheduler::new());
+        let mut run: FocusRun<crate::conductor::privacy::logger::TestLogger> = FocusRun::new(
+            "u".to_owned(), "persona-work".to_owned(), "f".to_owned(),
+            scheduler, "".to_owned(), false, None, None, false,
+            confirmed, None,
+        );
+        use crate::conductor::privacy::logger::DisclosureLoggerForRun;
+        use crate::conductor::privacy::PrivacyGateway;
+        run.privacy_gateway = Some(PrivacyGateway::new(
+            crate::conductor::privacy::logger::TestLogger::for_run("u", "persona-work", ""),
+        ));
+        let mut track = PersonalTrack::new();
+        let fact = make_fact("fact-1", "persona-student", true, Some("persona-student"));
+
+        run.apply_entity_fact_provenance_check(&mut track, fact).await.unwrap();
+
+        let logger = &run.privacy_gateway.as_ref().unwrap().logger;
+        assert_eq!(logger.entry_count(), 0, "a confirmed (included) fact must not write a disclosure-log entry");
     }
 }

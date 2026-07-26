@@ -41,6 +41,20 @@ pub trait DisclosureLogger: Send + Sync {
     ) -> Result<String, DisclosureLogWriteError>;
 }
 
+/// Constructs a DisclosureLogger from a FocusRun's own identity fields, at
+/// the moment PrivacyGateway is built (Phase 3 INITIALIZE). Separate from
+/// DisclosureLogger itself because not every logger needs run identity —
+/// NoopLogger/TestLogger/FailLogger are constructed with no arguments in
+/// tests, while SqliteDisclosureLogger (items.id=173) needs user_id /
+/// persona_id / key_hex to know which personal.db to open. Generic code in
+/// FocusRun<L>::initialize() calls L::for_run(...) so it can build any L
+/// without knowing which concrete logger L is — the same pattern
+/// build_personal_track() already uses for key_hex.as_deref().unwrap_or("")
+/// (empty string, not a hard failure, when key_hex is absent).
+pub trait DisclosureLoggerForRun: DisclosureLogger {
+    fn for_run(user_id: &str, persona_id: &str, key_hex: &str) -> Self;
+}
+
 // -- NoopLogger ---------------------------------------------------------------
 // Used before the SQLCipher persistence layer is ported.
 // Always succeeds. Never persists anything.
@@ -50,6 +64,12 @@ pub struct NoopLogger;
 impl DisclosureLogger for NoopLogger {
     async fn write(&self, _entry: DisclosureLogEntry) -> Result<String, DisclosureLogWriteError> {
         Ok("noop".to_string())
+    }
+}
+
+impl DisclosureLoggerForRun for NoopLogger {
+    fn for_run(_user_id: &str, _persona_id: &str, _key_hex: &str) -> Self {
+        NoopLogger
     }
 }
 
@@ -84,6 +104,12 @@ impl DisclosureLogger for TestLogger {
     }
 }
 
+impl DisclosureLoggerForRun for TestLogger {
+    fn for_run(_user_id: &str, _persona_id: &str, _key_hex: &str) -> Self {
+        TestLogger::new()
+    }
+}
+
 // -- FailLogger ---------------------------------------------------------------
 // Used by golden-vector tests for disclosure-log failure path verification.
 // Always returns Err. Gates apply fatality split based on execution_tier:
@@ -97,5 +123,11 @@ impl DisclosureLogger for FailLogger {
         Err(DisclosureLogWriteError::new(std::io::Error::other(
             "file is not a database",
         )))
+    }
+}
+
+impl DisclosureLoggerForRun for FailLogger {
+    fn for_run(_user_id: &str, _persona_id: &str, _key_hex: &str) -> Self {
+        FailLogger
     }
 }
