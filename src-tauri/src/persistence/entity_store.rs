@@ -60,9 +60,35 @@ use crate::persistence::personal_store::{open_personal_db, PersonalStoreError};
 // ---------------------------------------------------------------------------
 
 /// Lifecycle values permitted by the entities.status CHECK constraint
-/// (personal_001.sql). Validated here so callers get a plain-language
-/// Validation error instead of a raw SQLite CHECK failure.
-const VALID_STATUSES: &[&str] = &["active", "retired", "archived"];
+/// (personal_002.sql).
+///
+/// personal_001 originally had active/retired/archived. personal_002 merged
+/// that set with decisions.id=502's record-status set
+/// (active/deleted_in_source/user_archived/user_deleted) into the single
+/// column below, rather than carrying two overlapping status columns:
+/// 'user_archived' and 'archived' are the same idea and keep the shorter
+/// name, and 'retired' — introduced by cb-01 and never required by any
+/// decision — collapsed into 'archived'.
+///
+/// Meanings:
+///   active             normal, appears in all views
+///   archived           user explicitly archived it. Recoverable.
+///   deleted_in_source  the source no longer has it, QR still does.
+///                      Excluded from default views. Recoverable.
+///   user_deleted       tombstone. Never re-imported even if it reappears
+///                      in source (decisions.id=502, mirroring
+///                      rejected_tombstone on entity_facts).
+///
+/// Validated here so callers get a plain-language Validation error instead
+/// of a raw SQLite CHECK failure.
+const VALID_STATUSES: &[&str] =
+    &["active", "archived", "deleted_in_source", "user_deleted"];
+
+/// Values permitted by the entities.modification_state CHECK constraint
+/// (personal_002.sql, decisions.id=502). Governs what a user-triggered
+/// source refresh may do to the record.
+const VALID_MODIFICATION_STATES: &[&str] =
+    &["pristine", "user_modified", "user_created"];
 
 /// Escape character used with LIKE in search_entities. Backslash is not
 /// special to SQLite's LIKE by default — it becomes special only via the
@@ -94,6 +120,17 @@ pub struct Entity {
     pub aliases: Vec<String>,
     pub parent_entity_id: Option<String>,
     pub status: String,
+    /// pristine / user_modified / user_created (decisions.id=502).
+    /// Governs what a user-triggered source refresh may do to this record.
+    /// Defaults to user_created — a record with no import origin is QR's own.
+    pub modification_state: String,
+    /// source_registry.id this record was imported from, or None for
+    /// QR-origin records (decisions.id=502). Written by cb-11's
+    /// source_registry_store, not by create_entity.
+    pub source_registry_id: Option<String>,
+    /// The record's URL at its source, when it has one — decisions.id=502's
+    /// highest-confidence dedup match basis.
+    pub source_url: Option<String>,
     pub created_at: String,
     /// Stored as a JSON object TEXT column with a json_valid() CHECK.
     pub extra_metadata: serde_json::Value,
@@ -201,6 +238,9 @@ fn row_to_entity(row: &sqlx::sqlite::SqliteRow) -> Result<Entity, PersonalStoreE
         aliases,
         parent_entity_id: row.try_get("parent_entity_id")?,
         status: row.try_get("status")?,
+        modification_state: row.try_get("modification_state")?,
+        source_registry_id: row.try_get("source_registry_id")?,
+        source_url: row.try_get("source_url")?,
         created_at: row.try_get("created_at")?,
         extra_metadata,
     })
@@ -211,7 +251,18 @@ fn row_to_entity(row: &sqlx::sqlite::SqliteRow) -> Result<Entity, PersonalStoreE
 fn validate_status(status: &str) -> Result<(), PersonalStoreError> {
     if !VALID_STATUSES.contains(&status) {
         return Err(PersonalStoreError::Validation(format!(
-            "Unknown entity status '{status}'. Must be active, retired, or archived."
+            "Unknown entity status '{status}'. Must be one of: {}.",
+            VALID_STATUSES.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+fn validate_modification_state(state: &str) -> Result<(), PersonalStoreError> {
+    if !VALID_MODIFICATION_STATES.contains(&state) {
+        return Err(PersonalStoreError::Validation(format!(
+            "Unknown modification_state '{state}'. Must be one of: {}.",
+            VALID_MODIFICATION_STATES.join(", ")
         )));
     }
     Ok(())
@@ -282,7 +333,8 @@ fn filter_clause(filter: &EntityFilter) -> (String, Vec<String>) {
 /// list and row_to_entity() cannot drift apart.
 const ENTITY_COLUMNS: &str =
     "id, entity_type, display_name, aliases, parent_entity_id, status, \
-     created_at, extra_metadata";
+     modification_state, source_registry_id, source_url, created_at, \
+     extra_metadata";
 
 // ---------------------------------------------------------------------------
 // Create
@@ -413,6 +465,12 @@ pub struct EntityUpdate {
     pub aliases: Option<Vec<String>>,
     pub parent_entity_id: Option<Option<String>>,
     pub status: Option<String>,
+    /// pristine / user_modified / user_created (decisions.id=502).
+    /// Transitions are owned by cb-11's source_registry_store, which knows
+    /// what a refresh or an import means. Exposed here because the column
+    /// lives on this table and a direct set is occasionally the honest
+    /// operation.
+    pub modification_state: Option<String>,
     pub extra_metadata: Option<serde_json::Value>,
 }
 
@@ -422,6 +480,7 @@ impl EntityUpdate {
             && self.aliases.is_none()
             && self.parent_entity_id.is_none()
             && self.status.is_none()
+            && self.modification_state.is_none()
             && self.extra_metadata.is_none()
     }
 }
@@ -453,6 +512,9 @@ pub(crate) async fn update_entity_conn(
     }
     if let Some(status) = &update.status {
         validate_status(status)?;
+    }
+    if let Some(state) = &update.modification_state {
+        validate_modification_state(state)?;
     }
     if let Some(name) = &update.display_name {
         if name.trim().is_empty() {
@@ -493,6 +555,10 @@ pub(crate) async fn update_entity_conn(
         sets.push("status = ?");
         binds.push(Some(status.clone()));
     }
+    if let Some(state) = &update.modification_state {
+        sets.push("modification_state = ?");
+        binds.push(Some(state.clone()));
+    }
     if let Some(metadata) = &update.extra_metadata {
         let json = serde_json::to_string(metadata).map_err(|e| {
             PersonalStoreError::Validation(format!("extra_metadata not serializable: {e}"))
@@ -517,10 +583,12 @@ pub(crate) async fn update_entity_conn(
     Ok(())
 }
 
-/// Move an entity to a non-active lifecycle status ('retired' or
-/// 'archived'). This is the non-destructive alternative to deletion: facts,
-/// children, and history all survive, and the record simply stops appearing
-/// in EntityFilter::active_of_type() results.
+/// Move an entity to a non-active status — 'archived' (user archived it),
+/// 'deleted_in_source' (the source dropped it, QR kept it), or
+/// 'user_deleted' (tombstone, never re-imported; decisions.id=502). This is
+/// the non-destructive alternative to deletion: facts, children, and history
+/// all survive, and the record simply stops appearing in
+/// EntityFilter::active_of_type() results.
 ///
 /// See the module header for why no hard-delete path exists.
 pub async fn retire_entity(
@@ -768,9 +836,12 @@ mod tests {
     use sqlx::sqlite::SqliteConnectOptions;
     use sqlx::ConnectOptions;
 
-    const PERSONAL_SCHEMA: &str = include_str!("../../schema/personal_001.sql");
+    const PERSONAL_SCHEMA_V1: &str = include_str!("../../schema/personal_001.sql");
+    const PERSONAL_SCHEMA_V2: &str = include_str!("../../schema/personal_002.sql");
 
-    /// In-memory personal.db with the real schema applied.
+    /// In-memory personal.db with the real schema applied, v1 then v2 — the
+    /// same order and the same statement splitter the migration runner uses,
+    /// so the v2 entities rebuild is exercised on every single test.
     async fn test_db() -> SqliteConnection {
         let mut conn = SqliteConnectOptions::new()
             .filename(":memory:")
@@ -778,11 +849,13 @@ mod tests {
             .await
             .expect("in-memory connection failed");
 
-        for stmt in parse_statements(PERSONAL_SCHEMA) {
-            sqlx::query(&stmt)
-                .execute(&mut conn)
-                .await
-                .unwrap_or_else(|e| panic!("schema statement failed: {e}\n{stmt}"));
+        for schema in [PERSONAL_SCHEMA_V1, PERSONAL_SCHEMA_V2] {
+            for stmt in parse_statements(schema) {
+                sqlx::query(&stmt)
+                    .execute(&mut conn)
+                    .await
+                    .unwrap_or_else(|e| panic!("schema statement failed: {e}\n{stmt}"));
+            }
         }
         conn
     }
@@ -840,6 +913,10 @@ mod tests {
         assert_eq!(e.aliases, vec!["custard", "crème anglaise"]);
         assert_eq!(e.parent_entity_id, None);
         assert_eq!(e.status, "active");
+        assert_eq!(
+            e.modification_state, "user_created",
+            "a record with no import origin is QR's own (decisions.id=502)"
+        );
         assert_eq!(e.extra_metadata, serde_json::json!({"servings": 4}));
         assert!(!e.created_at.is_empty(), "created_at must be written");
     }
@@ -907,7 +984,7 @@ mod tests {
         let retired = create_entity_conn(conn, "recipe", "Old Scones", &[], None, None)
             .await
             .unwrap();
-        retire_entity_conn(conn, &retired, "retired").await.unwrap();
+        retire_entity_conn(conn, &retired, "archived").await.unwrap();
         create_entity_conn(conn, "device", "Oven", &[], None, None)
             .await
             .unwrap();
@@ -1352,5 +1429,187 @@ mod tests {
         });
         assert!(clause.contains("parent_entity_id IS NULL"));
         assert!(binds.is_empty(), "IS NULL takes no placeholder");
+    }
+
+    // -- personal_002 migration ---------------------------------------------
+
+    /// Apply v1 only, so the v2 rebuild can be exercised against real v1 data.
+    async fn v1_only_db() -> SqliteConnection {
+        let mut conn = SqliteConnectOptions::new()
+            .filename(":memory:")
+            .connect()
+            .await
+            .expect("in-memory connection failed");
+        for stmt in parse_statements(PERSONAL_SCHEMA_V1) {
+            sqlx::query(&stmt).execute(&mut conn).await.unwrap();
+        }
+        conn
+    }
+
+    async fn apply_v2(conn: &mut SqliteConnection) {
+        for stmt in parse_statements(PERSONAL_SCHEMA_V2) {
+            sqlx::query(&stmt)
+                .execute(&mut *conn)
+                .await
+                .unwrap_or_else(|e| panic!("v2 statement failed: {e}\n{stmt}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_v2_collapses_retired_into_archived_and_preserves_rows() {
+        let mut conn = v1_only_db().await;
+
+        // Three v1 rows, one in each v1 status.
+        for (id, name, status) in [
+            ("e-active", "Active One", "active"),
+            ("e-retired", "Retired One", "retired"),
+            ("e-archived", "Archived One", "archived"),
+        ] {
+            sqlx::query(
+                "INSERT INTO entities (id, entity_type, display_name, aliases,
+                 status, created_at, extra_metadata)
+                 VALUES (?, 'recipe', ?, '[\"alias\"]', ?, '2026-07-01T00:00:00Z', '{\"k\":1}')",
+            )
+            .bind(id)
+            .bind(name)
+            .bind(status)
+            .execute(&mut conn)
+            .await
+            .expect("v1 insert failed");
+        }
+
+        apply_v2(&mut conn).await;
+
+        let all = list_entities_conn(&mut conn, &EntityFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 3, "no row may be lost in the rebuild");
+
+        let by_id = |id: &str| all.iter().find(|e| e.id == id).unwrap().clone();
+        assert_eq!(by_id("e-active").status, "active");
+        assert_eq!(
+            by_id("e-retired").status,
+            "archived",
+            "'retired' must collapse into 'archived'"
+        );
+        assert_eq!(by_id("e-archived").status, "archived");
+
+        // Non-status columns must survive the copy intact.
+        let retired = by_id("e-retired");
+        assert_eq!(retired.display_name, "Retired One");
+        assert_eq!(retired.aliases, vec!["alias"]);
+        assert_eq!(retired.created_at, "2026-07-01T00:00:00Z");
+        assert_eq!(retired.extra_metadata, serde_json::json!({"k": 1}));
+        assert_eq!(
+            retired.modification_state, "user_created",
+            "pre-existing records have no import origin"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_v2_leaves_entity_facts_pointing_at_entities() {
+        // The rebuild drops `entities` and renames its replacement into
+        // place. SQLite rewrites REFERENCES clauses during ALTER TABLE
+        // RENAME, so without PRAGMA legacy_alter_table this is exactly where
+        // entity_facts' foreign key would silently start naming the
+        // temporary table. FK enforcement is off codebase-wide, so nothing
+        // would fail at runtime — the damage would only show up in an
+        // export or a future migration.
+        let mut conn = v1_only_db().await;
+        apply_v2(&mut conn).await;
+
+        let (ddl,): (String,) = sqlx::query_as(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='entity_facts'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+
+        assert!(
+            ddl.contains("REFERENCES entities(id)"),
+            "entity_facts must still reference `entities`, got: {ddl}"
+        );
+        assert!(
+            !ddl.contains("entities_v2"),
+            "the temporary table name must not leak into entity_facts: {ddl}"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_v2_creates_the_cb11_tables() {
+        let mut conn = test_db().await;
+        for table in ["source_registry", "dedup_candidates"] {
+            let found: Option<(String,)> = sqlx::query_as(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name = ?",
+            )
+            .bind(table)
+            .fetch_optional(&mut conn)
+            .await
+            .unwrap();
+            assert!(found.is_some(), "{table} must exist after v2");
+        }
+    }
+
+    #[tokio::test]
+    async fn status_set_matches_the_v2_check_constraint() {
+        let mut conn = test_db().await;
+        let id = create_entity_conn(&mut conn, "recipe", "Bread", &[], None, None)
+            .await
+            .unwrap();
+
+        // Every value this module accepts must also satisfy the DB CHECK —
+        // a mismatch would surface as a raw SQLite error instead of a
+        // plain-language one.
+        for status in VALID_STATUSES {
+            update_entity_conn(
+                &mut conn,
+                &id,
+                &EntityUpdate {
+                    status: Some((*status).to_owned()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("status '{status}' rejected by the DB: {e}"));
+        }
+        assert!(
+            !VALID_STATUSES.contains(&"retired"),
+            "'retired' was collapsed into 'archived' by personal_002"
+        );
+    }
+
+    #[tokio::test]
+    async fn modification_state_set_matches_the_v2_check_constraint() {
+        let mut conn = test_db().await;
+        let id = create_entity_conn(&mut conn, "recipe", "Bread", &[], None, None)
+            .await
+            .unwrap();
+
+        for state in VALID_MODIFICATION_STATES {
+            update_entity_conn(
+                &mut conn,
+                &id,
+                &EntityUpdate {
+                    modification_state: Some((*state).to_owned()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("modification_state '{state}' rejected: {e}"));
+        }
+
+        assert!(
+            update_entity_conn(
+                &mut conn,
+                &id,
+                &EntityUpdate {
+                    modification_state: Some("invented".to_owned()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .is_err(),
+            "an unknown modification_state must be rejected up front"
+        );
     }
 }
