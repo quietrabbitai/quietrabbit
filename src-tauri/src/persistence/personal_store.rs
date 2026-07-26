@@ -181,27 +181,21 @@ pub async fn load_personal_track(
 
     let mut conn = open_personal_db(user_id, persona_id, key_hex).await?;
     let mut track = PersonalTrack::new();
-
-    let rows = sqlx::query(
-        "SELECT field_name, field_value, sensitivity, sensitivity_severity,
-         source_id, abstraction_tier2, abstraction_tier3
-         FROM personal_fields ORDER BY field_name",
-    )
-    .fetch_all(&mut conn)
-    .await?;
-
-    for row in rows {
-        let field = PersonalField {
-            field_name: row.try_get("field_name")?,
-            field_value: row.try_get("field_value")?,
-            sensitivity: row.try_get("sensitivity")?,
-            sensitivity_severity: row.try_get::<i64, _>("sensitivity_severity")? as i32,
-            source_id: row.try_get("source_id")?,
-            abstraction_tier2: row.try_get("abstraction_tier2")?,
-            abstraction_tier3: row.try_get("abstraction_tier3")?,
-        };
-        track.add_field(field).map_err(|e| PersonalStoreError::Validation(e.to_string()))?;
-    }
+    // items.id=170 fix (2026-07-26): personal_fields was dropped by the
+    // entity-model migration; this function used to populate track.fields
+    // by reading that dead table via track.add_field(). track.fields is now
+    // left empty at INITIALIZE (PersonalField/PersonalTrack.fields is kept
+    // as a live type, not retired — it remains the IPC-facing shape for
+    // commands::personal -- but nothing currently needs it populated here).
+    // PersonalTrack.entity_facts (populated by build_personal_track() via
+    // load_entity_facts_for_context(), called separately right after this
+    // function returns) already carries every singleton fact a fresh
+    // install has. Populating both fields and entity_facts from the same
+    // underlying rows would be redundant duplication, not a fix. See
+    // items.id=170 handoff for the full verification trail (ownership_scope
+    // enforcement confirmed as a real write-time privacy gate,
+    // abstraction_tier2/tier3 domain match confirmed identical between
+    // personal_fields and entity_facts) behind this call.
 
     let profile = resolve_voice_profile_conn(&mut conn, persona_id).await?;
     track
@@ -256,6 +250,46 @@ pub async fn load_voice_profile(
 // Personal fields (read)
 // ---------------------------------------------------------------------------
 
+/// Map one singleton entity_facts row (entity_id IS NULL) onto PersonalField.
+/// Shared by every personal-field read path below (items.id=170 fix,
+/// 2026-07-26) so the extra_metadata source_id recovery logic lives in one
+/// place rather than being repeated per function.
+///
+/// source_id: entity_facts has no first-class source_id column (unlike the
+/// retired personal_fields table). save_personal_field (below) writes it
+/// into extra_metadata under the "source_id" key; this reads it back out.
+/// Falls back to "" if absent/malformed rather than erroring -- source_id
+/// was never validated as non-empty on the old table either, and a missing
+/// value here should surface as an empty string to callers, not fail the
+/// whole read.
+fn row_to_personal_field(r: &sqlx::sqlite::SqliteRow) -> Result<PersonalField, PersonalStoreError> {
+    let metadata_json: String = r.try_get("extra_metadata")?;
+    let source_id = serde_json::from_str::<serde_json::Value>(&metadata_json)
+        .ok()
+        .and_then(|v| v.get("source_id").and_then(|s| s.as_str().map(str::to_owned)))
+        .unwrap_or_default();
+
+    Ok(PersonalField {
+        field_name: r.try_get("field_name")?,
+        field_value: r.try_get("field_value")?,
+        sensitivity: r.try_get("sensitivity")?,
+        sensitivity_severity: r.try_get::<i64, _>("sensitivity_severity")? as i32,
+        source_id,
+        abstraction_tier2: r.try_get("abstraction_tier2")?,
+        abstraction_tier3: r.try_get("abstraction_tier3")?,
+    })
+}
+
+/// items.id=170 fix (2026-07-26): personal_fields does not exist post-
+/// entity-model migration. Reads the equivalent singleton entity_facts row
+/// (entity_id IS NULL, one active row per field_name enforced by
+/// idx_entity_facts_singleton_field) and maps it onto PersonalField.
+///
+/// source_id is recovered from extra_metadata (JSON key "source_id") --
+/// entity_facts has no first-class source_id column. Falls back to "" if
+/// absent (rows written before this fix, or written by a path that never
+/// set it) rather than erroring, since source_id was never validated as
+/// non-empty on the old table either.
 pub async fn get_personal_field(
     user_id: &str,
     persona_id: &str,
@@ -266,8 +300,9 @@ pub async fn get_personal_field(
 
     let row = sqlx::query(
         "SELECT field_name, field_value, sensitivity, sensitivity_severity,
-         source_id, abstraction_tier2, abstraction_tier3
-         FROM personal_fields WHERE field_name = ?",
+         abstraction_tier2, abstraction_tier3, extra_metadata
+         FROM entity_facts
+         WHERE entity_id IS NULL AND valid_until IS NULL AND field_name = ?",
     )
     .bind(field_name)
     .fetch_optional(&mut conn)
@@ -275,18 +310,18 @@ pub async fn get_personal_field(
 
     match row {
         None => Ok(None),
-        Some(r) => Ok(Some(PersonalField {
-            field_name: r.try_get("field_name")?,
-            field_value: r.try_get("field_value")?,
-            sensitivity: r.try_get("sensitivity")?,
-            sensitivity_severity: r.try_get::<i64, _>("sensitivity_severity")? as i32,
-            source_id: r.try_get("source_id")?,
-            abstraction_tier2: r.try_get("abstraction_tier2")?,
-            abstraction_tier3: r.try_get("abstraction_tier3")?,
-        })),
+        Some(r) => Ok(Some(row_to_personal_field(&r)?)),
     }
 }
 
+/// items.id=170 fix (2026-07-26): personal_fields does not exist post-
+/// entity-model migration. Lists singleton entity_facts rows (entity_id IS
+/// NULL, valid_until IS NULL) instead.
+///
+/// source_id filter matches against extra_metadata's "source_id" JSON key
+/// via json_extract, since entity_facts has no first-class source_id
+/// column -- see row_to_personal_field's doc comment for why that value
+/// lives in extra_metadata rather than a dedicated column.
 pub async fn list_personal_fields(
     user_id: &str,
     persona_id: &str,
@@ -298,11 +333,12 @@ pub async fn list_personal_fields(
 
     let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
         "SELECT field_name, field_value, sensitivity, sensitivity_severity,
-         source_id, abstraction_tier2, abstraction_tier3
-         FROM personal_fields WHERE 1=1",
+         abstraction_tier2, abstraction_tier3, extra_metadata
+         FROM entity_facts
+         WHERE entity_id IS NULL AND valid_until IS NULL",
     );
     if let Some(sid) = source_id {
-        qb.push(" AND source_id = ");
+        qb.push(" AND json_extract(extra_metadata, '$.source_id') = ");
         qb.push_bind(sid);
     }
     if let Some(sens) = sensitivity {
@@ -314,16 +350,8 @@ pub async fn list_personal_fields(
     let rows = qb.build().fetch_all(&mut conn).await?;
 
     let mut fields = Vec::new();
-    for r in rows {
-        fields.push(PersonalField {
-            field_name: r.try_get("field_name")?,
-            field_value: r.try_get("field_value")?,
-            sensitivity: r.try_get("sensitivity")?,
-            sensitivity_severity: r.try_get::<i64, _>("sensitivity_severity")? as i32,
-            source_id: r.try_get("source_id")?,
-            abstraction_tier2: r.try_get("abstraction_tier2")?,
-            abstraction_tier3: r.try_get("abstraction_tier3")?,
-        });
+    for r in &rows {
+        fields.push(row_to_personal_field(r)?);
     }
     Ok(fields)
 }
@@ -332,16 +360,42 @@ pub async fn list_personal_fields(
 // Personal fields (write)
 // ---------------------------------------------------------------------------
 
-/// Insert or update a personal field in personal.db.
-/// Returns field id (UUID — existing id if field_name already exists).
+/// Insert a personal field as a singleton entity_facts row (entity_id IS NULL).
+/// Returns the new row's id (UUID) -- always a fresh id, never the id of a
+/// prior version, since entity_facts rows are immutable (items.id=170 fix,
+/// 2026-07-26; see module note above and personal_001.sql's entity_facts
+/// comment: "Facts are immutable — updates are new rows. No updated_at
+/// column."). This is a real behavioral change from the retired
+/// personal_fields table, which allowed true UPDATE-in-place and returned
+/// the SAME id across repeated writes to the same field_name -- callers
+/// that cached a field's id across writes expecting it to stay stable no
+/// longer can. No live caller does this (checked commands/personal.rs,
+/// conductor/extract.rs) but it is a real contract change worth flagging.
 ///
-/// Atomic rollback protection: SAVEPOINT wraps the SELECT + INSERT/UPDATE
-/// so a partial write is rolled back on failure within this connection.
-/// Does NOT serialize concurrent writers — two connections can still race
-/// on INSERT. A UNIQUE(field_name) constraint + ON CONFLICT DO UPDATE would
-/// solve this cleanly. Flag to Chat-PM for a future personal_fields migration.
+/// Atomic rollback protection: SAVEPOINT wraps the supersede-then-insert
+/// sequence, mirroring create_entity_fact_with_provenance's pattern (same
+/// table, same immutability rule) rather than reinventing it.
 ///
-/// sensitivity_severity is a GENERATED ALWAYS column — omitted from UPDATE.
+/// source_persona_id (required by entity_facts' NOT-NULL-on-insert trigger,
+/// trg_entity_facts_provenance_required) is this function's own persona_id
+/// parameter -- the Persona instance this fact is being written into, same
+/// meaning create_entity_fact_with_provenance gives it. cross_persona_export
+/// defaults to false / origin_persona_id to None: every save_personal_field
+/// write is native to its own Persona, never a cross-Persona copy -- that
+/// path (if one is ever needed here) would need its own function, matching
+/// how create_entity_fact_with_provenance requires an explicit flag rather
+/// than inferring cross-Persona status.
+///
+/// source_id and ownership_scope: entity_facts has no first-class columns
+/// for either (unlike the retired personal_fields table). Both are written
+/// into extra_metadata under "source_id" / "ownership_scope" keys instead --
+/// preserved for audit/export, but no longer structurally queryable via a
+/// dedicated column since nothing in the live codebase reads either back
+/// out except this module's own export path (checked every caller before
+/// making this call; see items.id=170 handoff for the full trail).
+/// ownership_scope's write-time enforcement (below) is unaffected by this --
+/// the validation runs against the caller-supplied parameter, not a stored
+/// value, exactly as it always has.
 #[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
 pub async fn save_personal_field(
     user_id: &str,
@@ -385,8 +439,20 @@ pub async fn save_personal_field(
         );
     }
 
-    let metadata_json = serde_json::to_string(&extra_metadata.unwrap_or_default())
-        .unwrap_or_else(|_| "{}".to_owned());
+    // source_id / ownership_scope preserved in extra_metadata -- see doc
+    // comment above for why entity_facts carries these here rather than in
+    // dedicated columns. Caller-supplied extra_metadata keys are preserved
+    // alongside them; a caller that also sets "source_id"/"ownership_scope"
+    // in extra_metadata directly would have those overwritten below, but no
+    // live caller does (checked commands/personal.rs, conductor/extract.rs
+    // -- both pass extra_metadata=None).
+    let mut metadata = extra_metadata.unwrap_or_else(|| serde_json::json!({}));
+    if let Some(obj) = metadata.as_object_mut() {
+        obj.insert("source_id".to_owned(), serde_json::json!(source_id));
+        obj.insert("ownership_scope".to_owned(), serde_json::json!(ownership_scope));
+    }
+    let metadata_json = serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".to_owned());
+
     let timestamp = crate::providers::utils::now();
     let mut conn = open_personal_db(user_id, persona_id, key_hex).await?;
 
@@ -395,62 +461,41 @@ pub async fn save_personal_field(
         .await?;
 
     let step: Result<String, sqlx::Error> = async {
-        let existing = sqlx::query(
-            "SELECT id FROM personal_fields WHERE field_name = ?",
+        // Supersede any existing active singleton fact for this field_name --
+        // mirrors create_entity_fact_with_provenance's supersede-then-insert
+        // sequence. entity_facts rows are immutable; this is a new version,
+        // not an in-place UPDATE.
+        sqlx::query(
+            "UPDATE entity_facts SET valid_until = ?
+             WHERE entity_id IS NULL AND field_name = ? AND valid_until IS NULL",
         )
+        .bind(&timestamp)
         .bind(field_name)
-        .fetch_optional(&mut conn)
+        .execute(&mut conn)
         .await?;
 
-        let field_id = if let Some(row) = existing {
-            let id: String = row.try_get("id")?;
-            // sensitivity_severity intentionally omitted — GENERATED ALWAYS column.
-            sqlx::query(
-                "UPDATE personal_fields SET
-                 field_value = ?, sensitivity = ?, source_id = ?,
-                 ownership_scope = ?, abstraction_tier2 = ?, abstraction_tier3 = ?,
-                 source = ?, updated_at = ?, extra_metadata = ?
-                 WHERE id = ?",
-            )
-            .bind(field_value)
-            .bind(sensitivity)
-            .bind(source_id)
-            .bind(ownership_scope)
-            .bind(abstraction_tier2)
-            .bind(abstraction_tier3)
-            .bind(source)
-            .bind(&timestamp)
-            .bind(&metadata_json)
-            .bind(&id)
-            .execute(&mut conn)
-            .await?;
-            id
-        } else {
-            let new_id = uuid::Uuid::new_v4().to_string();
-            sqlx::query(
-                "INSERT INTO personal_fields
-                 (id, source_id, field_name, field_value, sensitivity,
-                  ownership_scope, abstraction_tier2, abstraction_tier3,
-                  source, created_at, updated_at, extra_metadata)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(&new_id)
-            .bind(source_id)
-            .bind(field_name)
-            .bind(field_value)
-            .bind(sensitivity)
-            .bind(ownership_scope)
-            .bind(abstraction_tier2)
-            .bind(abstraction_tier3)
-            .bind(source)
-            .bind(&timestamp)
-            .bind(&timestamp)
-            .bind(&metadata_json)
-            .execute(&mut conn)
-            .await?;
-            new_id
-        };
-        Ok(field_id)
+        let new_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO entity_facts
+             (id, entity_id, field_name, field_value, sensitivity, source,
+              created_at, extra_metadata, abstraction_tier2, abstraction_tier3,
+              source_persona_id, cross_persona_export, origin_persona_id)
+             VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL)",
+        )
+        .bind(&new_id)
+        .bind(field_name)
+        .bind(field_value)
+        .bind(sensitivity)
+        .bind(source)
+        .bind(&timestamp)
+        .bind(&metadata_json)
+        .bind(abstraction_tier2)
+        .bind(abstraction_tier3)
+        .bind(persona_id)
+        .execute(&mut conn)
+        .await?;
+
+        Ok(new_id)
     }
     .await;
 
@@ -479,9 +524,28 @@ pub async fn save_personal_field(
 }
 
 /// Logical deletion of a personal field.
-/// Blanks the field_value then deletes the row, both under a SAVEPOINT.
-/// Relies on SQLCipher file-level encryption for at-rest data protection —
-/// does NOT guarantee zero-overwrite of underlying SQLite pages or WAL contents.
+///
+/// items.id=170 fix (2026-07-26): rewritten to supersede the active
+/// singleton entity_facts row (set valid_until) rather than the retired
+/// personal_fields table's blank-then-hard-DELETE sequence. This is a
+/// deliberate behavior change, not a mechanical port: entity_facts rows are
+/// immutable by design (personal_001.sql: "Facts are immutable — updates
+/// are new rows"; every other writer in this module -- save_personal_field
+/// above, create_entity_fact_with_provenance in this same file -- follows
+/// supersede-then-insert, never a hard DELETE). A hard DELETE here would
+/// contradict that design and destroy history the table exists to keep.
+/// Checked before making this call: delete_personal_field has no live
+/// caller anywhere in the codebase (no IPC command, not referenced by
+/// commands/personal.rs or conductor/extract.rs), so no existing contract
+/// requires the old hard-delete return semantics -- following the table's
+/// own design intent is the correct default here, not a guess.
+///
+/// A superseded row (valid_until IS NOT NULL) is excluded from every read
+/// path in this module (get_personal_field, list_personal_fields,
+/// load_personal_track, export_personal_fields all filter on
+/// valid_until IS NULL) -- functionally invisible to every caller, exactly
+/// as a deleted personal_fields row was, but recoverable from history
+/// rather than destroyed.
 pub async fn delete_personal_field(
     user_id: &str,
     persona_id: &str,
@@ -492,7 +556,8 @@ pub async fn delete_personal_field(
     let timestamp = crate::providers::utils::now();
 
     let existing = sqlx::query(
-        "SELECT id FROM personal_fields WHERE field_name = ?",
+        "SELECT id FROM entity_facts
+         WHERE entity_id IS NULL AND field_name = ? AND valid_until IS NULL",
     )
     .bind(field_name)
     .fetch_optional(&mut conn)
@@ -502,53 +567,16 @@ pub async fn delete_personal_field(
         return Ok(false);
     }
 
-    sqlx::query("SAVEPOINT delete_personal_field")
-        .execute(&mut conn)
-        .await?;
+    sqlx::query(
+        "UPDATE entity_facts SET valid_until = ?
+         WHERE entity_id IS NULL AND field_name = ? AND valid_until IS NULL",
+    )
+    .bind(&timestamp)
+    .bind(field_name)
+    .execute(&mut conn)
+    .await?;
 
-    let step: Result<(), sqlx::Error> = async {
-        // Step 1: blank the value before deletion (logical zeroing).
-        sqlx::query(
-            "UPDATE personal_fields SET field_value = '', updated_at = ?
-             WHERE field_name = ?",
-        )
-        .bind(&timestamp)
-        .bind(field_name)
-        .execute(&mut conn)
-        .await?;
-
-        // Step 2: delete the now-blanked record.
-        sqlx::query("DELETE FROM personal_fields WHERE field_name = ?")
-            .bind(field_name)
-            .execute(&mut conn)
-            .await?;
-
-        Ok(())
-    }
-    .await;
-
-    match step {
-        Ok(()) => {
-            sqlx::query("RELEASE delete_personal_field")
-                .execute(&mut conn)
-                .await?;
-            Ok(true)
-        }
-        Err(e) => {
-            if let Err(rollback_err) = sqlx::query("ROLLBACK TO delete_personal_field")
-                .execute(&mut conn)
-                .await
-            {
-                log::error!(
-                    "Savepoint rollback failed in delete_personal_field: {rollback_err}"
-                );
-            }
-            let _ = sqlx::query("RELEASE delete_personal_field")
-                .execute(&mut conn)
-                .await;
-            Err(PersonalStoreError::Database(e))
-        }
-    }
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -825,6 +853,29 @@ pub async fn list_pending_cross_persona_exports(
 // Export
 // ---------------------------------------------------------------------------
 
+/// items.id=170 fix (2026-07-26): personal_fields does not exist post-
+/// entity-model migration. Exports active singleton entity_facts rows
+/// (entity_id IS NULL, valid_until IS NULL) instead.
+///
+/// Checked before making this call: export_personal_fields has no live
+/// caller anywhere in the codebase (no IPC command, not referenced
+/// elsewhere) -- unlike the other five functions in this fix, no existing
+/// contract constrains this rewrite. Field shape is kept identical to the
+/// old export payload regardless, since a Moving Day / export consumer is
+/// exactly the kind of caller that would arrive later expecting the
+/// documented shape, not a caller that already exists to check.
+///
+/// source_id / ownership_scope: recovered from extra_metadata, same as
+/// row_to_personal_field (see that function's doc comment) -- not read via
+/// row_to_personal_field itself because the export payload also carries
+/// ownership_scope, which PersonalField's struct shape does not have room
+/// for and was never asked to.
+///
+/// updated_at: entity_facts has no updated_at column (immutable rows have
+/// only created_at -- a "new version" is a new row with its own
+/// created_at, per personal_001.sql's design). Exported as equal to
+/// created_at rather than omitted, since that is the honest value for an
+/// immutable row -- not a placeholder standing in for a missing column.
 pub async fn export_personal_fields(
     user_id: &str,
     persona_id: &str,
@@ -835,13 +886,13 @@ pub async fn export_personal_fields(
 
     let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
         "SELECT field_name, sensitivity, sensitivity_severity,
-         source_id, abstraction_tier2, abstraction_tier3,
-         ownership_scope, source, created_at, updated_at
-         FROM personal_fields WHERE sensitivity_severity <= ",
+         abstraction_tier2, abstraction_tier3, source, created_at, extra_metadata
+         FROM entity_facts
+         WHERE entity_id IS NULL AND valid_until IS NULL AND sensitivity_severity <= ",
     );
     qb.push_bind(EXPORT_SENSITIVITY_CEILING);
     if let Some(sid) = source_id {
-        qb.push(" AND source_id = ");
+        qb.push(" AND json_extract(extra_metadata, '$.source_id') = ");
         qb.push_bind(sid);
     }
     qb.push(" ORDER BY field_name");
@@ -850,19 +901,34 @@ pub async fn export_personal_fields(
 
     let mut result = Vec::new();
     for r in rows {
+        let metadata_json: String = r.try_get("extra_metadata")?;
+        let metadata: serde_json::Value =
+            serde_json::from_str(&metadata_json).unwrap_or(serde_json::json!({}));
+        let source_id_out = metadata
+            .get("source_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_owned();
+        let ownership_scope_out = metadata
+            .get("ownership_scope")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_owned();
+        let created_at: String = r.try_get("created_at")?;
+
         result.push(serde_json::json!({
             "export_schema_version": EXPORT_SCHEMA_VERSION,
             "export_semantic": "metadata_only",
             "field_name": r.try_get::<String, _>("field_name")?,
             "sensitivity": r.try_get::<String, _>("sensitivity")?,
             "sensitivity_severity": r.try_get::<i64, _>("sensitivity_severity")? as i32,
-            "source_id": r.try_get::<String, _>("source_id")?,
+            "source_id": source_id_out,
             "abstraction_tier2": r.try_get::<String, _>("abstraction_tier2")?,
             "abstraction_tier3": r.try_get::<String, _>("abstraction_tier3")?,
-            "ownership_scope": r.try_get::<String, _>("ownership_scope")?,
+            "ownership_scope": ownership_scope_out,
             "source": r.try_get::<String, _>("source")?,
-            "created_at": r.try_get::<String, _>("created_at")?,
-            "updated_at": r.try_get::<String, _>("updated_at")?,
+            "created_at": created_at.clone(),
+            "updated_at": created_at,
         }));
     }
     Ok(result)

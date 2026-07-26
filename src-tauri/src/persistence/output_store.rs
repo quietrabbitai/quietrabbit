@@ -281,6 +281,61 @@ pub async fn get_focus_run_status(
 }
 
 // ---------------------------------------------------------------------------
+// List
+// ---------------------------------------------------------------------------
+
+/// List active outputs, optionally filtered by focus_id, topic_id, and/or
+/// output_type. Joins through focus_runs for focus_id/topic_id since those
+/// columns live there, not on outputs itself.
+///
+/// Ordered most-recent-first (outputs.created_at DESC) — the Library's
+/// natural browse order.
+///
+/// Does NOT enforce Focus profile visibility rules (Open/Organized/
+/// Protected) — that filtering layer is a separate, not-yet-built gap
+/// (items.id=91, part 3). Callers needing that enforcement must apply it
+/// on top of this function's results until it lands in the store.
+pub async fn list_outputs(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    focus_id: Option<&str>,
+    topic_id: Option<&str>,
+    output_type: Option<&str>,
+) -> Result<Vec<OutputRecord>, OutputStoreError> {
+    let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
+
+    let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        "SELECT o.id, o.focus_run_id, o.output_type, o.content,
+                o.sensitivity, o.status, o.created_at, o.updated_at
+         FROM outputs o
+         JOIN focus_runs r ON r.id = o.focus_run_id
+         WHERE o.status = 'active'",
+    );
+    if let Some(fid) = focus_id {
+        qb.push(" AND r.focus_id = ");
+        qb.push_bind(fid);
+    }
+    if let Some(tid) = topic_id {
+        qb.push(" AND r.topic_id = ");
+        qb.push_bind(tid);
+    }
+    if let Some(otype) = output_type {
+        qb.push(" AND o.output_type = ");
+        qb.push_bind(otype);
+    }
+    qb.push(" ORDER BY o.created_at DESC");
+
+    let rows = qb.build().fetch_all(&mut conn).await?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for r in &rows {
+        out.push(row_to_output_record(r).map_err(OutputStoreError::Database)?);
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
 // Delete (deferred — Layer 5+)
 // ---------------------------------------------------------------------------
 

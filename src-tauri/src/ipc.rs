@@ -50,6 +50,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::consent::submit_consent_decision,
         commands::consent::submit_floor_consent_decision,
         commands::consent::submit_element_consent_decision,
+        commands::consent::submit_friction_gate_decision,
         commands::consent::submit_extract_confirm,
         commands::consent::get_pending_cross_persona_confirmations,
         // Group 3 -- Onboarding

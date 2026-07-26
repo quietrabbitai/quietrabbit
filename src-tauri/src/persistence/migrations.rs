@@ -84,6 +84,8 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/scores_001.sql") },
     SchemaFile { prefix: "shared", version: 1,
         sql: include_str!("../../schema/shared_001.sql") },
+    SchemaFile { prefix: "shared", version: 2,
+        sql: include_str!("../../schema/shared_002.sql") },
 ];
 
 /// Validate manifest ordering on every run_migrations call.

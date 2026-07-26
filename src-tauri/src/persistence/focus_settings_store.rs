@@ -397,3 +397,78 @@ pub async fn update_focus_settings(
         updated_at,
     })
 }
+
+// ---------------------------------------------------------------------------
+// Friction gate decisions (items.id=92)
+// ---------------------------------------------------------------------------
+
+/// Record a user's decision to proceed with (or cancel) a privacy-loosening
+/// Focus settings change that tripped the friction gate.
+///
+/// Lives in focus_settings_friction_decisions (shared_002.sql), a sibling
+/// table to focus_settings rather than a row in outputs.db's
+/// consent_decisions -- see shared_002.sql's header comment for the full
+/// reasoning (consent_decisions.focus_run_id is NOT NULL, and this decision
+/// has no FocusRun to anchor to).
+///
+/// requested_privacy_tier / requested_focus_profile: pass None for whichever
+/// dimension did not trip the gate -- mirrors update_focus_settings itself
+/// treating every field as independently optional. At least one must be
+/// Some, enforced by the table's own CHECK constraint (a request with
+/// neither would mean the gate fired for no reason).
+///
+/// existing_privacy_tier / existing_focus_profile: the settings row's values
+/// at the moment the gate fired, for audit purposes (see shared_002.sql).
+/// Caller supplies these rather than this function re-reading
+/// focus_settings, since the caller (update_focus_settings) already has
+/// them in hand from its own gate check and a second read here could race
+/// against a concurrent write.
+#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
+pub async fn record_friction_gate_decision(
+    persona_id: &str,
+    focus_id: &str,
+    decision: &str,
+    requested_privacy_tier: Option<i32>,
+    requested_focus_profile: Option<&str>,
+    existing_privacy_tier: i32,
+    existing_focus_profile: &str,
+) -> Result<String, FocusSettingsStoreError> {
+    if !matches!(decision, "proceed" | "cancel") {
+        return Err(FocusSettingsStoreError::Validation(format!(
+            "friction gate decision must be 'proceed' or 'cancel', got '{decision}'."
+        )));
+    }
+    if requested_privacy_tier.is_none() && requested_focus_profile.is_none() {
+        return Err(FocusSettingsStoreError::Validation(
+            "friction gate decision requires at least one of \
+             requested_privacy_tier / requested_focus_profile -- a gate \
+             trip with neither means nothing actually triggered it."
+                .to_owned(),
+        ));
+    }
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let created_at = crate::providers::utils::now();
+    let mut conn = open_shared_db().await?;
+
+    sqlx::query(
+        "INSERT INTO focus_settings_friction_decisions
+         (id, persona_id, focus_id, decision, requested_privacy_tier,
+          requested_focus_profile, existing_privacy_tier, existing_focus_profile,
+          created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(persona_id)
+    .bind(focus_id)
+    .bind(decision)
+    .bind(requested_privacy_tier)
+    .bind(requested_focus_profile)
+    .bind(existing_privacy_tier)
+    .bind(existing_focus_profile)
+    .bind(&created_at)
+    .execute(&mut conn)
+    .await?;
+
+    Ok(id)
+}

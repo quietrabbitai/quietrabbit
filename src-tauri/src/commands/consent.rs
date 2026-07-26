@@ -28,6 +28,18 @@
 //   candidates (item 20). Validates, writes confirmed fields to personal.db,
 //   marks candidates decided, then sets status='complete'.
 //
+// submit_friction_gate_decision (items.id=92): processes the user's proceed/
+//   cancel decision after commands::persona::update_focus_settings returned
+//   a FrictionGateDetail-shaped Err. Unlike the run-scoped consent commands
+//   above, this decision has no FocusRun to anchor to -- it is recorded in
+//   shared.db's focus_settings_friction_decisions (shared_002.sql), a
+//   sibling table to focus_settings, not outputs.db's consent_decisions.
+//   See shared_002.sql's header for why that table was rejected for this
+//   purpose. On decision="proceed", this command both records the decision
+//   AND applies the originally-requested settings change (mirrors
+//   submit_extract_confirm's record-plus-follow-through shape) -- the
+//   frontend never calls update_focus_settings a second time itself.
+//
 // get_pending_cross_persona_confirmations: pre-Focus-start query for the
 //   Cross-Persona Data Provenance confirmation flow (decisions.id=546,
 //   decisions.id=639, items.id=27). Called by the frontend BEFORE
@@ -55,6 +67,7 @@ use sqlx::Row;
 
 use crate::conductor::extract;
 use crate::conductor::privacy::types::ExtractConfirmDecision;
+use crate::persistence::focus_settings_store;
 use crate::persistence::output_store;
 use crate::persistence::output_store::{get_focus_run_status, set_focus_run_status};
 use crate::persistence::personal_store;
@@ -121,6 +134,23 @@ pub struct GetPendingCrossPersonaConfirmationsRequest {
     pub user_id: String,
     pub persona_id: String,
     pub key_hex: String,
+}
+
+/// items.id=92 -- the user's proceed/cancel answer to a FrictionGateDetail
+/// the frontend received from a blocked update_focus_settings call.
+///
+/// original_request carries the FULL originally-attempted settings change
+/// (not just the two gate-relevant fields) so that on decision="proceed"
+/// this command can apply the whole update in one call -- a real settings
+/// screen may bundle a gate-tripping field change together with
+/// non-gate-tripping ones (e.g. privacy_tier loosening alongside a
+/// context_flow change), and both must land together, not in two separate
+/// writes the frontend has to sequence itself.
+#[derive(Debug, Deserialize, Type)]
+pub struct SubmitFrictionGateDecisionRequest {
+    /// "proceed" | "cancel"
+    pub decision: String,
+    pub original_request: crate::commands::persona::UpdateFocusSettingsRequest,
 }
 
 /// IPC-safe projection of an entity_facts row pending cross-Persona
@@ -208,6 +238,109 @@ pub async fn submit_element_consent_decision(
     )
     .await
     .map_err(|e| e.to_string())
+}
+
+/// items.id=92 -- process the user's proceed/cancel answer to a friction-gate
+/// block returned by commands::persona::update_focus_settings.
+///
+/// On "cancel": records the decision only. No settings change is applied --
+/// the Focus keeps its prior settings exactly as they were.
+///
+/// On "proceed": records the decision, THEN applies original_request via
+/// focus_settings_store::update_focus_settings directly (NOT by calling
+/// commands::persona::update_focus_settings again, which would immediately
+/// re-trip the same gate check this command exists to get past). Both
+/// writes happen in this one call -- the frontend does not make a second
+/// settings-update request itself.
+///
+/// Re-validates original_request's tier bounds before applying, mirroring
+/// update_focus_settings's own guard -- this command is a second entry
+/// point into the same mutation and must not skip a check the first entry
+/// point enforces, even though the friction-gate values themselves were
+/// already validated once when update_focus_settings first computed them.
+#[tauri::command]
+#[specta::specta]
+pub async fn submit_friction_gate_decision(
+    request: SubmitFrictionGateDecisionRequest,
+) -> Result<Option<crate::commands::persona::FocusInfo>, String> {
+    if !matches!(request.decision.as_str(), "proceed" | "cancel") {
+        return Err(format!(
+            "decision must be 'proceed' or 'cancel', got '{}'",
+            request.decision
+        ));
+    }
+
+    let orig = &request.original_request;
+
+    // Re-read current settings for the audit record's existing_* columns and
+    // to recompute which dimension(s) actually trip the gate -- do not trust
+    // a frontend-supplied FrictionGateDetail, since settings could have
+    // changed between the original blocked call and this decision.
+    let existing = focus_settings_store::get_focus_settings(&orig.persona_id, &orig.focus_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "not_found".to_string())?;
+
+    let privacy_would_loosen = orig
+        .privacy_tier
+        .map(|t| t > existing.privacy_tier)
+        .unwrap_or(false);
+    let moves_to_protected = orig
+        .focus_profile
+        .as_deref()
+        .map(|p| p == "protected" && existing.focus_profile != "protected")
+        .unwrap_or(false);
+
+    focus_settings_store::record_friction_gate_decision(
+        &orig.persona_id,
+        &orig.focus_id,
+        &request.decision,
+        if privacy_would_loosen { orig.privacy_tier } else { None },
+        if moves_to_protected { orig.focus_profile.as_deref() } else { None },
+        existing.privacy_tier,
+        &existing.focus_profile,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if request.decision == "cancel" {
+        return Ok(None);
+    }
+
+    // decision == "proceed": apply the originally-requested change.
+    for (name, val) in [
+        ("privacy_tier", orig.privacy_tier),
+        ("max_permitted_tier", orig.max_permitted_tier),
+    ] {
+        if let Some(v) = val {
+            if !(1..=3).contains(&v) {
+                return Err(format!("{name} must be between 1 and 3, got {v}"));
+            }
+        }
+    }
+
+    let s = focus_settings_store::update_focus_settings(
+        &orig.persona_id,
+        &orig.focus_id,
+        orig.context_flow.as_deref(),
+        orig.library_visibility.as_deref(),
+        orig.privacy_tier,
+        orig.max_permitted_tier,
+        orig.focus_profile.as_deref(),
+        None, // voice_override: not exposed in IPC surface v1
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(Some(crate::commands::persona::FocusInfo {
+        focus_id: s.focus_id,
+        focus_profile: s.focus_profile,
+        context_flow: s.context_flow,
+        library_visibility: s.library_visibility,
+        privacy_tier: s.privacy_tier,
+        max_permitted_tier: s.max_permitted_tier,
+        updated_at: s.updated_at,
+    }))
 }
 
 /// Process user decisions for extract-and-confirm candidates (item 20).

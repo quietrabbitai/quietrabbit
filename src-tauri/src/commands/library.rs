@@ -3,10 +3,13 @@
 // Group 7 — Library.
 // Commands: list_outputs, get_output, delete_output.
 //
-// list_outputs: STUB -- no list function in output_store. Flagged to Chat-PM.
+// list_outputs: wired to output_store::list_outputs() (items.id=91 part 1,
+//   fixed 2026-07-26). Supports optional focus_id/topic_id/output_type
+//   filters, joined through focus_runs.
 // get_output: wired to output_store::get_output().
 // delete_output: STUB -- full zero-then-delete sequence deferred to Layer 5+
 //   (see output_store::delete_output comment for correct deletion sequence).
+//   (items.id=91 part 2, lower priority, not a Release-1 blocker.)
 //
 // Library visibility gap (post-Release 1):
 //   output_store::get_output() enforces status='active' and per-scope DB
@@ -37,19 +40,50 @@ pub struct OutputInfo {
     pub created_at: String,
 }
 
+fn to_output_info(record: output_store::OutputRecord) -> OutputInfo {
+    OutputInfo {
+        id: record.id,
+        focus_run_id: record.focus_run_id,
+        output_type: record.output_type,
+        content: record.content,
+        sensitivity: record.sensitivity,
+        status: record.status,
+        created_at: record.created_at,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
 
-/// STUB -- list_outputs requires a list function in output_store (not yet added).
+/// Lists active outputs, optionally filtered by focus_id, topic_id, and/or
+/// output_type. Wired to output_store::list_outputs() (items.id=91, part 1).
+///
+/// Does NOT enforce Focus profile visibility rules (Open/Organized/
+/// Protected) -- that filtering layer is a separate, not-yet-built gap
+/// (items.id=91, part 3, post-Release 1). See module header.
 #[tauri::command]
 #[specta::specta]
 pub async fn list_outputs(
-    _focus_id: Option<String>,
-    _topic_id: Option<String>,
-    _output_type: Option<String>,
+    user_id: String,
+    persona_id: String,
+    key_hex: String,
+    focus_id: Option<String>,
+    topic_id: Option<String>,
+    output_type: Option<String>,
 ) -> Result<Vec<OutputInfo>, String> {
-    Err("not_implemented".to_string())
+    let records = output_store::list_outputs(
+        &user_id,
+        &persona_id,
+        &key_hex,
+        focus_id.as_deref(),
+        topic_id.as_deref(),
+        output_type.as_deref(),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(records.into_iter().map(to_output_info).collect())
 }
 
 #[tauri::command]
@@ -65,15 +99,7 @@ pub async fn get_output(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "not_found".to_string())?;
 
-    Ok(OutputInfo {
-        id: record.id,
-        focus_run_id: record.focus_run_id,
-        output_type: record.output_type,
-        content: record.content,
-        sensitivity: record.sensitivity,
-        status: record.status,
-        created_at: record.created_at,
-    })
+    Ok(to_output_info(record))
 }
 
 /// STUB -- full zero-then-delete sequence deferred to Layer 5+.

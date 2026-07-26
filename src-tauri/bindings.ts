@@ -26,6 +26,35 @@ export const commands = {
 	submitFloorConsentDecision: (request: SubmitFloorConsentDecisionRequest) => typedError<null, string>(__TAURI_INVOKE("submit_floor_consent_decision", { request })),
 	submitElementConsentDecision: (request: SubmitElementConsentDecisionRequest) => typedError<null, string>(__TAURI_INVOKE("submit_element_consent_decision", { request })),
 	/**
+	 *  items.id=92 -- process the user's proceed/cancel answer to a friction-gate
+	 *  block returned by commands::persona::update_focus_settings.
+	 * 
+	 *  On "cancel": records the decision only. No settings change is applied --
+	 *  the Focus keeps its prior settings exactly as they were.
+	 * 
+	 *  On "proceed": records the decision, THEN applies original_request via
+	 *  focus_settings_store::update_focus_settings directly (NOT by calling
+	 *  commands::persona::update_focus_settings again, which would immediately
+	 *  re-trip the same gate check this command exists to get past). Both
+	 *  writes happen in this one call -- the frontend does not make a second
+	 *  settings-update request itself.
+	 * 
+	 *  Re-validates original_request's tier bounds before applying, mirroring
+	 *  update_focus_settings's own guard -- this command is a second entry
+	 *  point into the same mutation and must not skip a check the first entry
+	 *  point enforces, even though the friction-gate values themselves were
+	 *  already validated once when update_focus_settings first computed them.
+	 */
+	submitFrictionGateDecision: (request: SubmitFrictionGateDecisionRequest) => typedError<{
+	focus_id: string,
+	focus_profile: string,
+	context_flow: string,
+	library_visibility: string,
+	privacy_tier: number,
+	max_permitted_tier: number,
+	updated_at: string,
+} | null, string>(__TAURI_INVOKE("submit_friction_gate_decision", { request })),
+	/**
 	 *  Process user decisions for extract-and-confirm candidates (item 20).
 	 * 
 	 *  Validation: confirmed==true with confirmed_value==None rejects entire call
@@ -74,6 +103,22 @@ export const commands = {
 	 *  composite. The IPC spec lists focus_id only (higher-level abstraction).
 	 */
 	getFocusSettings: (personaId: string, focusId: string) => typedError<FocusInfo, string>(__TAURI_INVOKE("get_focus_settings", { personaId, focusId })),
+	/**
+	 *  Applies a Focus settings change directly, UNLESS the change would loosen
+	 *  privacy_tier or move focus_profile to 'protected' -- in which case this
+	 *  returns Err(json-serialized FrictionGateDetail) instead of applying
+	 *  anything, and the frontend must route the user through
+	 *  commands::consent::submit_friction_gate_decision to either apply the
+	 *  change (decision="proceed") or drop it (decision="cancel"). See module
+	 *  header for the full flow and the tier-direction note.
+	 * 
+	 *  The error string is JSON (FrictionGateDetail serialized), not a plain
+	 *  message -- distinguishable from every other error this command can
+	 *  return (validation failures, not_found) by attempting a JSON parse.
+	 *  A frontend that doesn't parse it still gets a readable-enough string,
+	 *  but the structured shape is what submit_friction_gate_decision expects
+	 *  to be built from.
+	 */
 	updateFocusSettings: (request: UpdateFocusSettingsRequest) => typedError<FocusInfo, string>(__TAURI_INVOKE("update_focus_settings", { request })),
 	getActiveBoard: (userId: string, personaId: string, keyHex: string) => typedError<ActiveBoardResponse, string>(__TAURI_INVOKE("get_active_board", { userId, personaId, keyHex })),
 	getTopicList: (focusId: string, userId: string, personaId: string, keyHex: string) => typedError<TopicInfo[], string>(__TAURI_INVOKE("get_topic_list", { focusId, userId, personaId, keyHex })),
@@ -81,8 +126,15 @@ export const commands = {
 	getPersonalFields: (personaId: string, userId: string, keyHex: string) => typedError<PersonalFieldInfo[], string>(__TAURI_INVOKE("get_personal_fields", { personaId, userId, keyHex })),
 	updatePersonalField: (request: UpdatePersonalFieldRequest) => typedError<PersonalFieldInfo, string>(__TAURI_INVOKE("update_personal_field", { request })),
 	getVoiceProfile: (personaId: string, userId: string, keyHex: string) => typedError<VoiceProfileInfo, string>(__TAURI_INVOKE("get_voice_profile", { personaId, userId, keyHex })),
-	/**  STUB -- list_outputs requires a list function in output_store (not yet added). */
-	listOutputs: (focusId: string | null, topicId: string | null, outputType: string | null) => typedError<OutputInfo[], string>(__TAURI_INVOKE("list_outputs", { focusId, topicId, outputType })),
+	/**
+	 *  Lists active outputs, optionally filtered by focus_id, topic_id, and/or
+	 *  output_type. Wired to output_store::list_outputs() (items.id=91, part 1).
+	 * 
+	 *  Does NOT enforce Focus profile visibility rules (Open/Organized/
+	 *  Protected) -- that filtering layer is a separate, not-yet-built gap
+	 *  (items.id=91, part 3, post-Release 1). See module header.
+	 */
+	listOutputs: (userId: string, personaId: string, keyHex: string, focusId: string | null, topicId: string | null, outputType: string | null) => typedError<OutputInfo[], string>(__TAURI_INVOKE("list_outputs", { userId, personaId, keyHex, focusId, topicId, outputType })),
 	getOutput: (outputId: string, userId: string, personaId: string, keyHex: string) => typedError<OutputInfo, string>(__TAURI_INVOKE("get_output", { outputId, userId, personaId, keyHex })),
 	/**  STUB -- full zero-then-delete sequence deferred to Layer 5+. */
 	deleteOutput: (outputId: string, deepPurge: boolean | null) => typedError<null, string>(__TAURI_INVOKE("delete_output", { outputId, deepPurge })),
@@ -333,6 +385,24 @@ export type SubmitFocusRunRequest = {
 
 export type SubmitFocusRunResponse = {
 	run_id: string,
+};
+
+/**
+ *  items.id=92 -- the user's proceed/cancel answer to a FrictionGateDetail
+ *  the frontend received from a blocked update_focus_settings call.
+ * 
+ *  original_request carries the FULL originally-attempted settings change
+ *  (not just the two gate-relevant fields) so that on decision="proceed"
+ *  this command can apply the whole update in one call -- a real settings
+ *  screen may bundle a gate-tripping field change together with
+ *  non-gate-tripping ones (e.g. privacy_tier loosening alongside a
+ *  context_flow change), and both must land together, not in two separate
+ *  writes the frontend has to sequence itself.
+ */
+export type SubmitFrictionGateDecisionRequest = {
+	/**  "proceed" | "cancel" */
+	decision: string,
+	original_request: UpdateFocusSettingsRequest,
 };
 
 export type TopicInfo = {

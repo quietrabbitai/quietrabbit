@@ -4,13 +4,34 @@
 // Commands: list_personas, create_persona, list_focuses,
 //           get_focus_settings, update_focus_settings.
 //
-// Friction gate (HANDOFF_IPC_SURFACE.md — post-Release 1):
-//   update_focus_settings must enforce the friction gate for any change that
-//   increases privacy restriction or moves a Focus to Protected profile.
-//   The gate is a Conductor concern, not a frontend concern (IPC surface spec).
-//   Current state: privacy-restricting changes are blocked with
-//   Err("friction_gate_not_implemented") until the Conductor gate is wired.
-//   Non-restricting changes proceed immediately.
+// Friction gate (HANDOFF_IPC_SURFACE.md — implemented items.id=92, 2026-07-26):
+//   update_focus_settings enforces the friction gate for any change that
+//   loosens privacy_tier (numerically increases -- see note below) or moves
+//   a Focus to Protected profile. Per HANDOFF_IPC_SURFACE.md: "The gate is
+//   surfaced to the user before the command completes" and "Backend
+//   enforces it, frontend responds to the result" -- both satisfied by a
+//   structured FrictionGateBlocked error returned from this same command
+//   (not a second round trip), which the frontend uses to show a
+//   confirm/cancel prompt and then calls commands::consent::
+//   submit_friction_gate_decision with the user's choice.
+//
+//   TIER DIRECTION NOTE: privacy_tier is 1 (red, most restrictive) through
+//   3 (green, least restrictive) -- see focus_settings_store.rs header and
+//   conductor/lifecycle.rs's tier-ceiling check (a step "requires" a tier;
+//   higher tier = more external routing permitted = less private). A
+//   numeric tier *increase* therefore LOOSENS privacy, it does not
+//   restrict it. An earlier version of this comment and the code's own
+//   variable names had this backwards (calling a tier increase "privacy
+//   restriction increasing") -- fixed here; the underlying gate condition
+//   (t > existing.privacy_tier) was always correct, only the naming lied
+//   about what it meant.
+//
+//   submit_friction_gate_decision (commands/consent.rs) is the actor that
+//   both records the decision (focus_settings_friction_decisions,
+//   shared_002.sql) AND applies the settings change on 'proceed' -- mirrors
+//   submit_extract_confirm's shape (record + follow-through in one command)
+//   rather than adding a confirm flag back onto update_focus_settings,
+//   which would create two different code paths to the same mutation.
 //
 // list_personas IPC gap (post-Release 1):
 //   IPC surface specifies color, focus_count, and privacy defaults.
@@ -80,6 +101,31 @@ pub struct UpdateFocusSettingsRequest {
     pub privacy_tier: Option<i32>,
     pub max_permitted_tier: Option<i32>,
     pub focus_profile: Option<String>,
+}
+
+/// Structured detail for a friction-gate-blocked update_focus_settings call
+/// (items.id=92). The frontend uses this to build a confirm/cancel prompt,
+/// then calls commands::consent::submit_friction_gate_decision with the
+/// user's choice -- see that command's doc comment for the full flow.
+///
+/// requested_privacy_tier / requested_focus_profile: whichever of the two
+/// actually tripped the gate. Both are echoed even though only one may be
+/// gate-relevant, so the frontend can show the complete requested state
+/// without a second get_focus_settings round trip.
+#[derive(Debug, Serialize, Type)]
+pub struct FrictionGateDetail {
+    pub persona_id: String,
+    pub focus_id: String,
+    pub requested_privacy_tier: Option<i32>,
+    pub requested_focus_profile: Option<String>,
+    pub existing_privacy_tier: i32,
+    pub existing_focus_profile: String,
+    /// True when privacy_tier would numerically increase (loosen -- see
+    /// module header's TIER DIRECTION NOTE). False when only focus_profile
+    /// moving to 'protected' tripped the gate.
+    pub privacy_would_loosen: bool,
+    /// True when focus_profile would move to 'protected'.
+    pub moves_to_protected: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -179,6 +225,20 @@ pub async fn get_focus_settings(
     })
 }
 
+/// Applies a Focus settings change directly, UNLESS the change would loosen
+/// privacy_tier or move focus_profile to 'protected' -- in which case this
+/// returns Err(json-serialized FrictionGateDetail) instead of applying
+/// anything, and the frontend must route the user through
+/// commands::consent::submit_friction_gate_decision to either apply the
+/// change (decision="proceed") or drop it (decision="cancel"). See module
+/// header for the full flow and the tier-direction note.
+///
+/// The error string is JSON (FrictionGateDetail serialized), not a plain
+/// message -- distinguishable from every other error this command can
+/// return (validation failures, not_found) by attempting a JSON parse.
+/// A frontend that doesn't parse it still gets a readable-enough string,
+/// but the structured shape is what submit_friction_gate_decision expects
+/// to be built from.
 #[tauri::command]
 #[specta::specta]
 pub async fn update_focus_settings(
@@ -196,9 +256,9 @@ pub async fn update_focus_settings(
         }
     }
 
-    // Friction gate guard (post-Release 1: Conductor enforcement not yet wired).
-    // Block changes that increase privacy restriction or move to Protected profile
-    // rather than silently bypassing the gate.
+    // Friction gate check (items.id=92). privacy_tier is 1=red (most
+    // restrictive) .. 3=green (least restrictive) -- see module header's
+    // TIER DIRECTION NOTE. A numeric increase LOOSENS privacy.
     let existing = focus_settings_store::get_focus_settings(
         &request.persona_id,
         &request.focus_id,
@@ -207,7 +267,7 @@ pub async fn update_focus_settings(
     .map_err(|e| e.to_string())?
     .ok_or_else(|| "not_found".to_string())?;
 
-    let privacy_increases = request
+    let privacy_would_loosen = request
         .privacy_tier
         .map(|t| t > existing.privacy_tier)
         .unwrap_or(false);
@@ -217,8 +277,24 @@ pub async fn update_focus_settings(
         .map(|p| p == "protected" && existing.focus_profile != "protected")
         .unwrap_or(false);
 
-    if privacy_increases || moves_to_protected {
-        return Err("friction_gate_not_implemented".to_string());
+    if privacy_would_loosen || moves_to_protected {
+        let detail = FrictionGateDetail {
+            persona_id: request.persona_id.clone(),
+            focus_id: request.focus_id.clone(),
+            requested_privacy_tier: if privacy_would_loosen { request.privacy_tier } else { None },
+            requested_focus_profile: if moves_to_protected {
+                request.focus_profile.clone()
+            } else {
+                None
+            },
+            existing_privacy_tier: existing.privacy_tier,
+            existing_focus_profile: existing.focus_profile.clone(),
+            privacy_would_loosen,
+            moves_to_protected,
+        };
+        let detail_json = serde_json::to_string(&detail)
+            .unwrap_or_else(|_| "friction_gate_blocked".to_owned());
+        return Err(detail_json);
     }
 
     let s = focus_settings_store::update_focus_settings(
