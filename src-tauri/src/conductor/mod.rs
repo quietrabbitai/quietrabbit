@@ -9,5 +9,6 @@ pub mod memory_broker;
 pub mod privacy;
 pub mod propose_route;
 pub mod quality;
+pub mod reentry;
 pub mod tokens;
 pub mod types;
