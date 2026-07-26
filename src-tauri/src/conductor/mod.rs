@@ -7,6 +7,7 @@ pub mod failure;
 pub mod lifecycle;
 pub mod memory_broker;
 pub mod privacy;
+pub mod propose_route;
 pub mod quality;
 pub mod tokens;
 pub mod types;
