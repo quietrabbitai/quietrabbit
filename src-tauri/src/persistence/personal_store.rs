@@ -118,7 +118,7 @@ fn get_personal_db_path(user_id: &str, persona_id: &str) -> PathBuf {
 /// Open personal.db with SQLCipher key.
 /// Caller supplies bare hex; store wraps it in SQLCipher x'...' syntax.
 /// PRAGMA key fires before journal_mode via SqliteConnectOptions (D6-346).
-async fn open_personal_db(
+pub(crate) async fn open_personal_db(
     user_id: &str,
     persona_id: &str,
     key_hex: &str,
