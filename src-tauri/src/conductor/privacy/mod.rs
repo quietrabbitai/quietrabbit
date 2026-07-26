@@ -7,6 +7,7 @@ pub mod gate2;
 pub mod gate3;
 pub mod gate4;
 pub mod logger;
+pub mod output_scan;
 pub mod privacy_filter;
 pub mod types;
 
@@ -120,6 +121,32 @@ impl<L: DisclosureLogger> PrivacyGateway<L> {
             focus_run_id,
             content_sensitivity_severity,
             execution_tier,
+        )
+        .await
+    }
+
+    /// cb-09 -- Output Privacy Guardian scan. Post-hoc scan of finalized
+    /// output before a write/download/export boundary crossing. Distinct
+    /// egress point from gate3's mid-execution tier-to-tier promotion --
+    /// see output_scan.rs module doc for the full boundary distinction.
+    #[allow(clippy::too_many_arguments)] // Explicit architecture boundary; matches gate1-4's own allow.
+    pub async fn scan_output(
+        &self,
+        step_id: &str,
+        focus_run_id: &str,
+        content_text: &str,
+        execution_tier: u8,
+        content_sensitivity_severity: u8,
+        intensity: output_scan::ScanIntensity,
+    ) -> Result<output_scan::OutputScanResult, DisclosureLogWriteError> {
+        output_scan::scan_output(
+            &self.logger,
+            step_id,
+            focus_run_id,
+            content_text,
+            execution_tier,
+            content_sensitivity_severity,
+            intensity,
         )
         .await
     }
