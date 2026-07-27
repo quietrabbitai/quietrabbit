@@ -131,13 +131,22 @@ export const commands = {
 	 *  output_type. Wired to output_store::list_outputs() (items.id=91, part 1).
 	 * 
 	 *  Does NOT enforce Focus profile visibility rules (Open/Organized/
-	 *  Protected) -- that filtering layer is a separate, not-yet-built gap
-	 *  (items.id=91, part 3, post-Release 1). See module header.
+	 *  Protected) -- that filtering layer is a separate, not-yet-built gap,
+	 *  split to items.id=175 (post-Release 1). See module header.
 	 */
 	listOutputs: (userId: string, personaId: string, keyHex: string, focusId: string | null, topicId: string | null, outputType: string | null) => typedError<OutputInfo[], string>(__TAURI_INVOKE("list_outputs", { userId, personaId, keyHex, focusId, topicId, outputType })),
 	getOutput: (outputId: string, userId: string, personaId: string, keyHex: string) => typedError<OutputInfo, string>(__TAURI_INVOKE("get_output", { outputId, userId, personaId, keyHex })),
-	/**  STUB -- full zero-then-delete sequence deferred to Layer 5+. */
-	deleteOutput: (outputId: string, deepPurge: boolean | null) => typedError<null, string>(__TAURI_INVOKE("delete_output", { outputId, deepPurge })),
+	/**
+	 *  Deletes an output (items.id=91, part 2, complete 2026-07-26). Soft-delete
+	 *  only -- content is zeroed and status set to 'deleted'; the row is never
+	 *  hard-deleted (architecture Section 3.4, output_store::delete_output).
+	 * 
+	 *  deep_purge: accepted for command-contract stability but NOT implemented.
+	 *  Passing Some(true) returns Err("deep_purge_not_implemented"). See
+	 *  output_store::delete_output's doc comment for why this is deliberately
+	 *  out of scope for R1.
+	 */
+	deleteOutput: (outputId: string, userId: string, personaId: string, keyHex: string, deepPurge: boolean | null) => typedError<null, string>(__TAURI_INVOKE("delete_output", { outputId, userId, personaId, keyHex, deepPurge })),
 	getFocusBuilderSession: (focusId: string | null) => typedError<NotImplementedPlaceholder, string>(__TAURI_INVOKE("get_focus_builder_session", { focusId })),
 	submitFocusBuilderStep: (sessionId: string, input: NotImplementedPlaceholder) => typedError<NotImplementedPlaceholder, string>(__TAURI_INVOKE("submit_focus_builder_step", { sessionId, input })),
 	getTier2Config: () => typedError<NotImplementedPlaceholder, string>(__TAURI_INVOKE("get_tier2_config")),

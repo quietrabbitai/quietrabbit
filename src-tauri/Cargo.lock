@@ -2829,6 +2829,7 @@ dependencies = [
  "tokio",
  "unicode-normalization",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

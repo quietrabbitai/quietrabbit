@@ -60,6 +60,7 @@
 use std::env;
 
 use chrono::Utc;
+use zeroize::Zeroize;
 
 use crate::conductor::failure::ConductorError;
 use crate::persistence::domain_context_store;
@@ -240,11 +241,19 @@ impl ContextSlice {
     /// Explicitly drop block content from memory.
     /// Called by lifecycle immediately after render() to avoid retaining
     /// a second in-memory copy of sensitive context for the session duration.
-    /// Replaces retrieved_blocks with an empty Vec, dropping all String heap
-    /// allocations. Does NOT byte-zero the freed memory — zeroize is a
-    /// post-migration hardening item, not in scope for Phase B.
+    /// Byte-zeroes each block's content (the sensitive payload, per
+    /// MemoryBlock's field doc) via the zeroize crate before the Vec is
+    /// replaced with an empty one, so freed memory does not retain readable
+    /// sensitive context until reallocated. Note (upstream zeroize docs):
+    /// String's Zeroize impl zeros the buffer's current capacity, not
+    /// necessarily every prior reallocation the String may have undergone
+    /// during retrieval/assembly — this closes the clear()-time exposure
+    /// window, not every possible transient copy earlier in the pipeline.
     /// After clear(), render() returns empty string.
     pub fn clear(&mut self) {
+        for block in self.retrieved_blocks.iter_mut() {
+            block.content.zeroize();
+        }
         self.retrieved_blocks = Vec::new();
     }
 
@@ -623,5 +632,44 @@ impl MemoryBroker {
 impl Default for MemoryBroker {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_block(content: &str) -> MemoryBlock {
+        MemoryBlock {
+            block_id: "block-1".to_string(),
+            content: content.to_string(),
+            source_type: "domain_context".to_string(),
+            block_type: "knowledge".to_string(),
+            visibility_scope: "open".to_string(),
+            sensitivity_preset: "standard".to_string(),
+            token_estimate: 10,
+            retrieval_tier: "tier_a".to_string(),
+            source_topic_id: None,
+            dependency_refs: Vec::new(),
+        }
+    }
+
+    /// clear()'s stated contract (doc comment): retrieved_blocks is emptied
+    /// and render() returns an empty string afterward.
+    #[test]
+    fn clear_empties_blocks_and_render_returns_empty_string() {
+        let mut slice = ContextSlice::new("2026-07-26T00:00:00Z".to_string(), None);
+        slice.retrieved_blocks.push(sample_block("sensitive context text"));
+        assert!(!slice.retrieved_blocks.is_empty());
+        assert_eq!(slice.render(), "sensitive context text");
+
+        slice.clear();
+
+        assert!(slice.retrieved_blocks.is_empty());
+        assert_eq!(slice.render(), "");
     }
 }

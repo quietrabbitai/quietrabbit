@@ -11,12 +11,14 @@
 // the UI polling endpoint needs run status without importing lifecycle machinery.
 // Revisit when a service layer is introduced in Layer 8+.
 //
-// delete_output: full zero-then-delete sequence deferred to Layer 5+.
+// delete_output: soft-delete only (items.id=91 part 2, complete 2026-07-26).
 // Architecture Section 3.4 deletion sequence:
 //   1. Zero content:  UPDATE outputs SET content = '' WHERE id = ?
-//   2. FTS5 update:   handled by COALESCE trigger in schema
-//   3. Mark deleted:  UPDATE outputs SET status = 'deleted', deleted_at = ? WHERE id = ?
-// Row is never deleted — audit record preserved permanently.
+//   2. FTS5 update:   automatic via outputs_fts_update trigger (outputs_001.sql)
+//   3. Mark deleted:  UPDATE outputs SET status = 'deleted', updated_at = ? WHERE id = ?
+// Row is never hard-deleted — audit record preserved permanently.
+// deep_purge parameter accepted but not implemented — Some(true) returns
+// Err("deep_purge_not_implemented"). See delete_output's own doc comment.
 //
 // QUERY STYLE: runtime sqlx::query() only — no query!() macros.
 // PRAGMA key applied via SqliteConnectOptions (D6-346).
@@ -292,9 +294,9 @@ pub async fn get_focus_run_status(
 /// natural browse order.
 ///
 /// Does NOT enforce Focus profile visibility rules (Open/Organized/
-/// Protected) — that filtering layer is a separate, not-yet-built gap
-/// (items.id=91, part 3). Callers needing that enforcement must apply it
-/// on top of this function's results until it lands in the store.
+/// Protected) — that filtering layer is a separate, not-yet-built gap,
+/// split to items.id=175 (post-Release 1). Callers needing that enforcement
+/// must apply it on top of this function's results until it lands in the store.
 pub async fn list_outputs(
     user_id: &str,
     persona_id: &str,
@@ -336,25 +338,75 @@ pub async fn list_outputs(
 }
 
 // ---------------------------------------------------------------------------
-// Delete (deferred — Layer 5+)
+// Delete
 // ---------------------------------------------------------------------------
 
-/// Delete an output. Full sequence deferred to Layer 5+.
-/// Correct deletion sequence (architecture Section 3.4):
-///   1. Zero content:  UPDATE outputs SET content = '' WHERE id = ?
-///   2. FTS5 update:   handled by COALESCE trigger in schema
-///   3. Mark deleted:  UPDATE outputs SET status = 'deleted', deleted_at = ? WHERE id = ?
+/// Delete-sequence core, operating on an already-open connection.
+/// Testable directly against an in-memory SQLite connection (see tests
+/// module) without requiring a real SQLCipher-encrypted outputs.db file.
 ///
-/// Row is never deleted — audit record preserved permanently.
-pub async fn delete_output(
-    _user_id: &str,
-    _persona_id: &str,
-    _key_hex: &str,
-    _output_id: &str,
+/// Deletion sequence (architecture Section 3.4):
+///   1. Zero content:  UPDATE outputs SET content = '' WHERE id = ?
+///   2. FTS5 update:   automatic — outputs_fts_update trigger (outputs_001.sql)
+///      fires on this UPDATE and removes the old content from the FTS5 index
+///      as part of the same statement. No separate step is issued here.
+///   3. Mark deleted:  UPDATE outputs SET status = 'deleted', updated_at = ?
+///      WHERE id = ?
+///
+/// Row is never hard-deleted — audit record preserved permanently. Both
+/// UPDATEs are unconditional on id match; deleting an already-deleted or
+/// nonexistent id is a no-op (0 rows affected), not an error — matches the
+/// idempotent-delete convention used elsewhere in this file (e.g.
+/// cancel_focus_run's no-op-on-terminal-state pattern).
+async fn delete_output_conn(
+    conn: &mut SqliteConnection,
+    output_id: &str,
 ) -> Result<(), OutputStoreError> {
-    unimplemented!(
-        "delete_output: full zero-then-delete sequence implemented in Layer 5+"
-    )
+    let timestamp = crate::providers::utils::now();
+
+    sqlx::query("UPDATE outputs SET content = '' WHERE id = ?")
+        .bind(output_id)
+        .execute(&mut *conn)
+        .await?;
+
+    sqlx::query("UPDATE outputs SET status = 'deleted', updated_at = ? WHERE id = ?")
+        .bind(&timestamp)
+        .bind(output_id)
+        .execute(&mut *conn)
+        .await?;
+
+    Ok(())
+}
+
+/// Delete an output (items.id=91, part 2).
+///
+/// deep_purge: accepted for Tauri command-contract stability but NOT
+/// implemented. Passing Some(true) returns Err("deep_purge_not_implemented")
+/// rather than silently ignoring the flag or guessing at behavior. Deep
+/// purge has no specification for outputs — the nearest analog,
+/// decisions.id=242 ("Deep purge option at Plan deletion"), covers a
+/// different object type (Plan → Domain Context provenance cleanup via an
+/// interactive review flow) and does not transfer to a delete-call boolean
+/// here. This is deliberately out of scope for R1, consistent with this
+/// module's "row is never hard-deleted" architecture — a true purge would
+/// mean actually removing the row, which the schema and this function do
+/// not do. None or Some(false) proceed with the standard soft-delete
+/// sequence below.
+pub async fn delete_output(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    output_id: &str,
+    deep_purge: Option<bool>,
+) -> Result<(), OutputStoreError> {
+    if deep_purge == Some(true) {
+        return Err(OutputStoreError::Validation(
+            "deep_purge_not_implemented".to_string(),
+        ));
+    }
+
+    let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
+    delete_output_conn(&mut conn, output_id).await
 }
 
 // ---------------------------------------------------------------------------
@@ -520,6 +572,113 @@ pub async fn write_element_consent_decisions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persistence::migrations::parse_statements;
+    use sqlx::sqlite::SqliteConnectOptions;
+
+    const OUTPUTS_SCHEMA: &str = include_str!("../../schema/outputs_001.sql");
+
+    async fn test_db() -> SqliteConnection {
+        let mut conn = SqliteConnectOptions::new()
+            .filename(":memory:")
+            .connect()
+            .await
+            .expect("in-memory connection failed");
+        for stmt in parse_statements(OUTPUTS_SCHEMA) {
+            sqlx::query(&stmt)
+                .execute(&mut conn)
+                .await
+                .unwrap_or_else(|e| panic!("schema statement failed: {e}\n{stmt}"));
+        }
+        conn
+    }
+
+    /// Insert a focus_run and one active output row directly, bypassing
+    /// save_output (which requires a real outputs.db path). Returns the
+    /// output id.
+    async fn seed_output(conn: &mut SqliteConnection, content: &str) -> String {
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let output_id = uuid::Uuid::new_v4().to_string();
+        let now = "2026-07-26T00:00:00Z";
+
+        sqlx::query(
+            "INSERT INTO focus_runs (id, focus_id, status, started_at)
+             VALUES (?, 'focus-1', 'complete', ?)",
+        )
+        .bind(&run_id)
+        .bind(now)
+        .execute(&mut *conn)
+        .await
+        .expect("focus_runs insert failed");
+
+        sqlx::query(
+            "INSERT INTO outputs
+             (id, focus_run_id, output_type, content, sensitivity,
+              status, created_at, updated_at)
+             VALUES (?, ?, 'note', ?, 'general', 'active', ?, ?)",
+        )
+        .bind(&output_id)
+        .bind(&run_id)
+        .bind(content)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *conn)
+        .await
+        .expect("outputs insert failed");
+
+        output_id
+    }
+
+    #[tokio::test]
+    async fn delete_output_conn_zeroes_content_and_marks_deleted_without_removing_row() {
+        let mut conn = test_db().await;
+        let output_id = seed_output(&mut conn, "sensitive output text").await;
+
+        delete_output_conn(&mut conn, &output_id)
+            .await
+            .expect("delete_output_conn failed");
+
+        let row = sqlx::query("SELECT content, status FROM outputs WHERE id = ?")
+            .bind(&output_id)
+            .fetch_optional(&mut conn)
+            .await
+            .expect("query failed")
+            .expect("row must still exist — never hard-deleted");
+
+        let content: String = row.try_get("content").unwrap();
+        let status: String = row.try_get("status").unwrap();
+        assert_eq!(content, "", "content must be zeroed");
+        assert_eq!(status, "deleted", "status must be marked deleted");
+    }
+
+    #[tokio::test]
+    async fn delete_output_conn_removes_row_from_fts_index() {
+        let mut conn = test_db().await;
+        let output_id = seed_output(&mut conn, "findable via fts search term").await;
+
+        // Sanity check: findable before delete.
+        let before = sqlx::query("SELECT rowid FROM outputs_fts WHERE outputs_fts MATCH 'findable'")
+            .fetch_all(&mut conn)
+            .await
+            .expect("fts query failed");
+        assert!(!before.is_empty(), "seeded output must be findable before delete");
+
+        delete_output_conn(&mut conn, &output_id)
+            .await
+            .expect("delete_output_conn failed");
+
+        let after = sqlx::query("SELECT rowid FROM outputs_fts WHERE outputs_fts MATCH 'findable'")
+            .fetch_all(&mut conn)
+            .await
+            .expect("fts query failed");
+        assert!(after.is_empty(), "deleted output's content must no longer be searchable");
+    }
+
+    #[tokio::test]
+    async fn delete_output_conn_on_nonexistent_id_is_a_noop_not_an_error() {
+        let mut conn = test_db().await;
+        let result = delete_output_conn(&mut conn, "does-not-exist").await;
+        assert!(result.is_ok(), "deleting a nonexistent id must not error");
+    }
 
     #[tokio::test]
     async fn write_element_consent_decisions_returns_err_pending_migration() {
