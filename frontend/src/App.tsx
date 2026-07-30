@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { useTranslation } from 'react-i18next'
 import { commands, type HealthResponse } from './bindings'
 
 function App() {
@@ -7,6 +8,7 @@ function App() {
   // Rust command -> typed response -- actually works, not just that
   // bindings.ts loads. Only verifiable under `tauri dev`, not plain
   // `vite dev`, since IPC does not exist outside a real Tauri window.
+  const { t } = useTranslation()
   const [health, setHealth] = useState<HealthResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
 
@@ -22,19 +24,19 @@ function App() {
 
   return (
     <main>
-      <h1>Quiet Rabbit</h1>
-      {error && <p>IPC error: {error}</p>}
+      <h1>{t('app.title')}</h1>
+      {error && <p>{t('health.error', { message: error })}</p>}
       {health && (
         <dl>
-          <dt>Ollama status</dt>
+          <dt>{t('health.ollamaStatus')}</dt>
           <dd>{health.ollama.status}</dd>
-          <dt>Ollama source</dt>
+          <dt>{t('health.ollamaSource')}</dt>
           <dd>{health.ollama_source}</dd>
-          <dt>Tier 2 configured</dt>
+          <dt>{t('health.tier2Configured')}</dt>
           <dd>{String(health.tier2_configured)}</dd>
         </dl>
       )}
-      {!health && !error && <p>Loading health check…</p>}
+      {!health && !error && <p>{t('health.loading')}</p>}
     </main>
   )
 }

@@ -1,0 +1,12 @@
+{
+  "app": {
+    "title": "Quiet Rabbit"
+  },
+  "health": {
+    "loading": "Loading health check…",
+    "error": "IPC error: {{message}}",
+    "ollamaStatus": "Ollama status",
+    "ollamaSource": "Ollama source",
+    "tier2Configured": "Tier 2 configured"
+  }
+}
