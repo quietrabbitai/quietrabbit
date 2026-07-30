@@ -18,10 +18,10 @@
 //   The exported bindings are the framework-independent half of that flow.
 //   get_pending_cross_persona_confirmations and
 //   SubmitFocusRunRequest.confirmed_cross_persona_fact_ids become typed and
-//   drift-checked here, before any SPA framework is chosen. The confirmation
-//   UI itself is NOT built and cannot be until frontend_stack is decided --
-//   there is no frontend source tree in this repo and tauri.conf.json's
-//   frontendDist ("../dist") does not exist.
+//   drift-checked here. The confirmation UI itself (items.id=27's remaining
+//   scope) is not yet built -- frontend_stack is now decided (React + Vite,
+//   decisions.id=640) and a frontend tree exists (items.id=3), but building
+//   that UI is separate, later scope, not done by this module.
 
 use tauri_specta::{collect_commands, Builder};
 
@@ -29,10 +29,12 @@ use crate::commands;
 
 /// Path the generated bindings are written to, relative to src-tauri/.
 ///
-/// Deliberately inside src-tauri/ rather than a frontend source directory:
-/// no frontend tree exists yet, so there is no correct home under one. Move
-/// this when the SPA framework is chosen and a frontend tree exists.
-pub const BINDINGS_PATH: &str = "bindings.ts";
+/// Points into the frontend's own src/ tree (React + Vite, decisions.id=640),
+/// matching the standard tauri-specta convention (e.g. "../src/bindings.ts"
+/// in the crate's own docs) now that frontend/ exists. Previously
+/// "bindings.ts" (written inside src-tauri/ itself) when no frontend tree
+/// existed yet -- see items.id=3.
+pub const BINDINGS_PATH: &str = "../frontend/src/bindings.ts";
 
 /// The full IPC command surface, typed for TypeScript export.
 ///
