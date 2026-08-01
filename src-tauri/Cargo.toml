@@ -49,6 +49,29 @@ tauri-specta = { version = "2.0.0-rc.25", features = ["derive", "typescript"] }
 specta = { version = "2.0.0-rc.25", features = ["derive"] }
 specta-typescript = "0.0.12"
 
+# Tier 2/Tier 3 external session embedding (items.id=3 States 4-5,
+# decisions.id=699 -- Option 3b, CEF off-screen rendering). Version pinned to
+# the current published crates.io release, one patch ahead of 151.0.0+151.3.11
+# (the exact version the full items.id=192/195/196/198/199/200/201 evidence
+# chain tested) -- verified current/active via the crates.io sparse index
+# (index.crates.io/3/c/cef) this session, 2026-08-01. Behavior will be
+# validated against the spike's proven results during Phase A build/test,
+# not assumed identical on version alone.
+cef = { version = "151.1.0", features = ["accelerated_osr"] }
+# OSR render pipeline + sync window -- reuses the proven pipeline shape from
+# the retained spike (qr-spike-192/cef-rs/examples/osr), which imports CEF's
+# shared/accelerated-paint texture into a caller-owned wgpu::Texture, and a
+# separate winit window manually position/size-synced against the main Tauri
+# window (Phase A architecture decision, 2026-08-01 -- no supported path
+# exists to composite CEF's OSR output into Tauri's own webview surface, and
+# native OS-level child-window reparenting is unavailable on Wayland).
+wgpu = "30"
+winit = "0.30"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+env_logger = "0.11"
+glib = "0.18"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 unicode-normalization = "0.1"

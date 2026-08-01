@@ -7,3 +7,4 @@ pub mod ipc;
 pub mod ollama_sidecar;
 pub mod persistence;
 pub mod providers;
+pub mod tier3_pane;

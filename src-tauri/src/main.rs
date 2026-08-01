@@ -10,8 +10,46 @@ use quietrabbit_lib::ipc::specta_builder;
 use quietrabbit_lib::ollama_sidecar::{OllamaSidecar, OllamaSource};
 use quietrabbit_lib::providers::ollama_client::OllamaClient;
 
-#[tokio::main]
-async fn main() {
+/// Plain, synchronous entry point -- NOT `#[tokio::main]`.
+///
+/// CEF's subprocess dispatch (`tier3_pane::dispatch_cef_subprocess`) must
+/// run before Tokio initializes anything in this process. Per Tokio's own
+/// documentation, forking without an immediate exec is only supported
+/// "before the parent process has used Tokio in any way" -- and CEF's
+/// multi-process architecture forks+execs helper processes internally.
+/// `#[tokio::main] async fn main()` would enter the Tokio runtime as the
+/// first thing that happens, before this dispatch could run. See
+/// tier3_pane::bootstrap module docs for the full rationale.
+///
+/// Restructured 2026-08-01 for items.id=3 States 4-5 (Phase A), approved by
+/// Jason -- the async body that used to be the whole of `main()` is now
+/// `async_main()`, entered via a manually-constructed Tokio runtime only
+/// after CEF subprocess dispatch has confirmed this is the real
+/// browser-process invocation.
+fn main() {
+    // Diagnostic-only for Phase A verification -- pre-existing log:: calls
+    // in this codebase (e.g. ollama_sidecar.rs) had no registered backend
+    // before this, confirmed by an empty log file during the first Phase A
+    // run despite RUST_LOG being set. Not evaluating whether this should
+    // become the project's permanent logging setup -- flagged to Chat-PM
+    // rather than decided here.
+    env_logger::init();
+
+    if quietrabbit_lib::tier3_pane::dispatch_cef_subprocess() {
+        // This invocation was a CEF-spawned helper process (renderer, GPU,
+        // utility, etc). CEF's own subprocess entry point has already run
+        // to completion inside dispatch_cef_subprocess(). Nothing else in
+        // this binary -- no Tokio, no Tauri -- should run for this
+        // invocation.
+        return;
+    }
+
+    tokio::runtime::Runtime::new()
+        .expect("quietrabbit: failed to build Tokio runtime")
+        .block_on(async_main());
+}
+
+async fn async_main() {
     let scheduler = Arc::new(ConductorScheduler::new());
     // OllamaClient is stateless (three reqwest::Client instances, no mutable
     // state). Tauri State provides shared immutable access -- no Arc wrapping
@@ -24,7 +62,33 @@ async fn main() {
     // test, not at runtime -- there is no frontend to consume them yet.
     let builder = specta_builder();
 
-    tauri::Builder::default()
+    // Phase A (items.id=3 States 4-5, decisions.id=699): CEF is initialized
+    // for the browser process here, in setup(), after Tauri's own window
+    // exists -- CEF itself does not need a Tauri window to exist first, but
+    // ordering it here keeps startup sequencing simple to reason about for
+    // this phase. Uses multi_threaded_message_loop=true (see
+    // tier3_pane::bootstrap docs for the full root-cause history) -- CEF
+    // runs its own UI thread separately from Tauri's GTK main thread,
+    // which is what avoids the GTK/GLib main-loop busy-poll that a
+    // same-thread external-pump approach hit.
+    //
+    // PaneWindow is deliberately NOT stored via Tauri's .manage()/.state()
+    // (found the hard way, 2026-08-01): winit::EventLoop on X11 holds raw
+    // platform IME pointers (*mut _XIM/_XIC) that are not Send, and
+    // Tauri's Manager::state<T>() requires T: Send + Sync. PaneWindow is
+    // instead captured directly by the app.run() closure below, which owns
+    // it on the main thread without needing it to cross a generic Send
+    // boundary -- the correct fix per the type system's actual signal
+    // (real thread affinity in winit's X11 backend), not a suppressed
+    // unsafe impl Send. Window move/resize sync (on_window_event, a
+    // separate closure) reaches PaneWindow via an mpsc channel rather than
+    // shared state, for the same reason.
+    let _cef_init = quietrabbit_lib::tier3_pane::bootstrap::initialize_cef();
+    let mut pane_window =
+        quietrabbit_lib::tier3_pane::sync_window::PaneWindow::new("https://claude.ai");
+    let (sync_tx, sync_rx) = std::sync::mpsc::channel::<quietrabbit_lib::tier3_pane::sync_window::PhysicalRect>();
+
+    let app = tauri::Builder::default()
         .manage(scheduler)
         .manage(ollama_client)
         // OllamaSource: initialized to Unavailable; the setup task writes the
@@ -60,19 +124,50 @@ async fn main() {
             });
             Ok(())
         })
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { .. } = event {
-                // Stop the sidecar on window close. kill_on_drop(true) is the
-                // crash-exit safety net; this provides the graceful path with
-                // logging. Spawned without await — window closes immediately.
-                // TODO: handle RunEvent::Exit for headless/multi-window support.
-                log::info!("main: window close requested — stopping Ollama sidecar");
-                let handle = window.app_handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    let sidecar_state = handle.state::<Mutex<OllamaSidecar>>();
-                    let mut sidecar = sidecar_state.lock().await;
-                    sidecar.stop().await;
-                });
+        .on_window_event(move |window, event| {
+            match event {
+                tauri::WindowEvent::CloseRequested { .. } => {
+                    // Stop the sidecar on window close. kill_on_drop(true) is the
+                    // crash-exit safety net; this provides the graceful path with
+                    // logging. Spawned without await — window closes immediately.
+                    // TODO: handle RunEvent::Exit for headless/multi-window support.
+                    log::info!("main: window close requested — stopping Ollama sidecar");
+                    let handle = window.app_handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        let sidecar_state = handle.state::<Mutex<OllamaSidecar>>();
+                        let mut sidecar = sidecar_state.lock().await;
+                        sidecar.stop().await;
+                    });
+                }
+                tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_) => {
+                    // Phase A manual sync (see tier3_pane::sync_window docs
+                    // for why this is manual rather than OS-level child-window
+                    // reparenting). outer_position/outer_size are queried
+                    // fresh rather than derived from the event payload, since
+                    // WindowEvent::Moved/Resized report platform-specific
+                    // coordinate spaces that don't uniformly match what
+                    // outer_position()/outer_size() report.
+                    //
+                    // Sent via channel rather than shared state -- PaneWindow
+                    // is not Send (see the comment above its construction),
+                    // so it cannot be reached from this closure directly; the
+                    // app.run() closure, which owns it on the main thread,
+                    // drains this channel each MainEventsCleared tick.
+                    if let (Ok(pos), Ok(size)) = (window.outer_position(), window.outer_size()) {
+                        let rect = quietrabbit_lib::tier3_pane::sync_window::PhysicalRect {
+                            x: pos.x,
+                            y: pos.y,
+                            width: size.width as i32,
+                            height: size.height as i32,
+                        };
+                        // A closed/lagging receiver just means no sync this
+                        // tick -- not a fatal condition for a fire-and-forget
+                        // position update; the next move/resize event will
+                        // simply try again.
+                        let _ = sync_tx.send(rect);
+                    }
+                }
+                _ => {}
             }
         })
         // Command surface + generated TypeScript contract: see
@@ -80,6 +175,28 @@ async fn main() {
         // list lives there, not here -- keeping it in one home means the
         // exported bindings and the live handler can never disagree.
         .invoke_handler(builder.invoke_handler())
-        .run(tauri::generate_context!())
-        .expect("error while running Quiet Rabbit");
+        .build(tauri::generate_context!())
+        .expect("error while building Quiet Rabbit");
+
+    // Phase A message-pump interleaving (see tier3_pane::mod.rs docs on the
+    // process/thread model decision): the pane's own winit event loop is
+    // pumped once per Tauri main-loop iteration, on
+    // RunEvent::MainEventsCleared. CEF's own message loop runs entirely on
+    // its own OS thread now (multi_threaded_message_loop=true) and needs
+    // no interleaving from here at all -- see tier3_pane::bootstrap docs.
+    // pane_window and sync_rx are moved into this closure (not
+    // Tauri-managed state, per the Send constraint above) -- this closure
+    // runs on the main thread for the app's entire lifetime, which is
+    // exactly PaneWindow's required affinity.
+    app.run(move |_app_handle, event| {
+        if let tauri::RunEvent::MainEventsCleared = event {
+            // Drain all pending sync updates (not just the latest) so a
+            // burst of move/resize events during a drag doesn't leave the
+            // pane visibly behind by more than one tick's worth of catch-up.
+            while let Ok(rect) = sync_rx.try_recv() {
+                pane_window.sync_to(rect);
+            }
+            pane_window.pump();
+        }
+    });
 }
