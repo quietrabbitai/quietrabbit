@@ -8,5 +8,19 @@
     "ollamaStatus": "Ollama status",
     "ollamaSource": "Ollama source",
     "tier2Configured": "Tier 2 configured"
+  },
+  "middleZoneHarness": {
+    "contextPaneLabel": "Context pane (placeholder)",
+    "contextPaneBody": "Real content types (Library, a Focus dashboard, a Persona hub) are not built yet. This stands in for one until the top strip (IA spec Section 2) exists.",
+    "chatPaneLabel": "Chat pane (placeholder)",
+    "chatPaneBody": "A real chat transcript is not wired yet.",
+    "generatingToggleOn": "Simulate response generating",
+    "generatingToggleOff": "Stop simulating generation"
+  },
+  "tier3Selector": {
+    "tier2BoxLabel": "No login required",
+    "tier3BoxLabel": "Account required, data retained",
+    "selectionCount": "{{selected}} / {{max}} selected",
+    "continueButton": "Continue"
   }
 }
