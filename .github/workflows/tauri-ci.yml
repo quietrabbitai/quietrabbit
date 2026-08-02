@@ -1,16 +1,22 @@
 # Quiet Rabbit — Tauri CI
-# Status: STUB — manual trigger only. Configure and expand before first release build.
-# Traces to: D6-339 (Rust migration), item 16d-setup
+# Status: `check` job ACTIVE on push/pull_request to main (items.id=207,
+# 2026-08-02). The commented-out `build-tauri` release job below remains a
+# stub -- it needs signing secrets, a real frontend build command, and
+# target-triple verification, none of which this item covers.
+# Traces to: D6-339 (Rust migration), item 16d-setup, items.id=207
 #
-# When activating for release:
+# Before activating build-tauri for release:
 #   1. Add TAURI_SIGNING_PRIVATE_KEY + TAURI_SIGNING_PRIVATE_KEY_PASSWORD to GitHub secrets
 #   2. Set correct node version and frontend build command
-#   3. Expand 'on:' to include push/pull_request on main
-#   4. Verify target triples: windows, macOS x86, macOS arm64, Linux
+#   3. Verify target triples: windows, macOS x86, macOS arm64, Linux
 
 name: Tauri CI
 
 on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 jobs:
