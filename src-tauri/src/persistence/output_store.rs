@@ -26,7 +26,6 @@
 
 use std::path::PathBuf;
 
-use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::ConnectOptions;
 use sqlx::Row;
 use sqlx::SqliteConnection;
@@ -101,16 +100,8 @@ async fn open_outputs_db(
 ) -> Result<SqliteConnection, OutputStoreError> {
     let db_path = get_outputs_db_path(user_id, persona_id);
 
-    let network_storage = std::env::var("QR_NETWORK_STORAGE")
-        .map(|v| v.to_lowercase() == "true")
-        .unwrap_or(false);
-    let journal_mode = if network_storage { "DELETE" } else { "WAL" };
-
-    let conn = SqliteConnectOptions::new()
-        .filename(&db_path)
+    let conn = crate::providers::utils::connect_options_encrypted(&db_path, key_hex)
         .create_if_missing(false)
-        .pragma("key", format!("x'{key_hex}'"))
-        .pragma("journal_mode", journal_mode)
         .pragma("busy_timeout", "5000")
         .connect()
         .await?;

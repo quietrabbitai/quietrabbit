@@ -143,15 +143,6 @@ pub fn ensure_focus_dirs(
     Ok((focus_dir, topic_dir))
 }
 
-/// Return the canonical path for a focus's domain_context.db.
-pub fn get_domain_context_path(user_id: &str, persona_id: &str, focus_id: &str) -> PathBuf {
-    crate::persistence::migrations::get_data_root()
-        .join("users").join(user_id)
-        .join("personas").join(persona_id)
-        .join("focuses").join(focus_id)
-        .join("domain_context.db")
-}
-
 /// Return the canonical path for a topic's plan_state.db.
 pub fn get_plan_state_path(
     user_id: &str,
@@ -231,16 +222,8 @@ async fn open_outputs_db(
         .join("personas").join(persona_id)
         .join("outputs.db");
 
-    let network_storage = std::env::var("QR_NETWORK_STORAGE")
-        .map(|v| v.to_lowercase() == "true")
-        .unwrap_or(false);
-    let journal_mode = if network_storage { "DELETE" } else { "WAL" };
-
-    let conn = SqliteConnectOptions::new()
-        .filename(&db_path)
+    let conn = crate::providers::utils::connect_options_encrypted(&db_path, key_hex)
         .create_if_missing(false)
-        .pragma("key", format!("x'{key_hex}'"))
-        .pragma("journal_mode", journal_mode)
         .pragma("busy_timeout", "5000")
         .connect()
         .await?;
