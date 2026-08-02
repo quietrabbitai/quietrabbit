@@ -29,7 +29,11 @@
 //
 // QUERY STYLE: runtime sqlx::query() only — no query!() macros.
 // PRAGMA key applied via SqliteConnectOptions (D6-346).
-// Caller supplies bare hex; store wraps it in SQLCipher x'...' syntax.
+// Caller supplies bare hex; store wraps it in SQLCipher x'...' syntax,
+// itself wrapped in an outer pair of double quotes -- SQLCipher's
+// blob-literal PRAGMA key form requires it (items.id=206, 2026-08-02;
+// proven against commands/auth.rs::verify_integration_keys_db, which
+// isolated the exact failure via a standalone diagnostic test).
 
 use std::path::PathBuf;
 
@@ -116,7 +120,8 @@ fn get_personal_db_path(user_id: &str, persona_id: &str) -> PathBuf {
 // ---------------------------------------------------------------------------
 
 /// Open personal.db with SQLCipher key.
-/// Caller supplies bare hex; store wraps it in SQLCipher x'...' syntax.
+/// Caller supplies bare hex; store wraps it in SQLCipher x'...' syntax,
+/// itself wrapped in an outer pair of double quotes (items.id=206).
 /// PRAGMA key fires before journal_mode via SqliteConnectOptions (D6-346).
 pub(crate) async fn open_personal_db(
     user_id: &str,
@@ -141,7 +146,12 @@ pub(crate) async fn open_personal_db(
     let conn = SqliteConnectOptions::new()
         .filename(&db_path)
         .create_if_missing(false)
-        .pragma("key", format!("x'{key_hex}'"))
+        // SQLCipher's PRAGMA key blob-literal syntax requires the x'...'
+        // form itself wrapped in an outer pair of double quotes -- see
+        // commands/auth.rs::verify_integration_keys_db, which isolated
+        // this exact failure via a standalone diagnostic test
+        // (items.id=206, 2026-08-02).
+        .pragma("key", format!("\"x'{key_hex}'\""))
         .pragma("journal_mode", journal_mode)
         .connect()
         .await
@@ -1257,4 +1267,71 @@ pub async fn get_disclosure_log_for_run(
         }));
     }
     Ok(entries)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for items.id=206: open_personal_db's PRAGMA key
+    /// blob-literal form was missing the outer double quotes SQLCipher
+    /// requires, causing every real (non-mocked) connection attempt to
+    /// fail with a PRAGMA syntax error. This module previously had zero
+    /// test coverage on the connection path, which is why the bug was
+    /// never caught. This test points QR_DATA_ROOT at a tempdir, creates
+    /// a real SQLCipher-encrypted file at the exact path
+    /// get_personal_db_path derives (bootstrap connect, establishing the
+    /// key), then calls open_personal_db itself -- the actual function
+    /// under test, not a stand-in -- proving the fix round-trips against
+    /// a real encrypted file.
+    #[tokio::test]
+    async fn open_personal_db_opens_a_real_encrypted_file() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+        let user_id = "test-user";
+        let persona_id = "test-persona";
+        let db_path = get_personal_db_path(user_id, persona_id);
+        std::fs::create_dir_all(db_path.parent().unwrap())
+            .expect("failed to create parent dirs for test db");
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+
+        // Bootstrap: create the file under the key using the same
+        // corrected PRAGMA form, matching how a real first-write would
+        // establish the encrypted file.
+        {
+            let mut conn = SqliteConnectOptions::new()
+                .filename(&db_path)
+                .create_if_missing(true)
+                .pragma("key", format!("\"x'{key_hex}'\""))
+                .connect()
+                .await
+                .expect("bootstrap connect with corrected PRAGMA form must succeed");
+            sqlx::query("CREATE TABLE t (id INTEGER)")
+                .execute(&mut conn)
+                .await
+                .expect("must be able to write to a freshly-keyed encrypted db");
+        }
+
+        // Verification: open_personal_db itself (create_if_missing(false),
+        // the production code path) must be able to open the same file
+        // under the same key.
+        let result = open_personal_db(user_id, persona_id, key_hex).await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+
+        assert!(
+            result.is_ok(),
+            "open_personal_db must open a real encrypted file with the corrected PRAGMA form: {result:?}"
+        );
+    }
 }

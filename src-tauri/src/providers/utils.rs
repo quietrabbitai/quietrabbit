@@ -13,9 +13,11 @@
 //     journal_mode is set AFTER key via .pragma() call order.
 //     Never use connect_options_unencrypted() for encrypted databases.
 //
-// PRAGMA format verified against personal_store.rs (existing, compiling store):
-//   .pragma("key", format!("x'{key_hex}'"))   — no outer quotes
-//   .pragma("journal_mode", "WAL"|"DELETE")   — string value, not SqliteJournalMode enum
+// PRAGMA format (corrected items.id=206, 2026-08-02 -- the prior version of
+// this comment asserted the wrong form was correct; see the function doc
+// comment below for the full explanation and the proof source):
+//   .pragma("key", format!("\"x'{key_hex}'\""))  — outer double quotes required
+//   .pragma("journal_mode", "WAL"|"DELETE")       — string value, not SqliteJournalMode enum
 //
 // Path construction: /users/{user_id}/personas/{persona_id}/
 // (D6-224/D6-225: path_id -> focus_id; D6-298: lives -> personas)
@@ -133,8 +135,14 @@ pub fn connect_options_unencrypted(path: &Path) -> SqliteConnectOptions {
 /// SQLCipher contract: PRAGMA key MUST be the first operation after connection
 /// open. .pragma() calls are applied in order — key is set before journal_mode.
 ///
-/// PRAGMA format: x'{key_hex}' — verified against personal_store.rs.
-/// No outer double-quotes; SQLCipher interprets x'...' directly.
+/// PRAGMA format: "x'{key_hex}'" — the x'...' blob-literal form itself
+/// wrapped in an outer pair of double quotes. SQLCipher's PRAGMA key
+/// blob-literal syntax requires the outer quotes; omitting them produces
+/// "syntax error near x'...'" on every SQLite/SQLCipher build tested
+/// (items.id=206, 2026-08-02). This doc comment previously asserted the
+/// opposite (no outer quotes) -- that was the bug. Proven correct against
+/// commands/auth.rs::verify_integration_keys_db, which isolated the exact
+/// failure via a standalone diagnostic test.
 ///
 /// key_hex: hex-encoded key string from InMemoryKeyRegistry.
 /// Python oracle: open_personal_db() / open_outputs_db() / open_integration_keys_db()
@@ -142,7 +150,7 @@ pub fn connect_options_encrypted(path: &Path, key_hex: &str) -> SqliteConnectOpt
     SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(true)
-        .pragma("key", format!("x'{key_hex}'")) // FIRST — SQLCipher requirement
+        .pragma("key", format!("\"x'{key_hex}'\"")) // FIRST — SQLCipher requirement
         .pragma("journal_mode", journal_mode_value()) // AFTER key
 }
 
@@ -263,6 +271,54 @@ mod tests {
     fn connect_options_encrypted_constructs_without_panic() {
         let path = Path::new("/tmp/test.db");
         let _opts = connect_options_encrypted(path, "deadbeef1234");
+    }
+
+    /// Regression test for items.id=206: connect_options_encrypted's
+    /// PRAGMA key blob-literal form was missing the outer double quotes
+    /// SQLCipher requires. connect_options_encrypted_constructs_without_
+    /// panic above never calls .connect(), so it could not have caught
+    /// this -- it only proves the SqliteConnectOptions builder doesn't
+    /// panic, not that the resulting PRAGMA is valid SQL. This test
+    /// actually connects: it creates a real encrypted file via a
+    /// bootstrap connect using the same corrected PRAGMA form, then
+    /// reopens it through connect_options_encrypted itself, proving the
+    /// fix round-trips against a real file. This also covers
+    /// output_store.rs::open_outputs_db, topic_store.rs::open_outputs_db,
+    /// and conductor/lifecycle.rs, all of which delegate to
+    /// connect_options_encrypted rather than building their own
+    /// SqliteConnectOptions.
+    #[tokio::test]
+    async fn connect_options_encrypted_opens_a_real_encrypted_file() {
+        use sqlx::ConnectOptions;
+
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        let db_path = tempdir.path().join("test.db");
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+
+        // Bootstrap: create the file under the key via
+        // connect_options_encrypted itself (create_if_missing(true)),
+        // establishing the key on first write.
+        {
+            let mut conn = connect_options_encrypted(&db_path, key_hex)
+                .connect()
+                .await
+                .expect("bootstrap connect with corrected PRAGMA form must succeed");
+            sqlx::query("CREATE TABLE t (id INTEGER)")
+                .execute(&mut conn)
+                .await
+                .expect("must be able to write to a freshly-keyed encrypted db");
+        }
+
+        // Verification: connect_options_encrypted must be able to reopen
+        // the same file under the same key.
+        let reopened = connect_options_encrypted(&db_path, key_hex)
+            .create_if_missing(false)
+            .connect()
+            .await;
+        assert!(
+            reopened.is_ok(),
+            "connect_options_encrypted must reopen a real encrypted file with the corrected PRAGMA form: {reopened:?}"
+        );
     }
 
     #[test]
