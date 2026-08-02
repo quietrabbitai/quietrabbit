@@ -34,7 +34,39 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 gethostname = "0.4"
 log = "0.4"
-zeroize = "1.8"
+zeroize = { version = "1.8", features = ["derive"] }
+
+# Argon2id master-key derivation (items.id=205, Architecture Section 4.1).
+# default-features disabled deliberately: no PHC-string/PasswordVerifier
+# password-hash convenience API is used directly by this codebase (QR never
+# stores or interoperates with PHC-formatted hashes -- confirmed against
+# Architecture/AUTH_MULTIUSER_ARCHITECTURE.md this session, no PHC/
+# password_hash reference exists in that document; salts are generated/
+# stored via getrandom + user_salts.salt_hex directly).
+#
+# "alloc" IS required, corrected this session: hash_password_into() -- the
+# function this codebase actually calls, which derives a fixed-length key
+# into a caller-owned buffer -- is itself gated "Available on crate features
+# alloc and password-hash only" (argon2 0.5.3 docs, verified this session).
+# alloc's own feature definition enables password-hash/alloc as a
+# consequence (verified via the crates.io sparse index), so password-hash
+# compiles in as a side effect of alloc regardless -- confirmed empirically
+# this session (cargo test failed to find hash_password_into without alloc,
+# and the crate's own docs name hash_password_into_with_memory, which
+# requires the caller to manage an explicit argon2::Block buffer, as the
+# only no-alloc alternative). Not switching to that lower-level API: the
+# password-hash crate that comes along with alloc is unused, inert code
+# (its PasswordHash/SaltString types are never referenced anywhere in this
+# codebase), not an active surface -- the meaningful dependency-minimization
+# win (no PHC-string handling, no external password-hash interop) already
+# holds regardless of which of these two argon2 APIs is used.
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+# Explicit direct dependency rather than relying on it being transitively
+# available via uuid's v4 feature (fragile if that feature set ever
+# changes) -- version pinned to match the already-resolved transitive
+# version (0.4.x, verified via cargo tree this session) to avoid a
+# duplicate-major-version dependency tree.
+getrandom = "0.4"
 
 # Networking & Errors
 reqwest = { version = "0.12", features = ["json"] }
@@ -76,3 +108,11 @@ glib = "0.18"
 tokio = { version = "1", features = ["full", "test-util"] }
 unicode-normalization = "0.1"
 tempfile = "3"
+# tauri::test::mock_app()/mock_builder() for testing #[tauri::command]
+# functions that take tauri::State<T> (items.id=205, commands/auth.rs
+# login/logout tests) without needing the full webview/IPC layer -- "test"
+# is a real feature on this exact pinned version (tauri 2.11.x, verified
+# via docs.rs source Cargo.toml this session). dev-dependencies only, not
+# [dependencies] -- this feature and its mock app machinery must never
+# compile into a production build.
+tauri = { version = "2", features = ["test"] }

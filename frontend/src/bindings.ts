@@ -152,10 +152,9 @@ export const commands = {
 	getTier2Config: () => typedError<NotImplementedPlaceholder, string>(__TAURI_INVOKE("get_tier2_config")),
 	setTier2Provider: (provider: string, apiKey: string) => typedError<null, string>(__TAURI_INVOKE("set_tier2_provider", { provider, apiKey })),
 	dismissNotification: (notificationId: string) => typedError<null, string>(__TAURI_INVOKE("dismiss_notification", { notificationId })),
-	login: (password: string) => typedError<null, string>(__TAURI_INVOKE("login", { password })),
+	login: (displayName: string, password: string) => typedError<null, string>(__TAURI_INVOKE("login", { displayName, password })),
 	logout: () => typedError<null, string>(__TAURI_INVOKE("logout")),
-	/**  One-time display only — mnemonic is never stored (Section 8.6). */
-	getRecoveryKeyDisplay: () => typedError<string, string>(__TAURI_INVOKE("get_recovery_key_display")),
+	getRecoveryKeyDisplay: () => typedError<NotImplementedPlaceholder, string>(__TAURI_INVOKE("get_recovery_key_display")),
 	getHealth: () => typedError<HealthResponse, string>(__TAURI_INVOKE("get_health")),
 	getCapabilityProfile: () => typedError<CapabilityProfileResponse, string>(__TAURI_INVOKE("get_capability_profile")),
 };

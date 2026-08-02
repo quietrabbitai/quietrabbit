@@ -18,6 +18,23 @@
 -- (D6-291/294/297/299/302/303), both dev-fixture seed inserts (see their
 -- own notes below -- these are NOT churn, they seed real dev bootstrap data).
 -- Chat-DEV, per Chat-PM/Jason adjudication of Chat-DEV handoff id=99.
+--
+-- AUTH FOUNDATION CONSOLIDATION (items.id=205, 2026-08-01, Jason's direction):
+-- users/user_salts edited directly to their final Architecture/
+-- AUTH_MULTIUSER_ARCHITECTURE.md shape (role simplified, idle_timeout_minutes
+-- added, Argon2id KDF params replace PBKDF2), and user_capabilities added,
+-- rather than layered on as a separate shared_003.sql rebuild migration. Same
+-- precedent as this file's own 2026-07-24 consolidation above: pre-release,
+-- zero shipped users, no real install has ever built the pre-edit shape
+-- (verified this session -- auth.rs::login/logout are fully stubbed, no Rust
+-- code anywhere reads users.role's old CHECK values or
+-- user_salts.kdf_algorithm/kdf_iterations), so there is no intermediate state
+-- for a rebuild migration to walk through -- only a final shape to write.
+-- shared_002.sql (items.id=92, focus_settings_friction_decisions) is a
+-- genuinely separate, independently-shipped feature and is deliberately left
+-- untouched by this consolidation -- not folded in, not evaluated for
+-- collapsing here (flagged separately to Chat-PM as its own question, out of
+-- items.id=205's scope).
 
 CREATE TABLE IF NOT EXISTS schema_version (
     version         INTEGER PRIMARY KEY,
@@ -47,17 +64,26 @@ CREATE TABLE IF NOT EXISTS personas (
 );
 
 -- Users
+-- role: simplified to user|admin (Architecture Section 7.1) -- the 'builder'
+--   tier folded into persona-level functionality and no longer needs its
+--   own role value.
+-- idle_timeout_minutes: Section 3.2 -- per-user idle-lock timer, bounded
+--   5-240, default 15. Not admin-lockable (no enforcement/override
+--   mechanism exists anywhere in this schema or the codebase, consistent
+--   with the doc's "not admin-lockable" framing).
 CREATE TABLE IF NOT EXISTS users (
     id                          TEXT PRIMARY KEY,
     display_name                TEXT NOT NULL UNIQUE,
-    role                        TEXT NOT NULL DEFAULT 'builder'
-                                    CHECK (role IN ('consumer', 'builder', 'admin')),
+    role                        TEXT NOT NULL DEFAULT 'user'
+                                    CHECK (role IN ('user', 'admin')),
     is_primary                  INTEGER NOT NULL DEFAULT 0,
     auth_enabled                INTEGER NOT NULL DEFAULT 0,
     password_hash               TEXT,
     tier2_provider_preference   TEXT
                                     CHECK (tier2_provider_preference IS NULL
                                         OR tier2_provider_preference IN ('mistral', 'groq')),
+    idle_timeout_minutes        INTEGER NOT NULL DEFAULT 15
+                                    CHECK (idle_timeout_minutes BETWEEN 5 AND 240),
     created_at                  TEXT NOT NULL,
     extra_metadata              TEXT NOT NULL DEFAULT '{}'
 );
@@ -66,13 +92,19 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_single_primary
     ON users (is_primary) WHERE is_primary = 1;
 
--- User salts — includes KDF metadata for future algorithm upgrades
+-- User salts — includes KDF metadata for future algorithm upgrades.
+-- Argon2id (Section 4.1): m=65536 KiB (64 MiB), t=3 iterations, p=4
+-- parallelism lanes -- the "new application in 2026" starting profile the
+-- architecture doc specifies. Stored per-account, not hardcoded, so a
+-- future tuning change is a data change, not a schema change.
 CREATE TABLE IF NOT EXISTS user_salts (
-    user_id         TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-    salt_hex        TEXT NOT NULL,
-    kdf_algorithm   TEXT NOT NULL DEFAULT 'pbkdf2_sha256',
-    kdf_iterations  INTEGER NOT NULL DEFAULT 600000,
-    created_at      TEXT NOT NULL
+    user_id             TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    salt_hex            TEXT NOT NULL,
+    kdf_algorithm       TEXT NOT NULL DEFAULT 'argon2id',
+    kdf_memory_kib      INTEGER NOT NULL DEFAULT 65536,
+    kdf_iterations      INTEGER NOT NULL DEFAULT 3,
+    kdf_parallelism     INTEGER NOT NULL DEFAULT 4,
+    created_at          TEXT NOT NULL
 );
 
 -- User-persona membership
@@ -171,6 +203,31 @@ CREATE TABLE IF NOT EXISTS auth_lockouts (
     failure_count   INTEGER NOT NULL DEFAULT 0,
     locked_at       TEXT NOT NULL
 );
+
+-- user_capabilities (Architecture Section 7.2) -- per-account capability
+-- restrictions, e.g. a restricted child account that shouldn't be able to
+-- create new personas or Focuses. Default-allow, deny-only rows: absence of
+-- a row means allowed. persona_id nullable from day one; R1 only populates
+-- NULL (account-wide) rows -- see the architecture doc for the full
+-- most-specific-match-wins read-side semantics, not restated here.
+CREATE TABLE IF NOT EXISTS user_capabilities (
+    user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    persona_id   TEXT REFERENCES personas(id) ON DELETE CASCADE,  -- NULL = account-wide (R1)
+    capability   TEXT NOT NULL,   -- open vocabulary: 'create_persona' | 'create_focus' | ...
+    allowed      INTEGER NOT NULL DEFAULT 1,
+    created_at   TEXT NOT NULL,
+    PRIMARY KEY (user_id, persona_id, capability)
+);
+
+-- Enforce uniqueness for account-wide (persona_id IS NULL) capability rows.
+-- SQLite's composite PRIMARY KEY treats each NULL as distinct, so the PK
+-- above does not by itself prevent two account-wide rows for the same
+-- (user_id, capability). This partial index closes that gap for the R1 case
+-- (persona_id always NULL) without altering the PK the architecture doc
+-- specifies verbatim -- once persona_id is a real value, the existing PK
+-- already enforces uniqueness for that row on its own.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_user_capabilities_account_wide
+    ON user_capabilities (user_id, capability) WHERE persona_id IS NULL;
 
 -- topic_index — Persona-level pointer to active topics (Phase B, D6-226+).
 -- Allows Persona dashboard to surface active/paused topics across all
@@ -331,4 +388,4 @@ FROM personas p;
 
 INSERT OR IGNORE INTO schema_version (version, applied_at, description)
 VALUES (1, datetime('now'),
-    'shared.db schema (consolidated 2026-07-24, items.id=169): personas, users, artifact_versions, topic_index, asset_index, focus_settings + dev seeds');
+    'shared.db schema (consolidated 2026-07-24, items.id=169; auth foundation consolidated 2026-08-01, items.id=205): personas, users, user_salts, user_capabilities, artifact_versions, topic_index, asset_index, focus_settings + dev seeds');

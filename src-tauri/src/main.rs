@@ -86,7 +86,8 @@ async fn async_main() {
     let _cef_init = quietrabbit_lib::tier3_pane::bootstrap::initialize_cef();
     let mut pane_window =
         quietrabbit_lib::tier3_pane::sync_window::PaneWindow::new("https://claude.ai");
-    let (sync_tx, sync_rx) = std::sync::mpsc::channel::<quietrabbit_lib::tier3_pane::sync_window::PhysicalRect>();
+    let (sync_tx, sync_rx) =
+        std::sync::mpsc::channel::<quietrabbit_lib::tier3_pane::sync_window::PhysicalRect>();
 
     let app = tauri::Builder::default()
         .manage(scheduler)
@@ -99,6 +100,12 @@ async fn async_main() {
         // Mutex required because tokio::process::Child is not Sync.
         // Lock is held across ensure_available() (~0–7 s at startup only).
         .manage(Mutex::new(OllamaSidecar::new()))
+        // KeyRegistry: single-slot in-memory master-key registry (items.id=
+        // 205, Architecture/AUTH_MULTIUSER_ARCHITECTURE.md Section 4.2).
+        // Encapsulated type -- its own internal Mutex is not exposed
+        // directly (see auth::registry module header). Default::default()
+        // starts with an empty slot; login() (a later step) populates it.
+        .manage(quietrabbit_lib::auth::registry::KeyRegistry::default())
         .setup(|app| {
             // Detection runs in a spawned task — setup() is synchronous.
             // OllamaSource stays Unavailable until detection completes

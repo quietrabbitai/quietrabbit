@@ -68,26 +68,56 @@ struct SchemaFile {
 }
 
 static SCHEMA_FILES: &[SchemaFile] = &[
-    SchemaFile { prefix: "domain_context", version: 1,
-        sql: include_str!("../../schema/domain_context_001.sql") },
-    SchemaFile { prefix: "keys", version: 1,
-        sql: include_str!("../../schema/keys_001.sql") },
-    SchemaFile { prefix: "outputs", version: 1,
-        sql: include_str!("../../schema/outputs_001.sql") },
-    SchemaFile { prefix: "personal", version: 1,
-        sql: include_str!("../../schema/personal_001.sql") },
-    SchemaFile { prefix: "personal", version: 2,
-        sql: include_str!("../../schema/personal_002.sql") },
-    SchemaFile { prefix: "personal", version: 3,
-        sql: include_str!("../../schema/personal_003.sql") },
-    SchemaFile { prefix: "plan_state", version: 1,
-        sql: include_str!("../../schema/plan_state_001.sql") },
-    SchemaFile { prefix: "scores", version: 1,
-        sql: include_str!("../../schema/scores_001.sql") },
-    SchemaFile { prefix: "shared", version: 1,
-        sql: include_str!("../../schema/shared_001.sql") },
-    SchemaFile { prefix: "shared", version: 2,
-        sql: include_str!("../../schema/shared_002.sql") },
+    SchemaFile {
+        prefix: "domain_context",
+        version: 1,
+        sql: include_str!("../../schema/domain_context_001.sql"),
+    },
+    SchemaFile {
+        prefix: "keys",
+        version: 1,
+        sql: include_str!("../../schema/keys_001.sql"),
+    },
+    SchemaFile {
+        prefix: "outputs",
+        version: 1,
+        sql: include_str!("../../schema/outputs_001.sql"),
+    },
+    SchemaFile {
+        prefix: "personal",
+        version: 1,
+        sql: include_str!("../../schema/personal_001.sql"),
+    },
+    SchemaFile {
+        prefix: "personal",
+        version: 2,
+        sql: include_str!("../../schema/personal_002.sql"),
+    },
+    SchemaFile {
+        prefix: "personal",
+        version: 3,
+        sql: include_str!("../../schema/personal_003.sql"),
+    },
+    SchemaFile {
+        prefix: "plan_state",
+        version: 1,
+        sql: include_str!("../../schema/plan_state_001.sql"),
+    },
+    SchemaFile {
+        prefix: "scores",
+        version: 1,
+        sql: include_str!("../../schema/scores_001.sql"),
+    },
+    SchemaFile {
+        prefix: "shared",
+        version: 1,
+        sql: include_str!("../../schema/shared_001.sql"),
+    },
+    SchemaFile {
+        prefix: "shared",
+        version: 2,
+        sql: include_str!("../../schema/shared_002.sql"),
+    },
 ];
 
 /// Validate manifest ordering on every run_migrations call.
@@ -104,7 +134,9 @@ fn validate_manifest() {
                 f.version > prev,
                 "SCHEMA_FILES: prefix '{}' version {} not strictly \
                  greater than previous version {}",
-                f.prefix, f.version, prev
+                f.prefix,
+                f.version,
+                prev
             );
         }
         max_versions.insert(f.prefix, f.version);
@@ -160,9 +192,7 @@ pub fn parse_statements(sql: &str) -> Vec<String> {
     for line in stripped_sql.lines() {
         let upper = line.trim().to_uppercase();
 
-        if upper.starts_with("CREATE TRIGGER")
-            || upper.starts_with("CREATE OR REPLACE TRIGGER")
-        {
+        if upper.starts_with("CREATE TRIGGER") || upper.starts_with("CREATE OR REPLACE TRIGGER") {
             in_trigger = true;
         }
 
@@ -292,11 +322,10 @@ async fn acquire_lock(conn: &mut SqliteConnection) -> Result<bool, MigrationErro
 /// Release migration_lock unconditionally. Errors are swallowed — mirrors
 /// Python release_lock() which uses bare except pass.
 async fn release_lock(conn: &mut SqliteConnection) {
-    let _ = sqlx::query(
-        "UPDATE migration_lock SET locked_at = NULL, locked_by = NULL WHERE id = 1",
-    )
-    .execute(&mut *conn)
-    .await;
+    let _ =
+        sqlx::query("UPDATE migration_lock SET locked_at = NULL, locked_by = NULL WHERE id = 1")
+            .execute(&mut *conn)
+            .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -381,10 +410,7 @@ pub async fn run_migrations(
 }
 
 /// Inner migration loop — runs after lock is acquired.
-async fn run_pending(
-    conn: &mut SqliteConnection,
-    prefix: &str,
-) -> Result<u32, MigrationError> {
+async fn run_pending(conn: &mut SqliteConnection, prefix: &str) -> Result<u32, MigrationError> {
     let current_version = get_applied_version(conn).await;
     let migrations = get_migration_files(prefix);
     let mut applied: u32 = 0;
@@ -447,10 +473,9 @@ async fn run_pending(
         applied += 1;
     }
 
-    let check: Option<(String,)> =
-        sqlx::query_as("PRAGMA integrity_check")
-            .fetch_optional(&mut *conn)
-            .await?;
+    let check: Option<(String,)> = sqlx::query_as("PRAGMA integrity_check")
+        .fetch_optional(&mut *conn)
+        .await?;
 
     if !matches!(check, Some((ref s,)) if s == "ok") {
         return Err(MigrationError::Failed {
@@ -473,10 +498,7 @@ async fn run_pending(
 /// Mirrors Python get_data_root() from providers/utils.py — panics if unset,
 /// matching the Python behavior (raises RuntimeError if missing).
 pub fn get_data_root() -> PathBuf {
-    PathBuf::from(
-        std::env::var("QR_DATA_ROOT")
-            .expect("QR_DATA_ROOT environment variable not set"),
-    )
+    PathBuf::from(std::env::var("QR_DATA_ROOT").expect("QR_DATA_ROOT environment variable not set"))
 }
 
 // ---------------------------------------------------------------------------
@@ -498,8 +520,10 @@ pub async fn migrate_personal_db(
     key_hex: &str,
 ) -> Result<u32, MigrationError> {
     let db_path = get_data_root()
-        .join("users").join(user_id)
-        .join("personas").join(persona_id)
+        .join("users")
+        .join(user_id)
+        .join("personas")
+        .join(persona_id)
         .join("personal.db");
     std::fs::create_dir_all(db_path.parent().unwrap())?;
     let mut conn = open_raw(&db_path).await?;
@@ -513,8 +537,10 @@ pub async fn migrate_outputs_db(
     key_hex: &str,
 ) -> Result<u32, MigrationError> {
     let db_path = get_data_root()
-        .join("users").join(user_id)
-        .join("personas").join(persona_id)
+        .join("users")
+        .join(user_id)
+        .join("personas")
+        .join(persona_id)
         .join("outputs.db");
     std::fs::create_dir_all(db_path.parent().unwrap())?;
     let mut conn = open_raw(&db_path).await?;
@@ -524,7 +550,8 @@ pub async fn migrate_outputs_db(
 /// Migrate a user's integration_keys.db (encrypted). key_hex: bare hex bytes only.
 pub async fn migrate_keys_db(user_id: &str, key_hex: &str) -> Result<u32, MigrationError> {
     let db_path = get_data_root()
-        .join("users").join(user_id)
+        .join("users")
+        .join(user_id)
         .join("integration_keys.db");
     std::fs::create_dir_all(db_path.parent().unwrap())?;
     let mut conn = open_raw(&db_path).await?;
@@ -548,9 +575,12 @@ pub async fn migrate_domain_context_db(
     key_hex: &str,
 ) -> Result<u32, MigrationError> {
     let db_path = get_data_root()
-        .join("users").join(user_id)
-        .join("personas").join(persona_id)
-        .join("focuses").join(focus_id)
+        .join("users")
+        .join(user_id)
+        .join("personas")
+        .join(persona_id)
+        .join("focuses")
+        .join(focus_id)
         .join("domain_context.db");
     std::fs::create_dir_all(db_path.parent().unwrap())?;
     let mut conn = open_raw(&db_path).await?;
@@ -567,10 +597,14 @@ pub async fn migrate_plan_state_db(
     key_hex: &str,
 ) -> Result<u32, MigrationError> {
     let db_path = get_data_root()
-        .join("users").join(user_id)
-        .join("personas").join(persona_id)
-        .join("focuses").join(focus_id)
-        .join("topics").join(topic_id)
+        .join("users")
+        .join(user_id)
+        .join("personas")
+        .join(persona_id)
+        .join("focuses")
+        .join(focus_id)
+        .join("topics")
+        .join(topic_id)
         .join("plan_state.db");
     std::fs::create_dir_all(db_path.parent().unwrap())?;
     let mut conn = open_raw(&db_path).await?;
@@ -612,7 +646,8 @@ mod tests {
 
     #[test]
     fn test_parse_strips_comment_lines() {
-        let sql = "-- comment\nCREATE TABLE a (id INTEGER);\n-- another\nCREATE TABLE b (id INTEGER);";
+        let sql =
+            "-- comment\nCREATE TABLE a (id INTEGER);\n-- another\nCREATE TABLE b (id INTEGER);";
         let stmts = parse_statements(sql);
         assert_eq!(stmts.len(), 2);
         assert!(stmts[0].contains("CREATE TABLE a"));
@@ -623,7 +658,12 @@ mod tests {
     fn test_parse_trigger_block() {
         let sql = "CREATE TRIGGER trg AFTER INSERT ON foo\nBEGIN\n  UPDATE bar SET x = 1;\nEND;";
         let stmts = parse_statements(sql);
-        assert_eq!(stmts.len(), 1, "trigger must be one statement, got: {:?}", stmts);
+        assert_eq!(
+            stmts.len(),
+            1,
+            "trigger must be one statement, got: {:?}",
+            stmts
+        );
         assert!(stmts[0].contains("CREATE TRIGGER"));
         assert!(stmts[0].contains("END;"));
     }
@@ -668,7 +708,8 @@ mod tests {
             assert!(
                 !stmts.is_empty(),
                 "parse_statements produced no statements for {}_{}",
-                f.prefix, f.version
+                f.prefix,
+                f.version
             );
         }
     }
@@ -699,13 +740,16 @@ mod tests {
     #[tokio::test]
     async fn test_bootstrap_lock_table_idempotent() {
         let mut conn = make_test_conn().await;
-        bootstrap_lock_table(&mut conn).await.expect("first bootstrap failed");
-        bootstrap_lock_table(&mut conn).await.expect("second bootstrap must be idempotent");
-        let row: Option<(i64,)> =
-            sqlx::query_as("SELECT id FROM migration_lock WHERE id = 1")
-                .fetch_optional(&mut conn)
-                .await
-                .unwrap();
+        bootstrap_lock_table(&mut conn)
+            .await
+            .expect("first bootstrap failed");
+        bootstrap_lock_table(&mut conn)
+            .await
+            .expect("second bootstrap must be idempotent");
+        let row: Option<(i64,)> = sqlx::query_as("SELECT id FROM migration_lock WHERE id = 1")
+            .fetch_optional(&mut conn)
+            .await
+            .unwrap();
         assert!(row.is_some(), "seed row must exist after bootstrap");
     }
 
@@ -713,9 +757,162 @@ mod tests {
     async fn test_acquire_and_release_lock() {
         let mut conn = make_test_conn().await;
         bootstrap_lock_table(&mut conn).await.unwrap();
-        assert!(acquire_lock(&mut conn).await.unwrap(), "should acquire free lock");
-        assert!(!acquire_lock(&mut conn).await.unwrap(), "should not acquire already-held lock");
+        assert!(
+            acquire_lock(&mut conn).await.unwrap(),
+            "should acquire free lock"
+        );
+        assert!(
+            !acquire_lock(&mut conn).await.unwrap(),
+            "should not acquire already-held lock"
+        );
         release_lock(&mut conn).await;
-        assert!(acquire_lock(&mut conn).await.unwrap(), "should acquire after release");
+        assert!(
+            acquire_lock(&mut conn).await.unwrap(),
+            "should acquire after release"
+        );
+    }
+
+    // -- items.id=205: auth foundation migration tests ---------------------
+    //
+    // shared_001.sql was edited directly to its final auth-foundation shape
+    // (users/user_salts/user_capabilities) rather than layered on via a
+    // separate shared_003.sql rebuild migration (Jason's direction,
+    // 2026-08-01, mirroring shared_001.sql's own 2026-07-24 consolidation
+    // precedent) -- these tests exercise the resulting schema via
+    // run_migrations() itself, not just parse_statements() in isolation.
+
+    #[tokio::test]
+    async fn test_shared_migration_applies_cleanly() {
+        let mut conn = make_test_conn().await;
+        let applied = run_migrations(&mut conn, "shared", None)
+            .await
+            .expect("shared migration chain must apply cleanly on a fresh db");
+        assert_eq!(applied, 2, "expected both shared schema versions to apply");
+
+        let version: (i64,) = sqlx::query_as("SELECT MAX(version) FROM schema_version")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(version.0, 2);
+    }
+
+    #[tokio::test]
+    async fn test_shared_migration_users_final_shape() {
+        // No pre-edit 'builder'-role fixture to migrate from -- shared_001.sql
+        // was edited directly (items.id=205), so this asserts the final
+        // shape a fresh install actually gets, not a translation step.
+        let mut conn = make_test_conn().await;
+        run_migrations(&mut conn, "shared", None).await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO users (id, display_name, role, is_primary, auth_enabled, created_at) \
+             VALUES ('u-test-1', 'Test User', 'user', 1, 1, '2026-01-01T00:00:00Z')",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("a 'user'-role row must insert cleanly under the final role CHECK");
+
+        let row: (String, String, i64) = sqlx::query_as(
+            "SELECT id, role, idle_timeout_minutes FROM users WHERE id = 'u-test-1'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "u-test-1");
+        assert_eq!(row.1, "user");
+        assert_eq!(row.2, 15, "idle_timeout_minutes must default to 15");
+
+        sqlx::query(
+            "INSERT INTO user_salts (user_id, salt_hex, created_at) \
+             VALUES ('u-test-1', 'deadbeef', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        let salt_row: (String, i64, i64, i64) = sqlx::query_as(
+            "SELECT kdf_algorithm, kdf_memory_kib, kdf_iterations, kdf_parallelism \
+             FROM user_salts WHERE user_id = 'u-test-1'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(salt_row.0, "argon2id");
+        assert_eq!(salt_row.1, 65536);
+        assert_eq!(salt_row.2, 3);
+        assert_eq!(salt_row.3, 4);
+    }
+
+    #[tokio::test]
+    async fn test_shared_migration_creates_user_capabilities() {
+        let mut conn = make_test_conn().await;
+        run_migrations(&mut conn, "shared", None).await.unwrap();
+
+        let exists: Option<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='user_capabilities'",
+        )
+        .fetch_optional(&mut conn)
+        .await
+        .unwrap();
+        assert!(
+            exists.is_some(),
+            "user_capabilities table must exist after migration"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_user_capabilities_rejects_duplicate_account_wide_rows() {
+        // Regression test for the NULL-PK gap found and closed this session
+        // (items.id=205): SQLite's composite PRIMARY KEY treats each NULL as
+        // distinct, so (user_id, persona_id, capability) alone does not
+        // prevent two account-wide (persona_id IS NULL) rows for the same
+        // (user_id, capability) -- confirms the partial unique index added
+        // alongside the table actually closes that gap.
+        let mut conn = make_test_conn().await;
+        run_migrations(&mut conn, "shared", None).await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, display_name, role, created_at) \
+             VALUES ('u-cap-1', 'Cap Test', 'user', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO user_capabilities (user_id, persona_id, capability, allowed, created_at) \
+             VALUES ('u-cap-1', NULL, 'create_persona', 0, '2026-01-01T00:00:00Z')",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("first account-wide capability row must insert cleanly");
+
+        let dup = sqlx::query(
+            "INSERT INTO user_capabilities (user_id, persona_id, capability, allowed, created_at) \
+             VALUES ('u-cap-1', NULL, 'create_persona', 1, '2026-01-01T00:00:00Z')",
+        )
+        .execute(&mut conn)
+        .await;
+        assert!(
+            dup.is_err(),
+            "a second account-wide row for the same (user_id, capability) must be rejected \
+             by idx_user_capabilities_account_wide -- without it, the composite PK alone \
+             would silently allow both rows to coexist"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shared_migration_users_role_check_rejects_old_values() {
+        let mut conn = make_test_conn().await;
+        run_migrations(&mut conn, "shared", None).await.unwrap();
+
+        let result = sqlx::query(
+            "INSERT INTO users (id, display_name, role, created_at) \
+             VALUES ('u-bad', 'Bad Role', 'builder', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&mut conn)
+        .await;
+        assert!(
+            result.is_err(),
+            "old 'builder' role value must be rejected by the new CHECK"
+        );
     }
 }

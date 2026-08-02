@@ -47,8 +47,7 @@ pub fn now() -> String {
 /// Falls back to ./quietrabbit-data for Topology A (zero-config).
 /// Python oracle: get_data_root()
 pub fn get_data_root() -> PathBuf {
-    let root = std::env::var("QR_DATA_ROOT")
-        .unwrap_or_else(|_| "./quietrabbit-data".to_owned());
+    let root = std::env::var("QR_DATA_ROOT").unwrap_or_else(|_| "./quietrabbit-data".to_owned());
     PathBuf::from(root)
 }
 
@@ -143,8 +142,8 @@ pub fn connect_options_encrypted(path: &Path, key_hex: &str) -> SqliteConnectOpt
     SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(true)
-        .pragma("key", format!("x'{key_hex}'"))       // FIRST — SQLCipher requirement
-        .pragma("journal_mode", journal_mode_value())  // AFTER key
+        .pragma("key", format!("x'{key_hex}'")) // FIRST — SQLCipher requirement
+        .pragma("journal_mode", journal_mode_value()) // AFTER key
 }
 
 // ---------------------------------------------------------------------------
@@ -154,11 +153,13 @@ pub fn connect_options_encrypted(path: &Path, key_hex: &str) -> SqliteConnectOpt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     // Serialize all env-mutating tests — Rust test runner is multi-threaded.
     // ENV_MUTEX must be acquired before any set_var/remove_var call.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+    // Shared across every test module that mutates QR_DATA_ROOT (items.id=
+    // 205, 2026-08-01) -- see test_support.rs for why this must be one
+    // true mutex, not a per-module copy.
+    use crate::test_support::ENV_MUTEX;
 
     #[test]
     fn now_is_nonempty_rfc3339() {
@@ -176,7 +177,9 @@ mod tests {
         let root = get_data_root();
         assert_eq!(root, PathBuf::from("./quietrabbit-data"));
 
-        if let Some(v) = saved { std::env::set_var("QR_DATA_ROOT", v); }
+        if let Some(v) = saved {
+            std::env::set_var("QR_DATA_ROOT", v);
+        }
     }
 
     #[test]
@@ -189,7 +192,9 @@ mod tests {
         assert_eq!(root, PathBuf::from("/tmp/qr-test-root"));
 
         std::env::remove_var("QR_DATA_ROOT");
-        if let Some(v) = saved { std::env::set_var("QR_DATA_ROOT", v); }
+        if let Some(v) = saved {
+            std::env::set_var("QR_DATA_ROOT", v);
+        }
     }
 
     #[test]
@@ -213,7 +218,9 @@ mod tests {
         );
 
         std::env::remove_var("QR_DATA_ROOT");
-        if let Some(v) = saved { std::env::set_var("QR_DATA_ROOT", v); }
+        if let Some(v) = saved {
+            std::env::set_var("QR_DATA_ROOT", v);
+        }
     }
 
     #[test]
@@ -229,7 +236,9 @@ mod tests {
         );
 
         std::env::remove_var("QR_DATA_ROOT");
-        if let Some(v) = saved { std::env::set_var("QR_DATA_ROOT", v); }
+        if let Some(v) = saved {
+            std::env::set_var("QR_DATA_ROOT", v);
+        }
     }
 
     #[test]
@@ -245,7 +254,9 @@ mod tests {
         );
 
         std::env::remove_var("QR_DATA_ROOT");
-        if let Some(v) = saved { std::env::set_var("QR_DATA_ROOT", v); }
+        if let Some(v) = saved {
+            std::env::set_var("QR_DATA_ROOT", v);
+        }
     }
 
     #[test]
@@ -268,7 +279,9 @@ mod tests {
 
         assert_eq!(journal_mode_value(), "WAL");
 
-        if let Some(v) = saved { std::env::set_var("QR_NETWORK_STORAGE", v); }
+        if let Some(v) = saved {
+            std::env::set_var("QR_NETWORK_STORAGE", v);
+        }
     }
 
     #[test]
@@ -280,6 +293,8 @@ mod tests {
         assert_eq!(journal_mode_value(), "DELETE");
 
         std::env::remove_var("QR_NETWORK_STORAGE");
-        if let Some(v) = saved { std::env::set_var("QR_NETWORK_STORAGE", v); }
+        if let Some(v) = saved {
+            std::env::set_var("QR_NETWORK_STORAGE", v);
+        }
     }
 }
