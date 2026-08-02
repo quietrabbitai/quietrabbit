@@ -23,7 +23,9 @@
 // check below is a pass-through stub pending a real caller.
 //
 // OBJECT TYPE REGISTRATION MODEL (decisions.id=513: "a Chat-DEV scoping
-// item — must be defined before personal_007.sql build begins"):
+// item — must be defined before personal_003.sql build begins" [decision
+// text corrected 2026-08-01 from a pre-release planning filename,
+// personal_007.sql, that was never actually built]):
 // implemented as a static, compile-time registry rather than a DB table.
 // Object types are a code-level concept — adding one means adding Rust code
 // to read/write it, so gating the type list behind a migration would only

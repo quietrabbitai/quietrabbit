@@ -121,16 +121,21 @@ Design sessions must all complete before shared infrastructure build begins.
   control. Knowledge graph governs semantic relationships.
 - Source of truth framework (D6-460): source_registry, deduplication candidates,
   modification_state, soft-delete tombstone. First instantiated by Cooking.
-- parent_entity_id: DROP before personal_007.sql is applied. Confirm no Rust code
-  references this column. entity_relationships is the canonical relationship store.
+- parent_entity_id: DROP in a future migration (not yet scheduled). Confirm no
+  Rust code references this column first. entity_relationships is the canonical
+  relationship store.
 
 ## Entity Model (D6-371–D6-375 — LOCKED)
 personal_fields flat key-value model replaced by entities + entity_facts.
-Migration: personal_006.sql (complete). personal_007.sql pending (D6-459 additions).
-personal_005.sql VOIDED — must not be applied. Superseded by D6-374.
+Migration: personal_002.sql (complete, entities + entity_facts). D6-459 additions
+(source_registry, deduplication, modification_state, soft-delete tombstone) also
+complete -- see personal_002.sql. The personal_*.sql migration sequence was
+consolidated from 7 planned files to 2 before any of the later ones shipped
+(2026-08-01) -- prior references here to personal_005/006/007.sql described a
+planning-stage numbering that was never built; do not search for those files.
 
 Key facts:
-- entities: self-referential (parent_entity_id — PENDING DROP in personal_007.sql),
+- entities: self-referential (parent_entity_id — PENDING DROP, not yet scheduled),
   open type vocabulary, aliases as JSON array, status (active/retired/archived)
 - entity_facts: entity_id nullable (NULL = singleton), temporal validity,
   source field tracks provenance

@@ -17,9 +17,11 @@
 //   isolation (user_id/persona_id/key_hex opens the correct encrypted DB),
 //   but does not enforce Focus profile visibility rules (Open/Organized/
 //   Protected). That filtering layer is not yet implemented in the store.
-//   Scoped out to items.id=175 pending its own resolution -- foundation work
-//   (personal_007.sql, evaluate_object_visibility per decisions.id=513) is a
-//   prerequisite not yet built. See items.id=91 for the split record.
+//   items.id=175's foundation work (personal_003.sql, conductor::visibility::
+//   evaluate_object_visibility per decisions.id=513) landed 2026-08-01 --
+//   entity-level flags now exist, but wiring this store's get_output() path
+//   to call evaluate_object_visibility is separate follow-on work, not yet
+//   done. See items.id=91 for the split record.
 //
 // key_hex/user_id/persona_id via IPC: intentional for Release 1 (no auth
 //   layer yet). Layer 8 will move session key management into tauri::State.
