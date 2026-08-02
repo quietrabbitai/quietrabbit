@@ -686,7 +686,7 @@ pub async fn count_pending(
     .fetch_one(&mut conn)
     .await?;
 
-    Ok(row.try_get::<i64, _>("cnt")?)
+    row.try_get::<i64, _>("cnt")
 }
 
 // ---------------------------------------------------------------------------

@@ -130,7 +130,7 @@ pub async fn find_user_by_display_name(
 /// session, per external review -- an earlier draft used filter_map,
 /// which would silently truncate malformed hex instead of erroring).
 fn hex_decode(user_id: &str, s: &str) -> Result<Vec<u8>, UserStoreError> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(UserStoreError::CorruptSalt(user_id.to_owned()));
     }
     (0..s.len())
@@ -189,6 +189,14 @@ pub async fn get_salt_params(
 /// Section 2.1 reframes it as an onboarding-time invariant evaluated once
 /// at account creation (not a standing runtime toggle), so every account
 /// this function creates satisfies that invariant by construction.
+///
+/// #[allow(clippy::too_many_arguments)] justification (items.id=207): 8
+/// params, all distinct account-creation fields with no natural grouping;
+/// bundling into a struct would be a real API change touching
+/// commands/auth.rs's call site, out of scope for a lint-silencing pass.
+/// Revisit if a struct-shaped caller emerges naturally (e.g. an onboarding
+/// request type).
+#[allow(clippy::too_many_arguments)]
 pub async fn create_user(
     user_id: &str,
     display_name: &str,

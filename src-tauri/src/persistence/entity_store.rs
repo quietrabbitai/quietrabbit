@@ -371,6 +371,12 @@ const ENTITY_COLUMNS: &str = "id, entity_type, display_name, aliases, parent_ent
 ///
 /// Entities are mutable records (no valid_until / supersede chain) — unlike
 /// entity_facts, which are immutable and superseded rather than updated.
+///
+/// #[allow(clippy::too_many_arguments)] justification (items.id=207): 8
+/// params, all distinct entity-creation fields with no natural grouping;
+/// bundling into a struct would be a real API change touching this
+/// function's callers, out of scope for a lint-silencing pass.
+#[allow(clippy::too_many_arguments)]
 pub async fn create_entity(
     user_id: &str,
     persona_id: &str,

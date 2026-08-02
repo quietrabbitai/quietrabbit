@@ -727,6 +727,7 @@ pub(crate) async fn get_candidate_conn(
 ///      (decisions.id=502).
 ///   3. The loser is tombstoned as 'user_deleted' — never hard-deleted, and
 ///      never re-imported even if it reappears in source.
+///
 /// Content fields are NEVER combined. The winner keeps its own substance.
 ///
 /// ConfirmedDistinct: both records are left exactly as they are, and the

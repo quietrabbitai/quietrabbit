@@ -199,7 +199,7 @@ pub fn initialize_cef_with_pump_setting(_external_message_pump_ignored: bool) ->
         windowless_rendering_enabled: true as _,
         multi_threaded_message_loop: 1,
         no_sandbox: 1,
-        root_cache_path: cef::CefString::from(ROOT_CACHE_PATH).into(),
+        root_cache_path: cef::CefString::from(ROOT_CACHE_PATH),
         ..Default::default()
     };
 
