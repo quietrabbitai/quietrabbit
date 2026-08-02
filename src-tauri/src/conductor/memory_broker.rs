@@ -88,11 +88,11 @@ fn default_tier_a_ceiling() -> i32 {
 // Unknown presets default to rank 3 (locked) — fail closed on unrecognised values.
 fn preset_rank(preset: &str) -> i32 {
     match preset {
-        "standard"  => 0,
+        "standard" => 0,
         "sensitive" => 1,
-        "private"   => 2,
-        "locked"    => 3,
-        _           => 3, // fail closed
+        "private" => 2,
+        "locked" => 3,
+        _ => 3, // fail closed
     }
 }
 
@@ -329,11 +329,20 @@ impl MemoryBroker {
         reserve_margin: Option<f64>,
     ) -> ContextSlice {
         // Isolation assertions — fail closed before any retrieval.
-        assert!(!user_id.is_empty(),    "MemoryBroker: user_id must be non-empty");
-        assert!(!persona_id.is_empty(), "MemoryBroker: persona_id must be non-empty");
+        assert!(
+            !user_id.is_empty(),
+            "MemoryBroker: user_id must be non-empty"
+        );
+        assert!(
+            !persona_id.is_empty(),
+            "MemoryBroker: persona_id must be non-empty"
+        );
         // persona_id required for storage path resolution — not a privacy boundary.
         // Privacy isolation is scoped to (focus_id, topic_id) per D6-301.
-        assert!(!focus_id.is_empty(),   "MemoryBroker: focus_id must be non-empty");
+        assert!(
+            !focus_id.is_empty(),
+            "MemoryBroker: focus_id must be non-empty"
+        );
 
         let timestamp = Utc::now().to_rfc3339();
         let mut slice = ContextSlice::new(timestamp, topic_id.map(|s| s.to_string()));
@@ -389,8 +398,7 @@ impl MemoryBroker {
             }
         }
 
-        slice.token_budget_remaining =
-            model_context_window - reserve - slice.token_budget_used;
+        slice.token_budget_remaining = model_context_window - reserve - slice.token_budget_used;
         slice.loaded_block_count = slice.retrieved_blocks.len();
 
         log::debug!(
@@ -466,7 +474,10 @@ impl MemoryBroker {
             log::debug!(
                 "memory_broker: standing summary truncated by Tier A ceiling \
                  focus={} actual={} ceiling={} charged={}",
-                focus_id, summary.token_count, tier_a_ceiling, tokens_charged
+                focus_id,
+                summary.token_count,
+                tier_a_ceiling,
+                tokens_charged
             );
         }
 
@@ -508,7 +519,12 @@ impl MemoryBroker {
         budget: i32,
     ) {
         let dc_blocks = match domain_context_store::get_eligible_blocks(
-            user_id, persona_id, focus_id, key_hex, execution_tier, None,
+            user_id,
+            persona_id,
+            focus_id,
+            key_hex,
+            execution_tier,
+            None,
         )
         .await
         {
@@ -523,7 +539,14 @@ impl MemoryBroker {
         };
 
         let ps_blocks = match plan_state_store::get_eligible_blocks(
-            user_id, persona_id, focus_id, topic_id, key_hex, execution_tier, None, None,
+            user_id,
+            persona_id,
+            focus_id,
+            topic_id,
+            key_hex,
+            execution_tier,
+            None,
+            None,
         )
         .await
         {
@@ -531,7 +554,8 @@ impl MemoryBroker {
             Err(e) => {
                 log::warn!(
                     "memory_broker: get_eligible_blocks (PS) failed focus={} topic={} err={e}",
-                    focus_id, topic_id
+                    focus_id,
+                    topic_id
                 );
                 Vec::new()
             }
@@ -547,7 +571,9 @@ impl MemoryBroker {
                 log::debug!(
                     "memory_broker: DC block deferred — excluded_reason=budget \
                      block={} token_estimate={} remaining={}",
-                    dc_block.id, dc_block.token_estimate, budget - tokens_loaded,
+                    dc_block.id,
+                    dc_block.token_estimate,
+                    budget - tokens_loaded,
                 );
                 continue;
             }
@@ -575,7 +601,9 @@ impl MemoryBroker {
                 log::debug!(
                     "memory_broker: PS block deferred — excluded_reason=budget \
                      block={} token_estimate={} remaining={}",
-                    ps_block.id, ps_block.token_estimate, budget - tokens_loaded,
+                    ps_block.id,
+                    ps_block.token_estimate,
+                    budget - tokens_loaded,
                 );
                 continue;
             }
@@ -663,7 +691,9 @@ mod tests {
     #[test]
     fn clear_empties_blocks_and_render_returns_empty_string() {
         let mut slice = ContextSlice::new("2026-07-26T00:00:00Z".to_string(), None);
-        slice.retrieved_blocks.push(sample_block("sensitive context text"));
+        slice
+            .retrieved_blocks
+            .push(sample_block("sensitive context text"));
         assert!(!slice.retrieved_blocks.is_empty());
         assert_eq!(slice.render(), "sensitive context text");
 

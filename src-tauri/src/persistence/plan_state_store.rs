@@ -63,9 +63,9 @@ const DEFAULT_CEILING_THRESHOLD: i32 = 32000;
 fn preset_rank(preset: &str) -> i32 {
     match preset {
         "sensitive" => 1,
-        "private"   => 2,
-        "locked"    => 3,
-        _           => 0,
+        "private" => 2,
+        "locked" => 3,
+        _ => 0,
     }
 }
 
@@ -88,7 +88,12 @@ fn eligible_scopes_for_tier(execution_tier: i32) -> &'static [&'static str] {
         "execution_tier must be 1, 2, or 3 -- got {execution_tier}"
     );
     match execution_tier {
-        1 => &["tier_1_only", "anonymous_tier2", "tier2_permitted", "tier3_permitted"],
+        1 => &[
+            "tier_1_only",
+            "anonymous_tier2",
+            "tier2_permitted",
+            "tier3_permitted",
+        ],
         2 => &["anonymous_tier2", "tier2_permitted", "tier3_permitted"],
         3 => &["tier3_permitted"],
         _ => &[],
@@ -238,7 +243,9 @@ pub async fn ensure_plan_state_db(
     )
     .await
     .map_err(|e| PlanStateStoreError::Migration(e.to_string()))?;
-    Ok(get_plan_state_db_path(user_id, persona_id, focus_id, topic_id))
+    Ok(get_plan_state_db_path(
+        user_id, persona_id, focus_id, topic_id,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -273,16 +280,16 @@ pub async fn get_topic_header(
     match row {
         None => Ok(None),
         Some(r) => Ok(Some(TopicHeader {
-            topic_id:         r.try_get("topic_id")?,
-            focus_id:         r.try_get("focus_id")?,
-            persona_id:       r.try_get("persona_id")?,
-            name:             r.try_get("name")?,
+            topic_id: r.try_get("topic_id")?,
+            focus_id: r.try_get("focus_id")?,
+            persona_id: r.try_get("persona_id")?,
+            name: r.try_get("name")?,
             placeholder_name: r.try_get("placeholder_name")?,
-            lifecycle_state:  r.try_get("lifecycle_state")?,
-            current_phase:    r.try_get("current_phase")?,
-            session_count:    r.try_get::<i64, _>("session_count")? as i32,
-            created_at:       r.try_get("created_at")?,
-            updated_at:       r.try_get("updated_at")?,
+            lifecycle_state: r.try_get("lifecycle_state")?,
+            current_phase: r.try_get("current_phase")?,
+            session_count: r.try_get::<i64, _>("session_count")? as i32,
+            created_at: r.try_get("created_at")?,
+            updated_at: r.try_get("updated_at")?,
         })),
     }
 }
@@ -345,33 +352,27 @@ pub async fn update_topic_header(
     let mut conn = open_plan_state_db(user_id, persona_id, focus_id, topic_id, key_hex).await?;
 
     if let Some(state) = lifecycle_state {
-        sqlx::query(
-            "UPDATE topic_header SET lifecycle_state = ?, updated_at = ? WHERE id = 1",
-        )
-        .bind(state)
-        .bind(&timestamp)
-        .execute(&mut conn)
-        .await?;
+        sqlx::query("UPDATE topic_header SET lifecycle_state = ?, updated_at = ? WHERE id = 1")
+            .bind(state)
+            .bind(&timestamp)
+            .execute(&mut conn)
+            .await?;
     }
 
     if let Some(phase) = current_phase {
-        sqlx::query(
-            "UPDATE topic_header SET current_phase = ?, updated_at = ? WHERE id = 1",
-        )
-        .bind(phase)
-        .bind(&timestamp)
-        .execute(&mut conn)
-        .await?;
+        sqlx::query("UPDATE topic_header SET current_phase = ?, updated_at = ? WHERE id = 1")
+            .bind(phase)
+            .bind(&timestamp)
+            .execute(&mut conn)
+            .await?;
     }
 
     if let Some(n) = name {
-        sqlx::query(
-            "UPDATE topic_header SET name = ?, updated_at = ? WHERE id = 1",
-        )
-        .bind(n)
-        .bind(&timestamp)
-        .execute(&mut conn)
-        .await?;
+        sqlx::query("UPDATE topic_header SET name = ?, updated_at = ? WHERE id = 1")
+            .bind(n)
+            .bind(&timestamp)
+            .execute(&mut conn)
+            .await?;
     }
 
     if increment_session {
@@ -478,18 +479,18 @@ pub async fn get_eligible_blocks(
         .unwrap_or_default();
 
         blocks.push(PlanStateBlock {
-            id:                 row.try_get("id")?,
-            block_type:         row.try_get("block_type")?,
-            content:            row.try_get("content")?,
-            visibility_scope:   row.try_get("visibility_scope")?,
-            transformation:     row.try_get("transformation")?,
+            id: row.try_get("id")?,
+            block_type: row.try_get("block_type")?,
+            content: row.try_get("content")?,
+            visibility_scope: row.try_get("visibility_scope")?,
+            transformation: row.try_get("transformation")?,
             sensitivity_preset: row.try_get("sensitivity_preset")?,
             token_estimate,
             inferred_by_system: row.try_get::<i64, _>("inferred_by_system")? != 0,
-            focus_run_id:       row.try_get("focus_run_id")?,
-            created_at:         row.try_get("created_at")?,
-            updated_at:         row.try_get("updated_at")?,
-            archived_at:        row.try_get("archived_at")?,
+            focus_run_id: row.try_get("focus_run_id")?,
+            created_at: row.try_get("created_at")?,
+            updated_at: row.try_get("updated_at")?,
+            archived_at: row.try_get("archived_at")?,
             relevance_tags,
             dependency_refs,
         });
@@ -586,14 +587,16 @@ pub async fn write_block(
 ) -> Result<String, PlanStateStoreError> {
     let effective_preset: String = if let Some(refs) = dependency_refs {
         if !refs.is_empty() {
-            let inherited = get_sensitivity_ceiling(
-                user_id, persona_id, focus_id, topic_id, key_hex, refs,
-            )
-            .await?;
+            let inherited =
+                get_sensitivity_ceiling(user_id, persona_id, focus_id, topic_id, key_hex, refs)
+                    .await?;
             let current_rank = preset_rank(sensitivity_preset.unwrap_or("standard"));
             let inherited_rank = preset_rank(&inherited);
-            if inherited_rank > current_rank { inherited }
-            else { sensitivity_preset.unwrap_or("standard").to_owned() }
+            if inherited_rank > current_rank {
+                inherited
+            } else {
+                sensitivity_preset.unwrap_or("standard").to_owned()
+            }
         } else {
             sensitivity_preset.unwrap_or("standard").to_owned()
         }
@@ -603,10 +606,10 @@ pub async fn write_block(
 
     let block_id = uuid::Uuid::new_v4().to_string();
     let timestamp = crate::providers::utils::now();
-    let tags_json = serde_json::to_string(relevance_tags.unwrap_or(&[]))
-        .unwrap_or_else(|_| "[]".to_owned());
-    let refs_json = serde_json::to_string(dependency_refs.unwrap_or(&[]))
-        .unwrap_or_else(|_| "[]".to_owned());
+    let tags_json =
+        serde_json::to_string(relevance_tags.unwrap_or(&[])).unwrap_or_else(|_| "[]".to_owned());
+    let refs_json =
+        serde_json::to_string(dependency_refs.unwrap_or(&[])).unwrap_or_else(|_| "[]".to_owned());
     let inferred_flag: i64 = if inferred_by_system { 1 } else { 0 };
 
     let mut conn = open_plan_state_db(user_id, persona_id, focus_id, topic_id, key_hex).await?;
@@ -690,12 +693,11 @@ pub async fn archive_all_blocks(
     let timestamp = crate::providers::utils::now();
     let mut conn = open_plan_state_db(user_id, persona_id, focus_id, topic_id, key_hex).await?;
 
-    let result = sqlx::query(
-        "UPDATE plan_state_blocks SET archived_at = ? WHERE archived_at IS NULL",
-    )
-    .bind(&timestamp)
-    .execute(&mut conn)
-    .await?;
+    let result =
+        sqlx::query("UPDATE plan_state_blocks SET archived_at = ? WHERE archived_at IS NULL")
+            .bind(&timestamp)
+            .execute(&mut conn)
+            .await?;
 
     Ok(result.rows_affected())
 }
@@ -721,10 +723,9 @@ pub async fn create_handoff_token(
     expected_return_schema: Option<&serde_json::Value>,
 ) -> Result<String, PlanStateStoreError> {
     let token_id = uuid::Uuid::new_v4().to_string();
-    let schema_json = serde_json::to_string(
-        expected_return_schema.unwrap_or(&serde_json::json!({})),
-    )
-    .unwrap_or_else(|_| "{}".to_owned());
+    let schema_json =
+        serde_json::to_string(expected_return_schema.unwrap_or(&serde_json::json!({})))
+            .unwrap_or_else(|_| "{}".to_owned());
     let timestamp = crate::providers::utils::now();
 
     let mut conn = open_plan_state_db(user_id, persona_id, focus_id, topic_id, key_hex).await?;
@@ -845,9 +846,9 @@ pub async fn get_state_ceiling_status(
         None => Ok(None),
         Some(r) => Ok(Some(StateCeilingStatus {
             current_token_estimate: r.try_get::<i64, _>("current_token_estimate")? as i32,
-            ceiling_threshold:      r.try_get::<i64, _>("ceiling_threshold")? as i32,
-            notification_sent_at:   r.try_get("notification_sent_at")?,
-            user_response:          r.try_get("user_response")?,
+            ceiling_threshold: r.try_get::<i64, _>("ceiling_threshold")? as i32,
+            notification_sent_at: r.try_get("notification_sent_at")?,
+            user_response: r.try_get("user_response")?,
         })),
     }
 }

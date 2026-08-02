@@ -127,9 +127,12 @@ pub fn ensure_focus_dirs(
     topic_id: Option<&str>,
 ) -> Result<(PathBuf, Option<PathBuf>), TopicStoreError> {
     let focus_dir = crate::persistence::migrations::get_data_root()
-        .join("users").join(user_id)
-        .join("personas").join(persona_id)
-        .join("focuses").join(focus_id);
+        .join("users")
+        .join(user_id)
+        .join("personas")
+        .join(persona_id)
+        .join("focuses")
+        .join(focus_id);
     std::fs::create_dir_all(&focus_dir)?;
 
     let topic_dir = if let Some(tid) = topic_id {
@@ -151,10 +154,14 @@ pub fn get_plan_state_path(
     topic_id: &str,
 ) -> PathBuf {
     crate::persistence::migrations::get_data_root()
-        .join("users").join(user_id)
-        .join("personas").join(persona_id)
-        .join("focuses").join(focus_id)
-        .join("topics").join(topic_id)
+        .join("users")
+        .join(user_id)
+        .join("personas")
+        .join(persona_id)
+        .join("focuses")
+        .join(focus_id)
+        .join("topics")
+        .join(topic_id)
         .join("plan_state.db")
 }
 
@@ -173,17 +180,17 @@ fn row_to_topic(r: &sqlx::sqlite::SqliteRow) -> Result<Topic, sqlx::Error> {
     .unwrap_or_else(|_| serde_json::json!({}));
 
     Ok(Topic {
-        id:               r.try_get("id")?,
-        focus_id:         r.try_get("focus_id")?,
-        user_id:          r.try_get("user_id")?,
-        persona_id:       r.try_get("persona_id")?,
-        lifecycle_state:  r.try_get("lifecycle_state")?,
+        id: r.try_get("id")?,
+        focus_id: r.try_get("focus_id")?,
+        user_id: r.try_get("user_id")?,
+        persona_id: r.try_get("persona_id")?,
+        lifecycle_state: r.try_get("lifecycle_state")?,
         placeholder_name: r.try_get("placeholder_name")?,
-        created_at:       r.try_get("created_at")?,
-        updated_at:       r.try_get("updated_at")?,
-        name:             r.try_get("name")?,
-        dormant_since:    r.try_get("dormant_since")?,
-        closed_at:        r.try_get("closed_at")?,
+        created_at: r.try_get("created_at")?,
+        updated_at: r.try_get("updated_at")?,
+        name: r.try_get("name")?,
+        dormant_since: r.try_get("dormant_since")?,
+        closed_at: r.try_get("closed_at")?,
         extra_metadata,
     })
 }
@@ -192,18 +199,18 @@ fn row_to_classification_preference(
     r: &sqlx::sqlite::SqliteRow,
 ) -> Result<ClassificationPreference, sqlx::Error> {
     Ok(ClassificationPreference {
-        id:                 r.try_get("id")?,
-        focus_id:           r.try_get("focus_id")?,
-        persona_id:         r.try_get("persona_id")?,
-        content_type:       r.try_get("content_type")?,
-        visibility_scope:   r.try_get("visibility_scope")?,
-        transformation:     r.try_get("transformation")?,
+        id: r.try_get("id")?,
+        focus_id: r.try_get("focus_id")?,
+        persona_id: r.try_get("persona_id")?,
+        content_type: r.try_get("content_type")?,
+        visibility_scope: r.try_get("visibility_scope")?,
+        transformation: r.try_get("transformation")?,
         sensitivity_preset: r.try_get("sensitivity_preset")?,
-        user_calibrated:    r.try_get::<i64, _>("user_calibrated")? != 0,
-        confidence:         r.try_get("confidence")?,
-        last_applied_at:    r.try_get("last_applied_at")?,
-        created_at:         r.try_get("created_at")?,
-        updated_at:         r.try_get("updated_at")?,
+        user_calibrated: r.try_get::<i64, _>("user_calibrated")? != 0,
+        confidence: r.try_get("confidence")?,
+        last_applied_at: r.try_get("last_applied_at")?,
+        created_at: r.try_get("created_at")?,
+        updated_at: r.try_get("updated_at")?,
     })
 }
 
@@ -218,8 +225,10 @@ async fn open_outputs_db(
     key_hex: &str,
 ) -> Result<SqliteConnection, TopicStoreError> {
     let db_path = crate::persistence::migrations::get_data_root()
-        .join("users").join(user_id)
-        .join("personas").join(persona_id)
+        .join("users")
+        .join(user_id)
+        .join("personas")
+        .join(persona_id)
         .join("outputs.db");
 
     let conn = crate::providers::utils::connect_options_encrypted(&db_path, key_hex)
@@ -274,12 +283,10 @@ pub async fn create_topic(
     let timestamp = crate::providers::utils::now();
     // Placeholder format: "focus_id -- YYYY-MM-DD HH:MM"
     // Uses chrono format directly -- avoids brittle string-slice indexing.
-    let ph_name = placeholder_name
-        .map(|s| s.to_owned())
-        .unwrap_or_else(|| {
-            let formatted = Utc::now().format("%Y-%m-%d %H:%M").to_string();
-            format!("{} \u{2014} {}", focus_id, formatted)
-        });
+    let ph_name = placeholder_name.map(|s| s.to_owned()).unwrap_or_else(|| {
+        let formatted = Utc::now().format("%Y-%m-%d %H:%M").to_string();
+        format!("{} \u{2014} {}", focus_id, formatted)
+    });
     let plan_state_path = get_plan_state_path(user_id, persona_id, focus_id, &topic_id)
         .to_string_lossy()
         .to_string();
@@ -289,7 +296,9 @@ pub async fn create_topic(
     // SAVEPOINT: topics INSERT and topic_storage_locations INSERT are a logical unit.
     // If the storage location INSERT fails, the topic row must not persist orphaned.
     // ROLLBACK TO used to match the SAVEPOINT pattern in migrations.rs.
-    sqlx::query("SAVEPOINT create_topic_sp").execute(&mut conn).await?;
+    sqlx::query("SAVEPOINT create_topic_sp")
+        .execute(&mut conn)
+        .await?;
 
     let topic_result = sqlx::query(
         "INSERT INTO topics
@@ -297,12 +306,21 @@ pub async fn create_topic(
           lifecycle_state, created_at, updated_at, extra_metadata)
          VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, '{}')",
     )
-    .bind(&topic_id).bind(focus_id).bind(user_id).bind(persona_id)
-    .bind(name).bind(&ph_name).bind(&timestamp).bind(&timestamp)
-    .execute(&mut conn).await;
+    .bind(&topic_id)
+    .bind(focus_id)
+    .bind(user_id)
+    .bind(persona_id)
+    .bind(name)
+    .bind(&ph_name)
+    .bind(&timestamp)
+    .bind(&timestamp)
+    .execute(&mut conn)
+    .await;
 
     if let Err(e) = topic_result {
-        let _ = sqlx::query("ROLLBACK TO create_topic_sp").execute(&mut conn).await;
+        let _ = sqlx::query("ROLLBACK TO create_topic_sp")
+            .execute(&mut conn)
+            .await;
         return Err(TopicStoreError::Database(e));
     }
 
@@ -310,28 +328,48 @@ pub async fn create_topic(
         "INSERT INTO topic_storage_locations (topic_id, db_path, created_at)
          VALUES (?, ?, ?)",
     )
-    .bind(&topic_id).bind(&plan_state_path).bind(&timestamp)
-    .execute(&mut conn).await;
+    .bind(&topic_id)
+    .bind(&plan_state_path)
+    .bind(&timestamp)
+    .execute(&mut conn)
+    .await;
 
     if let Err(e) = storage_result {
-        let _ = sqlx::query("ROLLBACK TO create_topic_sp").execute(&mut conn).await;
+        let _ = sqlx::query("ROLLBACK TO create_topic_sp")
+            .execute(&mut conn)
+            .await;
         return Err(TopicStoreError::Database(e));
     }
 
-    sqlx::query("RELEASE create_topic_sp").execute(&mut conn).await?;
+    sqlx::query("RELEASE create_topic_sp")
+        .execute(&mut conn)
+        .await?;
 
     // Mirror to shared.db topic_index -- non-fatal.
     let _ = mirror_topic_index(
-        &topic_id, persona_id, focus_id,
-        name.unwrap_or(&ph_name), "active", &timestamp, 0, &timestamp,
-    ).await;
+        &topic_id,
+        persona_id,
+        focus_id,
+        name.unwrap_or(&ph_name),
+        "active",
+        &timestamp,
+        0,
+        &timestamp,
+    )
+    .await;
 
     Ok(Topic {
-        id: topic_id, focus_id: focus_id.to_owned(), user_id: user_id.to_owned(),
-        persona_id: persona_id.to_owned(), name: name.map(|s| s.to_owned()),
-        placeholder_name: ph_name, lifecycle_state: "active".to_owned(),
-        created_at: timestamp.clone(), updated_at: timestamp,
-        dormant_since: None, closed_at: None,
+        id: topic_id,
+        focus_id: focus_id.to_owned(),
+        user_id: user_id.to_owned(),
+        persona_id: persona_id.to_owned(),
+        name: name.map(|s| s.to_owned()),
+        placeholder_name: ph_name,
+        lifecycle_state: "active".to_owned(),
+        created_at: timestamp.clone(),
+        updated_at: timestamp,
+        dormant_since: None,
+        closed_at: None,
         extra_metadata: serde_json::json!({}),
     })
 }
@@ -352,7 +390,9 @@ pub async fn get_topic(
                 closed_at, extra_metadata
          FROM topics WHERE id = ? AND user_id = ? AND persona_id = ?",
     )
-    .bind(topic_id).bind(user_id).bind(persona_id)
+    .bind(topic_id)
+    .bind(user_id)
+    .bind(persona_id)
     .fetch_optional(&mut conn)
     .await?;
 
@@ -415,12 +455,11 @@ pub async fn update_topic_state(
     dormant_since: Option<&str>,
 ) -> Result<bool, TopicStoreError> {
     let timestamp = crate::providers::utils::now();
-    let closed_at: Option<&str> =
-        if lifecycle_state == "complete" || lifecycle_state == "closed" {
-            Some(&timestamp)
-        } else {
-            None
-        };
+    let closed_at: Option<&str> = if lifecycle_state == "complete" || lifecycle_state == "closed" {
+        Some(&timestamp)
+    } else {
+        None
+    };
 
     let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
 
@@ -428,9 +467,13 @@ pub async fn update_topic_state(
         "UPDATE topics SET lifecycle_state = ?, dormant_since = ?,
          closed_at = ?, updated_at = ? WHERE id = ?",
     )
-    .bind(lifecycle_state).bind(dormant_since).bind(closed_at)
-    .bind(&timestamp).bind(topic_id)
-    .execute(&mut conn).await?;
+    .bind(lifecycle_state)
+    .bind(dormant_since)
+    .bind(closed_at)
+    .bind(&timestamp)
+    .bind(topic_id)
+    .execute(&mut conn)
+    .await?;
 
     let updated = result.rows_affected() > 0;
     if updated {
@@ -451,11 +494,12 @@ pub async fn name_topic(
     let timestamp = crate::providers::utils::now();
     let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
 
-    let result = sqlx::query(
-        "UPDATE topics SET name = ?, updated_at = ? WHERE id = ?",
-    )
-    .bind(name).bind(&timestamp).bind(topic_id)
-    .execute(&mut conn).await?;
+    let result = sqlx::query("UPDATE topics SET name = ?, updated_at = ? WHERE id = ?")
+        .bind(name)
+        .bind(&timestamp)
+        .bind(topic_id)
+        .execute(&mut conn)
+        .await?;
 
     let updated = result.rows_affected() > 0;
     if updated {
@@ -467,9 +511,7 @@ pub async fn name_topic(
 /// Increment session_count on topic_index in shared.db.
 /// Called at Phase 3 INITIALIZE. Returns new session_count, 0 if not found.
 /// Note: touches shared.db only -- user_id/persona_id/key_hex are not needed.
-pub async fn increment_topic_session_count(
-    topic_id: &str,
-) -> Result<i32, TopicStoreError> {
+pub async fn increment_topic_session_count(topic_id: &str) -> Result<i32, TopicStoreError> {
     let timestamp = crate::providers::utils::now();
     let mut conn = open_shared_db().await?;
 
@@ -477,14 +519,16 @@ pub async fn increment_topic_session_count(
         "UPDATE topic_index SET session_count = session_count + 1,
          last_active_at = ?, updated_at = ? WHERE topic_id = ?",
     )
-    .bind(&timestamp).bind(&timestamp).bind(topic_id)
-    .execute(&mut conn).await?;
-
-    let row = sqlx::query(
-        "SELECT session_count FROM topic_index WHERE topic_id = ?",
-    )
+    .bind(&timestamp)
+    .bind(&timestamp)
     .bind(topic_id)
-    .fetch_optional(&mut conn).await?;
+    .execute(&mut conn)
+    .await?;
+
+    let row = sqlx::query("SELECT session_count FROM topic_index WHERE topic_id = ?")
+        .bind(topic_id)
+        .fetch_optional(&mut conn)
+        .await?;
 
     match row {
         None => Ok(0),
@@ -507,11 +551,10 @@ pub async fn get_plan_state_db_path(
 ) -> Result<Option<String>, TopicStoreError> {
     let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
 
-    let row = sqlx::query(
-        "SELECT db_path FROM topic_storage_locations WHERE topic_id = ?",
-    )
-    .bind(topic_id)
-    .fetch_optional(&mut conn).await?;
+    let row = sqlx::query("SELECT db_path FROM topic_storage_locations WHERE topic_id = ?")
+        .bind(topic_id)
+        .fetch_optional(&mut conn)
+        .await?;
 
     match row {
         None => Ok(None),
@@ -531,8 +574,10 @@ pub async fn mark_storage_location_verified(
         "UPDATE topic_storage_locations SET verified_at = ?, orphaned = 0
          WHERE topic_id = ?",
     )
-    .bind(crate::providers::utils::now()).bind(topic_id)
-    .execute(&mut conn).await?;
+    .bind(crate::providers::utils::now())
+    .bind(topic_id)
+    .execute(&mut conn)
+    .await?;
     Ok(())
 }
 
@@ -549,8 +594,10 @@ pub async fn mark_storage_location_orphaned(
         "UPDATE topic_storage_locations SET orphaned = 1, verified_at = ?
          WHERE topic_id = ?",
     )
-    .bind(crate::providers::utils::now()).bind(topic_id)
-    .execute(&mut conn).await?;
+    .bind(crate::providers::utils::now())
+    .bind(topic_id)
+    .execute(&mut conn)
+    .await?;
     Ok(())
 }
 
@@ -596,11 +643,18 @@ pub async fn create_run_history_entry(
           promote_window_expires_at, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
-    .bind(&entry_id).bind(focus_run_id).bind(focus_id).bind(persona_id)
-    .bind(topic_id).bind(output_id).bind(output_type)
+    .bind(&entry_id)
+    .bind(focus_run_id)
+    .bind(focus_id)
+    .bind(persona_id)
+    .bind(topic_id)
+    .bind(output_id)
+    .bind(output_type)
     .bind(if is_quick_ask { 1i64 } else { 0i64 })
-    .bind(promote_expires.as_deref()).bind(&timestamp)
-    .execute(&mut conn).await?;
+    .bind(promote_expires.as_deref())
+    .bind(&timestamp)
+    .execute(&mut conn)
+    .await?;
 
     Ok(entry_id)
 }
@@ -615,7 +669,9 @@ pub async fn nullify_run_history_output(
 ) -> Result<(), TopicStoreError> {
     let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
     sqlx::query("UPDATE run_history SET output_id = NULL WHERE output_id = ?")
-        .bind(output_id).execute(&mut conn).await?;
+        .bind(output_id)
+        .execute(&mut conn)
+        .await?;
     Ok(())
 }
 
@@ -650,12 +706,12 @@ pub async fn list_promotable_runs(
     let mut result = Vec::new();
     for r in rows {
         result.push(PromotableRun {
-            id:                        r.try_get("id")?,
-            focus_run_id:              r.try_get("focus_run_id")?,
-            focus_id:                  r.try_get("focus_id")?,
-            output_id:                 r.try_get("output_id")?,
-            output_type:               r.try_get("output_type")?,
-            created_at:                r.try_get("created_at")?,
+            id: r.try_get("id")?,
+            focus_run_id: r.try_get("focus_run_id")?,
+            focus_id: r.try_get("focus_id")?,
+            output_id: r.try_get("output_id")?,
+            output_type: r.try_get("output_type")?,
+            created_at: r.try_get("created_at")?,
             promote_window_expires_at: r.try_get("promote_window_expires_at")?,
         });
     }
@@ -684,8 +740,11 @@ pub async fn get_classification_preference(
          FROM classification_preferences
          WHERE focus_id = ? AND persona_id = ? AND content_type = ?",
     )
-    .bind(focus_id).bind(persona_id).bind(content_type)
-    .fetch_optional(&mut conn).await?;
+    .bind(focus_id)
+    .bind(persona_id)
+    .bind(content_type)
+    .fetch_optional(&mut conn)
+    .await?;
 
     match row {
         None => Ok(None),
@@ -723,8 +782,11 @@ pub async fn upsert_classification_preference(
         "SELECT id FROM classification_preferences
          WHERE focus_id = ? AND persona_id = ? AND content_type = ?",
     )
-    .bind(focus_id).bind(persona_id).bind(content_type)
-    .fetch_optional(&mut conn).await?
+    .bind(focus_id)
+    .bind(persona_id)
+    .bind(content_type)
+    .fetch_optional(&mut conn)
+    .await?
     .map(|r| r.try_get("id"))
     .transpose()
     .map_err(TopicStoreError::Database)?;
@@ -737,10 +799,15 @@ pub async fn upsert_classification_preference(
              confidence = ?, updated_at = ?
              WHERE id = ?",
         )
-        .bind(visibility_scope).bind(transformation).bind(sensitivity_preset)
+        .bind(visibility_scope)
+        .bind(transformation)
+        .bind(sensitivity_preset)
         .bind(if user_calibrated { 1i64 } else { 0i64 })
-        .bind(confidence).bind(&timestamp).bind(eid)
-        .execute(&mut conn).await?;
+        .bind(confidence)
+        .bind(&timestamp)
+        .bind(eid)
+        .execute(&mut conn)
+        .await?;
 
         Ok(eid.clone())
     } else {
@@ -752,11 +819,19 @@ pub async fn upsert_classification_preference(
               confidence, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
-        .bind(&pref_id).bind(focus_id).bind(persona_id).bind(content_type)
-        .bind(visibility_scope).bind(transformation).bind(sensitivity_preset)
+        .bind(&pref_id)
+        .bind(focus_id)
+        .bind(persona_id)
+        .bind(content_type)
+        .bind(visibility_scope)
+        .bind(transformation)
+        .bind(sensitivity_preset)
         .bind(if user_calibrated { 1i64 } else { 0i64 })
-        .bind(confidence).bind(&timestamp).bind(&timestamp)
-        .execute(&mut conn).await?;
+        .bind(confidence)
+        .bind(&timestamp)
+        .bind(&timestamp)
+        .execute(&mut conn)
+        .await?;
 
         Ok(pref_id)
     }
@@ -775,8 +850,12 @@ pub async fn record_preference_applied(
         "UPDATE classification_preferences SET last_applied_at = ?
          WHERE focus_id = ? AND persona_id = ? AND content_type = ?",
     )
-    .bind(crate::providers::utils::now()).bind(focus_id).bind(persona_id).bind(content_type)
-    .execute(&mut conn).await?;
+    .bind(crate::providers::utils::now())
+    .bind(focus_id)
+    .bind(persona_id)
+    .bind(content_type)
+    .execute(&mut conn)
+    .await?;
     Ok(())
 }
 
@@ -804,10 +883,17 @@ async fn mirror_topic_index(
           last_active_at, session_count, content_summary, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
     )
-    .bind(topic_id).bind(persona_id).bind(focus_id).bind(display_name)
-    .bind(lifecycle_state).bind(last_active_at).bind(session_count)
-    .bind(created_at).bind(created_at)
-    .execute(&mut conn).await?;
+    .bind(topic_id)
+    .bind(persona_id)
+    .bind(focus_id)
+    .bind(display_name)
+    .bind(lifecycle_state)
+    .bind(last_active_at)
+    .bind(session_count)
+    .bind(created_at)
+    .bind(created_at)
+    .execute(&mut conn)
+    .await?;
     Ok(())
 }
 
@@ -822,8 +908,12 @@ async fn update_topic_index_state(
         "UPDATE topic_index SET lifecycle_state = ?,
          last_active_at = ?, updated_at = ? WHERE topic_id = ?",
     )
-    .bind(lifecycle_state).bind(timestamp).bind(timestamp).bind(topic_id)
-    .execute(&mut conn).await?;
+    .bind(lifecycle_state)
+    .bind(timestamp)
+    .bind(timestamp)
+    .bind(topic_id)
+    .execute(&mut conn)
+    .await?;
     Ok(())
 }
 
@@ -834,10 +924,11 @@ async fn update_topic_index_display_name(
     timestamp: &str,
 ) -> Result<(), TopicStoreError> {
     let mut conn = open_shared_db().await?;
-    sqlx::query(
-        "UPDATE topic_index SET display_name = ?, updated_at = ? WHERE topic_id = ?",
-    )
-    .bind(display_name).bind(timestamp).bind(topic_id)
-    .execute(&mut conn).await?;
+    sqlx::query("UPDATE topic_index SET display_name = ?, updated_at = ? WHERE topic_id = ?")
+        .bind(display_name)
+        .bind(timestamp)
+        .bind(topic_id)
+        .execute(&mut conn)
+        .await?;
     Ok(())
 }

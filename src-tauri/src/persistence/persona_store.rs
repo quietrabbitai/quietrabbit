@@ -111,10 +111,7 @@ fn row_to_persona(row: &sqlx::sqlite::SqliteRow) -> Result<Persona, sqlx::Error>
 /// codes enabled, UNIQUE violations may surface as 1555 (SQLITE_CONSTRAINT_PRIMARYKEY)
 /// or 2067 (SQLITE_CONSTRAINT_UNIQUE). We check both the numeric code and the
 /// error message to be safe across sqlx versions and SQLite build configurations.
-fn classify_constraint_error(
-    persona_id: &str,
-    e: sqlx::Error,
-) -> PersonaStoreError {
+fn classify_constraint_error(persona_id: &str, e: sqlx::Error) -> PersonaStoreError {
     if let Some(db_err) = e.as_database_error() {
         let code = db_err.code().unwrap_or_default();
         let msg = db_err.message().to_lowercase();
@@ -132,9 +129,7 @@ fn classify_constraint_error(
 // ---------------------------------------------------------------------------
 
 /// Fetch a persona by ID. Returns None if not found.
-pub async fn get_persona(
-    persona_id: &str,
-) -> Result<Option<Persona>, PersonaStoreError> {
+pub async fn get_persona(persona_id: &str) -> Result<Option<Persona>, PersonaStoreError> {
     let mut conn = open_shared_db().await?;
 
     let row = sqlx::query(
@@ -147,7 +142,9 @@ pub async fn get_persona(
 
     match row {
         None => Ok(None),
-        Some(r) => Ok(Some(row_to_persona(&r).map_err(PersonaStoreError::Database)?)),
+        Some(r) => Ok(Some(
+            row_to_persona(&r).map_err(PersonaStoreError::Database)?,
+        )),
     }
 }
 
@@ -175,14 +172,14 @@ pub async fn get_persona_for_user(
 
     match row {
         None => Ok(None),
-        Some(r) => Ok(Some(row_to_persona(&r).map_err(PersonaStoreError::Database)?)),
+        Some(r) => Ok(Some(
+            row_to_persona(&r).map_err(PersonaStoreError::Database)?,
+        )),
     }
 }
 
 /// Return all personas accessible to a user, ordered by display_name.
-pub async fn list_personas_for_user(
-    user_id: &str,
-) -> Result<Vec<Persona>, PersonaStoreError> {
+pub async fn list_personas_for_user(user_id: &str) -> Result<Vec<Persona>, PersonaStoreError> {
     let mut conn = open_shared_db().await?;
 
     let rows = sqlx::query(
@@ -281,9 +278,7 @@ pub async fn create_persona(
 /// Returns true if deleted, false if not found.
 /// Does NOT delete per-persona databases (personal.db, outputs.db) —
 /// those require explicit user confirmation and a separate cleanup operation.
-pub async fn delete_persona(
-    persona_id: &str,
-) -> Result<bool, PersonaStoreError> {
+pub async fn delete_persona(persona_id: &str) -> Result<bool, PersonaStoreError> {
     let mut conn = open_shared_db().await?;
 
     let result = sqlx::query("DELETE FROM personas WHERE id = ?")
@@ -335,13 +330,11 @@ pub async fn remove_user_from_persona(
 ) -> Result<bool, PersonaStoreError> {
     let mut conn = open_shared_db().await?;
 
-    let result = sqlx::query(
-        "DELETE FROM user_personas WHERE user_id = ? AND persona_id = ?",
-    )
-    .bind(user_id)
-    .bind(persona_id)
-    .execute(&mut conn)
-    .await?;
+    let result = sqlx::query("DELETE FROM user_personas WHERE user_id = ? AND persona_id = ?")
+        .bind(user_id)
+        .bind(persona_id)
+        .execute(&mut conn)
+        .await?;
 
     Ok(result.rows_affected() > 0)
 }
@@ -353,13 +346,11 @@ pub async fn is_user_in_persona(
 ) -> Result<bool, PersonaStoreError> {
     let mut conn = open_shared_db().await?;
 
-    let row = sqlx::query(
-        "SELECT 1 FROM user_personas WHERE user_id = ? AND persona_id = ?",
-    )
-    .bind(user_id)
-    .bind(persona_id)
-    .fetch_optional(&mut conn)
-    .await?;
+    let row = sqlx::query("SELECT 1 FROM user_personas WHERE user_id = ? AND persona_id = ?")
+        .bind(user_id)
+        .bind(persona_id)
+        .fetch_optional(&mut conn)
+        .await?;
 
     Ok(row.is_some())
 }

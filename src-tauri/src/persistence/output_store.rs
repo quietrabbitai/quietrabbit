@@ -269,7 +269,9 @@ pub async fn get_focus_run_status(
 
     match row {
         None => Ok(None),
-        Some(r) => Ok(Some(r.try_get("status").map_err(OutputStoreError::Database)?)),
+        Some(r) => Ok(Some(
+            r.try_get("status").map_err(OutputStoreError::Database)?,
+        )),
     }
 }
 
@@ -416,13 +418,11 @@ pub async fn cancel_focus_run(
     let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
 
     // Check whether the run exists at all.
-    let exists: bool = sqlx::query(
-        "SELECT 1 FROM focus_runs WHERE id = ? LIMIT 1",
-    )
-    .bind(run_id)
-    .fetch_optional(&mut conn)
-    .await?
-    .is_some();
+    let exists: bool = sqlx::query("SELECT 1 FROM focus_runs WHERE id = ? LIMIT 1")
+        .bind(run_id)
+        .fetch_optional(&mut conn)
+        .await?
+        .is_some();
 
     if !exists {
         return Err(OutputStoreError::RunNotFound(run_id.to_string()));
@@ -647,11 +647,15 @@ mod tests {
         let output_id = seed_output(&mut conn, "findable via fts search term").await;
 
         // Sanity check: findable before delete.
-        let before = sqlx::query("SELECT rowid FROM outputs_fts WHERE outputs_fts MATCH 'findable'")
-            .fetch_all(&mut conn)
-            .await
-            .expect("fts query failed");
-        assert!(!before.is_empty(), "seeded output must be findable before delete");
+        let before =
+            sqlx::query("SELECT rowid FROM outputs_fts WHERE outputs_fts MATCH 'findable'")
+                .fetch_all(&mut conn)
+                .await
+                .expect("fts query failed");
+        assert!(
+            !before.is_empty(),
+            "seeded output must be findable before delete"
+        );
 
         delete_output_conn(&mut conn, &output_id)
             .await
@@ -661,7 +665,10 @@ mod tests {
             .fetch_all(&mut conn)
             .await
             .expect("fts query failed");
-        assert!(after.is_empty(), "deleted output's content must no longer be searchable");
+        assert!(
+            after.is_empty(),
+            "deleted output's content must no longer be searchable"
+        );
     }
 
     #[tokio::test]
@@ -673,10 +680,8 @@ mod tests {
 
     #[tokio::test]
     async fn write_element_consent_decisions_returns_err_pending_migration() {
-        let result = write_element_consent_decisions(
-            "user1", "persona1", "deadbeef", "run-123", "[]",
-        )
-        .await;
+        let result =
+            write_element_consent_decisions("user1", "persona1", "deadbeef", "run-123", "[]").await;
 
         match result.unwrap_err() {
             OutputStoreError::Validation(msg) => {

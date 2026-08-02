@@ -76,7 +76,7 @@ mod inner {
     // implements Send explicitly.
     #[repr(C)]
     pub struct PfCtx {
-        _data:   [u8; 0],
+        _data: [u8; 0],
         _marker: PhantomData<(*mut u8, PhantomPinned)>,
     }
 
@@ -85,7 +85,7 @@ mod inner {
     #[repr(C)]
     pub struct PfEntity {
         pub start: i32,                 // int32_t — byte offset, inclusive
-        pub end:   i32,                 // int32_t — byte offset, exclusive
+        pub end: i32,                   // int32_t — byte offset, exclusive
         pub score: libc::c_float,       // float   — confidence in [0.0, 1.0]
         pub label: *const libc::c_char, // const char* — ctx-owned, valid until pf_free
     }
@@ -103,7 +103,7 @@ mod inner {
         /// Returns NULL on failure; call pf_last_error for the reason.
         pub fn pf_load(
             gguf_path: *const libc::c_char,
-            device:    *const libc::c_char,
+            device: *const libc::c_char,
             n_threads: libc::c_int,
         ) -> *mut PfCtx;
 
@@ -128,12 +128,12 @@ mod inner {
         /// n_out:     set to the number of entities.
         /// Returns 0 on success, non-zero on error.
         pub fn pf_classify(
-            ctx:       *mut PfCtx,
-            text:      *const libc::c_char,
-            len:       libc::size_t,
+            ctx: *mut PfCtx,
+            text: *const libc::c_char,
+            len: libc::size_t,
             threshold: libc::c_float,
-            out:       *mut *mut PfEntity,
-            n_out:     *mut libc::size_t,
+            out: *mut *mut PfEntity,
+            n_out: *mut libc::size_t,
         ) -> libc::c_int;
 
         /// Free the entity array allocated by pf_classify.
@@ -151,7 +151,9 @@ mod inner {
     impl Drop for PrivacyFilter {
         fn drop(&mut self) {
             // Safety: ctx was returned by pf_load and has not been freed.
-            unsafe { pf_free(self.ctx); }
+            unsafe {
+                pf_free(self.ctx);
+            }
         }
     }
 
@@ -174,9 +176,7 @@ mod inner {
         }
         // 2. XDG-aligned default in user data directory.
         let home = std::env::var("HOME").ok()?;
-        let path = format!(
-            "{home}/.local/share/quietrabbit/models/privacy-filter-q8.gguf"
-        );
+        let path = format!("{home}/.local/share/quietrabbit/models/privacy-filter-q8.gguf");
         CString::new(path).ok()
     }
 
@@ -209,7 +209,7 @@ mod inner {
                     pf_load(
                         model_path.as_ptr(),
                         std::ptr::null(), // device: NULL → library default (cpu)
-                        0,               // n_threads: 0 → library default
+                        0,                // n_threads: 0 → library default
                     )
                 };
 
@@ -246,11 +246,10 @@ mod inner {
     /// Returns Ok(vec) on success; vec may be empty if no spans found.
     /// Returns Err(reason) if the filter is unavailable or the call fails.
     pub fn run_classify_blocking(
-        text:      &str,
+        text: &str,
         threshold: f32,
     ) -> Result<Vec<PfEntityDecoded>, String> {
-        let mutex = get_or_init()
-            .ok_or_else(|| "Privacy Filter unavailable".to_owned())?;
+        let mutex = get_or_init().ok_or_else(|| "Privacy Filter unavailable".to_owned())?;
 
         let guard = mutex
             .lock()
@@ -259,8 +258,8 @@ mod inner {
         // pf_classify does not require null termination (takes explicit len),
         // but CString is still used to satisfy *const c_char type. The byte
         // slice length is passed separately.
-        let c_text = CString::new(text)
-            .map_err(|e| format!("text contains interior null byte: {e}"))?;
+        let c_text =
+            CString::new(text).map_err(|e| format!("text contains interior null byte: {e}"))?;
         let text_len = text.len();
 
         let mut out_ptr: *mut PfEntity = std::ptr::null_mut();
@@ -303,36 +302,40 @@ mod inner {
             let slice = unsafe { std::slice::from_raw_parts(out_ptr, n) };
             let text_bytes = text.as_bytes();
 
-            slice.iter().map(|e| {
-                let label = unsafe {
-                    if e.label.is_null() {
-                        String::new()
-                    } else {
-                        CStr::from_ptr(e.label).to_string_lossy().into_owned()
+            slice
+                .iter()
+                .map(|e| {
+                    let label = unsafe {
+                        if e.label.is_null() {
+                            String::new()
+                        } else {
+                            CStr::from_ptr(e.label).to_string_lossy().into_owned()
+                        }
+                    };
+
+                    // i32 offsets — clamp to valid byte range before slicing.
+                    let start = (e.start.max(0) as usize).min(text_bytes.len());
+                    let end = (e.end.max(0) as usize).min(text_bytes.len());
+
+                    let span_text = String::from_utf8_lossy(&text_bytes[start..end]).into_owned();
+
+                    PfEntityDecoded {
+                        start_byte: e.start as usize,
+                        end_byte: e.end as usize,
+                        score: e.score,
+                        label,
+                        span_text,
                     }
-                };
-
-                // i32 offsets — clamp to valid byte range before slicing.
-                let start = (e.start.max(0) as usize).min(text_bytes.len());
-                let end   = (e.end.max(0)   as usize).min(text_bytes.len());
-
-                let span_text = String::from_utf8_lossy(&text_bytes[start..end])
-                    .into_owned();
-
-                PfEntityDecoded {
-                    start_byte: e.start as usize,
-                    end_byte:   e.end   as usize,
-                    score:      e.score,
-                    label,
-                    span_text,
-                }
-            }).collect()
+                })
+                .collect()
         };
 
         // Free the C-allocated array. pf_entities_free requires both pointer
         // and count (matches pf.h signature).
         if !out_ptr.is_null() {
-            unsafe { pf_entities_free(out_ptr, n); }
+            unsafe {
+                pf_entities_free(out_ptr, n);
+            }
         }
 
         Ok(entities)
@@ -356,15 +359,10 @@ pub fn is_available() -> bool {
 /// Returns Err when the Privacy Filter library was not compiled in.
 /// Gate3 calls this and falls back to pre-filter sensitivity block.
 #[cfg(not(privacy_filter_available))]
-pub fn run_classify_blocking(
-    _text:      &str,
-    _threshold: f32,
-) -> Result<Vec<PfEntityDecoded>, String> {
-    Err(
-        "Privacy Filter not compiled in \
+pub fn run_classify_blocking(_text: &str, _threshold: f32) -> Result<Vec<PfEntityDecoded>, String> {
+    Err("Privacy Filter not compiled in \
          (set PRIVACY_FILTER_LIB_DIR at build time)"
-            .to_owned(),
-    )
+        .to_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -394,10 +392,10 @@ mod tests {
     fn pf_entity_decoded_fields_accessible() {
         let e = PfEntityDecoded {
             start_byte: 10,
-            end_byte:   20,
-            score:      0.95,
-            label:      "private_person".to_owned(),
-            span_text:  "Alice Smith".to_owned(),
+            end_byte: 20,
+            score: 0.95,
+            label: "private_person".to_owned(),
+            span_text: "Alice Smith".to_owned(),
         };
         assert_eq!(e.start_byte, 10);
         assert_eq!(e.end_byte, 20);

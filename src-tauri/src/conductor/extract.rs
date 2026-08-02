@@ -144,16 +144,32 @@ pub fn classify_sensitivity(field_name: &str) -> &'static str {
     let lower = field_name.to_lowercase();
 
     const MEDICAL_TERMS: &[&str] = &[
-        "health", "medical", "diagnosis", "condition", "medication",
-        "allergy", "doctor", "symptom", "prescription", "illness",
+        "health",
+        "medical",
+        "diagnosis",
+        "condition",
+        "medication",
+        "allergy",
+        "doctor",
+        "symptom",
+        "prescription",
+        "illness",
     ];
     if MEDICAL_TERMS.iter().any(|t| lower.contains(t)) {
         return "medical";
     }
 
     const FINANCIAL_TERMS: &[&str] = &[
-        "income", "salary", "budget", "bank", "credit",
-        "debt", "investment", "tax", "financial", "account",
+        "income",
+        "salary",
+        "budget",
+        "bank",
+        "credit",
+        "debt",
+        "investment",
+        "tax",
+        "financial",
+        "account",
     ];
     if FINANCIAL_TERMS.iter().any(|t| lower.contains(t)) {
         return "financial";
@@ -274,10 +290,7 @@ Conversation:
 // parse_and_filter (module-local)
 // ---------------------------------------------------------------------------
 
-fn parse_and_filter(
-    response_text: &str,
-    excluded_fields: &[String],
-) -> Vec<ExtractCandidate> {
+fn parse_and_filter(response_text: &str, excluded_fields: &[String]) -> Vec<ExtractCandidate> {
     // Strip markdown fences if model wrapped the JSON
     let trimmed = response_text.trim();
     let json_str = if trimmed.starts_with("```") {
@@ -683,7 +696,7 @@ pub async fn count_pending(
 /// Typed return from get_candidate_fields().
 /// Avoids tuple field-order bugs at call sites in submit_extract_confirm.
 pub struct CandidateFields {
-    pub field_name:  String,
+    pub field_name: String,
     pub sensitivity: String,
 }
 
@@ -716,7 +729,7 @@ pub async fn get_candidate_fields(
     match row {
         None => Ok(None),
         Some(r) => Ok(Some(CandidateFields {
-            field_name:  r.try_get("field_name")?,
+            field_name: r.try_get("field_name")?,
             sensitivity: r.try_get("sensitivity")?,
         })),
     }
@@ -762,12 +775,12 @@ mod tests {
     #[test]
     fn test_validate_field_name_invalid() {
         assert!(!validate_field_name(""));
-        assert!(!validate_field_name("Home_City"));    // uppercase
-        assert!(!validate_field_name("home city"));   // space
-        assert!(!validate_field_name("home-city"));   // hyphen
-        assert!(!validate_field_name("1home"));       // starts with digit
-        assert!(!validate_field_name("foo;bar"));     // semicolon
-        assert!(!validate_field_name("../etc"));      // path traversal
+        assert!(!validate_field_name("Home_City")); // uppercase
+        assert!(!validate_field_name("home city")); // space
+        assert!(!validate_field_name("home-city")); // hyphen
+        assert!(!validate_field_name("1home")); // starts with digit
+        assert!(!validate_field_name("foo;bar")); // semicolon
+        assert!(!validate_field_name("../etc")); // path traversal
     }
 
     #[test]

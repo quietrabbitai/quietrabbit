@@ -55,11 +55,7 @@ const MEDIUM_SCORE_THRESHOLD: f32 = 0.70;
 /// Categories that qualify for Easy tier when all spans exceed EASY_SCORE_THRESHOLD.
 /// Contextual categories (private_date, private_url, secret) default to Medium
 /// even at high confidence.
-const EASY_TIER_CATEGORIES: &[&str] = &[
-    "private_email",
-    "private_phone",
-    "account_number",
-];
+const EASY_TIER_CATEGORIES: &[&str] = &["private_email", "private_phone", "account_number"];
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -83,16 +79,16 @@ pub async fn gate3<L: DisclosureLogger>(
     if target_tier > space_max_permitted_tier {
         logger
             .write(DisclosureLogEntry {
-                step_id:           step_id.to_string(),
-                focus_run_id:      focus_run_id.to_string(),
+                step_id: step_id.to_string(),
+                focus_run_id: focus_run_id.to_string(),
                 execution_tier,
-                abstraction_tier:  None,
-                provider:          None,
-                fields_shared:     vec![],
+                abstraction_tier: None,
+                provider: None,
+                fields_shared: vec![],
                 fields_abstracted: IndexMap::new(),
-                fields_withheld:   vec![content_key.to_string()],
+                fields_withheld: vec![content_key.to_string()],
                 override_declined: true,
-                event_type:        "gate3_tier_ceiling_block".to_string(),
+                event_type: "gate3_tier_ceiling_block".to_string(),
             })
             .await?;
 
@@ -134,16 +130,16 @@ pub async fn gate3<L: DisclosureLogger>(
     if content_sensitivity_severity >= 3 && target_tier >= 2 {
         logger
             .write(DisclosureLogEntry {
-                step_id:           step_id.to_string(),
-                focus_run_id:      focus_run_id.to_string(),
+                step_id: step_id.to_string(),
+                focus_run_id: focus_run_id.to_string(),
                 execution_tier,
-                abstraction_tier:  None,
-                provider:          None,
-                fields_shared:     vec![],
+                abstraction_tier: None,
+                provider: None,
+                fields_shared: vec![],
                 fields_abstracted: IndexMap::new(),
-                fields_withheld:   vec![content_key.to_string()],
+                fields_withheld: vec![content_key.to_string()],
                 override_declined: true,
-                event_type:        "gate3_sensitivity_block".to_string(),
+                event_type: "gate3_sensitivity_block".to_string(),
             })
             .await?;
 
@@ -162,20 +158,23 @@ pub async fn gate3<L: DisclosureLogger>(
     // Approved.
     logger
         .write(DisclosureLogEntry {
-            step_id:           step_id.to_string(),
-            focus_run_id:      focus_run_id.to_string(),
+            step_id: step_id.to_string(),
+            focus_run_id: focus_run_id.to_string(),
             execution_tier,
-            abstraction_tier:  None,
-            provider:          None,
-            fields_shared:     vec![content_key.to_string()],
+            abstraction_tier: None,
+            provider: None,
+            fields_shared: vec![content_key.to_string()],
             fields_abstracted: IndexMap::new(),
-            fields_withheld:   vec![],
+            fields_withheld: vec![],
             override_declined: false,
-            event_type:        "gate3_promotion_approved".to_string(),
+            event_type: "gate3_promotion_approved".to_string(),
         })
         .await?;
 
-    Ok(Gate3Result { approved: true, ..Gate3Result::default() })
+    Ok(Gate3Result {
+        approved: true,
+        ..Gate3Result::default()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -198,15 +197,10 @@ async fn gate3_with_pf<L: DisclosureLogger>(
     let text = content_text.to_owned();
 
     // spawn_blocking: FFI call is synchronous C library — must not block async executor.
-    let pf_task = tokio::task::spawn_blocking(move || {
-        privacy_filter::run_classify_blocking(&text, 0.0)
-    });
+    let pf_task =
+        tokio::task::spawn_blocking(move || privacy_filter::run_classify_blocking(&text, 0.0));
 
-    let pf_outcome = tokio::time::timeout(
-        Duration::from_secs(PF_TIMEOUT_SECS),
-        pf_task,
-    )
-    .await;
+    let pf_outcome = tokio::time::timeout(Duration::from_secs(PF_TIMEOUT_SECS), pf_task).await;
 
     let entities: Vec<PfEntityDecoded> = match pf_outcome {
         // Timeout: write gate_timeout to disclosure_log (IPC flag — distinct event type).
@@ -214,16 +208,16 @@ async fn gate3_with_pf<L: DisclosureLogger>(
             log::warn!("gate3: Privacy Filter timed out after {PF_TIMEOUT_SECS}s");
             logger
                 .write(DisclosureLogEntry {
-                    step_id:           step_id.to_string(),
-                    focus_run_id:      focus_run_id.to_string(),
+                    step_id: step_id.to_string(),
+                    focus_run_id: focus_run_id.to_string(),
                     execution_tier,
-                    abstraction_tier:  None,
-                    provider:          None,
-                    fields_shared:     vec![],
+                    abstraction_tier: None,
+                    provider: None,
+                    fields_shared: vec![],
                     fields_abstracted: IndexMap::new(),
-                    fields_withheld:   vec![content_key.to_string()],
+                    fields_withheld: vec![content_key.to_string()],
                     override_declined: true,
-                    event_type:        "gate_timeout".to_string(),
+                    event_type: "gate_timeout".to_string(),
                 })
                 .await?;
             let _ = handle.emit(
@@ -234,8 +228,7 @@ async fn gate3_with_pf<L: DisclosureLogger>(
                 blocked: true,
                 timeout: true,
                 plain_language: Some(
-                    "Privacy review timed out. Content blocked. [Try again]"
-                        .to_string(),
+                    "Privacy review timed out. Content blocked. [Try again]".to_string(),
                 ),
                 ..Gate3Result::default()
             });
@@ -246,16 +239,16 @@ async fn gate3_with_pf<L: DisclosureLogger>(
             log::error!("gate3: Privacy Filter task panicked: {join_err}");
             logger
                 .write(DisclosureLogEntry {
-                    step_id:           step_id.to_string(),
-                    focus_run_id:      focus_run_id.to_string(),
+                    step_id: step_id.to_string(),
+                    focus_run_id: focus_run_id.to_string(),
                     execution_tier,
-                    abstraction_tier:  None,
-                    provider:          None,
-                    fields_shared:     vec![],
+                    abstraction_tier: None,
+                    provider: None,
+                    fields_shared: vec![],
                     fields_abstracted: IndexMap::new(),
-                    fields_withheld:   vec![content_key.to_string()],
+                    fields_withheld: vec![content_key.to_string()],
                     override_declined: true,
-                    event_type:        "gate_timeout".to_string(),
+                    event_type: "gate_timeout".to_string(),
                 })
                 .await?;
             let _ = handle.emit(
@@ -266,8 +259,7 @@ async fn gate3_with_pf<L: DisclosureLogger>(
                 blocked: true,
                 timeout: true,
                 plain_language: Some(
-                    "Privacy review failed. Content blocked. [Try again]"
-                        .to_string(),
+                    "Privacy review failed. Content blocked. [Try again]".to_string(),
                 ),
                 ..Gate3Result::default()
             });
@@ -283,16 +275,16 @@ async fn gate3_with_pf<L: DisclosureLogger>(
             if content_sensitivity_severity >= 3 && target_tier >= 2 {
                 logger
                     .write(DisclosureLogEntry {
-                        step_id:           step_id.to_string(),
-                        focus_run_id:      focus_run_id.to_string(),
+                        step_id: step_id.to_string(),
+                        focus_run_id: focus_run_id.to_string(),
                         execution_tier,
-                        abstraction_tier:  None,
-                        provider:          None,
-                        fields_shared:     vec![],
+                        abstraction_tier: None,
+                        provider: None,
+                        fields_shared: vec![],
                         fields_abstracted: IndexMap::new(),
-                        fields_withheld:   vec![content_key.to_string()],
+                        fields_withheld: vec![content_key.to_string()],
                         override_declined: true,
-                        event_type:        "gate3_sensitivity_block".to_string(),
+                        event_type: "gate3_sensitivity_block".to_string(),
                     })
                     .await?;
                 return Ok(Gate3Result {
@@ -308,19 +300,22 @@ async fn gate3_with_pf<L: DisclosureLogger>(
             }
             logger
                 .write(DisclosureLogEntry {
-                    step_id:           step_id.to_string(),
-                    focus_run_id:      focus_run_id.to_string(),
+                    step_id: step_id.to_string(),
+                    focus_run_id: focus_run_id.to_string(),
                     execution_tier,
-                    abstraction_tier:  None,
-                    provider:          None,
-                    fields_shared:     vec![content_key.to_string()],
+                    abstraction_tier: None,
+                    provider: None,
+                    fields_shared: vec![content_key.to_string()],
                     fields_abstracted: IndexMap::new(),
-                    fields_withheld:   vec![],
+                    fields_withheld: vec![],
                     override_declined: false,
-                    event_type:        "gate3_promotion_approved".to_string(),
+                    event_type: "gate3_promotion_approved".to_string(),
                 })
                 .await?;
-            return Ok(Gate3Result { approved: true, ..Gate3Result::default() });
+            return Ok(Gate3Result {
+                approved: true,
+                ..Gate3Result::default()
+            });
         }
 
         // PF succeeded: process the entity list.
@@ -332,52 +327,58 @@ async fn gate3_with_pf<L: DisclosureLogger>(
     if entities.is_empty() {
         logger
             .write(DisclosureLogEntry {
-                step_id:           step_id.to_string(),
-                focus_run_id:      focus_run_id.to_string(),
+                step_id: step_id.to_string(),
+                focus_run_id: focus_run_id.to_string(),
                 execution_tier,
-                abstraction_tier:  None,
-                provider:          None,
-                fields_shared:     vec![content_key.to_string()],
+                abstraction_tier: None,
+                provider: None,
+                fields_shared: vec![content_key.to_string()],
                 fields_abstracted: IndexMap::new(),
-                fields_withheld:   vec![],
+                fields_withheld: vec![],
                 override_declined: false,
-                event_type:        "gate3_pf_no_spans".to_string(),
+                event_type: "gate3_pf_no_spans".to_string(),
             })
             .await?;
-        return Ok(Gate3Result { approved: true, ..Gate3Result::default() });
+        return Ok(Gate3Result {
+            approved: true,
+            ..Gate3Result::default()
+        });
     }
 
     // Non-zero spans: build consent payload, write audit record, THEN emit event.
     // Write-before-surface invariant: log write must precede emit() — if the write
     // fails (fatal DisclosureLogWriteError), the frontend must not receive the event.
-    let spans       = build_consent_spans(&entities);
+    let spans = build_consent_spans(&entities);
     let review_tier = assign_review_tier(&entities, content_sensitivity_severity, target_tier);
 
     let payload = ConsentRequestPayload {
         focus_run_id: focus_run_id.to_owned(),
-        focus_name:   focus_name.to_owned(),
+        focus_name: focus_name.to_owned(),
         review_tier,
         spans,
     };
 
     logger
         .write(DisclosureLogEntry {
-            step_id:           step_id.to_string(),
-            focus_run_id:      focus_run_id.to_string(),
+            step_id: step_id.to_string(),
+            focus_run_id: focus_run_id.to_string(),
             execution_tier,
-            abstraction_tier:  None,
-            provider:          None,
-            fields_shared:     vec![],
+            abstraction_tier: None,
+            provider: None,
+            fields_shared: vec![],
             fields_abstracted: IndexMap::new(),
-            fields_withheld:   vec![content_key.to_string()],
+            fields_withheld: vec![content_key.to_string()],
             override_declined: false,
-            event_type:        "gate3_consent_pending".to_string(),
+            event_type: "gate3_consent_pending".to_string(),
         })
         .await?;
 
     let _ = handle.emit("consent_request", &payload);
 
-    Ok(Gate3Result { pending_consent: true, ..Gate3Result::default() })
+    Ok(Gate3Result {
+        pending_consent: true,
+        ..Gate3Result::default()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -388,14 +389,14 @@ fn build_consent_spans(entities: &[PfEntityDecoded]) -> Vec<ConsentSpanItem> {
     entities
         .iter()
         .map(|e| ConsentSpanItem {
-            span_id:       Uuid::new_v4().to_string(),
-            category:      e.label.clone(),
-            user_label:    taxonomy_label(&e.label),
+            span_id: Uuid::new_v4().to_string(),
+            category: e.label.clone(),
+            user_label: taxonomy_label(&e.label),
             original_text: e.span_text.clone(),
-            suggestion:    generalization_suggestion(&e.label),
-            start_byte:    e.start_byte,
-            end_byte:      e.end_byte,
-            score:         e.score,
+            suggestion: generalization_suggestion(&e.label),
+            start_byte: e.start_byte,
+            end_byte: e.end_byte,
+            score: e.score,
         })
         .collect()
 }
@@ -426,15 +427,15 @@ fn assign_review_tier(
 /// Human-readable display label for a Privacy Filter category.
 fn taxonomy_label(category: &str) -> String {
     match category {
-        "private_person"  => "Person name",
+        "private_person" => "Person name",
         "private_address" => "Home or work address",
-        "private_email"   => "Email address",
-        "private_phone"   => "Phone number",
-        "private_url"     => "Web address",
-        "private_date"    => "Date or time",
-        "account_number"  => "Account number",
-        "secret"          => "Sensitive value",
-        _                 => "Sensitive information",
+        "private_email" => "Email address",
+        "private_phone" => "Phone number",
+        "private_url" => "Web address",
+        "private_date" => "Date or time",
+        "account_number" => "Account number",
+        "secret" => "Sensitive value",
+        _ => "Sensitive information",
     }
     .to_owned()
 }
@@ -443,15 +444,15 @@ fn taxonomy_label(category: &str) -> String {
 /// None → no rule matches → frontend renders editable placeholder (IPC flag 3).
 fn generalization_suggestion(category: &str) -> Option<String> {
     let s = match category {
-        "private_person"  => "[person]",
+        "private_person" => "[person]",
         "private_address" => "[address]",
-        "private_email"   => "[email address]",
-        "private_phone"   => "[phone number]",
-        "private_url"     => "[web address]",
-        "private_date"    => "[date]",
-        "account_number"  => "[account number]",
-        "secret"          => "[sensitive value]",
-        _                 => return None,
+        "private_email" => "[email address]",
+        "private_phone" => "[phone number]",
+        "private_url" => "[web address]",
+        "private_date" => "[date]",
+        "account_number" => "[account number]",
+        "secret" => "[sensitive value]",
+        _ => return None,
     };
     Some(s.to_owned())
 }
@@ -467,8 +468,11 @@ mod tests {
 
     fn entity(score: f32, label: &str) -> PfEntityDecoded {
         PfEntityDecoded {
-            start_byte: 0, end_byte: 5, score,
-            label: label.to_owned(), span_text: "test".to_owned(),
+            start_byte: 0,
+            end_byte: 5,
+            score,
+            label: label.to_owned(),
+            span_text: "test".to_owned(),
         }
     }
 
@@ -494,19 +498,13 @@ mod tests {
 
     #[test]
     fn all_high_confidence_easy_category_is_easy() {
-        let e = vec![
-            entity(0.95, "private_email"),
-            entity(0.92, "private_phone"),
-        ];
+        let e = vec![entity(0.95, "private_email"), entity(0.92, "private_phone")];
         assert!(matches!(assign_review_tier(&e, 1, 2), ReviewTier::Easy));
     }
 
     #[test]
     fn easy_category_but_one_medium_score_is_medium() {
-        let e = vec![
-            entity(0.95, "private_email"),
-            entity(0.75, "private_phone"),
-        ];
+        let e = vec![entity(0.95, "private_email"), entity(0.75, "private_phone")];
         assert!(matches!(assign_review_tier(&e, 1, 2), ReviewTier::Medium));
     }
 
@@ -521,9 +519,9 @@ mod tests {
     #[test]
     fn taxonomy_known_categories() {
         assert_eq!(taxonomy_label("private_person"), "Person name");
-        assert_eq!(taxonomy_label("private_email"),  "Email address");
+        assert_eq!(taxonomy_label("private_email"), "Email address");
         assert_eq!(taxonomy_label("account_number"), "Account number");
-        assert_eq!(taxonomy_label("secret"),         "Sensitive value");
+        assert_eq!(taxonomy_label("secret"), "Sensitive value");
     }
 
     #[test]
@@ -535,9 +533,18 @@ mod tests {
 
     #[test]
     fn suggestion_known_categories() {
-        assert_eq!(generalization_suggestion("private_person"),  Some("[person]".to_owned()));
-        assert_eq!(generalization_suggestion("private_email"),   Some("[email address]".to_owned()));
-        assert_eq!(generalization_suggestion("account_number"),  Some("[account number]".to_owned()));
+        assert_eq!(
+            generalization_suggestion("private_person"),
+            Some("[person]".to_owned())
+        );
+        assert_eq!(
+            generalization_suggestion("private_email"),
+            Some("[email address]".to_owned())
+        );
+        assert_eq!(
+            generalization_suggestion("account_number"),
+            Some("[account number]".to_owned())
+        );
     }
 
     #[test]

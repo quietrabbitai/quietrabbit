@@ -136,7 +136,11 @@ where
     /// response, evaluate and return the branch decision.
     pub fn evaluate(&self, proposal: impl Into<String>, feedback: FeedbackSignal) -> RouteOutcome {
         let decision = (self.evaluator)(&feedback);
-        RouteOutcome { decision, proposal: proposal.into(), feedback }
+        RouteOutcome {
+            decision,
+            proposal: proposal.into(),
+            feedback,
+        }
     }
 }
 
@@ -190,11 +194,17 @@ mod tests {
     use super::*;
 
     fn ok_feedback() -> FeedbackSignal {
-        FeedbackSignal { content: "looks good".to_owned(), succeeded: true }
+        FeedbackSignal {
+            content: "looks good".to_owned(),
+            succeeded: true,
+        }
     }
 
     fn fail_feedback() -> FeedbackSignal {
-        FeedbackSignal { content: "not quite right".to_owned(), succeeded: false }
+        FeedbackSignal {
+            content: "not quite right".to_owned(),
+            succeeded: false,
+        }
     }
 
     #[test]
@@ -230,7 +240,10 @@ mod tests {
     fn retry_then_escalate_retries_under_ceiling() {
         let per = ProposeEvaluateRoute::new(|fb: &FeedbackSignal| retry_then_escalate(fb, 1, 3));
         let outcome = per.evaluate("draft", fail_feedback());
-        assert_eq!(outcome.decision, RouteDecision::RetryDifferently { note: None });
+        assert_eq!(
+            outcome.decision,
+            RouteDecision::RetryDifferently { note: None }
+        );
     }
 
     #[test]
@@ -257,9 +270,10 @@ mod tests {
 
     #[test]
     fn custom_evaluator_can_produce_retry_differently_with_note() {
-        let per = ProposeEvaluateRoute::new(|_fb: &FeedbackSignal| RouteDecision::RetryDifferently {
-            note: Some("try a shorter draft".to_owned()),
-        });
+        let per =
+            ProposeEvaluateRoute::new(|_fb: &FeedbackSignal| RouteDecision::RetryDifferently {
+                note: Some("try a shorter draft".to_owned()),
+            });
         let outcome = per.evaluate("draft", fail_feedback());
         match outcome.decision {
             RouteDecision::RetryDifferently { note } => {
@@ -276,7 +290,9 @@ mod tests {
         // directly (e.g. keyword matching on a user's typed reply) can.
         let per = ProposeEvaluateRoute::new(|fb: &FeedbackSignal| {
             if fb.content.contains("not quite") {
-                RouteDecision::Escalate { reason: "user expressed dissatisfaction".to_owned() }
+                RouteDecision::Escalate {
+                    reason: "user expressed dissatisfaction".to_owned(),
+                }
             } else {
                 RouteDecision::Continue
             }

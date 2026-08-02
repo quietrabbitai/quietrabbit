@@ -92,21 +92,21 @@ pub enum ScanIntensity {
 #[derive(Debug, Clone)]
 pub struct OutputScanFinding {
     pub start_byte: usize,
-    pub end_byte:   usize,
-    pub label:      String,
-    pub score:      f32,
+    pub end_byte: usize,
+    pub label: String,
+    pub score: f32,
 }
 
 #[derive(Debug, Clone)]
 pub struct OutputScanResult {
     /// Full intensity only: true when the write/export must not proceed.
     /// Always false for Light intensity -- Light never blocks.
-    pub blocked:      bool,
+    pub blocked: bool,
     /// PF call exceeded PF_TIMEOUT_SECS. Full intensity treats a timeout
     /// as fail-closed (blocked=true) -- mirrors gate3.rs's own timeout
     /// handling, which also fails closed (blocked=true) on PF timeout.
-    pub timed_out:    bool,
-    pub findings:     Vec<OutputScanFinding>,
+    pub timed_out: bool,
+    pub findings: Vec<OutputScanFinding>,
     pub plain_language: Option<String>,
 }
 
@@ -166,9 +166,8 @@ async fn scan_with_pf<L: DisclosureLogger>(
 ) -> Result<OutputScanResult, DisclosureLogWriteError> {
     let text = content_text.to_owned();
 
-    let pf_task = tokio::task::spawn_blocking(move || {
-        privacy_filter::run_classify_blocking(&text, 0.0)
-    });
+    let pf_task =
+        tokio::task::spawn_blocking(move || privacy_filter::run_classify_blocking(&text, 0.0));
 
     let pf_outcome = tokio::time::timeout(Duration::from_secs(PF_TIMEOUT_SECS), pf_task).await;
 
@@ -177,16 +176,16 @@ async fn scan_with_pf<L: DisclosureLogger>(
             log::warn!("output_scan: Privacy Filter timed out after {PF_TIMEOUT_SECS}s");
             logger
                 .write(DisclosureLogEntry {
-                    step_id:           step_id.to_string(),
-                    focus_run_id:      focus_run_id.to_string(),
+                    step_id: step_id.to_string(),
+                    focus_run_id: focus_run_id.to_string(),
                     execution_tier,
-                    abstraction_tier:  None,
-                    provider:          None,
-                    fields_shared:     vec![],
+                    abstraction_tier: None,
+                    provider: None,
+                    fields_shared: vec![],
                     fields_abstracted: IndexMap::new(),
-                    fields_withheld:   vec![],
+                    fields_withheld: vec![],
                     override_declined: intensity == ScanIntensity::Full,
-                    event_type:        "output_scan_timeout".to_string(),
+                    event_type: "output_scan_timeout".to_string(),
                 })
                 .await?;
 
@@ -221,9 +220,9 @@ async fn scan_with_pf<L: DisclosureLogger>(
         .iter()
         .map(|e| OutputScanFinding {
             start_byte: e.start_byte,
-            end_byte:   e.end_byte,
-            label:      e.label.clone(),
-            score:      e.score,
+            end_byte: e.end_byte,
+            label: e.label.clone(),
+            score: e.score,
         })
         .collect();
 
@@ -232,18 +231,18 @@ async fn scan_with_pf<L: DisclosureLogger>(
 
     logger
         .write(DisclosureLogEntry {
-            step_id:           step_id.to_string(),
-            focus_run_id:      focus_run_id.to_string(),
+            step_id: step_id.to_string(),
+            focus_run_id: focus_run_id.to_string(),
             execution_tier,
-            abstraction_tier:  None,
-            provider:          None,
-            fields_shared:     vec![],
+            abstraction_tier: None,
+            provider: None,
+            fields_shared: vec![],
             fields_abstracted: IndexMap::new(),
-            fields_withheld:   findings.iter().map(|f| f.label.clone()).collect(),
+            fields_withheld: findings.iter().map(|f| f.label.clone()).collect(),
             override_declined: blocked,
             event_type: match intensity {
                 ScanIntensity::Light => "output_scan_light".to_string(),
-                ScanIntensity::Full  => "output_scan_full".to_string(),
+                ScanIntensity::Full => "output_scan_full".to_string(),
             },
         })
         .await?;
@@ -264,7 +263,12 @@ async fn scan_with_pf<L: DisclosureLogger>(
         None
     };
 
-    Ok(OutputScanResult { blocked, timed_out: false, findings, plain_language })
+    Ok(OutputScanResult {
+        blocked,
+        timed_out: false,
+        findings,
+        plain_language,
+    })
 }
 
 // -- Legacy fallback path (PF not compiled in) -------------------------------
@@ -282,18 +286,18 @@ async fn scan_legacy_fallback<L: DisclosureLogger>(
 
     logger
         .write(DisclosureLogEntry {
-            step_id:           step_id.to_string(),
-            focus_run_id:      focus_run_id.to_string(),
+            step_id: step_id.to_string(),
+            focus_run_id: focus_run_id.to_string(),
             execution_tier,
-            abstraction_tier:  None,
-            provider:          None,
-            fields_shared:     vec![],
+            abstraction_tier: None,
+            provider: None,
+            fields_shared: vec![],
             fields_abstracted: IndexMap::new(),
-            fields_withheld:   vec![],
+            fields_withheld: vec![],
             override_declined: blocked,
             event_type: match intensity {
                 ScanIntensity::Light => "output_scan_light_legacy".to_string(),
-                ScanIntensity::Full  => "output_scan_full_legacy".to_string(),
+                ScanIntensity::Full => "output_scan_full_legacy".to_string(),
             },
         })
         .await?;
@@ -308,7 +312,12 @@ async fn scan_legacy_fallback<L: DisclosureLogger>(
         None
     };
 
-    Ok(OutputScanResult { blocked, timed_out: false, findings: vec![], plain_language })
+    Ok(OutputScanResult {
+        blocked,
+        timed_out: false,
+        findings: vec![],
+        plain_language,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -352,7 +361,13 @@ mod tests {
     async fn legacy_full_blocks_at_or_above_threshold() {
         let logger = TestLogger::new();
         let result = scan_output(
-            &logger, "step-1", "run-1", "sensitive content", 1, 3, ScanIntensity::Full,
+            &logger,
+            "step-1",
+            "run-1",
+            "sensitive content",
+            1,
+            3,
+            ScanIntensity::Full,
         )
         .await
         .unwrap();
@@ -366,7 +381,13 @@ mod tests {
     async fn legacy_full_below_threshold_does_not_block() {
         let logger = TestLogger::new();
         let result = scan_output(
-            &logger, "step-1", "run-1", "ordinary content", 1, 2, ScanIntensity::Full,
+            &logger,
+            "step-1",
+            "run-1",
+            "ordinary content",
+            1,
+            2,
+            ScanIntensity::Full,
         )
         .await
         .unwrap();
@@ -380,7 +401,13 @@ mod tests {
         // legacy path has no detection engine, only the severity threshold.
         let logger = TestLogger::new();
         let result = scan_output(
-            &logger, "step-1", "run-1", "content", 1, 4, ScanIntensity::Full,
+            &logger,
+            "step-1",
+            "run-1",
+            "content",
+            1,
+            4,
+            ScanIntensity::Full,
         )
         .await
         .unwrap();
@@ -391,11 +418,21 @@ mod tests {
     async fn always_writes_disclosure_log_even_when_not_blocked() {
         let logger = TestLogger::new();
         let _ = scan_output(
-            &logger, "step-1", "run-1", "content", 1, 1, ScanIntensity::Light,
+            &logger,
+            "step-1",
+            "run-1",
+            "content",
+            1,
+            1,
+            ScanIntensity::Light,
         )
         .await
         .unwrap();
-        assert_eq!(logger.entry_count(), 1, "an unlogged egress-boundary scan would be a silent audit gap");
+        assert_eq!(
+            logger.entry_count(),
+            1,
+            "an unlogged egress-boundary scan would be a silent audit gap"
+        );
     }
 
     #[tokio::test]
@@ -403,7 +440,13 @@ mod tests {
         use crate::conductor::privacy::logger::FailLogger;
         let logger = FailLogger;
         let result = scan_output(
-            &logger, "step-1", "run-1", "content", 1, 1, ScanIntensity::Light,
+            &logger,
+            "step-1",
+            "run-1",
+            "content",
+            1,
+            1,
+            ScanIntensity::Light,
         )
         .await;
         assert!(result.is_err());

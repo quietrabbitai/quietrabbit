@@ -86,7 +86,8 @@ impl PaneWindow {
     /// (browser creation deferred to inside the event loop, not attempted
     /// during construction).
     pub fn new(initial_url: impl Into<String>) -> Self {
-        let event_loop = EventLoop::new().expect("tier3_pane::sync_window: failed to create winit event loop");
+        let event_loop =
+            EventLoop::new().expect("tier3_pane::sync_window: failed to create winit event loop");
         Self {
             event_loop: Some(event_loop),
             app: PaneApp {
@@ -243,7 +244,9 @@ impl ApplicationHandler for PaneApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let window = Arc::new(
             event_loop
-                .create_window(WindowAttributes::default().with_title("Quiet Rabbit — Tier 3 pane (Phase A)"))
+                .create_window(
+                    WindowAttributes::default().with_title("Quiet Rabbit — Tier 3 pane (Phase A)"),
+                )
                 .expect("tier3_pane::sync_window: failed to create pane window"),
         );
 
@@ -252,7 +255,11 @@ impl ApplicationHandler for PaneApp {
         // accelerated_osr is always enabled for the `cef` dependency (see
         // Cargo.toml) -- the platform check alone determines whether the
         // shared-texture path is used vs. the software on_paint fallback.
-        let accelerated_osr = cfg!(any(target_os = "macos", target_os = "windows", target_os = "linux"));
+        let accelerated_osr = cfg!(any(
+            target_os = "macos",
+            target_os = "windows",
+            target_os = "linux"
+        ));
         let window_info = cef::WindowInfo {
             windowless_rendering_enabled: true as _,
             shared_texture_enabled: accelerated_osr as _,
@@ -374,7 +381,8 @@ impl PaneApp {
         if let Some(render_state) = self.render_state.as_mut() {
             render_state.resize(size);
         }
-        if let (Some(browser_size), Some(window)) = (self.browser_size.as_ref(), self.window.as_ref())
+        if let (Some(browser_size), Some(window)) =
+            (self.browser_size.as_ref(), self.window.as_ref())
         {
             *browser_size.borrow_mut() = size.to_logical(window.scale_factor());
             if let Some(host) = self.browser.as_mut().and_then(|b| b.host()) {

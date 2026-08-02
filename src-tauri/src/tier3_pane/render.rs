@@ -160,11 +160,13 @@ impl RenderState {
             }
             _ => return,
         };
-        let view = surface_texture.texture.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("tier3_pane surface view"),
-            format: Some(self.surface_format),
-            ..Default::default()
-        });
+        let view = surface_texture
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor {
+                label: Some("tier3_pane surface view"),
+                format: Some(self.surface_format),
+                ..Default::default()
+            });
 
         let mut encoder = self
             .device
@@ -423,12 +425,12 @@ fn build_bind_group(device: &wgpu::Device, texture: &wgpu::Texture) -> wgpu::Bin
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
-                resource: wgpu::BindingResource::TextureView(
-                    &texture.create_view(&wgpu::TextureViewDescriptor {
+                resource: wgpu::BindingResource::TextureView(&texture.create_view(
+                    &wgpu::TextureViewDescriptor {
                         label: Some("tier3_pane cef texture view"),
                         ..Default::default()
-                    }),
-                ),
+                    },
+                )),
             },
             wgpu::BindGroupEntry {
                 binding: 1,
@@ -548,10 +550,22 @@ impl Geometry {
     fn new(device: &wgpu::Device) -> Self {
         let (x, y, width, height, z) = (-1.0f32, 1.0f32, 2.0f32, 2.0f32, 1.0f32);
         let vertices = [
-            Vertex { position: [x, y, z], tex_coords: [0.0, 0.0] },
-            Vertex { position: [x + width, y, z], tex_coords: [1.0, 0.0] },
-            Vertex { position: [x, y - height, z], tex_coords: [0.0, 1.0] },
-            Vertex { position: [x + width, y - height, z], tex_coords: [1.0, 1.0] },
+            Vertex {
+                position: [x, y, z],
+                tex_coords: [0.0, 0.0],
+            },
+            Vertex {
+                position: [x + width, y, z],
+                tex_coords: [1.0, 0.0],
+            },
+            Vertex {
+                position: [x, y - height, z],
+                tex_coords: [0.0, 1.0],
+            },
+            Vertex {
+                position: [x + width, y - height, z],
+                tex_coords: [1.0, 1.0],
+            },
         ];
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("tier3_pane quad vertex buffer"),

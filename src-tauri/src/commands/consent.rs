@@ -102,10 +102,10 @@ pub struct SubmitFloorConsentDecisionRequest {
 
 #[derive(Debug, Deserialize, Type)]
 pub struct SubmitElementConsentDecisionRequest {
-    pub run_id:         String,
-    pub user_id:        String,
-    pub persona_id:     String,
-    pub key_hex:        String,
+    pub run_id: String,
+    pub user_id: String,
+    pub persona_id: String,
+    pub key_hex: String,
     /// JSON-serialized Vec<ElementDecision> produced by the frontend.
     /// Expected shape per element:
     ///   { "span_id": string, "decision": "generalize"|"keep_private"|"release_original",
@@ -117,10 +117,10 @@ pub struct SubmitElementConsentDecisionRequest {
 
 #[derive(Debug, Deserialize, Type)]
 pub struct SubmitExtractConfirmRequest {
-    pub run_id:         String,
-    pub user_id:        String,
-    pub persona_id:     String,
-    pub key_hex:        String,
+    pub run_id: String,
+    pub user_id: String,
+    pub persona_id: String,
+    pub key_hex: String,
     /// JSON-serialized Vec<ExtractConfirmDecision>.
     /// Shape per element:
     ///   { "candidate_id": i64, "confirmed": bool,
@@ -178,9 +178,7 @@ pub struct PendingCrossPersonaFact {
 
 #[tauri::command]
 #[specta::specta]
-pub async fn submit_consent_decision(
-    request: SubmitConsentDecisionRequest,
-) -> Result<(), String> {
+pub async fn submit_consent_decision(request: SubmitConsentDecisionRequest) -> Result<(), String> {
     output_store::write_consent_decision(
         &request.user_id,
         &request.persona_id,
@@ -213,12 +211,9 @@ pub async fn submit_floor_consent_decision(
     // If user chose to save, write standing preference to personas.extra_metadata
     // in shared.db (D5-152). Scoped to abstraction_tier -- not a blanket consent.
     if request.save_preference && request.decision == "proceed" {
-        write_floor_consent_preference(
-            &request.persona_id,
-            request.abstraction_tier,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+        write_floor_consent_preference(&request.persona_id, request.abstraction_tier)
+            .await
+            .map_err(|e| e.to_string())?;
     }
 
     Ok(())
@@ -295,8 +290,16 @@ pub async fn submit_friction_gate_decision(
         &orig.persona_id,
         &orig.focus_id,
         &request.decision,
-        if privacy_would_loosen { orig.privacy_tier } else { None },
-        if moves_to_protected { orig.focus_profile.as_deref() } else { None },
+        if privacy_would_loosen {
+            orig.privacy_tier
+        } else {
+            None
+        },
+        if moves_to_protected {
+            orig.focus_profile.as_deref()
+        } else {
+            None
+        },
         existing.privacy_tier,
         &existing.focus_profile,
     )
@@ -390,9 +393,8 @@ pub async fn submit_extract_confirm(
     }
 
     // Deserialize decisions.
-    let decisions: Vec<ExtractConfirmDecision> =
-        serde_json::from_str(&request.decisions_json)
-            .map_err(|e| format!("decisions_json parse error: {e}"))?;
+    let decisions: Vec<ExtractConfirmDecision> = serde_json::from_str(&request.decisions_json)
+        .map_err(|e| format!("decisions_json parse error: {e}"))?;
 
     // Validation pass: reject entire call before any DB mutation.
     for d in &decisions {
@@ -452,10 +454,7 @@ pub async fn submit_extract_confirm(
             )
             .await
             .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!(
-                "candidate {} not found during confirmation",
-                d.candidate_id
-            ))?;
+            .ok_or_else(|| format!("candidate {} not found during confirmation", d.candidate_id))?;
 
             // Step 2: write to personal.db first (idempotent upsert).
             // Ordered before mark_decided so retry after step 3/4 failure
@@ -465,13 +464,13 @@ pub async fn submit_extract_confirm(
                 &request.persona_id,
                 &request.key_hex,
                 &fields.field_name,
-                d.confirmed_value
-                    .as_deref()
-                    .ok_or_else(|| format!(
+                d.confirmed_value.as_deref().ok_or_else(|| {
+                    format!(
                         "candidate {} confirmed_value is None after validation \
                          -- invariant violated",
                         d.candidate_id
-                    ))?,
+                    )
+                })?,
                 &fields.sensitivity,
             )
             .await
@@ -614,9 +613,7 @@ async fn write_floor_consent_preference(
     abstraction_tier: i32,
 ) -> Result<(), sqlx::Error> {
     let db_path = db_path_shared();
-    let mut conn = connect_options_unencrypted(&db_path)
-        .connect()
-        .await?;
+    let mut conn = connect_options_unencrypted(&db_path).connect().await?;
 
     let timestamp = now();
     let preference = serde_json::json!({
@@ -627,13 +624,12 @@ async fn write_floor_consent_preference(
     });
 
     // Fetch as Option<String> -- NULL extra_metadata is valid for new personas.
-    let existing_json: Option<String> = sqlx::query(
-        "SELECT extra_metadata FROM personas WHERE id = ?",
-    )
-    .bind(persona_id)
-    .fetch_one(&mut conn)
-    .await?
-    .try_get("extra_metadata")?;
+    let existing_json: Option<String> =
+        sqlx::query("SELECT extra_metadata FROM personas WHERE id = ?")
+            .bind(persona_id)
+            .fetch_one(&mut conn)
+            .await?
+            .try_get("extra_metadata")?;
 
     // Merge into existing metadata rather than overwriting the whole field.
     // Falls back to empty object if the column is NULL or contains invalid JSON.
@@ -644,13 +640,11 @@ async fn write_floor_consent_preference(
 
     meta["floor_consent_preference"] = preference;
 
-    sqlx::query(
-        "UPDATE personas SET extra_metadata = ? WHERE id = ?",
-    )
-    .bind(meta.to_string())
-    .bind(persona_id)
-    .execute(&mut conn)
-    .await?;
+    sqlx::query("UPDATE personas SET extra_metadata = ? WHERE id = ?")
+        .bind(meta.to_string())
+        .bind(persona_id)
+        .execute(&mut conn)
+        .await?;
 
     Ok(())
 }

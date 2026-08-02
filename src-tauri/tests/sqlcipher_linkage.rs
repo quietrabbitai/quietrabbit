@@ -9,10 +9,8 @@ use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::ConnectOptions;
 use tempfile::NamedTempFile;
 
-const KEY_HEX: &str =
-    "x'deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef'";
-const WRONG_KEY_HEX: &str =
-    "x'0000000000000000000000000000000000000000000000000000000000000000'";
+const KEY_HEX: &str = "x'deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef'";
+const WRONG_KEY_HEX: &str = "x'0000000000000000000000000000000000000000000000000000000000000000'";
 
 /// Open an encrypted connection using the options builder (avoids URI
 /// character-escaping pitfalls). PRAGMA key fires before journal_mode in
@@ -45,9 +43,7 @@ fn assert_encryption_db_error(db_err: &dyn sqlx::error::DatabaseError) {
     // Fallback for other SQLCipher versions that may use different codes.
     let msg = db_err.message().to_lowercase();
     assert!(
-        msg.contains("not a database")
-            || msg.contains("malformed")
-            || msg.contains("encrypted"),
+        msg.contains("not a database") || msg.contains("malformed") || msg.contains("encrypted"),
         "Expected encryption-related error, got code={:?} message='{}'",
         db_err.code(),
         db_err.message()
@@ -60,7 +56,10 @@ fn assert_encryption_db_error(db_err: &dyn sqlx::error::DatabaseError) {
 fn assert_encryption_error(err: sqlx::Error) {
     match err {
         sqlx::Error::Database(db_err) => assert_encryption_db_error(db_err.as_ref()),
-        e => panic!("Expected a Database error for encryption rejection, got: {:?}", e),
+        e => panic!(
+            "Expected a Database error for encryption rejection, got: {:?}",
+            e
+        ),
     }
 }
 
@@ -127,7 +126,10 @@ async fn test_sqlcipher_wrong_key_cannot_read() {
         Ok(mut conn) => {
             let result: Result<(String,), _> =
                 sqlx::query_as("SELECT v FROM t").fetch_one(&mut conn).await;
-            assert!(result.is_err(), "Wrong key must not be able to read encrypted data");
+            assert!(
+                result.is_err(),
+                "Wrong key must not be able to read encrypted data"
+            );
             assert_encryption_error(result.unwrap_err());
         }
         Err(e) => panic!("Unexpected non-database connection error: {:?}", e),
@@ -163,7 +165,10 @@ async fn test_sqlcipher_no_key_cannot_read() {
         Ok(mut conn) => {
             let result: Result<(String,), _> =
                 sqlx::query_as("SELECT v FROM t").fetch_one(&mut conn).await;
-            assert!(result.is_err(), "Unkeyed access must not read encrypted data");
+            assert!(
+                result.is_err(),
+                "Unkeyed access must not read encrypted data"
+            );
             assert_encryption_error(result.unwrap_err());
         }
         Err(e) => panic!("Unexpected non-database connection error: {:?}", e),

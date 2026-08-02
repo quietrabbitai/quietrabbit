@@ -17,9 +17,8 @@ use serde_json::Value;
 
 use crate::conductor::failure::ConductorError;
 use crate::providers::types::{
-    ChatMessage, ContextWindowStatus, ContextWindowStatusKind, GenerateOptions,
-    GenerateRequest, GenerateResponse, ModelfileVersion, ProviderHealth,
-    ProviderStatus, RecommendedAction,
+    ChatMessage, ContextWindowStatus, ContextWindowStatusKind, GenerateOptions, GenerateRequest,
+    GenerateResponse, ModelfileVersion, ProviderHealth, ProviderStatus, RecommendedAction,
 };
 
 // ---------------------------------------------------------------------------
@@ -47,10 +46,8 @@ const BUFFERED_TASK_TYPES: &[&str] = &["code", "research", "creative_writing", "
 /// `OLLAMA_HOST` must be a bare hostname or IP — not a full URL.
 /// This matches Python oracle: `f"http://{host}:{port}"`.
 fn base_url() -> String {
-    let host = std::env::var("OLLAMA_HOST")
-        .unwrap_or_else(|_| "127.0.0.1".to_owned());
-    let port = std::env::var("OLLAMA_PORT")
-        .unwrap_or_else(|_| "11434".to_owned());
+    let host = std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned());
+    let port = std::env::var("OLLAMA_PORT").unwrap_or_else(|_| "11434".to_owned());
     format!("http://{}:{}", host, port)
 }
 
@@ -128,11 +125,7 @@ impl OllamaClient {
                     .json::<Value>()
                     .await
                     .ok()
-                    .and_then(|v| {
-                        v.get("models")
-                            .and_then(|m| m.as_array())
-                            .cloned()
-                    })
+                    .and_then(|v| v.get("models").and_then(|m| m.as_array()).cloned())
                     .unwrap_or_default()
                     .into_iter()
                     .filter_map(|m| m.get("name")?.as_str().map(str::to_owned))
@@ -251,18 +244,18 @@ impl OllamaClient {
             });
         }
 
-        let data: Value = resp.json().await.map_err(|_| ConductorError::OllamaGeneration {
-            plain_language: "The local AI returned an unexpected response. \
+        let data: Value = resp
+            .json()
+            .await
+            .map_err(|_| ConductorError::OllamaGeneration {
+                plain_language: "The local AI returned an unexpected response. \
                 [Try again] [Get help]"
-                .to_owned(),
-        })?;
+                    .to_owned(),
+            })?;
 
         Ok(GenerateResponse {
             content: data["response"].as_str().unwrap_or("").to_owned(),
-            model: data["model"]
-                .as_str()
-                .unwrap_or(&request.model)
-                .to_owned(),
+            model: data["model"].as_str().unwrap_or(&request.model).to_owned(),
             prompt_token_count: data["prompt_eval_count"].as_u64().unwrap_or(0) as u32,
             output_token_count: data["eval_count"].as_u64().unwrap_or(0) as u32,
             latency_ms,
@@ -358,9 +351,13 @@ impl OllamaClient {
             });
         }
 
-        let data: Value = resp.json().await.map_err(|_| ConductorError::OllamaGeneration {
-            plain_language: "The local AI returned an unexpected response. [Try again]".to_owned(),
-        })?;
+        let data: Value = resp
+            .json()
+            .await
+            .map_err(|_| ConductorError::OllamaGeneration {
+                plain_language: "The local AI returned an unexpected response. [Try again]"
+                    .to_owned(),
+            })?;
 
         Ok(GenerateResponse {
             content: data["message"]["content"].as_str().unwrap_or("").to_owned(),
@@ -463,7 +460,11 @@ impl OllamaClient {
             .lines()
             .rfind(|l| !l.trim().is_empty())
             .and_then(|line| serde_json::from_str::<Value>(line).ok())
-            .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(|s| s == "success"))
+            .and_then(|v| {
+                v.get("status")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s == "success")
+            })
             .unwrap_or(false);
 
         success
@@ -623,7 +624,11 @@ mod tests {
         assert_eq!(result.status, ContextWindowStatusKind::Exceeded);
         assert_eq!(result.usage_fraction, 1.0);
         assert_eq!(result.context_window, 0);
-        assert!(result.plain_language.as_deref().unwrap_or("").contains("couldn't determine"));
+        assert!(result
+            .plain_language
+            .as_deref()
+            .unwrap_or("")
+            .contains("couldn't determine"));
         assert!(result.recommended_action.is_some());
     }
 

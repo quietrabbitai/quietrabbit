@@ -119,8 +119,7 @@ pub enum RefreshVerdict {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-const SOURCE_COLUMNS: &str =
-    "id, persona_id, focus_slug, source_type, connection_config, \
+const SOURCE_COLUMNS: &str = "id, persona_id, focus_slug, source_type, connection_config, \
      last_imported_at, last_synced_at, status, created_at, extra_metadata";
 
 fn row_to_source(row: &sqlx::sqlite::SqliteRow) -> Result<SourceRegistryEntry, PersonalStoreError> {
@@ -137,12 +136,11 @@ fn row_to_source(row: &sqlx::sqlite::SqliteRow) -> Result<SourceRegistryEntry, P
     };
 
     let metadata_raw: String = row.try_get("extra_metadata")?;
-    let extra_metadata: serde_json::Value =
-        serde_json::from_str(&metadata_raw).map_err(|e| {
-            PersonalStoreError::Validation(format!(
-                "source_registry.extra_metadata for id '{id}' is not valid JSON: {e}"
-            ))
-        })?;
+    let extra_metadata: serde_json::Value = serde_json::from_str(&metadata_raw).map_err(|e| {
+        PersonalStoreError::Validation(format!(
+            "source_registry.extra_metadata for id '{id}' is not valid JSON: {e}"
+        ))
+    })?;
 
     Ok(SourceRegistryEntry {
         id,
@@ -551,12 +549,10 @@ pub(crate) async fn list_record_ids_for_source_conn(
     conn: &mut SqliteConnection,
     source_id: &str,
 ) -> Result<Vec<String>, PersonalStoreError> {
-    let rows = sqlx::query(
-        "SELECT id FROM entities WHERE source_registry_id = ? ORDER BY id",
-    )
-    .bind(source_id)
-    .fetch_all(&mut *conn)
-    .await?;
+    let rows = sqlx::query("SELECT id FROM entities WHERE source_registry_id = ? ORDER BY id")
+        .bind(source_id)
+        .fetch_all(&mut *conn)
+        .await?;
 
     let mut out = Vec::with_capacity(rows.len());
     for row in &rows {
@@ -728,11 +724,13 @@ pub(crate) async fn apply_source_update_conn(
     entity_id: &str,
     update: &EntityUpdate,
 ) -> Result<RefreshVerdict, PersonalStoreError> {
-    let verdict = refresh_verdict_conn(conn, entity_id).await?.ok_or_else(|| {
-        PersonalStoreError::Validation(format!(
-            "No entity with id '{entity_id}' — nothing to refresh."
-        ))
-    })?;
+    let verdict = refresh_verdict_conn(conn, entity_id)
+        .await?
+        .ok_or_else(|| {
+            PersonalStoreError::Validation(format!(
+                "No entity with id '{entity_id}' — nothing to refresh."
+            ))
+        })?;
 
     if verdict == RefreshVerdict::AutoAccept {
         crate::persistence::entity_store::update_entity_conn(conn, entity_id, update).await?;
@@ -807,7 +805,10 @@ mod tests {
             s.connection_config,
             Some(serde_json::json!({"base_url": "http://localhost"}))
         );
-        assert_eq!(s.extra_metadata, serde_json::json!({"label": "2024 export"}));
+        assert_eq!(
+            s.extra_metadata,
+            serde_json::json!({"label": "2024 export"})
+        );
         assert!(s.last_imported_at.is_none());
         assert!(s.last_synced_at.is_none());
     }
@@ -859,9 +860,16 @@ mod tests {
     async fn list_sources_filters_by_focus_and_status() {
         let mut conn = test_db().await;
         let paprika = a_source(&mut conn).await;
-        register_source_conn(&mut conn, "persona-1", "cooking", "mealie_import", None, None)
-            .await
-            .unwrap();
+        register_source_conn(
+            &mut conn,
+            "persona-1",
+            "cooking",
+            "mealie_import",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         register_source_conn(&mut conn, "persona-1", "travel", "pdf_import", None, None)
             .await
             .unwrap();
@@ -893,8 +901,12 @@ mod tests {
                 .await
                 .unwrap_or_else(|e| panic!("status '{status}' rejected by the DB: {e}"));
         }
-        assert!(set_source_status_conn(&mut conn, &id, "invented").await.is_err());
-        assert!(set_source_status_conn(&mut conn, "no-such-id", "active").await.is_err());
+        assert!(set_source_status_conn(&mut conn, &id, "invented")
+            .await
+            .is_err());
+        assert!(set_source_status_conn(&mut conn, "no-such-id", "active")
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -909,7 +921,10 @@ mod tests {
 
         let s = get_source_conn(&mut conn, &id).await.unwrap().unwrap();
         assert!(s.last_imported_at.is_some(), "import must be stamped");
-        assert_eq!(s.status, "active", "a completed import clears pending_refresh");
+        assert_eq!(
+            s.status, "active",
+            "a completed import clears pending_refresh"
+        );
     }
 
     // -- record source edge -------------------------------------------------
@@ -970,9 +985,16 @@ mod tests {
     async fn list_record_ids_is_scoped_to_one_source() {
         let mut conn = test_db().await;
         let a = a_source(&mut conn).await;
-        let b = register_source_conn(&mut conn, "persona-1", "cooking", "mealie_import", None, None)
-            .await
-            .unwrap();
+        let b = register_source_conn(
+            &mut conn,
+            "persona-1",
+            "cooking",
+            "mealie_import",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         let from_a = import_record_conn(&mut conn, &a, "recipe", "A1", &[], None, None)
             .await
@@ -984,7 +1006,9 @@ mod tests {
             .await
             .unwrap();
 
-        let ids = list_record_ids_for_source_conn(&mut conn, &a).await.unwrap();
+        let ids = list_record_ids_for_source_conn(&mut conn, &a)
+            .await
+            .unwrap();
         assert_eq!(ids, vec![from_a], "only source A's records");
     }
 
@@ -995,16 +1019,19 @@ mod tests {
         let mut conn = test_db().await;
         let source = a_source(&mut conn).await;
 
-        let imported = import_record_conn(&mut conn, &source, "recipe", "Imported", &[], None, None)
-            .await
-            .unwrap();
+        let imported =
+            import_record_conn(&mut conn, &source, "recipe", "Imported", &[], None, None)
+                .await
+                .unwrap();
         assert_eq!(
             refresh_verdict_conn(&mut conn, &imported).await.unwrap(),
             Some(RefreshVerdict::AutoAccept),
             "pristine records accept source updates"
         );
 
-        mark_record_user_modified_conn(&mut conn, &imported).await.unwrap();
+        mark_record_user_modified_conn(&mut conn, &imported)
+            .await
+            .unwrap();
         assert_eq!(
             refresh_verdict_conn(&mut conn, &imported).await.unwrap(),
             Some(RefreshVerdict::Conflict),
@@ -1020,7 +1047,10 @@ mod tests {
             "QR is authoritative for user_created records"
         );
 
-        assert!(refresh_verdict_conn(&mut conn, "nope").await.unwrap().is_none());
+        assert!(refresh_verdict_conn(&mut conn, "nope")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -1066,18 +1096,28 @@ mod tests {
             .unwrap();
         assert_eq!(verdict, RefreshVerdict::AutoAccept);
         assert_eq!(
-            get_entity_conn(&mut conn, &id).await.unwrap().unwrap().display_name,
+            get_entity_conn(&mut conn, &id)
+                .await
+                .unwrap()
+                .unwrap()
+                .display_name,
             "From Source"
         );
 
         // Once the user has edited it, the same call must not overwrite.
-        mark_record_user_modified_conn(&mut conn, &id).await.unwrap();
+        mark_record_user_modified_conn(&mut conn, &id)
+            .await
+            .unwrap();
         let verdict = apply_source_update_conn(&mut conn, &id, &rename("Clobbered"))
             .await
             .unwrap();
         assert_eq!(verdict, RefreshVerdict::Conflict);
         assert_eq!(
-            get_entity_conn(&mut conn, &id).await.unwrap().unwrap().display_name,
+            get_entity_conn(&mut conn, &id)
+                .await
+                .unwrap()
+                .unwrap()
+                .display_name,
             "From Source",
             "user-generated data is never overwritten by source data"
         );
@@ -1089,9 +1129,16 @@ mod tests {
     async fn deleted_in_source_is_recoverable_and_source_scoped() {
         let mut conn = test_db().await;
         let a = a_source(&mut conn).await;
-        let b = register_source_conn(&mut conn, "persona-1", "cooking", "mealie_import", None, None)
-            .await
-            .unwrap();
+        let b = register_source_conn(
+            &mut conn,
+            "persona-1",
+            "cooking",
+            "mealie_import",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         let from_a = import_record_conn(&mut conn, &a, "recipe", "A1", &[], None, None)
             .await
@@ -1101,21 +1148,26 @@ mod tests {
             .unwrap();
 
         // Source A cannot tombstone source B's record.
-        let changed = mark_records_deleted_in_source_conn(
-            &mut conn,
-            &a,
-            &[from_a.clone(), from_b.clone()],
-        )
-        .await
-        .unwrap();
+        let changed =
+            mark_records_deleted_in_source_conn(&mut conn, &a, &[from_a.clone(), from_b.clone()])
+                .await
+                .unwrap();
         assert_eq!(changed, 1, "only A's own record may change");
 
         assert_eq!(
-            get_entity_conn(&mut conn, &from_a).await.unwrap().unwrap().status,
+            get_entity_conn(&mut conn, &from_a)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
             "deleted_in_source"
         );
         assert_eq!(
-            get_entity_conn(&mut conn, &from_b).await.unwrap().unwrap().status,
+            get_entity_conn(&mut conn, &from_b)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
             "active"
         );
 
@@ -1130,15 +1182,20 @@ mod tests {
         let id = import_record_conn(&mut conn, &source, "recipe", "Tombstoned", &[], None, None)
             .await
             .unwrap();
-        retire_entity_conn(&mut conn, &id, "user_deleted").await.unwrap();
+        retire_entity_conn(&mut conn, &id, "user_deleted")
+            .await
+            .unwrap();
 
-        let changed =
-            mark_records_deleted_in_source_conn(&mut conn, &source, &[id.clone()])
-                .await
-                .unwrap();
+        let changed = mark_records_deleted_in_source_conn(&mut conn, &source, &[id.clone()])
+            .await
+            .unwrap();
         assert_eq!(changed, 0, "a deliberate tombstone must survive a refresh");
         assert_eq!(
-            get_entity_conn(&mut conn, &id).await.unwrap().unwrap().status,
+            get_entity_conn(&mut conn, &id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
             "user_deleted"
         );
     }

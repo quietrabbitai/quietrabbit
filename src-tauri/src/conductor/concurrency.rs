@@ -220,8 +220,7 @@ impl ConductorScheduler {
         {
             let mut state = self.state.lock().unwrap();
             if priority == PathPriority::Interactive {
-                state.interactive_wait_count =
-                    state.interactive_wait_count.saturating_add(1);
+                state.interactive_wait_count = state.interactive_wait_count.saturating_add(1);
                 if let Some(holder) = state.inference_holder.clone() {
                     if state.active_runs.get(&holder) == Some(&PathPriority::Background) {
                         state.preempt_requested_for = Some(holder);
@@ -250,14 +249,12 @@ impl ConductorScheduler {
                 // next background reacquisition.
                 if priority == PathPriority::Interactive {
                     state.preempt_requested_for = None;
-                    state.interactive_wait_count =
-                        state.interactive_wait_count.saturating_sub(1);
+                    state.interactive_wait_count = state.interactive_wait_count.saturating_sub(1);
                 }
             } else {
                 // Timeout — undo arrival-block increment to keep count accurate.
                 if priority == PathPriority::Interactive {
-                    state.interactive_wait_count =
-                        state.interactive_wait_count.saturating_sub(1);
+                    state.interactive_wait_count = state.interactive_wait_count.saturating_sub(1);
                 }
             }
         }

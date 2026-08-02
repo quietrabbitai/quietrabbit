@@ -113,8 +113,10 @@ pub fn plan_reentry(
         return Err(ReentryError::NothingToDiscard(target_step_id.to_owned()));
     }
 
-    let preserved_step_ids: Vec<String> =
-        executed[..target_pos].iter().map(|s| s.step_id.clone()).collect();
+    let preserved_step_ids: Vec<String> = executed[..target_pos]
+        .iter()
+        .map(|s| s.step_id.clone())
+        .collect();
 
     let discarded: &[&TaskStep] = &executed[target_pos..];
     let discarded_step_ids: Vec<String> = discarded.iter().map(|s| s.step_id.clone()).collect();
@@ -155,8 +157,7 @@ pub fn plan_reentry(
 /// those steps' content no longer exists in this track.
 pub fn rebuild_preserved_track(task_track: &TaskTrack, plan: &ReentryPlan) -> TaskTrack {
     let mut rebuilt = TaskTrack::new();
-    let preserved: HashSet<&str> =
-        plan.preserved_step_ids.iter().map(|s| s.as_str()).collect();
+    let preserved: HashSet<&str> = plan.preserved_step_ids.iter().map(|s| s.as_str()).collect();
     for step in task_track.steps() {
         if preserved.contains(step.step_id.as_str()) {
             rebuilt.add_step(step.clone());
@@ -217,7 +218,10 @@ mod tests {
         let order = vec!["s1".to_owned(), "s2".to_owned(), "s3".to_owned()];
         let plan = plan_reentry(&track, &order, "s2").unwrap();
         assert_eq!(plan.preserved_step_ids, vec!["s1".to_owned()]);
-        assert_eq!(plan.discarded_step_ids, vec!["s2".to_owned(), "s3".to_owned()]);
+        assert_eq!(
+            plan.discarded_step_ids,
+            vec!["s2".to_owned(), "s3".to_owned()]
+        );
         assert_eq!(plan.resume_from_index, 1);
         assert_eq!(plan.target_step_id, "s2");
     }
@@ -228,7 +232,10 @@ mod tests {
         let order = vec!["s1".to_owned(), "s2".to_owned()];
         let plan = plan_reentry(&track, &order, "s1").unwrap();
         assert!(plan.preserved_step_ids.is_empty());
-        assert_eq!(plan.discarded_step_ids, vec!["s1".to_owned(), "s2".to_owned()]);
+        assert_eq!(
+            plan.discarded_step_ids,
+            vec!["s1".to_owned(), "s2".to_owned()]
+        );
         assert_eq!(plan.resume_from_index, 0);
     }
 
@@ -240,7 +247,12 @@ mod tests {
             step("s3", Some("review"), 1), // same var name reused -- dedup
             step("s4", None, 1),
         ]);
-        let order = vec!["s1".to_owned(), "s2".to_owned(), "s3".to_owned(), "s4".to_owned()];
+        let order = vec![
+            "s1".to_owned(),
+            "s2".to_owned(),
+            "s3".to_owned(),
+            "s4".to_owned(),
+        ];
         let plan = plan_reentry(&track, &order, "s2").unwrap();
         assert_eq!(plan.stale_output_vars, vec!["review".to_owned()]);
         // s1's "draft" is preserved, not discarded -- must not appear.
@@ -249,10 +261,7 @@ mod tests {
 
     #[test]
     fn plan_reentry_empty_output_var_not_collected() {
-        let track = track_with(&[
-            step("s1", None, 1),
-            step("s2", Some(""), 1),
-        ]);
+        let track = track_with(&[step("s1", None, 1), step("s2", Some(""), 1)]);
         let order = vec!["s1".to_owned(), "s2".to_owned()];
         let plan = plan_reentry(&track, &order, "s1").unwrap();
         assert!(plan.stale_output_vars.is_empty());

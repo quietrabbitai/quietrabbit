@@ -295,11 +295,7 @@ fn jaccard(a: &BTreeSet<String>, b: &BTreeSet<String>) -> f64 {
 /// from both records is skipped rather than scored zero, so a Focus can
 /// declare optional fields without every record being penalised for not
 /// having them.
-fn content_overlap(
-    decl: &FocusDedupDeclaration,
-    a: &DedupRecord,
-    b: &DedupRecord,
-) -> f64 {
+fn content_overlap(decl: &FocusDedupDeclaration, a: &DedupRecord, b: &DedupRecord) -> f64 {
     let mut scores = Vec::new();
     for field in &decl.content_fields {
         let (va, vb) = (a.field(field), b.field(field));
@@ -330,9 +326,10 @@ fn evaluate_pair(
     b: &DedupRecord,
 ) -> Option<(MatchStrategy, f64)> {
     if decl.strategies.contains(&MatchStrategy::SourceUrl) {
-        if let (Some(ua), Some(ub)) =
-            (a.entity.source_url.as_deref(), b.entity.source_url.as_deref())
-        {
+        if let (Some(ua), Some(ub)) = (
+            a.entity.source_url.as_deref(),
+            b.entity.source_url.as_deref(),
+        ) {
             if !ua.trim().is_empty() && ua.trim() == ub.trim() {
                 return Some((MatchStrategy::SourceUrl, 1.0));
             }
@@ -342,23 +339,21 @@ fn evaluate_pair(
     let name_a = normalise(&a.entity.display_name);
     let name_b = normalise(&b.entity.display_name);
 
-    if decl.strategies.contains(&MatchStrategy::Name)
-        && !name_a.is_empty()
-        && name_a == name_b
-    {
+    if decl.strategies.contains(&MatchStrategy::Name) && !name_a.is_empty() && name_a == name_b {
         return Some((MatchStrategy::Name, 0.9));
     }
 
-    if decl.strategies.contains(&MatchStrategy::NameAndFieldOverlap) {
+    if decl
+        .strategies
+        .contains(&MatchStrategy::NameAndFieldOverlap)
+    {
         let name_similarity = jaccard(&token_set(&name_a), &token_set(&name_b));
         if name_similarity > 0.0 {
             let overlap = content_overlap(decl, a, b);
             // Both halves must clear the bar: a shared word in the title is
             // not a duplicate signal on its own, and neither is generic
             // ingredient overlap between two unrelated records.
-            if name_similarity >= decl.overlap_threshold
-                && overlap >= decl.overlap_threshold
-            {
+            if name_similarity >= decl.overlap_threshold && overlap >= decl.overlap_threshold {
                 return Some((
                     MatchStrategy::NameAndFieldOverlap,
                     (name_similarity + overlap) / 2.0,
@@ -377,11 +372,7 @@ fn evaluate_pair(
 /// Key-difference fields are included unconditionally because their whole
 /// purpose is to be checked. decisions.id=502's example is leavening: the
 /// user needs to see it to judge, even when both records happen to agree.
-fn differing_fields(
-    decl: &FocusDedupDeclaration,
-    a: &DedupRecord,
-    b: &DedupRecord,
-) -> Vec<String> {
+fn differing_fields(decl: &FocusDedupDeclaration, a: &DedupRecord, b: &DedupRecord) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
 
     for field in &decl.content_fields {
@@ -639,9 +630,7 @@ pub(crate) async fn scan_for_duplicates_conn(
 
             let fields = differing_fields(decl, a, b);
             let fields_json = serde_json::to_string(&fields).map_err(|e| {
-                PersonalStoreError::Validation(format!(
-                    "differing_fields not serializable: {e}"
-                ))
+                PersonalStoreError::Validation(format!("differing_fields not serializable: {e}"))
             })?;
 
             let new_id = uuid::Uuid::new_v4().to_string();
@@ -765,9 +754,11 @@ pub(crate) async fn resolve_candidate_conn(
 ) -> Result<(), PersonalStoreError> {
     decl.validate()?;
 
-    let candidate = get_candidate_conn(conn, candidate_id).await?.ok_or_else(|| {
-        PersonalStoreError::Validation(format!("No dedup candidate with id '{candidate_id}'."))
-    })?;
+    let candidate = get_candidate_conn(conn, candidate_id)
+        .await?
+        .ok_or_else(|| {
+            PersonalStoreError::Validation(format!("No dedup candidate with id '{candidate_id}'."))
+        })?;
 
     if candidate.status != "pending" {
         return Err(PersonalStoreError::Validation(format!(
@@ -818,14 +809,12 @@ pub(crate) async fn resolve_candidate_conn(
                 .await?;
         }
 
-        sqlx::query(
-            "UPDATE dedup_candidates SET status = ?, resolved_at = ? WHERE id = ?",
-        )
-        .bind(resolution.as_db_str())
-        .bind(crate::providers::utils::now())
-        .bind(candidate_id)
-        .execute(&mut *conn)
-        .await?;
+        sqlx::query("UPDATE dedup_candidates SET status = ?, resolved_at = ? WHERE id = ?")
+            .bind(resolution.as_db_str())
+            .bind(crate::providers::utils::now())
+            .bind(candidate_id)
+            .execute(&mut *conn)
+            .await?;
 
         Ok(())
     }
@@ -1081,13 +1070,20 @@ mod tests {
         )
         .unwrap();
         assert!(out.contains("Winner note"));
-        assert!(out.contains("Loser note"), "the user's other note must survive");
+        assert!(
+            out.contains("Loser note"),
+            "the user's other note must survive"
+        );
     }
 
     #[test]
     fn combine_unions_tags_without_duplicates() {
-        let out = combine_values(CombineRule::Union, Some("bread, easy"), Some("Easy, weeknight"))
-            .unwrap();
+        let out = combine_values(
+            CombineRule::Union,
+            Some("bread, easy"),
+            Some("Easy, weeknight"),
+        )
+        .unwrap();
         assert_eq!(out, "bread, easy, weeknight");
     }
 
@@ -1139,15 +1135,23 @@ mod tests {
         let mut conn = test_db().await;
         let s = a_source(&mut conn).await;
         let a = add_record(&mut conn, &s, "Sourdough", Some("https://x.test/1"), &[]).await;
-        let b = add_record(&mut conn, &s, "Totally Different Name", Some("https://x.test/1"), &[])
-            .await;
+        let b = add_record(
+            &mut conn,
+            &s,
+            "Totally Different Name",
+            Some("https://x.test/1"),
+            &[],
+        )
+        .await;
 
         let created = scan_for_duplicates_conn(&mut conn, &cooking_decl(), &[a, b])
             .await
             .unwrap();
         assert_eq!(created.len(), 1);
 
-        let pending = list_pending_candidates_conn(&mut conn, "cooking").await.unwrap();
+        let pending = list_pending_candidates_conn(&mut conn, "cooking")
+            .await
+            .unwrap();
         assert_eq!(pending[0].match_basis, "url_match");
         assert!((pending[0].match_confidence - 1.0).abs() < 1e-9);
     }
@@ -1162,7 +1166,9 @@ mod tests {
         scan_for_duplicates_conn(&mut conn, &cooking_decl(), &[a, b])
             .await
             .unwrap();
-        let pending = list_pending_candidates_conn(&mut conn, "cooking").await.unwrap();
+        let pending = list_pending_candidates_conn(&mut conn, "cooking")
+            .await
+            .unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].match_basis, "name_match");
     }
@@ -1226,10 +1232,14 @@ mod tests {
         scan_for_duplicates_conn(&mut conn, &cooking_decl(), &[a, b])
             .await
             .unwrap();
-        let pending = list_pending_candidates_conn(&mut conn, "cooking").await.unwrap();
+        let pending = list_pending_candidates_conn(&mut conn, "cooking")
+            .await
+            .unwrap();
         assert_eq!(pending.len(), 1);
         assert!(
-            pending[0].differing_fields.contains(&"leavening".to_owned()),
+            pending[0]
+                .differing_fields
+                .contains(&"leavening".to_owned()),
             "a key-difference field must always be put in front of the user"
         );
     }
@@ -1242,13 +1252,17 @@ mod tests {
         let b = add_record(&mut conn, &s, "Bread", Some("https://x.test/1"), &[]).await;
         let ids = vec![a, b];
 
-        scan_for_duplicates_conn(&mut conn, &cooking_decl(), &ids).await.unwrap();
+        scan_for_duplicates_conn(&mut conn, &cooking_decl(), &ids)
+            .await
+            .unwrap();
         let again = scan_for_duplicates_conn(&mut conn, &cooking_decl(), &ids)
             .await
             .unwrap();
         assert!(again.is_empty(), "a pending pair must not be re-created");
 
-        let candidate = list_pending_candidates_conn(&mut conn, "cooking").await.unwrap()[0]
+        let candidate = list_pending_candidates_conn(&mut conn, "cooking")
+            .await
+            .unwrap()[0]
             .id
             .clone();
         resolve_candidate_conn(
@@ -1309,9 +1323,7 @@ mod tests {
 
     /// Build a resolved-ready pair: two duplicates, each with user-generated
     /// data the other lacks. Returns (candidate_id, record_a, record_b).
-    async fn a_pair_with_user_data(
-        conn: &mut SqliteConnection,
-    ) -> (String, String, String) {
+    async fn a_pair_with_user_data(conn: &mut SqliteConnection) -> (String, String, String) {
         let s = a_source(conn).await;
         let a = add_record(
             conn,
@@ -1355,9 +1367,10 @@ mod tests {
     async fn resolution_carries_every_user_generated_field_onto_the_winner() {
         let mut conn = test_db().await;
         let (candidate, a, b) = a_pair_with_user_data(&mut conn).await;
-        let winner_is_a = list_pending_candidates_conn(&mut conn, "cooking").await.unwrap()
-            [0]
-        .record_id_a
+        let winner_is_a = list_pending_candidates_conn(&mut conn, "cooking")
+            .await
+            .unwrap()[0]
+            .record_id_a
             == a;
         let resolution = if winner_is_a {
             Resolution::KeepA
@@ -1408,7 +1421,9 @@ mod tests {
         scan_for_duplicates_conn(&mut conn, &cooking_decl(), &[a.clone(), b.clone()])
             .await
             .unwrap();
-        let candidate = list_pending_candidates_conn(&mut conn, "cooking").await.unwrap()[0]
+        let candidate = list_pending_candidates_conn(&mut conn, "cooking")
+            .await
+            .unwrap()[0]
             .clone();
         let winner_id = candidate.record_id_a.clone();
 
@@ -1416,7 +1431,10 @@ mod tests {
             .await
             .unwrap();
 
-        let winner = load_record_conn(&mut conn, &winner_id).await.unwrap().unwrap();
+        let winner = load_record_conn(&mut conn, &winner_id)
+            .await
+            .unwrap()
+            .unwrap();
         let ingredients = winner.field("ingredients").unwrap();
         assert!(
             ingredients == "flour water salt" || ingredients == "cocoa sugar butter",
@@ -1486,7 +1504,9 @@ mod tests {
         scan_for_duplicates_conn(&mut conn, &cooking_decl(), &[a.clone(), b.clone()])
             .await
             .unwrap();
-        let candidate = list_pending_candidates_conn(&mut conn, "cooking").await.unwrap()[0]
+        let candidate = list_pending_candidates_conn(&mut conn, "cooking")
+            .await
+            .unwrap()[0]
             .clone();
 
         // Keep whichever record has no source_url.
@@ -1520,10 +1540,9 @@ mod tests {
         let s = a_source(&mut conn).await;
         let c = add_record(&mut conn, &s, "Bread", Some("https://x.test/1"), &[]).await;
 
-        let created =
-            scan_for_duplicates_conn(&mut conn, &cooking_decl(), &[a, b, c])
-                .await
-                .unwrap();
+        let created = scan_for_duplicates_conn(&mut conn, &cooking_decl(), &[a, b, c])
+            .await
+            .unwrap();
         assert_eq!(
             created.len(),
             1,

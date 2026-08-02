@@ -59,7 +59,11 @@ pub fn dispatch_cef_subprocess() -> bool {
     let is_browser_process = cmd.has_switch(Some(&type_switch)) != 1;
 
     let mut app = AppBuilder::build(Tier3PaneApp::new());
-    let ret = cef::execute_process(Some(args.as_main_args()), Some(&mut app), std::ptr::null_mut());
+    let ret = cef::execute_process(
+        Some(args.as_main_args()),
+        Some(&mut app),
+        std::ptr::null_mut(),
+    );
 
     if is_browser_process {
         // Per every CEF-Rust example in the retained spike: execute_process

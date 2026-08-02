@@ -98,22 +98,17 @@ pub async fn get_topic_list(
     persona_id: String,
     key_hex: String,
 ) -> Result<Vec<TopicInfo>, String> {
-    let topics =
-        topic_store::list_topics(&user_id, &persona_id, &key_hex, Some(&focus_id), None)
-            .await
-            .map_err(|e| e.to_string())?;
+    let topics = topic_store::list_topics(&user_id, &persona_id, &key_hex, Some(&focus_id), None)
+        .await
+        .map_err(|e| e.to_string())?;
 
     Ok(topics.into_iter().map(TopicInfo::from).collect())
 }
 
 #[tauri::command]
 #[specta::specta]
-pub async fn update_topic_state(
-    request: UpdateTopicStateRequest,
-) -> Result<(), String> {
-    const VALID_STATES: &[&str] = &[
-        "Active", "Paused", "Waiting on you", "Complete", "Closed",
-    ];
+pub async fn update_topic_state(request: UpdateTopicStateRequest) -> Result<(), String> {
+    const VALID_STATES: &[&str] = &["Active", "Paused", "Waiting on you", "Complete", "Closed"];
     if !VALID_STATES.contains(&request.state.as_str()) {
         return Err(format!(
             "invalid lifecycle state: {}. Valid: Active, Paused, \

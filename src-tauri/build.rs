@@ -9,7 +9,7 @@ fn main() {
             "libsqlcipher not found. Install the development package:\n  \
              Arch/Garuda: sudo pacman -S sqlcipher\n  \
              Debian/Ubuntu: sudo apt install libsqlcipher-dev\n  \
-             Then retry the build."
+             Then retry the build.",
         );
 
     // -- Privacy Filter (privacy-filter.cpp) --
@@ -40,8 +40,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(privacy_filter_available)");
 
     if let Ok(lib_dir) = std::env::var("PRIVACY_FILTER_LIB_DIR") {
-        let lib_name = std::env::var("PRIVACY_FILTER_LIB_NAME")
-            .unwrap_or_else(|_| "pf".to_owned());
+        let lib_name = std::env::var("PRIVACY_FILTER_LIB_NAME").unwrap_or_else(|_| "pf".to_owned());
 
         println!("cargo:rustc-cfg=privacy_filter_available");
         println!("cargo:rustc-link-search=native={lib_dir}");
@@ -57,9 +56,9 @@ fn main() {
         // Use CARGO_CFG_TARGET_OS (target, not host) to emit the right lib name.
         let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
         match target_os.as_str() {
-            "linux"  => println!("cargo:rustc-link-lib=stdc++"),
-            "macos"  => println!("cargo:rustc-link-lib=c++"),
-            _        => {} // Windows: MSVC links C++ runtime automatically
+            "linux" => println!("cargo:rustc-link-lib=stdc++"),
+            "macos" => println!("cargo:rustc-link-lib=c++"),
+            _ => {} // Windows: MSVC links C++ runtime automatically
         }
     } else {
         println!(

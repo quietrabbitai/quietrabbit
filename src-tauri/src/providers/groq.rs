@@ -53,7 +53,10 @@ impl GroqProvider {
             .timeout(Duration::from_secs(GROQ_HEALTH_TIMEOUT_SECONDS))
             .build()
             .expect("failed to build Groq health-check HTTP client");
-        Self { client, health_client }
+        Self {
+            client,
+            health_client,
+        }
     }
 
     /// Retrieve the Groq API key.
@@ -206,12 +209,8 @@ impl Tier2Provider for GroqProvider {
             })?
             .to_owned();
 
-        let prompt_tokens = body["usage"]["prompt_tokens"]
-            .as_u64()
-            .unwrap_or(0) as u32;
-        let completion_tokens = body["usage"]["completion_tokens"]
-            .as_u64()
-            .unwrap_or(0) as u32;
+        let prompt_tokens = body["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32;
+        let completion_tokens = body["usage"]["completion_tokens"].as_u64().unwrap_or(0) as u32;
 
         Ok(GenerateResponse {
             content,

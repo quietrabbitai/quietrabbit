@@ -168,16 +168,14 @@ pub async fn create_persona(
 
     let persona_id = uuid::Uuid::new_v4().to_string();
 
-    let persona = persona_store::create_persona(
-        &persona_id,
-        &request.name,
-        persona_type,
-        &request.user_id,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+    let persona =
+        persona_store::create_persona(&persona_id, &request.name, persona_type, &request.user_id)
+            .await
+            .map_err(|e| e.to_string())?;
 
-    Ok(CreatePersonaResponse { persona_id: persona.id })
+    Ok(CreatePersonaResponse {
+        persona_id: persona.id,
+    })
 }
 
 #[tauri::command]
@@ -205,10 +203,7 @@ pub async fn list_focuses(persona_id: String) -> Result<Vec<FocusInfo>, String> 
 /// composite. The IPC spec lists focus_id only (higher-level abstraction).
 #[tauri::command]
 #[specta::specta]
-pub async fn get_focus_settings(
-    persona_id: String,
-    focus_id: String,
-) -> Result<FocusInfo, String> {
+pub async fn get_focus_settings(persona_id: String, focus_id: String) -> Result<FocusInfo, String> {
     let s = focus_settings_store::get_focus_settings(&persona_id, &focus_id)
         .await
         .map_err(|e| e.to_string())?
@@ -259,13 +254,10 @@ pub async fn update_focus_settings(
     // Friction gate check (items.id=92). privacy_tier is 1=red (most
     // restrictive) .. 3=green (least restrictive) -- see module header's
     // TIER DIRECTION NOTE. A numeric increase LOOSENS privacy.
-    let existing = focus_settings_store::get_focus_settings(
-        &request.persona_id,
-        &request.focus_id,
-    )
-    .await
-    .map_err(|e| e.to_string())?
-    .ok_or_else(|| "not_found".to_string())?;
+    let existing = focus_settings_store::get_focus_settings(&request.persona_id, &request.focus_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "not_found".to_string())?;
 
     let privacy_would_loosen = request
         .privacy_tier
@@ -281,7 +273,11 @@ pub async fn update_focus_settings(
         let detail = FrictionGateDetail {
             persona_id: request.persona_id.clone(),
             focus_id: request.focus_id.clone(),
-            requested_privacy_tier: if privacy_would_loosen { request.privacy_tier } else { None },
+            requested_privacy_tier: if privacy_would_loosen {
+                request.privacy_tier
+            } else {
+                None
+            },
             requested_focus_profile: if moves_to_protected {
                 request.focus_profile.clone()
             } else {
@@ -292,8 +288,8 @@ pub async fn update_focus_settings(
             privacy_would_loosen,
             moves_to_protected,
         };
-        let detail_json = serde_json::to_string(&detail)
-            .unwrap_or_else(|_| "friction_gate_blocked".to_owned());
+        let detail_json =
+            serde_json::to_string(&detail).unwrap_or_else(|_| "friction_gate_blocked".to_owned());
         return Err(detail_json);
     }
 

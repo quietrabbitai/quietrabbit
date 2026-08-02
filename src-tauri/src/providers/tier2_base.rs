@@ -71,10 +71,8 @@ pub trait Tier2Provider: Send + Sync {
     /// - `ConductorError::ProviderTimeout`     — timeout (retryable)
     /// - `ConductorError::ProviderUnavailable` — connection error (retryable)
     /// - `ConductorError::Provider`            — unexpected HTTP status (terminal)
-    async fn generate(
-        &self,
-        request: &GenerateRequest,
-    ) -> Result<GenerateResponse, ConductorError>;
+    async fn generate(&self, request: &GenerateRequest)
+        -> Result<GenerateResponse, ConductorError>;
 
     /// Check provider availability.
     ///

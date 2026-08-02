@@ -36,13 +36,17 @@ pub async fn gate1<L: DisclosureLogger>(
     provider: Option<String>,
 ) -> Result<Gate1Result, DisclosureLogWriteError> {
     let mut approved: IndexMap<String, String> = IndexMap::new();
-    let mut withheld: Vec<String>              = Vec::new();
+    let mut withheld: Vec<String> = Vec::new();
 
     // Evaluate every field in insertion order (IndexMap preserves order).
     for (field_name, personal_field) in personal_track.fields() {
         match apply_abstraction(personal_field, abstraction_tier) {
-            Some(abstracted) => { approved.insert(field_name.clone(), abstracted); }
-            None             => { withheld.push(field_name.clone()); }
+            Some(abstracted) => {
+                approved.insert(field_name.clone(), abstracted);
+            }
+            None => {
+                withheld.push(field_name.clone());
+            }
         }
     }
 
@@ -51,7 +55,7 @@ pub async fn gate1<L: DisclosureLogger>(
     let mut floor_clamped: Vec<String> = Vec::new();
     if raw_abstraction != abstraction_tier {
         for (field_name, personal_field) in personal_track.fields() {
-            let raw_result     = apply_abstraction(personal_field, raw_abstraction);
+            let raw_result = apply_abstraction(personal_field, raw_abstraction);
             let clamped_result = approved.get(field_name).cloned();
             if raw_result != clamped_result {
                 floor_clamped.push(field_name.clone());
@@ -65,7 +69,10 @@ pub async fn gate1<L: DisclosureLogger>(
         .fields()
         .iter()
         .filter(|(name, pf)| {
-            approved.get(*name).map(|v| v == &pf.field_value).unwrap_or(false)
+            approved
+                .get(*name)
+                .map(|v| v == &pf.field_value)
+                .unwrap_or(false)
         })
         .map(|(name, _)| name.clone())
         .collect();
@@ -82,16 +89,16 @@ pub async fn gate1<L: DisclosureLogger>(
     let log_id = {
         let result = logger
             .write(DisclosureLogEntry {
-                step_id:           step_id.to_string(),
-                focus_run_id:      focus_run_id.to_string(),
+                step_id: step_id.to_string(),
+                focus_run_id: focus_run_id.to_string(),
                 execution_tier,
-                abstraction_tier:  Some(abstraction_tier),
+                abstraction_tier: Some(abstraction_tier),
                 provider,
-                fields_shared:     fields_shared.clone(),
+                fields_shared: fields_shared.clone(),
                 fields_abstracted: fields_abstracted.clone(),
-                fields_withheld:   withheld.clone(),
+                fields_withheld: withheld.clone(),
                 override_declined: false,
-                event_type:        "gate1_pass".to_string(),
+                event_type: "gate1_pass".to_string(),
             })
             .await;
 
@@ -99,7 +106,7 @@ pub async fn gate1<L: DisclosureLogger>(
             Ok(id) => id,
             Err(e) => {
                 if execution_tier > 1 {
-                    return Err(e);   // FATAL at tier 2+
+                    return Err(e); // FATAL at tier 2+
                 }
                 // Non-fatal at tier 1: swallow, use empty sentinel.
                 String::new()
@@ -108,11 +115,11 @@ pub async fn gate1<L: DisclosureLogger>(
     };
 
     Ok(Gate1Result {
-        approved_fields:      approved,
-        withheld_fields:      withheld,
+        approved_fields: approved,
+        withheld_fields: withheld,
         fields_shared,
         floor_clamped_fields: floor_clamped,
-        disclosure_log_id:    log_id,
-        blocked:              false,
+        disclosure_log_id: log_id,
+        blocked: false,
     })
 }

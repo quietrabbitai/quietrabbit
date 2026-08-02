@@ -18,16 +18,16 @@ use super::errors::DisclosureLogWriteError;
 /// event_type carried explicitly (stored in extra_metadata JSON in Python).
 #[derive(Debug, Clone)]
 pub struct DisclosureLogEntry {
-    pub step_id:           String,
-    pub focus_run_id:      String,
-    pub execution_tier:    u8,
-    pub abstraction_tier:  Option<u8>,
-    pub provider:          Option<String>,
-    pub fields_shared:     Vec<String>,
+    pub step_id: String,
+    pub focus_run_id: String,
+    pub execution_tier: u8,
+    pub abstraction_tier: Option<u8>,
+    pub provider: Option<String>,
+    pub fields_shared: Vec<String>,
     pub fields_abstracted: IndexMap<String, String>,
-    pub fields_withheld:   Vec<String>,
+    pub fields_withheld: Vec<String>,
     pub override_declined: bool,
-    pub event_type:        String,
+    pub event_type: String,
 }
 
 #[async_trait]
@@ -35,10 +35,7 @@ pub trait DisclosureLogger: Send + Sync {
     /// Write a disclosure log entry. Returns the log entry id on success.
     /// Always returns a Result — gate functions decide fatality based on
     /// execution_tier (non-fatal at tier 1, fatal at tier 2+).
-    async fn write(
-        &self,
-        entry: DisclosureLogEntry,
-    ) -> Result<String, DisclosureLogWriteError>;
+    async fn write(&self, entry: DisclosureLogEntry) -> Result<String, DisclosureLogWriteError>;
 }
 
 /// Constructs a DisclosureLogger from a FocusRun's own identity fields, at
@@ -83,7 +80,9 @@ pub struct TestLogger {
 impl TestLogger {
     #[allow(clippy::new_without_default)] // Test helper; Default not meaningful.
     pub fn new() -> Self {
-        Self { writes: Mutex::new(Vec::new()) }
+        Self {
+            writes: Mutex::new(Vec::new()),
+        }
     }
 
     pub fn entry_count(&self) -> usize {

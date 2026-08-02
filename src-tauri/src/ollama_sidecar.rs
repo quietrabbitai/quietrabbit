@@ -128,7 +128,10 @@ impl OllamaSidecar {
     /// Tie to `RunEvent::Exit` for headless or multi-window support.
     pub async fn stop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            log::info!("ollama_sidecar: stopping bundled sidecar (PID {:?})", child.id());
+            log::info!(
+                "ollama_sidecar: stopping bundled sidecar (PID {:?})",
+                child.id()
+            );
             if let Err(e) = child.kill().await {
                 log::warn!("ollama_sidecar: kill failed: {e}");
             }
@@ -149,19 +152,12 @@ impl OllamaSidecar {
     ///   - binary question only (running or not)
     ///   - startup-only, not used for runtime monitoring
     async fn detect(&self) -> DetectionResult {
-        let client = match Client::builder()
-            .timeout(Duration::from_secs(2))
-            .build()
-        {
+        let client = match Client::builder().timeout(Duration::from_secs(2)).build() {
             Ok(c) => c,
             Err(_) => return DetectionResult::NotFound,
         };
 
-        match client
-            .get("http://127.0.0.1:11434/api/tags")
-            .send()
-            .await
-        {
+        match client.get("http://127.0.0.1:11434/api/tags").send().await {
             Ok(resp) if resp.status().is_success() => DetectionResult::SystemOllama,
             _ => DetectionResult::NotFound,
         }
@@ -226,21 +222,14 @@ impl OllamaSidecar {
 
     /// Poll 127.0.0.1:11434/api/tags every 500 ms for up to 5 s (10 attempts).
     async fn wait_for_ready(&self) -> bool {
-        let client = match Client::builder()
-            .timeout(Duration::from_secs(2))
-            .build()
-        {
+        let client = match Client::builder().timeout(Duration::from_secs(2)).build() {
             Ok(c) => c,
             Err(_) => return false,
         };
 
         for attempt in 1u8..=10 {
             tokio::time::sleep(Duration::from_millis(500)).await;
-            match client
-                .get("http://127.0.0.1:11434/api/tags")
-                .send()
-                .await
-            {
+            match client.get("http://127.0.0.1:11434/api/tags").send().await {
                 Ok(resp) if resp.status().is_success() => {
                     log::info!("ollama_sidecar: ready after {} poll(s)", attempt);
                     return true;

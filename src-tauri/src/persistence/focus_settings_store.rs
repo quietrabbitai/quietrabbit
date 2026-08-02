@@ -53,7 +53,10 @@ pub enum FocusSettingsStoreError {
     #[error("Validation error: {0}")]
     Validation(String),
     #[error("Not found: focus_settings for persona='{persona_id}' focus='{focus_id}'")]
-    NotFound { persona_id: String, focus_id: String },
+    NotFound {
+        persona_id: String,
+        focus_id: String,
+    },
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -114,9 +117,7 @@ async fn open_shared_db() -> Result<SqliteConnection, FocusSettingsStoreError> {
 // Row extraction
 // ---------------------------------------------------------------------------
 
-fn row_to_focus_settings(
-    row: &sqlx::sqlite::SqliteRow,
-) -> Result<FocusSettings, sqlx::Error> {
+fn row_to_focus_settings(row: &sqlx::sqlite::SqliteRow) -> Result<FocusSettings, sqlx::Error> {
     let voice_raw: Option<String> = row.try_get("voice_override")?;
     let voice_override: Option<serde_json::Value> = match voice_raw {
         None => None,
@@ -236,9 +237,7 @@ pub async fn list_focus_settings_for_persona(
 
     let mut result = Vec::new();
     for r in rows {
-        result.push(
-            row_to_focus_settings(&r).map_err(FocusSettingsStoreError::Database)?,
-        );
+        result.push(row_to_focus_settings(&r).map_err(FocusSettingsStoreError::Database)?);
     }
     Ok(result)
 }
@@ -335,13 +334,12 @@ pub async fn update_focus_settings(
     focus_profile: Option<&str>,
     voice_override: Option<Option<serde_json::Value>>,
 ) -> Result<FocusSettings, FocusSettingsStoreError> {
-    let existing =
-        get_focus_settings(persona_id, focus_id)
-            .await?
-            .ok_or_else(|| FocusSettingsStoreError::NotFound {
-                persona_id: persona_id.to_owned(),
-                focus_id: focus_id.to_owned(),
-            })?;
+    let existing = get_focus_settings(persona_id, focus_id)
+        .await?
+        .ok_or_else(|| FocusSettingsStoreError::NotFound {
+            persona_id: persona_id.to_owned(),
+            focus_id: focus_id.to_owned(),
+        })?;
 
     let new_flow = context_flow.unwrap_or(&existing.context_flow);
     let new_vis = library_visibility.unwrap_or(&existing.library_visibility);

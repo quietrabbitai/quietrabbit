@@ -39,7 +39,9 @@
 use async_trait::async_trait;
 
 use crate::conductor::privacy::errors::DisclosureLogWriteError;
-use crate::conductor::privacy::logger::{DisclosureLogEntry, DisclosureLogger, DisclosureLoggerForRun};
+use crate::conductor::privacy::logger::{
+    DisclosureLogEntry, DisclosureLogger, DisclosureLoggerForRun,
+};
 use crate::persistence::personal_store::{open_personal_db, PersonalStoreError};
 
 /// Concrete, SQLCipher-backed DisclosureLogger. Holds only the identity
@@ -56,8 +58,16 @@ pub struct SqliteDisclosureLogger {
 }
 
 impl SqliteDisclosureLogger {
-    pub fn new(user_id: impl Into<String>, persona_id: impl Into<String>, key_hex: impl Into<String>) -> Self {
-        Self { user_id: user_id.into(), persona_id: persona_id.into(), key_hex: key_hex.into() }
+    pub fn new(
+        user_id: impl Into<String>,
+        persona_id: impl Into<String>,
+        key_hex: impl Into<String>,
+    ) -> Self {
+        Self {
+            user_id: user_id.into(),
+            persona_id: persona_id.into(),
+            key_hex: key_hex.into(),
+        }
     }
 }
 
@@ -139,9 +149,7 @@ pub(crate) async fn write_conn(
     let extra_metadata_json = serde_json::to_string(&serde_json::json!({
         "event_type": entry.event_type,
     }))
-    .map_err(|e| {
-        PersonalStoreError::Validation(format!("extra_metadata not serializable: {e}"))
-    })?;
+    .map_err(|e| PersonalStoreError::Validation(format!("extra_metadata not serializable: {e}")))?;
 
     let declined_at: Option<String> = if entry.override_declined {
         Some(created_at.clone())
@@ -258,7 +266,10 @@ mod tests {
         assert_eq!(persona_id, "persona-1");
         assert_eq!(focus_run_id, "run-1");
         assert_eq!(step_id, "step-1");
-        assert_eq!(routing_tier, 2, "routing_tier must be sourced from execution_tier");
+        assert_eq!(
+            routing_tier, 2,
+            "routing_tier must be sourced from execution_tier"
+        );
         assert_eq!(provider.as_deref(), Some("anthropic"));
         assert_eq!(execution_tier, Some(2));
         assert_eq!(abstraction_tier, Some(1));
@@ -268,7 +279,9 @@ mod tests {
     async fn write_conn_serializes_json_fields_correctly() {
         let mut conn = test_db().await;
         let mut entry = sample_entry("test_event");
-        entry.fields_abstracted.insert("name".to_owned(), "abstracted_value".to_owned());
+        entry
+            .fields_abstracted
+            .insert("name".to_owned(), "abstracted_value".to_owned());
         let id = write_conn(&mut conn, "user-1", "persona-1", entry)
             .await
             .expect("write failed");
@@ -284,11 +297,17 @@ mod tests {
         let fields_withheld: String = row.try_get("fields_withheld").unwrap();
         let extra_metadata: String = row.try_get("extra_metadata").unwrap();
 
-        assert_eq!(serde_json::from_str::<Vec<String>>(&fields_shared).unwrap(), vec!["field_a"]);
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&fields_shared).unwrap(),
+            vec!["field_a"]
+        );
         let abstracted: std::collections::HashMap<String, String> =
             serde_json::from_str(&fields_abstracted).unwrap();
         assert_eq!(abstracted.get("name"), Some(&"abstracted_value".to_owned()));
-        assert_eq!(serde_json::from_str::<Vec<String>>(&fields_withheld).unwrap(), vec!["field_b"]);
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&fields_withheld).unwrap(),
+            vec!["field_b"]
+        );
         let metadata: serde_json::Value = serde_json::from_str(&extra_metadata).unwrap();
         assert_eq!(metadata["event_type"], "test_event");
     }
@@ -298,13 +317,17 @@ mod tests {
         let mut conn = test_db().await;
         let mut entry = sample_entry("declined_event");
         entry.override_declined = true;
-        let id = write_conn(&mut conn, "user-1", "persona-1", entry).await.unwrap();
-
-        let row = sqlx::query("SELECT override_declined, declined_at, created_at FROM disclosure_log WHERE id = ?")
-            .bind(&id)
-            .fetch_one(&mut conn)
+        let id = write_conn(&mut conn, "user-1", "persona-1", entry)
             .await
             .unwrap();
+
+        let row = sqlx::query(
+            "SELECT override_declined, declined_at, created_at FROM disclosure_log WHERE id = ?",
+        )
+        .bind(&id)
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
         let override_declined: bool = row.try_get("override_declined").unwrap();
         let declined_at: Option<String> = row.try_get("declined_at").unwrap();
         let created_at: String = row.try_get("created_at").unwrap();
@@ -316,9 +339,14 @@ mod tests {
     #[tokio::test]
     async fn write_conn_leaves_declined_at_null_when_not_declined() {
         let mut conn = test_db().await;
-        let id = write_conn(&mut conn, "user-1", "persona-1", sample_entry("normal_event"))
-            .await
-            .unwrap();
+        let id = write_conn(
+            &mut conn,
+            "user-1",
+            "persona-1",
+            sample_entry("normal_event"),
+        )
+        .await
+        .unwrap();
 
         let row = sqlx::query("SELECT declined_at FROM disclosure_log WHERE id = ?")
             .bind(&id)
@@ -335,7 +363,9 @@ mod tests {
         let mut entry = sample_entry("no_provider_event");
         entry.provider = None;
         entry.abstraction_tier = None;
-        let id = write_conn(&mut conn, "user-1", "persona-1", entry).await.unwrap();
+        let id = write_conn(&mut conn, "user-1", "persona-1", entry)
+            .await
+            .unwrap();
 
         let row = sqlx::query("SELECT provider, abstraction_tier FROM disclosure_log WHERE id = ?")
             .bind(&id)
@@ -356,9 +386,14 @@ mod tests {
         // test ever needs a delete_* call to compile, that is the signal
         // the append-only contract has been violated.
         let mut conn = test_db().await;
-        let id = write_conn(&mut conn, "user-1", "persona-1", sample_entry("permanent_event"))
-            .await
-            .unwrap();
+        let id = write_conn(
+            &mut conn,
+            "user-1",
+            "persona-1",
+            sample_entry("permanent_event"),
+        )
+        .await
+        .unwrap();
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM disclosure_log WHERE id = ?")
             .bind(&id)
             .fetch_one(&mut conn)
@@ -370,8 +405,12 @@ mod tests {
     #[tokio::test]
     async fn multiple_writes_produce_distinct_ids() {
         let mut conn = test_db().await;
-        let id1 = write_conn(&mut conn, "user-1", "persona-1", sample_entry("e1")).await.unwrap();
-        let id2 = write_conn(&mut conn, "user-1", "persona-1", sample_entry("e2")).await.unwrap();
+        let id1 = write_conn(&mut conn, "user-1", "persona-1", sample_entry("e1"))
+            .await
+            .unwrap();
+        let id2 = write_conn(&mut conn, "user-1", "persona-1", sample_entry("e2"))
+            .await
+            .unwrap();
         assert_ne!(id1, id2);
 
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM disclosure_log")

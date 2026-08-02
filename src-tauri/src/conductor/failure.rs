@@ -102,7 +102,7 @@ pub enum ConductorError {
     #[error("{plain_language}")]
     ProviderUnavailable { plain_language: String },
     #[error("{plain_language}")]
-    Provider { plain_language: String },          // generic provider error
+    Provider { plain_language: String }, // generic provider error
 
     // F4 subtype — voice profile contamination detected at Tier 2+
     // Secondary containment: primary prevention is write-time validation.
@@ -228,7 +228,7 @@ pub enum FailureSeverity {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FailureResult {
     pub action: FailureAction,
-    pub failure_mode: Option<String>,             // F1-F10, F_SYSTEM, F_UNEXPECTED, or None
+    pub failure_mode: Option<String>, // F1-F10, F_SYSTEM, F_UNEXPECTED, or None
     pub plain_language: String,
     pub is_recoverable: bool,
     pub severity: FailureSeverity,
@@ -259,7 +259,9 @@ impl FailureHandler {
             "space_max_permitted_tier must be 1, 2, or 3 — got {}",
             space_max_permitted_tier
         );
-        Self { space_max_permitted_tier }
+        Self {
+            space_max_permitted_tier,
+        }
     }
 
     /// Map a ConductorError to a FailureResult.
@@ -292,13 +294,10 @@ impl FailureHandler {
             },
 
             // F1 — Ollama unavailable: tier branch determines action
-            ConductorError::OllamaUnavailable { .. } => {
-                self.handle_f1_unavailable(msg, sid, fid)
-            }
+            ConductorError::OllamaUnavailable { .. } => self.handle_f1_unavailable(msg, sid, fid),
 
             // F1 — Timeout / generation failure: retry up to MAX_RETRIES
-            ConductorError::OllamaTimeout { .. }
-            | ConductorError::OllamaGeneration { .. } => {
+            ConductorError::OllamaTimeout { .. } | ConductorError::OllamaGeneration { .. } => {
                 if retry_count >= MAX_RETRIES {
                     return self.escalate_failed_retry("F1", sid, fid);
                 }
@@ -327,9 +326,7 @@ impl FailureHandler {
             },
 
             // F2 — Quality below floor: tier + retry branch
-            ConductorError::QualityBelowFloor { .. } => {
-                self.handle_f2(msg, sid, fid, retry_count)
-            }
+            ConductorError::QualityBelowFloor { .. } => self.handle_f2(msg, sid, fid, retry_count),
 
             // F3 — Context window exceeded
             ConductorError::ContextWindowExceeded { .. } => FailureResult {
@@ -402,7 +399,8 @@ impl FailureHandler {
                     "Quiet Rabbit couldn't save your progress checkpoint. ",
                     "Your work will continue but can't be resumed if interrupted. ",
                     "[Continue] [Stop and save manually]",
-                ).to_owned(),
+                )
+                .to_owned(),
                 is_recoverable: true,
                 severity: FailureSeverity::Suggest,
                 step_id: sid,
@@ -418,7 +416,8 @@ impl FailureHandler {
                 plain_language: concat!(
                     "Quiet Rabbit detected a loop and stopped to protect ",
                     "your session. Your work is saved. [Get help]",
-                ).to_owned(),
+                )
+                .to_owned(),
                 is_recoverable: false,
                 severity: FailureSeverity::Stop,
                 step_id: sid,
@@ -427,17 +426,18 @@ impl FailureHandler {
             },
 
             // F10 — API key problems: surface to user
-            ConductorError::MissingApiKey { .. }
-            | ConductorError::InvalidApiKey { .. } => FailureResult {
-                action: FailureAction::AwaitUser,
-                failure_mode: Some("F10".to_owned()),
-                plain_language: msg,
-                is_recoverable: true,
-                severity: FailureSeverity::Require,
-                step_id: sid,
-                focus_id: fid,
-                metadata: None,
-            },
+            ConductorError::MissingApiKey { .. } | ConductorError::InvalidApiKey { .. } => {
+                FailureResult {
+                    action: FailureAction::AwaitUser,
+                    failure_mode: Some("F10".to_owned()),
+                    plain_language: msg,
+                    is_recoverable: true,
+                    severity: FailureSeverity::Require,
+                    step_id: sid,
+                    focus_id: fid,
+                    metadata: None,
+                }
+            }
 
             // F10 — Rate limit: retry with suggest severity
             ConductorError::ProviderRateLimit { .. } => {
@@ -457,8 +457,7 @@ impl FailureHandler {
             }
 
             // F10 — Timeout / unavailable: retry with require severity
-            ConductorError::ProviderTimeout { .. }
-            | ConductorError::ProviderUnavailable { .. } => {
+            ConductorError::ProviderTimeout { .. } | ConductorError::ProviderUnavailable { .. } => {
                 if retry_count >= MAX_RETRIES {
                     return self.escalate_failed_retry("F10", sid, fid);
                 }
@@ -565,7 +564,8 @@ impl FailureHandler {
             plain_language: concat!(
                 "Something unexpected happened. Your work is saved. ",
                 "[Try again] [Get help]",
-            ).to_owned(),
+            )
+            .to_owned(),
             is_recoverable: false,
             severity: FailureSeverity::Stop,
             step_id: step_id.map(|s| s.to_owned()),
@@ -600,7 +600,8 @@ impl FailureHandler {
             plain_language: concat!(
                 "The local AI isn't responding, and this life doesn't ",
                 "allow external services. [Try again] [Get help]",
-            ).to_owned(),
+            )
+            .to_owned(),
             is_recoverable: false,
             severity: FailureSeverity::Stop,
             step_id,
@@ -626,34 +627,49 @@ impl FailureHandler {
                         "The result quality fell below standard repeatedly. ",
                         "Try using an external service? ",
                         "[Use external service] [Keep result] [Get help]",
-                    ).to_owned()
+                    )
+                    .to_owned()
                 } else {
                     concat!(
                         "The result wasn't quite right. ",
                         "Want to try with an external service? ",
                         "[Use external service] [Keep this result] [Try again]",
-                    ).to_owned()
+                    )
+                    .to_owned()
                 },
                 is_recoverable: true,
-                severity: if exhausted { FailureSeverity::Require } else { FailureSeverity::Suggest },
+                severity: if exhausted {
+                    FailureSeverity::Require
+                } else {
+                    FailureSeverity::Suggest
+                },
                 step_id,
                 focus_id,
                 metadata: None,
             };
         }
         FailureResult {
-            action: if exhausted { FailureAction::AwaitUser } else { FailureAction::Retry },
+            action: if exhausted {
+                FailureAction::AwaitUser
+            } else {
+                FailureAction::Retry
+            },
             failure_mode: Some("F2".to_owned()),
             plain_language: if exhausted {
                 concat!(
                     "The local model output quality fell below standard repeatedly. ",
                     "[Review output] [Try again]",
-                ).to_owned()
+                )
+                .to_owned()
             } else {
                 "The result wasn't quite right. Trying again. [Keep this result]".to_owned()
             },
             is_recoverable: true,
-            severity: if exhausted { FailureSeverity::Require } else { FailureSeverity::Suggest },
+            severity: if exhausted {
+                FailureSeverity::Require
+            } else {
+                FailureSeverity::Suggest
+            },
             step_id,
             focus_id,
             metadata: None,
@@ -673,7 +689,8 @@ impl FailureHandler {
                 plain_language: concat!(
                     "This step has failed repeatedly. ",
                     "Switch to an external service? [Use external service] [Stop]",
-                ).to_owned(),
+                )
+                .to_owned(),
                 is_recoverable: true,
                 severity: FailureSeverity::Require,
                 step_id,
@@ -687,7 +704,8 @@ impl FailureHandler {
             plain_language: concat!(
                 "This step failed repeatedly and has been paused. ",
                 "[Try again] [Get help]",
-            ).to_owned(),
+            )
+            .to_owned(),
             is_recoverable: true,
             severity: FailureSeverity::Stop,
             step_id,
@@ -719,8 +737,12 @@ mod tests {
     fn f_system_taxonomy_integrity() {
         let h = handler(1);
         let r = h.handle(
-            &err(ConductorError::TaxonomyIntegrity { plain_language: "bad".to_owned() }),
-            None, None, 0,
+            &err(ConductorError::TaxonomyIntegrity {
+                plain_language: "bad".to_owned(),
+            }),
+            None,
+            None,
+            0,
         );
         assert_eq!(r.action, FailureAction::Stop);
         assert_eq!(r.failure_mode.as_deref(), Some("F_SYSTEM"));
@@ -732,8 +754,12 @@ mod tests {
     fn f_system_disclosure_log_write() {
         let h = handler(1);
         let r = h.handle(
-            &err(ConductorError::DisclosureLogWrite { plain_language: "audit fail".to_owned() }),
-            Some("s1"), Some("f1"), 0,
+            &err(ConductorError::DisclosureLogWrite {
+                plain_language: "audit fail".to_owned(),
+            }),
+            Some("s1"),
+            Some("f1"),
+            0,
         );
         assert_eq!(r.failure_mode.as_deref(), Some("F_SYSTEM"));
         assert!(!r.is_recoverable);
@@ -747,8 +773,12 @@ mod tests {
     fn f1_unavailable_tier1_stops() {
         let h = handler(1);
         let r = h.handle(
-            &err(ConductorError::OllamaUnavailable { plain_language: "down".to_owned() }),
-            None, None, 0,
+            &err(ConductorError::OllamaUnavailable {
+                plain_language: "down".to_owned(),
+            }),
+            None,
+            None,
+            0,
         );
         assert_eq!(r.action, FailureAction::Stop);
         assert!(!r.is_recoverable);
@@ -759,8 +789,12 @@ mod tests {
     fn f1_unavailable_tier2_offers_tier2() {
         let h = handler(2);
         let r = h.handle(
-            &err(ConductorError::OllamaUnavailable { plain_language: "down".to_owned() }),
-            None, None, 0,
+            &err(ConductorError::OllamaUnavailable {
+                plain_language: "down".to_owned(),
+            }),
+            None,
+            None,
+            0,
         );
         assert_eq!(r.action, FailureAction::OfferTier2);
         assert_eq!(r.failure_mode.as_deref(), Some("F1"));
@@ -770,8 +804,12 @@ mod tests {
     fn f1_timeout_retries_under_max() {
         let h = handler(1);
         let r = h.handle(
-            &err(ConductorError::OllamaTimeout { plain_language: "timeout".to_owned() }),
-            None, None, 2,
+            &err(ConductorError::OllamaTimeout {
+                plain_language: "timeout".to_owned(),
+            }),
+            None,
+            None,
+            2,
         );
         assert_eq!(r.action, FailureAction::Retry);
     }
@@ -780,8 +818,12 @@ mod tests {
     fn f1_timeout_escalates_at_max_tier1() {
         let h = handler(1);
         let r = h.handle(
-            &err(ConductorError::OllamaTimeout { plain_language: "timeout".to_owned() }),
-            None, None, MAX_RETRIES,
+            &err(ConductorError::OllamaTimeout {
+                plain_language: "timeout".to_owned(),
+            }),
+            None,
+            None,
+            MAX_RETRIES,
         );
         assert_eq!(r.action, FailureAction::AwaitUser);
         assert_eq!(r.failure_mode.as_deref(), Some("F1"));
@@ -791,8 +833,12 @@ mod tests {
     fn f1_timeout_escalates_at_max_tier2() {
         let h = handler(2);
         let r = h.handle(
-            &err(ConductorError::OllamaTimeout { plain_language: "timeout".to_owned() }),
-            None, None, MAX_RETRIES,
+            &err(ConductorError::OllamaTimeout {
+                plain_language: "timeout".to_owned(),
+            }),
+            None,
+            None,
+            MAX_RETRIES,
         );
         assert_eq!(r.action, FailureAction::OfferTier2);
     }
@@ -801,8 +847,12 @@ mod tests {
     fn f1_invalid_request_stops() {
         let h = handler(2);
         let r = h.handle(
-            &err(ConductorError::OllamaInvalidRequest { plain_language: "bad req".to_owned() }),
-            None, None, 0,
+            &err(ConductorError::OllamaInvalidRequest {
+                plain_language: "bad req".to_owned(),
+            }),
+            None,
+            None,
+            0,
         );
         assert_eq!(r.action, FailureAction::Stop);
         assert!(!r.is_recoverable);
@@ -814,8 +864,12 @@ mod tests {
     fn f2_first_attempt_tier1_retries() {
         let h = handler(1);
         let r = h.handle(
-            &err(ConductorError::QualityBelowFloor { plain_language: "low".to_owned() }),
-            None, None, 0,
+            &err(ConductorError::QualityBelowFloor {
+                plain_language: "low".to_owned(),
+            }),
+            None,
+            None,
+            0,
         );
         assert_eq!(r.action, FailureAction::Retry);
         assert_eq!(r.severity, FailureSeverity::Suggest);
@@ -825,8 +879,12 @@ mod tests {
     fn f2_exhausted_tier1_awaits_user() {
         let h = handler(1);
         let r = h.handle(
-            &err(ConductorError::QualityBelowFloor { plain_language: "low".to_owned() }),
-            None, None, MAX_RETRIES,
+            &err(ConductorError::QualityBelowFloor {
+                plain_language: "low".to_owned(),
+            }),
+            None,
+            None,
+            MAX_RETRIES,
         );
         assert_eq!(r.action, FailureAction::AwaitUser);
         assert_eq!(r.severity, FailureSeverity::Require);
@@ -836,8 +894,12 @@ mod tests {
     fn f2_first_attempt_tier2_offers_tier2() {
         let h = handler(2);
         let r = h.handle(
-            &err(ConductorError::QualityBelowFloor { plain_language: "low".to_owned() }),
-            None, None, 0,
+            &err(ConductorError::QualityBelowFloor {
+                plain_language: "low".to_owned(),
+            }),
+            None,
+            None,
+            0,
         );
         assert_eq!(r.action, FailureAction::OfferTier2);
         assert_eq!(r.severity, FailureSeverity::Suggest);
@@ -847,8 +909,12 @@ mod tests {
     fn f2_exhausted_tier2_offers_tier2_require() {
         let h = handler(2);
         let r = h.handle(
-            &err(ConductorError::QualityBelowFloor { plain_language: "low".to_owned() }),
-            None, None, MAX_RETRIES,
+            &err(ConductorError::QualityBelowFloor {
+                plain_language: "low".to_owned(),
+            }),
+            None,
+            None,
+            MAX_RETRIES,
         );
         assert_eq!(r.action, FailureAction::OfferTier2);
         assert_eq!(r.severity, FailureSeverity::Require);
@@ -860,8 +926,12 @@ mod tests {
     fn f3_context_window_offers_compact() {
         let h = handler(1);
         let r = h.handle(
-            &err(ConductorError::ContextWindowExceeded { plain_language: "too long".to_owned() }),
-            None, None, 0,
+            &err(ConductorError::ContextWindowExceeded {
+                plain_language: "too long".to_owned(),
+            }),
+            None,
+            None,
+            0,
         );
         assert_eq!(r.action, FailureAction::OfferCompact);
         assert_eq!(r.failure_mode.as_deref(), Some("F3"));
@@ -871,8 +941,12 @@ mod tests {
     fn f4_privacy_gate_blocked_awaits_user() {
         let h = handler(1);
         let r = h.handle(
-            &err(ConductorError::PrivacyGateBlocked { plain_language: "blocked".to_owned() }),
-            None, None, 0,
+            &err(ConductorError::PrivacyGateBlocked {
+                plain_language: "blocked".to_owned(),
+            }),
+            None,
+            None,
+            0,
         );
         assert_eq!(r.action, FailureAction::AwaitUser);
         assert_eq!(r.severity, FailureSeverity::Stop);
@@ -882,8 +956,12 @@ mod tests {
     fn f4_content_promotion_blocked_awaits_user() {
         let h = handler(1);
         let r = h.handle(
-            &err(ConductorError::ContentPromotionBlocked { plain_language: "blocked".to_owned() }),
-            None, None, 0,
+            &err(ConductorError::ContentPromotionBlocked {
+                plain_language: "blocked".to_owned(),
+            }),
+            None,
+            None,
+            0,
         );
         assert_eq!(r.action, FailureAction::AwaitUser);
         assert_eq!(r.failure_mode.as_deref(), Some("F4"));
@@ -893,8 +971,12 @@ mod tests {
     fn f5_security_flag_stops() {
         let h = handler(1);
         let r = h.handle(
-            &err(ConductorError::SecurityCheckerFlag { plain_language: "flagged".to_owned() }),
-            None, None, 0,
+            &err(ConductorError::SecurityCheckerFlag {
+                plain_language: "flagged".to_owned(),
+            }),
+            None,
+            None,
+            0,
         );
         assert_eq!(r.action, FailureAction::Stop);
         assert!(!r.is_recoverable);
@@ -904,8 +986,12 @@ mod tests {
     fn f6_inbound_contamination_holds_for_gate() {
         let h = handler(1);
         let r = h.handle(
-            &err(ConductorError::InboundContamination { plain_language: "contaminated".to_owned() }),
-            None, None, 0,
+            &err(ConductorError::InboundContamination {
+                plain_language: "contaminated".to_owned(),
+            }),
+            None,
+            None,
+            0,
         );
         assert_eq!(r.action, FailureAction::HoldForGate);
         assert_eq!(r.failure_mode.as_deref(), Some("F6"));
@@ -915,8 +1001,12 @@ mod tests {
     fn f7_personal_db_not_found_stops() {
         let h = handler(1);
         let r = h.handle(
-            &err(ConductorError::PersonalDbNotFound { plain_language: "missing".to_owned() }),
-            None, None, 0,
+            &err(ConductorError::PersonalDbNotFound {
+                plain_language: "missing".to_owned(),
+            }),
+            None,
+            None,
+            0,
         );
         assert_eq!(r.action, FailureAction::Stop);
         assert!(!r.is_recoverable);
@@ -927,8 +1017,12 @@ mod tests {
     fn f8_snapshot_write_degrades() {
         let h = handler(1);
         let r = h.handle(
-            &err(ConductorError::SnapshotWrite { plain_language: "disk full".to_owned() }),
-            None, None, 0,
+            &err(ConductorError::SnapshotWrite {
+                plain_language: "disk full".to_owned(),
+            }),
+            None,
+            None,
+            0,
         );
         assert_eq!(r.action, FailureAction::Degrade);
         assert_eq!(r.severity, FailureSeverity::Suggest);
@@ -939,8 +1033,12 @@ mod tests {
     fn f9_loop_detected_stops() {
         let h = handler(1);
         let r = h.handle(
-            &err(ConductorError::LoopDetected { plain_language: "loop".to_owned() }),
-            None, None, 0,
+            &err(ConductorError::LoopDetected {
+                plain_language: "loop".to_owned(),
+            }),
+            None,
+            None,
+            0,
         );
         assert_eq!(r.action, FailureAction::Stop);
         assert!(!r.is_recoverable);
@@ -953,8 +1051,12 @@ mod tests {
     fn f10_missing_api_key_awaits_user() {
         let h = handler(2);
         let r = h.handle(
-            &err(ConductorError::MissingApiKey { plain_language: "no key".to_owned() }),
-            None, None, 0,
+            &err(ConductorError::MissingApiKey {
+                plain_language: "no key".to_owned(),
+            }),
+            None,
+            None,
+            0,
         );
         assert_eq!(r.action, FailureAction::AwaitUser);
         assert_eq!(r.failure_mode.as_deref(), Some("F10"));
@@ -964,8 +1066,12 @@ mod tests {
     fn f10_rate_limit_retries_with_suggest() {
         let h = handler(2);
         let r = h.handle(
-            &err(ConductorError::ProviderRateLimit { plain_language: "429".to_owned() }),
-            None, None, 0,
+            &err(ConductorError::ProviderRateLimit {
+                plain_language: "429".to_owned(),
+            }),
+            None,
+            None,
+            0,
         );
         assert_eq!(r.action, FailureAction::Retry);
         assert_eq!(r.severity, FailureSeverity::Suggest);
@@ -975,8 +1081,12 @@ mod tests {
     fn f10_rate_limit_escalates_at_max() {
         let h = handler(2);
         let r = h.handle(
-            &err(ConductorError::ProviderRateLimit { plain_language: "429".to_owned() }),
-            None, None, MAX_RETRIES,
+            &err(ConductorError::ProviderRateLimit {
+                plain_language: "429".to_owned(),
+            }),
+            None,
+            None,
+            MAX_RETRIES,
         );
         assert_eq!(r.action, FailureAction::OfferTier2);
     }
@@ -985,8 +1095,12 @@ mod tests {
     fn f10_provider_timeout_retries() {
         let h = handler(1);
         let r = h.handle(
-            &err(ConductorError::ProviderTimeout { plain_language: "timeout".to_owned() }),
-            None, None, 1,
+            &err(ConductorError::ProviderTimeout {
+                plain_language: "timeout".to_owned(),
+            }),
+            None,
+            None,
+            1,
         );
         assert_eq!(r.action, FailureAction::Retry);
         assert_eq!(r.severity, FailureSeverity::Require);
@@ -996,8 +1110,12 @@ mod tests {
     fn f10_generic_provider_awaits_user() {
         let h = handler(2);
         let r = h.handle(
-            &err(ConductorError::Provider { plain_language: "oops".to_owned() }),
-            None, None, 0,
+            &err(ConductorError::Provider {
+                plain_language: "oops".to_owned(),
+            }),
+            None,
+            None,
+            0,
         );
         assert_eq!(r.action, FailureAction::AwaitUser);
         assert_eq!(r.failure_mode.as_deref(), Some("F10"));
@@ -1023,8 +1141,12 @@ mod tests {
     fn step_and_focus_id_threaded_through() {
         let h = handler(1);
         let r = h.handle(
-            &err(ConductorError::LoopDetected { plain_language: "loop".to_owned() }),
-            Some("step-42"), Some("focus-7"), 0,
+            &err(ConductorError::LoopDetected {
+                plain_language: "loop".to_owned(),
+            }),
+            Some("step-42"),
+            Some("focus-7"),
+            0,
         );
         assert_eq!(r.step_id.as_deref(), Some("step-42"));
         assert_eq!(r.focus_id.as_deref(), Some("focus-7"));
@@ -1039,7 +1161,9 @@ mod tests {
             &err(ConductorError::VoiceProfileContamination {
                 plain_language: "pii detected in voice profile".to_owned(),
             }),
-            None, None, 0,
+            None,
+            None,
+            0,
         );
         assert_eq!(r.action, FailureAction::Stop);
         assert_eq!(r.failure_mode.as_deref(), Some("F4"));
@@ -1054,7 +1178,9 @@ mod tests {
             &err(ConductorError::MissingTier2Config {
                 plain_language: "no external provider configured".to_owned(),
             }),
-            None, None, 0,
+            None,
+            None,
+            0,
         );
         assert_eq!(r.action, FailureAction::AwaitUser);
         assert_eq!(r.failure_mode.as_deref(), Some("F10"));
@@ -1069,7 +1195,9 @@ mod tests {
             &err(ConductorError::TierBoundaryViolation {
                 plain_language: "step requires tier 2, life permits tier 1".to_owned(),
             }),
-            None, None, 0,
+            None,
+            None,
+            0,
         );
         assert_eq!(r.action, FailureAction::Stop);
         assert_eq!(r.failure_mode.as_deref(), Some("F_SYSTEM"));
@@ -1083,7 +1211,9 @@ mod tests {
             &err(ConductorError::InsecureKeychain {
                 plain_language: "platform keychain is plaintext".to_owned(),
             }),
-            None, None, 0,
+            None,
+            None,
+            0,
         );
         assert_eq!(r.action, FailureAction::Stop);
         assert_eq!(r.failure_mode.as_deref(), Some("F_SYSTEM"));

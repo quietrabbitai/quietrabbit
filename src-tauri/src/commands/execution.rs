@@ -95,8 +95,10 @@ pub async fn submit_focus_run(
 ) -> Result<SubmitFocusRunResponse, String> {
     let is_quick_ask = request.focus_id == "quick-ask";
     let scheduler = Arc::clone(&*scheduler);
-    let confirmed_cross_persona_fact_ids: std::collections::HashSet<String> =
-        request.confirmed_cross_persona_fact_ids.into_iter().collect();
+    let confirmed_cross_persona_fact_ids: std::collections::HashSet<String> = request
+        .confirmed_cross_persona_fact_ids
+        .into_iter()
+        .collect();
 
     // Default type param (FocusRun<L = SqliteDisclosureLogger>) does not
     // resolve through full inference at a plain `let` binding -- explicit

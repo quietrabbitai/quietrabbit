@@ -45,8 +45,8 @@ pub async fn gate2<L: DisclosureLogger>(
     let response_lower = response_content.to_lowercase();
 
     // Build shared-field exclusion set (None = no exclusion, all fields scanned).
-    let shared_set: Option<std::collections::HashSet<&str>> = fields_shared
-        .map(|s| s.iter().map(|x| x.as_str()).collect());
+    let shared_set: Option<std::collections::HashSet<&str>> =
+        fields_shared.map(|s| s.iter().map(|x| x.as_str()).collect());
 
     let mut matched: Vec<String> = Vec::new();
 
@@ -78,21 +78,21 @@ pub async fn gate2<L: DisclosureLogger>(
     if flagged {
         let write_result = logger
             .write(DisclosureLogEntry {
-                step_id:           step_id.to_string(),
-                focus_run_id:      focus_run_id.to_string(),
+                step_id: step_id.to_string(),
+                focus_run_id: focus_run_id.to_string(),
                 execution_tier,
-                abstraction_tier:  None,
+                abstraction_tier: None,
                 provider,
-                fields_shared:     vec![],
+                fields_shared: vec![],
                 fields_abstracted: IndexMap::new(),
-                fields_withheld:   matched.clone(),
+                fields_withheld: matched.clone(),
                 override_declined: false,
-                event_type:        "gate2_contamination_detected".to_string(),
+                event_type: "gate2_contamination_detected".to_string(),
             })
             .await;
         if let Err(e) = write_result {
             if execution_tier > 1 {
-                return Err(e);   // FATAL at tier 2+
+                return Err(e); // FATAL at tier 2+
             }
             // Non-fatal at tier 1: swallow, continue.
         }

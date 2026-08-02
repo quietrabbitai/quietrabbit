@@ -171,14 +171,14 @@ struct RawFocusFile {
     id: Option<String>,
     display_name: Option<String>,
     description: Option<String>,
-    version: Option<serde_yaml::Value>,          // YAML may parse "1.0" as Number; stringify
+    version: Option<serde_yaml::Value>, // YAML may parse "1.0" as Number; stringify
     max_routing_tier: Option<u8>,
-    output_types: Option<Vec<String>>,            // conductor-brief (preferred)
-    output_type: Option<String>,                  // legacy single value — fallback only
-    guides: Option<Vec<String>>,                  // focus-level; first entry = step default
+    output_types: Option<Vec<String>>, // conductor-brief (preferred)
+    output_type: Option<String>,       // legacy single value — fallback only
+    guides: Option<Vec<String>>,       // focus-level; first entry = step default
     suggest_in_focuses: Option<Vec<String>>,
     multi_source_validation: Option<bool>,
-    steps: Option<IndexMap<String, RawStep>>,     // IndexMap preserves YAML dict order
+    steps: Option<IndexMap<String, RawStep>>, // IndexMap preserves YAML dict order
     #[allow(dead_code)] // D6-343: parsed for forward compat, not wired in Release 1.
     brief: Option<serde_yaml::Value>,
     // decisions.id=513 (D6-471), items.id=175. No .focus file in this repo
@@ -204,14 +204,14 @@ struct RawDisplayConfig {
 #[derive(Deserialize)]
 struct RawStep {
     display_name: Option<String>,
-    guide_id: Option<String>,                     // overrides focus-level default if present
+    guide_id: Option<String>, // overrides focus-level default if present
     task_type: Option<String>,
     routing_tier: Option<u8>,
     step_type: Option<String>,
     output_var: Option<String>,
     prompt_template: Option<String>,
     field_requirements: Option<Vec<RawFieldRequirement>>,
-    options_override: Option<serde_yaml::Value>,  // YAML map -> HashMap<String, json::Value>
+    options_override: Option<serde_yaml::Value>, // YAML map -> HashMap<String, json::Value>
 }
 
 #[derive(Deserialize)]
@@ -308,7 +308,9 @@ fn parse_focus_definition(raw: RawFocusFile) -> Result<FocusDefinition, Lifecycl
             steps.push(StepDefinition {
                 step_id: step_id_key.clone(),
                 display_name: raw_step.display_name.unwrap_or_else(|| step_id_key.clone()),
-                guide_id: raw_step.guide_id.unwrap_or_else(|| default_guide_id.clone()),
+                guide_id: raw_step
+                    .guide_id
+                    .unwrap_or_else(|| default_guide_id.clone()),
                 task_type: raw_step.task_type.unwrap_or_else(|| "general".to_owned()),
                 routing_tier: raw_step.routing_tier.unwrap_or(1),
                 step_type,
@@ -636,7 +638,9 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
     /// Verify tier permissions and key; create focus_run record at status=initializing.
     /// Python oracle: FocusRun.authorize()
     pub async fn authorize(&mut self) -> Result<(), LifecycleError> {
-        let _ = self.focus_def.as_ref()
+        let _ = self
+            .focus_def
+            .as_ref()
             .expect("authorize() requires load() to have succeeded first");
 
         // Key presence check — PersonalDBDecryptionError equivalent.
@@ -830,10 +834,13 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             .await
             .map_err(|e| LifecycleError::PersonalStore(e.to_string()))?;
         for fact in entity_facts {
-            self.apply_entity_fact_provenance_check(&mut track, fact).await?;
+            self.apply_entity_fact_provenance_check(&mut track, fact)
+                .await?;
         }
 
-        let focus_def = self.focus_def.as_ref()
+        let focus_def = self
+            .focus_def
+            .as_ref()
             .expect("build_personal_track() requires focus_def");
 
         let mut guide_ids: Vec<String> =
@@ -966,7 +973,9 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                 "lifecycle: entity_facts row (id='{}', field='{}', \
                  origin_persona_id={:?}) omitted from context — not present \
                  in confirmed_cross_persona_fact_ids (decisions.id=639).",
-                fact.id, fact.field_name, fact.origin_persona_id,
+                fact.id,
+                fact.field_name,
+                fact.origin_persona_id,
             );
             return Ok(());
         }
@@ -1057,15 +1066,30 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
     pub async fn execute(&mut self) -> Result<Option<RunResult>, LifecycleError> {
         // Programmer-error guards (not privacy invariants — see D6-348).
         assert!(
-            self.personal_track.as_ref().map(|t| t.is_sealed()).unwrap_or(false),
+            self.personal_track
+                .as_ref()
+                .map(|t| t.is_sealed())
+                .unwrap_or(false),
             "execute() requires a sealed PersonalTrack"
         );
         assert!(self.task_track.is_some(), "execute() requires task_track");
-        assert!(self.shared_state.is_some(), "execute() requires shared_state");
+        assert!(
+            self.shared_state.is_some(),
+            "execute() requires shared_state"
+        );
         assert!(self.focus_def.is_some(), "execute() requires focus_def");
-        assert!(self.focus_run_id.is_some(), "execute() requires focus_run_id");
-        assert!(self.failure_handler.is_some(), "execute() requires failure_handler");
-        assert!(self.privacy_gateway.is_some(), "execute() requires privacy_gateway");
+        assert!(
+            self.focus_run_id.is_some(),
+            "execute() requires focus_run_id"
+        );
+        assert!(
+            self.failure_handler.is_some(),
+            "execute() requires failure_handler"
+        );
+        assert!(
+            self.privacy_gateway.is_some(),
+            "execute() requires privacy_gateway"
+        );
 
         let checkpoint_every = std::env::var("QR_CHECKPOINT_EVERY_N_STEPS")
             .ok()
@@ -1163,8 +1187,11 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         log::debug!(
             "lifecycle: step={} execution_tier={} abstraction_tier={} \
              raw_abstraction={} focus_privacy_tier={}",
-            step.step_id, execution_tier, abstraction_tier,
-            raw_abstraction, self._focus_privacy_tier,
+            step.step_id,
+            execution_tier,
+            abstraction_tier,
+            raw_abstraction,
+            self._focus_privacy_tier,
         );
 
         // Gate3 look-ahead: next step's execution_tier
@@ -1460,9 +1487,13 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
     /// Delete all snapshots for this run. Non-fatal.
     /// Python oracle: FocusRun._purge_snapshots()
     async fn purge_snapshots(&self) {
-        let Some(focus_run_id) = &self.focus_run_id else { return };
+        let Some(focus_run_id) = &self.focus_run_id else {
+            return;
+        };
         let key_hex = self.key_hex.as_deref().unwrap_or("");
-        if key_hex.is_empty() { return }
+        if key_hex.is_empty() {
+            return;
+        }
         let Ok(mut conn) = open_outputs_db(&self.user_id, &self.persona_id, key_hex).await else {
             return;
         };
@@ -1494,7 +1525,8 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             log::warn!(
                 "lifecycle: run_history write failed (non-fatal) — \
                  focus={} focus_run_id={} error={e}",
-                self.focus_id, focus_run_id,
+                self.focus_id,
+                focus_run_id,
             );
         }
     }
@@ -1536,12 +1568,16 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             Err(e) => {
                 // F_SYSTEM: TaxonomyIntegrity or DatabaseMigration -> FailureResult
                 let maybe_conductor = match &e {
-                    LifecycleError::TaxonomyIntegrity(msg) => Some(ConductorError::TaxonomyIntegrity {
-                        plain_language: msg.clone(),
-                    }),
-                    LifecycleError::DatabaseMigration(msg) => Some(ConductorError::DatabaseMigration {
-                        plain_language: msg.clone(),
-                    }),
+                    LifecycleError::TaxonomyIntegrity(msg) => {
+                        Some(ConductorError::TaxonomyIntegrity {
+                            plain_language: msg.clone(),
+                        })
+                    }
+                    LifecycleError::DatabaseMigration(msg) => {
+                        Some(ConductorError::DatabaseMigration {
+                            plain_language: msg.clone(),
+                        })
+                    }
                     _ => None,
                 };
 
@@ -1625,8 +1661,8 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         // Field names only -- values never leave the PersonalTrack boundary.
         // Deduplicated via HashSet to avoid redundant model prompt context.
         let excluded_fields: Vec<String> = {
-            use std::collections::HashSet;
             use crate::persistence::personal_store::list_personal_fields;
+            use std::collections::HashSet;
 
             let key_hex = self.key_hex.as_deref().ok_or(LifecycleError::NoKey)?;
 
@@ -1641,18 +1677,13 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                 })
                 .unwrap_or_default();
 
-            let existing: Vec<String> = list_personal_fields(
-                &self.user_id,
-                &self.persona_id,
-                key_hex,
-                None,
-                None,
-            )
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|f| f.field_name)
-            .collect();
+            let existing: Vec<String> =
+                list_personal_fields(&self.user_id, &self.persona_id, key_hex, None, None)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|f| f.field_name)
+                    .collect();
 
             focus_fields
                 .into_iter()
@@ -1669,16 +1700,12 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
 
         if !candidates.is_empty() {
             // Invariant: focus_run_id must be set by AUTHORIZE before we reach here.
-            let focus_run_id = self
-                .focus_run_id
-                .clone()
-                .ok_or_else(|| LifecycleError::ValidationFailed(
+            let focus_run_id = self.focus_run_id.clone().ok_or_else(|| {
+                LifecycleError::ValidationFailed(
                     "focus_run_id missing during extraction pass".to_owned(),
-                ))?;
-            let key_hex = self
-                .key_hex
-                .clone()
-                .ok_or(LifecycleError::NoKey)?;
+                )
+            })?;
+            let key_hex = self.key_hex.clone().ok_or(LifecycleError::NoKey)?;
 
             // Persist candidates to outputs.db.
             // INVARIANT: persist_candidates() returns ids in the same order as
@@ -1859,7 +1886,10 @@ mod tests {
         let mut r = minimal_raw();
         r.output_types = Some(vec!["research_report".to_owned()]);
         r.output_type = Some("ignored".to_owned());
-        assert_eq!(parse_focus_definition(r).unwrap().output_type, "research_report");
+        assert_eq!(
+            parse_focus_definition(r).unwrap().output_type,
+            "research_report"
+        );
 
         let mut r2 = minimal_raw();
         r2.output_types = None;
@@ -1906,9 +1936,15 @@ mod tests {
         steps_map.insert(
             "step_x".to_owned(),
             RawStep {
-                display_name: None, guide_id: None, task_type: None,
-                routing_tier: None, step_type: None, output_var: None,
-                prompt_template: None, field_requirements: None, options_override: None,
+                display_name: None,
+                guide_id: None,
+                task_type: None,
+                routing_tier: None,
+                step_type: None,
+                output_var: None,
+                prompt_template: None,
+                field_requirements: None,
+                options_override: None,
             },
         );
         let mut raw = minimal_raw();
@@ -1933,14 +1969,24 @@ mod tests {
     fn run_for_sensitivity(ceiling: i32) -> FocusRun {
         let scheduler = Arc::new(ConductorScheduler::new());
         let mut run = FocusRun::new(
-            "u".to_owned(), "p".to_owned(), "f".to_owned(),
-            scheduler, "".to_owned(), false, None, None, false,
-            std::collections::HashSet::new(), None,
+            "u".to_owned(),
+            "p".to_owned(),
+            "f".to_owned(),
+            scheduler,
+            "".to_owned(),
+            false,
+            None,
+            None,
+            false,
+            std::collections::HashSet::new(),
+            None,
         );
         let mut tt = TaskTrack::new();
         tt.add_step(TaskStep {
-            step_id: "s".to_owned(), output_var: None,
-            content: "x".to_owned(), sensitivity_severity: ceiling,
+            step_id: "s".to_owned(),
+            output_var: None,
+            content: "x".to_owned(),
+            sensitivity_severity: ceiling,
             routing_tier_used: 1,
         });
         run.task_track = Some(tt);
@@ -1948,13 +1994,21 @@ mod tests {
     }
 
     #[test]
-    fn output_sensitivity_general()   { assert_eq!(run_for_sensitivity(1).output_sensitivity(), "general");   }
+    fn output_sensitivity_general() {
+        assert_eq!(run_for_sensitivity(1).output_sensitivity(), "general");
+    }
     #[test]
-    fn output_sensitivity_personal()  { assert_eq!(run_for_sensitivity(2).output_sensitivity(), "personal");  }
+    fn output_sensitivity_personal() {
+        assert_eq!(run_for_sensitivity(2).output_sensitivity(), "personal");
+    }
     #[test]
-    fn output_sensitivity_medical()   { assert_eq!(run_for_sensitivity(3).output_sensitivity(), "medical");   }
+    fn output_sensitivity_medical() {
+        assert_eq!(run_for_sensitivity(3).output_sensitivity(), "medical");
+    }
     #[test]
-    fn output_sensitivity_financial() { assert_eq!(run_for_sensitivity(4).output_sensitivity(), "financial"); }
+    fn output_sensitivity_financial() {
+        assert_eq!(run_for_sensitivity(4).output_sensitivity(), "financial");
+    }
     #[test]
     fn output_sensitivity_out_of_range_defaults_general() {
         assert_eq!(run_for_sensitivity(99).output_sensitivity(), "general");
@@ -1963,9 +2017,17 @@ mod tests {
     fn output_sensitivity_no_track_defaults_general() {
         let scheduler = Arc::new(ConductorScheduler::new());
         let run: FocusRun = FocusRun::new(
-            "u".to_owned(), "p".to_owned(), "f".to_owned(),
-            scheduler, "".to_owned(), false, None, None, false,
-            std::collections::HashSet::new(), None,
+            "u".to_owned(),
+            "p".to_owned(),
+            "f".to_owned(),
+            scheduler,
+            "".to_owned(),
+            false,
+            None,
+            None,
+            false,
+            std::collections::HashSet::new(),
+            None,
         );
         assert_eq!(run.output_sensitivity(), "general");
     }
@@ -2019,9 +2081,17 @@ mod tests {
     ) -> FocusRun {
         let scheduler = Arc::new(ConductorScheduler::new());
         FocusRun::new(
-            "u".to_owned(), persona_id.to_owned(), "f".to_owned(),
-            scheduler, "".to_owned(), false, None, None, false,
-            confirmed_cross_persona_fact_ids, None,
+            "u".to_owned(),
+            persona_id.to_owned(),
+            "f".to_owned(),
+            scheduler,
+            "".to_owned(),
+            false,
+            None,
+            None,
+            false,
+            confirmed_cross_persona_fact_ids,
+            None,
         )
     }
 
@@ -2050,7 +2120,9 @@ mod tests {
         let mut track = PersonalTrack::new();
         let fact = make_fact("fact-1", "persona-student", false, None);
 
-        let result = run.apply_entity_fact_provenance_check(&mut track, fact).await;
+        let result = run
+            .apply_entity_fact_provenance_check(&mut track, fact)
+            .await;
 
         assert!(result.is_ok());
         assert_eq!(track.entity_facts().len(), 1);
@@ -2064,7 +2136,9 @@ mod tests {
         // the "should be unreachable" integrity-violation case.
         let fact = make_fact("fact-1", "persona-student", false, None);
 
-        let result = run.apply_entity_fact_provenance_check(&mut track, fact).await;
+        let result = run
+            .apply_entity_fact_provenance_check(&mut track, fact)
+            .await;
 
         assert!(result.is_err());
         assert_eq!(track.entity_facts().len(), 0);
@@ -2086,7 +2160,9 @@ mod tests {
         let mut track = PersonalTrack::new();
         let fact = make_fact("fact-1", "persona-student", true, Some("persona-student"));
 
-        let result = run.apply_entity_fact_provenance_check(&mut track, fact).await;
+        let result = run
+            .apply_entity_fact_provenance_check(&mut track, fact)
+            .await;
 
         assert!(result.is_ok());
         assert_eq!(track.entity_facts().len(), 1);
@@ -2101,10 +2177,19 @@ mod tests {
         let mut track = PersonalTrack::new();
         let fact = make_fact("fact-1", "persona-student", true, Some("persona-student"));
 
-        let result = run.apply_entity_fact_provenance_check(&mut track, fact).await;
+        let result = run
+            .apply_entity_fact_provenance_check(&mut track, fact)
+            .await;
 
-        assert!(result.is_ok(), "declined cross-Persona fact must not error the run");
-        assert_eq!(track.entity_facts().len(), 0, "declined fact must be omitted, not included");
+        assert!(
+            result.is_ok(),
+            "declined cross-Persona fact must not error the run"
+        );
+        assert_eq!(
+            track.entity_facts().len(),
+            0,
+            "declined fact must be omitted, not included"
+        );
     }
 
     #[tokio::test]
@@ -2117,7 +2202,9 @@ mod tests {
         let mut track = PersonalTrack::new();
         let fact = make_fact("fact-1", "persona-student", true, Some("persona-student"));
 
-        let result = run.apply_entity_fact_provenance_check(&mut track, fact).await;
+        let result = run
+            .apply_entity_fact_provenance_check(&mut track, fact)
+            .await;
 
         assert!(result.is_ok());
         assert_eq!(track.entity_facts().len(), 0);
@@ -2131,7 +2218,9 @@ mod tests {
         let mut track = PersonalTrack::new();
         let fact = make_fact("fact-1", "persona-student", false, None);
 
-        run.apply_entity_fact_provenance_check(&mut track, fact).await.unwrap();
+        run.apply_entity_fact_provenance_check(&mut track, fact)
+            .await
+            .unwrap();
 
         assert_eq!(track.fields().len(), 0);
         assert_eq!(track.entity_facts().len(), 1);
@@ -2150,9 +2239,17 @@ mod tests {
     ) -> FocusRun<crate::conductor::privacy::logger::TestLogger> {
         let scheduler = Arc::new(ConductorScheduler::new());
         let mut run: FocusRun<crate::conductor::privacy::logger::TestLogger> = FocusRun::new(
-            "u".to_owned(), persona_id.to_owned(), "f".to_owned(),
-            scheduler, "".to_owned(), false, None, None, false,
-            std::collections::HashSet::new(), None,
+            "u".to_owned(),
+            persona_id.to_owned(),
+            "f".to_owned(),
+            scheduler,
+            "".to_owned(),
+            false,
+            None,
+            None,
+            false,
+            std::collections::HashSet::new(),
+            None,
         );
         // apply_entity_fact_provenance_check only writes when
         // self.privacy_gateway is Some (see its `if let Some(gateway)`
@@ -2173,10 +2270,16 @@ mod tests {
         let mut track = PersonalTrack::new();
         let fact = make_fact("fact-1", "persona-student", true, Some("persona-student"));
 
-        run.apply_entity_fact_provenance_check(&mut track, fact).await.unwrap();
+        run.apply_entity_fact_provenance_check(&mut track, fact)
+            .await
+            .unwrap();
 
         let logger = &run.privacy_gateway.as_ref().unwrap().logger;
-        assert_eq!(logger.entry_count(), 1, "the decline must produce exactly one disclosure-log entry");
+        assert_eq!(
+            logger.entry_count(),
+            1,
+            "the decline must produce exactly one disclosure-log entry"
+        );
         let entry = &logger.entries()[0];
         assert_eq!(entry.step_id, "initialize");
         // Key format is "entity_id:field_name" (compute_content_hash's own
@@ -2200,9 +2303,17 @@ mod tests {
         confirmed.insert("fact-1".to_owned());
         let scheduler = Arc::new(ConductorScheduler::new());
         let mut run: FocusRun<crate::conductor::privacy::logger::TestLogger> = FocusRun::new(
-            "u".to_owned(), "persona-work".to_owned(), "f".to_owned(),
-            scheduler, "".to_owned(), false, None, None, false,
-            confirmed, None,
+            "u".to_owned(),
+            "persona-work".to_owned(),
+            "f".to_owned(),
+            scheduler,
+            "".to_owned(),
+            false,
+            None,
+            None,
+            false,
+            confirmed,
+            None,
         );
         use crate::conductor::privacy::logger::DisclosureLoggerForRun;
         use crate::conductor::privacy::PrivacyGateway;
@@ -2212,9 +2323,15 @@ mod tests {
         let mut track = PersonalTrack::new();
         let fact = make_fact("fact-1", "persona-student", true, Some("persona-student"));
 
-        run.apply_entity_fact_provenance_check(&mut track, fact).await.unwrap();
+        run.apply_entity_fact_provenance_check(&mut track, fact)
+            .await
+            .unwrap();
 
         let logger = &run.privacy_gateway.as_ref().unwrap().logger;
-        assert_eq!(logger.entry_count(), 0, "a confirmed (included) fact must not write a disclosure-log entry");
+        assert_eq!(
+            logger.entry_count(),
+            0,
+            "a confirmed (included) fact must not write a disclosure-log entry"
+        );
     }
 }

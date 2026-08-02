@@ -70,10 +70,9 @@ pub async fn get_personal_fields(
     user_id: String,
     key_hex: String,
 ) -> Result<Vec<PersonalFieldInfo>, String> {
-    let fields =
-        personal_store::list_personal_fields(&user_id, &persona_id, &key_hex, None, None)
-            .await
-            .map_err(|e| e.to_string())?;
+    let fields = personal_store::list_personal_fields(&user_id, &persona_id, &key_hex, None, None)
+        .await
+        .map_err(|e| e.to_string())?;
 
     // Project to IPC-safe struct. field_value is never included.
     Ok(fields
@@ -101,12 +100,12 @@ pub async fn update_personal_field(
         &request.field_name,
         &request.value,
         sensitivity,
-        "user",  // source_id: user-entered fields always have source "user"
-        "self",  // ownership_scope: default per-user ownership
-        "",      // abstraction_tier2: empty -- set by Gate logic, not user
-        "",      // abstraction_tier3: empty -- set by Gate logic, not user
-        "ipc",   // source: provenance tag for this write path
-        None,    // extra_metadata
+        "user", // source_id: user-entered fields always have source "user"
+        "self", // ownership_scope: default per-user ownership
+        "",     // abstraction_tier2: empty -- set by Gate logic, not user
+        "",     // abstraction_tier3: empty -- set by Gate logic, not user
+        "ipc",  // source: provenance tag for this write path
+        None,   // extra_metadata
     )
     .await
     .map_err(|e| e.to_string())?;
@@ -137,10 +136,9 @@ pub async fn get_voice_profile(
     user_id: String,
     key_hex: String,
 ) -> Result<VoiceProfileInfo, String> {
-    let profile =
-        personal_store::load_voice_profile(&user_id, &persona_id, &key_hex)
-            .await
-            .map_err(|e| e.to_string())?;
+    let profile = personal_store::load_voice_profile(&user_id, &persona_id, &key_hex)
+        .await
+        .map_err(|e| e.to_string())?;
 
     Ok(VoiceProfileInfo {
         tone: profile.get("tone").cloned().unwrap_or_default(),

@@ -72,30 +72,36 @@ pub enum ProviderError {
 
     /// No Tier 2 provider configured — install interview not completed.
     #[error("no Tier 2 provider configured")]
-    MissingTier2Config {
-        plain_language: String,
-    },
+    MissingTier2Config { plain_language: String },
 }
 
 impl From<ProviderError> for ConductorError {
     fn from(e: ProviderError) -> Self {
         match e {
-            ProviderError::MissingApiKey { plain_language, .. } =>
-                ConductorError::MissingApiKey { plain_language },
-            ProviderError::InvalidApiKey { plain_language, .. } =>
-                ConductorError::InvalidApiKey { plain_language },
-            ProviderError::RateLimit { plain_language, .. } =>
-                ConductorError::ProviderRateLimit { plain_language },
-            ProviderError::Timeout { plain_language, .. } =>
-                ConductorError::ProviderTimeout { plain_language },
-            ProviderError::Unavailable { plain_language, .. } =>
-                ConductorError::ProviderUnavailable { plain_language },
-            ProviderError::ProviderFailure { plain_language, .. } =>
-                ConductorError::Provider { plain_language },
-            ProviderError::UnknownProvider { plain_language, .. } =>
-                ConductorError::UnknownProvider { plain_language },
-            ProviderError::MissingTier2Config { plain_language } =>
-                ConductorError::MissingTier2Config { plain_language },
+            ProviderError::MissingApiKey { plain_language, .. } => {
+                ConductorError::MissingApiKey { plain_language }
+            }
+            ProviderError::InvalidApiKey { plain_language, .. } => {
+                ConductorError::InvalidApiKey { plain_language }
+            }
+            ProviderError::RateLimit { plain_language, .. } => {
+                ConductorError::ProviderRateLimit { plain_language }
+            }
+            ProviderError::Timeout { plain_language, .. } => {
+                ConductorError::ProviderTimeout { plain_language }
+            }
+            ProviderError::Unavailable { plain_language, .. } => {
+                ConductorError::ProviderUnavailable { plain_language }
+            }
+            ProviderError::ProviderFailure { plain_language, .. } => {
+                ConductorError::Provider { plain_language }
+            }
+            ProviderError::UnknownProvider { plain_language, .. } => {
+                ConductorError::UnknownProvider { plain_language }
+            }
+            ProviderError::MissingTier2Config { plain_language } => {
+                ConductorError::MissingTier2Config { plain_language }
+            }
         }
     }
 }

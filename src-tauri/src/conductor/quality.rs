@@ -75,7 +75,11 @@ pub enum CriterionKind {
 
 impl QualityCriterion {
     pub fn new(name: impl Into<String>, kind: CriterionKind) -> Self {
-        Self { name: name.into(), kind, weight: 1.0 }
+        Self {
+            name: name.into(),
+            kind,
+            weight: 1.0,
+        }
     }
 
     pub fn with_weight(mut self, weight: f32) -> Self {
@@ -167,7 +171,11 @@ impl QualityAssessor {
                     if trimmed.len() < *min {
                         (
                             false,
-                            format!("content is {} characters, minimum is {}", trimmed.len(), min),
+                            format!(
+                                "content is {} characters, minimum is {}",
+                                trimmed.len(),
+                                min
+                            ),
                         )
                     } else {
                         (true, String::new())
@@ -192,7 +200,10 @@ impl QualityAssessor {
             if satisfied {
                 weight_satisfied += c.weight;
             } else {
-                gaps.push(QualityGap { criterion_name: c.name.clone(), detail });
+                gaps.push(QualityGap {
+                    criterion_name: c.name.clone(),
+                    detail,
+                });
             }
         }
 
@@ -203,7 +214,10 @@ impl QualityAssessor {
     /// criteria. NonEmpty/MinLength/Custom apply to the concatenation of all
     /// field values (order-independent join, single space separator) --
     /// RequiredFields applies directly to the field-name set.
-    pub fn assess_record(&self, record: &std::collections::HashMap<String, String>) -> QualityVerdict {
+    pub fn assess_record(
+        &self,
+        record: &std::collections::HashMap<String, String>,
+    ) -> QualityVerdict {
         let joined: String = {
             let mut vals: Vec<&str> = record.values().map(|s| s.as_str()).collect();
             vals.sort_unstable(); // deterministic join order
@@ -228,7 +242,11 @@ impl QualityAssessor {
                     if trimmed.len() < *min {
                         (
                             false,
-                            format!("combined field values are {} characters, minimum is {}", trimmed.len(), min),
+                            format!(
+                                "combined field values are {} characters, minimum is {}",
+                                trimmed.len(),
+                                min
+                            ),
                         )
                     } else {
                         (true, String::new())
@@ -248,7 +266,10 @@ impl QualityAssessor {
                     if missing.is_empty() {
                         (true, String::new())
                     } else {
-                        (false, format!("missing or blank field(s): {}", missing.join(", ")))
+                        (
+                            false,
+                            format!("missing or blank field(s): {}", missing.join(", ")),
+                        )
                     }
                 }
                 CriterionKind::Custom(f) => {
@@ -264,22 +285,38 @@ impl QualityAssessor {
             if satisfied {
                 weight_satisfied += c.weight;
             } else {
-                gaps.push(QualityGap { criterion_name: c.name.clone(), detail });
+                gaps.push(QualityGap {
+                    criterion_name: c.name.clone(),
+                    detail,
+                });
             }
         }
 
         self.finish(gaps, weight_total, weight_satisfied)
     }
 
-    fn finish(&self, gaps: Vec<QualityGap>, weight_total: f32, weight_satisfied: f32) -> QualityVerdict {
-        let score = if weight_total <= 0.0 { 1.0 } else { weight_satisfied / weight_total };
+    fn finish(
+        &self,
+        gaps: Vec<QualityGap>,
+        weight_total: f32,
+        weight_satisfied: f32,
+    ) -> QualityVerdict {
+        let score = if weight_total <= 0.0 {
+            1.0
+        } else {
+            weight_satisfied / weight_total
+        };
         // Fails only if a nonzero-weight criterion was not satisfied --
         // i.e. score < 1.0 on the nonzero-weight subset. Since weight-0.0
         // criteria never subtract from weight_satisfied relative to their
         // own (zero) contribution to weight_total, score == 1.0 iff every
         // nonzero-weight criterion passed.
         let passed = score >= 1.0;
-        QualityVerdict { passed, gaps, score }
+        QualityVerdict {
+            passed,
+            gaps,
+            score,
+        }
     }
 }
 
@@ -303,14 +340,20 @@ mod tests {
 
     #[test]
     fn non_empty_passes_on_content() {
-        let a = QualityAssessor::new(vec![QualityCriterion::new("has content", CriterionKind::NonEmpty)]);
+        let a = QualityAssessor::new(vec![QualityCriterion::new(
+            "has content",
+            CriterionKind::NonEmpty,
+        )]);
         let v = a.assess_content("hello");
         assert!(v.passed);
     }
 
     #[test]
     fn non_empty_fails_on_blank() {
-        let a = QualityAssessor::new(vec![QualityCriterion::new("has content", CriterionKind::NonEmpty)]);
+        let a = QualityAssessor::new(vec![QualityCriterion::new(
+            "has content",
+            CriterionKind::NonEmpty,
+        )]);
         let v = a.assess_content("   ");
         assert!(!v.passed);
         assert_eq!(v.gaps.len(), 1);
@@ -319,7 +362,10 @@ mod tests {
 
     #[test]
     fn min_length_fails_under_threshold() {
-        let a = QualityAssessor::new(vec![QualityCriterion::new("length", CriterionKind::MinLength(20))]);
+        let a = QualityAssessor::new(vec![QualityCriterion::new(
+            "length",
+            CriterionKind::MinLength(20),
+        )]);
         let v = a.assess_content("too short");
         assert!(!v.passed);
         assert!(v.gaps[0].detail.contains("minimum is 20"));
@@ -327,7 +373,10 @@ mod tests {
 
     #[test]
     fn min_length_passes_at_threshold() {
-        let a = QualityAssessor::new(vec![QualityCriterion::new("length", CriterionKind::MinLength(5))]);
+        let a = QualityAssessor::new(vec![QualityCriterion::new(
+            "length",
+            CriterionKind::MinLength(5),
+        )]);
         let v = a.assess_content("12345");
         assert!(v.passed);
     }
@@ -431,7 +480,11 @@ mod tests {
 
     #[test]
     fn to_plain_language_no_gaps() {
-        let v = QualityVerdict { passed: true, gaps: vec![], score: 1.0 };
+        let v = QualityVerdict {
+            passed: true,
+            gaps: vec![],
+            score: 1.0,
+        };
         assert_eq!(v.to_plain_language(), "Quality check found no issues.");
     }
 
@@ -440,8 +493,14 @@ mod tests {
         let v = QualityVerdict {
             passed: false,
             gaps: vec![
-                QualityGap { criterion_name: "title".to_owned(), detail: "missing".to_owned() },
-                QualityGap { criterion_name: "length".to_owned(), detail: "too short".to_owned() },
+                QualityGap {
+                    criterion_name: "title".to_owned(),
+                    detail: "missing".to_owned(),
+                },
+                QualityGap {
+                    criterion_name: "length".to_owned(),
+                    detail: "too short".to_owned(),
+                },
             ],
             score: 0.0,
         };
@@ -455,7 +514,10 @@ mod tests {
         // HashMap iteration order is not guaranteed -- confirm the sorted
         // join keeps MinLength deterministic across two maps built with
         // insertions in a different order but identical content.
-        let a = QualityAssessor::new(vec![QualityCriterion::new("length", CriterionKind::MinLength(5))]);
+        let a = QualityAssessor::new(vec![QualityCriterion::new(
+            "length",
+            CriterionKind::MinLength(5),
+        )]);
         let mut r1 = HashMap::new();
         r1.insert("a".to_owned(), "ab".to_owned());
         r1.insert("b".to_owned(), "cd".to_owned());

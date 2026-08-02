@@ -215,8 +215,7 @@ fn looks_like_code(content: &str) -> bool {
     // with a preceding space is rare and false-positives are safe here.
     for keyword in &["def ", "class "] {
         if let Some(idx) = content.find(keyword) {
-            let left_ok =
-                idx == 0 || !content.as_bytes()[idx - 1].is_ascii_alphanumeric();
+            let left_ok = idx == 0 || !content.as_bytes()[idx - 1].is_ascii_alphanumeric();
             if left_ok {
                 return true;
             }
@@ -290,8 +289,10 @@ impl EvaluationHarness {
             .await?;
 
         let format_ok = check_format_compliance(&response.content, task.expected_format);
-        let latency_score =
-            f64::min(1.0, task.latency_target_ms / f64::max(response.latency_ms, 1.0));
+        let latency_score = f64::min(
+            1.0,
+            task.latency_target_ms / f64::max(response.latency_ms, 1.0),
+        );
         let score = (latency_score * 0.40) + (if format_ok { 1.0 } else { 0.0 } * 0.60);
 
         let result = EvaluationResult {
@@ -340,17 +341,16 @@ impl EvaluationHarness {
                             task_type,
                             result.score,
                             result.latency_ms,
-                            if result.format_compliant { "OK" } else { "FAIL" },
+                            if result.format_compliant {
+                                "OK"
+                            } else {
+                                "FAIL"
+                            },
                         );
                         results.push(result);
                     }
                     Err(e) => {
-                        log::warn!(
-                            "evaluation: {} / {}: SKIP ({})",
-                            model_id,
-                            task_type,
-                            e
-                        );
+                        log::warn!("evaluation: {} / {}: SKIP ({})", model_id, task_type, e);
                     }
                 }
             }
@@ -397,7 +397,11 @@ impl EvaluationHarness {
         .bind(&result.model_id)
         .bind(&result.task_type)
         .bind(result.latency_ms)
-        .bind(if result.format_compliant { 1.0_f64 } else { 0.0_f64 })
+        .bind(if result.format_compliant {
+            1.0_f64
+        } else {
+            0.0_f64
+        })
         .bind(result.hardware_factor)
         .bind(result.seeded_score)
         .bind(now())
@@ -531,7 +535,10 @@ mod tests {
 
     #[test]
     fn short_answer_nonempty_is_compliant() {
-        assert!(check_format_compliance("Paris", ExpectedFormat::ShortAnswer));
+        assert!(check_format_compliance(
+            "Paris",
+            ExpectedFormat::ShortAnswer
+        ));
     }
 
     #[test]

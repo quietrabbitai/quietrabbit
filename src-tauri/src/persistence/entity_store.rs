@@ -81,14 +81,12 @@ use crate::persistence::personal_store::{open_personal_db, PersonalStoreError};
 ///
 /// Validated here so callers get a plain-language Validation error instead
 /// of a raw SQLite CHECK failure.
-const VALID_STATUSES: &[&str] =
-    &["active", "archived", "deleted_in_source", "user_deleted"];
+const VALID_STATUSES: &[&str] = &["active", "archived", "deleted_in_source", "user_deleted"];
 
 /// Values permitted by the entities.modification_state CHECK constraint
 /// (personal_002.sql, decisions.id=502). Governs what a user-triggered
 /// source refresh may do to the record.
-const VALID_MODIFICATION_STATES: &[&str] =
-    &["pristine", "user_modified", "user_created"];
+const VALID_MODIFICATION_STATES: &[&str] = &["pristine", "user_modified", "user_created"];
 
 /// Escape character used with LIKE in search_entities. Backslash is not
 /// special to SQLite's LIKE by default — it becomes special only via the
@@ -244,12 +242,11 @@ fn row_to_entity(row: &sqlx::sqlite::SqliteRow) -> Result<Entity, PersonalStoreE
         ))
     })?;
 
-    let extra_metadata: serde_json::Value =
-        serde_json::from_str(&metadata_json).map_err(|e| {
-            PersonalStoreError::Validation(format!(
-                "entities.extra_metadata for id '{id}' is not valid JSON: {e}"
-            ))
-        })?;
+    let extra_metadata: serde_json::Value = serde_json::from_str(&metadata_json).map_err(|e| {
+        PersonalStoreError::Validation(format!(
+            "entities.extra_metadata for id '{id}' is not valid JSON: {e}"
+        ))
+    })?;
 
     let redact_identification_int: i64 = row.try_get("redact_identification")?;
     let hide_from_shared_surfaces_int: i64 = row.try_get("hide_from_shared_surfaces")?;
@@ -356,8 +353,7 @@ fn filter_clause(filter: &EntityFilter) -> (String, Vec<String>) {
 
 /// Columns selected by every read path — kept in one place so the SELECT
 /// list and row_to_entity() cannot drift apart.
-const ENTITY_COLUMNS: &str =
-    "id, entity_type, display_name, aliases, parent_entity_id, status, \
+const ENTITY_COLUMNS: &str = "id, entity_type, display_name, aliases, parent_entity_id, status, \
      modification_state, source_registry_id, source_url, created_at, \
      extra_metadata, redact_identification, hide_from_shared_surfaces";
 
@@ -410,8 +406,8 @@ pub(crate) async fn create_entity_conn(
     let new_id = uuid::Uuid::new_v4().to_string();
     let aliases_json = serde_json::to_string(aliases)
         .map_err(|e| PersonalStoreError::Validation(format!("aliases not serializable: {e}")))?;
-    let metadata_json =
-        serde_json::to_string(&extra_metadata.unwrap_or(serde_json::json!({}))).map_err(|e| {
+    let metadata_json = serde_json::to_string(&extra_metadata.unwrap_or(serde_json::json!({})))
+        .map_err(|e| {
             PersonalStoreError::Validation(format!("extra_metadata not serializable: {e}"))
         })?;
 
@@ -700,9 +696,7 @@ pub(crate) async fn list_entities_conn(
     }
 
     let (where_clause, binds) = filter_clause(filter);
-    let sql = format!(
-        "SELECT {ENTITY_COLUMNS} FROM entities{where_clause} ORDER BY display_name"
-    );
+    let sql = format!("SELECT {ENTITY_COLUMNS} FROM entities{where_clause} ORDER BY display_name");
 
     let mut q = sqlx::query(&sql);
     for b in binds {
@@ -770,7 +764,11 @@ pub(crate) async fn search_entities_conn(
     }
 
     let (where_clause, filter_binds) = filter_clause(filter);
-    let joiner = if where_clause.is_empty() { " WHERE" } else { " AND" };
+    let joiner = if where_clause.is_empty() {
+        " WHERE"
+    } else {
+        " AND"
+    };
     let pattern = format!("%{}%", escape_like(&query.trim().to_lowercase()));
 
     let sql = format!(
@@ -1080,16 +1078,9 @@ mod tests {
     /// Small fixture: two recipes (one retired), one device, and a child
     /// recipe under the first. Returns (parent_recipe_id, child_recipe_id).
     async fn seed_filter_fixture(conn: &mut SqliteConnection) -> (String, String) {
-        let parent = create_entity_conn(
-            conn,
-            "recipe",
-            "Bread",
-            &["loaf".to_owned()],
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+        let parent = create_entity_conn(conn, "recipe", "Bread", &["loaf".to_owned()], None, None)
+            .await
+            .unwrap();
         let child = create_entity_conn(
             conn,
             "recipe",
@@ -1103,7 +1094,9 @@ mod tests {
         let retired = create_entity_conn(conn, "recipe", "Old Scones", &[], None, None)
             .await
             .unwrap();
-        retire_entity_conn(conn, &retired, "archived").await.unwrap();
+        retire_entity_conn(conn, &retired, "archived")
+            .await
+            .unwrap();
         create_entity_conn(conn, "device", "Oven", &[], None, None)
             .await
             .unwrap();
@@ -1128,7 +1121,10 @@ mod tests {
             .await
             .unwrap();
         let names: Vec<&str> = all.iter().map(|e| e.display_name.as_str()).collect();
-        assert_eq!(names, vec!["Bread", "Old Scones", "Oven", "Sourdough Starter"]);
+        assert_eq!(
+            names,
+            vec!["Bread", "Old Scones", "Oven", "Sourdough Starter"]
+        );
     }
 
     #[tokio::test]
@@ -1136,10 +1132,9 @@ mod tests {
         let mut conn = test_db().await;
         seed_filter_fixture(&mut conn).await;
 
-        let active_recipes =
-            list_entities_conn(&mut conn, &EntityFilter::active_of_type("recipe"))
-                .await
-                .unwrap();
+        let active_recipes = list_entities_conn(&mut conn, &EntityFilter::active_of_type("recipe"))
+            .await
+            .unwrap();
         let names: Vec<&str> = active_recipes
             .iter()
             .map(|e| e.display_name.as_str())
@@ -1237,9 +1232,16 @@ mod tests {
     #[tokio::test]
     async fn search_applies_the_structured_filter_too() {
         let mut conn = test_db().await;
-        create_entity_conn(&mut conn, "recipe", "Iron Skillet Cornbread", &[], None, None)
-            .await
-            .unwrap();
+        create_entity_conn(
+            &mut conn,
+            "recipe",
+            "Iron Skillet Cornbread",
+            &[],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         create_entity_conn(&mut conn, "device", "Iron Skillet", &[], None, None)
             .await
             .unwrap();
@@ -1427,19 +1429,30 @@ mod tests {
             .unwrap();
         insert_fact(&mut conn, &id, "oven_temp", None).await;
 
-        retire_entity_conn(&mut conn, &id, "archived").await.unwrap();
+        retire_entity_conn(&mut conn, &id, "archived")
+            .await
+            .unwrap();
 
         let active = list_entities_conn(&mut conn, &EntityFilter::active_of_type("recipe"))
             .await
             .unwrap();
-        assert!(active.is_empty(), "archived record must leave active listings");
+        assert!(
+            active.is_empty(),
+            "archived record must leave active listings"
+        );
 
         let still_there = get_entity_conn(&mut conn, &id).await.unwrap();
         assert!(still_there.is_some(), "retire must not delete the row");
         assert_eq!(still_there.unwrap().status, "archived");
 
-        let cascade = check_entity_cascade_conn(&mut conn, &id).await.unwrap().unwrap();
-        assert_eq!(cascade.active_fact_count, 1, "facts must survive retirement");
+        let cascade = check_entity_cascade_conn(&mut conn, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cascade.active_fact_count, 1,
+            "facts must survive retirement"
+        );
     }
 
     #[tokio::test]
@@ -1475,7 +1488,13 @@ mod tests {
 
         insert_fact(&mut conn, &parent, "hydration", None).await;
         insert_fact(&mut conn, &parent, "bake_time", None).await;
-        insert_fact(&mut conn, &parent, "hydration", Some("2026-07-01T00:00:00Z")).await;
+        insert_fact(
+            &mut conn,
+            &parent,
+            "hydration",
+            Some("2026-07-01T00:00:00Z"),
+        )
+        .await;
 
         let cascade = check_entity_cascade_conn(&mut conn, &parent)
             .await
@@ -1519,7 +1538,10 @@ mod tests {
             .unwrap();
         insert_fact(&mut conn, &b, "hydration", None).await;
 
-        let cascade = check_entity_cascade_conn(&mut conn, &a).await.unwrap().unwrap();
+        let cascade = check_entity_cascade_conn(&mut conn, &a)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(cascade.is_isolated(), "A must not see B's facts");
     }
 
@@ -1659,13 +1681,12 @@ mod tests {
     async fn migration_v2_creates_the_cb11_tables() {
         let mut conn = test_db().await;
         for table in ["source_registry", "dedup_candidates"] {
-            let found: Option<(String,)> = sqlx::query_as(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name = ?",
-            )
-            .bind(table)
-            .fetch_optional(&mut conn)
-            .await
-            .unwrap();
+            let found: Option<(String,)> =
+                sqlx::query_as("SELECT name FROM sqlite_master WHERE type='table' AND name = ?")
+                    .bind(table)
+                    .fetch_optional(&mut conn)
+                    .await
+                    .unwrap();
             assert!(found.is_some(), "{table} must exist after v2");
         }
     }
@@ -1770,7 +1791,10 @@ mod tests {
             .await
             .expect("get failed")
             .expect("row must survive the v3 ADD COLUMN migration");
-        assert_eq!(e.display_name, "Pre-v3 Bread", "pre-existing data must survive");
+        assert_eq!(
+            e.display_name, "Pre-v3 Bread",
+            "pre-existing data must survive"
+        );
         assert!(
             !e.redact_identification,
             "pre-existing rows must default to false, not NULL or an error"

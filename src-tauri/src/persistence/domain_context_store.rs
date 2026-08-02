@@ -105,7 +105,12 @@ struct TierScopes {
 static ELIGIBLE_SCOPES_BY_TIER: &[TierScopes] = &[
     TierScopes {
         tier: 1,
-        scopes: &["tier_1_only", "anonymous_tier2", "tier2_permitted", "tier3_permitted"],
+        scopes: &[
+            "tier_1_only",
+            "anonymous_tier2",
+            "tier2_permitted",
+            "tier3_permitted",
+        ],
     },
     TierScopes {
         tier: 2,
@@ -672,8 +677,7 @@ pub async fn regenerate_standing_summary(
     }
 
     let summary_content = assembled.join("\n\n");
-    let source_ids_json =
-        serde_json::to_string(&source_ids).unwrap_or_else(|_| "[]".to_owned());
+    let source_ids_json = serde_json::to_string(&source_ids).unwrap_or_else(|_| "[]".to_owned());
 
     sqlx::query(
         "UPDATE standing_summary SET content = ?, token_count = ?,

@@ -94,7 +94,11 @@ pub struct ObjectTypeRegistration {
 pub static OBJECT_TYPE_REGISTRY: &[ObjectTypeRegistration] = &[ObjectTypeRegistration {
     object_type: "entity",
     carries_flags: true,
-    eligible_surfaces: &[SurfaceClass::Ambient, SurfaceClass::Direct, SurfaceClass::Boundary],
+    eligible_surfaces: &[
+        SurfaceClass::Ambient,
+        SurfaceClass::Direct,
+        SurfaceClass::Boundary,
+    ],
     inherits_to: &[],
 }];
 
@@ -251,20 +255,28 @@ mod tests {
     }
 
     fn unflagged() -> TestObject {
-        TestObject { redact: false, hide: false }
+        TestObject {
+            redact: false,
+            hide: false,
+        }
     }
 
     #[test]
     fn unregistered_object_type_is_suppressed() {
         let obj = unflagged();
-        let decision = evaluate_object_visibility(&obj, "not_a_real_type", SurfaceClass::Ambient, None);
+        let decision =
+            evaluate_object_visibility(&obj, "not_a_real_type", SurfaceClass::Ambient, None);
         assert_eq!(decision, VisibilityDecision::Suppressed);
     }
 
     #[test]
     fn unflagged_entity_is_visible_on_every_registered_surface() {
         let obj = unflagged();
-        for surface in [SurfaceClass::Ambient, SurfaceClass::Direct, SurfaceClass::Boundary] {
+        for surface in [
+            SurfaceClass::Ambient,
+            SurfaceClass::Direct,
+            SurfaceClass::Boundary,
+        ] {
             assert_eq!(
                 evaluate_object_visibility(&obj, "entity", surface, None),
                 VisibilityDecision::Visible,
@@ -275,7 +287,10 @@ mod tests {
 
     #[test]
     fn redact_identification_redacts_on_ambient_and_boundary() {
-        let obj = TestObject { redact: true, hide: false };
+        let obj = TestObject {
+            redact: true,
+            hide: false,
+        };
         assert_eq!(
             evaluate_object_visibility(&obj, "entity", SurfaceClass::Ambient, None),
             VisibilityDecision::Redacted
@@ -291,7 +306,10 @@ mod tests {
         // decisions.id=513: redact_identification "still applies at export
         // and Tier 2/3 boundaries within Direct surfaces" -- Direct does
         // not exempt redact the way it exempts hide.
-        let obj = TestObject { redact: true, hide: false };
+        let obj = TestObject {
+            redact: true,
+            hide: false,
+        };
         assert_eq!(
             evaluate_object_visibility(&obj, "entity", SurfaceClass::Direct, None),
             VisibilityDecision::Redacted
@@ -300,7 +318,10 @@ mod tests {
 
     #[test]
     fn hide_from_shared_surfaces_suppresses_ambient_and_boundary_but_not_direct() {
-        let obj = TestObject { redact: false, hide: true };
+        let obj = TestObject {
+            redact: false,
+            hide: true,
+        };
         assert_eq!(
             evaluate_object_visibility(&obj, "entity", SurfaceClass::Ambient, None),
             VisibilityDecision::Suppressed
@@ -318,7 +339,10 @@ mod tests {
 
     #[test]
     fn both_flags_hide_wins_on_boundary() {
-        let obj = TestObject { redact: true, hide: true };
+        let obj = TestObject {
+            redact: true,
+            hide: true,
+        };
         assert_eq!(
             evaluate_object_visibility(&obj, "entity", SurfaceClass::Boundary, None),
             VisibilityDecision::Suppressed,
@@ -341,8 +365,12 @@ mod tests {
             eligible_surfaces: &[SurfaceClass::Direct],
             inherits_to: &[],
         };
-        assert!(!restricted.eligible_surfaces.contains(&SurfaceClass::Ambient));
-        assert!(!restricted.eligible_surfaces.contains(&SurfaceClass::Boundary));
+        assert!(!restricted
+            .eligible_surfaces
+            .contains(&SurfaceClass::Ambient));
+        assert!(!restricted
+            .eligible_surfaces
+            .contains(&SurfaceClass::Boundary));
         assert!(restricted.eligible_surfaces.contains(&SurfaceClass::Direct));
     }
 

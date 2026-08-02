@@ -32,11 +32,11 @@ use serde::{Deserialize, Serialize};
 /// output_var names declared in .focus files must not appear in this list.
 /// Python oracle: frozenset in conductor/tokens.py — 5 tokens, verified.
 pub const SYSTEM_TOKENS: [&str; 5] = [
-    "user_input",       // the user's current request
-    "persona_context",  // persona-level shared context
-    "voice_profile",    // assembled voice profile for this step
-    "previous_output",  // output_var from the immediately preceding step
-    "focus_context",    // focus-level metadata (name, description)
+    "user_input",      // the user's current request
+    "persona_context", // persona-level shared context
+    "voice_profile",   // assembled voice profile for this step
+    "previous_output", // output_var from the immediately preceding step
+    "focus_context",   // focus-level metadata (name, description)
 ];
 
 /// O(1)-equivalent membership test for a 5-element static array.
@@ -68,9 +68,9 @@ impl FromStr for StepType {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "generate"        => Ok(Self::Generate),
+            "generate" => Ok(Self::Generate),
             "voice_transform" => Ok(Self::VoiceTransform),
-            "post_process"    => Ok(Self::PostProcess),
+            "post_process" => Ok(Self::PostProcess),
             other => Err(format!(
                 "unknown step_type '{}'. Must be: generate | voice_transform | post_process",
                 other
@@ -82,9 +82,9 @@ impl FromStr for StepType {
 impl StepType {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Generate       => "generate",
+            Self::Generate => "generate",
             Self::VoiceTransform => "voice_transform",
-            Self::PostProcess    => "post_process",
+            Self::PostProcess => "post_process",
         }
     }
 }
@@ -109,8 +109,8 @@ impl FromStr for FieldRequirement {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "recommended" => Ok(Self::Recommended),
-            "optional"    => Ok(Self::Optional),
-            "not_needed"  => Ok(Self::NotNeeded),
+            "optional" => Ok(Self::Optional),
+            "not_needed" => Ok(Self::NotNeeded),
             other => Err(format!(
                 "unknown field_requirement '{}'. Must be: recommended | optional | not_needed",
                 other
@@ -142,8 +142,8 @@ pub struct StepDefinition {
     pub step_id: String,
     pub display_name: String,
     pub guide_id: String,
-    pub task_type: String,     // validated against task_types.yaml at LOAD
-    pub routing_tier: u8,      // 1, 2, or 3 — see validate_step()
+    pub task_type: String, // validated against task_types.yaml at LOAD
+    pub routing_tier: u8,  // 1, 2, or 3 — see validate_step()
     pub step_type: StepType,
     pub output_var: Option<String>,
     pub prompt_template: String,
@@ -274,8 +274,14 @@ mod tests {
     #[test]
     fn step_type_from_str_valid() {
         assert_eq!("generate".parse::<StepType>().unwrap(), StepType::Generate);
-        assert_eq!("voice_transform".parse::<StepType>().unwrap(), StepType::VoiceTransform);
-        assert_eq!("post_process".parse::<StepType>().unwrap(), StepType::PostProcess);
+        assert_eq!(
+            "voice_transform".parse::<StepType>().unwrap(),
+            StepType::VoiceTransform
+        );
+        assert_eq!(
+            "post_process".parse::<StepType>().unwrap(),
+            StepType::PostProcess
+        );
     }
 
     #[test]
@@ -293,9 +299,18 @@ mod tests {
 
     #[test]
     fn field_requirement_from_str() {
-        assert_eq!("recommended".parse::<FieldRequirement>().unwrap(), FieldRequirement::Recommended);
-        assert_eq!("optional".parse::<FieldRequirement>().unwrap(), FieldRequirement::Optional);
-        assert_eq!("not_needed".parse::<FieldRequirement>().unwrap(), FieldRequirement::NotNeeded);
+        assert_eq!(
+            "recommended".parse::<FieldRequirement>().unwrap(),
+            FieldRequirement::Recommended
+        );
+        assert_eq!(
+            "optional".parse::<FieldRequirement>().unwrap(),
+            FieldRequirement::Optional
+        );
+        assert_eq!(
+            "not_needed".parse::<FieldRequirement>().unwrap(),
+            FieldRequirement::NotNeeded
+        );
         assert!("invalid".parse::<FieldRequirement>().is_err());
     }
 }

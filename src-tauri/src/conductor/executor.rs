@@ -146,12 +146,12 @@ pub struct StepContext {
     pub focus_id: String,
     pub focus_run_id: String,
     pub user_input: String,
-    pub persona_context: String,              // rendered MemoryBroker output (Phase 3)
+    pub persona_context: String, // rendered MemoryBroker output (Phase 3)
     pub space_max_permitted_tier: u8,
     pub execution_tier: u8,
     pub abstraction_tier: u8,
     pub raw_abstraction: u8,
-    pub floor_consent_preference: Option<String>,  // "modified" | "local" | None
+    pub floor_consent_preference: Option<String>, // "modified" | "local" | None
     pub next_execution_tier: Option<u8>,
     pub retry_count: u32,
     /// Display name of the Focus, passed to gate3 for the consent modal header.
@@ -169,11 +169,15 @@ pub struct StepContext {
 pub struct StepExecutor;
 
 impl Default for StepExecutor {
-    fn default() -> Self { Self }
+    fn default() -> Self {
+        Self
+    }
 }
 
 impl StepExecutor {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 
     // =========================================================================
     // Public entry point
@@ -270,9 +274,9 @@ impl StepExecutor {
         scheduler: &Arc<ConductorScheduler>,
         app_handle: Option<&tauri::AppHandle<tauri::Wry>>,
     ) -> Result<Option<FailureResult>, ConductorError> {
-        let execution_tier  = ctx.execution_tier;
+        let execution_tier = ctx.execution_tier;
         let abstraction_tier = ctx.abstraction_tier;
-        let raw_abstraction  = ctx.raw_abstraction;
+        let raw_abstraction = ctx.raw_abstraction;
 
         // -- Floor invariants (ADR-012 Amendment 3, D6-348) --
         // Explicit Err() returns — never debug_assert!, which is stripped in release builds.
@@ -313,8 +317,7 @@ impl StepExecutor {
                     plain_language: format!(
                         "Step '{}' requires tier {} but this life only permits \
                          tier {}. [Get help]",
-                        ctx.step.step_id, ctx.step.routing_tier,
-                        ctx.space_max_permitted_tier
+                        ctx.step.step_id, ctx.step.routing_tier, ctx.space_max_permitted_tier
                     ),
                 },
                 Some(&ctx.step.step_id),
@@ -342,7 +345,11 @@ impl StepExecutor {
                 abstraction_tier,
                 raw_abstraction,
                 execution_tier,
-                if execution_tier >= 2 { Some(model_id.clone()) } else { None },
+                if execution_tier >= 2 {
+                    Some(model_id.clone())
+                } else {
+                    None
+                },
             )
             .await
             .map_err(|e| ConductorError::DisclosureLogWrite {
@@ -352,31 +359,32 @@ impl StepExecutor {
         if g1.blocked {
             // blocked is always false in current migration (not_permitted path deferred).
             // Preserved for correctness when gate blocking is fully wired.
-            return Ok(Some(failure_handler.handle(
-                &ConductorError::PrivacyGateBlocked {
-                    plain_language: "A required personal field cannot be shared in this \
+            return Ok(Some(
+                failure_handler.handle(
+                    &ConductorError::PrivacyGateBlocked {
+                        plain_language: "A required personal field cannot be shared in this \
                         context. [Review privacy settings] [Get help]"
-                        .to_owned(),
-                },
-                Some(&ctx.step.step_id),
-                Some(&ctx.focus_id),
-                retry_count,
-            )));
+                            .to_owned(),
+                    },
+                    Some(&ctx.step.step_id),
+                    Some(&ctx.focus_id),
+                    retry_count,
+                ),
+            ));
         }
 
         // -- Field projection — step-scope boundary --
         // Post-Layer 6 fix: Gate1 evaluates full PersonalTrack; projection scopes
         // approved_fields to the step's declared field_requirements.
-        let projected_fields: HashMap<String, String> =
-            if !ctx.step.field_requirements.is_empty() {
-                g1.approved_fields
-                    .iter()
-                    .filter(|(name, _)| ctx.step.field_requirements.contains_key(*name))
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect()
-            } else {
-                HashMap::new()
-            };
+        let projected_fields: HashMap<String, String> = if !ctx.step.field_requirements.is_empty() {
+            g1.approved_fields
+                .iter()
+                .filter(|(name, _)| ctx.step.field_requirements.contains_key(*name))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        } else {
+            HashMap::new()
+        };
 
         // -- Floor Consent Gate (ADR-012 Amendment 3) --
         if !g1.floor_clamped_fields.is_empty() {
@@ -406,19 +414,17 @@ impl StepExecutor {
                 let mut meta = HashMap::new();
                 meta.insert(
                     "floor_clamped_fields".to_owned(),
-                    serde_json::to_value(&g1.floor_clamped_fields)
-                        .unwrap_or_else(|e| {
-                            log::warn!("executor: floor_clamped_fields serialize failed: {e}");
-                            serde_json::Value::Array(vec![])
-                        }),
+                    serde_json::to_value(&g1.floor_clamped_fields).unwrap_or_else(|e| {
+                        log::warn!("executor: floor_clamped_fields serialize failed: {e}");
+                        serde_json::Value::Array(vec![])
+                    }),
                 );
                 meta.insert(
                     "approved_fields".to_owned(),
-                    serde_json::to_value(&projected_fields)
-                        .unwrap_or_else(|e| {
-                            log::warn!("executor: projected_fields serialize failed: {e}");
-                            serde_json::Value::Object(serde_json::Map::new())
-                        }),
+                    serde_json::to_value(&projected_fields).unwrap_or_else(|e| {
+                        log::warn!("executor: projected_fields serialize failed: {e}");
+                        serde_json::Value::Object(serde_json::Map::new())
+                    }),
                 );
                 meta.insert(
                     "step_id".to_owned(),
@@ -435,10 +441,9 @@ impl StepExecutor {
                 return Ok(Some(FailureResult {
                     action: FailureAction::AwaitFloorConsent,
                     failure_mode: None,
-                    plain_language:
-                        "Quiet Rabbit modified some of your fields to maintain \
+                    plain_language: "Quiet Rabbit modified some of your fields to maintain \
                          privacy for external use. Please review and choose."
-                            .to_owned(),
+                        .to_owned(),
                     is_recoverable: true,
                     severity: FailureSeverity::Pause,
                     step_id: Some(ctx.step.step_id.clone()),
@@ -466,7 +471,11 @@ impl StepExecutor {
         let prompt = if execution_tier >= 2 {
             let disclosure = shared_state.read_disclosure_buffer(&ctx.step.step_id);
             render_prompt_with_disclosure(
-                ctx, &output_vars, &previous_output, &disclosure, &voice_profile_str,
+                ctx,
+                &output_vars,
+                &previous_output,
+                &disclosure,
+                &voice_profile_str,
             )
         } else {
             render_prompt(ctx, &output_vars, &previous_output, &voice_profile_str)
@@ -512,7 +521,7 @@ impl StepExecutor {
             model: model_id.clone(),
             prompt,
             task_type: ctx.step.task_type.clone(),
-            stream: Some(false),  // always false in Release 1 — resolved by StepExecutor
+            stream: Some(false), // always false in Release 1 — resolved by StepExecutor
             options: Some(options),
         };
 
@@ -522,16 +531,18 @@ impl StepExecutor {
             .await;
 
         if !inference_acquired {
-            return Ok(Some(failure_handler.handle(
-                &ConductorError::OllamaUnavailable {
-                    plain_language: "Quiet Rabbit is busy with another task. \
+            return Ok(Some(
+                failure_handler.handle(
+                    &ConductorError::OllamaUnavailable {
+                        plain_language: "Quiet Rabbit is busy with another task. \
                         [Try again] [Get help]"
-                        .to_owned(),
-                },
-                Some(&ctx.step.step_id),
-                Some(&ctx.focus_id),
-                retry_count,
-            )));
+                            .to_owned(),
+                    },
+                    Some(&ctx.step.step_id),
+                    Some(&ctx.focus_id),
+                    retry_count,
+                ),
+            ));
         }
 
         let generate_result: Result<_, ConductorError> = if execution_tier >= 2 {
@@ -563,7 +574,11 @@ impl StepExecutor {
                 &response.content,
                 &gate_track,
                 execution_tier,
-                if execution_tier >= 2 { Some(model_id.clone()) } else { None },
+                if execution_tier >= 2 {
+                    Some(model_id.clone())
+                } else {
+                    None
+                },
                 Some(&g1.fields_shared),
             )
             .await
@@ -572,27 +587,25 @@ impl StepExecutor {
             })?;
 
         if g2.flagged {
-            return Ok(Some(failure_handler.handle(
-                &ConductorError::InboundContamination {
-                    plain_language: "The response may contain personal information. \
+            return Ok(Some(
+                failure_handler.handle(
+                    &ConductorError::InboundContamination {
+                        plain_language: "The response may contain personal information. \
                         [Review and continue] [Discard] [Get help]"
-                        .to_owned(),
-                },
-                Some(&ctx.step.step_id),
-                Some(&ctx.focus_id),
-                retry_count,
-            )));
+                            .to_owned(),
+                    },
+                    Some(&ctx.step.step_id),
+                    Some(&ctx.focus_id),
+                    retry_count,
+                ),
+            ));
         }
 
         // -- Step 12 — update TaskTrack --
         // D4-040: content = model output ONLY — never prompt-expanded input.
         // step_sensitivity: from projected fields (Tier 2) or template token scan (Tier 1).
-        let step_sensitivity = compute_step_sensitivity(
-            ctx,
-            personal_track,
-            &projected_fields,
-            execution_tier,
-        );
+        let step_sensitivity =
+            compute_step_sensitivity(ctx, personal_track, &projected_fields, execution_tier);
 
         let output_var = ctx
             .step
@@ -613,8 +626,7 @@ impl StepExecutor {
         // Only when next step has higher execution_tier.
         if let Some(next_tier) = ctx.next_execution_tier {
             if next_tier > execution_tier {
-                let content_key = ctx.step.output_var.as_deref()
-                    .unwrap_or(&ctx.step.step_id);
+                let content_key = ctx.step.output_var.as_deref().unwrap_or(&ctx.step.step_id);
 
                 let g3 = privacy_gateway
                     .gate3(
@@ -651,25 +663,21 @@ impl StepExecutor {
 
                 if g3.pending_consent {
                     return Ok(Some(FailureResult {
-                        action:         FailureAction::AwaitConsent,
-                        failure_mode:   None,
+                        action: FailureAction::AwaitConsent,
+                        failure_mode: None,
                         plain_language: "Quiet Rabbit identified personal information in this \
                                          content. Please review before it leaves your device."
                             .to_owned(),
                         is_recoverable: true,
-                        severity:       FailureSeverity::Pause,
-                        step_id:        Some(ctx.step.step_id.clone()),
-                        focus_id:       Some(ctx.focus_id.clone()),
-                        metadata:       None,
+                        severity: FailureSeverity::Pause,
+                        step_id: Some(ctx.step.step_id.clone()),
+                        focus_id: Some(ctx.focus_id.clone()),
+                        metadata: None,
                     }));
                 }
 
                 if g3.approved {
-                    shared_state.promote_content(
-                        &ctx.step.step_id,
-                        content_key,
-                        &response.content,
-                    );
+                    shared_state.promote_content(&ctx.step.step_id, content_key, &response.content);
                 }
             }
         }
@@ -727,7 +735,12 @@ fn render_prompt(
     tokens.insert("focus_context".to_owned(), ctx.focus_id.clone());
     tokens.insert("persona_context".to_owned(), ctx.persona_context.clone());
     tokens.insert("voice_profile".to_owned(), voice_profile_str.to_owned());
-    render_template(&ctx.step.prompt_template, &tokens, &ctx.step.step_id, &ctx.focus_id)
+    render_template(
+        &ctx.step.prompt_template,
+        &tokens,
+        &ctx.step.step_id,
+        &ctx.focus_id,
+    )
 }
 
 /// Tier 2+ prompt render. NEVER reads PersonalTrack directly — only disclosure buffer.
@@ -754,7 +767,12 @@ fn render_prompt_with_disclosure(
     tokens.insert("focus_context".to_owned(), ctx.focus_id.clone());
     tokens.insert("persona_context".to_owned(), ctx.persona_context.clone());
     tokens.insert("voice_profile".to_owned(), voice_profile_str.to_owned());
-    render_template(&ctx.step.prompt_template, &tokens, &ctx.step.step_id, &ctx.focus_id)
+    render_template(
+        &ctx.step.prompt_template,
+        &tokens,
+        &ctx.step.step_id,
+        &ctx.focus_id,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -842,12 +860,11 @@ async fn scan_voice_profile<L: DisclosureLogger>(
             if ctx.execution_tier >= 2 {
                 // Tier 2+: halt — contaminated data must not leave the device.
                 return Err(ConductorError::VoiceProfileContamination {
-                    plain_language:
-                        "One of your communication style settings appears to contain \
+                    plain_language: "One of your communication style settings appears to contain \
                          personal information. Quiet Rabbit stopped this request \
                          before sending it outside your device. Review your voice \
                          profile settings and remove personal details before trying again."
-                            .to_owned(),
+                        .to_owned(),
                 });
             }
             // Tier 1: strip attr, continue scanning remaining attrs.
@@ -881,11 +898,11 @@ fn select_model(task_type: &str, tier: u8) -> String {
 /// Python oracle: StepExecutor._get_context_window()
 fn get_context_window(model_id: &str) -> u32 {
     match model_id {
-        "llama3.2:3b"               => 4096,
-        "llama3.1:8b"               => 8192,
-        "qwen2.5:7b"                => 8192,
+        "llama3.2:3b" => 4096,
+        "llama3.1:8b" => 8192,
+        "qwen2.5:7b" => 8192,
         "groq:llama-3.1-8b-instant" => 8192,
-        _                           => 2048,
+        _ => 2048,
     }
 }
 
@@ -970,19 +987,19 @@ fn to_gate_track(ct: &PersonalTrack) -> GateTrack {
     let mut gt = GateTrack::new();
     for (_, field) in ct.fields() {
         let sensitivity = match field.sensitivity.as_str() {
-            "personal"  => Sensitivity::Personal,
-            "medical"   => Sensitivity::Medical,
+            "personal" => Sensitivity::Personal,
+            "medical" => Sensitivity::Medical,
             "financial" => Sensitivity::Financial,
-            _           => Sensitivity::General,  // "general" + unknown -> General (fail-safe)
+            _ => Sensitivity::General, // "general" + unknown -> General (fail-safe)
         };
         let _ = gt.add_field(GateField {
-            field_name:           field.field_name.clone(),
-            field_value:          field.field_value.clone(),
+            field_name: field.field_name.clone(),
+            field_value: field.field_value.clone(),
             sensitivity,
             sensitivity_severity: field.sensitivity_severity as u8,
-            source_id:            field.source_id.clone(),
-            abstraction_tier2:    AbstractionPolicy::from_str(&field.abstraction_tier2),
-            abstraction_tier3:    AbstractionPolicy::from_str(&field.abstraction_tier3),
+            source_id: field.source_id.clone(),
+            abstraction_tier2: AbstractionPolicy::from_str(&field.abstraction_tier2),
+            abstraction_tier3: AbstractionPolicy::from_str(&field.abstraction_tier3),
         });
     }
     gt.seal();
@@ -1041,7 +1058,10 @@ fn find_tokens(template: &str) -> Vec<String> {
         let token: String = chars[start..j].iter().collect();
         // Validate pattern: [a-z_][a-z0-9_]*
         let mut tc = token.chars();
-        let first_ok = tc.next().map(|c| c == '_' || c.is_ascii_lowercase()).unwrap_or(false);
+        let first_ok = tc
+            .next()
+            .map(|c| c == '_' || c.is_ascii_lowercase())
+            .unwrap_or(false);
         let rest_ok = tc.all(|c| c == '_' || c.is_ascii_digit() || c.is_ascii_lowercase());
         if first_ok && rest_ok && !seen.contains(&token) {
             seen.insert(token.clone());
@@ -1080,13 +1100,21 @@ fn has_word_boundary_match_ci(haystack: &str, needle: &str) -> bool {
         let before_ok = if abs_pos == 0 {
             true
         } else {
-            h[..abs_pos].chars().next_back().map(|c| !c.is_alphanumeric()).unwrap_or(true)
+            h[..abs_pos]
+                .chars()
+                .next_back()
+                .map(|c| !c.is_alphanumeric())
+                .unwrap_or(true)
         };
         let end = abs_pos + n_len;
         let after_ok = if end >= h.len() {
             true
         } else {
-            h[end..].chars().next().map(|c| !c.is_alphanumeric()).unwrap_or(true)
+            h[end..]
+                .chars()
+                .next()
+                .map(|c| !c.is_alphanumeric())
+                .unwrap_or(true)
         };
         if before_ok && after_ok {
             return true;
@@ -1142,11 +1170,7 @@ fn format_voice_profile(voice_profile: &HashMap<String, String>) -> String {
     }
     let mut approved: Vec<(&str, &str)> = ALLOWED_VOICE_ATTRIBUTES
         .iter()
-        .filter_map(|attr| {
-            voice_profile
-                .get(*attr)
-                .map(|v| (*attr, v.as_str()))
-        })
+        .filter_map(|attr| voice_profile.get(*attr).map(|v| (*attr, v.as_str())))
         .collect();
 
     let unknown: Vec<&str> = voice_profile
@@ -1227,40 +1251,64 @@ mod tests {
     }
 
     #[test]
-    fn digit_dense_detects_7_digits() { assert!(has_digit_dense("1234567")); }
+    fn digit_dense_detects_7_digits() {
+        assert!(has_digit_dense("1234567"));
+    }
 
     #[test]
-    fn digit_dense_detects_embedded_digits() { assert!(has_digit_dense("call 1234567 now")); }
+    fn digit_dense_detects_embedded_digits() {
+        assert!(has_digit_dense("call 1234567 now"));
+    }
 
     #[test]
-    fn digit_dense_6_digits_no_match() { assert!(!has_digit_dense("123456")); }
+    fn digit_dense_6_digits_no_match() {
+        assert!(!has_digit_dense("123456"));
+    }
 
     #[test]
-    fn digit_dense_interrupted_digits() { assert!(!has_digit_dense("123-456")); }
+    fn digit_dense_interrupted_digits() {
+        assert!(!has_digit_dense("123-456"));
+    }
 
     #[test]
-    fn digit_dense_empty() { assert!(!has_digit_dense("")); }
+    fn digit_dense_empty() {
+        assert!(!has_digit_dense(""));
+    }
 
     #[test]
-    fn email_detects_basic_address() { assert!(is_email_pattern("user@example.com")); }
+    fn email_detects_basic_address() {
+        assert!(is_email_pattern("user@example.com"));
+    }
 
     #[test]
-    fn email_no_at_sign() { assert!(!is_email_pattern("notanemail")); }
+    fn email_no_at_sign() {
+        assert!(!is_email_pattern("notanemail"));
+    }
 
     #[test]
-    fn email_no_dot_after_at() { assert!(!is_email_pattern("user@nodot")); }
+    fn email_no_dot_after_at() {
+        assert!(!is_email_pattern("user@nodot"));
+    }
 
     #[test]
-    fn email_empty_local() { assert!(!is_email_pattern("@example.com")); }
+    fn email_empty_local() {
+        assert!(!is_email_pattern("@example.com"));
+    }
 
     #[test]
     fn word_boundary_whole_word_match() {
-        assert!(has_word_boundary_match_ci("I live in Portland today", "Portland"));
+        assert!(has_word_boundary_match_ci(
+            "I live in Portland today",
+            "Portland"
+        ));
     }
 
     #[test]
     fn word_boundary_case_insensitive() {
-        assert!(has_word_boundary_match_ci("Tone like portland vibes", "PORTLAND"));
+        assert!(has_word_boundary_match_ci(
+            "Tone like portland vibes",
+            "PORTLAND"
+        ));
     }
 
     #[test]
@@ -1286,7 +1334,10 @@ mod tests {
 
     #[test]
     fn word_boundary_no_match() {
-        assert!(!has_word_boundary_match_ci("tone: conversational", "Portland"));
+        assert!(!has_word_boundary_match_ci(
+            "tone: conversational",
+            "Portland"
+        ));
     }
 
     #[test]
@@ -1323,7 +1374,9 @@ mod tests {
     }
 
     #[test]
-    fn select_model_tier1_code() { assert_eq!(select_model("code", 1), "qwen2.5:7b"); }
+    fn select_model_tier1_code() {
+        assert_eq!(select_model("code", 1), "qwen2.5:7b");
+    }
 
     #[test]
     fn select_model_tier1_quick_response() {
@@ -1417,7 +1470,8 @@ mod tests {
             source_id: "personal-specialist".to_owned(),
             abstraction_tier2: "pass".to_owned(),
             abstraction_tier3: "omit".to_owned(),
-        }).unwrap();
+        })
+        .unwrap();
         ct.seal();
         let gt = to_gate_track(&ct);
         assert!(gt.is_sealed());
@@ -1442,7 +1496,8 @@ mod tests {
             source_id: "s".to_owned(),
             abstraction_tier2: "pass".to_owned(),
             abstraction_tier3: "pass".to_owned(),
-        }).unwrap();
+        })
+        .unwrap();
         ct.seal();
         let gt = to_gate_track(&ct);
         let gf = gt.fields().get("x").unwrap();
@@ -1455,32 +1510,50 @@ mod tests {
         use crate::conductor::types::PersonalField as CF;
         let mut pt = PersonalTrack::new();
         pt.add_field(CF {
-            field_name: "name".to_owned(), field_value: "Alice".to_owned(),
-            sensitivity: "personal".to_owned(), sensitivity_severity: 2,
-            source_id: "s".to_owned(), abstraction_tier2: "pass".to_owned(),
+            field_name: "name".to_owned(),
+            field_value: "Alice".to_owned(),
+            sensitivity: "personal".to_owned(),
+            sensitivity_severity: 2,
+            source_id: "s".to_owned(),
+            abstraction_tier2: "pass".to_owned(),
             abstraction_tier3: "omit".to_owned(),
-        }).unwrap();
+        })
+        .unwrap();
         pt.add_field(CF {
-            field_name: "diagnosis".to_owned(), field_value: "X".to_owned(),
-            sensitivity: "medical".to_owned(), sensitivity_severity: 3,
-            source_id: "s".to_owned(), abstraction_tier2: "omit".to_owned(),
+            field_name: "diagnosis".to_owned(),
+            field_value: "X".to_owned(),
+            sensitivity: "medical".to_owned(),
+            sensitivity_severity: 3,
+            source_id: "s".to_owned(),
+            abstraction_tier2: "omit".to_owned(),
             abstraction_tier3: "omit".to_owned(),
-        }).unwrap();
+        })
+        .unwrap();
         pt.seal();
         let ctx = StepContext {
             step: StepDefinition {
-                step_id: "s1".to_owned(), display_name: "Step 1".to_owned(),
-                guide_id: "g".to_owned(), task_type: "general".to_owned(),
-                routing_tier: 2, step_type: StepType::default(), output_var: None,
+                step_id: "s1".to_owned(),
+                display_name: "Step 1".to_owned(),
+                guide_id: "g".to_owned(),
+                task_type: "general".to_owned(),
+                routing_tier: 2,
+                step_type: StepType::default(),
+                output_var: None,
                 prompt_template: "Hello {name}".to_owned(),
                 field_requirements: std::collections::HashMap::new(),
                 options_override: std::collections::HashMap::new(),
             },
-            focus_id: "f".to_owned(), focus_run_id: "fr".to_owned(),
-            user_input: "".to_owned(), persona_context: "".to_owned(),
-            space_max_permitted_tier: 2, execution_tier: 2,
-            abstraction_tier: 2, raw_abstraction: 1,
-            floor_consent_preference: None, next_execution_tier: None, retry_count: 0,
+            focus_id: "f".to_owned(),
+            focus_run_id: "fr".to_owned(),
+            user_input: "".to_owned(),
+            persona_context: "".to_owned(),
+            space_max_permitted_tier: 2,
+            execution_tier: 2,
+            abstraction_tier: 2,
+            raw_abstraction: 1,
+            floor_consent_preference: None,
+            next_execution_tier: None,
+            retry_count: 0,
             focus_name: "test".to_owned(),
         };
         let mut projected = HashMap::new();
@@ -1494,26 +1567,40 @@ mod tests {
         use crate::conductor::types::PersonalField as CF;
         let mut pt = PersonalTrack::new();
         pt.add_field(CF {
-            field_name: "name".to_owned(), field_value: "Alice".to_owned(),
-            sensitivity: "personal".to_owned(), sensitivity_severity: 2,
-            source_id: "s".to_owned(), abstraction_tier2: "pass".to_owned(),
+            field_name: "name".to_owned(),
+            field_value: "Alice".to_owned(),
+            sensitivity: "personal".to_owned(),
+            sensitivity_severity: 2,
+            source_id: "s".to_owned(),
+            abstraction_tier2: "pass".to_owned(),
             abstraction_tier3: "omit".to_owned(),
-        }).unwrap();
+        })
+        .unwrap();
         pt.seal();
         let ctx = StepContext {
             step: StepDefinition {
-                step_id: "s1".to_owned(), display_name: "Step 1".to_owned(),
-                guide_id: "g".to_owned(), task_type: "general".to_owned(),
-                routing_tier: 1, step_type: StepType::default(), output_var: None,
+                step_id: "s1".to_owned(),
+                display_name: "Step 1".to_owned(),
+                guide_id: "g".to_owned(),
+                task_type: "general".to_owned(),
+                routing_tier: 1,
+                step_type: StepType::default(),
+                output_var: None,
                 prompt_template: "Hello {name}".to_owned(),
                 field_requirements: std::collections::HashMap::new(),
                 options_override: std::collections::HashMap::new(),
             },
-            focus_id: "f".to_owned(), focus_run_id: "fr".to_owned(),
-            user_input: "".to_owned(), persona_context: "".to_owned(),
-            space_max_permitted_tier: 1, execution_tier: 1,
-            abstraction_tier: 1, raw_abstraction: 1,
-            floor_consent_preference: None, next_execution_tier: None, retry_count: 0,
+            focus_id: "f".to_owned(),
+            focus_run_id: "fr".to_owned(),
+            user_input: "".to_owned(),
+            persona_context: "".to_owned(),
+            space_max_permitted_tier: 1,
+            execution_tier: 1,
+            abstraction_tier: 1,
+            raw_abstraction: 1,
+            floor_consent_preference: None,
+            next_execution_tier: None,
+            retry_count: 0,
             focus_name: "test".to_owned(),
         };
         assert_eq!(compute_step_sensitivity(&ctx, &pt, &HashMap::new(), 1), 2);
@@ -1525,18 +1612,28 @@ mod tests {
         let pt = PersonalTrack::new();
         let ctx = StepContext {
             step: StepDefinition {
-                step_id: "s1".to_owned(), display_name: "Step 1".to_owned(),
-                guide_id: "g".to_owned(), task_type: "general".to_owned(),
-                routing_tier: 1, step_type: StepType::default(), output_var: None,
+                step_id: "s1".to_owned(),
+                display_name: "Step 1".to_owned(),
+                guide_id: "g".to_owned(),
+                task_type: "general".to_owned(),
+                routing_tier: 1,
+                step_type: StepType::default(),
+                output_var: None,
                 prompt_template: "Hello {user_input}".to_owned(),
                 field_requirements: std::collections::HashMap::new(),
                 options_override: std::collections::HashMap::new(),
             },
-            focus_id: "f".to_owned(), focus_run_id: "fr".to_owned(),
-            user_input: "".to_owned(), persona_context: "".to_owned(),
-            space_max_permitted_tier: 1, execution_tier: 1,
-            abstraction_tier: 1, raw_abstraction: 1,
-            floor_consent_preference: None, next_execution_tier: None, retry_count: 0,
+            focus_id: "f".to_owned(),
+            focus_run_id: "fr".to_owned(),
+            user_input: "".to_owned(),
+            persona_context: "".to_owned(),
+            space_max_permitted_tier: 1,
+            execution_tier: 1,
+            abstraction_tier: 1,
+            raw_abstraction: 1,
+            floor_consent_preference: None,
+            next_execution_tier: None,
+            retry_count: 0,
             focus_name: "test".to_owned(),
         };
         assert_eq!(compute_step_sensitivity(&ctx, &pt, &HashMap::new(), 1), 1);

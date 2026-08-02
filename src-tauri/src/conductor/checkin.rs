@@ -168,7 +168,12 @@ mod tests {
     use super::*;
 
     fn candidate(id: &str, lv: SignalStrength, eng: SignalStrength) -> CandidateItem {
-        CandidateItem { id: id.to_owned(), summary: format!("candidate {id}"), learning_value: lv, engagement: eng }
+        CandidateItem {
+            id: id.to_owned(),
+            summary: format!("candidate {id}"),
+            learning_value: lv,
+            engagement: eng,
+        }
     }
 
     // -- SignalStrength --------------------------------------------------
@@ -243,7 +248,11 @@ mod tests {
 
     #[test]
     fn surfaced_candidates_includes_follow_thread() {
-        let items = vec![candidate("a", SignalStrength::Medium, SignalStrength::Medium)];
+        let items = vec![candidate(
+            "a",
+            SignalStrength::Medium,
+            SignalStrength::Medium,
+        )];
         let surfaced = SessionOpenCheckin::surfaced_candidates(&items);
         assert_eq!(surfaced.len(), 1);
     }

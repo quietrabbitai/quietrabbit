@@ -61,7 +61,7 @@ pub struct PersonalDBDecryptionError {
 pub struct PersonalField {
     pub field_name: String,
     #[serde(skip)]
-    pub field_value: String,        // decrypted — never serialized
+    pub field_value: String, // decrypted — never serialized
     pub sensitivity: String,
     pub sensitivity_severity: i32,
     pub source_id: String,
@@ -113,7 +113,7 @@ pub struct EntityFact {
     pub entity_id: Option<String>,
     pub field_name: String,
     #[serde(skip)]
-    pub field_value: String,        // decrypted — never serialized
+    pub field_value: String, // decrypted — never serialized
     pub sensitivity: String,
     pub sensitivity_severity: i32,
     pub source_persona_id: String,
@@ -164,7 +164,7 @@ pub struct PersonalTrack {
     /// to read them distinctly. Populated at INITIALIZE, read-only after seal.
     entity_facts: IndexMap<String, EntityFact>,
     voice_profile: IndexMap<String, String>,
-    life_context: IndexMap<String, String>,       // legacy name — D6-323, do not rename
+    life_context: IndexMap<String, String>, // legacy name — D6-323, do not rename
     source_versions: IndexMap<String, String>,
     sealed: bool,
 }
@@ -314,9 +314,9 @@ impl Default for PersonalTrack {
 /// NEVER contains field values.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersonalContextManifest {
-    pub field_names: Vec<String>,                  // sorted — deterministic comparison
-    pub field_hashes: HashMap<String, String>,     // field_name → sha256(name:value)
-    pub source_versions: HashMap<String, String>,  // source_id → version string
+    pub field_names: Vec<String>, // sorted — deterministic comparison
+    pub field_hashes: HashMap<String, String>, // field_name → sha256(name:value)
+    pub source_versions: HashMap<String, String>, // source_id → version string
     pub snapshot_taken_at: String,
 }
 
@@ -513,7 +513,8 @@ impl SharedStateTrack {
         step_id: impl Into<String>,
         approved_fields: HashMap<String, String>,
     ) {
-        self.step_disclosure_buffers.insert(step_id.into(), approved_fields);
+        self.step_disclosure_buffers
+            .insert(step_id.into(), approved_fields);
     }
 
     /// Read abstracted field values for a step.
@@ -619,7 +620,9 @@ mod tests {
     fn personal_track_sealed_rejects_add() {
         let mut track = PersonalTrack::new();
         track.seal();
-        let err = track.add_field(make_field("city", "Portland", 2)).unwrap_err();
+        let err = track
+            .add_field(make_field("city", "Portland", 2))
+            .unwrap_err();
         assert!(err.to_string().contains("sealed"));
     }
 
@@ -717,7 +720,10 @@ mod tests {
         // entity-scoped fact of the same field_name+value.
         let singleton = make_entity_fact(None, "name", "Robert", 2, "persona-a");
         let scoped = make_entity_fact(Some("ent-1"), "name", "Robert", 2, "persona-a");
-        assert_ne!(singleton.compute_content_hash(), scoped.compute_content_hash());
+        assert_ne!(
+            singleton.compute_content_hash(),
+            scoped.compute_content_hash()
+        );
     }
 
     // -- PersonalTrack.entity_facts ---------------------------------------------
@@ -726,7 +732,13 @@ mod tests {
     fn personal_track_add_entity_fact_and_seal() {
         let mut track = PersonalTrack::new();
         track
-            .add_entity_fact(make_entity_fact(Some("ent-1"), "name", "Robert", 2, "persona-a"))
+            .add_entity_fact(make_entity_fact(
+                Some("ent-1"),
+                "name",
+                "Robert",
+                2,
+                "persona-a",
+            ))
             .unwrap();
         assert!(!track.is_sealed());
         track.seal();
@@ -738,7 +750,13 @@ mod tests {
         let mut track = PersonalTrack::new();
         track.seal();
         let err = track
-            .add_entity_fact(make_entity_fact(Some("ent-1"), "name", "Robert", 2, "persona-a"))
+            .add_entity_fact(make_entity_fact(
+                Some("ent-1"),
+                "name",
+                "Robert",
+                2,
+                "persona-a",
+            ))
             .unwrap_err();
         assert!(err.to_string().contains("sealed"));
     }
@@ -747,7 +765,13 @@ mod tests {
     fn personal_track_entity_facts_accessor_returns_added_fact() {
         let mut track = PersonalTrack::new();
         track
-            .add_entity_fact(make_entity_fact(Some("ent-1"), "name", "Robert", 2, "persona-a"))
+            .add_entity_fact(make_entity_fact(
+                Some("ent-1"),
+                "name",
+                "Robert",
+                2,
+                "persona-a",
+            ))
             .unwrap();
         assert_eq!(track.entity_facts().len(), 1);
         let key = "ent-1:name";
@@ -760,7 +784,13 @@ mod tests {
     fn personal_track_entity_facts_singleton_key_has_empty_entity_prefix() {
         let mut track = PersonalTrack::new();
         track
-            .add_entity_fact(make_entity_fact(None, "life_stage", "retired", 1, "persona-a"))
+            .add_entity_fact(make_entity_fact(
+                None,
+                "life_stage",
+                "retired",
+                1,
+                "persona-a",
+            ))
             .unwrap();
         assert!(track.entity_facts().contains_key(":life_stage"));
     }
@@ -771,10 +801,22 @@ mod tests {
         // can share the same field_name without colliding.
         let mut track = PersonalTrack::new();
         track
-            .add_entity_fact(make_entity_fact(Some("ent-1"), "name", "Robert", 2, "persona-a"))
+            .add_entity_fact(make_entity_fact(
+                Some("ent-1"),
+                "name",
+                "Robert",
+                2,
+                "persona-a",
+            ))
             .unwrap();
         track
-            .add_entity_fact(make_entity_fact(Some("ent-2"), "name", "Susan", 2, "persona-a"))
+            .add_entity_fact(make_entity_fact(
+                Some("ent-2"),
+                "name",
+                "Susan",
+                2,
+                "persona-a",
+            ))
             .unwrap();
         assert_eq!(track.entity_facts().len(), 2);
     }
@@ -786,10 +828,22 @@ mod tests {
         // field_name) replaces the prior entry rather than duplicating it.
         let mut track = PersonalTrack::new();
         track
-            .add_entity_fact(make_entity_fact(Some("ent-1"), "name", "Robert", 2, "persona-a"))
+            .add_entity_fact(make_entity_fact(
+                Some("ent-1"),
+                "name",
+                "Robert",
+                2,
+                "persona-a",
+            ))
             .unwrap();
         track
-            .add_entity_fact(make_entity_fact(Some("ent-1"), "name", "Bob", 2, "persona-a"))
+            .add_entity_fact(make_entity_fact(
+                Some("ent-1"),
+                "name",
+                "Bob",
+                2,
+                "persona-a",
+            ))
             .unwrap();
         assert_eq!(track.entity_facts().len(), 1);
         assert_eq!(
@@ -805,7 +859,13 @@ mod tests {
         let mut track = PersonalTrack::new();
         track.add_field(make_field("city", "Portland", 2)).unwrap();
         track
-            .add_entity_fact(make_entity_fact(Some("ent-1"), "name", "Robert", 2, "persona-a"))
+            .add_entity_fact(make_entity_fact(
+                Some("ent-1"),
+                "name",
+                "Robert",
+                2,
+                "persona-a",
+            ))
             .unwrap();
         assert_eq!(track.fields().len(), 1);
         assert_eq!(track.entity_facts().len(), 1);
@@ -815,7 +875,13 @@ mod tests {
     #[test]
     fn personal_track_entity_facts_provenance_round_trip() {
         let mut track = PersonalTrack::new();
-        let mut fact = make_entity_fact(Some("ent-1"), "diagnosis", "confidential", 3, "persona-medical");
+        let mut fact = make_entity_fact(
+            Some("ent-1"),
+            "diagnosis",
+            "confidential",
+            3,
+            "persona-medical",
+        );
         fact.cross_persona_export = true;
         fact.origin_persona_id = Some("persona-medical".to_owned());
         track.add_entity_fact(fact).unwrap();
@@ -832,9 +898,8 @@ mod tests {
     fn manifest_matches_identical_track() {
         let mut track = PersonalTrack::new();
         track.add_field(make_field("city", "Portland", 2)).unwrap();
-        let manifest = PersonalContextManifest::from_personal_track(
-            &track, "2026-06-19T00:00:00Z".to_owned(),
-        );
+        let manifest =
+            PersonalContextManifest::from_personal_track(&track, "2026-06-19T00:00:00Z".to_owned());
         assert!(manifest.matches(&track));
     }
 
@@ -842,9 +907,8 @@ mod tests {
     fn manifest_detects_value_change() {
         let mut track = PersonalTrack::new();
         track.add_field(make_field("city", "Portland", 2)).unwrap();
-        let manifest = PersonalContextManifest::from_personal_track(
-            &track, "2026-06-19T00:00:00Z".to_owned(),
-        );
+        let manifest =
+            PersonalContextManifest::from_personal_track(&track, "2026-06-19T00:00:00Z".to_owned());
         let mut track2 = PersonalTrack::new();
         track2.add_field(make_field("city", "Seattle", 2)).unwrap();
         assert!(!manifest.matches(&track2));
@@ -854,9 +918,8 @@ mod tests {
     fn manifest_detects_field_added() {
         let mut track = PersonalTrack::new();
         track.add_field(make_field("city", "Portland", 2)).unwrap();
-        let manifest = PersonalContextManifest::from_personal_track(
-            &track, "2026-06-19T00:00:00Z".to_owned(),
-        );
+        let manifest =
+            PersonalContextManifest::from_personal_track(&track, "2026-06-19T00:00:00Z".to_owned());
         let mut track2 = PersonalTrack::new();
         track2.add_field(make_field("city", "Portland", 2)).unwrap();
         track2.add_field(make_field("age", "35", 2)).unwrap();
@@ -870,9 +933,8 @@ mod tests {
         let mut versions = IndexMap::new();
         versions.insert("personal-specialist".to_owned(), "v1".to_owned());
         track.set_source_versions(versions).unwrap();
-        let manifest = PersonalContextManifest::from_personal_track(
-            &track, "2026-06-19T00:00:00Z".to_owned(),
-        );
+        let manifest =
+            PersonalContextManifest::from_personal_track(&track, "2026-06-19T00:00:00Z".to_owned());
         let mut track2 = PersonalTrack::new();
         track2.add_field(make_field("city", "Portland", 2)).unwrap();
         let mut versions2 = IndexMap::new();
@@ -975,7 +1037,10 @@ mod tests {
         fields.insert("city".to_owned(), "Pacific Northwest".to_owned());
         sst.write_disclosure_buffer("step-1", fields);
         let buf = sst.read_disclosure_buffer("step-1");
-        assert_eq!(buf.get("city").map(|s| s.as_str()), Some("Pacific Northwest"));
+        assert_eq!(
+            buf.get("city").map(|s| s.as_str()),
+            Some("Pacific Northwest")
+        );
     }
 
     #[test]

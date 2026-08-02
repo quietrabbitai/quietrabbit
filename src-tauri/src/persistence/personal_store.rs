@@ -276,7 +276,10 @@ fn row_to_personal_field(r: &sqlx::sqlite::SqliteRow) -> Result<PersonalField, P
     let metadata_json: String = r.try_get("extra_metadata")?;
     let source_id = serde_json::from_str::<serde_json::Value>(&metadata_json)
         .ok()
-        .and_then(|v| v.get("source_id").and_then(|s| s.as_str().map(str::to_owned)))
+        .and_then(|v| {
+            v.get("source_id")
+                .and_then(|s| s.as_str().map(str::to_owned))
+        })
         .unwrap_or_default();
 
     Ok(PersonalField {
@@ -445,7 +448,9 @@ pub async fn save_personal_field(
         log::warn!(
             "short-field write: field='{}' sensitivity='{}' len={}. \
              Gate2 cannot detect short values in model responses.",
-            field_name, sensitivity, field_value.len()
+            field_name,
+            sensitivity,
+            field_value.len()
         );
     }
 
@@ -459,7 +464,10 @@ pub async fn save_personal_field(
     let mut metadata = extra_metadata.unwrap_or_else(|| serde_json::json!({}));
     if let Some(obj) = metadata.as_object_mut() {
         obj.insert("source_id".to_owned(), serde_json::json!(source_id));
-        obj.insert("ownership_scope".to_owned(), serde_json::json!(ownership_scope));
+        obj.insert(
+            "ownership_scope".to_owned(),
+            serde_json::json!(ownership_scope),
+        );
     }
     let metadata_json = serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".to_owned());
 
@@ -521,9 +529,7 @@ pub async fn save_personal_field(
                 .execute(&mut conn)
                 .await
             {
-                log::error!(
-                    "Savepoint rollback failed in save_personal_field: {rollback_err}"
-                );
+                log::error!("Savepoint rollback failed in save_personal_field: {rollback_err}");
             }
             let _ = sqlx::query("RELEASE save_personal_field")
                 .execute(&mut conn)
@@ -641,7 +647,10 @@ pub async fn create_entity_fact_with_provenance(
     origin_persona_id: Option<&str>,
     extra_metadata: Option<serde_json::Value>,
 ) -> Result<String, PersonalStoreError> {
-    if !matches!(sensitivity, "general" | "personal" | "medical" | "financial") {
+    if !matches!(
+        sensitivity,
+        "general" | "personal" | "medical" | "financial"
+    ) {
         return Err(PersonalStoreError::Validation(format!(
             "Unknown sensitivity '{sensitivity}'. \
              Must be general, personal, medical, or financial."
@@ -948,17 +957,15 @@ pub async fn export_personal_fields(
 // Voice profile value validation (D5-151)
 // ---------------------------------------------------------------------------
 
-fn validate_voice_profile_value(
-    attribute: &str,
-    value: &str,
-) -> Result<(), PersonalStoreError> {
+fn validate_voice_profile_value(attribute: &str, value: &str) -> Result<(), PersonalStoreError> {
     let normalized = value.trim();
     let word_count = normalized.split_whitespace().count();
 
     if word_count > VOICE_VALUE_MAX_WORDS {
         log::warn!(
             "voice_profile write rejected: value too long attribute='{}' word_count={}",
-            attribute, word_count
+            attribute,
+            word_count
         );
         return Err(PersonalStoreError::Validation(
             VOICE_VALUE_REJECTION_MSG.to_owned(),
@@ -989,7 +996,8 @@ fn validate_voice_profile_value(
         };
         log::warn!(
             "voice_profile write rejected: {} detected attribute='{}'",
-            reason, attribute
+            reason,
+            attribute
         );
         return Err(PersonalStoreError::Validation(
             VOICE_VALUE_REJECTION_MSG.to_owned(),
@@ -1019,9 +1027,7 @@ pub async fn save_voice_profile_entry(
 ) -> Result<String, PersonalStoreError> {
     validate_voice_profile_value(attribute, value)?;
 
-    if !(VOICE_PRECEDENCE_MODEL_BASELINE..=VOICE_PRECEDENCE_WRITING_CONTEXT)
-        .contains(&precedence)
-    {
+    if !(VOICE_PRECEDENCE_MODEL_BASELINE..=VOICE_PRECEDENCE_WRITING_CONTEXT).contains(&precedence) {
         return Err(PersonalStoreError::Validation(format!(
             "Voice profile precedence must be {}-{}, got {precedence}.",
             VOICE_PRECEDENCE_MODEL_BASELINE, VOICE_PRECEDENCE_WRITING_CONTEXT
@@ -1162,12 +1168,10 @@ pub async fn write_disclosure_log(
 ) -> Result<String, PersonalStoreError> {
     let entry_id = uuid::Uuid::new_v4().to_string();
     let timestamp = crate::providers::utils::now();
-    let shared_json = serde_json::to_string(fields_shared)
-        .unwrap_or_else(|_| "[]".to_owned());
-    let abstracted_json = serde_json::to_string(fields_abstracted)
-        .unwrap_or_else(|_| "{}".to_owned());
-    let withheld_json = serde_json::to_string(fields_withheld)
-        .unwrap_or_else(|_| "[]".to_owned());
+    let shared_json = serde_json::to_string(fields_shared).unwrap_or_else(|_| "[]".to_owned());
+    let abstracted_json =
+        serde_json::to_string(fields_abstracted).unwrap_or_else(|_| "{}".to_owned());
+    let withheld_json = serde_json::to_string(fields_withheld).unwrap_or_else(|_| "[]".to_owned());
     let metadata_json = serde_json::to_string(&extra_metadata.unwrap_or_default())
         .unwrap_or_else(|_| "{}".to_owned());
     let override_flag: i32 = if override_declined { 1 } else { 0 };
@@ -1230,22 +1234,18 @@ pub async fn get_disclosure_log_for_run(
     for r in rows {
         // Deserialize JSON TEXT columns to Value on read — callers receive
         // parsed structures, not raw JSON strings.
-        let fields_shared: serde_json::Value = serde_json::from_str(
-            &r.try_get::<String, _>("fields_shared")?,
-        )
-        .unwrap_or(serde_json::json!([]));
-        let fields_abstracted: serde_json::Value = serde_json::from_str(
-            &r.try_get::<String, _>("fields_abstracted")?,
-        )
-        .unwrap_or(serde_json::json!({}));
-        let fields_withheld: serde_json::Value = serde_json::from_str(
-            &r.try_get::<String, _>("fields_withheld")?,
-        )
-        .unwrap_or(serde_json::json!([]));
-        let extra_metadata: serde_json::Value = serde_json::from_str(
-            &r.try_get::<String, _>("extra_metadata")?,
-        )
-        .unwrap_or(serde_json::json!({}));
+        let fields_shared: serde_json::Value =
+            serde_json::from_str(&r.try_get::<String, _>("fields_shared")?)
+                .unwrap_or(serde_json::json!([]));
+        let fields_abstracted: serde_json::Value =
+            serde_json::from_str(&r.try_get::<String, _>("fields_abstracted")?)
+                .unwrap_or(serde_json::json!({}));
+        let fields_withheld: serde_json::Value =
+            serde_json::from_str(&r.try_get::<String, _>("fields_withheld")?)
+                .unwrap_or(serde_json::json!([]));
+        let extra_metadata: serde_json::Value =
+            serde_json::from_str(&r.try_get::<String, _>("extra_metadata")?)
+                .unwrap_or(serde_json::json!({}));
 
         entries.push(serde_json::json!({
             "id": r.try_get::<String, _>("id")?,

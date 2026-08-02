@@ -23,12 +23,12 @@ impl AbstractionPolicy {
     #[allow(clippy::should_implement_trait)] // Returns Self not Result; cannot impl std::str::FromStr.
     pub fn from_str(s: &str) -> Self {
         match s {
-            "pass"          => Self::Pass,
-            "omit"          => Self::Omit,
-            "summarize"     => Self::Summarize,
-            "range_only"    => Self::RangeOnly,
+            "pass" => Self::Pass,
+            "omit" => Self::Omit,
+            "summarize" => Self::Summarize,
+            "range_only" => Self::RangeOnly,
             "not_permitted" => Self::NotPermitted,
-            other           => Self::Unknown(other.to_string()),
+            other => Self::Unknown(other.to_string()),
         }
     }
 }
@@ -47,18 +47,18 @@ pub enum Sensitivity {
 impl Sensitivity {
     pub fn severity(&self) -> u8 {
         match self {
-            Sensitivity::General   => 1,
-            Sensitivity::Personal  => 2,
-            Sensitivity::Medical   => 3,
+            Sensitivity::General => 1,
+            Sensitivity::Personal => 2,
+            Sensitivity::Medical => 3,
             Sensitivity::Financial => 4,
         }
     }
 
     pub fn label(&self) -> &'static str {
         match self {
-            Sensitivity::General   => "general",
-            Sensitivity::Personal  => "personal",
-            Sensitivity::Medical   => "medical",
+            Sensitivity::General => "general",
+            Sensitivity::Personal => "personal",
+            Sensitivity::Medical => "medical",
             Sensitivity::Financial => "financial",
         }
     }
@@ -70,13 +70,13 @@ impl Sensitivity {
 
 #[derive(Debug, Clone)]
 pub struct PersonalField {
-    pub field_name:           String,
-    pub field_value:          String,
-    pub sensitivity:          Sensitivity,
+    pub field_name: String,
+    pub field_value: String,
+    pub sensitivity: Sensitivity,
     pub sensitivity_severity: u8,
-    pub source_id:            String,
-    pub abstraction_tier2:    AbstractionPolicy,
-    pub abstraction_tier3:    AbstractionPolicy,
+    pub source_id: String,
+    pub abstraction_tier2: AbstractionPolicy,
+    pub abstraction_tier3: AbstractionPolicy,
 }
 
 // -- PersonalTrack ------------------------------------------------------------
@@ -124,25 +124,25 @@ impl PersonalTrack {
 
 #[derive(Debug)]
 pub struct Gate1Result {
-    pub approved_fields:      IndexMap<String, String>,
-    pub withheld_fields:      Vec<String>,
-    pub fields_shared:        Vec<String>,
+    pub approved_fields: IndexMap<String, String>,
+    pub withheld_fields: Vec<String>,
+    pub fields_shared: Vec<String>,
     pub floor_clamped_fields: Vec<String>,
-    pub disclosure_log_id:    String,
-    pub blocked:              bool,
+    pub disclosure_log_id: String,
+    pub blocked: bool,
 }
 
 #[derive(Debug)]
 pub struct Gate2Result {
-    pub flagged:             bool,
+    pub flagged: bool,
     pub matched_field_names: Vec<String>,
 }
 
 #[derive(Debug, Default)]
 pub struct Gate3Result {
-    pub approved:        bool,
-    pub blocked:         bool,
-    pub plain_language:  Option<String>,
+    pub approved: bool,
+    pub blocked: bool,
+    pub plain_language: Option<String>,
     /// Privacy Filter identified spans and emitted consent_request event.
     /// Execution is paused — waiting for per-element user decision.
     /// When true: approved=false, blocked=false.
@@ -150,14 +150,14 @@ pub struct Gate3Result {
     /// Privacy Filter call exceeded the timeout window.
     /// gate_timeout event written to disclosure_log before returning.
     /// When true: approved=false, blocked=true.
-    pub timeout:         bool,
+    pub timeout: bool,
 }
 
 #[derive(Debug)]
 pub struct Gate4Result {
-    pub content_approved:  bool,
+    pub content_approved: bool,
     pub clipboard_blocked: bool,
-    pub plain_language:    Option<String>,
+    pub plain_language: Option<String>,
 }
 
 pub const CLIPBOARD_MAX_SENSITIVITY_SEVERITY: u8 = 2;
@@ -194,24 +194,24 @@ pub enum ReviewTier {
 pub struct ConsentSpanItem {
     /// Unique ID within this gate invocation. Used to correlate ElementDecision
     /// responses from the frontend back to the original span.
-    pub span_id:       String,
+    pub span_id: String,
     /// Raw category label from the Privacy Filter (e.g. "private_person").
-    pub category:      String,
+    pub category: String,
     /// Human-readable label for display (e.g. "Person name").
     /// Derived from the QR taxonomy mapping in gate3.rs.
-    pub user_label:    String,
+    pub user_label: String,
     /// The original text identified by the Privacy Filter.
     pub original_text: String,
     /// Pre-populated generalization suggestion (e.g. "[person]").
     /// None if no rule matches — frontend renders an editable placeholder.
-    pub suggestion:    Option<String>,
+    pub suggestion: Option<String>,
     /// Byte offset of the span start in the original content text (inclusive).
     /// Slicing must use byte indexing: &text[start_byte..end_byte].
-    pub start_byte:    usize,
+    pub start_byte: usize,
     /// Byte offset of the span end in the original content text (exclusive).
-    pub end_byte:      usize,
+    pub end_byte: usize,
     /// Confidence score from the Privacy Filter in [0.0, 1.0].
-    pub score:         f32,
+    pub score: f32,
 }
 
 /// Full payload for the consent_request push event emitted by gate3.
@@ -222,11 +222,11 @@ pub struct ConsentRequestPayload {
     /// per-element return command back to the correct run.
     pub focus_run_id: String,
     /// Display name of the Focus being executed (shown in the modal header).
-    pub focus_name:   String,
+    pub focus_name: String,
     /// Review tier for the modal. Controls visual weight and friction level.
-    pub review_tier:  ReviewTier,
+    pub review_tier: ReviewTier,
     /// Identified spans. May be empty — see gate3.rs zero-span handling.
-    pub spans:        Vec<ConsentSpanItem>,
+    pub spans: Vec<ConsentSpanItem>,
 }
 
 /// The user's decision type for a single identified span.
@@ -247,12 +247,12 @@ pub enum ElementDecisionKind {
 #[derive(Debug, Deserialize, specta::Type)]
 pub struct ElementDecision {
     /// Matches ConsentSpanItem.span_id for this decision.
-    pub span_id:            String,
+    pub span_id: String,
     /// The user's choice for this span.
-    pub decision:           ElementDecisionKind,
+    pub decision: ElementDecisionKind,
     /// The suggestion text that was displayed to the user (original, unedited).
     /// Required per IPC flag: per-element return must include original suggestion.
-    pub suggestion_text:    Option<String>,
+    pub suggestion_text: Option<String>,
     /// The text the user actually entered, if they edited the suggestion.
     /// None if the user accepted the suggestion without modification.
     pub user_modified_text: Option<String>,
@@ -272,18 +272,18 @@ pub struct ElementDecision {
 #[derive(Debug, Clone, Serialize, specta::Type)]
 pub struct ExtractedCandidate {
     /// Row id in extract_confirm_candidates. i64 matches INTEGER PRIMARY KEY.
-    pub candidate_id:    i64,
-    pub field_name:      String,
+    pub candidate_id: i64,
+    pub field_name: String,
     pub extracted_value: String,
     /// Sensitivity tier: "medical" | "financial" | "personal".
-    pub sensitivity:     String,
+    pub sensitivity: String,
     /// One sentence explaining why this fact was extracted.
-    pub reason:          Option<String>,
+    pub reason: Option<String>,
     /// Confidence in [0.6, 1.0] -- values below 0.6 are suppressed pre-persist.
-    pub confidence:      f64,
+    pub confidence: f64,
     /// True when confidence is in the 0.6-0.8 warn band.
     /// Frontend should surface a lower-confidence indicator for these candidates.
-    pub warn_flag:       bool,
+    pub warn_flag: bool,
 }
 
 /// The user's decision for a single extraction candidate.
@@ -299,9 +299,9 @@ pub struct ExtractedCandidate {
 #[derive(Debug, Clone, Deserialize, specta::Type)]
 pub struct ExtractConfirmDecision {
     /// Matches ExtractedCandidate.candidate_id.
-    pub candidate_id:    i64,
+    pub candidate_id: i64,
     /// True if the user accepted this candidate for storage.
-    pub confirmed:       bool,
+    pub confirmed: bool,
     /// The original extracted value (audit provenance -- always required).
     pub extracted_value: String,
     /// The value the user accepted, possibly edited. Must be Some when confirmed == true.
