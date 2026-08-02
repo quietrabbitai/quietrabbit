@@ -35,18 +35,22 @@ use specta::Type;
 /// contract. This type says that explicitly instead. Each of the five should
 /// be given its real request/response struct when its feature is designed --
 /// this is deliberately not a contract to build against.
+///
+/// UPDATE (items.id=185, 2026-08-02): tier2::get_tier2_config now has a real
+/// return type (commands::tier2::Tier2Config) and no longer uses this
+/// placeholder -- four of the original five remain unbuilt.
 #[derive(Debug, Serialize, Deserialize, Type)]
 pub struct NotImplementedPlaceholder {}
 
-pub mod execution;
+pub mod active_board;
+pub mod auth;
 pub mod consent;
+pub mod execution;
+pub mod focus_builder;
+pub mod library;
+pub mod notifications;
 pub mod onboarding;
 pub mod persona;
-pub mod active_board;
 pub mod personal;
-pub mod library;
-pub mod focus_builder;
-pub mod tier2;
-pub mod notifications;
-pub mod auth;
 pub mod system;
+pub mod tier2;

@@ -80,7 +80,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         // Group 8 -- Focus Builder (stubs)
         commands::focus_builder::get_focus_builder_session,
         commands::focus_builder::submit_focus_builder_step,
-        // Group 9 -- Tier 2 configuration (stubs)
+        // Group 9 -- Tier 2 configuration (items.id=185, 2026-08-02)
         commands::tier2::get_tier2_config,
         commands::tier2::set_tier2_provider,
         // Group 10 -- Notifications (stub)

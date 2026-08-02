@@ -149,7 +149,13 @@ export const commands = {
 	deleteOutput: (outputId: string, userId: string, personaId: string, keyHex: string, deepPurge: boolean | null) => typedError<null, string>(__TAURI_INVOKE("delete_output", { outputId, userId, personaId, keyHex, deepPurge })),
 	getFocusBuilderSession: (focusId: string | null) => typedError<NotImplementedPlaceholder, string>(__TAURI_INVOKE("get_focus_builder_session", { focusId })),
 	submitFocusBuilderStep: (sessionId: string, input: NotImplementedPlaceholder) => typedError<NotImplementedPlaceholder, string>(__TAURI_INVOKE("submit_focus_builder_step", { sessionId, input })),
-	getTier2Config: () => typedError<NotImplementedPlaceholder, string>(__TAURI_INVOKE("get_tier2_config")),
+	/**
+	 *  Report configuration state for a Tier 2 provider. Returns
+	 *  configured=false (not an error) when no key is set yet -- an
+	 *  unconfigured provider is a normal, expected state, not a failure.
+	 */
+	getTier2Config: (provider: string) => typedError<Tier2Config, string>(__TAURI_INVOKE("get_tier2_config", { provider })),
+	/**  Set (or replace) the credential for a Tier 2 provider, user-global scope. */
 	setTier2Provider: (provider: string, apiKey: string) => typedError<null, string>(__TAURI_INVOKE("set_tier2_provider", { provider, apiKey })),
 	dismissNotification: (notificationId: string) => typedError<null, string>(__TAURI_INVOKE("dismiss_notification", { notificationId })),
 	login: (displayName: string, password: string) => typedError<null, string>(__TAURI_INVOKE("login", { displayName, password })),
@@ -247,6 +253,10 @@ export type HealthResponse = {
  *  contract. This type says that explicitly instead. Each of the five should
  *  be given its real request/response struct when its feature is designed --
  *  this is deliberately not a contract to build against.
+ * 
+ *  UPDATE (items.id=185, 2026-08-02): tier2::get_tier2_config now has a real
+ *  return type (commands::tier2::Tier2Config) and no longer uses this
+ *  placeholder -- four of the original five remain unbuilt.
  */
 export type NotImplementedPlaceholder = Record<string, never>;
 
@@ -411,6 +421,17 @@ export type SubmitFrictionGateDecisionRequest = {
 	/**  "proceed" | "cancel" */
 	decision: string,
 	original_request: UpdateFocusSettingsRequest,
+};
+
+/**
+ *  Non-secret Tier 2 configuration state -- never carries the credential
+ *  itself. `configured` is true iff an active user-global tier2 key exists
+ *  for `provider`.
+ */
+export type Tier2Config = {
+	provider: string,
+	configured: boolean,
+	expires_at: string | null,
 };
 
 export type TopicInfo = {

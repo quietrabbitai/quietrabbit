@@ -51,6 +51,28 @@
 -- accepting it. expires_at nullable -- OAuth tokens expire, static keys do
 -- not.
 --
+-- persona_id NO LONGER carries REFERENCES personas(id) ON DELETE CASCADE
+-- (removed items.id=185, 2026-08-02): personas lives in shared.db, a
+-- separate physical SQLite file from integration_keys.db -- SQLite has no
+-- cross-database foreign key support, so this constraint could never
+-- actually be satisfied. Under sqlx's own default (foreign_keys(true) --
+-- SQLx enables FK enforcement by default, confirmed against sqlx's
+-- current docs this session), every insert into this table failed with
+-- "no such table: main.personas", even when persona_id was NULL --
+-- reproduced directly. keys_001.sql's own earlier header already noted no
+-- Rust code had ever written persona_id before this session; that is why
+-- this was never caught until the first real store module (
+-- integration_keys_store.rs) actually inserted a row. ON DELETE CASCADE
+-- never fired cross-database anyway, so removing the clause loses no real
+-- enforcement -- only a reference annotation that was misleading (implying
+-- protection the schema could never provide), the same category of dead
+-- constraint entity_store.rs's own header already documents for a
+-- different table (entity_facts.entity_id, PRAGMA foreign_keys note).
+-- persona_id's meaning (NULL = user-global key) and validity (must name a
+-- real persona if set) are enforced at the application layer instead --
+-- consistent with key_type below, which was already open/
+-- application-validated rather than DB-constrained.
+--
 -- UNIQUE (provider, key_type, integration_id, persona_id) -- INCLUDES
 -- persona_id, Jason's explicit direction (2026-08-01): a user may hold a
 -- personal-use key and a separate Work-persona key for the same provider
@@ -90,7 +112,7 @@ CREATE TABLE IF NOT EXISTS integration_keys (
     integration_id      TEXT NOT NULL DEFAULT '_default',
     credential_label    TEXT NOT NULL,
     credential          TEXT NOT NULL,
-    persona_id          TEXT REFERENCES personas(id) ON DELETE CASCADE,
+    persona_id          TEXT,
     auth_type           TEXT
                             CHECK (auth_type IS NULL
                                    OR auth_type IN ('api_key', 'oauth_token', 'manual_copy')),
@@ -106,4 +128,4 @@ CREATE INDEX IF NOT EXISTS idx_integration_keys_lookup
     ON integration_keys (provider, key_type, is_active, last_verified_at);
 
 INSERT OR IGNORE INTO schema_version (version, applied_at, description)
-VALUES (1, datetime('now'), 'integration_keys.db schema (items.id=205, 2026-08-01: credential/persona_id/auth_type/expires_at, field-level encryption removed per Section 8.1)');
+VALUES (1, datetime('now'), 'integration_keys.db schema (items.id=205, 2026-08-01: credential/persona_id/auth_type/expires_at, field-level encryption removed per Section 8.1; items.id=185, 2026-08-02: removed persona_id REFERENCES personas(id) -- unsatisfiable cross-database FK, blocked every insert under sqlx default foreign_keys(true))');
