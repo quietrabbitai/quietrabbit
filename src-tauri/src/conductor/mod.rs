@@ -13,3 +13,4 @@ pub mod quality;
 pub mod reentry;
 pub mod tokens;
 pub mod types;
+pub mod visibility;

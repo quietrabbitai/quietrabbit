@@ -134,6 +134,26 @@ pub struct Entity {
     pub created_at: String,
     /// Stored as a JSON object TEXT column with a json_valid() CHECK.
     pub extra_metadata: serde_json::Value,
+    /// decisions.id=513 (D6-471) Layer 2 flag. When true: identifying facts
+    /// removed on Ambient and Boundary surfaces; generic title substituted.
+    /// Full semantics owned by decisions.id=513 (P4 -- One Home), evaluated
+    /// by conductor::visibility::evaluate_object_visibility. Defaults false
+    /// (personal_003.sql).
+    pub redact_identification: bool,
+    /// decisions.id=513 (D6-471) Layer 2 flag. When true: suppressed
+    /// entirely from Ambient surfaces; Direct-surface navigation unaffected.
+    /// Full semantics owned by decisions.id=513 (P4 -- One Home). Defaults
+    /// false (personal_003.sql).
+    pub hide_from_shared_surfaces: bool,
+}
+
+impl crate::conductor::visibility::VisibilityFlags for Entity {
+    fn redact_identification(&self) -> bool {
+        self.redact_identification
+    }
+    fn hide_from_shared_surfaces(&self) -> bool {
+        self.hide_from_shared_surfaces
+    }
 }
 
 /// Parent-hierarchy filter. A plain Option<String> could not distinguish
@@ -231,6 +251,9 @@ fn row_to_entity(row: &sqlx::sqlite::SqliteRow) -> Result<Entity, PersonalStoreE
             ))
         })?;
 
+    let redact_identification_int: i64 = row.try_get("redact_identification")?;
+    let hide_from_shared_surfaces_int: i64 = row.try_get("hide_from_shared_surfaces")?;
+
     Ok(Entity {
         id,
         entity_type: row.try_get("entity_type")?,
@@ -243,6 +266,8 @@ fn row_to_entity(row: &sqlx::sqlite::SqliteRow) -> Result<Entity, PersonalStoreE
         source_url: row.try_get("source_url")?,
         created_at: row.try_get("created_at")?,
         extra_metadata,
+        redact_identification: redact_identification_int != 0,
+        hide_from_shared_surfaces: hide_from_shared_surfaces_int != 0,
     })
 }
 
@@ -334,7 +359,7 @@ fn filter_clause(filter: &EntityFilter) -> (String, Vec<String>) {
 const ENTITY_COLUMNS: &str =
     "id, entity_type, display_name, aliases, parent_entity_id, status, \
      modification_state, source_registry_id, source_url, created_at, \
-     extra_metadata";
+     extra_metadata, redact_identification, hide_from_shared_surfaces";
 
 // ---------------------------------------------------------------------------
 // Create
@@ -472,6 +497,11 @@ pub struct EntityUpdate {
     /// operation.
     pub modification_state: Option<String>,
     pub extra_metadata: Option<serde_json::Value>,
+    /// decisions.id=513 (D6-471) Layer 2 flag. User-adjustable at any time
+    /// (decisions.id=513: "User controls both per object at any time").
+    pub redact_identification: Option<bool>,
+    /// decisions.id=513 (D6-471) Layer 2 flag. User-adjustable at any time.
+    pub hide_from_shared_surfaces: Option<bool>,
 }
 
 impl EntityUpdate {
@@ -482,6 +512,8 @@ impl EntityUpdate {
             && self.status.is_none()
             && self.modification_state.is_none()
             && self.extra_metadata.is_none()
+            && self.redact_identification.is_none()
+            && self.hide_from_shared_surfaces.is_none()
     }
 }
 
@@ -565,6 +597,19 @@ pub(crate) async fn update_entity_conn(
         })?;
         sets.push("extra_metadata = ?");
         binds.push(Some(json));
+    }
+    if let Some(flag) = update.redact_identification {
+        // Bound as "0"/"1" text against the INTEGER column -- SQLite's
+        // dynamic typing coerces the TEXT literal into the column's INTEGER
+        // affinity, and the CHECK (... IN (0, 1)) constraint accepts the
+        // coerced value. Kept as a string here rather than restructuring
+        // the whole bind Vec's element type for two bool columns.
+        sets.push("redact_identification = ?");
+        binds.push(Some(if flag { "1" } else { "0" }.to_owned()));
+    }
+    if let Some(flag) = update.hide_from_shared_surfaces {
+        sets.push("hide_from_shared_surfaces = ?");
+        binds.push(Some(if flag { "1" } else { "0" }.to_owned()));
     }
 
     let sql = format!("UPDATE entities SET {} WHERE id = ?", sets.join(", "));
@@ -838,10 +883,12 @@ mod tests {
 
     const PERSONAL_SCHEMA_V1: &str = include_str!("../../schema/personal_001.sql");
     const PERSONAL_SCHEMA_V2: &str = include_str!("../../schema/personal_002.sql");
+    const PERSONAL_SCHEMA_V3: &str = include_str!("../../schema/personal_003.sql");
 
-    /// In-memory personal.db with the real schema applied, v1 then v2 — the
-    /// same order and the same statement splitter the migration runner uses,
-    /// so the v2 entities rebuild is exercised on every single test.
+    /// In-memory personal.db with the real schema applied, v1 through v3 —
+    /// the same order and the same statement splitter the migration runner
+    /// uses, so the v2 entities rebuild and the v3 flag-column additions are
+    /// both exercised on every single test.
     async fn test_db() -> SqliteConnection {
         let mut conn = SqliteConnectOptions::new()
             .filename(":memory:")
@@ -849,7 +896,7 @@ mod tests {
             .await
             .expect("in-memory connection failed");
 
-        for schema in [PERSONAL_SCHEMA_V1, PERSONAL_SCHEMA_V2] {
+        for schema in [PERSONAL_SCHEMA_V1, PERSONAL_SCHEMA_V2, PERSONAL_SCHEMA_V3] {
             for stmt in parse_statements(schema) {
                 sqlx::query(&stmt)
                     .execute(&mut conn)
@@ -954,6 +1001,78 @@ mod tests {
         let e = get_entity_conn(&mut conn, &id).await.unwrap().unwrap();
         assert!(e.aliases.is_empty());
         assert_eq!(e.extra_metadata, serde_json::json!({}));
+    }
+
+    #[tokio::test]
+    async fn create_defaults_both_visibility_flags_to_false() {
+        // decisions.id=513: both flags default false.
+        let mut conn = test_db().await;
+        let id = create_entity_conn(&mut conn, "recipe", "Plain Toast", &[], None, None)
+            .await
+            .expect("create failed");
+        let e = get_entity_conn(&mut conn, &id).await.unwrap().unwrap();
+        assert!(!e.redact_identification);
+        assert!(!e.hide_from_shared_surfaces);
+    }
+
+    #[tokio::test]
+    async fn update_entity_sets_each_visibility_flag_independently() {
+        // decisions.id=513: "Both flags independent and combinable."
+        let mut conn = test_db().await;
+        let id = create_entity_conn(&mut conn, "device", "Home Router", &[], None, None)
+            .await
+            .expect("create failed");
+
+        update_entity_conn(
+            &mut conn,
+            &id,
+            &EntityUpdate {
+                redact_identification: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("update failed");
+
+        let e = get_entity_conn(&mut conn, &id).await.unwrap().unwrap();
+        assert!(e.redact_identification);
+        assert!(
+            !e.hide_from_shared_surfaces,
+            "setting one flag must not touch the other"
+        );
+
+        update_entity_conn(
+            &mut conn,
+            &id,
+            &EntityUpdate {
+                hide_from_shared_surfaces: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("update failed");
+
+        let e = get_entity_conn(&mut conn, &id).await.unwrap().unwrap();
+        assert!(e.redact_identification, "first flag must persist");
+        assert!(e.hide_from_shared_surfaces);
+
+        // Explicit false must also apply, not be treated as "leave unchanged"
+        // — Option<bool>::Some(false) is a real value here, unlike a plain
+        // Option<T> field where None means "no change."
+        update_entity_conn(
+            &mut conn,
+            &id,
+            &EntityUpdate {
+                redact_identification: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("update failed");
+
+        let e = get_entity_conn(&mut conn, &id).await.unwrap().unwrap();
+        assert!(!e.redact_identification, "explicit false must be applied");
+        assert!(e.hide_from_shared_surfaces, "untouched flag must persist");
     }
 
     // -- structured filter --------------------------------------------------
@@ -1479,6 +1598,7 @@ mod tests {
         }
 
         apply_v2(&mut conn).await;
+        apply_v3(&mut conn).await;
 
         let all = list_entities_conn(&mut conn, &EntityFilter::default())
             .await
@@ -1610,6 +1730,78 @@ mod tests {
             .await
             .is_err(),
             "an unknown modification_state must be rejected up front"
+        );
+    }
+
+    // -- personal_003 migration (decisions.id=513, items.id=175) -----------
+
+    async fn apply_v3(conn: &mut SqliteConnection) {
+        for stmt in parse_statements(PERSONAL_SCHEMA_V3) {
+            sqlx::query(&stmt)
+                .execute(&mut *conn)
+                .await
+                .unwrap_or_else(|e| panic!("v3 statement failed: {e}\n{stmt}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_v3_adds_visibility_columns_defaulting_false_and_preserves_rows() {
+        // Applies v1+v2 first (pre-existing row, no knowledge of the new
+        // columns), then v3 -- confirms ADD COLUMN is additive: no row lost,
+        // no pre-existing column disturbed, new columns default to false.
+        let mut conn = SqliteConnectOptions::new()
+            .filename(":memory:")
+            .connect()
+            .await
+            .expect("in-memory connection failed");
+        for schema in [PERSONAL_SCHEMA_V1, PERSONAL_SCHEMA_V2] {
+            for stmt in parse_statements(schema) {
+                sqlx::query(&stmt).execute(&mut conn).await.unwrap();
+            }
+        }
+
+        let id = create_entity_conn(&mut conn, "recipe", "Pre-v3 Bread", &[], None, None)
+            .await
+            .expect("pre-v3 create failed");
+
+        apply_v3(&mut conn).await;
+
+        let e = get_entity_conn(&mut conn, &id)
+            .await
+            .expect("get failed")
+            .expect("row must survive the v3 ADD COLUMN migration");
+        assert_eq!(e.display_name, "Pre-v3 Bread", "pre-existing data must survive");
+        assert!(
+            !e.redact_identification,
+            "pre-existing rows must default to false, not NULL or an error"
+        );
+        assert!(!e.hide_from_shared_surfaces);
+    }
+
+    #[tokio::test]
+    async fn migration_v3_check_constraints_reject_non_boolean_values() {
+        let mut conn = SqliteConnectOptions::new()
+            .filename(":memory:")
+            .connect()
+            .await
+            .expect("in-memory connection failed");
+        for schema in [PERSONAL_SCHEMA_V1, PERSONAL_SCHEMA_V2, PERSONAL_SCHEMA_V3] {
+            for stmt in parse_statements(schema) {
+                sqlx::query(&stmt).execute(&mut conn).await.unwrap();
+            }
+        }
+
+        let id = create_entity_conn(&mut conn, "recipe", "Bread", &[], None, None)
+            .await
+            .unwrap();
+
+        let result = sqlx::query("UPDATE entities SET redact_identification = 2 WHERE id = ?")
+            .bind(&id)
+            .execute(&mut conn)
+            .await;
+        assert!(
+            result.is_err(),
+            "the CHECK (redact_identification IN (0, 1)) constraint must reject 2"
         );
     }
 }

@@ -181,6 +181,24 @@ struct RawFocusFile {
     steps: Option<IndexMap<String, RawStep>>,     // IndexMap preserves YAML dict order
     #[allow(dead_code)] // D6-343: parsed for forward compat, not wired in Release 1.
     brief: Option<serde_yaml::Value>,
+    // decisions.id=513 (D6-471), items.id=175. No .focus file in this repo
+    // declares this section yet — Option so every existing file keeps
+    // parsing unchanged. Only generic_title_template is built now; type
+    // policy (status/age/always-visible conditions) is a separate, larger
+    // piece of decisions.id=513 scoped out until the first Focus that
+    // declares one is built (see conductor/visibility.rs module header).
+    display_config: Option<RawDisplayConfig>,
+}
+
+#[derive(Deserialize)]
+struct RawDisplayConfig {
+    // decisions.id=513: "Focus declares generic title template in .focus
+    // file display_config section... Template must handle full range of
+    // object states — not just the open-ticket case." Substitution syntax
+    // and consuming call sites (get_active_board and other Ambient
+    // surfaces) are a separate, later wiring task — this struct only
+    // carries the declared string through parsing.
+    generic_title_template: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -241,6 +259,15 @@ fn parse_focus_definition(raw: RawFocusFile) -> Result<FocusDefinition, Lifecycl
     };
 
     let suggest_in_focuses = raw.suggest_in_focuses.unwrap_or_default();
+
+    // decisions.id=513: generic_title_template, defaulting to a platform-
+    // wide generic string when the Focus declares no display_config section
+    // at all (every existing .focus file in this repo, as of items.id=175 —
+    // this default keeps them all parsing unchanged).
+    let generic_title_template = raw
+        .display_config
+        .and_then(|dc| dc.generic_title_template)
+        .unwrap_or_else(|| "Hidden item".to_owned());
 
     let mut steps: Vec<StepDefinition> = Vec::new();
     if let Some(raw_steps) = raw.steps {
@@ -303,6 +330,7 @@ fn parse_focus_definition(raw: RawFocusFile) -> Result<FocusDefinition, Lifecycl
         steps,
         output_type,
         suggest_in_focuses,
+        generic_title_template,
     })
 }
 
@@ -327,6 +355,13 @@ pub struct FocusDefinition {
     pub output_type: String,
     pub suggest_in_focuses: Vec<String>,
     pub multi_source_validation: bool,
+    /// decisions.id=513 (D6-471), items.id=175. Declared in the .focus
+    /// file's display_config section; defaults to a platform-wide generic
+    /// string when the Focus declares none. Not yet consumed by any caller
+    /// -- get_active_board and other Ambient-surface renderers wiring this
+    /// in is a separate, later task (this field only carries the value
+    /// through parsing).
+    pub generic_title_template: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -1771,6 +1806,7 @@ mod tests {
             multi_source_validation: None,
             steps: None,
             brief: None,
+            display_config: None,
         }
     }
 
@@ -1785,6 +1821,37 @@ mod tests {
         assert!(def.steps.is_empty());
         assert!(!def.multi_source_validation);
         assert!(def.suggest_in_focuses.is_empty());
+        assert_eq!(
+            def.generic_title_template, "Hidden item",
+            "no display_config declared -- platform default applies"
+        );
+    }
+
+    #[test]
+    fn parse_generic_title_template_from_display_config() {
+        let mut r = minimal_raw();
+        r.display_config = Some(RawDisplayConfig {
+            generic_title_template: Some("A {entity_type} record".to_owned()),
+        });
+        assert_eq!(
+            parse_focus_definition(r).unwrap().generic_title_template,
+            "A {entity_type} record"
+        );
+    }
+
+    #[test]
+    fn parse_generic_title_template_defaults_when_display_config_present_but_empty() {
+        // decisions.id=513: template "must handle full range of object
+        // states" -- an explicitly present but empty display_config section
+        // must still fall back to the platform default, not an empty string.
+        let mut r = minimal_raw();
+        r.display_config = Some(RawDisplayConfig {
+            generic_title_template: None,
+        });
+        assert_eq!(
+            parse_focus_definition(r).unwrap().generic_title_template,
+            "Hidden item"
+        );
     }
 
     #[test]
