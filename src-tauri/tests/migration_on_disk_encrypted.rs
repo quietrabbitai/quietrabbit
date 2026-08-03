@@ -100,8 +100,7 @@ async fn test_migration_pipeline_wrong_key_cannot_read_migrated_file() {
     // by some step of the pipeline. SQLCipher may reject at connect time or
     // defer rejection to first query, depending on build -- both are valid
     // (same tolerance as sqlcipher_linkage.rs).
-    const WRONG_KEY_HEX: &str =
-        "0000000000000000000000000000000000000000000000000000000000000000";
+    const WRONG_KEY_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000000";
     let wrong_key_result = SqliteConnectOptions::new()
         .filename(&temp_path)
         .pragma("key", format!("\"x'{WRONG_KEY_HEX}'\""))

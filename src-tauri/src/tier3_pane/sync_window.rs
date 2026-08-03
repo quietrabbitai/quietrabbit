@@ -28,9 +28,9 @@ use crate::tier3_pane::render::{ClientBuilder, PaneRenderHandler, RenderState};
 /// `browser: Option<cef::Browser>` + `browser_created: bool` pair
 /// (items.id=204, design finalized in jolly-popping-pumpkin.md).
 #[allow(dead_code)] // Closing/Closed: no code path drives these yet --
-                     // Phase A never calls close_browser/handles
-                     // on_before_close. Kept per the finalized design;
-                     // wire them when real pane-close semantics land.
+                    // Phase A never calls close_browser/handles
+                    // on_before_close. Kept per the finalized design;
+                    // wire them when real pane-close semantics land.
 enum BrowserLifecycleState {
     Uninitialized,
     Creating,
@@ -46,9 +46,9 @@ enum BrowserLifecycleState {
 /// signal yet (that's explicitly Phase B scope).
 #[derive(Debug)]
 #[allow(dead_code)] // SetCookie: explicit stub per the finalized design --
-                     // no cookie-manager API is wired in this codebase yet
-                     // (Phase B, see mod.rs), so nothing constructs this
-                     // variant. apply_action already returns Err for it.
+                    // no cookie-manager API is wired in this codebase yet
+                    // (Phase B, see mod.rs), so nothing constructs this
+                    // variant. apply_action already returns Err for it.
 enum PendingAction {
     Navigate(String),
     SetCookie { name: String, value: String },
@@ -123,9 +123,9 @@ fn apply_action(browser: &cef::Browser, action: &PendingAction) -> Result<(), St
             frame.load_url(Some(&cef::CefString::from(url.as_str())));
             Ok(())
         }
-        PendingAction::SetCookie { .. } => Err(
-            "SetCookie not yet supported -- Phase B cookie-jar wiring (see mod.rs)".to_string(),
-        ),
+        PendingAction::SetCookie { .. } => {
+            Err("SetCookie not yet supported -- Phase B cookie-jar wiring (see mod.rs)".to_string())
+        }
     }
 }
 
@@ -147,10 +147,7 @@ struct PaneApp {
     // this on the main thread. See PaneRenderHandler::size docs (render.rs)
     // for why this must not be an Rc<RefCell<>> under
     // multi_threaded_message_loop=true (items.id=203 audit, 2026-08-03).
-    pending_render_handler: Option<(
-        PaneRenderHandler,
-        Arc<Mutex<winit::dpi::LogicalSize<f32>>>,
-    )>,
+    pending_render_handler: Option<(PaneRenderHandler, Arc<Mutex<winit::dpi::LogicalSize<f32>>>)>,
     browser_size: Option<Arc<Mutex<winit::dpi::LogicalSize<f32>>>>,
     window_info_and_settings: Option<(cef::WindowInfo, cef::BrowserSettings)>,
     /// Receives the constructed `Browser` from `LifeSpanHandler::on_after_created`

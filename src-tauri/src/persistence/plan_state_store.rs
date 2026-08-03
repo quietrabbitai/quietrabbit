@@ -911,8 +911,7 @@ pub async fn record_ceiling_user_response(
 mod tests {
     use super::*;
 
-    const TEST_KEY_HEX: &str =
-        "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+    const TEST_KEY_HEX: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
 
     /// Regression test for items.id=773: consume_handoff_token previously
     /// only checked expired_at IS NULL, not whether expiry_at had actually
@@ -952,7 +951,12 @@ mod tests {
         .expect("create_handoff_token must succeed");
 
         let result = consume_handoff_token(
-            user_id, persona_id, focus_id, topic_id, TEST_KEY_HEX, &token_id,
+            user_id,
+            persona_id,
+            focus_id,
+            topic_id,
+            TEST_KEY_HEX,
+            &token_id,
         )
         .await;
 
@@ -1002,7 +1006,12 @@ mod tests {
         .expect("create_handoff_token must succeed");
 
         let result = consume_handoff_token(
-            user_id, persona_id, focus_id, topic_id, TEST_KEY_HEX, &token_id,
+            user_id,
+            persona_id,
+            focus_id,
+            topic_id,
+            TEST_KEY_HEX,
+            &token_id,
         )
         .await;
 

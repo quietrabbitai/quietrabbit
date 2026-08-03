@@ -464,10 +464,8 @@ mod tests {
     // re-verify every scoping branch already covered above in-memory; they
     // focus on the one dimension those tests structurally cannot reach.
 
-    const TEST_KEY_HEX: &str =
-        "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
-    const WRONG_KEY_HEX: &str =
-        "00112233445566778899aabbccddeeff00112233445566778899aabbccddee";
+    const TEST_KEY_HEX: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+    const WRONG_KEY_HEX: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddee";
 
     #[tokio::test]
     async fn get_active_key_and_upsert_key_round_trip_against_real_migrated_db() {
@@ -525,12 +523,26 @@ mod tests {
             .expect("real migration must succeed");
 
         upsert_key(
-            user_id, TEST_KEY_HEX, "groq", "tier2", "old-key", None, None, None,
+            user_id,
+            TEST_KEY_HEX,
+            "groq",
+            "tier2",
+            "old-key",
+            None,
+            None,
+            None,
         )
         .await
         .expect("first upsert_key must succeed");
         upsert_key(
-            user_id, TEST_KEY_HEX, "groq", "tier2", "new-key", None, None, None,
+            user_id,
+            TEST_KEY_HEX,
+            "groq",
+            "tier2",
+            "new-key",
+            None,
+            None,
+            None,
         )
         .await
         .expect("second upsert_key on the same scope must succeed");
@@ -576,7 +588,14 @@ mod tests {
             .await
             .expect("real migration must succeed");
         upsert_key(
-            user_id, TEST_KEY_HEX, "groq", "tier2", "some-key", None, None, None,
+            user_id,
+            TEST_KEY_HEX,
+            "groq",
+            "tier2",
+            "some-key",
+            None,
+            None,
+            None,
         )
         .await
         .expect("upsert_key must succeed with the correct key");
@@ -614,7 +633,14 @@ mod tests {
             .join("integration_keys.db");
 
         let result = upsert_key(
-            user_id, TEST_KEY_HEX, "openai", "api_key", "   ", None, None, None,
+            user_id,
+            TEST_KEY_HEX,
+            "openai",
+            "api_key",
+            "   ",
+            None,
+            None,
+            None,
         )
         .await;
 

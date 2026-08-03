@@ -932,10 +932,8 @@ mod tests {
     // plan_state_store.rs's tests (real migration call, not a hand-
     // bootstrapped dummy table).
 
-    const TEST_KEY_HEX: &str =
-        "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
-    const WRONG_KEY_HEX: &str =
-        "00112233445566778899aabbccddeeff00112233445566778899aabbccddee";
+    const TEST_KEY_HEX: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+    const WRONG_KEY_HEX: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddee";
 
     /// Opens a verification connection to an already-migrated real file,
     /// applying the key with the same builder shape run_migrations itself
@@ -953,13 +951,12 @@ mod tests {
     }
 
     async fn table_exists(conn: &mut SqliteConnection, table: &str) -> bool {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name = ?",
-        )
-        .bind(table)
-        .fetch_optional(conn)
-        .await
-        .unwrap();
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT name FROM sqlite_master WHERE type='table' AND name = ?")
+                .bind(table)
+                .fetch_optional(conn)
+                .await
+                .unwrap();
         row.is_some()
     }
 
@@ -1084,7 +1081,8 @@ mod tests {
             std::env::remove_var("QR_DATA_ROOT");
         }
 
-        let err = result.expect_err("reopening a real encrypted file with the wrong key must error");
+        let err =
+            result.expect_err("reopening a real encrypted file with the wrong key must error");
         let msg = err.to_string();
         assert!(
             msg.contains("not a database"),
@@ -1188,7 +1186,13 @@ mod tests {
         );
 
         let mut conn = open_verify_conn(&db_path, Some(TEST_KEY_HEX)).await;
-        for table in ["outputs", "focus_runs", "outputs_fts", "topics", "run_history"] {
+        for table in [
+            "outputs",
+            "focus_runs",
+            "outputs_fts",
+            "topics",
+            "run_history",
+        ] {
             assert!(
                 table_exists(&mut conn, table).await,
                 "table {table} must exist after migration to a real encrypted file"
@@ -1304,7 +1308,10 @@ mod tests {
         }
 
         assert_eq!(result.expect("migration must apply cleanly"), 1);
-        assert!(db_path.exists(), "scores.db must exist as a real file on disk");
+        assert!(
+            db_path.exists(),
+            "scores.db must exist as a real file on disk"
+        );
 
         let mut conn = open_verify_conn(&db_path, None).await;
         assert!(table_exists(&mut conn, "model_hardware_scores").await);
@@ -1383,7 +1390,10 @@ mod tests {
             .join("focuses")
             .join(focus_id);
         let dc_path = focus_dir.join("domain_context.db");
-        let ps_path = focus_dir.join("topics").join(topic_id).join("plan_state.db");
+        let ps_path = focus_dir
+            .join("topics")
+            .join(topic_id)
+            .join("plan_state.db");
 
         let result =
             migrate_focus_storage(user_id, persona_id, focus_id, topic_id, TEST_KEY_HEX).await;
@@ -1395,8 +1405,14 @@ mod tests {
         }
 
         assert_eq!(result.expect("migration must apply cleanly"), (1, 1));
-        assert!(dc_path.exists(), "domain_context.db must exist as its own real file");
-        assert!(ps_path.exists(), "plan_state.db must exist as its own real file");
+        assert!(
+            dc_path.exists(),
+            "domain_context.db must exist as its own real file"
+        );
+        assert!(
+            ps_path.exists(),
+            "plan_state.db must exist as its own real file"
+        );
 
         let mut dc_conn = open_verify_conn(&dc_path, Some(TEST_KEY_HEX)).await;
         assert!(table_exists(&mut dc_conn, "domain_context_blocks").await);
