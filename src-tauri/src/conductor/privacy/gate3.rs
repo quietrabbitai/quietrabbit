@@ -9,7 +9,10 @@
 //       - Timeout           → gate_timeout disclosure event + blocked result
 //       - spawn_blocking panic → same as timeout (conservative)
 //       - PF error          → fall back to legacy sensitivity block
-//       - Zero spans        → gate3_pf_no_spans + approved (no modal)
+//       - Zero spans, severity < 3 AND target_tier < 3 → gate3_pf_no_spans + approved (no modal)
+//       - Zero spans, severity >= 3 OR target_tier >= 3 → still routed to the
+//         consent gate (High tier, empty spans list) — see D6-362/decisions.id=405
+//         note below. NOT auto-approved.
 //       - Non-zero spans    → gate3_consent_pending written THEN consent_request emit
 //   2b. Legacy sensitivity block fallback (no PF or no handle — dev/test builds):
 //       - severity >= 3 AND target_tier >= 2 → gate3_sensitivity_block + blocked
@@ -18,6 +21,15 @@
 // D6-362: PG_GATE_3 fires unconditionally when sensitivity_ceiling > 0 AND
 // content is about to cross a tier boundary. Fallback path preserves existing
 // golden-vector behavior for builds where Privacy Filter library is not compiled in.
+//
+// decisions.id=405 (Q2): High tier always applies to Medical/Financial content
+// and to any content where Privacy Filter confidence is low, regardless of PF
+// confidence. Zero PF detections is the extreme case of low confidence — it
+// must NOT be treated as "nothing to review." Content whose sensitivity comes
+// from context outside PF's base taxonomy (financial figures, medical history)
+// routinely returns zero spans; auto-approving on span count alone bypasses
+// the severity-forced-High rule for exactly the content it's meant to protect.
+// See items.id=36 / PRIVACY_FILTER_THRESHOLD_CALIBRATION.md finding #5.
 //
 // Write-before-surface invariant: disclosure_log write MUST precede any emit()
 // call. If the log write fails (fatal DisclosureLogWriteError), the frontend
@@ -322,9 +334,20 @@ async fn gate3_with_pf<L: DisclosureLogger>(
         Ok(Ok(Ok(entities))) => entities,
     };
 
-    // Zero spans: PF found nothing identifiable — approve directly.
+    // Zero spans, NOT severity/tier-forced: PF found nothing identifiable and
+    // there's no independent reason to force review — approve directly.
     // D6-362: gate still fired (field-tracking trigger), nothing to surface to user.
-    if entities.is_empty() {
+    //
+    // FIX (items.id=36): this branch previously fired on `entities.is_empty()`
+    // alone, auto-approving BEFORE assign_review_tier's severity/target_tier
+    // check ever ran. That silently shipped severity>=3 content (e.g. financial
+    // figures outside PF's base taxonomy) with no consent modal at all —
+    // contradicting decisions.id=405 Q2's "Medical/Financial always High
+    // regardless of PF confidence" rule. The severity/target_tier guard below
+    // must stay in sync with assign_review_tier's forced-High condition.
+    if entities.is_empty()
+        && zero_spans_safe_to_auto_approve(content_sensitivity_severity, target_tier)
+    {
         logger
             .write(DisclosureLogEntry {
                 step_id: step_id.to_string(),
@@ -345,11 +368,16 @@ async fn gate3_with_pf<L: DisclosureLogger>(
         });
     }
 
-    // Non-zero spans: build consent payload, write audit record, THEN emit event.
+    // Non-zero spans, OR zero spans that severity/target_tier force to High:
+    // build consent payload (spans list may be empty in the forced-High/
+    // no-detection case — frontend must handle an empty spans list by still
+    // surfacing the High-tier consent gate, not by treating it as nothing to
+    // show), write audit record, THEN emit event.
     // Write-before-surface invariant: log write must precede emit() — if the write
     // fails (fatal DisclosureLogWriteError), the frontend must not receive the event.
     let spans = build_consent_spans(&entities);
     let review_tier = assign_review_tier(&entities, content_sensitivity_severity, target_tier);
+    let no_spans_forced_high = spans.is_empty();
 
     let payload = ConsentRequestPayload {
         focus_run_id: focus_run_id.to_owned(),
@@ -369,7 +397,11 @@ async fn gate3_with_pf<L: DisclosureLogger>(
             fields_abstracted: IndexMap::new(),
             fields_withheld: vec![content_key.to_string()],
             override_declined: false,
-            event_type: "gate3_consent_pending".to_string(),
+            event_type: if no_spans_forced_high {
+                "gate3_pf_no_spans_forced_review".to_string()
+            } else {
+                "gate3_consent_pending".to_string()
+            },
         })
         .await?;
 
@@ -399,6 +431,15 @@ fn build_consent_spans(entities: &[PfEntityDecoded]) -> Vec<ConsentSpanItem> {
             score: e.score,
         })
         .collect()
+}
+
+/// True only when PF returning zero spans is safe to auto-approve without a
+/// consent gate: severity and target_tier must both be below the High-forcing
+/// thresholds used by `assign_review_tier`. Kept in sync with that function's
+/// `target_tier >= 3 || content_sensitivity_severity >= 3` condition — this is
+/// the entities-independent half of the same rule (items.id=36).
+fn zero_spans_safe_to_auto_approve(content_sensitivity_severity: u8, target_tier: u8) -> bool {
+    !(content_sensitivity_severity >= 3 || target_tier >= 3)
 }
 
 fn assign_review_tier(
@@ -476,6 +517,37 @@ mod tests {
         }
     }
 
+    // -- zero_spans_safe_to_auto_approve -------------------------------------
+    // items.id=36: zero-span PF results must NOT bypass the severity/target_tier
+    // forced-High rule. Repro case from calibration testing: financial content
+    // ("household income is around $85,000", "$12,000 in credit card debt")
+    // tagged content_sensitivity_severity=3 returns zero PF spans because
+    // financial/medical context is outside PF's base taxonomy (decisions.id=405
+    // Q2) -- that must still force a High-tier consent gate, not auto-approve.
+
+    #[test]
+    fn zero_spans_auto_approve_allowed_when_low_severity_and_tier() {
+        assert!(zero_spans_safe_to_auto_approve(1, 2));
+        assert!(zero_spans_safe_to_auto_approve(2, 2));
+    }
+
+    #[test]
+    fn zero_spans_auto_approve_blocked_by_severity_financial_repro() {
+        // Repro: "$85,000 household income" / "$12,000 credit card debt" --
+        // severity=3 (financial), zero PF spans. Must NOT be auto-approved.
+        assert!(!zero_spans_safe_to_auto_approve(3, 2));
+    }
+
+    #[test]
+    fn zero_spans_auto_approve_blocked_by_medical_severity() {
+        assert!(!zero_spans_safe_to_auto_approve(4, 2));
+    }
+
+    #[test]
+    fn zero_spans_auto_approve_blocked_by_target_tier() {
+        assert!(!zero_spans_safe_to_auto_approve(1, 3));
+    }
+
     // -- assign_review_tier --------------------------------------------------
 
     #[test]
@@ -487,6 +559,21 @@ mod tests {
     #[test]
     fn medical_severity_forces_high() {
         let e = vec![entity(0.99, "private_email")];
+        assert!(matches!(assign_review_tier(&e, 3, 2), ReviewTier::High));
+    }
+
+    #[test]
+    fn tier3_target_forces_high_even_with_zero_entities() {
+        // Guards against the vacuous-truth trap: entities.iter().all(...) on an
+        // empty slice is vacuously true, which would wrongly resolve to Easy if
+        // the severity/target_tier check didn't short-circuit first (items.id=36).
+        let e: Vec<PfEntityDecoded> = vec![];
+        assert!(matches!(assign_review_tier(&e, 1, 3), ReviewTier::High));
+    }
+
+    #[test]
+    fn medical_severity_forces_high_even_with_zero_entities() {
+        let e: Vec<PfEntityDecoded> = vec![];
         assert!(matches!(assign_review_tier(&e, 3, 2), ReviewTier::High));
     }
 
