@@ -20,9 +20,114 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowAttributes, WindowId};
 
-use cef::{ImplBrowser, ImplBrowserHost};
+use cef::{ImplBrowser, ImplBrowserHost, ImplFrame};
 
 use crate::tier3_pane::render::{ClientBuilder, PaneRenderHandler, RenderState};
+
+/// Lifecycle of the pane's CEF browser, replacing the old
+/// `browser: Option<cef::Browser>` + `browser_created: bool` pair
+/// (items.id=204, design finalized in jolly-popping-pumpkin.md).
+#[allow(dead_code)] // Closing/Closed: no code path drives these yet --
+                     // Phase A never calls close_browser/handles
+                     // on_before_close. Kept per the finalized design;
+                     // wire them when real pane-close semantics land.
+enum BrowserLifecycleState {
+    Uninitialized,
+    Creating,
+    Ready(cef::Browser),
+    Closing,
+    Closed,
+    Failed(String),
+}
+
+/// Deferred until the browser is `Ready`; applied immediately if it
+/// already is. Failure policy (items.id=204, resolved): every failed
+/// apply gets an unconditional log::warn! -- no retry, no completion
+/// signal yet (that's explicitly Phase B scope).
+#[derive(Debug)]
+#[allow(dead_code)] // SetCookie: explicit stub per the finalized design --
+                     // no cookie-manager API is wired in this codebase yet
+                     // (Phase B, see mod.rs), so nothing constructs this
+                     // variant. apply_action already returns Err for it.
+enum PendingAction {
+    Navigate(String),
+    SetCookie { name: String, value: String },
+}
+
+struct BrowserLifecycle {
+    state: BrowserLifecycleState,
+    pending: Vec<PendingAction>,
+}
+
+impl BrowserLifecycle {
+    fn new() -> Self {
+        Self {
+            state: BrowserLifecycleState::Uninitialized,
+            pending: Vec::new(),
+        }
+    }
+
+    /// `true` (and transitions to `Creating`) only the first time this is
+    /// called while `Uninitialized` -- mirrors the old `browser_created`
+    /// one-shot flag exactly.
+    fn start_creation(&mut self) -> bool {
+        if matches!(self.state, BrowserLifecycleState::Uninitialized) {
+            self.state = BrowserLifecycleState::Creating;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn fail(&mut self, reason: impl Into<String>) {
+        self.state = BrowserLifecycleState::Failed(reason.into());
+    }
+
+    /// Called from `PaneWindow::pump()` when `browser_ready_rx` yields a
+    /// `Browser` -- transitions to `Ready` and drains anything queued
+    /// while `Uninitialized`/`Creating`.
+    fn on_created(&mut self, browser: cef::Browser) {
+        self.state = BrowserLifecycleState::Ready(browser.clone());
+        for action in self.pending.drain(..) {
+            if let Err(e) = apply_action(&browser, &action) {
+                log::warn!("tier3_pane: queued action failed on drain: {action:?}: {e}");
+            }
+        }
+    }
+
+    fn enqueue(&mut self, action: PendingAction) {
+        match &self.state {
+            BrowserLifecycleState::Ready(browser) => {
+                if let Err(e) = apply_action(browser, &action) {
+                    log::warn!("tier3_pane: action failed immediately: {action:?}: {e}");
+                }
+            }
+            _ => self.pending.push(action),
+        }
+    }
+
+    fn browser(&self) -> Option<&cef::Browser> {
+        match &self.state {
+            BrowserLifecycleState::Ready(browser) => Some(browser),
+            _ => None,
+        }
+    }
+}
+
+fn apply_action(browser: &cef::Browser, action: &PendingAction) -> Result<(), String> {
+    match action {
+        PendingAction::Navigate(url) => {
+            let Some(frame) = browser.main_frame() else {
+                return Err("browser has no main_frame yet".to_string());
+            };
+            frame.load_url(Some(&cef::CefString::from(url.as_str())));
+            Ok(())
+        }
+        PendingAction::SetCookie { .. } => Err(
+            "SetCookie not yet supported -- Phase B cookie-jar wiring (see mod.rs)".to_string(),
+        ),
+    }
+}
 
 /// Owns the pane's winit window, wgpu render state, and the CEF browser
 /// instance backing it. Constructed once at startup (Phase A: eagerly, no
@@ -36,8 +141,7 @@ pub struct PaneWindow {
 struct PaneApp {
     window: Option<Arc<Window>>,
     render_state: Option<RenderState>,
-    browser: Option<cef::Browser>,
-    browser_created: bool,
+    browser_lifecycle: BrowserLifecycle,
     // Arc<Mutex<>>, not Rc<RefCell<>> -- shared with PaneRenderHandler, whose
     // view_rect runs on CEF's UI thread while apply_resize (below) writes
     // this on the main thread. See PaneRenderHandler::size docs (render.rs)
@@ -101,8 +205,7 @@ impl PaneWindow {
             app: PaneApp {
                 window: None,
                 render_state: None,
-                browser: None,
-                browser_created: false,
+                browser_lifecycle: BrowserLifecycle::new(),
                 pending_render_handler: None,
                 browser_size: None,
                 window_info_and_settings: None,
@@ -143,7 +246,7 @@ impl PaneWindow {
         if let Some(rx) = self.app.browser_ready_rx.as_ref() {
             if let Ok(browser) = rx.try_recv() {
                 log::info!("tier3_pane::sync_window: browser delivered via on_after_created");
-                self.app.browser = Some(browser);
+                self.app.browser_lifecycle.on_created(browser);
             }
         }
 
@@ -306,7 +409,7 @@ impl ApplicationHandler for PaneApp {
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
-                if let Some(host) = self.browser.as_mut().and_then(|b| b.host()) {
+                if let Some(host) = self.browser_lifecycle.browser().and_then(|b| b.host()) {
                     host.send_external_begin_frame();
                 }
                 if let (Some(render_state), Some(window)) =
@@ -333,13 +436,11 @@ impl ApplicationHandler for PaneApp {
                     // correctly -- no self-perpetuating redraw needed.
                 }
 
-                if !self.browser_created {
-                    self.browser_created = true;
+                if self.browser_lifecycle.start_creation() {
                     if let (Some((render_handler, _)), Some((window_info, browser_settings))) = (
                         self.pending_render_handler.take(),
                         self.window_info_and_settings.as_ref(),
                     ) {
-                        let url = cef::CefString::from(self.initial_url.as_str());
                         // ASYNC creation (2026-08-01): browser_host_create_browser_sync
                         // requires being called from CEF's own UI thread, which is no
                         // longer this thread under multi_threaded_message_loop (see
@@ -348,12 +449,18 @@ impl ApplicationHandler for PaneApp {
                         // no error). browser_host_create_browser is callable from any
                         // thread and delivers the Browser asynchronously via
                         // on_after_created, received in PaneWindow::pump().
+                        //
+                        // items.id=204: no starting URL is passed here anymore --
+                        // initial_url is instead the pending-action queue's first
+                        // real use (enqueued below once dispatch succeeds), applied
+                        // by BrowserLifecycle::on_created the moment the browser is
+                        // actually Ready, same as any future navigation would be.
                         let (tx, rx) = std::sync::mpsc::channel();
                         self.browser_ready_rx = Some(rx);
                         let created = cef::browser_host_create_browser(
                             Some(window_info),
                             Some(&mut ClientBuilder::build(render_handler, tx)),
-                            Some(&url),
+                            None,
                             Some(browser_settings),
                             None,
                             None, // default in-memory context -- Phase A scope; real
@@ -362,6 +469,14 @@ impl ApplicationHandler for PaneApp {
                         log::info!(
                             "tier3_pane::sync_window: browser_host_create_browser (async) dispatched -> {created}"
                         );
+                        if created != 0 {
+                            self.browser_lifecycle
+                                .enqueue(PendingAction::Navigate(self.initial_url.clone()));
+                        } else {
+                            self.browser_lifecycle.fail(
+                                "browser_host_create_browser returned false (async creation dispatch failed)",
+                            );
+                        }
                     }
                 }
             }
@@ -393,7 +508,7 @@ impl PaneApp {
             (self.browser_size.as_ref(), self.window.as_ref())
         {
             *browser_size.lock().unwrap() = size.to_logical(window.scale_factor());
-            if let Some(host) = self.browser.as_mut().and_then(|b| b.host()) {
+            if let Some(host) = self.browser_lifecycle.browser().and_then(|b| b.host()) {
                 host.was_resized();
             }
         }
