@@ -324,27 +324,39 @@ async fn scan_legacy_fallback<L: DisclosureLogger>(
 // Tests
 // ---------------------------------------------------------------------------
 //
-// PF is not compiled in on this machine (PRIVACY_FILTER_LIB_DIR unset --
-// see build warning), so privacy_filter::is_available() is always false in
-// this test run and scan_output() always exercises scan_legacy_fallback().
-// This mirrors gate3.rs's own test coverage split exactly (its PF-path
-// tests are gated behind the same compiled-in condition; its legacy-path
-// tests run unconditionally). No live-PF tests are added here for the same
-// reason gate3.rs has none runnable on this machine.
+// Whether privacy_filter::is_available() is true or false depends on
+// process-wide state (PF_INSTANCE, a OnceLock) that latches to whatever the
+// first caller in the test binary observes -- it is not reliably false just
+// because this module's own tests don't set up PF. Tests that specifically
+// exercise the legacy fallback therefore call scan_legacy_fallback()
+// directly instead of scan_output(), so they don't depend on PF_INSTANCE's
+// state. No live-PF tests are added here, matching gate3.rs's split (its
+// PF-path tests are gated behind the same compiled-in condition).
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::conductor::privacy::logger::TestLogger;
 
+    // The four `legacy_*` tests below call `scan_legacy_fallback` directly
+    // rather than going through the public `scan_output` dispatcher. They
+    // exist to pin down scan_legacy_fallback's own behavior, and that
+    // behavior must hold regardless of whether Privacy Filter happens to be
+    // available in this process. `scan_output`'s dispatch reads a
+    // process-wide OnceLock (PF_INSTANCE) that latches permanently to
+    // whatever the first caller in the test binary observes -- so routing
+    // through scan_output here would make these tests pass or fail based on
+    // test execution order / whatever else in this binary touched PF_INSTANCE
+    // first, rather than on scan_legacy_fallback's actual logic. Calling the
+    // legacy path directly sidesteps that global entirely.
+
     #[tokio::test]
     async fn legacy_light_never_blocks_even_at_max_severity() {
         let logger = TestLogger::new();
-        let result = scan_output(
+        let result = scan_legacy_fallback(
             &logger,
             "step-1",
             "run-1",
-            "some finished draft text",
             1,
             4, // financial -- highest severity
             ScanIntensity::Light,
@@ -360,17 +372,9 @@ mod tests {
     #[tokio::test]
     async fn legacy_full_blocks_at_or_above_threshold() {
         let logger = TestLogger::new();
-        let result = scan_output(
-            &logger,
-            "step-1",
-            "run-1",
-            "sensitive content",
-            1,
-            3,
-            ScanIntensity::Full,
-        )
-        .await
-        .unwrap();
+        let result = scan_legacy_fallback(&logger, "step-1", "run-1", 1, 3, ScanIntensity::Full)
+            .await
+            .unwrap();
         assert!(result.blocked);
         assert!(result.plain_language.is_some());
         assert_eq!(logger.entries()[0].event_type, "output_scan_full_legacy");
@@ -380,37 +384,21 @@ mod tests {
     #[tokio::test]
     async fn legacy_full_below_threshold_does_not_block() {
         let logger = TestLogger::new();
-        let result = scan_output(
-            &logger,
-            "step-1",
-            "run-1",
-            "ordinary content",
-            1,
-            2,
-            ScanIntensity::Full,
-        )
-        .await
-        .unwrap();
+        let result = scan_legacy_fallback(&logger, "step-1", "run-1", 1, 2, ScanIntensity::Full)
+            .await
+            .unwrap();
         assert!(!result.blocked);
         assert!(result.plain_language.is_none());
     }
 
     #[tokio::test]
     async fn legacy_fallback_never_produces_pf_findings() {
-        // Without PF compiled in, findings must always be empty -- the
-        // legacy path has no detection engine, only the severity threshold.
+        // The legacy path has no detection engine, only the severity
+        // threshold -- findings must always be empty.
         let logger = TestLogger::new();
-        let result = scan_output(
-            &logger,
-            "step-1",
-            "run-1",
-            "content",
-            1,
-            4,
-            ScanIntensity::Full,
-        )
-        .await
-        .unwrap();
+        let result = scan_legacy_fallback(&logger, "step-1", "run-1", 1, 4, ScanIntensity::Full)
+            .await
+            .unwrap();
         assert!(result.findings.is_empty());
     }
 
