@@ -40,12 +40,22 @@ Quiet Rabbit will:
 
 ## Privacy Model
 
-Quiet Rabbit uses a three-tier routing system:
+Quiet Rabbit uses a tiered routing system:
 
 - **Tier 1 — Local Ollama:** runs on your hardware, fully private, default for sensitive Personas
-- **Tier 2 — Configurable API:** faster inference for general Focuses, user-selectable provider
-  (Mistral recommended for privacy-conscious users; Groq available as a free-tier option)
-- **Tier 3 — Cloud review:** Claude, ChatGPT, or Gemini for final validation — always optional, always explicit
+- **Tier 1.5 — Faster hosted inference (opt-in):** same open-source model class as Tier 1, run on
+  faster hosted hardware (e.g. Groq) when your own hardware is the bottleneck. Requires an
+  account, so it's not anonymous — never automatic, never default, always your explicit choice
+  per task.
+- **Tier 2 — Private cloud review (split-screen):** an anonymous, no-retention alternative to
+  Tier 3. Quiet Rabbit prepares your context; you paste it into a provider that doesn't require
+  sign-in (e.g. Duck.ai, Brave Leo) and paste the response back. Stronger models than Tier 1.5,
+  no account needed.
+- **Tier 3 — Full cloud service:** Claude, ChatGPT, or Gemini for final validation. Quiet Rabbit
+  generates a chat starter from your history, and you paste it in through a split-screen view —
+  always optional, always explicit. A direct in-app API round-trip (skipping the copy/paste step)
+  was evaluated and found technically workable, but doesn't yet have a clear case for this
+  release — it's parked as a possible future paid option, not part of Phase 1.
 
 Sensitive Personas (Medical, Legal, Finance) never leave Tier 1.
 Every external service interaction asks before acting.
