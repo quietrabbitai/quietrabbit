@@ -126,7 +126,7 @@ async fn open_outputs_db(
     SqliteConnectOptions::new()
         .filename(&db_path)
         .create_if_missing(false)
-        .pragma("key", format!("x'{key_hex}'"))
+        .pragma("key", format!("\"x'{key_hex}'\""))
         .pragma("journal_mode", journal_mode)
         .pragma("busy_timeout", "5000")
         .connect()
