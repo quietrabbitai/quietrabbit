@@ -449,4 +449,188 @@ mod tests {
         let credential = "   ";
         assert!(credential.trim().is_empty());
     }
+
+    // -- real on-disk SQLCipher tests ---------------------------------------
+    //
+    // Every test above exercises the private *_conn helpers against
+    // seeded_conn()'s hand-written, unencrypted :memory: schema -- the
+    // public get_active_key/upsert_key wrappers (the only functions that
+    // call open_integration_keys_db -> connect_options_encrypted) are never
+    // invoked by any test. These tests close that gap by running the real
+    // migration (migrations::migrate_keys_db) against a tempdir-backed
+    // QR_DATA_ROOT, then exercising the public wrappers against that real
+    // encrypted file -- following the same pattern as
+    // plan_state_store.rs's real-file tests. They deliberately do not
+    // re-verify every scoping branch already covered above in-memory; they
+    // focus on the one dimension those tests structurally cannot reach.
+
+    const TEST_KEY_HEX: &str =
+        "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+    const WRONG_KEY_HEX: &str =
+        "00112233445566778899aabbccddeeff00112233445566778899aabbccddee";
+
+    #[tokio::test]
+    async fn get_active_key_and_upsert_key_round_trip_against_real_migrated_db() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "test-user";
+
+        crate::persistence::migrations::migrate_keys_db(user_id, TEST_KEY_HEX)
+            .await
+            .expect("real migration must succeed");
+
+        upsert_key(
+            user_id,
+            TEST_KEY_HEX,
+            "openai",
+            "api_key",
+            "secret-value",
+            None,
+            Some("api_key"),
+            None,
+        )
+        .await
+        .expect("upsert_key must succeed against a real migrated encrypted file");
+
+        let found = get_active_key(user_id, TEST_KEY_HEX, "openai", "api_key", None).await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+
+        let key = found
+            .expect("get_active_key must succeed against a real migrated encrypted file")
+            .expect("the key upserted above must be found");
+        assert_eq!(key.credential, "secret-value");
+        assert_eq!(key.auth_type, Some("api_key".to_owned()));
+        assert!(key.is_active);
+    }
+
+    #[tokio::test]
+    async fn upsert_key_replaces_not_duplicates_against_real_migrated_db() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "test-user";
+
+        crate::persistence::migrations::migrate_keys_db(user_id, TEST_KEY_HEX)
+            .await
+            .expect("real migration must succeed");
+
+        upsert_key(
+            user_id, TEST_KEY_HEX, "groq", "tier2", "old-key", None, None, None,
+        )
+        .await
+        .expect("first upsert_key must succeed");
+        upsert_key(
+            user_id, TEST_KEY_HEX, "groq", "tier2", "new-key", None, None, None,
+        )
+        .await
+        .expect("second upsert_key on the same scope must succeed");
+
+        let mut verify_conn = open_integration_keys_db(user_id, TEST_KEY_HEX)
+            .await
+            .expect("verification connection must open");
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM integration_keys")
+            .fetch_one(&mut verify_conn)
+            .await
+            .unwrap();
+
+        let found = get_active_key(user_id, TEST_KEY_HEX, "groq", "tier2", None).await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+
+        assert_eq!(
+            count.0, 1,
+            "same (provider, key_type, integration_id, persona_id) must replace, not add a \
+             row, in the real migrated schema -- not just the hand-seeded in-memory one"
+        );
+        assert_eq!(
+            found.unwrap().unwrap().credential,
+            "new-key",
+            "the latest upsert must win against a real migrated encrypted file"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_active_key_returns_err_not_none_for_wrong_key_against_real_db() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "test-user";
+
+        crate::persistence::migrations::migrate_keys_db(user_id, TEST_KEY_HEX)
+            .await
+            .expect("real migration must succeed");
+        upsert_key(
+            user_id, TEST_KEY_HEX, "groq", "tier2", "some-key", None, None, None,
+        )
+        .await
+        .expect("upsert_key must succeed with the correct key");
+
+        let result = get_active_key(user_id, WRONG_KEY_HEX, "groq", "tier2", None).await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+
+        assert!(
+            result.is_err(),
+            "a wrong key against a real encrypted file must surface as an error, not be \
+             mistaken for Ok(None) (\"no key configured\")"
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_key_rejects_empty_credential_before_touching_real_db() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "test-user";
+        // Deliberately NOT migrated -- the empty-credential check must
+        // short-circuit before any connection attempt, so the db file must
+        // never be created.
+        let db_path = tempdir
+            .path()
+            .join("users")
+            .join(user_id)
+            .join("integration_keys.db");
+
+        let result = upsert_key(
+            user_id, TEST_KEY_HEX, "openai", "api_key", "   ", None, None, None,
+        )
+        .await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+
+        assert!(
+            matches!(result, Err(IntegrationKeysStoreError::Validation(_))),
+            "an empty credential must be rejected as a Validation error: {result:?}"
+        );
+        assert!(
+            !db_path.exists(),
+            "validation must short-circuit before any connection attempt creates the db file"
+        );
+    }
 }

@@ -915,4 +915,475 @@ mod tests {
             "old 'builder' role value must be rejected by the new CHECK"
         );
     }
+
+    // -- real on-disk SQLCipher migration tests -----------------------------
+    //
+    // The tests above all exercise run_migrations() with key_hex=None
+    // against :memory:. None of them exercise the encrypted branch, and
+    // none of the typed migrate_*_db path-construction helpers are called
+    // by any test anywhere in the codebase. These tests close that gap by
+    // running the real typed helpers against a real on-disk file under a
+    // tempdir-backed QR_DATA_ROOT, following the pattern established in
+    // plan_state_store.rs's tests (real migration call, not a hand-
+    // bootstrapped dummy table).
+
+    const TEST_KEY_HEX: &str =
+        "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+    const WRONG_KEY_HEX: &str =
+        "00112233445566778899aabbccddeeff00112233445566778899aabbccddee";
+
+    /// Opens a verification connection to an already-migrated real file,
+    /// applying the key with the same builder shape run_migrations itself
+    /// requires (key first, nothing else configured here).
+    async fn open_verify_conn(db_path: &Path, key_hex: Option<&str>) -> SqliteConnection {
+        let mut opts = SqliteConnectOptions::new()
+            .filename(db_path)
+            .create_if_missing(false);
+        if let Some(key) = key_hex {
+            opts = opts.pragma("key", format!("\"x'{key}'\""));
+        }
+        opts.connect()
+            .await
+            .expect("verification connection to a real migrated file must open")
+    }
+
+    async fn table_exists(conn: &mut SqliteConnection, table: &str) -> bool {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name = ?",
+        )
+        .bind(table)
+        .fetch_optional(conn)
+        .await
+        .unwrap();
+        row.is_some()
+    }
+
+    #[tokio::test]
+    async fn schema_version_exists_returns_false_for_nonexistent_path() {
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        let db_path = tempdir.path().join("does-not-exist.db");
+        assert!(
+            !schema_version_exists(&db_path, None).await,
+            "a path that doesn't exist must report false without opening a connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_personal_db_applies_all_three_versions_to_real_encrypted_file() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "test-user";
+        let persona_id = "test-persona";
+        let db_path = tempdir
+            .path()
+            .join("users")
+            .join(user_id)
+            .join("personas")
+            .join(persona_id)
+            .join("personal.db");
+
+        let result = migrate_personal_db(user_id, persona_id, TEST_KEY_HEX).await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+
+        assert_eq!(
+            result.expect("migration must apply cleanly to a real encrypted file"),
+            3,
+            "personal_001 + personal_002 + personal_003 must all apply in one pass"
+        );
+
+        let mut conn = open_verify_conn(&db_path, Some(TEST_KEY_HEX)).await;
+        for table in [
+            "entities",
+            "entity_facts",
+            "voice_profiles",
+            "disclosure_log",
+            "source_registry",
+            "dedup_candidates",
+        ] {
+            assert!(
+                table_exists(&mut conn, table).await,
+                "table {table} must exist after migration to a real encrypted file"
+            );
+        }
+
+        let columns: Vec<(i64, String, String, i64, Option<String>, i64)> =
+            sqlx::query_as("PRAGMA table_info(entities)")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        let column_names: Vec<&str> = columns.iter().map(|c| c.1.as_str()).collect();
+        assert!(
+            column_names.contains(&"redact_identification"),
+            "personal_003's ALTER TABLE must have applied to the real file"
+        );
+        assert!(
+            column_names.contains(&"hide_from_shared_surfaces"),
+            "personal_003's ALTER TABLE must have applied to the real file"
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_personal_db_is_idempotent_on_real_file() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "test-user";
+        let persona_id = "test-persona";
+
+        let first = migrate_personal_db(user_id, persona_id, TEST_KEY_HEX).await;
+        let second = migrate_personal_db(user_id, persona_id, TEST_KEY_HEX).await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+
+        assert_eq!(first.expect("first migration must succeed"), 3);
+        assert_eq!(
+            second.expect("second migration on an already-migrated real file must not error"),
+            0,
+            "re-running the migration on an already-migrated real file must be a no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_personal_db_rejects_wrong_key_on_real_file() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "test-user";
+        let persona_id = "test-persona";
+
+        migrate_personal_db(user_id, persona_id, TEST_KEY_HEX)
+            .await
+            .expect("initial migration with the correct key must succeed");
+
+        let result = migrate_personal_db(user_id, persona_id, WRONG_KEY_HEX).await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+
+        let err = result.expect_err("reopening a real encrypted file with the wrong key must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not a database"),
+            "wrong-key error must be classifiable the same way this codebase already \
+             classifies it elsewhere (commands/auth.rs, personal_store.rs): {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_version_exists_true_for_real_encrypted_file_with_correct_key() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "test-user";
+        let persona_id = "test-persona";
+        let db_path = tempdir
+            .path()
+            .join("users")
+            .join(user_id)
+            .join("personas")
+            .join(persona_id)
+            .join("personal.db");
+
+        migrate_personal_db(user_id, persona_id, TEST_KEY_HEX)
+            .await
+            .expect("migration must succeed");
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+
+        assert!(schema_version_exists(&db_path, Some(TEST_KEY_HEX)).await);
+    }
+
+    #[tokio::test]
+    async fn schema_version_exists_false_for_real_encrypted_file_with_wrong_key() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "test-user";
+        let persona_id = "test-persona";
+        let db_path = tempdir
+            .path()
+            .join("users")
+            .join(user_id)
+            .join("personas")
+            .join(persona_id)
+            .join("personal.db");
+
+        migrate_personal_db(user_id, persona_id, TEST_KEY_HEX)
+            .await
+            .expect("migration must succeed");
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+
+        assert!(
+            !schema_version_exists(&db_path, Some(WRONG_KEY_HEX)).await,
+            "the wrong key against a real encrypted file must be swallowed to false, not panic"
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_outputs_db_applies_to_real_encrypted_file() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "test-user";
+        let persona_id = "test-persona";
+        let db_path = tempdir
+            .path()
+            .join("users")
+            .join(user_id)
+            .join("personas")
+            .join(persona_id)
+            .join("outputs.db");
+
+        let result = migrate_outputs_db(user_id, persona_id, TEST_KEY_HEX).await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+
+        assert_eq!(result.expect("migration must apply cleanly"), 1);
+
+        let mut conn = open_verify_conn(&db_path, Some(TEST_KEY_HEX)).await;
+        for table in ["outputs", "focus_runs", "outputs_fts", "topics", "run_history"] {
+            assert!(
+                table_exists(&mut conn, table).await,
+                "table {table} must exist after migration to a real encrypted file"
+            );
+        }
+
+        // Prove the FTS5 trigger fires for real, not just that outputs_fts
+        // was created as an empty virtual table.
+        sqlx::query(
+            "INSERT INTO focus_runs (id, focus_id, started_at) \
+             VALUES ('fr-1', 'focus-1', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO outputs (id, focus_run_id, output_type, content, created_at, updated_at) \
+             VALUES ('out-1', 'fr-1', 'quick_ask', 'hello world', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        let matched: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM outputs_fts WHERE outputs_fts MATCH 'hello'")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(
+            matched.0, 1,
+            "outputs_fts_insert trigger must index the row on insert into a real encrypted file"
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_keys_db_applies_to_real_encrypted_file() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "test-user";
+        let db_path = tempdir
+            .path()
+            .join("users")
+            .join(user_id)
+            .join("integration_keys.db");
+
+        let result = migrate_keys_db(user_id, TEST_KEY_HEX).await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+
+        assert_eq!(result.expect("migration must apply cleanly"), 1);
+
+        let mut conn = open_verify_conn(&db_path, Some(TEST_KEY_HEX)).await;
+        assert!(table_exists(&mut conn, "integration_keys").await);
+
+        let invalid = sqlx::query(
+            "INSERT INTO integration_keys \
+                (id, provider, key_type, credential_label, credential, auth_type, created_at) \
+             VALUES ('k-bad', 'groq', 'tier2', 'groq', 'secret', 'bogus_type', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&mut conn)
+        .await;
+        assert!(
+            invalid.is_err(),
+            "auth_type CHECK must be enforced against a real encrypted file"
+        );
+
+        let valid = sqlx::query(
+            "INSERT INTO integration_keys \
+                (id, provider, key_type, credential_label, credential, auth_type, created_at) \
+             VALUES ('k-good', 'groq', 'tier2', 'groq', 'secret', 'api_key', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&mut conn)
+        .await;
+        assert!(valid.is_ok(), "a valid auth_type must insert cleanly");
+    }
+
+    #[tokio::test]
+    async fn migrate_scores_db_creates_real_unencrypted_file_on_disk() {
+        // scores.db is intentionally unencrypted (key_hex=None) -- no
+        // SQLCipher key is involved here by design. This test still uses a
+        // real tempdir-backed file (not :memory:) to exercise the real
+        // path-construction/file-creation code, which no existing test does.
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let db_path = tempdir.path().join("models").join("scores.db");
+
+        let result = migrate_scores_db().await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+
+        assert_eq!(result.expect("migration must apply cleanly"), 1);
+        assert!(db_path.exists(), "scores.db must exist as a real file on disk");
+
+        let mut conn = open_verify_conn(&db_path, None).await;
+        assert!(table_exists(&mut conn, "model_hardware_scores").await);
+    }
+
+    #[tokio::test]
+    async fn migrate_domain_context_db_applies_to_real_encrypted_file() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "test-user";
+        let persona_id = "test-persona";
+        let focus_id = "test-focus";
+        let db_path = tempdir
+            .path()
+            .join("users")
+            .join(user_id)
+            .join("personas")
+            .join(persona_id)
+            .join("focuses")
+            .join(focus_id)
+            .join("domain_context.db");
+
+        let result = migrate_domain_context_db(user_id, persona_id, focus_id, TEST_KEY_HEX).await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+
+        assert_eq!(result.expect("migration must apply cleanly"), 1);
+
+        let mut conn = open_verify_conn(&db_path, Some(TEST_KEY_HEX)).await;
+        for table in [
+            "domain_context_blocks",
+            "standing_summary",
+            "pending_extractions",
+            "provenance_log",
+        ] {
+            assert!(
+                table_exists(&mut conn, table).await,
+                "table {table} must exist after migration to a real encrypted file"
+            );
+        }
+
+        let seeded: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM standing_summary")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            seeded.0, 1,
+            "domain_context_001.sql's seeded standing_summary row must land in the real file"
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_focus_storage_migrates_both_real_encrypted_files() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "test-user";
+        let persona_id = "test-persona";
+        let focus_id = "test-focus";
+        let topic_id = "test-topic";
+        let focus_dir = tempdir
+            .path()
+            .join("users")
+            .join(user_id)
+            .join("personas")
+            .join(persona_id)
+            .join("focuses")
+            .join(focus_id);
+        let dc_path = focus_dir.join("domain_context.db");
+        let ps_path = focus_dir.join("topics").join(topic_id).join("plan_state.db");
+
+        let result =
+            migrate_focus_storage(user_id, persona_id, focus_id, topic_id, TEST_KEY_HEX).await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+
+        assert_eq!(result.expect("migration must apply cleanly"), (1, 1));
+        assert!(dc_path.exists(), "domain_context.db must exist as its own real file");
+        assert!(ps_path.exists(), "plan_state.db must exist as its own real file");
+
+        let mut dc_conn = open_verify_conn(&dc_path, Some(TEST_KEY_HEX)).await;
+        assert!(table_exists(&mut dc_conn, "domain_context_blocks").await);
+
+        let mut ps_conn = open_verify_conn(&ps_path, Some(TEST_KEY_HEX)).await;
+        assert!(table_exists(&mut ps_conn, "topic_header").await);
+        assert!(table_exists(&mut ps_conn, "handoff_tokens").await);
+    }
 }
