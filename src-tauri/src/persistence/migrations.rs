@@ -84,6 +84,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/outputs_001.sql"),
     },
     SchemaFile {
+        prefix: "outputs",
+        version: 2,
+        sql: include_str!("../../schema/outputs_002.sql"),
+    },
+    SchemaFile {
         prefix: "personal",
         version: 1,
         sql: include_str!("../../schema/personal_001.sql"),
@@ -1176,7 +1181,11 @@ mod tests {
             std::env::remove_var("QR_DATA_ROOT");
         }
 
-        assert_eq!(result.expect("migration must apply cleanly"), 1);
+        assert_eq!(
+            result.expect("migration must apply cleanly"),
+            2,
+            "outputs_001 + outputs_002 must all apply in one pass"
+        );
 
         let mut conn = open_verify_conn(&db_path, Some(TEST_KEY_HEX)).await;
         for table in ["outputs", "focus_runs", "outputs_fts", "topics", "run_history"] {
@@ -1185,6 +1194,16 @@ mod tests {
                 "table {table} must exist after migration to a real encrypted file"
             );
         }
+
+        let columns: Vec<(i64, String, String, i64, Option<String>, i64)> =
+            sqlx::query_as("PRAGMA table_info(extract_confirm_candidates)")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        assert!(
+            columns.iter().any(|c| c.1 == "source"),
+            "outputs_002's ALTER TABLE must have applied to the real file"
+        );
 
         // Prove the FTS5 trigger fires for real, not just that outputs_fts
         // was created as an empty virtual table.
