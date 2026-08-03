@@ -38,3 +38,7 @@ quietrabbit-data/
 # Taxonomy manifest (build artifact — regenerate with scripts/generate_manifest.py)
 app/taxonomy/manifest.yaml
 src-tauri/target/
+
+# Privacy Filter backend .so files staged by build.rs from PRIVACY_FILTER_LIB_DIR
+# (regenerated on every build; see build.rs and tauri.conf.json bundle.resources)
+src-tauri/resources/ggml-backends/

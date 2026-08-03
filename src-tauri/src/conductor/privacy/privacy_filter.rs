@@ -60,9 +60,44 @@ pub struct PfEntityDecoded {
 mod inner {
     use std::ffi::{CStr, CString};
     use std::marker::{PhantomData, PhantomPinned};
+    use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock};
 
     use super::PfEntityDecoded;
+
+    // Directory ggml should search for backend .so files (CPU-ISA variants,
+    // GPU backends). Set once via set_backend_dir() — from main.rs's setup()
+    // hook, using Tauri's resource dir — before the first pf_load(). Falls
+    // back to the build-time-baked dev bin/ dir (see build.rs) for contexts
+    // with no Tauri AppHandle, e.g. `cargo test` or a standalone harness.
+    //
+    // ggml's own default search (compile-time GGML_BACKEND_DIR, then the
+    // running executable's directory, then cwd — see privacy-filter.cpp's
+    // ggml-backend-reg.cpp) does not resolve correctly for a Tauri app,
+    // whose resource directory varies by install/bundle format and isn't
+    // known at privacy-filter.cpp's own build time. Hence this override,
+    // threaded through pf_set_backend_dir (added to pf.h for this purpose).
+    static BACKEND_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+    /// Set the directory ggml searches for backend .so files. Must be called
+    /// before the first is_available()/run_classify_blocking() call in the
+    /// process — the underlying loader runs once, lazily, on first use, and
+    /// is cached for the process lifetime (see pf_set_backend_dir in pf.h).
+    /// Second and later calls are ignored (OnceLock — logs a warning).
+    pub fn set_backend_dir(dir: PathBuf) {
+        if BACKEND_DIR.set(dir.clone()).is_err() {
+            log::warn!(
+                "privacy_filter: set_backend_dir({dir:?}) ignored — \
+                 already set to {:?}",
+                BACKEND_DIR.get()
+            );
+        }
+    }
+
+    /// Compile-time fallback for dev/test/example contexts that never call
+    /// set_backend_dir() (no Tauri AppHandle to resolve a resource dir from).
+    /// Baked by build.rs from PRIVACY_FILTER_LIB_DIR/bin at compile time.
+    const BACKEND_DIR_DEV_FALLBACK: &str = env!("PRIVACY_FILTER_BACKEND_DIR_DEV");
 
     // ABI version this wrapper was written against.
     // Matches PF_ABI_VERSION in pf.h. Initialisation fails if the runtime
@@ -95,6 +130,12 @@ mod inner {
         /// Returns the library ABI version (int in pf.h).
         /// Compare as u32 against EXPECTED_PF_ABI_VERSION.
         pub fn pf_abi_version() -> libc::c_int;
+
+        /// Override the directory ggml searches for backend .so files.
+        /// Must be called before the first pf_load() in the process —
+        /// the underlying search happens once, lazily, on first load.
+        /// NULL restores ggml's built-in default search.
+        pub fn pf_set_backend_dir(dir_path: *const libc::c_char);
 
         /// Initialise a Privacy Filter context.
         /// gguf_path: path to the GGUF model file (UTF-8, null-terminated).
@@ -195,6 +236,25 @@ mod inner {
                     return None;
                 }
                 log::info!("privacy_filter: ABI version {abi} confirmed");
+
+                // Must happen before pf_load — see BACKEND_DIR doc comment.
+                // BACKEND_DIR is populated by set_backend_dir() (called from
+                // main.rs's setup() hook with Tauri's resolved resource dir)
+                // if this process has a Tauri AppHandle; otherwise fall back
+                // to the build-time-baked dev bin/ dir (calibration harness,
+                // `cargo test`, etc).
+                let backend_dir = BACKEND_DIR
+                    .get()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| BACKEND_DIR_DEV_FALLBACK.to_owned());
+                match CString::new(backend_dir.clone()) {
+                    Ok(c_dir) => unsafe { pf_set_backend_dir(c_dir.as_ptr()) },
+                    Err(e) => log::warn!(
+                        "privacy_filter: backend dir {backend_dir:?} has interior \
+                         null byte, cannot set ({e}) — falling back to ggml's \
+                         built-in search"
+                    ),
+                }
 
                 let model_path = match model_path_cstring() {
                     Some(p) => p,
@@ -344,7 +404,7 @@ mod inner {
 
 // Re-export live implementations when compiled in.
 #[cfg(privacy_filter_available)]
-pub use inner::{is_available, run_classify_blocking};
+pub use inner::{is_available, run_classify_blocking, set_backend_dir};
 
 // ---------------------------------------------------------------------------
 // Stub path — when PRIVACY_FILTER_LIB_DIR was not set at build time
@@ -364,6 +424,11 @@ pub fn run_classify_blocking(_text: &str, _threshold: f32) -> Result<Vec<PfEntit
          (set PRIVACY_FILTER_LIB_DIR at build time)"
         .to_owned())
 }
+
+/// No-op when the Privacy Filter library was not compiled in — lets callers
+/// (main.rs's setup hook) call this unconditionally without cfg-gating.
+#[cfg(not(privacy_filter_available))]
+pub fn set_backend_dir(_dir: std::path::PathBuf) {}
 
 // ---------------------------------------------------------------------------
 // Tests
