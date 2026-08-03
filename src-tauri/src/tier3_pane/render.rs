@@ -11,7 +11,6 @@
 //! already separately proved).
 
 use cef::*;
-use std::cell::RefCell;
 use wgpu::util::DeviceExt;
 
 /// wgpu render state for the sync window's surface: device/queue, the
@@ -173,10 +172,8 @@ impl RenderState {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("tier3_pane render encoder"),
             });
-        CEF_TEXTURE.with_borrow(|bind_group| {
-            let Some(bind_group) = bind_group.as_ref() else {
-                return;
-            };
+        let cef_texture = CEF_TEXTURE.lock().unwrap();
+        if let Some(bind_group) = cef_texture.as_ref() {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("tier3_pane render pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -194,7 +191,8 @@ impl RenderState {
             pass.set_bind_group(0, bind_group, &[]);
             pass.set_vertex_buffer(0, self.quad.vertex_buffer.slice(..));
             pass.draw(0..self.quad.vertex_count, 0..1);
-        });
+        }
+        drop(cef_texture);
         self.queue.submit(std::iter::once(encoder.finish()));
 
         window.pre_present_notify();
@@ -237,16 +235,26 @@ fn texture_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
 // Single-pane slot for Phase A -- deliberately not the spike's Vec<Option<_>>
 // multi-instance form (items.id=195 step 1) since only one pane exists this
 // phase. Revisit when Phase B adds multiple panes.
-thread_local! {
-    static CEF_TEXTURE: RefCell<Option<wgpu::BindGroup>> = const { RefCell::new(None) };
-}
+//
+// A plain (not thread_local!) static: on_paint/on_accelerated_paint write
+// this from CEF's own UI thread while RenderState::render reads it from the
+// main thread (see multi_threaded_message_loop docs in bootstrap.rs). A
+// thread_local! here would give each thread its own independent cell, so
+// the main thread would never observe CEF's writes -- found during the
+// items.id=203 thread-safety audit (2026-08-03).
+static CEF_TEXTURE: std::sync::Mutex<Option<wgpu::BindGroup>> = std::sync::Mutex::new(None);
 
 /// CEF `RenderHandler` implementation: receives paint callbacks and imports
 /// the result into `CEF_TEXTURE` for `RenderState::render` to draw.
 #[derive(Clone)]
 pub struct PaneRenderHandler {
     device_scale_factor: f32,
-    size: std::rc::Rc<RefCell<winit::dpi::LogicalSize<f32>>>,
+    // Arc<Mutex<>>, not Rc<RefCell<>>: view_rect (CEF's UI thread) reads this
+    // while PaneApp::apply_resize (main thread) writes it -- Rc's non-atomic
+    // refcount would race across those two real OS threads under
+    // multi_threaded_message_loop=true. Found during the items.id=203
+    // thread-safety audit (2026-08-03).
+    size: std::sync::Arc<std::sync::Mutex<winit::dpi::LogicalSize<f32>>>,
     device: wgpu::Device,
     queue: wgpu::Queue,
 }
@@ -257,8 +265,11 @@ impl PaneRenderHandler {
         queue: wgpu::Queue,
         device_scale_factor: f32,
         initial_size: winit::dpi::LogicalSize<f32>,
-    ) -> (Self, std::rc::Rc<RefCell<winit::dpi::LogicalSize<f32>>>) {
-        let size = std::rc::Rc::new(RefCell::new(initial_size));
+    ) -> (
+        Self,
+        std::sync::Arc<std::sync::Mutex<winit::dpi::LogicalSize<f32>>>,
+    ) {
+        let size = std::sync::Arc::new(std::sync::Mutex::new(initial_size));
         (
             Self {
                 device_scale_factor,
@@ -279,7 +290,7 @@ wrap_render_handler! {
     impl RenderHandler {
         fn view_rect(&self, _browser: Option<&mut Browser>, rect: Option<&mut Rect>) {
             if let Some(rect) = rect {
-                let size = self.handler.size.borrow();
+                let size = self.handler.size.lock().unwrap();
                 if size.width > 0.0 && size.height > 0.0 {
                     rect.width = size.width as _;
                     rect.height = size.height as _;
@@ -340,7 +351,7 @@ wrap_render_handler! {
             };
 
             let bind_group = build_bind_group(&self.handler.device, &src_texture);
-            CEF_TEXTURE.with_borrow_mut(|slot| *slot = Some(bind_group));
+            *CEF_TEXTURE.lock().unwrap() = Some(bind_group);
         }
 
         // items.id=207: on_paint's signature (including the raw `buffer:
@@ -406,7 +417,7 @@ wrap_render_handler! {
             );
 
             let bind_group = build_bind_group(&self.handler.device, &texture);
-            CEF_TEXTURE.with_borrow_mut(|slot| *slot = Some(bind_group));
+            *CEF_TEXTURE.lock().unwrap() = Some(bind_group);
         }
     }
 }

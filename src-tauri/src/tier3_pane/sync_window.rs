@@ -13,7 +13,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -38,8 +38,16 @@ struct PaneApp {
     render_state: Option<RenderState>,
     browser: Option<cef::Browser>,
     browser_created: bool,
-    pending_render_handler: Option<(PaneRenderHandler, Rc<RefCell<winit::dpi::LogicalSize<f32>>>)>,
-    browser_size: Option<Rc<RefCell<winit::dpi::LogicalSize<f32>>>>,
+    // Arc<Mutex<>>, not Rc<RefCell<>> -- shared with PaneRenderHandler, whose
+    // view_rect runs on CEF's UI thread while apply_resize (below) writes
+    // this on the main thread. See PaneRenderHandler::size docs (render.rs)
+    // for why this must not be an Rc<RefCell<>> under
+    // multi_threaded_message_loop=true (items.id=203 audit, 2026-08-03).
+    pending_render_handler: Option<(
+        PaneRenderHandler,
+        Arc<Mutex<winit::dpi::LogicalSize<f32>>>,
+    )>,
+    browser_size: Option<Arc<Mutex<winit::dpi::LogicalSize<f32>>>>,
     window_info_and_settings: Option<(cef::WindowInfo, cef::BrowserSettings)>,
     /// Receives the constructed `Browser` from `LifeSpanHandler::on_after_created`
     /// (see render.rs docs) -- CEF's UI thread delivers it here since
@@ -384,7 +392,7 @@ impl PaneApp {
         if let (Some(browser_size), Some(window)) =
             (self.browser_size.as_ref(), self.window.as_ref())
         {
-            *browser_size.borrow_mut() = size.to_logical(window.scale_factor());
+            *browser_size.lock().unwrap() = size.to_logical(window.scale_factor());
             if let Some(host) = self.browser.as_mut().and_then(|b| b.host()) {
                 host.was_resized();
             }
