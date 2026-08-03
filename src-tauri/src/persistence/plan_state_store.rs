@@ -31,11 +31,11 @@
 //   per migrations.py and the schema header. Rust port uses the encrypted
 //   opener with key_hex, which is architecturally correct.
 //
-// Future consideration (flagged for Chat-PM):
-//   consume_handoff_token checks expired_at IS NULL but does not verify
-//   expiry_at >= now() at the query layer. A token past its expiry_at but
-//   not yet swept by Boot Check can still be consumed. Adding
-//   AND expiry_at >= ? would close this window — deferred, not a Phase 1 blocker.
+// Handoff token expiry (items.id=773 fix):
+//   consume_handoff_token checks expired_at IS NULL AND expiry_at >= now() at
+//   the query layer, so a token past its expiry_at but not yet swept by Boot
+//   Check cannot be consumed. Complementary to expire_overdue_handoff_tokens'
+//   own expiry_at < now() sweep condition — no gap between the two.
 //
 // QUERY STYLE: runtime sqlx::query() only — no query!() macros.
 // PRAGMA key applied via SqliteConnectOptions (D6-346).
@@ -750,11 +750,8 @@ pub async fn create_handoff_token(
 }
 
 /// Mark a handoff token as consumed after a valid return result.
-/// Returns true if found and consumed, false if not found or already consumed/expired.
-///
-/// Note: does not check expiry_at >= now() at the query layer -- a token past its
-/// expiry_at but not yet swept by Boot Check can still be consumed. See module
-/// header comment for future enhancement rationale.
+/// Returns true if found and consumed, false if not found, already
+/// consumed/expired, or past its expiry_at but not yet swept by Boot Check.
 pub async fn consume_handoff_token(
     user_id: &str,
     persona_id: &str,
@@ -769,13 +766,15 @@ pub async fn consume_handoff_token(
     }
 
     let mut conn = open_plan_state_db(user_id, persona_id, focus_id, topic_id, key_hex).await?;
+    let now = crate::providers::utils::now();
 
     let result = sqlx::query(
         "UPDATE handoff_tokens SET consumed_at = ?
-         WHERE id = ? AND consumed_at IS NULL AND expired_at IS NULL",
+         WHERE id = ? AND consumed_at IS NULL AND expired_at IS NULL AND expiry_at >= ?",
     )
-    .bind(crate::providers::utils::now())
+    .bind(&now)
     .bind(token_id)
+    .bind(&now)
     .execute(&mut conn)
     .await?;
 
@@ -902,4 +901,120 @@ pub async fn record_ceiling_user_response(
         .await?;
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_KEY_HEX: &str =
+        "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+
+    /// Regression test for items.id=773: consume_handoff_token previously
+    /// only checked expired_at IS NULL, not whether expiry_at had actually
+    /// passed. A token past its expiry_at but not yet swept by Boot Check
+    /// (expired_at still NULL) was consumable when it shouldn't be. Sets up
+    /// a real SQLCipher-encrypted plan_state.db via the real migration
+    /// (ensure_plan_state_db), inserts a handoff token with an expiry_at in
+    /// the past, and confirms consume_handoff_token now rejects it.
+    #[tokio::test]
+    async fn consume_handoff_token_rejects_expired_unswept_token() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "test-user";
+        let persona_id = "test-persona";
+        let focus_id = "test-focus";
+        let topic_id = "test-topic";
+
+        ensure_plan_state_db(user_id, persona_id, focus_id, topic_id, TEST_KEY_HEX)
+            .await
+            .expect("migration must succeed");
+
+        let token_id = create_handoff_token(
+            user_id,
+            persona_id,
+            focus_id,
+            topic_id,
+            TEST_KEY_HEX,
+            "test-focus-run",
+            "test-action",
+            "2020-01-01T00:00:00+00:00", // well in the past
+            None,
+        )
+        .await
+        .expect("create_handoff_token must succeed");
+
+        let result = consume_handoff_token(
+            user_id, persona_id, focus_id, topic_id, TEST_KEY_HEX, &token_id,
+        )
+        .await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+
+        assert!(
+            !result.expect("consume_handoff_token must not error"),
+            "an expired-but-unswept token must not be consumable"
+        );
+    }
+
+    /// Companion to the regression test above: a token whose expiry_at is
+    /// still in the future must remain consumable, guarding against the
+    /// fix being too strict.
+    #[tokio::test]
+    async fn consume_handoff_token_accepts_unexpired_token() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "test-user";
+        let persona_id = "test-persona";
+        let focus_id = "test-focus";
+        let topic_id = "test-topic";
+
+        ensure_plan_state_db(user_id, persona_id, focus_id, topic_id, TEST_KEY_HEX)
+            .await
+            .expect("migration must succeed");
+
+        let token_id = create_handoff_token(
+            user_id,
+            persona_id,
+            focus_id,
+            topic_id,
+            TEST_KEY_HEX,
+            "test-focus-run",
+            "test-action",
+            "2999-01-01T00:00:00+00:00", // well in the future
+            None,
+        )
+        .await
+        .expect("create_handoff_token must succeed");
+
+        let result = consume_handoff_token(
+            user_id, persona_id, focus_id, topic_id, TEST_KEY_HEX, &token_id,
+        )
+        .await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+
+        assert!(
+            result.expect("consume_handoff_token must not error"),
+            "an unexpired token must remain consumable"
+        );
+    }
 }
