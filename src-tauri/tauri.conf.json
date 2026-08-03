@@ -37,6 +37,9 @@
     "icon": [],
     "externalBin": [
       "binaries/ollama"
-    ]
+    ],
+    "resources": {
+      "resources/ggml-backends/*": "ggml-backends/"
+    }
   }
 }

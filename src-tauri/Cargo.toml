@@ -10,6 +10,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 pkg-config = "0.3"
+# Reads tauri.conf.json's productName in build.rs, to compute the same
+# usr/lib/<productName>/ path Tauri's bundler and resource_dir() use --
+# see build.rs's ggml runtime rpath comment.
+serde_json = "1"
 
 [dependencies]
 # Framework & Runtime

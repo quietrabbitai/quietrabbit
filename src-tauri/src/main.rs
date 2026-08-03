@@ -6,6 +6,7 @@ use tauri::Manager;
 use tokio::sync::{Mutex, RwLock};
 
 use quietrabbit_lib::conductor::concurrency::ConductorScheduler;
+use quietrabbit_lib::conductor::privacy::privacy_filter;
 use quietrabbit_lib::ipc::specta_builder;
 use quietrabbit_lib::ollama_sidecar::{OllamaSidecar, OllamaSource};
 use quietrabbit_lib::providers::ollama_client::OllamaClient;
@@ -107,6 +108,20 @@ async fn async_main() {
         // starts with an empty slot; login() (a later step) populates it.
         .manage(quietrabbit_lib::auth::registry::KeyRegistry::default())
         .setup(|app| {
+            // Must run synchronously here, before any command handler could
+            // trigger gate3's first Privacy Filter classification — ggml's
+            // backend loader (see privacy_filter.rs) runs once, lazily, on
+            // first use, and is cached for the process lifetime. Ollama
+            // detection below is spawned async since it's not similarly
+            // latch-once; this call is cheap and must not race it.
+            match app.path().resource_dir() {
+                Ok(dir) => privacy_filter::set_backend_dir(dir.join("ggml-backends")),
+                Err(e) => log::warn!(
+                    "main: could not resolve resource_dir for Privacy Filter \
+                     backend dir: {e} — falling back to build-time dev path"
+                ),
+            }
+
             // Detection runs in a spawned task — setup() is synchronous.
             // OllamaSource stays Unavailable until detection completes
             // (typically < 2 s on Garuda where system Ollama is running).
