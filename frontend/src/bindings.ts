@@ -163,6 +163,48 @@ export const commands = {
 	getRecoveryKeyDisplay: () => typedError<NotImplementedPlaceholder, string>(__TAURI_INVOKE("get_recovery_key_display")),
 	getHealth: () => typedError<HealthResponse, string>(__TAURI_INVOKE("get_health")),
 	getCapabilityProfile: () => typedError<CapabilityProfileResponse, string>(__TAURI_INVOKE("get_capability_profile")),
+	/**
+	 *  The selector screen's primary read path (TIER3_ACCESS_MODEL.md State 3,
+	 *  items.id=202 piece 1's remaining wiring) -- replaces
+	 *  tier3AccessConfig.ts's PLACEHOLDER_PROVIDERS stand-in array.
+	 */
+	listActiveProviders: () => typedError<Tier3ProviderSummary[], string>(__TAURI_INVOKE("list_active_providers")),
+	/**
+	 *  Opens one pane per confirmed provider selection (items.id=223's actual
+	 *  trigger -- nothing in tier3_pane/ creates a pane except in response to
+	 *  this). `launch_url` is looked up server-side; the frontend only ever
+	 *  passes provider IDs. Best-effort across the batch: the first provider
+	 *  that fails to resolve or send aborts the remaining opens rather than
+	 *  silently skipping them, since a partial open would leave the selector's
+	 *  own "confirmed" state and the actual open panes disagreeing about what's
+	 *  open.
+	 * 
+	 *  FOUND THE HARD WAY (2026-08-04, manual verification): sending
+	 *  `PaneCommand::Open` is not enough by itself. main.rs's heartbeat thread
+	 *  only calls `run_on_main_thread` (the only thing that forces tao's GTK
+	 *  loop to fire `MainEventsCleared`, per the freeze-bug root cause) while
+	 *  `open_pane_count > 0` -- but a pane can only become open by processing
+	 *  this very `Open` command, which requires `MainEventsCleared` to fire
+	 *  first. With zero panes open, the heartbeat provides no help at all, and
+	 *  nothing else guarantees the main window stays busy enough to dispatch
+	 *  the queued event promptly (confirmed empirically: a real click on this
+	 *  command's own trigger button did not itself produce a dispatch within
+	 *  several seconds). Fix: force exactly one wake here, synchronously,
+	 *  right after queuing the command -- the same `run_on_main_thread`
+	 *  mechanism the heartbeat uses, just called from the command that
+	 *  actually needs the wake instead of waited for. This does not reintroduce
+	 *  the always-on cost items.id=223 exists to avoid: it is one wake per
+	 *  open/close call, not a resumed continuous cadence.
+	 */
+	openTier3Panes: (providerIds: string[]) => typedError<null, string>(__TAURI_INVOKE("open_tier3_panes", { providerIds })),
+	/**
+	 *  Closes one pane by provider ID. A no-op (not an error) if that provider
+	 *  has no open pane -- PaneManager::close_pane already tolerates this
+	 *  (sync_window.rs), and a caller racing a close against an already-closed
+	 *  pane is a normal condition, not a failure. See open_tier3_panes' doc for
+	 *  why the explicit wake below is required, not optional.
+	 */
+	closeTier3Pane: (providerId: string) => typedError<null, string>(__TAURI_INVOKE("close_tier3_pane", { providerId })),
 };
 
 /* Types */
@@ -432,6 +474,18 @@ export type Tier2Config = {
 	provider: string,
 	configured: boolean,
 	expires_at: string | null,
+};
+
+/**
+ *  Selector-screen-facing provider summary. `lane` mirrors
+ *  `provider_store::ProviderTier`'s own serde rendering ("tier2"/"tier3")
+ *  and the frontend's `ProviderLane` string type (tier3AccessConfig.ts)
+ *  verbatim -- no further transformation needed on the TypeScript side.
+ */
+export type Tier3ProviderSummary = {
+	id: string,
+	display_name: string,
+	lane: string,
 };
 
 export type TopicInfo = {

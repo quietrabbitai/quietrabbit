@@ -2,16 +2,21 @@
 //! draws it into a dedicated winit window's surface.
 //!
 //! Adapted from the retained spike's proven pipeline
-//! (qr-spike-192/cef-rs/examples/osr/src/{main,webrender}.rs), narrowed to
-//! Phase A's single-pane scope -- no multi-instance texture slots, no
-//! popup handling (items.id=192's known deferred cost), no cookie-jar
-//! wiring yet (Phase B, when real provider RequestContexts are added; this
-//! phase uses CEF's default in-memory context to isolate the render/window
-//! integration question from the isolation question, which items.id=195
-//! already separately proved).
+//! (qr-spike-192/cef-rs/examples/osr/src/{main,webrender}.rs). Phase A
+//! (single pane, in-memory CEF context) narrowed this to one static texture
+//! slot and no cookie-jar wiring; Phase B (items.id=202 piece 5 / items.id=
+//! 223) generalizes both -- one texture slot per pane, keyed by
+//! `tier3_pane::PaneKey`, and real per-provider `RequestContext` isolation
+//! (see sync_window.rs). Popup handling remains items.id=192's known
+//! deferred cost, still out of scope here.
+
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 
 use cef::*;
 use wgpu::util::DeviceExt;
+
+use crate::tier3_pane::PaneKey;
 
 /// wgpu render state for the sync window's surface: device/queue, the
 /// single-textured-quad pipeline that draws CEF's paint output, and the
@@ -24,10 +29,15 @@ pub struct RenderState {
     surface_format: wgpu::TextureFormat,
     size: winit::dpi::PhysicalSize<u32>,
     quad: Geometry,
+    /// Which pane's slot in `PANE_TEXTURES` this instance's `render()` reads
+    /// from. One `RenderState` per pane (constructed per `PaneState`, see
+    /// sync_window.rs), so this is fixed at construction, not threaded
+    /// through every call.
+    pane_key: PaneKey,
 }
 
 impl RenderState {
-    pub async fn new(window: std::sync::Arc<winit::window::Window>) -> Self {
+    pub async fn new(window: std::sync::Arc<winit::window::Window>, pane_key: PaneKey) -> Self {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             #[cfg(target_os = "windows")]
             backends: wgpu::Backends::from_comma_list("dx12"),
@@ -118,6 +128,7 @@ impl RenderState {
             surface_format,
             size,
             quad,
+            pane_key,
         };
         state.configure_surface();
         state
@@ -172,8 +183,8 @@ impl RenderState {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("tier3_pane render encoder"),
             });
-        let cef_texture = CEF_TEXTURE.lock().unwrap();
-        if let Some(bind_group) = cef_texture.as_ref() {
+        let pane_textures = PANE_TEXTURES.lock().unwrap();
+        if let Some(bind_group) = pane_textures.get(&self.pane_key) {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("tier3_pane render pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -192,7 +203,7 @@ impl RenderState {
             pass.set_vertex_buffer(0, self.quad.vertex_buffer.slice(..));
             pass.draw(0..self.quad.vertex_count, 0..1);
         }
-        drop(cef_texture);
+        drop(pane_textures);
         self.queue.submit(std::iter::once(encoder.finish()));
 
         window.pre_present_notify();
@@ -232,9 +243,11 @@ fn texture_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     })
 }
 
-// Single-pane slot for Phase A -- deliberately not the spike's Vec<Option<_>>
-// multi-instance form (items.id=195 step 1) since only one pane exists this
-// phase. Revisit when Phase B adds multiple panes.
+// Phase B (items.id=202 piece 5): one texture slot per pane, keyed by
+// PaneKey -- the Vec<Option<_>>/HashMap<PaneId, _> multi-instance form
+// items.id=195 step 1 already anticipated. Plain HashMap, not IndexMap:
+// this is a pure key->value lookup (each pane's own RenderState only ever
+// reads its own key), never iterated, so insertion order has no observer.
 //
 // A plain (not thread_local!) static: on_paint/on_accelerated_paint write
 // this from CEF's own UI thread while RenderState::render reads it from the
@@ -242,7 +255,21 @@ fn texture_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
 // thread_local! here would give each thread its own independent cell, so
 // the main thread would never observe CEF's writes -- found during the
 // items.id=203 thread-safety audit (2026-08-03).
-static CEF_TEXTURE: std::sync::Mutex<Option<wgpu::BindGroup>> = std::sync::Mutex::new(None);
+static PANE_TEXTURES: LazyLock<Mutex<HashMap<PaneKey, wgpu::BindGroup>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Drops a closed pane's texture entry. Must be called as part of that
+/// pane's teardown (sync_window.rs), before/alongside dropping its
+/// RenderState/wgpu::Device -- leaving a stale entry around risks a future
+/// redraw (of some *other* pane, since this pane's own window is gone and
+/// can no longer trigger one) finding a BindGroup built from an
+/// already-dropped device. Not currently reachable that way (each pane's
+/// render() only ever reads its own key), but removing eagerly costs
+/// nothing and closes off the failure mode by construction rather than by
+/// argument.
+pub fn remove_pane_texture(key: &PaneKey) {
+    PANE_TEXTURES.lock().unwrap().remove(key);
+}
 
 /// CEF `RenderHandler` implementation: receives paint callbacks and imports
 /// the result into `CEF_TEXTURE` for `RenderState::render` to draw.
@@ -257,6 +284,10 @@ pub struct PaneRenderHandler {
     size: std::sync::Arc<std::sync::Mutex<winit::dpi::LogicalSize<f32>>>,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    /// Which `PANE_TEXTURES` slot on_paint/on_accelerated_paint (CEF's own
+    /// UI thread) write into. See PaneKey docs (tier3_pane::mod) -- this is
+    /// the provider ID the pane this handler belongs to was opened for.
+    pane_key: PaneKey,
 }
 
 impl PaneRenderHandler {
@@ -265,6 +296,7 @@ impl PaneRenderHandler {
         queue: wgpu::Queue,
         device_scale_factor: f32,
         initial_size: winit::dpi::LogicalSize<f32>,
+        pane_key: PaneKey,
     ) -> (
         Self,
         std::sync::Arc<std::sync::Mutex<winit::dpi::LogicalSize<f32>>>,
@@ -276,6 +308,7 @@ impl PaneRenderHandler {
                 size: size.clone(),
                 device,
                 queue,
+                pane_key,
             },
             size,
         )
@@ -351,7 +384,10 @@ wrap_render_handler! {
             };
 
             let bind_group = build_bind_group(&self.handler.device, &src_texture);
-            *CEF_TEXTURE.lock().unwrap() = Some(bind_group);
+            PANE_TEXTURES
+                .lock()
+                .unwrap()
+                .insert(self.handler.pane_key.clone(), bind_group);
         }
 
         // items.id=207: on_paint's signature (including the raw `buffer:
@@ -417,7 +453,10 @@ wrap_render_handler! {
             );
 
             let bind_group = build_bind_group(&self.handler.device, &texture);
-            *CEF_TEXTURE.lock().unwrap() = Some(bind_group);
+            PANE_TEXTURES
+                .lock()
+                .unwrap()
+                .insert(self.handler.pane_key.clone(), bind_group);
         }
     }
 }

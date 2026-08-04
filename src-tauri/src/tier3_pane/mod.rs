@@ -74,3 +74,13 @@ pub mod render;
 pub mod sync_window;
 
 pub use bootstrap::dispatch_cef_subprocess;
+
+/// Identifies one pane across `sync_window`/`render`/CEF `RequestContext`
+/// wiring. Deliberately the provider's own `provider_store::Provider::id`
+/// (a stable, meaningful string already unique across the selector's cap-of-3
+/// distinct providers, decisions.id=681) -- not a positional index (fragile:
+/// which pane is "index 1" once a different pane closes?) and not a UUID
+/// (adds indirection with no payoff, since providers are already uniquely
+/// identified and multi-account was resolved as logout/login-managed, not
+/// simultaneous same-provider panes -- decided 2026-08-04, handoff id=148).
+pub type PaneKey = String;

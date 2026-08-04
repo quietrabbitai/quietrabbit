@@ -84,25 +84,21 @@ pub fn dispatch_cef_subprocess() -> bool {
     }
 }
 
-/// Root cache path for CEF's global settings (`Settings.root_cache_path`).
-///
-/// Required in addition to per-RequestContext `cache_path` -- items.id=192's
-/// finding: without this, CEF emits a startup warning and per-context
-/// persistence silently degrades to in-memory (`flush_store` reports success
-/// but nothing persists). This is the QR-specific path, distinct from the
-/// spike's throwaway `/tmp/qr_*` paths.
-///
-/// TODO (Phase B, when real provider RequestContexts are wired): resolve
-/// this from Tauri's app_data_dir rather than a fixed path, so it lives
-/// under QR's normal per-user data directory rather than a hardcoded
-/// location. Fixed for Phase A since only bootstrap/render verification is
-/// in scope, not real per-provider persistence.
-pub const ROOT_CACHE_PATH: &str = "/tmp/qr_tier3_pane_root_cache";
-
 /// Initializes CEF for the browser process. Must be called exactly once,
 /// after `dispatch_cef_subprocess()` has returned `false` (i.e. this is
 /// confirmed to be the browser-process invocation), and before any browser
 /// instance is created.
+///
+/// `root_cache_path` is CEF's global `Settings.root_cache_path`, required in
+/// addition to each pane's own per-provider `RequestContextSettings.cache_path`
+/// (items.id=192's finding: without this, CEF emits a startup warning and
+/// per-context persistence silently degrades to in-memory -- `flush_store`
+/// reports success but nothing persists). Phase A used a fixed
+/// `/tmp/qr_tier3_pane_root_cache` path (bootstrap/render verification only,
+/// no real per-provider persistence yet); Phase B (items.id=202 piece 5)
+/// resolves this from Tauri's `app_data_dir` instead, per this const's own
+/// prior TODO -- the caller (main.rs) is responsible for that resolution,
+/// this function just takes the result.
 ///
 /// Returns the shared flag CEF's `OnScheduleMessagePumpWork` callback
 /// writes to -- the host loop (Tauri's `RunEvent::MainEventsCleared`, see
@@ -111,8 +107,8 @@ pub const ROOT_CACHE_PATH: &str = "/tmp/qr_tier3_pane_root_cache";
 /// (not `RefCell`/`Rc`) because CEF documents this callback as callable
 /// "on any thread" -- confirmed the hard way in the spike (RefCell panicked
 /// with "already borrowed" under real cross-thread contention).
-pub fn initialize_cef() -> CefInitResult {
-    initialize_cef_with_pump_setting(true)
+pub fn initialize_cef(root_cache_path: &std::path::Path) -> CefInitResult {
+    initialize_cef_with_pump_setting(root_cache_path, true)
 }
 
 /// Result of `initialize_cef()`. `pending_work` is retained for
@@ -129,7 +125,10 @@ pub struct CefInitResult {
 /// `multi_threaded_message_loop` is used (see module docs), kept only so
 /// bin/bare_tauri_cpu_test.rs still compiles against this signature.
 /// Production code should call `initialize_cef()`.
-pub fn initialize_cef_with_pump_setting(_external_message_pump_ignored: bool) -> CefInitResult {
+pub fn initialize_cef_with_pump_setting(
+    root_cache_path: &std::path::Path,
+    _external_message_pump_ignored: bool,
+) -> CefInitResult {
     // ROOT CAUSE + FIX HISTORY (2026-08-01, items.id=3 Phase A) --
     // read this before touching this function again.
     //
@@ -195,11 +194,12 @@ pub fn initialize_cef_with_pump_setting(_external_message_pump_ignored: bool) ->
 
     let mut app = AppBuilder::build(Tier3PaneApp::new_with_pump(pending_work.clone()));
 
+    let root_cache_path_str = root_cache_path.to_string_lossy().into_owned();
     let settings = Settings {
         windowless_rendering_enabled: true as _,
         multi_threaded_message_loop: 1,
         no_sandbox: 1,
-        root_cache_path: cef::CefString::from(ROOT_CACHE_PATH),
+        root_cache_path: cef::CefString::from(root_cache_path_str.as_str()),
         ..Default::default()
     };
 
@@ -216,7 +216,7 @@ pub fn initialize_cef_with_pump_setting(_external_message_pump_ignored: bool) ->
     );
 
     log::info!(
-        "tier3_pane::bootstrap: CEF initialized, root_cache_path={ROOT_CACHE_PATH}, multi_threaded_message_loop=true"
+        "tier3_pane::bootstrap: CEF initialized, root_cache_path={root_cache_path_str}, multi_threaded_message_loop=true"
     );
     CefInitResult { pending_work }
 }

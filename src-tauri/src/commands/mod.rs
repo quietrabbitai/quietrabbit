@@ -1,6 +1,6 @@
 // src-tauri/src/commands/mod.rs
 //
-// IPC command surface — 36 Tauri commands across 12 functional groups.
+// IPC command surface — 39 Tauri commands across 13 functional groups.
 // Push events (run_status_update, consent_request, floor_consent_request,
 // notification_available) are NOT registered here — they fire from FocusRun
 // via AppHandle::emit() in conductor/lifecycle.rs.
@@ -54,3 +54,4 @@ pub mod persona;
 pub mod personal;
 pub mod system;
 pub mod tier2;
+pub mod tier3_pane;

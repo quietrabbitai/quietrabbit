@@ -22,5 +22,14 @@
     "tier3BoxLabel": "Account required, data retained",
     "selectionCount": "{{selected}} / {{max}} selected",
     "continueButton": "Continue"
+  },
+  "tier3PaneHarness": {
+    "heading": "Tier3Selector harness",
+    "loadingProviders": "Loading providers…",
+    "providerError": "Could not load providers: {{message}}",
+    "openError": "Could not open pane(s): {{message}}",
+    "openPanesLabel": "Open panes",
+    "noPanesOpen": "No panes open",
+    "closeButton": "Close"
   }
 }

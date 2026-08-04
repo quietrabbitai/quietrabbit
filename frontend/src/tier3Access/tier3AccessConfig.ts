@@ -22,6 +22,17 @@
 // (INFORMATION_ARCHITECTURE_SPEC.md / TIER3_ACCESS_MODEL.md are both
 // owner_chat=Chat-BRAND). Class names and structure are written to be
 // easy to reskin, not styled as a design decision.
+//
+// PROVIDER DATA (items.id=202 piece 1, 2026-08-04): fetchActiveProviders()
+// replaces the prior PLACEHOLDER_PROVIDERS stand-in array -- real data now
+// comes from commands.listActiveProviders(), backed by
+// provider_store::list_active_providers() (commit 4e5147f). The IPC
+// response's `lane` field is already "tier2"/"tier3" (mirrors
+// provider_store::ProviderTier's own serde rendering exactly), so no
+// tier-to-lane transformation happens here -- just a field rename
+// (display_name -> name) to match this file's own Provider shape.
+
+import { commands } from '../bindings'
 
 /** The two lanes a provider can belong to (decisions.id=680/681).
  *  Tier is a routing designation only, never surfaced to the user by
@@ -30,30 +41,32 @@
  *  not by tier name. This type exists for internal routing only. */
 export type ProviderLane = 'tier2' | 'tier3'
 
-/** One selectable destination in the selector screen.
- *  PLACEHOLDER DATA SET -- the doc (Infrastructure Dependencies, Schema
- *  requirements) requires a real "provider configuration record" with
- *  citably-sourced fields (decisions.id=684), explicitly flagged as new
- *  build + research work, not yet built. The five named providers below
- *  (Duck.ai, Brave Leo / Claude, ChatGPT, Gemini) are the ones the doc
- *  itself names as of Session 2 -- listed here as a structural stand-in
- *  so the selector screen has something real to render and select
- *  against, NOT as the sourced, card-ready data the real feature needs.
- *  Mistral is deliberately excluded (decisions.id=665: disposition
- *  unresolved, not guessed at here, per the doc's own instruction). */
+/** One selectable destination in the selector screen. Backed by the real
+ *  provider catalog (provider_store::tier3_providers, decisions.id=684/710)
+ *  via commands.listActiveProviders() -- see fetchActiveProviders() below.
+ *  Card-ready fields beyond id/name/lane (retention posture, documentation
+ *  gate) are not surfaced here; this screen only needs enough to render
+ *  and select. */
 export interface Provider {
   id: string
   name: string
   lane: ProviderLane
 }
 
-export const PLACEHOLDER_PROVIDERS: Provider[] = [
-  { id: 'duckai', name: 'Duck.ai', lane: 'tier2' },
-  { id: 'brave-leo', name: 'Brave Leo', lane: 'tier2' },
-  { id: 'claude', name: 'Claude', lane: 'tier3' },
-  { id: 'chatgpt', name: 'ChatGPT', lane: 'tier3' },
-  { id: 'gemini', name: 'Gemini', lane: 'tier3' },
-]
+/** Fetches the selector screen's real provider list. Ordered tier-then-name
+ *  by the backing query (provider_store::list_active_providers) -- the
+ *  frontend does not re-sort. */
+export async function fetchActiveProviders(): Promise<Provider[]> {
+  const result = await commands.listActiveProviders()
+  if (result.status !== 'ok') {
+    throw new Error(result.error)
+  }
+  return result.data.map((p) => ({
+    id: p.id,
+    name: p.display_name,
+    lane: p.lane as ProviderLane,
+  }))
+}
 
 /** Combined hard cap across BOTH boxes (decisions.id=681):
  *  screen-real-estate-driven, not provider-count-driven. This is a

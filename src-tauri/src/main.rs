@@ -63,16 +63,6 @@ async fn async_main() {
     // test, not at runtime -- there is no frontend to consume them yet.
     let builder = specta_builder();
 
-    // Phase A (items.id=3 States 4-5, decisions.id=699): CEF is initialized
-    // for the browser process here, in setup(), after Tauri's own window
-    // exists -- CEF itself does not need a Tauri window to exist first, but
-    // ordering it here keeps startup sequencing simple to reason about for
-    // this phase. Uses multi_threaded_message_loop=true (see
-    // tier3_pane::bootstrap docs for the full root-cause history) -- CEF
-    // runs its own UI thread separately from Tauri's GTK main thread,
-    // which is what avoids the GTK/GLib main-loop busy-poll that a
-    // same-thread external-pump approach hit.
-    //
     // PaneWindow is deliberately NOT stored via Tauri's .manage()/.state()
     // (found the hard way, 2026-08-01): winit::EventLoop on X11 holds raw
     // platform IME pointers (*mut _XIM/_XIC) that are not Send, and
@@ -83,16 +73,11 @@ async fn async_main() {
     // (real thread affinity in winit's X11 backend), not a suppressed
     // unsafe impl Send. Window move/resize sync (on_window_event, a
     // separate closure) reaches PaneWindow via an mpsc channel rather than
-    // shared state, for the same reason.
-    let _cef_init = quietrabbit_lib::tier3_pane::bootstrap::initialize_cef();
-    let mut pane_window =
-        quietrabbit_lib::tier3_pane::sync_window::PaneWindow::new("https://claude.ai");
-    // Cloned before pane_window moves into the app.run() closure below --
-    // shared with the heartbeat thread so it can stop once the pane's own
-    // event loop exits. See PaneWindow::running field docs: this is a
-    // one-shot signal (Phase A has no reopen path), not a general
-    // active/inactive toggle.
-    let pane_running = pane_window.running_flag();
+    // shared state, for the same reason. `PaneWindow::proxy()` -- winit's
+    // `EventLoopProxy` IS `Send + Sync` -- is what crosses that boundary
+    // instead, managed as real Tauri state below (items.id=202 piece 5 /
+    // items.id=223) so async IPC command handlers can request pane
+    // open/close without touching PaneWindow itself.
     let (sync_tx, sync_rx) =
         std::sync::mpsc::channel::<quietrabbit_lib::tier3_pane::sync_window::PhysicalRect>();
 
@@ -206,6 +191,47 @@ async fn async_main() {
         .build(tauri::generate_context!())
         .expect("error while building Quiet Rabbit");
 
+    // CEF init + PaneWindow construction moved here (items.id=202 piece 5,
+    // 2026-08-04) from before tauri::Builder::default() -- root_cache_path
+    // (both CEF's global Settings.root_cache_path and PaneWindow's own
+    // per-provider cache_path base, see bootstrap.rs/sync_window.rs docs)
+    // needs app.path().app_data_dir(), which requires a built App/AppHandle
+    // and does not exist before .build() returns. The prior placement's own
+    // comment already claimed this ran "after Tauri's own window exists"
+    // and noted "CEF itself does not need a Tauri window to exist first" --
+    // this placement now actually matches that, rather than running before
+    // tauri::Builder::default() was even constructed.
+    let app_data_dir = app.path().app_data_dir().unwrap_or_else(|e| {
+        log::warn!(
+            "main: could not resolve app_data_dir for tier3_pane root_cache_path: {e} \
+             -- falling back to a temp dir (persistence across restarts will not work \
+             correctly at this fallback location)"
+        );
+        std::env::temp_dir().join("quietrabbit")
+    });
+    let root_cache_path = app_data_dir.join("tier3_pane_cache");
+    // Uses multi_threaded_message_loop=true (see tier3_pane::bootstrap docs
+    // for the full root-cause history) -- CEF runs its own UI thread
+    // separately from Tauri's GTK main thread, which is what avoids the
+    // GTK/GLib main-loop busy-poll that a same-thread external-pump
+    // approach hit.
+    let _cef_init = quietrabbit_lib::tier3_pane::bootstrap::initialize_cef(&root_cache_path);
+    // Phase B (items.id=202 piece 5 / items.id=223): zero panes exist yet --
+    // PaneWindow::new no longer takes an initial URL or creates anything
+    // eagerly. Panes are created on demand via the proxy managed below, in
+    // response to a real Tier 2/3 selection -- see sync_window.rs docs.
+    let mut pane_window =
+        quietrabbit_lib::tier3_pane::sync_window::PaneWindow::new(root_cache_path);
+    // EventLoopProxy IS Send + Sync (unlike PaneWindow itself, see the
+    // .manage() comment above) -- this is what lets an async IPC command
+    // handler (commands::tier3_pane, tokio-side) request a pane open/close
+    // without needing access to PaneWindow's winit-thread-affine state.
+    app.manage(pane_window.proxy());
+    // Shared with the heartbeat thread below so it can gate its real cost
+    // on whether any pane is actually open right now, rather than Phase
+    // A's one-shot "exit once the single pane closes" latch -- items.id=223.
+    let open_pane_count = pane_window.open_pane_count();
+
     // ROOT CAUSE + FIX (2026-08-04, items.id=202 freeze) -- read before
     // touching this again.
     //
@@ -261,65 +287,60 @@ async fn async_main() {
     // TIER3_ACCESS_MODEL.md treats Tier 2/3 as something the user opens
     // deliberately, and an always-on 16ms wake for every user contradicts
     // the idle-CPU discipline decisions.id=700 already fought for (Finding
-    // 1, the CPU-collision fix, this same code cluster). Checked what
-    // pane-lifecycle hooks actually exist before gating on anything: NONE.
-    // No `Drop` impl, no `is_running`/`is_active`, no create/destroy API
-    // anywhere in tier3_pane/ -- PaneWindow is constructed once, eagerly, at
-    // startup (per mod.rs's own documented Phase A scope: "always visible,
-    // no compaction... no user-initiated open/close yet"), and nothing ever
-    // tore it down. The ONE real signal that exists is
-    // `WindowEvent::CloseRequested` -> `event_loop.exit()` in
-    // sync_window.rs's `window_event`, whose result
-    // (`winit::platform::pump_events::PumpStatus`) `pump()` was discarding
-    // (`let _ = ...`) before this change. `PaneWindow::running_flag()`
-    // (added this change) exposes that already-existing signal instead of
-    // inventing a new one, so the heartbeat below stops once it fires.
+    // 1, the CPU-collision fix, this same code cluster).
     //
-    // WHAT THIS DOES NOT FIX, reported plainly rather than implied: Phase A
-    // creates the pane (and therefore needs this heartbeat) unconditionally
-    // at startup for every user, whether they ever touch Tier 2/3 or not --
-    // that eager-creation choice, not just this heartbeat, is the real
-    // "always-on regardless of use" cost, and it is Phase B/C's
-    // selector-screen wiring (open-on-demand) that has to fix it, not this
-    // bug-fix commit. Gating on CloseRequested only helps in the one
-    // one-shot case where the pane's own window happens to get closed (a
-    // path Phase A doesn't currently expose any UI for, and whose
-    // decorations are themselves still an open design question per
-    // items.id=202's status_detail); it does not make the heartbeat
-    // conditional on whether Tier 2/3 was ever opened in the first place.
-    // Tracked as a follow-on (see spawn_task at the end of this session) so
-    // it isn't silently carried forward once Phase B's real multi-pane
-    // open/close lands.
+    // UPDATE (2026-08-04, items.id=223, same session as the multi-pane
+    // refactor above): at the time this heartbeat was first added, no
+    // pane-lifecycle hooks existed anywhere in tier3_pane/ -- PaneWindow was
+    // constructed once, eagerly, at startup, and nothing ever tore it down,
+    // so the only gate available was `WindowEvent::CloseRequested`'s
+    // one-shot exit signal (`PaneWindow::running_flag()`, since removed).
+    // Phase B's on-demand `PaneCommand::Open`/`Close` (sync_window.rs) is
+    // that real lifecycle hook, and `open_pane_count` (below) is a live
+    // count rather than a one-shot latch -- so this loop no longer exits
+    // permanently on first close; it just skips the actual wake (the
+    // `run_on_main_thread` call, which is what forces GTK's loop to keep
+    // firing `MainEventsCleared`) on any tick where zero panes are open,
+    // and resumes waking automatically the next time one opens. The OS
+    // thread itself still sleeps for the app's entire lifetime -- cheaper
+    // to leave one thread doing a 16ms `Relaxed` atomic load than to
+    // spawn/kill it on every open/close and risk a start race.
     {
         let heartbeat_handle = app.handle().clone();
         std::thread::spawn(move || loop {
-            if !pane_running.load(std::sync::atomic::Ordering::Relaxed) {
-                break;
-            }
             std::thread::sleep(std::time::Duration::from_millis(16));
+            if open_pane_count.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                continue;
+            }
             if heartbeat_handle.run_on_main_thread(|| {}).is_err() {
                 break;
             }
         });
     }
 
-    // Phase A message-pump interleaving (see tier3_pane::mod.rs docs on the
-    // process/thread model decision): the pane's own winit event loop is
-    // pumped once per Tauri main-loop iteration, on
-    // RunEvent::MainEventsCleared. CEF's own message loop runs entirely on
-    // its own OS thread now (multi_threaded_message_loop=true) and needs
-    // no interleaving from here at all -- see tier3_pane::bootstrap docs.
-    // pane_window and sync_rx are moved into this closure (not
+    // Shared winit event loop interleaving (see tier3_pane::mod.rs docs on
+    // the process/thread model decision): every currently-open pane's
+    // winit machinery is pumped once per Tauri main-loop iteration, on
+    // RunEvent::MainEventsCleared -- one pump() call regardless of pane
+    // count (see PaneWindow::pump docs). CEF's own message loop runs
+    // entirely on its own OS thread now (multi_threaded_message_loop=true)
+    // and needs no interleaving from here at all -- see tier3_pane::bootstrap
+    // docs. pane_window and sync_rx are moved into this closure (not
     // Tauri-managed state, per the Send constraint above) -- this closure
     // runs on the main thread for the app's entire lifetime, which is
     // exactly PaneWindow's required affinity.
     app.run(move |_app_handle, event| {
         if let tauri::RunEvent::MainEventsCleared = event {
             // Drain all pending sync updates (not just the latest) so a
-            // burst of move/resize events during a drag doesn't leave the
+            // burst of move/resize events during a drag doesn't leave any
             // pane visibly behind by more than one tick's worth of catch-up.
+            // Applied to every currently-open pane (Phase A had exactly
+            // one; Phase B may have zero to three) -- see PaneWindow::sync_to
+            // docs for the placeholder (not yet Phase C real) layout math.
             while let Ok(rect) = sync_rx.try_recv() {
-                pane_window.sync_to(rect);
+                for key in pane_window.pane_keys() {
+                    pane_window.sync_to(&key, rect);
+                }
             }
             pane_window.pump();
         }
