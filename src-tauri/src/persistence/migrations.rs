@@ -439,20 +439,33 @@ async fn run_pending(conn: &mut SqliteConnection, prefix: &str) -> Result<u32, M
 
             // Record the applied version inside the SAVEPOINT so that schema
             // content and tracking record commit or rollback atomically.
-            // OR IGNORE: each schema file's own trailing INSERT (see
-            // SCHEMA AUTHORING convention) already seeds this row with a
-            // real applied_at/description; this bookkeeping insert is a
-            // fallback for the rare file that omits its own seed row, and
-            // must not fail with NOT NULL when the file already inserted it.
-            sqlx::query(
-                "INSERT OR IGNORE INTO schema_version (version, applied_at, description) \
-                 VALUES (?, ?, ?)",
-            )
-            .bind(version as i64)
-            .bind(now())
-            .bind(format!("{prefix} v{version}"))
-            .execute(&mut *conn)
-            .await?;
+            // Every current schema file's own trailing INSERT (see SCHEMA
+            // AUTHORING convention) already seeds this row with a real
+            // applied_at/description as one of the `statements` executed
+            // just above -- so this existence check is expected to find a
+            // row and skip every time today. It exists as a fallback for
+            // the rare file that omits its own seed row: checking first
+            // (rather than INSERT OR IGNORE unconditionally) avoids a
+            // redundant second INSERT attempt against the same row on
+            // every well-formed migration, while still catching the file
+            // that forgot to seed itself.
+            let already_recorded: Option<(i64,)> =
+                sqlx::query_as("SELECT 1 FROM schema_version WHERE version = ?")
+                    .bind(version as i64)
+                    .fetch_optional(&mut *conn)
+                    .await?;
+
+            if already_recorded.is_none() {
+                sqlx::query(
+                    "INSERT INTO schema_version (version, applied_at, description) \
+                     VALUES (?, ?, ?)",
+                )
+                .bind(version as i64)
+                .bind(now())
+                .bind(format!("{prefix} v{version}"))
+                .execute(&mut *conn)
+                .await?;
+            }
 
             sqlx::query(&format!("RELEASE {savepoint}"))
                 .execute(&mut *conn)

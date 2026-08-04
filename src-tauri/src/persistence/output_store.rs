@@ -31,6 +31,8 @@ use sqlx::Row;
 use sqlx::SqliteConnection;
 use thiserror::Error;
 
+use crate::conductor::privacy::types::{ElementDecision, ElementDecisionKind};
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -528,32 +530,91 @@ pub async fn write_floor_consent_decision(
     Ok(())
 }
 
-/// Record per-element Privacy Guardian consent decisions for a paused focus run.
+/// Record per-element Privacy Guardian consent decisions for a paused focus run
+/// (D6-362, items.id=37). One row per ElementDecision -- see outputs_001.sql's
+/// consent_decisions header for why this is a fan-out, not a single row
+/// holding a JSON blob.
 ///
 /// decisions_json: JSON-serialized Vec<ElementDecision> from the Privacy Guardian
-///   modal. The caller (consent.rs) is responsible for serialization.
+///   modal. The caller (consent.rs) is responsible for serialization; this
+///   function deserializes it (D6-362 IPC boundary rule keeps consent.rs's
+///   command layer from importing conductor types).
 ///   Expected JSON shape per element:
-///     { "span_id": string, "decision": "Generalize"|"KeepPrivate"|"ReleaseOriginal",
+///     { "span_id": string, "decision": "generalize"|"keep_private"|"release_original",
 ///       "suggestion_text": string|null, "user_modified_text": string|null }
 ///
-/// BLOCKED PENDING MIGRATION: 'element_consent' decision_type requires
-/// outputs_007 (CHECK constraint extension via table recreation in SQLite).
-/// Until outputs_007 runs, this function returns Err immediately -- no DB
-/// connection is opened. See outputs_006.sql for the planned constraint extension.
+/// All rows in one call share a single created_at timestamp (one user
+/// submission -> N rows, same instant) and are written inside a SAVEPOINT --
+/// a mid-batch failure leaves no partial rows.
 pub async fn write_element_consent_decisions(
-    _user_id: &str,
-    _persona_id: &str,
-    _key_hex: &str,
-    _run_id: &str,
-    _decisions_json: &str,
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    run_id: &str,
+    decisions_json: &str,
 ) -> Result<(), OutputStoreError> {
-    // Hard return before any DB access -- guard is structural by position.
-    Err(OutputStoreError::Validation(
-        "decision_type 'element_consent' is not yet supported by the database schema \
-         -- outputs_007 migration required to extend the consent_decisions \
-         CHECK constraint."
-            .to_owned(),
-    ))
+    let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
+    write_element_consent_decisions_conn(&mut conn, run_id, decisions_json).await
+}
+
+async fn write_element_consent_decisions_conn(
+    conn: &mut SqliteConnection,
+    run_id: &str,
+    decisions_json: &str,
+) -> Result<(), OutputStoreError> {
+    let decisions: Vec<ElementDecision> = serde_json::from_str(decisions_json).map_err(|e| {
+        OutputStoreError::Validation(format!("decisions_json parse error: {e}"))
+    })?;
+
+    if decisions.is_empty() {
+        return Err(OutputStoreError::Validation(
+            "decisions_json must contain at least one element decision".to_owned(),
+        ));
+    }
+
+    let now = crate::providers::utils::now();
+
+    sqlx::query("SAVEPOINT write_element_consent_sp")
+        .execute(&mut *conn)
+        .await?;
+
+    for d in &decisions {
+        let decision_str = match d.decision {
+            ElementDecisionKind::Generalize => "generalize",
+            ElementDecisionKind::KeepPrivate => "keep_private",
+            ElementDecisionKind::ReleaseOriginal => "release_original",
+        };
+        let id = uuid::Uuid::new_v4().to_string();
+
+        let result = sqlx::query(
+            "INSERT INTO consent_decisions
+                 (id, focus_run_id, decision_type, decision, abstraction_tier,
+                  save_preference, span_id, suggestion_text, user_modified_text, created_at)
+             VALUES (?, ?, 'element_consent', ?, NULL, NULL, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(run_id)
+        .bind(decision_str)
+        .bind(&d.span_id)
+        .bind(&d.suggestion_text)
+        .bind(&d.user_modified_text)
+        .bind(&now)
+        .execute(&mut *conn)
+        .await;
+
+        if let Err(e) = result {
+            let _ = sqlx::query("ROLLBACK TO write_element_consent_sp")
+                .execute(&mut *conn)
+                .await;
+            return Err(OutputStoreError::Database(e));
+        }
+    }
+
+    sqlx::query("RELEASE write_element_consent_sp")
+        .execute(&mut *conn)
+        .await?;
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -619,6 +680,20 @@ mod tests {
         output_id
     }
 
+    /// Insert a bare focus_run row directly. Returns the run id.
+    async fn seed_focus_run(conn: &mut SqliteConnection) -> String {
+        let run_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO focus_runs (id, focus_id, status, started_at)
+             VALUES (?, 'focus-1', 'complete', '2026-08-03T00:00:00Z')",
+        )
+        .bind(&run_id)
+        .execute(&mut *conn)
+        .await
+        .expect("focus_runs insert failed");
+        run_id
+    }
+
     #[tokio::test]
     async fn delete_output_conn_zeroes_content_and_marks_deleted_without_removing_row() {
         let mut conn = test_db().await;
@@ -679,22 +754,151 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_element_consent_decisions_returns_err_pending_migration() {
-        let result =
-            write_element_consent_decisions("user1", "persona1", "deadbeef", "run-123", "[]").await;
+    async fn write_element_consent_decisions_conn_inserts_one_row_per_element() {
+        let mut conn = test_db().await;
+        let run_id = seed_focus_run(&mut conn).await;
+
+        // Third element deliberately omits suggestion_text/user_modified_text --
+        // the fully-NULL-optionals shape must be accepted, not just the
+        // all-fields-populated case.
+        let decisions_json = r#"[
+            {"span_id": "span-1", "decision": "generalize",
+             "suggestion_text": "[person]", "user_modified_text": null},
+            {"span_id": "span-2", "decision": "release_original",
+             "suggestion_text": null, "user_modified_text": "edited value"},
+            {"span_id": "span-3", "decision": "keep_private",
+             "suggestion_text": null, "user_modified_text": null}
+        ]"#;
+
+        write_element_consent_decisions_conn(&mut conn, &run_id, decisions_json)
+            .await
+            .expect("write_element_consent_decisions_conn failed");
+
+        let rows = sqlx::query(
+            "SELECT decision, span_id, suggestion_text, user_modified_text,
+                    abstraction_tier, save_preference
+             FROM consent_decisions WHERE focus_run_id = ? ORDER BY span_id",
+        )
+        .bind(&run_id)
+        .fetch_all(&mut conn)
+        .await
+        .expect("query failed");
+
+        assert_eq!(rows.len(), 3, "must insert one row per element");
+
+        let decision: String = rows[0].try_get("decision").unwrap();
+        let span_id: String = rows[0].try_get("span_id").unwrap();
+        let suggestion_text: Option<String> = rows[0].try_get("suggestion_text").unwrap();
+        assert_eq!(decision, "generalize");
+        assert_eq!(span_id, "span-1");
+        assert_eq!(suggestion_text.as_deref(), Some("[person]"));
+
+        let abstraction_tier: Option<i64> = rows[2].try_get("abstraction_tier").unwrap();
+        let save_preference: Option<i64> = rows[2].try_get("save_preference").unwrap();
+        let suggestion_text_3: Option<String> = rows[2].try_get("suggestion_text").unwrap();
+        let user_modified_text_3: Option<String> = rows[2].try_get("user_modified_text").unwrap();
+        assert!(abstraction_tier.is_none(), "abstraction_tier must be NULL");
+        assert!(save_preference.is_none(), "save_preference must be NULL");
+        assert!(
+            suggestion_text_3.is_none() && user_modified_text_3.is_none(),
+            "fully-NULL optional fields must be accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_element_consent_decisions_conn_rejects_empty_array() {
+        let mut conn = test_db().await;
+        let run_id = seed_focus_run(&mut conn).await;
+
+        let result = write_element_consent_decisions_conn(&mut conn, &run_id, "[]").await;
 
         match result.unwrap_err() {
             OutputStoreError::Validation(msg) => {
-                assert!(
-                    msg.contains("element_consent"),
-                    "error must name the decision type: {msg}"
-                );
-                assert!(
-                    msg.contains("outputs_007"),
-                    "error must cite the required migration: {msg}"
-                );
+                assert!(msg.contains("at least one"), "unexpected message: {msg}")
             }
             other => panic!("expected Validation variant, got: {other:?}"),
         }
+
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM consent_decisions")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(count.0, 0, "no rows may be written on rejection");
+    }
+
+    #[tokio::test]
+    async fn write_element_consent_decisions_conn_rejects_malformed_json() {
+        let mut conn = test_db().await;
+        let run_id = seed_focus_run(&mut conn).await;
+
+        let result =
+            write_element_consent_decisions_conn(&mut conn, &run_id, "not valid json").await;
+
+        assert!(matches!(result, Err(OutputStoreError::Validation(_))));
+    }
+
+    #[tokio::test]
+    async fn consent_decisions_check_rejects_element_consent_row_with_invalid_decision() {
+        let mut conn = test_db().await;
+        let run_id = seed_focus_run(&mut conn).await;
+
+        let result = sqlx::query(
+            "INSERT INTO consent_decisions
+                 (id, focus_run_id, decision_type, decision, span_id, created_at)
+             VALUES ('id-1', ?, 'element_consent', 'not_a_real_decision', 'span-1', 'now')",
+        )
+        .bind(&run_id)
+        .execute(&mut conn)
+        .await;
+
+        assert!(
+            result.is_err(),
+            "CHECK constraint must reject an unrecognized element_consent decision value"
+        );
+    }
+
+    #[tokio::test]
+    async fn consent_decisions_check_rejects_element_consent_row_with_null_span_id() {
+        let mut conn = test_db().await;
+        let run_id = seed_focus_run(&mut conn).await;
+
+        let result = sqlx::query(
+            "INSERT INTO consent_decisions
+                 (id, focus_run_id, decision_type, decision, span_id, created_at)
+             VALUES ('id-1', ?, 'element_consent', 'generalize', NULL, 'now')",
+        )
+        .bind(&run_id)
+        .execute(&mut conn)
+        .await;
+
+        assert!(
+            result.is_err(),
+            "CHECK constraint must require span_id for element_consent rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn consent_decisions_check_still_accepts_valid_gate3_and_floor_rows() {
+        let mut conn = test_db().await;
+        let run_id = seed_focus_run(&mut conn).await;
+
+        sqlx::query(
+            "INSERT INTO consent_decisions (id, focus_run_id, decision_type, decision, created_at)
+             VALUES ('id-gate3', ?, 'gate3', 'approved', 'now')",
+        )
+        .bind(&run_id)
+        .execute(&mut conn)
+        .await
+        .expect("gate3 row must still satisfy the updated 3-branch CHECK");
+
+        sqlx::query(
+            "INSERT INTO consent_decisions
+                 (id, focus_run_id, decision_type, decision, abstraction_tier, created_at)
+             VALUES ('id-floor', ?, 'floor', 'proceed', 2, 'now')",
+        )
+        .bind(&run_id)
+        .execute(&mut conn)
+        .await
+        .expect("floor row must still satisfy the updated 3-branch CHECK");
     }
 }

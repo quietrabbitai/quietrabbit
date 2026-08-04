@@ -22,7 +22,8 @@
 //   (D6-362). The frontend serializes Vec<ElementDecision> to JSON and passes it
 //   as decisions_json -- the IPC boundary carries a plain String, keeping the
 //   command layer free of Conductor type imports.
-//   BLOCKED until outputs_007 migration (CHECK constraint extension). Returns Err.
+//   Writes to consent_decisions table via write_element_consent_decisions()
+//   (D6-362, items.id=37) -- one row per element, decision_type='element_consent'.
 //
 // submit_extract_confirm: processes user decisions for extracted personal field
 //   candidates (item 20). Validates, writes confirmed fields to personal.db,

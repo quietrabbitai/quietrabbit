@@ -18,17 +18,19 @@
 -- outputs/model_quality_scores/drift_observations, closing the deferral
 -- outputs_002 left open), outputs_006 (consent_decisions table, D6-352),
 -- outputs_007 (PLACEHOLDER ONLY -- reserved for an element_consent CHECK
--- constraint extension on consent_decisions that was never built; the real
--- migration remains a dedicated pre-release session, per outputs_007's own
--- header. 'element_consent' is NOT a valid decision_type in this consolidated
--- file -- only 'gate3' and 'floor', matching outputs_006's constraint
--- unchanged. Do not add element_consent here without doing that deferred
--- work first), outputs_008 (extract_confirm_candidates table, item 20),
--- outputs_009 (extend focus_runs.status CHECK with
--- awaiting_extract_confirm, item 20).
+-- constraint extension on consent_decisions, never built), outputs_008
+-- (extract_confirm_candidates table, item 20), outputs_009 (extend
+-- focus_runs.status CHECK with awaiting_extract_confirm, item 20).
 -- Pre-release, zero shipped users -- consolidated directly to final naming
--- and final constraint shapes (except the deliberately-still-deferred
--- element_consent extension, preserved as a gap, not silently resolved).
+-- and final constraint shapes. items.id=37 (2026-08-03) closed the one
+-- gap outputs_007 had left open: consent_decisions now also supports
+-- 'element_consent' (Privacy Guardian per-span consent, D6-362) folded
+-- directly into this file rather than added as outputs_010.sql -- per
+-- Jason's direction this session, pre-release code with zero shipped users
+-- consolidates into existing files whenever practical instead of carrying
+-- incremental ALTER-migration history forward. NOTE: any local outputs.db
+-- with schema_version row 1 already recorded predates this change and must
+-- be deleted so it gets recreated from this file.
 -- Chat-DEV, per Chat-PM/Jason adjudication of Chat-DEV handoff id=99.
 
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -365,48 +367,68 @@ CREATE TABLE IF NOT EXISTS topic_storage_locations (
     orphaned        INTEGER NOT NULL DEFAULT 0
 );
 
--- consent_decisions — Gate 3 and floor consent decisions per focus run (D6-352).
+-- consent_decisions — Gate 3, floor, and per-element Privacy Guardian consent
+-- decisions per focus run (D6-352, D6-362 for element_consent).
 -- decision_type: 'gate3' for cross-tier promotion consent (Gate 3);
---   'floor' for floor abstraction clamping consent.
+--   'floor' for floor abstraction clamping consent;
+--   'element_consent' for per-span Privacy Guardian review (items.id=37).
 -- decision values are intentionally asymmetric -- different UX semantics:
---   gate3:  'approved'|'declined'  (approve or decline content promotion)
---   floor:  'proceed'|'cancel'     (proceed with or cancel execution)
+--   gate3:            'approved'|'declined'  (approve or decline content promotion)
+--   floor:            'proceed'|'cancel'     (proceed with or cancel execution)
+--   element_consent:  'generalize'|'keep_private'|'release_original'
+--                      (per-span choice -- matches ElementDecisionKind's
+--                      #[serde(rename_all = "snake_case")] wire format,
+--                      conductor/privacy/types.rs)
 --   Do not normalize these values across types.
--- abstraction_tier: required for floor decisions; NULL for gate3.
+-- abstraction_tier: required for floor decisions; NULL for gate3 and
+--   element_consent (not applicable to either).
 -- save_preference: 1 if user chose to save floor consent as standing preference
 --   (D5-152 -- caller writes personas.extra_metadata in shared.db separately).
---   NULL for gate3 (not applicable). 0 = explicit "do not save".
---
--- NOTE: 'element_consent' is NOT a valid decision_type here. It was proposed
--- as a planned extension (originally slated for outputs_007) that was never
--- built -- outputs_007.sql was a placeholder only, its own header deferring
--- the real CHECK-constraint work to "a dedicated pre-release session" that
--- has not happened. write_element_consent_decisions() must continue to
--- return Err rather than attempting a write that would violate this
--- constraint, until that dedicated work is done. See items.id=169 handoff
--- for the flag to Chat-PM.
+--   NULL for gate3 and element_consent (not applicable). 0 = explicit "do not save".
+-- span_id / suggestion_text / user_modified_text: element_consent only, one row
+--   per ElementDecision (fan-out, not a JSON blob in `decision` -- keeps every
+--   row individually checkable and matches ConsentSpanItem/ElementDecision's
+--   real per-span shape). span_id is always required for element_consent
+--   (ElementDecision.span_id: String). suggestion_text/user_modified_text are
+--   both Option<String> on ElementDecision and legitimately NULL together --
+--   e.g. no Privacy Filter suggestion existed for a span, or the user accepted
+--   a suggestion without editing it -- so, unlike span_id, neither is
+--   constrained to NOT NULL here. All three columns are NULL for gate3/floor
+--   rows, enforced by the CHECK below.
 --
 -- Append-only design: a run may accumulate multiple consent rows if the user
--- declines and is re-presented. No UNIQUE constraint on (focus_run_id,
+-- declines and is re-presented, and element_consent always writes one row per
+-- span in a single batch. No UNIQUE constraint on (focus_run_id,
 -- decision_type) -- multiple decisions per type per run are permitted.
--- All readers MUST order by created_at DESC and select the newest row.
+-- All readers MUST order by created_at DESC and select the newest row
+-- (element_consent readers additionally group by created_at to reconstruct
+-- a batch, since a batch has no shared id of its own).
 CREATE TABLE IF NOT EXISTS consent_decisions (
-    id               TEXT    PRIMARY KEY,
-    focus_run_id     TEXT    NOT NULL REFERENCES focus_runs(id),
-    decision_type    TEXT    NOT NULL CHECK (decision_type IN ('gate3','floor')),
-    decision         TEXT    NOT NULL,
-    abstraction_tier INTEGER,
-    save_preference  INTEGER,
-    created_at       TEXT    NOT NULL,
+    id                  TEXT    PRIMARY KEY,
+    focus_run_id        TEXT    NOT NULL REFERENCES focus_runs(id),
+    decision_type       TEXT    NOT NULL CHECK (decision_type IN ('gate3','floor','element_consent')),
+    decision            TEXT    NOT NULL,
+    abstraction_tier    INTEGER,
+    save_preference     INTEGER,
+    span_id             TEXT,
+    suggestion_text     TEXT,
+    user_modified_text  TEXT,
+    created_at          TEXT    NOT NULL,
 
     CHECK (
         (decision_type = 'gate3'
             AND decision IN ('approved','declined')
-            AND abstraction_tier IS NULL)
+            AND abstraction_tier IS NULL
+            AND span_id IS NULL AND suggestion_text IS NULL AND user_modified_text IS NULL)
      OR (decision_type = 'floor'
             AND decision IN ('proceed','cancel')
             AND abstraction_tier IS NOT NULL
-            AND abstraction_tier BETWEEN 1 AND 3)
+            AND abstraction_tier BETWEEN 1 AND 3
+            AND span_id IS NULL AND suggestion_text IS NULL AND user_modified_text IS NULL)
+     OR (decision_type = 'element_consent'
+            AND decision IN ('generalize','keep_private','release_original')
+            AND abstraction_tier IS NULL
+            AND span_id IS NOT NULL)
     )
 );
 
