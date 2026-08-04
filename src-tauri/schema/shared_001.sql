@@ -386,6 +386,112 @@ SELECT
     datetime('now'), datetime('now')
 FROM personas p;
 
+-- tier3_providers (items.id=202, 2026-08-04): the curated Tier 2/Tier 3
+-- provider catalog backing TIER3_ACCESS_MODEL.md's selector screen (State
+-- 3, decisions.id=681). Per decisions.id=684 (schema required, scoped
+-- together with items.id=186's curation policy) and decisions.id=710
+-- (items.id=186 scoped -- policy this schema expresses).
+--
+-- WHY shared.db, NOT integration_keys.db (keys_001.sql): this is
+-- non-secret catalog data, identical across every install, not per-user
+-- credential data -- shared.db's own header ("not per-user encrypted --
+-- must be readable before any user logs in") is the correct fit, unlike
+-- integration_keys.db's per-user SQLCipher-encrypted credential rows.
+--
+-- WHY ADDED HERE, NOT a new shared_003.sql: Jason's direction, 2026-08-04
+-- -- consolidated directly into this file rather than as a separate
+-- migration, consistent with this file's own established "pre-release,
+-- zero shipped users" precedent (see CONSOLIDATION NOTE above) for schema
+-- additions that don't need to walk an existing install through an
+-- intermediate state.
+--
+-- Release-bundled per decisions.id=710(b) (no remote/server-fetched list
+-- for R1) -- rows are seeded by app releases, not created at runtime by
+-- users.
+--
+-- CARD DISPLAY: loosely based on Active Board's card anatomy
+-- (decisions.id=377), NOT a literal reuse. Active Board's shared skeleton
+-- (Persona color bar, name, small badge icon top-right, primary CTA
+-- bottom-right) carries over in spirit (display_name -> card title,
+-- login_required -> badge cue, a CTA to add/select), but decisions.id=377
+-- explicitly lists "privacy label text" as something that NEVER appears
+-- on an Active Board card surface -- the exact opposite of what this
+-- card's own purpose requires (TIER3_ACCESS_MODEL.md's two-box framing,
+-- "no login required" / "account required, data retained", is built
+-- entirely around surfacing that information). Flagging this explicitly
+-- so a future reader doesn't read "loosely based on" as closer than it
+-- is: the retention/documentation-gate fields below are meant to render
+-- directly on this card, which Active Board's own convention forbids for
+-- its own card type.
+--
+-- COLUMN DESIGN, per decisions.id=710's policy (concrete columns left to
+-- Chat-DEV per that decision's own text):
+--   tier: 2 or 3 -- INTEGER not TEXT, closed 2-value domain, CHECK-
+--     enforced (unlike keys_001.sql's open key_type, whose value set is
+--     expected to grow with Phase 2 integrations -- tier here is exactly
+--     TIER3_ACCESS_MODEL.md's two lanes, a closed set by the spec itself).
+--   mode: 'embedded_web' | 'api' -- CHECK-enforced closed set. Only
+--     'embedded_web' is used for R1 (TIER3_ACCESS_MODEL.md's Manual
+--     mode); 'api' reserved so a future Managed/API build (items.id=151)
+--     extends this table rather than needing a parallel one. Mode-
+--     specific fields (e.g. an API base URL/auth shape) are NOT designed
+--     here -- out of scope until items.id=151 is actually scheduled.
+--   launch_url: the embedded_web pane's target URL. NULL when mode='api'.
+--   login_required: INTEGER boolean. Drives the selector's two box labels
+--     directly -- kept as its own explicit column rather than inferred
+--     from tier, in case a future tier assignment and login status ever
+--     diverge.
+--   activation_status: 'active' | 'deprecated'. Deliberately NOT a richer
+--     state machine (no 'pending'/'suspended' etc.): decisions.id=710(b)
+--     confirmed the list is release-bundled, not runtime-activated, so
+--     there is no window where a row exists but isn't yet live. Mirrors
+--     keys_001.sql's is_active INTEGER simplicity over inventing states
+--     the actual lifecycle doesn't need.
+--   documentation_gate: TEXT, JSON, default '{}'. Space for decisions.id=
+--     710(a)'s documentation/transparency gate criteria (ToS/retention
+--     policy citation, disclosed jurisdiction, note on any known
+--     contradictory third-party reporting) -- also the source for this
+--     card's retention-posture display fields (see CARD DISPLAY above).
+--     Freeform JSON mirrors extra_metadata's escape-hatch convention
+--     (keys_001.sql, personas.extra_metadata) rather than dedicated
+--     columns per field: this is qualitative, descriptive content, not
+--     values something would query/filter on.
+--   last_reviewed_at: TEXT (ISO8601), nullable. Records WHEN a provider
+--     was last reviewed per decisions.id=710's schema implication --
+--     does NOT itself drive any scheduling logic (no cron/cadence
+--     mechanism here, matching 710(c)'s explicit rejection of
+--     fixed-schedule re-review -- the trigger is a real signal, not a
+--     timer reading this column).
+--   review_trigger_note: TEXT, nullable. Freeform note on what triggered
+--     the most recent review (e.g. "Groq ToS vs. third-party retention
+--     discrepancy, 2026-07-29" per decisions.id=710(a)'s own cautionary
+--     precedent) -- audit-trail content, plain TEXT not JSON since it's a
+--     single freeform note rather than structured data.
+--
+-- Seed data: NOT included here. Populating real, verified rows for
+-- Duck.ai/Brave Leo/Claude/ChatGPT/Gemini against decisions.id=710(a)'s
+-- documentation-gate criteria is research/content work (decisions.id=684's
+-- own "real research work, not app-install configuration" framing),
+-- explicitly out of scope for this schema addition -- flagged in handoff.
+CREATE TABLE IF NOT EXISTS tier3_providers (
+    id                      TEXT PRIMARY KEY,
+    display_name            TEXT NOT NULL,
+    tier                    INTEGER NOT NULL CHECK (tier IN (2, 3)),
+    mode                    TEXT NOT NULL DEFAULT 'embedded_web'
+                                CHECK (mode IN ('embedded_web', 'api')),
+    launch_url              TEXT,
+    login_required          INTEGER NOT NULL CHECK (login_required IN (0, 1)),
+    activation_status       TEXT NOT NULL DEFAULT 'active'
+                                CHECK (activation_status IN ('active', 'deprecated')),
+    documentation_gate      TEXT NOT NULL DEFAULT '{}',
+    last_reviewed_at        TEXT,
+    review_trigger_note     TEXT,
+    created_at              TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_tier3_providers_selector
+    ON tier3_providers (activation_status, tier, login_required);
+
 INSERT OR IGNORE INTO schema_version (version, applied_at, description)
 VALUES (1, datetime('now'),
-    'shared.db schema (consolidated 2026-07-24, items.id=169; auth foundation consolidated 2026-08-01, items.id=205): personas, users, user_salts, user_capabilities, artifact_versions, topic_index, asset_index, focus_settings + dev seeds');
+    'shared.db schema (consolidated 2026-07-24, items.id=169; auth foundation consolidated 2026-08-01, items.id=205; tier3_providers added 2026-08-04, items.id=202): personas, users, user_salts, user_capabilities, artifact_versions, topic_index, asset_index, focus_settings, tier3_providers + dev seeds');
