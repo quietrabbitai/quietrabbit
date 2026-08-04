@@ -136,6 +136,16 @@ fn apply_action(browser: &cef::Browser, action: &PendingAction) -> Result<(), St
 pub struct PaneWindow {
     event_loop: Option<EventLoop<()>>,
     app: PaneApp,
+    /// Set false once `pump()` observes `PumpStatus::Exit` (i.e. the pane's
+    /// own `WindowEvent::CloseRequested` handler called `event_loop.exit()`).
+    /// This is the ONLY pane lifecycle signal that exists anywhere in this
+    /// module today -- there is no create/destroy API, no `Drop` impl, and
+    /// Phase A never actually offers a way to close or reopen this window
+    /// (it's created once, eagerly, at startup, per mod.rs's own documented
+    /// scope). `running_flag()` exists so callers (main.rs's heartbeat, see
+    /// items.id=202) can stop polling once this one-shot transition happens,
+    /// without main.rs needing to know how a "closed" pane is represented.
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct PaneApp {
@@ -212,7 +222,15 @@ impl PaneWindow {
                 last_resize_event_at: None,
                 initial_url: initial_url.into(),
             },
+            running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
+    }
+
+    /// Shared handle a caller can poll (or hand to another thread) to learn
+    /// when this pane's event loop has exited. See the `running` field doc
+    /// for why this is the only lifecycle signal available today.
+    pub fn running_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.running.clone()
     }
 
     /// Runs one non-blocking iteration of the pane's winit event loop.
@@ -235,7 +253,7 @@ impl PaneWindow {
     /// removing it would still busy-loop this winit pump, independent of
     /// the CEF fix.
     pub fn pump(&mut self) {
-        use winit::platform::pump_events::EventLoopExtPumpEvents;
+        use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
 
         // Deliver any browser CEF's UI thread finished constructing since
         // the last tick (see render.rs's LifeSpanHandler docs for why this
@@ -267,7 +285,14 @@ impl PaneWindow {
         }
 
         if let Some(event_loop) = self.event_loop.as_mut() {
-            let _ = event_loop.pump_app_events(Some(std::time::Duration::ZERO), &mut self.app);
+            let status =
+                event_loop.pump_app_events(Some(std::time::Duration::ZERO), &mut self.app);
+            if matches!(status, PumpStatus::Exit(_)) {
+                // The pane's own WindowEvent::CloseRequested handler called
+                // event_loop.exit() -- see running field docs. One-shot:
+                // nothing currently un-sets this (Phase A has no reopen path).
+                self.running.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
         }
 
         std::thread::sleep(std::time::Duration::from_millis(1000 / 60));
@@ -350,6 +375,30 @@ pub struct PhysicalRect {
 
 impl ApplicationHandler for PaneApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        // GUARD, added 2026-08-04 (found while investigating items.id=202's
+        // heartbeat-scope fix, not the freeze itself -- a separate bug).
+        // winit calls `resumed()` whenever it likes across a window's
+        // lifetime, not just once at startup -- confirmed empirically here:
+        // closing the pane window (WindowEvent::CloseRequested) causes a
+        // SECOND `resumed()` call (two separate wgpu device/adapter
+        // creations logged, back to back with the close). Without this
+        // guard, every call below unconditionally rebuilds `window` and
+        // `render_state`, silently dropping whatever was already there --
+        // including the old wgpu::Device, which destroys every wgpu-core
+        // resource allocated from it. render.rs's CEF_TEXTURE static is a
+        // separate global that keeps holding a BindGroup built from that
+        // now-dropped device, so the next RedrawRequested's render() call
+        // panics inside wgpu-core (`Cannot get non-existent resource
+        // BindGroupId(..)`) trying to use it. Root-caused via a full
+        // RUST_BACKTRACE, not guessed: the panic's own stack is an entirely
+        // ordinary render() -> set_bind_group() call, which only makes sense
+        // if the bind group it's using no longer belongs to the pipeline's
+        // current device. This is the standard, idiomatic winit pattern for
+        // this exact scenario (see winit's own examples), not a new concept.
+        if self.window.is_some() {
+            return;
+        }
+
         let window = Arc::new(
             event_loop
                 .create_window(

@@ -87,6 +87,12 @@ async fn async_main() {
     let _cef_init = quietrabbit_lib::tier3_pane::bootstrap::initialize_cef();
     let mut pane_window =
         quietrabbit_lib::tier3_pane::sync_window::PaneWindow::new("https://claude.ai");
+    // Cloned before pane_window moves into the app.run() closure below --
+    // shared with the heartbeat thread so it can stop once the pane's own
+    // event loop exits. See PaneWindow::running field docs: this is a
+    // one-shot signal (Phase A has no reopen path), not a general
+    // active/inactive toggle.
+    let pane_running = pane_window.running_flag();
     let (sync_tx, sync_rx) =
         std::sync::mpsc::channel::<quietrabbit_lib::tier3_pane::sync_window::PhysicalRect>();
 
@@ -199,6 +205,103 @@ async fn async_main() {
         .invoke_handler(builder.invoke_handler())
         .build(tauri::generate_context!())
         .expect("error while building Quiet Rabbit");
+
+    // ROOT CAUSE + FIX (2026-08-04, items.id=202 freeze) -- read before
+    // touching this again.
+    //
+    // SYMPTOM: the pane freezes (compositor marks it "Not Responding",
+    // fractional/unsettled window geometry) after maximize/restore-style
+    // interaction with the pane window specifically. Two prior fix attempts
+    // (the RESIZE_DEBOUNCE in sync_window.rs) targeted a different trigger
+    // (maximize-via-snap) and didn't touch this one. `gdb thread apply all
+    // bt` during the freeze showed every thread legitimately idle -- no
+    // deadlock, no lock contention.
+    //
+    // ROOT CAUSE, gdb-confirmed by breaking into a live freeze (process
+    // launched as gdb's own child, so no ptrace_scope restriction applied):
+    // the main thread was blocked inside tao's own
+    // `tao::platform_impl::platform::event_loop::EventLoop::run_return`
+    // (tao-0.35.3, linux/event_loop.rs:1044/1154), which on Linux drives its
+    // loop via a genuinely BLOCKING `gtk_main_iteration_do(blocking: true)`
+    // whenever `ControlFlow::Wait` (tao's default, and the only mode
+    // Tauri's public API exposes) has nothing queued. Confirmed directly in
+    // tao's own source (linux/event_loop.rs's `run_return`): with
+    // `ControlFlow::Wait` and an empty event queue, the loop sets
+    // `blocking = true` and does not fire `Event::MainEventsCleared` again
+    // until *something* lands in that queue.
+    //
+    // `PaneWindow::pump()` below -- which services the pane's own,
+    // completely separate `winit::event_loop::EventLoop` (its own Wayland
+    // connection, its own `xdg_wm_base` ping/pong, its own CEF
+    // `send_external_begin_frame()`, its own redraw) -- only ever runs from
+    // inside `RunEvent::MainEventsCleared`. GTK's main context has no
+    // visibility into the pane's separate connection at all, so whenever
+    // the MAIN window is idle (no mouse movement, no timers, nothing GTK
+    // itself needs to dispatch) -- which any interaction confined to the
+    // pane window trivially produces -- tao's loop blocks indefinitely and
+    // `pump()` simply never runs. Confirmed via the Wayland trace
+    // (WAYLAND_DEBUG=1): the pane's connection goes completely silent (no
+    // configure, no ack, no surface commit) for the same duration tao sits
+    // blocked, then catches up in one burst the moment something wakes it.
+    // This is also why prior `gdb` runs found every thread idle: blocking
+    // on a real GTK/glib wait for an event that never arrives isn't a
+    // deadlock from Rust's point of view -- there's no held lock to see.
+    //
+    // FIX: force tao's loop to wake on a steady cadence regardless of what
+    // the main window is doing. `AppHandle::run_on_main_thread` is
+    // implemented (tauri-runtime-wry) as a `tao::event_loop::EventLoopProxy
+    // ::send_event` -- the same queue `run_return` checks -- so a periodic
+    // no-op call here forces `MainEventsCleared` to keep firing on
+    // approximately the same ~16ms cadence `PaneWindow::pump()` already
+    // assumes for its own throttling, independent of the main window's own
+    // activity.
+    //
+    // SCOPE (raised in review, 2026-08-04): this must not run for the app's
+    // entire lifetime regardless of whether the pane is ever used --
+    // TIER3_ACCESS_MODEL.md treats Tier 2/3 as something the user opens
+    // deliberately, and an always-on 16ms wake for every user contradicts
+    // the idle-CPU discipline decisions.id=700 already fought for (Finding
+    // 1, the CPU-collision fix, this same code cluster). Checked what
+    // pane-lifecycle hooks actually exist before gating on anything: NONE.
+    // No `Drop` impl, no `is_running`/`is_active`, no create/destroy API
+    // anywhere in tier3_pane/ -- PaneWindow is constructed once, eagerly, at
+    // startup (per mod.rs's own documented Phase A scope: "always visible,
+    // no compaction... no user-initiated open/close yet"), and nothing ever
+    // tore it down. The ONE real signal that exists is
+    // `WindowEvent::CloseRequested` -> `event_loop.exit()` in
+    // sync_window.rs's `window_event`, whose result
+    // (`winit::platform::pump_events::PumpStatus`) `pump()` was discarding
+    // (`let _ = ...`) before this change. `PaneWindow::running_flag()`
+    // (added this change) exposes that already-existing signal instead of
+    // inventing a new one, so the heartbeat below stops once it fires.
+    //
+    // WHAT THIS DOES NOT FIX, reported plainly rather than implied: Phase A
+    // creates the pane (and therefore needs this heartbeat) unconditionally
+    // at startup for every user, whether they ever touch Tier 2/3 or not --
+    // that eager-creation choice, not just this heartbeat, is the real
+    // "always-on regardless of use" cost, and it is Phase B/C's
+    // selector-screen wiring (open-on-demand) that has to fix it, not this
+    // bug-fix commit. Gating on CloseRequested only helps in the one
+    // one-shot case where the pane's own window happens to get closed (a
+    // path Phase A doesn't currently expose any UI for, and whose
+    // decorations are themselves still an open design question per
+    // items.id=202's status_detail); it does not make the heartbeat
+    // conditional on whether Tier 2/3 was ever opened in the first place.
+    // Tracked as a follow-on (see spawn_task at the end of this session) so
+    // it isn't silently carried forward once Phase B's real multi-pane
+    // open/close lands.
+    {
+        let heartbeat_handle = app.handle().clone();
+        std::thread::spawn(move || loop {
+            if !pane_running.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(16));
+            if heartbeat_handle.run_on_main_thread(|| {}).is_err() {
+                break;
+            }
+        });
+    }
 
     // Phase A message-pump interleaving (see tier3_pane::mod.rs docs on the
     // process/thread model decision): the pane's own winit event loop is
