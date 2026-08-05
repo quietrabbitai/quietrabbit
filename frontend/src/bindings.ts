@@ -177,7 +177,9 @@ export const commands = {
 	 *  that fails to resolve or send aborts the remaining opens rather than
 	 *  silently skipping them, since a partial open would leave the selector's
 	 *  own "confirmed" state and the actual open panes disagreeing about what's
-	 *  open.
+	 *  open. Cookie restore (items.id=224 resolution) is a separate, narrower
+	 *  best-effort layer within each iteration -- see restore_cookies_into_jar's
+	 *  own doc on why that failure mode does NOT abort the batch the same way.
 	 * 
 	 *  FOUND THE HARD WAY (2026-08-04, manual verification): sending
 	 *  `PaneCommand::Open` is not enough by itself. main.rs's heartbeat thread
@@ -202,7 +204,10 @@ export const commands = {
 	 *  has no open pane -- PaneManager::close_pane already tolerates this
 	 *  (sync_window.rs), and a caller racing a close against an already-closed
 	 *  pane is a normal condition, not a failure. See open_tier3_panes' doc for
-	 *  why the explicit wake below is required, not optional.
+	 *  why the explicit wake below is required, not optional. Cookie persist
+	 *  (items.id=224 resolution) runs before the close is sent -- see
+	 *  persist_cookies_from_jar's own doc; its failure is logged, never a
+	 *  reason this command returns an error (the pane must still close).
 	 */
 	closeTier3Pane: (providerId: string) => typedError<null, string>(__TAURI_INVOKE("close_tier3_pane", { providerId })),
 };

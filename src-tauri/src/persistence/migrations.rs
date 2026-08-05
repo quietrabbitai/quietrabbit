@@ -123,6 +123,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         version: 2,
         sql: include_str!("../../schema/shared_002.sql"),
     },
+    SchemaFile {
+        prefix: "tier3_cookies",
+        version: 1,
+        sql: include_str!("../../schema/tier3_cookies_001.sql"),
+    },
 ];
 
 /// Validate manifest ordering on every run_migrations call.
@@ -574,6 +579,21 @@ pub async fn migrate_keys_db(user_id: &str, key_hex: &str) -> Result<u32, Migrat
     std::fs::create_dir_all(db_path.parent().unwrap())?;
     let mut conn = open_raw(&db_path).await?;
     run_migrations(&mut conn, "keys", Some(key_hex)).await
+}
+
+/// Migrate a user's tier3_cookies.db (encrypted). key_hex: bare hex bytes
+/// only. Per-user, not per-persona -- mirrors migrate_keys_db's path shape
+/// exactly (items.id=224 resolution, decisions.id=711: cookie identity is
+/// keyed by (user, provider), matching KeyRegistry's own user_id-only
+/// scoping -- see tier3_cookies_001.sql's own header).
+pub async fn migrate_tier3_cookies_db(user_id: &str, key_hex: &str) -> Result<u32, MigrationError> {
+    let db_path = get_data_root()
+        .join("users")
+        .join(user_id)
+        .join("tier3_cookies.db");
+    std::fs::create_dir_all(db_path.parent().unwrap())?;
+    let mut conn = open_raw(&db_path).await?;
+    run_migrations(&mut conn, "tier3_cookies", Some(key_hex)).await
 }
 
 /// Migrate models/scores.db (unencrypted).

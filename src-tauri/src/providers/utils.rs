@@ -115,6 +115,16 @@ pub fn db_path_integration_keys(user_id: &str) -> PathBuf {
         .join("integration_keys.db")
 }
 
+/// Path to a user's tier3_cookies.db (encrypted). Per-user, not per-persona
+/// -- mirrors db_path_integration_keys's shape exactly (items.id=224
+/// resolution, decisions.id=711; see tier3_cookies_001.sql's own header).
+pub fn db_path_tier3_cookies(user_id: &str) -> PathBuf {
+    get_data_root()
+        .join("users")
+        .join(user_id)
+        .join("tier3_cookies.db")
+}
+
 // ---------------------------------------------------------------------------
 // SqliteConnectOptions builders
 // ---------------------------------------------------------------------------

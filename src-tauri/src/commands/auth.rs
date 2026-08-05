@@ -275,6 +275,13 @@ pub async fn login(
             // via Display covers all four correctly.
             .map_err(|e| e.to_string())?;
 
+        // Establishes tier3_cookies.db fresh, same create-or-migrate call
+        // shape as integration_keys.db just above (items.id=224 resolution,
+        // decisions.id=711) -- see tier3_cookies_001.sql's own header.
+        crate::persistence::migrations::migrate_tier3_cookies_db(&user_id, &key_hex(&master_key))
+            .await
+            .map_err(|e| e.to_string())?;
+
         // <<< SEAM: if future onboarding design decides the first-run
         // flow should also create a default persona, that call goes here
         // -- e.g. persona_store::create_persona(&user_id, ...). Not built

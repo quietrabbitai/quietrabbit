@@ -13,4 +13,5 @@ pub mod personal_store;
 pub mod plan_state_store;
 pub mod provider_store;
 pub mod source_registry_store;
+pub mod tier3_cookie_store;
 pub mod topic_store;

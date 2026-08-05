@@ -46,9 +46,8 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use indexmap::IndexMap;
@@ -57,12 +56,7 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowAttributes, WindowId};
 
-use cef::rc::Rc as _;
-use cef::{
-    wrap_request_context_handler, CefString, ImplBrowser, ImplBrowserHost, ImplFrame,
-    ImplRequestContextHandler, RequestContextHandler, RequestContextSettings,
-    WrapRequestContextHandler,
-};
+use cef::{ImplBrowser, ImplBrowserHost, ImplFrame};
 
 use crate::tier3_pane::render::{ClientBuilder, PaneRenderHandler, RenderState};
 use crate::tier3_pane::PaneKey;
@@ -192,7 +186,8 @@ pub enum PaneCommand {
 }
 
 /// Per-pane state: today's Phase A `PaneApp` fields, unchanged in shape,
-/// plus the per-provider `RequestContext` wiring Phase B adds.
+/// (no per-provider `RequestContext` -- items.id=224 resolution,
+/// decisions.id=711; every pane uses CEF's one global context).
 struct PaneState {
     window: Option<Arc<Window>>,
     render_state: Option<RenderState>,
@@ -227,28 +222,13 @@ struct PaneState {
     /// loop entirely during the gesture).
     pending_resize: Option<winit::dpi::PhysicalSize<u32>>,
     last_resize_event_at: Option<std::time::Instant>,
-    /// URL loaded on first browser creation, once its `RequestContext`
-    /// reports ready (see `context_ready`) -- the provider's own
+    /// URL loaded on first browser creation -- the provider's own
     /// `launch_url` (`provider_store::Provider`), resolved server-side by
-    /// the IPC command that issues this pane's `PaneCommand::Open`.
+    /// the IPC command that issues this pane's `PaneCommand::Open`. That
+    /// same command handler restores this provider's stored cookies into
+    /// CEF's global jar (persistence::tier3_cookie_store) before sending
+    /// `Open`, so they're already in place by the time this URL loads.
     initial_url: String,
-    /// Kept alive for the pane's lifetime -- CEF requires the
-    /// `RequestContext` used at browser creation to remain valid for as
-    /// long as the browser exists. Dropped (torn down) alongside the rest
-    /// of this `PaneState` on `close_pane`.
-    request_context: Option<cef::RequestContext>,
-    /// Set by `PaneRequestContextHandler::on_request_context_initialized`,
-    /// which -- under `multi_threaded_message_loop = true` (bootstrap.rs,
-    /// decisions.id=700) -- fires on CEF's own UI thread, a different OS
-    /// thread than the one that owns `PaneManager`. `Arc<AtomicBool>`, not
-    /// the retained spike's `Rc<RefCell<bool>>`: `Rc<RefCell<>>` is not
-    /// `Send` and would be unsound observed/written across that boundary.
-    /// This codebase already established the fix for the identical class
-    /// of problem elsewhere in this pane's own machinery (`browser_size`
-    /// above, `PaneRenderHandler::size` in render.rs -- both flagged "found
-    /// during items.id=203 thread-safety audit"); this field follows the
-    /// same fix rather than copying the standalone spike's exact type.
-    context_ready: Arc<AtomicBool>,
 }
 
 impl PaneState {
@@ -279,38 +259,6 @@ impl PaneState {
 /// rapid-fire sequence from a compositor animation into one final apply.
 const RESIZE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// Bridges `on_request_context_initialized` (CEF's UI thread) to
-/// `context_ready` (polled on the winit thread, see `PaneState` docs on
-/// why this is `Arc<AtomicBool>` rather than the spike's `Rc<RefCell<>>`).
-#[derive(Clone)]
-struct PaneRequestContextHandler {
-    ready: Arc<AtomicBool>,
-}
-
-impl PaneRequestContextHandler {
-    fn new(ready: Arc<AtomicBool>) -> Self {
-        Self { ready }
-    }
-}
-
-wrap_request_context_handler! {
-    struct RequestContextHandlerBuilder {
-        handler: PaneRequestContextHandler,
-    }
-
-    impl RequestContextHandler {
-        fn on_request_context_initialized(&self, _request_context: Option<&mut cef::RequestContext>) {
-            self.handler.ready.store(true, Ordering::Relaxed);
-        }
-    }
-}
-
-impl RequestContextHandlerBuilder {
-    fn build(handler: PaneRequestContextHandler) -> cef::RequestContextHandler {
-        Self::new(handler)
-    }
-}
-
 /// One shared `ApplicationHandler`, owning every currently-open pane.
 struct PaneManager {
     /// `IndexMap`, not `HashMap`: insertion order == pane open order,
@@ -321,7 +269,6 @@ struct PaneManager {
     /// Reverse lookup -- `window_event` only carries a `WindowId`. Plain
     /// `HashMap`: pure key->value lookup, never iterated.
     window_ids: HashMap<WindowId, PaneKey>,
-    root_cache_path: PathBuf,
     /// Live count (not Phase A's one-shot `running` latch) -- incremented
     /// on `Open`, decremented on `Close`/`CloseRequested`. Shared with
     /// main.rs's heartbeat thread so it can gate its real cost (and, by
@@ -378,56 +325,26 @@ impl PaneManager {
             key.clone(),
         );
 
-        // Per-provider isolated RequestContext -- items.id=195's proven
-        // pattern (qr-spike-192/cef-rs/examples/osr/src/main.rs), see
-        // PaneState::context_ready's doc for the one required deviation
-        // (Arc<AtomicBool>, not Rc<RefCell<bool>>). cache_path nests under
-        // the global root_cache_path CEF's Settings.root_cache_path already
-        // requires (bootstrap.rs) -- without root_cache_path, per-context
-        // cache_path silently degrades to in-memory (items.id=192's
-        // finding). persist_session_cookies=1: any real provider login's
-        // session cookie (no explicit expiry) would not survive process
-        // exit otherwise, regardless of cache_path -- same rationale as the
-        // spike's own comment on this field.
-        //
-        // OPEN ISSUE, found during this session's manual verification
-        // (2026-08-04), NOT resolved -- flagging plainly rather than
-        // silently shipping broken persistence. Every real pane open
-        // (reproduced twice, same key) logs, from CEF itself:
-        //   ERROR:cef/libcef/browser/chrome/chrome_browser_context.cc:116]
-        //   Cannot create profile at path <root_cache_path>/contexts/<key>
-        // on_request_context_initialized still fires and the browser still
-        // renders real content, so this is NOT fatal to Phase B's own
-        // scope (multi-pane + on-demand lifecycle) -- but the profile
-        // directory that results is empty (verified via `ls`), meaning
-        // persistent cookie storage is almost certainly NOT actually
-        // working, despite CEF reporting successful initialization -- the
-        // exact silent-failure class decisions.id=691 already warned about
-        // once before. Leading hypothesis, NOT verified: items.id=195's
-        // isolation proof was run under `external_message_pump: true`
-        // (single-threaded pump), not `multi_threaded_message_loop: true`
-        // (bootstrap.rs's setting here, adopted later for the CPU-collision
-        // fix, decisions.id=700) -- the two may never have been exercised
-        // together before this session, and "chrome_browser_context.cc"
-        // in the error points at CEF's Chrome-style profile manager, which
-        // this crate's `Settings` exposes no `chrome_runtime`/RuntimeStyle
-        // field to switch away from. Needs its own dedicated investigation
-        // (gdb/strace on the actual ProfileManager::CreateProfileAsync
-        // failure path, not guessed at here) before Tier 2/3's persistent-
-        // login promise can be considered delivered.
-        let context_ready = Arc::new(AtomicBool::new(false));
-        let cache_path = self.root_cache_path.join("contexts").join(&key);
-        let context_settings = RequestContextSettings {
-            cache_path: CefString::from(cache_path.to_string_lossy().as_ref()),
-            persist_session_cookies: 1,
-            ..Default::default()
-        };
-        let request_context = cef::request_context_create_context(
-            Some(&context_settings),
-            Some(&mut RequestContextHandlerBuilder::build(
-                PaneRequestContextHandler::new(context_ready.clone()),
-            )),
-        );
+        // No per-pane RequestContext (items.id=224 resolution,
+        // decisions.id=711): CEF's Chrome-runtime ChromeBrowserContext
+        // structurally rejects any second RequestContext -- confirmed via
+        // gdb (src-tauri/examples/repro_224.rs), the first (global,
+        // root_cache_path-rooted) context is the only one that ever reaches
+        // Chromium's real ProfileManager::CreateProfileAsync; any second
+        // context's InitializeAsync self-invokes a synthetic failure
+        // without ever calling it, independent of message-pump/threading
+        // config. Every pane now uses CEF's one working global context
+        // (request_context=None below -- "If |request_context| is NULL the
+        // global request context will be used," confirmed against the
+        // vendored cef crate's own doc comment). Per-provider cookie
+        // *persistence* across app restarts is handled at the QR
+        // application layer instead -- see
+        // commands/tier3_pane.rs::open_tier3_panes/close_tier3_pane, which
+        // load/save via persistence::tier3_cookie_store into/from this one
+        // shared jar around this pane's lifetime. Domain-scoping inside
+        // that single jar already keeps different providers' cookies apart
+        // (the same guarantee two tabs in one ordinary browser profile
+        // already rely on) -- no per-pane isolation mechanism is needed.
 
         self.panes.insert(
             key.clone(),
@@ -443,8 +360,6 @@ impl PaneManager {
                 pending_resize: None,
                 last_resize_event_at: None,
                 initial_url: url,
-                request_context,
-                context_ready,
             },
         );
         self.window_ids.insert(window.id(), key);
@@ -470,9 +385,11 @@ impl PaneManager {
         }
         crate::tier3_pane::render::remove_pane_texture(key);
         self.open_pane_count.fetch_sub(1, Ordering::Relaxed);
-        // pane itself (window, render_state, request_context) drops here,
-        // tearing down the wgpu device/surface and releasing the
-        // RequestContext's own resources.
+        // pane itself (window, render_state) drops here, tearing down the
+        // wgpu device/surface. CEF's global cookie jar is untouched by a
+        // pane close -- it's shared across all panes, not pane-scoped (see
+        // commands/tier3_pane.rs::close_tier3_pane for where this pane's
+        // provider's cookies actually get persisted, before this call).
     }
 }
 
@@ -539,15 +456,14 @@ impl ApplicationHandler<PaneCommand> for PaneManager {
                     // this handler.
                 }
 
-                // Deferred until this pane's own RequestContext reports
-                // ready (see context_ready's doc) -- start_creation() is
-                // still the one-shot latch it always was, but now gated on
-                // context readiness first via short-circuit, so it never
-                // flips to Creating before the context this browser will
-                // be created against actually exists.
-                if pane.context_ready.load(Ordering::Relaxed)
-                    && pane.browser_lifecycle.start_creation()
-                {
+                // start_creation() is the one-shot latch that ensures this
+                // fires exactly once per pane. No context-readiness gate
+                // needed (Phase B had one here for the now-removed per-pane
+                // RequestContext) -- CEF's global context is already fully
+                // initialized well before any pane can open at all (it's
+                // the context items.id=224's trace confirmed does reach
+                // the real ProfileManager, at CEF startup).
+                if pane.browser_lifecycle.start_creation() {
                     if let (Some((render_handler, _)), Some((window_info, browser_settings))) = (
                         pane.pending_render_handler.take(),
                         pane.window_info_and_settings.as_ref(),
@@ -562,13 +478,15 @@ impl ApplicationHandler<PaneCommand> for PaneManager {
                         // on_after_created, received in PaneWindow::pump().
                         let (tx, rx) = std::sync::mpsc::channel();
                         pane.browser_ready_rx = Some(rx);
+                        // request_context: None -- CEF's global context is
+                        // used (items.id=224 resolution, decisions.id=711).
                         let created = cef::browser_host_create_browser(
                             Some(window_info),
                             Some(&mut ClientBuilder::build(render_handler, tx)),
                             None,
                             Some(browser_settings),
                             None,
-                            pane.request_context.as_mut(),
+                            None,
                         );
                         log::info!(
                             "tier3_pane::sync_window: browser_host_create_browser (async, pane={key}) dispatched -> {created}"
@@ -619,12 +537,13 @@ pub struct PaneWindow {
 }
 
 impl PaneWindow {
-    /// `root_cache_path`: CEF's global `Settings.root_cache_path`
-    /// (bootstrap.rs) -- passed through so each pane's own per-provider
-    /// `cache_path` (see `PaneManager::open_pane`) can nest under it, per
-    /// items.id=192's finding that persistence silently degrades to
-    /// in-memory without a root path CEF is happy with.
-    pub fn new(root_cache_path: impl Into<PathBuf>) -> Self {
+    /// No longer takes `root_cache_path` (items.id=224 resolution,
+    /// decisions.id=711) -- `PaneManager` no longer builds a per-pane
+    /// `cache_path` under it (there is no per-pane `RequestContext` left
+    /// to build one for). `root_cache_path` is still needed by
+    /// `bootstrap::initialize_cef` in main.rs -- that's CEF's global
+    /// context path, unaffected by this change.
+    pub fn new() -> Self {
         let event_loop = EventLoop::<PaneCommand>::with_user_event()
             .build()
             .expect("tier3_pane::sync_window: failed to create winit event loop");
@@ -635,7 +554,6 @@ impl PaneWindow {
             manager: PaneManager {
                 panes: IndexMap::new(),
                 window_ids: HashMap::new(),
-                root_cache_path: root_cache_path.into(),
                 open_pane_count: open_pane_count.clone(),
             },
             proxy,

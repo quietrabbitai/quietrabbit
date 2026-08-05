@@ -191,16 +191,18 @@ async fn async_main() {
         .build(tauri::generate_context!())
         .expect("error while building Quiet Rabbit");
 
-    // CEF init + PaneWindow construction moved here (items.id=202 piece 5,
-    // 2026-08-04) from before tauri::Builder::default() -- root_cache_path
-    // (both CEF's global Settings.root_cache_path and PaneWindow's own
-    // per-provider cache_path base, see bootstrap.rs/sync_window.rs docs)
-    // needs app.path().app_data_dir(), which requires a built App/AppHandle
-    // and does not exist before .build() returns. The prior placement's own
+    // CEF init moved here (items.id=202 piece 5, 2026-08-04) from before
+    // tauri::Builder::default() -- root_cache_path (CEF's global
+    // Settings.root_cache_path, see bootstrap.rs docs) needs
+    // app.path().app_data_dir(), which requires a built App/AppHandle and
+    // does not exist before .build() returns. The prior placement's own
     // comment already claimed this ran "after Tauri's own window exists"
     // and noted "CEF itself does not need a Tauri window to exist first" --
     // this placement now actually matches that, rather than running before
-    // tauri::Builder::default() was even constructed.
+    // tauri::Builder::default() was even constructed. PaneWindow itself no
+    // longer needs this path (items.id=224 resolution, decisions.id=711 --
+    // no more per-pane cache_path built under it), but CEF's global context
+    // still does.
     let app_data_dir = app.path().app_data_dir().unwrap_or_else(|e| {
         log::warn!(
             "main: could not resolve app_data_dir for tier3_pane root_cache_path: {e} \
@@ -217,11 +219,11 @@ async fn async_main() {
     // approach hit.
     let _cef_init = quietrabbit_lib::tier3_pane::bootstrap::initialize_cef(&root_cache_path);
     // Phase B (items.id=202 piece 5 / items.id=223): zero panes exist yet --
-    // PaneWindow::new no longer takes an initial URL or creates anything
-    // eagerly. Panes are created on demand via the proxy managed below, in
-    // response to a real Tier 2/3 selection -- see sync_window.rs docs.
-    let mut pane_window =
-        quietrabbit_lib::tier3_pane::sync_window::PaneWindow::new(root_cache_path);
+    // PaneWindow::new no longer takes an initial URL, a root_cache_path
+    // (items.id=224 resolution), or creates anything eagerly. Panes are
+    // created on demand via the proxy managed below, in response to a real
+    // Tier 2/3 selection -- see sync_window.rs docs.
+    let mut pane_window = quietrabbit_lib::tier3_pane::sync_window::PaneWindow::new();
     // EventLoopProxy IS Send + Sync (unlike PaneWindow itself, see the
     // .manage() comment above) -- this is what lets an async IPC command
     // handler (commands::tier3_pane, tokio-side) request a pane open/close
