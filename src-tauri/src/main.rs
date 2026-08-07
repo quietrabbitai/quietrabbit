@@ -63,27 +63,17 @@ async fn async_main() {
     // test, not at runtime -- there is no frontend to consume them yet.
     let builder = specta_builder();
 
-    // PaneWindow is deliberately NOT stored via Tauri's .manage()/.state()
-    // (found the hard way, 2026-08-01): winit::EventLoop on X11 holds raw
-    // platform IME pointers (*mut _XIM/_XIC) that are not Send, and
-    // Tauri's Manager::state<T>() requires T: Send + Sync. PaneWindow is
-    // instead captured directly by the app.run() closure below, which owns
-    // it on the main thread without needing it to cross a generic Send
-    // boundary -- the correct fix per the type system's actual signal
-    // (real thread affinity in winit's X11 backend), not a suppressed
-    // unsafe impl Send. Window move/resize sync (on_window_event, a
-    // separate closure) reaches PaneWindow via an mpsc channel rather than
-    // shared state, for the same reason. `PaneWindow::proxy()` -- winit's
-    // `EventLoopProxy` IS `Send + Sync` -- is what crosses that boundary
-    // instead, managed as real Tauri state below (items.id=202 piece 5 /
-    // items.id=223) so async IPC command handlers can request pane
-    // open/close without touching PaneWindow itself.
-    let (sync_tx, sync_rx) =
-        std::sync::mpsc::channel::<quietrabbit_lib::tier3_pane::sync_window::PhysicalRect>();
-
+    // PaneHost (GTK objects throughout) is deliberately NOT stored via
+    // Tauri's .manage()/.state() -- Tauri's Manager::state<T>() requires
+    // T: Send + Sync, and GTK types aren't (same class of constraint
+    // winit's X11 IME pointers used to impose here). PaneHost instead lives
+    // in a main-thread-only thread-local (see tier3_pane::pane_host's own
+    // module docs on why, and how commands::tier3_pane reaches it via
+    // AppHandle::run_on_main_thread instead of Tauri-managed state).
     let app = tauri::Builder::default()
         .manage(scheduler)
         .manage(ollama_client)
+        .manage(quietrabbit_lib::commands::tier3_pane::PaneLayoutState::default())
         // OllamaSource: initialized to Unavailable; the setup task writes the
         // real value after detect-first completes. get_health() reads via
         // read lock — zero contention after the first ~2 s of startup.
@@ -137,50 +127,31 @@ async fn async_main() {
             });
             Ok(())
         })
+        // No Moved/Resized handling here anymore (items.id=202 real
+        // positioning fix, 2026-08-07): that handler used to query
+        // window.inner_position()/inner_size() and push the result through
+        // a channel to re-sync each pane's separate OS window -- confirmed
+        // broken on Wayland (pinned x=0,y=0 plus a wrong size on this dev
+        // machine's KDE/Wayland session, consistent with
+        // tauri-apps/tauri#12411/tao#566), and the exact code path this
+        // rewrite deletes rather than patches. Every open pane now lives
+        // inside GTK's own GLArea widget, in the SAME window -- GTK
+        // relayouts it for free on window move/resize, no Rust-side
+        // geometry query needed. Only CloseRequested is left to handle, so
+        // this is an `if let`, not a `match` (clippy::single_match).
         .on_window_event(move |window, event| {
-            match event {
-                tauri::WindowEvent::CloseRequested { .. } => {
-                    // Stop the sidecar on window close. kill_on_drop(true) is the
-                    // crash-exit safety net; this provides the graceful path with
-                    // logging. Spawned without await — window closes immediately.
-                    // TODO: handle RunEvent::Exit for headless/multi-window support.
-                    log::info!("main: window close requested — stopping Ollama sidecar");
-                    let handle = window.app_handle().clone();
-                    tauri::async_runtime::spawn(async move {
-                        let sidecar_state = handle.state::<Mutex<OllamaSidecar>>();
-                        let mut sidecar = sidecar_state.lock().await;
-                        sidecar.stop().await;
-                    });
-                }
-                tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_) => {
-                    // Phase A manual sync (see tier3_pane::sync_window docs
-                    // for why this is manual rather than OS-level child-window
-                    // reparenting). outer_position/outer_size are queried
-                    // fresh rather than derived from the event payload, since
-                    // WindowEvent::Moved/Resized report platform-specific
-                    // coordinate spaces that don't uniformly match what
-                    // outer_position()/outer_size() report.
-                    //
-                    // Sent via channel rather than shared state -- PaneWindow
-                    // is not Send (see the comment above its construction),
-                    // so it cannot be reached from this closure directly; the
-                    // app.run() closure, which owns it on the main thread,
-                    // drains this channel each MainEventsCleared tick.
-                    if let (Ok(pos), Ok(size)) = (window.outer_position(), window.outer_size()) {
-                        let rect = quietrabbit_lib::tier3_pane::sync_window::PhysicalRect {
-                            x: pos.x,
-                            y: pos.y,
-                            width: size.width as i32,
-                            height: size.height as i32,
-                        };
-                        // A closed/lagging receiver just means no sync this
-                        // tick -- not a fatal condition for a fire-and-forget
-                        // position update; the next move/resize event will
-                        // simply try again.
-                        let _ = sync_tx.send(rect);
-                    }
-                }
-                _ => {}
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                // Stop the sidecar on window close. kill_on_drop(true) is the
+                // crash-exit safety net; this provides the graceful path with
+                // logging. Spawned without await — window closes immediately.
+                // TODO: handle RunEvent::Exit for headless/multi-window support.
+                log::info!("main: window close requested — stopping Ollama sidecar");
+                let handle = window.app_handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let sidecar_state = handle.state::<Mutex<OllamaSidecar>>();
+                    let mut sidecar = sidecar_state.lock().await;
+                    sidecar.stop().await;
+                });
             }
         })
         // Command surface + generated TypeScript contract: see
@@ -218,133 +189,58 @@ async fn async_main() {
     // GTK/GLib main-loop busy-poll that a same-thread external-pump
     // approach hit.
     let _cef_init = quietrabbit_lib::tier3_pane::bootstrap::initialize_cef(&root_cache_path);
-    // Phase B (items.id=202 piece 5 / items.id=223): zero panes exist yet --
-    // PaneWindow::new no longer takes an initial URL, a root_cache_path
-    // (items.id=224 resolution), or creates anything eagerly. Panes are
-    // created on demand via the proxy managed below, in response to a real
-    // Tier 2/3 selection -- see sync_window.rs docs.
-    let mut pane_window = quietrabbit_lib::tier3_pane::sync_window::PaneWindow::new();
-    // EventLoopProxy IS Send + Sync (unlike PaneWindow itself, see the
-    // .manage() comment above) -- this is what lets an async IPC command
-    // handler (commands::tier3_pane, tokio-side) request a pane open/close
-    // without needing access to PaneWindow's winit-thread-affine state.
-    app.manage(pane_window.proxy());
-    // Shared with the heartbeat thread below so it can gate its real cost
-    // on whether any pane is actually open right now, rather than Phase
-    // A's one-shot "exit once the single pane closes" latch -- items.id=223.
-    let open_pane_count = pane_window.open_pane_count();
 
-    // ROOT CAUSE + FIX (2026-08-04, items.id=202 freeze) -- read before
-    // touching this again.
+    // Single-window GTK/wgpu pane host (items.id=202 real positioning fix,
+    // 2026-08-07 -- see tier3_pane::pane_host's module docs for the full
+    // architecture). Reparents Tauri's own webview widget into a
+    // gtk::Overlay and adds the shared GLArea every open pane composites
+    // into, on top of it, inside THIS window -- no separate OS window, no
+    // separate winit event loop, and therefore none of the
+    // window-position-query machinery that used to live in this file (the
+    // deleted on_window_event Moved/Resized arm above, PhysicalRect,
+    // sync_tx/sync_rx) or the freeze-bug heartbeat below it. Zero panes
+    // exist yet -- installing the host creates nothing but the GLArea
+    // widget itself; panes are created on demand via
+    // pane_host::dispatch(PaneCommand::Open) in response to a real Tier 2/3
+    // selection (commands::tier3_pane).
     //
-    // SYMPTOM: the pane freezes (compositor marks it "Not Responding",
-    // fractional/unsettled window geometry) after maximize/restore-style
-    // interaction with the pane window specifically. Two prior fix attempts
-    // (the RESIZE_DEBOUNCE in sync_window.rs) targeted a different trigger
-    // (maximize-via-snap) and didn't touch this one. `gdb thread apply all
-    // bt` during the freeze showed every thread legitimately idle -- no
-    // deadlock, no lock contention.
-    //
-    // ROOT CAUSE, gdb-confirmed by breaking into a live freeze (process
-    // launched as gdb's own child, so no ptrace_scope restriction applied):
-    // the main thread was blocked inside tao's own
-    // `tao::platform_impl::platform::event_loop::EventLoop::run_return`
-    // (tao-0.35.3, linux/event_loop.rs:1044/1154), which on Linux drives its
-    // loop via a genuinely BLOCKING `gtk_main_iteration_do(blocking: true)`
-    // whenever `ControlFlow::Wait` (tao's default, and the only mode
-    // Tauri's public API exposes) has nothing queued. Confirmed directly in
-    // tao's own source (linux/event_loop.rs's `run_return`): with
-    // `ControlFlow::Wait` and an empty event queue, the loop sets
-    // `blocking = true` and does not fire `Event::MainEventsCleared` again
-    // until *something* lands in that queue.
-    //
-    // `PaneWindow::pump()` below -- which services the pane's own,
-    // completely separate `winit::event_loop::EventLoop` (its own Wayland
-    // connection, its own `xdg_wm_base` ping/pong, its own CEF
-    // `send_external_begin_frame()`, its own redraw) -- only ever runs from
-    // inside `RunEvent::MainEventsCleared`. GTK's main context has no
-    // visibility into the pane's separate connection at all, so whenever
-    // the MAIN window is idle (no mouse movement, no timers, nothing GTK
-    // itself needs to dispatch) -- which any interaction confined to the
-    // pane window trivially produces -- tao's loop blocks indefinitely and
-    // `pump()` simply never runs. Confirmed via the Wayland trace
-    // (WAYLAND_DEBUG=1): the pane's connection goes completely silent (no
-    // configure, no ack, no surface commit) for the same duration tao sits
-    // blocked, then catches up in one burst the moment something wakes it.
-    // This is also why prior `gdb` runs found every thread idle: blocking
-    // on a real GTK/glib wait for an event that never arrives isn't a
-    // deadlock from Rust's point of view -- there's no held lock to see.
-    //
-    // FIX: force tao's loop to wake on a steady cadence regardless of what
-    // the main window is doing. `AppHandle::run_on_main_thread` is
-    // implemented (tauri-runtime-wry) as a `tao::event_loop::EventLoopProxy
-    // ::send_event` -- the same queue `run_return` checks -- so a periodic
-    // no-op call here forces `MainEventsCleared` to keep firing on
-    // approximately the same ~16ms cadence `PaneWindow::pump()` already
-    // assumes for its own throttling, independent of the main window's own
-    // activity.
-    //
-    // SCOPE (raised in review, 2026-08-04): this must not run for the app's
-    // entire lifetime regardless of whether the pane is ever used --
-    // TIER3_ACCESS_MODEL.md treats Tier 2/3 as something the user opens
-    // deliberately, and an always-on 16ms wake for every user contradicts
-    // the idle-CPU discipline decisions.id=700 already fought for (Finding
-    // 1, the CPU-collision fix, this same code cluster).
-    //
-    // UPDATE (2026-08-04, items.id=223, same session as the multi-pane
-    // refactor above): at the time this heartbeat was first added, no
-    // pane-lifecycle hooks existed anywhere in tier3_pane/ -- PaneWindow was
-    // constructed once, eagerly, at startup, and nothing ever tore it down,
-    // so the only gate available was `WindowEvent::CloseRequested`'s
-    // one-shot exit signal (`PaneWindow::running_flag()`, since removed).
-    // Phase B's on-demand `PaneCommand::Open`/`Close` (sync_window.rs) is
-    // that real lifecycle hook, and `open_pane_count` (below) is a live
-    // count rather than a one-shot latch -- so this loop no longer exits
-    // permanently on first close; it just skips the actual wake (the
-    // `run_on_main_thread` call, which is what forces GTK's loop to keep
-    // firing `MainEventsCleared`) on any tick where zero panes are open,
-    // and resumes waking automatically the next time one opens. The OS
-    // thread itself still sleeps for the app's entire lifetime -- cheaper
-    // to leave one thread doing a 16ms `Relaxed` atomic load than to
-    // spawn/kill it on every open/close and risk a start race.
-    {
-        let heartbeat_handle = app.handle().clone();
-        std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_millis(16));
-            if open_pane_count.load(std::sync::atomic::Ordering::Relaxed) == 0 {
-                continue;
-            }
-            if heartbeat_handle.run_on_main_thread(|| {}).is_err() {
-                break;
-            }
-        });
-    }
+    // FOUND THE HARD WAY (2026-08-07, manual verification): installing
+    // right here -- between `.build()` returning and `.run()` starting --
+    // panics: `app.get_webview_window("main")` returns `None`, even though
+    // tauri.conf.json declares exactly one window and no other code path
+    // ever removes it. The window is not yet registered as retrievable at
+    // this point in Tauri's own startup sequence; `RunEvent::Ready`
+    // ("Application ready", fired once the event loop has actually
+    // started) is the documented, correct point to depend on a window
+    // existing. `.build()` returning is not the same milestone.
+    app.run(move |app_handle, event| {
+        if let tauri::RunEvent::Ready = event {
+            let main_window = app_handle
+                .get_webview_window("main")
+                .expect("quietrabbit: main window not found on RunEvent::Ready");
+            let open_pane_count = quietrabbit_lib::tier3_pane::pane_host::install(
+                &main_window,
+                app_handle.clone(),
+            );
 
-    // Shared winit event loop interleaving (see tier3_pane::mod.rs docs on
-    // the process/thread model decision): every currently-open pane's
-    // winit machinery is pumped once per Tauri main-loop iteration, on
-    // RunEvent::MainEventsCleared -- one pump() call regardless of pane
-    // count (see PaneWindow::pump docs). CEF's own message loop runs
-    // entirely on its own OS thread now (multi_threaded_message_loop=true)
-    // and needs no interleaving from here at all -- see tier3_pane::bootstrap
-    // docs. pane_window and sync_rx are moved into this closure (not
-    // Tauri-managed state, per the Send constraint above) -- this closure
-    // runs on the main thread for the app's entire lifetime, which is
-    // exactly PaneWindow's required affinity.
-    app.run(move |_app_handle, event| {
-        if let tauri::RunEvent::MainEventsCleared = event {
-            // Drain all pending sync updates (not just the latest) so a
-            // burst of move/resize events during a drag doesn't leave any
-            // pane visibly behind by more than one tick's worth of catch-up.
-            // Applied to every currently-open pane (Phase A had exactly
-            // one; Phase B may have zero to three) -- see PaneWindow::sync_to
-            // docs for the placeholder (not yet Phase C real) layout math.
-            while let Ok(rect) = sync_rx.try_recv() {
-                for key in pane_window.pane_keys() {
-                    pane_window.sync_to(&key, rect);
+            // Replaces the old freeze-bug heartbeat thread (a 16ms
+            // run_on_main_thread(|| {}) loop whose entire purpose was
+            // forcing tao's own blocking GTK loop to notice a SECOND,
+            // GTK-invisible winit/Wayland connection -- see pane_host.rs's
+            // module docs on why that whole problem class no longer
+            // exists). This timeout is a real, first-class GSource on
+            // GTK's own main loop -- not a workaround for a blind spot,
+            // just the normal way to drive a periodic redraw. Gated on
+            // open_pane_count > 0 for the same on-demand-cost reason as
+            // before (items.id=223): a user who never opens Tier 2/3 pays
+            // nothing here. 16ms matches the old cadence (~60fps) and
+            // CEF's own windowless_frame_rate: 60 (pane_host.rs).
+            glib::source::timeout_add_local(std::time::Duration::from_millis(16), move || {
+                if open_pane_count.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                    quietrabbit_lib::tier3_pane::pane_host::queue_draw();
                 }
-            }
-            pane_window.pump();
+                glib::ControlFlow::Continue
+            });
         }
     });
 }

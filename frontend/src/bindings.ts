@@ -181,35 +181,47 @@ export const commands = {
 	 *  best-effort layer within each iteration -- see restore_cookies_into_jar's
 	 *  own doc on why that failure mode does NOT abort the batch the same way.
 	 * 
-	 *  FOUND THE HARD WAY (2026-08-04, manual verification): sending
-	 *  `PaneCommand::Open` is not enough by itself. main.rs's heartbeat thread
-	 *  only calls `run_on_main_thread` (the only thing that forces tao's GTK
-	 *  loop to fire `MainEventsCleared`, per the freeze-bug root cause) while
-	 *  `open_pane_count > 0` -- but a pane can only become open by processing
-	 *  this very `Open` command, which requires `MainEventsCleared` to fire
-	 *  first. With zero panes open, the heartbeat provides no help at all, and
-	 *  nothing else guarantees the main window stays busy enough to dispatch
-	 *  the queued event promptly (confirmed empirically: a real click on this
-	 *  command's own trigger button did not itself produce a dispatch within
-	 *  several seconds). Fix: force exactly one wake here, synchronously,
-	 *  right after queuing the command -- the same `run_on_main_thread`
-	 *  mechanism the heartbeat uses, just called from the command that
-	 *  actually needs the wake instead of waited for. This does not reintroduce
-	 *  the always-on cost items.id=223 exists to avoid: it is one wake per
-	 *  open/close call, not a resumed continuous cadence.
+	 *  Dispatch is a single `AppHandle::run_on_main_thread` call per provider
+	 *  (items.id=202 real positioning fix, 2026-08-07) -- unlike the old
+	 *  `EventLoopProxy::send_event`, this both queues the work AND guarantees it
+	 *  runs promptly: `run_on_main_thread` is Tauri/tao's own main-thread
+	 *  dispatch queue, serviced as part of GTK's ordinary main-loop operation,
+	 *  not a queue that needed a *separate* explicit wake call to be noticed
+	 *  (see the old design's now-deleted note here about a real, empirically
+	 *  confirmed dispatch-delay bug that required exactly that workaround).
 	 */
 	openTier3Panes: (providerIds: string[]) => typedError<null, string>(__TAURI_INVOKE("open_tier3_panes", { providerIds })),
 	/**
 	 *  Closes one pane by provider ID. A no-op (not an error) if that provider
-	 *  has no open pane -- PaneManager::close_pane already tolerates this
-	 *  (sync_window.rs), and a caller racing a close against an already-closed
-	 *  pane is a normal condition, not a failure. See open_tier3_panes' doc for
-	 *  why the explicit wake below is required, not optional. Cookie persist
-	 *  (items.id=224 resolution) runs before the close is sent -- see
-	 *  persist_cookies_from_jar's own doc; its failure is logged, never a
-	 *  reason this command returns an error (the pane must still close).
+	 *  has no open pane -- `PaneManager::close_pane` already tolerates this
+	 *  (pane_host.rs), and a caller racing a close against an already-closed
+	 *  pane is a normal condition, not a failure. See open_tier3_panes' doc on
+	 *  why a single `run_on_main_thread` call is dispatch and guaranteed-prompt
+	 *  delivery in one step now. Cookie persist (items.id=224 resolution) runs
+	 *  before the close is dispatched -- see persist_cookies_from_jar's own
+	 *  doc; its failure is logged, never a reason this command returns an
+	 *  error (the pane must still close).
 	 */
 	closeTier3Pane: (providerId: string) => typedError<null, string>(__TAURI_INVOKE("close_tier3_pane", { providerId })),
+	/**
+	 *  items.id=202 piece 4, real positioning fix 2026-08-07 -- stores the
+	 *  frontend's live layout fractions (unchanged `PaneRectFraction` semantics:
+	 *  fraction of the whole window's content area) and requests a redraw so the
+	 *  GLArea's own `render` callback (pane_host.rs) picks up the new layout on
+	 *  its very next tick. Called whenever the frontend's pane-dock region
+	 *  resizes or `openPaneIds` changes (a different pane count changes the
+	 *  column split even at the same dock size).
+	 * 
+	 *  No window-geometry query here anymore. The old version queried
+	 *  `window.inner_position()`/`inner_size()` to build an absolute
+	 *  `PhysicalRect` for a separate OS window to sync against -- confirmed
+	 *  broken on Wayland (pinned, wrong origin/size on this dev machine's
+	 *  KDE/Wayland session) and the exact code this rewrite deletes rather than
+	 *  patches. Under single-window compositing every pane's target is already
+	 *  expressed relative to the GLArea's own size (render.rs's `render()`
+	 *  reads `PaneLayoutState` directly), so there is nothing left to query.
+	 */
+	setPaneLayout: (layout: PaneLayoutEntry[]) => typedError<null, string>(__TAURI_INVOKE("set_pane_layout", { layout })),
 };
 
 /* Types */
@@ -315,6 +327,36 @@ export type OutputInfo = {
 	sensitivity: string,
 	status: string,
 	created_at: string,
+};
+
+/**
+ *  `Vec`, not `HashMap`, to match this codebase's existing IPC-struct
+ *  convention -- no command signature anywhere else uses `HashMap`.
+ */
+export type PaneLayoutEntry = {
+	provider_id: string,
+	rect: PaneRectFraction,
+};
+
+/**
+ *  One pane's target region, as a fraction (0..1) of the main window's own
+ *  *content* area -- not absolute screen pixels. Dimensionless on purpose:
+ *  the frontend computes this from plain DOM geometry
+ *  (`getBoundingClientRect()` / `window.innerWidth`/`innerHeight`), with no
+ *  need for `devicePixelRatio` or a Tauri window-position API call. Under
+ *  single-window compositing (items.id=202 real positioning fix,
+ *  2026-08-07, see pane_host.rs) this fraction is multiplied directly
+ *  against GTK's own live `GLArea` size inside `RenderState::render()` --
+ *  no Rust-side window-geometry query is involved at all, so a window
+ *  *move* alone stays correctly synced for free (GTK relayouts the GLArea
+ *  as an ordinary child widget), and even a resize only needs the GLArea's
+ *  own `resize` signal, not anything from `main.rs`.
+ */
+export type PaneRectFraction = {
+	x: number | null,
+	y: number | null,
+	width: number | null,
+	height: number | null,
 };
 
 /**

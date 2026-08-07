@@ -30,6 +30,7 @@
     "openError": "Could not open pane(s): {{message}}",
     "openPanesLabel": "Open panes",
     "noPanesOpen": "No panes open",
-    "closeButton": "Close"
+    "closeButton": "Close",
+    "dockLabel": "{{count}} pane(s) reserved here — actual CEF panes render as separate OS windows synced to this region, not inline"
   }
 }

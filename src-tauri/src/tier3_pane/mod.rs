@@ -51,31 +51,71 @@
 //!    `NSWindow addChildWindow:` gives genuine OS-driven auto-sync, but
 //!    `winit` does not expose it (open request since 2017, issue #220).
 //!
-//!    Decision: build ONE manually-synced separate window architecture
-//!    across all platforms, rather than forking into a "good path" for
-//!    some platforms and a workaround for others -- because except for
-//!    macOS, no platform actually gets a free ride from native
-//!    reparenting (Windows/X11 still need the same manual sync logic to
-//!    avoid lag). Native macOS `addChildWindow:` is a tracked future
-//!    optimization opportunity, not an architectural dependency of this
-//!    phase.
+//!    Decision (2026-08-01, SUPERSEDED 2026-08-07, see below): build ONE
+//!    manually-synced separate window architecture across all platforms,
+//!    rather than forking into a "good path" for some platforms and a
+//!    workaround for others -- because except for macOS, no platform
+//!    actually gets a free ride from native reparenting (Windows/X11 still
+//!    need the same manual sync logic to avoid lag). Native macOS
+//!    `addChildWindow:` is a tracked future optimization opportunity, not
+//!    an architectural dependency of that phase.
+//!
+//! # Real positioning fix, Linux (2026-08-07) -- supersedes the "separate
+//! # window" half of the decision above
+//! The separate-window design's `window.set_outer_position()`/
+//! `request_inner_size()` sync depended on
+//! `tauri::Window::inner_position()`/`inner_size()` to locate the main
+//! window on screen -- confirmed broken on Wayland by manual verification
+//! (pinned, wrong `x=0,y=0` plus an oversized rect on this dev machine's
+//! KDE/Wayland session, consistent with the real upstream issues
+//! tauri-apps/tauri#12411 and tauri-apps/tao#566). A same-night spike
+//! proved the real fix: wgpu can present into a `gtk::GLArea` overlaid on
+//! Tauri's own webview, in Tauri's own window, via wgpu-hal's
+//! external-GL-context interop (`wgpu_hal::gles::Adapter::new_external`) --
+//! confirmed with matched `glReadPixels` values across 19 frames and direct
+//! visual confirmation of a wgpu-rendered pane composited over a real
+//! webview. See `pane_host.rs`'s own module doc for the full architecture
+//! and what it replaces.
+//!
+//! **This reverses the "one architecture across all platforms" policy
+//! above, for Linux specifically.** `gtk::GLArea` has no equivalent on
+//! Windows (WebView2/HWND) or macOS (WKWebView/NSWindow) -- consistent with
+//! every other result in this track being Linux-only (isolation, native
+//! Wayland, NVIDIA/GBM, popup delegation), this fix ships for Linux now;
+//! Windows/macOS need their own equivalent single-window host mechanism,
+//! not designed here.
+//!
+//! `winit` is dropped from this module entirely as a consequence (see
+//! `pane_host.rs`) -- CEF's panes were always off-screen-rendered, so the
+//! per-pane `winit::Window` this decision originally required only ever
+//! existed to give wgpu a presentation surface and a window to
+//! position-sync; neither is needed once wgpu presents into GTK's own
+//! framebuffer instead.
 //!
 //! # Known limitations carried forward, not solved this phase
-//! - Sync window will lag on rapid resize (manual sync, not eliminated --
-//!   consistent with the ADR's own accepted risk for this class of
-//!   approach).
-//! - macOS: same manual-sync behavior as Windows/Linux for now.
-//! - Popups/dropdowns, IME, multi-pane, compaction: out of scope.
+//! - **RESOLVED on Linux (2026-08-07):** sync lag on rapid resize -- no
+//!   longer a *separate OS window* being resized (there isn't one), just
+//!   ordinary GTK widget layout.
+//! - macOS/Windows: this fix is Linux-only (see above) -- both platforms
+//!   still need their own single-window host mechanism designed, not just
+//!   the old manual-sync behavior this phase originally left them with.
+//! - Popups/dropdowns, IME: still out of scope, unchanged.
+//! - Mouse/keyboard/focus input forwarding into CEF: **not implemented at
+//!   any layer**, old or new design -- a real, pre-existing gap, flagged
+//!   explicitly rather than discovered by surprise later. Panes render but
+//!   cannot currently be clicked or typed into.
 //! - Windows/macOS: entirely untested by any prior spike in this track:
-//!   every proven result (isolation, Wayland, NVIDIA/GBM) is Linux-only.
+//!   every proven result (isolation, Wayland, NVIDIA/GBM, single-window
+//!   compositing) is Linux-only.
 
 pub mod bootstrap;
+pub mod gl_loader;
+pub mod pane_host;
 pub mod render;
-pub mod sync_window;
 
 pub use bootstrap::dispatch_cef_subprocess;
 
-/// Identifies one pane across `sync_window`/`render`/CEF `RequestContext`
+/// Identifies one pane across `pane_host`/`render`/CEF `RequestContext`
 /// wiring. Deliberately the provider's own `provider_store::Provider::id`
 /// (a stable, meaningful string already unique across the selector's cap-of-3
 /// distinct providers, decisions.id=681) -- not a positional index (fragile:

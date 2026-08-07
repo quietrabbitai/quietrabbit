@@ -6,8 +6,8 @@
 // items.id=202 piece 5 / items.id=223 connective tissue: neither item's own
 // description enumerates an IPC command, but on-demand pane creation
 // (items.id=223's whole point) needs something to actually call
-// tier3_pane::sync_window::PaneWindow::request_open/close from the frontend
-// side -- this module is that something.
+// tier3_pane::pane_host's open/close from the frontend side -- this module
+// is that something.
 //
 // list_active_providers wraps persistence::provider_store::list_active_providers()
 // (commit 4e5147f) in a frontend-facing DTO rather than exposing
@@ -18,11 +18,14 @@
 // carries several fields (documentation_gate, review bookkeeping) this
 // screen has no use for.
 //
-// open_tier3_panes/close_tier3_pane send PaneCommand::Open/Close through
-// the EventLoopProxy managed as Tauri state in main.rs -- the proxy is
-// Send + Sync (winit's own guarantee), unlike PaneWindow/PaneManager
-// themselves, which is what lets these async command handlers reach the
-// winit-thread-affine pane machinery at all. launch_url is resolved
+// open_tier3_panes/close_tier3_pane dispatch PaneCommand::Open/Close via
+// AppHandle::run_on_main_thread (items.id=202 real positioning fix,
+// 2026-08-07 -- replaces the old EventLoopProxy<PaneCommand>, dropped along
+// with the rest of winit; see tier3_pane::pane_host's module docs).
+// PaneHost lives in a main-thread-only thread-local (GTK objects aren't
+// Send), reached via pane_host::dispatch() from inside the
+// run_on_main_thread closure -- that closure itself only needs to be Send,
+// which plain owned Strings/PaneKeys satisfy. launch_url is resolved
 // server-side from provider_store, not accepted from the frontend -- the
 // frontend only ever knows provider IDs.
 //
@@ -30,15 +33,15 @@
 // Chrome-runtime ChromeBrowserContext structurally rejects any second
 // RequestContext (confirmed via gdb, src-tauri/examples/repro_224.rs) --
 // every pane now shares CEF's one working global context/cookie jar
-// instead (sync_window.rs no longer builds a per-pane context at all).
-// This module is the actual lifecycle hook for per-provider persistence
-// across app restarts: open_tier3_panes restores a provider's stored
-// cookies into that shared jar (via CookieManager::set_cookie, awaited)
-// *before* sending PaneCommand::Open, so they're already in place before
-// the pane's first navigation; close_tier3_pane reads the jar back (via
+// instead (pane_host.rs no longer builds a per-pane context at all). This
+// module is the actual lifecycle hook for per-provider persistence across
+// app restarts: open_tier3_panes restores a provider's stored cookies into
+// that shared jar (via CookieManager::set_cookie, awaited) *before*
+// dispatching PaneCommand::Open, so they're already in place before the
+// pane's first navigation; close_tier3_pane reads the jar back (via
 // CookieManager::visit_url_cookies, awaited with a bounded timeout -- see
 // that function's own doc on why a timeout is required, not optional) and
-// persists via persistence::tier3_cookie_store *before* sending
+// persists via persistence::tier3_cookie_store *before* dispatching
 // PaneCommand::Close. Both directions are best-effort: a cookie
 // restore/persist failure is logged, never silently dropped, but must not
 // block the pane open/close itself -- worse cookie fidelity is a real but
@@ -47,9 +50,10 @@
 // CookieManager (and SetCookieCallback/CookieVisitor) are Send + Sync
 // (cef::rc::RefGuard's own unconditional unsafe impl) and, per their own
 // doc comment, "may be called on any thread" -- callable directly from
-// this module's async Tokio context, no need to route through
-// sync_window.rs's winit-thread-affine PaneManager at all.
+// this module's async Tokio context, no need to route through the
+// main-thread-only pane host at all.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -61,12 +65,12 @@ use cef::{
 };
 use tauri::State;
 use tokio::sync::oneshot;
-use winit::event_loop::EventLoopProxy;
 
 use crate::auth::registry::KeyRegistry;
 use crate::persistence::provider_store::{self, ProviderTier};
 use crate::persistence::tier3_cookie_store::{self, StoredCookie};
-use crate::tier3_pane::sync_window::PaneCommand;
+use crate::tier3_pane::pane_host::{self, PaneCommand};
+use crate::tier3_pane::PaneKey;
 
 /// How long to wait for a single CEF cookie-jar round trip
 /// (set_cookie's completion callback, or visit_url_cookies' last-cookie
@@ -99,6 +103,42 @@ fn lane_str(tier: ProviderTier) -> &'static str {
         ProviderTier::Tier3 => "tier3",
     }
 }
+
+/// One pane's target region, as a fraction (0..1) of the main window's own
+/// *content* area -- not absolute screen pixels. Dimensionless on purpose:
+/// the frontend computes this from plain DOM geometry
+/// (`getBoundingClientRect()` / `window.innerWidth`/`innerHeight`), with no
+/// need for `devicePixelRatio` or a Tauri window-position API call. Under
+/// single-window compositing (items.id=202 real positioning fix,
+/// 2026-08-07, see pane_host.rs) this fraction is multiplied directly
+/// against GTK's own live `GLArea` size inside `RenderState::render()` --
+/// no Rust-side window-geometry query is involved at all, so a window
+/// *move* alone stays correctly synced for free (GTK relayouts the GLArea
+/// as an ordinary child widget), and even a resize only needs the GLArea's
+/// own `resize` signal, not anything from `main.rs`.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, specta::Type)]
+pub struct PaneRectFraction {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// `Vec`, not `HashMap`, to match this codebase's existing IPC-struct
+/// convention -- no command signature anywhere else uses `HashMap`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, specta::Type)]
+pub struct PaneLayoutEntry {
+    pub provider_id: String,
+    pub rect: PaneRectFraction,
+}
+
+/// Tauri-managed state holding the frontend's last-reported layout. Plain
+/// data (`Arc<Mutex<HashMap<...>>>`), trivially `Send + Sync` -- unlike
+/// `PaneHost`/`PaneManager` (GTK objects throughout), nothing here is
+/// thread-affine, so this can be read directly from pane_host.rs's GLArea
+/// `render`/`resize` closures via `AppHandle::state()`.
+#[derive(Default)]
+pub struct PaneLayoutState(pub Mutex<HashMap<PaneKey, PaneRectFraction>>);
 
 /// Matches auth.rs/tier2.rs's own local copy exactly (not yet unified
 /// behind a shared helper anywhere in this codebase -- see tier2.rs's own
@@ -174,7 +214,11 @@ fn cef_cookie_to_stored(c: &Cookie) -> StoredCookie {
         same_site: c.same_site.get_raw() as i32,
         priority: c.priority.get_raw() as i32,
         has_expires,
-        expires: if has_expires { Some(c.expires.val) } else { None },
+        expires: if has_expires {
+            Some(c.expires.val)
+        } else {
+            None
+        },
         creation: c.creation.val,
         last_access: c.last_access.val,
     }
@@ -256,7 +300,12 @@ wrap_cookie_visitor! {
 /// or timed-out set_cookie is logged and skipped, never aborts the batch --
 /// a partially-restored session (or none at all) is still a working pane,
 /// just possibly logged out.
-async fn restore_cookies_into_jar(user_id: &str, key_hex_str: &str, provider_id: &str, launch_url: &str) {
+async fn restore_cookies_into_jar(
+    user_id: &str,
+    key_hex_str: &str,
+    provider_id: &str,
+    launch_url: &str,
+) {
     let stored = match tier3_cookie_store::list_cookies(user_id, key_hex_str, provider_id).await {
         Ok(c) => c,
         Err(e) => {
@@ -319,7 +368,12 @@ async fn restore_cookies_into_jar(user_id: &str, key_hex_str: &str, provider_id:
 /// persists them (full-replace) via tier3_cookie_store. Best-effort: a
 /// failure here is logged, never propagated as a reason the pane can't
 /// close.
-async fn persist_cookies_from_jar(user_id: &str, key_hex_str: &str, provider_id: &str, launch_url: &str) {
+async fn persist_cookies_from_jar(
+    user_id: &str,
+    key_hex_str: &str,
+    provider_id: &str,
+    launch_url: &str,
+) {
     let Some(manager) = cef::cookie_manager_get_global_manager(None) else {
         log::warn!(
             "tier3_pane: CEF's global cookie manager unavailable -- cannot persist \
@@ -350,7 +404,9 @@ async fn persist_cookies_from_jar(user_id: &str, key_hex_str: &str, provider_id:
 
     let collected: Vec<StoredCookie> = cookies.lock().unwrap().clone();
 
-    if let Err(e) = tier3_cookie_store::upsert_cookies(user_id, key_hex_str, provider_id, &collected).await {
+    if let Err(e) =
+        tier3_cookie_store::upsert_cookies(user_id, key_hex_str, provider_id, &collected).await
+    {
         log::warn!("tier3_pane: could not persist cookies for provider={provider_id}: {e}");
     }
 }
@@ -390,27 +446,18 @@ pub async fn list_active_providers() -> Result<Vec<Tier3ProviderSummary>, String
 /// best-effort layer within each iteration -- see restore_cookies_into_jar's
 /// own doc on why that failure mode does NOT abort the batch the same way.
 ///
-/// FOUND THE HARD WAY (2026-08-04, manual verification): sending
-/// `PaneCommand::Open` is not enough by itself. main.rs's heartbeat thread
-/// only calls `run_on_main_thread` (the only thing that forces tao's GTK
-/// loop to fire `MainEventsCleared`, per the freeze-bug root cause) while
-/// `open_pane_count > 0` -- but a pane can only become open by processing
-/// this very `Open` command, which requires `MainEventsCleared` to fire
-/// first. With zero panes open, the heartbeat provides no help at all, and
-/// nothing else guarantees the main window stays busy enough to dispatch
-/// the queued event promptly (confirmed empirically: a real click on this
-/// command's own trigger button did not itself produce a dispatch within
-/// several seconds). Fix: force exactly one wake here, synchronously,
-/// right after queuing the command -- the same `run_on_main_thread`
-/// mechanism the heartbeat uses, just called from the command that
-/// actually needs the wake instead of waited for. This does not reintroduce
-/// the always-on cost items.id=223 exists to avoid: it is one wake per
-/// open/close call, not a resumed continuous cadence.
+/// Dispatch is a single `AppHandle::run_on_main_thread` call per provider
+/// (items.id=202 real positioning fix, 2026-08-07) -- unlike the old
+/// `EventLoopProxy::send_event`, this both queues the work AND guarantees it
+/// runs promptly: `run_on_main_thread` is Tauri/tao's own main-thread
+/// dispatch queue, serviced as part of GTK's ordinary main-loop operation,
+/// not a queue that needed a *separate* explicit wake call to be noticed
+/// (see the old design's now-deleted note here about a real, empirically
+/// confirmed dispatch-delay bug that required exactly that workaround).
 #[tauri::command]
 #[specta::specta]
 pub async fn open_tier3_panes(
     provider_ids: Vec<String>,
-    proxy: State<'_, EventLoopProxy<PaneCommand>>,
     key_registry: State<'_, KeyRegistry>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
@@ -442,30 +489,31 @@ pub async fn open_tier3_panes(
             );
         }
 
-        proxy
-            .send_event(PaneCommand::Open {
-                key: provider_id,
-                url: launch_url,
+        app_handle
+            .run_on_main_thread(move || {
+                pane_host::dispatch(PaneCommand::Open {
+                    key: provider_id,
+                    url: launch_url,
+                })
             })
-            .map_err(|_| "tier3_pane event loop is no longer running".to_string())?;
-        let _ = app_handle.run_on_main_thread(|| {});
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
 
 /// Closes one pane by provider ID. A no-op (not an error) if that provider
-/// has no open pane -- PaneManager::close_pane already tolerates this
-/// (sync_window.rs), and a caller racing a close against an already-closed
-/// pane is a normal condition, not a failure. See open_tier3_panes' doc for
-/// why the explicit wake below is required, not optional. Cookie persist
-/// (items.id=224 resolution) runs before the close is sent -- see
-/// persist_cookies_from_jar's own doc; its failure is logged, never a
-/// reason this command returns an error (the pane must still close).
+/// has no open pane -- `PaneManager::close_pane` already tolerates this
+/// (pane_host.rs), and a caller racing a close against an already-closed
+/// pane is a normal condition, not a failure. See open_tier3_panes' doc on
+/// why a single `run_on_main_thread` call is dispatch and guaranteed-prompt
+/// delivery in one step now. Cookie persist (items.id=224 resolution) runs
+/// before the close is dispatched -- see persist_cookies_from_jar's own
+/// doc; its failure is logged, never a reason this command returns an
+/// error (the pane must still close).
 #[tauri::command]
 #[specta::specta]
 pub async fn close_tier3_pane(
     provider_id: String,
-    proxy: State<'_, EventLoopProxy<PaneCommand>>,
     key_registry: State<'_, KeyRegistry>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
@@ -492,9 +540,45 @@ pub async fn close_tier3_pane(
         ),
     }
 
-    proxy
-        .send_event(PaneCommand::Close { key: provider_id })
-        .map_err(|_| "tier3_pane event loop is no longer running".to_string())?;
-    let _ = app_handle.run_on_main_thread(|| {});
+    app_handle
+        .run_on_main_thread(move || pane_host::dispatch(PaneCommand::Close { key: provider_id }))
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// items.id=202 piece 4, real positioning fix 2026-08-07 -- stores the
+/// frontend's live layout fractions (unchanged `PaneRectFraction` semantics:
+/// fraction of the whole window's content area) and requests a redraw so the
+/// GLArea's own `render` callback (pane_host.rs) picks up the new layout on
+/// its very next tick. Called whenever the frontend's pane-dock region
+/// resizes or `openPaneIds` changes (a different pane count changes the
+/// column split even at the same dock size).
+///
+/// No window-geometry query here anymore. The old version queried
+/// `window.inner_position()`/`inner_size()` to build an absolute
+/// `PhysicalRect` for a separate OS window to sync against -- confirmed
+/// broken on Wayland (pinned, wrong origin/size on this dev machine's
+/// KDE/Wayland session) and the exact code this rewrite deletes rather than
+/// patches. Under single-window compositing every pane's target is already
+/// expressed relative to the GLArea's own size (render.rs's `render()`
+/// reads `PaneLayoutState` directly), so there is nothing left to query.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_pane_layout(
+    layout: Vec<PaneLayoutEntry>,
+    layout_state: State<'_, PaneLayoutState>,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    {
+        let mut map = layout_state.0.lock().unwrap();
+        map.clear();
+        for entry in layout {
+            map.insert(entry.provider_id, entry.rect);
+        }
+    }
+
+    app_handle
+        .run_on_main_thread(pane_host::queue_draw)
+        .map_err(|e| e.to_string())?;
     Ok(())
 }

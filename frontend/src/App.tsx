@@ -1,8 +1,9 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { commands, type HealthResponse } from './bindings'
 import { MiddleZone } from './middleZone/MiddleZone'
 import { DEFAULT_BROWSING_PROFILE } from './middleZone/middleZoneConfig'
+import { computePaneLayout } from './tier3Access/paneLayout'
 import { Tier3Selector } from './tier3Access/Tier3Selector'
 import {
   fetchActiveProviders,
@@ -49,14 +50,67 @@ function App() {
   const [confirmedProviders, setConfirmedProviders] = useState<
     Provider[] | null
   >(null)
-  // Open panes are separate, OS-level windows (sync_window.rs) synced
-  // beside the Tauri window -- there is no DOM element to host them in,
-  // so this harness can only show which ones are open, not render them
-  // inline. `openPaneIds` mirrors the pane manager's own state via
-  // openTier3Panes'/closeTier3Pane's own success, not a live push
+  // Open panes composite into a shared gtk::GLArea overlaid on this same
+  // window (pane_host.rs, items.id=202 real positioning fix, 2026-08-07) --
+  // not a DOM element, so this harness still can't render them inline, just
+  // show which ones are open. `openPaneIds` mirrors the pane manager's own
+  // state via openTier3Panes'/closeTier3Pane's own success, not a live push
   // subscription -- adequate for this harness, not the real integration.
   const [openPaneIds, setOpenPaneIds] = useState<string[]>([])
   const [openError, setOpenError] = useState<string | null>(null)
+
+  // items.id=202 piece 4: the actual split-screen container. `paneDock`
+  // reserves the on-screen region open panes should sit alongside (this is
+  // what makes MiddleZone's own on-screen region concrete, not incidental)
+  // -- open CEF panes never render inside it directly (see the openPaneIds
+  // comment above), this div only exists to be measured.
+  const paneDockRef = useRef<HTMLDivElement>(null)
+
+  const syncPaneLayout = useCallback(() => {
+    const dock = paneDockRef.current
+    if (!dock || openPaneIds.length === 0) return
+    const layout = computePaneLayout(
+      dock.getBoundingClientRect(),
+      window.innerWidth,
+      window.innerHeight,
+      openPaneIds,
+    )
+    const entries = Object.entries(layout).map(([providerId, rect]) => ({
+      provider_id: providerId,
+      rect,
+    }))
+    commands.setPaneLayout(entries).then((result) => {
+      if (result.status !== 'ok') {
+        setOpenError(result.error)
+      }
+    })
+  }, [openPaneIds])
+
+  // Recomputes on mount, whenever openPaneIds changes (a different pane
+  // count changes the column split even at the same dock pixel size -- the
+  // ResizeObserver alone would miss that), and on any actual resize of the
+  // dock itself (window resize, or the dock's own width transition when
+  // panes open/close). rAF-debounced so a main-window drag-resize doesn't
+  // spam the IPC call once per intermediate frame.
+  useEffect(() => {
+    const dock = paneDockRef.current
+    if (!dock) return
+    let frame: number | null = null
+    const scheduleSync = () => {
+      if (frame !== null) return
+      frame = requestAnimationFrame(() => {
+        frame = null
+        syncPaneLayout()
+      })
+    }
+    scheduleSync()
+    const observer = new ResizeObserver(scheduleSync)
+    observer.observe(dock)
+    return () => {
+      observer.disconnect()
+      if (frame !== null) cancelAnimationFrame(frame)
+    }
+  }, [syncPaneLayout])
 
   useEffect(() => {
     fetchActiveProviders()
@@ -112,24 +166,79 @@ function App() {
           : t('middleZoneHarness.generatingToggleOn')}
       </button>
 
-      <MiddleZone
-        contextKey="harness-placeholder"
-        profile={DEFAULT_BROWSING_PROFILE}
-        isGenerating={isGenerating}
-        contextPane={
-          <div>
-            <h2>{t('middleZoneHarness.contextPaneLabel')}</h2>
-            <p>{t('middleZoneHarness.contextPaneBody')}</p>
-          </div>
-        }
-        chatPane={
-          <div>
-            <h2>{t('middleZoneHarness.chatPaneLabel')}</h2>
-            <p>{t('middleZoneHarness.chatPaneBody')}</p>
-            <input type="text" aria-label={t('middleZoneHarness.chatPaneLabel')} />
-          </div>
-        }
-      />
+      {/* position: sticky pins this row's on-screen position regardless of
+          how far the rest of this scrollable harness page is scrolled --
+          required, not cosmetic: computePaneLayout reads the dock's
+          getBoundingClientRect(), which is viewport-relative. Without this,
+          scrolling down to reach the Tier3Selector/Continue button below
+          (unavoidable at this window size) pushes the dock above the
+          viewport, producing a negative top and sending every pane to a
+          bogus position near the window's top-left -- found via manual
+          verification, 2026-08-07. */}
+      <div
+        style={{
+          display: 'flex',
+          flexDirection: 'row',
+          gap: 8,
+          width: '100%',
+          position: 'sticky',
+          top: 0,
+          zIndex: 1,
+          background: 'var(--bg)',
+        }}
+      >
+        <div
+          style={{
+            flex: openPaneIds.length > 0 ? '1 1 55%' : '1 1 100%',
+            minWidth: 0,
+          }}
+        >
+          <MiddleZone
+            contextKey="harness-placeholder"
+            profile={DEFAULT_BROWSING_PROFILE}
+            isGenerating={isGenerating}
+            contextPane={
+              <div>
+                <h2>{t('middleZoneHarness.contextPaneLabel')}</h2>
+                <p>{t('middleZoneHarness.contextPaneBody')}</p>
+              </div>
+            }
+            chatPane={
+              <div>
+                <h2>{t('middleZoneHarness.chatPaneLabel')}</h2>
+                <p>{t('middleZoneHarness.chatPaneBody')}</p>
+                <input type="text" aria-label={t('middleZoneHarness.chatPaneLabel')} />
+              </div>
+            }
+          />
+        </div>
+        <div
+          ref={paneDockRef}
+          style={{
+            // No CSS transition here (removed 2026-08-07): animating
+            // flex-basis made ResizeObserver fire repeatedly on
+            // intermediate, not-yet-final sizes during the 220ms animation.
+            // Combined with sync_to's own guard against fighting an
+            // externally-resized pane window, each pane could freeze at
+            // whatever mid-animation size happened to land right before the
+            // guard started rejecting further updates -- found via manual
+            // verification (distinct pane sizes, none matching the final
+            // layout). The width change is instant now.
+            flex: openPaneIds.length > 0 ? '0 0 45%' : '0 0 0%',
+            minWidth: 0,
+            minHeight: 200,
+            border: openPaneIds.length > 0 ? '1px dashed var(--border)' : 'none',
+            borderRadius: 8,
+            overflow: 'hidden',
+          }}
+        >
+          {openPaneIds.length > 0 && (
+            <p style={{ padding: 8, margin: 0, fontSize: 12 }}>
+              {t('tier3PaneHarness.dockLabel', { count: openPaneIds.length })}
+            </p>
+          )}
+        </div>
+      </div>
 
       <h2>{t('tier3PaneHarness.heading')}</h2>
       {providerError && (

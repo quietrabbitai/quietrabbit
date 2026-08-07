@@ -94,19 +94,53 @@ specta-typescript = "0.0.12"
 # validated against the spike's proven results during Phase A build/test,
 # not assumed identical on version alone.
 cef = { version = "151.1.0", features = ["accelerated_osr"] }
-# OSR render pipeline + sync window -- reuses the proven pipeline shape from
-# the retained spike (qr-spike-192/cef-rs/examples/osr), which imports CEF's
-# shared/accelerated-paint texture into a caller-owned wgpu::Texture, and a
-# separate winit window manually position/size-synced against the main Tauri
-# window (Phase A architecture decision, 2026-08-01 -- no supported path
-# exists to composite CEF's OSR output into Tauri's own webview surface, and
-# native OS-level child-window reparenting is unavailable on Wayland).
+# OSR render pipeline + single-window GTK/wgpu compositing (items.id=202
+# piece 5 real fix, 2026-08-07 -- replaces the separate-winit-window-per-pane
+# architecture, which depended on tauri::Window::inner_position()/inner_size(),
+# confirmed broken on Wayland -- tauri-apps/tauri#12411, tauri-apps/tao#566).
+# wgpu now presents into a gtk::GLArea overlaid on Tauri's own webview in its
+# own window, via wgpu-hal's external-GL-context interop
+# (wgpu_hal::gles::Adapter::new_external) -- proven working this session
+# (matched glReadPixels across 19 frames, direct visual confirmation of a
+# wgpu-rendered pane composited over a real webview). winit is dropped
+# entirely: CEF's panes were always off-screen-rendered (no OS window of
+# their own), the per-pane winit::Window only ever existed to give wgpu a
+# presentation surface and something to position-sync -- gone now that wgpu
+# presents into GTK's own framebuffer instead.
 wgpu = "30"
-winit = "0.30"
+# Direct dependency on the exact version already resolved transitively via
+# wgpu (see Cargo.lock) -- needed directly for the external-adapter/
+# hal-interop API surface (wgpu_hal::gles::Adapter::new_external,
+# wgpu_hal::gles::Texture::default_framebuffer, wgpu_hal::api::Gles), which
+# is not re-exported through the public wgpu crate.
+wgpu-hal = { version = "30", features = ["gles"] }
+wgpu-types = "30"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"
 env_logger = "0.11"
 glib = "0.18"
+# GTK widget-tree access (overlay compositing the GLArea onto Tauri's own
+# webview widget, obtained via tauri::WebviewWindow::gtk_window()/
+# default_vbox()) -- version pinned to match gtk-rs's own already-resolved
+# transitive version (see Cargo.lock), the same version tauri/wry build
+# against on Linux.
+gtk = "0.18"
+# GL function loading. Originally planned as the `epoxy` crate (the standard
+# gtk-rs pattern, since GTK itself loads GL via libepoxy on Linux) -- dropped
+# after `cargo build` found it unbuildable via crates.io: its `gl_generator`
+# build-dependency requires `xml-rs = "^0.7.0"`, every published 0.7.x version
+# of which is yanked, so dependency resolution fails outright regardless of
+# this crate's own version pin. `libloading` dlopen's libepoxy directly for
+# `epoxy_get_proc_address` instead (a single stable C symbol, no codegen
+# needed) -- both the GL proc-address loader
+# `wgpu_hal::gles::Adapter::new_external` requires, and (via `glow`, already
+# resolved transitively through wgpu-hal's `gles` backend, added here
+# directly for its own safe API) the raw GL_DRAW_FRAMEBUFFER_BINDING
+# capture/rebind calls single-window compositing needs outside wgpu's own
+# abstraction (wgpu-hal does not preserve the host's framebuffer binding,
+# confirmed this session).
+libloading = "0.8"
+glow = "0.16"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

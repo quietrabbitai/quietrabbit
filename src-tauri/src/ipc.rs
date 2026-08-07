@@ -97,6 +97,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::tier3_pane::list_active_providers,
         commands::tier3_pane::open_tier3_panes,
         commands::tier3_pane::close_tier3_pane,
+        commands::tier3_pane::set_pane_layout,
     ])
 }
 
