@@ -131,12 +131,25 @@ impl GlProcLoader {
 
     /// A loader closure suitable for
     /// `wgpu_hal::gles::Adapter::new_external`/`glow::Context::from_loader_function`
-    /// -- both take `impl FnMut(&str) -> *const c_void`. Each call site
-    /// should open its own `GlProcLoader` (dlopen of an already-loaded
-    /// shared object is cheap -- the OS returns the cached handle) rather
-    /// than share one across the two consumers, avoiding any ownership
-    /// entanglement between wgpu-hal's internal `glow::Context` and this
-    /// module's own separate one.
+    /// -- both take `impl FnMut(&str) -> *const c_void`.
+    ///
+    /// CORRECTED (items.id=226, 2026-08-08): this used to recommend that
+    /// each call site open its own `GlProcLoader` rather than share one.
+    /// That was the root cause of a real SIGSEGV, confirmed via gdb against
+    /// a coredump: both consumers only call the loader closure at
+    /// construction time to eagerly resolve and cache raw function
+    /// pointers, then never touch it again -- they do not keep the
+    /// `GlProcLoader` (or its `libloading::Library` handles) alive
+    /// themselves. A `GlProcLoader` dropped right after use `dlclose`s
+    /// `libGLESv2.so.2`/`libEGL.so.1`, and once nothing else in the process
+    /// independently references them (confirmed: nothing else in this
+    /// GTK/EGL/Mesa stack loads `libGLESv2.so.2` directly), that's a real
+    /// `munmap`, not just a refcount decrement -- every pointer already
+    /// cached by either consumer is left dangling. The one instance this
+    /// module's own struct doc already says to keep alive for the GLArea's
+    /// realized lifetime must in fact be the *same* instance shared by
+    /// every consumer that resolves pointers from it during that lifetime,
+    /// not one each.
     pub fn loader_fn(&self) -> impl FnMut(&str) -> *const c_void + '_ {
         move |name: &str| self.get_proc_address(name)
     }

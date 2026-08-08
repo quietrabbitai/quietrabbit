@@ -519,6 +519,37 @@ impl PaneHost {
         // wgpu's own abstraction (see the `render` handler below and
         // gl_loader.rs's module doc).
         let gl_context: Rc<RefCell<Option<glow::Context>>> = Rc::new(RefCell::new(None));
+        // ROOT CAUSE FOUND (items.id=226, 2026-08-08): confirmed via gdb
+        // against a real coredump that the previous code opened a
+        // `GlProcLoader` as a closure-local inside `connect_realize`, fed
+        // its `loader_fn()` to both `RenderState::new` and
+        // `glow::Context::from_loader_function`, then let it drop (and
+        // `dlclose` its `libGLESv2.so.2`/`libEGL.so.1` handles) at the end
+        // of that same closure invocation. Both consumers cache raw
+        // resolved function pointers at construction time and never touch
+        // the loader again -- once its library handles were closed and
+        // (confirmed: `libGLESv2.so.2` was completely absent from the
+        // crashed process's own memory map, unlike `libGLdispatch.so.0`/
+        // `libEGL.so.1`, which have other independent referrers) actually
+        // unmapped, every one of those cached pointers was dangling. The
+        // very first real GL call issued each frame (the
+        // `GL_DRAW_FRAMEBUFFER_BINDING` capture below) jumped through one
+        // and segfaulted. Fix: one `GlProcLoader`, opened once, kept alive
+        // in this `Rc` for the GLArea's whole realized lifetime -- matching
+        // gl_loader.rs's own already-documented contract ("callers keep
+        // this alive for as long as they need proc-address resolution"),
+        // which the old call site simply didn't follow. Both consumers now
+        // share this one instance instead of each opening (and dropping)
+        // their own -- gl_loader.rs's per-call-site-opens-its-own-instance
+        // guidance predates this bug and is superseded by it.
+        //
+        // `RefCell<Option<_>>`, not an eagerly-constructed `GlProcLoader`,
+        // for the same reason `render_state`/`gl_context` above are: opening
+        // it is only valid once the GLArea's context is current
+        // (`area.make_current()`, called first thing in `connect_realize`
+        // below) -- it cannot be constructed before the GLArea is realized.
+        let gl_loader: Rc<RefCell<Option<crate::tier3_pane::gl_loader::GlProcLoader>>> =
+            Rc::new(RefCell::new(None));
         let manager = Rc::new(RefCell::new(PaneManager {
             panes: IndexMap::new(),
             open_pane_count: Arc::new(AtomicUsize::new(0)),
@@ -528,6 +559,7 @@ impl PaneHost {
         {
             let render_state = render_state.clone();
             let gl_context = gl_context.clone();
+            let gl_loader = gl_loader.clone();
             let glarea_for_realize = glarea.clone();
             glarea.connect_realize(move |area| {
                 area.make_current();
@@ -558,15 +590,23 @@ impl PaneHost {
                 }
                 let width = glarea_for_realize.allocated_width().max(1) as u32;
                 let height = glarea_for_realize.allocated_height().max(1) as u32;
-                let loader = crate::tier3_pane::gl_loader::GlProcLoader::open();
+                // One `GlProcLoader`, stored in `gl_loader` for the GLArea's
+                // whole realized lifetime (see the ROOT CAUSE FOUND comment
+                // near this closure's construction) -- both `RenderState`
+                // and the standalone `glow::Context` below resolve their
+                // function pointers from this same still-alive instance
+                // instead of two that would otherwise be dropped (and
+                // `dlclose`d) the moment this closure returns.
+                *gl_loader.borrow_mut() = Some(crate::tier3_pane::gl_loader::GlProcLoader::open());
+                let loader_ref = gl_loader.borrow();
+                let loader = loader_ref.as_ref().expect("just set above");
                 let state =
                     pollster::block_on(RenderState::new(loader.loader_fn(), (width, height)));
                 *render_state.borrow_mut() = Some(state);
-                let gl = unsafe {
-                    let loader = crate::tier3_pane::gl_loader::GlProcLoader::open();
-                    glow::Context::from_loader_function(loader.loader_fn())
-                };
+                let gl =
+                    unsafe { glow::Context::from_loader_function(loader.loader_fn()) };
                 *gl_context.borrow_mut() = Some(gl);
+                drop(loader_ref);
                 log::info!("tier3_pane::pane_host: shared RenderState constructed from GTK's external GL context ({width}x{height})");
             });
         }
