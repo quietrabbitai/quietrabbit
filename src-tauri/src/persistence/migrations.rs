@@ -153,6 +153,26 @@ fn validate_manifest() {
     }
 }
 
+/// v1 schema files are always re-run (see run_pending) to pick up in-place
+/// amendments, so they must consist solely of idempotent statements. Scans
+/// parsed statements (not raw source) so that explanatory comments in v2+
+/// files mentioning "ALTER TABLE" can't false-positive a v1 file that merely
+/// quotes them.
+fn validate_v1_rerun_safety() {
+    for f in SCHEMA_FILES.iter().filter(|f| f.version == 1) {
+        for stmt in parse_statements(f.sql) {
+            let upper = stmt.trim_start().to_uppercase();
+            assert!(
+                !upper.starts_with("ALTER TABLE") && !upper.starts_with("DROP "),
+                "{}_001.sql (v1, always re-run every startup) contains a non-\
+                 idempotent statement: {stmt:?} — use a new versioned migration \
+                 file (v2+) instead of amending a v1 file in place for this change",
+                f.prefix,
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -383,6 +403,7 @@ pub async fn run_migrations(
 ) -> Result<u32, MigrationError> {
     // Always validate manifest — O(19), negligible cost, catches hand-edit errors.
     validate_manifest();
+    validate_v1_rerun_safety();
 
     // PRAGMA key MUST precede journal_mode — non-negotiable (CLAUDE.md).
     if let Some(key) = key_hex {
@@ -426,7 +447,17 @@ async fn run_pending(conn: &mut SqliteConnection, prefix: &str) -> Result<u32, M
     let mut applied: u32 = 0;
 
     for (version, sql) in migrations {
-        if version <= current_version {
+        let already_applied = version <= current_version;
+        // v1 schema files are this project's amend-in-place surface (see
+        // CLAUDE.md Schema Authoring convention + shared_001.sql's
+        // tier3_providers precedent, items.id=228). They are required to
+        // consist solely of idempotent statements (enforced by
+        // validate_v1_rerun_safety() below), so re-running them on every
+        // call is always safe and is how a v1 file amended after a database
+        // already recorded version 1 gets picked up without deleting the
+        // database. Versions 2+ are real incremental migrations (may
+        // contain ALTER TABLE) and must still run exactly once.
+        if already_applied && version != 1 {
             continue;
         }
 
@@ -493,7 +524,9 @@ async fn run_pending(conn: &mut SqliteConnection, prefix: &str) -> Result<u32, M
             });
         }
 
-        applied += 1;
+        if !already_applied {
+            applied += 1;
+        }
     }
 
     let check: Option<(String,)> = sqlx::query_as("PRAGMA integrity_check")
@@ -759,6 +792,11 @@ mod tests {
         validate_manifest();
     }
 
+    #[test]
+    fn test_v1_schema_files_are_rerun_safe() {
+        validate_v1_rerun_safety();
+    }
+
     // -- migration runner integration tests ---------------------------------
 
     async fn make_test_conn() -> SqliteConnection {
@@ -832,6 +870,59 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(version.0, 2);
+    }
+
+    #[tokio::test]
+    async fn run_pending_heals_content_drift_in_stale_v1_database() {
+        // Simulates items.id=228: a database that recorded schema_version=1
+        // before tier3_providers was added in place to shared_001.sql.
+        // Hand-builds the stale shape (schema_version row present,
+        // tier3_providers absent) since SCHEMA_FILES is a compile-time
+        // static and can't be swapped to an old shared_001.sql revision at
+        // test time.
+        let mut conn = make_test_conn().await;
+        sqlx::query(
+            "CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, description TEXT NOT NULL
+            )",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO schema_version (version, applied_at, description) \
+             VALUES (1, '2026-01-01T00:00:00Z', 'stale pre-tier3_providers shared v1')",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        let applied = run_migrations(&mut conn, "shared", None)
+            .await
+            .expect("drift-healing run must succeed");
+
+        assert_eq!(applied, 1, "only shared v2 should count as newly applied");
+
+        let exists: Option<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='tier3_providers'",
+        )
+        .fetch_optional(&mut conn)
+        .await
+        .unwrap();
+        assert!(
+            exists.is_some(),
+            "tier3_providers must be healed into a database stale at schema_version=1, \
+             without requiring the database to be deleted and recreated"
+        );
+
+        let seeded: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM tier3_providers")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert!(
+            seeded.0 > 0,
+            "shared_001.sql's seeded provider rows must also be healed in"
+        );
     }
 
     #[tokio::test]
