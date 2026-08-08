@@ -492,6 +492,65 @@ CREATE TABLE IF NOT EXISTS tier3_providers (
 CREATE INDEX IF NOT EXISTS idx_tier3_providers_selector
     ON tier3_providers (activation_status, tier, login_required);
 
+-- Seed data (items.id=225, 2026-08-07): real, vetted rows against
+-- decisions.id=710(a)'s documentation gate (documented/legible ToS+
+-- retention policy, no known contradictory third-party reporting,
+-- disclosed jurisdiction). Sources read live this session, not carried
+-- forward from stale project memory.
+--
+-- Groq and Mistral (named as candidates in items.id=225's own task
+-- description) are deliberately NOT seeded here:
+--   - Groq is Tier 1.5 per decisions.id=665 (non-local, faster-than-
+--     hardware, same capability class as Tier 1; API-based, not an
+--     anonymous split-screen destination) -- a structurally different
+--     product slot from this table, which is TIER3_ACCESS_MODEL.md's
+--     Tier 2/3 embedded_web selector only. Does not belong in this
+--     table regardless of documentation-gate posture.
+--   - Mistral's Tier 2 vs. Tier 3 placement is explicitly unresolved
+--     (decisions.id=665) and TIER3_ACCESS_MODEL.md states it is
+--     "excluded from both selector boxes... Not guessed at here."
+--     Seeding an active row would contradict that locked disposition.
+-- Brave Leo (named in TIER3_ACCESS_MODEL.md itself as a Tier 2
+-- candidate) is also NOT seeded: verified this session that Leo has no
+-- standalone web launch URL -- it is reachable only inside the Brave
+-- browser itself (brave://leo-ai internal scheme), which this table's
+-- mode='embedded_web'/launch_url model (a URL loaded into a CEF pane)
+-- cannot target. A real, working row is not currently possible for this
+-- provider; flagged to Chat-PM as a design-assumption correction, not
+-- silently dropped.
+INSERT OR IGNORE INTO tier3_providers
+    (id, display_name, tier, mode, launch_url, login_required,
+     activation_status, documentation_gate, last_reviewed_at,
+     review_trigger_note, created_at)
+VALUES
+    ('duckai', 'Duck.ai', 2, 'embedded_web', 'https://duck.ai', 0,
+     'active',
+     '{"tos_url":"https://duckduckgo.com/duckai/privacy-terms","retention_summary":"Chats are not retained by DuckDuckGo by default. All PII-bearing metadata (for example IP address) is stripped before a prompt is forwarded to the underlying model provider. Model providers are contractually required to delete request data once no longer needed, at most within 30 days, with limited safety/legal exceptions. Optional Sync and Backup stores encrypted chat history on DDG servers, auto-deleted after 18 months of inactivity -- opt-in, not default.","jurisdiction":"DuckDuckGo LLC, Paoli, Pennsylvania, USA. EEA/UK users route DSA-related complaints to legal@duckduckgo.com -- no separate EU legal entity identified.","contradictory_reporting":"None found this review. Independent commentary (factually.co, 2026) notes transient connection metadata may still qualify as personal data under some regimes even though DDG does not persist it -- a scope caveat, not a contradiction of the retention claim.","sources":["https://duckduckgo.com/duckai/privacy-terms"]}',
+     '2026-08-07T00:00:00Z',
+     'Initial catalog seeding and documentation-gate review, items.id=225, 2026-08-07 -- ToS/retention read directly from duckduckgo.com/duckai/privacy-terms, no known contradictory third-party reporting found.',
+     datetime('now')),
+
+    ('claude', 'Claude.ai', 3, 'embedded_web', 'https://claude.ai', 1,
+     'active',
+     '{"tos_url":"https://privacy.claude.com/en/articles/9301722-updates-to-our-acceptable-use-policy-now-usage-policy-consumer-terms-of-service-and-privacy-policy","retention_summary":"Default backend retention is 30 days for deleted conversations -- removed from chat history immediately on deletion, purged from Anthropic backend systems within 30 days. Consumer accounts (Free, Pro, Max) are opted IN to model-training use of conversations by default as of the August 2025 policy change -- users must actively opt out. Training-enabled data is retained for up to 5 years. Deleting a conversation excludes it from future training.","jurisdiction":"Anthropic PBC, USA, for US and rest-of-world consumer accounts. Anthropic Ireland, Limited is the data controller and consumer-terms counterparty for EEA, UK, and Swiss users.","contradictory_reporting":"None found this review.","review_caveat":"August 2025 policy change flipped the consumer training default from opt-in to opt-out-required -- a material posture shift from earlier project evaluations of this provider. Re-verify if Anthropic changes the default again.","sources":["https://privacy.claude.com/en/articles/9301722-updates-to-our-acceptable-use-policy-now-usage-policy-consumer-terms-of-service-and-privacy-policy","https://www.anthropic.com/news/updates-to-our-consumer-terms"]}',
+     '2026-08-07T00:00:00Z',
+     'Initial catalog seeding and documentation-gate review, items.id=225, 2026-08-07 -- flags the August 2025 consumer training opt-out-required default change as the most recent material posture shift.',
+     datetime('now')),
+
+    ('chatgpt', 'ChatGPT', 3, 'embedded_web', 'https://chatgpt.com', 1,
+     'active',
+     '{"tos_url":"https://openai.com/policies/row-privacy-policy/","retention_summary":"Deleted conversations and Temporary Chats are stated to auto-delete within 30 days. Free and Plus tier conversations are used for model training by default unless the user opts out. Content is retained up to 30 days for abuse and safety monitoring regardless of the training setting.","jurisdiction":"OpenAI OpCo, LLC, San Francisco, USA, for US and rest-of-world users. OpenAI Ireland Limited, Dublin, is the data controller for EEA and Switzerland users, effective since February 2024.","contradictory_reporting":"YES -- flagged, matching the Groq ToS-vs-third-party cautionary precedent from the original curation review. The New York Times v. OpenAI copyright litigation produced a court-ordered litigation hold, through September 26 2025, requiring OpenAI to preserve all ChatGPT consumer and API output including chats users had deleted -- a direct, court-documented contradiction of the stated 30-day deletion promise for that period. OpenAI states the hold itself ended September 26 2025 and normal 30-day deletion resumed. The underlying litigation remains active: a January 5 2026 order affirmed OpenAI must produce 20 million de-identified ChatGPT logs to plaintiffs, and reporting from July 2026 alleges OpenAI misrepresented its ability to search its own retained chat-log and training data. Net assessment: OpenAI retention claims have a real, recent, court-documented history of being overridden by legal process, and the dispute is unresolved as of this review.","sources":["https://openai.com/index/response-to-nyt-data-demands/","https://news.bloomberglaw.com/ip-law/openai-must-turn-over-20-million-chatgpt-logs-judge-affirms","https://techcrunch.com/2026/07/09/new-york-times-says-openai-hid-evidence-in-chatgpt-copyright-trial/"]}',
+     '2026-08-07T00:00:00Z',
+     'Initial catalog seeding and documentation-gate review, items.id=225, 2026-08-07 -- flags the NYT v. OpenAI litigation hold history (lifted September 26 2025, litigation ongoing through at least July 2026) as a documented retention-claim divergence, same shape as the Groq precedent.',
+     datetime('now')),
+
+    ('gemini', 'Gemini', 3, 'embedded_web', 'https://gemini.google.com', 1,
+     'active',
+     '{"tos_url":"https://support.google.com/gemini/answer/13594961","retention_summary":"Default retention is 18 months for Gemini Apps Activity, user-configurable to 3 or 36 months or indefinite. Keep Activity off reduces retention to 72 hours for most conversations. A subset of conversations selected for human review, for quality and safety purposes, is retained separately for up to 3 years and is NOT deleted when the user deletes their activity -- this human-reviewed subset does not follow the headline retention window.","jurisdiction":"Google Ireland Limited for EEA and Switzerland users. Google LLC, USA, for all other users.","contradictory_reporting":"No third-party contradiction found this review, but flagging an internal-policy caveat worth surfacing on the card: the up-to-3-years human-review carve-out, which survives user deletion, materially changes the retention story beyond the headline 18-month figure -- same spirit as the Groq precedent of not taking the top-line retention number at face value.","sources":["https://support.google.com/gemini/answer/13594961"]}',
+     '2026-08-07T00:00:00Z',
+     'Initial catalog seeding and documentation-gate review, items.id=225, 2026-08-07 -- flags the human-reviewed-chat 3-year retention carve-out, which survives user deletion, as a caveat beyond the 18-month headline figure.',
+     datetime('now'));
+
 INSERT OR IGNORE INTO schema_version (version, applied_at, description)
 VALUES (1, datetime('now'),
-    'shared.db schema (consolidated 2026-07-24, items.id=169; auth foundation consolidated 2026-08-01, items.id=205; tier3_providers added 2026-08-04, items.id=202): personas, users, user_salts, user_capabilities, artifact_versions, topic_index, asset_index, focus_settings, tier3_providers + dev seeds');
+    'shared.db schema (consolidated 2026-07-24, items.id=169; auth foundation consolidated 2026-08-01, items.id=205; tier3_providers added 2026-08-04, items.id=202; tier3_providers seeded 2026-08-07, items.id=225): personas, users, user_salts, user_capabilities, artifact_versions, topic_index, asset_index, focus_settings, tier3_providers + dev seeds');

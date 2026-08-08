@@ -475,6 +475,14 @@ impl PaneHost {
         glarea.set_has_alpha(true);
         glarea.set_hexpand(true);
         glarea.set_vexpand(true);
+        // DIAGNOSTIC (items.id=225, 2026-08-07): the GLArea overlay appears
+        // to swallow all pointer input across the whole window even with
+        // overlay pass-through set below -- confirmed via direct click
+        // testing (Tier3Selector checkboxes and the harness's own
+        // "Simulate response generating" button are both completely inert).
+        // set_can_focus(false) rules out one candidate cause (the GLArea
+        // grabbing keyboard/click-to-focus before pass-through routing).
+        glarea.set_can_focus(false);
         // Redraw only on an explicit queue_draw() call (from the GLib
         // timeout below, gated on open_pane_count > 0) -- not on every GTK
         // frame-clock tick regardless of whether any pane is open. Matches
@@ -490,9 +498,19 @@ impl PaneHost {
         // do anything with them.
         overlay.set_overlay_pass_through(&glarea, true);
 
-        vbox.add(&overlay);
-        overlay.show_all();
-
+        // ROOT CAUSE FOUND (items.id=225, 2026-08-07): every signal handler
+        // below (`connect_realize`/`connect_resize`/`connect_render`) was
+        // previously connected AFTER `vbox.add(&overlay); overlay.show_all();`
+        // -- confirmed via diagnostic logging that `overlay.show_all()`
+        // itself synchronously realizes the whole subtree (GtkOverlay/
+        // GtkGLArea/the reparented webview all report realized=true
+        // immediately after it returns). GTK does not replay a signal for
+        // handlers connected after it already fired, so `connect_realize`'s
+        // body -- the ONLY place `RenderState`/`gl_context` ever get
+        // constructed -- has never once executed in the live app (confirmed:
+        // its own log lines never appeared in any run). All signal
+        // connections now happen BEFORE `show_all()`, matching ordinary GTK
+        // usage (connect signals, then show).
         let render_state: Rc<RefCell<Option<RenderState>>> = Rc::new(RefCell::new(None));
         // Separate from RenderState's own internal glow::Context (built
         // inside wgpu_hal::gles::Adapter::new_external, never exposed back
@@ -517,14 +535,35 @@ impl PaneHost {
                     log::error!("tier3_pane::pane_host: GLArea realize error: {err}");
                     return;
                 }
+                // DIAGNOSTIC (items.id=225, 2026-08-07): reassert pass-through
+                // directly on the realized GdkWindow. gtk_overlay_set_overlay_
+                // pass_through() (called at construction, before this widget
+                // had a window) is documented to apply lazily once a window
+                // exists, but confirmed-by-testing input is still fully
+                // blocked -- this rules out (or fixes, if it turns out to be
+                // an ordering/propagation gap in this GTK version) a
+                // realize-timing explanation for that.
+                if let Some(window) = area.window() {
+                    window.set_pass_through(true);
+                    log::info!(
+                        "tier3_pane::pane_host: GLArea GdkWindow pass_through reasserted, \
+                         is_pass_through={}",
+                        window.is_pass_through()
+                    );
+                } else {
+                    log::warn!(
+                        "tier3_pane::pane_host: GLArea has no GdkWindow at realize -- \
+                         cannot reassert pass_through"
+                    );
+                }
                 let width = glarea_for_realize.allocated_width().max(1) as u32;
                 let height = glarea_for_realize.allocated_height().max(1) as u32;
-                let loader = crate::tier3_pane::gl_loader::EpoxyLoader::open();
+                let loader = crate::tier3_pane::gl_loader::GlProcLoader::open();
                 let state =
                     pollster::block_on(RenderState::new(loader.loader_fn(), (width, height)));
                 *render_state.borrow_mut() = Some(state);
                 let gl = unsafe {
-                    let loader = crate::tier3_pane::gl_loader::EpoxyLoader::open();
+                    let loader = crate::tier3_pane::gl_loader::GlProcLoader::open();
                     glow::Context::from_loader_function(loader.loader_fn())
                 };
                 *gl_context.borrow_mut() = Some(gl);
@@ -602,6 +641,18 @@ impl PaneHost {
                 glib::Propagation::Stop
             });
         }
+
+        // Realize/map/show happens LAST, now that every signal handler
+        // above is already connected -- see the ROOT CAUSE FOUND comment
+        // near this function's start.
+        vbox.add(&overlay);
+        overlay.show_all();
+        log::info!(
+            "tier3_pane::pane_host: post-show_all state -- overlay(realized={}, mapped={}, visible={}) glarea(realized={}, mapped={}, visible={}) webview(realized={}, mapped={}, visible={})",
+            overlay.is_realized(), overlay.is_mapped(), overlay.get_visible(),
+            glarea.is_realized(), glarea.is_mapped(), glarea.get_visible(),
+            webview_widget.is_realized(), webview_widget.is_mapped(), webview_widget.get_visible(),
+        );
 
         Self {
             glarea,
