@@ -90,6 +90,36 @@ async fn async_main() {
         .manage(quietrabbit_lib::auth::registry::KeyRegistry::default())
         .setup(|app| {
             // Must run synchronously here, before any command handler could
+            // touch persistence::migrations::get_data_root() -- every prior
+            // caller of that function was test code, which points
+            // QR_DATA_ROOT at a tempdir itself (see test_support.rs);
+            // nothing in the real app ever set it, so any real IPC call
+            // that touched the DB layer (get_health, listActiveProviders,
+            // ...) panicked on a tokio worker thread with "QR_DATA_ROOT
+            // environment variable not set" the first time this app was
+            // actually driven end-to-end through a live window (found via
+            // WAYLAND_DEBUG repro session, 2026-08-08 -- see items.id=227
+            // investigation). Derived from the same app_data_dir() Tauri
+            // already resolves for the CEF root_cache_path below, so both
+            // land under the same per-install data directory.
+            match app.path().app_data_dir() {
+                Ok(dir) => {
+                    if let Err(e) = std::fs::create_dir_all(&dir) {
+                        log::error!(
+                            "main: could not create app_data_dir {dir:?} for \
+                             QR_DATA_ROOT: {e} — persistence commands will panic"
+                        );
+                    } else {
+                        std::env::set_var("QR_DATA_ROOT", &dir);
+                    }
+                }
+                Err(e) => log::error!(
+                    "main: could not resolve app_data_dir for QR_DATA_ROOT: {e} \
+                     — persistence commands will panic until this is set"
+                ),
+            }
+
+            // Must run synchronously here, before any command handler could
             // trigger gate3's first Privacy Filter classification — ggml's
             // backend loader (see privacy_filter.rs) runs once, lazily, on
             // first use, and is cached for the process lifetime. Ollama
@@ -235,8 +265,15 @@ async fn async_main() {
             // before (items.id=223): a user who never opens Tier 2/3 pays
             // nothing here. 16ms matches the old cadence (~60fps) and
             // CEF's own windowless_frame_rate: 60 (pane_host.rs).
+            let diag_tick = std::cell::Cell::new(0u64);
             glib::source::timeout_add_local(std::time::Duration::from_millis(16), move || {
-                if open_pane_count.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                let count = open_pane_count.load(std::sync::atomic::Ordering::Relaxed);
+                let tick = diag_tick.get() + 1;
+                diag_tick.set(tick);
+                if tick % 60 == 0 {
+                    log::debug!("DIAG items.id=227: 16ms timeout tick={tick} open_pane_count={count}");
+                }
+                if count > 0 {
                     quietrabbit_lib::tier3_pane::pane_host::queue_draw();
                 }
                 glib::ControlFlow::Continue

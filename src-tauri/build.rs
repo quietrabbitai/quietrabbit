@@ -85,8 +85,22 @@ fn main() {
                     .is_some_and(|n| n.starts_with("libggml-cpu-") && n.ends_with(".so"));
                 if is_backend_so {
                     let dest = dest_dir.join(path.file_name().unwrap());
-                    std::fs::copy(&path, &dest)
-                        .unwrap_or_else(|e| panic!("failed to copy {path:?} to {dest:?}: {e}"));
+                    // Skip the copy if dest already exists (dev-loop fix,
+                    // items.id=227 physical-test session): tauri's file
+                    // watcher sees resources/ change on every unconditional
+                    // copy, which re-triggers `cargo tauri dev`'s rebuild,
+                    // which re-runs build.rs, which copies again -- an
+                    // infinite rebuild loop. These are static build
+                    // artifacts from PRIVACY_FILTER_LIB_DIR; they don't
+                    // change between runs on the same machine, so existence
+                    // is a sufficient check (not content-hashing -- same
+                    // amend-in-place idempotency reasoning as items.id=228,
+                    // just for files instead of SQL).
+                    if !dest.exists() {
+                        std::fs::copy(&path, &dest).unwrap_or_else(|e| {
+                            panic!("failed to copy {path:?} to {dest:?}: {e}")
+                        });
+                    }
                     staged_any = true;
                 }
             }
@@ -151,8 +165,12 @@ fn main() {
         for soname in ["libggml-base.so.0", "libggml.so.0"] {
             let src = std::path::Path::new(&ggml_src_dir).join(soname);
             let dest = dest_dir.join(soname);
-            std::fs::copy(&src, &dest)
-                .unwrap_or_else(|e| panic!("failed to copy {src:?} to {dest:?}: {e}"));
+            // Same dev-loop fix as the CPU-variant copy above -- skip if
+            // already staged.
+            if !dest.exists() {
+                std::fs::copy(&src, &dest)
+                    .unwrap_or_else(|e| panic!("failed to copy {src:?} to {dest:?}: {e}"));
+            }
         }
 
         if target_os == "linux" {

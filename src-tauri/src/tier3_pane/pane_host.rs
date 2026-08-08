@@ -616,6 +616,9 @@ impl PaneHost {
             let manager = manager.clone();
             let app_handle = app_handle.clone();
             glarea.connect_resize(move |area, width, height| {
+                log::debug!(
+                    "DIAG items.id=227: connect_resize fired width={width} height={height}"
+                );
                 let (width, height) = (width.max(1) as u32, height.max(1) as u32);
                 if let Some(rs) = render_state.borrow_mut().as_mut() {
                     rs.resize((width, height));
@@ -640,6 +643,10 @@ impl PaneHost {
             let app_handle = app_handle.clone();
             glarea.connect_render(move |_area, _gtk_gl_context| {
                 use glow::HasContext as _;
+                log::debug!(
+                    "DIAG items.id=227: connect_render fired, open_panes={}",
+                    manager.borrow().panes.len()
+                );
 
                 // CRITICAL (confirmed this session): capture GTK's real
                 // bound draw framebuffer BEFORE any wgpu device/queue call.
@@ -728,10 +735,12 @@ impl PaneHost {
                 self.manager
                     .borrow_mut()
                     .open_pane(key, url, &device, &queue, scale, size);
+                log::debug!("DIAG items.id=227: dispatch(Open) -> glarea.queue_draw()");
                 self.glarea.queue_draw();
             }
             PaneCommand::Close { key } => {
                 self.manager.borrow_mut().close_pane(&key);
+                log::debug!("DIAG items.id=227: dispatch(Close) -> glarea.queue_draw()");
                 self.glarea.queue_draw();
             }
         }
@@ -776,6 +785,7 @@ impl PaneHost {
     /// resync the moment the frontend reports new layout fractions, same
     /// intent as the old design's immediate `sync_tx` push.
     pub fn queue_draw(&self) {
+        log::debug!("DIAG items.id=227: PaneHost::queue_draw() called");
         self.glarea.queue_draw();
     }
 }
