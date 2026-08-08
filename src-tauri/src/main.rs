@@ -133,7 +133,7 @@ async fn async_main() {
             // GTK4's EventControllerLegacy has one (that was this session's
             // first, incorrect draft, corrected via ChatGPT review against
             // this project's actual gtk-rs 0.18 dependency). Returning
-            // Inhibit(false) from both handlers is deliberate: this must
+            // glib::Propagation::Proceed from both handlers is deliberate: this must
             // stay strictly observational and never consume/alter the
             // event or affect real click behavior. Does not attempt to
             // resolve or log a specific target widget -- GTK3's event
@@ -144,10 +144,10 @@ async fn async_main() {
             if let Some(webview_window) = app.get_webview_window("main") {
                 match webview_window.gtk_window() {
                     Ok(gtk_window) => {
-                        use gtk::prelude::WidgetExt;
+                        use gtk::prelude::{WidgetExt, WidgetExtManual};
                         gtk_window.add_events(
-                            gdk::EventMask::BUTTON_PRESS_MASK
-                                | gdk::EventMask::BUTTON_RELEASE_MASK,
+                            gtk::gdk::EventMask::BUTTON_PRESS_MASK
+                                | gtk::gdk::EventMask::BUTTON_RELEASE_MASK,
                         );
                         gtk_window.connect_button_press_event(|_widget, event| {
                             log::debug!(
@@ -157,7 +157,7 @@ async fn async_main() {
                                 event.position(),
                                 event.time(),
                             );
-                            gtk::Inhibit(false)
+                            glib::Propagation::Proceed
                         });
                         gtk_window.connect_button_release_event(|_widget, event| {
                             log::debug!(
@@ -167,7 +167,7 @@ async fn async_main() {
                                 event.position(),
                                 event.time(),
                             );
-                            gtk::Inhibit(false)
+                            glib::Propagation::Proceed
                         });
                     }
                     Err(e) => log::warn!(
