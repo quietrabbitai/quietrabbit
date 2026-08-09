@@ -3558,6 +3558,7 @@ dependencies = [
  "tokio",
  "unicode-normalization",
  "uuid",
+ "webkit2gtk",
  "wgpu",
  "wgpu-hal",
  "wgpu-types",

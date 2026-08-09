@@ -125,6 +125,13 @@ glib = "0.18"
 # transitive version (see Cargo.lock), the same version tauri/wry build
 # against on Linux.
 gtk = "0.18"
+# webkit2gtk-rs's WebViewExt (run_javascript) -- version pinned to match the
+# same already-resolved transitive version wry/tauri-runtime-wry build
+# against (see Cargo.lock), same rationale as the gtk pin above. Needed for
+# items.id=227's reimplemented mouse-back/forward JS synthesis in
+# pane_host.rs (see that module's own doc comment for why this is
+# reimplemented locally rather than reused from wry).
+webkit2gtk = "2.0.2"
 # GL function loading. Originally planned as the `epoxy` crate (the standard
 # gtk-rs pattern, since GTK itself loads GL via libepoxy on Linux) -- dropped
 # after `cargo build` found it unbuildable via crates.io: its `gl_generator`
