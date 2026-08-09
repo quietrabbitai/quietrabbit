@@ -1,10 +1,12 @@
 # Quiet Rabbit — Claude Code Context
-# Last updated: June 28, 2026
+# Last updated: August 8, 2026
 
 ## Session Discipline
 - Respond with code only. No preamble, no recap, no explanation unless asked.
 - Run /compact at natural phase boundaries: end of each file written, before
-  integration review, before returning to Chat-PM. Do not wait for auto-compaction.
+  integration review, before returning to Chat-PM (see "Ending a Session"
+  near the end of this file for the actual handoff step). Do not wait for
+  auto-compaction.
 - When compacting, preserve: open files, current task, architectural decisions,
   unresolved errors, and the next action.
 - One task at a time. Draft → Jason approves → write file. Never skip approval.
@@ -226,3 +228,38 @@ indexmap (not HashMap) wherever gate policy dispatch requires insertion-order de
 API keys and credentials are NEVER hardcoded in source or committed files.
 Values live in .env only (gitignored). This applies to every session touching
 this repo, human or AI.
+
+## Ending a Session (write the handoff yourself)
+This project runs a multi-chat coordination system outside this repo (a
+SQLite database, not something Claude Code needs to understand fully). The
+one piece that matters here: before you finish, record what you did so
+Chat-PM (a separate Claude session that reviews all work) can pick it up
+without Jason re-explaining it.
+
+Run exactly one command, from anywhere (it's not path-sensitive):
+
+```
+python3 /home/kulaga/QuietRabbit/03_ProjectDocs/scripts/db_utilities/handoff_write.py \
+  --chat "Code" \
+  --summary "What you did and found -- assume the reader has zero context on this session." \
+  --decisions "Anything Chat-PM should weigh in on, or the literal word none." \
+  --blocked "Anything unresolved/flagged, or omit this flag entirely if nothing." \
+  --files "Every file you touched, comma-separated, or the literal word none."
+```
+
+Rules, enforced by the script itself, not just convention:
+- Always `--chat "Code"` for this repo — hardcoded, don't change it. (This
+  is a distinct chats row from "Chat-DEV" so Chat-PM can tell Claude Code
+  sessions apart from terminal Chat-DEV sessions -- both do the same kind
+  of work, this is attribution only.)
+- `--decisions` and `--files` are required and cannot be blank — pass the
+  literal word `none` if there's nothing to report, never omit them.
+- You do NOT mark this reviewed, and there is no flag to try — the script
+  always inserts `reviewed=0`. Only Chat-PM closes the loop on your work.
+- This is the ONLY database write available to you. Don't look for or run
+  any other Chat-PM/Chat-DEV workflow, starter script, or process doc —
+  they exist for a different, much longer-running session type and are not
+  meant for a Claude Code session. If Jason wants something beyond this,
+  he'll tell you directly.
+- After running it, tell Jason the command ran and stop. He'll bring it to
+  Chat-PM himself.
