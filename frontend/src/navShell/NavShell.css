@@ -1,0 +1,98 @@
+/* Top-strip / navigation-shell -- structural/functional CSS only.
+ *
+ * NOT a Chat-BRAND visual pass. No QR palette, typography, or the "dot
+ * on button" / "selected-state" visual treatment decisions.id=654 and
+ * Section 2e's own open visual-design question actually call for is
+ * applied here -- this is a functional skeleton, same placeholder
+ * discipline as middleZone/MiddleZone.css and tier3Access/Tier3Selector.css.
+ * data-selected="anchor"|"alias" and the color-dot span are left for that
+ * pass to style; both exist structurally already. */
+
+.nav-shell {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 1;
+  min-height: 0;
+}
+
+.nav-shell__top-strip {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.nav-shell__persona-cluster {
+  display: flex;
+  flex-direction: row;
+  gap: 4px;
+  padding: 0 4px;
+  border-left: 1px solid var(--border);
+  border-right: 1px solid var(--border);
+}
+
+.nav-shell__button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.nav-shell__persona-color-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+}
+
+.nav-shell__content {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.nav-shell__content > * {
+  flex: 1;
+  min-width: 0;
+}
+
+.tier3-access-pane {
+  display: flex;
+  flex-direction: row;
+  gap: 8px;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+}
+
+.tier3-access-pane__conversation {
+  flex: 1 1 55%;
+  min-width: 0;
+  display: flex;
+}
+
+.tier3-access-pane__dock-column {
+  flex: 1 1 45%;
+  min-width: 0;
+  overflow: auto;
+}
+
+.tier3-access-pane__dock {
+  min-height: 200px;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.tier3-access-pane__dock[data-has-panes] {
+  border: 1px dashed var(--border);
+}
+
+.persona-hub__action-row {
+  display: flex;
+  flex-direction: row;
+  gap: 8px;
+}
