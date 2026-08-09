@@ -49,6 +49,11 @@ const VALID_SENSITIVITY: &[&str] = &["general", "personal", "medical", "financia
 pub struct OutputRecord {
     pub id: String,
     pub focus_run_id: String,
+    /// The owning focus_runs.focus_id -- present on every row via the
+    /// NOT NULL REFERENCES focus_runs(id) FK, so this join can never drop a
+    /// row. Needed by commands/library.rs to look up focus_settings.
+    /// focus_profile for Library visibility enforcement (items.id=230).
+    pub focus_id: String,
     pub output_type: String,
     pub content: String,
     pub sensitivity: String,
@@ -111,6 +116,32 @@ async fn open_outputs_db(
     Ok(conn)
 }
 
+/// Test-only seed helper: inserts a minimal focus_runs row into the real
+/// encrypted outputs.db at the given user/persona/key path (status=complete),
+/// so commands::library's tests can seed a save_output()-referenceable
+/// focus_run without duplicating this module's schema/path knowledge.
+/// Not used by any non-test code path.
+#[cfg(test)]
+pub(crate) async fn test_seed_focus_run(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    focus_run_id: &str,
+    focus_id: &str,
+) -> Result<(), OutputStoreError> {
+    let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
+    sqlx::query(
+        "INSERT INTO focus_runs (id, focus_id, status, started_at)
+         VALUES (?, ?, 'complete', ?)",
+    )
+    .bind(focus_run_id)
+    .bind(focus_id)
+    .bind(crate::providers::utils::now())
+    .execute(&mut conn)
+    .await?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Row mapping helper
 // ---------------------------------------------------------------------------
@@ -119,6 +150,7 @@ fn row_to_output_record(r: &sqlx::sqlite::SqliteRow) -> Result<OutputRecord, sql
     Ok(OutputRecord {
         id: r.try_get("id")?,
         focus_run_id: r.try_get("focus_run_id")?,
+        focus_id: r.try_get("focus_id")?,
         output_type: r.try_get("output_type")?,
         content: r.try_get("content")?,
         sensitivity: r.try_get("sensitivity")?,
@@ -197,10 +229,11 @@ pub async fn get_output(
     let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
 
     let row = sqlx::query(
-        "SELECT id, focus_run_id, output_type, content,
-                sensitivity, status, created_at, updated_at
-         FROM outputs
-         WHERE id = ? AND status = 'active'",
+        "SELECT o.id, o.focus_run_id, r.focus_id, o.output_type, o.content,
+                o.sensitivity, o.status, o.created_at, o.updated_at
+         FROM outputs o
+         JOIN focus_runs r ON r.id = o.focus_run_id
+         WHERE o.id = ? AND o.status = 'active'",
     )
     .bind(output_id)
     .fetch_optional(&mut conn)
@@ -226,11 +259,12 @@ pub async fn get_output_for_run(
     let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
 
     let row = sqlx::query(
-        "SELECT id, focus_run_id, output_type, content,
-                sensitivity, status, created_at, updated_at
-         FROM outputs
-         WHERE focus_run_id = ? AND status = 'active'
-         ORDER BY created_at DESC
+        "SELECT o.id, o.focus_run_id, r.focus_id, o.output_type, o.content,
+                o.sensitivity, o.status, o.created_at, o.updated_at
+         FROM outputs o
+         JOIN focus_runs r ON r.id = o.focus_run_id
+         WHERE o.focus_run_id = ? AND o.status = 'active'
+         ORDER BY o.created_at DESC
          LIMIT 1",
     )
     .bind(focus_run_id)
@@ -289,9 +323,10 @@ pub async fn get_focus_run_status(
 /// natural browse order.
 ///
 /// Does NOT enforce Focus profile visibility rules (Open/Organized/
-/// Protected) — that filtering layer is a separate, not-yet-built gap,
-/// split to items.id=175 (post-Release 1). Callers needing that enforcement
-/// must apply it on top of this function's results until it lands in the store.
+/// Protected) — that's a separate field (focus_settings.focus_profile, a
+/// shared.db lookup, not something this outputs.db query can join against)
+/// and is enforced by the caller. See commands::library::list_outputs
+/// (items.id=230), which applies it on top of this function's results.
 pub async fn list_outputs(
     user_id: &str,
     persona_id: &str,
@@ -303,7 +338,7 @@ pub async fn list_outputs(
     let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
 
     let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-        "SELECT o.id, o.focus_run_id, o.output_type, o.content,
+        "SELECT o.id, o.focus_run_id, r.focus_id, o.output_type, o.content,
                 o.sensitivity, o.status, o.created_at, o.updated_at
          FROM outputs o
          JOIN focus_runs r ON r.id = o.focus_run_id

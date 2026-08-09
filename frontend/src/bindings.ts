@@ -130,11 +130,17 @@ export const commands = {
 	 *  Lists active outputs, optionally filtered by focus_id, topic_id, and/or
 	 *  output_type. Wired to output_store::list_outputs() (items.id=91, part 1).
 	 * 
-	 *  Does NOT enforce Focus profile visibility rules (Open/Organized/
-	 *  Protected) -- that filtering layer is a separate, not-yet-built gap,
-	 *  split to items.id=175 (post-Release 1). See module header.
+	 *  Enforces focus_settings.focus_profile visibility on top of output_store's
+	 *  results -- outputs owned by a 'protected' Focus are excluded (items.id=230).
+	 *  See module header.
 	 */
 	listOutputs: (userId: string, personaId: string, keyHex: string, focusId: string | null, topicId: string | null, outputType: string | null) => typedError<OutputInfo[], string>(__TAURI_INVOKE("list_outputs", { userId, personaId, keyHex, focusId, topicId, outputType })),
+	/**
+	 *  Enforces focus_settings.focus_profile visibility -- an output owned by a
+	 *  'protected' Focus returns the same "not_found" error a genuinely missing
+	 *  id would (items.id=230); a Protected output must not be distinguishable
+	 *  from a nonexistent one by its error.
+	 */
 	getOutput: (outputId: string, userId: string, personaId: string, keyHex: string) => typedError<OutputInfo, string>(__TAURI_INVOKE("get_output", { outputId, userId, personaId, keyHex })),
 	/**
 	 *  Deletes an output (items.id=91, part 2, complete 2026-07-26). Soft-delete
