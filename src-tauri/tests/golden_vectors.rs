@@ -704,13 +704,6 @@ async fn test_gate1_normal_paths() {
             "floor_clamped_fields MISMATCH [{label}]"
         );
 
-        // Assert blocked
-        assert_eq!(
-            result.blocked,
-            v["blocked"].as_bool().unwrap(),
-            "blocked MISMATCH [{label}]"
-        );
-
         // Assert disclosure log written (TestLogger recorded exactly one entry)
         assert_eq!(
             logger.entry_count(),

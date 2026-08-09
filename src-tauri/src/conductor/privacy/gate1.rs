@@ -120,6 +120,5 @@ pub async fn gate1<L: DisclosureLogger>(
         fields_shared,
         floor_clamped_fields: floor_clamped,
         disclosure_log_id: log_id,
-        blocked: false,
     })
 }

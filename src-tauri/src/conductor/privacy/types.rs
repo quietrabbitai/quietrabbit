@@ -129,7 +129,6 @@ pub struct Gate1Result {
     pub fields_shared: Vec<String>,
     pub floor_clamped_fields: Vec<String>,
     pub disclosure_log_id: String,
-    pub blocked: bool,
 }
 
 #[derive(Debug)]

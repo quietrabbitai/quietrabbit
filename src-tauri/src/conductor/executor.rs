@@ -40,8 +40,6 @@
 //     before render, results passed in); this avoids async closure complexity.
 //   - floor invariant violations return Err(ConductorError::TierBoundaryViolation)
 //     (D6-348 — debug_assert! stripped in release builds).
-//   - gate1.blocked always false in current migration (not_permitted path deferred);
-//     check is preserved for correctness when gate is fully wired.
 //
 // PII detection notes:
 //   word-boundary: str::find + ASCII char boundary checks (semantically equiv to
@@ -355,23 +353,6 @@ impl StepExecutor {
             .map_err(|e| ConductorError::DisclosureLogWrite {
                 plain_language: e.plain_language.clone(),
             })?;
-
-        if g1.blocked {
-            // blocked is always false in current migration (not_permitted path deferred).
-            // Preserved for correctness when gate blocking is fully wired.
-            return Ok(Some(
-                failure_handler.handle(
-                    &ConductorError::PrivacyGateBlocked {
-                        plain_language: "A required personal field cannot be shared in this \
-                        context. [Review privacy settings] [Get help]"
-                            .to_owned(),
-                    },
-                    Some(&ctx.step.step_id),
-                    Some(&ctx.focus_id),
-                    retry_count,
-                ),
-            ));
-        }
 
         // -- Field projection — step-scope boundary --
         // Post-Layer 6 fix: Gate1 evaluates full PersonalTrack; projection scopes
