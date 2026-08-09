@@ -390,7 +390,7 @@ pub struct RunResult {
 /// Python oracle: N/A — Rust-only IPC push event (no Python equivalent).
 /// IPC surface: HANDOFF_IPC_SURFACE.md push event — confirm event name on
 /// IPC wire-up in Layer 8.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, specta::Type)]
 pub struct RunStatusPayload {
     pub focus_run_id: String,
     pub status: String,
@@ -401,6 +401,13 @@ pub struct RunStatusPayload {
     /// where no specific step is active. Some(&step.display_name) at each step boundary.
     /// IPC surface: HANDOFF_IPC_SURFACE.md push event — align with frontend on field name.
     pub step_display_name: Option<String>,
+    /// The just-completed step's real generated content (TaskStep.content),
+    /// for ChatPane.tsx's staged/incremental reveal (items.id=245-ish).
+    /// Some(...) only on the step-COMPLETION emission inside the EXECUTE
+    /// loop (execute() below, right after execute_step() succeeds) — every
+    /// other emit_status call site, including the step-START announcement
+    /// that fires at the top of the same loop iteration, passes None here.
+    pub step_content: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -555,6 +562,19 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
     /// step_display_name: Some(&step.display_name) at step boundaries;
     ///   None during phase transitions where no specific step is active.
     fn emit_status(&self, status: &str, step_display_name: Option<&str>) {
+        self.emit_status_with_content(status, step_display_name, None);
+    }
+
+    /// step_content: the just-completed step's real generated content
+    /// (TaskStep.content, via task_track.last_output()). Only the
+    /// step-completion call site in execute() passes Some(...); every other
+    /// caller (including plain emit_status above) passes None.
+    fn emit_status_with_content(
+        &self,
+        status: &str,
+        step_display_name: Option<&str>,
+        step_content: Option<&str>,
+    ) {
         let Some(handle) = &self.app_handle else {
             return; // no handle in tests — silent no-op
         };
@@ -565,6 +585,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             current_step: self.current_step,
             total_steps: total,
             step_display_name: step_display_name.map(|s| s.to_owned()),
+            step_content: step_content.map(|s| s.to_owned()),
         };
         use tauri::Emitter;
         if let Err(e) = handle.emit("run-status-update", &payload) {
@@ -1138,6 +1159,22 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                 let result = self.handle_step_failure(failure).await?;
                 return Ok(Some(result));
             }
+
+            // Step completed successfully -- emit its real content for
+            // ChatPane.tsx's staged/incremental reveal (items.id=245-ish),
+            // distinct from the step-START announcement above (which fires
+            // before content exists). last_output() is the step just pushed
+            // by execute_step() above.
+            let step_content = self
+                .task_track
+                .as_ref()
+                .and_then(|tt| tt.last_output())
+                .map(|s| s.to_owned());
+            self.emit_status_with_content(
+                "running",
+                Some(&step.display_name),
+                step_content.as_deref(),
+            );
 
             checkpoint_counter += 1;
             if checkpoint_counter >= checkpoint_every && !self._checkpointing_suspended {

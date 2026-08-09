@@ -86,13 +86,19 @@ pub struct ResumeRunRequest {
 // Commands
 // ---------------------------------------------------------------------------
 
-#[tauri::command]
-#[specta::specta]
-pub async fn submit_focus_run(
+/// Shared LOAD+AUTHORIZE core of submit_focus_run, factored out so callers
+/// besides the plain submit_focus_run IPC command (namely
+/// commands::messages::send_message, items.id=245-ish) can retain ownership
+/// of the constructed, authorized `FocusRun` across the execute_full() await
+/// instead of only getting back a bare run_id -- e.g. to write the run's
+/// eventual output into a different store once generation completes.
+/// submit_focus_run itself doesn't need this: it fires execute_full() and
+/// forgets it, relying entirely on push events for progress.
+pub(crate) async fn load_and_authorize_run(
     app_handle: tauri::AppHandle,
     scheduler: tauri::State<'_, Arc<ConductorScheduler>>,
     request: SubmitFocusRunRequest,
-) -> Result<SubmitFocusRunResponse, String> {
+) -> Result<FocusRun, String> {
     let is_quick_ask = request.focus_id == "quick-ask";
     let scheduler = Arc::clone(&*scheduler);
     let confirmed_cross_persona_fact_ids: std::collections::HashSet<String> = request
@@ -121,9 +127,21 @@ pub async fn submit_focus_run(
     );
 
     // Phase 1 LOAD and Phase 2 AUTHORIZE run synchronously before returning,
-    // guaranteeing a valid run_id is available in the response.
+    // guaranteeing a valid run_id is available to the caller.
     run.load().await.map_err(|e| e.to_string())?;
     run.authorize().await.map_err(|e| e.to_string())?;
+
+    Ok(run)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn submit_focus_run(
+    app_handle: tauri::AppHandle,
+    scheduler: tauri::State<'_, Arc<ConductorScheduler>>,
+    request: SubmitFocusRunRequest,
+) -> Result<SubmitFocusRunResponse, String> {
+    let mut run = load_and_authorize_run(app_handle, scheduler, request).await?;
 
     let run_id = run
         .focus_run_id

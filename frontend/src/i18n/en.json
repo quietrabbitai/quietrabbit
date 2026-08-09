@@ -14,7 +14,19 @@
       "myFactsPlaceholder": "My Facts -- not yet built.",
       "chatPlaceholder": "Chat -- not yet wired for this screen.",
       "tier3ContextPlaceholder": "QR's own conversation stays visible here alongside Tier 3 (Section 9) -- not yet wired.",
-      "tier3ChatPlaceholder": "Chat -- not yet wired."
+      "tier3ChatUnavailable": "Chat is unavailable -- no Persona is associated with this Tier 3 session."
+    },
+    "chat": {
+      "emptyTranscript": "No messages yet.",
+      "loadError": "Could not load messages: {{message}}",
+      "sendError": "Could not send: {{message}}",
+      "inputLabel": "Message",
+      "inputPlaceholder": "Type a message…",
+      "sendButton": "Send",
+      "unsentBadge": "Not sent",
+      "notSentNotice": "This isn't saved or sent yet -- secure sign-in isn't wired up in this build. Your text stays on screen for now, but it'll be gone if you reload or navigate away.",
+      "generating": "Generating… ({{elapsed}}s)",
+      "generatingWithStep": "Generating: {{step}}… ({{elapsed}}s)"
     },
     "personaHub": {
       "focusesHeading": "Focuses",

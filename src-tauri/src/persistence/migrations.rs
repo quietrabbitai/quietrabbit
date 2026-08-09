@@ -79,6 +79,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/keys_001.sql"),
     },
     SchemaFile {
+        prefix: "messages",
+        version: 1,
+        sql: include_str!("../../schema/messages_001.sql"),
+    },
+    SchemaFile {
         prefix: "outputs",
         version: 1,
         sql: include_str!("../../schema/outputs_001.sql"),
@@ -601,6 +606,23 @@ pub async fn migrate_outputs_db(
     std::fs::create_dir_all(db_path.parent().unwrap())?;
     let mut conn = open_raw(&db_path).await?;
     run_migrations(&mut conn, "outputs", Some(key_hex)).await
+}
+
+/// Migrate a user's messages.db (encrypted). key_hex: bare hex bytes only.
+pub async fn migrate_messages_db(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+) -> Result<u32, MigrationError> {
+    let db_path = get_data_root()
+        .join("users")
+        .join(user_id)
+        .join("personas")
+        .join(persona_id)
+        .join("messages.db");
+    std::fs::create_dir_all(db_path.parent().unwrap())?;
+    let mut conn = open_raw(&db_path).await?;
+    run_migrations(&mut conn, "messages", Some(key_hex)).await
 }
 
 /// Migrate a user's integration_keys.db (encrypted). key_hex: bare hex bytes only.

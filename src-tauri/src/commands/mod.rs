@@ -48,6 +48,7 @@ pub mod consent;
 pub mod execution;
 pub mod focus_builder;
 pub mod library;
+pub mod messages;
 pub mod notifications;
 pub mod onboarding;
 pub mod persona;

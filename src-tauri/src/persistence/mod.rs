@@ -6,6 +6,7 @@ pub mod domain_context_store;
 pub mod entity_store;
 pub mod focus_settings_store;
 pub mod integration_keys_store;
+pub mod message_store;
 pub mod migrations;
 pub mod output_store;
 pub mod persona_store;

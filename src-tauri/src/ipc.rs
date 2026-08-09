@@ -99,6 +99,9 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::tier3_pane::open_tier3_panes,
         commands::tier3_pane::close_tier3_pane,
         commands::tier3_pane::set_pane_layout,
+        // Group 14 -- Messages/transcript (ChatPane.tsx backing)
+        commands::messages::send_message,
+        commands::messages::list_messages,
     ])
 }
 

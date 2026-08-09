@@ -30,6 +30,7 @@ import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import './NavShell.css'
 import { commands, type PersonaInfo } from '../bindings'
+import { ChatPane } from '../chat/ChatPane'
 import { MiddleZone } from '../middleZone/MiddleZone'
 import { DEFAULT_BROWSING_PROFILE } from '../middleZone/middleZoneConfig'
 import { PersonaHub } from './PersonaHub'
@@ -55,6 +56,15 @@ export function NavShell() {
   const [navState, setNavState] = useState<NavState>(DEFAULT_NAV_STATE)
   const [personas, setPersonas] = useState<PersonaInfo[]>([])
   const [personaError, setPersonaError] = useState<string | null>(null)
+  // The persona a Tier 3 session was opened from. isTier3Enabled requires
+  // the CURRENT anchor to be a Persona, but selectAnchor({kind:'fixed',
+  // id:'tier3'}) discards that persona from navState.anchor on the very
+  // same transition -- NavState has no room to carry it through (AnchorId's
+  // 'fixed' variant isn't per-button-parameterized). Tier3AccessPane needs
+  // a real personaId for persistence (every store in this codebase is
+  // opened per user/persona -- no exceptions), so this is captured here,
+  // once, right before the anchor switches.
+  const [tier3PersonaId, setTier3PersonaId] = useState<string | null>(null)
 
   useEffect(() => {
     commands.listPersonas(getPlaceholderUserId()).then((result) => {
@@ -67,7 +77,13 @@ export function NavShell() {
   }, [])
 
   const handleSelectFixed = (id: FixedButtonId) => {
-    if (id === 'tier3' && !isTier3Enabled(navState)) return
+    if (id === 'tier3') {
+      if (!isTier3Enabled(navState)) return
+      // isTier3Enabled guarantees anchor.kind === 'persona' here.
+      if (navState.anchor.kind === 'persona') {
+        setTier3PersonaId(navState.anchor.personaId)
+      }
+    }
     setNavState(selectAnchor({ kind: 'fixed', id }))
   }
 
@@ -165,6 +181,7 @@ export function NavShell() {
         <NavShellContent
           content={content}
           onOpenPersonaLibrary={handleOpenPersonaLibrary}
+          tier3PersonaId={tier3PersonaId}
         />
       </div>
     </main>
@@ -174,6 +191,7 @@ export function NavShell() {
 interface NavShellContentProps {
   content: ContentDescriptor
   onOpenPersonaLibrary: (personaId: string) => void
+  tier3PersonaId: string | null
 }
 
 /** Resolves the current ContentDescriptor to what actually mounts in the
@@ -184,11 +202,13 @@ interface NavShellContentProps {
 function NavShellContent({
   content,
   onOpenPersonaLibrary,
+  tier3PersonaId,
 }: NavShellContentProps) {
   const { t } = useTranslation()
+  const [personaHubGenerating, setPersonaHubGenerating] = useState(false)
 
   if (content.type === 'tier3') {
-    return <Tier3AccessPane />
+    return <Tier3AccessPane personaId={tier3PersonaId} />
   }
 
   if (content.type === 'personaHub') {
@@ -196,14 +216,24 @@ function NavShellContent({
       <MiddleZone
         contextKey={`persona-hub-${content.personaId}`}
         profile={DEFAULT_BROWSING_PROFILE}
-        isGenerating={false}
+        isGenerating={personaHubGenerating}
         contextPane={
           <PersonaHub
             personaId={content.personaId}
             onOpenLibrary={() => onOpenPersonaLibrary(content.personaId)}
           />
         }
-        chatPane={<p>{t('navShell.content.chatPlaceholder')}</p>}
+        chatPane={
+          <ChatPane
+            contextKey={`persona-hub-${content.personaId}`}
+            userId={getPlaceholderUserId()}
+            personaId={content.personaId}
+            keyHex={null}
+            focusId="quick-ask"
+            gate3Track={false}
+            onGenerating={setPersonaHubGenerating}
+          />
+        }
       />
     )
   }

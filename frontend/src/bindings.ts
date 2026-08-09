@@ -234,6 +234,8 @@ export const commands = {
 	 *  reads `PaneLayoutState` directly), so there is nothing left to query.
 	 */
 	setPaneLayout: (layout: PaneLayoutEntry[]) => typedError<null, string>(__TAURI_INVOKE("set_pane_layout", { layout })),
+	sendMessage: (userId: string, personaId: string, keyHex: string, contextKey: string, content: string, focusId: string, gate3Track: boolean) => typedError<MessageInfo[], string>(__TAURI_INVOKE("send_message", { userId, personaId, keyHex, contextKey, content, focusId, gate3Track })),
+	listMessages: (userId: string, personaId: string, keyHex: string, contextKey: string) => typedError<MessageInfo[], string>(__TAURI_INVOKE("list_messages", { userId, personaId, keyHex, contextKey })),
 };
 
 /* Types */
@@ -301,6 +303,16 @@ export type HealthResponse = {
 	ollama_source: string,
 	/**  Always false until integration_keys store is ported (Group 9 stub). */
 	tier2_configured: boolean,
+};
+
+export type MessageInfo = {
+	id: string,
+	context_key: string,
+	sender: string,
+	content: string,
+	focus_run_id: string | null,
+	gate3_review_status: string | null,
+	created_at: string,
 };
 
 /**
