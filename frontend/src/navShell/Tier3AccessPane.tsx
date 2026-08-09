@@ -13,10 +13,11 @@
 // side-by-side relationship is what this pane is responsible for.
 //
 // Does NOT mount the outbound Privacy Guardian gate that must precede
-// this screen in the real flow (items.id=233 -- explicitly out of scope
-// for items.id=232, blocked on it). Same caller responsibility
-// Tier3Selector's own header already documents; this pane is the
-// caller, and still doesn't do it.
+// this screen in the real flow. items.id=233 investigated this (its
+// former blocker, items.id=232, is now resolved) and confirmed which
+// gate applies, then deliberately descoped to this stub rather than
+// build the real flow -- see the loud marker at the Tier3Selector
+// render site below for what's still missing and why.
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -149,6 +150,47 @@ export function Tier3AccessPane() {
         {providers.length === 0 && !providerError && (
           <p>{t('navShell.tier3AccessPane.loadingProviders')}</p>
         )}
+        {/*
+         * NO OUTBOUND PRIVACY GUARDIAN REVIEW HAPPENS BEFORE THIS SCREEN.
+         * items.id=233 -- confirmed (2026-08-09) which gate belongs here,
+         * then deliberately descoped to this stub rather than build the
+         * real flow this session. Per TIER3_ACCESS_MODEL.md's locked
+         * design, the Selector screen below must not be reachable until
+         * a Privacy Guardian review has resolved on the drafted content
+         * headed to Tier 3 -- today it renders unconditionally instead.
+         *
+         * Confirmed gate: PG_GATE_3 (conductor/privacy/gate3.rs), NOT
+         * Gate 1 and NOT Gate 4. TIER3_ACCESS_MODEL.md states plainly
+         * that Tier 3's outbound review "uses the locked per-span modal
+         * directly, with Tier 3 destination forcing the High tier" --
+         * i.e. PRIVACY_GUARDIAN_GATE_SPEC.md's Easy/Medium/High modal,
+         * which gate3.rs's assign_review_tier() already implements
+         * (target_tier >= 3 forces ReviewTier::High). Gate 1 is wrong
+         * for this trigger point regardless of naming: it needs an
+         * executing Focus step's PersonalTrack/step_id/focus_run_id,
+         * none of which exist here -- commands.openTier3Panes takes
+         * only provider IDs. Gate 4 is uncited in any spec doc.
+         *
+         * gate3() DOES have a real call site -- conductor/executor.rs:632,
+         * inside the Conductor's own Focus-execution step loop -- but it
+         * is not exposed as an IPC command, and it needs ctx.step /
+         * focus_run_id / a prior step's response content, none of which
+         * exist at this trigger point either. Useful precedent for the
+         * data shape the real wiring will need, not something reusable
+         * as-is.
+         *
+         * Three pieces are missing before this can be real, none built:
+         *   1. A starter-drafting step -- TIER3_ACCESS_MODEL.md's
+         *      "QR-only pre-conversation" state, where QR assembles the
+         *      content that will actually cross to Tier 3. MiddleZone
+         *      here is still a placeholder with no real chat wiring, so
+         *      there is no drafted content to gate in the first place.
+         *   2. An IPC path that runs gate3() against that drafted
+         *      content and returns/streams the result to this screen.
+         *   3. The Easy/Medium/High consent modal UI itself
+         *      (PRIVACY_GUARDIAN_GATE_SPEC.md) -- no such component
+         *      exists anywhere in frontend/src today.
+         */}
         {providers.length > 0 && (
           <Tier3Selector providers={providers} onConfirm={handleConfirm} />
         )}
