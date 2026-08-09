@@ -231,6 +231,26 @@ function describePlaceholder(
   switch (content.type) {
     case 'activeBoard':
       return t('navShell.content.activeBoardPlaceholder')
+    // items.id=243 -- commands.copyOutputToClipboard is a complete, tested
+    // backend command: a real Privacy Guardian egress scan
+    // (output_scan::scan_output, Full intensity -- see commands/library.rs's
+    // prepare_clipboard_copy) gates the copy, then writes to the system
+    // clipboard via tauri-plugin-clipboard-manager. Retired gate4.rs's
+    // permanent stub (content_approved was always true) in favor of this.
+    //
+    // No caller wires it yet because there is nothing to wire it FROM --
+    // this placeholder is Library's entire screen today (no list, no detail
+    // view, output content never reaches the frontend at all). Building
+    // that screen is real, separately-scoped work -- see navShellConfig.ts's
+    // own header note that Library "has no built screen yet." Deliberately
+    // descoped rather than build a Library viewer inside a Gate4-retirement
+    // task (same judgment call as commit 49dc315 / items.id=233).
+    //
+    // When the Library screen exists: add a Copy button that calls
+    // commands.copyOutputToClipboard(outputId, userId, personaId, keyHex)
+    // and surfaces a rejected promise's message directly to the user --
+    // it is already the actionable, clipboard-specific message, not a
+    // generic error to be replaced.
     case 'library':
       return content.personaFilter
         ? t('navShell.content.libraryPlaceholderFiltered')

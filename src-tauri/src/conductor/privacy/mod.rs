@@ -5,7 +5,6 @@ pub mod errors;
 pub mod gate1;
 pub mod gate2;
 pub mod gate3;
-pub mod gate4;
 pub mod logger;
 pub mod output_scan;
 pub mod privacy_filter;
@@ -19,7 +18,7 @@ pub mod types;
 
 use errors::DisclosureLogWriteError;
 use logger::DisclosureLogger;
-use types::{Gate1Result, Gate2Result, Gate3Result, Gate4Result, PersonalTrack};
+use types::{Gate1Result, Gate2Result, Gate3Result, PersonalTrack};
 
 pub struct PrivacyGateway<L: DisclosureLogger> {
     pub logger: L,
@@ -104,23 +103,6 @@ impl<L: DisclosureLogger> PrivacyGateway<L> {
             space_max_permitted_tier,
             execution_tier,
             app_handle,
-        )
-        .await
-    }
-
-    pub async fn gate4(
-        &self,
-        step_id: &str,
-        focus_run_id: &str,
-        content_sensitivity_severity: u8,
-        execution_tier: u8,
-    ) -> Result<Gate4Result, DisclosureLogWriteError> {
-        gate4::gate4(
-            &self.logger,
-            step_id,
-            focus_run_id,
-            content_sensitivity_severity,
-            execution_tier,
         )
         .await
     }

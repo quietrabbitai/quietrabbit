@@ -153,6 +153,12 @@ export const commands = {
 	 *  out of scope for R1.
 	 */
 	deleteOutput: (outputId: string, userId: string, personaId: string, keyHex: string, deepPurge: boolean | null) => typedError<null, string>(__TAURI_INVOKE("delete_output", { outputId, userId, personaId, keyHex, deepPurge })),
+	/**
+	 *  Thin IPC wrapper -- the actual system-clipboard write via
+	 *  tauri-plugin-clipboard-manager. See prepare_clipboard_copy for the real
+	 *  (tested) logic.
+	 */
+	copyOutputToClipboard: (outputId: string, userId: string, personaId: string, keyHex: string) => typedError<null, string>(__TAURI_INVOKE("copy_output_to_clipboard", { outputId, userId, personaId, keyHex })),
 	getFocusBuilderSession: (focusId: string | null) => typedError<NotImplementedPlaceholder, string>(__TAURI_INVOKE("get_focus_builder_session", { focusId })),
 	submitFocusBuilderStep: (sessionId: string, input: NotImplementedPlaceholder) => typedError<NotImplementedPlaceholder, string>(__TAURI_INVOKE("submit_focus_builder_step", { sessionId, input })),
 	/**

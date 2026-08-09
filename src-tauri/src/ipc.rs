@@ -77,6 +77,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::library::list_outputs,
         commands::library::get_output,
         commands::library::delete_output,
+        commands::library::copy_output_to_clipboard,
         // Group 8 -- Focus Builder (stubs)
         commands::focus_builder::get_focus_builder_session,
         commands::focus_builder::submit_focus_builder_step,

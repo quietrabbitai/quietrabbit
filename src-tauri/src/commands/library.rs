@@ -40,9 +40,25 @@ use std::collections::HashMap;
 
 use serde::Serialize;
 use specta::Type;
+use tauri_plugin_clipboard_manager::ClipboardExt;
 
+use crate::conductor::privacy::output_scan::{scan_output, ScanIntensity};
+use crate::conductor::privacy::types::Sensitivity;
+use crate::persistence::disclosure_log_store::SqliteDisclosureLogger;
 use crate::persistence::focus_settings_store;
 use crate::persistence::output_store;
+
+/// String -> Sensitivity -> severity mapping. Mirrors executor.rs's
+/// to_gate_track() fail-safe: unrecognised/"general" values map to General.
+fn sensitivity_severity(sensitivity: &str) -> u8 {
+    match sensitivity {
+        "personal" => Sensitivity::Personal,
+        "medical" => Sensitivity::Medical,
+        "financial" => Sensitivity::Financial,
+        _ => Sensitivity::General,
+    }
+    .severity()
+}
 
 /// Whether the Focus owning `focus_id` is in 'protected' profile, per
 /// focus_settings.focus_profile (D6-294). A missing focus_settings row
@@ -183,6 +199,94 @@ pub async fn delete_output(
         .map_err(|e| e.to_string())
 }
 
+/// The real clipboard gate (items.id=243), replacing the retired gate4.rs
+/// stub (content_approved was always true). Runs output_scan::scan_output()
+/// at Full intensity -- when Privacy Filter is available this blocks on any
+/// detected PII span, not just a coarse severity tier (a deliberate
+/// tightening vs the old stub, confirmed with Jason: clipboard has no
+/// checkpoint after it, so the stricter per-entity block is the right
+/// tradeoff here).
+///
+/// Kept free of AppHandle/clipboard I/O on purpose -- this is the
+/// privacy-critical logic and is directly unit-testable via cargo test.
+/// Returns the content to copy on success, or the user-facing blocked
+/// message on failure.
+async fn prepare_clipboard_copy(
+    output_id: &str,
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+) -> Result<String, String> {
+    let record = output_store::get_output(user_id, persona_id, key_hex, output_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "not_found".to_string())?;
+
+    if is_protected(persona_id, &record.focus_id).await? {
+        return Err("not_found".to_string());
+    }
+
+    let execution_tier = output_store::get_focus_run_routing_tier(
+        user_id,
+        persona_id,
+        key_hex,
+        &record.focus_run_id,
+    )
+    .await
+    .map_err(|e| e.to_string())?
+    .unwrap_or(1) as u8;
+
+    let logger = SqliteDisclosureLogger::new(user_id, persona_id, key_hex);
+    let severity = sensitivity_severity(&record.sensitivity);
+
+    let result = scan_output(
+        &logger,
+        &format!("clipboard-copy-{output_id}"),
+        &record.focus_run_id,
+        &record.content,
+        execution_tier,
+        severity,
+        ScanIntensity::Full,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if result.blocked {
+        // Actionable, clipboard-specific -- not scan_output's generic
+        // "can't be exported as-is" message, which doesn't say what the
+        // user can still do. No [Get help] bracket: checked whether any
+        // frontend code renders these as real links -- nothing does today,
+        // so a dangling affordance would be worse than none here.
+        return Err(
+            "This output contains information that can't be copied to your clipboard \
+             automatically. You can still view and use it here in Quiet Rabbit -- copy \
+             only the parts you need by hand."
+                .to_string(),
+        );
+    }
+
+    Ok(record.content)
+}
+
+/// Thin IPC wrapper -- the actual system-clipboard write via
+/// tauri-plugin-clipboard-manager. See prepare_clipboard_copy for the real
+/// (tested) logic.
+#[tauri::command]
+#[specta::specta]
+pub async fn copy_output_to_clipboard(
+    app: tauri::AppHandle,
+    output_id: String,
+    user_id: String,
+    persona_id: String,
+    key_hex: String,
+) -> Result<(), String> {
+    let content = prepare_clipboard_copy(&output_id, &user_id, &persona_id, &key_hex).await?;
+
+    app.clipboard()
+        .write_text(content)
+        .map_err(|e| e.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -215,6 +319,11 @@ mod tests {
     /// Real shared.db + real encrypted outputs.db via the actual migration
     /// path, plus a persona row -- mirrors auth.rs/tier2.rs's setup()
     /// pattern. Exercises the real store queries end to end, not mocks.
+    ///
+    /// Also migrates personal.db (items.id=243): prepare_clipboard_copy's
+    /// SqliteDisclosureLogger writes to disclosure_log, which lives in
+    /// personal.db -- unlike the pre-existing list/get/delete tests, the
+    /// clipboard tests actually exercise that write, so it must exist here.
     async fn setup() -> TestEnv {
         let lock = ENV_MUTEX.lock().unwrap();
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
@@ -228,6 +337,9 @@ mod tests {
         crate::persistence::migrations::migrate_outputs_db(USER_ID, PERSONA_ID, KEY_HEX)
             .await
             .expect("outputs.db migration must succeed in test setup");
+        crate::persistence::migrations::migrate_personal_db(USER_ID, PERSONA_ID, KEY_HEX)
+            .await
+            .expect("personal.db migration must succeed in test setup");
         // user_personas.user_id REFERENCES users(id) -- create_persona's
         // FK requires a real users row first.
         crate::auth::user_store::create_user(
@@ -402,5 +514,121 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].content, "a content");
+    }
+
+    // -----------------------------------------------------------------------
+    // prepare_clipboard_copy (items.id=243)
+    //
+    // This dev environment has Privacy Filter FFI disabled
+    // (PRIVACY_FILTER_LIB_DIR unset -- confirmed by the `cargo build`
+    // warning), so scan_output() deterministically takes the legacy
+    // severity-based fallback path here: blocks Full intensity at
+    // severity >= 3 (medical/financial). Same discipline output_scan.rs's
+    // own tests already document -- PF_INSTANCE is a process-wide latch,
+    // so exercising the legacy path directly/deterministically via
+    // severity choice is the established pattern, not a new one.
+    // -----------------------------------------------------------------------
+
+    /// Like seed_output_for_focus, but lets the caller pick sensitivity
+    /// instead of hardcoding "general" -- needed to exercise the blocked path.
+    async fn seed_output_with_sensitivity(
+        focus_id: &str,
+        focus_profile: &str,
+        content: &str,
+        sensitivity: &str,
+    ) -> String {
+        focus_settings_store::create_focus_settings(
+            PERSONA_ID,
+            focus_id,
+            "bidirectional",
+            "shared",
+            2,
+            2,
+            focus_profile,
+            None,
+        )
+        .await
+        .expect("create_focus_settings must succeed in test setup");
+
+        let focus_run_id = format!("run-{focus_id}");
+        output_store::test_seed_focus_run(USER_ID, PERSONA_ID, KEY_HEX, &focus_run_id, focus_id)
+            .await
+            .expect("test_seed_focus_run must succeed in test setup");
+
+        output_store::save_output(
+            USER_ID,
+            PERSONA_ID,
+            KEY_HEX,
+            &focus_run_id,
+            "note",
+            content,
+            sensitivity,
+            None,
+        )
+        .await
+        .expect("save_output must succeed in test setup")
+    }
+
+    #[tokio::test]
+    async fn clipboard_copy_succeeds_for_low_severity_output() {
+        let _env = setup().await;
+        let output_id =
+            seed_output_with_sensitivity("focus-open", "open", "shareable content", "general")
+                .await;
+
+        let result = prepare_clipboard_copy(&output_id, USER_ID, PERSONA_ID, KEY_HEX).await;
+
+        assert_eq!(result, Ok("shareable content".to_string()));
+    }
+
+    #[tokio::test]
+    async fn clipboard_copy_blocks_financial_severity_output() {
+        let _env = setup().await;
+        let output_id = seed_output_with_sensitivity(
+            "focus-open",
+            "open",
+            "account number 123456789",
+            "financial",
+        )
+        .await;
+
+        let result = prepare_clipboard_copy(&output_id, USER_ID, PERSONA_ID, KEY_HEX).await;
+
+        let err = result.expect_err("financial-severity output must be blocked");
+        assert!(
+            err.contains("clipboard") && err.contains("view and use it here"),
+            "blocked message must be actionable, not generic: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn clipboard_copy_blocks_protected_focus_output_as_not_found() {
+        let _env = setup().await;
+        let output_id = seed_output_with_sensitivity(
+            "focus-protected",
+            "protected",
+            "protected content",
+            "general",
+        )
+        .await;
+
+        let result = prepare_clipboard_copy(&output_id, USER_ID, PERSONA_ID, KEY_HEX).await;
+
+        assert_eq!(
+            result.unwrap_err(),
+            "not_found",
+            "a Protected output must not be clipboard-copyable, and must be \
+             indistinguishable from a nonexistent one"
+        );
+    }
+
+    #[tokio::test]
+    async fn clipboard_copy_still_returns_not_found_for_a_genuinely_missing_id() {
+        let _env = setup().await;
+
+        let result =
+            prepare_clipboard_copy("does-not-exist", USER_ID, PERSONA_ID, KEY_HEX).await;
+
+        assert_eq!(result.unwrap_err(), "not_found");
     }
 }

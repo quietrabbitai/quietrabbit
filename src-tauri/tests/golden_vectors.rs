@@ -1,13 +1,22 @@
 // src-tauri/tests/golden_vectors.rs
 //
-// Golden-vector parity suite for Gate1-4.
-// Loads src-tauri/tests/golden/gate{1,2,3,4}.json (Python oracle output)
+// Golden-vector parity suite for Gate1-3.
+// Loads src-tauri/tests/golden/gate{1,2,3}.json (Python oracle output)
 // and asserts that the Rust port produces bit-identical results.
 //
-// Gate3 and Gate4: inputs are fully stored in fixture -- driven directly.
+// Gate3: inputs are fully stored in fixture -- driven directly.
 // Gate1 and Gate2: fixture stores outputs only -- inputs reconstructed from
 //   label strings using the same logic as the Python extraction script.
 // apply_abstraction: all inputs stored in fixture -- driven directly.
+//
+// Gate4 (items.id=243): gate4.rs was a permanent stub, retired in favor of
+// output_scan.rs's scan_output() wired in as the real clipboard gate
+// (commands/library.rs's prepare_clipboard_copy). test_gate4 and its
+// gate4.json fixture-driven parity check were removed along with it --
+// output_scan.rs has its own inline unit tests instead (not a Python-oracle
+// port, so no golden fixture applies). gate4.json itself is left in place,
+// unread, matching this suite's own precedent of not touching fixture files
+// on removal (see items.id=231's gate1.json).
 
 use std::path::PathBuf;
 
@@ -18,7 +27,6 @@ use quietrabbit_lib::conductor::privacy::{
     gate1::gate1,
     gate2::gate2,
     gate3::gate3,
-    gate4::gate4,
     logger::{FailLogger, TestLogger},
     types::{AbstractionPolicy, PersonalField, PersonalTrack, Sensitivity},
 };
@@ -995,64 +1003,3 @@ async fn test_gate3() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Test: gate4 (inputs fully in fixture)
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn test_gate4() {
-    let root = load_json("gate4.json");
-    let vectors = root.as_array().expect("gate4.json must be array");
-
-    for v in vectors {
-        let label = v["label"].as_str().unwrap();
-        let severity = v["content_sensitivity_severity"].as_u64().unwrap() as u8;
-        let expected_approved = v["content_approved"].as_bool().unwrap();
-        let expected_clipboard = v["clipboard_blocked"].as_bool().unwrap();
-
-        let logger = TestLogger::new();
-        let result = gate4(
-            &logger,
-            &format!("step-{label}"),
-            &format!("run-{label}"),
-            severity,
-            3,
-        )
-        .await
-        .unwrap_or_else(|e| panic!("{label}: gate4 returned Err: {e}"));
-
-        assert_eq!(
-            result.content_approved, expected_approved,
-            "content_approved MISMATCH [{label}]"
-        );
-        assert_eq!(
-            result.clipboard_blocked, expected_clipboard,
-            "clipboard_blocked MISMATCH [{label}]"
-        );
-
-        // Always writes disclosure log
-        assert_eq!(
-            logger.entry_count(),
-            1,
-            "Expected 1 disclosure log write [{label}]"
-        );
-        assert_eq!(
-            logger.entries()[0].event_type,
-            "gate4_stub_validation",
-            "event_type MISMATCH [{label}]"
-        );
-
-        // plain_language present iff clipboard_blocked
-        if expected_clipboard {
-            assert!(
-                result.plain_language.is_some(),
-                "Clipboard-blocked gate4 must have plain_language [{label}]"
-            );
-        } else {
-            assert!(
-                result.plain_language.is_none(),
-                "Non-blocked gate4 must not have plain_language [{label}]"
-            );
-        }
-    }
-}

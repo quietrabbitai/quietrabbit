@@ -71,6 +71,7 @@ async fn async_main() {
     // module docs on why, and how commands::tier3_pane reaches it via
     // AppHandle::run_on_main_thread instead of Tauri-managed state).
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_clipboard_manager::init())
         .manage(scheduler)
         .manage(ollama_client)
         .manage(quietrabbit_lib::commands::tier3_pane::PaneLayoutState::default())

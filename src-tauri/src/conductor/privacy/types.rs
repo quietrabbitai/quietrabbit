@@ -152,15 +152,6 @@ pub struct Gate3Result {
     pub timeout: bool,
 }
 
-#[derive(Debug)]
-pub struct Gate4Result {
-    pub content_approved: bool,
-    pub clipboard_blocked: bool,
-    pub plain_language: Option<String>,
-}
-
-pub const CLIPBOARD_MAX_SENSITIVITY_SEVERITY: u8 = 2;
-
 // -- Privacy Guardian Gate 3 IPC types ----------------------------------------
 //
 // These types cross the Tauri IPC boundary and must derive Serialize,

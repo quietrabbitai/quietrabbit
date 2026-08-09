@@ -311,6 +311,32 @@ pub async fn get_focus_run_status(
     }
 }
 
+/// Fetch the routing_tier_used (the tier the run actually executed under) for
+/// a focus run. Returns None if the run isn't found or the column is NULL
+/// (routing_tier_used is nullable -- e.g. a run that never completed).
+/// Same connection-per-call shape as get_focus_run_status above.
+pub async fn get_focus_run_routing_tier(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    focus_run_id: &str,
+) -> Result<Option<i32>, OutputStoreError> {
+    let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
+
+    let row = sqlx::query("SELECT routing_tier_used FROM focus_runs WHERE id = ?")
+        .bind(focus_run_id)
+        .fetch_optional(&mut conn)
+        .await?;
+
+    match row {
+        None => Ok(None),
+        Some(r) => Ok(r
+            .try_get::<Option<i64>, _>("routing_tier_used")
+            .map_err(OutputStoreError::Database)?
+            .map(|v| v as i32)),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // List
 // ---------------------------------------------------------------------------
