@@ -14,7 +14,12 @@
 // resume_run: routes by focus_run status. For awaiting_extract_confirm:
 //   crash-recovery replay, then re-emit if pending > 0, or not_implemented
 //   if pending == 0 (output() is owned by submit_extract_confirm, not here).
-//   Other statuses: returns not_implemented (stub unchanged).
+//   complete/cancelled/failed: distinct "run_already_finished" error (terminal,
+//   nothing to resume). awaiting_feedback: distinct "no_resume_needed" error
+//   (output already saved, Phase 6 feedback out of scope). awaiting_user/
+//   paused/running/initializing: still not_implemented -- blocked on
+//   user_input never being persisted, so a live FocusRun can't be
+//   reconstructed to re-enter execute() (see resume_run()'s own doc comment).
 //
 // Lifecycle ownership for awaiting_extract_confirm (item 20):
 //   resume_run() = crash recovery + UI rehydration only.
@@ -192,6 +197,10 @@ pub async fn cancel_run(
 
 /// Resume a paused focus run.
 ///
+/// Routes by focus_runs.status (schema/outputs_001.sql CHECK — the full set
+/// is 'initializing','running','paused','awaiting_user','awaiting_feedback',
+/// 'awaiting_extract_confirm','complete','cancelled','failed').
+///
 /// awaiting_extract_confirm routing:
 ///   1. Crash-recovery replay: rows with status='confirmed' AND persisted_at IS NULL
 ///      -> replay persist_confirmed_field() + set_persisted_at() using persisted
@@ -201,7 +210,26 @@ pub async fn cancel_run(
 ///      submit_extract_confirm once the user submits decisions -- not from here.
 ///      Full snapshot replay for this path is deferred post-Release-1.
 ///
-/// Other statuses: returns not_implemented (stub behaviour unchanged).
+/// complete/cancelled/failed: terminal -- there is nothing to resume, so this
+/// returns a distinct "already finished" error rather than not_implemented,
+/// which would incorrectly imply resume itself is the missing piece.
+///
+/// awaiting_feedback: Phase 5 OUTPUT already ran and saved content (see
+/// lifecycle.rs output()) -- Phase 6 FEEDBACK is explicitly out of scope of
+/// the FocusRun module (lifecycle.rs module header, "out of scope for this
+/// module (async paste-back)"). Nothing is pending execution; the caller
+/// should fetch the already-produced output via get_run_output instead.
+///
+/// awaiting_user, paused, running, initializing: genuinely not_implemented
+/// (unchanged stub behaviour). All four are blocked on the same structural
+/// gap, not a missing switch statement: FocusRun::new() requires
+/// `user_input`, and every step's prompt render threads it through
+/// StepContext (lifecycle.rs execute_step()) -- but user_input is never
+/// persisted anywhere (not on focus_runs, not in focus_run_snapshots). There
+/// is currently no way to reconstruct a live FocusRun to re-enter execute()
+/// for any of these four statuses without first adding somewhere to store
+/// it, which is a schema change, not a resume_run fix. See each match arm
+/// below for the state-specific detail on top of that shared blocker.
 #[tauri::command]
 #[specta::specta]
 pub async fn resume_run(
@@ -224,8 +252,55 @@ pub async fn resume_run(
     .map_err(|e| e.to_string())?
     .ok_or_else(|| "not_found".to_string())?;
 
-    if status != "awaiting_extract_confirm" {
-        return Err("not_implemented".to_string());
+    match status.as_str() {
+        "awaiting_extract_confirm" => {}
+
+        // Terminal -- resuming a finished run is meaningless. Distinct from
+        // not_implemented: nothing needs building here, the run is just done.
+        "complete" | "cancelled" | "failed" => {
+            return Err(format!("run_already_finished:{status}"));
+        }
+
+        // Phase 5 OUTPUT already completed and saved content; Phase 6
+        // FEEDBACK (the only thing this status is waiting on) is out of
+        // scope of this module. Nothing to resume -- direct the caller to
+        // the output that already exists instead of claiming this is unbuilt.
+        "awaiting_feedback" => {
+            return Err("no_resume_needed:awaiting_feedback -- output already \
+                         produced, call get_run_output"
+                .to_string());
+        }
+
+        // Tier 3 boundary (lifecycle.rs execute(), routing_tier == 3) or a
+        // consent-gate pause (handle_step_failure()'s AwaitUser/HoldForGate/
+        // OfferTier2/OfferCompact/AwaitFloorConsent/AwaitConsent actions).
+        // consent.rs's own module header ("lifecycle checks consent_decisions
+        // when the run is resumed") names resume_run as the intended
+        // re-attachment point once the user answers the consent_decisions
+        // row those commands write -- but reattaching means rebuilding
+        // PersonalTrack/TaskTrack/SharedStateTrack from focus_run_snapshots
+        // and continuing execute() from current_step, which hits the
+        // missing-user_input blocker described above.
+        "awaiting_user" => return Err("not_implemented".to_string()),
+
+        // Crash-demoted by demote_interrupted_runs() (stale 'running' or
+        // 'initializing', see that function's own doc comment) -- the
+        // FocusRun actor that held the live tracks is gone. Same
+        // missing-user_input blocker; additionally needs the
+        // focus_run_snapshots -> PersonalTrack/TaskTrack/SharedStateTrack
+        // rehydration that reentry.rs explicitly declined to build (see its
+        // module header: it only computes a plan, it does not resume).
+        "paused" => return Err("not_implemented".to_string()),
+
+        // Set at Phase 3 INITIALIZE (lifecycle.rs initialize(), before the
+        // EXECUTE loop starts) or Phase 2 AUTHORIZE (authorize(), before
+        // tracks even exist). A row seen in either state via resume_run
+        // implies either a very recent crash (not yet demoted to 'paused' by
+        // demote_interrupted_runs()) or that demotion never ran -- same
+        // missing-user_input blocker as 'paused' either way.
+        "running" | "initializing" => return Err("not_implemented".to_string()),
+
+        other => return Err(format!("not_implemented:unrecognized_status:{other}")),
     }
 
     // Step 1: crash-recovery replay.

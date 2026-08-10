@@ -10,6 +10,10 @@ export const commands = {
 	/**
 	 *  Resume a paused focus run.
 	 * 
+	 *  Routes by focus_runs.status (schema/outputs_001.sql CHECK — the full set
+	 *  is 'initializing','running','paused','awaiting_user','awaiting_feedback',
+	 *  'awaiting_extract_confirm','complete','cancelled','failed').
+	 * 
 	 *  awaiting_extract_confirm routing:
 	 *    1. Crash-recovery replay: rows with status='confirmed' AND persisted_at IS NULL
 	 *       -> replay persist_confirmed_field() + set_persisted_at() using persisted
@@ -19,7 +23,26 @@ export const commands = {
 	 *       submit_extract_confirm once the user submits decisions -- not from here.
 	 *       Full snapshot replay for this path is deferred post-Release-1.
 	 * 
-	 *  Other statuses: returns not_implemented (stub behaviour unchanged).
+	 *  complete/cancelled/failed: terminal -- there is nothing to resume, so this
+	 *  returns a distinct "already finished" error rather than not_implemented,
+	 *  which would incorrectly imply resume itself is the missing piece.
+	 * 
+	 *  awaiting_feedback: Phase 5 OUTPUT already ran and saved content (see
+	 *  lifecycle.rs output()) -- Phase 6 FEEDBACK is explicitly out of scope of
+	 *  the FocusRun module (lifecycle.rs module header, "out of scope for this
+	 *  module (async paste-back)"). Nothing is pending execution; the caller
+	 *  should fetch the already-produced output via get_run_output instead.
+	 * 
+	 *  awaiting_user, paused, running, initializing: genuinely not_implemented
+	 *  (unchanged stub behaviour). All four are blocked on the same structural
+	 *  gap, not a missing switch statement: FocusRun::new() requires
+	 *  `user_input`, and every step's prompt render threads it through
+	 *  StepContext (lifecycle.rs execute_step()) -- but user_input is never
+	 *  persisted anywhere (not on focus_runs, not in focus_run_snapshots). There
+	 *  is currently no way to reconstruct a live FocusRun to re-enter execute()
+	 *  for any of these four statuses without first adding somewhere to store
+	 *  it, which is a schema change, not a resume_run fix. See each match arm
+	 *  below for the state-specific detail on top of that shared blocker.
 	 */
 	resumeRun: (request: ResumeRunRequest) => typedError<string, string>(__TAURI_INVOKE("resume_run", { request })),
 	submitConsentDecision: (request: SubmitConsentDecisionRequest) => typedError<null, string>(__TAURI_INVOKE("submit_consent_decision", { request })),
