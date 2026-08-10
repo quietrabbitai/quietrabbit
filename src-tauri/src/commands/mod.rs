@@ -39,6 +39,12 @@ use specta::Type;
 /// UPDATE (items.id=185, 2026-08-02): tier2::get_tier2_config now has a real
 /// return type (commands::tier2::Tier2Config) and no longer uses this
 /// placeholder -- four of the original five remain unbuilt.
+///
+/// UPDATE (items.id=229, 2026-08-09): auth::get_recovery_key_display also
+/// stopped using this placeholder (commands::auth::RecoveryKeyDisplay) --
+/// it was never one of the original five (it started using this type later,
+/// in commit dddc086/items.id=205, after this doc comment was written), so
+/// its removal doesn't change the "four of five" count above.
 #[derive(Debug, Serialize, Deserialize, Type)]
 pub struct NotImplementedPlaceholder {}
 

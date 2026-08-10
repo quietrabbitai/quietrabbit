@@ -73,6 +73,12 @@ argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 # duplicate-major-version dependency tree.
 getrandom = "0.4"
 
+# Recovery-key mnemonic (Architecture/AUTH_MULTIUSER_ARCHITECTURE.md Section
+# 5, Section 8.5 -- Option B, mnemonic IS the master key). Default features
+# (alloc, std, unicode-normalization) are sufficient: English is the built-in
+# wordlist, not a feature-gated language.
+bip39 = "2.2.2"
+
 # Networking & Errors
 reqwest = { version = "0.12", features = ["json"] }
 thiserror = "1"

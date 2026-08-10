@@ -222,7 +222,16 @@ export const commands = {
 	dismissNotification: (notificationId: string) => typedError<null, string>(__TAURI_INVOKE("dismiss_notification", { notificationId })),
 	login: (displayName: string, password: string) => typedError<null, string>(__TAURI_INVOKE("login", { displayName, password })),
 	logout: () => typedError<null, string>(__TAURI_INVOKE("logout")),
-	getRecoveryKeyDisplay: () => typedError<NotImplementedPlaceholder, string>(__TAURI_INVOKE("get_recovery_key_display")),
+	/**
+	 *  Derive and return the current session's recovery mnemonic for one-time
+	 *  display. Section 8.5's Option B: `Mnemonic::from_entropy()` on the raw
+	 *  32-byte master key directly, not a wrapper key -- `Mnemonic::parse()` on
+	 *  the returned phrase later recovers the exact original bytes, no
+	 *  unwrapping step. Requires a resident session (KeyRegistry) the same way
+	 *  tier2::get_tier2_config does; "not logged in" is the same error string
+	 *  for the same reason -- there is no key to derive a mnemonic from yet.
+	 */
+	getRecoveryKeyDisplay: () => typedError<RecoveryKeyDisplay, string>(__TAURI_INVOKE("get_recovery_key_display")),
 	getHealth: () => typedError<HealthResponse, string>(__TAURI_INVOKE("get_health")),
 	getCapabilityProfile: () => typedError<CapabilityProfileResponse, string>(__TAURI_INVOKE("get_capability_profile")),
 	/**
@@ -404,6 +413,12 @@ export type MessageInfo = {
  *  UPDATE (items.id=185, 2026-08-02): tier2::get_tier2_config now has a real
  *  return type (commands::tier2::Tier2Config) and no longer uses this
  *  placeholder -- four of the original five remain unbuilt.
+ * 
+ *  UPDATE (items.id=229, 2026-08-09): auth::get_recovery_key_display also
+ *  stopped using this placeholder (commands::auth::RecoveryKeyDisplay) --
+ *  it was never one of the original five (it started using this type later,
+ *  in commit dddc086/items.id=205, after this doc comment was written), so
+ *  its removal doesn't change the "four of five" count above.
  */
 export type NotImplementedPlaceholder = Record<string, never>;
 
@@ -499,6 +514,15 @@ export type ProviderHealth = {
 };
 
 export type ProviderStatus = "available" | "degraded" | "unavailable";
+
+/**
+ *  One-time recovery mnemonic display. Never persisted anywhere past this
+ *  response -- QR holds no copy of `mnemonic` or the entropy it was derived
+ *  from once this call returns (Section 5/8.5 invariant).
+ */
+export type RecoveryKeyDisplay = {
+	mnemonic: string,
+};
 
 export type RequestTier3Gate3ReviewRequest = {
 	user_id: string,

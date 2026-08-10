@@ -88,7 +88,8 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::tier2::set_tier2_provider,
         // Group 10 -- Notifications (stub)
         commands::notifications::dismiss_notification,
-        // Group 11 -- Auth (stubs)
+        // Group 11 -- Auth (items.id=205, 2026-08-01; get_recovery_key_display
+        // wired items.id=229, 2026-08-09 -- none of the three are stubs now)
         commands::auth::login,
         commands::auth::logout,
         commands::auth::get_recovery_key_display,

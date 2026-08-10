@@ -4,8 +4,13 @@
 //
 // login/logout wired items.id=205 (2026-08-01) against the auth foundation
 // (auth::kdf, auth::registry, auth::user_store) built earlier this session.
-// get_recovery_key_display remains stubbed -- Section 5 (recovery mnemonic)
-// is explicitly out of items.id=205's scope per the Chat-PM ruling.
+// get_recovery_key_display wired items.id=229 (2026-08-09) per Architecture/
+// AUTH_MULTIUSER_ARCHITECTURE.md Section 5/8.5 (Option B: the mnemonic IS
+// the master key, not a wrapper around it) -- reads the resident master key
+// out of KeyRegistry and encodes it via BIP39, never persisting it. Only
+// meaningful immediately after a session is established (bootstrap login or
+// a later recovery flow); "not logged in" is a real, expected error path,
+// not an internal-inconsistency case.
 //
 // SIGNATURE CHANGE, flagged: login() originally took only `password:
 // String`. It now also takes `display_name: String` -- user_store's
@@ -63,6 +68,18 @@ use tauri::State;
 use crate::auth::kdf;
 use crate::auth::registry::{KeyRegistry, UnlockedKey};
 use crate::auth::user_store;
+
+// ---------------------------------------------------------------------------
+// IPC types
+// ---------------------------------------------------------------------------
+
+/// One-time recovery mnemonic display. Never persisted anywhere past this
+/// response -- QR holds no copy of `mnemonic` or the entropy it was derived
+/// from once this call returns (Section 5/8.5 invariant).
+#[derive(Debug, serde::Serialize, serde::Deserialize, specta::Type)]
+pub struct RecoveryKeyDisplay {
+    pub mnemonic: String,
+}
 
 // ---------------------------------------------------------------------------
 // shared.db opener (for auth_sessions/auth_failures/auth_lockouts)
@@ -400,11 +417,28 @@ pub async fn logout(key_registry: State<'_, KeyRegistry>) -> Result<(), String> 
     Ok(())
 }
 
+/// Derive and return the current session's recovery mnemonic for one-time
+/// display. Section 8.5's Option B: `Mnemonic::from_entropy()` on the raw
+/// 32-byte master key directly, not a wrapper key -- `Mnemonic::parse()` on
+/// the returned phrase later recovers the exact original bytes, no
+/// unwrapping step. Requires a resident session (KeyRegistry) the same way
+/// tier2::get_tier2_config does; "not logged in" is the same error string
+/// for the same reason -- there is no key to derive a mnemonic from yet.
 #[tauri::command]
 #[specta::specta]
-pub async fn get_recovery_key_display() -> Result<crate::commands::NotImplementedPlaceholder, String>
-{
-    Err("not_implemented".to_string())
+pub async fn get_recovery_key_display(
+    key_registry: State<'_, KeyRegistry>,
+) -> Result<RecoveryKeyDisplay, String> {
+    let master_key = key_registry
+        .with_key(|k| k.master_key)
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
+    let mnemonic = bip39::Mnemonic::from_entropy(&master_key)
+        .map_err(|e| e.to_string())?
+        .to_string();
+
+    Ok(RecoveryKeyDisplay { mnemonic })
 }
 
 #[cfg(test)]
@@ -704,5 +738,52 @@ mod tests {
 
         let result = logout(registry.clone()).await;
         assert!(result.is_ok(), "logout with no resident key must not error");
+    }
+
+    #[tokio::test]
+    async fn get_recovery_key_display_fails_without_a_resident_session() {
+        let _env = setup().await;
+        let app = mock_app_with_registry();
+        let registry = app.state::<KeyRegistry>();
+
+        let result = get_recovery_key_display(registry.clone()).await;
+        assert_eq!(result.err(), Some("not logged in".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn get_recovery_key_display_mnemonic_round_trips_to_the_exact_master_key() {
+        // Section 8.5: "the mnemonic IS the master key" -- Mnemonic::parse()
+        // on the displayed phrase must reconstruct the original 32 bytes
+        // bit-for-bit, no wrapping.
+        let _env = setup().await;
+        let app = mock_app_with_registry();
+        let registry = app.state::<KeyRegistry>();
+
+        login(
+            "Alice".to_owned(),
+            "correct horse battery staple".to_owned(),
+            registry.clone(),
+        )
+        .await
+        .unwrap();
+
+        let resident_key = registry.with_key(|k| k.master_key).await.unwrap();
+
+        let display = get_recovery_key_display(registry.clone()).await.unwrap();
+        assert_eq!(
+            display.mnemonic.split_whitespace().count(),
+            24,
+            "256 bits of entropy must encode to a 24-word BIP39 phrase"
+        );
+
+        let recovered: [u8; kdf::MASTER_KEY_LEN] = bip39::Mnemonic::parse(&display.mnemonic)
+            .unwrap()
+            .to_entropy()
+            .try_into()
+            .unwrap();
+        assert_eq!(
+            recovered, resident_key,
+            "recovered entropy must match the resident master key exactly"
+        );
     }
 }
