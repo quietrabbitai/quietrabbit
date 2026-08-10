@@ -374,7 +374,18 @@ export type HealthResponse = {
 	 *  "unavailable" is returned during the brief startup detection window.
 	 */
 	ollama_source: string,
-	/**  Always false until integration_keys store is ported (Group 9 stub). */
+	/**
+	 *  True iff an active user-global key exists for ANY Tier 2 provider
+	 *  (mistral or groq) -- a capability-status signal ("is Tier 2 usable
+	 *  at all," e.g. for an onboarding nudge), not a report of which
+	 *  provider is active. Provider *selection* at execution time is a
+	 *  separate, currently-unwired concern (executor.rs hardcodes Groq
+	 *  today; users.tier2_provider_preference exists in schema but nothing
+	 *  reads it yet) -- out of scope for this field, confirmed no-loss
+	 *  this session: there is no per-provider consumer downstream to feed.
+	 *  False, not an error, when no session is resident -- get_health must
+	 *  stay callable pre-login (Ollama status has no such requirement).
+	 */
 	tier2_configured: boolean,
 };
 
