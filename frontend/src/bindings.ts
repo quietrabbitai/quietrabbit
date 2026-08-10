@@ -92,6 +92,56 @@ export const commands = {
 	 *  the whole run).
 	 */
 	getPendingCrossPersonaConfirmations: (request: GetPendingCrossPersonaConfirmationsRequest) => typedError<PendingCrossPersonaFact[], string>(__TAURI_INVOKE("get_pending_cross_persona_confirmations", { request })),
+	/**
+	 *  PG_GATE_3, invoked against a drafted Tier-3-starter message
+	 *  (messages.gate3_review_status = 'drafted', written by
+	 *  commands::messages::send_message's gate3_track=true path). Completes
+	 *  items.id=233's remaining stub -- see the former "NO OUTBOUND PRIVACY
+	 *  GUARDIAN REVIEW HAPPENS" marker this command replaces in
+	 *  Tier3AccessPane.tsx for the investigation that scoped it.
+	 * 
+	 *  Unlike every other command in this file, this one *triggers* gate3()
+	 *  rather than *responding to* an already-fired one -- gate3()'s only prior
+	 *  call site was conductor/executor.rs's own step-execution loop, with no
+	 *  StepContext/PersonalTrack available here.
+	 * 
+	 *  Parameter sourcing (fixed/derived from quick-ask.focus, not guessed):
+	 *    - target_tier=3: this flow only exists ahead of Tier 3 access.
+	 *    - execution_tier=1, content_sensitivity_severity=1: quick-ask.focus
+	 *      declares max_routing_tier: 1 and field_requirements: [] -- no
+	 *      personal fields ever flow through it. target_tier=3 alone already
+	 *      forces ReviewTier::High and defeats gate3's zero-span auto-approve
+	 *      path (zero_spans_safe_to_auto_approve's target_tier >= 3 arm)
+	 *      regardless of severity, so this default does not weaken review.
+	 *    - step_id="draft", focus_name="Quick Ask": quick-ask.focus's own step
+	 *      id and display_name.
+	 *    - space_max_permitted_tier: a real per-Persona focus_settings lookup,
+	 *      never a constant -- missing row is a hard Err, mirroring AUTHORIZE's
+	 *      own assertion (lifecycle.rs).
+	 * 
+	 *  Uses SqliteDisclosureLogger (FocusRun's own default logger), not
+	 *  NoopLogger/TestLogger, so the write-before-surface disclosure_log entry
+	 *  gate3() writes is real, not discarded.
+	 * 
+	 *  gate3_review_status transition: 'pending_consent' -> 'pending-review';
+	 *  'approved' (PF found nothing needing review) -> 'approved'. On
+	 *  'blocked'/'timeout' the row is left at 'drafted' -- gate3_review_status's
+	 *  CHECK constraint has no "blocked" state, and leaving it at 'drafted'
+	 *  keeps the row retry-able rather than overloading 'withheld' (a status
+	 *  meaning the user declined, not that gate3 itself refused).
+	 */
+	requestTier3Gate3Review: (request: RequestTier3Gate3ReviewRequest) => typedError<Gate3ReviewResult, string>(__TAURI_INVOKE("request_tier3_gate3_review", { request })),
+	/**
+	 *  Records the user's resolution of a Privacy Guardian consent review
+	 *  (pending-review -> approved | withheld). Separate from
+	 *  submit_element_consent_decision: that command writes the per-span audit
+	 *  record to outputs.db's consent_decisions (keyed by run_id); this one
+	 *  transitions messages.db's gate3_review_status (keyed by message_id) --
+	 *  two different persistence targets. The frontend calls both after the
+	 *  user resolves the Privacy Guardian modal (submit_element_consent_decision
+	 *  first, then this).
+	 */
+	resolveTier3Gate3Review: (request: ResolveTier3Gate3ReviewRequest) => typedError<null, string>(__TAURI_INVOKE("resolve_tier3_gate3_review", { request })),
 	getOnboardingFocusSuggestions: (personas: string[]) => typedError<NotImplementedPlaceholder, string>(__TAURI_INVOKE("get_onboarding_focus_suggestions", { personas })),
 	submitOnboardingPersonaSelection: (personas: string[]) => typedError<string[], string>(__TAURI_INVOKE("submit_onboarding_persona_selection", { personas })),
 	submitOnboardingFocusSelection: (focusSelections: NotImplementedPlaceholder[]) => typedError<string[], string>(__TAURI_INVOKE("submit_onboarding_focus_selection", { focusSelections })),
@@ -281,6 +331,20 @@ export type FocusInfo = {
 	updated_at: string,
 };
 
+/**
+ *  IPC-safe projection of Gate3Result — Gate3Result itself derives neither
+ *  Serialize nor specta::Type (it's an internal gate3.rs/executor.rs return
+ *  type). Field-for-field mirror; see Gate3Result's own doc comments for
+ *  what each bool means.
+ */
+export type Gate3ReviewResult = {
+	approved: boolean,
+	blocked: boolean,
+	pending_consent: boolean,
+	timeout: boolean,
+	plain_language: string | null,
+};
+
 export type GetPendingCrossPersonaConfirmationsRequest = {
 	user_id: string,
 	persona_id: string,
@@ -435,6 +499,27 @@ export type ProviderHealth = {
 };
 
 export type ProviderStatus = "available" | "degraded" | "unavailable";
+
+export type RequestTier3Gate3ReviewRequest = {
+	user_id: string,
+	persona_id: string,
+	key_hex: string,
+	message_id: string,
+};
+
+export type ResolveTier3Gate3ReviewRequest = {
+	user_id: string,
+	persona_id: string,
+	key_hex: string,
+	message_id: string,
+	/**
+	 *  "approved" | "withheld" -- the two terminal states a resolved
+	 *  consent review can reach. "drafted"/"pending-review" are gate3's own
+	 *  transitions (request_tier3_gate3_review writes those), not valid
+	 *  input here.
+	 */
+	status: string,
+};
 
 export type ResumeRunRequest = {
 	run_id: string,

@@ -33,6 +33,13 @@ export interface ChatPaneProps {
   /** Lets the caller compute MiddleZone's isGenerating prop for real,
    *  replacing today's hardcoded false at both call sites. */
   onGenerating?: (isGenerating: boolean) => void
+  /** Fires once, per run, the moment a gate3Track=true assistant reply has
+   *  been backfilled with real content and is still gate3_review_status
+   *  'drafted' -- the signal that it's ready for Privacy Guardian review.
+   *  Only ever fires when gate3Track is true; ignored (never called) for
+   *  Persona-hub usage. The caller (Tier3AccessPane) is responsible for
+   *  invoking commands.requestTier3Gate3Review with the given messageId. */
+  onDraftReady?: (messageId: string) => void
 }
 
 /** Hand-declared, not generated: RunStatusPayload (conductor/lifecycle.rs)
@@ -74,6 +81,7 @@ export function ChatPane({
   focusId,
   gate3Track,
   onGenerating,
+  onDraftReady,
 }: ChatPaneProps) {
   const { t } = useTranslation()
   const [messages, setMessages] = useState<MessageInfo[]>([])
@@ -173,6 +181,25 @@ export function ChatPane({
             if (cancelled) return
             if (result.status === 'ok') {
               setMessages(result.data)
+              // Draft-ready signal (items.id=233): only for gate3Track
+              // usage, and only the first time this run's assistant row is
+              // seen still 'drafted' -- a later re-fetch (e.g. contextKey
+              // unchanged, a second send on the same mount) would otherwise
+              // re-fire for the same message once its status has already
+              // moved past 'drafted'.
+              if (gate3Track) {
+                const drafted = [...result.data]
+                  .reverse()
+                  .find(
+                    (m) =>
+                      m.sender === 'assistant' &&
+                      m.focus_run_id === activeRunId &&
+                      m.gate3_review_status === 'drafted',
+                  )
+                if (drafted) {
+                  onDraftReady?.(drafted.id)
+                }
+              }
             }
             setActiveRunId(null)
             setLiveContent('')
@@ -192,7 +219,7 @@ export function ChatPane({
       cancelled = true
       unlisten?.()
     }
-  }, [activeRunId, userId, personaId, keyHex, contextKey])
+  }, [activeRunId, userId, personaId, keyHex, contextKey, gate3Track, onDraftReady])
 
   // Elapsed-time-aware "generating..." messaging for the gaps between step
   // reveals -- pure frontend presentation, no backend involvement.
@@ -271,6 +298,11 @@ export function ChatPane({
               <span className="chat-pane__message-content">
                 {m.id === liveMessageId && liveContent ? liveContent : m.content}
               </span>
+              {m.gate3_review_status === 'pending-review' && (
+                <span className="chat-pane__pending-review-notice">
+                  {t('navShell.chat.pendingReviewNotice')}
+                </span>
+              )}
             </li>
           ))}
           {localUnsent.map((m) => (

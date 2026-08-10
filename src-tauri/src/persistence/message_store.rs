@@ -217,6 +217,34 @@ pub async fn list_messages(
     Ok(out)
 }
 
+/// Fetch a single message by id — the read a gate3-review command needs
+/// before mutating gate3_review_status. Returns None if not found (an
+/// Option return, not a NotFound error variant, since "not found" is a
+/// normal caller-checkable condition here, matching
+/// focus_settings_store::get_focus_settings's own shape).
+pub async fn get_message(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    message_id: &str,
+) -> Result<Option<MessageRecord>, MessageStoreError> {
+    let mut conn = open_messages_db(user_id, persona_id, key_hex).await?;
+
+    let row = sqlx::query(
+        "SELECT id, context_key, sender, content, focus_run_id, gate3_review_status, created_at
+         FROM messages
+         WHERE id = ?",
+    )
+    .bind(message_id)
+    .fetch_optional(&mut conn)
+    .await?;
+
+    match row {
+        None => Ok(None),
+        Some(r) => Ok(Some(row_to_message_record(&r).map_err(MessageStoreError::Database)?)),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Update
 // ---------------------------------------------------------------------------
@@ -558,6 +586,45 @@ mod tests {
         assert_eq!(persona_hub_transcript[0].content, "persona hub message");
         assert_eq!(tier3_transcript.len(), 1);
         assert_eq!(tier3_transcript[0].content, "tier3 message");
+    }
+
+    #[tokio::test]
+    async fn get_message_returns_the_saved_row() {
+        let _env = setup().await;
+
+        let record = save_message(
+            USER_ID,
+            PERSONA_ID,
+            KEY_HEX,
+            "tier3-access-persona-1",
+            "assistant",
+            "drafted starter text",
+            Some("run-1"),
+            Some("drafted"),
+        )
+        .await
+        .expect("save_message must succeed");
+
+        let fetched = get_message(USER_ID, PERSONA_ID, KEY_HEX, &record.id)
+            .await
+            .expect("get_message must succeed")
+            .expect("message must exist");
+
+        assert_eq!(fetched.id, record.id);
+        assert_eq!(fetched.content, "drafted starter text");
+        assert_eq!(fetched.focus_run_id.as_deref(), Some("run-1"));
+        assert_eq!(fetched.gate3_review_status.as_deref(), Some("drafted"));
+    }
+
+    #[tokio::test]
+    async fn get_message_returns_none_for_unknown_id() {
+        let _env = setup().await;
+
+        let fetched = get_message(USER_ID, PERSONA_ID, KEY_HEX, "no-such-id")
+            .await
+            .expect("get_message must succeed");
+
+        assert!(fetched.is_none());
     }
 
     #[tokio::test]

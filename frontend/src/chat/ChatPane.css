@@ -82,6 +82,12 @@
   background: var(--code-bg);
 }
 
+.chat-pane__pending-review-notice {
+  font-size: 12px;
+  color: var(--text);
+  align-self: flex-start;
+}
+
 .chat-pane__input-row {
   display: flex;
   align-items: center;

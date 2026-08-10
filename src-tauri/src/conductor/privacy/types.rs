@@ -152,6 +152,31 @@ pub struct Gate3Result {
     pub timeout: bool,
 }
 
+/// IPC-safe projection of Gate3Result — Gate3Result itself derives neither
+/// Serialize nor specta::Type (it's an internal gate3.rs/executor.rs return
+/// type). Field-for-field mirror; see Gate3Result's own doc comments for
+/// what each bool means.
+#[derive(Debug, Clone, Serialize, specta::Type)]
+pub struct Gate3ReviewResult {
+    pub approved: bool,
+    pub blocked: bool,
+    pub pending_consent: bool,
+    pub timeout: bool,
+    pub plain_language: Option<String>,
+}
+
+impl From<Gate3Result> for Gate3ReviewResult {
+    fn from(r: Gate3Result) -> Self {
+        Self {
+            approved: r.approved,
+            blocked: r.blocked,
+            pending_consent: r.pending_consent,
+            timeout: r.timeout,
+            plain_language: r.plain_language,
+        }
+    }
+}
+
 // -- Privacy Guardian Gate 3 IPC types ----------------------------------------
 //
 // These types cross the Tauri IPC boundary and must derive Serialize,

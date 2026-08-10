@@ -1,0 +1,356 @@
+/* Privacy Guardian consent modal -- visual treatment per
+ * PRIVACY_GUARDIAN_GATE_SPEC.md (LOCKED). Deliberately does NOT consume
+ * index.css's --text/--bg/--border/--accent set the way every other
+ * component in this tree does -- this modal is a fixed "authority" surface
+ * (--pg-ink/--pg-ember/--pg-sage-mist, also declared in index.css) that
+ * does not track the app's light/dark theme, per that variable block's own
+ * comment. rgba() opacity variants below are computed from those same two
+ * colors (Ink #242c2a -> rgb(36,44,42), Ember #b04030 -> rgb(176,64,48)) --
+ * plain CSS has no var()-based alpha composition available here without a
+ * color-mix()/build-step this codebase doesn't otherwise use.
+ *
+ * Font: the spec calls for "DM Sans" throughout; this codebase has no font
+ * loading mechanism for anything beyond the system stack declared in
+ * index.css's --sans/--heading, so this file falls back to var(--sans)
+ * rather than silently failing a @font-face that was never set up. */
+
+.pg-modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+}
+
+.pg-modal {
+  width: 560px;
+  max-width: calc(100vw - 32px);
+  max-height: 580px;
+  display: flex;
+  flex-direction: column;
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--pg-sage-mist);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.18);
+  font-family: var(--sans);
+  text-align: left;
+}
+
+.pg-modal__header {
+  flex-shrink: 0;
+  height: 52px;
+  padding: 0 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--pg-ink);
+}
+
+.pg-modal__header-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--pg-ember);
+  flex-shrink: 0;
+}
+
+.pg-modal__header-title {
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  color: rgba(230, 233, 226, 0.85);
+}
+
+.pg-modal__subheader {
+  flex-shrink: 0;
+  border-bottom: 1px solid rgba(36, 44, 42, 0.3);
+  padding: 12px 20px 8px;
+  font-size: 12px;
+  color: rgba(36, 44, 42, 0.55);
+}
+
+.pg-modal__body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 16px 20px;
+  position: relative;
+}
+
+.pg-modal__body::after {
+  /* Bottom fade over the scrollable row list -- sage mist to transparent,
+   * per spec. Purely decorative, so it does not intercept row clicks. */
+  content: '';
+  position: sticky;
+  display: block;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 20px;
+  margin-top: -20px;
+  background: linear-gradient(to bottom, transparent, var(--pg-sage-mist));
+  pointer-events: none;
+}
+
+.pg-modal__body--scanning,
+.pg-modal__body--confirming {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  text-align: center;
+  min-height: 160px;
+}
+
+.pg-modal__scanning-line {
+  font-size: 14px;
+  color: rgba(36, 44, 42, 0.7);
+}
+
+.pg-modal__scanning-slow-line {
+  font-size: 13px;
+  color: rgba(36, 44, 42, 0.55);
+}
+
+.pg-modal__confirmation {
+  font-size: 14px;
+  color: var(--pg-ink);
+}
+
+.pg-modal__cancel-button {
+  font-size: 13px;
+  color: rgba(36, 44, 42, 0.65);
+  border-radius: 6px;
+  border: 1px solid rgba(36, 44, 42, 0.2);
+  background: transparent;
+  padding: 6px 14px;
+  cursor: pointer;
+}
+
+.pg-modal__heading {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--pg-ink);
+  margin: 0 0 4px;
+}
+
+.pg-modal__subline {
+  font-size: 12px;
+  color: rgba(36, 44, 42, 0.55);
+  margin: 0 0 12px;
+}
+
+.pg-modal__select-all {
+  display: block;
+  margin-left: auto;
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: rgba(36, 44, 42, 0.5);
+  background: none;
+  border: none;
+  min-height: 44px;
+  cursor: pointer;
+}
+
+.pg-modal__row-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.pg-modal__row {
+  background: #fff;
+  border: 0.5px solid rgba(36, 44, 42, 0.15);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.pg-modal__row[data-tier='high'] {
+  border-left: 3px solid rgba(176, 64, 48, 0.15);
+}
+
+.pg-modal__row-header {
+  padding: 10px 14px 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.pg-modal__row-category {
+  font-size: 12px;
+  font-weight: 500;
+  color: rgba(36, 44, 42, 0.8);
+}
+
+.pg-modal__row-original {
+  font-size: 12px;
+  color: rgba(36, 44, 42, 0.6);
+  background: rgba(176, 64, 48, 0.08);
+  padding: 4px 8px;
+  border-radius: 3px;
+}
+
+.pg-modal__row-decision {
+  display: grid;
+  grid-template-columns: 60% 40%;
+  border-top: 1px solid rgba(36, 44, 42, 0.1);
+  margin-top: 10px;
+}
+
+.pg-modal__row-overrides {
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid rgba(36, 44, 42, 0.1);
+}
+
+.pg-modal__cell {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  text-align: left;
+  font: inherit;
+  padding: 12px 14px;
+  border: 1px solid rgba(36, 44, 42, 0.12);
+  background: none;
+  cursor: pointer;
+  min-height: 44px;
+}
+
+.pg-modal__row-overrides .pg-modal__cell:first-child {
+  border-bottom: 1px solid rgba(36, 44, 42, 0.1);
+}
+
+.pg-modal__cell--default.pg-modal__cell--generalize[data-selected] {
+  background: rgba(36, 44, 42, 0.08);
+  border-color: rgba(36, 44, 42, 0.3);
+}
+
+.pg-modal__cell--default.pg-modal__cell--keep_private[data-selected] {
+  background: rgba(36, 44, 42, 0.08);
+  border-color: rgba(36, 44, 42, 0.3);
+}
+
+.pg-modal__cell--keep_private.pg-modal__cell--override[data-selected] {
+  background: rgba(176, 64, 48, 0.08);
+  border-color: rgba(176, 64, 48, 0.25);
+}
+
+.pg-modal__cell--release_original[data-selected] {
+  background: rgba(176, 64, 48, 0.05);
+  border-color: rgba(176, 64, 48, 0.2);
+}
+
+.pg-modal__cell--override.pg-modal__cell--generalize[data-selected] {
+  background: rgba(36, 44, 42, 0.08);
+  border-color: rgba(36, 44, 42, 0.3);
+}
+
+.pg-modal__cell-label {
+  font-size: 13px;
+  font-weight: 500;
+  color: rgba(36, 44, 42, 0.85);
+}
+
+.pg-modal__cell--release_original .pg-modal__cell-label,
+.pg-modal__cell--override .pg-modal__cell-label {
+  font-size: 11px;
+  font-weight: 400;
+  color: rgba(36, 44, 42, 0.4);
+}
+
+.pg-modal__cell--release_original[data-selected] .pg-modal__cell-label {
+  color: rgba(36, 44, 42, 0.6);
+}
+
+.pg-modal__cell-suggestion {
+  font-size: 12px;
+  font-style: italic;
+  color: rgba(36, 44, 42, 0.65);
+}
+
+.pg-modal__cell-edit-affordance {
+  font: inherit;
+  font-size: 11px;
+  color: rgba(36, 44, 42, 0.45);
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+
+.pg-modal__cell-edit-field {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+}
+
+.pg-modal__cell-edit-field input {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  border: 1px solid rgba(36, 44, 42, 0.3);
+}
+
+.pg-modal__cell-edit-cancel {
+  border: none;
+  background: none;
+  color: rgba(36, 44, 42, 0.5);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.pg-modal__cta-row {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 20px 16px;
+  border-top: 1px solid rgba(36, 44, 42, 0.12);
+}
+
+.pg-modal__cta-count {
+  font-size: 12px;
+  color: rgba(36, 44, 42, 0.45);
+  margin-right: auto;
+}
+
+.pg-modal__keep-all-private {
+  font-size: 13px;
+  color: rgba(36, 44, 42, 0.65);
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+.pg-modal__send {
+  margin-left: auto;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--pg-sage-mist);
+  background: var(--pg-ink);
+  border: none;
+  border-radius: 6px;
+  padding: 8px 18px;
+  cursor: pointer;
+}
+
+.pg-modal__send:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}

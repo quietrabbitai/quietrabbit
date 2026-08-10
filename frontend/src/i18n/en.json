@@ -23,6 +23,7 @@
       "sendButton": "Send",
       "unsentBadge": "Not sent",
       "notSentNotice": "This isn't saved or sent yet -- secure sign-in isn't wired up in this build. Your text stays on screen for now, but it'll be gone if you reload or navigate away.",
+      "pendingReviewNotice": "Pending privacy review",
       "generating": "Generating… ({{elapsed}}s)",
       "generatingWithStep": "Generating: {{step}}… ({{elapsed}}s)"
     },
@@ -55,7 +56,10 @@
       "openPanesLabel": "Open panes",
       "noPanesOpen": "No panes open",
       "closeButton": "Close",
-      "dockLabel": "{{count}} pane(s) reserved here — actual CEF panes render as separate OS windows synced to this region, not inline"
+      "dockLabel": "{{count}} pane(s) reserved here — actual CEF panes render as separate OS windows synced to this region, not inline",
+      "gate3BlockedFallback": "This content can't be shared with Tier 3 right now.",
+      "gate3Withheld": "Kept private — nothing was sent to Tier 3.",
+      "gate3ReviewError": "Could not start the privacy review: {{message}}"
     }
   },
   "tier3Selector": {
@@ -63,5 +67,38 @@
     "tier3BoxLabel": "Account required, data retained",
     "selectionCount": "{{selected}} / {{max}} selected",
     "continueButton": "Continue"
+  },
+  "privacyGuardianModal": {
+    "headerTitle": "PRIVACY GUARDIAN",
+    "focusContext": "This came up while running your {{focusName}} focus.",
+    "scanningLine": "Privacy Guardian is reviewing what's about to leave.",
+    "scanningSlowLine": "This is taking longer than expected.",
+    "cancelButton": "Cancel",
+    "suggestionPlaceholder": "[Describe what to use instead]",
+    "editLabel": "Edit",
+    "cancelEdit": "Cancel edit",
+    "cellGeneralize": "Generalize",
+    "cellKeepPrivate": "Keep private",
+    "cellReleaseOriginal": "Release original",
+    "keepEverythingPrivate": "Keep everything private",
+    "confirmKeepAllPrivate": "Confirm — keep all private?",
+    "selectAllGeneralize": "Select all: Generalize",
+    "confirmSelectAll": "Confirm — select all?",
+    "selectedCount": "{{count}} of {{total}} selected",
+    "reviewedCount": "{{count}} of {{total}} reviewed",
+    "sendButton": "Send →",
+    "confirmAllKeptPrivate": "Kept private. Stopping here.",
+    "confirmMixed": "{{generalized}} generalized, {{keptPrivate}} kept private, {{released}} released original. Logged.",
+    "easy": {
+      "heading": "The following information is about to leave your device."
+    },
+    "medium": {
+      "heading": "Review what's about to leave your device.",
+      "subline": "Each item needs a decision. The suggestion is pre-selected."
+    },
+    "high": {
+      "heading": "Review carefully before anything leaves your device.",
+      "subline": "Each item needs a decision. Nothing is pre-authorized."
+    }
   }
 }

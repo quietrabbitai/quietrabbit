@@ -55,6 +55,15 @@
 //   "per-session, non-persisted") -- there is no submit_ command here writing
 //   a decision record, unlike the other consent commands in this file.
 //
+// request_tier3_gate3_review / resolve_tier3_gate3_review (items.id=233's
+//   remaining stub): the outbound Privacy Guardian review ahead of Tier 3
+//   access. Unlike every other command in this file, request_tier3_gate3_review
+//   *triggers* a gate rather than *responding to* one already fired --
+//   gate3()'s only prior call site was conductor/executor.rs's own
+//   step-execution loop, never exposed over IPC. See each command's own doc
+//   comment for the parameter-sourcing rationale (all fixed/derived from
+//   quick-ask.focus, not guessed).
+//
 // All commands are fire-and-respond: lifecycle checks consent_decisions when
 // the run is resumed. No direct signalling into the background task.
 // (get_pending_cross_persona_confirmations is a plain read query -- no
@@ -67,8 +76,11 @@ use sqlx::ConnectOptions;
 use sqlx::Row;
 
 use crate::conductor::extract;
-use crate::conductor::privacy::types::ExtractConfirmDecision;
+use crate::conductor::privacy::types::{ExtractConfirmDecision, Gate3ReviewResult};
+use crate::conductor::privacy::PrivacyGateway;
+use crate::persistence::disclosure_log_store::SqliteDisclosureLogger;
 use crate::persistence::focus_settings_store;
+use crate::persistence::message_store;
 use crate::persistence::output_store;
 use crate::persistence::output_store::{get_focus_run_status, set_focus_run_status};
 use crate::persistence::personal_store;
@@ -135,6 +147,27 @@ pub struct GetPendingCrossPersonaConfirmationsRequest {
     pub user_id: String,
     pub persona_id: String,
     pub key_hex: String,
+}
+
+#[derive(Debug, Deserialize, Type)]
+pub struct RequestTier3Gate3ReviewRequest {
+    pub user_id: String,
+    pub persona_id: String,
+    pub key_hex: String,
+    pub message_id: String,
+}
+
+#[derive(Debug, Deserialize, Type)]
+pub struct ResolveTier3Gate3ReviewRequest {
+    pub user_id: String,
+    pub persona_id: String,
+    pub key_hex: String,
+    pub message_id: String,
+    /// "approved" | "withheld" -- the two terminal states a resolved
+    /// consent review can reach. "drafted"/"pending-review" are gate3's own
+    /// transitions (request_tier3_gate3_review writes those), not valid
+    /// input here.
+    pub status: String,
 }
 
 /// items.id=92 -- the user's proceed/cancel answer to a FrictionGateDetail
@@ -596,6 +629,171 @@ pub async fn get_pending_cross_persona_confirmations(
         .collect())
 }
 
+/// The focus_id every gate3-reviewed drafted message is generated under.
+/// Tier 3 access has no dedicated Focus of its own -- FOCUS_ROADMAP.md:346
+/// ("Tier 3 -- shared infrastructure, built on-demand, not standalone
+/// Focuses") and TIER3_ACCESS_MODEL.md:413 both confirm the starter-drafting
+/// pre-conversation reuses the same "quick-ask" path Persona hub chat uses.
+const TIER3_DRAFT_FOCUS_ID: &str = "quick-ask";
+
+/// PG_GATE_3, invoked against a drafted Tier-3-starter message
+/// (messages.gate3_review_status = 'drafted', written by
+/// commands::messages::send_message's gate3_track=true path). Completes
+/// items.id=233's remaining stub -- see the former "NO OUTBOUND PRIVACY
+/// GUARDIAN REVIEW HAPPENS" marker this command replaces in
+/// Tier3AccessPane.tsx for the investigation that scoped it.
+///
+/// Unlike every other command in this file, this one *triggers* gate3()
+/// rather than *responding to* an already-fired one -- gate3()'s only prior
+/// call site was conductor/executor.rs's own step-execution loop, with no
+/// StepContext/PersonalTrack available here.
+///
+/// Parameter sourcing (fixed/derived from quick-ask.focus, not guessed):
+///   - target_tier=3: this flow only exists ahead of Tier 3 access.
+///   - execution_tier=1, content_sensitivity_severity=1: quick-ask.focus
+///     declares max_routing_tier: 1 and field_requirements: [] -- no
+///     personal fields ever flow through it. target_tier=3 alone already
+///     forces ReviewTier::High and defeats gate3's zero-span auto-approve
+///     path (zero_spans_safe_to_auto_approve's target_tier >= 3 arm)
+///     regardless of severity, so this default does not weaken review.
+///   - step_id="draft", focus_name="Quick Ask": quick-ask.focus's own step
+///     id and display_name.
+///   - space_max_permitted_tier: a real per-Persona focus_settings lookup,
+///     never a constant -- missing row is a hard Err, mirroring AUTHORIZE's
+///     own assertion (lifecycle.rs).
+///
+/// Uses SqliteDisclosureLogger (FocusRun's own default logger), not
+/// NoopLogger/TestLogger, so the write-before-surface disclosure_log entry
+/// gate3() writes is real, not discarded.
+///
+/// gate3_review_status transition: 'pending_consent' -> 'pending-review';
+/// 'approved' (PF found nothing needing review) -> 'approved'. On
+/// 'blocked'/'timeout' the row is left at 'drafted' -- gate3_review_status's
+/// CHECK constraint has no "blocked" state, and leaving it at 'drafted'
+/// keeps the row retry-able rather than overloading 'withheld' (a status
+/// meaning the user declined, not that gate3 itself refused).
+#[tauri::command]
+#[specta::specta]
+pub async fn request_tier3_gate3_review(
+    app_handle: tauri::AppHandle,
+    request: RequestTier3Gate3ReviewRequest,
+) -> Result<Gate3ReviewResult, String> {
+    let message = message_store::get_message(
+        &request.user_id,
+        &request.persona_id,
+        &request.key_hex,
+        &request.message_id,
+    )
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| "not_found".to_string())?;
+
+    if message.gate3_review_status.as_deref() != Some("drafted") {
+        return Err(format!(
+            "message {} is not awaiting gate3 review (gate3_review_status: {:?})",
+            request.message_id, message.gate3_review_status
+        ));
+    }
+    if message.content.is_empty() {
+        return Err(format!(
+            "message {} has no content yet -- draft generation has not \
+             finished backfilling",
+            request.message_id
+        ));
+    }
+    let focus_run_id = message.focus_run_id.clone().ok_or_else(|| {
+        format!(
+            "message {} has gate3_review_status='drafted' but no \
+             focus_run_id -- invariant violated",
+            request.message_id
+        )
+    })?;
+
+    let settings =
+        focus_settings_store::get_focus_settings(&request.persona_id, TIER3_DRAFT_FOCUS_ID)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| {
+                format!(
+                    "no focus_settings row for persona='{}' focus='{}'",
+                    request.persona_id, TIER3_DRAFT_FOCUS_ID
+                )
+            })?;
+
+    let gateway = PrivacyGateway::new(SqliteDisclosureLogger::new(
+        &request.user_id,
+        &request.persona_id,
+        &request.key_hex,
+    ));
+
+    let result = gateway
+        .gate3(
+            "draft",
+            &focus_run_id,
+            "Quick Ask",
+            &message.id,
+            &message.content,
+            1, // content_sensitivity_severity
+            3, // target_tier
+            settings.max_permitted_tier as u8,
+            1, // execution_tier
+            Some(&app_handle),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let new_status = if result.pending_consent {
+        Some("pending-review")
+    } else if result.approved {
+        Some("approved")
+    } else {
+        None
+    };
+    if let Some(status) = new_status {
+        message_store::update_gate3_review_status(
+            &request.user_id,
+            &request.persona_id,
+            &request.key_hex,
+            &request.message_id,
+            status,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+
+    Ok(result.into())
+}
+
+/// Records the user's resolution of a Privacy Guardian consent review
+/// (pending-review -> approved | withheld). Separate from
+/// submit_element_consent_decision: that command writes the per-span audit
+/// record to outputs.db's consent_decisions (keyed by run_id); this one
+/// transitions messages.db's gate3_review_status (keyed by message_id) --
+/// two different persistence targets. The frontend calls both after the
+/// user resolves the Privacy Guardian modal (submit_element_consent_decision
+/// first, then this).
+#[tauri::command]
+#[specta::specta]
+pub async fn resolve_tier3_gate3_review(
+    request: ResolveTier3Gate3ReviewRequest,
+) -> Result<(), String> {
+    if !matches!(request.status.as_str(), "approved" | "withheld") {
+        return Err(format!(
+            "status must be 'approved' or 'withheld', got '{}'",
+            request.status
+        ));
+    }
+    message_store::update_gate3_review_status(
+        &request.user_id,
+        &request.persona_id,
+        &request.key_hex,
+        &request.message_id,
+        &request.status,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -648,4 +846,218 @@ async fn write_floor_consent_preference(
         .await?;
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+//
+// request_tier3_gate3_review is NOT unit-tested at the command-function
+// level here -- it takes `app_handle: tauri::AppHandle`, which (like every
+// other AppHandle-taking command in this codebase -- submit_extract_confirm
+// in this same file, commands::execution::load_and_authorize_run,
+// commands::messages::send_message) has no fake/mock construction path in a
+// plain #[tokio::test], and there is zero existing precedent anywhere in
+// this codebase for unit-testing one. Its guard clauses (message not found,
+// wrong gate3_review_status, empty content, missing focus_settings row) are
+// straightforward re-reads of message_store::get_message and
+// focus_settings_store::get_focus_settings, both already covered by their
+// own module's tests; gate3() itself has its own extensive test suite
+// (conductor/privacy/gate3.rs). What remains genuinely untested by
+// construction is the wiring between them, exercised instead via a real
+// dev-server run against a provisioned key_hex, matching send_message's own
+// documented verification approach (commands/messages.rs's test module
+// comment).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::persistence::{focus_settings_store, message_store};
+    use crate::test_support::ENV_MUTEX;
+
+    const USER_ID: &str = "user-consent-test";
+    const PERSONA_ID: &str = "persona-consent-test";
+    const KEY_HEX: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+
+    struct TestEnv {
+        _tempdir: tempfile::TempDir,
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved_root: Option<String>,
+    }
+
+    impl Drop for TestEnv {
+        fn drop(&mut self) {
+            match &self.saved_root {
+                Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+                None => std::env::remove_var("QR_DATA_ROOT"),
+            }
+        }
+    }
+
+    async fn setup() -> TestEnv {
+        let lock = ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        crate::persistence::migrations::migrate_messages_db(USER_ID, PERSONA_ID, KEY_HEX)
+            .await
+            .expect("messages.db migration must succeed in test setup");
+
+        TestEnv {
+            _tempdir: tempdir,
+            _lock: lock,
+            saved_root,
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_tier3_gate3_review_rejects_invalid_status() {
+        let _env = setup().await;
+
+        let result = resolve_tier3_gate3_review(ResolveTier3Gate3ReviewRequest {
+            user_id: USER_ID.to_owned(),
+            persona_id: PERSONA_ID.to_owned(),
+            key_hex: KEY_HEX.to_owned(),
+            message_id: "msg-1".to_owned(),
+            status: "drafted".to_owned(),
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("must be 'approved' or 'withheld'"));
+    }
+
+    #[tokio::test]
+    async fn resolve_tier3_gate3_review_transitions_to_approved() {
+        let _env = setup().await;
+
+        let record = message_store::save_message(
+            USER_ID,
+            PERSONA_ID,
+            KEY_HEX,
+            "tier3-access-persona-1",
+            "assistant",
+            "drafted starter text",
+            Some("run-1"),
+            Some("pending-review"),
+        )
+        .await
+        .expect("save_message must succeed");
+
+        resolve_tier3_gate3_review(ResolveTier3Gate3ReviewRequest {
+            user_id: USER_ID.to_owned(),
+            persona_id: PERSONA_ID.to_owned(),
+            key_hex: KEY_HEX.to_owned(),
+            message_id: record.id.clone(),
+            status: "approved".to_owned(),
+        })
+        .await
+        .expect("resolve_tier3_gate3_review must succeed");
+
+        let fetched = message_store::get_message(USER_ID, PERSONA_ID, KEY_HEX, &record.id)
+            .await
+            .expect("get_message must succeed")
+            .expect("message must exist");
+        assert_eq!(fetched.gate3_review_status.as_deref(), Some("approved"));
+    }
+
+    #[tokio::test]
+    async fn resolve_tier3_gate3_review_transitions_to_withheld() {
+        let _env = setup().await;
+
+        let record = message_store::save_message(
+            USER_ID,
+            PERSONA_ID,
+            KEY_HEX,
+            "tier3-access-persona-1",
+            "assistant",
+            "drafted starter text",
+            Some("run-1"),
+            Some("pending-review"),
+        )
+        .await
+        .expect("save_message must succeed");
+
+        resolve_tier3_gate3_review(ResolveTier3Gate3ReviewRequest {
+            user_id: USER_ID.to_owned(),
+            persona_id: PERSONA_ID.to_owned(),
+            key_hex: KEY_HEX.to_owned(),
+            message_id: record.id.clone(),
+            status: "withheld".to_owned(),
+        })
+        .await
+        .expect("resolve_tier3_gate3_review must succeed");
+
+        let fetched = message_store::get_message(USER_ID, PERSONA_ID, KEY_HEX, &record.id)
+            .await
+            .expect("get_message must succeed")
+            .expect("message must exist");
+        assert_eq!(fetched.gate3_review_status.as_deref(), Some("withheld"));
+    }
+
+    /// TIER3_DRAFT_FOCUS_ID must stay "quick-ask" -- a silent rename here
+    /// would desync request_tier3_gate3_review's focus_settings lookup from
+    /// the actual focus_id ChatPane/Tier3AccessPane draft against
+    /// (app/core_artifacts/focuses/quick-ask.focus) without any compiler
+    /// error to catch it.
+    #[test]
+    fn tier3_draft_focus_id_is_quick_ask() {
+        assert_eq!(TIER3_DRAFT_FOCUS_ID, "quick-ask");
+    }
+
+    /// Guards the focus_settings lookup shape request_tier3_gate3_review
+    /// depends on (get_focus_settings(persona_id, "quick-ask")) without
+    /// needing an AppHandle -- confirms a real row round-trips the
+    /// max_permitted_tier value the command reads as space_max_permitted_tier.
+    #[tokio::test]
+    async fn quick_ask_focus_settings_round_trip_max_permitted_tier() {
+        let _env = setup().await;
+        crate::persistence::migrations::migrate_shared_db()
+            .await
+            .expect("shared.db migration must succeed in test setup");
+        // focus_settings.persona_id has a FOREIGN KEY into personas(id) --
+        // create_persona's own FK requires a real users row first, mirroring
+        // commands/library.rs's setup() precedent exactly.
+        crate::auth::user_store::create_user(
+            USER_ID,
+            "Consent Test User",
+            "user",
+            false,
+            &[0u8; crate::auth::kdf::SALT_LEN],
+            crate::auth::kdf::DEFAULT_ARGON2_MEMORY_KIB,
+            crate::auth::kdf::DEFAULT_ARGON2_ITERATIONS,
+            crate::auth::kdf::DEFAULT_ARGON2_PARALLELISM,
+        )
+        .await
+        .expect("create_user must succeed in test setup");
+        crate::persistence::persona_store::create_persona(
+            PERSONA_ID,
+            "Consent Test Persona",
+            "personal",
+            USER_ID,
+        )
+        .await
+        .expect("create_persona must succeed in test setup");
+
+        focus_settings_store::create_focus_settings(
+            PERSONA_ID,
+            TIER3_DRAFT_FOCUS_ID,
+            "bidirectional",
+            "shared",
+            1,
+            3,
+            "open",
+            None,
+        )
+        .await
+        .expect("create_focus_settings must succeed");
+
+        let settings = focus_settings_store::get_focus_settings(PERSONA_ID, TIER3_DRAFT_FOCUS_ID)
+            .await
+            .expect("get_focus_settings must succeed")
+            .expect("row must exist");
+        assert_eq!(settings.max_permitted_tier, 3);
+    }
 }

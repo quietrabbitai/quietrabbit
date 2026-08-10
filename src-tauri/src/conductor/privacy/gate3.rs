@@ -465,15 +465,17 @@ fn assign_review_tier(
     ReviewTier::Medium
 }
 
-/// Human-readable display label for a Privacy Filter category.
+/// Human-readable display label for a Privacy Filter category. Must match
+/// PRIVACY_GUARDIAN_GATE_SPEC.md's taxonomy table verbatim — that spec is
+/// locked/authoritative; this function conforms to it, not the reverse.
 fn taxonomy_label(category: &str) -> String {
     match category {
-        "private_person" => "Person name",
-        "private_address" => "Home or work address",
+        "private_person" => "Name or identity",
+        "private_address" => "Address or location",
         "private_email" => "Email address",
         "private_phone" => "Phone number",
-        "private_url" => "Web address",
-        "private_date" => "Date or time",
+        "private_url" => "Personal web address",
+        "private_date" => "Personal date",
         "account_number" => "Account number",
         "secret" => "Sensitive value",
         _ => "Sensitive information",
@@ -605,8 +607,12 @@ mod tests {
 
     #[test]
     fn taxonomy_known_categories() {
-        assert_eq!(taxonomy_label("private_person"), "Person name");
+        assert_eq!(taxonomy_label("private_person"), "Name or identity");
+        assert_eq!(taxonomy_label("private_address"), "Address or location");
         assert_eq!(taxonomy_label("private_email"), "Email address");
+        assert_eq!(taxonomy_label("private_phone"), "Phone number");
+        assert_eq!(taxonomy_label("private_url"), "Personal web address");
+        assert_eq!(taxonomy_label("private_date"), "Personal date");
         assert_eq!(taxonomy_label("account_number"), "Account number");
         assert_eq!(taxonomy_label("secret"), "Sensitive value");
     }

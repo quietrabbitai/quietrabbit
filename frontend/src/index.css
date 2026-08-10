@@ -15,6 +15,20 @@
   --heading: system-ui, 'Segoe UI', Roboto, sans-serif;
   --mono: ui-monospace, Consolas, monospace;
 
+  /* Privacy Guardian modal palette (PRIVACY_GUARDIAN_GATE_SPEC.md, LOCKED).
+   * Fixed values, not gated by prefers-color-scheme like the rest of this
+   * file's variables -- the spec gives exactly one hex per role with no
+   * dark-mode alternate anywhere in its 611 lines, and the modal is
+   * deliberately a fixed "authority" surface distinct from the app's own
+   * adaptive chrome ("User is still inside QR -- not a foreign surface,"
+   * but with its own recognizable identity regardless of app theme).
+   * Inventing dark-mode alternates the spec never specified would be
+   * guessing, not implementing -- see CLAUDE.md's "stop and ask rather
+   * than invent." */
+  --pg-ink: #242c2a;
+  --pg-ember: #b04030;
+  --pg-sage-mist: #e6e9e2;
+
   font: 18px/145% var(--sans);
   letter-spacing: 0.18px;
   color-scheme: light dark;
