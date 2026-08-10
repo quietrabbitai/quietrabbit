@@ -26,6 +26,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 sha2 = "0.10"
+# Voice profile PII pattern matching (D5-151, items.id=229) -- already
+# resolved transitively (1.12.4, verified via Cargo.lock) as a dependency
+# of other crates in the tree; declared directly here rather than relying
+# on that transitive path, same reasoning as getrandom above.
+regex = "1"
 
 # Database
 sqlx = { version = "0.8", features = ["runtime-tokio-native-tls", "sqlite"] }

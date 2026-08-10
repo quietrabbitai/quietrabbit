@@ -36,7 +36,9 @@
 // isolated the exact failure via a standalone diagnostic test).
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
+use regex::Regex;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::ConnectOptions;
 use sqlx::Row;
@@ -85,6 +87,21 @@ const VOICE_VALUE_REJECTION_MSG: &str =
     "We couldn't save that voice preference — it looks like it contains \
      personal details. Voice preferences describe how you communicate, \
      not who you are. Try something like 'professional and direct' instead.";
+
+/// Phone-number PII pattern for voice profile writes (D5-151). Exact port
+/// of the retired Python oracle's pattern (persistence/personal_store.py,
+/// commit a27a2b1~1: `_VOICE_VALUE_PII_PATTERNS`) --
+/// `r'\+?\d[\d\s\-(). ]{7,}\d'` -- an optional leading '+', a digit, 8+
+/// digit/space/punctuation characters, then a closing digit. Compiled once
+/// (OnceLock, same singleton pattern as executor.rs's GROQ_PROVIDER,
+/// D6-349) rather than per call -- validate_voice_profile_value runs on
+/// every voice profile write.
+fn phone_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r"\+?\d[\d\s\-(). ]{7,}\d").expect("phone_pattern regex must compile")
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -979,12 +996,9 @@ fn validate_voice_profile_value(attribute: &str, value: &str) -> Result<(), Pers
     let has_url = normalized.contains("http://")
         || normalized.contains("https://")
         || normalized.contains("www.");
-    // Phone detection: counts raw digit characters.
-    // Phase 1 stub — produces more false negatives and fewer false positives
-    // than the Python regex (e.g. spelled-out numbers bypass detection).
-    // TODO: replace with regex crate pattern match for full Python parity.
-    let digit_count = normalized.chars().filter(|c| c.is_ascii_digit()).count();
-    let has_phone = digit_count >= 8;
+    // Phone detection: real pattern match, full Python parity (see
+    // phone_pattern()'s own doc comment for the exact ported regex).
+    let has_phone = phone_pattern().is_match(normalized);
 
     if has_email || has_url || has_phone {
         let reason = if has_email {
@@ -1333,5 +1347,63 @@ mod tests {
             result.is_ok(),
             "open_personal_db must open a real encrypted file with the corrected PRAGMA form: {result:?}"
         );
+    }
+
+    // D5-151 / items.id=229: phone_pattern() replaced a raw digit_count >= 8
+    // heuristic with the exact ported Python regex. digit_count already
+    // caught most real phone numbers (they have plenty of digits) -- the
+    // gap this closes is numbers with FEWER than 8 total digits (e.g. a
+    // 7-digit local number), which the old heuristic silently let through
+    // as a false negative. This module had zero voice-profile-validation
+    // test coverage before this session (see REAL GAP 1.8 in
+    // CODEBASE_PLACEHOLDER_AUDIT_20260808.md) -- these are the first.
+
+    #[test]
+    fn seven_digit_number_with_separators_is_a_true_negative_under_the_old_digit_count_heuristic() {
+        // digit_count("555-12-34") == 7, below the old >= 8 threshold --
+        // the exact class of false negative the audit flagged. The
+        // ported regex only requires 9 total characters (digit + 7 + digit),
+        // not 8 digit characters specifically -- separators count toward
+        // the middle run, so it still matches (verified against the regex
+        // crate directly before writing this assertion).
+        assert!(validate_voice_profile_value("tone", "call 555-12-34").is_err());
+    }
+
+    #[test]
+    fn phone_number_with_spaces_is_detected() {
+        assert!(validate_voice_profile_value("tone", "555 123 4567").is_err());
+    }
+
+    #[test]
+    fn international_format_with_leading_plus_is_detected() {
+        assert!(validate_voice_profile_value("tone", "+1 555-123-4567").is_err());
+    }
+
+    #[test]
+    fn parenthesized_area_code_is_detected() {
+        assert!(validate_voice_profile_value("tone", "(555) 123-4567").is_err());
+    }
+
+    #[test]
+    fn a_short_year_like_number_is_not_flagged_as_a_phone() {
+        // "1999" is 4 characters -- below the regex's 9-character minimum
+        // (digit + 7 + digit) -- must not false-positive, same as the
+        // Python oracle it's ported from.
+        assert!(validate_voice_profile_value("tone", "born in 1999").is_ok());
+    }
+
+    #[test]
+    fn eight_contiguous_digits_with_no_separators_is_a_true_positive_under_the_old_heuristic() {
+        // digit_count("12345678") == 8 -- the old heuristic's threshold --
+        // so it flagged this unconditionally. The 8-character run alone is
+        // one short of the regex's 9-character minimum, so parity with the
+        // Python oracle means this is correctly NOT flagged as a phone
+        // number on its own (verified against the regex crate directly).
+        assert!(validate_voice_profile_value("tone", "12345678").is_ok());
+    }
+
+    #[test]
+    fn ordinary_behavioral_descriptor_is_accepted() {
+        assert!(validate_voice_profile_value("tone", "professional and direct").is_ok());
     }
 }
