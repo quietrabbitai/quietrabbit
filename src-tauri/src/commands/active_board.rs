@@ -12,9 +12,12 @@
 //   No .focus file in this repo declares a trigger yet -- Travel/Habit were
 //   scoped as "currently-built" in items.id=236's original framing, but
 //   neither exists (correction tracked separately by Jason, not this code).
-//   daily_brief is a placeholder field (always None) -- not yet implemented,
-//   out of scope for items.id=236. quick_launch (Quick Launch Dock) was
-//   removed entirely -- retired feature, decisions.id=375->637->652.
+//   quick_launch (Quick Launch Dock) and daily_brief were both removed
+//   entirely -- retired features. quick_launch: decisions.id=375->637->652
+//   (Quick Launch Dock superseded in full). daily_brief: decisions.id=652
+//   ("Daily Brief retired as a separate concept and surface") + IA_SPEC
+//   Section 2a's two-container model (high-priority section + full list,
+//   no third container).
 // get_topic_list: returns topics for a focus.
 // update_topic_state: updates topic lifecycle state.
 //   Valid states per D6-220: "Active", "Paused", "Waiting on you",
@@ -70,9 +73,6 @@ pub struct ActiveBoardResponse {
     /// frontend (not yet built) owns rendering/dedup between the bordered
     /// high-priority container and the full list.
     pub high_priority: Vec<TopicInfo>,
-    /// Placeholder -- Daily Brief not yet implemented. Will become a typed
-    /// struct when wired; serialized as JSON string in the interim.
-    pub daily_brief: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Type)]
@@ -155,7 +155,6 @@ pub async fn get_active_board(
     Ok(ActiveBoardResponse {
         topics: topics.into_iter().map(TopicInfo::from).collect(),
         high_priority,
-        daily_brief: None,
     })
 }
 

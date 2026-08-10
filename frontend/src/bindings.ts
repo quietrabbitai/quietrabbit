@@ -339,11 +339,6 @@ export type ActiveBoardResponse = {
 	 *  high-priority container and the full list.
 	 */
 	high_priority: TopicInfo[],
-	/**
-	 *  Placeholder -- Daily Brief not yet implemented. Will become a typed
-	 *  struct when wired; serialized as JSON string in the interim.
-	 */
-	daily_brief: string | null,
 };
 
 export type CapabilityProfileResponse = {
