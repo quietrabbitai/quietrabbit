@@ -195,6 +195,26 @@ pub async fn get_tier2_provider_preference(
     Ok(row.and_then(|(pref,)| pref))
 }
 
+/// Write a user's Tier 2 provider preference (items.id=253, pairs with
+/// get_tier2_provider_preference above). `provider` must be "mistral",
+/// "groq", or None to clear -- enforced by the caller (commands::tier2)
+/// before this is reached; the schema CHECK constraint
+/// (shared_001.sql:82-84) is defense-in-depth, not the primary gate, so a
+/// bad value surfaces here as an opaque sqlx::Error::Database rather than
+/// a friendly message.
+pub async fn set_tier2_provider_preference(
+    user_id: &str,
+    provider: Option<&str>,
+) -> Result<(), UserStoreError> {
+    let mut conn = open_shared_db().await?;
+    sqlx::query("UPDATE users SET tier2_provider_preference = ? WHERE id = ?")
+        .bind(provider)
+        .bind(user_id)
+        .execute(&mut conn)
+        .await?;
+    Ok(())
+}
+
 /// Create a new user + their salt row, atomically (SAVEPOINT, mirrors
 /// persona_store::create_persona's pattern -- on failure, ROLLBACK TO
 /// without a subsequent RELEASE, since the connection is dropped
@@ -441,24 +461,44 @@ mod tests {
 
     #[tokio::test]
     async fn get_tier2_provider_preference_round_trips() {
-        // No setter exists yet (items.id=251 only wires the read path) --
-        // written directly via UPDATE, same as tier2.rs's own tests reach
-        // past the command layer to seed store state directly.
         let _env = setup().await;
         create_user("u1", "Alice", "admin", true, b"salt1234", 1024, 1, 1)
             .await
             .unwrap();
 
-        let mut conn = open_shared_db().await.unwrap();
-        sqlx::query("UPDATE users SET tier2_provider_preference = ? WHERE id = ?")
-            .bind("mistral")
-            .bind("u1")
-            .execute(&mut conn)
+        set_tier2_provider_preference("u1", Some("mistral"))
             .await
             .unwrap();
 
         let pref = get_tier2_provider_preference("u1").await.unwrap();
         assert_eq!(pref, Some("mistral".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn set_tier2_provider_preference_can_clear_back_to_none() {
+        let _env = setup().await;
+        create_user("u1", "Alice", "admin", true, b"salt1234", 1024, 1, 1)
+            .await
+            .unwrap();
+
+        set_tier2_provider_preference("u1", Some("groq"))
+            .await
+            .unwrap();
+        set_tier2_provider_preference("u1", None).await.unwrap();
+
+        let pref = get_tier2_provider_preference("u1").await.unwrap();
+        assert_eq!(pref, None);
+    }
+
+    #[tokio::test]
+    async fn set_tier2_provider_preference_rejects_value_outside_check_constraint() {
+        let _env = setup().await;
+        create_user("u1", "Alice", "admin", true, b"salt1234", 1024, 1, 1)
+            .await
+            .unwrap();
+
+        let result = set_tier2_provider_preference("u1", Some("bogus")).await;
+        assert!(matches!(result, Err(UserStoreError::Database(_))));
     }
 
     #[tokio::test]

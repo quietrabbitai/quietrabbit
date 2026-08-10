@@ -46,6 +46,7 @@ use crate::auth::registry::KeyRegistry;
 use crate::persistence::integration_keys_store;
 
 const TIER2_KEY_TYPE: &str = "tier2";
+const VALID_TIER2_PROVIDERS: &[&str] = &["mistral", "groq"];
 
 fn key_hex(key: &[u8; crate::auth::kdf::MASTER_KEY_LEN]) -> String {
     key.iter().map(|b| format!("{b:02x}")).collect()
@@ -134,6 +135,35 @@ pub async fn set_tier2_provider(
     )
     .await
     .map_err(|e| e.to_string())
+}
+
+/// Set (or clear, with `provider: None`) the current user's Tier 2 provider
+/// preference -- distinct from set_tier2_provider above, which stores a
+/// credential. This is the "which provider should QR actually use" choice
+/// executor.rs reads via user_store::get_tier2_provider_preference
+/// (items.id=253, unblocks items.id=251's read path).
+#[tauri::command]
+#[specta::specta]
+pub async fn set_tier2_provider_preference(
+    provider: Option<String>,
+    key_registry: State<'_, KeyRegistry>,
+) -> Result<(), String> {
+    if let Some(p) = &provider {
+        if !VALID_TIER2_PROVIDERS.contains(&p.as_str()) {
+            return Err(format!(
+                "invalid Tier 2 provider: {p}. Valid: mistral, groq, or null to clear"
+            ));
+        }
+    }
+
+    let user_id = key_registry
+        .with_key(|k| k.user_id.clone())
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
+    crate::auth::user_store::set_tier2_provider_preference(&user_id, provider.as_deref())
+        .await
+        .map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -270,6 +300,97 @@ mod tests {
         let registry = app.state::<KeyRegistry>();
 
         let result = set_tier2_provider("groq".to_owned(), "some-key".to_owned(), registry).await;
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // set_tier2_provider_preference tests
+    //
+    // This command touches shared.db (via auth::user_store), not
+    // integration_keys.db -- the TestEnv/setup() above (which migrates the
+    // SQLCipher keys db) doesn't apply here. This is a separate fixture that
+    // mirrors auth/user_store.rs's own setup(): migrate_shared_db() + a real
+    // user row via create_user(), combined with this file's existing
+    // mock_app_with_registry()/populate_registry() for the KeyRegistry half.
+    // -----------------------------------------------------------------------
+
+    struct SharedDbTestEnv {
+        _tempdir: tempfile::TempDir,
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved_root: Option<String>,
+    }
+
+    impl Drop for SharedDbTestEnv {
+        fn drop(&mut self) {
+            match &self.saved_root {
+                Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+                None => std::env::remove_var("QR_DATA_ROOT"),
+            }
+        }
+    }
+
+    async fn setup_shared_db(user_id: &str) -> SharedDbTestEnv {
+        let lock = ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        crate::persistence::migrations::migrate_shared_db()
+            .await
+            .expect("shared.db migration must succeed in test setup");
+
+        crate::auth::user_store::create_user(
+            user_id, "Alice", "admin", true, b"salt1234", 1024, 1, 1,
+        )
+        .await
+        .expect("create_user must succeed in test setup");
+
+        SharedDbTestEnv {
+            _tempdir: tempdir,
+            _lock: lock,
+            saved_root,
+        }
+    }
+
+    #[tokio::test]
+    async fn set_tier2_provider_preference_round_trips_via_user_store() {
+        let master_key = [0x33u8; crate::auth::kdf::MASTER_KEY_LEN];
+        let _env = setup_shared_db("user-c").await;
+        let app = mock_app_with_registry();
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(&registry, "user-c", master_key).await;
+
+        set_tier2_provider_preference(Some("groq".to_owned()), registry.clone())
+            .await
+            .expect("set_tier2_provider_preference must succeed when logged in");
+
+        let pref = crate::auth::user_store::get_tier2_provider_preference("user-c")
+            .await
+            .unwrap();
+        assert_eq!(pref, Some("groq".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn set_tier2_provider_preference_rejects_unknown_provider() {
+        let master_key = [0x44u8; crate::auth::kdf::MASTER_KEY_LEN];
+        let _env = setup_shared_db("user-d").await;
+        let app = mock_app_with_registry();
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(&registry, "user-d", master_key).await;
+
+        let result = set_tier2_provider_preference(Some("openai".to_owned()), registry).await;
+        let err = result.expect_err("openai is not a valid Tier 2 provider");
+        assert!(err.contains("invalid Tier 2 provider"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn set_tier2_provider_preference_fails_cleanly_when_not_logged_in() {
+        let app = tauri::test::mock_app();
+        app.manage(KeyRegistry::default());
+        let registry = app.state::<KeyRegistry>();
+
+        let result = set_tier2_provider_preference(Some("groq".to_owned()), registry).await;
         assert!(result.is_err());
     }
 }

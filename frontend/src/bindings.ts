@@ -242,6 +242,14 @@ export const commands = {
 	getTier2Config: (provider: string) => typedError<Tier2Config, string>(__TAURI_INVOKE("get_tier2_config", { provider })),
 	/**  Set (or replace) the credential for a Tier 2 provider, user-global scope. */
 	setTier2Provider: (provider: string, apiKey: string) => typedError<null, string>(__TAURI_INVOKE("set_tier2_provider", { provider, apiKey })),
+	/**
+	 *  Set (or clear, with `provider: None`) the current user's Tier 2 provider
+	 *  preference -- distinct from set_tier2_provider above, which stores a
+	 *  credential. This is the "which provider should QR actually use" choice
+	 *  executor.rs reads via user_store::get_tier2_provider_preference
+	 *  (items.id=253, unblocks items.id=251's read path).
+	 */
+	setTier2ProviderPreference: (provider: string | null) => typedError<null, string>(__TAURI_INVOKE("set_tier2_provider_preference", { provider })),
 	dismissNotification: (notificationId: string) => typedError<null, string>(__TAURI_INVOKE("dismiss_notification", { notificationId })),
 	login: (displayName: string, password: string) => typedError<null, string>(__TAURI_INVOKE("login", { displayName, password })),
 	logout: () => typedError<null, string>(__TAURI_INVOKE("logout")),
