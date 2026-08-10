@@ -3,6 +3,7 @@
 pub mod errors;
 pub mod evaluation;
 pub mod groq;
+pub mod mistral;
 pub mod ollama_client;
 pub mod tier2_base;
 pub mod types;

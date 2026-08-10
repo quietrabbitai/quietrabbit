@@ -1254,6 +1254,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         let persona_context = self._persona_context_rendered.clone();
         let space_max_permitted_tier = self._focus_max_permitted_tier;
         let scheduler = Arc::clone(&self.scheduler);
+        let user_id = self.user_id.clone();
 
         // Floor consent preference (D5-152). Read from personas.extra_metadata in shared.db.
         // Non-fatal — consent gate fires normally if read fails.
@@ -1283,6 +1284,20 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         }
         .await;
 
+        // Tier 2 provider preference (items.id=251). Only relevant at
+        // tier>=2 -- Tier 1 never dispatches to an external provider. DB
+        // read failure collapses to None, same as "no preference set" --
+        // StepExecutor turns None into the F10 MissingTier2Config failure
+        // rather than guessing a provider.
+        let tier2_provider_preference: Option<String> = if execution_tier >= 2 {
+            crate::auth::user_store::get_tier2_provider_preference(&user_id)
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+
         let ctx = StepContext {
             step: step.clone(),
             focus_id,
@@ -1294,6 +1309,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             abstraction_tier,
             raw_abstraction,
             floor_consent_preference,
+            tier2_provider_preference,
             next_execution_tier,
             retry_count: 0,
             focus_name: self

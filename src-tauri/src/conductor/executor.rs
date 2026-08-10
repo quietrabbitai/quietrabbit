@@ -71,6 +71,7 @@ use crate::conductor::privacy::PrivacyGateway;
 use crate::conductor::tokens::StepDefinition;
 use crate::conductor::types::{PersonalTrack, SharedStateTrack, TaskStep, TaskTrack};
 use crate::providers::groq::GroqProvider;
+use crate::providers::mistral::MistralProvider;
 use crate::providers::ollama_client::{check_context_window, OllamaClient};
 use crate::providers::tier2_base::Tier2Provider;
 use crate::providers::types::{ContextWindowStatusKind, GenerateOptions, GenerateRequest};
@@ -110,10 +111,15 @@ const ALLOWED_VOICE_ATTRIBUTES: &[&str] = &[
 // D6-349: GroqProvider instantiation at call sites in executor.rs, not in FocusRun.
 
 static GROQ_PROVIDER: OnceLock<GroqProvider> = OnceLock::new();
+static MISTRAL_PROVIDER: OnceLock<MistralProvider> = OnceLock::new();
 static OLLAMA_CLIENT: OnceLock<OllamaClient> = OnceLock::new();
 
 fn groq_provider() -> &'static GroqProvider {
     GROQ_PROVIDER.get_or_init(GroqProvider::new)
+}
+
+fn mistral_provider() -> &'static MistralProvider {
+    MISTRAL_PROVIDER.get_or_init(MistralProvider::new)
 }
 
 fn ollama_client() -> &'static OllamaClient {
@@ -139,6 +145,13 @@ fn ollama_client() -> &'static OllamaClient {
 ///   "modified" -> skip Floor Consent Gate this run; write floor_consent_auto event.
 ///   None       -> normal Floor Consent Gate evaluation.
 ///   One-run scope: applies for this context only; not persisted.
+///
+/// tier2_provider_preference: read from users.tier2_provider_preference by
+///   lifecycle (items.id=251), only when execution_tier >= 2.
+///   Some("mistral") | Some("groq") -> dispatch to that provider.
+///   None -> no provider chosen yet; StepExecutor raises F10
+///   MissingTier2Config rather than guessing (architecture: "no prescribed
+///   default"). Always None at execution_tier == 1.
 pub struct StepContext {
     pub step: StepDefinition,
     pub focus_id: String,
@@ -150,6 +163,7 @@ pub struct StepContext {
     pub abstraction_tier: u8,
     pub raw_abstraction: u8,
     pub floor_consent_preference: Option<String>, // "modified" | "local" | None
+    pub tier2_provider_preference: Option<String>, // "mistral" | "groq" | None
     pub next_execution_tier: Option<u8>,
     pub retry_count: u32,
     /// Display name of the Focus, passed to gate3 for the consent modal header.
@@ -326,7 +340,31 @@ impl StepExecutor {
 
         // -- Step 4 — Tier 3 boundary handled by lifecycle; executor never reached --
 
-        let model_id = select_model(&ctx.step.task_type, execution_tier);
+        // -- Step 4.5 — Tier 2 provider preference gate (F10) --
+        // No prescribed default (architecture: "User choice at install. No
+        // prescribed default."). An unset preference is a real gap, not
+        // silently resolved to Groq — short-circuits before any provider
+        // is touched. Only checked at tier>=2; Tier 1 never needs a
+        // provider.
+        if execution_tier >= 2 && ctx.tier2_provider_preference.is_none() {
+            return Ok(Some(failure_handler.handle(
+                &ConductorError::MissingTier2Config {
+                    plain_language: "No Tier 2 AI provider is set up yet. \
+                        Choose Groq or Mistral in Settings to continue. \
+                        [Open Settings] [Get help]"
+                        .to_owned(),
+                },
+                Some(&ctx.step.step_id),
+                Some(&ctx.focus_id),
+                retry_count,
+            )));
+        }
+
+        let model_id = select_model(
+            &ctx.step.task_type,
+            execution_tier,
+            ctx.tier2_provider_preference.as_deref(),
+        );
 
         // Build gate track for Gate1/Gate2 calls.
         // privacy::types::PersonalTrack (typed enum fields) differs from
@@ -527,7 +565,26 @@ impl StepExecutor {
         }
 
         let generate_result: Result<_, ConductorError> = if execution_tier >= 2 {
-            groq_provider().generate(&request).await
+            // Step 4.5 above already guarantees tier2_provider_preference is
+            // Some("mistral" | "groq") at this point -- no silent fallback
+            // to Groq for anything else (matches select_model()'s policy;
+            // a third schema-permitted provider value must fail loudly
+            // here, not misroute).
+            match ctx.tier2_provider_preference.as_deref() {
+                Some("mistral") => mistral_provider().generate(&request).await,
+                Some("groq") => groq_provider().generate(&request).await,
+                Some(other) => unreachable!(
+                    "tier2_provider_preference '{other}' is not one of the \
+                     schema-permitted values ('mistral', 'groq') -- \
+                     schema/shared_001.sql's CHECK constraint should have \
+                     prevented this from ever being stored"
+                ),
+                None => unreachable!(
+                    "execution_tier >= 2 with no tier2_provider_preference -- \
+                     the Step 4.5 guard above must already have \
+                     short-circuited to MissingTier2Config"
+                ),
+            }
         } else {
             ollama_client().generate(&request).await
         };
@@ -861,9 +918,19 @@ async fn scan_voice_profile<L: DisclosureLogger>(
 // Model selection and options
 // ---------------------------------------------------------------------------
 
-/// Select model ID based on task_type and execution tier.
+/// Select model ID based on task_type, execution tier, and (at tier>=2)
+/// the user's Tier 2 provider preference.
 /// Python oracle: StepExecutor._select_model()
-fn select_model(task_type: &str, tier: u8) -> String {
+///
+/// tier2_provider must be Some("mistral") or Some("groq") whenever
+/// tier >= 2 — the caller (execute_once's Step 4.5 guard) short-circuits
+/// to the F10 MissingTier2Config failure before ever reaching this
+/// function with tier >= 2 and None. No catch-all fallback to Groq: an
+/// unexpected value here means schema/shared_001.sql's CHECK constraint
+/// on tier2_provider_preference was bypassed, or this function was called
+/// without going through the Step 4.5 guard — both are bugs that must
+/// fail loudly, not silently misroute to a provider the user didn't pick.
+fn select_model(task_type: &str, tier: u8, tier2_provider: Option<&str>) -> String {
     if tier == 1 {
         match task_type {
             "code" => "qwen2.5:7b".to_owned(),
@@ -871,7 +938,22 @@ fn select_model(task_type: &str, tier: u8) -> String {
             _ => "llama3.1:8b".to_owned(),
         }
     } else {
-        "groq:llama-3.1-8b-instant".to_owned()
+        match tier2_provider {
+            Some("mistral") => "mistral:mistral-small-latest".to_owned(),
+            Some("groq") => "groq:llama-3.1-8b-instant".to_owned(),
+            Some(other) => unreachable!(
+                "tier2_provider_preference '{other}' is not one of the \
+                 schema-permitted values ('mistral', 'groq') -- \
+                 schema/shared_001.sql's CHECK constraint should have \
+                 prevented this from ever being stored"
+            ),
+            None => unreachable!(
+                "select_model called with tier>=2 and no tier2_provider -- \
+                 caller must guard on ctx.tier2_provider_preference.is_none() \
+                 before calling select_model (see the Step 4.5 \
+                 MissingTier2Config check in execute_once)"
+            ),
+        }
     }
 }
 
@@ -883,6 +965,7 @@ fn get_context_window(model_id: &str) -> u32 {
         "llama3.1:8b" => 8192,
         "qwen2.5:7b" => 8192,
         "groq:llama-3.1-8b-instant" => 8192,
+        "mistral:mistral-small-latest" => 32768,
         _ => 2048,
     }
 }
@@ -1356,28 +1439,71 @@ mod tests {
 
     #[test]
     fn select_model_tier1_code() {
-        assert_eq!(select_model("code", 1), "qwen2.5:7b");
+        assert_eq!(select_model("code", 1, None), "qwen2.5:7b");
     }
 
     #[test]
     fn select_model_tier1_quick_response() {
-        assert_eq!(select_model("quick_response", 1), "llama3.2:3b");
+        assert_eq!(select_model("quick_response", 1, None), "llama3.2:3b");
     }
 
     #[test]
     fn select_model_tier1_summarization() {
-        assert_eq!(select_model("summarization", 1), "llama3.2:3b");
+        assert_eq!(select_model("summarization", 1, None), "llama3.2:3b");
     }
 
     #[test]
     fn select_model_tier1_general() {
-        assert_eq!(select_model("general", 1), "llama3.1:8b");
+        assert_eq!(select_model("general", 1, None), "llama3.1:8b");
     }
 
     #[test]
-    fn select_model_tier2_any_type() {
-        assert_eq!(select_model("code", 2), "groq:llama-3.1-8b-instant");
-        assert_eq!(select_model("general", 2), "groq:llama-3.1-8b-instant");
+    fn select_model_tier2_groq_any_type() {
+        assert_eq!(
+            select_model("code", 2, Some("groq")),
+            "groq:llama-3.1-8b-instant"
+        );
+        assert_eq!(
+            select_model("general", 2, Some("groq")),
+            "groq:llama-3.1-8b-instant"
+        );
+    }
+
+    #[test]
+    fn select_model_tier2_mistral_any_type() {
+        assert_eq!(
+            select_model("code", 2, Some("mistral")),
+            "mistral:mistral-small-latest"
+        );
+        assert_eq!(
+            select_model("general", 2, Some("mistral")),
+            "mistral:mistral-small-latest"
+        );
+    }
+
+    /// items.id=251 — the test proving provider selection actually
+    /// switches behavior, not just that a preference can be stored.
+    /// Same task_type and tier; the only thing that differs is
+    /// tier2_provider, and the two calls must produce different models.
+    #[test]
+    fn select_model_switches_on_tier2_provider_preference() {
+        let groq_model = select_model("general", 2, Some("groq"));
+        let mistral_model = select_model("general", 2, Some("mistral"));
+        assert_ne!(groq_model, mistral_model);
+        assert_eq!(groq_model, "groq:llama-3.1-8b-instant");
+        assert_eq!(mistral_model, "mistral:mistral-small-latest");
+    }
+
+    #[test]
+    #[should_panic(expected = "select_model called with tier>=2 and no tier2_provider")]
+    fn select_model_tier2_none_preference_panics() {
+        select_model("general", 2, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "is not one of the schema-permitted values")]
+    fn select_model_tier2_unknown_provider_panics() {
+        select_model("general", 2, Some("openai"));
     }
 
     #[test]
@@ -1386,6 +1512,7 @@ mod tests {
         assert_eq!(get_context_window("llama3.1:8b"), 8192);
         assert_eq!(get_context_window("qwen2.5:7b"), 8192);
         assert_eq!(get_context_window("groq:llama-3.1-8b-instant"), 8192);
+        assert_eq!(get_context_window("mistral:mistral-small-latest"), 32768);
     }
 
     #[test]
@@ -1533,6 +1660,7 @@ mod tests {
             abstraction_tier: 2,
             raw_abstraction: 1,
             floor_consent_preference: None,
+            tier2_provider_preference: None,
             next_execution_tier: None,
             retry_count: 0,
             focus_name: "test".to_owned(),
@@ -1580,6 +1708,7 @@ mod tests {
             abstraction_tier: 1,
             raw_abstraction: 1,
             floor_consent_preference: None,
+            tier2_provider_preference: None,
             next_execution_tier: None,
             retry_count: 0,
             focus_name: "test".to_owned(),
@@ -1613,6 +1742,7 @@ mod tests {
             abstraction_tier: 1,
             raw_abstraction: 1,
             floor_consent_preference: None,
+            tier2_provider_preference: None,
             next_execution_tier: None,
             retry_count: 0,
             focus_name: "test".to_owned(),

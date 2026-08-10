@@ -178,6 +178,23 @@ pub async fn get_salt_params(
     Ok(Some((salt, memory_kib, iterations, parallelism)))
 }
 
+/// Read a user's stored Tier 2 provider preference (items.id=251).
+/// `"mistral"` / `"groq"` / `NULL` per schema/shared_001.sql's CHECK
+/// constraint. No user row and a `NULL` preference both collapse to
+/// `Ok(None)` -- callers (conductor/lifecycle.rs) treat "unset" and
+/// "unknown user" identically, so this function doesn't distinguish them.
+pub async fn get_tier2_provider_preference(
+    user_id: &str,
+) -> Result<Option<String>, UserStoreError> {
+    let mut conn = open_shared_db().await?;
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT tier2_provider_preference FROM users WHERE id = ?")
+            .bind(user_id)
+            .fetch_optional(&mut conn)
+            .await?;
+    Ok(row.and_then(|(pref,)| pref))
+}
+
 /// Create a new user + their salt row, atomically (SAVEPOINT, mirrors
 /// persona_store::create_persona's pattern -- on failure, ROLLBACK TO
 /// without a subsequent RELEASE, since the connection is dropped
@@ -420,6 +437,46 @@ mod tests {
         let _env = setup().await;
         let params = get_salt_params("nonexistent").await.unwrap();
         assert!(params.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_tier2_provider_preference_round_trips() {
+        // No setter exists yet (items.id=251 only wires the read path) --
+        // written directly via UPDATE, same as tier2.rs's own tests reach
+        // past the command layer to seed store state directly.
+        let _env = setup().await;
+        create_user("u1", "Alice", "admin", true, b"salt1234", 1024, 1, 1)
+            .await
+            .unwrap();
+
+        let mut conn = open_shared_db().await.unwrap();
+        sqlx::query("UPDATE users SET tier2_provider_preference = ? WHERE id = ?")
+            .bind("mistral")
+            .bind("u1")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+
+        let pref = get_tier2_provider_preference("u1").await.unwrap();
+        assert_eq!(pref, Some("mistral".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn get_tier2_provider_preference_is_none_when_unset() {
+        let _env = setup().await;
+        create_user("u1", "Alice", "admin", true, b"salt1234", 1024, 1, 1)
+            .await
+            .unwrap();
+
+        let pref = get_tier2_provider_preference("u1").await.unwrap();
+        assert_eq!(pref, None, "schema default for tier2_provider_preference is NULL");
+    }
+
+    #[tokio::test]
+    async fn get_tier2_provider_preference_is_none_for_unknown_user() {
+        let _env = setup().await;
+        let pref = get_tier2_provider_preference("nonexistent").await.unwrap();
+        assert_eq!(pref, None);
     }
 
     #[test]
