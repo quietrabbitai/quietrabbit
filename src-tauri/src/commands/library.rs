@@ -354,7 +354,7 @@ mod tests {
         )
         .await
         .expect("create_user must succeed in test setup");
-        persona_store::create_persona(PERSONA_ID, "Lib Test Persona", "personal", USER_ID)
+        persona_store::create_persona(PERSONA_ID, "Lib Test Persona", "personal", USER_ID, None)
             .await
             .expect("create_persona must succeed in test setup");
 

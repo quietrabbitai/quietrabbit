@@ -222,7 +222,9 @@ function NavShellContent({
         isGenerating={personaHubGenerating}
         contextPane={
           <PersonaHub
+            userId={getPlaceholderUserId()}
             personaId={content.personaId}
+            keyHex={null}
             onOpenLibrary={() => onOpenPersonaLibrary(content.personaId)}
           />
         }

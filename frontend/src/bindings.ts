@@ -76,6 +76,12 @@ export const commands = {
 	privacy_tier: number,
 	max_permitted_tier: number,
 	updated_at: string,
+	/**
+	 *  Most recent focus_runs.started_at for this Focus (outputs.db), or
+	 *  None if it has never run or outputs.db isn't reachable with the
+	 *  supplied key_hex. NOT the same as updated_at (settings-edit time).
+	 */
+	last_used: string | null,
 } | null, string>(__TAURI_INVOKE("submit_friction_gate_decision", { request })),
 	/**
 	 *  Process user decisions for extract-and-confirm candidates (item 20).
@@ -170,12 +176,12 @@ export const commands = {
 	submitOnboardingFocusSelection: (focusSelections: NotImplementedPlaceholder[]) => typedError<string[], string>(__TAURI_INVOKE("submit_onboarding_focus_selection", { focusSelections })),
 	listPersonas: (userId: string) => typedError<PersonaInfo[], string>(__TAURI_INVOKE("list_personas", { userId })),
 	createPersona: (request: CreatePersonaRequest) => typedError<CreatePersonaResponse, string>(__TAURI_INVOKE("create_persona", { request })),
-	listFocuses: (personaId: string) => typedError<FocusInfo[], string>(__TAURI_INVOKE("list_focuses", { personaId })),
+	listFocuses: (userId: string, personaId: string, keyHex: string) => typedError<FocusInfo[], string>(__TAURI_INVOKE("list_focuses", { userId, personaId, keyHex })),
 	/**
 	 *  get_focus_settings takes both persona_id and focus_id — the store key is
 	 *  composite. The IPC spec lists focus_id only (higher-level abstraction).
 	 */
-	getFocusSettings: (personaId: string, focusId: string) => typedError<FocusInfo, string>(__TAURI_INVOKE("get_focus_settings", { personaId, focusId })),
+	getFocusSettings: (userId: string, personaId: string, keyHex: string, focusId: string) => typedError<FocusInfo, string>(__TAURI_INVOKE("get_focus_settings", { userId, personaId, keyHex, focusId })),
 	/**
 	 *  Applies a Focus settings change directly, UNLESS the change would loosen
 	 *  privacy_tier or move focus_profile to 'protected' -- in which case this
@@ -192,7 +198,7 @@ export const commands = {
 	 *  but the structured shape is what submit_friction_gate_decision expects
 	 *  to be built from.
 	 */
-	updateFocusSettings: (request: UpdateFocusSettingsRequest) => typedError<FocusInfo, string>(__TAURI_INVOKE("update_focus_settings", { request })),
+	updateFocusSettings: (userId: string, keyHex: string, request: UpdateFocusSettingsRequest) => typedError<FocusInfo, string>(__TAURI_INVOKE("update_focus_settings", { userId, keyHex, request })),
 	getActiveBoard: (userId: string, personaId: string, keyHex: string) => typedError<ActiveBoardResponse, string>(__TAURI_INVOKE("get_active_board", { userId, personaId, keyHex })),
 	getTopicList: (focusId: string, userId: string, personaId: string, keyHex: string) => typedError<TopicInfo[], string>(__TAURI_INVOKE("get_topic_list", { focusId, userId, personaId, keyHex })),
 	updateTopicState: (request: UpdateTopicStateRequest) => typedError<null, string>(__TAURI_INVOKE("update_topic_state", { request })),
@@ -354,6 +360,7 @@ export type CapabilityProfileResponse = {
 export type CreatePersonaRequest = {
 	user_id: string,
 	name: string,
+	color: string | null,
 	persona_type: string | null,
 };
 
@@ -361,7 +368,10 @@ export type CreatePersonaResponse = {
 	persona_id: string,
 };
 
-/**  IPC gap: missing dormancy_state, last_used (post-Release 1). */
+/**
+ *  IPC gap: dormancy_state still missing -- split to items.id=256 (see
+ *  module header). last_used closed by items.id=237.
+ */
 export type FocusInfo = {
 	focus_id: string,
 	focus_profile: string,
@@ -370,6 +380,12 @@ export type FocusInfo = {
 	privacy_tier: number,
 	max_permitted_tier: number,
 	updated_at: string,
+	/**
+	 *  Most recent focus_runs.started_at for this Focus (outputs.db), or
+	 *  None if it has never run or outputs.db isn't reachable with the
+	 *  supplied key_hex. NOT the same as updated_at (settings-edit time).
+	 */
+	last_used: string | null,
 };
 
 /**
@@ -529,12 +545,21 @@ export type PendingCrossPersonaFact = {
 	origin_persona_id: string | null,
 };
 
-/**  IPC gap: missing color, focus_count, privacy defaults (post-Release 1). */
+/**
+ *  IPC gap: privacy defaults still missing (post-Release 1, not this item's
+ *  scope -- see module header). color/focus_count closed by items.id=237.
+ */
 export type PersonaInfo = {
 	id: string,
 	display_name: string,
 	persona_type: string,
 	created_at: string,
+	color: string | null,
+	/**
+	 *  i32, not Persona.focus_count's i64 -- specta forbids exporting
+	 *  BigInt-style types (i64/u64/...) to TypeScript.
+	 */
+	focus_count: number,
 };
 
 /**  IPC-safe projection of PersonalField. field_value is intentionally absent. */

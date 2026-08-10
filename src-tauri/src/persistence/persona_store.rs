@@ -49,8 +49,13 @@ pub struct Persona {
     pub persona_type: String,
     pub created_at: String,
     /// Stored as JSON TEXT in DB. Default is empty object {}.
-    /// Includes floor_consent_preference when set (D5-152).
+    /// Includes floor_consent_preference when set (D5-152), color when set
+    /// (items.id=237).
     pub extra_metadata: serde_json::Value,
+    /// COUNT of this persona's focus_settings rows (items.id=237). Computed
+    /// via LEFT JOIN in every read query below; hardcoded 0 in create_persona
+    /// since a freshly created persona has no focus_settings rows yet.
+    pub focus_count: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -100,6 +105,7 @@ fn row_to_persona(row: &sqlx::sqlite::SqliteRow) -> Result<Persona, sqlx::Error>
         persona_type: row.try_get("persona_type")?,
         created_at: row.try_get("created_at")?,
         extra_metadata,
+        focus_count: row.try_get("focus_count")?,
     })
 }
 
@@ -136,8 +142,12 @@ pub async fn get_persona(persona_id: &str) -> Result<Option<Persona>, PersonaSto
     let mut conn = open_shared_db().await?;
 
     let row = sqlx::query(
-        "SELECT id, display_name, persona_type, created_at, extra_metadata
-         FROM personas WHERE id = ?",
+        "SELECT p.id, p.display_name, p.persona_type, p.created_at, p.extra_metadata,
+         COUNT(fs.focus_id) AS focus_count
+         FROM personas p
+         LEFT JOIN focus_settings fs ON fs.persona_id = p.id
+         WHERE p.id = ?
+         GROUP BY p.id",
     )
     .bind(persona_id)
     .fetch_optional(&mut conn)
@@ -163,10 +173,13 @@ pub async fn get_persona_for_user(
 
     let row = sqlx::query(
         "SELECT p.id, p.display_name, p.persona_type,
-         p.created_at, p.extra_metadata
+         p.created_at, p.extra_metadata,
+         COUNT(fs.focus_id) AS focus_count
          FROM personas p
          JOIN user_personas up ON up.persona_id = p.id
-         WHERE up.user_id = ? AND p.id = ?",
+         LEFT JOIN focus_settings fs ON fs.persona_id = p.id
+         WHERE up.user_id = ? AND p.id = ?
+         GROUP BY p.id",
     )
     .bind(user_id)
     .bind(persona_id)
@@ -187,10 +200,13 @@ pub async fn list_personas_for_user(user_id: &str) -> Result<Vec<Persona>, Perso
 
     let rows = sqlx::query(
         "SELECT p.id, p.display_name, p.persona_type,
-         p.created_at, p.extra_metadata
+         p.created_at, p.extra_metadata,
+         COUNT(fs.focus_id) AS focus_count
          FROM personas p
          JOIN user_personas up ON up.persona_id = p.id
+         LEFT JOIN focus_settings fs ON fs.persona_id = p.id
          WHERE up.user_id = ?
+         GROUP BY p.id
          ORDER BY p.display_name",
     )
     .bind(user_id)
@@ -212,13 +228,23 @@ pub async fn list_personas_for_user(user_id: &str) -> Result<Vec<Persona>, Perso
 /// Returns Err(AlreadyExists) if persona_id already exists.
 /// Atomic: INSERT personas + INSERT user_personas under a SAVEPOINT.
 /// No tier parameters — tier settings belong to focus_settings (D6-297).
+///
+/// color (items.id=237, HANDOFF_IPC_SURFACE.md row 15: "create_persona |
+/// name, color?"): stored under extra_metadata.color when Some. No merge
+/// needed here (unlike write_floor_consent_preference's read-merge-write in
+/// commands/consent.rs) since this is the row's very first write.
 pub async fn create_persona(
     persona_id: &str,
     display_name: &str,
     persona_type: &str,
     creator_user_id: &str,
+    color: Option<&str>,
 ) -> Result<Persona, PersonaStoreError> {
     let created_at = crate::providers::utils::now();
+    let extra_metadata_json = match color {
+        Some(c) => serde_json::json!({ "color": c }).to_string(),
+        None => "{}".to_owned(),
+    };
     let mut conn = open_shared_db().await?;
 
     sqlx::query("SAVEPOINT create_persona")
@@ -235,7 +261,7 @@ pub async fn create_persona(
         .bind(display_name)
         .bind(persona_type)
         .bind(&created_at)
-        .bind("{}")
+        .bind(&extra_metadata_json)
         .execute(&mut conn)
         .await?;
 
@@ -278,7 +304,10 @@ pub async fn create_persona(
         display_name: display_name.to_owned(),
         persona_type: persona_type.to_owned(),
         created_at,
-        extra_metadata: serde_json::Value::Object(serde_json::Map::new()),
+        extra_metadata: serde_json::from_str(&extra_metadata_json).unwrap_or_else(|_| {
+            serde_json::Value::Object(serde_json::Map::new())
+        }),
+        focus_count: 0,
     })
 }
 

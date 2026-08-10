@@ -377,6 +377,10 @@ pub async fn submit_friction_gate_decision(
         privacy_tier: s.privacy_tier,
         max_permitted_tier: s.max_permitted_tier,
         updated_at: s.updated_at,
+        // last_used: not exposed here -- SubmitFrictionGateDecisionRequest
+        // has no user_id/key_hex (items.id=237 scoped last_used to
+        // list_focuses/get_focus_settings/update_focus_settings only).
+        last_used: None,
     }))
 }
 
@@ -1037,6 +1041,7 @@ mod tests {
             "Consent Test Persona",
             "personal",
             USER_ID,
+            None,
         )
         .await
         .expect("create_persona must succeed in test setup");

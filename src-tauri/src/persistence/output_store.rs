@@ -338,6 +338,114 @@ pub async fn get_focus_run_routing_tier(
 }
 
 // ---------------------------------------------------------------------------
+// Last-used (items.id=237)
+// ---------------------------------------------------------------------------
+
+/// Best-effort last-used timestamp for a single Focus (MAX(started_at) over
+/// its focus_runs). Returns None on ANY failure -- missing outputs.db (a
+/// persona that has never run this Focus, or ever been unlocked this
+/// session), bad/empty key_hex, or a genuine query error -- because this is
+/// a display value for commands::persona::get_focus_settings/
+/// update_focus_settings, not something that should ever break the rest of
+/// a Focus's settings from being returned.
+///
+/// Only logs (warn) when outputs.db exists on disk but still failed to open
+/// or query -- a persona whose outputs.db was never created is the common,
+/// expected case (empty key_hex pre-Layer-8, or a brand-new Focus) and is
+/// not worth a log line every call.
+pub async fn get_focus_last_used(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    focus_id: &str,
+) -> Option<String> {
+    if key_hex.is_empty() || !get_outputs_db_path(user_id, persona_id).exists() {
+        return None;
+    }
+
+    let mut conn = match open_outputs_db(user_id, persona_id, key_hex).await {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!(
+                "get_focus_last_used: could not open outputs.db for \
+                 persona='{persona_id}' focus='{focus_id}': {e}"
+            );
+            return None;
+        }
+    };
+
+    match sqlx::query("SELECT MAX(started_at) AS last_used FROM focus_runs WHERE focus_id = ?")
+        .bind(focus_id)
+        .fetch_one(&mut conn)
+        .await
+        .and_then(|r| r.try_get::<Option<String>, _>("last_used"))
+    {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!(
+                "get_focus_last_used: query failed for persona='{persona_id}' \
+                 focus='{focus_id}': {e}"
+            );
+            None
+        }
+    }
+}
+
+/// Batched form of get_focus_last_used for a whole persona's Focus list
+/// (commands::persona::list_focuses) -- one connection covering every
+/// focus_id via GROUP BY, instead of one connection per Focus. Same
+/// best-effort/no-error-propagation contract: returns an empty map on any
+/// failure rather than an error.
+pub async fn get_last_used_map(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+) -> std::collections::HashMap<String, String> {
+    if key_hex.is_empty() || !get_outputs_db_path(user_id, persona_id).exists() {
+        return std::collections::HashMap::new();
+    }
+
+    let mut conn = match open_outputs_db(user_id, persona_id, key_hex).await {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!(
+                "get_last_used_map: could not open outputs.db for persona='{persona_id}': {e}"
+            );
+            return std::collections::HashMap::new();
+        }
+    };
+
+    let rows = match sqlx::query(
+        "SELECT focus_id, MAX(started_at) AS last_used FROM focus_runs GROUP BY focus_id",
+    )
+    .fetch_all(&mut conn)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            log::warn!("get_last_used_map: query failed for persona='{persona_id}': {e}");
+            return std::collections::HashMap::new();
+        }
+    };
+
+    let mut map = std::collections::HashMap::with_capacity(rows.len());
+    for r in rows {
+        let focus_id: String = match r.try_get("focus_id") {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let last_used: Option<String> = match r.try_get("last_used") {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(last_used) = last_used {
+            map.insert(focus_id, last_used);
+        }
+    }
+    map
+}
+
+// ---------------------------------------------------------------------------
 // List
 // ---------------------------------------------------------------------------
 

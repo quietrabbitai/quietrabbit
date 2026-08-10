@@ -33,15 +33,26 @@
 //   rather than adding a confirm flag back onto update_focus_settings,
 //   which would create two different code paths to the same mutation.
 //
-// list_personas IPC gap (post-Release 1):
-//   IPC surface specifies color, focus_count, and privacy defaults.
-//   PersonaInfo currently returns id, display_name, persona_type, created_at only.
-//   color and privacy defaults are in personas.extra_metadata (not yet parsed).
-//   focus_count requires a join not present in persona_store.
+// list_personas IPC gap -- items.id=237, color/focus_count CLOSED:
+//   PersonaInfo now returns color (personas.extra_metadata.color, written by
+//   create_persona) and focus_count (LEFT JOIN focus_settings, persona_store.rs).
+//   "privacy defaults" from the IPC surface's row 14 is still open -- no
+//   decision names what a Persona-level privacy default even is (privacy
+//   settings are Focus-level per D6-297); not in items.id=237's scope.
 //
-// list_focuses IPC gap (post-Release 1):
-//   IPC surface specifies dormancy state and last_used.
-//   FocusInfo uses updated_at as a proxy; dormancy state is not in focus_settings.
+// list_focuses IPC gap -- items.id=237, last_used CLOSED:
+//   FocusInfo.last_used is now a real value: MAX(started_at) from outputs.db's
+//   focus_runs (persistence::output_store::get_focus_last_used/get_last_used_map),
+//   which is why list_focuses/get_focus_settings/update_focus_settings now take
+//   user_id + key_hex -- the same per-persona encrypted DB access pattern
+//   already used by commands::active_board::get_active_board/get_topic_list.
+//   dormancy_state is NOT part of this fix -- split to items.id=256. The
+//   dispatch for this item assumed an existing Persona-level Hibernate/Archive
+//   lifecycle model (items.id=20) could be reused for it; investigation found
+//   items.id=20 is a design description only (QUIET_RABBIT_DESIGN.md), with no
+//   personas.status column, enum, or commands anywhere in this repo -- nothing
+//   to reuse, and the exact value set is a real design decision, not something
+//   to invent mid-build.
 //
 // get_focus_settings takes (persona_id, focus_id) — the store key is composite.
 //   The IPC surface spec lists focus_id only, written at a higher level of
@@ -51,27 +62,32 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 
 use crate::persistence::focus_settings_store;
+use crate::persistence::output_store;
 use crate::persistence::persona_store;
 
 // ---------------------------------------------------------------------------
 // Response structs
 // ---------------------------------------------------------------------------
 
-/// IPC gap: missing color, focus_count, privacy defaults (post-Release 1).
+/// IPC gap: privacy defaults still missing (post-Release 1, not this item's
+/// scope -- see module header). color/focus_count closed by items.id=237.
 #[derive(Debug, Serialize, Type)]
 pub struct PersonaInfo {
     pub id: String,
     pub display_name: String,
     pub persona_type: String,
     pub created_at: String,
+    pub color: Option<String>,
+    /// i32, not Persona.focus_count's i64 -- specta forbids exporting
+    /// BigInt-style types (i64/u64/...) to TypeScript.
+    pub focus_count: i32,
 }
 
 #[derive(Debug, Deserialize, Type)]
 pub struct CreatePersonaRequest {
     pub user_id: String,
     pub name: String,
-    // color omitted: persona_store::create_persona has no extra_metadata param.
-    // Add when persistence supports it.
+    pub color: Option<String>,
     pub persona_type: Option<String>,
 }
 
@@ -80,7 +96,8 @@ pub struct CreatePersonaResponse {
     pub persona_id: String,
 }
 
-/// IPC gap: missing dormancy_state, last_used (post-Release 1).
+/// IPC gap: dormancy_state still missing -- split to items.id=256 (see
+/// module header). last_used closed by items.id=237.
 #[derive(Debug, Serialize, Type)]
 pub struct FocusInfo {
     pub focus_id: String,
@@ -90,6 +107,10 @@ pub struct FocusInfo {
     pub privacy_tier: i32,
     pub max_permitted_tier: i32,
     pub updated_at: String,
+    /// Most recent focus_runs.started_at for this Focus (outputs.db), or
+    /// None if it has never run or outputs.db isn't reachable with the
+    /// supplied key_hex. NOT the same as updated_at (settings-edit time).
+    pub last_used: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Type)]
@@ -141,11 +162,20 @@ pub async fn list_personas(user_id: String) -> Result<Vec<PersonaInfo>, String> 
 
     Ok(personas
         .into_iter()
-        .map(|p| PersonaInfo {
-            id: p.id,
-            display_name: p.display_name,
-            persona_type: p.persona_type,
-            created_at: p.created_at,
+        .map(|p| {
+            let color = p
+                .extra_metadata
+                .get("color")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            PersonaInfo {
+                id: p.id,
+                display_name: p.display_name,
+                persona_type: p.persona_type,
+                created_at: p.created_at,
+                color,
+                focus_count: p.focus_count as i32,
+            }
         })
         .collect())
 }
@@ -168,10 +198,15 @@ pub async fn create_persona(
 
     let persona_id = uuid::Uuid::new_v4().to_string();
 
-    let persona =
-        persona_store::create_persona(&persona_id, &request.name, persona_type, &request.user_id)
-            .await
-            .map_err(|e| e.to_string())?;
+    let persona = persona_store::create_persona(
+        &persona_id,
+        &request.name,
+        persona_type,
+        &request.user_id,
+        request.color.as_deref(),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
     Ok(CreatePersonaResponse {
         persona_id: persona.id,
@@ -180,21 +215,31 @@ pub async fn create_persona(
 
 #[tauri::command]
 #[specta::specta]
-pub async fn list_focuses(persona_id: String) -> Result<Vec<FocusInfo>, String> {
+pub async fn list_focuses(
+    user_id: String,
+    persona_id: String,
+    key_hex: String,
+) -> Result<Vec<FocusInfo>, String> {
     let settings = focus_settings_store::list_focus_settings_for_persona(&persona_id)
         .await
         .map_err(|e| e.to_string())?;
 
+    let last_used_map = output_store::get_last_used_map(&user_id, &persona_id, &key_hex).await;
+
     Ok(settings
         .into_iter()
-        .map(|s| FocusInfo {
-            focus_id: s.focus_id,
-            focus_profile: s.focus_profile,
-            context_flow: s.context_flow,
-            library_visibility: s.library_visibility,
-            privacy_tier: s.privacy_tier,
-            max_permitted_tier: s.max_permitted_tier,
-            updated_at: s.updated_at,
+        .map(|s| {
+            let last_used = last_used_map.get(&s.focus_id).cloned();
+            FocusInfo {
+                focus_id: s.focus_id,
+                focus_profile: s.focus_profile,
+                context_flow: s.context_flow,
+                library_visibility: s.library_visibility,
+                privacy_tier: s.privacy_tier,
+                max_permitted_tier: s.max_permitted_tier,
+                updated_at: s.updated_at,
+                last_used,
+            }
         })
         .collect())
 }
@@ -203,11 +248,18 @@ pub async fn list_focuses(persona_id: String) -> Result<Vec<FocusInfo>, String> 
 /// composite. The IPC spec lists focus_id only (higher-level abstraction).
 #[tauri::command]
 #[specta::specta]
-pub async fn get_focus_settings(persona_id: String, focus_id: String) -> Result<FocusInfo, String> {
+pub async fn get_focus_settings(
+    user_id: String,
+    persona_id: String,
+    key_hex: String,
+    focus_id: String,
+) -> Result<FocusInfo, String> {
     let s = focus_settings_store::get_focus_settings(&persona_id, &focus_id)
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "not_found".to_string())?;
+
+    let last_used = output_store::get_focus_last_used(&user_id, &persona_id, &key_hex, &focus_id).await;
 
     Ok(FocusInfo {
         focus_id: s.focus_id,
@@ -217,6 +269,7 @@ pub async fn get_focus_settings(persona_id: String, focus_id: String) -> Result<
         privacy_tier: s.privacy_tier,
         max_permitted_tier: s.max_permitted_tier,
         updated_at: s.updated_at,
+        last_used,
     })
 }
 
@@ -237,6 +290,8 @@ pub async fn get_focus_settings(persona_id: String, focus_id: String) -> Result<
 #[tauri::command]
 #[specta::specta]
 pub async fn update_focus_settings(
+    user_id: String,
+    key_hex: String,
     request: UpdateFocusSettingsRequest,
 ) -> Result<FocusInfo, String> {
     // Tier bounds check: valid tiers are 1-3.
@@ -306,6 +361,10 @@ pub async fn update_focus_settings(
     .await
     .map_err(|e| e.to_string())?;
 
+    let last_used =
+        output_store::get_focus_last_used(&user_id, &request.persona_id, &key_hex, &request.focus_id)
+            .await;
+
     Ok(FocusInfo {
         focus_id: s.focus_id,
         focus_profile: s.focus_profile,
@@ -314,5 +373,261 @@ pub async fn update_focus_settings(
         privacy_tier: s.privacy_tier,
         max_permitted_tier: s.max_permitted_tier,
         updated_at: s.updated_at,
+        last_used,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Tests (items.id=237)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::persistence::output_store;
+    use crate::test_support::ENV_MUTEX;
+
+    const USER_ID: &str = "user-persona-test";
+    const PERSONA_ID: &str = "persona-persona-test";
+    const KEY_HEX: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+
+    struct TestEnv {
+        _tempdir: tempfile::TempDir,
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved_root: Option<String>,
+    }
+
+    impl Drop for TestEnv {
+        fn drop(&mut self) {
+            match &self.saved_root {
+                Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+                None => std::env::remove_var("QR_DATA_ROOT"),
+            }
+        }
+    }
+
+    /// Real shared.db + real encrypted outputs.db via the actual migration
+    /// path -- mirrors commands::library's setup() (library.rs:294-366).
+    /// Does NOT create a persona -- each test creates its own via
+    /// persona_store::create_persona so color/focus_count can vary per test.
+    async fn setup() -> TestEnv {
+        let lock = ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        crate::persistence::migrations::migrate_shared_db()
+            .await
+            .expect("shared.db migration must succeed in test setup");
+        crate::persistence::migrations::migrate_outputs_db(USER_ID, PERSONA_ID, KEY_HEX)
+            .await
+            .expect("outputs.db migration must succeed in test setup");
+
+        crate::auth::user_store::create_user(
+            USER_ID,
+            "Persona Test User",
+            "user",
+            false,
+            &[0u8; crate::auth::kdf::SALT_LEN],
+            crate::auth::kdf::DEFAULT_ARGON2_MEMORY_KIB,
+            crate::auth::kdf::DEFAULT_ARGON2_ITERATIONS,
+            crate::auth::kdf::DEFAULT_ARGON2_PARALLELISM,
+        )
+        .await
+        .expect("create_user must succeed in test setup");
+
+        TestEnv {
+            _tempdir: tempdir,
+            _lock: lock,
+            saved_root,
+        }
+    }
+
+    #[tokio::test]
+    async fn list_personas_returns_real_color() {
+        let _env = setup().await;
+        persona_store::create_persona(
+            PERSONA_ID,
+            "Color Test Persona",
+            "personal",
+            USER_ID,
+            Some("indigo"),
+        )
+        .await
+        .expect("create_persona must succeed");
+
+        let personas = list_personas(USER_ID.to_owned())
+            .await
+            .expect("list_personas must succeed");
+
+        assert_eq!(personas.len(), 1);
+        assert_eq!(
+            personas[0].color,
+            Some("indigo".to_owned()),
+            "color must round-trip through extra_metadata, not be a placeholder"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_personas_color_is_none_when_unset() {
+        let _env = setup().await;
+        persona_store::create_persona(PERSONA_ID, "No Color Persona", "personal", USER_ID, None)
+            .await
+            .expect("create_persona must succeed");
+
+        let personas = list_personas(USER_ID.to_owned())
+            .await
+            .expect("list_personas must succeed");
+
+        assert_eq!(
+            personas[0].color, None,
+            "schema default for a persona created without color is None, not a placeholder string"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_personas_focus_count_reflects_real_focus_settings_rows() {
+        let _env = setup().await;
+        persona_store::create_persona(PERSONA_ID, "Focus Count Persona", "personal", USER_ID, None)
+            .await
+            .expect("create_persona must succeed");
+
+        let before = list_personas(USER_ID.to_owned())
+            .await
+            .expect("list_personas must succeed");
+        assert_eq!(before[0].focus_count, 0, "a fresh persona has no Focuses yet");
+
+        for focus_id in ["quick-ask", "writing-assistant"] {
+            focus_settings_store::create_focus_settings(
+                PERSONA_ID,
+                focus_id,
+                "bidirectional",
+                "shared",
+                2,
+                2,
+                "open",
+                None,
+            )
+            .await
+            .expect("create_focus_settings must succeed");
+        }
+
+        let after = list_personas(USER_ID.to_owned())
+            .await
+            .expect("list_personas must succeed");
+        assert_eq!(
+            after[0].focus_count, 2,
+            "focus_count must reflect the real number of focus_settings rows, not a default"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_focus_settings_last_used_is_none_before_any_run() {
+        let _env = setup().await;
+        persona_store::create_persona(PERSONA_ID, "Last Used Persona", "personal", USER_ID, None)
+            .await
+            .expect("create_persona must succeed");
+        focus_settings_store::create_focus_settings(
+            PERSONA_ID,
+            "quick-ask",
+            "bidirectional",
+            "shared",
+            2,
+            2,
+            "open",
+            None,
+        )
+        .await
+        .expect("create_focus_settings must succeed");
+
+        let info = get_focus_settings(
+            USER_ID.to_owned(),
+            PERSONA_ID.to_owned(),
+            KEY_HEX.to_owned(),
+            "quick-ask".to_owned(),
+        )
+        .await
+        .expect("get_focus_settings must succeed");
+
+        assert_eq!(
+            info.last_used, None,
+            "a Focus with zero focus_runs must report last_used=None, not a placeholder"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_focus_settings_last_used_is_real_after_a_run() {
+        let _env = setup().await;
+        persona_store::create_persona(PERSONA_ID, "Last Used Persona 2", "personal", USER_ID, None)
+            .await
+            .expect("create_persona must succeed");
+        focus_settings_store::create_focus_settings(
+            PERSONA_ID,
+            "quick-ask",
+            "bidirectional",
+            "shared",
+            2,
+            2,
+            "open",
+            None,
+        )
+        .await
+        .expect("create_focus_settings must succeed");
+        output_store::test_seed_focus_run(USER_ID, PERSONA_ID, KEY_HEX, "run-1", "quick-ask")
+            .await
+            .expect("test_seed_focus_run must succeed");
+
+        let info = get_focus_settings(
+            USER_ID.to_owned(),
+            PERSONA_ID.to_owned(),
+            KEY_HEX.to_owned(),
+            "quick-ask".to_owned(),
+        )
+        .await
+        .expect("get_focus_settings must succeed");
+
+        assert!(
+            info.last_used.is_some(),
+            "last_used must be a real MAX(started_at) value once a focus_run exists, not None"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_focuses_last_used_matches_get_focus_settings_via_batch_map() {
+        let _env = setup().await;
+        persona_store::create_persona(PERSONA_ID, "Batch Persona", "personal", USER_ID, None)
+            .await
+            .expect("create_persona must succeed");
+        focus_settings_store::create_focus_settings(
+            PERSONA_ID,
+            "quick-ask",
+            "bidirectional",
+            "shared",
+            2,
+            2,
+            "open",
+            None,
+        )
+        .await
+        .expect("create_focus_settings must succeed");
+        output_store::test_seed_focus_run(USER_ID, PERSONA_ID, KEY_HEX, "run-1", "quick-ask")
+            .await
+            .expect("test_seed_focus_run must succeed");
+
+        let focuses = list_focuses(
+            USER_ID.to_owned(),
+            PERSONA_ID.to_owned(),
+            KEY_HEX.to_owned(),
+        )
+        .await
+        .expect("list_focuses must succeed");
+
+        assert_eq!(focuses.len(), 1);
+        assert!(
+            focuses[0].last_used.is_some(),
+            "list_focuses' batched last_used map must surface the same real value \
+             get_focus_settings' single-focus lookup does"
+        );
+    }
 }

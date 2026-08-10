@@ -23,11 +23,13 @@ import { useTranslation } from 'react-i18next'
 import { commands, type FocusInfo } from '../bindings'
 
 export interface PersonaHubProps {
+  userId: string
   personaId: string
+  keyHex: string | null
   onOpenLibrary: () => void
 }
 
-export function PersonaHub({ personaId, onOpenLibrary }: PersonaHubProps) {
+export function PersonaHub({ userId, personaId, keyHex, onOpenLibrary }: PersonaHubProps) {
   const { t } = useTranslation()
   const [focuses, setFocuses] = useState<FocusInfo[]>([])
   const [error, setError] = useState<string | null>(null)
@@ -35,14 +37,14 @@ export function PersonaHub({ personaId, onOpenLibrary }: PersonaHubProps) {
   useEffect(() => {
     setFocuses([])
     setError(null)
-    commands.listFocuses(personaId).then((result) => {
+    commands.listFocuses(userId, personaId, keyHex ?? '').then((result) => {
       if (result.status === 'ok') {
         setFocuses(result.data)
       } else {
         setError(result.error)
       }
     })
-  }, [personaId])
+  }, [userId, personaId, keyHex])
 
   return (
     <div className="persona-hub">
