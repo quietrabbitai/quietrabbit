@@ -9,8 +9,6 @@
     "tier3": "Tier 3 access",
     "content": {
       "activeBoardPlaceholder": "Active Board -- not yet built.",
-      "libraryPlaceholder": "Library -- not yet built.",
-      "libraryPlaceholderFiltered": "Library -- not yet built (filtered to this Persona).",
       "myFactsPlaceholder": "My Facts -- not yet built.",
       "chatPlaceholder": "Chat -- not yet wired for this screen.",
       "tier3ContextPlaceholder": "QR's own conversation stays visible here alongside Tier 3 (Section 9) -- not yet wired.",
@@ -27,6 +25,18 @@
       "notSentNotice": "This isn't saved or sent yet -- secure sign-in isn't wired up in this build. Your text stays on screen for now, but it'll be gone if you reload or navigate away.",
       "generating": "Generating… ({{elapsed}}s)",
       "generatingWithStep": "Generating: {{step}}… ({{elapsed}}s)"
+    },
+    "libraryPane": {
+      "listHeading": "Outputs",
+      "noPersonaContext": "Open Library from a Persona to see its outputs -- there's no Persona selected here yet.",
+      "notAvailable": "Not available in this build yet -- secure sign-in isn't wired up.",
+      "listLoadError": "Could not load outputs: {{message}}",
+      "emptyList": "No outputs yet.",
+      "itemLabel": "{{type}} -- {{date}}",
+      "backButton": "Back to outputs",
+      "detailLoadError": "Could not load this output: {{message}}",
+      "copyButton": "Copy to clipboard",
+      "copySuccess": "Copied to clipboard."
     },
     "personaHub": {
       "focusesHeading": "Focuses",

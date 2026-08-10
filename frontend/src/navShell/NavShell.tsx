@@ -13,13 +13,15 @@
 // - The outbound Privacy Guardian gate that must precede Tier 3 access
 //   in the real flow (items.id=233) -- separate item, blocked on this one.
 // - Active Board's real screen (high-priority section + full list,
-//   Section 2a/2b) and Library's real screen (Section 2c) -- both
-//   genuine, separately-scoped features. Active Board additionally
+//   Section 2a/2b) -- a genuine, separately-scoped feature. Additionally
 //   cannot be real yet regardless of scope: commands.getActiveBoard
 //   requires key_hex, which has no placeholder equivalent to
 //   getPlaceholderUserId() (see navShellConfig.ts's note on why that gap
-//   is deliberately NOT bridged the same way). Both render as flagged
-//   placeholder content below.
+//   is deliberately NOT bridged the same way). Renders as flagged
+//   placeholder content below. Library's real screen (Section 2c) is
+//   built (see LibraryPane.tsx) -- same key_hex gap, but the screen
+//   itself short-circuits per-call rather than staying an unbuilt
+//   placeholder; see LibraryPane.tsx's own header comment.
 // - My Facts' real screen (items.id=176, Chat-BRAND's design).
 // - Onboarding's strip-wide gating (Section 11b) -- not built because
 //   nothing in this pass triggers Onboarding at all.
@@ -31,6 +33,7 @@ import { useTranslation } from 'react-i18next'
 import './NavShell.css'
 import { commands, type PersonaInfo } from '../bindings'
 import { ChatPane } from '../chat/ChatPane'
+import { LibraryPane } from '../library/LibraryPane'
 import { MiddleZone } from '../middleZone/MiddleZone'
 import { DEFAULT_BROWSING_PROFILE } from '../middleZone/middleZoneConfig'
 import { PersonaHub } from './PersonaHub'
@@ -238,14 +241,29 @@ function NavShellContent({
     )
   }
 
-  const contextKey =
-    content.type === 'library' && content.personaFilter
-      ? `library-${content.personaFilter}`
-      : content.type
+  if (content.type === 'library') {
+    const personaId = content.personaFilter ?? null
+    const contextKey = personaId ? `library-${personaId}` : 'library'
+    return (
+      <MiddleZone
+        contextKey={contextKey}
+        profile={DEFAULT_BROWSING_PROFILE}
+        isGenerating={false}
+        contextPane={
+          <LibraryPane
+            userId={getPlaceholderUserId()}
+            personaId={personaId}
+            keyHex={null}
+          />
+        }
+        chatPane={<p>{t('navShell.content.chatPlaceholder')}</p>}
+      />
+    )
+  }
 
   return (
     <MiddleZone
-      contextKey={contextKey}
+      contextKey={content.type}
       profile={DEFAULT_BROWSING_PROFILE}
       isGenerating={false}
       contextPane={<p>{describePlaceholder(content, t)}</p>}
@@ -261,30 +279,6 @@ function describePlaceholder(
   switch (content.type) {
     case 'activeBoard':
       return t('navShell.content.activeBoardPlaceholder')
-    // items.id=243 -- commands.copyOutputToClipboard is a complete, tested
-    // backend command: a real Privacy Guardian egress scan
-    // (output_scan::scan_output, Full intensity -- see commands/library.rs's
-    // prepare_clipboard_copy) gates the copy, then writes to the system
-    // clipboard via tauri-plugin-clipboard-manager. Retired gate4.rs's
-    // permanent stub (content_approved was always true) in favor of this.
-    //
-    // No caller wires it yet because there is nothing to wire it FROM --
-    // this placeholder is Library's entire screen today (no list, no detail
-    // view, output content never reaches the frontend at all). Building
-    // that screen is real, separately-scoped work -- see navShellConfig.ts's
-    // own header note that Library "has no built screen yet." Deliberately
-    // descoped rather than build a Library viewer inside a Gate4-retirement
-    // task (same judgment call as commit 49dc315 / items.id=233).
-    //
-    // When the Library screen exists: add a Copy button that calls
-    // commands.copyOutputToClipboard(outputId, userId, personaId, keyHex)
-    // and surfaces a rejected promise's message directly to the user --
-    // it is already the actionable, clipboard-specific message, not a
-    // generic error to be replaced.
-    case 'library':
-      return content.personaFilter
-        ? t('navShell.content.libraryPlaceholderFiltered')
-        : t('navShell.content.libraryPlaceholder')
     case 'myFacts':
       return t('navShell.content.myFactsPlaceholder')
     default:
