@@ -81,18 +81,21 @@ async fn open_shared_db() -> Result<SqliteConnection, PersonaStoreError> {
 // ---------------------------------------------------------------------------
 
 fn row_to_persona(row: &sqlx::sqlite::SqliteRow) -> Result<Persona, sqlx::Error> {
+    let id: String = row.try_get("id")?;
     let raw: Option<String> = row.try_get("extra_metadata")?;
     let extra_metadata: serde_json::Value = match raw {
         None => serde_json::Value::Object(serde_json::Map::new()),
-        Some(s) => {
-            // TODO: log parse failure for forensic visibility
-            serde_json::from_str(&s)
-                .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()))
-        }
+        Some(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
+            log::warn!(
+                "persona '{id}' extra_metadata failed to parse as JSON, \
+                 defaulting to empty object: {e}"
+            );
+            serde_json::Value::Object(serde_json::Map::new())
+        }),
     };
 
     Ok(Persona {
-        id: row.try_get("id")?,
+        id,
         display_name: row.try_get("display_name")?,
         persona_type: row.try_get("persona_type")?,
         created_at: row.try_get("created_at")?,
@@ -257,10 +260,15 @@ pub async fn create_persona(
                 .await?;
         }
         Err(e) => {
-            // TODO: log rollback failure for forensic visibility.
-            let _ = sqlx::query("ROLLBACK TO create_persona")
+            if let Err(rollback_err) = sqlx::query("ROLLBACK TO create_persona")
                 .execute(&mut conn)
-                .await;
+                .await
+            {
+                log::error!(
+                    "Savepoint rollback failed in create_persona (persona_id='{persona_id}'): \
+                     {rollback_err} -- original error still being propagated: {e}"
+                );
+            }
             return Err(classify_constraint_error(persona_id, e));
         }
     }

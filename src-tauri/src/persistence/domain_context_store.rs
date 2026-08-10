@@ -193,11 +193,18 @@ fn i32_col(row: &SqliteRow, col: &str) -> Result<i32, sqlx::Error> {
 }
 
 /// Parse a JSON TEXT column into Vec<String>. Returns empty vec on NULL or parse failure.
-fn json_vec_col(row: &SqliteRow, col: &str) -> Result<Vec<String>, sqlx::Error> {
+/// `context` is a short caller-supplied label (e.g. the owning record's id) for
+/// forensic logging when a parse failure occurs.
+fn json_vec_col(row: &SqliteRow, col: &str, context: &str) -> Result<Vec<String>, sqlx::Error> {
     let raw: Option<String> = row.try_get(col)?;
     let s = raw.unwrap_or_else(|| "[]".to_owned());
-    // TODO: log parse failure for forensic visibility
-    Ok(serde_json::from_str(&s).unwrap_or_default())
+    Ok(serde_json::from_str(&s).unwrap_or_else(|e| {
+        log::warn!(
+            "domain_context: column '{col}' failed to parse as JSON array for {context}, \
+             defaulting to empty vec: {e}"
+        );
+        Vec::new()
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -285,8 +292,8 @@ pub async fn get_eligible_blocks(
             }
             accumulated += token_estimate;
         }
+        let id: String = row.try_get("id")?;
         blocks.push(DomainContextBlock {
-            id: row.try_get("id")?,
             content: row.try_get("content")?,
             visibility_scope: row.try_get("visibility_scope")?,
             transformation: row.try_get("transformation")?,
@@ -298,10 +305,19 @@ pub async fn get_eligible_blocks(
             standing_summary_eligible: bool_col(&row, "standing_summary_eligible")?,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
-            relevance_tags: json_vec_col(&row, "relevance_tags")?,
-            dependency_refs: json_vec_col(&row, "dependency_refs")?,
+            relevance_tags: json_vec_col(
+                &row,
+                "relevance_tags",
+                &format!("domain_context_blocks.id='{id}'"),
+            )?,
+            dependency_refs: json_vec_col(
+                &row,
+                "dependency_refs",
+                &format!("domain_context_blocks.id='{id}'"),
+            )?,
             revoked_at: row.try_get("revoked_at")?,
             revocation_reason: row.try_get("revocation_reason")?,
+            id,
         });
     }
 
@@ -336,7 +352,7 @@ pub async fn get_standing_summary(
         Some(r) => Ok(Some(StandingSummary {
             content: r.try_get("content")?,
             token_count: i32_col(&r, "token_count")?,
-            source_block_ids: json_vec_col(&r, "source_block_ids")?,
+            source_block_ids: json_vec_col(&r, "source_block_ids", "standing_summary")?,
             generated_at: r.try_get("generated_at")?,
             invalidated_at: r.try_get("invalidated_at")?,
         })),
@@ -538,11 +554,16 @@ pub async fn write_approved_extraction(
                 .await?;
         }
         Err(e) => {
-            // ROLLBACK failure is swallowed — mirrors Python except: pass.
-            // TODO: log rollback failure for forensic visibility.
-            let _ = sqlx::query("ROLLBACK TO write_approved")
+            if let Err(rollback_err) = sqlx::query("ROLLBACK TO write_approved")
                 .execute(&mut conn)
-                .await;
+                .await
+            {
+                log::error!(
+                    "Savepoint rollback failed in write_approved_extraction \
+                     (pending_id='{pending_id}', block_id='{block_id}'): {rollback_err} \
+                     -- original error still being propagated: {e}"
+                );
+            }
             return Err(DomainContextStoreError::Database(e));
         }
     }

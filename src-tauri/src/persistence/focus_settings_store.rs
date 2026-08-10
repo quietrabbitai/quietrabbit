@@ -118,18 +118,26 @@ async fn open_shared_db() -> Result<SqliteConnection, FocusSettingsStoreError> {
 // ---------------------------------------------------------------------------
 
 fn row_to_focus_settings(row: &sqlx::sqlite::SqliteRow) -> Result<FocusSettings, sqlx::Error> {
+    let persona_id: String = row.try_get("persona_id")?;
+    let focus_id: String = row.try_get("focus_id")?;
     let voice_raw: Option<String> = row.try_get("voice_override")?;
     let voice_override: Option<serde_json::Value> = match voice_raw {
         None => None,
-        Some(s) => {
-            // TODO: log parse failure for forensic visibility
-            serde_json::from_str(&s).ok()
-        }
+        Some(s) => match serde_json::from_str(&s) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                log::warn!(
+                    "focus_settings voice_override failed to parse as JSON for \
+                     persona='{persona_id}' focus='{focus_id}', defaulting to None: {e}"
+                );
+                None
+            }
+        },
     };
 
     Ok(FocusSettings {
-        persona_id: row.try_get("persona_id")?,
-        focus_id: row.try_get("focus_id")?,
+        persona_id,
+        focus_id,
         context_flow: row.try_get("context_flow")?,
         library_visibility: row.try_get("library_visibility")?,
         privacy_tier: row.try_get::<i64, _>("privacy_tier")? as i32,

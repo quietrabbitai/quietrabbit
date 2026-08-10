@@ -193,6 +193,7 @@ async fn open_shared_db() -> Result<SqliteConnection, ProviderStoreError> {
 // ---------------------------------------------------------------------------
 
 fn row_to_provider(row: &sqlx::sqlite::SqliteRow) -> Result<Provider, ProviderStoreError> {
+    let id: String = row.try_get("id").map_err(ProviderStoreError::Database)?;
     let tier_raw: i64 = row.try_get("tier").map_err(ProviderStoreError::Database)?;
     let mode_raw: String = row.try_get("mode").map_err(ProviderStoreError::Database)?;
     let login_required_raw: i64 = row
@@ -205,13 +206,17 @@ fn row_to_provider(row: &sqlx::sqlite::SqliteRow) -> Result<Provider, ProviderSt
         .try_get("documentation_gate")
         .map_err(ProviderStoreError::Database)?;
 
-    let documentation_gate: serde_json::Value = serde_json::from_str(&doc_gate_raw)
-        // TODO: log parse failure for forensic visibility (same pattern as
-        // persona_store.rs's extra_metadata handling).
-        .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+    let documentation_gate: serde_json::Value =
+        serde_json::from_str(&doc_gate_raw).unwrap_or_else(|e| {
+            log::warn!(
+                "provider '{id}' documentation_gate failed to parse as JSON, \
+                 defaulting to empty object: {e}"
+            );
+            serde_json::Value::Object(serde_json::Map::new())
+        });
 
     Ok(Provider {
-        id: row.try_get("id").map_err(ProviderStoreError::Database)?,
+        id,
         display_name: row
             .try_get("display_name")
             .map_err(ProviderStoreError::Database)?,
