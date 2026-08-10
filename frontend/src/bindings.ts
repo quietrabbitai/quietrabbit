@@ -332,12 +332,18 @@ export const commands = {
 export type ActiveBoardResponse = {
 	topics: TopicInfo[],
 	/**
+	 *  IA_SPEC Section 2a/2b, decisions.id=712. Subset of `topics` whose
+	 *  Focus type declared a high_priority_trigger that has fired for that
+	 *  topic's anchor date. Additive, not exclusive of `topics` -- the
+	 *  frontend (not yet built) owns rendering/dedup between the bordered
+	 *  high-priority container and the full list.
+	 */
+	high_priority: TopicInfo[],
+	/**
 	 *  Placeholder -- Daily Brief not yet implemented. Will become a typed
 	 *  struct when wired; serialized as JSON string in the interim.
 	 */
 	daily_brief: string | null,
-	/**  Placeholder -- Quick Launch Dock not yet implemented. */
-	quick_launch: string[],
 };
 
 export type CapabilityProfileResponse = {

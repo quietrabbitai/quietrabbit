@@ -69,6 +69,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use chrono::{DateTime, Duration, Utc};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -199,6 +200,21 @@ struct RawDisplayConfig {
     // surfaces) are a separate, later wiring task — this struct only
     // carries the declared string through parsing.
     generic_title_template: Option<String>,
+    // decisions.id=712: Active Board high-priority section trigger.
+    // Declared once per Focus type at build time, not per-instance.
+    // No .focus file in this repo declares this yet (Travel/Habit are
+    // not built — see items.id=236 correction) -- Option so every
+    // existing file keeps parsing unchanged.
+    high_priority_trigger: Option<RawHighPriorityTrigger>,
+}
+
+#[derive(Deserialize)]
+struct RawHighPriorityTrigger {
+    // Key into a Topic's extra_metadata JSON where the anchor RFC3339
+    // timestamp lives for this Focus type.
+    anchor_field: String,
+    // Signed time offset relative to the anchor, e.g. "-4h", "+0", "-1d".
+    offset: String,
 }
 
 #[derive(Deserialize)]
@@ -223,6 +239,38 @@ struct RawFieldRequirement {
 // ---------------------------------------------------------------------------
 // parse_focus_definition
 // ---------------------------------------------------------------------------
+
+/// Parse a decisions.id=712 signed time-offset string, e.g. "-4h", "+0",
+/// "-1d". Grammar: optional sign (default +), then either a bare `0`
+/// (unit optional -- unambiguous, 0h == 0d) or `<int><unit>` where unit is
+/// `h` (hours) or `d` (days). Anything else is a parse error.
+fn parse_offset(raw: &str) -> Result<Duration, String> {
+    let s = raw.trim();
+    let (sign, rest): (i64, &str) = match s.as_bytes().first() {
+        Some(b'+') => (1, &s[1..]),
+        Some(b'-') => (-1, &s[1..]),
+        _ => (1, s),
+    };
+    if rest == "0" {
+        return Ok(Duration::zero());
+    }
+    if rest.is_empty() {
+        return Err(format!("invalid offset: {raw:?}"));
+    }
+    let unit_pos = rest.len() - 1;
+    let (digits, unit) = rest.split_at(unit_pos);
+    let n: i64 = digits
+        .parse()
+        .map_err(|_| format!("invalid offset: {raw:?}"))?;
+    let signed_n = sign * n;
+    match unit {
+        "h" => Ok(Duration::hours(signed_n)),
+        "d" => Ok(Duration::days(signed_n)),
+        _ => Err(format!(
+            "invalid offset unit in {raw:?} (expected h or d)"
+        )),
+    }
+}
 
 /// Convert RawFocusFile -> FocusDefinition.
 /// Replaces Python's hand-written _parse_focus_definition() with serde_yaml.
@@ -264,10 +312,33 @@ fn parse_focus_definition(raw: RawFocusFile) -> Result<FocusDefinition, Lifecycl
     // wide generic string when the Focus declares no display_config section
     // at all (every existing .focus file in this repo, as of items.id=175 —
     // this default keeps them all parsing unchanged).
-    let generic_title_template = raw
-        .display_config
-        .and_then(|dc| dc.generic_title_template)
-        .unwrap_or_else(|| "Hidden item".to_owned());
+    //
+    // decisions.id=712: high_priority_trigger, parsed alongside it since
+    // both live under the same display_config section. A malformed offset
+    // string fails the whole Focus load, matching step-validation behavior.
+    let (generic_title_template, high_priority_trigger) = match raw.display_config {
+        Some(dc) => {
+            let title = dc
+                .generic_title_template
+                .unwrap_or_else(|| "Hidden item".to_owned());
+            let trigger = match dc.high_priority_trigger {
+                Some(t) => {
+                    let offset = parse_offset(&t.offset).map_err(|e| {
+                        LifecycleError::ValidationFailed(format!(
+                            "display_config.high_priority_trigger.offset: {e}"
+                        ))
+                    })?;
+                    Some(HighPriorityTrigger {
+                        anchor_field: t.anchor_field,
+                        offset,
+                    })
+                }
+                None => None,
+            };
+            (title, trigger)
+        }
+        None => ("Hidden item".to_owned(), None),
+    };
 
     let mut steps: Vec<StepDefinition> = Vec::new();
     if let Some(raw_steps) = raw.steps {
@@ -333,7 +404,64 @@ fn parse_focus_definition(raw: RawFocusFile) -> Result<FocusDefinition, Lifecycl
         output_type,
         suggest_in_focuses,
         generic_title_template,
+        high_priority_trigger,
     })
+}
+
+/// Parse and validate a .focus YAML file by focus_id — no DB access, no
+/// FocusRun construction required. Extracted from FocusRun::load() (items.
+/// id=236) so callers that only need a FocusDefinition (e.g.
+/// commands::active_board::get_active_board) aren't forced to construct a
+/// full FocusRun (11 constructor args) just to read display_config.
+pub async fn load_focus_definition(focus_id: &str) -> Result<FocusDefinition, LifecycleError> {
+    let focus_file = find_focus_file(focus_id)?;
+    let text = tokio::fs::read_to_string(&focus_file).await?;
+    let raw: RawFocusFile = serde_yaml::from_str(&text)?;
+    let focus_def = parse_focus_definition(raw)?;
+
+    let mut all_errors: Vec<String> = Vec::new();
+    for step in &focus_def.steps {
+        all_errors.extend(validate_step(step));
+    }
+    if !all_errors.is_empty() {
+        return Err(LifecycleError::ValidationFailed(format!(
+            "Focus '{}' failed validation:\n{}",
+            focus_def.focus_id,
+            all_errors
+                .iter()
+                .map(|e| format!("  - {e}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )));
+    }
+
+    Ok(focus_def)
+}
+
+fn find_focus_file(focus_id: &str) -> Result<PathBuf, LifecycleError> {
+    // Two search locations. In Tauri production, focuses are embedded via
+    // Tauri resources config (bundling TBD). Until bundled, resolve relative
+    // to CWD (dev workflow — matches Python oracle's repo-relative path).
+    let data_root = crate::providers::utils::get_data_root();
+    let filename = format!("{focus_id}.focus");
+
+    let candidates = [
+        PathBuf::from("app")
+            .join("core_artifacts")
+            .join("focuses")
+            .join(&filename),
+        data_root
+            .join("community_artifacts")
+            .join("focuses")
+            .join(&filename),
+    ];
+
+    for candidate in &candidates {
+        if candidate.exists() {
+            return Ok(candidate.clone());
+        }
+    }
+    Err(LifecycleError::FocusNotFound(focus_id.to_owned()))
 }
 
 // ---------------------------------------------------------------------------
@@ -364,6 +492,30 @@ pub struct FocusDefinition {
     /// in is a separate, later task (this field only carries the value
     /// through parsing).
     pub generic_title_template: String,
+    /// decisions.id=712. Active Board high-priority section trigger,
+    /// declared once per Focus type in display_config. None when the type
+    /// declares no anchor date (most types — see IA_SPEC 2a's collapse-
+    /// when-empty behavior). No .focus file in this repo declares one yet;
+    /// consumed by commands::active_board::get_active_board.
+    pub high_priority_trigger: Option<HighPriorityTrigger>,
+}
+
+/// decisions.id=712: a Focus type's Active Board high-priority section
+/// trigger — a signed time offset relative to that type's own anchor date
+/// field (identified by anchor_field, a key into a Topic's extra_metadata).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HighPriorityTrigger {
+    pub anchor_field: String,
+    pub offset: Duration,
+}
+
+impl HighPriorityTrigger {
+    /// One-sided window: true from anchor+offset onward, no upper bound.
+    /// Exit happens via the topic's own lifecycle transition (e.g. marked
+    /// complete), not via the clock — see items.id=236 plan judgment call 4.
+    pub fn is_active(&self, anchor: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+        now >= anchor + self.offset
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -601,55 +753,8 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
     /// Populates self.focus_def. No DB access.
     /// Python oracle: FocusRun.load()
     pub async fn load(&mut self) -> Result<(), LifecycleError> {
-        let focus_file = self.find_focus_file()?;
-        let text = tokio::fs::read_to_string(&focus_file).await?;
-        let raw: RawFocusFile = serde_yaml::from_str(&text)?;
-        let focus_def = parse_focus_definition(raw)?;
-
-        let mut all_errors: Vec<String> = Vec::new();
-        for step in &focus_def.steps {
-            all_errors.extend(validate_step(step));
-        }
-        if !all_errors.is_empty() {
-            return Err(LifecycleError::ValidationFailed(format!(
-                "Focus '{}' failed validation:\n{}",
-                focus_def.focus_id,
-                all_errors
-                    .iter()
-                    .map(|e| format!("  - {e}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            )));
-        }
-
-        self.focus_def = Some(focus_def);
+        self.focus_def = Some(load_focus_definition(&self.focus_id).await?);
         Ok(())
-    }
-
-    fn find_focus_file(&self) -> Result<PathBuf, LifecycleError> {
-        // Two search locations. In Tauri production, focuses are embedded via
-        // Tauri resources config (bundling TBD). Until bundled, resolve relative
-        // to CWD (dev workflow — matches Python oracle's repo-relative path).
-        let data_root = crate::providers::utils::get_data_root();
-        let filename = format!("{}.focus", self.focus_id);
-
-        let candidates = [
-            PathBuf::from("app")
-                .join("core_artifacts")
-                .join("focuses")
-                .join(&filename),
-            data_root
-                .join("community_artifacts")
-                .join("focuses")
-                .join(&filename),
-        ];
-
-        for candidate in &candidates {
-            if candidate.exists() {
-                return Ok(candidate.clone());
-            }
-        }
-        Err(LifecycleError::FocusNotFound(self.focus_id.clone()))
     }
 
     // =========================================================================
@@ -1912,6 +2017,7 @@ mod tests {
         let mut r = minimal_raw();
         r.display_config = Some(RawDisplayConfig {
             generic_title_template: Some("A {entity_type} record".to_owned()),
+            high_priority_trigger: None,
         });
         assert_eq!(
             parse_focus_definition(r).unwrap().generic_title_template,
@@ -1927,11 +2033,127 @@ mod tests {
         let mut r = minimal_raw();
         r.display_config = Some(RawDisplayConfig {
             generic_title_template: None,
+            high_priority_trigger: None,
         });
         assert_eq!(
             parse_focus_definition(r).unwrap().generic_title_template,
             "Hidden item"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // parse_offset / high_priority_trigger (decisions.id=712, items.id=236)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn parse_offset_valid_values() {
+        assert_eq!(parse_offset("-4h").unwrap(), Duration::hours(-4));
+        assert_eq!(parse_offset("+0").unwrap(), Duration::zero());
+        assert_eq!(parse_offset("0").unwrap(), Duration::zero());
+        assert_eq!(parse_offset("-0").unwrap(), Duration::zero());
+        assert_eq!(parse_offset("-1d").unwrap(), Duration::days(-1));
+        assert_eq!(parse_offset("+2h").unwrap(), Duration::hours(2));
+        assert_eq!(parse_offset("3d").unwrap(), Duration::days(3));
+    }
+
+    #[test]
+    fn parse_offset_rejects_malformed_values() {
+        for bad in ["-4", "h4", "+1w", "", "+", "-", "4hh", "d"] {
+            assert!(
+                parse_offset(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_high_priority_trigger_from_display_config() {
+        // Synthetic fixture modeled after Travel's departure-time anchor
+        // (decisions.id=712) — no travel.focus file exists in this repo
+        // (items.id=236 scope correction).
+        let mut r = minimal_raw();
+        r.display_config = Some(RawDisplayConfig {
+            generic_title_template: None,
+            high_priority_trigger: Some(RawHighPriorityTrigger {
+                anchor_field: "departure_time".to_owned(),
+                offset: "-4h".to_owned(),
+            }),
+        });
+        let trigger = parse_focus_definition(r)
+            .unwrap()
+            .high_priority_trigger
+            .unwrap();
+        assert_eq!(trigger.anchor_field, "departure_time");
+        assert_eq!(trigger.offset, Duration::hours(-4));
+    }
+
+    #[test]
+    fn parse_high_priority_trigger_zero_offset_accepts_no_unit() {
+        // Synthetic fixture modeled after Habit's due-date anchor
+        // (decisions.id=712) — no habit.focus file exists in this repo
+        // (items.id=236 scope correction).
+        let mut r = minimal_raw();
+        r.display_config = Some(RawDisplayConfig {
+            generic_title_template: None,
+            high_priority_trigger: Some(RawHighPriorityTrigger {
+                anchor_field: "due_date".to_owned(),
+                offset: "+0".to_owned(),
+            }),
+        });
+        let trigger = parse_focus_definition(r)
+            .unwrap()
+            .high_priority_trigger
+            .unwrap();
+        assert_eq!(trigger.anchor_field, "due_date");
+        assert_eq!(trigger.offset, Duration::zero());
+    }
+
+    #[test]
+    fn parse_high_priority_trigger_rejects_malformed_offset() {
+        let mut r = minimal_raw();
+        r.display_config = Some(RawDisplayConfig {
+            generic_title_template: None,
+            high_priority_trigger: Some(RawHighPriorityTrigger {
+                anchor_field: "due_date".to_owned(),
+                offset: "not-an-offset".to_owned(),
+            }),
+        });
+        let err = parse_focus_definition(r).unwrap_err();
+        assert!(matches!(err, LifecycleError::ValidationFailed(_)));
+    }
+
+    #[test]
+    fn parse_focus_definition_with_no_display_config_has_no_trigger() {
+        // Regression guard: none of today's four real .focus files declare
+        // display_config.high_priority_trigger — they must keep parsing to
+        // high_priority_trigger: None.
+        assert!(parse_focus_definition(minimal_raw())
+            .unwrap()
+            .high_priority_trigger
+            .is_none());
+    }
+
+    #[test]
+    fn high_priority_trigger_is_active_boundary_is_inclusive() {
+        let trigger = HighPriorityTrigger {
+            anchor_field: "departure_time".to_owned(),
+            offset: Duration::hours(-4),
+        };
+        let anchor = "2026-08-10T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
+
+        // Exactly at the threshold (anchor + offset) -- inclusive.
+        assert!(trigger.is_active(anchor, anchor + Duration::hours(-4)));
+        // One second before the threshold -- not yet active.
+        assert!(!trigger.is_active(
+            anchor,
+            anchor + Duration::hours(-4) - Duration::seconds(1)
+        ));
+        // Exactly at the anchor -- active (window is open-ended forward).
+        assert!(trigger.is_active(anchor, anchor));
+        // Long past the anchor -- still active, no upper bound
+        // (items.id=236 plan judgment call 4: exit is via lifecycle
+        // transition, not the clock).
+        assert!(trigger.is_active(anchor, anchor + Duration::days(30)));
     }
 
     #[test]
