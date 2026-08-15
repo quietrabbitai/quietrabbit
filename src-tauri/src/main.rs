@@ -112,6 +112,54 @@ async fn async_main() {
                         );
                     } else {
                         std::env::set_var("QR_DATA_ROOT", &dir);
+
+                        // items.id=275: instance/shared.db is never created
+                        // outside test code -- every prior caller of
+                        // migrate_shared_db() is inside a #[cfg(test)]
+                        // module, which points QR_DATA_ROOT at its own
+                        // tempdir. Nothing in the real startup path ever
+                        // created/migrated it, so login()'s bootstrap check
+                        // (user_store::has_any_users(), which opens
+                        // shared.db with create_if_missing(false)) failed
+                        // hard on any real, fresh install. Must run here,
+                        // synchronously, after QR_DATA_ROOT above (which
+                        // get_data_root() depends on) and before any command
+                        // handler could touch the DB layer -- same reasoning
+                        // as the QR_DATA_ROOT fix itself.
+                        //
+                        // tauri::async_runtime::block_on() is deliberately
+                        // NOT used here: this closure already runs nested
+                        // inside main()'s own
+                        // `Runtime::new().block_on(async_main())`, and
+                        // calling block_on() again -- even on tauri's own
+                        // separate, lazily-created global runtime --
+                        // panics ("Cannot start a runtime from within a
+                        // runtime"). Tokio's nested-block_on check is
+                        // thread-local, not tied to which Runtime instance
+                        // is entered; commands/tier2.rs's own test module
+                        // already documents hitting this exact panic for
+                        // the analogous #[tokio::test] case.
+                        // block_in_place() + Handle::current().block_on()
+                        // is Tokio's documented pattern for calling async
+                        // code synchronously from sync code inside an async
+                        // fn on a multi-thread runtime (this project's
+                        // tokio dependency uses the "full" feature set,
+                        // which includes rt-multi-thread).
+                        let migration_result = tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(
+                                quietrabbit_lib::persistence::migrations::migrate_shared_db(),
+                            )
+                        });
+                        match migration_result {
+                            Ok(applied) => log::info!(
+                                "main: shared.db migration complete ({applied} pending \
+                                 migration(s) applied)"
+                            ),
+                            Err(e) => log::error!(
+                                "main: shared.db migration failed: {e} — login will fail \
+                                 until this is resolved"
+                            ),
+                        }
                     }
                 }
                 Err(e) => log::error!(
