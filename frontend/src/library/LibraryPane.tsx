@@ -3,10 +3,10 @@
 // NavShell.tsx's describePlaceholder. See that file's former stub comment
 // (removed once this landed) for the original wiring intent.
 //
-// keyHex is null at its only call site today -- Layer 8 auth isn't built,
-// and there is no code path for this frontend to obtain a real key_hex
-// (see navShellConfig.ts's getPlaceholderUserId() note: that placeholder
-// pattern is deliberately NOT extended to key_hex). Every IPC call this
+// keyHex is null at its only call site today -- there is no code path for
+// this frontend to obtain a real key_hex yet (see navShellConfig.ts's
+// requireCurrentUserId() note: the real-session pattern built for user_id
+// is deliberately NOT extended to key_hex, items.id=268). Every IPC call this
 // component could make -- listOutputs, getOutput, copyOutputToClipboard --
 // requires a real key_hex, so each short-circuits client-side with an
 // actionable "not available yet" notice instead, same bar as ChatPane's

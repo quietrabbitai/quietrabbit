@@ -81,6 +81,17 @@ pub struct RecoveryKeyDisplay {
     pub mnemonic: String,
 }
 
+/// The current session's user identity, for get_session (items.id=267).
+/// Deliberately excludes master_key/key_hex -- CLAUDE.md's "Master key
+/// never persisted" rule has no IPC-boundary carve-out.
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, specta::Type)]
+pub struct SessionInfo {
+    pub user_id: String,
+    pub display_name: String,
+    pub role: String,
+    pub is_primary: bool,
+}
+
 // ---------------------------------------------------------------------------
 // shared.db opener (for auth_sessions/auth_failures/auth_lockouts)
 // ---------------------------------------------------------------------------
@@ -441,6 +452,36 @@ pub async fn get_recovery_key_display(
     Ok(RecoveryKeyDisplay { mnemonic })
 }
 
+/// Read back the current session's identity (items.id=267), if any.
+/// `Ok(None)` -- not `Err` -- is the expected result on every cold app
+/// launch: the master key is never persisted (CLAUDE.md), so KeyRegistry
+/// starts empty every process lifetime and there is no auto-relogin. `Err`
+/// is reserved for a real query failure, including the internal
+/// inconsistency of a resident user_id with no matching users row (should
+/// be impossible -- same reasoning login()'s "account exists with no salt
+/// record" branch uses).
+#[tauri::command]
+#[specta::specta]
+pub async fn get_session(
+    key_registry: State<'_, KeyRegistry>,
+) -> Result<Option<SessionInfo>, String> {
+    let Some(user_id) = key_registry.with_key(|k| k.user_id.clone()).await else {
+        return Ok(None);
+    };
+
+    let user = user_store::find_user_by_id(&user_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "internal error: session references a nonexistent user".to_owned())?;
+
+    Ok(Some(SessionInfo {
+        user_id: user.id,
+        display_name: user.display_name,
+        role: user.role,
+        is_primary: user.is_primary,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -785,5 +826,64 @@ mod tests {
             recovered, resident_key,
             "recovered entropy must match the resident master key exactly"
         );
+    }
+
+    #[tokio::test]
+    async fn get_session_with_no_resident_key_returns_ok_none() {
+        let _env = setup().await;
+        let app = mock_app_with_registry();
+        let registry = app.state::<KeyRegistry>();
+
+        let result = get_session(registry.clone()).await;
+        assert_eq!(result, Ok(None));
+    }
+
+    #[tokio::test]
+    async fn get_session_after_login_returns_session_info() {
+        let _env = setup().await;
+        let app = mock_app_with_registry();
+        let registry = app.state::<KeyRegistry>();
+
+        login(
+            "Alice".to_owned(),
+            "correct horse battery staple".to_owned(),
+            registry.clone(),
+        )
+        .await
+        .unwrap();
+
+        let session = get_session(registry.clone()).await.unwrap();
+        assert!(session.is_some());
+        let session = session.unwrap();
+        assert_eq!(session.display_name, "Alice");
+        assert_eq!(session.role, "admin");
+        assert!(session.is_primary);
+
+        let user = user_store::find_user_by_display_name("Alice")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.user_id, user.id);
+    }
+
+    #[tokio::test]
+    async fn get_session_after_logout_reverts_to_none() {
+        let _env = setup().await;
+        let app = mock_app_with_registry();
+        let registry = app.state::<KeyRegistry>();
+
+        login(
+            "Alice".to_owned(),
+            "password123".to_owned(),
+            registry.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(get_session(registry.clone()).await.unwrap().is_some());
+
+        logout(registry.clone()).await.unwrap();
+
+        let result = get_session(registry.clone()).await;
+        assert_eq!(result, Ok(None));
     }
 }

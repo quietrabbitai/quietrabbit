@@ -269,6 +269,22 @@ export const commands = {
 	 *  for the same reason -- there is no key to derive a mnemonic from yet.
 	 */
 	getRecoveryKeyDisplay: () => typedError<RecoveryKeyDisplay, string>(__TAURI_INVOKE("get_recovery_key_display")),
+	/**
+	 *  Read back the current session's identity (items.id=267), if any.
+	 *  `Ok(None)` -- not `Err` -- is the expected result on every cold app
+	 *  launch: the master key is never persisted (CLAUDE.md), so KeyRegistry
+	 *  starts empty every process lifetime and there is no auto-relogin. `Err`
+	 *  is reserved for a real query failure, including the internal
+	 *  inconsistency of a resident user_id with no matching users row (should
+	 *  be impossible -- same reasoning login()'s "account exists with no salt
+	 *  record" branch uses).
+	 */
+	getSession: () => typedError<{
+	user_id: string,
+	display_name: string,
+	role: string,
+	is_primary: boolean,
+} | null, string>(__TAURI_INVOKE("get_session")),
 	getHealth: () => typedError<HealthResponse, string>(__TAURI_INVOKE("get_health")),
 	getCapabilityProfile: () => typedError<CapabilityProfileResponse, string>(__TAURI_INVOKE("get_capability_profile")),
 	/**
@@ -618,6 +634,18 @@ export type ResumeRunRequest = {
 	user_id: string,
 	persona_id: string,
 	key_hex: string,
+};
+
+/**
+ *  The current session's user identity, for get_session (items.id=267).
+ *  Deliberately excludes master_key/key_hex -- CLAUDE.md's "Master key
+ *  never persisted" rule has no IPC-boundary carve-out.
+ */
+export type SessionInfo = {
+	user_id: string,
+	display_name: string,
+	role: string,
+	is_primary: boolean,
 };
 
 export type SubmitConsentDecisionRequest = {

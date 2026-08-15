@@ -1,4 +1,12 @@
 {
+  "auth": {
+    "checkingSession": "Checking for an existing session…",
+    "displayNameLabel": "Display name",
+    "passwordLabel": "Password",
+    "submitButton": "Log in",
+    "loginError": "Could not log in: {{message}}",
+    "sessionMissingAfterLogin": "Logged in, but no session was returned. Try again."
+  },
   "navShell": {
     "topStripLabel": "Top navigation",
     "personaClusterLabel": "Personas",

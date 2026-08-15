@@ -16,7 +16,7 @@
 //   Section 2a/2b) -- a genuine, separately-scoped feature. Additionally
 //   cannot be real yet regardless of scope: commands.getActiveBoard
 //   requires key_hex, which has no placeholder equivalent to
-//   getPlaceholderUserId() (see navShellConfig.ts's note on why that gap
+//   getCurrentUserId() (see navShellConfig.ts's note on why that gap
 //   is deliberately NOT bridged the same way). Renders as flagged
 //   placeholder content below. Library's real screen (Section 2c) is
 //   built (see LibraryPane.tsx) -- same key_hex gap, but the screen
@@ -43,7 +43,8 @@ import {
   FIXED_BUTTON_ORDER,
   currentContent,
   fixedButtonLitState,
-  getPlaceholderUserId,
+  getCurrentUserId,
+  requireCurrentUserId,
   isPersonaAnchor,
   isTier3Enabled,
   pushCrumb,
@@ -70,7 +71,13 @@ export function NavShell() {
   const [tier3PersonaId, setTier3PersonaId] = useState<string | null>(null)
 
   useEffect(() => {
-    commands.listPersonas(getPlaceholderUserId()).then((result) => {
+    // NavShell only mounts once App.tsx's login gate has confirmed a
+    // session, so this should always be non-null in practice -- guarded
+    // anyway rather than assumed, since this effect doesn't itself know
+    // that invariant holds.
+    const userId = getCurrentUserId()
+    if (!userId) return
+    commands.listPersonas(userId).then((result) => {
       if (result.status === 'ok') {
         setPersonas(result.data)
       } else {
@@ -222,7 +229,7 @@ function NavShellContent({
         isGenerating={personaHubGenerating}
         contextPane={
           <PersonaHub
-            userId={getPlaceholderUserId()}
+            userId={requireCurrentUserId()}
             personaId={content.personaId}
             keyHex={null}
             onOpenLibrary={() => onOpenPersonaLibrary(content.personaId)}
@@ -231,7 +238,7 @@ function NavShellContent({
         chatPane={
           <ChatPane
             contextKey={`persona-hub-${content.personaId}`}
-            userId={getPlaceholderUserId()}
+            userId={requireCurrentUserId()}
             personaId={content.personaId}
             keyHex={null}
             focusId="quick-ask"
@@ -253,7 +260,7 @@ function NavShellContent({
         isGenerating={false}
         contextPane={
           <LibraryPane
-            userId={getPlaceholderUserId()}
+            userId={requireCurrentUserId()}
             personaId={personaId}
             keyHex={null}
           />

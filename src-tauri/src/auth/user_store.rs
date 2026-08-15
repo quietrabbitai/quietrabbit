@@ -124,6 +124,28 @@ pub async fn find_user_by_display_name(
     }))
 }
 
+/// Fetch a user by id. Mirrors find_user_by_display_name's row shape --
+/// used by commands::auth::get_session to resolve the resident
+/// KeyRegistry.user_id (a raw id, not a display_name) into the fields the
+/// frontend session response needs.
+pub async fn find_user_by_id(user_id: &str) -> Result<Option<UserRecord>, UserStoreError> {
+    let mut conn = open_shared_db().await?;
+    let row = sqlx::query(
+        "SELECT id, display_name, role, is_primary, idle_timeout_minutes
+         FROM users WHERE id = ?",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut conn)
+    .await?;
+    Ok(row.map(|r| UserRecord {
+        id: r.get("id"),
+        display_name: r.get("display_name"),
+        role: r.get("role"),
+        is_primary: r.get::<i64, _>("is_primary") != 0,
+        idle_timeout_minutes: r.get("idle_timeout_minutes"),
+    }))
+}
+
 /// Decode a hex string into bytes, failing on any malformed input rather
 /// than silently dropping unparseable pairs. Authentication material must
 /// fail loudly on corruption, not partially decode (corrected this
@@ -396,6 +418,28 @@ mod tests {
     async fn find_user_by_display_name_returns_none_when_absent() {
         let _env = setup().await;
         let found = find_user_by_display_name("Nobody").await.unwrap();
+        assert!(found.is_none());
+    }
+
+    #[tokio::test]
+    async fn find_user_by_id_round_trips() {
+        let _env = setup().await;
+        create_user("u1", "Alice", "admin", true, b"salt1234", 1024, 1, 1)
+            .await
+            .unwrap();
+
+        let found = find_user_by_id("u1").await.unwrap();
+        assert!(found.is_some());
+        let record = found.unwrap();
+        assert_eq!(record.display_name, "Alice");
+        assert_eq!(record.role, "admin");
+        assert!(record.is_primary);
+    }
+
+    #[tokio::test]
+    async fn find_user_by_id_returns_none_when_absent() {
+        let _env = setup().await;
+        let found = find_user_by_id("nonexistent").await.unwrap();
         assert!(found.is_none());
     }
 

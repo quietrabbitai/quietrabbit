@@ -160,33 +160,50 @@ export function isTier3Enabled(state: NavState): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Placeholder session identity -- items.id=232 checkpoint, Jason 2026-08-09
+// Real session identity -- items.id=267, 2026-08-15
 // ---------------------------------------------------------------------------
 //
-// BLOCKS ON REAL AUTH (Layer 8, not yet built). list_personas requires a
-// user_id, but nothing in this frontend can source a real one yet:
 // commands.login() returns null on success (per CLAUDE.md, the master key
 // and session state never leave Rust/AppState, never in an IPC response),
-// and there is no get_session / get_current_user IPC command.
+// so App.tsx's login flow calls commands.getSession() immediately after a
+// successful login to learn the resulting user_id, then hands it to
+// setCurrentUserId() below. Every call site that needs the current user's
+// id goes through getCurrentUserId() -- never inline the literal -- kept
+// as a single module-level choke point (mirrors the PLACEHOLDER-constant
+// discipline already established in middleZone/middleZoneConfig.ts) rather
+// than threading userId as a prop through every consumer.
 //
-// This function is a flagged stand-in ONLY. Every call site that needs
-// the current user's id MUST go through getPlaceholderUserId() -- never
-// inline the literal -- so the eventual real-session swap-in is a one-line
-// change here, not a hunt across call sites. Mirrors persona_store's own
-// "test-user" test-only convention and the PLACEHOLDER-constant discipline
-// already established in middleZone/middleZoneConfig.ts.
+// Returns null before a session exists (during App.tsx's initial
+// getSession() check, and on the login screen itself) -- callers that run
+// before NavShell mounts must handle that; callers inside NavShell's own
+// tree can rely on it being non-null, since NavShell only mounts once
+// App.tsx's login gate has confirmed a session.
 //
 // Do NOT extend this pattern to key_hex anywhere. CLAUDE.md's "Master key
 // never persisted" rule has no equivalent carve-out, and a fake key_hex
 // would be a materially more sensitive thing to stand in for than a
 // user_id. Content that requires key_hex (e.g. commands.getActiveBoard)
-// stays real-session-only and unbuilt until Layer 8 lands -- see the
+// stays real-session-only and unbuilt until items.id=268 lands -- see the
 // Active Board placeholder content in NavShell.tsx.
-//
-// FLAGGED FOR FOLLOW-UP: needs its own tracked item once a real
-// session/current-user IPC path exists, so this function (and every call
-// site depending on it) can be swapped over in one pass. Do not let this
-// get buried -- see this session's handoff.
-export function getPlaceholderUserId(): string {
-  return 'test-user'
+let currentUserId: string | null = null
+
+export function setCurrentUserId(userId: string | null): void {
+  currentUserId = userId
+}
+
+export function getCurrentUserId(): string | null {
+  return currentUserId
+}
+
+/** Non-nullable variant for call sites inside NavShell's own render tree,
+ *  where a session is guaranteed by construction (NavShell only mounts
+ *  post-login) -- fails loudly on the invariant being violated rather than
+ *  silently passing an empty string downstream, matching this codebase's
+ *  existing discipline of erroring on corrupt/impossible state rather than
+ *  papering over it (e.g. auth/user_store.rs's hex_decode). */
+export function requireCurrentUserId(): string {
+  if (!currentUserId) {
+    throw new Error('requireCurrentUserId() called with no active session')
+  }
+  return currentUserId
 }

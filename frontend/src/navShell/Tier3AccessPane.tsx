@@ -39,7 +39,7 @@ import { commands } from '../bindings'
 import { ChatPane } from '../chat/ChatPane'
 import { MiddleZone } from '../middleZone/MiddleZone'
 import { DEFAULT_CONVERSATION_PROFILE } from '../middleZone/middleZoneConfig'
-import { getPlaceholderUserId } from './navShellConfig'
+import { requireCurrentUserId } from './navShellConfig'
 import { computePaneLayout } from '../tier3Access/paneLayout'
 import {
   PrivacyGuardianModal,
@@ -180,7 +180,7 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
       setPendingMessageId(messageId)
       commands
         .requestTier3Gate3Review({
-          user_id: getPlaceholderUserId(),
+          user_id: requireCurrentUserId(),
           persona_id: personaId,
           key_hex: keyHex,
           message_id: messageId,
@@ -243,14 +243,14 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
     commands
       .submitElementConsentDecision({
         run_id: consentPayload.focus_run_id,
-        user_id: getPlaceholderUserId(),
+        user_id: requireCurrentUserId(),
         persona_id: personaId,
         key_hex: keyHex,
         decisions_json: JSON.stringify(decisions),
       })
       .then(() =>
         commands.resolveTier3Gate3Review({
-          user_id: getPlaceholderUserId(),
+          user_id: requireCurrentUserId(),
           persona_id: personaId,
           key_hex: keyHex,
           message_id: pendingMessageId,
@@ -284,7 +284,7 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
             personaId ? (
               <ChatPane
                 contextKey={`tier3-access-${personaId}`}
-                userId={getPlaceholderUserId()}
+                userId={requireCurrentUserId()}
                 personaId={personaId}
                 keyHex={keyHex}
                 focusId="quick-ask"

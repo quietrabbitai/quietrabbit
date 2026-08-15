@@ -4,10 +4,10 @@
 // component for both: gate3Track is the only behavioral difference (whether
 // the assistant reply gets gate3_review_status="drafted").
 //
-// keyHex is null at both call sites today -- Layer 8 auth isn't built, and
-// there is no code path for this frontend to obtain a real key_hex (see
-// navShellConfig.ts's getPlaceholderUserId() note: that placeholder pattern
-// is deliberately NOT extended to key_hex). When null, send() never calls
+// keyHex is null at both call sites today -- there is no code path for this
+// frontend to obtain a real key_hex yet (see navShellConfig.ts's
+// requireCurrentUserId() note: the real-session pattern built for user_id
+// is deliberately NOT extended to key_hex, items.id=268). When null, send() never calls
 // IPC at all -- it short-circuits client-side with an actionable "not sent"
 // notice, same bar as commands/library.rs's prepare_clipboard_copy blocked
 // message (states what happened and what the user can still do, no dead
