@@ -66,7 +66,7 @@ use cef::{
 use tauri::State;
 use tokio::sync::oneshot;
 
-use crate::auth::registry::KeyRegistry;
+use crate::auth::registry::{key_hex, KeyRegistry};
 use crate::persistence::provider_store::{self, ProviderTier};
 use crate::persistence::tier3_cookie_store::{self, StoredCookie};
 use crate::tier3_pane::pane_host::{self, PaneCommand};
@@ -139,14 +139,6 @@ pub struct PaneLayoutEntry {
 /// `render`/`resize` closures via `AppHandle::state()`.
 #[derive(Default)]
 pub struct PaneLayoutState(pub Mutex<HashMap<PaneKey, PaneRectFraction>>);
-
-/// Matches auth.rs/tier2.rs's own local copy exactly (not yet unified
-/// behind a shared helper anywhere in this codebase -- see tier2.rs's own
-/// header on Architecture Section 4.2 being a first-slice migration, not
-/// yet a completed one).
-fn key_hex(key: &[u8; crate::auth::kdf::MASTER_KEY_LEN]) -> String {
-    key.iter().map(|b| format!("{b:02x}")).collect()
-}
 
 // ---------------------------------------------------------------------------
 // cef::Cookie <-> StoredCookie conversions

@@ -24,7 +24,9 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use specta::Type;
+use tauri::State;
 
+use crate::auth::registry::{key_hex, KeyRegistry};
 use crate::commands::execution::{self, SubmitFocusRunRequest};
 use crate::conductor::concurrency::ConductorScheduler;
 use crate::persistence::{message_store, output_store};
@@ -107,10 +109,15 @@ fn build_conversation_prompt(history: &[message_store::MessageRecord]) -> String
 pub async fn list_messages(
     user_id: String,
     persona_id: String,
-    key_hex: String,
+    key_registry: State<'_, KeyRegistry>,
     context_key: String,
 ) -> Result<Vec<MessageInfo>, String> {
-    let records = message_store::list_messages(&user_id, &persona_id, &key_hex, &context_key)
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
+    let records = message_store::list_messages(&user_id, &persona_id, &key_hex_str, &context_key)
         .await
         .map_err(|e| e.to_string())?;
     Ok(records.into_iter().map(to_message_info).collect())
@@ -122,19 +129,24 @@ pub async fn list_messages(
 pub async fn send_message(
     app_handle: tauri::AppHandle,
     scheduler: tauri::State<'_, Arc<ConductorScheduler>>,
+    key_registry: State<'_, KeyRegistry>,
     user_id: String,
     persona_id: String,
-    key_hex: String,
     context_key: String,
     content: String,
     focus_id: String,
     gate3_track: bool,
 ) -> Result<Vec<MessageInfo>, String> {
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
     // 1. Persist the user's turn.
     message_store::save_message(
         &user_id,
         &persona_id,
-        &key_hex,
+        &key_hex_str,
         &context_key,
         "user",
         &content,
@@ -146,7 +158,7 @@ pub async fn send_message(
 
     // 2. Build the bounded conversation-history prefix (includes the turn
     // just saved above as the last entry).
-    let history = message_store::list_messages(&user_id, &persona_id, &key_hex, &context_key)
+    let history = message_store::list_messages(&user_id, &persona_id, &key_hex_str, &context_key)
         .await
         .map_err(|e| e.to_string())?;
     let user_input = build_conversation_prompt(&history);
@@ -159,11 +171,12 @@ pub async fn send_message(
         user_input,
         user_id: user_id.clone(),
         persona_id: persona_id.clone(),
-        key_hex: key_hex.clone(),
         topic_id: None,
         confirmed_cross_persona_fact_ids: vec![],
     };
-    let mut run = execution::load_and_authorize_run(app_handle, scheduler, request).await?;
+    let mut run =
+        execution::load_and_authorize_run(app_handle, scheduler, key_hex_str.clone(), request)
+            .await?;
     let run_id = run
         .focus_run_id
         .clone()
@@ -176,7 +189,7 @@ pub async fn send_message(
     let assistant_record = message_store::save_message(
         &user_id,
         &persona_id,
-        &key_hex,
+        &key_hex_str,
         &context_key,
         "assistant",
         "",
@@ -192,7 +205,7 @@ pub async fn send_message(
     // errors here are lost sends, not crashes.
     let bg_user_id = user_id.clone();
     let bg_persona_id = persona_id.clone();
-    let bg_key_hex = key_hex.clone();
+    let bg_key_hex = key_hex_str.clone();
     let bg_run_id = run_id.clone();
     let bg_message_id = assistant_record.id.clone();
     tokio::spawn(async move {
@@ -227,9 +240,10 @@ pub async fn send_message(
     // 6. Return the transcript as it stands now (includes the just-reserved,
     // still-empty assistant placeholder — the caller renders staged/final
     // content via the run-status-update listener and a later refetch).
-    let transcript = message_store::list_messages(&user_id, &persona_id, &key_hex, &context_key)
-        .await
-        .map_err(|e| e.to_string())?;
+    let transcript =
+        message_store::list_messages(&user_id, &persona_id, &key_hex_str, &context_key)
+            .await
+            .map_err(|e| e.to_string())?;
     Ok(transcript.into_iter().map(to_message_info).collect())
 }
 
@@ -307,11 +321,17 @@ mod tests {
     // commands::library's tests / persistence::message_store's tests).
     // -----------------------------------------------------------------
 
-    use crate::test_support::ENV_MUTEX;
+    use crate::test_support::{mock_app_with_registry, populate_registry, ENV_MUTEX};
+    use tauri::Manager;
 
     const USER_ID: &str = "user-msgcmd-test";
     const PERSONA_ID: &str = "persona-msgcmd-test";
-    const KEY_HEX: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+    const MASTER_KEY: [u8; crate::auth::kdf::MASTER_KEY_LEN] =
+        [0xEFu8; crate::auth::kdf::MASTER_KEY_LEN];
+
+    fn key_hex_str() -> String {
+        key_hex(&MASTER_KEY)
+    }
 
     struct TestEnv {
         _tempdir: tempfile::TempDir,
@@ -335,7 +355,7 @@ mod tests {
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
 
-        crate::persistence::migrations::migrate_messages_db(USER_ID, PERSONA_ID, KEY_HEX)
+        crate::persistence::migrations::migrate_messages_db(USER_ID, PERSONA_ID, &key_hex_str())
             .await
             .expect("messages.db migration must succeed in test setup");
 
@@ -353,7 +373,7 @@ mod tests {
         message_store::save_message(
             USER_ID,
             PERSONA_ID,
-            KEY_HEX,
+            &key_hex_str(),
             "persona-hub-persona-1",
             "user",
             "hello",
@@ -363,10 +383,14 @@ mod tests {
         .await
         .expect("save_message must succeed");
 
+        let app = mock_app_with_registry();
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(&registry, USER_ID, MASTER_KEY).await;
+
         let results = list_messages(
             USER_ID.to_owned(),
             PERSONA_ID.to_owned(),
-            KEY_HEX.to_owned(),
+            registry,
             "persona-hub-persona-1".to_owned(),
         )
         .await
@@ -381,10 +405,14 @@ mod tests {
     async fn list_messages_command_returns_empty_vec_for_unknown_context_key() {
         let _env = setup().await;
 
+        let app = mock_app_with_registry();
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(&registry, USER_ID, MASTER_KEY).await;
+
         let results = list_messages(
             USER_ID.to_owned(),
             PERSONA_ID.to_owned(),
-            KEY_HEX.to_owned(),
+            registry,
             "never-sent-to".to_owned(),
         )
         .await

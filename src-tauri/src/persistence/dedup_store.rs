@@ -570,6 +570,18 @@ const CANDIDATE_COLUMNS: &str =
 ///
 /// Records already tombstoned ('user_deleted') take no part: resolving a
 /// duplicate must not cause the loser to reappear in a later scan.
+///
+/// key_hex boundary (items.id=268): this fn (and list_pending_candidates/
+/// resolve_candidate below) keep taking key_hex: &str, same as every other
+/// store in this codebase -- these are plain library functions, not
+/// #[tauri::command]s, and this file has no opener of its own (it imports
+/// personal_store::open_personal_db directly, see the use import above).
+/// Unlike the other three items.id=268 stores, this module currently has
+/// zero live command-layer callers -- confirmed via `grep -rn
+/// "dedup_store::" src-tauri/src/commands/` returning nothing -- so there is
+/// no IPC boundary to migrate here yet. Noted rather than silently skipped;
+/// whichever command eventually wires this up should derive key_hex from
+/// auth::registry::KeyRegistry server-side, matching commands/tier2.rs.
 pub async fn scan_for_duplicates(
     user_id: &str,
     persona_id: &str,

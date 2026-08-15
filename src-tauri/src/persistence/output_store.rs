@@ -100,6 +100,15 @@ fn get_outputs_db_path(user_id: &str, persona_id: &str) -> PathBuf {
 /// PRAGMA key fires before journal_mode via SqliteConnectOptions (D6-346).
 /// busy_timeout=5000ms guards against transient SQLITE_BUSY during concurrent
 /// UI polling and Conductor writes.
+///
+/// key_hex boundary (items.id=268): this fn and every public fn in this file
+/// keep taking key_hex: &str -- that hasn't changed, and shouldn't, since
+/// these are plain library functions (not #[tauri::command]s) also called
+/// directly from this file's own tests and from background tasks. What
+/// changed is who calls them: every command-layer caller now derives
+/// key_hex from auth::registry::KeyRegistry server-side (see
+/// commands/tier2.rs for the reference pattern) instead of accepting it as
+/// a bare IPC parameter from the frontend.
 async fn open_outputs_db(
     user_id: &str,
     persona_id: &str,

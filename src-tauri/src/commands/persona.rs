@@ -44,8 +44,10 @@
 //   FocusInfo.last_used is now a real value: MAX(started_at) from outputs.db's
 //   focus_runs (persistence::output_store::get_focus_last_used/get_last_used_map),
 //   which is why list_focuses/get_focus_settings/update_focus_settings now take
-//   user_id + key_hex -- the same per-persona encrypted DB access pattern
-//   already used by commands::active_board::get_active_board/get_topic_list.
+//   user_id and access outputs.db -- the same per-persona encrypted DB access
+//   pattern already used by commands::active_board::get_active_board/get_topic_list.
+//   key_hex itself is derived server-side from KeyRegistry (items.id=268), not
+//   accepted as an IPC parameter -- see auth::registry::key_hex.
 //   dormancy_state is NOT part of this fix -- split to items.id=256. The
 //   dispatch for this item assumed an existing Persona-level Hibernate/Archive
 //   lifecycle model (items.id=20) could be reused for it; investigation found
@@ -60,7 +62,9 @@
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
+use tauri::State;
 
+use crate::auth::registry::{key_hex, KeyRegistry};
 use crate::persistence::focus_settings_store;
 use crate::persistence::output_store;
 use crate::persistence::persona_store;
@@ -218,13 +222,18 @@ pub async fn create_persona(
 pub async fn list_focuses(
     user_id: String,
     persona_id: String,
-    key_hex: String,
+    key_registry: State<'_, KeyRegistry>,
 ) -> Result<Vec<FocusInfo>, String> {
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
     let settings = focus_settings_store::list_focus_settings_for_persona(&persona_id)
         .await
         .map_err(|e| e.to_string())?;
 
-    let last_used_map = output_store::get_last_used_map(&user_id, &persona_id, &key_hex).await;
+    let last_used_map = output_store::get_last_used_map(&user_id, &persona_id, &key_hex_str).await;
 
     Ok(settings
         .into_iter()
@@ -251,15 +260,21 @@ pub async fn list_focuses(
 pub async fn get_focus_settings(
     user_id: String,
     persona_id: String,
-    key_hex: String,
+    key_registry: State<'_, KeyRegistry>,
     focus_id: String,
 ) -> Result<FocusInfo, String> {
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
     let s = focus_settings_store::get_focus_settings(&persona_id, &focus_id)
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "not_found".to_string())?;
 
-    let last_used = output_store::get_focus_last_used(&user_id, &persona_id, &key_hex, &focus_id).await;
+    let last_used =
+        output_store::get_focus_last_used(&user_id, &persona_id, &key_hex_str, &focus_id).await;
 
     Ok(FocusInfo {
         focus_id: s.focus_id,
@@ -291,9 +306,14 @@ pub async fn get_focus_settings(
 #[specta::specta]
 pub async fn update_focus_settings(
     user_id: String,
-    key_hex: String,
+    key_registry: State<'_, KeyRegistry>,
     request: UpdateFocusSettingsRequest,
 ) -> Result<FocusInfo, String> {
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
     // Tier bounds check: valid tiers are 1-3.
     for (name, val) in [
         ("privacy_tier", request.privacy_tier),
@@ -361,9 +381,13 @@ pub async fn update_focus_settings(
     .await
     .map_err(|e| e.to_string())?;
 
-    let last_used =
-        output_store::get_focus_last_used(&user_id, &request.persona_id, &key_hex, &request.focus_id)
-            .await;
+    let last_used = output_store::get_focus_last_used(
+        &user_id,
+        &request.persona_id,
+        &key_hex_str,
+        &request.focus_id,
+    )
+    .await;
 
     Ok(FocusInfo {
         focus_id: s.focus_id,
@@ -385,11 +409,13 @@ pub async fn update_focus_settings(
 mod tests {
     use super::*;
     use crate::persistence::output_store;
-    use crate::test_support::ENV_MUTEX;
+    use crate::test_support::{mock_app_with_registry, populate_registry, ENV_MUTEX};
+    use tauri::Manager;
 
     const USER_ID: &str = "user-persona-test";
     const PERSONA_ID: &str = "persona-persona-test";
-    const KEY_HEX: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+    const MASTER_KEY: [u8; crate::auth::kdf::MASTER_KEY_LEN] =
+        [0xABu8; crate::auth::kdf::MASTER_KEY_LEN];
 
     struct TestEnv {
         _tempdir: tempfile::TempDir,
@@ -420,9 +446,13 @@ mod tests {
         crate::persistence::migrations::migrate_shared_db()
             .await
             .expect("shared.db migration must succeed in test setup");
-        crate::persistence::migrations::migrate_outputs_db(USER_ID, PERSONA_ID, KEY_HEX)
-            .await
-            .expect("outputs.db migration must succeed in test setup");
+        crate::persistence::migrations::migrate_outputs_db(
+            USER_ID,
+            PERSONA_ID,
+            &key_hex(&MASTER_KEY),
+        )
+        .await
+        .expect("outputs.db migration must succeed in test setup");
 
         crate::auth::user_store::create_user(
             USER_ID,
@@ -541,10 +571,14 @@ mod tests {
         .await
         .expect("create_focus_settings must succeed");
 
+        let app = mock_app_with_registry();
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(&registry, USER_ID, MASTER_KEY).await;
+
         let info = get_focus_settings(
             USER_ID.to_owned(),
             PERSONA_ID.to_owned(),
-            KEY_HEX.to_owned(),
+            registry,
             "quick-ask".to_owned(),
         )
         .await
@@ -574,14 +608,24 @@ mod tests {
         )
         .await
         .expect("create_focus_settings must succeed");
-        output_store::test_seed_focus_run(USER_ID, PERSONA_ID, KEY_HEX, "run-1", "quick-ask")
-            .await
-            .expect("test_seed_focus_run must succeed");
+        output_store::test_seed_focus_run(
+            USER_ID,
+            PERSONA_ID,
+            &key_hex(&MASTER_KEY),
+            "run-1",
+            "quick-ask",
+        )
+        .await
+        .expect("test_seed_focus_run must succeed");
+
+        let app = mock_app_with_registry();
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(&registry, USER_ID, MASTER_KEY).await;
 
         let info = get_focus_settings(
             USER_ID.to_owned(),
             PERSONA_ID.to_owned(),
-            KEY_HEX.to_owned(),
+            registry,
             "quick-ask".to_owned(),
         )
         .await
@@ -611,17 +655,23 @@ mod tests {
         )
         .await
         .expect("create_focus_settings must succeed");
-        output_store::test_seed_focus_run(USER_ID, PERSONA_ID, KEY_HEX, "run-1", "quick-ask")
-            .await
-            .expect("test_seed_focus_run must succeed");
-
-        let focuses = list_focuses(
-            USER_ID.to_owned(),
-            PERSONA_ID.to_owned(),
-            KEY_HEX.to_owned(),
+        output_store::test_seed_focus_run(
+            USER_ID,
+            PERSONA_ID,
+            &key_hex(&MASTER_KEY),
+            "run-1",
+            "quick-ask",
         )
         .await
-        .expect("list_focuses must succeed");
+        .expect("test_seed_focus_run must succeed");
+
+        let app = mock_app_with_registry();
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(&registry, USER_ID, MASTER_KEY).await;
+
+        let focuses = list_focuses(USER_ID.to_owned(), PERSONA_ID.to_owned(), registry)
+            .await
+            .expect("list_focuses must succeed");
 
         assert_eq!(focuses.len(), 1);
         assert!(

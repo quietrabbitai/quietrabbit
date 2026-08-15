@@ -66,7 +66,7 @@
 use tauri::State;
 
 use crate::auth::kdf;
-use crate::auth::registry::{KeyRegistry, UnlockedKey};
+use crate::auth::registry::{key_hex, KeyRegistry, UnlockedKey};
 use crate::auth::user_store;
 
 // ---------------------------------------------------------------------------
@@ -185,10 +185,6 @@ async fn verify_integration_keys_db(user_id: &str, key_hex: &str) -> Result<(), 
                 KeyVerification::Other(e.to_string())
             }
         })
-}
-
-fn key_hex(key: &[u8; kdf::MASTER_KEY_LEN]) -> String {
-    key.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 // ---------------------------------------------------------------------------

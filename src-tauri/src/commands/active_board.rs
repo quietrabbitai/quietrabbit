@@ -34,7 +34,9 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use specta::Type;
+use tauri::State;
 
+use crate::auth::registry::{key_hex, KeyRegistry};
 use crate::conductor::lifecycle::{load_focus_definition, FocusDefinition};
 use crate::persistence::topic_store::{self, Topic};
 
@@ -80,7 +82,6 @@ pub struct UpdateTopicStateRequest {
     pub topic_id: String,
     pub user_id: String,
     pub persona_id: String,
-    pub key_hex: String,
     pub state: String,
 }
 
@@ -119,9 +120,14 @@ fn topic_is_high_priority(topic: &Topic, focus_def: &FocusDefinition, now: DateT
 pub async fn get_active_board(
     user_id: String,
     persona_id: String,
-    key_hex: String,
+    key_registry: State<'_, KeyRegistry>,
 ) -> Result<ActiveBoardResponse, String> {
-    let topics = topic_store::list_topics(&user_id, &persona_id, &key_hex, None, None)
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
+    let topics = topic_store::list_topics(&user_id, &persona_id, &key_hex_str, None, None)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -164,18 +170,27 @@ pub async fn get_topic_list(
     focus_id: String,
     user_id: String,
     persona_id: String,
-    key_hex: String,
+    key_registry: State<'_, KeyRegistry>,
 ) -> Result<Vec<TopicInfo>, String> {
-    let topics = topic_store::list_topics(&user_id, &persona_id, &key_hex, Some(&focus_id), None)
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
         .await
-        .map_err(|e| e.to_string())?;
+        .ok_or_else(|| "not logged in".to_owned())?;
+
+    let topics =
+        topic_store::list_topics(&user_id, &persona_id, &key_hex_str, Some(&focus_id), None)
+            .await
+            .map_err(|e| e.to_string())?;
 
     Ok(topics.into_iter().map(TopicInfo::from).collect())
 }
 
 #[tauri::command]
 #[specta::specta]
-pub async fn update_topic_state(request: UpdateTopicStateRequest) -> Result<(), String> {
+pub async fn update_topic_state(
+    request: UpdateTopicStateRequest,
+    key_registry: State<'_, KeyRegistry>,
+) -> Result<(), String> {
     const VALID_STATES: &[&str] = &["Active", "Paused", "Waiting on you", "Complete", "Closed"];
     if !VALID_STATES.contains(&request.state.as_str()) {
         return Err(format!(
@@ -185,10 +200,15 @@ pub async fn update_topic_state(request: UpdateTopicStateRequest) -> Result<(), 
         ));
     }
 
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
     topic_store::update_topic_state(
         &request.user_id,
         &request.persona_id,
-        &request.key_hex,
+        &key_hex_str,
         &request.topic_id,
         &request.state,
         None, // dormant_since: not exposed in IPC v1

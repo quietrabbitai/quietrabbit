@@ -74,7 +74,9 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 use sqlx::ConnectOptions;
 use sqlx::Row;
+use tauri::State;
 
+use crate::auth::registry::{key_hex, KeyRegistry};
 use crate::conductor::extract;
 use crate::conductor::privacy::types::{ExtractConfirmDecision, Gate3ReviewResult};
 use crate::conductor::privacy::PrivacyGateway;
@@ -95,7 +97,6 @@ pub struct SubmitConsentDecisionRequest {
     pub run_id: String,
     pub user_id: String,
     pub persona_id: String,
-    pub key_hex: String,
     /// "approved" | "declined"
     pub decision: String,
 }
@@ -105,7 +106,6 @@ pub struct SubmitFloorConsentDecisionRequest {
     pub run_id: String,
     pub user_id: String,
     pub persona_id: String,
-    pub key_hex: String,
     pub abstraction_tier: i32,
     /// "proceed" | "cancel"
     pub decision: String,
@@ -118,7 +118,6 @@ pub struct SubmitElementConsentDecisionRequest {
     pub run_id: String,
     pub user_id: String,
     pub persona_id: String,
-    pub key_hex: String,
     /// JSON-serialized Vec<ElementDecision> produced by the frontend.
     /// Expected shape per element:
     ///   { "span_id": string, "decision": "generalize"|"keep_private"|"release_original",
@@ -133,7 +132,6 @@ pub struct SubmitExtractConfirmRequest {
     pub run_id: String,
     pub user_id: String,
     pub persona_id: String,
-    pub key_hex: String,
     /// JSON-serialized Vec<ExtractConfirmDecision>.
     /// Shape per element:
     ///   { "candidate_id": i64, "confirmed": bool,
@@ -146,14 +144,12 @@ pub struct SubmitExtractConfirmRequest {
 pub struct GetPendingCrossPersonaConfirmationsRequest {
     pub user_id: String,
     pub persona_id: String,
-    pub key_hex: String,
 }
 
 #[derive(Debug, Deserialize, Type)]
 pub struct RequestTier3Gate3ReviewRequest {
     pub user_id: String,
     pub persona_id: String,
-    pub key_hex: String,
     pub message_id: String,
 }
 
@@ -161,7 +157,6 @@ pub struct RequestTier3Gate3ReviewRequest {
 pub struct ResolveTier3Gate3ReviewRequest {
     pub user_id: String,
     pub persona_id: String,
-    pub key_hex: String,
     pub message_id: String,
     /// "approved" | "withheld" -- the two terminal states a resolved
     /// consent review can reach. "drafted"/"pending-review" are gate3's own
@@ -212,11 +207,19 @@ pub struct PendingCrossPersonaFact {
 
 #[tauri::command]
 #[specta::specta]
-pub async fn submit_consent_decision(request: SubmitConsentDecisionRequest) -> Result<(), String> {
+pub async fn submit_consent_decision(
+    request: SubmitConsentDecisionRequest,
+    key_registry: State<'_, KeyRegistry>,
+) -> Result<(), String> {
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
     output_store::write_consent_decision(
         &request.user_id,
         &request.persona_id,
-        &request.key_hex,
+        &key_hex_str,
         &request.run_id,
         &request.decision,
     )
@@ -228,12 +231,18 @@ pub async fn submit_consent_decision(request: SubmitConsentDecisionRequest) -> R
 #[specta::specta]
 pub async fn submit_floor_consent_decision(
     request: SubmitFloorConsentDecisionRequest,
+    key_registry: State<'_, KeyRegistry>,
 ) -> Result<(), String> {
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
     // Write the decision record to consent_decisions in outputs.db.
     output_store::write_floor_consent_decision(
         &request.user_id,
         &request.persona_id,
-        &request.key_hex,
+        &key_hex_str,
         &request.run_id,
         request.abstraction_tier,
         &request.decision,
@@ -257,11 +266,17 @@ pub async fn submit_floor_consent_decision(
 #[specta::specta]
 pub async fn submit_element_consent_decision(
     request: SubmitElementConsentDecisionRequest,
+    key_registry: State<'_, KeyRegistry>,
 ) -> Result<(), String> {
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
     output_store::write_element_consent_decisions(
         &request.user_id,
         &request.persona_id,
-        &request.key_hex,
+        &key_hex_str,
         &request.run_id,
         &request.decisions_json,
     )
@@ -409,14 +424,20 @@ pub async fn submit_friction_gate_decision(
 pub async fn submit_extract_confirm(
     app_handle: tauri::AppHandle,
     request: SubmitExtractConfirmRequest,
+    key_registry: State<'_, KeyRegistry>,
 ) -> Result<(), String> {
     use tauri::Emitter;
+
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
 
     // Verify run is in the expected state.
     let status = get_focus_run_status(
         &request.user_id,
         &request.persona_id,
-        &request.key_hex,
+        &key_hex_str,
         &request.run_id,
     )
     .await
@@ -450,7 +471,7 @@ pub async fn submit_extract_confirm(
     let pending_candidates = extract::load_pending_candidates(
         &request.user_id,
         &request.persona_id,
-        &request.key_hex,
+        &key_hex_str,
         &request.run_id,
     )
     .await
@@ -459,7 +480,7 @@ pub async fn submit_extract_confirm(
     let unrecovered_before = extract::load_unrecovered_rows(
         &request.user_id,
         &request.persona_id,
-        &request.key_hex,
+        &key_hex_str,
         &request.run_id,
     )
     .await
@@ -487,7 +508,7 @@ pub async fn submit_extract_confirm(
             let fields = extract::get_candidate_fields(
                 &request.user_id,
                 &request.persona_id,
-                &request.key_hex,
+                &key_hex_str,
                 d.candidate_id,
             )
             .await
@@ -500,7 +521,7 @@ pub async fn submit_extract_confirm(
             extract::persist_confirmed_field(
                 &request.user_id,
                 &request.persona_id,
-                &request.key_hex,
+                &key_hex_str,
                 &fields.field_name,
                 d.confirmed_value.as_deref().ok_or_else(|| {
                     format!(
@@ -518,7 +539,7 @@ pub async fn submit_extract_confirm(
             extract::mark_candidate_decided(
                 &request.user_id,
                 &request.persona_id,
-                &request.key_hex,
+                &key_hex_str,
                 d.candidate_id,
                 true,
                 d.confirmed_value.as_deref(),
@@ -530,7 +551,7 @@ pub async fn submit_extract_confirm(
             extract::set_persisted_at(
                 &request.user_id,
                 &request.persona_id,
-                &request.key_hex,
+                &key_hex_str,
                 d.candidate_id,
             )
             .await
@@ -540,7 +561,7 @@ pub async fn submit_extract_confirm(
             extract::mark_candidate_decided(
                 &request.user_id,
                 &request.persona_id,
-                &request.key_hex,
+                &key_hex_str,
                 d.candidate_id,
                 false,
                 None,
@@ -556,7 +577,7 @@ pub async fn submit_extract_confirm(
     let unrecovered_after = extract::load_unrecovered_rows(
         &request.user_id,
         &request.persona_id,
-        &request.key_hex,
+        &key_hex_str,
         &request.run_id,
     )
     .await
@@ -574,7 +595,7 @@ pub async fn submit_extract_confirm(
     set_focus_run_status(
         &request.user_id,
         &request.persona_id,
-        &request.key_hex,
+        &key_hex_str,
         &request.run_id,
         "complete",
     )
@@ -612,11 +633,17 @@ pub async fn submit_extract_confirm(
 #[specta::specta]
 pub async fn get_pending_cross_persona_confirmations(
     request: GetPendingCrossPersonaConfirmationsRequest,
+    key_registry: State<'_, KeyRegistry>,
 ) -> Result<Vec<PendingCrossPersonaFact>, String> {
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
     let facts = personal_store::list_pending_cross_persona_exports(
         &request.user_id,
         &request.persona_id,
-        &request.key_hex,
+        &key_hex_str,
     )
     .await
     .map_err(|e| e.to_string())?;
@@ -681,11 +708,17 @@ const TIER3_DRAFT_FOCUS_ID: &str = "quick-ask";
 pub async fn request_tier3_gate3_review(
     app_handle: tauri::AppHandle,
     request: RequestTier3Gate3ReviewRequest,
+    key_registry: State<'_, KeyRegistry>,
 ) -> Result<Gate3ReviewResult, String> {
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
     let message = message_store::get_message(
         &request.user_id,
         &request.persona_id,
-        &request.key_hex,
+        &key_hex_str,
         &request.message_id,
     )
     .await
@@ -727,7 +760,7 @@ pub async fn request_tier3_gate3_review(
     let gateway = PrivacyGateway::new(SqliteDisclosureLogger::new(
         &request.user_id,
         &request.persona_id,
-        &request.key_hex,
+        &key_hex_str,
     ));
 
     let result = gateway
@@ -757,7 +790,7 @@ pub async fn request_tier3_gate3_review(
         message_store::update_gate3_review_status(
             &request.user_id,
             &request.persona_id,
-            &request.key_hex,
+            &key_hex_str,
             &request.message_id,
             status,
         )
@@ -780,6 +813,7 @@ pub async fn request_tier3_gate3_review(
 #[specta::specta]
 pub async fn resolve_tier3_gate3_review(
     request: ResolveTier3Gate3ReviewRequest,
+    key_registry: State<'_, KeyRegistry>,
 ) -> Result<(), String> {
     if !matches!(request.status.as_str(), "approved" | "withheld") {
         return Err(format!(
@@ -787,10 +821,16 @@ pub async fn resolve_tier3_gate3_review(
             request.status
         ));
     }
+
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
     message_store::update_gate3_review_status(
         &request.user_id,
         &request.persona_id,
-        &request.key_hex,
+        &key_hex_str,
         &request.message_id,
         &request.status,
     )
@@ -877,11 +917,17 @@ async fn write_floor_consent_preference(
 mod tests {
     use super::*;
     use crate::persistence::{focus_settings_store, message_store};
-    use crate::test_support::ENV_MUTEX;
+    use crate::test_support::{mock_app_with_registry, populate_registry, ENV_MUTEX};
+    use tauri::Manager;
 
     const USER_ID: &str = "user-consent-test";
     const PERSONA_ID: &str = "persona-consent-test";
-    const KEY_HEX: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+    const MASTER_KEY: [u8; crate::auth::kdf::MASTER_KEY_LEN] =
+        [0x12u8; crate::auth::kdf::MASTER_KEY_LEN];
+
+    fn key_hex_str() -> String {
+        key_hex(&MASTER_KEY)
+    }
 
     struct TestEnv {
         _tempdir: tempfile::TempDir,
@@ -905,7 +951,7 @@ mod tests {
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
 
-        crate::persistence::migrations::migrate_messages_db(USER_ID, PERSONA_ID, KEY_HEX)
+        crate::persistence::migrations::migrate_messages_db(USER_ID, PERSONA_ID, &key_hex_str())
             .await
             .expect("messages.db migration must succeed in test setup");
 
@@ -920,13 +966,19 @@ mod tests {
     async fn resolve_tier3_gate3_review_rejects_invalid_status() {
         let _env = setup().await;
 
-        let result = resolve_tier3_gate3_review(ResolveTier3Gate3ReviewRequest {
-            user_id: USER_ID.to_owned(),
-            persona_id: PERSONA_ID.to_owned(),
-            key_hex: KEY_HEX.to_owned(),
-            message_id: "msg-1".to_owned(),
-            status: "drafted".to_owned(),
-        })
+        let app = mock_app_with_registry();
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(&registry, USER_ID, MASTER_KEY).await;
+
+        let result = resolve_tier3_gate3_review(
+            ResolveTier3Gate3ReviewRequest {
+                user_id: USER_ID.to_owned(),
+                persona_id: PERSONA_ID.to_owned(),
+                message_id: "msg-1".to_owned(),
+                status: "drafted".to_owned(),
+            },
+            registry,
+        )
         .await;
 
         assert!(result.is_err());
@@ -940,7 +992,7 @@ mod tests {
         let record = message_store::save_message(
             USER_ID,
             PERSONA_ID,
-            KEY_HEX,
+            &key_hex_str(),
             "tier3-access-persona-1",
             "assistant",
             "drafted starter text",
@@ -950,17 +1002,23 @@ mod tests {
         .await
         .expect("save_message must succeed");
 
-        resolve_tier3_gate3_review(ResolveTier3Gate3ReviewRequest {
-            user_id: USER_ID.to_owned(),
-            persona_id: PERSONA_ID.to_owned(),
-            key_hex: KEY_HEX.to_owned(),
-            message_id: record.id.clone(),
-            status: "approved".to_owned(),
-        })
+        let app = mock_app_with_registry();
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(&registry, USER_ID, MASTER_KEY).await;
+
+        resolve_tier3_gate3_review(
+            ResolveTier3Gate3ReviewRequest {
+                user_id: USER_ID.to_owned(),
+                persona_id: PERSONA_ID.to_owned(),
+                message_id: record.id.clone(),
+                status: "approved".to_owned(),
+            },
+            registry,
+        )
         .await
         .expect("resolve_tier3_gate3_review must succeed");
 
-        let fetched = message_store::get_message(USER_ID, PERSONA_ID, KEY_HEX, &record.id)
+        let fetched = message_store::get_message(USER_ID, PERSONA_ID, &key_hex_str(), &record.id)
             .await
             .expect("get_message must succeed")
             .expect("message must exist");
@@ -974,7 +1032,7 @@ mod tests {
         let record = message_store::save_message(
             USER_ID,
             PERSONA_ID,
-            KEY_HEX,
+            &key_hex_str(),
             "tier3-access-persona-1",
             "assistant",
             "drafted starter text",
@@ -984,17 +1042,23 @@ mod tests {
         .await
         .expect("save_message must succeed");
 
-        resolve_tier3_gate3_review(ResolveTier3Gate3ReviewRequest {
-            user_id: USER_ID.to_owned(),
-            persona_id: PERSONA_ID.to_owned(),
-            key_hex: KEY_HEX.to_owned(),
-            message_id: record.id.clone(),
-            status: "withheld".to_owned(),
-        })
+        let app = mock_app_with_registry();
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(&registry, USER_ID, MASTER_KEY).await;
+
+        resolve_tier3_gate3_review(
+            ResolveTier3Gate3ReviewRequest {
+                user_id: USER_ID.to_owned(),
+                persona_id: PERSONA_ID.to_owned(),
+                message_id: record.id.clone(),
+                status: "withheld".to_owned(),
+            },
+            registry,
+        )
         .await
         .expect("resolve_tier3_gate3_review must succeed");
 
-        let fetched = message_store::get_message(USER_ID, PERSONA_ID, KEY_HEX, &record.id)
+        let fetched = message_store::get_message(USER_ID, PERSONA_ID, &key_hex_str(), &record.id)
             .await
             .expect("get_message must succeed")
             .expect("message must exist");

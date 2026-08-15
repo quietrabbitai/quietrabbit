@@ -21,15 +21,11 @@ use serde::Serialize;
 use specta::Type;
 use tokio::sync::RwLock;
 
-use crate::auth::registry::KeyRegistry;
+use crate::auth::registry::{key_hex, KeyRegistry};
 use crate::ollama_sidecar::OllamaSource;
 use crate::persistence::integration_keys_store;
 use crate::providers::ollama_client::OllamaClient;
 use crate::providers::types::{ProviderHealth, ProviderStatus};
-
-fn key_hex(key: &[u8; crate::auth::kdf::MASTER_KEY_LEN]) -> String {
-    key.iter().map(|b| format!("{b:02x}")).collect()
-}
 
 // The two Tier 2 providers named throughout the architecture (CLAUDE.md,
 // Architecture/QUIET_RABBIT_ARCHITECTURE.md:96-97, schema/shared_001.sql's
@@ -160,8 +156,7 @@ pub async fn get_capability_profile(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::registry::UnlockedKey;
-    use crate::test_support::ENV_MUTEX;
+    use crate::test_support::{mock_app_with_registry, populate_registry, ENV_MUTEX};
     use tauri::Manager;
 
     struct TestEnv {
@@ -195,26 +190,6 @@ mod tests {
             _lock: lock,
             saved_root,
         }
-    }
-
-    fn mock_app_with_registry() -> tauri::App<tauri::test::MockRuntime> {
-        let app = tauri::test::mock_app();
-        app.manage(KeyRegistry::default());
-        app
-    }
-
-    async fn populate_registry(
-        registry: &tauri::State<'_, KeyRegistry>,
-        user_id: &str,
-        master_key: [u8; crate::auth::kdf::MASTER_KEY_LEN],
-    ) {
-        registry
-            .replace(UnlockedKey {
-                user_id: user_id.to_owned(),
-                master_key,
-                unlocked_at: crate::providers::utils::now(),
-            })
-            .await;
     }
 
     #[tokio::test]

@@ -14,12 +14,14 @@
 // unknown sensitivity values with a Validation error. No duplicate check
 // needed at the IPC boundary.
 //
-// key_hex: passed per-call in Release 1 (no auth layer yet). Layer 8 will
-// move session key management into tauri::State and eliminate per-call passing.
+// key_hex: derived server-side from KeyRegistry (items.id=268) -- no longer
+// passed per-call from the frontend. See auth::registry::key_hex.
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
+use tauri::State;
 
+use crate::auth::registry::{key_hex, KeyRegistry};
 use crate::persistence::personal_store;
 
 // ---------------------------------------------------------------------------
@@ -41,7 +43,6 @@ pub struct PersonalFieldInfo {
 pub struct UpdatePersonalFieldRequest {
     pub persona_id: String,
     pub user_id: String,
-    pub key_hex: String,
     pub field_name: String,
     pub value: String,
     /// Sensitivity of the field value. Defaults to "personal" if omitted.
@@ -68,11 +69,17 @@ pub struct VoiceProfileInfo {
 pub async fn get_personal_fields(
     persona_id: String,
     user_id: String,
-    key_hex: String,
+    key_registry: State<'_, KeyRegistry>,
 ) -> Result<Vec<PersonalFieldInfo>, String> {
-    let fields = personal_store::list_personal_fields(&user_id, &persona_id, &key_hex, None, None)
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
         .await
-        .map_err(|e| e.to_string())?;
+        .ok_or_else(|| "not logged in".to_owned())?;
+
+    let fields =
+        personal_store::list_personal_fields(&user_id, &persona_id, &key_hex_str, None, None)
+            .await
+            .map_err(|e| e.to_string())?;
 
     // Project to IPC-safe struct. field_value is never included.
     Ok(fields
@@ -90,13 +97,19 @@ pub async fn get_personal_fields(
 #[specta::specta]
 pub async fn update_personal_field(
     request: UpdatePersonalFieldRequest,
+    key_registry: State<'_, KeyRegistry>,
 ) -> Result<PersonalFieldInfo, String> {
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
     let sensitivity = request.sensitivity.as_deref().unwrap_or("personal");
 
     personal_store::save_personal_field(
         &request.user_id,
         &request.persona_id,
-        &request.key_hex,
+        &key_hex_str,
         &request.field_name,
         &request.value,
         sensitivity,
@@ -114,7 +127,7 @@ pub async fn update_personal_field(
     let field = personal_store::get_personal_field(
         &request.user_id,
         &request.persona_id,
-        &request.key_hex,
+        &key_hex_str,
         &request.field_name,
     )
     .await
@@ -134,9 +147,14 @@ pub async fn update_personal_field(
 pub async fn get_voice_profile(
     persona_id: String,
     user_id: String,
-    key_hex: String,
+    key_registry: State<'_, KeyRegistry>,
 ) -> Result<VoiceProfileInfo, String> {
-    let profile = personal_store::load_voice_profile(&user_id, &persona_id, &key_hex)
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
+    let profile = personal_store::load_voice_profile(&user_id, &persona_id, &key_hex_str)
         .await
         .map_err(|e| e.to_string())?;
 

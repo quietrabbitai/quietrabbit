@@ -21,3 +21,47 @@
 
 #[cfg(test)]
 pub static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+// ---------------------------------------------------------------------------
+// KeyRegistry test harness (items.id=268)
+//
+// SAME ROOT CAUSE AS ABOVE, caught before it spread further: tier2.rs and
+// system.rs had each independently written a byte-identical
+// mock_app_with_registry()/populate_registry() pair for standing up a
+// KeyRegistry-backed #[tauri::command] test. items.id=268 added
+// key_registry: State<'_, KeyRegistry> to four more command modules
+// (persona.rs, library.rs, messages.rs, consent.rs) that need the exact
+// same harness -- rather than let that become a fifth/sixth/seventh
+// textually-identical copy, it's promoted here once, matching the ENV_MUTEX
+// precedent above.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+pub fn mock_app_with_registry() -> tauri::App<tauri::test::MockRuntime> {
+    use tauri::Manager;
+
+    let app = tauri::test::mock_app();
+    app.manage(crate::auth::registry::KeyRegistry::default());
+    app
+}
+
+/// Populates an already-managed KeyRegistry. Separate from
+/// mock_app_with_registry() (which only constructs the app) because
+/// populating requires an .await, and #[tokio::test] already runs in a
+/// Tokio runtime: tauri::async_runtime::block_on inside that context panics
+/// ("cannot start a runtime from within a runtime") -- see tier2.rs's
+/// original version of this comment for the full history.
+#[cfg(test)]
+pub async fn populate_registry(
+    registry: &tauri::State<'_, crate::auth::registry::KeyRegistry>,
+    user_id: &str,
+    master_key: [u8; crate::auth::kdf::MASTER_KEY_LEN],
+) {
+    registry
+        .replace(crate::auth::registry::UnlockedKey {
+            user_id: user_id.to_owned(),
+            master_key,
+            unlocked_at: crate::providers::utils::now(),
+        })
+        .await;
+}

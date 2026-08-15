@@ -40,7 +40,9 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
+use tauri::State;
 
+use crate::auth::registry::{key_hex, KeyRegistry};
 use crate::conductor::concurrency::ConductorScheduler;
 use crate::conductor::lifecycle::FocusRun;
 use crate::persistence::output_store;
@@ -55,7 +57,6 @@ pub struct SubmitFocusRunRequest {
     pub user_input: String,
     pub user_id: String,
     pub persona_id: String,
-    pub key_hex: String,
     pub topic_id: Option<String>,
     /// entity_facts.id values the user approved via the pre-Focus-start
     /// cross-Persona confirmation flow (decisions.id=546, decisions.id=639,
@@ -84,7 +85,6 @@ pub struct ResumeRunRequest {
     pub run_id: String,
     pub user_id: String,
     pub persona_id: String,
-    pub key_hex: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -99,9 +99,16 @@ pub struct ResumeRunRequest {
 /// eventual output into a different store once generation completes.
 /// submit_focus_run itself doesn't need this: it fires execute_full() and
 /// forgets it, relying entirely on push events for progress.
+///
+/// key_hex is a separate parameter, not a SubmitFocusRunRequest field
+/// (items.id=268): this fn isn't a #[tauri::command] itself, so it can't
+/// take State<KeyRegistry> directly -- each of its two command-layer callers
+/// (submit_focus_run, commands::messages::send_message) derives key_hex from
+/// KeyRegistry and passes the owned String in here.
 pub(crate) async fn load_and_authorize_run(
     app_handle: tauri::AppHandle,
     scheduler: tauri::State<'_, Arc<ConductorScheduler>>,
+    key_hex: String,
     request: SubmitFocusRunRequest,
 ) -> Result<FocusRun, String> {
     let is_quick_ask = request.focus_id == "quick-ask";
@@ -124,7 +131,7 @@ pub(crate) async fn load_and_authorize_run(
         scheduler,
         request.user_input,
         false, // is_fast_lane: always false at IPC boundary
-        Some(request.key_hex),
+        Some(key_hex),
         request.topic_id,
         is_quick_ask,
         confirmed_cross_persona_fact_ids,
@@ -144,9 +151,15 @@ pub(crate) async fn load_and_authorize_run(
 pub async fn submit_focus_run(
     app_handle: tauri::AppHandle,
     scheduler: tauri::State<'_, Arc<ConductorScheduler>>,
+    key_registry: State<'_, KeyRegistry>,
     request: SubmitFocusRunRequest,
 ) -> Result<SubmitFocusRunResponse, String> {
-    let mut run = load_and_authorize_run(app_handle, scheduler, request).await?;
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
+    let mut run = load_and_authorize_run(app_handle, scheduler, key_hex_str, request).await?;
 
     let run_id = run
         .focus_run_id
@@ -168,9 +181,14 @@ pub async fn get_run_output(
     run_id: String,
     user_id: String,
     persona_id: String,
-    key_hex: String,
+    key_registry: State<'_, KeyRegistry>,
 ) -> Result<GetRunOutputResponse, String> {
-    let record = output_store::get_output_for_run(&user_id, &persona_id, &key_hex, &run_id)
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
+    let record = output_store::get_output_for_run(&user_id, &persona_id, &key_hex_str, &run_id)
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "not_found".to_string())?;
@@ -188,9 +206,14 @@ pub async fn cancel_run(
     run_id: String,
     user_id: String,
     persona_id: String,
-    key_hex: String,
+    key_registry: State<'_, KeyRegistry>,
 ) -> Result<(), String> {
-    output_store::cancel_focus_run(&user_id, &persona_id, &key_hex, &run_id)
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
+    output_store::cancel_focus_run(&user_id, &persona_id, &key_hex_str, &run_id)
         .await
         .map_err(|e| e.to_string())
 }
@@ -235,6 +258,7 @@ pub async fn cancel_run(
 pub async fn resume_run(
     app_handle: tauri::AppHandle,
     _scheduler: tauri::State<'_, Arc<ConductorScheduler>>,
+    key_registry: State<'_, KeyRegistry>,
     request: ResumeRunRequest,
 ) -> Result<String, String> {
     use crate::conductor::extract;
@@ -242,10 +266,15 @@ pub async fn resume_run(
     use crate::persistence::output_store::get_focus_run_status;
     use tauri::Emitter;
 
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
     let status = get_focus_run_status(
         &request.user_id,
         &request.persona_id,
-        &request.key_hex,
+        &key_hex_str,
         &request.run_id,
     )
     .await
@@ -308,7 +337,7 @@ pub async fn resume_run(
     let unrecovered = extract::load_unrecovered_rows(
         &request.user_id,
         &request.persona_id,
-        &request.key_hex,
+        &key_hex_str,
         &request.run_id,
     )
     .await
@@ -318,7 +347,7 @@ pub async fn resume_run(
         extract::persist_confirmed_field(
             &request.user_id,
             &request.persona_id,
-            &request.key_hex,
+            &key_hex_str,
             &field_name,
             &confirmed_value,
             &sensitivity,
@@ -329,7 +358,7 @@ pub async fn resume_run(
         extract::set_persisted_at(
             &request.user_id,
             &request.persona_id,
-            &request.key_hex,
+            &key_hex_str,
             candidate_id,
         )
         .await
@@ -340,7 +369,7 @@ pub async fn resume_run(
     let pending = extract::count_pending(
         &request.user_id,
         &request.persona_id,
-        &request.key_hex,
+        &key_hex_str,
         &request.run_id,
     )
     .await
@@ -351,7 +380,7 @@ pub async fn resume_run(
         let candidates = extract::load_pending_candidates(
             &request.user_id,
             &request.persona_id,
-            &request.key_hex,
+            &key_hex_str,
             &request.run_id,
         )
         .await

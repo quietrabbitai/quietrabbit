@@ -33,15 +33,18 @@
 //   left unenforced (falls through to visible/fetchable, same as 'open')
 //   pending an actual design decision. Do not infer one here.
 //
-// key_hex/user_id/persona_id via IPC: intentional for Release 1 (no auth
-//   layer yet). Layer 8 will move session key management into tauri::State.
+// user_id/persona_id via IPC: intentional for Release 1 (no auth layer yet).
+//   key_hex is derived server-side from KeyRegistry (items.id=268) -- no
+//   longer passed per-call from the frontend. See auth::registry::key_hex.
 
 use std::collections::HashMap;
 
 use serde::Serialize;
 use specta::Type;
+use tauri::State;
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
+use crate::auth::registry::{key_hex, KeyRegistry};
 use crate::conductor::privacy::output_scan::{scan_output, ScanIntensity};
 use crate::conductor::privacy::types::Sensitivity;
 use crate::persistence::disclosure_log_store::SqliteDisclosureLogger;
@@ -115,15 +118,20 @@ fn to_output_info(record: output_store::OutputRecord) -> OutputInfo {
 pub async fn list_outputs(
     user_id: String,
     persona_id: String,
-    key_hex: String,
+    key_registry: State<'_, KeyRegistry>,
     focus_id: Option<String>,
     topic_id: Option<String>,
     output_type: Option<String>,
 ) -> Result<Vec<OutputInfo>, String> {
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
     let records = output_store::list_outputs(
         &user_id,
         &persona_id,
-        &key_hex,
+        &key_hex_str,
         focus_id.as_deref(),
         topic_id.as_deref(),
         output_type.as_deref(),
@@ -163,9 +171,14 @@ pub async fn get_output(
     output_id: String,
     user_id: String,
     persona_id: String,
-    key_hex: String,
+    key_registry: State<'_, KeyRegistry>,
 ) -> Result<OutputInfo, String> {
-    let record = output_store::get_output(&user_id, &persona_id, &key_hex, &output_id)
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
+    let record = output_store::get_output(&user_id, &persona_id, &key_hex_str, &output_id)
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "not_found".to_string())?;
@@ -191,10 +204,15 @@ pub async fn delete_output(
     output_id: String,
     user_id: String,
     persona_id: String,
-    key_hex: String,
+    key_registry: State<'_, KeyRegistry>,
     deep_purge: Option<bool>,
 ) -> Result<(), String> {
-    output_store::delete_output(&user_id, &persona_id, &key_hex, &output_id, deep_purge)
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
+    output_store::delete_output(&user_id, &persona_id, &key_hex_str, &output_id, deep_purge)
         .await
         .map_err(|e| e.to_string())
 }
@@ -278,9 +296,14 @@ pub async fn copy_output_to_clipboard(
     output_id: String,
     user_id: String,
     persona_id: String,
-    key_hex: String,
+    key_registry: State<'_, KeyRegistry>,
 ) -> Result<(), String> {
-    let content = prepare_clipboard_copy(&output_id, &user_id, &persona_id, &key_hex).await?;
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
+    let content = prepare_clipboard_copy(&output_id, &user_id, &persona_id, &key_hex_str).await?;
 
     app.clipboard()
         .write_text(content)
@@ -294,12 +317,18 @@ pub async fn copy_output_to_clipboard(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::persistence::{persona_store, output_store};
-    use crate::test_support::ENV_MUTEX;
+    use crate::persistence::{output_store, persona_store};
+    use crate::test_support::{mock_app_with_registry, populate_registry, ENV_MUTEX};
+    use tauri::Manager;
 
     const USER_ID: &str = "user-lib-test";
     const PERSONA_ID: &str = "persona-lib-test";
-    const KEY_HEX: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+    const MASTER_KEY: [u8; crate::auth::kdf::MASTER_KEY_LEN] =
+        [0xCDu8; crate::auth::kdf::MASTER_KEY_LEN];
+
+    fn key_hex_str() -> String {
+        key_hex(&MASTER_KEY)
+    }
 
     struct TestEnv {
         _tempdir: tempfile::TempDir,
@@ -334,10 +363,10 @@ mod tests {
         crate::persistence::migrations::migrate_shared_db()
             .await
             .expect("shared.db migration must succeed in test setup");
-        crate::persistence::migrations::migrate_outputs_db(USER_ID, PERSONA_ID, KEY_HEX)
+        crate::persistence::migrations::migrate_outputs_db(USER_ID, PERSONA_ID, &key_hex_str())
             .await
             .expect("outputs.db migration must succeed in test setup");
-        crate::persistence::migrations::migrate_personal_db(USER_ID, PERSONA_ID, KEY_HEX)
+        crate::persistence::migrations::migrate_personal_db(USER_ID, PERSONA_ID, &key_hex_str())
             .await
             .expect("personal.db migration must succeed in test setup");
         // user_personas.user_id REFERENCES users(id) -- create_persona's
@@ -383,14 +412,20 @@ mod tests {
         .expect("create_focus_settings must succeed in test setup");
 
         let focus_run_id = format!("run-{focus_id}");
-        output_store::test_seed_focus_run(USER_ID, PERSONA_ID, KEY_HEX, &focus_run_id, focus_id)
-            .await
-            .expect("test_seed_focus_run must succeed in test setup");
+        output_store::test_seed_focus_run(
+            USER_ID,
+            PERSONA_ID,
+            &key_hex_str(),
+            &focus_run_id,
+            focus_id,
+        )
+        .await
+        .expect("test_seed_focus_run must succeed in test setup");
 
         output_store::save_output(
             USER_ID,
             PERSONA_ID,
-            KEY_HEX,
+            &key_hex_str(),
             &focus_run_id,
             "note",
             content,
@@ -406,10 +441,14 @@ mod tests {
         let _env = setup().await;
         seed_output_for_focus("focus-open", "open", "visible content").await;
 
+        let app = mock_app_with_registry();
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(&registry, USER_ID, MASTER_KEY).await;
+
         let results = list_outputs(
             USER_ID.to_owned(),
             PERSONA_ID.to_owned(),
-            KEY_HEX.to_owned(),
+            registry,
             None,
             None,
             None,
@@ -427,10 +466,14 @@ mod tests {
         seed_output_for_focus("focus-open", "open", "open content").await;
         seed_output_for_focus("focus-protected", "protected", "protected content").await;
 
+        let app = mock_app_with_registry();
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(&registry, USER_ID, MASTER_KEY).await;
+
         let results = list_outputs(
             USER_ID.to_owned(),
             PERSONA_ID.to_owned(),
-            KEY_HEX.to_owned(),
+            registry,
             None,
             None,
             None,
@@ -447,14 +490,13 @@ mod tests {
         let _env = setup().await;
         let output_id = seed_output_for_focus("focus-open", "open", "visible content").await;
 
-        let result = get_output(
-            output_id,
-            USER_ID.to_owned(),
-            PERSONA_ID.to_owned(),
-            KEY_HEX.to_owned(),
-        )
-        .await
-        .expect("get_output must succeed for an open-profile output");
+        let app = mock_app_with_registry();
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(&registry, USER_ID, MASTER_KEY).await;
+
+        let result = get_output(output_id, USER_ID.to_owned(), PERSONA_ID.to_owned(), registry)
+            .await
+            .expect("get_output must succeed for an open-profile output");
 
         assert_eq!(result.content, "visible content");
     }
@@ -465,13 +507,12 @@ mod tests {
         let output_id =
             seed_output_for_focus("focus-protected", "protected", "protected content").await;
 
-        let result = get_output(
-            output_id,
-            USER_ID.to_owned(),
-            PERSONA_ID.to_owned(),
-            KEY_HEX.to_owned(),
-        )
-        .await;
+        let app = mock_app_with_registry();
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(&registry, USER_ID, MASTER_KEY).await;
+
+        let result = get_output(output_id, USER_ID.to_owned(), PERSONA_ID.to_owned(), registry)
+            .await;
 
         assert_eq!(
             result.unwrap_err(),
@@ -484,11 +525,15 @@ mod tests {
     async fn get_output_still_returns_not_found_for_a_genuinely_missing_id() {
         let _env = setup().await;
 
+        let app = mock_app_with_registry();
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(&registry, USER_ID, MASTER_KEY).await;
+
         let result = get_output(
             "does-not-exist".to_owned(),
             USER_ID.to_owned(),
             PERSONA_ID.to_owned(),
-            KEY_HEX.to_owned(),
+            registry,
         )
         .await;
 
@@ -501,10 +546,14 @@ mod tests {
         seed_output_for_focus("focus-a", "open", "a content").await;
         seed_output_for_focus("focus-b", "open", "b content").await;
 
+        let app = mock_app_with_registry();
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(&registry, USER_ID, MASTER_KEY).await;
+
         let results = list_outputs(
             USER_ID.to_owned(),
             PERSONA_ID.to_owned(),
-            KEY_HEX.to_owned(),
+            registry,
             Some("focus-a".to_owned()),
             None,
             None,
@@ -551,14 +600,20 @@ mod tests {
         .expect("create_focus_settings must succeed in test setup");
 
         let focus_run_id = format!("run-{focus_id}");
-        output_store::test_seed_focus_run(USER_ID, PERSONA_ID, KEY_HEX, &focus_run_id, focus_id)
-            .await
-            .expect("test_seed_focus_run must succeed in test setup");
+        output_store::test_seed_focus_run(
+            USER_ID,
+            PERSONA_ID,
+            &key_hex_str(),
+            &focus_run_id,
+            focus_id,
+        )
+        .await
+        .expect("test_seed_focus_run must succeed in test setup");
 
         output_store::save_output(
             USER_ID,
             PERSONA_ID,
-            KEY_HEX,
+            &key_hex_str(),
             &focus_run_id,
             "note",
             content,
@@ -576,7 +631,7 @@ mod tests {
             seed_output_with_sensitivity("focus-open", "open", "shareable content", "general")
                 .await;
 
-        let result = prepare_clipboard_copy(&output_id, USER_ID, PERSONA_ID, KEY_HEX).await;
+        let result = prepare_clipboard_copy(&output_id, USER_ID, PERSONA_ID, &key_hex_str()).await;
 
         assert_eq!(result, Ok("shareable content".to_string()));
     }
@@ -592,7 +647,7 @@ mod tests {
         )
         .await;
 
-        let result = prepare_clipboard_copy(&output_id, USER_ID, PERSONA_ID, KEY_HEX).await;
+        let result = prepare_clipboard_copy(&output_id, USER_ID, PERSONA_ID, &key_hex_str()).await;
 
         let err = result.expect_err("financial-severity output must be blocked");
         assert!(
@@ -612,7 +667,7 @@ mod tests {
         )
         .await;
 
-        let result = prepare_clipboard_copy(&output_id, USER_ID, PERSONA_ID, KEY_HEX).await;
+        let result = prepare_clipboard_copy(&output_id, USER_ID, PERSONA_ID, &key_hex_str()).await;
 
         assert_eq!(
             result.unwrap_err(),
@@ -627,7 +682,7 @@ mod tests {
         let _env = setup().await;
 
         let result =
-            prepare_clipboard_copy("does-not-exist", USER_ID, PERSONA_ID, KEY_HEX).await;
+            prepare_clipboard_copy("does-not-exist", USER_ID, PERSONA_ID, &key_hex_str()).await;
 
         assert_eq!(result.unwrap_err(), "not_found");
     }

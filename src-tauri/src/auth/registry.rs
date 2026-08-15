@@ -48,6 +48,16 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::auth::kdf;
 
+/// Hex-encode a resident master key for use as a store's `key_hex: &str`
+/// parameter (e.g. the SQLCipher PRAGMA key value). Shared implementation --
+/// items.id=268 found three independent byte-identical private copies
+/// (commands/tier2.rs, commands/system.rs, commands/tier3_pane.rs) that had
+/// accreted before this was ever unified; those three, plus every command
+/// migrated in that item, call this one instead.
+pub(crate) fn key_hex(key: &[u8; kdf::MASTER_KEY_LEN]) -> String {
+    key.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// One account's resident, unlocked master key. Never persisted -- exists
 /// only as Tauri managed state for this process's lifetime. Fields are
 /// pub(crate): constructed only by login() (a later step, same crate);

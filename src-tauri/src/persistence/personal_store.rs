@@ -140,6 +140,15 @@ fn get_personal_db_path(user_id: &str, persona_id: &str) -> PathBuf {
 /// Caller supplies bare hex; store wraps it in SQLCipher x'...' syntax,
 /// itself wrapped in an outer pair of double quotes (items.id=206).
 /// PRAGMA key fires before journal_mode via SqliteConnectOptions (D6-346).
+///
+/// key_hex boundary (items.id=268): this fn and every public fn in this file
+/// keep taking key_hex: &str -- that hasn't changed, and shouldn't, since
+/// these are plain library functions (not #[tauri::command]s), also called
+/// directly by dedup_store.rs (which imports this fn) and by this file's own
+/// tests. What changed is who calls them: every command-layer caller now
+/// derives key_hex from auth::registry::KeyRegistry server-side (see
+/// commands/tier2.rs for the reference pattern) instead of accepting it as
+/// a bare IPC parameter from the frontend.
 pub(crate) async fn open_personal_db(
     user_id: &str,
     persona_id: &str,

@@ -5,8 +5,8 @@ import { invoke as __TAURI_INVOKE } from "@tauri-apps/api/core";
 /** Commands */
 export const commands = {
 	submitFocusRun: (request: SubmitFocusRunRequest) => typedError<SubmitFocusRunResponse, string>(__TAURI_INVOKE("submit_focus_run", { request })),
-	getRunOutput: (runId: string, userId: string, personaId: string, keyHex: string) => typedError<GetRunOutputResponse, string>(__TAURI_INVOKE("get_run_output", { runId, userId, personaId, keyHex })),
-	cancelRun: (runId: string, userId: string, personaId: string, keyHex: string) => typedError<null, string>(__TAURI_INVOKE("cancel_run", { runId, userId, personaId, keyHex })),
+	getRunOutput: (runId: string, userId: string, personaId: string) => typedError<GetRunOutputResponse, string>(__TAURI_INVOKE("get_run_output", { runId, userId, personaId })),
+	cancelRun: (runId: string, userId: string, personaId: string) => typedError<null, string>(__TAURI_INVOKE("cancel_run", { runId, userId, personaId })),
 	/**
 	 *  Resume a paused focus run.
 	 * 
@@ -176,12 +176,12 @@ export const commands = {
 	submitOnboardingFocusSelection: (focusSelections: NotImplementedPlaceholder[]) => typedError<string[], string>(__TAURI_INVOKE("submit_onboarding_focus_selection", { focusSelections })),
 	listPersonas: (userId: string) => typedError<PersonaInfo[], string>(__TAURI_INVOKE("list_personas", { userId })),
 	createPersona: (request: CreatePersonaRequest) => typedError<CreatePersonaResponse, string>(__TAURI_INVOKE("create_persona", { request })),
-	listFocuses: (userId: string, personaId: string, keyHex: string) => typedError<FocusInfo[], string>(__TAURI_INVOKE("list_focuses", { userId, personaId, keyHex })),
+	listFocuses: (userId: string, personaId: string) => typedError<FocusInfo[], string>(__TAURI_INVOKE("list_focuses", { userId, personaId })),
 	/**
 	 *  get_focus_settings takes both persona_id and focus_id — the store key is
 	 *  composite. The IPC spec lists focus_id only (higher-level abstraction).
 	 */
-	getFocusSettings: (userId: string, personaId: string, keyHex: string, focusId: string) => typedError<FocusInfo, string>(__TAURI_INVOKE("get_focus_settings", { userId, personaId, keyHex, focusId })),
+	getFocusSettings: (userId: string, personaId: string, focusId: string) => typedError<FocusInfo, string>(__TAURI_INVOKE("get_focus_settings", { userId, personaId, focusId })),
 	/**
 	 *  Applies a Focus settings change directly, UNLESS the change would loosen
 	 *  privacy_tier or move focus_profile to 'protected' -- in which case this
@@ -198,13 +198,13 @@ export const commands = {
 	 *  but the structured shape is what submit_friction_gate_decision expects
 	 *  to be built from.
 	 */
-	updateFocusSettings: (userId: string, keyHex: string, request: UpdateFocusSettingsRequest) => typedError<FocusInfo, string>(__TAURI_INVOKE("update_focus_settings", { userId, keyHex, request })),
-	getActiveBoard: (userId: string, personaId: string, keyHex: string) => typedError<ActiveBoardResponse, string>(__TAURI_INVOKE("get_active_board", { userId, personaId, keyHex })),
-	getTopicList: (focusId: string, userId: string, personaId: string, keyHex: string) => typedError<TopicInfo[], string>(__TAURI_INVOKE("get_topic_list", { focusId, userId, personaId, keyHex })),
+	updateFocusSettings: (userId: string, request: UpdateFocusSettingsRequest) => typedError<FocusInfo, string>(__TAURI_INVOKE("update_focus_settings", { userId, request })),
+	getActiveBoard: (userId: string, personaId: string) => typedError<ActiveBoardResponse, string>(__TAURI_INVOKE("get_active_board", { userId, personaId })),
+	getTopicList: (focusId: string, userId: string, personaId: string) => typedError<TopicInfo[], string>(__TAURI_INVOKE("get_topic_list", { focusId, userId, personaId })),
 	updateTopicState: (request: UpdateTopicStateRequest) => typedError<null, string>(__TAURI_INVOKE("update_topic_state", { request })),
-	getPersonalFields: (personaId: string, userId: string, keyHex: string) => typedError<PersonalFieldInfo[], string>(__TAURI_INVOKE("get_personal_fields", { personaId, userId, keyHex })),
+	getPersonalFields: (personaId: string, userId: string) => typedError<PersonalFieldInfo[], string>(__TAURI_INVOKE("get_personal_fields", { personaId, userId })),
 	updatePersonalField: (request: UpdatePersonalFieldRequest) => typedError<PersonalFieldInfo, string>(__TAURI_INVOKE("update_personal_field", { request })),
-	getVoiceProfile: (personaId: string, userId: string, keyHex: string) => typedError<VoiceProfileInfo, string>(__TAURI_INVOKE("get_voice_profile", { personaId, userId, keyHex })),
+	getVoiceProfile: (personaId: string, userId: string) => typedError<VoiceProfileInfo, string>(__TAURI_INVOKE("get_voice_profile", { personaId, userId })),
 	/**
 	 *  Lists active outputs, optionally filtered by focus_id, topic_id, and/or
 	 *  output_type. Wired to output_store::list_outputs() (items.id=91, part 1).
@@ -213,14 +213,14 @@ export const commands = {
 	 *  results -- outputs owned by a 'protected' Focus are excluded (items.id=230).
 	 *  See module header.
 	 */
-	listOutputs: (userId: string, personaId: string, keyHex: string, focusId: string | null, topicId: string | null, outputType: string | null) => typedError<OutputInfo[], string>(__TAURI_INVOKE("list_outputs", { userId, personaId, keyHex, focusId, topicId, outputType })),
+	listOutputs: (userId: string, personaId: string, focusId: string | null, topicId: string | null, outputType: string | null) => typedError<OutputInfo[], string>(__TAURI_INVOKE("list_outputs", { userId, personaId, focusId, topicId, outputType })),
 	/**
 	 *  Enforces focus_settings.focus_profile visibility -- an output owned by a
 	 *  'protected' Focus returns the same "not_found" error a genuinely missing
 	 *  id would (items.id=230); a Protected output must not be distinguishable
 	 *  from a nonexistent one by its error.
 	 */
-	getOutput: (outputId: string, userId: string, personaId: string, keyHex: string) => typedError<OutputInfo, string>(__TAURI_INVOKE("get_output", { outputId, userId, personaId, keyHex })),
+	getOutput: (outputId: string, userId: string, personaId: string) => typedError<OutputInfo, string>(__TAURI_INVOKE("get_output", { outputId, userId, personaId })),
 	/**
 	 *  Deletes an output (items.id=91, part 2, complete 2026-07-26). Soft-delete
 	 *  only -- content is zeroed and status set to 'deleted'; the row is never
@@ -231,13 +231,13 @@ export const commands = {
 	 *  output_store::delete_output's doc comment for why this is deliberately
 	 *  out of scope for R1.
 	 */
-	deleteOutput: (outputId: string, userId: string, personaId: string, keyHex: string, deepPurge: boolean | null) => typedError<null, string>(__TAURI_INVOKE("delete_output", { outputId, userId, personaId, keyHex, deepPurge })),
+	deleteOutput: (outputId: string, userId: string, personaId: string, deepPurge: boolean | null) => typedError<null, string>(__TAURI_INVOKE("delete_output", { outputId, userId, personaId, deepPurge })),
 	/**
 	 *  Thin IPC wrapper -- the actual system-clipboard write via
 	 *  tauri-plugin-clipboard-manager. See prepare_clipboard_copy for the real
 	 *  (tested) logic.
 	 */
-	copyOutputToClipboard: (outputId: string, userId: string, personaId: string, keyHex: string) => typedError<null, string>(__TAURI_INVOKE("copy_output_to_clipboard", { outputId, userId, personaId, keyHex })),
+	copyOutputToClipboard: (outputId: string, userId: string, personaId: string) => typedError<null, string>(__TAURI_INVOKE("copy_output_to_clipboard", { outputId, userId, personaId })),
 	getFocusBuilderSession: (focusId: string | null) => typedError<NotImplementedPlaceholder, string>(__TAURI_INVOKE("get_focus_builder_session", { focusId })),
 	submitFocusBuilderStep: (sessionId: string, input: NotImplementedPlaceholder) => typedError<NotImplementedPlaceholder, string>(__TAURI_INVOKE("submit_focus_builder_step", { sessionId, input })),
 	/**
@@ -346,8 +346,8 @@ export const commands = {
 	 *  reads `PaneLayoutState` directly), so there is nothing left to query.
 	 */
 	setPaneLayout: (layout: PaneLayoutEntry[]) => typedError<null, string>(__TAURI_INVOKE("set_pane_layout", { layout })),
-	sendMessage: (userId: string, personaId: string, keyHex: string, contextKey: string, content: string, focusId: string, gate3Track: boolean) => typedError<MessageInfo[], string>(__TAURI_INVOKE("send_message", { userId, personaId, keyHex, contextKey, content, focusId, gate3Track })),
-	listMessages: (userId: string, personaId: string, keyHex: string, contextKey: string) => typedError<MessageInfo[], string>(__TAURI_INVOKE("list_messages", { userId, personaId, keyHex, contextKey })),
+	sendMessage: (userId: string, personaId: string, contextKey: string, content: string, focusId: string, gate3Track: boolean) => typedError<MessageInfo[], string>(__TAURI_INVOKE("send_message", { userId, personaId, contextKey, content, focusId, gate3Track })),
+	listMessages: (userId: string, personaId: string, contextKey: string) => typedError<MessageInfo[], string>(__TAURI_INVOKE("list_messages", { userId, personaId, contextKey })),
 };
 
 /* Types */
@@ -421,7 +421,6 @@ export type Gate3ReviewResult = {
 export type GetPendingCrossPersonaConfirmationsRequest = {
 	user_id: string,
 	persona_id: string,
-	key_hex: string,
 };
 
 export type GetRunOutputResponse = {
@@ -611,14 +610,12 @@ export type RecoveryKeyDisplay = {
 export type RequestTier3Gate3ReviewRequest = {
 	user_id: string,
 	persona_id: string,
-	key_hex: string,
 	message_id: string,
 };
 
 export type ResolveTier3Gate3ReviewRequest = {
 	user_id: string,
 	persona_id: string,
-	key_hex: string,
 	message_id: string,
 	/**
 	 *  "approved" | "withheld" -- the two terminal states a resolved
@@ -633,7 +630,6 @@ export type ResumeRunRequest = {
 	run_id: string,
 	user_id: string,
 	persona_id: string,
-	key_hex: string,
 };
 
 /**
@@ -652,7 +648,6 @@ export type SubmitConsentDecisionRequest = {
 	run_id: string,
 	user_id: string,
 	persona_id: string,
-	key_hex: string,
 	/**  "approved" | "declined" */
 	decision: string,
 };
@@ -661,7 +656,6 @@ export type SubmitElementConsentDecisionRequest = {
 	run_id: string,
 	user_id: string,
 	persona_id: string,
-	key_hex: string,
 	/**
 	 *  JSON-serialized Vec<ElementDecision> produced by the frontend.
 	 *  Expected shape per element:
@@ -677,7 +671,6 @@ export type SubmitExtractConfirmRequest = {
 	run_id: string,
 	user_id: string,
 	persona_id: string,
-	key_hex: string,
 	/**
 	 *  JSON-serialized Vec<ExtractConfirmDecision>.
 	 *  Shape per element:
@@ -692,7 +685,6 @@ export type SubmitFloorConsentDecisionRequest = {
 	run_id: string,
 	user_id: string,
 	persona_id: string,
-	key_hex: string,
 	abstraction_tier: number,
 	/**  "proceed" | "cancel" */
 	decision: string,
@@ -705,7 +697,6 @@ export type SubmitFocusRunRequest = {
 	user_input: string,
 	user_id: string,
 	persona_id: string,
-	key_hex: string,
 	topic_id: string | null,
 	/**
 	 *  entity_facts.id values the user approved via the pre-Focus-start
@@ -785,7 +776,6 @@ export type UpdateFocusSettingsRequest = {
 export type UpdatePersonalFieldRequest = {
 	persona_id: string,
 	user_id: string,
-	key_hex: string,
 	field_name: string,
 	value: string,
 	/**
@@ -799,7 +789,6 @@ export type UpdateTopicStateRequest = {
 	topic_id: string,
 	user_id: string,
 	persona_id: string,
-	key_hex: string,
 	state: string,
 };
 

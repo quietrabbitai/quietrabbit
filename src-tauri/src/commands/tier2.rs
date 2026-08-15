@@ -42,15 +42,11 @@
 
 use tauri::State;
 
-use crate::auth::registry::KeyRegistry;
+use crate::auth::registry::{key_hex, KeyRegistry};
 use crate::persistence::integration_keys_store;
 
 const TIER2_KEY_TYPE: &str = "tier2";
 const VALID_TIER2_PROVIDERS: &[&str] = &["mistral", "groq"];
-
-fn key_hex(key: &[u8; crate::auth::kdf::MASTER_KEY_LEN]) -> String {
-    key.iter().map(|b| format!("{b:02x}")).collect()
-}
 
 // ---------------------------------------------------------------------------
 // IPC types
@@ -173,8 +169,7 @@ pub async fn set_tier2_provider_preference(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::registry::UnlockedKey;
-    use crate::test_support::ENV_MUTEX;
+    use crate::test_support::{mock_app_with_registry, populate_registry, ENV_MUTEX};
     use tauri::Manager;
 
     struct TestEnv {
@@ -214,38 +209,6 @@ mod tests {
             _lock: lock,
             saved_root,
         }
-    }
-
-    fn mock_app_with_registry() -> tauri::App<tauri::test::MockRuntime> {
-        let app = tauri::test::mock_app();
-        app.manage(KeyRegistry::default());
-        app
-    }
-
-    /// Populates an already-managed KeyRegistry. Separate from
-    /// mock_app_with_registry() (which only constructs the app) because
-    /// populating requires an .await, and #[tokio::test] already runs in
-    /// a Tokio runtime: tauri::async_runtime::block_on inside that context
-    /// panics ("cannot start a runtime from within a runtime"), confirmed
-    /// this session -- an earlier version of this test module used
-    /// block_on here and every test using it failed with that panic.
-    /// auth.rs's own tests avoid the whole question by populating the
-    /// registry through login() (itself async and normally awaited); this
-    /// module's tests need a pre-populated registry without going through
-    /// the full login() flow (auth.rs's own concern, not this module's),
-    /// so this awaits replace() directly instead.
-    async fn populate_registry(
-        registry: &State<'_, KeyRegistry>,
-        user_id: &str,
-        master_key: [u8; crate::auth::kdf::MASTER_KEY_LEN],
-    ) {
-        registry
-            .replace(UnlockedKey {
-                user_id: user_id.to_owned(),
-                master_key,
-                unlocked_at: crate::providers::utils::now(),
-            })
-            .await;
     }
 
     #[tokio::test]
