@@ -553,7 +553,10 @@ mod tests {
             .unwrap();
 
         let pref = get_tier2_provider_preference("u1").await.unwrap();
-        assert_eq!(pref, None, "schema default for tier2_provider_preference is NULL");
+        assert_eq!(
+            pref, None,
+            "schema default for tier2_provider_preference is NULL"
+        );
     }
 
     #[tokio::test]

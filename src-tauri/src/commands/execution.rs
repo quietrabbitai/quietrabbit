@@ -176,14 +176,9 @@ pub async fn submit_focus_run(
     // blended with any history here, so this is already the "fresh turn".
     let crisis_detected = crate::conductor::crisis::detect(&request.user_input);
 
-    let mut run = load_and_authorize_run(
-        app_handle,
-        scheduler,
-        key_hex_str,
-        crisis_detected,
-        request,
-    )
-    .await?;
+    let mut run =
+        load_and_authorize_run(app_handle, scheduler, key_hex_str, crisis_detected, request)
+            .await?;
 
     let run_id = run
         .focus_run_id

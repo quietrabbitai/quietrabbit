@@ -91,7 +91,11 @@ fn build_conversation_prompt(history: &[message_store::MessageRecord]) -> String
         if m.content.is_empty() {
             continue;
         }
-        let label = if m.sender == "user" { "User" } else { "Assistant" };
+        let label = if m.sender == "user" {
+            "User"
+        } else {
+            "Assistant"
+        };
         prompt.push_str(label);
         prompt.push_str(": ");
         prompt.push_str(&m.content);

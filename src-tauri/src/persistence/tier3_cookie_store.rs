@@ -330,9 +330,13 @@ mod tests {
     #[tokio::test]
     async fn different_providers_do_not_collide() {
         let mut conn = test_db().await;
-        upsert_cookies_conn(&mut conn, "claude", &[sample_cookie("session", "claude.ai")])
-            .await
-            .unwrap();
+        upsert_cookies_conn(
+            &mut conn,
+            "claude",
+            &[sample_cookie("session", "claude.ai")],
+        )
+        .await
+        .unwrap();
         upsert_cookies_conn(
             &mut conn,
             "chatgpt",
@@ -352,9 +356,13 @@ mod tests {
     #[tokio::test]
     async fn upsert_empty_snapshot_clears_provider() {
         let mut conn = test_db().await;
-        upsert_cookies_conn(&mut conn, "claude", &[sample_cookie("session", "claude.ai")])
-            .await
-            .unwrap();
+        upsert_cookies_conn(
+            &mut conn,
+            "claude",
+            &[sample_cookie("session", "claude.ai")],
+        )
+        .await
+        .unwrap();
         upsert_cookies_conn(&mut conn, "claude", &[]).await.unwrap();
 
         let fetched = list_cookies_conn(&mut conn, "claude").await.unwrap();

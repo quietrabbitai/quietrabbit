@@ -304,7 +304,14 @@ mod tests {
             .expect("shared.db migration must succeed in test setup");
 
         crate::auth::user_store::create_user(
-            user_id, "Alice", "admin", true, b"salt1234", 1024, 1, 1,
+            user_id,
+            "Alice",
+            "admin",
+            true,
+            b"salt1234",
+            1024,
+            1,
+            1,
         )
         .await
         .expect("create_user must succeed in test setup");

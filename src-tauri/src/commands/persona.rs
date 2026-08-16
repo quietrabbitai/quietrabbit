@@ -526,7 +526,10 @@ mod tests {
         let before = list_personas(USER_ID.to_owned())
             .await
             .expect("list_personas must succeed");
-        assert_eq!(before[0].focus_count, 0, "a fresh persona has no Focuses yet");
+        assert_eq!(
+            before[0].focus_count, 0,
+            "a fresh persona has no Focuses yet"
+        );
 
         for focus_id in ["quick-ask", "writing-assistant"] {
             focus_settings_store::create_focus_settings(

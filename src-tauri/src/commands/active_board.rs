@@ -320,7 +320,11 @@ mod tests {
             "travel-like-test-fixture",
             json!({ "departure_time": departure.to_rfc3339() }),
         );
-        assert!(topic_is_high_priority(&topic, &travel_like_focus_def(), now));
+        assert!(topic_is_high_priority(
+            &topic,
+            &travel_like_focus_def(),
+            now
+        ));
     }
 
     #[test]
@@ -331,21 +335,31 @@ mod tests {
             "travel-like-test-fixture",
             json!({ "departure_time": departure.to_rfc3339() }),
         );
-        assert!(!topic_is_high_priority(&topic, &travel_like_focus_def(), now));
+        assert!(!topic_is_high_priority(
+            &topic,
+            &travel_like_focus_def(),
+            now
+        ));
     }
 
     #[test]
     fn habit_like_topic_is_high_priority_when_overdue() {
         let now = "2026-08-10T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let due = now - Duration::days(1);
-        let topic = make_topic("habit-like-test-fixture", json!({ "due_date": due.to_rfc3339() }));
+        let topic = make_topic(
+            "habit-like-test-fixture",
+            json!({ "due_date": due.to_rfc3339() }),
+        );
         assert!(topic_is_high_priority(&topic, &habit_like_focus_def(), now));
     }
 
     #[test]
     fn habit_like_topic_is_high_priority_exactly_at_due_instant() {
         let now = "2026-08-10T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        let topic = make_topic("habit-like-test-fixture", json!({ "due_date": now.to_rfc3339() }));
+        let topic = make_topic(
+            "habit-like-test-fixture",
+            json!({ "due_date": now.to_rfc3339() }),
+        );
         assert!(topic_is_high_priority(&topic, &habit_like_focus_def(), now));
     }
 
@@ -353,15 +367,26 @@ mod tests {
     fn habit_like_topic_is_not_high_priority_before_due() {
         let now = "2026-08-10T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let due = now + Duration::hours(1);
-        let topic = make_topic("habit-like-test-fixture", json!({ "due_date": due.to_rfc3339() }));
-        assert!(!topic_is_high_priority(&topic, &habit_like_focus_def(), now));
+        let topic = make_topic(
+            "habit-like-test-fixture",
+            json!({ "due_date": due.to_rfc3339() }),
+        );
+        assert!(!topic_is_high_priority(
+            &topic,
+            &habit_like_focus_def(),
+            now
+        ));
     }
 
     #[test]
     fn topic_missing_anchor_field_in_extra_metadata_is_not_high_priority() {
         let now = "2026-08-10T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let topic = make_topic("travel-like-test-fixture", json!({}));
-        assert!(!topic_is_high_priority(&topic, &travel_like_focus_def(), now));
+        assert!(!topic_is_high_priority(
+            &topic,
+            &travel_like_focus_def(),
+            now
+        ));
     }
 
     #[test]
@@ -372,6 +397,10 @@ mod tests {
             "quick-ask",
             json!({ "departure_time": (now - Duration::days(1)).to_rfc3339() }),
         );
-        assert!(!topic_is_high_priority(&topic, &no_trigger_focus_def(), now));
+        assert!(!topic_is_high_priority(
+            &topic,
+            &no_trigger_focus_def(),
+            now
+        ));
     }
 }

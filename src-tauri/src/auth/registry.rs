@@ -225,7 +225,9 @@ impl GroupKeyRegistry {
         F: FnOnce(&UnlockedGroupKey) -> R,
     {
         let guard = self.keys.lock().await;
-        guard.get(&(persona_id.to_owned(), group_id.to_owned())).map(f)
+        guard
+            .get(&(persona_id.to_owned(), group_id.to_owned()))
+            .map(f)
     }
 }
 

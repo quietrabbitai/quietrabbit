@@ -266,9 +266,7 @@ fn parse_offset(raw: &str) -> Result<Duration, String> {
     match unit {
         "h" => Ok(Duration::hours(signed_n)),
         "d" => Ok(Duration::days(signed_n)),
-        _ => Err(format!(
-            "invalid offset unit in {raw:?} (expected h or d)"
-        )),
+        _ => Err(format!("invalid offset unit in {raw:?} (expected h or d)")),
     }
 }
 
@@ -2177,10 +2175,7 @@ mod tests {
         // Exactly at the threshold (anchor + offset) -- inclusive.
         assert!(trigger.is_active(anchor, anchor + Duration::hours(-4)));
         // One second before the threshold -- not yet active.
-        assert!(!trigger.is_active(
-            anchor,
-            anchor + Duration::hours(-4) - Duration::seconds(1)
-        ));
+        assert!(!trigger.is_active(anchor, anchor + Duration::hours(-4) - Duration::seconds(1)));
         // Exactly at the anchor -- active (window is open-ended forward).
         assert!(trigger.is_active(anchor, anchor));
         // Long past the anchor -- still active, no upper bound

@@ -69,11 +69,13 @@ fn sensitivity_severity(sensitivity: &str) -> u8 {
 /// *confirmed* 'protected', it does not invent behavior for the unknown
 /// case (items.id=230).
 async fn is_protected(persona_id: &str, focus_id: &str) -> Result<bool, String> {
-    Ok(focus_settings_store::get_focus_settings(persona_id, focus_id)
-        .await
-        .map_err(|e| e.to_string())?
-        .map(|s| s.focus_profile == "protected")
-        .unwrap_or(false))
+    Ok(
+        focus_settings_store::get_focus_settings(persona_id, focus_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .map(|s| s.focus_profile == "protected")
+            .unwrap_or(false),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -494,9 +496,14 @@ mod tests {
         let registry = app.state::<KeyRegistry>();
         populate_registry(&registry, USER_ID, MASTER_KEY).await;
 
-        let result = get_output(output_id, USER_ID.to_owned(), PERSONA_ID.to_owned(), registry)
-            .await
-            .expect("get_output must succeed for an open-profile output");
+        let result = get_output(
+            output_id,
+            USER_ID.to_owned(),
+            PERSONA_ID.to_owned(),
+            registry,
+        )
+        .await
+        .expect("get_output must succeed for an open-profile output");
 
         assert_eq!(result.content, "visible content");
     }
@@ -511,8 +518,13 @@ mod tests {
         let registry = app.state::<KeyRegistry>();
         populate_registry(&registry, USER_ID, MASTER_KEY).await;
 
-        let result = get_output(output_id, USER_ID.to_owned(), PERSONA_ID.to_owned(), registry)
-            .await;
+        let result = get_output(
+            output_id,
+            USER_ID.to_owned(),
+            PERSONA_ID.to_owned(),
+            registry,
+        )
+        .await;
 
         assert_eq!(
             result.unwrap_err(),

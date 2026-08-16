@@ -367,10 +367,8 @@ async fn async_main() {
             let main_window = app_handle
                 .get_webview_window("main")
                 .expect("quietrabbit: main window not found on RunEvent::Ready");
-            let open_pane_count = quietrabbit_lib::tier3_pane::pane_host::install(
-                &main_window,
-                app_handle.clone(),
-            );
+            let open_pane_count =
+                quietrabbit_lib::tier3_pane::pane_host::install(&main_window, app_handle.clone());
 
             // Replaces the old freeze-bug heartbeat thread (a 16ms
             // run_on_main_thread(|| {}) loop whose entire purpose was
@@ -390,7 +388,9 @@ async fn async_main() {
                 let tick = diag_tick.get() + 1;
                 diag_tick.set(tick);
                 if tick % 60 == 0 {
-                    log::debug!("DIAG items.id=227: 16ms timeout tick={tick} open_pane_count={count}");
+                    log::debug!(
+                        "DIAG items.id=227: 16ms timeout tick={tick} open_pane_count={count}"
+                    );
                 }
                 if count > 0 {
                     quietrabbit_lib::tier3_pane::pane_host::queue_draw();

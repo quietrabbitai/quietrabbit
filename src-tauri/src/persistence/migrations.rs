@@ -925,7 +925,10 @@ mod tests {
         let applied = run_migrations(&mut conn, "shared", None)
             .await
             .expect("shared migration chain must apply cleanly on a fresh db");
-        assert_eq!(applied, 3, "expected all three shared schema versions to apply");
+        assert_eq!(
+            applied, 3,
+            "expected all three shared schema versions to apply"
+        );
 
         let version: (i64,) = sqlx::query_as("SELECT MAX(version) FROM schema_version")
             .fetch_one(&mut conn)

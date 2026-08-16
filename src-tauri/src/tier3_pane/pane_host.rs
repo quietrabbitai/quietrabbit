@@ -696,8 +696,8 @@ impl PaneHost {
                 gtk::gdk::EventMask::BUTTON1_MOTION_MASK | gtk::gdk::EventMask::BUTTON_PRESS_MASK,
             );
             let press_state: Rc<RefCell<u8>> = Rc::new(RefCell::new(0));
-            webview_widget.connect_button_press_event(move |_widget, event: &gtk::gdk::EventButton| {
-                match event.button() {
+            webview_widget.connect_button_press_event(
+                move |_widget, event: &gtk::gdk::EventButton| match event.button() {
                     8 | 9 => {
                         let held = {
                             let mut state = press_state.borrow_mut();
@@ -712,8 +712,8 @@ impl PaneHost {
                         glib::Propagation::Stop
                     }
                     _ => glib::Propagation::Proceed,
-                }
-            });
+                },
+            );
         } else {
             log::warn!(
                 "tier3_pane::pane_host: main window's webview widget is not a \

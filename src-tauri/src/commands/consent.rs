@@ -982,7 +982,9 @@ mod tests {
         .await;
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("must be 'approved' or 'withheld'"));
+        assert!(result
+            .unwrap_err()
+            .contains("must be 'approved' or 'withheld'"));
     }
 
     #[tokio::test]

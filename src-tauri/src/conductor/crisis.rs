@@ -288,12 +288,16 @@ mod tests {
 
     #[test]
     fn detect_fires_on_explicit_intent() {
-        assert!(detect("I'm going to kill myself tonight, I can't do this anymore."));
+        assert!(detect(
+            "I'm going to kill myself tonight, I can't do this anymore."
+        ));
     }
 
     #[test]
     fn detect_fires_on_means() {
-        assert!(detect("I have the pills to end it and I'm going to take them all."));
+        assert!(detect(
+            "I have the pills to end it and I'm going to take them all."
+        ));
     }
 
     #[test]
@@ -305,7 +309,9 @@ mod tests {
 
     #[test]
     fn detect_fires_on_acute_abuse() {
-        assert!(detect("He said he's going to kill me tonight and I don't know what to do."));
+        assert!(detect(
+            "He said he's going to kill me tonight and I don't know what to do."
+        ));
     }
 
     #[test]
@@ -331,7 +337,9 @@ mod tests {
 
     #[test]
     fn detect_does_not_fire_on_work_venting() {
-        assert!(!detect("Work is killing me lately, I need a real vacation."));
+        assert!(!detect(
+            "Work is killing me lately, I need a real vacation."
+        ));
     }
 
     #[test]
@@ -396,7 +404,9 @@ mod tests {
 
     #[test]
     fn detect_still_fires_on_bare_end_my_life_without_hyperbole_context() {
-        assert!(detect("I don't want to be here anymore, I want to end my life."));
+        assert!(detect(
+            "I don't want to be here anymore, I want to end my life."
+        ));
     }
 
     #[test]
@@ -434,7 +444,9 @@ mod tests {
 
     #[test]
     fn detect_still_fires_on_pronoun_qualified_trying_to_kill_me() {
-        assert!(detect("He's trying to kill me right now, please send help."));
+        assert!(detect(
+            "He's trying to kill me right now, please send help."
+        ));
     }
 
     #[test]

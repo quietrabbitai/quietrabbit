@@ -97,9 +97,8 @@ fn main() {
                     // amend-in-place idempotency reasoning as items.id=228,
                     // just for files instead of SQL).
                     if !dest.exists() {
-                        std::fs::copy(&path, &dest).unwrap_or_else(|e| {
-                            panic!("failed to copy {path:?} to {dest:?}: {e}")
-                        });
+                        std::fs::copy(&path, &dest)
+                            .unwrap_or_else(|e| panic!("failed to copy {path:?} to {dest:?}: {e}"));
                     }
                     staged_any = true;
                 }
@@ -175,9 +174,8 @@ fn main() {
 
         if target_os == "linux" {
             let product_name = {
-                let conf_path =
-                    std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
-                        .join("tauri.conf.json");
+                let conf_path = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                    .join("tauri.conf.json");
                 let conf_text = std::fs::read_to_string(&conf_path)
                     .unwrap_or_else(|e| panic!("failed to read {conf_path:?}: {e}"));
                 let conf: serde_json::Value = serde_json::from_str(&conf_text)

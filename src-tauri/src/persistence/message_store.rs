@@ -23,8 +23,7 @@ use thiserror::Error;
 // ---------------------------------------------------------------------------
 
 const VALID_SENDER: &[&str] = &["user", "assistant"];
-const VALID_GATE3_REVIEW_STATUS: &[&str] =
-    &["drafted", "pending-review", "approved", "withheld"];
+const VALID_GATE3_REVIEW_STATUS: &[&str] = &["drafted", "pending-review", "approved", "withheld"];
 
 // ---------------------------------------------------------------------------
 // MessageRecord
@@ -247,7 +246,9 @@ pub async fn get_message(
 
     match row {
         None => Ok(None),
-        Some(r) => Ok(Some(row_to_message_record(&r).map_err(MessageStoreError::Database)?)),
+        Some(r) => Ok(Some(
+            row_to_message_record(&r).map_err(MessageStoreError::Database)?,
+        )),
     }
 }
 
@@ -584,9 +585,10 @@ mod tests {
             list_messages(USER_ID, PERSONA_ID, KEY_HEX, "persona-hub-persona-1")
                 .await
                 .expect("list_messages must succeed");
-        let tier3_transcript = list_messages(USER_ID, PERSONA_ID, KEY_HEX, "tier3-access-persona-1")
-            .await
-            .expect("list_messages must succeed");
+        let tier3_transcript =
+            list_messages(USER_ID, PERSONA_ID, KEY_HEX, "tier3-access-persona-1")
+                .await
+                .expect("list_messages must succeed");
 
         assert_eq!(persona_hub_transcript.len(), 1);
         assert_eq!(persona_hub_transcript[0].content, "persona hub message");
@@ -659,7 +661,10 @@ mod tests {
             .expect("list_messages must succeed");
 
         assert_eq!(transcript.len(), 1);
-        assert_eq!(transcript[0].gate3_review_status.as_deref(), Some("approved"));
+        assert_eq!(
+            transcript[0].gate3_review_status.as_deref(),
+            Some("approved")
+        );
     }
 
     #[tokio::test]

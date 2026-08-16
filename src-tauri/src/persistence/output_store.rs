@@ -746,9 +746,8 @@ async fn write_element_consent_decisions_conn(
     run_id: &str,
     decisions_json: &str,
 ) -> Result<(), OutputStoreError> {
-    let decisions: Vec<ElementDecision> = serde_json::from_str(decisions_json).map_err(|e| {
-        OutputStoreError::Validation(format!("decisions_json parse error: {e}"))
-    })?;
+    let decisions: Vec<ElementDecision> = serde_json::from_str(decisions_json)
+        .map_err(|e| OutputStoreError::Validation(format!("decisions_json parse error: {e}")))?;
 
     if decisions.is_empty() {
         return Err(OutputStoreError::Validation(

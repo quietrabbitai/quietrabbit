@@ -347,17 +347,19 @@ impl StepExecutor {
         // is touched. Only checked at tier>=2; Tier 1 never needs a
         // provider.
         if execution_tier >= 2 && ctx.tier2_provider_preference.is_none() {
-            return Ok(Some(failure_handler.handle(
-                &ConductorError::MissingTier2Config {
-                    plain_language: "No Tier 2 AI provider is set up yet. \
+            return Ok(Some(
+                failure_handler.handle(
+                    &ConductorError::MissingTier2Config {
+                        plain_language: "No Tier 2 AI provider is set up yet. \
                         Choose Groq or Mistral in Settings to continue. \
                         [Open Settings] [Get help]"
-                        .to_owned(),
-                },
-                Some(&ctx.step.step_id),
-                Some(&ctx.focus_id),
-                retry_count,
-            )));
+                            .to_owned(),
+                    },
+                    Some(&ctx.step.step_id),
+                    Some(&ctx.focus_id),
+                    retry_count,
+                ),
+            ));
         }
 
         let model_id = select_model(

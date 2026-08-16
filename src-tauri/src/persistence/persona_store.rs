@@ -304,9 +304,8 @@ pub async fn create_persona(
         display_name: display_name.to_owned(),
         persona_type: persona_type.to_owned(),
         created_at,
-        extra_metadata: serde_json::from_str(&extra_metadata_json).unwrap_or_else(|_| {
-            serde_json::Value::Object(serde_json::Map::new())
-        }),
+        extra_metadata: serde_json::from_str(&extra_metadata_json)
+            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
         focus_count: 0,
     })
 }
