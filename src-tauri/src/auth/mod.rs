@@ -9,4 +9,5 @@
 
 pub mod kdf;
 pub mod registry;
+pub mod sharing_keypair;
 pub mod user_store;

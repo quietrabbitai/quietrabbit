@@ -66,11 +66,30 @@ pub(crate) fn key_hex(key: &[u8; kdf::MASTER_KEY_LEN]) -> String {
 /// not part of the IPC surface, so no external caller can reach these
 /// fields regardless -- accessor methods would add ceremony without
 /// defending against a real access path.
+///
+/// sharing_private_key (items.id=289, decisions.id=677): the account's
+/// X25519 sharing keypair's private half, HKDF-derived from master_key (see
+/// auth::sharing_keypair::derive_sharing_keypair). Follows master_key's own
+/// single-slot lifecycle deliberately -- not a second standing secret, it's
+/// re-derived alongside master_key on every login and evicted alongside it
+/// on clear().
+///
+/// Stored as raw [u8; 32] rather than x25519_dalek::StaticSecret directly --
+/// tried the latter first, but StaticSecret (even with x25519-dalek's own
+/// "zeroize" feature enabled) only implements ZeroizeOnDrop internally, not
+/// the callable Zeroize trait #[derive(Zeroize)] requires of every
+/// non-skipped field (confirmed via a real compile error this session:
+/// "StaticSecret: DefaultIsZeroes ... required by StaticSecret: Zeroize").
+/// Raw bytes get the exact same #[derive(Zeroize)] treatment master_key
+/// already has here, and StaticSecret::from(bytes) reconstructs an
+/// equivalent key on demand wherever one is actually needed (e.g.
+/// auth::sharing_keypair::decrypt_own_envelope).
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct UnlockedKey {
     #[zeroize(skip)]
     pub(crate) user_id: String,
     pub(crate) master_key: [u8; kdf::MASTER_KEY_LEN],
+    pub(crate) sharing_private_key: [u8; 32],
     #[zeroize(skip)]
     pub(crate) unlocked_at: String,
 }
@@ -236,9 +255,13 @@ mod tests {
     use super::*;
 
     fn make_key(user_id: &str, byte_fill: u8) -> UnlockedKey {
+        let master_key = [byte_fill; kdf::MASTER_KEY_LEN];
+        let (sharing_private_key, _) =
+            crate::auth::sharing_keypair::derive_sharing_keypair(&master_key, user_id);
         UnlockedKey {
             user_id: user_id.to_owned(),
-            master_key: [byte_fill; kdf::MASTER_KEY_LEN],
+            master_key,
+            sharing_private_key: sharing_private_key.to_bytes(),
             unlocked_at: "2026-01-01T00:00:00Z".to_owned(),
         }
     }

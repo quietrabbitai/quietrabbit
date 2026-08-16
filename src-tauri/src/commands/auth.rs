@@ -67,6 +67,7 @@ use tauri::State;
 
 use crate::auth::kdf;
 use crate::auth::registry::{key_hex, KeyRegistry, UnlockedKey};
+use crate::auth::sharing_keypair;
 use crate::auth::user_store;
 
 // ---------------------------------------------------------------------------
@@ -272,6 +273,17 @@ pub async fn login(
         .map_err(|e| e.to_string())?;
 
         let user_id = uuid::Uuid::new_v4().to_string();
+
+        // items.id=289, decisions.id=677: derived once here purely to get
+        // the public key for the shared.db write below (create_user writes
+        // it atomically alongside users/user_salts). finish_login (below)
+        // re-derives the same keypair a second time to populate the
+        // resident KeyRegistry entry -- a deliberate, cheap redundancy (see
+        // that call site's own comment) rather than threading this value
+        // through as extra state.
+        let (_, sharing_public_key) =
+            sharing_keypair::derive_sharing_keypair(&master_key, &user_id);
+
         user_store::create_user(
             &user_id,
             &display_name,
@@ -281,6 +293,7 @@ pub async fn login(
             kdf::DEFAULT_ARGON2_MEMORY_KIB,
             kdf::DEFAULT_ARGON2_ITERATIONS,
             kdf::DEFAULT_ARGON2_PARALLELISM,
+            sharing_public_key.as_bytes(),
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -366,10 +379,18 @@ async fn finish_login(
     key_registry: &State<'_, KeyRegistry>,
 ) -> Result<(), String> {
     let now = crate::providers::utils::now();
+
+    // items.id=289, decisions.id=677: re-derived here (not persisted -- see
+    // auth::sharing_keypair's module header) so it follows master_key's own
+    // single-slot lifecycle exactly -- both installed into the registry
+    // together, both evicted together on logout/clear.
+    let (sharing_private_key, _) = sharing_keypair::derive_sharing_keypair(&master_key, user_id);
+
     key_registry
         .replace(UnlockedKey {
             user_id: user_id.to_owned(),
             master_key,
+            sharing_private_key: sharing_private_key.to_bytes(),
             unlocked_at: now.clone(),
         })
         .await;

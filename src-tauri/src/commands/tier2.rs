@@ -312,6 +312,7 @@ mod tests {
             1024,
             1,
             1,
+            &[0u8; 32],
         )
         .await
         .expect("create_user must succeed in test setup");

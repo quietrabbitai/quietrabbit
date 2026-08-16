@@ -255,6 +255,13 @@ pub async fn set_tier2_provider_preference(
 /// commands/auth.rs's call site, out of scope for a lint-silencing pass.
 /// Revisit if a struct-shaped caller emerges naturally (e.g. an onboarding
 /// request type).
+///
+/// sharing_public_key (items.id=289, decisions.id=677): the account's
+/// X25519 sharing public key, written into user_sharing_keys inside this
+/// same SAVEPOINT -- same atomicity guarantee the users/user_salts pair
+/// already gets. Not secret (shared.db is unencrypted, instance-wide); the
+/// matching private key is never written anywhere -- see
+/// auth::sharing_keypair's module header.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_user(
     user_id: &str,
@@ -265,6 +272,7 @@ pub async fn create_user(
     kdf_memory_kib: u32,
     kdf_iterations: u32,
     kdf_parallelism: u32,
+    sharing_public_key: &[u8; 32],
 ) -> Result<(), UserStoreError> {
     let created_at = crate::providers::utils::now();
     let mut conn = open_shared_db().await?;
@@ -298,6 +306,17 @@ pub async fn create_user(
         .bind(kdf_memory_kib)
         .bind(kdf_iterations)
         .bind(kdf_parallelism)
+        .bind(&created_at)
+        .execute(&mut conn)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO user_sharing_keys
+             (user_id, public_key_hex, created_at)
+             VALUES (?, ?, ?)",
+        )
+        .bind(user_id)
+        .bind(hex_encode(sharing_public_key))
         .bind(&created_at)
         .execute(&mut conn)
         .await?;
@@ -392,18 +411,38 @@ mod tests {
     #[tokio::test]
     async fn create_user_then_has_any_users_is_true() {
         let _env = setup().await;
-        create_user("u1", "Alice", "admin", true, b"salt1234", 1024, 1, 1)
-            .await
-            .expect("create_user should succeed");
+        create_user(
+            "u1",
+            "Alice",
+            "admin",
+            true,
+            b"salt1234",
+            1024,
+            1,
+            1,
+            &[0u8; 32],
+        )
+        .await
+        .expect("create_user should succeed");
         assert!(has_any_users().await.unwrap());
     }
 
     #[tokio::test]
     async fn find_user_by_display_name_round_trips() {
         let _env = setup().await;
-        create_user("u1", "Alice", "admin", true, b"salt1234", 1024, 1, 1)
-            .await
-            .unwrap();
+        create_user(
+            "u1",
+            "Alice",
+            "admin",
+            true,
+            b"salt1234",
+            1024,
+            1,
+            1,
+            &[0u8; 32],
+        )
+        .await
+        .unwrap();
 
         let found = find_user_by_display_name("Alice").await.unwrap();
         assert!(found.is_some());
@@ -424,9 +463,19 @@ mod tests {
     #[tokio::test]
     async fn find_user_by_id_round_trips() {
         let _env = setup().await;
-        create_user("u1", "Alice", "admin", true, b"salt1234", 1024, 1, 1)
-            .await
-            .unwrap();
+        create_user(
+            "u1",
+            "Alice",
+            "admin",
+            true,
+            b"salt1234",
+            1024,
+            1,
+            1,
+            &[0u8; 32],
+        )
+        .await
+        .unwrap();
 
         let found = find_user_by_id("u1").await.unwrap();
         assert!(found.is_some());
@@ -446,11 +495,32 @@ mod tests {
     #[tokio::test]
     async fn create_user_duplicate_display_name_is_already_exists() {
         let _env = setup().await;
-        create_user("u1", "Alice", "admin", true, b"salt1234", 1024, 1, 1)
-            .await
-            .unwrap();
+        create_user(
+            "u1",
+            "Alice",
+            "admin",
+            true,
+            b"salt1234",
+            1024,
+            1,
+            1,
+            &[0u8; 32],
+        )
+        .await
+        .unwrap();
 
-        let result = create_user("u2", "Alice", "user", false, b"salt5678", 1024, 1, 1).await;
+        let result = create_user(
+            "u2",
+            "Alice",
+            "user",
+            false,
+            b"salt5678",
+            1024,
+            1,
+            1,
+            &[0u8; 32],
+        )
+        .await;
         assert!(matches!(result, Err(UserStoreError::AlreadyExists(_))));
     }
 
@@ -460,11 +530,32 @@ mod tests {
         // must reject a second is_primary=true row -- confirms create_user
         // doesn't accidentally bypass that constraint.
         let _env = setup().await;
-        create_user("u1", "Alice", "admin", true, b"salt1234", 1024, 1, 1)
-            .await
-            .unwrap();
+        create_user(
+            "u1",
+            "Alice",
+            "admin",
+            true,
+            b"salt1234",
+            1024,
+            1,
+            1,
+            &[0u8; 32],
+        )
+        .await
+        .unwrap();
 
-        let result = create_user("u2", "Bob", "admin", true, b"salt5678", 1024, 1, 1).await;
+        let result = create_user(
+            "u2",
+            "Bob",
+            "admin",
+            true,
+            b"salt5678",
+            1024,
+            1,
+            1,
+            &[0u8; 32],
+        )
+        .await;
         assert!(
             result.is_err(),
             "a second is_primary=true user must be rejected"
@@ -483,6 +574,7 @@ mod tests {
             65536,
             3,
             4,
+            &[0u8; 32],
         )
         .await
         .unwrap();
@@ -506,9 +598,19 @@ mod tests {
     #[tokio::test]
     async fn get_tier2_provider_preference_round_trips() {
         let _env = setup().await;
-        create_user("u1", "Alice", "admin", true, b"salt1234", 1024, 1, 1)
-            .await
-            .unwrap();
+        create_user(
+            "u1",
+            "Alice",
+            "admin",
+            true,
+            b"salt1234",
+            1024,
+            1,
+            1,
+            &[0u8; 32],
+        )
+        .await
+        .unwrap();
 
         set_tier2_provider_preference("u1", Some("mistral"))
             .await
@@ -521,9 +623,19 @@ mod tests {
     #[tokio::test]
     async fn set_tier2_provider_preference_can_clear_back_to_none() {
         let _env = setup().await;
-        create_user("u1", "Alice", "admin", true, b"salt1234", 1024, 1, 1)
-            .await
-            .unwrap();
+        create_user(
+            "u1",
+            "Alice",
+            "admin",
+            true,
+            b"salt1234",
+            1024,
+            1,
+            1,
+            &[0u8; 32],
+        )
+        .await
+        .unwrap();
 
         set_tier2_provider_preference("u1", Some("groq"))
             .await
@@ -537,9 +649,19 @@ mod tests {
     #[tokio::test]
     async fn set_tier2_provider_preference_rejects_value_outside_check_constraint() {
         let _env = setup().await;
-        create_user("u1", "Alice", "admin", true, b"salt1234", 1024, 1, 1)
-            .await
-            .unwrap();
+        create_user(
+            "u1",
+            "Alice",
+            "admin",
+            true,
+            b"salt1234",
+            1024,
+            1,
+            1,
+            &[0u8; 32],
+        )
+        .await
+        .unwrap();
 
         let result = set_tier2_provider_preference("u1", Some("bogus")).await;
         assert!(matches!(result, Err(UserStoreError::Database(_))));
@@ -548,9 +670,19 @@ mod tests {
     #[tokio::test]
     async fn get_tier2_provider_preference_is_none_when_unset() {
         let _env = setup().await;
-        create_user("u1", "Alice", "admin", true, b"salt1234", 1024, 1, 1)
-            .await
-            .unwrap();
+        create_user(
+            "u1",
+            "Alice",
+            "admin",
+            true,
+            b"salt1234",
+            1024,
+            1,
+            1,
+            &[0u8; 32],
+        )
+        .await
+        .unwrap();
 
         let pref = get_tier2_provider_preference("u1").await.unwrap();
         assert_eq!(

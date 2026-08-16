@@ -84,6 +84,42 @@ getrandom = "0.4"
 # wordlist, not a feature-gated language.
 bip39 = "2.2.2"
 
+# Account-creation asymmetric keypair (items.id=289, decisions.id=677).
+# X25519 key agreement + HKDF-SHA256 + ChaCha20-Poly1305, bare primitives --
+# no crypto_box/hpke wrapper (locked architecture, matches this codebase's
+# existing minimal-dependency style, e.g. the argon2 comment above).
+#
+# x25519-dalek 3.0.0: "static_secrets" feature gives StaticSecret, used for
+# BOTH the deterministic account keypair (derived via HKDF, never random) and
+# the per-envelope ephemeral keypair (random bytes from the getrandom crate
+# already depended on below, wrapped the same way) -- one type covers both
+# uses, so x25519-dalek's own EphemeralSecret/"reusable_secrets"/"getrandom"
+# features are not needed. "zeroize" feature makes StaticSecret itself
+# Zeroize/ZeroizeOnDrop-capable, composing directly with KeyRegistry's
+# UnlockedKey derive (src-tauri/src/auth/registry.rs). Default feature
+# "precomputed-tables" left enabled -- unlike argon2's deliberate
+# default-features=false, there's no unwanted API-surface concern here to
+# avoid.
+x25519-dalek = { version = "3.0.0", features = ["static_secrets", "zeroize"] }
+
+# ChaCha20-Poly1305 AEAD for the envelope ciphertext (locked architecture --
+# the X25519 DH output is never used directly as a cipher key, only after
+# passing through HKDF below).
+chacha20poly1305 = "0.11.0"
+
+# HKDF-SHA256 -- used both to derive the account's X25519 private key from
+# the master key (explicit domain-separation context string, never the raw
+# master key bytes as the scalar) and to derive the envelope's
+# ChaCha20-Poly1305 key from the X25519 DH shared secret (never the raw DH
+# output as the cipher key). Pinned to 0.12, NOT the newer 0.13 -- verified
+# this session via a scratch resolution: hkdf 0.13 depends on digest 0.11,
+# but this codebase's existing sha2 = "0.10" depends on digest 0.10, so
+# Hkdf::<Sha256> from hkdf 0.13 would not typecheck against our sha2::Sha256.
+# hkdf 0.12.4 resolves to digest 0.10.7, matching sha2 0.10 exactly --
+# confirmed via a real `cargo check` with all of sha2/hkdf/x25519-dalek/
+# chacha20poly1305 present together.
+hkdf = "0.12"
+
 # Networking & Errors
 reqwest = { version = "0.12", features = ["json"] }
 thiserror = "1"

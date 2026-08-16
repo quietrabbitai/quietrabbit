@@ -463,6 +463,7 @@ mod tests {
             crate::auth::kdf::DEFAULT_ARGON2_MEMORY_KIB,
             crate::auth::kdf::DEFAULT_ARGON2_ITERATIONS,
             crate::auth::kdf::DEFAULT_ARGON2_PARALLELISM,
+            &[0u8; 32],
         )
         .await
         .expect("create_user must succeed in test setup");
