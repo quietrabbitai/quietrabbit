@@ -156,6 +156,15 @@ pub async fn send_message(
     .await
     .map_err(|e| e.to_string())?;
 
+    // 1.5. R1 crisis-handling floor (decisions.id=607, items.id=265): local,
+    // deterministic check on the raw fresh turn (`content`), NOT the blended
+    // history window built in step 2 below -- detecting on the blended
+    // window would re-fire the resource block on every following turn for
+    // up to HISTORY_WINDOW messages after the actual disclosure, which is
+    // exactly the "repeated check-in" behavior decisions.id=607 point 2
+    // rules out.
+    let crisis_detected = crate::conductor::crisis::detect(&content);
+
     // 2. Build the bounded conversation-history prefix (includes the turn
     // just saved above as the last entry).
     let history = message_store::list_messages(&user_id, &persona_id, &key_hex_str, &context_key)
@@ -174,9 +183,14 @@ pub async fn send_message(
         topic_id: None,
         confirmed_cross_persona_fact_ids: vec![],
     };
-    let mut run =
-        execution::load_and_authorize_run(app_handle, scheduler, key_hex_str.clone(), request)
-            .await?;
+    let mut run = execution::load_and_authorize_run(
+        app_handle,
+        scheduler,
+        key_hex_str.clone(),
+        crisis_detected,
+        request,
+    )
+    .await?;
     let run_id = run
         .focus_run_id
         .clone()

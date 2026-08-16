@@ -2,6 +2,7 @@
 
 pub mod checkin;
 pub mod concurrency;
+pub mod crisis;
 pub mod executor;
 pub mod extract;
 pub mod failure;

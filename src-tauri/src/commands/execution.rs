@@ -105,10 +105,21 @@ pub struct ResumeRunRequest {
 /// take State<KeyRegistry> directly -- each of its two command-layer callers
 /// (submit_focus_run, commands::messages::send_message) derives key_hex from
 /// KeyRegistry and passes the owned String in here.
+///
+/// crisis_detected follows the same pattern for the same reason
+/// (decisions.id=607, items.id=265): each caller runs
+/// conductor::crisis::detect() on the actual fresh user turn it has on hand
+/// (request.user_input here; commands::messages::send_message uses its raw
+/// `content` param, not the blended history window it builds from it) and
+/// passes the result in. It is deliberately NOT a SubmitFocusRunRequest
+/// field -- that DTO is deserialized directly from the frontend, and this
+/// safety floor must always be server-computed from the real text, never
+/// trusted from the client.
 pub(crate) async fn load_and_authorize_run(
     app_handle: tauri::AppHandle,
     scheduler: tauri::State<'_, Arc<ConductorScheduler>>,
     key_hex: String,
+    crisis_detected: bool,
     request: SubmitFocusRunRequest,
 ) -> Result<FocusRun, String> {
     let is_quick_ask = request.focus_id == "quick-ask";
@@ -137,6 +148,7 @@ pub(crate) async fn load_and_authorize_run(
         confirmed_cross_persona_fact_ids,
         Some(app_handle),
     );
+    run.crisis_floor_triggered = crisis_detected;
 
     // Phase 1 LOAD and Phase 2 AUTHORIZE run synchronously before returning,
     // guaranteeing a valid run_id is available to the caller.
@@ -159,7 +171,19 @@ pub async fn submit_focus_run(
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
-    let mut run = load_and_authorize_run(app_handle, scheduler, key_hex_str, request).await?;
+    // R1 crisis-handling floor (decisions.id=607, items.id=265): local,
+    // deterministic check on the actual fresh input for this run -- not
+    // blended with any history here, so this is already the "fresh turn".
+    let crisis_detected = crate::conductor::crisis::detect(&request.user_input);
+
+    let mut run = load_and_authorize_run(
+        app_handle,
+        scheduler,
+        key_hex_str,
+        crisis_detected,
+        request,
+    )
+    .await?;
 
     let run_id = run
         .focus_run_id

@@ -669,6 +669,16 @@ pub struct FocusRun<L: DisclosureLoggerForRun = SqliteDisclosureLogger> {
     /// Rendered MemoryBroker context string for this session.
     /// Assembled at Phase 3 INITIALIZE. Cleared at Phase 7 CLEANUP.
     _persona_context_rendered: String,
+
+    /// R1 crisis-handling floor (decisions.id=607, items.id=265). Set by the
+    /// caller (commands::execution::load_and_authorize_run) right after
+    /// construction, from a local/deterministic check (conductor::crisis::detect)
+    /// on the actual fresh user turn -- never client-supplied over IPC, never
+    /// computed from the blended conversation-history window. Defaults false;
+    /// not part of the constructor argument list so existing call sites
+    /// (including the six test helpers in this file) are unaffected.
+    /// Consumed once, at Phase 5 OUTPUT (see output()); never persisted.
+    pub(crate) crisis_floor_triggered: bool,
 }
 
 impl<L: DisclosureLoggerForRun> FocusRun<L> {
@@ -711,6 +721,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             current_step: 0,
             _checkpointing_suspended: false,
             _persona_context_rendered: String::new(),
+            crisis_floor_triggered: false,
         }
     }
 
@@ -1593,13 +1604,25 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
     pub async fn output(&mut self) -> Result<RunResult, LifecycleError> {
         use crate::persistence::output_store::save_output;
 
-        let final_content = self
+        let mut final_content = self
             .task_track
             .as_ref()
             .unwrap()
             .last_output()
             .unwrap_or("")
             .to_owned();
+
+        // R1 crisis-handling floor (decisions.id=607, items.id=265): append
+        // (never replace) the model's real response with the static local
+        // resource block. This is the run's single content-finalization
+        // point, reached identically regardless of Persona/Focus/tier --
+        // see crisis.rs module doc for the full reasoning, including the
+        // known scope boundary (runs that pause or fail before reaching
+        // OUTPUT do not currently surface this block).
+        if self.crisis_floor_triggered {
+            final_content.push_str("\n\n");
+            final_content.push_str(&crate::conductor::crisis::resource_block());
+        }
 
         let output_type = self.focus_def.as_ref().unwrap().output_type.clone();
         let focus_run_id = self.focus_run_id.clone().unwrap_or_default();
