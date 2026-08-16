@@ -111,6 +111,8 @@ pub enum TopicStoreError {
     Database(#[from] sqlx::Error),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("Migration error: {0}")]
+    Migration(#[from] crate::persistence::migrations::MigrationError),
 }
 
 // ---------------------------------------------------------------------------
@@ -238,6 +240,10 @@ async fn open_outputs_db(
         .join("personas")
         .join(persona_id)
         .join("outputs.db");
+
+    if !db_path.exists() {
+        crate::persistence::migrations::migrate_outputs_db(user_id, persona_id, key_hex).await?;
+    }
 
     let conn = crate::providers::utils::connect_options_encrypted(&db_path, key_hex)
         .create_if_missing(false)

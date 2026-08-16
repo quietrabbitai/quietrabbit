@@ -53,6 +53,8 @@ pub enum MessageStoreError {
     Validation(String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("Migration error: {0}")]
+    Migration(#[from] crate::persistence::migrations::MigrationError),
 }
 
 // ---------------------------------------------------------------------------
@@ -95,6 +97,10 @@ async fn open_messages_db(
     }
 
     let db_path = get_messages_db_path(user_id, persona_id);
+
+    if !db_path.exists() {
+        crate::persistence::migrations::migrate_messages_db(user_id, persona_id, key_hex).await?;
+    }
 
     let conn = crate::providers::utils::connect_options_encrypted(&db_path, key_hex)
         .create_if_missing(false)

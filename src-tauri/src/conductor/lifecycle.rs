@@ -574,7 +574,17 @@ async fn open_outputs_db(
     key_hex: &str,
 ) -> Result<SqliteConnection, LifecycleError> {
     let path = db_path_outputs(user_id, persona_id);
-    let conn = connect_options_encrypted(&path, key_hex).connect().await?;
+
+    if !path.exists() {
+        crate::persistence::migrations::migrate_outputs_db(user_id, persona_id, key_hex)
+            .await
+            .map_err(|e| LifecycleError::DatabaseMigration(e.to_string()))?;
+    }
+
+    let conn = connect_options_encrypted(&path, key_hex)
+        .create_if_missing(false)
+        .connect()
+        .await?;
     Ok(conn)
 }
 

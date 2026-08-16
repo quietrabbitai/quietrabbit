@@ -24,7 +24,7 @@
 // The many-small-encrypted-DBs topology has no static DATABASE_URL, so compile-time
 // query verification is unavailable. Row extraction uses sqlx::Row::try_get().
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteRow};
 use sqlx::ConnectOptions;
@@ -153,10 +153,29 @@ fn get_domain_context_path(user_id: &str, persona_id: &str, focus_id: &str) -> P
 /// PRAGMA key fires before journal_mode in the pragma batch — ordering guaranteed
 /// by SqliteConnectOptions.pragma() insertion order (D6-346).
 /// key_hex: bare hex bytes only (no x'...' wrapper).
+///
+/// Self-heals a never-yet-created domain_context.db (items.id=278): if the
+/// file doesn't exist, migrates it first via the already-idempotent
+/// migrate_domain_context_db() (which also create_dir_all's the focus
+/// directory), then connects. Callers that only read (get_eligible_blocks,
+/// get_standing_summary, list_pending_extractions, revoke_block) still
+/// short-circuit on their own db_path.exists() check before ever reaching
+/// here, so a focus that was never written to stays untouched.
 async fn open_domain_context_db(
-    db_path: &Path,
+    user_id: &str,
+    persona_id: &str,
+    focus_id: &str,
     key_hex: &str,
 ) -> Result<SqliteConnection, DomainContextStoreError> {
+    let db_path = get_domain_context_path(user_id, persona_id, focus_id);
+
+    if !db_path.exists() {
+        crate::persistence::migrations::migrate_domain_context_db(
+            user_id, persona_id, focus_id, key_hex,
+        )
+        .await?;
+    }
+
     let network_storage = std::env::var("QR_NETWORK_STORAGE")
         .map(|v| v.to_lowercase() == "true")
         .unwrap_or(false);
@@ -166,7 +185,7 @@ async fn open_domain_context_db(
     // SqliteConnectOptions.pragma() fires pragmas in insertion order after
     // sqlite3_open_v2 — key is first, journal_mode second.
     let conn = SqliteConnectOptions::new()
-        .filename(db_path)
+        .filename(&db_path)
         .create_if_missing(false)
         .pragma("key", format!("\"x'{key_hex}'\""))
         .pragma("journal_mode", journal_mode)
@@ -259,7 +278,7 @@ pub async fn get_eligible_blocks(
         return Ok(vec![]);
     }
 
-    let mut conn = open_domain_context_db(&db_path, key_hex).await?;
+    let mut conn = open_domain_context_db(user_id, persona_id, focus_id, key_hex).await?;
 
     // Use QueryBuilder to construct the IN (...) clause safely.
     // push_bind() handles placeholder insertion and binding atomically —
@@ -338,7 +357,7 @@ pub async fn get_standing_summary(
         return Ok(None);
     }
 
-    let mut conn = open_domain_context_db(&db_path, key_hex).await?;
+    let mut conn = open_domain_context_db(user_id, persona_id, focus_id, key_hex).await?;
 
     let row = sqlx::query(
         "SELECT content, token_count, source_block_ids, generated_at, invalidated_at
@@ -371,7 +390,7 @@ pub async fn list_pending_extractions(
         return Ok(vec![]);
     }
 
-    let mut conn = open_domain_context_db(&db_path, key_hex).await?;
+    let mut conn = open_domain_context_db(user_id, persona_id, focus_id, key_hex).await?;
 
     let rows = sqlx::query(
         "SELECT id, source_topic_id, source_focus_run_id, proposed_content,
@@ -416,10 +435,9 @@ pub async fn write_pending_extraction(
     proposed_preset: &str,
 ) -> Result<String, DomainContextStoreError> {
     let entry_id = uuid::Uuid::new_v4().to_string();
-    let db_path = get_domain_context_path(user_id, persona_id, focus_id);
     let timestamp = crate::providers::utils::now();
 
-    let mut conn = open_domain_context_db(&db_path, key_hex).await?;
+    let mut conn = open_domain_context_db(user_id, persona_id, focus_id, key_hex).await?;
 
     sqlx::query(
         "INSERT INTO pending_extractions
@@ -471,10 +489,9 @@ pub async fn write_approved_extraction(
     let block_id = uuid::Uuid::new_v4().to_string();
     let tags_json = serde_json::to_string(&relevance_tags.unwrap_or_default())
         .unwrap_or_else(|_| "[]".to_owned());
-    let db_path = get_domain_context_path(user_id, persona_id, focus_id);
     let inferred_flag: i32 = if inferred_by_system { 1 } else { 0 };
 
-    let mut conn = open_domain_context_db(&db_path, key_hex).await?;
+    let mut conn = open_domain_context_db(user_id, persona_id, focus_id, key_hex).await?;
 
     sqlx::query("SAVEPOINT write_approved")
         .execute(&mut conn)
@@ -587,9 +604,8 @@ pub async fn discard_pending_extraction(
 ) -> Result<(), DomainContextStoreError> {
     let timestamp = crate::providers::utils::now();
     let provenance_id = uuid::Uuid::new_v4().to_string();
-    let db_path = get_domain_context_path(user_id, persona_id, focus_id);
 
-    let mut conn = open_domain_context_db(&db_path, key_hex).await?;
+    let mut conn = open_domain_context_db(user_id, persona_id, focus_id, key_hex).await?;
 
     sqlx::query(
         "INSERT INTO provenance_log
@@ -634,7 +650,7 @@ pub async fn revoke_block(
         return Ok(false);
     }
 
-    let mut conn = open_domain_context_db(&db_path, key_hex).await?;
+    let mut conn = open_domain_context_db(user_id, persona_id, focus_id, key_hex).await?;
 
     let result = sqlx::query(
         "UPDATE domain_context_blocks
@@ -670,10 +686,9 @@ pub async fn regenerate_standing_summary(
     key_hex: &str,
     max_tokens: i32,
 ) -> Result<StandingSummary, DomainContextStoreError> {
-    let db_path = get_domain_context_path(user_id, persona_id, focus_id);
     let timestamp = crate::providers::utils::now();
 
-    let mut conn = open_domain_context_db(&db_path, key_hex).await?;
+    let mut conn = open_domain_context_db(user_id, persona_id, focus_id, key_hex).await?;
 
     let rows = sqlx::query(
         "SELECT id, content, token_estimate FROM domain_context_blocks

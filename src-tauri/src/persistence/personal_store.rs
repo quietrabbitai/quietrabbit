@@ -117,6 +117,8 @@ pub enum PersonalStoreError {
     Validation(String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("Migration error: {0}")]
+    Migration(#[from] crate::persistence::migrations::MigrationError),
 }
 
 // ---------------------------------------------------------------------------
@@ -157,11 +159,7 @@ pub(crate) async fn open_personal_db(
     let db_path = get_personal_db_path(user_id, persona_id);
 
     if !db_path.exists() {
-        return Err(PersonalStoreError::Decryption(PersonalDBDecryptionError {
-            plain_language: "Quiet Rabbit couldn't open your personal information. \
-                             Your session may have expired. Please log in again."
-                .to_owned(),
-        }));
+        crate::persistence::migrations::migrate_personal_db(user_id, persona_id, key_hex).await?;
     }
 
     let network_storage = std::env::var("QR_NETWORK_STORAGE")
@@ -1356,6 +1354,56 @@ mod tests {
             result.is_ok(),
             "open_personal_db must open a real encrypted file with the corrected PRAGMA form: {result:?}"
         );
+    }
+
+    /// Regression test for items.id=278: open_personal_db must self-heal a
+    /// never-yet-created personal.db by running migrate_personal_db()
+    /// itself, rather than hard-failing with SQLITE_CANTOPEN -- the same
+    /// bug class items.id=275 fixed for shared.db (a single eager call in
+    /// main.rs's setup()), applied here at the connection layer instead
+    /// since personal.db is per-user-per-persona, not a single app-wide
+    /// file main.rs can migrate eagerly at boot. Deliberately does NOT
+    /// pre-create the file or call migrate_personal_db() anywhere in this
+    /// test -- that absence is exactly the fresh-persona, first-access
+    /// case under test. Also proves the healed file has a real migrated
+    /// schema (not just an empty file) by querying a real table.
+    #[tokio::test]
+    async fn open_personal_db_self_heals_a_never_created_file() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+        let user_id = "self-heal-user";
+        let persona_id = "self-heal-persona";
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+
+        let db_path = get_personal_db_path(user_id, persona_id);
+        assert!(
+            !db_path.exists(),
+            "test setup must start with no db file -- that's the fresh-persona case under test"
+        );
+
+        let result = open_personal_db(user_id, persona_id, key_hex).await;
+
+        let verify = async {
+            let mut conn = result.expect(
+                "open_personal_db must self-heal a fresh persona's never-created \
+                 personal.db, not hard-fail",
+            );
+            let row = sqlx::query("SELECT COUNT(*) AS n FROM entities")
+                .fetch_one(&mut conn)
+                .await
+                .expect("entities table must exist after self-heal migration");
+            let n: i64 = row.try_get("n").unwrap();
+            assert_eq!(n, 0);
+        };
+        verify.await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
     }
 
     // D5-151 / items.id=229: phone_pattern() replaced a raw digit_count >= 8

@@ -118,6 +118,16 @@ async fn open_outputs_db(
 ) -> Result<SqliteConnection, sqlx::Error> {
     let db_path = get_outputs_db_path(user_id, persona_id);
 
+    if !db_path.exists() {
+        crate::persistence::migrations::migrate_outputs_db(user_id, persona_id, key_hex)
+            .await
+            .map_err(|e| {
+                sqlx::Error::Io(std::io::Error::other(format!(
+                    "outputs.db migration failed: {e}"
+                )))
+            })?;
+    }
+
     let network_storage = std::env::var("QR_NETWORK_STORAGE")
         .map(|v| v.to_lowercase() == "true")
         .unwrap_or(false);

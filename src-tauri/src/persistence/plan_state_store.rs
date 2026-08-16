@@ -207,6 +207,14 @@ async fn open_plan_state_db(
 ) -> Result<SqliteConnection, PlanStateStoreError> {
     let db_path = get_plan_state_db_path(user_id, persona_id, focus_id, topic_id);
 
+    if !db_path.exists() {
+        crate::persistence::migrations::migrate_plan_state_db(
+            user_id, persona_id, focus_id, topic_id, key_hex,
+        )
+        .await
+        .map_err(|e| PlanStateStoreError::Migration(e.to_string()))?;
+    }
+
     let network_storage = std::env::var("QR_NETWORK_STORAGE")
         .map(|v| v.to_lowercase() == "true")
         .unwrap_or(false);

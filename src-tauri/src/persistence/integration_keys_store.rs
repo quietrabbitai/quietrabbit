@@ -57,6 +57,8 @@ pub enum IntegrationKeysStoreError {
     Database(#[from] sqlx::Error),
     #[error("Validation error: {0}")]
     Validation(String),
+    #[error("Migration error: {0}")]
+    Migration(#[from] crate::persistence::migrations::MigrationError),
 }
 
 // ---------------------------------------------------------------------------
@@ -119,6 +121,11 @@ async fn open_integration_keys_db(
     key_hex: &str,
 ) -> Result<SqliteConnection, IntegrationKeysStoreError> {
     let db_path = get_integration_keys_db_path(user_id);
+
+    if !db_path.exists() {
+        crate::persistence::migrations::migrate_keys_db(user_id, key_hex).await?;
+    }
+
     let conn = crate::providers::utils::connect_options_encrypted(&db_path, key_hex)
         .create_if_missing(false)
         .connect()

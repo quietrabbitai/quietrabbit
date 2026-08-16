@@ -76,6 +76,8 @@ pub enum OutputStoreError {
     Io(#[from] std::io::Error),
     #[error("Run not found: {0}")]
     RunNotFound(String),
+    #[error("Migration error: {0}")]
+    Migration(#[from] crate::persistence::migrations::MigrationError),
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +117,10 @@ async fn open_outputs_db(
     key_hex: &str,
 ) -> Result<SqliteConnection, OutputStoreError> {
     let db_path = get_outputs_db_path(user_id, persona_id);
+
+    if !db_path.exists() {
+        crate::persistence::migrations::migrate_outputs_db(user_id, persona_id, key_hex).await?;
+    }
 
     let conn = crate::providers::utils::connect_options_encrypted(&db_path, key_hex)
         .create_if_missing(false)
@@ -1078,5 +1084,54 @@ mod tests {
         .execute(&mut conn)
         .await
         .expect("floor row must still satisfy the updated 3-branch CHECK");
+    }
+
+    /// Regression test for items.id=278: open_outputs_db must self-heal a
+    /// never-yet-created outputs.db by running migrate_outputs_db() itself,
+    /// rather than hard-failing with SQLITE_CANTOPEN -- the same bug class
+    /// items.id=275 fixed for shared.db (a single eager call in main.rs's
+    /// setup()), applied here at the connection layer instead since
+    /// outputs.db is per-user-per-persona, not a single app-wide file
+    /// main.rs can migrate eagerly at boot. Deliberately does NOT
+    /// pre-create the file or call migrate_outputs_db() anywhere in this
+    /// test -- that absence is exactly the fresh-persona, first-access
+    /// case under test. Also proves the healed file has a real migrated
+    /// schema (not just an empty file) by querying a real table.
+    #[tokio::test]
+    async fn open_outputs_db_self_heals_a_never_created_file() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+        let user_id = "self-heal-user";
+        let persona_id = "self-heal-persona";
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+
+        let db_path = get_outputs_db_path(user_id, persona_id);
+        assert!(
+            !db_path.exists(),
+            "test setup must start with no db file -- that's the fresh-persona case under test"
+        );
+
+        let result = open_outputs_db(user_id, persona_id, key_hex).await;
+
+        {
+            let mut conn = result.expect(
+                "open_outputs_db must self-heal a fresh persona's never-created \
+                 outputs.db, not hard-fail",
+            );
+            let row = sqlx::query("SELECT COUNT(*) AS n FROM outputs")
+                .fetch_one(&mut conn)
+                .await
+                .expect("outputs table must exist after self-heal migration");
+            let n: i64 = row.try_get("n").unwrap();
+            assert_eq!(n, 0);
+        }
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
     }
 }

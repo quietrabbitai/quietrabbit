@@ -38,6 +38,8 @@ use thiserror::Error;
 pub enum Tier3CookieStoreError {
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
+    #[error("Migration error: {0}")]
+    Migration(#[from] crate::persistence::migrations::MigrationError),
 }
 
 // ---------------------------------------------------------------------------
@@ -99,6 +101,11 @@ async fn open_tier3_cookies_db(
     key_hex: &str,
 ) -> Result<SqliteConnection, Tier3CookieStoreError> {
     let db_path = get_tier3_cookies_db_path(user_id);
+
+    if !db_path.exists() {
+        crate::persistence::migrations::migrate_tier3_cookies_db(user_id, key_hex).await?;
+    }
+
     let conn = crate::providers::utils::connect_options_encrypted(&db_path, key_hex)
         .create_if_missing(false)
         .connect()
