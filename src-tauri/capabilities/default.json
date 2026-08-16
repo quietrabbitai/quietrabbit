@@ -1,0 +1,9 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Core event permissions for the main window's push-event listeners (run-status-update, consent_request).",
+  "windows": ["main"],
+  "permissions": [
+    "core:event:default"
+  ]
+}

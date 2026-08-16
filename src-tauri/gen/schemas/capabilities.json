@@ -1,1 +1,1 @@
-{}
+{"default":{"identifier":"default","description":"Core event permissions for the main window's push-event listeners (run-status-update, consent_request).","local":true,"windows":["main"],"permissions":["core:event:default"]}}
