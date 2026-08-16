@@ -25,11 +25,10 @@ import { commands, type FocusInfo } from '../bindings'
 export interface PersonaHubProps {
   userId: string
   personaId: string
-  keyHex: string | null
   onOpenLibrary: () => void
 }
 
-export function PersonaHub({ userId, personaId, keyHex, onOpenLibrary }: PersonaHubProps) {
+export function PersonaHub({ userId, personaId, onOpenLibrary }: PersonaHubProps) {
   const { t } = useTranslation()
   const [focuses, setFocuses] = useState<FocusInfo[]>([])
   const [error, setError] = useState<string | null>(null)
@@ -37,14 +36,14 @@ export function PersonaHub({ userId, personaId, keyHex, onOpenLibrary }: Persona
   useEffect(() => {
     setFocuses([])
     setError(null)
-    commands.listFocuses(userId, personaId, keyHex ?? '').then((result) => {
+    commands.listFocuses(userId, personaId).then((result) => {
       if (result.status === 'ok') {
         setFocuses(result.data)
       } else {
         setError(result.error)
       }
     })
-  }, [userId, personaId, keyHex])
+  }, [userId, personaId])
 
   return (
     <div className="persona-hub">

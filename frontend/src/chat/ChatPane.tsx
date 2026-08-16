@@ -3,16 +3,6 @@
 // personaHub branch and Tier3AccessPane.tsx's conversation pane. One
 // component for both: gate3Track is the only behavioral difference (whether
 // the assistant reply gets gate3_review_status="drafted").
-//
-// keyHex is null at both call sites today -- there is no code path for this
-// frontend to obtain a real key_hex yet (see navShellConfig.ts's
-// requireCurrentUserId() note: the real-session pattern built for user_id
-// is deliberately NOT extended to key_hex, items.id=268). When null, send() never calls
-// IPC at all -- it short-circuits client-side with an actionable "not sent"
-// notice, same bar as commands/library.rs's prepare_clipboard_copy blocked
-// message (states what happened and what the user can still do, no dead
-// affordances). Real IPC wiring (commands.sendMessage/listMessages) is
-// fully built and used the moment a real keyHex is supplied.
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -26,8 +16,6 @@ export interface ChatPaneProps {
   contextKey: string
   userId: string
   personaId: string
-  /** null until Layer 8 auth exists -- see this file's header comment. */
-  keyHex: string | null
   focusId: string
   gate3Track: boolean
   /** Lets the caller compute MiddleZone's isGenerating prop for real,
@@ -68,16 +56,10 @@ const TERMINAL_STATUSES = new Set([
   'awaiting_feedback',
 ])
 
-interface LocalUnsentMessage {
-  id: string
-  content: string
-}
-
 export function ChatPane({
   contextKey,
   userId,
   personaId,
-  keyHex,
   focusId,
   gate3Track,
   onGenerating,
@@ -88,8 +70,6 @@ export function ChatPane({
   const [loadError, setLoadError] = useState<string | null>(null)
   const [draft, setDraft] = useState('')
   const [sendError, setSendError] = useState<string | null>(null)
-  const [localUnsent, setLocalUnsent] = useState<LocalUnsentMessage[]>([])
-  const [showNotSentNotice, setShowNotSentNotice] = useState(false)
 
   const [activeRunId, setActiveRunId] = useState<string | null>(null)
   const [liveStepDisplayName, setLiveStepDisplayName] = useState<
@@ -110,24 +90,13 @@ export function ChatPane({
   // header comment), so re-fetching on identity change is this component's
   // job, not MiddleZone's.
   useEffect(() => {
-    setLocalUnsent([])
-    setShowNotSentNotice(false)
     setSendError(null)
     setActiveRunId(null)
     setLiveContent('')
     setLiveStepDisplayName(null)
 
-    if (keyHex === null) {
-      // No real session to fetch against -- nothing was ever really sent
-      // for this contextKey, so an empty transcript is the honest state,
-      // not a fetch failure. See this file's header comment.
-      setMessages([])
-      setLoadError(null)
-      return
-    }
-
     setLoadError(null)
-    commands.listMessages(userId, personaId, keyHex, contextKey).then(
+    commands.listMessages(userId, personaId, contextKey).then(
       (result) => {
         if (result.status === 'ok') {
           setMessages(result.data)
@@ -136,7 +105,7 @@ export function ChatPane({
         }
       },
     )
-  }, [contextKey, userId, personaId, keyHex])
+  }, [contextKey, userId, personaId])
 
   // First listen() call in this frontend (see this file's header comment on
   // RunStatusPayload) -- effect-returns-cleanup-closure shape, matching
@@ -176,7 +145,7 @@ export function ChatPane({
         // so re-fetch rather than trusting liveContent as final -- avoids
         // ChatPane's own live-rendered text silently diverging from what's
         // actually persisted.
-        commands.listMessages(userId, personaId, keyHex ?? '', contextKey).then(
+        commands.listMessages(userId, personaId, contextKey).then(
           (result) => {
             if (cancelled) return
             if (result.status === 'ok') {
@@ -219,7 +188,7 @@ export function ChatPane({
       cancelled = true
       unlisten?.()
     }
-  }, [activeRunId, userId, personaId, keyHex, contextKey, gate3Track, onDraftReady])
+  }, [activeRunId, userId, personaId, contextKey, gate3Track, onDraftReady])
 
   // Elapsed-time-aware "generating..." messaging for the gaps between step
   // reveals -- pure frontend presentation, no backend involvement.
@@ -245,18 +214,9 @@ export function ChatPane({
     if (!text) return
     setDraft('')
 
-    if (keyHex === null) {
-      setLocalUnsent((prev) => [
-        ...prev,
-        { id: `local-${Date.now()}-${prev.length}`, content: text },
-      ])
-      setShowNotSentNotice(true)
-      return
-    }
-
     setSendError(null)
     commands
-      .sendMessage(userId, personaId, keyHex, contextKey, text, focusId, gate3Track)
+      .sendMessage(userId, personaId, contextKey, text, focusId, gate3Track)
       .then((result) => {
         if (result.status === 'ok') {
           setMessages(result.data)
@@ -268,7 +228,7 @@ export function ChatPane({
           setSendError(result.error)
         }
       })
-  }, [draft, keyHex, userId, personaId, contextKey, focusId, gate3Track])
+  }, [draft, userId, personaId, contextKey, focusId, gate3Track])
 
   // The transcript row that should render liveContent instead of its own
   // (still-empty, not-yet-backfilled) content -- the placeholder assistant
@@ -289,7 +249,7 @@ export function ChatPane({
             {t('navShell.chat.loadError', { message: loadError })}
           </p>
         )}
-        {messages.length === 0 && localUnsent.length === 0 && !loadError && (
+        {messages.length === 0 && !loadError && (
           <p>{t('navShell.chat.emptyTranscript')}</p>
         )}
         <ul className="chat-pane__message-list">
@@ -305,17 +265,6 @@ export function ChatPane({
               )}
             </li>
           ))}
-          {localUnsent.map((m) => (
-            <li
-              key={m.id}
-              className="chat-pane__message chat-pane__message--user chat-pane__message--unsent"
-            >
-              <span className="chat-pane__message-content">{m.content}</span>
-              <span className="chat-pane__unsent-badge">
-                {t('navShell.chat.unsentBadge')}
-              </span>
-            </li>
-          ))}
         </ul>
         {isGenerating && (
           <p className="chat-pane__generating" aria-live="polite">
@@ -325,11 +274,6 @@ export function ChatPane({
                   elapsed: elapsedSeconds,
                 })
               : t('navShell.chat.generating', { elapsed: elapsedSeconds })}
-          </p>
-        )}
-        {showNotSentNotice && (
-          <p className="chat-pane__not-sent-notice">
-            {t('navShell.chat.notSentNotice')}
           </p>
         )}
         {sendError && (

@@ -75,17 +75,6 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
   const [openError, setOpenError] = useState<string | null>(null)
   const paneDockRef = useRef<HTMLDivElement>(null)
 
-  // null at this call site today for the same reason ChatPane's own keyHex
-  // prop is null -- Layer 8 session auth isn't built, and there is no code
-  // path for this frontend to obtain a real key_hex yet (see ChatPane.tsx's
-  // header comment; that placeholder pattern is deliberately NOT extended
-  // to key_hex). handleDraftReady only ever fires after ChatPane has
-  // actually sent a message, which itself requires a real keyHex -- so the
-  // null-guard below is defensive, not expected to trigger in practice
-  // until Layer 8 exists, at which point this becomes a real prop/state
-  // value instead of a literal null.
-  const keyHex: string | null = null
-
   const [reviewOutcome, setReviewOutcome] = useState<ReviewOutcome | null>(null)
   const [reviewMessage, setReviewMessage] = useState<string | null>(null)
   const [consentPayload, setConsentPayload] = useState<ConsentRequestPayload | null>(null)
@@ -174,7 +163,7 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
   // (approved/blocked/timeout) and the not-found/error path.
   const handleDraftReady = useCallback(
     (messageId: string) => {
-      if (!personaId || keyHex === null) return
+      if (!personaId) return
       setReviewOutcome('pending')
       setReviewMessage(null)
       setPendingMessageId(messageId)
@@ -182,7 +171,6 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
         .requestTier3Gate3Review({
           user_id: requireCurrentUserId(),
           persona_id: personaId,
-          key_hex: keyHex,
           message_id: messageId,
         })
         .then((result) => {
@@ -209,7 +197,7 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
           setReviewMessage(data.plain_language)
         })
     },
-    [personaId, keyHex, t],
+    [personaId, t],
   )
 
   // Same cancelled/unlisten cleanup idiom as ChatPane's own first listen()
@@ -236,7 +224,7 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
   }, [])
 
   const handleModalResolve = (decisions: ElementDecision[]) => {
-    if (!consentPayload || !personaId || keyHex === null || !pendingMessageId) return
+    if (!consentPayload || !personaId || !pendingMessageId) return
     const allKeptPrivate = decisions.every((d) => d.decision === 'keep_private')
     const status = allKeptPrivate ? 'withheld' : 'approved'
 
@@ -245,14 +233,12 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
         run_id: consentPayload.focus_run_id,
         user_id: requireCurrentUserId(),
         persona_id: personaId,
-        key_hex: keyHex,
         decisions_json: JSON.stringify(decisions),
       })
       .then(() =>
         commands.resolveTier3Gate3Review({
           user_id: requireCurrentUserId(),
           persona_id: personaId,
-          key_hex: keyHex,
           message_id: pendingMessageId,
           status,
         }),
@@ -286,7 +272,6 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
                 contextKey={`tier3-access-${personaId}`}
                 userId={requireCurrentUserId()}
                 personaId={personaId}
-                keyHex={keyHex}
                 focusId="quick-ask"
                 gate3Track={true}
                 onGenerating={setChatGenerating}

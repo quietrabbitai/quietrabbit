@@ -18,10 +18,7 @@
 //   requires key_hex, which has no placeholder equivalent to
 //   getCurrentUserId() (see navShellConfig.ts's note on why that gap
 //   is deliberately NOT bridged the same way). Renders as flagged
-//   placeholder content below. Library's real screen (Section 2c) is
-//   built (see LibraryPane.tsx) -- same key_hex gap, but the screen
-//   itself short-circuits per-call rather than staying an unbuilt
-//   placeholder; see LibraryPane.tsx's own header comment.
+//   placeholder content below.
 // - My Facts' real screen (items.id=176, Chat-BRAND's design).
 // - Onboarding's strip-wide gating (Section 11b) -- not built because
 //   nothing in this pass triggers Onboarding at all.
@@ -231,7 +228,6 @@ function NavShellContent({
           <PersonaHub
             userId={requireCurrentUserId()}
             personaId={content.personaId}
-            keyHex={null}
             onOpenLibrary={() => onOpenPersonaLibrary(content.personaId)}
           />
         }
@@ -240,7 +236,6 @@ function NavShellContent({
             contextKey={`persona-hub-${content.personaId}`}
             userId={requireCurrentUserId()}
             personaId={content.personaId}
-            keyHex={null}
             focusId="quick-ask"
             gate3Track={false}
             onGenerating={setPersonaHubGenerating}
@@ -262,7 +257,6 @@ function NavShellContent({
           <LibraryPane
             userId={requireCurrentUserId()}
             personaId={personaId}
-            keyHex={null}
           />
         }
         chatPane={<p>{t('navShell.content.chatPlaceholder')}</p>}

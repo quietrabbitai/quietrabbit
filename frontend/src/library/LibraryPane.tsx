@@ -2,18 +2,6 @@
 // content branch, replacing the placeholder <p> previously returned by
 // NavShell.tsx's describePlaceholder. See that file's former stub comment
 // (removed once this landed) for the original wiring intent.
-//
-// keyHex is null at its only call site today -- there is no code path for
-// this frontend to obtain a real key_hex yet (see navShellConfig.ts's
-// requireCurrentUserId() note: the real-session pattern built for user_id
-// is deliberately NOT extended to key_hex, items.id=268). Every IPC call this
-// component could make -- listOutputs, getOutput, copyOutputToClipboard --
-// requires a real key_hex, so each short-circuits client-side with an
-// actionable "not available yet" notice instead, same bar as ChatPane's
-// own keyHex === null handling and commands/library.rs's
-// prepare_clipboard_copy blocked message (states what happened and what
-// the user can still do, no dead affordances). Real IPC wiring is fully
-// built and used the moment a real keyHex is supplied.
 
 import { useCallback, useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -26,11 +14,9 @@ export interface LibraryPaneProps {
    *  context (content.personaFilter absent) -- see navShellConfig.ts's
    *  ContentDescriptor. Outputs cannot be scoped without one. */
   personaId: string | null
-  /** null until Layer 8 auth exists -- see this file's header comment. */
-  keyHex: string | null
 }
 
-export function LibraryPane({ userId, personaId, keyHex }: LibraryPaneProps) {
+export function LibraryPane({ userId, personaId }: LibraryPaneProps) {
   const { t } = useTranslation()
   const [outputs, setOutputs] = useState<OutputInfo[]>([])
   const [listError, setListError] = useState<string | null>(null)
@@ -55,13 +41,13 @@ export function LibraryPane({ userId, personaId, keyHex }: LibraryPaneProps) {
     setCopyError(null)
     setCopySucceeded(false)
 
-    if (personaId === null || keyHex === null) {
+    if (personaId === null) {
       // Nothing was ever really listable for this identity -- honest
-      // empty state, not a fetch failure. See this file's header comment.
+      // empty state, not a fetch failure.
       return
     }
 
-    commands.listOutputs(userId, personaId, keyHex, null, null, null).then(
+    commands.listOutputs(userId, personaId, null, null, null).then(
       (result) => {
         if (result.status === 'ok') {
           setOutputs(result.data)
@@ -70,7 +56,7 @@ export function LibraryPane({ userId, personaId, keyHex }: LibraryPaneProps) {
         }
       },
     )
-  }, [userId, personaId, keyHex])
+  }, [userId, personaId])
 
   // Detail load, keyed on selection -- re-fetches via getOutput rather than
   // trusting the list row's own cached content, matching ChatPane's
@@ -83,9 +69,9 @@ export function LibraryPane({ userId, personaId, keyHex }: LibraryPaneProps) {
     setCopySucceeded(false)
 
     if (selectedOutputId === null) return
-    if (personaId === null || keyHex === null) return // defensive, same guard as the list effect
+    if (personaId === null) return // defensive, same guard as the list effect
 
-    commands.getOutput(selectedOutputId, userId, personaId, keyHex).then(
+    commands.getOutput(selectedOutputId, userId, personaId).then(
       (result) => {
         if (result.status === 'ok') {
           setSelectedOutput(result.data)
@@ -94,22 +80,18 @@ export function LibraryPane({ userId, personaId, keyHex }: LibraryPaneProps) {
         }
       },
     )
-  }, [selectedOutputId, userId, personaId, keyHex])
+  }, [selectedOutputId, userId, personaId])
 
-  const copyGateBlocked = personaId === null || keyHex === null
+  const copyGateBlocked = personaId === null
 
   const handleCopy = useCallback(() => {
-    if (copyGateBlocked || selectedOutput === null || personaId === null || keyHex === null) {
-      // No IPC call made -- the shared "not available yet" notice below
-      // already explains why, matching ChatPane.handleSend's own
-      // independent keyHex check rather than relying solely on the button
-      // being disabled.
+    if (copyGateBlocked || selectedOutput === null || personaId === null) {
       return
     }
     setCopyError(null)
     setCopySucceeded(false)
     commands
-      .copyOutputToClipboard(selectedOutput.id, userId, personaId, keyHex)
+      .copyOutputToClipboard(selectedOutput.id, userId, personaId)
       .then((result) => {
         if (result.status === 'ok') {
           setCopySucceeded(true)
@@ -119,7 +101,7 @@ export function LibraryPane({ userId, personaId, keyHex }: LibraryPaneProps) {
           setCopyError(result.error)
         }
       })
-  }, [copyGateBlocked, selectedOutput, userId, personaId, keyHex])
+  }, [copyGateBlocked, selectedOutput, userId, personaId])
 
   if (personaId === null) {
     return (
@@ -136,7 +118,6 @@ export function LibraryPane({ userId, personaId, keyHex }: LibraryPaneProps) {
       <LibraryOutputDetail
         output={selectedOutput}
         detailError={detailError}
-        keyHex={keyHex}
         copyError={copyError}
         copySucceeded={copySucceeded}
         copyGateBlocked={copyGateBlocked}
@@ -151,17 +132,12 @@ export function LibraryPane({ userId, personaId, keyHex }: LibraryPaneProps) {
       <h2 className="library-pane__heading">
         {t('navShell.libraryPane.listHeading')}
       </h2>
-      {keyHex === null && (
-        <p className="library-pane__notice">
-          {t('navShell.libraryPane.notAvailable')}
-        </p>
-      )}
       {listError && (
         <p role="alert">
           {t('navShell.libraryPane.listLoadError', { message: listError })}
         </p>
       )}
-      {keyHex !== null && outputs.length === 0 && !listError && (
+      {outputs.length === 0 && !listError && (
         <p>{t('navShell.libraryPane.emptyList')}</p>
       )}
       {outputs.length > 0 && (
@@ -188,7 +164,6 @@ export function LibraryPane({ userId, personaId, keyHex }: LibraryPaneProps) {
 interface LibraryOutputDetailProps {
   output: OutputInfo | null
   detailError: string | null
-  keyHex: string | null
   copyError: string | null
   copySucceeded: boolean
   copyGateBlocked: boolean
@@ -199,7 +174,6 @@ interface LibraryOutputDetailProps {
 function LibraryOutputDetail({
   output,
   detailError,
-  keyHex,
   copyError,
   copySucceeded,
   copyGateBlocked,
@@ -212,11 +186,6 @@ function LibraryOutputDetail({
       <button type="button" onClick={onBack}>
         {t('navShell.libraryPane.backButton')}
       </button>
-      {keyHex === null && (
-        <p className="library-pane__notice">
-          {t('navShell.libraryPane.notAvailable')}
-        </p>
-      )}
       {detailError && (
         <p role="alert">
           {t('navShell.libraryPane.detailLoadError', {
