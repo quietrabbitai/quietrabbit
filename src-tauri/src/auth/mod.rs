@@ -7,6 +7,7 @@
 // separation persistence/personal_store.rs already uses relative to
 // commands/personal.rs.
 
+pub mod group_invitations;
 pub mod kdf;
 pub mod registry;
 pub mod sharing_keypair;
