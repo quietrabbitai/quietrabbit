@@ -89,6 +89,13 @@ async fn async_main() {
         // directly (see auth::registry module header). Default::default()
         // starts with an empty slot; login() (a later step) populates it.
         .manage(quietrabbit_lib::auth::registry::KeyRegistry::default())
+        // GroupKeyRegistry: multi-key group registry (items.id=283,
+        // Working/GROUP_DB_DESIGN_20260802.md Section 2.1), alongside the
+        // single-slot KeyRegistry above, not a replacement for it. Same
+        // encapsulation discipline -- see auth::registry module header.
+        // Default::default() starts empty; a later item's invitation-accept
+        // / group-unlock path populates entries.
+        .manage(quietrabbit_lib::auth::registry::GroupKeyRegistry::default())
         .setup(|app| {
             // Must run synchronously here, before any command handler could
             // touch persistence::migrations::get_data_root() -- every prior

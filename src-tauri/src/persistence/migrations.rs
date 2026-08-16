@@ -74,6 +74,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/domain_context_001.sql"),
     },
     SchemaFile {
+        prefix: "group",
+        version: 1,
+        sql: include_str!("../../schema/group_001.sql"),
+    },
+    SchemaFile {
         prefix: "keys",
         version: 1,
         sql: include_str!("../../schema/keys_001.sql"),
@@ -132,6 +137,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         prefix: "shared",
         version: 2,
         sql: include_str!("../../schema/shared_002.sql"),
+    },
+    SchemaFile {
+        prefix: "shared",
+        version: 3,
+        sql: include_str!("../../schema/shared_003.sql"),
     },
     SchemaFile {
         prefix: "tier3_cookies",
@@ -596,6 +606,31 @@ pub async fn migrate_personal_db(
     run_migrations(&mut conn, "personal", Some(key_hex)).await
 }
 
+/// Migrate a group's group.db (encrypted). key_hex: bare hex bytes only.
+///
+/// PATH, deliberately NOT users/{user_id}/personas/{persona_id}/...: per
+/// GROUP_DB_DESIGN_20260802.md Section 2.1, group.db is "not part of any
+/// individual member's account tree" -- it lives under its own top-level
+/// root instead, scoped by (persona_id, group_id) matching
+/// GroupKeyRegistry's own key order (auth::registry). No user_id
+/// parameter/path segment: group membership is per-Persona, not
+/// per-account, and this function's own signature (persona_id, group_id,
+/// key_hex) has no user_id to construct one from.
+pub async fn migrate_group_db(
+    persona_id: &str,
+    group_id: &str,
+    key_hex: &str,
+) -> Result<u32, MigrationError> {
+    let db_path = get_data_root()
+        .join("groups")
+        .join(persona_id)
+        .join(group_id)
+        .join("group.db");
+    std::fs::create_dir_all(db_path.parent().unwrap())?;
+    let mut conn = open_raw(&db_path).await?;
+    run_migrations(&mut conn, "group", Some(key_hex)).await
+}
+
 /// Migrate a user's outputs.db (encrypted). key_hex: bare hex bytes only.
 pub async fn migrate_outputs_db(
     user_id: &str,
@@ -890,13 +925,32 @@ mod tests {
         let applied = run_migrations(&mut conn, "shared", None)
             .await
             .expect("shared migration chain must apply cleanly on a fresh db");
-        assert_eq!(applied, 2, "expected both shared schema versions to apply");
+        assert_eq!(applied, 3, "expected all three shared schema versions to apply");
 
         let version: (i64,) = sqlx::query_as("SELECT MAX(version) FROM schema_version")
             .fetch_one(&mut conn)
             .await
             .unwrap();
-        assert_eq!(version.0, 2);
+        assert_eq!(version.0, 3);
+    }
+
+    #[tokio::test]
+    async fn test_shared_migration_creates_pending_group_invitations() {
+        // items.id=283: shared_003.sql must load cleanly via a real
+        // migration run, not just parse as syntactically valid SQL.
+        let mut conn = make_test_conn().await;
+        run_migrations(&mut conn, "shared", None).await.unwrap();
+
+        let exists: Option<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='pending_group_invitations'",
+        )
+        .fetch_optional(&mut conn)
+        .await
+        .unwrap();
+        assert!(
+            exists.is_some(),
+            "pending_group_invitations table must exist after migration"
+        );
     }
 
     #[tokio::test]
@@ -928,7 +982,10 @@ mod tests {
             .await
             .expect("drift-healing run must succeed");
 
-        assert_eq!(applied, 1, "only shared v2 should count as newly applied");
+        assert_eq!(
+            applied, 2,
+            "shared v2 and v3 should count as newly applied from a stale v1 database"
+        );
 
         let exists: Option<(String,)> = sqlx::query_as(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='tier3_providers'",
@@ -1239,6 +1296,74 @@ mod tests {
             msg.contains("not a database"),
             "wrong-key error must be classifiable the same way this codebase already \
              classifies it elsewhere (commands/auth.rs, personal_store.rs): {msg}"
+        );
+    }
+
+    // -- items.id=283: migrate_group_db real on-disk tests --------------------
+
+    #[tokio::test]
+    async fn migrate_group_db_applies_to_real_encrypted_file() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let persona_id = "test-persona";
+        let group_id = "test-group";
+        let db_path = tempdir
+            .path()
+            .join("groups")
+            .join(persona_id)
+            .join(group_id)
+            .join("group.db");
+
+        let result = migrate_group_db(persona_id, group_id, TEST_KEY_HEX).await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+
+        assert_eq!(
+            result.expect("migration must apply cleanly to a real encrypted file"),
+            1,
+            "group_001 must apply in one pass"
+        );
+
+        let mut conn = open_verify_conn(&db_path, Some(TEST_KEY_HEX)).await;
+        for table in ["documents", "document_permissions"] {
+            assert!(
+                table_exists(&mut conn, table).await,
+                "table {table} must exist after migration to a real encrypted file"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn migrate_group_db_is_idempotent_on_real_file() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let persona_id = "test-persona";
+        let group_id = "test-group";
+
+        let first = migrate_group_db(persona_id, group_id, TEST_KEY_HEX).await;
+        let second = migrate_group_db(persona_id, group_id, TEST_KEY_HEX).await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+
+        assert_eq!(first.expect("first migration must succeed"), 1);
+        assert_eq!(
+            second.expect("second migration on an already-migrated real file must not error"),
+            0,
+            "re-running the migration on an already-migrated real file must be a no-op"
         );
     }
 

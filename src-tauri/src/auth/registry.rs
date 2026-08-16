@@ -44,6 +44,8 @@
 // replace(). Whoever writes login() (a later step) needs to verify that
 // path separately; this module's guarantee starts once a key is inside it.
 
+use std::collections::HashMap;
+
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::auth::kdf;
@@ -114,6 +116,116 @@ impl KeyRegistry {
     {
         let guard = self.slot.lock().await;
         guard.as_ref().map(f)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GroupKeyRegistry (items.id=283, GROUP_DB_DESIGN_20260802.md Section 2.1)
+// ---------------------------------------------------------------------------
+//
+// Alongside KeyRegistry above, not a replacement for it -- the single-slot
+// account master key registry is unchanged. This is a separate, additive
+// structure holding zero or more resident GROUP symmetric keys, keyed by
+// (persona_id, group_id): group membership is per-Persona, not per-account
+// (design doc Section 2.1), so the same person's different Personas never
+// share group-key state, and one Persona can hold keys for more than one
+// group at once.
+//
+// KEY SIZE: [u8; kdf::MASTER_KEY_LEN], same as UnlockedKey.master_key.
+// group.db is encrypted the same way personal.db is (design doc Section
+// 2.1), and migrate_group_db's key_hex feeds the same SQLCipher PRAGMA key
+// mechanism migrate_personal_db does -- no basis found for a different
+// size. Tied to the constant, not a hardcoded 32, so it tracks the one
+// real invariant if that ever changes.
+//
+// ID TYPING: persona_id/group_id are plain String, not dedicated newtypes.
+// Checked first -- no PersonaId/GroupId type exists anywhere in this
+// codebase; every existing ID (UnlockedKey.user_id included) is a bare
+// String/&str. Matches that convention rather than inventing one just for
+// this struct.
+//
+// ENCAPSULATION: same discipline as KeyRegistry -- the inner Mutex<HashMap>
+// is private; replace()/with_key()/is_occupied()/clear()/clear_persona()
+// are the only ways in. No path exists for calling code to get &mut access
+// to a resident UnlockedGroupKey's fields.
+//
+// REMOVAL API -- two granularities, both provided:
+//   clear(persona_id, group_id): evict exactly one group's key -- e.g.
+//     leaving a specific group, or a future key-rotation replacement
+//     (items.id=288) without disturbing the Persona's other group keys.
+//   clear_persona(persona_id): evict every group key resident for one
+//     Persona -- e.g. that Persona's own account session ending. Mirrors
+//     the lifecycle discipline KeyRegistry::clear() already gives the
+//     master key on logout, rather than leaving orphaned group keys
+//     resident after the owning account has logged out (design doc Section
+//     4 item 3 flags exactly this as something the implementation must not
+//     assume away).
+// Neither is wired into any real call site here (no logout code is
+// touched in this item) -- these are the primitives only.
+
+/// One Persona's resident, unlocked symmetric key for one group. Never
+/// persisted -- exists only as Tauri managed state for this process's
+/// lifetime, same as UnlockedKey. Fields are pub(crate): constructed only
+/// by the (later) invitation-accept / group-unlock path, same crate; not
+/// part of the IPC surface.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct UnlockedGroupKey {
+    #[zeroize(skip)]
+    pub(crate) group_id: String,
+    pub(crate) group_key: [u8; kdf::MASTER_KEY_LEN],
+    #[zeroize(skip)]
+    pub(crate) unlocked_at: String,
+}
+
+/// Multi-key group registry, keyed by (persona_id, group_id). Encapsulated
+/// -- see module header above for why the inner Mutex is not exposed
+/// directly.
+#[derive(Default)]
+pub struct GroupKeyRegistry {
+    keys: tokio::sync::Mutex<HashMap<(String, String), UnlockedGroupKey>>,
+}
+
+impl GroupKeyRegistry {
+    /// Populate (or replace) the entry for (persona_id, group_id) with a
+    /// newly-unlocked group key. The only writer path that installs a key.
+    pub async fn replace(&self, persona_id: &str, group_id: &str, new_value: UnlockedGroupKey) {
+        let mut guard = self.keys.lock().await;
+        guard.insert((persona_id.to_owned(), group_id.to_owned()), new_value);
+    }
+
+    /// Evict exactly one (persona_id, group_id) entry, if present. Dropping
+    /// the outgoing UnlockedGroupKey here is what fires ZeroizeOnDrop on it.
+    pub async fn clear(&self, persona_id: &str, group_id: &str) {
+        let mut guard = self.keys.lock().await;
+        guard.remove(&(persona_id.to_owned(), group_id.to_owned()));
+    }
+
+    /// Evict every entry resident for one Persona, across all of that
+    /// Persona's groups -- e.g. that Persona's own account session ending.
+    /// Other Personas' entries (including other Personas held by the same
+    /// account) are untouched.
+    pub async fn clear_persona(&self, persona_id: &str) {
+        let mut guard = self.keys.lock().await;
+        guard.retain(|(pid, _), _| pid != persona_id);
+    }
+
+    /// Whether a key is currently resident for this (persona_id, group_id)
+    /// pair. Used by callers that need to check residency without needing
+    /// the key itself (e.g. deciding whether to prompt for group unlock).
+    pub async fn is_occupied(&self, persona_id: &str, group_id: &str) -> bool {
+        let guard = self.keys.lock().await;
+        guard.contains_key(&(persona_id.to_owned(), group_id.to_owned()))
+    }
+
+    /// Run a closure with read access to one resident group key, if any.
+    /// The closure receives &UnlockedGroupKey (never &mut) -- the only
+    /// sanctioned read path, same shape as KeyRegistry::with_key.
+    pub async fn with_key<F, R>(&self, persona_id: &str, group_id: &str, f: F) -> Option<R>
+    where
+        F: FnOnce(&UnlockedGroupKey) -> R,
+    {
+        let guard = self.keys.lock().await;
+        guard.get(&(persona_id.to_owned(), group_id.to_owned())).map(f)
     }
 }
 
@@ -218,6 +330,167 @@ mod tests {
             "UnlockedKey must have a real Drop impl from #[derive(Zeroize, ZeroizeOnDrop)] -- \
              plain String/[u8; N] fields alone would not need_drop, so this failing would mean \
              the derive did not generate the expected Drop glue"
+        );
+    }
+}
+
+#[cfg(test)]
+mod group_key_registry_tests {
+    use super::*;
+
+    fn make_group_key(group_id: &str, byte_fill: u8) -> UnlockedGroupKey {
+        UnlockedGroupKey {
+            group_id: group_id.to_owned(),
+            group_key: [byte_fill; kdf::MASTER_KEY_LEN],
+            unlocked_at: "2026-01-01T00:00:00Z".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_registry_is_not_occupied() {
+        let registry = GroupKeyRegistry::default();
+        assert!(!registry.is_occupied("persona-a", "group-1").await);
+    }
+
+    #[tokio::test]
+    async fn replace_populates_the_entry() {
+        let registry = GroupKeyRegistry::default();
+        registry
+            .replace("persona-a", "group-1", make_group_key("group-1", 0xAA))
+            .await;
+        assert!(registry.is_occupied("persona-a", "group-1").await);
+    }
+
+    #[tokio::test]
+    async fn replace_for_a_different_key_does_not_clobber_the_first() {
+        // The real point of the HashMap over KeyRegistry's single slot:
+        // multiple (persona_id, group_id) entries coexist. Covers both
+        // axes -- a different group for the same persona, and the same
+        // group for a different persona.
+        let registry = GroupKeyRegistry::default();
+        registry
+            .replace("persona-a", "group-1", make_group_key("group-1", 0xAA))
+            .await;
+        registry
+            .replace("persona-a", "group-2", make_group_key("group-2", 0xBB))
+            .await;
+        registry
+            .replace("persona-b", "group-1", make_group_key("group-1", 0xCC))
+            .await;
+
+        assert!(registry.is_occupied("persona-a", "group-1").await);
+        assert!(registry.is_occupied("persona-a", "group-2").await);
+        assert!(registry.is_occupied("persona-b", "group-1").await);
+
+        let a1 = registry
+            .with_key("persona-a", "group-1", |k| k.group_key)
+            .await;
+        let a2 = registry
+            .with_key("persona-a", "group-2", |k| k.group_key)
+            .await;
+        let b1 = registry
+            .with_key("persona-b", "group-1", |k| k.group_key)
+            .await;
+        assert_eq!(a1, Some([0xAAu8; kdf::MASTER_KEY_LEN]));
+        assert_eq!(a2, Some([0xBBu8; kdf::MASTER_KEY_LEN]));
+        assert_eq!(b1, Some([0xCCu8; kdf::MASTER_KEY_LEN]));
+    }
+
+    #[tokio::test]
+    async fn replace_on_same_pair_overwrites_rather_than_stacking() {
+        let registry = GroupKeyRegistry::default();
+        registry
+            .replace("persona-a", "group-1", make_group_key("group-1", 0xAA))
+            .await;
+        registry
+            .replace("persona-a", "group-1", make_group_key("group-1", 0xBB))
+            .await;
+
+        let key = registry
+            .with_key("persona-a", "group-1", |k| k.group_key)
+            .await;
+        assert_eq!(key, Some([0xBBu8; kdf::MASTER_KEY_LEN]));
+    }
+
+    #[tokio::test]
+    async fn clear_removes_only_the_targeted_entry() {
+        let registry = GroupKeyRegistry::default();
+        registry
+            .replace("persona-a", "group-1", make_group_key("group-1", 0xAA))
+            .await;
+        registry
+            .replace("persona-a", "group-2", make_group_key("group-2", 0xBB))
+            .await;
+
+        registry.clear("persona-a", "group-1").await;
+
+        assert!(!registry.is_occupied("persona-a", "group-1").await);
+        assert!(registry.is_occupied("persona-a", "group-2").await);
+    }
+
+    #[tokio::test]
+    async fn clear_on_missing_entry_is_a_no_op() {
+        let registry = GroupKeyRegistry::default();
+        registry.clear("persona-a", "group-1").await; // must not panic
+        assert!(!registry.is_occupied("persona-a", "group-1").await);
+    }
+
+    #[tokio::test]
+    async fn clear_persona_evicts_all_of_that_personas_entries_but_not_others() {
+        let registry = GroupKeyRegistry::default();
+        registry
+            .replace("persona-a", "group-1", make_group_key("group-1", 0xAA))
+            .await;
+        registry
+            .replace("persona-a", "group-2", make_group_key("group-2", 0xBB))
+            .await;
+        registry
+            .replace("persona-b", "group-1", make_group_key("group-1", 0xCC))
+            .await;
+
+        registry.clear_persona("persona-a").await;
+
+        assert!(!registry.is_occupied("persona-a", "group-1").await);
+        assert!(!registry.is_occupied("persona-a", "group-2").await);
+        assert!(
+            registry.is_occupied("persona-b", "group-1").await,
+            "clear_persona must not touch a different persona's entries"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_key_returns_none_when_absent() {
+        let registry = GroupKeyRegistry::default();
+        let result = registry
+            .with_key("persona-a", "group-1", |k| k.group_id.clone())
+            .await;
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn with_key_reads_resident_key_data() {
+        let registry = GroupKeyRegistry::default();
+        registry
+            .replace("persona-a", "group-1", make_group_key("group-1", 0x42))
+            .await;
+
+        let group_key = registry
+            .with_key("persona-a", "group-1", |k| k.group_key)
+            .await;
+        assert_eq!(group_key, Some([0x42u8; kdf::MASTER_KEY_LEN]));
+    }
+
+    #[test]
+    fn unlocked_group_key_implements_zeroize_on_drop() {
+        // Same reasoning as unlocked_key_implements_zeroize_on_drop above --
+        // needs_drop confirms the derive actually generated Drop glue,
+        // rather than attempting an unreliable raw-pointer memory inspection.
+        assert!(
+            std::mem::needs_drop::<UnlockedGroupKey>(),
+            "UnlockedGroupKey must have a real Drop impl from \
+             #[derive(Zeroize, ZeroizeOnDrop)] -- plain String/[u8; N] fields \
+             alone would not need_drop, so this failing would mean the derive \
+             did not generate the expected Drop glue"
         );
     }
 }
