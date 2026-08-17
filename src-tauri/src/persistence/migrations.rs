@@ -907,6 +907,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_build_supports_fts5() {
+        // Standalone capability probe, independent of ENV_MUTEX/setup(): if the
+        // linked SQLite/SQLCipher build lacks SQLITE_ENABLE_FTS5, this fails by
+        // itself with a direct error instead of surfacing as a poisoned-mutex
+        // cascade through unrelated tests (see outputs_001.sql's outputs_fts table).
+        let mut conn = make_test_conn().await;
+        sqlx::query("CREATE VIRTUAL TABLE fts5_probe USING fts5(x)")
+            .execute(&mut conn)
+            .await
+            .expect("linked SQLite/SQLCipher build must support FTS5 (SQLITE_ENABLE_FTS5)");
+    }
+
+    #[tokio::test]
     async fn test_get_applied_version_empty_db() {
         let mut conn = make_test_conn().await;
         assert_eq!(get_applied_version(&mut conn).await, 0);

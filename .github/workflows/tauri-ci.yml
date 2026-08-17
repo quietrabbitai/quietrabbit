@@ -33,9 +33,53 @@ jobs:
       - name: Install Linux dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libsqlcipher-dev \
+          sudo apt-get install -y libwebkit2gtk-4.1-dev \
             build-essential curl wget file libssl-dev libgtk-3-dev \
             libayatana-appindicator3-dev librsvg2-dev
+
+      # Ubuntu 24.04's apt libsqlcipher-dev (4.5.6-1build2) is not compiled with
+      # SQLITE_ENABLE_FTS5, which outputs_001.sql's outputs_fts virtual table
+      # requires. No FTS5-enabled PPA exists for noble, so build SQLCipher from
+      # source here instead -- CI only, local dev (Garuda/pacman, sqlcipher
+      # 4.14.0) already has FTS5 and is unaffected. Pinned to v4.14.0 to match
+      # Garuda exactly. Flags mirror Debian's own sqlcipher packaging
+      # (salsa.debian.org debian/rules) so this build exposes the same symbol
+      # set sqlx-sqlite links against (column-metadata, unlock-notify, etc.),
+      # translated to this version's autosetup-based ./configure --help options.
+      - name: Cache SQLCipher (FTS5-enabled) build
+        id: sqlcipher-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/sqlcipher-fts5
+          key: sqlcipher-fts5-v4.14.0-${{ runner.os }}-v2
+
+      - name: Build SQLCipher with FTS5 from source
+        if: steps.sqlcipher-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch v4.14.0 https://github.com/sqlcipher/sqlcipher.git /tmp/sqlcipher-src
+          cd /tmp/sqlcipher-src
+          ./configure --prefix="$HOME/.cache/sqlcipher-fts5" \
+            --with-tempstore=yes --fts3 --fts4 --fts5 --rtree --update-limit \
+            --column-metadata --disable-tcl \
+            CFLAGS="-fno-strict-aliasing -DSQLITE_HAS_CODEC \
+              -DSQLITE_EXTRA_INIT=sqlcipher_extra_init \
+              -DSQLITE_EXTRA_SHUTDOWN=sqlcipher_extra_shutdown \
+              -DSQLITE_SECURE_DELETE -DSQLITE_ENABLE_UNLOCK_NOTIFY \
+              -DSQLITE_SOUNDEX=1 -DSQLITE_OMIT_LOOKASIDE=1 \
+              -DSQLITE_MAX_SCHEMA_RETRY=25 -DHAVE_USLEEP=1" \
+            LDFLAGS="-lcrypto"
+          make -j"$(nproc)" install-dll install-headers install-pc
+          # build.rs probes pkg-config for a package literally named "sqlcipher";
+          # upstream's plain build only produces sqlite3.pc, so alias it.
+          sed -e 's/^Name: SQLite$/Name: SQLCipher/' \
+              -e 's/^Description: SQL database engine$/Description: SQLCipher - SQL database engine with encryption/' \
+              "$HOME/.cache/sqlcipher-fts5/lib/pkgconfig/sqlite3.pc" \
+              > "$HOME/.cache/sqlcipher-fts5/lib/pkgconfig/sqlcipher.pc"
+
+      - name: Point pkg-config / the linker at the FTS5-enabled SQLCipher build
+        run: |
+          echo "PKG_CONFIG_PATH=$HOME/.cache/sqlcipher-fts5/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$HOME/.cache/sqlcipher-fts5/lib" >> "$GITHUB_ENV"
 
       - name: Format check
         working-directory: src-tauri
