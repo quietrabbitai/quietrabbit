@@ -359,6 +359,29 @@ pub async fn accept_invitation(
     .execute(&mut conn)
     .await?;
 
+    // items.id=287 "app-start" pull cadence, per-group: the registry starts
+    // empty at process boot (nothing is unlocked before login), so a
+    // literal process-boot pull would find nothing to poll. The moment that
+    // actually matters is right here -- a group's key just became resident
+    // for the first time this session. main.rs's periodic timer covers the
+    // steady-state case; this covers the immediate one. Best-effort, same
+    // as every other push/pull call site -- a sync failure must not turn
+    // an otherwise-successful accept_invitation into an Err.
+    let group_key_hex = crate::auth::registry::key_hex(&group_key);
+    if let Err(e) = crate::group_sync::engine::pull_if_newer(
+        recipient_persona_id,
+        &invitation.group_id,
+        &group_key_hex,
+    )
+    .await
+    {
+        log::warn!(
+            "accept_invitation: post-accept pull failed for persona={recipient_persona_id} \
+             group={}: {e}",
+            invitation.group_id
+        );
+    }
+
     Ok(())
 }
 

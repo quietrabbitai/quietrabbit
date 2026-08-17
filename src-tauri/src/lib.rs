@@ -4,6 +4,7 @@
 pub mod auth;
 pub mod commands;
 pub mod conductor;
+pub mod group_sync;
 pub mod ipc;
 pub mod ollama_sidecar;
 pub mod persistence;

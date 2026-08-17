@@ -248,6 +248,34 @@ impl GroupKeyRegistry {
             .get(&(persona_id.to_owned(), group_id.to_owned()))
             .map(f)
     }
+
+    /// Resolve one resident group key straight to its key_hex form, or
+    /// None if not resident. Convenience combining with_key() + key_hex()
+    /// for callers outside this crate's own module tree (key_hex itself is
+    /// pub(crate), not reachable from the main.rs binary crate, which is a
+    /// separate crate root from this lib despite sharing one Cargo
+    /// package) -- items.id=287's periodic pull loop (main.rs) is the
+    /// first such caller.
+    pub async fn key_hex_for(&self, persona_id: &str, group_id: &str) -> Option<String> {
+        self.with_key(persona_id, group_id, |k| key_hex(&k.group_key))
+            .await
+    }
+
+    /// Every (persona_id, group_id) pair currently resident, in no
+    /// particular order. Returns owned identifiers only, never key
+    /// material -- items.id=287's periodic folder-sync pull loop uses this
+    /// to know *what* to poll (it cannot discover "all groups this persona
+    /// belongs to" any other way -- there is no durable group-membership
+    /// table yet, items.id=290), then calls with_key() separately per pair
+    /// to get the actual key right before doing real I/O. The lock is
+    /// acquired, cloned out of, and released before this function returns --
+    /// never held across an .await beyond that, matching
+    /// ConductorScheduler's documented "no Mutex guard held across .await"
+    /// rule (conductor/concurrency.rs).
+    pub async fn resident_keys(&self) -> Vec<(String, String)> {
+        let guard = self.keys.lock().await;
+        guard.keys().cloned().collect()
+    }
 }
 
 #[cfg(test)]
@@ -503,6 +531,65 @@ mod group_key_registry_tests {
             .with_key("persona-a", "group-1", |k| k.group_key)
             .await;
         assert_eq!(group_key, Some([0x42u8; kdf::MASTER_KEY_LEN]));
+    }
+
+    #[tokio::test]
+    async fn key_hex_for_matches_with_key_and_is_none_when_absent() {
+        let registry = GroupKeyRegistry::default();
+        assert_eq!(registry.key_hex_for("persona-a", "group-1").await, None);
+
+        registry
+            .replace("persona-a", "group-1", make_group_key("group-1", 0x42))
+            .await;
+
+        let via_with_key = registry
+            .with_key("persona-a", "group-1", |k| key_hex(&k.group_key))
+            .await;
+        assert_eq!(registry.key_hex_for("persona-a", "group-1").await, via_with_key);
+    }
+
+    #[tokio::test]
+    async fn resident_keys_reflects_replace_and_clear() {
+        let registry = GroupKeyRegistry::default();
+        assert_eq!(registry.resident_keys().await, Vec::new());
+
+        registry
+            .replace("persona-a", "group-1", make_group_key("group-1", 0xAA))
+            .await;
+        registry
+            .replace("persona-a", "group-2", make_group_key("group-2", 0xBB))
+            .await;
+        registry
+            .replace("persona-b", "group-1", make_group_key("group-1", 0xCC))
+            .await;
+
+        let mut pairs = registry.resident_keys().await;
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                ("persona-a".to_owned(), "group-1".to_owned()),
+                ("persona-a".to_owned(), "group-2".to_owned()),
+                ("persona-b".to_owned(), "group-1".to_owned()),
+            ]
+        );
+
+        registry.clear("persona-a", "group-1").await;
+        let mut pairs_after_clear = registry.resident_keys().await;
+        pairs_after_clear.sort();
+        assert_eq!(
+            pairs_after_clear,
+            vec![
+                ("persona-a".to_owned(), "group-2".to_owned()),
+                ("persona-b".to_owned(), "group-1".to_owned()),
+            ]
+        );
+
+        registry.clear_persona("persona-b").await;
+        assert_eq!(
+            registry.resident_keys().await,
+            vec![("persona-a".to_owned(), "group-2".to_owned())]
+        );
     }
 
     #[test]

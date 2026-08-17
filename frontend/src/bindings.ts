@@ -348,6 +348,24 @@ export const commands = {
 	setPaneLayout: (layout: PaneLayoutEntry[]) => typedError<null, string>(__TAURI_INVOKE("set_pane_layout", { layout })),
 	sendMessage: (userId: string, personaId: string, contextKey: string, content: string, focusId: string, gate3Track: boolean) => typedError<MessageInfo[], string>(__TAURI_INVOKE("send_message", { userId, personaId, contextKey, content, focusId, gate3Track })),
 	listMessages: (userId: string, personaId: string, contextKey: string) => typedError<MessageInfo[], string>(__TAURI_INVOKE("list_messages", { userId, personaId, contextKey })),
+	/**
+	 *  Configure (or reconfigure) this install's folder-sync destination for a
+	 *  (persona_id, group_id) pair. Upsert -- see
+	 *  group_sync::settings_store::set_group_sync_folder's own doc comment.
+	 */
+	setGroupSyncFolder: (personaId: string, groupId: string, folderPath: string) => typedError<null, string>(__TAURI_INVOKE("set_group_sync_folder", { personaId, groupId, folderPath })),
+	/**
+	 *  Fetch this install's folder-sync settings for a (persona_id, group_id)
+	 *  pair. Returns Ok(None) if sync has never been configured for this pair
+	 *  -- not an error, matching get_focus_settings-style "None is a valid
+	 *  state" shape for a settings row that may genuinely not exist yet.
+	 */
+	getGroupSyncFolder: (personaId: string, groupId: string) => typedError<{
+	folder_path: string,
+	last_synced_at: string | null,
+	last_error: string | null,
+	updated_at: string,
+} | null, string>(__TAURI_INVOKE("get_group_sync_folder", { personaId, groupId })),
 };
 
 /* Types */
@@ -427,6 +445,13 @@ export type GetRunOutputResponse = {
 	content: string,
 	output_type: string,
 	sensitivity: string,
+};
+
+export type GroupSyncSettingsInfo = {
+	folder_path: string,
+	last_synced_at: string | null,
+	last_error: string | null,
+	updated_at: string,
 };
 
 export type HealthResponse = {

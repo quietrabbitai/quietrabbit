@@ -108,6 +108,9 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         // Group 14 -- Messages/transcript (ChatPane.tsx backing)
         commands::messages::send_message,
         commands::messages::list_messages,
+        // Group 15 -- Group folder sync (items.id=287, group.db 266e)
+        commands::group::set_group_sync_folder,
+        commands::group::get_group_sync_folder,
     ])
 }
 

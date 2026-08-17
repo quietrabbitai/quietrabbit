@@ -326,7 +326,6 @@ async fn create_document_conn(
 /// own header (content_ref STORAGE SHAPE) for the full reasoning on why
 /// this is inline text, not a filesystem path, despite the column's "_ref"
 /// name and "pointer to actual content storage" schema comment.
-#[allow(dead_code)] // items.id=285: ahead of its first real caller (no IPC layer yet, items.id=283/284 precedent)
 pub async fn create_document(
     persona_id: &str,
     group_id: &str,
@@ -362,7 +361,6 @@ async fn get_document_conn(
 /// owner-or-any-permission-row -- see require_read_access_conn's own doc
 /// comment for the read-access design call and its reasoning. No tier
 /// distinction for reading: write and read_only both grant read access.
-#[allow(dead_code)] // items.id=285: ahead of its first real caller (no IPC layer yet, items.id=283/284 precedent)
 pub async fn get_document(
     persona_id: &str,
     group_id: &str,
@@ -371,6 +369,45 @@ pub async fn get_document(
 ) -> Result<DocumentRecord, GroupStoreError> {
     let mut conn = open_group_db(persona_id, group_id, key_hex).await?;
     get_document_conn(&mut conn, document_id, persona_id).await
+}
+
+/// Fetch a document's current local row, if any, WITHOUT the owner-or-
+/// permission-row check get_document enforces. `pub(crate)` -- for
+/// group_sync::engine's own internal "is the remote copy actually newer
+/// than what's already here" comparison only, never exposed as something a
+/// user-facing caller can reach.
+///
+/// WHY THIS MUST BYPASS require_read_access_conn: pull_if_newer needs to
+/// compare a remote document against whatever this persona already has
+/// stored locally -- but a document freshly received via a previous pull
+/// (apply_synced_document) has no document_permissions row for this
+/// persona (permission grants are not part of what design doc Section 2.4
+/// syncs, only document content), so requiring the same read-access check
+/// get_document does would make this persona structurally unable to ever
+/// compare against -- and therefore ever re-pull an update to -- a
+/// document they don't own. This does not weaken the actual security
+/// posture: per this file's own header, group-key possession already lets
+/// a member decrypt every raw row directly, and the content only becomes
+/// locally present at all via apply_synced_document, itself already an
+/// explicit, documented bypass of the same check for the same reason.
+/// Returns Ok(None) rather than Err(DocumentNotFound) -- the caller treats
+/// "never seen before" as a normal case (first sight of a new document),
+/// not a failure.
+pub(crate) async fn get_document_unchecked(
+    persona_id: &str,
+    group_id: &str,
+    key_hex: &str,
+    document_id: &str,
+) -> Result<Option<DocumentRecord>, GroupStoreError> {
+    let mut conn = open_group_db(persona_id, group_id, key_hex).await?;
+    let row = sqlx::query("SELECT * FROM documents WHERE id = ?")
+        .bind(document_id)
+        .fetch_optional(&mut conn)
+        .await?;
+    match row {
+        None => Ok(None),
+        Some(r) => Ok(Some(row_to_document_record(&r).map_err(GroupStoreError::Database)?)),
+    }
 }
 
 async fn list_documents_conn(
@@ -449,7 +486,6 @@ async fn update_document_conn(
 /// specify, and would conflict with Section 2.4's single-writer-per-
 /// document sync model letting owner/write-tier holders push quick canon
 /// updates without extra ceremony.
-#[allow(dead_code)] // items.id=285: ahead of its first real caller (no IPC layer yet, items.id=283/284 precedent)
 pub async fn update_document(
     persona_id: &str,
     group_id: &str,
@@ -459,6 +495,101 @@ pub async fn update_document(
 ) -> Result<(), GroupStoreError> {
     let mut conn = open_group_db(persona_id, group_id, key_hex).await?;
     update_document_conn(&mut conn, document_id, persona_id, content).await
+}
+
+// ---------------------------------------------------------------------------
+// Sync (items.id=287, design doc Section 2.4 -- pull side)
+// ---------------------------------------------------------------------------
+
+async fn apply_synced_document_conn(
+    conn: &mut SqliteConnection,
+    document_id: &str,
+    title: &str,
+    content: &str,
+    owner_persona_id: &str,
+    created_at: &str,
+    updated_at: &str,
+    extra_metadata: &str,
+) -> Result<(), GroupStoreError> {
+    sqlx::query(
+        "INSERT INTO documents
+            (id, title, content_ref, owner_persona_id, created_at, updated_at, extra_metadata)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+            title = excluded.title,
+            content_ref = excluded.content_ref,
+            owner_persona_id = excluded.owner_persona_id,
+            updated_at = excluded.updated_at,
+            extra_metadata = excluded.extra_metadata",
+    )
+    .bind(document_id)
+    .bind(title)
+    .bind(content)
+    .bind(owner_persona_id)
+    .bind(created_at)
+    .bind(updated_at)
+    .bind(extra_metadata)
+    .execute(&mut *conn)
+    .await?;
+
+    Ok(())
+}
+
+/// Write another persona's already-authoritative canon update into this
+/// persona's local `documents` table -- the pull half of design doc Section
+/// 2.4's folder-sync. `persona_id` is receiving a change someone else
+/// authored, not editing, so `require_write_access_conn` does not apply
+/// here and is deliberately NOT called -- gating this on the local
+/// persona's own write access would be backwards: a read-only member must
+/// still be able to *receive* a synced update from the actual owner, that's
+/// the entire point of pull. The only real "access control" this function
+/// enforces is structural: it's `pub(crate)`, callable only from
+/// `group_sync::engine`, which is the only code path that has already
+/// authenticated the remote content (opened it with the shared group key)
+/// before calling this.
+///
+/// UPSERT, not a plain UPDATE: a document owned by another persona and
+/// never before seen locally arrives here as a first-time INSERT (this
+/// persona's local group.db previously had no row for it at all).
+///
+/// `checked_out_by_persona_id`/`checked_out_at` are deliberately excluded
+/// from the UPDATE clause (and simply default to NULL on first INSERT) --
+/// those are local-only checkout-lock state (see this file's own header,
+/// checkout-not-required-for-write design call); a remote sync must never
+/// silently release or corrupt someone's local checkout.
+///
+/// `created_at` is likewise excluded from the UPDATE clause: it's the
+/// document's original creation time, which does not change on a canon
+/// edit -- nothing to reconcile on repeat syncs.
+///
+/// The caller (group_sync::engine::pull_if_newer) is responsible for the
+/// "only apply if actually newer" comparison -- this function always
+/// applies unconditionally, matching every other *_conn function in this
+/// file staying thin and unconditional.
+pub(crate) async fn apply_synced_document(
+    persona_id: &str,
+    group_id: &str,
+    key_hex: &str,
+    document_id: &str,
+    title: &str,
+    content: &str,
+    owner_persona_id: &str,
+    created_at: &str,
+    updated_at: &str,
+    extra_metadata: &str,
+) -> Result<(), GroupStoreError> {
+    let mut conn = open_group_db(persona_id, group_id, key_hex).await?;
+    apply_synced_document_conn(
+        &mut conn,
+        document_id,
+        title,
+        content,
+        owner_persona_id,
+        created_at,
+        updated_at,
+        extra_metadata,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -1065,6 +1196,178 @@ mod tests {
         checkout_document_conn(&mut conn, &doc_id, "owner-1")
             .await
             .expect("checkout after force-unlock must succeed");
+    }
+
+    // -- get_document_unchecked (items.id=287 pull side) -------------------------
+
+    #[tokio::test]
+    async fn get_document_unchecked_returns_none_for_a_never_created_document() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let persona_id = "unchecked-none-persona";
+        let group_id = "unchecked-none-group";
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+
+        let verify = async {
+            let result = get_document_unchecked(persona_id, group_id, key_hex, "no-such-doc")
+                .await
+                .expect("get_document_unchecked must not error for a missing document");
+            assert!(result.is_none());
+        };
+        verify.await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    #[tokio::test]
+    async fn get_document_unchecked_bypasses_permission_denied() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let owner_persona_id = "unchecked-owner";
+        let stranger_persona_id = "unchecked-stranger";
+        let group_id = "unchecked-group";
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+
+        let verify = async {
+            // Seed the document into the STRANGER's own local group.db copy
+            // directly (create_document doesn't require persona_id ==
+            // owner_persona_id -- see its own doc comment), same technique
+            // document_fork_store.rs's own PermissionDenied test uses to
+            // reach this state without waiting on real folder-sync.
+            let doc_id = create_document(
+                stranger_persona_id,
+                group_id,
+                key_hex,
+                owner_persona_id,
+                "Policy Doc",
+                "v1",
+            )
+            .await
+            .expect("create_document failed");
+
+            let checked = get_document(stranger_persona_id, group_id, key_hex, &doc_id).await;
+            assert!(
+                matches!(checked, Err(GroupStoreError::PermissionDenied(_, _))),
+                "sanity check: the checked path must reject a persona with \
+                 no owner/permission relation to the document"
+            );
+
+            let unchecked = get_document_unchecked(stranger_persona_id, group_id, key_hex, &doc_id)
+                .await
+                .expect("get_document_unchecked must not error");
+            let doc = unchecked.expect(
+                "get_document_unchecked must still see the row despite \
+                 stranger_persona_id having no grant on it -- that's the \
+                 whole point of the bypass",
+            );
+            assert_eq!(doc.content, "v1");
+            assert_eq!(doc.owner_persona_id, owner_persona_id);
+        };
+        verify.await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    // -- apply_synced_document (items.id=287 pull side) -------------------------
+
+    #[tokio::test]
+    async fn apply_synced_document_inserts_a_never_before_seen_document() {
+        let mut conn = test_db().await;
+
+        apply_synced_document_conn(
+            &mut conn,
+            "remote-doc-1",
+            "Remote Title",
+            "remote content",
+            "remote-owner",
+            "2026-08-01T00:00:00Z",
+            "2026-08-01T00:00:00Z",
+            "{}",
+        )
+        .await
+        .expect("apply_synced_document_conn must succeed for a new document id");
+
+        let doc = get_document_conn(&mut conn, "remote-doc-1", "remote-owner")
+            .await
+            .expect("owner must be able to read the freshly-applied document");
+        assert_eq!(doc.title, "Remote Title");
+        assert_eq!(doc.content, "remote content");
+        assert_eq!(doc.owner_persona_id, "remote-owner");
+        assert!(
+            doc.checked_out_by_persona_id.is_none(),
+            "a freshly-synced document must not appear checked out"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_synced_document_overwrites_an_existing_document() {
+        let mut conn = test_db().await;
+        let doc_id = create_document_conn(&mut conn, "owner-1", "Doc", "v1")
+            .await
+            .unwrap();
+
+        apply_synced_document_conn(
+            &mut conn,
+            &doc_id,
+            "Doc",
+            "v2 from sync",
+            "owner-1",
+            "2026-08-01T00:00:00Z",
+            "2026-08-02T00:00:00Z",
+            "{}",
+        )
+        .await
+        .expect("apply_synced_document_conn must succeed for an existing document id");
+
+        let doc = get_document_conn(&mut conn, &doc_id, "owner-1").await.unwrap();
+        assert_eq!(doc.content, "v2 from sync");
+        assert_eq!(doc.updated_at, "2026-08-02T00:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn apply_synced_document_does_not_clobber_an_existing_checkout() {
+        let mut conn = test_db().await;
+        let doc_id = create_document_conn(&mut conn, "owner-1", "Doc", "v1")
+            .await
+            .unwrap();
+        checkout_document_conn(&mut conn, &doc_id, "owner-1")
+            .await
+            .unwrap();
+
+        apply_synced_document_conn(
+            &mut conn,
+            &doc_id,
+            "Doc",
+            "v2 from sync",
+            "owner-1",
+            "2026-08-01T00:00:00Z",
+            "2026-08-02T00:00:00Z",
+            "{}",
+        )
+        .await
+        .expect("apply_synced_document_conn must succeed");
+
+        let doc = get_document_conn(&mut conn, &doc_id, "owner-1").await.unwrap();
+        assert_eq!(
+            doc.checked_out_by_persona_id,
+            Some("owner-1".to_owned()),
+            "a pull must not silently release an existing local checkout"
+        );
+        assert_eq!(doc.content, "v2 from sync", "the content update must still apply");
     }
 
     // -- real encrypted-file round trip (public API, not just _conn) ------------

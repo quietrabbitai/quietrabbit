@@ -274,6 +274,53 @@ async fn async_main() {
                 let source_state = handle.state::<RwLock<OllamaSource>>();
                 *source_state.write().await = source;
             });
+
+            // items.id=287 (group.db 266e): folder-sync periodic pull.
+            // Pattern-matched off the Ollama detection spawn immediately
+            // above -- a second tauri::async_runtime::spawn, this one
+            // holding a tokio::time::interval loop (the first in this
+            // codebase). Pull cadence confirmed with Jason: app-start (per-
+            // group, the moment a group's key becomes resident -- see
+            // auth::group_invitations::accept_invitation's own immediate
+            // pull call) plus this steady periodic sweep while the app is
+            // open. Every 5 minutes is arbitrary but small relative to the
+            // cost (a cheap folder scan per resident group key, not a
+            // heavy operation) -- no source specifies an exact interval.
+            //
+            // resident_keys() is the only way to know what to poll: there
+            // is no durable group-membership table yet (items.id=290), so
+            // this can only ever poll groups whose key is currently
+            // resident in GroupKeyRegistry this session, never "all groups
+            // this persona belongs to". Known, accepted scope limit.
+            let pull_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
+                loop {
+                    ticker.tick().await;
+                    let registry = pull_handle
+                        .state::<quietrabbit_lib::auth::registry::GroupKeyRegistry>();
+                    for (persona_id, group_id) in registry.resident_keys().await {
+                        let key_hex_opt = registry.key_hex_for(&persona_id, &group_id).await;
+                        let Some(key_hex_str) = key_hex_opt else {
+                            // Evicted between resident_keys() and with_key()
+                            // -- nothing to poll for this pair this tick.
+                            continue;
+                        };
+                        if let Err(e) = quietrabbit_lib::group_sync::engine::pull_if_newer(
+                            &persona_id,
+                            &group_id,
+                            &key_hex_str,
+                        )
+                        .await
+                        {
+                            log::warn!(
+                                "main: periodic group_sync pull failed for \
+                                 persona={persona_id} group={group_id}: {e}"
+                            );
+                        }
+                    }
+                }
+            });
             Ok(())
         })
         // No Moved/Resized handling here anymore (items.id=202 real
