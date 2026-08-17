@@ -204,6 +204,23 @@ fn main() {
              Privacy Filter FFI disabled. Gate3 will use pre-filter \
              sensitivity block. Set this variable for production builds."
         );
+
+        // resources/ggml-backends/ is only staged above, inside the
+        // PRIVACY_FILTER_LIB_DIR branch. Without it, tauri_build::build()'s
+        // resource-glob validation panics on tauri.conf.json's
+        // "resources/ggml-backends/*" entry (path doesn't exist) — on a
+        // fresh checkout, in CI, or on any machine without Privacy Filter
+        // built locally. TAURI_CONFIG is tauri-build's own supported config
+        // override: it's parsed and RFC 7386 merge-patched into the config
+        // before resources are globbed (tauri-build 2.6.2 lib.rs:487-489),
+        // and a null value there removes the key entirely (json-patch 3.0.1
+        // lib.rs:661-678). Must be std::env::set_var, not cargo:rustc-env=
+        // — this needs to affect tauri_build::build() in this same process,
+        // not the compiled binary.
+        std::env::set_var(
+            "TAURI_CONFIG",
+            r#"{"bundle":{"resources":{"resources/ggml-backends/*":null}}}"#,
+        );
     }
 
     tauri_build::build()
