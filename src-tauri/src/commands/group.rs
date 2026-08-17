@@ -13,10 +13,26 @@
 // folder path itself is not group content and reading/setting it isn't
 // gated on the group key being unlocked (see schema/shared_005.sql's own
 // header for the full placement reasoning).
+//
+// Group 16 — Group membership (items.id=288, group.db 266f).
+// Commands: remove_group_member.
+//
+// Ships ahead of frontend too, same precedent as Group 15 above -- but for
+// a sharper reason than "that's what we did last time": document CRUD
+// (283-286) stayed library-only because it had an internal hook (a future
+// save event) to eventually attach to; folder-path config (287) broke that
+// because it's inherently user-initiated, no internal hook exists. Member
+// removal is the same shape as 287's case, not 283-286's -- nothing else in
+// this system would ever call remove_member on its own; someone must always
+// explicitly trigger it. A library-only version here would be exactly as
+// dead as pre-287 group_store CRUD was.
 
 use serde::Serialize;
 use specta::Type;
+use tauri::State;
 
+use crate::auth::group_membership::{self, DepartureReason};
+use crate::auth::registry::GroupKeyRegistry;
 use crate::group_sync::settings_store;
 
 #[derive(Debug, Serialize, Type)]
@@ -62,6 +78,42 @@ pub async fn get_group_sync_folder(
         last_error: s.last_error,
         updated_at: s.updated_at,
     }))
+}
+
+/// Remove a member from a group (or record their own departure): rotates
+/// the group's symmetric key and queues redistribution to remaining
+/// members via the same asymmetric-keypair envelope mechanism item 284's
+/// invitation flow uses (items.id=288, group.db 266f). Does not itself
+/// rekey any local group.db file -- see auth::group_membership's own module
+/// header (TWO HALVES) for why that happens separately, per remaining
+/// member, via the periodic poll loop in main.rs.
+///
+/// `reason` is "left" or "removed" -- any other value is rejected with a
+/// string error before reaching group_membership::remove_member.
+///
+/// No group-admin/permission model gates who may call this -- there is no
+/// group-admin concept anywhere in this schema yet; building one is a
+/// separate scope decision, not made here (known limitation, not silently
+/// assumed away).
+#[tauri::command]
+#[specta::specta]
+pub async fn remove_group_member(
+    group_id: String,
+    departing_persona_id: String,
+    reason: String,
+    sender_label: String,
+    group_key_registry: State<'_, GroupKeyRegistry>,
+) -> Result<(), String> {
+    let reason: DepartureReason = reason.parse().map_err(|e: group_membership::GroupMembershipError| e.to_string())?;
+    group_membership::remove_member(
+        &group_id,
+        &departing_persona_id,
+        reason,
+        &sender_label,
+        &group_key_registry,
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------

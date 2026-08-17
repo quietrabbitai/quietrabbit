@@ -136,6 +136,24 @@ impl KeyRegistry {
         let guard = self.slot.lock().await;
         guard.as_ref().map(f)
     }
+
+    /// Resolve the resident account's sharing private key as raw bytes, or
+    /// None if no account is currently unlocked. Convenience for callers
+    /// outside this crate's own module tree -- UnlockedKey.sharing_private_key
+    /// is pub(crate), not reachable from the main.rs binary crate (a
+    /// separate crate root from this lib despite sharing one Cargo package,
+    /// same boundary GroupKeyRegistry::key_hex_for's own doc comment below
+    /// already explains). main.rs's periodic rotation-apply loop
+    /// (items.id=288) is the first such caller. Returns raw bytes rather
+    /// than StaticSecret directly -- StaticSecret is UnlockedKey's own
+    /// internal representation choice (see this struct's field-level doc
+    /// comment on why raw bytes were chosen there over StaticSecret); the
+    /// caller reconstructs StaticSecret::from(bytes) itself, matching how
+    /// auth::group_invitations::accept_invitation's own caller already does
+    /// this same reconstruction.
+    pub async fn sharing_private_key(&self) -> Option<[u8; 32]> {
+        self.with_key(|k| k.sharing_private_key).await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -351,6 +369,17 @@ mod tests {
 
         let master_key = registry.with_key(|k| k.master_key).await;
         assert_eq!(master_key, Some([0x42u8; kdf::MASTER_KEY_LEN]));
+    }
+
+    #[tokio::test]
+    async fn sharing_private_key_matches_with_key_and_is_none_when_empty() {
+        let registry = KeyRegistry::default();
+        assert_eq!(registry.sharing_private_key().await, None);
+
+        registry.replace(make_key("user-a", 0x42)).await;
+
+        let via_with_key = registry.with_key(|k| k.sharing_private_key).await;
+        assert_eq!(registry.sharing_private_key().await, via_with_key);
     }
 
     #[test]

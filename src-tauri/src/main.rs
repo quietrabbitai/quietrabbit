@@ -299,6 +299,51 @@ async fn async_main() {
                     ticker.tick().await;
                     let registry = pull_handle
                         .state::<quietrabbit_lib::auth::registry::GroupKeyRegistry>();
+
+                    // items.id=288 (group.db 266f): apply any pending key
+                    // rotations before this tick's pull sweep below -- a
+                    // rotation must land before a pull can usefully decrypt
+                    // anything pushed under the new key. Same
+                    // resident-keys-only limitation as the pull sweep: a
+                    // rotation for a persona whose OLD key isn't currently
+                    // resident is skipped by apply_pending_rotations itself
+                    // and retried next tick, inheriting items.id=290's
+                    // already-accepted limitation rather than introducing a
+                    // new one. sharing_private_key is per-ACCOUNT (KeyRegistry's
+                    // single slot), not per-persona -- fetched once per tick
+                    // and reused for every resident persona, since at most
+                    // one account is ever unlocked in this process (Section
+                    // 4.2's single-slot model).
+                    let key_registry =
+                        pull_handle.state::<quietrabbit_lib::auth::registry::KeyRegistry>();
+                    if let Some(sharing_private_key_bytes) =
+                        key_registry.sharing_private_key().await
+                    {
+                        let sharing_private_key =
+                            x25519_dalek::StaticSecret::from(sharing_private_key_bytes);
+                        let resident_personas: std::collections::HashSet<String> = registry
+                            .resident_keys()
+                            .await
+                            .into_iter()
+                            .map(|(persona_id, _group_id)| persona_id)
+                            .collect();
+                        for persona_id in resident_personas {
+                            if let Err(e) =
+                                quietrabbit_lib::auth::group_membership::apply_pending_rotations(
+                                    &persona_id,
+                                    &registry,
+                                    &sharing_private_key,
+                                )
+                                .await
+                            {
+                                log::warn!(
+                                    "main: periodic key-rotation apply failed for \
+                                     persona={persona_id}: {e}"
+                                );
+                            }
+                        }
+                    }
+
                     for (persona_id, group_id) in registry.resident_keys().await {
                         let key_hex_opt = registry.key_hex_for(&persona_id, &group_id).await;
                         let Some(key_hex_str) = key_hex_opt else {

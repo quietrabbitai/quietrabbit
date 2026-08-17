@@ -127,6 +127,43 @@ pub(crate) async fn open_group_db(
     Ok(conn)
 }
 
+/// Re-encrypt an already-existing group.db in place under a new key
+/// (items.id=288, key rotation on member departure). Opens under
+/// `old_key_hex` (SQLCipher requires the current key be established before
+/// any other operation, same rule open_group_db and every other opener in
+/// this codebase follow), then issues `PRAGMA rekey` to re-encrypt every
+/// page under `new_key_hex`. The caller (auth::group_membership::
+/// apply_pending_rotations) is responsible for having already confirmed
+/// `old_key_hex` is the file's real current key -- passing the wrong key
+/// here fails the same way opening under a wrong key always does elsewhere
+/// in this codebase (a decrypt/integrity failure), not silently.
+///
+/// PRAGMA quoting matches connect_options_encrypted's own proven-correct
+/// form (items.id=206): outer double quotes around the x'...' blob literal.
+///
+/// Does not call migrate_group_db first -- unlike open_group_db, a rekey
+/// only makes sense against a file that already exists; create_if_missing
+/// is deliberately false here, not self-healing.
+pub(crate) async fn rekey_group_db(
+    persona_id: &str,
+    group_id: &str,
+    old_key_hex: &str,
+    new_key_hex: &str,
+) -> Result<(), GroupStoreError> {
+    let db_path = get_group_db_path(persona_id, group_id);
+
+    let mut conn = crate::providers::utils::connect_options_encrypted(&db_path, old_key_hex)
+        .create_if_missing(false)
+        .connect()
+        .await?;
+
+    sqlx::query(&format!("PRAGMA rekey = \"x'{new_key_hex}'\""))
+        .execute(&mut conn)
+        .await?;
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Data type
 // ---------------------------------------------------------------------------
@@ -435,8 +472,9 @@ async fn list_documents_conn(
 
 /// List documents `persona_id` can see in this group.db -- same visibility
 /// rule as get_document (owner or any permission row), not every document
-/// in the file.
-#[allow(dead_code)] // items.id=285: ahead of its first real caller (no IPC layer yet, items.id=283/284 precedent)
+/// in the file. First real caller: group_sync::engine::
+/// republish_owned_documents (items.id=288), filtering this down to just
+/// the documents `persona_id` owns.
 pub async fn list_documents(
     persona_id: &str,
     group_id: &str,
@@ -1400,6 +1438,56 @@ mod tests {
             assert_eq!(doc.content, "hello");
             assert_eq!(doc.title, "Real Doc");
             assert_eq!(doc.owner_persona_id, persona_id);
+        };
+        verify.await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    // -- rekey_group_db (items.id=288 key rotation) -----------------------------
+
+    /// Proves rekey_group_db actually re-encrypts the real on-disk file, not
+    /// just something in memory: a document written under the old key is
+    /// still readable after rekey, but only under the NEW key -- the old
+    /// key must no longer decrypt anything (design doc Section 2.5's "the
+    /// departed member's old key no longer opens anything" bar, verified at
+    /// the file level here).
+    #[tokio::test]
+    async fn rekey_group_db_round_trip_opens_under_new_key_not_old() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let persona_id = "rekey-persona";
+        let group_id = "rekey-group";
+        let old_key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+        let new_key_hex = "11223344556677889900aabbccddeeff00112233445566778899aabbccddee";
+
+        let verify = async {
+            let doc_id =
+                create_document(persona_id, group_id, old_key_hex, persona_id, "Doc", "hello")
+                    .await
+                    .expect("create_document under old key must succeed");
+
+            rekey_group_db(persona_id, group_id, old_key_hex, new_key_hex)
+                .await
+                .expect("rekey_group_db must succeed");
+
+            let doc = get_document(persona_id, group_id, new_key_hex, &doc_id)
+                .await
+                .expect("document must be readable under the new key after rekey");
+            assert_eq!(doc.content, "hello");
+
+            let old_key_result = get_document(persona_id, group_id, old_key_hex, &doc_id).await;
+            assert!(
+                old_key_result.is_err(),
+                "the old key must no longer decrypt the file after rekey"
+            );
         };
         verify.await;
 

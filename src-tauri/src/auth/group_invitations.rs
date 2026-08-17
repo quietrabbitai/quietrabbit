@@ -136,7 +136,11 @@ fn hex_encode(bytes: &[u8]) -> String {
 // persona -> owning user_id resolution
 // ---------------------------------------------------------------------------
 
-async fn resolve_persona_owner(
+/// pub(crate), not private: items.id=288's group_membership module also
+/// needs to resolve a remaining member's owning account before it can look
+/// up their public key for a rotation envelope -- same lookup this module's
+/// own send_invitation already does, no reason to duplicate the query.
+pub(crate) async fn resolve_persona_owner(
     persona_id: &str,
     conn: &mut SqliteConnection,
 ) -> Result<String, GroupInvitationError> {

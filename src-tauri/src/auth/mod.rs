@@ -8,6 +8,7 @@
 // commands/personal.rs.
 
 pub mod group_invitations;
+pub mod group_membership;
 pub mod kdf;
 pub mod registry;
 pub mod sharing_keypair;

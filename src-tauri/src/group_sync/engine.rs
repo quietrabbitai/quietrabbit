@@ -227,6 +227,40 @@ pub async fn update_and_push_document(
     Ok(())
 }
 
+/// Re-push every document `persona_id` owns in `group_id`, using the
+/// already-rotated new key (items.id=288, key rotation on member
+/// departure). Called by auth::group_membership::apply_pending_rotations
+/// immediately after a local rekey completes -- overwrites each owned
+/// document's stale .qrsync file (still sitting in the shared folder,
+/// encrypted under the old, now-evicted key) at its existing path, since
+/// sync_file_path is keyed by document_id alone, not by key version.
+///
+/// Documents owned by OTHER personas, including a departed member's, are
+/// not touched here -- push is owner-only (see this module's own header,
+/// PUSH SCOPE); nobody but the original owner's own install can ever
+/// re-push them. A departed member's previously-owned documents therefore
+/// become permanently stale/orphaned in the shared folder after rotation --
+/// a known, accepted limitation (items.id=288's own scoping), not solved by
+/// this function.
+pub async fn republish_owned_documents(
+    persona_id: &str,
+    group_id: &str,
+    key_hex: &str,
+) -> Result<(), GroupSyncError> {
+    let owned_ids: Vec<String> = group_store::list_documents(persona_id, group_id, key_hex)
+        .await?
+        .into_iter()
+        .filter(|d| d.owner_persona_id == persona_id)
+        .map(|d| d.id)
+        .collect();
+
+    for document_id in owned_ids {
+        push_if_owner(persona_id, group_id, key_hex, &document_id).await;
+    }
+
+    Ok(())
+}
+
 async fn push_if_owner(persona_id: &str, group_id: &str, key_hex: &str, document_id: &str) {
     let doc = match group_store::get_document(persona_id, group_id, key_hex, document_id).await {
         Ok(d) => d,

@@ -366,6 +366,24 @@ export const commands = {
 	last_error: string | null,
 	updated_at: string,
 } | null, string>(__TAURI_INVOKE("get_group_sync_folder", { personaId, groupId })),
+	/**
+	 *  Remove a member from a group (or record their own departure): rotates
+	 *  the group's symmetric key and queues redistribution to remaining
+	 *  members via the same asymmetric-keypair envelope mechanism item 284's
+	 *  invitation flow uses (items.id=288, group.db 266f). Does not itself
+	 *  rekey any local group.db file -- see auth::group_membership's own module
+	 *  header (TWO HALVES) for why that happens separately, per remaining
+	 *  member, via the periodic poll loop in main.rs.
+	 * 
+	 *  `reason` is "left" or "removed" -- any other value is rejected with a
+	 *  string error before reaching group_membership::remove_member.
+	 * 
+	 *  No group-admin/permission model gates who may call this -- there is no
+	 *  group-admin concept anywhere in this schema yet; building one is a
+	 *  separate scope decision, not made here (known limitation, not silently
+	 *  assumed away).
+	 */
+	removeGroupMember: (groupId: string, departingPersonaId: string, reason: string, senderLabel: string) => typedError<null, string>(__TAURI_INVOKE("remove_group_member", { groupId, departingPersonaId, reason, senderLabel })),
 };
 
 /* Types */
