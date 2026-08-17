@@ -415,6 +415,19 @@ pub async fn accept_invitation(
             invitation.group_id
         );
     }
+    if let Err(e) = crate::group_sync::engine::pull_permissions_if_newer(
+        recipient_persona_id,
+        &invitation.group_id,
+        &group_key_hex,
+    )
+    .await
+    {
+        log::warn!(
+            "accept_invitation: post-accept permissions pull failed for \
+             persona={recipient_persona_id} group={}: {e}",
+            invitation.group_id
+        );
+    }
 
     Ok(())
 }

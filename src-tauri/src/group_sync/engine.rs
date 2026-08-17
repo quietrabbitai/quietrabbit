@@ -52,7 +52,7 @@
 use thiserror::Error;
 
 use crate::group_sync::settings_store::{self, GroupSyncSettingsError};
-use crate::persistence::group_store::{self, DocumentRecord, GroupStoreError};
+use crate::persistence::group_store::{self, DocumentRecord, GroupStoreError, PermissionGrant};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -84,6 +84,36 @@ fn sync_documents_dir(folder_path: &str, group_id: &str) -> std::path::PathBuf {
 
 fn sync_file_path(folder_path: &str, group_id: &str, document_id: &str) -> std::path::PathBuf {
     sync_documents_dir(folder_path, group_id).join(format!("{document_id}.qrsync"))
+}
+
+// items.id=292 (decisions.id=720): document_permissions grants sync as
+// their own artifact, one directory over from documents/ -- same
+// `.qrsync` extension (it already generically means "a per-artifact
+// SQLCipher-encrypted sync file"; the subdirectory is what differentiates
+// artifact type, same convention sync_documents_dir already establishes),
+// NOT folded into the document's own .qrsync file. Folding in was
+// considered and rejected: grant_permission/revoke_permission don't go
+// through create_and_push_document/update_and_push_document, so the
+// content artifact's own push trigger doesn't naturally cover a
+// permissions-only change (a grant with no content edit would never get
+// pushed), and a combined artifact would need its own independent
+// staleness signal since document_permissions has no updated_at the way
+// documents does.
+
+fn sync_permissions_dir(folder_path: &str, group_id: &str) -> std::path::PathBuf {
+    std::path::Path::new(folder_path)
+        .join("quietrabbit")
+        .join("groups")
+        .join(group_id)
+        .join("permissions")
+}
+
+fn permission_sync_file_path(
+    folder_path: &str,
+    group_id: &str,
+    document_id: &str,
+) -> std::path::PathBuf {
+    sync_permissions_dir(folder_path, group_id).join(format!("{document_id}.qrsync"))
 }
 
 // ---------------------------------------------------------------------------
@@ -179,6 +209,93 @@ async fn read_sync_file(
     })
 }
 
+/// Write the complete current grant manifest for one document. Whole-table
+/// clear-and-refill, NOT a per-row upsert like write_sync_file's single-row
+/// document upsert -- a shrinking grant list (a revoke) must also remove
+/// the dropped grantee's row from the file itself, otherwise a revoke would
+/// never be representable in the pushed artifact at all.
+async fn write_permissions_sync_file(
+    path: &std::path::Path,
+    key_hex: &str,
+    grants: &[PermissionGrant],
+) -> Result<(), GroupSyncError> {
+    use sqlx::ConnectOptions;
+
+    let mut conn = crate::providers::utils::connect_options_encrypted(path, key_hex)
+        .connect()
+        .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS synced_permissions (
+            document_id     TEXT NOT NULL,
+            persona_id      TEXT NOT NULL,
+            tier            TEXT NOT NULL,
+            granted_at      TEXT NOT NULL,
+            PRIMARY KEY (document_id, persona_id)
+        )",
+    )
+    .execute(&mut conn)
+    .await?;
+
+    sqlx::query("DELETE FROM synced_permissions")
+        .execute(&mut conn)
+        .await?;
+
+    // document_id isn't passed in explicitly -- callers only ever write one
+    // document's manifest per file, keyed by this file's own path/filename
+    // (permission_sync_file_path), mirrored back out on read via
+    // path.file_stem() rather than trusted from row content (see
+    // apply_one_synced_permissions_file's own comment on why: an
+    // all-revoked/empty manifest has no rows to read a document_id from at
+    // all, so the filename must stay the authoritative source).
+    let document_id = path
+        .file_stem()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or_default();
+
+    for g in grants {
+        sqlx::query(
+            "INSERT INTO synced_permissions (document_id, persona_id, tier, granted_at)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(document_id)
+        .bind(&g.persona_id)
+        .bind(&g.tier)
+        .bind(&g.granted_at)
+        .execute(&mut conn)
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn read_permissions_sync_file(
+    path: &std::path::Path,
+    key_hex: &str,
+) -> Result<Vec<PermissionGrant>, GroupSyncError> {
+    use sqlx::ConnectOptions;
+    use sqlx::Row;
+
+    let mut conn = crate::providers::utils::connect_options_encrypted(path, key_hex)
+        .create_if_missing(false)
+        .connect()
+        .await?;
+
+    let rows = sqlx::query("SELECT persona_id, tier, granted_at FROM synced_permissions")
+        .fetch_all(&mut conn)
+        .await?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for r in &rows {
+        out.push(PermissionGrant {
+            persona_id: r.try_get("persona_id")?,
+            tier: r.try_get("tier")?,
+            granted_at: r.try_get("granted_at")?,
+        });
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Push (save hook)
 // ---------------------------------------------------------------------------
@@ -254,8 +371,12 @@ pub async fn republish_owned_documents(
         .map(|d| d.id)
         .collect();
 
-    for document_id in owned_ids {
-        push_if_owner(persona_id, group_id, key_hex, &document_id).await;
+    for document_id in &owned_ids {
+        push_if_owner(persona_id, group_id, key_hex, document_id).await;
+        // A stale permissions .qrsync file (still encrypted under the old,
+        // now-evicted key) needs the same re-publish the content file just
+        // got above -- same reasoning, items.id=292 extending items.id=288.
+        push_permissions(persona_id, group_id, key_hex, document_id).await;
     }
 
     Ok(())
@@ -317,6 +438,116 @@ async fn push_document_inner(
     }
 
     write_sync_file(&path, key_hex, doc).await
+}
+
+/// Grant (or promote/demote) `grantee_persona_id`'s tier via
+/// group_store::grant_permission (unmodified -- reuse of its owner-only
+/// check), then push the document's full resulting grant manifest. Unlike
+/// push_if_owner, no separate owner re-check is needed before pushing:
+/// grant_permission already requires `persona_id` to be the document's
+/// owner to succeed at all, so reaching the push step already confirms it.
+pub async fn grant_and_push_permission(
+    persona_id: &str,
+    group_id: &str,
+    key_hex: &str,
+    document_id: &str,
+    grantee_persona_id: &str,
+    tier: &str,
+) -> Result<(), GroupSyncError> {
+    group_store::grant_permission(
+        persona_id,
+        group_id,
+        key_hex,
+        document_id,
+        grantee_persona_id,
+        tier,
+    )
+    .await?;
+
+    push_permissions(persona_id, group_id, key_hex, document_id).await;
+
+    Ok(())
+}
+
+/// Revoke `grantee_persona_id`'s permission via group_store::revoke_
+/// permission (unmodified), then push the document's full resulting grant
+/// manifest -- the revoke itself propagates to other installs as this
+/// persona's absence from that manifest (see apply_synced_permissions'
+/// own doc comment: full-replace, not a separate revoke artifact).
+pub async fn revoke_and_push_permission(
+    persona_id: &str,
+    group_id: &str,
+    key_hex: &str,
+    document_id: &str,
+    grantee_persona_id: &str,
+) -> Result<(), GroupSyncError> {
+    group_store::revoke_permission(persona_id, group_id, key_hex, document_id, grantee_persona_id)
+        .await?;
+
+    push_permissions(persona_id, group_id, key_hex, document_id).await;
+
+    Ok(())
+}
+
+/// Push `document_id`'s full current grant manifest. Same silent-no-op-if-
+/// unconfigured / log-and-record-via-settings_store::record_sync_result-on-
+/// failure contract as push_if_owner/push_document_inner -- a sync failure
+/// must not turn an otherwise-successful local grant/revoke into an Err.
+async fn push_permissions(persona_id: &str, group_id: &str, key_hex: &str, document_id: &str) {
+    let grants =
+        match group_store::list_permissions_for_document(persona_id, group_id, key_hex, document_id)
+            .await
+        {
+            Ok(g) => g,
+            Err(e) => {
+                log::warn!(
+                    "group_sync: could not re-fetch permissions for document \
+                     {document_id} after write (persona={persona_id} group={group_id}), \
+                     skipping permissions push: {e}"
+                );
+                return;
+            }
+        };
+
+    let result = push_permissions_inner(persona_id, group_id, key_hex, document_id, &grants).await;
+    let record_result = result.as_ref().map(|_| ()).map_err(std::string::ToString::to_string);
+    if let Err(e) = &record_result {
+        log::warn!(
+            "group_sync: permissions push failed for persona={persona_id} group={group_id} \
+             document={document_id}: {e}"
+        );
+    }
+    if let Err(e) = settings_store::record_sync_result(
+        persona_id,
+        group_id,
+        record_result.as_ref().map(|_| ()).map_err(|s| s.as_str()),
+    )
+    .await
+    {
+        log::warn!("group_sync: could not record permissions push result: {e}");
+    }
+}
+
+async fn push_permissions_inner(
+    persona_id: &str,
+    group_id: &str,
+    key_hex: &str,
+    document_id: &str,
+    grants: &[PermissionGrant],
+) -> Result<(), GroupSyncError> {
+    let Some(settings) = settings_store::get_group_sync_settings(persona_id, group_id).await?
+    else {
+        // Sync not configured for this group on this install yet -- silent
+        // no-op, matches push_document_inner's own contract.
+        return Ok(());
+    };
+
+    let path = permission_sync_file_path(&settings.folder_path, group_id, document_id);
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    write_permissions_sync_file(&path, key_hex, grants).await
 }
 
 // ---------------------------------------------------------------------------
@@ -465,6 +696,164 @@ async fn apply_one_synced_file(
     .await?;
 
     Ok(true)
+}
+
+/// Sweep the configured shared folder's permissions/ subdirectory for
+/// grant manifests differing from what's already stored locally, applying
+/// any found. Structurally identical to pull_if_newer -- same settings/
+/// NotFound/per-file-error handling, same record_sync_result bookkeeping,
+/// same PullSummary shape.
+pub async fn pull_permissions_if_newer(
+    persona_id: &str,
+    group_id: &str,
+    key_hex: &str,
+) -> Result<PullSummary, GroupSyncError> {
+    let Some(settings) = settings_store::get_group_sync_settings(persona_id, group_id).await?
+    else {
+        return Ok(PullSummary::default());
+    };
+
+    let perms_dir = sync_permissions_dir(&settings.folder_path, group_id);
+    let mut summary = PullSummary::default();
+
+    let mut entries = match tokio::fs::read_dir(&perms_dir).await {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Err(e2) = settings_store::record_sync_result(persona_id, group_id, Ok(())).await
+            {
+                log::warn!("group_sync: could not record permissions pull result: {e2}");
+            }
+            return Ok(summary);
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            log::warn!(
+                "group_sync: permissions pull failed to read sync folder for \
+                 persona={persona_id} group={group_id}: {e}"
+            );
+            if let Err(e2) =
+                settings_store::record_sync_result(persona_id, group_id, Err(msg.as_str())).await
+            {
+                log::warn!("group_sync: could not record permissions pull failure: {e2}");
+            }
+            return Ok(summary);
+        }
+    };
+
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(e)) => e,
+            Ok(None) => break,
+            Err(e) => {
+                log::warn!(
+                    "group_sync: error walking permissions sync folder entries for \
+                     persona={persona_id} group={group_id}, stopping this sweep: {e}"
+                );
+                break;
+            }
+        };
+
+        let path = entry.path();
+        if path.extension().and_then(std::ffi::OsStr::to_str) != Some("qrsync") {
+            continue;
+        }
+
+        match apply_one_synced_permissions_file(persona_id, group_id, key_hex, &path).await {
+            Ok(true) => summary.applied += 1,
+            Ok(false) => summary.skipped += 1,
+            Err(e) => {
+                log::warn!(
+                    "group_sync: skipping unreadable permissions sync file {path:?} for \
+                     persona={persona_id} group={group_id}: {e}"
+                );
+                summary.skipped += 1;
+            }
+        }
+    }
+
+    if let Err(e) = settings_store::record_sync_result(persona_id, group_id, Ok(())).await {
+        log::warn!("group_sync: could not record permissions pull result: {e}");
+    }
+
+    Ok(summary)
+}
+
+/// Returns Ok(true) if the pulled manifest was applied, Ok(false) if it was
+/// read successfully but skipped (own document, document not synced
+/// locally yet, or manifest unchanged from what's already here).
+async fn apply_one_synced_permissions_file(
+    persona_id: &str,
+    group_id: &str,
+    key_hex: &str,
+    path: &std::path::Path,
+) -> Result<bool, GroupSyncError> {
+    // document_id comes from the filename, not from manifest row content --
+    // an all-revoked manifest has zero rows, so row content alone can't
+    // always recover which document it belongs to (see write_permissions_
+    // sync_file's own comment).
+    let Some(document_id) = path.file_stem().and_then(std::ffi::OsStr::to_str) else {
+        return Ok(false);
+    };
+
+    // A permissions manifest presupposes the document itself already
+    // exists locally -- it can race ahead of the content pull that creates
+    // it (separate artifact, separate sweep). Treat "not here yet" as a
+    // normal, self-healing case: skip, the next sweep (after a content
+    // pull has landed the document) will pick it up. This also doubles as
+    // the source for the owner check below, avoiding a second query.
+    let Some(local_doc) =
+        group_store::get_document_unchecked(persona_id, group_id, key_hex, document_id).await?
+    else {
+        return Ok(false);
+    };
+
+    // Never apply our own document's permissions manifest back over
+    // ourselves -- mirrors apply_one_synced_file's identical guard for
+    // content.
+    if local_doc.owner_persona_id == persona_id {
+        return Ok(false);
+    }
+
+    let remote_grants = read_permissions_sync_file(path, key_hex).await?;
+    let local_grants =
+        group_store::list_permissions_for_document(persona_id, group_id, key_hex, document_id)
+            .await?;
+
+    if same_grant_set(&remote_grants, &local_grants) {
+        return Ok(false);
+    }
+
+    group_store::apply_synced_permissions(
+        persona_id,
+        group_id,
+        key_hex,
+        document_id,
+        &remote_grants,
+    )
+    .await?;
+
+    Ok(true)
+}
+
+/// (persona_id, tier) set equality, order-independent -- document_id isn't
+/// compared since both sides are already scoped to the same document_id by
+/// the caller, and granted_at isn't compared since it's not access-control-
+/// relevant (require_read_access_conn/require_write_access_conn only ever
+/// check tier, never granted_at) -- an owner re-granting the same tier
+/// bumps granted_at without changing what access anyone actually has, and
+/// treating that as "changed" would cause a needless reapply every sweep
+/// until the next real tier change.
+fn same_grant_set(a: &[PermissionGrant], b: &[PermissionGrant]) -> bool {
+    use std::collections::BTreeSet;
+
+    let to_set = |grants: &[PermissionGrant]| -> BTreeSet<(String, String)> {
+        grants
+            .iter()
+            .map(|g| (g.persona_id.clone(), g.tier.clone()))
+            .collect()
+    };
+
+    to_set(a) == to_set(b)
 }
 
 // ---------------------------------------------------------------------------
@@ -734,5 +1123,260 @@ mod tests {
             .await
             .expect("pull_if_newer must succeed with no configured folder");
         assert_eq!(summary, PullSummary::default());
+    }
+
+    // -- items.id=292: document_permissions grant sync ----------------------
+
+    #[tokio::test]
+    async fn permissions_push_is_a_silent_noop_when_folder_is_unset() {
+        let _env = setup().await;
+        let doc_id = create_and_push_document("alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
+            .await
+            .unwrap();
+
+        // No set_group_sync_folder call -- sync not configured.
+        grant_and_push_permission("alice", "group-1", KEY_HEX, &doc_id, "bob", "write")
+            .await
+            .expect(
+                "grant_and_push_permission must succeed even with no sync folder configured",
+            );
+    }
+
+    #[tokio::test]
+    async fn grant_then_pull_round_trips_a_new_grant_to_a_second_install() {
+        let _env = setup().await;
+        let shared_folder = tempfile::tempdir().expect("failed to create shared folder tempdir");
+        let shared_path = shared_folder.path().to_str().unwrap();
+        settings_store::set_group_sync_folder("alice", "group-1", shared_path)
+            .await
+            .unwrap();
+        settings_store::set_group_sync_folder("carol", "group-1", shared_path)
+            .await
+            .unwrap();
+
+        let doc_id =
+            create_and_push_document("alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
+                .await
+                .unwrap();
+        // Carol must have the document locally before her own permissions
+        // pull can attach a grant to it (documents/ and permissions/ are
+        // independent sweeps).
+        pull_if_newer("carol", "group-1", KEY_HEX).await.unwrap();
+
+        grant_and_push_permission("alice", "group-1", KEY_HEX, &doc_id, "carol", "write")
+            .await
+            .unwrap();
+
+        let summary = pull_permissions_if_newer("carol", "group-1", KEY_HEX)
+            .await
+            .expect("pull_permissions_if_newer must succeed");
+        assert_eq!(summary, PullSummary { applied: 1, skipped: 0 });
+
+        let carol_grants =
+            group_store::list_permissions_for_document("carol", "group-1", KEY_HEX, &doc_id)
+                .await
+                .unwrap();
+        assert_eq!(carol_grants.len(), 1);
+        assert_eq!(carol_grants[0].persona_id, "carol");
+        assert_eq!(carol_grants[0].tier, "write");
+    }
+
+    #[tokio::test]
+    async fn revoke_then_pull_removes_the_grantees_local_row_on_another_install() {
+        let _env = setup().await;
+        let shared_folder = tempfile::tempdir().expect("failed to create shared folder tempdir");
+        let shared_path = shared_folder.path().to_str().unwrap();
+        settings_store::set_group_sync_folder("alice", "group-1", shared_path)
+            .await
+            .unwrap();
+        settings_store::set_group_sync_folder("carol", "group-1", shared_path)
+            .await
+            .unwrap();
+
+        let doc_id =
+            create_and_push_document("alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
+                .await
+                .unwrap();
+        pull_if_newer("carol", "group-1", KEY_HEX).await.unwrap();
+
+        grant_and_push_permission("alice", "group-1", KEY_HEX, &doc_id, "carol", "write")
+            .await
+            .unwrap();
+        pull_permissions_if_newer("carol", "group-1", KEY_HEX)
+            .await
+            .unwrap();
+        assert_eq!(
+            group_store::list_permissions_for_document("carol", "group-1", KEY_HEX, &doc_id)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "carol must have the grant locally before it can be revoked away"
+        );
+
+        revoke_and_push_permission("alice", "group-1", KEY_HEX, &doc_id, "carol")
+            .await
+            .unwrap();
+        let summary = pull_permissions_if_newer("carol", "group-1", KEY_HEX)
+            .await
+            .expect("pull_permissions_if_newer must succeed");
+        assert_eq!(summary, PullSummary { applied: 1, skipped: 0 });
+
+        let carol_grants =
+            group_store::list_permissions_for_document("carol", "group-1", KEY_HEX, &doc_id)
+                .await
+                .unwrap();
+        assert!(
+            carol_grants.is_empty(),
+            "carol's local grant row must be gone after the revoke propagates"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_permissions_manifest_is_not_reapplied_on_a_repeat_pull() {
+        let _env = setup().await;
+        let shared_folder = tempfile::tempdir().expect("failed to create shared folder tempdir");
+        let shared_path = shared_folder.path().to_str().unwrap();
+        settings_store::set_group_sync_folder("alice", "group-1", shared_path)
+            .await
+            .unwrap();
+        settings_store::set_group_sync_folder("carol", "group-1", shared_path)
+            .await
+            .unwrap();
+
+        let doc_id =
+            create_and_push_document("alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
+                .await
+                .unwrap();
+        pull_if_newer("carol", "group-1", KEY_HEX).await.unwrap();
+        grant_and_push_permission("alice", "group-1", KEY_HEX, &doc_id, "carol", "write")
+            .await
+            .unwrap();
+
+        let first = pull_permissions_if_newer("carol", "group-1", KEY_HEX)
+            .await
+            .unwrap();
+        assert_eq!(first, PullSummary { applied: 1, skipped: 0 });
+
+        let second = pull_permissions_if_newer("carol", "group-1", KEY_HEX)
+            .await
+            .unwrap();
+        assert_eq!(
+            second,
+            PullSummary { applied: 0, skipped: 1 },
+            "nothing changed since the last pull -- must not reapply"
+        );
+    }
+
+    #[tokio::test]
+    async fn permissions_pull_never_applies_a_manifest_for_a_document_the_puller_owns() {
+        let _env = setup().await;
+        let shared_folder = tempfile::tempdir().expect("failed to create shared folder tempdir");
+        let shared_path = shared_folder.path().to_str().unwrap();
+        settings_store::set_group_sync_folder("alice", "group-1", shared_path)
+            .await
+            .unwrap();
+
+        let doc_id =
+            create_and_push_document("alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
+                .await
+                .unwrap();
+        grant_and_push_permission("alice", "group-1", KEY_HEX, &doc_id, "bob", "write")
+            .await
+            .unwrap();
+
+        // Alice pulling her own group must see the file (skipped: 1) but
+        // never apply her own document's manifest back over herself.
+        let summary = pull_permissions_if_newer("alice", "group-1", KEY_HEX)
+            .await
+            .unwrap();
+        assert_eq!(summary, PullSummary { applied: 0, skipped: 1 });
+    }
+
+    #[tokio::test]
+    async fn a_permissions_manifest_ahead_of_its_document_is_skipped_then_applied_once_the_document_exists(
+    ) {
+        let _env = setup().await;
+        let shared_folder = tempfile::tempdir().expect("failed to create shared folder tempdir");
+        let shared_path = shared_folder.path().to_str().unwrap();
+        settings_store::set_group_sync_folder("alice", "group-1", shared_path)
+            .await
+            .unwrap();
+        settings_store::set_group_sync_folder("carol", "group-1", shared_path)
+            .await
+            .unwrap();
+
+        let doc_id =
+            create_and_push_document("alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
+                .await
+                .unwrap();
+        grant_and_push_permission("alice", "group-1", KEY_HEX, &doc_id, "carol", "write")
+            .await
+            .unwrap();
+
+        // Carol pulls permissions before ever having pulled the document
+        // itself -- the manifest must be skipped, not applied, and must not
+        // error the sweep.
+        let before = pull_permissions_if_newer("carol", "group-1", KEY_HEX)
+            .await
+            .expect("pull_permissions_if_newer must not error on an unsynced document");
+        assert_eq!(before, PullSummary { applied: 0, skipped: 1 });
+        assert!(
+            group_store::list_permissions_for_document("carol", "group-1", KEY_HEX, &doc_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Once the document itself has synced, a later sweep picks the
+        // already-waiting manifest up.
+        pull_if_newer("carol", "group-1", KEY_HEX).await.unwrap();
+        let after = pull_permissions_if_newer("carol", "group-1", KEY_HEX)
+            .await
+            .unwrap();
+        assert_eq!(after, PullSummary { applied: 1, skipped: 0 });
+        assert_eq!(
+            group_store::list_permissions_for_document("carol", "group-1", KEY_HEX, &doc_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn same_grant_set_ignores_order_and_granted_at() {
+        let a = vec![
+            PermissionGrant {
+                persona_id: "bob".to_owned(),
+                tier: "write".to_owned(),
+                granted_at: "2026-01-01T00:00:00Z".to_owned(),
+            },
+            PermissionGrant {
+                persona_id: "carol".to_owned(),
+                tier: "read_only".to_owned(),
+                granted_at: "2026-01-02T00:00:00Z".to_owned(),
+            },
+        ];
+        let b = vec![
+            PermissionGrant {
+                persona_id: "carol".to_owned(),
+                tier: "read_only".to_owned(),
+                granted_at: "2099-12-31T00:00:00Z".to_owned(),
+            },
+            PermissionGrant {
+                persona_id: "bob".to_owned(),
+                tier: "write".to_owned(),
+                granted_at: "2026-01-01T00:00:00Z".to_owned(),
+            },
+        ];
+        assert!(same_grant_set(&a, &b));
+
+        let c = vec![PermissionGrant {
+            persona_id: "bob".to_owned(),
+            tier: "read_only".to_owned(),
+            granted_at: "2026-01-01T00:00:00Z".to_owned(),
+        }];
+        assert!(!same_grant_set(&a, &c));
     }
 }

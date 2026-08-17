@@ -184,6 +184,19 @@ pub struct DocumentRecord {
     pub extra_metadata: String,
 }
 
+/// One document_permissions row, detached from any particular document --
+/// used by group_sync::engine to push/pull a document's full grant manifest
+/// (items.id=292). Mirrors DocumentRecord's own fully-`pub` field
+/// convention (this struct is `pub(crate)`, restricting external
+/// visibility; the fields don't need their own narrower visibility on top
+/// of that).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PermissionGrant {
+    pub persona_id: String,
+    pub tier: String,
+    pub granted_at: String,
+}
+
 fn row_to_document_record(r: &sqlx::sqlite::SqliteRow) -> Result<DocumentRecord, sqlx::Error> {
     Ok(DocumentRecord {
         id: r.try_get("id")?,
@@ -631,6 +644,162 @@ pub(crate) async fn apply_synced_document(
 }
 
 // ---------------------------------------------------------------------------
+// Permission sync (items.id=292, decisions.id=720 -- pull side; see also
+// group_sync::engine's grant_and_push_permission/revoke_and_push_permission
+// for the push side, and list_permissions_for_document below for what they
+// push)
+// ---------------------------------------------------------------------------
+
+async fn list_permissions_for_document_conn(
+    conn: &mut SqliteConnection,
+    document_id: &str,
+) -> Result<Vec<PermissionGrant>, GroupStoreError> {
+    let rows = sqlx::query(
+        "SELECT persona_id, tier, granted_at FROM document_permissions WHERE document_id = ?",
+    )
+    .bind(document_id)
+    .fetch_all(&mut *conn)
+    .await?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for r in &rows {
+        out.push(PermissionGrant {
+            persona_id: r.try_get("persona_id")?,
+            tier: r.try_get("tier")?,
+            granted_at: r.try_get("granted_at")?,
+        });
+    }
+    Ok(out)
+}
+
+/// The complete current grant list for a document, no owner/permission
+/// check. `pub(crate)` -- only called from group_sync::engine, either right
+/// after that module's own grant_and_push_permission/revoke_and_push_
+/// permission already succeeded through the owner-gated grant_permission/
+/// revoke_permission calls above, or as the local half of pull_permissions_
+/// if_newer's set comparison against a pulled manifest (same "no local read-
+/// access check makes sense here" reasoning as get_document_unchecked's own
+/// doc comment -- this persona may hold no grant at all on a document
+/// that's still theirs to reconcile local state for).
+pub(crate) async fn list_permissions_for_document(
+    persona_id: &str,
+    group_id: &str,
+    key_hex: &str,
+    document_id: &str,
+) -> Result<Vec<PermissionGrant>, GroupStoreError> {
+    let mut conn = open_group_db(persona_id, group_id, key_hex).await?;
+    list_permissions_for_document_conn(&mut conn, document_id).await
+}
+
+async fn apply_synced_permissions_conn(
+    conn: &mut SqliteConnection,
+    document_id: &str,
+    grants: &[PermissionGrant],
+) -> Result<(), GroupStoreError> {
+    // SAVEPOINT: the delete-then-insert full replace below is a logical
+    // unit -- a delete that succeeds followed by an insert that fails would
+    // leave this persona's local grant set for `document_id` truncated
+    // relative to both the pulled manifest AND whatever was there before.
+    // ROLLBACK TO (not conn.begin()) to match the SAVEPOINT pattern already
+    // established in this codebase for the same reason (plan_state_store.rs
+    // write_block, itself following migrations.rs's own SAVEPOINT
+    // convention).
+    sqlx::query("SAVEPOINT apply_synced_permissions_sp")
+        .execute(&mut *conn)
+        .await?;
+
+    let placeholders = std::iter::repeat_n("?", grants.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let delete_sql = if grants.is_empty() {
+        "DELETE FROM document_permissions WHERE document_id = ?".to_owned()
+    } else {
+        format!(
+            "DELETE FROM document_permissions \
+             WHERE document_id = ? AND persona_id NOT IN ({placeholders})"
+        )
+    };
+    let mut delete_query = sqlx::query(&delete_sql).bind(document_id);
+    for g in grants {
+        delete_query = delete_query.bind(&g.persona_id);
+    }
+    let delete_result = delete_query.execute(&mut *conn).await;
+
+    if let Err(e) = delete_result {
+        // Rollback failure means the connection is already broken; the
+        // upstream ? on the next operation will surface it (same pattern
+        // plan_state_store.rs's write_block uses).
+        let _ = sqlx::query("ROLLBACK TO apply_synced_permissions_sp")
+            .execute(&mut *conn)
+            .await;
+        return Err(GroupStoreError::Database(e));
+    }
+
+    for g in grants {
+        let insert_result = sqlx::query(
+            "INSERT INTO document_permissions (document_id, persona_id, tier, granted_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(document_id, persona_id)
+             DO UPDATE SET tier = excluded.tier, granted_at = excluded.granted_at",
+        )
+        .bind(document_id)
+        .bind(&g.persona_id)
+        .bind(&g.tier)
+        .bind(&g.granted_at)
+        .execute(&mut *conn)
+        .await;
+
+        if let Err(e) = insert_result {
+            let _ = sqlx::query("ROLLBACK TO apply_synced_permissions_sp")
+                .execute(&mut *conn)
+                .await;
+            return Err(GroupStoreError::Database(e));
+        }
+    }
+
+    sqlx::query("RELEASE apply_synced_permissions_sp")
+        .execute(&mut *conn)
+        .await?;
+
+    Ok(())
+}
+
+/// Replace `document_id`'s entire local document_permissions row set with
+/// `grants` -- the pull half of items.id=292's grant sync. `persona_id` is
+/// receiving another persona's (the document owner's) already-authoritative
+/// grant manifest, not granting/revoking themselves, so require_owner_conn
+/// does not apply here and is deliberately NOT called -- same reasoning as
+/// apply_synced_document (group_store.rs's existing precedent): gating this
+/// on the local persona's own ownership would be backwards, since the
+/// persona applying a pulled manifest is essentially never the document's
+/// owner. The only real access control is structural: `pub(crate)`,
+/// callable only from group_sync::engine, which has already authenticated
+/// the remote content by opening it with the shared group key.
+///
+/// FULL REPLACE, not an incremental diff: `grants` is the complete current
+/// grant set for `document_id` (group_sync::engine::push_permissions always
+/// pushes the full list, never a delta), so any local row for a persona not
+/// in `grants` is a stale grant that must be deleted -- this is how a
+/// revoke propagates, since there is no separate "revoke" artifact (see
+/// this item's own design notes: full-replace gets revocation propagation
+/// for free).
+///
+/// The caller (group_sync::engine::apply_one_synced_permissions_file) is
+/// responsible for the "only apply if the manifest actually differs from
+/// what's already here" comparison -- this function always applies
+/// unconditionally, matching apply_synced_document's own contract.
+pub(crate) async fn apply_synced_permissions(
+    persona_id: &str,
+    group_id: &str,
+    key_hex: &str,
+    document_id: &str,
+    grants: &[PermissionGrant],
+) -> Result<(), GroupStoreError> {
+    let mut conn = open_group_db(persona_id, group_id, key_hex).await?;
+    apply_synced_permissions_conn(&mut conn, document_id, grants).await
+}
+
+// ---------------------------------------------------------------------------
 // Grant / Revoke
 // ---------------------------------------------------------------------------
 
@@ -690,7 +859,6 @@ async fn grant_permission_conn(
 /// that could create that conflict). ON CONFLICT DO UPDATE makes
 /// re-granting a different tier a clean promotion/demotion, not a second
 /// row or an error.
-#[allow(dead_code)] // items.id=285: ahead of its first real caller (no IPC layer yet, items.id=283/284 precedent)
 pub async fn grant_permission(
     persona_id: &str,
     group_id: &str,
@@ -724,7 +892,6 @@ async fn revoke_permission_conn(
 /// (see grant_permission's own doc comment). Idempotent -- revoking a
 /// grant that doesn't exist is a no-op, not an error, matching
 /// output_store.rs::delete_output_conn's idempotent-delete convention.
-#[allow(dead_code)] // items.id=285: ahead of its first real caller (no IPC layer yet, items.id=283/284 precedent)
 pub async fn revoke_permission(
     persona_id: &str,
     group_id: &str,
@@ -1406,6 +1573,62 @@ mod tests {
             "a pull must not silently release an existing local checkout"
         );
         assert_eq!(doc.content, "v2 from sync", "the content update must still apply");
+    }
+
+    // -- apply_synced_permissions (items.id=292 pull side) ----------------------
+
+    #[tokio::test]
+    async fn apply_synced_permissions_full_replace_drops_and_adds_grants() {
+        let mut conn = test_db().await;
+        let doc_id = create_document_conn(&mut conn, "owner-1", "Doc", "v1")
+            .await
+            .unwrap();
+        grant_permission_conn(&mut conn, &doc_id, "owner-1", "bob", "write")
+            .await
+            .unwrap();
+
+        // The pulled manifest drops bob and adds carol -- exercising both
+        // halves of a full replace in one call, not just an add or a drop
+        // in isolation.
+        let manifest = vec![PermissionGrant {
+            persona_id: "carol".to_owned(),
+            tier: "read_only".to_owned(),
+            granted_at: "2026-08-01T00:00:00Z".to_owned(),
+        }];
+        apply_synced_permissions_conn(&mut conn, &doc_id, &manifest)
+            .await
+            .expect("apply_synced_permissions_conn must succeed");
+
+        let rows = list_permissions_for_document_conn(&mut conn, &doc_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "the final row set must match the manifest exactly, not be a superset/union"
+        );
+        assert_eq!(rows[0].persona_id, "carol");
+        assert_eq!(rows[0].tier, "read_only");
+    }
+
+    #[tokio::test]
+    async fn apply_synced_permissions_with_an_empty_manifest_clears_all_local_grants() {
+        let mut conn = test_db().await;
+        let doc_id = create_document_conn(&mut conn, "owner-1", "Doc", "v1")
+            .await
+            .unwrap();
+        grant_permission_conn(&mut conn, &doc_id, "owner-1", "bob", "write")
+            .await
+            .unwrap();
+
+        apply_synced_permissions_conn(&mut conn, &doc_id, &[])
+            .await
+            .expect("an empty manifest (everyone revoked) must still apply");
+
+        let rows = list_permissions_for_document_conn(&mut conn, &doc_id)
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
     }
 
     // -- real encrypted-file round trip (public API, not just _conn) ------------

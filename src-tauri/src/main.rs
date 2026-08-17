@@ -370,6 +370,19 @@ async fn async_main() {
                                  persona={persona_id} group={group_id}: {e}"
                             );
                         }
+                        if let Err(e) =
+                            quietrabbit_lib::group_sync::engine::pull_permissions_if_newer(
+                                &persona_id,
+                                &group_id,
+                                &key_hex_str,
+                            )
+                            .await
+                        {
+                            log::warn!(
+                                "main: periodic group_sync permissions pull failed for \
+                                 persona={persona_id} group={group_id}: {e}"
+                            );
+                        }
                     }
                 }
             });
