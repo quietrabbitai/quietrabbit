@@ -66,7 +66,9 @@
 use tauri::State;
 
 use crate::auth::kdf;
-use crate::auth::registry::{key_hex, GroupKeyRegistry, KeyRegistry, UnlockedGroupKey, UnlockedKey};
+use crate::auth::registry::{
+    key_hex, GroupKeyRegistry, KeyRegistry, UnlockedGroupKey, UnlockedKey,
+};
 use crate::auth::sharing_keypair;
 use crate::auth::user_store;
 use crate::persistence::{group_key_store, persona_store};
@@ -1130,8 +1132,10 @@ mod tests {
             &crate::providers::utils::now(),
         )
         .await
-        .expect("save_group_key must succeed even for a malformed value -- \
-                 the store layer doesn't validate, only the rehydration reader does");
+        .expect(
+            "save_group_key must succeed even for a malformed value -- \
+                 the store layer doesn't validate, only the rehydration reader does",
+        );
 
         registry.clear().await;
 

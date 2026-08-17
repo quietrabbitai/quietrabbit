@@ -151,8 +151,7 @@ pub async fn create_group(
     // 3. Generate.
     let group_id = uuid::Uuid::new_v4().to_string();
     let mut group_key = [0u8; kdf::MASTER_KEY_LEN];
-    getrandom::fill(&mut group_key)
-        .map_err(|e| GroupCreationError::RandomSource(e.to_string()))?;
+    getrandom::fill(&mut group_key).map_err(|e| GroupCreationError::RandomSource(e.to_string()))?;
     let group_key_hex = key_hex(&group_key);
 
     // 4. Materialize the creator's own local group.db -- open_group_db

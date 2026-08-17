@@ -467,8 +467,7 @@ mod tests {
     use crate::persistence::persona_store;
     use crate::test_support::ENV_MUTEX;
 
-    const PERSONAL_KEY_HEX: &str =
-        "aabbccddeeff00112233445566778899aabbccddeeff0011223344556677aa";
+    const PERSONAL_KEY_HEX: &str = "aabbccddeeff00112233445566778899aabbccddeeff0011223344556677aa";
 
     struct TestEnv {
         _tempdir: tempfile::TempDir,

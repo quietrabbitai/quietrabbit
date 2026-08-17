@@ -325,7 +325,12 @@ pub async fn remove_member(
     // ever reachable when departing_persona_id is this account's own
     // persona; a no-op everywhere else.
     if let Some((current_user_id, current_key_hex)) = key_registry
-        .with_key(|k| (k.user_id.clone(), crate::auth::registry::key_hex(&k.master_key)))
+        .with_key(|k| {
+            (
+                k.user_id.clone(),
+                crate::auth::registry::key_hex(&k.master_key),
+            )
+        })
         .await
     {
         match group_invitations::resolve_persona_owner(departing_persona_id, &mut conn).await {
@@ -394,9 +399,7 @@ async fn remove_member_inner(
             group_invitations::resolve_persona_owner(&member_persona_id, conn).await?;
         let recipient_public_key = sharing_keypair::get_public_key(&owner_user_id)
             .await?
-            .ok_or_else(|| {
-                GroupMembershipError::RecipientHasNoSharingKey(owner_user_id.clone())
-            })?;
+            .ok_or_else(|| GroupMembershipError::RecipientHasNoSharingKey(owner_user_id.clone()))?;
         let envelope =
             sharing_keypair::encrypt_to_public_key(&recipient_public_key, &new_group_key)?;
 
@@ -476,8 +479,7 @@ pub async fn apply_pending_rotations(
     let owner_user_id = group_invitations::resolve_persona_owner(persona_id, &mut conn).await?;
 
     for (rotation_id, group_id, encrypted_hex) in rows {
-        let Some(old_key_hex) = group_key_registry.key_hex_for(persona_id, &group_id).await
-        else {
+        let Some(old_key_hex) = group_key_registry.key_hex_for(persona_id, &group_id).await else {
             continue;
         };
 
@@ -527,8 +529,7 @@ pub async fn apply_pending_rotations(
         // group_sync call site -- a re-push failure must not turn an
         // otherwise-successful rotation apply into an Err.
         if let Err(e) =
-            group_sync_engine::republish_owned_documents(persona_id, &group_id, &new_key_hex)
-                .await
+            group_sync_engine::republish_owned_documents(persona_id, &group_id, &new_key_hex).await
         {
             log::warn!(
                 "apply_pending_rotations: republish_owned_documents failed for \
@@ -550,8 +551,7 @@ mod tests {
     use crate::persistence::persona_store;
     use crate::test_support::ENV_MUTEX;
 
-    const PERSONAL_KEY_HEX: &str =
-        "aabbccddeeff00112233445566778899aabbccddeeff0011223344556677aa";
+    const PERSONAL_KEY_HEX: &str = "aabbccddeeff00112233445566778899aabbccddeeff0011223344556677aa";
 
     struct TestEnv {
         _tempdir: tempfile::TempDir,
@@ -799,7 +799,11 @@ mod tests {
         .fetch_all(&mut conn)
         .await
         .unwrap();
-        assert_eq!(rows.len(), 1, "only Carol should receive a rotation envelope");
+        assert_eq!(
+            rows.len(),
+            1,
+            "only Carol should receive a rotation envelope"
+        );
         assert_eq!(rows[0].0, c_persona);
 
         let envelope = hex_decode("test", &rows[0].1).unwrap();
@@ -856,7 +860,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(rows_before.len(), 1, "durable row must exist before departure");
+        assert_eq!(
+            rows_before.len(),
+            1,
+            "durable row must exist before departure"
+        );
 
         let key_registry = KeyRegistry::default();
         key_registry
@@ -1181,7 +1189,10 @@ mod tests {
 
     #[test]
     fn departure_reason_round_trips_through_str() {
-        assert_eq!("left".parse::<DepartureReason>().unwrap(), DepartureReason::Left);
+        assert_eq!(
+            "left".parse::<DepartureReason>().unwrap(),
+            DepartureReason::Left
+        );
         assert_eq!(
             "removed".parse::<DepartureReason>().unwrap(),
             DepartureReason::Removed

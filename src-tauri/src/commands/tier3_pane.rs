@@ -204,7 +204,7 @@ fn cef_cookie_to_stored(c: &Cookie) -> StoredCookie {
         secure: c.secure != 0,
         httponly: c.httponly != 0,
         same_site: c.same_site.get_raw() as i32,
-        priority: c.priority.get_raw() as i32,
+        priority: c.priority.get_raw(),
         has_expires,
         expires: if has_expires {
             Some(c.expires.val)

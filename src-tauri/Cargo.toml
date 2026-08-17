@@ -179,7 +179,7 @@ gtk = "0.18"
 # items.id=227's reimplemented mouse-back/forward JS synthesis in
 # pane_host.rs (see that module's own doc comment for why this is
 # reimplemented locally rather than reused from wry).
-webkit2gtk = "2.0.2"
+webkit2gtk = { version = "2.0.2", features = ["v2_40"] }
 # GL function loading. Originally planned as the `epoxy` crate (the standard
 # gtk-rs pattern, since GTK itself loads GL via libepoxy on Linux) -- dropped
 # after `cargo build` found it unbuildable via crates.io: its `gl_generator`

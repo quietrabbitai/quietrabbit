@@ -112,7 +112,9 @@ pub async fn get_group_sync_settings(
 
     match row {
         None => Ok(None),
-        Some(r) => Ok(Some(row_to_settings(&r).map_err(GroupSyncSettingsError::Database)?)),
+        Some(r) => Ok(Some(
+            row_to_settings(&r).map_err(GroupSyncSettingsError::Database)?,
+        )),
     }
 }
 
@@ -342,7 +344,10 @@ mod tests {
             after_failure.last_synced_at, synced_at,
             "last_synced_at must keep reflecting the last real success, not the last attempt"
         );
-        assert_eq!(after_failure.last_error, Some("folder unreachable".to_owned()));
+        assert_eq!(
+            after_failure.last_error,
+            Some("folder unreachable".to_owned())
+        );
     }
 
     #[tokio::test]

@@ -297,8 +297,8 @@ async fn async_main() {
                 let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
                 loop {
                     ticker.tick().await;
-                    let registry = pull_handle
-                        .state::<quietrabbit_lib::auth::registry::GroupKeyRegistry>();
+                    let registry =
+                        pull_handle.state::<quietrabbit_lib::auth::registry::GroupKeyRegistry>();
 
                     // items.id=288 (group.db 266f): apply any pending key
                     // rotations before this tick's pull sweep below -- a
@@ -499,7 +499,7 @@ async fn async_main() {
                 let count = open_pane_count.load(std::sync::atomic::Ordering::Relaxed);
                 let tick = diag_tick.get() + 1;
                 diag_tick.set(tick);
-                if tick % 60 == 0 {
+                if tick.is_multiple_of(60) {
                     log::debug!(
                         "DIAG items.id=227: 16ms timeout tick={tick} open_pane_count={count}"
                     );

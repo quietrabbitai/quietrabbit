@@ -38,6 +38,7 @@
 //!      `libEGL.so.1`) as the fallback, for extension functions -- per the
 //!      EGL spec, extensions are not guaranteed plain-dlsym-able, only
 //!      reachable via `eglGetProcAddress`.
+//!
 //! This dlsym-first-then-eglGetProcAddress order is the standard pattern
 //! real GL loaders (SDL2, GLFW, ANGLE) use on EGL platforms, not a
 //! one-off guess for this bug.

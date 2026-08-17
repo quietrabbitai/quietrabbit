@@ -113,7 +113,9 @@ pub async fn remove_group_member(
     group_key_registry: State<'_, GroupKeyRegistry>,
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<(), String> {
-    let reason: DepartureReason = reason.parse().map_err(|e: group_membership::GroupMembershipError| e.to_string())?;
+    let reason: DepartureReason = reason
+        .parse()
+        .map_err(|e: group_membership::GroupMembershipError| e.to_string())?;
     group_membership::remove_member(
         &group_id,
         &departing_persona_id,
@@ -228,9 +230,12 @@ mod tests {
     #[tokio::test]
     async fn set_group_sync_folder_rejects_empty_path_with_a_string_error() {
         let _env = setup().await;
-        let result =
-            set_group_sync_folder("persona-1".to_owned(), "group-1".to_owned(), "   ".to_owned())
-                .await;
+        let result = set_group_sync_folder(
+            "persona-1".to_owned(),
+            "group-1".to_owned(),
+            "   ".to_owned(),
+        )
+        .await;
         assert!(result.is_err());
     }
 }

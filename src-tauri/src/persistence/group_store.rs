@@ -197,6 +197,20 @@ pub(crate) struct PermissionGrant {
     pub granted_at: String,
 }
 
+/// Borrowed field bag for `apply_synced_document`/`apply_synced_document_conn`
+/// -- groups their shared document-payload params (was 7-10 positional
+/// args, over clippy's too_many_arguments threshold) into one struct.
+/// Mirrors `PermissionGrant`'s own fully-`pub` field convention.
+pub(crate) struct SyncedDocumentFields<'a> {
+    pub document_id: &'a str,
+    pub title: &'a str,
+    pub content: &'a str,
+    pub owner_persona_id: &'a str,
+    pub created_at: &'a str,
+    pub updated_at: &'a str,
+    pub extra_metadata: &'a str,
+}
+
 fn row_to_document_record(r: &sqlx::sqlite::SqliteRow) -> Result<DocumentRecord, sqlx::Error> {
     Ok(DocumentRecord {
         id: r.try_get("id")?,
@@ -456,7 +470,9 @@ pub(crate) async fn get_document_unchecked(
         .await?;
     match row {
         None => Ok(None),
-        Some(r) => Ok(Some(row_to_document_record(&r).map_err(GroupStoreError::Database)?)),
+        Some(r) => Ok(Some(
+            row_to_document_record(&r).map_err(GroupStoreError::Database)?,
+        )),
     }
 }
 
@@ -554,13 +570,7 @@ pub async fn update_document(
 
 async fn apply_synced_document_conn(
     conn: &mut SqliteConnection,
-    document_id: &str,
-    title: &str,
-    content: &str,
-    owner_persona_id: &str,
-    created_at: &str,
-    updated_at: &str,
-    extra_metadata: &str,
+    doc: &SyncedDocumentFields<'_>,
 ) -> Result<(), GroupStoreError> {
     sqlx::query(
         "INSERT INTO documents
@@ -573,13 +583,13 @@ async fn apply_synced_document_conn(
             updated_at = excluded.updated_at,
             extra_metadata = excluded.extra_metadata",
     )
-    .bind(document_id)
-    .bind(title)
-    .bind(content)
-    .bind(owner_persona_id)
-    .bind(created_at)
-    .bind(updated_at)
-    .bind(extra_metadata)
+    .bind(doc.document_id)
+    .bind(doc.title)
+    .bind(doc.content)
+    .bind(doc.owner_persona_id)
+    .bind(doc.created_at)
+    .bind(doc.updated_at)
+    .bind(doc.extra_metadata)
     .execute(&mut *conn)
     .await?;
 
@@ -621,26 +631,10 @@ pub(crate) async fn apply_synced_document(
     persona_id: &str,
     group_id: &str,
     key_hex: &str,
-    document_id: &str,
-    title: &str,
-    content: &str,
-    owner_persona_id: &str,
-    created_at: &str,
-    updated_at: &str,
-    extra_metadata: &str,
+    doc: &SyncedDocumentFields<'_>,
 ) -> Result<(), GroupStoreError> {
     let mut conn = open_group_db(persona_id, group_id, key_hex).await?;
-    apply_synced_document_conn(
-        &mut conn,
-        document_id,
-        title,
-        content,
-        owner_persona_id,
-        created_at,
-        updated_at,
-        extra_metadata,
-    )
-    .await
+    apply_synced_document_conn(&mut conn, doc).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1495,13 +1489,15 @@ mod tests {
 
         apply_synced_document_conn(
             &mut conn,
-            "remote-doc-1",
-            "Remote Title",
-            "remote content",
-            "remote-owner",
-            "2026-08-01T00:00:00Z",
-            "2026-08-01T00:00:00Z",
-            "{}",
+            &SyncedDocumentFields {
+                document_id: "remote-doc-1",
+                title: "Remote Title",
+                content: "remote content",
+                owner_persona_id: "remote-owner",
+                created_at: "2026-08-01T00:00:00Z",
+                updated_at: "2026-08-01T00:00:00Z",
+                extra_metadata: "{}",
+            },
         )
         .await
         .expect("apply_synced_document_conn must succeed for a new document id");
@@ -1527,18 +1523,22 @@ mod tests {
 
         apply_synced_document_conn(
             &mut conn,
-            &doc_id,
-            "Doc",
-            "v2 from sync",
-            "owner-1",
-            "2026-08-01T00:00:00Z",
-            "2026-08-02T00:00:00Z",
-            "{}",
+            &SyncedDocumentFields {
+                document_id: &doc_id,
+                title: "Doc",
+                content: "v2 from sync",
+                owner_persona_id: "owner-1",
+                created_at: "2026-08-01T00:00:00Z",
+                updated_at: "2026-08-02T00:00:00Z",
+                extra_metadata: "{}",
+            },
         )
         .await
         .expect("apply_synced_document_conn must succeed for an existing document id");
 
-        let doc = get_document_conn(&mut conn, &doc_id, "owner-1").await.unwrap();
+        let doc = get_document_conn(&mut conn, &doc_id, "owner-1")
+            .await
+            .unwrap();
         assert_eq!(doc.content, "v2 from sync");
         assert_eq!(doc.updated_at, "2026-08-02T00:00:00Z");
     }
@@ -1555,24 +1555,31 @@ mod tests {
 
         apply_synced_document_conn(
             &mut conn,
-            &doc_id,
-            "Doc",
-            "v2 from sync",
-            "owner-1",
-            "2026-08-01T00:00:00Z",
-            "2026-08-02T00:00:00Z",
-            "{}",
+            &SyncedDocumentFields {
+                document_id: &doc_id,
+                title: "Doc",
+                content: "v2 from sync",
+                owner_persona_id: "owner-1",
+                created_at: "2026-08-01T00:00:00Z",
+                updated_at: "2026-08-02T00:00:00Z",
+                extra_metadata: "{}",
+            },
         )
         .await
         .expect("apply_synced_document_conn must succeed");
 
-        let doc = get_document_conn(&mut conn, &doc_id, "owner-1").await.unwrap();
+        let doc = get_document_conn(&mut conn, &doc_id, "owner-1")
+            .await
+            .unwrap();
         assert_eq!(
             doc.checked_out_by_persona_id,
             Some("owner-1".to_owned()),
             "a pull must not silently release an existing local checkout"
         );
-        assert_eq!(doc.content, "v2 from sync", "the content update must still apply");
+        assert_eq!(
+            doc.content, "v2 from sync",
+            "the content update must still apply"
+        );
     }
 
     // -- apply_synced_permissions (items.id=292 pull side) ----------------------
@@ -1692,10 +1699,16 @@ mod tests {
         let new_key_hex = "11223344556677889900aabbccddeeff00112233445566778899aabbccddee";
 
         let verify = async {
-            let doc_id =
-                create_document(persona_id, group_id, old_key_hex, persona_id, "Doc", "hello")
-                    .await
-                    .expect("create_document under old key must succeed");
+            let doc_id = create_document(
+                persona_id,
+                group_id,
+                old_key_hex,
+                persona_id,
+                "Doc",
+                "hello",
+            )
+            .await
+            .expect("create_document under old key must succeed");
 
             rekey_group_db(persona_id, group_id, old_key_hex, new_key_hex)
                 .await

@@ -400,7 +400,10 @@ async fn push_if_owner(persona_id: &str, group_id: &str, key_hex: &str, document
     }
 
     let result = push_document_inner(persona_id, group_id, key_hex, &doc).await;
-    let record_result = result.as_ref().map(|_| ()).map_err(std::string::ToString::to_string);
+    let record_result = result
+        .as_ref()
+        .map(|_| ())
+        .map_err(std::string::ToString::to_string);
     if let Err(e) = &record_result {
         log::warn!(
             "group_sync: push failed for persona={persona_id} group={group_id} \
@@ -481,8 +484,14 @@ pub async fn revoke_and_push_permission(
     document_id: &str,
     grantee_persona_id: &str,
 ) -> Result<(), GroupSyncError> {
-    group_store::revoke_permission(persona_id, group_id, key_hex, document_id, grantee_persona_id)
-        .await?;
+    group_store::revoke_permission(
+        persona_id,
+        group_id,
+        key_hex,
+        document_id,
+        grantee_persona_id,
+    )
+    .await?;
 
     push_permissions(persona_id, group_id, key_hex, document_id).await;
 
@@ -494,23 +503,30 @@ pub async fn revoke_and_push_permission(
 /// failure contract as push_if_owner/push_document_inner -- a sync failure
 /// must not turn an otherwise-successful local grant/revoke into an Err.
 async fn push_permissions(persona_id: &str, group_id: &str, key_hex: &str, document_id: &str) {
-    let grants =
-        match group_store::list_permissions_for_document(persona_id, group_id, key_hex, document_id)
-            .await
-        {
-            Ok(g) => g,
-            Err(e) => {
-                log::warn!(
-                    "group_sync: could not re-fetch permissions for document \
+    let grants = match group_store::list_permissions_for_document(
+        persona_id,
+        group_id,
+        key_hex,
+        document_id,
+    )
+    .await
+    {
+        Ok(g) => g,
+        Err(e) => {
+            log::warn!(
+                "group_sync: could not re-fetch permissions for document \
                      {document_id} after write (persona={persona_id} group={group_id}), \
                      skipping permissions push: {e}"
-                );
-                return;
-            }
-        };
+            );
+            return;
+        }
+    };
 
     let result = push_permissions_inner(persona_id, group_id, key_hex, document_id, &grants).await;
-    let record_result = result.as_ref().map(|_| ()).map_err(std::string::ToString::to_string);
+    let record_result = result
+        .as_ref()
+        .map(|_| ())
+        .map_err(std::string::ToString::to_string);
     if let Err(e) = &record_result {
         log::warn!(
             "group_sync: permissions push failed for persona={persona_id} group={group_id} \
@@ -669,8 +685,8 @@ async fn apply_one_synced_file(
     // that function's own doc comment) -- the checked read path would make
     // this persona unable to ever compare against, and therefore ever
     // re-pull an update to, a document they don't own.
-    let local = group_store::get_document_unchecked(persona_id, group_id, key_hex, &remote.id)
-        .await?;
+    let local =
+        group_store::get_document_unchecked(persona_id, group_id, key_hex, &remote.id).await?;
 
     let should_apply = match &local {
         None => true,
@@ -685,13 +701,15 @@ async fn apply_one_synced_file(
         persona_id,
         group_id,
         key_hex,
-        &remote.id,
-        &remote.title,
-        &remote.content,
-        &remote.owner_persona_id,
-        &remote.created_at,
-        &remote.updated_at,
-        &remote.extra_metadata,
+        &group_store::SyncedDocumentFields {
+            document_id: &remote.id,
+            title: &remote.title,
+            content: &remote.content,
+            owner_persona_id: &remote.owner_persona_id,
+            created_at: &remote.created_at,
+            updated_at: &remote.updated_at,
+            extra_metadata: &remote.extra_metadata,
+        },
     )
     .await?;
 
@@ -902,16 +920,9 @@ mod tests {
     async fn push_is_a_silent_noop_when_folder_is_unset() {
         let _env = setup().await;
         // No set_group_sync_folder call -- sync not configured.
-        let doc_id = create_and_push_document(
-            "alice",
-            "group-1",
-            KEY_HEX,
-            "alice",
-            "Doc",
-            "v1",
-        )
-        .await
-        .expect("create_and_push_document must succeed even with no sync folder configured");
+        let doc_id = create_and_push_document("alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
+            .await
+            .expect("create_and_push_document must succeed even with no sync folder configured");
 
         let doc = group_store::get_document("alice", "group-1", KEY_HEX, &doc_id)
             .await
@@ -953,7 +964,13 @@ mod tests {
         let summary = pull_if_newer("bob", "group-1", KEY_HEX)
             .await
             .expect("pull_if_newer must succeed");
-        assert_eq!(summary, PullSummary { applied: 1, skipped: 0 });
+        assert_eq!(
+            summary,
+            PullSummary {
+                applied: 1,
+                skipped: 0
+            }
+        );
 
         let after = group_store::get_document_unchecked("bob", "group-1", KEY_HEX, &doc_id)
             .await
@@ -982,7 +999,13 @@ mod tests {
 
         // Pulling again with nothing new pushed must not re-apply.
         let repeat = pull_if_newer("bob", "group-1", KEY_HEX).await.unwrap();
-        assert_eq!(repeat, PullSummary { applied: 0, skipped: 1 });
+        assert_eq!(
+            repeat,
+            PullSummary {
+                applied: 0,
+                skipped: 1
+            }
+        );
 
         // updated_at is a timestamp with second-ish granularity in some
         // environments -- force a strictly-later value so the "newer" check
@@ -1006,7 +1029,13 @@ mod tests {
         push_if_owner("alice", "group-1", KEY_HEX, &doc_id).await;
 
         let after_second_pull = pull_if_newer("bob", "group-1", KEY_HEX).await.unwrap();
-        assert_eq!(after_second_pull, PullSummary { applied: 1, skipped: 0 });
+        assert_eq!(
+            after_second_pull,
+            PullSummary {
+                applied: 1,
+                skipped: 0
+            }
+        );
 
         let doc = group_store::get_document_unchecked("bob", "group-1", KEY_HEX, &doc_id)
             .await
@@ -1032,7 +1061,13 @@ mod tests {
         // her own pushed document back over herself -- the file is seen
         // (hence skipped: 1, not 0), just never applied (applied: 0).
         let summary = pull_if_newer("alice", "group-1", KEY_HEX).await.unwrap();
-        assert_eq!(summary, PullSummary { applied: 0, skipped: 1 });
+        assert_eq!(
+            summary,
+            PullSummary {
+                applied: 0,
+                skipped: 1
+            }
+        );
     }
 
     #[tokio::test]
@@ -1076,9 +1111,17 @@ mod tests {
             .unwrap();
         }
 
-        update_and_push_document("alice", "group-1", KEY_HEX, &doc_id, "v2").await.unwrap();
+        update_and_push_document("alice", "group-1", KEY_HEX, &doc_id, "v2")
+            .await
+            .unwrap();
         let summary = pull_if_newer("bob", "group-1", KEY_HEX).await.unwrap();
-        assert_eq!(summary, PullSummary { applied: 1, skipped: 0 });
+        assert_eq!(
+            summary,
+            PullSummary {
+                applied: 1,
+                skipped: 0
+            }
+        );
 
         let doc = group_store::get_document_unchecked("bob", "group-1", KEY_HEX, &doc_id)
             .await
@@ -1137,9 +1180,7 @@ mod tests {
         // No set_group_sync_folder call -- sync not configured.
         grant_and_push_permission("alice", "group-1", KEY_HEX, &doc_id, "bob", "write")
             .await
-            .expect(
-                "grant_and_push_permission must succeed even with no sync folder configured",
-            );
+            .expect("grant_and_push_permission must succeed even with no sync folder configured");
     }
 
     #[tokio::test]
@@ -1154,10 +1195,9 @@ mod tests {
             .await
             .unwrap();
 
-        let doc_id =
-            create_and_push_document("alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
-                .await
-                .unwrap();
+        let doc_id = create_and_push_document("alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
+            .await
+            .unwrap();
         // Carol must have the document locally before her own permissions
         // pull can attach a grant to it (documents/ and permissions/ are
         // independent sweeps).
@@ -1170,7 +1210,13 @@ mod tests {
         let summary = pull_permissions_if_newer("carol", "group-1", KEY_HEX)
             .await
             .expect("pull_permissions_if_newer must succeed");
-        assert_eq!(summary, PullSummary { applied: 1, skipped: 0 });
+        assert_eq!(
+            summary,
+            PullSummary {
+                applied: 1,
+                skipped: 0
+            }
+        );
 
         let carol_grants =
             group_store::list_permissions_for_document("carol", "group-1", KEY_HEX, &doc_id)
@@ -1193,10 +1239,9 @@ mod tests {
             .await
             .unwrap();
 
-        let doc_id =
-            create_and_push_document("alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
-                .await
-                .unwrap();
+        let doc_id = create_and_push_document("alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
+            .await
+            .unwrap();
         pull_if_newer("carol", "group-1", KEY_HEX).await.unwrap();
 
         grant_and_push_permission("alice", "group-1", KEY_HEX, &doc_id, "carol", "write")
@@ -1220,7 +1265,13 @@ mod tests {
         let summary = pull_permissions_if_newer("carol", "group-1", KEY_HEX)
             .await
             .expect("pull_permissions_if_newer must succeed");
-        assert_eq!(summary, PullSummary { applied: 1, skipped: 0 });
+        assert_eq!(
+            summary,
+            PullSummary {
+                applied: 1,
+                skipped: 0
+            }
+        );
 
         let carol_grants =
             group_store::list_permissions_for_document("carol", "group-1", KEY_HEX, &doc_id)
@@ -1244,10 +1295,9 @@ mod tests {
             .await
             .unwrap();
 
-        let doc_id =
-            create_and_push_document("alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
-                .await
-                .unwrap();
+        let doc_id = create_and_push_document("alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
+            .await
+            .unwrap();
         pull_if_newer("carol", "group-1", KEY_HEX).await.unwrap();
         grant_and_push_permission("alice", "group-1", KEY_HEX, &doc_id, "carol", "write")
             .await
@@ -1256,14 +1306,23 @@ mod tests {
         let first = pull_permissions_if_newer("carol", "group-1", KEY_HEX)
             .await
             .unwrap();
-        assert_eq!(first, PullSummary { applied: 1, skipped: 0 });
+        assert_eq!(
+            first,
+            PullSummary {
+                applied: 1,
+                skipped: 0
+            }
+        );
 
         let second = pull_permissions_if_newer("carol", "group-1", KEY_HEX)
             .await
             .unwrap();
         assert_eq!(
             second,
-            PullSummary { applied: 0, skipped: 1 },
+            PullSummary {
+                applied: 0,
+                skipped: 1
+            },
             "nothing changed since the last pull -- must not reapply"
         );
     }
@@ -1277,10 +1336,9 @@ mod tests {
             .await
             .unwrap();
 
-        let doc_id =
-            create_and_push_document("alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
-                .await
-                .unwrap();
+        let doc_id = create_and_push_document("alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
+            .await
+            .unwrap();
         grant_and_push_permission("alice", "group-1", KEY_HEX, &doc_id, "bob", "write")
             .await
             .unwrap();
@@ -1290,7 +1348,13 @@ mod tests {
         let summary = pull_permissions_if_newer("alice", "group-1", KEY_HEX)
             .await
             .unwrap();
-        assert_eq!(summary, PullSummary { applied: 0, skipped: 1 });
+        assert_eq!(
+            summary,
+            PullSummary {
+                applied: 0,
+                skipped: 1
+            }
+        );
     }
 
     #[tokio::test]
@@ -1306,10 +1370,9 @@ mod tests {
             .await
             .unwrap();
 
-        let doc_id =
-            create_and_push_document("alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
-                .await
-                .unwrap();
+        let doc_id = create_and_push_document("alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
+            .await
+            .unwrap();
         grant_and_push_permission("alice", "group-1", KEY_HEX, &doc_id, "carol", "write")
             .await
             .unwrap();
@@ -1320,7 +1383,13 @@ mod tests {
         let before = pull_permissions_if_newer("carol", "group-1", KEY_HEX)
             .await
             .expect("pull_permissions_if_newer must not error on an unsynced document");
-        assert_eq!(before, PullSummary { applied: 0, skipped: 1 });
+        assert_eq!(
+            before,
+            PullSummary {
+                applied: 0,
+                skipped: 1
+            }
+        );
         assert!(
             group_store::list_permissions_for_document("carol", "group-1", KEY_HEX, &doc_id)
                 .await
@@ -1334,7 +1403,13 @@ mod tests {
         let after = pull_permissions_if_newer("carol", "group-1", KEY_HEX)
             .await
             .unwrap();
-        assert_eq!(after, PullSummary { applied: 1, skipped: 0 });
+        assert_eq!(
+            after,
+            PullSummary {
+                applied: 1,
+                skipped: 0
+            }
+        );
         assert_eq!(
             group_store::list_permissions_for_document("carol", "group-1", KEY_HEX, &doc_id)
                 .await

@@ -704,8 +704,10 @@ impl PaneHost {
                             *state |= if event.button() == 8 { 0b01 } else { 0b10 };
                             *state
                         };
-                        webview.run_javascript(
+                        webview.evaluate_javascript(
                             &mouse_backforward_mousedown_js(event, held),
+                            None,
+                            None,
                             None::<&gtk::gio::Cancellable>,
                             |_| {},
                         );

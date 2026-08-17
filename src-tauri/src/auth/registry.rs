@@ -586,7 +586,10 @@ mod group_key_registry_tests {
         let via_with_key = registry
             .with_key("persona-a", "group-1", |k| key_hex(&k.group_key))
             .await;
-        assert_eq!(registry.key_hex_for("persona-a", "group-1").await, via_with_key);
+        assert_eq!(
+            registry.key_hex_for("persona-a", "group-1").await,
+            via_with_key
+        );
     }
 
     #[tokio::test]
