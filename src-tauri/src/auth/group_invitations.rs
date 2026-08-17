@@ -42,16 +42,17 @@
 // add_user_to_persona), but the schema and the store API both genuinely
 // allow it, so this function does not pretend otherwise.
 //
-// REAL GAP, flagged not solved here: GroupKeyRegistry is explicitly
-// volatile Tauri-managed state (see its own header in auth/registry.rs) --
-// after accept_invitation populates it, that in-memory slot is the ONLY
-// place the decrypted group key exists. There is no groups/durable-
-// membership table anywhere in shared.db. On app restart or logout, the key
-// is gone, pending_group_invitations.status still reads 'accepted', and
-// nothing re-derives it -- the invitation envelope itself isn't a durable
-// secret store, it's only decryptable via the exact flow that already ran
-// once. Durable group-membership/key storage is items.id=285/288 territory,
-// not this item's -- flagged in this item's handoff, not built here.
+// FORMER GAP, closed by items.id=290 (decisions.id=718): GroupKeyRegistry is
+// explicitly volatile Tauri-managed state (see its own header in
+// auth/registry.rs) -- after accept_invitation populates it, that in-memory
+// slot used to be the ONLY place the decrypted group key existed. On app
+// restart or logout, the key was gone, pending_group_invitations.status
+// still read 'accepted', and nothing re-derived it -- the invitation
+// envelope itself isn't a durable secret store, it's only decryptable via
+// the exact flow that already ran once. accept_invitation now also writes
+// the key to personal.db's group_keys table (group_key_store.rs) right
+// after populating the registry; commands::auth::finish_login reads it back
+// at login to rehydrate the registry.
 //
 // QUERY STYLE: runtime sqlx::query() only -- no query!() macros. shared.db
 // is unencrypted -- no PRAGMA key required (same as persona_store.rs).
@@ -66,6 +67,8 @@ use x25519_dalek::StaticSecret;
 use crate::auth::kdf;
 use crate::auth::registry::{GroupKeyRegistry, UnlockedGroupKey};
 use crate::auth::sharing_keypair::{self, SharingKeypairError};
+use crate::persistence::group_key_store;
+use crate::persistence::personal_store::PersonalStoreError;
 
 #[derive(Debug, Error)]
 pub enum GroupInvitationError {
@@ -87,6 +90,8 @@ pub enum GroupInvitationError {
     NotFound(String),
     #[error("Invitation '{0}' is not pending (status: {1})")]
     NotPending(String, String),
+    #[error("Failed to durably persist group key: {0}")]
+    PersonalStore(#[from] PersonalStoreError),
 }
 
 // ---------------------------------------------------------------------------
@@ -307,27 +312,35 @@ async fn fetch_pending_invitation(
 /// own resident sharing private key (KeyRegistry::with_key exposes it as
 /// UnlockedKey.sharing_private_key -- reconstruct via
 /// StaticSecret::from(unlocked_key.sharing_private_key)), populate
-/// GroupKeyRegistry, and mark the row accepted.
+/// GroupKeyRegistry, durably persist the key to personal.db (items.id=290,
+/// decisions.id=718), and mark the row accepted.
 ///
 /// ORDERING, deliberate: decrypt (step 2) happens before ANY row mutation --
 /// on tamper/wrong-key it returns Err(GroupInvitationError::Sharing(
 /// SharingKeypairError::DecryptionFailed)) unchanged and the row is left
 /// exactly as it was (still 'pending'), not silently marked accepted or
-/// declined. No SAVEPOINT wraps steps 4-5 (registry populate, then status
-/// UPDATE): memory (GroupKeyRegistry) and shared.db are two different
-/// storage systems, so no SAVEPOINT could make them atomic together
-/// regardless. What actually makes this safe is idempotency, not atomicity
-/// -- decrypt_own_envelope is a pure function of the stored ciphertext and
-/// the caller's private key, so a crash between steps 4 and 5 just leaves
-/// the row 'pending'; retrying accept_invitation on that still-pending row
-/// reproduces the identical group key and re-overwrites the same registry
-/// slot, rather than producing a different or corrupted result.
+/// declined. The personal.db write (items.id=290) happens after the
+/// registry populate but BEFORE the status UPDATE below, and its failure
+/// propagates as Err -- durable storage is this function's actual point,
+/// not a nice-to-have, so a write failure must leave the invitation
+/// 'pending' for retry rather than silently completing without it. No
+/// SAVEPOINT wraps registry populate / personal.db write / status UPDATE:
+/// three different storage systems (memory, personal.db, shared.db), so no
+/// SAVEPOINT could make them atomic together regardless. What actually
+/// makes this safe is idempotency, not atomicity -- decrypt_own_envelope is
+/// a pure function of the stored ciphertext and the caller's private key,
+/// and group_key_store::save_group_key upserts on group_id, so a crash at
+/// any point before the final status UPDATE just leaves the row 'pending';
+/// retrying accept_invitation on that still-pending row reproduces the
+/// identical group key and re-overwrites the same registry slot / personal.db
+/// row, rather than producing a different or corrupted result.
 #[allow(dead_code)] // items.id=284: ahead of its first real caller (invite-UI item, not yet scoped)
 pub async fn accept_invitation(
     invitation_id: &str,
     recipient_persona_id: &str,
     sharing_private_key: &StaticSecret,
     group_key_registry: &GroupKeyRegistry,
+    personal_key_hex: &str,
 ) -> Result<(), GroupInvitationError> {
     let mut conn = open_shared_db().await?;
     let invitation =
@@ -348,10 +361,27 @@ pub async fn accept_invitation(
             UnlockedGroupKey {
                 group_id: invitation.group_id.clone(),
                 group_key,
-                unlocked_at,
+                unlocked_at: unlocked_at.clone(),
             },
         )
         .await;
+
+    // items.id=290, decisions.id=718: durable backing for the registry
+    // entry just populated above -- without this, the key above is gone the
+    // instant this process restarts, with pending_group_invitations still
+    // reading 'accepted' and no way to re-derive it. Hard requirement (see
+    // this fn's own doc comment on ORDERING) -- a failure here must abort
+    // before the row is marked accepted, not complete silently without it.
+    let owner_user_id = resolve_persona_owner(recipient_persona_id, &mut conn).await?;
+    group_key_store::save_group_key(
+        &owner_user_id,
+        recipient_persona_id,
+        personal_key_hex,
+        &invitation.group_id,
+        &crate::auth::registry::key_hex(&group_key),
+        &unlocked_at,
+    )
+    .await?;
 
     sqlx::query(
         "UPDATE pending_group_invitations
@@ -423,6 +453,9 @@ mod tests {
     use super::*;
     use crate::persistence::persona_store;
     use crate::test_support::ENV_MUTEX;
+
+    const PERSONAL_KEY_HEX: &str =
+        "aabbccddeeff00112233445566778899aabbccddeeff0011223344556677aa";
 
     struct TestEnv {
         _tempdir: tempfile::TempDir,
@@ -524,6 +557,7 @@ mod tests {
             &recipient_persona,
             &recipient_private_key,
             &registry,
+            PERSONAL_KEY_HEX,
         )
         .await
         .expect("accept_invitation must succeed");
@@ -538,6 +572,56 @@ mod tests {
             .await
             .expect("list_pending_invitations must succeed");
         assert!(pending_after.is_empty());
+    }
+
+    #[tokio::test]
+    async fn accept_invitation_durably_persists_the_group_key_to_personal_db() {
+        // items.id=290, decisions.id=718: the whole point of the durable
+        // write -- prove it actually lands in personal.db's group_keys
+        // table, not just the in-memory registry.
+        let _env = setup().await;
+        let (_sender_user, sender_persona, _) = make_user_with_persona("Alice", 0xA1).await;
+        let (recipient_user, recipient_persona, recipient_private_key) =
+            make_user_with_persona("Bob", 0xA2).await;
+
+        let group_id = "group-durable-1";
+        let group_key = [0xE1u8; kdf::MASTER_KEY_LEN];
+
+        let invitation_id = send_invitation(
+            &recipient_persona,
+            group_id,
+            "Durable Test Group",
+            &sender_persona,
+            &group_key,
+        )
+        .await
+        .expect("send_invitation must succeed");
+
+        let registry = GroupKeyRegistry::default();
+        accept_invitation(
+            &invitation_id,
+            &recipient_persona,
+            &recipient_private_key,
+            &registry,
+            PERSONAL_KEY_HEX,
+        )
+        .await
+        .expect("accept_invitation must succeed");
+
+        let rows = crate::persistence::group_key_store::list_group_keys(
+            &recipient_user,
+            &recipient_persona,
+            PERSONAL_KEY_HEX,
+        )
+        .await
+        .expect("list_group_keys must succeed");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].group_id, group_id);
+        assert_eq!(
+            rows[0].group_key_hex,
+            crate::auth::registry::key_hex(&group_key)
+        );
     }
 
     #[tokio::test]
@@ -617,6 +701,7 @@ mod tests {
             &recipient_persona,
             &recipient_private_key,
             &registry,
+            PERSONAL_KEY_HEX,
         )
         .await;
 
@@ -694,8 +779,14 @@ mod tests {
         let (_user, persona_id, private_key) = make_user_with_persona("Solo", 0xBB).await;
         let registry = GroupKeyRegistry::default();
 
-        let result =
-            accept_invitation("nonexistent-id", &persona_id, &private_key, &registry).await;
+        let result = accept_invitation(
+            "nonexistent-id",
+            &persona_id,
+            &private_key,
+            &registry,
+            PERSONAL_KEY_HEX,
+        )
+        .await;
         assert!(matches!(result, Err(GroupInvitationError::NotFound(_))));
     }
 
@@ -723,6 +814,7 @@ mod tests {
             &recipient_persona,
             &recipient_private_key,
             &registry,
+            PERSONAL_KEY_HEX,
         )
         .await
         .expect("first accept must succeed");
@@ -732,6 +824,7 @@ mod tests {
             &recipient_persona,
             &recipient_private_key,
             &registry,
+            PERSONAL_KEY_HEX,
         )
         .await;
         assert!(matches!(

@@ -124,6 +124,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/personal_004.sql"),
     },
     SchemaFile {
+        prefix: "personal",
+        version: 5,
+        sql: include_str!("../../schema/personal_005.sql"),
+    },
+    SchemaFile {
         prefix: "plan_state",
         version: 1,
         sql: include_str!("../../schema/plan_state_001.sql"),
@@ -1247,8 +1252,8 @@ mod tests {
 
         assert_eq!(
             result.expect("migration must apply cleanly to a real encrypted file"),
-            4,
-            "personal_001 + personal_002 + personal_003 + personal_004 must all apply in one pass"
+            5,
+            "personal_001 + personal_002 + personal_003 + personal_004 + personal_005 must all apply in one pass"
         );
 
         let mut conn = open_verify_conn(&db_path, Some(TEST_KEY_HEX)).await;
@@ -1260,6 +1265,7 @@ mod tests {
             "source_registry",
             "dedup_candidates",
             "document_forks",
+            "group_keys",
         ] {
             assert!(
                 table_exists(&mut conn, table).await,
@@ -1302,7 +1308,7 @@ mod tests {
             std::env::remove_var("QR_DATA_ROOT");
         }
 
-        assert_eq!(first.expect("first migration must succeed"), 4);
+        assert_eq!(first.expect("first migration must succeed"), 5);
         assert_eq!(
             second.expect("second migration on an already-migrated real file must not error"),
             0,

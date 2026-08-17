@@ -47,14 +47,17 @@
 // resident persona, run before that tick's pull sweep -- a rotation must
 // land before a pull can usefully decrypt anything pushed under the new
 // key. If a remaining member's OLD key isn't currently resident in
-// GroupKeyRegistry when polled (e.g. the app was restarted -- group keys do
-// not survive restart today, items.id=290, not fixed here), the rotation
-// for that persona simply stays 'pending' and is retried next poll --
-// inherits items.id=290's already-accepted limitation rather than
-// introducing a new one.
+// GroupKeyRegistry when polled, the rotation for that persona simply stays
+// 'pending' and is retried next poll. items.id=290/decisions.id=718 closed
+// the common cause of this (group keys now survive restart -- rehydrated at
+// login by commands::auth::finish_login from personal.db's group_keys
+// table), but the skip-and-retry behavior itself stays as a safety net --
+// rehydration is itself best-effort (a corrupt row/persona is skipped and
+// logged rather than blocking login) and only runs at login, not
+// continuously.
 //
 // ROSTER DERIVATION, deliberately NOT a durable membership table
-// (items.id=290/291 stay out of scope, per Jason's brief): "remaining
+// (items.id=291 stays out of scope, per Jason's brief): "remaining
 // members" = every persona_id with an ACCEPTED row in
 // pending_group_invitations for this group_id, minus anyone recorded in the
 // new group_departures table (schema/shared_006.sql), minus the persona
@@ -99,10 +102,12 @@ use x25519_dalek::StaticSecret;
 
 use crate::auth::group_invitations::{self, GroupInvitationError};
 use crate::auth::kdf;
-use crate::auth::registry::{GroupKeyRegistry, UnlockedGroupKey};
+use crate::auth::registry::{GroupKeyRegistry, KeyRegistry, UnlockedGroupKey};
 use crate::auth::sharing_keypair::{self, SharingKeypairError};
 use crate::group_sync::engine as group_sync_engine;
+use crate::persistence::group_key_store;
 use crate::persistence::group_store::{self, GroupStoreError};
+use crate::persistence::personal_store::PersonalStoreError;
 
 #[derive(Debug, Error)]
 pub enum GroupMembershipError {
@@ -126,6 +131,8 @@ pub enum GroupMembershipError {
     CorruptGroupKey(String),
     #[error("Invalid departure reason '{0}' -- must be 'left' or 'removed'")]
     InvalidReason(String),
+    #[error("Failed to durably persist group key: {0}")]
+    PersonalStore(#[from] PersonalStoreError),
 }
 
 // ---------------------------------------------------------------------------
@@ -253,12 +260,26 @@ pub(crate) async fn remaining_members(
 /// in-memory state atomic together regardless (same reasoning
 /// accept_invitation's own doc comment gives for its registry-then-DB
 /// ordering).
+///
+/// PERSONAL.DB SYNC ON EVICT (items.id=290, decisions.id=718): right after
+/// evicting the registry entry, this also attempts to delete the matching
+/// durable row from personal.db's group_keys table, so the two don't drift
+/// apart. Deliberately best-effort (log on failure, never propagated) for a
+/// structural reason, not convenience: `remove_member` runs on the
+/// *initiator's* install, and `departing_persona_id`'s owning account's
+/// master key is only ever resident here (via `key_registry`) when the
+/// departing persona IS the currently logged-in account -- true
+/// self-departure. For every other case (this account removing someone
+/// else's persona), there's nothing local to delete, by construction, not
+/// by failure -- see this module's own header ("a household's members each
+/// run their own QR install").
 pub async fn remove_member(
     group_id: &str,
     departing_persona_id: &str,
     reason: DepartureReason,
     sender_label: &str,
     group_key_registry: &GroupKeyRegistry,
+    key_registry: &KeyRegistry,
 ) -> Result<(), GroupMembershipError> {
     let mut conn = open_shared_db().await?;
 
@@ -296,6 +317,33 @@ pub async fn remove_member(
     group_key_registry
         .clear(departing_persona_id, group_id)
         .await;
+
+    // See this fn's own doc comment (PERSONAL.DB SYNC ON EVICT) -- only
+    // ever reachable when departing_persona_id is this account's own
+    // persona; a no-op everywhere else.
+    if let Some((current_user_id, current_key_hex)) = key_registry
+        .with_key(|k| (k.user_id.clone(), crate::auth::registry::key_hex(&k.master_key)))
+        .await
+    {
+        match group_invitations::resolve_persona_owner(departing_persona_id, &mut conn).await {
+            Ok(owner_user_id) if owner_user_id == current_user_id => {
+                if let Err(e) = group_key_store::delete_group_key(
+                    &current_user_id,
+                    departing_persona_id,
+                    &current_key_hex,
+                    group_id,
+                )
+                .await
+                {
+                    log::warn!(
+                        "remove_member: couldn't delete stale personal.db group_keys row for \
+                         persona={departing_persona_id} group={group_id}: {e}"
+                    );
+                }
+            }
+            _ => {} // not this account's own departure -- nothing local to clean up
+        }
+    }
 
     Ok(())
 }
@@ -391,10 +439,26 @@ async fn remove_member_inner(
 /// row is a correctness problem (this persona's local group.db key state
 /// could end up wrong) worth surfacing to the caller's log, not a routine
 /// "peer hasn't pushed yet" condition to silently skip past.
+///
+/// PERSONAL.DB DURABLE WRITE (items.id=290, decisions.id=718): each
+/// iteration now also durably persists the freshly-decrypted key to
+/// personal.db (group_key_store::save_group_key) BEFORE calling
+/// `rekey_group_db` below -- not merely before the status UPDATE.
+/// `rekey_group_db` physically rewrites the group.db file under the new
+/// key, an irreversible step that is not safely re-runnable: if the
+/// personal.db write were placed after it and then failed, a retry would
+/// still be holding the now-stale `old_key_hex` (the registry hasn't been
+/// updated yet either) and would try to open a file already rewritten under
+/// the new key, and fail. Placing the durable write first keeps every step
+/// safely re-runnable on failure -- decrypt is a pure function of the
+/// stored envelope, and save_group_key upserts on group_id, so retrying
+/// from a `write failed` state reproduces the identical key and simply
+/// tries the write again.
 pub async fn apply_pending_rotations(
     persona_id: &str,
     group_key_registry: &GroupKeyRegistry,
     sharing_private_key: &StaticSecret,
+    personal_key_hex: &str,
 ) -> Result<(), GroupMembershipError> {
     let mut conn = open_shared_db().await?;
 
@@ -405,6 +469,8 @@ pub async fn apply_pending_rotations(
     .bind(persona_id)
     .fetch_all(&mut conn)
     .await?;
+
+    let owner_user_id = group_invitations::resolve_persona_owner(persona_id, &mut conn).await?;
 
     for (rotation_id, group_id, encrypted_hex) in rows {
         let Some(old_key_hex) = group_key_registry.key_hex_for(persona_id, &group_id).await
@@ -418,6 +484,18 @@ pub async fn apply_pending_rotations(
             .try_into()
             .map_err(|_| GroupMembershipError::CorruptGroupKey(rotation_id.clone()))?;
         let new_key_hex = crate::auth::registry::key_hex(&new_group_key);
+
+        // See this fn's own doc comment (PERSONAL.DB DURABLE WRITE) -- must
+        // run before rekey_group_db, not after.
+        group_key_store::save_group_key(
+            &owner_user_id,
+            persona_id,
+            personal_key_hex,
+            &group_id,
+            &new_key_hex,
+            &crate::providers::utils::now(),
+        )
+        .await?;
 
         group_store::rekey_group_db(persona_id, &group_id, &old_key_hex, &new_key_hex).await?;
 
@@ -468,6 +546,9 @@ mod tests {
     use super::*;
     use crate::persistence::persona_store;
     use crate::test_support::ENV_MUTEX;
+
+    const PERSONAL_KEY_HEX: &str =
+        "aabbccddeeff00112233445566778899aabbccddeeff0011223344556677aa";
 
     struct TestEnv {
         _tempdir: tempfile::TempDir,
@@ -613,6 +694,7 @@ mod tests {
             DepartureReason::Left,
             &sender_persona,
             &registry,
+            &KeyRegistry::default(),
         )
         .await
         .expect("first remove_member must succeed");
@@ -623,6 +705,7 @@ mod tests {
             DepartureReason::Left,
             &sender_persona,
             &registry,
+            &KeyRegistry::default(),
         )
         .await;
         assert!(matches!(
@@ -651,9 +734,15 @@ mod tests {
         )
         .await
         .unwrap();
-        group_invitations::accept_invitation(&b_invitation, &b_persona, &b_private_key, &registry)
-            .await
-            .unwrap();
+        group_invitations::accept_invitation(
+            &b_invitation,
+            &b_persona,
+            &b_private_key,
+            &registry,
+            PERSONAL_KEY_HEX,
+        )
+        .await
+        .unwrap();
 
         let c_invitation = group_invitations::send_invitation(
             &c_persona,
@@ -664,9 +753,15 @@ mod tests {
         )
         .await
         .unwrap();
-        group_invitations::accept_invitation(&c_invitation, &c_persona, &c_private_key, &registry)
-            .await
-            .unwrap();
+        group_invitations::accept_invitation(
+            &c_invitation,
+            &c_persona,
+            &c_private_key,
+            &registry,
+            PERSONAL_KEY_HEX,
+        )
+        .await
+        .unwrap();
 
         assert!(registry.is_occupied(&b_persona, group_id).await);
         assert!(registry.is_occupied(&c_persona, group_id).await);
@@ -677,6 +772,7 @@ mod tests {
             DepartureReason::Removed,
             &sender_persona,
             &registry,
+            &KeyRegistry::default(),
         )
         .await
         .expect("remove_member must succeed");
@@ -712,6 +808,165 @@ mod tests {
         assert_eq!(decrypted.len(), kdf::MASTER_KEY_LEN);
     }
 
+    #[tokio::test]
+    async fn remove_member_self_departure_deletes_personal_db_row() {
+        // items.id=290, decisions.id=718: the departing persona's own
+        // account (its master key resident in KeyRegistry) must have its
+        // durable group_keys row cleaned up alongside the in-memory
+        // eviction -- see remove_member's own doc comment (PERSONAL.DB
+        // SYNC ON EVICT).
+        let _env = setup().await;
+        let (_sender_user, sender_persona, _) = make_user_with_persona("Sender", 0xE0).await;
+
+        let departing_master_key = [0xE1u8; kdf::MASTER_KEY_LEN];
+        let (departing_user, departing_persona, departing_private_key) =
+            make_user_with_persona("Departing", 0xE1).await;
+        let departing_key_hex = crate::auth::registry::key_hex(&departing_master_key);
+
+        let group_id = "group-self-departure-1";
+        let group_key = [0xE2u8; kdf::MASTER_KEY_LEN];
+        let registry = GroupKeyRegistry::default();
+
+        let invitation = group_invitations::send_invitation(
+            &departing_persona,
+            group_id,
+            "Test Group",
+            &sender_persona,
+            &group_key,
+        )
+        .await
+        .unwrap();
+        group_invitations::accept_invitation(
+            &invitation,
+            &departing_persona,
+            &departing_private_key,
+            &registry,
+            &departing_key_hex,
+        )
+        .await
+        .unwrap();
+
+        let rows_before = crate::persistence::group_key_store::list_group_keys(
+            &departing_user,
+            &departing_persona,
+            &departing_key_hex,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows_before.len(), 1, "durable row must exist before departure");
+
+        let key_registry = KeyRegistry::default();
+        key_registry
+            .replace(crate::auth::registry::UnlockedKey {
+                user_id: departing_user.clone(),
+                master_key: departing_master_key,
+                sharing_private_key: departing_private_key.to_bytes(),
+                unlocked_at: "2026-01-01T00:00:00Z".to_owned(),
+            })
+            .await;
+
+        remove_member(
+            group_id,
+            &departing_persona,
+            DepartureReason::Left,
+            &sender_persona,
+            &registry,
+            &key_registry,
+        )
+        .await
+        .expect("remove_member must succeed");
+
+        let rows_after = crate::persistence::group_key_store::list_group_keys(
+            &departing_user,
+            &departing_persona,
+            &departing_key_hex,
+        )
+        .await
+        .unwrap();
+        assert!(
+            rows_after.is_empty(),
+            "self-departure must delete the durable personal.db row"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_member_of_someone_else_does_not_touch_their_personal_db() {
+        // The structural no-op case (this module's own doc comment) -- the
+        // initiator's install has no way to reach a different account's
+        // personal.db (no resident key for it), so the delete attempt must
+        // be silently skipped, not error, when key_registry holds a
+        // DIFFERENT account than departing_persona_id's owner.
+        let _env = setup().await;
+        let (_sender_user, sender_persona, _) = make_user_with_persona("Sender", 0xE3).await;
+
+        let departing_master_key = [0xE4u8; kdf::MASTER_KEY_LEN];
+        let (departing_user, departing_persona, departing_private_key) =
+            make_user_with_persona("Departing", 0xE4).await;
+        let departing_key_hex = crate::auth::registry::key_hex(&departing_master_key);
+
+        let group_id = "group-remote-departure-1";
+        let group_key = [0xE5u8; kdf::MASTER_KEY_LEN];
+        let registry = GroupKeyRegistry::default();
+
+        let invitation = group_invitations::send_invitation(
+            &departing_persona,
+            group_id,
+            "Test Group",
+            &sender_persona,
+            &group_key,
+        )
+        .await
+        .unwrap();
+        group_invitations::accept_invitation(
+            &invitation,
+            &departing_persona,
+            &departing_private_key,
+            &registry,
+            &departing_key_hex,
+        )
+        .await
+        .unwrap();
+
+        // The initiator's own resident session -- a DIFFERENT account from
+        // the departing persona's owner.
+        let (initiator_user, _initiator_persona, initiator_private_key) =
+            make_user_with_persona("Initiator", 0xE6).await;
+        let initiator_master_key = [0xE6u8; kdf::MASTER_KEY_LEN];
+        let key_registry = KeyRegistry::default();
+        key_registry
+            .replace(crate::auth::registry::UnlockedKey {
+                user_id: initiator_user,
+                master_key: initiator_master_key,
+                sharing_private_key: initiator_private_key.to_bytes(),
+                unlocked_at: "2026-01-01T00:00:00Z".to_owned(),
+            })
+            .await;
+
+        remove_member(
+            group_id,
+            &departing_persona,
+            DepartureReason::Removed,
+            &sender_persona,
+            &registry,
+            &key_registry,
+        )
+        .await
+        .expect("remove_member must succeed even when it can't reach the departing persona's own personal.db");
+
+        let rows_after = crate::persistence::group_key_store::list_group_keys(
+            &departing_user,
+            &departing_persona,
+            &departing_key_hex,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rows_after.len(),
+            1,
+            "a different account's own personal.db row must be untouched"
+        );
+    }
+
     // -- apply_pending_rotations -----------------------------------------------
 
     #[tokio::test]
@@ -741,6 +996,7 @@ mod tests {
             &recipient_persona,
             &recipient_private_key,
             &registry,
+            PERSONAL_KEY_HEX,
         )
         .await
         .unwrap();
@@ -773,6 +1029,7 @@ mod tests {
             &departing_persona,
             &departing_private_key,
             &registry,
+            PERSONAL_KEY_HEX,
         )
         .await
         .unwrap();
@@ -783,13 +1040,19 @@ mod tests {
             DepartureReason::Left,
             &sender_persona,
             &registry,
+            &KeyRegistry::default(),
         )
         .await
         .unwrap();
 
-        apply_pending_rotations(&recipient_persona, &registry, &recipient_private_key)
-            .await
-            .expect("apply_pending_rotations must succeed");
+        apply_pending_rotations(
+            &recipient_persona,
+            &registry,
+            &recipient_private_key,
+            PERSONAL_KEY_HEX,
+        )
+        .await
+        .expect("apply_pending_rotations must succeed");
 
         let new_key_hex = registry
             .key_hex_for(&recipient_persona, group_id)
@@ -849,6 +1112,7 @@ mod tests {
             &recipient_persona,
             &recipient_private_key,
             &registry,
+            PERSONAL_KEY_HEX,
         )
         .await
         .unwrap();
@@ -867,6 +1131,7 @@ mod tests {
             &departing_persona,
             &departing_private_key,
             &registry,
+            PERSONAL_KEY_HEX,
         )
         .await
         .unwrap();
@@ -877,17 +1142,23 @@ mod tests {
             DepartureReason::Left,
             &sender_persona,
             &registry,
+            &KeyRegistry::default(),
         )
         .await
         .unwrap();
 
         // Simulate recipient's key not being resident this session (e.g.
-        // app restarted, items.id=290) by evicting it before polling.
+        // app restarted) by evicting it before polling.
         registry.clear(&recipient_persona, group_id).await;
 
-        apply_pending_rotations(&recipient_persona, &registry, &recipient_private_key)
-            .await
-            .expect("apply_pending_rotations must not error when the old key isn't resident");
+        apply_pending_rotations(
+            &recipient_persona,
+            &registry,
+            &recipient_private_key,
+            PERSONAL_KEY_HEX,
+        )
+        .await
+        .expect("apply_pending_rotations must not error when the old key isn't resident");
 
         let mut conn = open_shared_db().await.unwrap();
         let status: (String,) = sqlx::query_as(

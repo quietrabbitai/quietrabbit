@@ -307,17 +307,23 @@ async fn async_main() {
                     // resident-keys-only limitation as the pull sweep: a
                     // rotation for a persona whose OLD key isn't currently
                     // resident is skipped by apply_pending_rotations itself
-                    // and retried next tick, inheriting items.id=290's
-                    // already-accepted limitation rather than introducing a
-                    // new one. sharing_private_key is per-ACCOUNT (KeyRegistry's
+                    // and retried next tick -- items.id=290/decisions.id=718
+                    // closes the common restart case of this (rehydrated at
+                    // login), see group_membership.rs's own header for
+                    // remaining caveats. sharing_private_key AND
+                    // personal_key_hex are both per-ACCOUNT (KeyRegistry's
                     // single slot), not per-persona -- fetched once per tick
                     // and reused for every resident persona, since at most
                     // one account is ever unlocked in this process (Section
-                    // 4.2's single-slot model).
+                    // 4.2's single-slot model). personal_key_hex feeds
+                    // apply_pending_rotations' own items.id=290 durable-write
+                    // step (group_key_store::save_group_key).
                     let key_registry =
                         pull_handle.state::<quietrabbit_lib::auth::registry::KeyRegistry>();
-                    if let Some(sharing_private_key_bytes) =
-                        key_registry.sharing_private_key().await
+                    let sharing_private_key_opt = key_registry.sharing_private_key().await;
+                    let personal_key_hex_opt = key_registry.personal_key_hex().await;
+                    if let (Some(sharing_private_key_bytes), Some(personal_key_hex)) =
+                        (sharing_private_key_opt, personal_key_hex_opt)
                     {
                         let sharing_private_key =
                             x25519_dalek::StaticSecret::from(sharing_private_key_bytes);
@@ -333,6 +339,7 @@ async fn async_main() {
                                     &persona_id,
                                     &registry,
                                     &sharing_private_key,
+                                    &personal_key_hex,
                                 )
                                 .await
                             {

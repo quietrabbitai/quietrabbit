@@ -66,9 +66,10 @@
 use tauri::State;
 
 use crate::auth::kdf;
-use crate::auth::registry::{key_hex, KeyRegistry, UnlockedKey};
+use crate::auth::registry::{key_hex, GroupKeyRegistry, KeyRegistry, UnlockedGroupKey, UnlockedKey};
 use crate::auth::sharing_keypair;
 use crate::auth::user_store;
+use crate::persistence::{group_key_store, persona_store};
 
 // ---------------------------------------------------------------------------
 // IPC types
@@ -251,6 +252,7 @@ pub async fn login(
     display_name: String,
     password: String,
     key_registry: State<'_, KeyRegistry>,
+    group_key_registry: State<'_, GroupKeyRegistry>,
 ) -> Result<(), String> {
     let has_users = user_store::has_any_users()
         .await
@@ -329,7 +331,7 @@ pub async fn login(
         // onboarding runs -- a real, named, deliberate intermediate
         // state, not an oversight. >>>
 
-        finish_login(&user_id, master_key, &key_registry).await
+        finish_login(&user_id, master_key, &key_registry, &group_key_registry).await
     } else {
         let user = user_store::find_user_by_display_name(&display_name)
             .await
@@ -368,15 +370,35 @@ pub async fn login(
                 // the password was wrong.
                 Err(format!("couldn't verify credentials: {msg}"))
             }
-            Ok(()) => finish_login(&user.id, candidate_key, &key_registry).await,
+            Ok(()) => {
+                finish_login(&user.id, candidate_key, &key_registry, &group_key_registry).await
+            }
         }
     }
+}
+
+/// Decode a stored group_key_hex value into raw key bytes, or None if it's
+/// malformed (odd length, non-hex characters, or the wrong decoded length).
+/// Local to this module, matching this codebase's established convention of
+/// duplicating this small hex-decode loop per module rather than factoring
+/// out a shared utility (existing independent copies: auth/sharing_keypair.rs,
+/// auth/group_invitations.rs, auth/group_membership.rs, auth/user_store.rs).
+fn hex_decode_group_key(s: &str) -> Option<[u8; kdf::MASTER_KEY_LEN]> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes: Option<Vec<u8>> = (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+        .collect();
+    bytes?.try_into().ok()
 }
 
 async fn finish_login(
     user_id: &str,
     master_key: [u8; kdf::MASTER_KEY_LEN],
     key_registry: &State<'_, KeyRegistry>,
+    group_key_registry: &State<'_, GroupKeyRegistry>,
 ) -> Result<(), String> {
     let now = crate::providers::utils::now();
 
@@ -394,6 +416,62 @@ async fn finish_login(
             unlocked_at: now.clone(),
         })
         .await;
+
+    // items.id=290, decisions.id=718: rehydrate GroupKeyRegistry from every
+    // one of this account's personas' personal.db group_keys tables --
+    // GroupKeyRegistry itself stays deliberately volatile (auth/registry.rs's
+    // own header), so this is the only point anything re-populates it after
+    // a restart. Best-effort at every level (Q1, confirmed): a malformed
+    // row, an entire persona's unreadable personal.db, or the persona list
+    // itself failing are all logged and skipped, never propagated -- this
+    // is account-level login, and blocking an entire account over one
+    // corrupted ancillary row would be a lockout bug, not a safety
+    // improvement (there would be no way to fix the row without being able
+    // to log in in the first place).
+    let personal_key_hex = key_hex(&master_key);
+    match persona_store::list_personas_for_user(user_id).await {
+        Ok(personas) => {
+            for persona in personas {
+                match group_key_store::list_group_keys(user_id, &persona.id, &personal_key_hex)
+                    .await
+                {
+                    Ok(rows) => {
+                        for row in rows {
+                            let Some(group_key) = hex_decode_group_key(&row.group_key_hex) else {
+                                log::warn!(
+                                    "finish_login: malformed group_key_hex for persona={} \
+                                     group={} -- skipping this row",
+                                    persona.id,
+                                    row.group_id
+                                );
+                                continue;
+                            };
+                            group_key_registry
+                                .replace(
+                                    &persona.id,
+                                    &row.group_id,
+                                    UnlockedGroupKey {
+                                        group_id: row.group_id.clone(),
+                                        group_key,
+                                        unlocked_at: now.clone(),
+                                    },
+                                )
+                                .await;
+                        }
+                    }
+                    Err(e) => log::warn!(
+                        "finish_login: couldn't read group_keys for persona={}: {e} -- \
+                         skipping this persona",
+                        persona.id
+                    ),
+                }
+            }
+        }
+        Err(e) => log::warn!(
+            "finish_login: couldn't list personas for user={user_id}: {e} -- \
+             skipping group-key rehydration entirely"
+        ),
+    }
 
     let mut conn = open_shared_db().await?;
     // Section 3.1: absolute session lifetime, "hard ceiling... currently
@@ -559,6 +637,7 @@ mod tests {
     fn mock_app_with_registry() -> tauri::App<tauri::test::MockRuntime> {
         let app = tauri::test::mock_app();
         app.manage(KeyRegistry::default());
+        app.manage(GroupKeyRegistry::default());
         app
     }
 
@@ -567,11 +646,13 @@ mod tests {
         let _env = setup().await;
         let app = mock_app_with_registry();
         let registry = app.state::<KeyRegistry>();
+        let group_key_registry = app.state::<GroupKeyRegistry>();
 
         let result = login(
             "Alice".to_owned(),
             "correct horse battery staple".to_owned(),
             registry.clone(),
+            group_key_registry.clone(),
         )
         .await;
         assert!(result.is_ok(), "bootstrap login should succeed: {result:?}");
@@ -594,11 +675,13 @@ mod tests {
         let _env = setup().await;
         let app = mock_app_with_registry();
         let registry = app.state::<KeyRegistry>();
+        let group_key_registry = app.state::<GroupKeyRegistry>();
 
         login(
             "Alice".to_owned(),
             "password123".to_owned(),
             registry.clone(),
+            group_key_registry.clone(),
         )
         .await
         .unwrap();
@@ -623,11 +706,13 @@ mod tests {
         let _env = setup().await;
         let app = mock_app_with_registry();
         let registry = app.state::<KeyRegistry>();
+        let group_key_registry = app.state::<GroupKeyRegistry>();
 
         login(
             "Alice".to_owned(),
             "password123".to_owned(),
             registry.clone(),
+            group_key_registry.clone(),
         )
         .await
         .unwrap();
@@ -637,6 +722,7 @@ mod tests {
             "Alice".to_owned(),
             "password123".to_owned(),
             registry.clone(),
+            group_key_registry.clone(),
         )
         .await;
         assert!(
@@ -650,11 +736,13 @@ mod tests {
         let _env = setup().await;
         let app = mock_app_with_registry();
         let registry = app.state::<KeyRegistry>();
+        let group_key_registry = app.state::<GroupKeyRegistry>();
 
         login(
             "Alice".to_owned(),
             "correct-password".to_owned(),
             registry.clone(),
+            group_key_registry.clone(),
         )
         .await
         .unwrap();
@@ -664,6 +752,7 @@ mod tests {
             "Alice".to_owned(),
             "wrong-password".to_owned(),
             registry.clone(),
+            group_key_registry.clone(),
         )
         .await;
         assert!(result.is_err(), "wrong password must fail");
@@ -678,11 +767,13 @@ mod tests {
         let _env = setup().await;
         let app = mock_app_with_registry();
         let registry = app.state::<KeyRegistry>();
+        let group_key_registry = app.state::<GroupKeyRegistry>();
 
         login(
             "Alice".to_owned(),
             "correct-password".to_owned(),
             registry.clone(),
+            group_key_registry.clone(),
         )
         .await
         .unwrap();
@@ -692,6 +783,7 @@ mod tests {
             "Alice".to_owned(),
             "wrong-password".to_owned(),
             registry.clone(),
+            group_key_registry.clone(),
         )
         .await;
 
@@ -712,6 +804,7 @@ mod tests {
         let _env = setup().await;
         let app = mock_app_with_registry();
         let registry = app.state::<KeyRegistry>();
+        let group_key_registry = app.state::<GroupKeyRegistry>();
 
         // Bootstrap someone first so has_any_users() is true and this
         // exercises the existing-account branch, not bootstrap.
@@ -719,12 +812,19 @@ mod tests {
             "Alice".to_owned(),
             "password123".to_owned(),
             registry.clone(),
+            group_key_registry.clone(),
         )
         .await
         .unwrap();
         registry.clear().await;
 
-        let result = login("Nobody".to_owned(), "whatever".to_owned(), registry.clone()).await;
+        let result = login(
+            "Nobody".to_owned(),
+            "whatever".to_owned(),
+            registry.clone(),
+            group_key_registry.clone(),
+        )
+        .await;
         assert_eq!(result, Err("invalid credentials".to_owned()));
     }
 
@@ -733,11 +833,13 @@ mod tests {
         let _env = setup().await;
         let app = mock_app_with_registry();
         let registry = app.state::<KeyRegistry>();
+        let group_key_registry = app.state::<GroupKeyRegistry>();
 
         login(
             "Alice".to_owned(),
             "password123".to_owned(),
             registry.clone(),
+            group_key_registry.clone(),
         )
         .await
         .unwrap();
@@ -755,11 +857,13 @@ mod tests {
         let _env = setup().await;
         let app = mock_app_with_registry();
         let registry = app.state::<KeyRegistry>();
+        let group_key_registry = app.state::<GroupKeyRegistry>();
 
         login(
             "Alice".to_owned(),
             "password123".to_owned(),
             registry.clone(),
+            group_key_registry.clone(),
         )
         .await
         .unwrap();
@@ -793,6 +897,7 @@ mod tests {
         let _env = setup().await;
         let app = mock_app_with_registry();
         let registry = app.state::<KeyRegistry>();
+        let group_key_registry = app.state::<GroupKeyRegistry>();
 
         let result = logout(registry.clone()).await;
         assert!(result.is_ok(), "logout with no resident key must not error");
@@ -803,6 +908,7 @@ mod tests {
         let _env = setup().await;
         let app = mock_app_with_registry();
         let registry = app.state::<KeyRegistry>();
+        let group_key_registry = app.state::<GroupKeyRegistry>();
 
         let result = get_recovery_key_display(registry.clone()).await;
         assert_eq!(result.err(), Some("not logged in".to_owned()));
@@ -816,11 +922,13 @@ mod tests {
         let _env = setup().await;
         let app = mock_app_with_registry();
         let registry = app.state::<KeyRegistry>();
+        let group_key_registry = app.state::<GroupKeyRegistry>();
 
         login(
             "Alice".to_owned(),
             "correct horse battery staple".to_owned(),
             registry.clone(),
+            group_key_registry.clone(),
         )
         .await
         .unwrap();
@@ -850,6 +958,7 @@ mod tests {
         let _env = setup().await;
         let app = mock_app_with_registry();
         let registry = app.state::<KeyRegistry>();
+        let group_key_registry = app.state::<GroupKeyRegistry>();
 
         let result = get_session(registry.clone()).await;
         assert_eq!(result, Ok(None));
@@ -860,11 +969,13 @@ mod tests {
         let _env = setup().await;
         let app = mock_app_with_registry();
         let registry = app.state::<KeyRegistry>();
+        let group_key_registry = app.state::<GroupKeyRegistry>();
 
         login(
             "Alice".to_owned(),
             "correct horse battery staple".to_owned(),
             registry.clone(),
+            group_key_registry.clone(),
         )
         .await
         .unwrap();
@@ -888,11 +999,13 @@ mod tests {
         let _env = setup().await;
         let app = mock_app_with_registry();
         let registry = app.state::<KeyRegistry>();
+        let group_key_registry = app.state::<GroupKeyRegistry>();
 
         login(
             "Alice".to_owned(),
             "password123".to_owned(),
             registry.clone(),
+            group_key_registry.clone(),
         )
         .await
         .unwrap();
@@ -902,5 +1015,141 @@ mod tests {
 
         let result = get_session(registry.clone()).await;
         assert_eq!(result, Ok(None));
+    }
+
+    // -- group-key rehydration (items.id=290, decisions.id=718) --------------
+
+    #[tokio::test]
+    async fn login_rehydrates_group_key_registry_from_personal_db() {
+        let _env = setup().await;
+        let app = mock_app_with_registry();
+        let registry = app.state::<KeyRegistry>();
+        let group_key_registry = app.state::<GroupKeyRegistry>();
+
+        login(
+            "Alice".to_owned(),
+            "password123".to_owned(),
+            registry.clone(),
+            group_key_registry.clone(),
+        )
+        .await
+        .unwrap();
+
+        let user = user_store::find_user_by_display_name("Alice")
+            .await
+            .unwrap()
+            .unwrap();
+        let personal_key_hex = registry.personal_key_hex().await.unwrap();
+
+        let persona_id = uuid::Uuid::new_v4().to_string();
+        persona_store::create_persona(&persona_id, "Test Persona", "personal", &user.id, None)
+            .await
+            .expect("create_persona must succeed");
+
+        let group_id = "group-rehydrate-1";
+        let group_key_hex = "11".repeat(kdf::MASTER_KEY_LEN);
+        group_key_store::save_group_key(
+            &user.id,
+            &persona_id,
+            &personal_key_hex,
+            group_id,
+            &group_key_hex,
+            &crate::providers::utils::now(),
+        )
+        .await
+        .expect("save_group_key must succeed");
+
+        assert!(
+            !group_key_registry.is_occupied(&persona_id, group_id).await,
+            "sanity check: nothing populated the registry yet"
+        );
+
+        // Simulate a process restart -- KeyRegistry loses its resident key,
+        // GroupKeyRegistry is untouched by anything in this test (it was
+        // never populated), matching a fresh process's empty state.
+        registry.clear().await;
+
+        login(
+            "Alice".to_owned(),
+            "password123".to_owned(),
+            registry.clone(),
+            group_key_registry.clone(),
+        )
+        .await
+        .expect("second login must succeed");
+
+        assert!(
+            group_key_registry.is_occupied(&persona_id, group_id).await,
+            "finish_login must rehydrate the durable group_keys row into GroupKeyRegistry"
+        );
+        let rehydrated_hex = group_key_registry
+            .key_hex_for(&persona_id, group_id)
+            .await
+            .unwrap();
+        assert_eq!(rehydrated_hex, group_key_hex);
+    }
+
+    #[tokio::test]
+    async fn login_skips_a_malformed_group_keys_row_without_failing() {
+        // Q1 (decisions mid-planning, items.id=290): a corrupted personal.db
+        // group_keys row must never block login -- account-level lockout
+        // over one ancillary row would be a support-ticket bug, not a
+        // safety improvement.
+        let _env = setup().await;
+        let app = mock_app_with_registry();
+        let registry = app.state::<KeyRegistry>();
+        let group_key_registry = app.state::<GroupKeyRegistry>();
+
+        login(
+            "Alice".to_owned(),
+            "password123".to_owned(),
+            registry.clone(),
+            group_key_registry.clone(),
+        )
+        .await
+        .unwrap();
+
+        let user = user_store::find_user_by_display_name("Alice")
+            .await
+            .unwrap()
+            .unwrap();
+        let personal_key_hex = registry.personal_key_hex().await.unwrap();
+
+        let persona_id = uuid::Uuid::new_v4().to_string();
+        persona_store::create_persona(&persona_id, "Test Persona", "personal", &user.id, None)
+            .await
+            .expect("create_persona must succeed");
+
+        let group_id = "group-malformed-1";
+        group_key_store::save_group_key(
+            &user.id,
+            &persona_id,
+            &personal_key_hex,
+            group_id,
+            "not-valid-hex", // odd length AND non-hex characters
+            &crate::providers::utils::now(),
+        )
+        .await
+        .expect("save_group_key must succeed even for a malformed value -- \
+                 the store layer doesn't validate, only the rehydration reader does");
+
+        registry.clear().await;
+
+        let result = login(
+            "Alice".to_owned(),
+            "password123".to_owned(),
+            registry.clone(),
+            group_key_registry.clone(),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "login must succeed even when a group_keys row is malformed: {result:?}"
+        );
+        assert!(
+            !group_key_registry.is_occupied(&persona_id, group_id).await,
+            "the malformed row must be skipped, not loaded"
+        );
     }
 }

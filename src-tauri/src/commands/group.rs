@@ -32,7 +32,7 @@ use specta::Type;
 use tauri::State;
 
 use crate::auth::group_membership::{self, DepartureReason};
-use crate::auth::registry::GroupKeyRegistry;
+use crate::auth::registry::{GroupKeyRegistry, KeyRegistry};
 use crate::group_sync::settings_store;
 
 #[derive(Debug, Serialize, Type)]
@@ -103,6 +103,7 @@ pub async fn remove_group_member(
     reason: String,
     sender_label: String,
     group_key_registry: State<'_, GroupKeyRegistry>,
+    key_registry: State<'_, KeyRegistry>,
 ) -> Result<(), String> {
     let reason: DepartureReason = reason.parse().map_err(|e: group_membership::GroupMembershipError| e.to_string())?;
     group_membership::remove_member(
@@ -111,6 +112,7 @@ pub async fn remove_group_member(
         reason,
         &sender_label,
         &group_key_registry,
+        &key_registry,
     )
     .await
     .map_err(|e| e.to_string())

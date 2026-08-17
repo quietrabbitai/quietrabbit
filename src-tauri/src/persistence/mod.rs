@@ -6,6 +6,7 @@ pub mod document_fork_store;
 pub mod domain_context_store;
 pub mod entity_store;
 pub mod focus_settings_store;
+pub mod group_key_store;
 pub mod group_store;
 pub mod integration_keys_store;
 pub mod message_store;

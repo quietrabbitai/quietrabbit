@@ -154,6 +154,18 @@ impl KeyRegistry {
     pub async fn sharing_private_key(&self) -> Option<[u8; 32]> {
         self.with_key(|k| k.sharing_private_key).await
     }
+
+    /// Resolve the resident account's master key as key_hex, or None if no
+    /// account is currently unlocked. Same convenience-for-outside-crate
+    /// reasoning as sharing_private_key above -- key_hex() itself is
+    /// pub(crate), not reachable from the main.rs binary crate. items.id=290
+    /// (decisions.id=718): main.rs's periodic rotation-apply loop needs this
+    /// alongside sharing_private_key every tick, to feed
+    /// auth::group_membership::apply_pending_rotations' own personal.db
+    /// durable-write step (group_key_store::save_group_key).
+    pub async fn personal_key_hex(&self) -> Option<String> {
+        self.with_key(|k| key_hex(&k.master_key)).await
+    }
 }
 
 // ---------------------------------------------------------------------------
