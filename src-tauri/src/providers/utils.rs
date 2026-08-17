@@ -161,6 +161,7 @@ pub fn connect_options_encrypted(path: &Path, key_hex: &str) -> SqliteConnectOpt
         .filename(path)
         .create_if_missing(true)
         .pragma("key", format!("\"x'{key_hex}'\"")) // FIRST — SQLCipher requirement
+        .pragma("cipher_compatibility", "4") // pin SQLCipher 4.x KDF/page/HMAC defaults
         .pragma("journal_mode", journal_mode_value()) // AFTER key
 }
 

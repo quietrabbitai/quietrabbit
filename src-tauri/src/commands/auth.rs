@@ -177,6 +177,7 @@ async fn verify_integration_keys_db(user_id: &str, key_hex: &str) -> Result<(), 
         // fixed here, since personal_store.rs is outside items.id=205's
         // scope.
         .pragma("key", format!("\"x'{key_hex}'\""))
+        .pragma("cipher_compatibility", "4")
         .pragma("journal_mode", journal_mode)
         .connect()
         .await

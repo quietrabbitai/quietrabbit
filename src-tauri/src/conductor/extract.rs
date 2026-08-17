@@ -137,6 +137,7 @@ async fn open_outputs_db(
         .filename(&db_path)
         .create_if_missing(false)
         .pragma("key", format!("\"x'{key_hex}'\""))
+        .pragma("cipher_compatibility", "4")
         .pragma("journal_mode", journal_mode)
         .pragma("busy_timeout", "5000")
         .connect()

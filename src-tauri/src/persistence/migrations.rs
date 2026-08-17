@@ -427,6 +427,14 @@ pub async fn schema_version_exists(db_path: &Path, key_hex: Option<&str>) -> boo
         if sqlx::query(&pragma).execute(&mut conn).await.is_err() {
             return false;
         }
+        // Pin SQLCipher 4.x KDF/page/HMAC defaults, right after key.
+        if sqlx::query("PRAGMA cipher_compatibility = 4")
+            .execute(&mut conn)
+            .await
+            .is_err()
+        {
+            return false;
+        }
     }
     let result: Result<Option<(String,)>, _> = sqlx::query_as(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'",
@@ -454,6 +462,10 @@ pub async fn run_migrations(
     if let Some(key) = key_hex {
         let pragma = format!("PRAGMA key = \"x'{key}'\"");
         sqlx::query(&pragma).execute(&mut *conn).await?;
+        // Pin SQLCipher 4.x KDF/page/HMAC defaults, right after key.
+        sqlx::query("PRAGMA cipher_compatibility = 4")
+            .execute(&mut *conn)
+            .await?;
     }
 
     let network_storage = std::env::var("QR_NETWORK_STORAGE")

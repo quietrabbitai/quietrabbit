@@ -176,6 +176,7 @@ pub(crate) async fn open_personal_db(
         // this exact failure via a standalone diagnostic test
         // (items.id=206, 2026-08-02).
         .pragma("key", format!("\"x'{key_hex}'\""))
+        .pragma("cipher_compatibility", "4")
         .pragma("journal_mode", journal_mode)
         .connect()
         .await
