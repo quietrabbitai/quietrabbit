@@ -64,10 +64,13 @@
 // currently departing. group_departures stores no keys and answers only
 // "who has left," never "who is currently a member" in general -- a
 // strictly narrower question than either 290 or 291 would need to answer.
-// KNOWN FALSE NEGATIVE, inherited not introduced: a group's creator never
-// appears in pending_group_invitations (they never received one, and
-// items.id=291's group-creation flow doesn't exist yet to define "creator"
-// in the first place) -- invisible to this derivation regardless.
+// CREATOR VISIBILITY: a group's creator never receives an invitation, so
+// they would otherwise be invisible to this derivation. Resolved by
+// items.id=291's auth::group_creation::create_group, which gives the
+// creator their own pending_group_invitations row, already
+// status='accepted', at creation time -- see that module's own header
+// (ROSTER RECONCILIATION) for why that was chosen over a real membership
+// table. No query change needed here as a result.
 //
 // .qrsync RE-PUSH: apply_pending_rotations calls group_sync::engine::
 // republish_owned_documents (items.id=288 addition to that module) right

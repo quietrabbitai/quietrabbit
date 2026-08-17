@@ -26,11 +26,19 @@
 // this system would ever call remove_member on its own; someone must always
 // explicitly trigger it. A library-only version here would be exactly as
 // dead as pre-287 group_store CRUD was.
+//
+// Group 17 — Group creation (items.id=291).
+// Commands: create_group.
+//
+// Same user-initiated shape as Group 16 -- someone must always explicitly
+// create a group, so this ships as a real command ahead of frontend rather
+// than staying library-only like send_invitation.
 
 use serde::Serialize;
 use specta::Type;
 use tauri::State;
 
+use crate::auth::group_creation;
 use crate::auth::group_membership::{self, DepartureReason};
 use crate::auth::registry::{GroupKeyRegistry, KeyRegistry};
 use crate::group_sync::settings_store;
@@ -111,6 +119,35 @@ pub async fn remove_group_member(
         &departing_persona_id,
         reason,
         &sender_label,
+        &group_key_registry,
+        &key_registry,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Create a new group: generates its symmetric key and id, materializes the
+/// creator's own local group.db, and establishes the creator's own
+/// membership state (items.id=291). See auth::group_creation's own module
+/// header for the full design, including how the creator's own membership
+/// is made visible to group_membership::remaining_members.
+///
+/// The caller must currently be logged in as `creator_persona_id`'s owning
+/// account -- returns an error otherwise, rather than silently failing
+/// later when personal.db can't be opened.
+#[tauri::command]
+#[specta::specta]
+pub async fn create_group(
+    creator_persona_id: String,
+    group_display_name: String,
+    creator_label: String,
+    group_key_registry: State<'_, GroupKeyRegistry>,
+    key_registry: State<'_, KeyRegistry>,
+) -> Result<String, String> {
+    group_creation::create_group(
+        &creator_persona_id,
+        &group_display_name,
+        &creator_label,
         &group_key_registry,
         &key_registry,
     )

@@ -31,10 +31,12 @@
 -- need to answer. Its only job: let remove_member derive "remaining
 -- members" as (everyone who ever accepted an invitation to this group) minus
 -- (everyone recorded here), without inventing a real membership store.
--- Known false-negative, inherited not introduced: a group's creator never
--- appears in pending_group_invitations (they never received one, and
--- items.id=291's creation flow doesn't exist yet either), so they're
--- invisible to that derivation regardless of this table.
+-- Creator visibility: a group's creator never receives an invitation, so
+-- they'd otherwise be invisible to that derivation. items.id=291's
+-- auth::group_creation::create_group resolves this without a schema
+-- change -- it gives the creator their own pending_group_invitations row,
+-- already status='accepted', at creation time (see that module's own
+-- header, ROSTER RECONCILIATION).
 --
 -- group_id: deliberately no FK on either table -- same reasoning
 -- shared_003.sql's own header gives: group.db is a separate encrypted file,

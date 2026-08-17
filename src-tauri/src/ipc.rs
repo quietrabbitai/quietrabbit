@@ -113,6 +113,8 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::group::get_group_sync_folder,
         // Group 16 -- Group membership (items.id=288, group.db 266f)
         commands::group::remove_group_member,
+        // Group 17 -- Group creation (items.id=291)
+        commands::group::create_group,
     ])
 }
 

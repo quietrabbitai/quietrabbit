@@ -384,6 +384,18 @@ export const commands = {
 	 *  assumed away).
 	 */
 	removeGroupMember: (groupId: string, departingPersonaId: string, reason: string, senderLabel: string) => typedError<null, string>(__TAURI_INVOKE("remove_group_member", { groupId, departingPersonaId, reason, senderLabel })),
+	/**
+	 *  Create a new group: generates its symmetric key and id, materializes the
+	 *  creator's own local group.db, and establishes the creator's own
+	 *  membership state (items.id=291). See auth::group_creation's own module
+	 *  header for the full design, including how the creator's own membership
+	 *  is made visible to group_membership::remaining_members.
+	 * 
+	 *  The caller must currently be logged in as `creator_persona_id`'s owning
+	 *  account -- returns an error otherwise, rather than silently failing
+	 *  later when personal.db can't be opened.
+	 */
+	createGroup: (creatorPersonaId: string, groupDisplayName: string, creatorLabel: string) => typedError<string, string>(__TAURI_INVOKE("create_group", { creatorPersonaId, groupDisplayName, creatorLabel })),
 };
 
 /* Types */
