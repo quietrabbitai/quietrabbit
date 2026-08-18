@@ -115,6 +115,9 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::group::remove_group_member,
         // Group 17 -- Group creation (items.id=291)
         commands::group::create_group,
+        // Group 18 -- Group facts opt-in (items.id=296, group.db 266h)
+        commands::group::set_group_fact_source_opt_in,
+        commands::group::get_group_fact_sources,
     ])
 }
 

@@ -137,6 +137,63 @@ impl EntityFact {
 }
 
 // ---------------------------------------------------------------------------
+// GroupFact
+// ---------------------------------------------------------------------------
+
+/// A single group_facts row loaded from one group.db for this run
+/// (items.id=296, GROUP_DB_DESIGN_20260802.md Section 3).
+///
+/// Deliberately NOT EntityFact: reusing EntityFact would mean fabricating
+/// values for fields that don't apply to group facts (a fake
+/// source_persona_id, cross_persona_export always false) for data that was
+/// never a personal fact, and — more concretely — EntityFact's map key
+/// ("entity_id:field_name", entity_id empty for every singleton) would
+/// collide with a real personal singleton fact sharing the same
+/// field_name, silently overwriting one or the other depending on load
+/// order. GroupFact gets its own IndexMap on PersonalTrack, keyed by
+/// "group_id:field_name" instead — namespaced by group, so it cannot
+/// collide with entity_facts' keyspace or with another group's facts.
+///
+/// field_value is the decrypted value — held in memory only, never written
+/// to snapshots or logs. Mirrors EntityFact/PersonalField's #[serde(skip)]
+/// treatment.
+///
+/// Deliberately narrower than the group_facts table itself: like
+/// EntityFact (which does not carry entity_facts.abstraction_tier2/tier3/
+/// extra_metadata either — nothing downstream consumes those yet), this
+/// struct only carries what load_group_facts_for_context actually selects
+/// today. abstraction_tier2/tier3 stay in the schema for the eventual
+/// Gate1 wiring; adding them here ahead of a real consumer would be
+/// speculative.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupFact {
+    /// group_facts.id (TEXT PRIMARY KEY, group_002.sql).
+    pub id: String,
+    /// Stamped from the caller's own group_id parameter at load time —
+    /// group_facts has no group_id column (every table in one group.db is
+    /// implicitly scoped to that group, matching group_001.sql's
+    /// documents/document_permissions convention).
+    pub group_id: String,
+    pub field_name: String,
+    #[serde(skip)]
+    pub field_value: String, // decrypted — never serialized
+    pub sensitivity: String,
+    pub sensitivity_severity: i32,
+}
+
+impl GroupFact {
+    /// SHA-256 of "group_id:field_name:field_value". Mirrors EntityFact::
+    /// compute_content_hash's shape — group_id takes entity_id's structural
+    /// role as the disambiguating prefix.
+    pub fn compute_content_hash(&self) -> String {
+        let payload = format!("{}:{}:{}", self.group_id, self.field_name, self.field_value);
+        let mut hasher = Sha256::new();
+        hasher.update(payload.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PersonalTrack
 // ---------------------------------------------------------------------------
 
@@ -163,6 +220,11 @@ pub struct PersonalTrack {
     /// and the decisions.id=424 enforcement check (not yet implemented) needs
     /// to read them distinctly. Populated at INITIALIZE, read-only after seal.
     entity_facts: IndexMap<String, EntityFact>,
+    /// group_facts rows, keyed by "group_id:field_name" — see GroupFact's
+    /// own doc comment for why this is a separate map from entity_facts
+    /// rather than reusing its keyspace. Populated at INITIALIZE (items.id
+    /// =296), read-only after seal.
+    group_facts: IndexMap<String, GroupFact>,
     voice_profile: IndexMap<String, String>,
     life_context: IndexMap<String, String>, // legacy name — D6-323, do not rename
     source_versions: IndexMap<String, String>,
@@ -174,6 +236,7 @@ impl PersonalTrack {
         Self {
             fields: IndexMap::new(),
             entity_facts: IndexMap::new(),
+            group_facts: IndexMap::new(),
             voice_profile: IndexMap::new(),
             life_context: IndexMap::new(),
             source_versions: IndexMap::new(),
@@ -200,6 +263,18 @@ impl PersonalTrack {
         }
         let key = format!("{}:{}", f.entity_id.as_deref().unwrap_or(""), f.field_name);
         self.entity_facts.insert(key, f);
+        Ok(())
+    }
+
+    /// Add a group_facts row. Key is "group_id:field_name" — see GroupFact's
+    /// own doc comment for why this is namespaced by group rather than
+    /// sharing entity_facts' keyspace.
+    pub fn add_group_fact(&mut self, f: GroupFact) -> Result<(), TrackError> {
+        if self.sealed {
+            return Err(TrackError::SealedTrack);
+        }
+        let key = format!("{}:{}", f.group_id, f.field_name);
+        self.group_facts.insert(key, f);
         Ok(())
     }
 
@@ -252,6 +327,11 @@ impl PersonalTrack {
     /// during context assembly.
     pub fn entity_facts(&self) -> &IndexMap<String, EntityFact> {
         &self.entity_facts
+    }
+
+    /// group_facts rows, keyed by "group_id:field_name". Read-only.
+    pub fn group_facts(&self) -> &IndexMap<String, GroupFact> {
+        &self.group_facts
     }
 
     pub fn voice_profile(&self) -> &IndexMap<String, String> {
@@ -691,6 +771,17 @@ mod tests {
         }
     }
 
+    fn make_group_fact(group_id: &str, field_name: &str, value: &str, severity: i32) -> GroupFact {
+        GroupFact {
+            id: "test-group-fact-id".to_owned(),
+            group_id: group_id.to_owned(),
+            field_name: field_name.to_owned(),
+            field_value: value.to_owned(),
+            sensitivity: "personal".to_owned(),
+            sensitivity_severity: severity,
+        }
+    }
+
     #[test]
     fn entity_fact_compute_content_hash_deterministic() {
         let f = make_entity_fact(Some("ent-1"), "name", "Robert", 2, "persona-a");
@@ -890,6 +981,132 @@ mod tests {
         assert_eq!(stored.source_persona_id, "persona-medical");
         assert!(stored.cross_persona_export);
         assert_eq!(stored.origin_persona_id.as_deref(), Some("persona-medical"));
+    }
+
+    // -- PersonalTrack.group_facts -----------------------------------------
+
+    #[test]
+    fn personal_track_add_group_fact_and_seal() {
+        let mut track = PersonalTrack::new();
+        track
+            .add_group_fact(make_group_fact("group-1", "business_name", "Acme", 1))
+            .unwrap();
+        assert!(!track.is_sealed());
+        track.seal();
+        assert!(track.is_sealed());
+    }
+
+    #[test]
+    fn personal_track_sealed_rejects_add_group_fact() {
+        let mut track = PersonalTrack::new();
+        track.seal();
+        let err = track
+            .add_group_fact(make_group_fact("group-1", "business_name", "Acme", 1))
+            .unwrap_err();
+        assert!(err.to_string().contains("sealed"));
+    }
+
+    #[test]
+    fn personal_track_group_facts_accessor_returns_added_fact() {
+        let mut track = PersonalTrack::new();
+        track
+            .add_group_fact(make_group_fact("group-1", "business_name", "Acme", 1))
+            .unwrap();
+        assert_eq!(track.group_facts().len(), 1);
+        let f = track.group_facts().get("group-1:business_name").unwrap();
+        assert_eq!(f.field_value, "Acme");
+        assert_eq!(f.group_id, "group-1");
+    }
+
+    #[test]
+    fn personal_track_group_facts_distinct_groups_same_field_name_coexist() {
+        // (group_id, field_name) is the identity — two different groups can
+        // share the same field_name without colliding, same shape
+        // entity_facts' (entity_id, field_name) identity already has.
+        let mut track = PersonalTrack::new();
+        track
+            .add_group_fact(make_group_fact("group-1", "pricing_tier", "standard", 2))
+            .unwrap();
+        track
+            .add_group_fact(make_group_fact("group-2", "pricing_tier", "premium", 2))
+            .unwrap();
+        assert_eq!(track.group_facts().len(), 2);
+    }
+
+    #[test]
+    fn personal_track_group_facts_same_key_overwrites() {
+        let mut track = PersonalTrack::new();
+        track
+            .add_group_fact(make_group_fact("group-1", "pricing_tier", "standard", 2))
+            .unwrap();
+        track
+            .add_group_fact(make_group_fact("group-1", "pricing_tier", "premium", 2))
+            .unwrap();
+        assert_eq!(track.group_facts().len(), 1);
+        assert_eq!(
+            track
+                .group_facts()
+                .get("group-1:pricing_tier")
+                .unwrap()
+                .field_value,
+            "premium"
+        );
+    }
+
+    #[test]
+    fn personal_track_group_facts_do_not_collide_with_entity_facts_empty_entity_id_key() {
+        // The bug GroupFact's own doc comment exists to avoid: a singleton
+        // entity_fact (entity_id = None) keys as ":field_name" in
+        // entity_facts. A group_fact for the same field_name keys as
+        // "group_id:field_name" in the SEPARATE group_facts map — even a
+        // group_id that happened to be textually empty could never produce
+        // the exact same key entity_facts uses, because the two live in
+        // different IndexMaps entirely. This test pins that separation.
+        let mut track = PersonalTrack::new();
+        track
+            .add_entity_fact(make_entity_fact(
+                None,
+                "business_name",
+                "Personal Co",
+                1,
+                "persona-a",
+            ))
+            .unwrap();
+        track
+            .add_group_fact(make_group_fact("group-1", "business_name", "Group Co", 1))
+            .unwrap();
+
+        assert_eq!(track.entity_facts().len(), 1);
+        assert_eq!(track.group_facts().len(), 1);
+        assert_eq!(
+            track
+                .entity_facts()
+                .get(":business_name")
+                .unwrap()
+                .field_value,
+            "Personal Co"
+        );
+        assert_eq!(
+            track
+                .group_facts()
+                .get("group-1:business_name")
+                .unwrap()
+                .field_value,
+            "Group Co"
+        );
+    }
+
+    #[test]
+    fn personal_track_group_facts_content_hash_deterministic() {
+        let f = make_group_fact("group-1", "business_name", "Acme", 1);
+        assert_eq!(f.compute_content_hash(), f.compute_content_hash());
+    }
+
+    #[test]
+    fn personal_track_group_facts_content_hash_differs_by_group() {
+        let a = make_group_fact("group-1", "business_name", "Acme", 1);
+        let b = make_group_fact("group-2", "business_name", "Acme", 1);
+        assert_ne!(a.compute_content_hash(), b.compute_content_hash());
     }
 
     // -- PersonalContextManifest ---------------------------------------------

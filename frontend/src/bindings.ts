@@ -396,6 +396,17 @@ export const commands = {
 	 *  later when personal.db can't be opened.
 	 */
 	createGroup: (creatorPersonaId: string, groupDisplayName: string, creatorLabel: string) => typedError<string, string>(__TAURI_INVOKE("create_group", { creatorPersonaId, groupDisplayName, creatorLabel })),
+	/**
+	 *  Opt (or opt back out) `persona_id`'s context assembly into checking
+	 *  `group_id`'s facts. One-time-per-persona decision (Section 3.2) -- not
+	 *  re-evaluated per Focus run; conductor::lifecycle::build_personal_track()
+	 *  reads this table once per run and separately checks whether the group's
+	 *  key is currently resident (auth::registry::GroupKeyRegistry) before
+	 *  actually loading anything.
+	 */
+	setGroupFactSourceOptIn: (personaId: string, groupId: string, optedIn: boolean) => typedError<null, string>(__TAURI_INVOKE("set_group_fact_source_opt_in", { personaId, groupId, optedIn })),
+	/**  Every group_id `persona_id` is currently opted into. */
+	getGroupFactSources: (personaId: string) => typedError<string[], string>(__TAURI_INVOKE("get_group_fact_sources", { personaId })),
 };
 
 /* Types */

@@ -76,6 +76,7 @@ use sha2::{Digest, Sha256};
 use sqlx::ConnectOptions;
 use sqlx::Row;
 use sqlx::SqliteConnection;
+use tauri::Manager;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -983,6 +984,9 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                 .await?;
         }
 
+        self.load_group_facts_into_track(&mut track, key_hex)
+            .await?;
+
         let focus_def = self
             .focus_def
             .as_ref()
@@ -1001,6 +1005,78 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             .map_err(|e| LifecycleError::PersonalStore(e.to_string()))?;
 
         Ok(track)
+    }
+
+    /// items.id=296 (GROUP_DB_DESIGN_20260802.md Section 3.3): load this
+    /// run's group facts into `track`, for every group_id this persona is
+    /// opted into (personal.db's group_fact_sources, personal_006.sql) AND
+    /// currently holds a *resident* key for in auth::registry::
+    /// GroupKeyRegistry. Both conditions gate independently — the opt-in
+    /// alone is not sufficient (a group whose key isn't resident this
+    /// session is silently skipped, not an error: "no key, no access, full
+    /// stop" per Section 3.3 point 4). No provenance branching the way
+    /// apply_entity_fact_provenance_check needs — group facts have no
+    /// cross-persona-export concept; the resident-key check (cryptographic)
+    /// combined with the opt-in (this function's own two conditions) IS the
+    /// complete gate, no second stacked check.
+    ///
+    /// GroupKeyRegistry access via self.app_handle rather than a new
+    /// FocusRun field/constructor parameter: main.rs's own periodic
+    /// folder-sync pull loop already resolves GroupKeyRegistry the same way
+    /// (`pull_handle.state::<GroupKeyRegistry>()` off a cloned AppHandle) —
+    /// reusing that avoids touching FocusRun::new()'s signature (and its 4
+    /// test call sites + 2 real command call sites) for a value already
+    /// reachable through a field FocusRun already carries. app_handle is
+    /// `None` in every existing test (matching this file's own doc comment
+    /// on that field), so this step is correctly a no-op there — same
+    /// graceful-degradation shape push-event emission already has when
+    /// app_handle is absent.
+    async fn load_group_facts_into_track(
+        &self,
+        track: &mut PersonalTrack,
+        key_hex: &str,
+    ) -> Result<(), LifecycleError> {
+        use crate::auth::registry::GroupKeyRegistry;
+        use crate::persistence::{group_fact_sources_store, group_fact_store};
+
+        let Some(app_handle) = self.app_handle.as_ref() else {
+            return Ok(());
+        };
+        let group_key_registry = app_handle.state::<GroupKeyRegistry>();
+
+        let opted_in_group_ids = group_fact_sources_store::list_group_fact_sources(
+            &self.user_id,
+            &self.persona_id,
+            key_hex,
+        )
+        .await
+        .map_err(|e| LifecycleError::PersonalStore(e.to_string()))?;
+
+        for group_id in opted_in_group_ids {
+            let Some(group_key_hex) = group_key_registry
+                .key_hex_for(&self.persona_id, &group_id)
+                .await
+            else {
+                // Not resident this session — skip, not an error.
+                continue;
+            };
+
+            let facts = group_fact_store::load_group_facts_for_context(
+                &self.persona_id,
+                &group_id,
+                &group_key_hex,
+            )
+            .await
+            .map_err(|e| LifecycleError::PersonalStore(e.to_string()))?;
+
+            for fact in facts {
+                track
+                    .add_group_fact(fact)
+                    .map_err(|e| LifecycleError::PersonalStore(e.to_string()))?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Apply the decisions.id=424 provenance check to a single entity_facts
@@ -2527,6 +2603,43 @@ mod tests {
 
         assert_eq!(track.fields().len(), 0);
         assert_eq!(track.entity_facts().len(), 1);
+    }
+
+    // -------------------------------------------------------------------------
+    // load_group_facts_into_track (items.id=296)
+    //
+    // KNOWN TEST BOUNDARY: FocusRun.app_handle is concretely typed
+    // Option<tauri::AppHandle<tauri::Wry>> (not generic over the runtime),
+    // and tauri::test::mock_app() only ever produces an
+    // AppHandle<tauri::test::MockRuntime> -- there is no way to construct a
+    // real AppHandle<Wry> in a unit test, which is exactly why every other
+    // FocusRun test helper in this file (run_with_persona and friends)
+    // passes app_handle: None. That is a pre-existing limitation of this
+    // test infrastructure, not something introduced here. What IS tested
+    // directly here is the graceful no-op when app_handle is None (the
+    // state every unit test — including every other test in this file —
+    // actually runs FocusRun in). The opted-in/resident-key gating logic
+    // itself is covered at the layer below: persistence::
+    // group_fact_sources_store's own tests (opt-in CRUD),
+    // persistence::group_fact_store's own tests (group.db read), and
+    // auth::registry::GroupKeyRegistry's own tests (key_hex_for
+    // resident/absent behavior) — load_group_facts_into_track is a thin
+    // composition of exactly those three already-tested primitives.
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn load_group_facts_into_track_is_a_noop_without_an_app_handle() {
+        let run = run_with_persona("persona-a"); // app_handle: None
+        let mut track = PersonalTrack::new();
+
+        let result = run.load_group_facts_into_track(&mut track, "").await;
+
+        assert!(result.is_ok(), "must not error when app_handle is absent");
+        assert_eq!(
+            track.group_facts().len(),
+            0,
+            "no group facts can be loaded without an AppHandle to resolve GroupKeyRegistry from"
+        );
     }
 
     // -------------------------------------------------------------------------

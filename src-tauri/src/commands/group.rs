@@ -40,8 +40,9 @@ use tauri::State;
 
 use crate::auth::group_creation;
 use crate::auth::group_membership::{self, DepartureReason};
-use crate::auth::registry::{GroupKeyRegistry, KeyRegistry};
+use crate::auth::registry::{key_hex, GroupKeyRegistry, KeyRegistry};
 use crate::group_sync::settings_store;
+use crate::persistence::group_fact_sources_store;
 
 #[derive(Debug, Serialize, Type)]
 pub struct GroupSyncSettingsInfo {
@@ -157,6 +158,77 @@ pub async fn create_group(
     .map_err(|e| e.to_string())
 }
 
+// Group 18 -- Group facts opt-in (items.id=296, group.db 266h;
+// GROUP_DB_DESIGN_20260802.md Section 3.2/3.3).
+//
+// Backend-only -- no frontend UI exists yet to call these (manual-entry UI
+// and the promotion-from-personal-fact flow are separate, still-open work,
+// out of scope for this item). Same "ships ahead of frontend" precedent as
+// Groups 15-17 above: opting into a group's facts is inherently
+// user-initiated, no internal hook to eventually attach to.
+//
+// user_id is deliberately NOT a command parameter -- derived from
+// key_registry instead (same convention get_tier2_config/
+// set_tier2_provider_preference already use), so it can't be spoofed by
+// whatever the frontend happens to pass.
+
+/// Opt (or opt back out) `persona_id`'s context assembly into checking
+/// `group_id`'s facts. One-time-per-persona decision (Section 3.2) -- not
+/// re-evaluated per Focus run; conductor::lifecycle::build_personal_track()
+/// reads this table once per run and separately checks whether the group's
+/// key is currently resident (auth::registry::GroupKeyRegistry) before
+/// actually loading anything.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_group_fact_source_opt_in(
+    persona_id: String,
+    group_id: String,
+    opted_in: bool,
+    key_registry: State<'_, KeyRegistry>,
+) -> Result<(), String> {
+    let (user_id, key_hex_str) = key_registry
+        .with_key(|k| (k.user_id.clone(), key_hex(&k.master_key)))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
+    if opted_in {
+        group_fact_sources_store::opt_in_to_group_facts(
+            &user_id,
+            &persona_id,
+            &key_hex_str,
+            &group_id,
+        )
+        .await
+        .map_err(|e| e.to_string())
+    } else {
+        group_fact_sources_store::opt_out_of_group_facts(
+            &user_id,
+            &persona_id,
+            &key_hex_str,
+            &group_id,
+        )
+        .await
+        .map_err(|e| e.to_string())
+    }
+}
+
+/// Every group_id `persona_id` is currently opted into.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_group_fact_sources(
+    persona_id: String,
+    key_registry: State<'_, KeyRegistry>,
+) -> Result<Vec<String>, String> {
+    let (user_id, key_hex_str) = key_registry
+        .with_key(|k| (k.user_id.clone(), key_hex(&k.master_key)))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
+    group_fact_sources_store::list_group_fact_sources(&user_id, &persona_id, &key_hex_str)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -164,7 +236,8 @@ pub async fn create_group(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::ENV_MUTEX;
+    use crate::test_support::{mock_app_with_registry, populate_registry, ENV_MUTEX};
+    use tauri::Manager;
 
     struct TestEnv {
         _tempdir: tempfile::TempDir,
@@ -234,6 +307,104 @@ mod tests {
             "persona-1".to_owned(),
             "group-1".to_owned(),
             "   ".to_owned(),
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    // -- Group 18: group facts opt-in ----------------------------------------
+
+    #[tokio::test]
+    async fn get_group_fact_sources_is_empty_before_any_opt_in() {
+        let _env = setup().await;
+        let app = mock_app_with_registry();
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(
+            &registry,
+            "user-1",
+            [0x11u8; crate::auth::kdf::MASTER_KEY_LEN],
+        )
+        .await;
+
+        let result = get_group_fact_sources("persona-1".to_owned(), registry)
+            .await
+            .expect("get_group_fact_sources must succeed");
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_then_get_group_fact_source_opt_in_round_trips() {
+        let _env = setup().await;
+        let app = mock_app_with_registry();
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(
+            &registry,
+            "user-1",
+            [0x22u8; crate::auth::kdf::MASTER_KEY_LEN],
+        )
+        .await;
+
+        set_group_fact_source_opt_in(
+            "persona-1".to_owned(),
+            "group-1".to_owned(),
+            true,
+            registry.clone(),
+        )
+        .await
+        .expect("set_group_fact_source_opt_in must succeed");
+
+        let result = get_group_fact_sources("persona-1".to_owned(), registry)
+            .await
+            .expect("get_group_fact_sources must succeed");
+        assert_eq!(result, vec!["group-1".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn set_group_fact_source_opt_in_false_removes_a_prior_opt_in() {
+        let _env = setup().await;
+        let app = mock_app_with_registry();
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(
+            &registry,
+            "user-1",
+            [0x33u8; crate::auth::kdf::MASTER_KEY_LEN],
+        )
+        .await;
+
+        set_group_fact_source_opt_in(
+            "persona-1".to_owned(),
+            "group-1".to_owned(),
+            true,
+            registry.clone(),
+        )
+        .await
+        .unwrap();
+        set_group_fact_source_opt_in(
+            "persona-1".to_owned(),
+            "group-1".to_owned(),
+            false,
+            registry.clone(),
+        )
+        .await
+        .expect("opting out must succeed");
+
+        let result = get_group_fact_sources("persona-1".to_owned(), registry)
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_group_fact_source_opt_in_fails_cleanly_when_not_logged_in() {
+        let app = tauri::test::mock_app();
+        app.manage(KeyRegistry::default());
+        let registry = app.state::<KeyRegistry>();
+
+        let result = set_group_fact_source_opt_in(
+            "persona-1".to_owned(),
+            "group-1".to_owned(),
+            true,
+            registry,
         )
         .await;
         assert!(result.is_err());
