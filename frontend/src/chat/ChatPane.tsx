@@ -46,6 +46,12 @@ interface RunStatusPayload {
   total_steps: number
   step_display_name: string | null
   step_content: string | null
+  /** R1 crisis-handling floor (items.id=297): mirrors RunResult's field of
+   *  the same name (conductor/lifecycle.rs). Some(...) only on the same
+   *  "failed"/"awaiting_user" emit that accompanies a crisis-flagged run's
+   *  Tier 3 pause or step failure -- mutually exclusive with step_content in
+   *  practice. */
+  crisis_resource_block: string | null
 }
 
 const TERMINAL_STATUSES = new Set([
@@ -133,48 +139,84 @@ export function ChatPane({
       // sites (both "quick-ask", a single-step Focus, so there's only
       // ever one step_content event to begin with) but a real mismatch
       // for any future multi-step Focus wired through ChatPane.
-      if (payload.step_content) {
+      // R1 crisis-handling floor (items.id=297): crisis_resource_block is
+      // mutually exclusive with step_content in practice (Rust never sets
+      // both on the same emit -- see lifecycle.rs's emit_status_with_content
+      // call sites), so this is a plain either/or, not a merge.
+      if (payload.crisis_resource_block) {
+        setLiveContent(payload.crisis_resource_block)
+      } else if (payload.step_content) {
         setLiveContent(payload.step_content)
       }
       setLiveStepDisplayName(payload.step_display_name)
 
       if (TERMINAL_STATUSES.has(payload.status)) {
+        const crisisBlock = payload.crisis_resource_block
+
         // Reconciliation point (see this item's plan): the backend has by
         // now backfilled the placeholder assistant message's real content
         // (commands::messages::send_message's background completion hook),
         // so re-fetch rather than trusting liveContent as final -- avoids
         // ChatPane's own live-rendered text silently diverging from what's
         // actually persisted.
-        commands.listMessages(userId, personaId, contextKey).then(
-          (result) => {
-            if (cancelled) return
-            if (result.status === 'ok') {
-              setMessages(result.data)
-              // Draft-ready signal (items.id=233): only for gate3Track
-              // usage, and only the first time this run's assistant row is
-              // seen still 'drafted' -- a later re-fetch (e.g. contextKey
-              // unchanged, a second send on the same mount) would otherwise
-              // re-fire for the same message once its status has already
-              // moved past 'drafted'.
-              if (gate3Track) {
-                const drafted = [...result.data]
-                  .reverse()
-                  .find(
-                    (m) =>
-                      m.sender === 'assistant' &&
-                      m.focus_run_id === activeRunId &&
-                      m.gate3_review_status === 'drafted',
-                  )
-                if (drafted) {
-                  onDraftReady?.(drafted.id)
-                }
+        const finalize = (result: Awaited<ReturnType<typeof commands.listMessages>>) => {
+          if (cancelled) return
+          if (result.status === 'ok') {
+            setMessages(result.data)
+            // Draft-ready signal (items.id=233): only for gate3Track
+            // usage, and only the first time this run's assistant row is
+            // seen still 'drafted' -- a later re-fetch (e.g. contextKey
+            // unchanged, a second send on the same mount) would otherwise
+            // re-fire for the same message once its status has already
+            // moved past 'drafted'.
+            if (gate3Track) {
+              const drafted = [...result.data]
+                .reverse()
+                .find(
+                  (m) =>
+                    m.sender === 'assistant' &&
+                    m.focus_run_id === activeRunId &&
+                    m.gate3_review_status === 'drafted',
+                )
+              if (drafted) {
+                onDraftReady?.(drafted.id)
               }
             }
-            setActiveRunId(null)
-            setLiveContent('')
-            setLiveStepDisplayName(null)
-          },
-        )
+          }
+          setActiveRunId(null)
+          setLiveContent('')
+          setLiveStepDisplayName(null)
+        }
+
+        commands.listMessages(userId, personaId, contextKey).then((result) => {
+          if (cancelled) return
+
+          // handle_step_failure()'s emit fires before send_message's
+          // background task gets to backfill the placeholder (unlike
+          // output()'s success path, which saves before it emits) -- so this
+          // refetch can race ahead of that write. If we already have the
+          // crisis text from this same event but the persisted row hasn't
+          // caught up yet, keep showing it and retry once shortly instead of
+          // blanking a correct message down to an empty bubble.
+          const liveRow =
+            result.status === 'ok'
+              ? [...result.data]
+                  .reverse()
+                  .find(
+                    (m) => m.sender === 'assistant' && m.focus_run_id === activeRunId,
+                  )
+              : undefined
+
+          if (crisisBlock && !liveRow?.content) {
+            if (result.status === 'ok') setMessages(result.data)
+            window.setTimeout(() => {
+              commands.listMessages(userId, personaId, contextKey).then(finalize)
+            }, 250)
+            return
+          }
+
+          finalize(result)
+        })
       }
     }).then((fn) => {
       if (cancelled) {

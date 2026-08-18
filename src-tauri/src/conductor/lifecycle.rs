@@ -530,6 +530,13 @@ pub struct RunResult {
     pub output_id: Option<String>,
     pub output_content: Option<String>,
     pub failure: Option<FailureResult>,
+    /// R1 crisis-handling floor (decisions.id=607, items.id=265, items.id=297):
+    /// Some(crisis::resource_block()) iff crisis_floor_triggered was set on
+    /// this run, at every construction site reachable from EXECUTE (Tier 3
+    /// boundary, handle_step_failure(), output()). Phase 1/2 (LOAD/AUTHORIZE)
+    /// failure paths deliberately do not populate this — see crisis.rs module
+    /// doc for the scope boundary.
+    pub crisis_resource_block: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -559,6 +566,15 @@ pub struct RunStatusPayload {
     /// other emit_status call site, including the step-START announcement
     /// that fires at the top of the same loop iteration, passes None here.
     pub step_content: Option<String>,
+    /// R1 crisis-handling floor (items.id=297): mirrors RunResult's field of
+    /// the same name, carried over the live "run-status-update" push event so
+    /// the frontend can show the block the moment a run pauses/fails, without
+    /// waiting on the awaited IPC call that never actually carries RunResult
+    /// back to the UI on any current call path (see lifecycle.rs's
+    /// handle_step_failure() and the Tier 3 boundary in execute()). Some(...)
+    /// only on the same emit call as a "failed"/"awaiting_user" transition
+    /// for a crisis-flagged run; None otherwise.
+    pub crisis_resource_block: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -734,18 +750,25 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
     /// step_display_name: Some(&step.display_name) at step boundaries;
     ///   None during phase transitions where no specific step is active.
     fn emit_status(&self, status: &str, step_display_name: Option<&str>) {
-        self.emit_status_with_content(status, step_display_name, None);
+        self.emit_status_with_content(status, step_display_name, None, None);
     }
 
     /// step_content: the just-completed step's real generated content
     /// (TaskStep.content, via task_track.last_output()). Only the
     /// step-completion call site in execute() passes Some(...); every other
     /// caller (including plain emit_status above) passes None.
+    ///
+    /// crisis_resource_block: R1 crisis-handling floor (items.id=297). Some(...)
+    /// only on the same "failed"/"awaiting_user" emit that accompanies a
+    /// crisis-flagged run's Tier 3 pause or handle_step_failure() exit — see
+    /// RunStatusPayload's own field doc for why this travels over the push
+    /// event rather than relying solely on RunResult.
     fn emit_status_with_content(
         &self,
         status: &str,
         step_display_name: Option<&str>,
         step_content: Option<&str>,
+        crisis_resource_block: Option<&str>,
     ) {
         let Some(handle) = &self.app_handle else {
             return; // no handle in tests — silent no-op
@@ -758,6 +781,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             total_steps: total,
             step_display_name: step_display_name.map(|s| s.to_owned()),
             step_content: step_content.map(|s| s.to_owned()),
+            crisis_resource_block: crisis_resource_block.map(|s| s.to_owned()),
         };
         use tauri::Emitter;
         if let Err(e) = handle.emit("run-status-update", &payload) {
@@ -1338,13 +1362,28 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                     }
                 }
                 let _ = self.write_focus_run_record("awaiting_user").await;
-                self.emit_status("awaiting_user", Some(&step.display_name));
+                // R1 crisis-handling floor (items.id=297): Tier 3 is a pause
+                // before OUTPUT, so without this the crisis-flagged run's
+                // resource block would never surface -- see crisis.rs module
+                // doc for the scope boundary this closes.
+                let crisis_resource_block = if self.crisis_floor_triggered {
+                    Some(crate::conductor::crisis::resource_block())
+                } else {
+                    None
+                };
+                self.emit_status_with_content(
+                    "awaiting_user",
+                    Some(&step.display_name),
+                    None,
+                    crisis_resource_block.as_deref(),
+                );
                 return Ok(Some(RunResult {
                     focus_run_id: self.focus_run_id.clone().unwrap_or_default(),
                     status: "awaiting_user".to_owned(),
                     output_id: None,
                     output_content: None,
                     failure: None,
+                    crisis_resource_block,
                 }));
             }
 
@@ -1374,6 +1413,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                 "running",
                 Some(&step.display_name),
                 step_content.as_deref(),
+                None,
             );
 
             checkpoint_counter += 1;
@@ -1547,9 +1587,21 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         &mut self,
         failure: FailureResult,
     ) -> Result<RunResult, LifecycleError> {
+        // R1 crisis-handling floor (items.id=297): every exit this function
+        // can take (Stop/failed, and AwaitUser/HoldForGate/OfferTier2/
+        // OfferCompact/AwaitFloorConsent/AwaitConsent -- Tier 3, consent
+        // gates, and Gate3-hold all funnel through here) is a pause/failure
+        // before OUTPUT, so without this the crisis-flagged run's resource
+        // block would never surface -- see crisis.rs module doc.
+        let crisis_resource_block = if self.crisis_floor_triggered {
+            Some(crate::conductor::crisis::resource_block())
+        } else {
+            None
+        };
+
         if failure.action == FailureAction::Stop && !failure.is_recoverable {
             let _ = self.write_focus_run_record("failed").await;
-            self.emit_status("failed", None);
+            self.emit_status_with_content("failed", None, None, crisis_resource_block.as_deref());
         } else if matches!(
             failure.action,
             FailureAction::AwaitUser
@@ -1560,7 +1612,12 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                 | FailureAction::AwaitConsent
         ) {
             let _ = self.write_focus_run_record("awaiting_user").await;
-            self.emit_status("awaiting_user", None);
+            self.emit_status_with_content(
+                "awaiting_user",
+                None,
+                None,
+                crisis_resource_block.as_deref(),
+            );
         }
 
         let status = self.get_current_status().await;
@@ -1570,6 +1627,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             output_id: None,
             output_content: None,
             failure: Some(failure),
+            crisis_resource_block,
         })
     }
 
@@ -1688,14 +1746,20 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
 
         // R1 crisis-handling floor (decisions.id=607, items.id=265): append
         // (never replace) the model's real response with the static local
-        // resource block. This is the run's single content-finalization
-        // point, reached identically regardless of Persona/Focus/tier --
-        // see crisis.rs module doc for the full reasoning, including the
-        // known scope boundary (runs that pause or fail before reaching
-        // OUTPUT do not currently surface this block).
-        if self.crisis_floor_triggered {
+        // resource block. This is the run's success-path content-finalization
+        // point, reached identically regardless of Persona/Focus/tier -- see
+        // crisis.rs module doc for the full reasoning. Tier 3 pauses and step
+        // failures don't reach here at all (they return early from execute());
+        // items.id=297 covers those via the Tier 3 boundary and
+        // handle_step_failure() instead, each with its own identical check.
+        let crisis_resource_block = if self.crisis_floor_triggered {
+            Some(crate::conductor::crisis::resource_block())
+        } else {
+            None
+        };
+        if let Some(block) = &crisis_resource_block {
             final_content.push_str("\n\n");
-            final_content.push_str(&crate::conductor::crisis::resource_block());
+            final_content.push_str(block);
         }
 
         let output_type = self.focus_def.as_ref().unwrap().output_type.clone();
@@ -1729,6 +1793,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             output_id: Some(output_id),
             output_content: Some(final_content),
             failure: None,
+            crisis_resource_block,
         })
     }
 
@@ -1873,6 +1938,11 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                         output_id: None,
                         output_content: None,
                         failure: Some(failure),
+                        // F_SYSTEM (TaxonomyIntegrity/DatabaseMigration) is a
+                        // system/data-integrity failure, not a Phase 4 step
+                        // outcome -- out of scope for items.id=297's crisis
+                        // floor coverage, same as Phase 1/2 LOAD/AUTHORIZE.
+                        crisis_resource_block: None,
                     });
                 }
 
@@ -2029,6 +2099,11 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                 output_id: output_result.output_id,
                 output_content: output_result.output_content,
                 failure: None,
+                // Forward, don't recompute -- output() (above) already ran
+                // and already decided this; output_content already has the
+                // block appended, this just carries the structured signal
+                // through too.
+                crisis_resource_block: output_result.crisis_resource_block,
             });
         }
 
@@ -2749,5 +2824,247 @@ mod tests {
             0,
             "a confirmed (included) fact must not write a disclosure-log entry"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // R1 crisis-handling floor -- Tier 3 boundary and handle_step_failure()
+    // (items.id=297). Both are Phase 4 EXECUTE exits that leave a run
+    // without ever reaching output() (the pre-existing, already-tested-by-
+    // hand crisis-append point), so RunResult.crisis_resource_block must be
+    // populated here identically to how output() populates it.
+    // -------------------------------------------------------------------------
+
+    const CRISIS_TEST_KEY_HEX: &str =
+        "1122334455667788112233445566778811223344556677881122334455667788";
+
+    /// Run a future with QR_DATA_ROOT pointed at a scratch tempdir, matching
+    /// document_fork_store.rs's established per-test sandboxing pattern --
+    /// write_checkpoint()/write_focus_run_record() do real (non-fatal-on-
+    /// error, but real) DB I/O even in these tests, and must never touch a
+    /// real user data directory.
+    async fn with_temp_data_root<F: std::future::Future>(f: F) -> F::Output {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let result = f.await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+        result
+    }
+
+    /// A FocusDefinition with a single Tier 3 step -- enough for execute()'s
+    /// loop to hit the Tier 3 boundary on its very first iteration, before
+    /// execute_step() (and everything it would otherwise require) ever runs.
+    fn single_tier3_step_focus_def() -> FocusDefinition {
+        let mut steps_map = IndexMap::new();
+        steps_map.insert(
+            "step_a".to_owned(),
+            RawStep {
+                display_name: Some("Step A".to_owned()),
+                guide_id: None,
+                task_type: Some("general".to_owned()),
+                routing_tier: Some(3),
+                step_type: None,
+                output_var: Some("result".to_owned()),
+                prompt_template: Some("Hello {user_input}".to_owned()),
+                field_requirements: None,
+                options_override: None,
+            },
+        );
+        let mut raw = minimal_raw();
+        raw.max_routing_tier = Some(3);
+        raw.steps = Some(steps_map);
+        parse_focus_definition(raw).unwrap()
+    }
+
+    /// A FocusRun with every field execute()'s own assert!()s require
+    /// populated (sealed PersonalTrack, task_track, shared_state, focus_def,
+    /// focus_run_id, failure_handler, privacy_gateway) -- everything pure/
+    /// in-memory except the DB writes execute() itself triggers, which is
+    /// what with_temp_data_root() above is for. app_handle stays None (as
+    /// in every other test in this file), so emit_status_with_content() is a
+    /// silent no-op here -- these tests assert on the returned RunResult,
+    /// not on the push event.
+    fn tier3_ready_run(
+        crisis_floor_triggered: bool,
+    ) -> FocusRun<crate::conductor::privacy::logger::TestLogger> {
+        use crate::conductor::privacy::logger::DisclosureLoggerForRun;
+
+        let scheduler = Arc::new(ConductorScheduler::new());
+        let mut run: FocusRun<crate::conductor::privacy::logger::TestLogger> = FocusRun::new(
+            "u".to_owned(),
+            "p".to_owned(),
+            "f".to_owned(),
+            scheduler,
+            "".to_owned(),
+            false,
+            Some(CRISIS_TEST_KEY_HEX.to_owned()),
+            None,
+            false,
+            std::collections::HashSet::new(),
+            None,
+        );
+        run.focus_run_id = Some(uuid::Uuid::new_v4().to_string());
+        run.focus_def = Some(single_tier3_step_focus_def());
+        let mut personal_track = PersonalTrack::new();
+        personal_track.seal();
+        run.personal_track = Some(personal_track);
+        run.task_track = Some(TaskTrack::new());
+        run.shared_state = Some(SharedStateTrack::new());
+        run.failure_handler = Some(FailureHandler::new(1));
+        run.privacy_gateway = Some(PrivacyGateway::new(
+            crate::conductor::privacy::logger::TestLogger::for_run("u", "p", ""),
+        ));
+        run.crisis_floor_triggered = crisis_floor_triggered;
+        run
+    }
+
+    #[tokio::test]
+    async fn tier3_boundary_sets_crisis_resource_block_when_triggered() {
+        with_temp_data_root(async {
+            let mut run = tier3_ready_run(true);
+            let result = run
+                .execute()
+                .await
+                .unwrap()
+                .expect("a Tier 3 first step must return Some(RunResult), not fall through");
+            assert_eq!(result.status, "awaiting_user");
+            let block = result
+                .crisis_resource_block
+                .expect("crisis-flagged Tier 3 pause must carry the resource block");
+            assert!(
+                block.contains("988"),
+                "must be the real crisis resource text, not a placeholder: {block}"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn tier3_boundary_omits_crisis_resource_block_when_not_triggered() {
+        with_temp_data_root(async {
+            let mut run = tier3_ready_run(false);
+            let result = run
+                .execute()
+                .await
+                .unwrap()
+                .expect("a Tier 3 first step must return Some(RunResult), not fall through");
+            assert_eq!(result.status, "awaiting_user");
+            assert!(
+                result.crisis_resource_block.is_none(),
+                "a non-crisis-flagged run must not get the resource block"
+            );
+        })
+        .await;
+    }
+
+    /// Minimal FocusRun for handle_step_failure() directly -- unlike the
+    /// Tier 3 boundary, handle_step_failure() takes its FailureResult as a
+    /// plain parameter rather than deriving it from self.failure_handler /
+    /// self.privacy_gateway / a real step, so it needs none of those: just
+    /// focus_run_id + key_hex (write_focus_run_record() panics without
+    /// either) and the crisis flag under test.
+    fn failure_ready_run(crisis_floor_triggered: bool) -> FocusRun {
+        let scheduler = Arc::new(ConductorScheduler::new());
+        let mut run: FocusRun = FocusRun::new(
+            "u".to_owned(),
+            "p".to_owned(),
+            "f".to_owned(),
+            scheduler,
+            "".to_owned(),
+            false,
+            Some(CRISIS_TEST_KEY_HEX.to_owned()),
+            None,
+            false,
+            std::collections::HashSet::new(),
+            None,
+        );
+        run.focus_run_id = Some(uuid::Uuid::new_v4().to_string());
+        run.crisis_floor_triggered = crisis_floor_triggered;
+        run
+    }
+
+    fn stop_failure() -> FailureResult {
+        FailureResult {
+            action: FailureAction::Stop,
+            failure_mode: Some("F1".to_owned()),
+            plain_language: "Something went wrong.".to_owned(),
+            is_recoverable: false,
+            severity: FailureSeverity::Stop,
+            step_id: Some("step_a".to_owned()),
+            focus_id: Some("f".to_owned()),
+            metadata: None,
+        }
+    }
+
+    fn await_user_failure() -> FailureResult {
+        FailureResult {
+            action: FailureAction::AwaitFloorConsent,
+            failure_mode: Some("F6".to_owned()),
+            plain_language: "Needs your input to continue.".to_owned(),
+            is_recoverable: true,
+            severity: FailureSeverity::Pause,
+            step_id: Some("step_a".to_owned()),
+            focus_id: Some("f".to_owned()),
+            metadata: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_step_failure_stop_branch_sets_crisis_resource_block_when_triggered() {
+        with_temp_data_root(async {
+            let mut run = failure_ready_run(true);
+            let result = run.handle_step_failure(stop_failure()).await.unwrap();
+            assert_eq!(result.status, "failed");
+            let block = result
+                .crisis_resource_block
+                .expect("crisis-flagged Stop failure must carry the resource block");
+            assert!(block.contains("988"));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn handle_step_failure_await_user_branch_sets_crisis_resource_block_when_triggered() {
+        with_temp_data_root(async {
+            let mut run = failure_ready_run(true);
+            let result = run.handle_step_failure(await_user_failure()).await.unwrap();
+            // Round-trips through write_focus_run_record()'s INSERT and
+            // get_current_status()'s own SELECT against the same tempdir
+            // outputs.db -- confirms this test's fixture is exercising the
+            // real DB path, not silently short-circuiting on an error.
+            assert_eq!(result.status, "awaiting_user");
+            let block = result
+                .crisis_resource_block
+                .expect("crisis-flagged AwaitFloorConsent pause must carry the resource block");
+            assert!(block.contains("988"));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn handle_step_failure_omits_crisis_resource_block_when_not_triggered() {
+        with_temp_data_root(async {
+            let mut run = failure_ready_run(false);
+            let stop_result = run.handle_step_failure(stop_failure()).await.unwrap();
+            assert!(stop_result.crisis_resource_block.is_none());
+
+            let mut run2 = failure_ready_run(false);
+            let await_result = run2
+                .handle_step_failure(await_user_failure())
+                .await
+                .unwrap();
+            assert!(
+                await_result.crisis_resource_block.is_none(),
+                "neither branch should populate the block for a non-crisis-flagged run"
+            );
+        })
+        .await;
     }
 }

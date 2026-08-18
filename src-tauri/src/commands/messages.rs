@@ -104,6 +104,25 @@ fn build_conversation_prompt(history: &[message_store::MessageRecord]) -> String
     prompt
 }
 
+/// R1 crisis-handling floor (items.id=297): the Ok(None) arm of send_message's
+/// background backfill match (no saved `outputs` row -- true for every run
+/// that paused or failed before output()) has only `execute_full()`'s
+/// RunResult left to check for a crisis resource block. Pulled out as its own
+/// pure function so this decision is directly unit-testable without spinning
+/// up the full tokio::spawn/DB backfill path. Err(_) (execute_full() itself
+/// failed) is treated the same as "no block" -- nothing to persist.
+fn crisis_block_from_result(
+    result: &Result<
+        crate::conductor::lifecycle::RunResult,
+        crate::conductor::lifecycle::LifecycleError,
+    >,
+) -> Option<&str> {
+    result
+        .as_ref()
+        .ok()
+        .and_then(|r| r.crisis_resource_block.as_deref())
+}
+
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
@@ -227,7 +246,7 @@ pub async fn send_message(
     let bg_run_id = run_id.clone();
     let bg_message_id = assistant_record.id.clone();
     tokio::spawn(async move {
-        let _result = run.execute_full().await;
+        let result = run.execute_full().await;
         match output_store::get_output_for_run(&bg_user_id, &bg_persona_id, &bg_key_hex, &bg_run_id)
             .await
         {
@@ -245,9 +264,32 @@ pub async fn send_message(
                 }
             }
             Ok(None) => {
-                log::warn!(
-                    "send_message: run {bg_run_id} finished but produced no output to backfill"
-                );
+                // No saved `outputs` row -- true for every run that paused or
+                // failed before reaching output() (Tier 3, consent gates,
+                // Gate3 review, step failure). R1 crisis-handling floor
+                // (items.id=297): if the run was crisis-flagged, persist the
+                // resource block into the placeholder now, so it survives a
+                // reload/reopen even if the live "run-status-update" event
+                // that also carries it was missed by the frontend. Ordinary
+                // (non-crisis) pauses/failures keep today's behavior -- the
+                // placeholder stays empty, just logged.
+                if let Some(block) = crisis_block_from_result(&result) {
+                    if let Err(e) = message_store::update_message_content(
+                        &bg_user_id,
+                        &bg_persona_id,
+                        &bg_key_hex,
+                        &bg_message_id,
+                        block,
+                    )
+                    .await
+                    {
+                        log::warn!("send_message: failed to backfill crisis resource block: {e}");
+                    }
+                } else {
+                    log::warn!(
+                        "send_message: run {bg_run_id} finished but produced no output to backfill"
+                    );
+                }
             }
             Err(e) => {
                 log::warn!("send_message: failed to fetch output for run {bg_run_id}: {e}");
@@ -330,6 +372,42 @@ mod tests {
     #[test]
     fn build_conversation_prompt_on_empty_history_is_empty_string() {
         assert_eq!(build_conversation_prompt(&[]), "");
+    }
+
+    // -----------------------------------------------------------------
+    // crisis_block_from_result (items.id=297) -- also a pure function, same
+    // rationale as build_conversation_prompt above.
+    // -----------------------------------------------------------------
+
+    fn run_result(crisis_resource_block: Option<&str>) -> crate::conductor::lifecycle::RunResult {
+        crate::conductor::lifecycle::RunResult {
+            focus_run_id: "run-1".to_owned(),
+            status: "awaiting_user".to_owned(),
+            output_id: None,
+            output_content: None,
+            failure: None,
+            crisis_resource_block: crisis_resource_block.map(|s| s.to_owned()),
+        }
+    }
+
+    #[test]
+    fn crisis_block_from_result_present_when_run_was_crisis_flagged() {
+        let result = Ok(run_result(Some("call 988")));
+        assert_eq!(crisis_block_from_result(&result), Some("call 988"));
+    }
+
+    #[test]
+    fn crisis_block_from_result_absent_for_an_ordinary_pause_or_failure() {
+        let result = Ok(run_result(None));
+        assert_eq!(crisis_block_from_result(&result), None);
+    }
+
+    #[test]
+    fn crisis_block_from_result_absent_when_execute_full_itself_errored() {
+        let result: Result<_, crate::conductor::lifecycle::LifecycleError> = Err(
+            crate::conductor::lifecycle::LifecycleError::FocusNotFound("quick-ask".to_owned()),
+        );
+        assert_eq!(crisis_block_from_result(&result), None);
     }
 
     // -----------------------------------------------------------------

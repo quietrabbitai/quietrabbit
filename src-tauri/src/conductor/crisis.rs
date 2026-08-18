@@ -23,7 +23,12 @@
 //      from Quebec does not reach Quebec's own service), lifeline.org.au
 //      (AU). Tracked for ongoing accuracy by maintenance_items.id=44.
 //   4. Placement  -- named floor entry, applied everywhere unconditionally.
-//      See lifecycle.rs FocusRun.crisis_floor_triggered / output().
+//      See lifecycle.rs FocusRun.crisis_floor_triggered, checked at every
+//      Phase 4 EXECUTE exit that can leave a run without reaching OUTPUT
+//      (Tier 3 boundary and handle_step_failure(), items.id=297) as well as
+//      output() itself. Phase 1/2 (LOAD/AUTHORIZE) failure paths are not
+//      covered -- a run that never reaches EXECUTE was never assessed for
+//      crisis_floor_triggered in the first place.
 //
 // STRUCTURAL LIMITATION (state this plainly, not just here): a curated,
 // hardcoded phrase list is inherently narrow by construction. It will miss
