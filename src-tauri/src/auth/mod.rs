@@ -11,6 +11,7 @@ pub mod group_creation;
 pub mod group_invitations;
 pub mod group_membership;
 pub mod kdf;
+pub mod persona_sharing;
 pub mod registry;
 pub mod sharing_keypair;
 pub mod user_store;
