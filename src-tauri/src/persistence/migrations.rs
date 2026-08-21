@@ -194,9 +194,19 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/shared_009.sql"),
     },
     SchemaFile {
+        prefix: "shared",
+        version: 10,
+        sql: include_str!("../../schema/shared_010.sql"),
+    },
+    SchemaFile {
         prefix: "tier3_cookies",
         version: 1,
         sql: include_str!("../../schema/tier3_cookies_001.sql"),
+    },
+    SchemaFile {
+        prefix: "view_cache",
+        version: 1,
+        sql: include_str!("../../schema/view_cache_001.sql"),
     },
 ];
 
@@ -727,6 +737,35 @@ pub async fn migrate_messages_db(
     run_migrations(&mut conn, "messages", Some(key_hex)).await
 }
 
+/// Migrate a VIEW-ONLY persona share's recipient-side read-only cache
+/// (encrypted). key_hex: bare hex bytes only.
+///
+/// PATH shape combines two existing precedents: migrate_keys_db /
+/// migrate_tier3_cookies_db already key a per-account (not per-persona) file
+/// directly with the account's own master-key hex at
+/// users/{user_id}/{name}.db; migrate_group_db already adds a second
+/// identifier as an extra path segment. items.id=304 (decisions.id=723): a
+/// VIEW-ONLY share never materializes a Persona, so this cannot live under
+/// personas/{persona_id}/ the way personal.db does -- it is scoped to
+/// (user_id, share_id) instead, encrypted with the same account master key
+/// personal.db already uses (no new key derivation, no new KeyRegistry
+/// plumbing).
+pub async fn migrate_view_cache_db(
+    user_id: &str,
+    share_id: &str,
+    key_hex: &str,
+) -> Result<u32, MigrationError> {
+    let db_path = get_data_root()
+        .join("users")
+        .join(user_id)
+        .join("persona_view_shares")
+        .join(share_id)
+        .join("view_cache.db");
+    std::fs::create_dir_all(db_path.parent().unwrap())?;
+    let mut conn = open_raw(&db_path).await?;
+    run_migrations(&mut conn, "view_cache", Some(key_hex)).await
+}
+
 /// Migrate a user's integration_keys.db (encrypted). key_hex: bare hex bytes only.
 pub async fn migrate_keys_db(user_id: &str, key_hex: &str) -> Result<u32, MigrationError> {
     let db_path = get_data_root()
@@ -1001,15 +1040,15 @@ mod tests {
             .await
             .expect("shared migration chain must apply cleanly on a fresh db");
         assert_eq!(
-            applied, 9,
-            "expected all nine shared schema versions to apply"
+            applied, 10,
+            "expected all ten shared schema versions to apply"
         );
 
         let version: (i64,) = sqlx::query_as("SELECT MAX(version) FROM schema_version")
             .fetch_one(&mut conn)
             .await
             .unwrap();
-        assert_eq!(version.0, 9);
+        assert_eq!(version.0, 10);
     }
 
     #[tokio::test]
@@ -1080,8 +1119,8 @@ mod tests {
             .expect("drift-healing run must succeed");
 
         assert_eq!(
-            applied, 8,
-            "shared v2, v3, v4, v5, v6, v7, v8, and v9 should count as newly applied from a stale v1 database"
+            applied, 9,
+            "shared v2, v3, v4, v5, v6, v7, v8, v9, and v10 should count as newly applied from a stale v1 database"
         );
 
         let exists: Option<(String,)> = sqlx::query_as(

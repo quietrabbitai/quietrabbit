@@ -396,6 +396,17 @@ async fn async_main() {
                     // -- run once per tick for whichever account is
                     // currently logged in (a no-op if nobody is).
                     quietrabbit_lib::persona_sync::engine::run_periodic_sweep(&key_registry).await;
+
+                    // items.id=304 (decisions.id=723): VIEW-ONLY persona-share
+                    // sync periodic push + pull, same timer tick, same
+                    // content-hash-gating mechanism as the SYNCED sweep above
+                    // -- a separate sibling call, not folded into that
+                    // function's body, since VIEW-ONLY's push/pull are a
+                    // parallel module with no provisioning/reconciliation
+                    // concerns of their own (see persona_view_sync::engine's
+                    // own module header).
+                    quietrabbit_lib::persona_view_sync::engine::run_periodic_sweep(&key_registry)
+                        .await;
                 }
             });
             Ok(())

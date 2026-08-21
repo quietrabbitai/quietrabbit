@@ -121,6 +121,10 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         // Group 19 -- Persona share folder sync (items.id=303, decisions.id=722)
         commands::persona_sync::set_persona_share_sync_folder,
         commands::persona_sync::get_persona_share_sync_folder,
+        // Group 20 -- VIEW-ONLY persona share folder sync (items.id=304,
+        // decisions.id=723)
+        commands::persona_view_sync::set_persona_view_share_sync_folder,
+        commands::persona_view_sync::get_persona_view_share_sync_folder,
     ])
 }
 

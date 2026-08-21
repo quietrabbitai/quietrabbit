@@ -436,6 +436,17 @@ async fn finish_login(
     )
     .await;
 
+    // items.id=304 (decisions.id=723): same "app-start" pull trigger, for
+    // VIEW-ONLY shares -- mirrors the SYNCED call immediately above, as a
+    // separate sibling call for the same module-separation reasoning
+    // persona_view_sync::engine's own header gives.
+    crate::persona_view_sync::engine::pull_all_accepted_view_shares_on_login(
+        user_id,
+        &personal_key_hex_for_sync,
+        &sharing_private_key,
+    )
+    .await;
+
     // items.id=290, decisions.id=718: rehydrate GroupKeyRegistry from every
     // one of this account's personas' personal.db group_keys tables --
     // GroupKeyRegistry itself stays deliberately volatile (auth/registry.rs's

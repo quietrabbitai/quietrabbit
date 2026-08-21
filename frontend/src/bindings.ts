@@ -429,6 +429,22 @@ export const commands = {
 	last_error: string | null,
 	updated_at: string,
 } | null, string>(__TAURI_INVOKE("get_persona_share_sync_folder", { personaId, shareId })),
+	/**
+	 *  Configure (or reconfigure) this install's folder-sync source location for
+	 *  a (recipient_user_id, share_id) pair. Upsert on folder_path.
+	 */
+	setPersonaViewShareSyncFolder: (recipientUserId: string, shareId: string, folderPath: string) => typedError<null, string>(__TAURI_INVOKE("set_persona_view_share_sync_folder", { recipientUserId, shareId, folderPath })),
+	/**
+	 *  Fetch this install's folder-sync settings for a (recipient_user_id,
+	 *  share_id) pair. Returns Ok(None) if sync has never been configured for
+	 *  this pair -- not an error, matching get_persona_share_sync_folder's
+	 *  "None is a valid state" shape.
+	 */
+	getPersonaViewShareSyncFolder: (recipientUserId: string, shareId: string) => typedError<{
+	folder_path: string,
+	last_error: string | null,
+	updated_at: string,
+} | null, string>(__TAURI_INVOKE("get_persona_view_share_sync_folder", { recipientUserId, shareId })),
 };
 
 /* Types */
@@ -671,6 +687,12 @@ export type PersonaShareSyncSettingsInfo = {
 	last_synced_at: string | null,
 	last_pushed_at: string | null,
 	last_content_hash: string | null,
+	last_error: string | null,
+	updated_at: string,
+};
+
+export type PersonaViewShareSyncSettingsInfo = {
+	folder_path: string,
 	last_error: string | null,
 	updated_at: string,
 };

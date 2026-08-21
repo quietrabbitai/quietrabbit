@@ -80,6 +80,36 @@ use crate::persistence::personal_store::{self, PersonalStoreError};
 /// time a consumer is built, not discovered as an afterthought.
 pub const PERSONA_SHARE_PAYLOAD_SCHEMA_VERSION: &str = "1.0";
 
+/// Which of decisions.id=617's two grant types a pending_persona_shares row
+/// is (items.id=304, decisions.id=723). Added to an already-shipped table
+/// via a plain ADD COLUMN with no SQL-level CHECK (schema/shared_010.sql's
+/// own header: SQLite can't cleanly add a CHECK to an existing table without
+/// a full rebuild), so the allowed-value set is enforced here instead --
+/// same pattern persona_sync::settings_store::SyncRole::parse already
+/// establishes for exactly this situation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShareType {
+    Synced,
+    ViewOnly,
+}
+
+impl ShareType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ShareType::Synced => "synced",
+            ShareType::ViewOnly => "view_only",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self, PersonaSharingError> {
+        match s {
+            "synced" => Ok(ShareType::Synced),
+            "view_only" => Ok(ShareType::ViewOnly),
+            other => Err(PersonaSharingError::UnknownShareType(other.to_owned())),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum PersonaSharingError {
     #[error("Database error: {0}")]
@@ -104,6 +134,8 @@ pub enum PersonaSharingError {
     CorruptStoredEnvelope(String),
     #[error("Persona share '{0}' decrypted to a payload that failed to deserialize: {1}")]
     CorruptPayload(String, serde_json::Error),
+    #[error("Unknown pending_persona_shares.share_type '{0}'. Must be synced or view_only.")]
+    UnknownShareType(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -190,13 +222,17 @@ pub(crate) struct SharedVoiceProfileEntry {
     pub(crate) extra_metadata: serde_json::Value,
 }
 
+// pub(crate) (not private): items.id=304's accept_persona_view_share decrypts
+// and deserializes this exact same envelope shape -- decisions.id=723
+// confirms the owner-side grant content is identical for both grant types,
+// only what accept does with it afterward differs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-struct PersonaSharePayload {
-    schema_version: String,
-    floor_consent_preference: Option<serde_json::Value>,
-    entities: Vec<Entity>,
-    entity_facts: Vec<SharedEntityFact>,
-    voice_profile_entries: Vec<SharedVoiceProfileEntry>,
+pub(crate) struct PersonaSharePayload {
+    pub(crate) schema_version: String,
+    pub(crate) floor_consent_preference: Option<serde_json::Value>,
+    pub(crate) entities: Vec<Entity>,
+    pub(crate) entity_facts: Vec<SharedEntityFact>,
+    pub(crate) voice_profile_entries: Vec<SharedVoiceProfileEntry>,
 }
 
 // ---------------------------------------------------------------------------
@@ -303,6 +339,7 @@ pub async fn send_persona_share(
     source_persona_id: &str,
     owner_key_hex: &str,
     recipient_user_id: &str,
+    share_type: ShareType,
 ) -> Result<String, PersonaSharingError> {
     let persona = persona_store::get_persona_for_user(owner_user_id, source_persona_id)
         .await?
@@ -361,8 +398,8 @@ pub async fn send_persona_share(
         "INSERT INTO pending_persona_shares
          (id, recipient_user_id, source_persona_id, source_persona_display_name,
           source_persona_type, payload_schema_version, encrypted_payload, status,
-          created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+          created_at, share_type)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
     )
     .bind(&id)
     .bind(recipient_user_id)
@@ -372,6 +409,7 @@ pub async fn send_persona_share(
     .bind(PERSONA_SHARE_PAYLOAD_SCHEMA_VERSION)
     .bind(hex_encode(&envelope))
     .bind(&created_at)
+    .bind(share_type.as_str())
     .execute(&mut shared_conn)
     .await?;
 
@@ -382,23 +420,34 @@ pub async fn send_persona_share(
 // Accept / materialize (items.id=302)
 // ---------------------------------------------------------------------------
 
-struct PendingPersonaShareRow {
-    source_persona_display_name: String,
-    source_persona_type: String,
-    encrypted_payload: String,
+// pub(crate) (not private): items.id=304's persona_view_sync engine reuses
+// this row shape and the fetch below directly for accept_persona_view_share
+// -- the fetch-by-(id, recipient)/pending-status logic is identical for both
+// grant types, only what happens to the decrypted payload afterward differs.
+pub(crate) struct PendingPersonaShareRow {
+    pub(crate) source_persona_display_name: String,
+    pub(crate) source_persona_type: String,
+    pub(crate) encrypted_payload: String,
+    /// "synced" | "view_only" (ShareType::as_str). accept_persona_share
+    /// (this file) never reads this field -- it's SYNCED-only and doesn't
+    /// need to check its own share_type. accept_persona_view_share
+    /// (persona_view_sync::engine) does, to reject accepting a SYNCED share
+    /// through the VIEW-ONLY path.
+    pub(crate) share_type: String,
 }
 
 /// Mirrors group_invitations.rs::fetch_pending_invitation: id + recipient
 /// both filter the same WHERE clause, so "exists but belongs to a different
 /// recipient" collapses into the same NotFound as "doesn't exist" -- no
 /// separate error, no existence leak.
-async fn fetch_pending_persona_share(
+pub(crate) async fn fetch_pending_persona_share(
     share_id: &str,
     recipient_user_id: &str,
     conn: &mut SqliteConnection,
 ) -> Result<PendingPersonaShareRow, PersonaSharingError> {
     let row = sqlx::query(
-        "SELECT source_persona_display_name, source_persona_type, encrypted_payload, status
+        "SELECT source_persona_display_name, source_persona_type, encrypted_payload, status,
+                share_type
          FROM pending_persona_shares
          WHERE id = ? AND recipient_user_id = ?",
     )
@@ -417,6 +466,7 @@ async fn fetch_pending_persona_share(
         source_persona_display_name: row.try_get("source_persona_display_name")?,
         source_persona_type: row.try_get("source_persona_type")?,
         encrypted_payload: row.try_get("encrypted_payload")?,
+        share_type: row.try_get("share_type")?,
     })
 }
 
@@ -819,7 +869,13 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let share_id = send_persona_share(owner_id, owner_persona, owner_key_hex, recipient_id)
+        let share_id = send_persona_share(
+            owner_id,
+            owner_persona,
+            owner_key_hex,
+            recipient_id,
+            ShareType::Synced,
+        )
             .await
             .expect("send_persona_share must succeed");
 
@@ -875,7 +931,13 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let share_id = send_persona_share(&owner_id, &owner_persona, &owner_key_hex, &recipient_id)
+        let share_id = send_persona_share(
+            &owner_id,
+            &owner_persona,
+            &owner_key_hex,
+            &recipient_id,
+            ShareType::Synced,
+        )
             .await
             .expect("send_persona_share must succeed");
 
@@ -955,7 +1017,13 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let share_id = send_persona_share(&owner_id, &owner_persona, &owner_key_hex, &recipient_id)
+        let share_id = send_persona_share(
+            &owner_id,
+            &owner_persona,
+            &owner_key_hex,
+            &recipient_id,
+            ShareType::Synced,
+        )
             .await
             .unwrap();
 
@@ -1002,7 +1070,13 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let share_id = send_persona_share(&owner_id, &owner_persona, &owner_key_hex, &recipient_id)
+        let share_id = send_persona_share(
+            &owner_id,
+            &owner_persona,
+            &owner_key_hex,
+            &recipient_id,
+            ShareType::Synced,
+        )
             .await
             .unwrap();
 
@@ -1040,7 +1114,13 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let share_id = send_persona_share(&owner_id, &owner_persona, &owner_key_hex, &recipient_id)
+        let share_id = send_persona_share(
+            &owner_id,
+            &owner_persona,
+            &owner_key_hex,
+            &recipient_id,
+            ShareType::Synced,
+        )
             .await
             .unwrap();
 
@@ -1063,8 +1143,14 @@ mod tests {
         let (_other_owner, other_persona, _, _) = make_user_with_persona("Carol", 0xAA).await;
         let (recipient_id, _, _, _) = make_user_with_persona("Bob", 0xBB).await;
 
-        let result =
-            send_persona_share(&owner_id, &other_persona, &owner_key_hex, &recipient_id).await;
+        let result = send_persona_share(
+            &owner_id,
+            &other_persona,
+            &owner_key_hex,
+            &recipient_id,
+            ShareType::Synced,
+        )
+        .await;
 
         assert!(matches!(
             result,
@@ -1083,6 +1169,7 @@ mod tests {
             &owner_persona,
             &owner_key_hex,
             "nonexistent-user-id",
+            ShareType::Synced,
         )
         .await;
 
@@ -1284,7 +1371,13 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let share_id = send_persona_share(&owner_id, &owner_persona, &owner_key_hex, &recipient_id)
+        let share_id = send_persona_share(
+            &owner_id,
+            &owner_persona,
+            &owner_key_hex,
+            &recipient_id,
+            ShareType::Synced,
+        )
             .await
             .unwrap();
 

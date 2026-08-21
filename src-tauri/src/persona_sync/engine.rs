@@ -1055,7 +1055,7 @@ pub async fn pull_all_accepted_shares_on_login(
 mod tests {
     use super::*;
     use crate::auth::kdf;
-    use crate::auth::persona_sharing::send_persona_share;
+    use crate::auth::persona_sharing::{send_persona_share, ShareType};
     use crate::auth::sharing_keypair as sk;
     use crate::persistence::persona_store;
     use crate::test_support::ENV_MUTEX;
@@ -1157,7 +1157,13 @@ mod tests {
         .await
         .unwrap();
 
-        let share_id = send_persona_share(&owner_id, &owner_persona, &owner_key, &recipient_id)
+        let share_id = send_persona_share(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            &recipient_id,
+            ShareType::Synced,
+        )
             .await
             .unwrap();
         let persona_id =
@@ -1212,7 +1218,13 @@ mod tests {
         .await
         .unwrap();
 
-        let share_id = send_persona_share(&owner_id, &owner_persona, &owner_key, &recipient_id)
+        let share_id = send_persona_share(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            &recipient_id,
+            ShareType::Synced,
+        )
             .await
             .unwrap();
         let persona_id =
@@ -1272,7 +1284,13 @@ mod tests {
         .await
         .unwrap();
 
-        let share_id = send_persona_share(&owner_id, &owner_persona, &owner_key, &recipient_id)
+        let share_id = send_persona_share(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            &recipient_id,
+            ShareType::Synced,
+        )
             .await
             .unwrap();
 
@@ -1384,7 +1402,13 @@ mod tests {
         .await
         .unwrap();
 
-        let share_id = send_persona_share(&owner_id, &owner_persona, &owner_key, &recipient_id)
+        let share_id = send_persona_share(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            &recipient_id,
+            ShareType::Synced,
+        )
             .await
             .unwrap();
         let persona_id =
@@ -1486,7 +1510,13 @@ mod tests {
         )
         .await
         .unwrap();
-        let share_id = send_persona_share(&owner_id, &owner_persona, &owner_key, &recipient_id)
+        let share_id = send_persona_share(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            &recipient_id,
+            ShareType::Synced,
+        )
             .await
             .unwrap();
 
@@ -1543,7 +1573,13 @@ mod tests {
         .await
         .unwrap();
 
-        let share_id = send_persona_share(&owner_id, &owner_persona, &owner_key, &recipient_id)
+        let share_id = send_persona_share(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            &recipient_id,
+            ShareType::Synced,
+        )
             .await
             .unwrap();
         let persona_id =
@@ -1665,7 +1701,13 @@ mod tests {
         .await
         .unwrap();
 
-        let share_id = send_persona_share(&owner_id, &owner_persona, &owner_key, &recipient_id)
+        let share_id = send_persona_share(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            &recipient_id,
+            ShareType::Synced,
+        )
             .await
             .unwrap();
         let persona_id =
