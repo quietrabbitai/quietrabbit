@@ -3,17 +3,15 @@
 // SYNCED persona-sharing grant flow (items.id=299, narrowed 2026-08-17
 // Chat-PM/Jason): serialize an owner's Persona identity+facts content,
 // encrypt it to a recipient account's public key (Architecture Section 4.3,
-// items.id=289), and write a pending envelope row. This is the ONE piece of
-// items.id=299's original five-piece scope that is fully resolved
-// (items.id=189, 2026-08-16) and does not depend on the still-open design
-// question. Recipient-side listing/accept/decline, materialization (turning
-// the decrypted payload into a real new Persona + personal.db), ongoing
-// sync wiring, and share-stopping are ALL out of scope here -- they require
-// a dedicated design pass (items.id=301, mirroring items.id=210's own
-// precedent before items.id=266 was decomposed into 283-292) that has not
-// happened yet. This module ships the send-side primitive only, ahead of
-// its first real caller -- same convention every group.db primitive already
-// established (group_store.rs::open_group_db, everything in
+// items.id=289), and write a pending envelope row. items.id=302 adds the
+// recipient-side counterpart: decrypt that envelope and materialize it into
+// a real, independent Persona (new personas row + its own personal.db).
+// Recipient-side listing UI, ongoing sync wiring, and share-stopping remain
+// out of scope -- the still-open remainder of items.id=301 (mirroring
+// items.id=210's own precedent before items.id=266 was decomposed into
+// 283-292). This module ships send/accept as library primitives only,
+// ahead of any real caller -- same convention every group.db primitive
+// already established (group_store.rs::open_group_db, everything in
 // group_invitations.rs): #[allow(dead_code)], real tests, no
 // #[tauri::command].
 //
@@ -69,6 +67,7 @@ use sqlx::ConnectOptions;
 use sqlx::Row;
 use sqlx::SqliteConnection;
 use thiserror::Error;
+use x25519_dalek::StaticSecret;
 
 use crate::auth::sharing_keypair::{self, SharingKeypairError};
 use crate::persistence::entity_store::{Entity, EntityFilter, ParentFilter};
@@ -97,6 +96,14 @@ pub enum PersonaSharingError {
     PersonaNotOwnedByUser(String, String),
     #[error("Recipient user '{0}' has no registered sharing public key")]
     RecipientHasNoSharingKey(String),
+    #[error("Persona share '{0}' not found")]
+    NotFound(String),
+    #[error("Persona share '{0}' is not pending (status: {1})")]
+    NotPending(String, String),
+    #[error("Persona share '{0}' has a stored encrypted_payload that is not valid hex")]
+    CorruptStoredEnvelope(String),
+    #[error("Persona share '{0}' decrypted to a payload that failed to deserialize: {1}")]
+    CorruptPayload(String, serde_json::Error),
 }
 
 // ---------------------------------------------------------------------------
@@ -125,6 +132,24 @@ async fn open_shared_db() -> Result<SqliteConnection, PersonaSharingError> {
 
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Duplicated from group_invitations.rs::hex_decode rather than reused --
+/// same reasoning this file's own hex_encode/open_shared_db already give:
+/// different error type per module, not worth coupling.
+fn hex_decode(context: &str, s: &str) -> Result<Vec<u8>, PersonaSharingError> {
+    if !s.len().is_multiple_of(2) {
+        return Err(PersonaSharingError::CorruptStoredEnvelope(
+            context.to_owned(),
+        ));
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&s[i..i + 2], 16)
+                .map_err(|_| PersonaSharingError::CorruptStoredEnvelope(context.to_owned()))
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -328,13 +353,15 @@ pub async fn send_persona_share(
     sqlx::query(
         "INSERT INTO pending_persona_shares
          (id, recipient_user_id, source_persona_id, source_persona_display_name,
-          payload_schema_version, encrypted_payload, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
+          source_persona_type, payload_schema_version, encrypted_payload, status,
+          created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
     )
     .bind(&id)
     .bind(recipient_user_id)
     .bind(source_persona_id)
     .bind(&persona.display_name)
+    .bind(&persona.persona_type)
     .bind(PERSONA_SHARE_PAYLOAD_SCHEMA_VERSION)
     .bind(hex_encode(&envelope))
     .bind(&created_at)
@@ -342,6 +369,293 @@ pub async fn send_persona_share(
     .await?;
 
     Ok(id)
+}
+
+// ---------------------------------------------------------------------------
+// Accept / materialize (items.id=302)
+// ---------------------------------------------------------------------------
+
+struct PendingPersonaShareRow {
+    source_persona_display_name: String,
+    source_persona_type: String,
+    encrypted_payload: String,
+}
+
+/// Mirrors group_invitations.rs::fetch_pending_invitation: id + recipient
+/// both filter the same WHERE clause, so "exists but belongs to a different
+/// recipient" collapses into the same NotFound as "doesn't exist" -- no
+/// separate error, no existence leak.
+async fn fetch_pending_persona_share(
+    share_id: &str,
+    recipient_user_id: &str,
+    conn: &mut SqliteConnection,
+) -> Result<PendingPersonaShareRow, PersonaSharingError> {
+    let row = sqlx::query(
+        "SELECT source_persona_display_name, source_persona_type, encrypted_payload, status
+         FROM pending_persona_shares
+         WHERE id = ? AND recipient_user_id = ?",
+    )
+    .bind(share_id)
+    .bind(recipient_user_id)
+    .fetch_optional(&mut *conn)
+    .await?
+    .ok_or_else(|| PersonaSharingError::NotFound(share_id.to_owned()))?;
+
+    let status: String = row.try_get("status")?;
+    if status != "pending" {
+        return Err(PersonaSharingError::NotPending(share_id.to_owned(), status));
+    }
+
+    Ok(PendingPersonaShareRow {
+        source_persona_display_name: row.try_get("source_persona_display_name")?,
+        source_persona_type: row.try_get("source_persona_type")?,
+        encrypted_payload: row.try_get("encrypted_payload")?,
+    })
+}
+
+/// Accept a pending SYNCED persona share: decrypt its envelope with the
+/// recipient's own resident sharing private key (KeyRegistry::with_key
+/// exposes it as UnlockedKey.sharing_private_key -- reconstruct via
+/// StaticSecret::from), and materialize the decrypted payload into a new,
+/// independent Persona -- a fresh personal.db (entities, entity_facts,
+/// voice profiles) plus a new personas/user_personas row in shared.db.
+/// Returns the new persona's id.
+///
+/// ORDERING, deliberate, mirroring accept_invitation's own reasoning
+/// (group_invitations.rs:318-336): decrypt happens before ANY row mutation
+/// -- on tamper/wrong-key this returns Err(Sharing(DecryptionFailed))
+/// unchanged and the share row is left exactly as it was (still 'pending').
+/// The new persona's personal.db content is written FIRST, in its own
+/// SAVEPOINT; only once that succeeds do we touch shared.db (INSERT
+/// personas, INSERT user_personas, UPDATE the share to 'accepted'), in a
+/// second SAVEPOINT. No single SAVEPOINT can span both files -- same
+/// constraint accept_invitation lives with (memory / personal.db / shared.db
+/// are different storage systems there; personal.db / shared.db are here).
+/// This ordering means a failure in the personal.db write leaves the share
+/// 'pending' and shared.db untouched (safe retry, new persona_id next
+/// attempt); a failure in the shared.db write after personal.db succeeded
+/// leaves an orphaned personal.db file that no persona ever points at --
+/// inert, not user-visible, acceptable at this pre-release stage.
+#[allow(dead_code)] // items.id=302: ahead of its first real caller (accept-UI item, not yet scoped)
+pub async fn accept_persona_share(
+    share_id: &str,
+    recipient_user_id: &str,
+    recipient_personal_key_hex: &str,
+    sharing_private_key: &StaticSecret,
+) -> Result<String, PersonaSharingError> {
+    let mut shared_conn = open_shared_db().await?;
+    let share = fetch_pending_persona_share(share_id, recipient_user_id, &mut shared_conn).await?;
+
+    let envelope = hex_decode(share_id, &share.encrypted_payload)?;
+    let plaintext = sharing_keypair::decrypt_own_envelope(sharing_private_key, &envelope)?;
+    let payload: PersonaSharePayload = serde_json::from_slice(&plaintext)
+        .map_err(|e| PersonaSharingError::CorruptPayload(share_id.to_owned(), e))?;
+
+    let persona_id = uuid::Uuid::new_v4().to_string();
+    let now = crate::providers::utils::now();
+
+    // --- personal.db: entities, entity_facts, voice_profiles -----------
+    let mut personal_conn = personal_store::open_personal_db(
+        recipient_user_id,
+        &persona_id,
+        recipient_personal_key_hex,
+    )
+    .await?;
+
+    sqlx::query("SAVEPOINT accept_persona_share")
+        .execute(&mut personal_conn)
+        .await?;
+
+    let content_step: Result<(), sqlx::Error> = async {
+        // entities.parent_entity_id is a real, enforced FK (sqlx enables
+        // PRAGMA foreign_keys by default) -- a single insert pass in
+        // payload order could violate it if a child sorts before its
+        // parent, and a parent excluded from the payload (e.g. archived,
+        // filtered out by send_persona_share) would violate it permanently.
+        // Two passes avoids both: pass 1 inserts every entity with
+        // parent_entity_id forced NULL (never violates the FK); pass 2
+        // fills in parent_entity_id only where that parent actually made
+        // it into this payload -- a parent that didn't is correctly left
+        // NULL, since it doesn't exist anywhere in the recipient's new
+        // personal.db either.
+        let included_entity_ids: std::collections::HashSet<&str> =
+            payload.entities.iter().map(|e| e.id.as_str()).collect();
+
+        for entity in &payload.entities {
+            let aliases_json =
+                serde_json::to_string(&entity.aliases).unwrap_or_else(|_| "[]".to_owned());
+            let extra_metadata_json = entity.extra_metadata.to_string();
+            sqlx::query(
+                "INSERT INTO entities
+                 (id, entity_type, display_name, aliases, parent_entity_id, status,
+                  modification_state, source_registry_id, source_url, created_at,
+                  extra_metadata, redact_identification, hide_from_shared_surfaces)
+                 VALUES (?, ?, ?, ?, NULL, ?, 'user_created', NULL, ?, ?, ?, ?, ?)",
+            )
+            .bind(&entity.id)
+            .bind(&entity.entity_type)
+            .bind(&entity.display_name)
+            .bind(&aliases_json)
+            .bind(&entity.status)
+            .bind(&entity.source_url)
+            .bind(&entity.created_at)
+            .bind(&extra_metadata_json)
+            .bind(entity.redact_identification)
+            .bind(entity.hide_from_shared_surfaces)
+            .execute(&mut personal_conn)
+            .await?;
+        }
+
+        for entity in &payload.entities {
+            let Some(parent_id) = entity.parent_entity_id.as_deref() else {
+                continue;
+            };
+            if !included_entity_ids.contains(parent_id) {
+                continue;
+            }
+            sqlx::query("UPDATE entities SET parent_entity_id = ? WHERE id = ?")
+                .bind(parent_id)
+                .bind(&entity.id)
+                .execute(&mut personal_conn)
+                .await?;
+        }
+
+        for fact in &payload.entity_facts {
+            let extra_metadata_json = fact.extra_metadata.to_string();
+            sqlx::query(
+                "INSERT INTO entity_facts
+                 (id, entity_id, field_name, field_value, sensitivity,
+                  abstraction_tier2, abstraction_tier3, source, valid_from,
+                  created_at, extra_metadata, source_persona_id,
+                  cross_persona_export, origin_persona_id)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 'synced_share', ?, ?, ?, ?, 0, NULL)",
+            )
+            .bind(&fact.id)
+            .bind(&fact.entity_id)
+            .bind(&fact.field_name)
+            .bind(&fact.field_value)
+            .bind(&fact.sensitivity)
+            .bind(&fact.abstraction_tier2)
+            .bind(&fact.abstraction_tier3)
+            .bind(&fact.valid_from)
+            .bind(&fact.created_at)
+            .bind(&extra_metadata_json)
+            .bind(&persona_id)
+            .execute(&mut personal_conn)
+            .await?;
+        }
+
+        for entry in &payload.voice_profile_entries {
+            let extra_metadata_json = entry.extra_metadata.to_string();
+            sqlx::query(
+                "INSERT INTO voice_profiles
+                 (id, persona_id, source_id, precedence, attribute, value,
+                  created_at, updated_at, extra_metadata)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&entry.id)
+            .bind(&persona_id)
+            .bind(&entry.source_id)
+            .bind(entry.precedence)
+            .bind(&entry.attribute)
+            .bind(&entry.value)
+            .bind(&entry.created_at)
+            .bind(&entry.updated_at)
+            .bind(&extra_metadata_json)
+            .execute(&mut personal_conn)
+            .await?;
+        }
+
+        Ok(())
+    }
+    .await;
+
+    match content_step {
+        Ok(()) => {
+            sqlx::query("RELEASE accept_persona_share")
+                .execute(&mut personal_conn)
+                .await?;
+        }
+        Err(e) => {
+            if let Err(rollback_err) = sqlx::query("ROLLBACK TO accept_persona_share")
+                .execute(&mut personal_conn)
+                .await
+            {
+                log::error!(
+                    "Savepoint rollback failed in accept_persona_share content write \
+                     (persona_id='{persona_id}'): {rollback_err} -- original error still \
+                     being propagated: {e}"
+                );
+            }
+            return Err(PersonaSharingError::Database(e));
+        }
+    }
+    drop(personal_conn);
+
+    // --- shared.db: personas, user_personas, share status ---------------
+    let extra_metadata_json = match &payload.floor_consent_preference {
+        Some(v) => serde_json::json!({ "floor_consent_preference": v }).to_string(),
+        None => "{}".to_owned(),
+    };
+
+    sqlx::query("SAVEPOINT accept_persona_share")
+        .execute(&mut shared_conn)
+        .await?;
+
+    let registration_step: Result<(), sqlx::Error> = async {
+        sqlx::query(
+            "INSERT INTO personas (id, display_name, persona_type, created_at, extra_metadata)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&persona_id)
+        .bind(&share.source_persona_display_name)
+        .bind(&share.source_persona_type)
+        .bind(&now)
+        .bind(&extra_metadata_json)
+        .execute(&mut shared_conn)
+        .await?;
+
+        sqlx::query("INSERT INTO user_personas (user_id, persona_id, joined_at) VALUES (?, ?, ?)")
+            .bind(recipient_user_id)
+            .bind(&persona_id)
+            .bind(&now)
+            .execute(&mut shared_conn)
+            .await?;
+
+        sqlx::query(
+            "UPDATE pending_persona_shares SET status = 'accepted', responded_at = ? WHERE id = ?",
+        )
+        .bind(&now)
+        .bind(share_id)
+        .execute(&mut shared_conn)
+        .await?;
+
+        Ok(())
+    }
+    .await;
+
+    match registration_step {
+        Ok(()) => {
+            sqlx::query("RELEASE accept_persona_share")
+                .execute(&mut shared_conn)
+                .await?;
+        }
+        Err(e) => {
+            if let Err(rollback_err) = sqlx::query("ROLLBACK TO accept_persona_share")
+                .execute(&mut shared_conn)
+                .await
+            {
+                log::error!(
+                    "Savepoint rollback failed in accept_persona_share registration \
+                     (persona_id='{persona_id}'): {rollback_err} -- original error still \
+                     being propagated: {e}"
+                );
+            }
+            return Err(PersonaSharingError::Database(e));
+        }
+    }
+
+    Ok(persona_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -435,6 +749,64 @@ mod tests {
             .collect();
         let plaintext = sk::decrypt_own_envelope(recipient_private_key, &envelope).unwrap();
         serde_json::from_slice(&plaintext).unwrap()
+    }
+
+    /// Sends a share from owner -> recipient carrying one entity, one
+    /// entity_fact on it, and one persona-scoped voice_profile entry -- the
+    /// fixture every accept-side test below builds on. Returns
+    /// (share_id, entity_id).
+    async fn send_share_with_content(
+        owner_id: &str,
+        owner_persona: &str,
+        owner_key_hex: &str,
+        recipient_id: &str,
+    ) -> (String, String) {
+        let entity_id = entity_store::create_entity(
+            owner_id,
+            owner_persona,
+            owner_key_hex,
+            "person",
+            "Sam",
+            &[],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut conn = personal_store::open_personal_db(owner_id, owner_persona, owner_key_hex)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO entity_facts
+             (id, entity_id, field_name, field_value, sensitivity, source_persona_id,
+              cross_persona_export, created_at)
+             VALUES ('accept-fact-1', ?, 'favorite_color', 'green', 'general', ?, 0, ?)",
+        )
+        .bind(&entity_id)
+        .bind(owner_persona)
+        .bind(crate::providers::utils::now())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO voice_profiles
+             (id, persona_id, precedence, attribute, value, created_at, updated_at)
+             VALUES ('accept-vp-1', ?, 4, 'tone', 'direct', ?, ?)",
+        )
+        .bind(owner_persona)
+        .bind(crate::providers::utils::now())
+        .bind(crate::providers::utils::now())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        drop(conn);
+
+        let share_id = send_persona_share(owner_id, owner_persona, owner_key_hex, recipient_id)
+            .await
+            .expect("send_persona_share must succeed");
+
+        (share_id, entity_id)
     }
 
     #[tokio::test]
@@ -701,5 +1073,351 @@ mod tests {
             result,
             Err(PersonaSharingError::RecipientHasNoSharingKey(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn round_trip_accept_materializes_persona_with_content() {
+        let _env = setup().await;
+        let (owner_id, owner_persona, owner_key_hex, _) =
+            make_user_with_persona("Alice", 0x31).await;
+        let (recipient_id, _, recipient_key_hex, recipient_private_key) =
+            make_user_with_persona("Bob", 0x32).await;
+
+        let (share_id, entity_id) =
+            send_share_with_content(&owner_id, &owner_persona, &owner_key_hex, &recipient_id)
+                .await;
+
+        let new_persona_id = accept_persona_share(
+            &share_id,
+            &recipient_id,
+            &recipient_key_hex,
+            &recipient_private_key,
+        )
+        .await
+        .expect("accept_persona_share must succeed");
+
+        let new_persona = persona_store::get_persona(&new_persona_id)
+            .await
+            .unwrap()
+            .expect("materialized persona must exist");
+        assert_eq!(new_persona.display_name, "Shared Persona");
+        assert_eq!(new_persona.persona_type, "personal");
+        assert!(
+            persona_store::is_user_in_persona(&recipient_id, &new_persona_id)
+                .await
+                .unwrap()
+        );
+
+        let mut conn =
+            personal_store::open_personal_db(&recipient_id, &new_persona_id, &recipient_key_hex)
+                .await
+                .unwrap();
+        let entity_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entities WHERE id = ?")
+            .bind(&entity_id)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(entity_count, 1);
+        let fact_value: String =
+            sqlx::query_scalar("SELECT field_value FROM entity_facts WHERE id = 'accept-fact-1'")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(fact_value, "green");
+        let vp_value: String =
+            sqlx::query_scalar("SELECT value FROM voice_profiles WHERE id = 'accept-vp-1'")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(vp_value, "direct");
+        drop(conn);
+
+        let mut shared_conn = open_shared_db().await.unwrap();
+        let share_status: String =
+            sqlx::query_scalar("SELECT status FROM pending_persona_shares WHERE id = ?")
+                .bind(&share_id)
+                .fetch_one(&mut shared_conn)
+                .await
+                .unwrap();
+        assert_eq!(share_status, "accepted");
+    }
+
+    #[tokio::test]
+    async fn materialized_entity_facts_get_synced_share_provenance_tag() {
+        let _env = setup().await;
+        let (owner_id, owner_persona, owner_key_hex, _) =
+            make_user_with_persona("Alice", 0x41).await;
+        let (recipient_id, _, recipient_key_hex, recipient_private_key) =
+            make_user_with_persona("Bob", 0x42).await;
+
+        let (share_id, _) =
+            send_share_with_content(&owner_id, &owner_persona, &owner_key_hex, &recipient_id)
+                .await;
+
+        let new_persona_id = accept_persona_share(
+            &share_id,
+            &recipient_id,
+            &recipient_key_hex,
+            &recipient_private_key,
+        )
+        .await
+        .unwrap();
+
+        let mut conn =
+            personal_store::open_personal_db(&recipient_id, &new_persona_id, &recipient_key_hex)
+                .await
+                .unwrap();
+        let row = sqlx::query(
+            "SELECT source, source_persona_id, cross_persona_export, origin_persona_id
+             FROM entity_facts WHERE id = 'accept-fact-1'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<String, _>("source"), "synced_share");
+        assert_eq!(row.get::<String, _>("source_persona_id"), new_persona_id);
+        assert_eq!(row.get::<i64, _>("cross_persona_export"), 0);
+        assert!(row.get::<Option<String>, _>("origin_persona_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn floor_consent_preference_is_embedded_in_new_persona() {
+        let _env = setup().await;
+        let (owner_id, owner_persona, owner_key_hex, _) =
+            make_user_with_persona("Alice", 0x51).await;
+        let (recipient_id, _, recipient_key_hex, recipient_private_key) =
+            make_user_with_persona("Bob", 0x52).await;
+
+        let mut conn = open_shared_db().await.unwrap();
+        sqlx::query("UPDATE personas SET extra_metadata = ? WHERE id = ?")
+            .bind(r#"{"floor_consent_preference":{"mode":"modified","abstraction_tier":2}}"#)
+            .bind(&owner_persona)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        drop(conn);
+
+        let (share_id, _) =
+            send_share_with_content(&owner_id, &owner_persona, &owner_key_hex, &recipient_id)
+                .await;
+
+        let new_persona_id = accept_persona_share(
+            &share_id,
+            &recipient_id,
+            &recipient_key_hex,
+            &recipient_private_key,
+        )
+        .await
+        .unwrap();
+
+        let new_persona = persona_store::get_persona(&new_persona_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let pref = new_persona
+            .extra_metadata
+            .get("floor_consent_preference")
+            .expect("floor_consent_preference must be present");
+        assert_eq!(pref["abstraction_tier"], 2);
+    }
+
+    #[tokio::test]
+    async fn materialized_entity_drops_source_registry_id_and_resets_modification_state() {
+        let _env = setup().await;
+        let (owner_id, owner_persona, owner_key_hex, _) =
+            make_user_with_persona("Alice", 0x61).await;
+        let (recipient_id, _, recipient_key_hex, recipient_private_key) =
+            make_user_with_persona("Bob", 0x62).await;
+
+        let entity_id = entity_store::create_entity(
+            &owner_id,
+            &owner_persona,
+            &owner_key_hex,
+            "person",
+            "Imported Contact",
+            &[],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut conn = personal_store::open_personal_db(&owner_id, &owner_persona, &owner_key_hex)
+            .await
+            .unwrap();
+        // source_registry_id is a real, enforced FK -- a genuine row is
+        // required, a bogus id would fail the UPDATE below, not just be
+        // silently tolerated (sqlx enables PRAGMA foreign_keys by default).
+        sqlx::query(
+            "INSERT INTO source_registry (id, persona_id, focus_slug, source_type, created_at)
+             VALUES ('real-source', ?, 'contacts', 'url_ingestion', ?)",
+        )
+        .bind(&owner_persona)
+        .bind(crate::providers::utils::now())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE entities SET modification_state = 'pristine', source_registry_id = 'real-source'
+             WHERE id = ?",
+        )
+        .bind(&entity_id)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        drop(conn);
+
+        let share_id = send_persona_share(&owner_id, &owner_persona, &owner_key_hex, &recipient_id)
+            .await
+            .unwrap();
+
+        let new_persona_id = accept_persona_share(
+            &share_id,
+            &recipient_id,
+            &recipient_key_hex,
+            &recipient_private_key,
+        )
+        .await
+        .unwrap();
+
+        let mut conn =
+            personal_store::open_personal_db(&recipient_id, &new_persona_id, &recipient_key_hex)
+                .await
+                .unwrap();
+        let row = sqlx::query("SELECT modification_state, source_registry_id FROM entities WHERE id = ?")
+            .bind(&entity_id)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<String, _>("modification_state"), "user_created");
+        assert!(row
+            .get::<Option<String>, _>("source_registry_id")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn accept_unknown_share_id_is_not_found() {
+        let _env = setup().await;
+        let (recipient_id, _, recipient_key_hex, recipient_private_key) =
+            make_user_with_persona("Bob", 0x71).await;
+
+        let result = accept_persona_share(
+            "nonexistent-share-id",
+            &recipient_id,
+            &recipient_key_hex,
+            &recipient_private_key,
+        )
+        .await;
+
+        assert!(matches!(result, Err(PersonaSharingError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn accept_already_accepted_share_is_not_pending() {
+        let _env = setup().await;
+        let (owner_id, owner_persona, owner_key_hex, _) =
+            make_user_with_persona("Alice", 0x81).await;
+        let (recipient_id, _, recipient_key_hex, recipient_private_key) =
+            make_user_with_persona("Bob", 0x82).await;
+
+        let (share_id, _) =
+            send_share_with_content(&owner_id, &owner_persona, &owner_key_hex, &recipient_id)
+                .await;
+
+        accept_persona_share(
+            &share_id,
+            &recipient_id,
+            &recipient_key_hex,
+            &recipient_private_key,
+        )
+        .await
+        .expect("first accept must succeed");
+
+        let second = accept_persona_share(
+            &share_id,
+            &recipient_id,
+            &recipient_key_hex,
+            &recipient_private_key,
+        )
+        .await;
+
+        assert!(matches!(second, Err(PersonaSharingError::NotPending(_, _))));
+    }
+
+    #[tokio::test]
+    async fn accept_wrong_recipient_is_not_found() {
+        let _env = setup().await;
+        let (owner_id, owner_persona, owner_key_hex, _) =
+            make_user_with_persona("Alice", 0x91).await;
+        let (recipient_id, _, _, _) = make_user_with_persona("Bob", 0x92).await;
+        let (other_id, _, other_key_hex, other_private_key) =
+            make_user_with_persona("Carol", 0x93).await;
+
+        let (share_id, _) =
+            send_share_with_content(&owner_id, &owner_persona, &owner_key_hex, &recipient_id)
+                .await;
+
+        let result =
+            accept_persona_share(&share_id, &other_id, &other_key_hex, &other_private_key).await;
+
+        assert!(matches!(result, Err(PersonaSharingError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn tampered_envelope_fails_with_decryption_failed_and_leaves_share_pending() {
+        let _env = setup().await;
+        let (owner_id, owner_persona, owner_key_hex, _) =
+            make_user_with_persona("Alice", 0xA1).await;
+        let (recipient_id, _, recipient_key_hex, recipient_private_key) =
+            make_user_with_persona("Bob", 0xA2).await;
+
+        let (share_id, _) =
+            send_share_with_content(&owner_id, &owner_persona, &owner_key_hex, &recipient_id)
+                .await;
+
+        let mut conn = open_shared_db().await.unwrap();
+        let encrypted_hex: String =
+            sqlx::query_scalar("SELECT encrypted_payload FROM pending_persona_shares WHERE id = ?")
+                .bind(&share_id)
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        let mut bytes = hex_decode("test", &encrypted_hex).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        sqlx::query("UPDATE pending_persona_shares SET encrypted_payload = ? WHERE id = ?")
+            .bind(hex_encode(&bytes))
+            .bind(&share_id)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        drop(conn);
+
+        let result = accept_persona_share(
+            &share_id,
+            &recipient_id,
+            &recipient_key_hex,
+            &recipient_private_key,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(PersonaSharingError::Sharing(
+                    SharingKeypairError::DecryptionFailed
+                ))
+            ),
+            "expected DecryptionFailed, got {result:?}"
+        );
+
+        let mut conn = open_shared_db().await.unwrap();
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM pending_persona_shares WHERE id = ?")
+                .bind(&share_id)
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(status, "pending", "tampered accept must leave share pending");
     }
 }
