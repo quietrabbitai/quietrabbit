@@ -407,6 +407,28 @@ export const commands = {
 	setGroupFactSourceOptIn: (personaId: string, groupId: string, optedIn: boolean) => typedError<null, string>(__TAURI_INVOKE("set_group_fact_source_opt_in", { personaId, groupId, optedIn })),
 	/**  Every group_id `persona_id` is currently opted into. */
 	getGroupFactSources: (personaId: string) => typedError<string[], string>(__TAURI_INVOKE("get_group_fact_sources", { personaId })),
+	/**
+	 *  Configure (or reconfigure) this install's folder-sync destination for a
+	 *  (persona_id, share_id) pair. `role` is "owner" or "recipient" -- see
+	 *  settings_store::set_persona_share_sync_folder's own doc comment on why a
+	 *  reconfigure may not change it. Upsert on folder_path.
+	 */
+	setPersonaShareSyncFolder: (personaId: string, shareId: string, role: string, folderPath: string) => typedError<null, string>(__TAURI_INVOKE("set_persona_share_sync_folder", { personaId, shareId, role, folderPath })),
+	/**
+	 *  Fetch this install's folder-sync settings for a (persona_id, share_id)
+	 *  pair. Returns Ok(None) if sync has never been configured for this pair
+	 *  -- not an error, matching get_group_sync_folder's "None is a valid
+	 *  state" shape.
+	 */
+	getPersonaShareSyncFolder: (personaId: string, shareId: string) => typedError<{
+	role: string,
+	folder_path: string,
+	last_synced_at: string | null,
+	last_pushed_at: string | null,
+	last_content_hash: string | null,
+	last_error: string | null,
+	updated_at: string,
+} | null, string>(__TAURI_INVOKE("get_persona_share_sync_folder", { personaId, shareId })),
 };
 
 /* Types */
@@ -641,6 +663,16 @@ export type PersonaInfo = {
 	 *  BigInt-style types (i64/u64/...) to TypeScript.
 	 */
 	focus_count: number,
+};
+
+export type PersonaShareSyncSettingsInfo = {
+	role: string,
+	folder_path: string,
+	last_synced_at: string | null,
+	last_pushed_at: string | null,
+	last_content_hash: string | null,
+	last_error: string | null,
+	updated_at: string,
 };
 
 /**  IPC-safe projection of PersonalField. field_value is intentionally absent. */

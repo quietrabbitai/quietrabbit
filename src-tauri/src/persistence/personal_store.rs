@@ -657,11 +657,103 @@ pub async fn delete_personal_field(
 /// fields exists or should be added.
 ///
 /// Atomic: SAVEPOINT wraps the supersede-then-insert sequence.
+///
+/// Also flips the fact's owning entity (if any) to user_modified
+/// (items.id=303) — see this function's own doc comment on why that lives
+/// here rather than in create_entity_fact_with_provenance_conn.
 #[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
 pub async fn create_entity_fact_with_provenance(
     user_id: &str,
     persona_id: &str,
     key_hex: &str,
+    entity_id: Option<&str>,
+    field_name: &str,
+    field_value: &str,
+    sensitivity: &str,
+    source: &str,
+    source_persona_id: &str,
+    cross_persona_export: bool,
+    origin_persona_id: Option<&str>,
+    extra_metadata: Option<serde_json::Value>,
+) -> Result<String, PersonalStoreError> {
+    let mut conn = open_personal_db(user_id, persona_id, key_hex).await?;
+
+    // Outer SAVEPOINT, nested around create_entity_fact_with_provenance_
+    // conn's own inner one — keeps the fact write and the user_modified
+    // flag atomic together, same guarantee entity_store::update_entity's
+    // own wrapper gives its two statements.
+    sqlx::query("SAVEPOINT create_entity_fact_with_provenance_outer")
+        .execute(&mut conn)
+        .await?;
+
+    let step: Result<String, PersonalStoreError> = async {
+        let new_id = create_entity_fact_with_provenance_conn(
+            &mut conn,
+            entity_id,
+            field_name,
+            field_value,
+            sensitivity,
+            source,
+            source_persona_id,
+            cross_persona_export,
+            origin_persona_id,
+            extra_metadata,
+        )
+        .await?;
+
+        // A directly-written entity-linked fact is a genuine local edit —
+        // same reasoning as entity_store::update_entity's own guard, and
+        // the same deliberate split: the sync engine (items.id=303) applies
+        // an incoming update's facts via
+        // create_entity_fact_with_provenance_conn directly, on its own
+        // connection, bypassing this wrapper — that path must never trip
+        // this guard either, for the identical reason update_entity_conn's
+        // caller (apply_source_update_conn) must not. Singleton facts
+        // (entity_id None, e.g. save_personal_field's writes) have no
+        // owning entity to flag and are skipped.
+        if let Some(eid) = entity_id {
+            crate::persistence::source_registry_store::mark_record_user_modified_conn(
+                &mut conn, eid,
+            )
+            .await?;
+        }
+
+        Ok(new_id)
+    }
+    .await;
+
+    match step {
+        Ok(id) => {
+            sqlx::query("RELEASE create_entity_fact_with_provenance_outer")
+                .execute(&mut conn)
+                .await?;
+            Ok(id)
+        }
+        Err(e) => {
+            if let Err(rollback_err) =
+                sqlx::query("ROLLBACK TO create_entity_fact_with_provenance_outer")
+                    .execute(&mut conn)
+                    .await
+            {
+                log::error!(
+                    "Savepoint rollback failed in create_entity_fact_with_provenance: {rollback_err}"
+                );
+            }
+            let _ = sqlx::query("RELEASE create_entity_fact_with_provenance_outer")
+                .execute(&mut conn)
+                .await;
+            Err(e)
+        }
+    }
+}
+
+/// Connection-level counterpart of create_entity_fact_with_provenance,
+/// callable on an already-open connection/transaction without the outer
+/// wrapper's user_modified side effect — see that function's own doc
+/// comment for why the sync engine (items.id=303) must call this instead.
+#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
+pub(crate) async fn create_entity_fact_with_provenance_conn(
+    conn: &mut SqliteConnection,
     entity_id: Option<&str>,
     field_name: &str,
     field_value: &str,
@@ -709,10 +801,9 @@ pub async fn create_entity_fact_with_provenance(
         .unwrap_or_else(|_| "{}".to_owned());
     let timestamp = crate::providers::utils::now();
     let cross_persona_export_flag: i32 = if cross_persona_export { 1 } else { 0 };
-    let mut conn = open_personal_db(user_id, persona_id, key_hex).await?;
 
     sqlx::query("SAVEPOINT create_entity_fact_with_provenance")
-        .execute(&mut conn)
+        .execute(&mut *conn)
         .await?;
 
     let step: Result<String, sqlx::Error> = async {
@@ -729,7 +820,7 @@ pub async fn create_entity_fact_with_provenance(
         .bind(field_name)
         .bind(entity_id)
         .bind(entity_id)
-        .execute(&mut conn)
+        .execute(&mut *conn)
         .await?;
 
         let new_id = uuid::Uuid::new_v4().to_string();
@@ -751,7 +842,7 @@ pub async fn create_entity_fact_with_provenance(
         .bind(source_persona_id)
         .bind(cross_persona_export_flag)
         .bind(origin_persona_id)
-        .execute(&mut conn)
+        .execute(&mut *conn)
         .await?;
 
         Ok(new_id)
@@ -761,13 +852,13 @@ pub async fn create_entity_fact_with_provenance(
     match step {
         Ok(id) => {
             sqlx::query("RELEASE create_entity_fact_with_provenance")
-                .execute(&mut conn)
+                .execute(&mut *conn)
                 .await?;
             Ok(id)
         }
         Err(e) => {
             if let Err(rollback_err) = sqlx::query("ROLLBACK TO create_entity_fact_with_provenance")
-                .execute(&mut conn)
+                .execute(&mut *conn)
                 .await
             {
                 log::error!(
@@ -775,7 +866,7 @@ pub async fn create_entity_fact_with_provenance(
                 );
             }
             let _ = sqlx::query("RELEASE create_entity_fact_with_provenance")
-                .execute(&mut conn)
+                .execute(&mut *conn)
                 .await;
             Err(PersonalStoreError::Database(e))
         }

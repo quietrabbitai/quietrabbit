@@ -523,6 +523,10 @@ impl EntityUpdate {
 ///
 /// Errors (rather than silently no-opping) when the id does not exist —
 /// a caller updating a record that isn't there has a bug worth surfacing.
+///
+/// Also flips a pristine record to user_modified (items.id=303) — see the
+/// SAVEPOINT block below for why that lives here and not in
+/// update_entity_conn.
 pub async fn update_entity(
     user_id: &str,
     persona_id: &str,
@@ -531,7 +535,52 @@ pub async fn update_entity(
     update: &EntityUpdate,
 ) -> Result<(), PersonalStoreError> {
     let mut conn = open_personal_db(user_id, persona_id, key_hex).await?;
-    update_entity_conn(&mut conn, entity_id, update).await
+
+    sqlx::query("SAVEPOINT update_entity")
+        .execute(&mut conn)
+        .await?;
+
+    let step: Result<(), PersonalStoreError> = async {
+        update_entity_conn(&mut conn, entity_id, update).await?;
+
+        // A direct edit through this path is exactly what decisions.id=502's
+        // modification_state machine means by "the user edited it" — flip
+        // pristine -> user_modified so a future source/sync refresh surfaces
+        // a conflict instead of silently overwriting it (items.id=303,
+        // wiring source_registry_store::mark_record_user_modified_conn into
+        // its intended call site for the first time — it previously had
+        // none). Deliberately NOT added to update_entity_conn itself:
+        // source_registry_store::apply_source_update_conn calls
+        // update_entity_conn directly, on its own connection, specifically
+        // to apply an incoming source/sync update — that path must never
+        // trip this guard, or every auto-accepted update would immediately
+        // mark itself a conflicting local edit and block every update after
+        // it.
+        crate::persistence::source_registry_store::mark_record_user_modified_conn(
+            &mut conn, entity_id,
+        )
+        .await
+    }
+    .await;
+
+    match step {
+        Ok(()) => {
+            sqlx::query("RELEASE update_entity")
+                .execute(&mut conn)
+                .await?;
+            Ok(())
+        }
+        Err(e) => {
+            if let Err(rollback_err) = sqlx::query("ROLLBACK TO update_entity")
+                .execute(&mut conn)
+                .await
+            {
+                log::error!("Savepoint rollback failed in update_entity: {rollback_err}");
+            }
+            let _ = sqlx::query("RELEASE update_entity").execute(&mut conn).await;
+            Err(e)
+        }
+    }
 }
 
 pub(crate) async fn update_entity_conn(

@@ -59,6 +59,7 @@ pub mod messages;
 pub mod notifications;
 pub mod onboarding;
 pub mod persona;
+pub mod persona_sync;
 pub mod personal;
 pub mod system;
 pub mod tier2;

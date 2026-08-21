@@ -118,6 +118,9 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         // Group 18 -- Group facts opt-in (items.id=296, group.db 266h)
         commands::group::set_group_fact_source_opt_in,
         commands::group::get_group_fact_sources,
+        // Group 19 -- Persona share folder sync (items.id=303, decisions.id=722)
+        commands::persona_sync::set_persona_share_sync_folder,
+        commands::persona_sync::get_persona_share_sync_folder,
     ])
 }
 

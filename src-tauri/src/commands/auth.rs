@@ -420,6 +420,22 @@ async fn finish_login(
         })
         .await;
 
+    // items.id=303 (decisions.id=722): persona-share sync's "app-start" pull
+    // trigger -- the moment this account's sharing private key becomes
+    // resident, mirroring auth::group_invitations::accept_invitation's own
+    // immediate pull for the identical reason (the registry starts empty at
+    // process boot, so a literal process-boot pull would find nothing;
+    // main.rs's periodic timer covers the steady-state case). Best-effort,
+    // fire-and-forget inside the fn -- never turns an otherwise-successful
+    // login into an Err.
+    let personal_key_hex_for_sync = key_hex(&master_key);
+    crate::persona_sync::engine::pull_all_accepted_shares_on_login(
+        user_id,
+        &personal_key_hex_for_sync,
+        &sharing_private_key,
+    )
+    .await;
+
     // items.id=290, decisions.id=718: rehydrate GroupKeyRegistry from every
     // one of this account's personas' personal.db group_keys tables --
     // GroupKeyRegistry itself stays deliberately volatile (auth/registry.rs's

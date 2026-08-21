@@ -384,6 +384,18 @@ async fn async_main() {
                             );
                         }
                     }
+
+                    // items.id=303 (decisions.id=722): persona-share sync
+                    // periodic push + pull, same timer as group.db's pull
+                    // above -- Jason's direction, narrowing decisions.id=722's
+                    // "push-on-save" to a periodic sweep (persona content has
+                    // no single save-hook choke point the way group.db's
+                    // one-document-one-save-function shape does; see
+                    // persona_sync::engine's own module header). Account-
+                    // scoped, not per-resident-group-key like the loop above
+                    // -- run once per tick for whichever account is
+                    // currently logged in (a no-op if nobody is).
+                    quietrabbit_lib::persona_sync::engine::run_periodic_sweep(&key_registry).await;
                 }
             });
             Ok(())

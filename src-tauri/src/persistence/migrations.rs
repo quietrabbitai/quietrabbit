@@ -189,6 +189,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/shared_008.sql"),
     },
     SchemaFile {
+        prefix: "shared",
+        version: 9,
+        sql: include_str!("../../schema/shared_009.sql"),
+    },
+    SchemaFile {
         prefix: "tier3_cookies",
         version: 1,
         sql: include_str!("../../schema/tier3_cookies_001.sql"),
@@ -996,15 +1001,15 @@ mod tests {
             .await
             .expect("shared migration chain must apply cleanly on a fresh db");
         assert_eq!(
-            applied, 8,
-            "expected all eight shared schema versions to apply"
+            applied, 9,
+            "expected all nine shared schema versions to apply"
         );
 
         let version: (i64,) = sqlx::query_as("SELECT MAX(version) FROM schema_version")
             .fetch_one(&mut conn)
             .await
             .unwrap();
-        assert_eq!(version.0, 8);
+        assert_eq!(version.0, 9);
     }
 
     #[tokio::test]
@@ -1075,8 +1080,8 @@ mod tests {
             .expect("drift-healing run must succeed");
 
         assert_eq!(
-            applied, 7,
-            "shared v2, v3, v4, v5, v6, v7, and v8 should count as newly applied from a stale v1 database"
+            applied, 8,
+            "shared v2, v3, v4, v5, v6, v7, v8, and v9 should count as newly applied from a stale v1 database"
         );
 
         let exists: Option<(String,)> = sqlx::query_as(

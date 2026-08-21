@@ -156,31 +156,38 @@ fn hex_decode(context: &str, s: &str) -> Result<Vec<u8>, PersonaSharingError> {
 // Payload shape
 // ---------------------------------------------------------------------------
 
+// pub(crate) (not private): items.id=303's persona_sync engine reuses these
+// two shapes and the loaders below directly for its own ongoing-update
+// payload, rather than a second, divergence-risking copy of this content-
+// scope filtering logic. PersonaSharePayload itself stays private — the
+// ongoing-update payload is its own distinct struct (persona_sync::engine::
+// PersonaSyncUpdatePayload), not this one; see that struct's own doc
+// comment for why.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-struct SharedEntityFact {
-    id: String,
-    entity_id: Option<String>,
-    field_name: String,
-    field_value: String,
-    sensitivity: String,
-    abstraction_tier2: String,
-    abstraction_tier3: String,
-    source: String,
-    valid_from: Option<String>,
-    created_at: String,
-    extra_metadata: serde_json::Value,
+pub(crate) struct SharedEntityFact {
+    pub(crate) id: String,
+    pub(crate) entity_id: Option<String>,
+    pub(crate) field_name: String,
+    pub(crate) field_value: String,
+    pub(crate) sensitivity: String,
+    pub(crate) abstraction_tier2: String,
+    pub(crate) abstraction_tier3: String,
+    pub(crate) source: String,
+    pub(crate) valid_from: Option<String>,
+    pub(crate) created_at: String,
+    pub(crate) extra_metadata: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-struct SharedVoiceProfileEntry {
-    id: String,
-    source_id: Option<String>,
-    precedence: i64,
-    attribute: String,
-    value: String,
-    created_at: String,
-    updated_at: String,
-    extra_metadata: serde_json::Value,
+pub(crate) struct SharedVoiceProfileEntry {
+    pub(crate) id: String,
+    pub(crate) source_id: Option<String>,
+    pub(crate) precedence: i64,
+    pub(crate) attribute: String,
+    pub(crate) value: String,
+    pub(crate) created_at: String,
+    pub(crate) updated_at: String,
+    pub(crate) extra_metadata: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -196,7 +203,7 @@ struct PersonaSharePayload {
 // Payload construction
 // ---------------------------------------------------------------------------
 
-async fn load_shared_entity_facts(
+pub(crate) async fn load_shared_entity_facts(
     conn: &mut SqliteConnection,
     active_entity_ids: &[String],
 ) -> Result<Vec<SharedEntityFact>, PersonaSharingError> {
@@ -242,7 +249,7 @@ async fn load_shared_entity_facts(
     Ok(facts)
 }
 
-async fn load_shared_voice_profile_entries(
+pub(crate) async fn load_shared_voice_profile_entries(
     conn: &mut SqliteConnection,
     source_persona_id: &str,
 ) -> Result<Vec<SharedVoiceProfileEntry>, PersonaSharingError> {
@@ -436,7 +443,10 @@ async fn fetch_pending_persona_share(
 /// attempt); a failure in the shared.db write after personal.db succeeded
 /// leaves an orphaned personal.db file that no persona ever points at --
 /// inert, not user-visible, acceptable at this pre-release stage.
-#[allow(dead_code)] // items.id=302: ahead of its first real caller (accept-UI item, not yet scoped)
+// items.id=303: persona_sync::engine::accept_and_provision_sync is this
+// function's first real caller (wraps it unmodified, then provisions the
+// ongoing-sync relationship) -- no longer ahead of a caller, so the
+// #[allow(dead_code)] items.id=302 originally carried here is gone.
 pub async fn accept_persona_share(
     share_id: &str,
     recipient_user_id: &str,
@@ -622,10 +632,17 @@ pub async fn accept_persona_share(
             .execute(&mut shared_conn)
             .await?;
 
+        // materialized_persona_id (items.id=303, shared_009.sql): durable
+        // record of which persona this share became, so the sync engine can
+        // find it across restarts without depending on whatever called
+        // accept_persona_share to have recorded it somewhere else.
         sqlx::query(
-            "UPDATE pending_persona_shares SET status = 'accepted', responded_at = ? WHERE id = ?",
+            "UPDATE pending_persona_shares
+             SET status = 'accepted', responded_at = ?, materialized_persona_id = ?
+             WHERE id = ?",
         )
         .bind(&now)
+        .bind(&persona_id)
         .bind(share_id)
         .execute(&mut shared_conn)
         .await?;

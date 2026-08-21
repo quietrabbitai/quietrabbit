@@ -8,6 +8,7 @@ pub mod group_sync;
 pub mod ipc;
 pub mod ollama_sidecar;
 pub mod persistence;
+pub mod persona_sync;
 pub mod providers;
 #[cfg(test)]
 pub mod test_support;
