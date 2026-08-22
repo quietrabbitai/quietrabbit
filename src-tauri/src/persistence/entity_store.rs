@@ -29,15 +29,17 @@
 //
 //   2. Hard delete.
 //      Not named in cb-01's description, and actively hazardous here:
-//      PRAGMA foreign_keys is not set anywhere in this codebase (see the
-//      note in outputs_001.sql), so `entity_facts.entity_id ... ON DELETE
-//      CASCADE` does NOT fire at runtime. A DELETE FROM entities would
-//      silently orphan immutable entity_facts provenance rows rather than
-//      cascading. retire_entity() (a status transition) plus
-//      check_entity_cascade() (read-only impact report) cover the stated
-//      capability without a destructive path. If hard delete is ever added,
-//      it must delete dependent facts explicitly inside a SAVEPOINT and
-//      must not rely on the unfired cascade.
+//      PRAGMA foreign_keys is ON by default on every connection (sqlx's
+//      default, never overridden -- see schema/personal_002.sql's rebuild
+//      note), so `entity_facts.entity_id ... ON DELETE CASCADE` DOES fire
+//      at runtime. A DELETE FROM entities would silently cascade-delete
+//      the entity's entity_facts rows -- destroying immutable provenance
+//      history rather than merely orphaning it, which is worse.
+//      retire_entity() (a status transition) plus check_entity_cascade()
+//      (read-only impact report) cover the stated capability without a
+//      destructive path. If hard delete is ever added, it must delete (or
+//      preserve) dependent facts explicitly inside a SAVEPOINT rather than
+//      rely on the cascade to do the right thing.
 //
 // TESTABILITY: every public function opens the DB and delegates to a
 // `*_conn(&mut SqliteConnection, ...)` inner function — mirroring the
@@ -1709,9 +1711,10 @@ mod tests {
         // place. SQLite rewrites REFERENCES clauses during ALTER TABLE
         // RENAME, so without PRAGMA legacy_alter_table this is exactly where
         // entity_facts' foreign key would silently start naming the
-        // temporary table. FK enforcement is off codebase-wide, so nothing
-        // would fail at runtime — the damage would only show up in an
-        // export or a future migration.
+        // temporary table. FK enforcement is genuinely ON (sqlx's default),
+        // so a dangling/misrewritten reference would surface immediately on
+        // the next insert into entity_facts -- this test exists to catch
+        // that regression before it becomes a runtime failure.
         let mut conn = v1_only_db().await;
         apply_v2(&mut conn).await;
 

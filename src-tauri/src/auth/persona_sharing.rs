@@ -1247,6 +1247,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accept_persona_share_materializes_parent_child_hierarchy_regardless_of_payload_order() {
+        // Regression test for items.id=302's two-pass insert
+        // (accept_persona_share, entities.parent_entity_id is a real,
+        // enforced FK). list_entities orders payload.entities by
+        // display_name, so naming the child before the parent
+        // alphabetically forces the child to appear first in the payload --
+        // exactly the ordering a naive single-pass insert would violate the
+        // FK on.
+        let _env = setup().await;
+        let (owner_id, owner_persona, owner_key_hex, _) =
+            make_user_with_persona("Alice", 0x61).await;
+        let (recipient_id, _, recipient_key_hex, recipient_private_key) =
+            make_user_with_persona("Bob", 0x62).await;
+
+        let parent_id = entity_store::create_entity(
+            &owner_id,
+            &owner_persona,
+            &owner_key_hex,
+            "person",
+            "Zed Parent",
+            &[],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let child_id = entity_store::create_entity(
+            &owner_id,
+            &owner_persona,
+            &owner_key_hex,
+            "person",
+            "Aaron Child",
+            &[],
+            Some(&parent_id),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let share_id = send_persona_share(
+            &owner_id,
+            &owner_persona,
+            &owner_key_hex,
+            &recipient_id,
+            ShareType::Synced,
+        )
+        .await
+        .expect("send_persona_share must succeed");
+
+        let new_persona_id = accept_persona_share(
+            &share_id,
+            &recipient_id,
+            &recipient_key_hex,
+            &recipient_private_key,
+        )
+        .await
+        .expect("accept_persona_share must succeed despite child-before-parent payload order");
+
+        let mut conn =
+            personal_store::open_personal_db(&recipient_id, &new_persona_id, &recipient_key_hex)
+                .await
+                .unwrap();
+        let linked_parent_id: Option<String> =
+            sqlx::query_scalar("SELECT parent_entity_id FROM entities WHERE id = ?")
+                .bind(&child_id)
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(linked_parent_id.as_deref(), Some(parent_id.as_str()));
+        let parent_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entities WHERE id = ?")
+            .bind(&parent_id)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(parent_count, 1);
+    }
+
+    #[tokio::test]
     async fn materialized_entity_facts_get_synced_share_provenance_tag() {
         let _env = setup().await;
         let (owner_id, owner_persona, owner_key_hex, _) =

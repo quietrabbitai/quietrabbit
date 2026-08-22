@@ -1549,6 +1549,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn push_then_pull_materializes_a_new_parent_child_hierarchy_regardless_of_order() {
+        // Regression test for items.id=302's two-pass insert, applied here
+        // to the ongoing-sync path (apply_update / insert_synced_entity,
+        // items.id=303) rather than the initial accept. list_entities
+        // orders payload.entities by display_name, so naming the child
+        // before the parent alphabetically forces the child to appear
+        // first in the pull payload -- exactly the ordering a naive
+        // single-pass insert would violate entities.parent_entity_id's FK
+        // on.
+        let _env = setup().await;
+        let (owner_id, owner_persona, owner_key, _) = make_user_with_persona("Alice", 0x14).await;
+        let (recipient_id, _, recipient_key, recipient_priv) =
+            make_user_with_persona("Bob", 0x24).await;
+
+        entity_store::create_entity(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            "person",
+            "Contact",
+            &[],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let share_id = send_persona_share(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            &recipient_id,
+            ShareType::Synced,
+        )
+            .await
+            .unwrap();
+        let persona_id =
+            accept_and_provision_sync(&share_id, &recipient_id, &recipient_key, &recipient_priv)
+                .await
+                .unwrap();
+
+        let shared_folder = tempfile::tempdir().unwrap();
+        let folder_path = shared_folder.path().to_str().unwrap();
+        settings_store::set_persona_share_sync_folder(
+            &owner_persona,
+            &share_id,
+            settings_store::SyncRole::Owner,
+            folder_path,
+        )
+        .await
+        .unwrap();
+        settings_store::set_persona_share_sync_folder(
+            &persona_id,
+            &share_id,
+            settings_store::SyncRole::Recipient,
+            folder_path,
+        )
+        .await
+        .unwrap();
+
+        // New parent/child pair, created after the initial accept, so this
+        // hierarchy is only ever seen via apply_update's pull path.
+        let parent_id = entity_store::create_entity(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            "person",
+            "Zed Parent",
+            &[],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let child_id = entity_store::create_entity(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            "person",
+            "Aaron Child",
+            &[],
+            Some(&parent_id),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let pushed = push_if_changed(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            &share_id,
+            &recipient_id,
+        )
+        .await
+        .expect("push_if_changed must succeed");
+        assert!(pushed);
+
+        let applied = pull_if_newer(
+            &recipient_id,
+            &persona_id,
+            &recipient_key,
+            &share_id,
+            &recipient_priv,
+        )
+        .await
+        .expect("pull_if_newer must succeed despite child-before-parent payload order");
+        assert!(applied);
+
+        let mut conn =
+            personal_store::open_personal_db(&recipient_id, &persona_id, &recipient_key)
+                .await
+                .unwrap();
+        let linked_parent_id: Option<String> =
+            sqlx::query_scalar("SELECT parent_entity_id FROM entities WHERE id = ?")
+                .bind(&child_id)
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(linked_parent_id.as_deref(), Some(parent_id.as_str()));
+        let parent_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entities WHERE id = ?")
+            .bind(&parent_id)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(parent_count, 1);
+    }
+
+    #[tokio::test]
     async fn a_repeat_push_with_unchanged_content_is_skipped() {
         let _env = setup().await;
         let (owner_id, owner_persona, owner_key, _) = make_user_with_persona("Alice", 0x13).await;

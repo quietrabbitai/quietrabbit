@@ -36,8 +36,12 @@
 -- schema during ALTER TABLE ... RENAME — which can either error out or
 -- rewrite the reference to the temporary name. PRAGMA legacy_alter_table
 -- suppresses that re-parse for the duration of the rename, which is the
--- documented workaround. PRAGMA foreign_keys is not enabled anywhere in this
--- codebase, so no FK enforcement is being bypassed by the drop itself.
+-- documented workaround. Note this is unrelated to FK enforcement: sqlx
+-- enables PRAGMA foreign_keys=ON by default (confirmed empirically,
+-- items.id=185, schema/keys_001.sql) and nothing in this codebase overrides
+-- it, but that pragma only gates DML (INSERT/UPDATE/DELETE) -- it never
+-- blocks DROP TABLE, so the drop itself was never at risk regardless of the
+-- pragma's value. legacy_alter_table is the only thing doing real work here.
 -- A migration test asserts entity_facts still names `entities` afterward.
 --
 -- SCHEMA AUTHORING RULE (migrations.rs): no semicolons inside string
@@ -196,9 +200,11 @@ PRAGMA legacy_alter_table = OFF;
 -- the sole authority on whether two records are the same thing.
 --
 -- record_id_a / record_id_b reference entities(id). No FK is declared:
--- PRAGMA foreign_keys is off codebase-wide, so a declared constraint would
--- be decorative, and a resolved candidate must outlive the record it
--- tombstoned. Referential integrity is enforced in the store layer.
+-- PRAGMA foreign_keys is actually ON (sqlx's default, never overridden here
+-- -- see the rebuild note above), so a declared constraint would NOT be
+-- decorative -- it would actively forbid what this table requires: a
+-- resolved candidate must outlive the record it tombstoned. Referential
+-- integrity is enforced in the store layer instead.
 --
 -- match_confidence is advisory ONLY. decisions.id=502 is explicit that high
 -- confidence does not mean the records are the same: one key field

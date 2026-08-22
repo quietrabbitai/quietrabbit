@@ -488,11 +488,11 @@ CREATE INDEX IF NOT EXISTS idx_consent_decisions_run
 --   crash-recovery replay).
 --
 -- focus_run_id CASCADE DELETE: candidates are cleaned up when the run
---   is deleted. No orphan rows -- but note PRAGMA foreign_keys is not set
---   by the migration runner, so this CASCADE only fires when the app layer
---   sets it at connection time; it is not automatic during migrations
---   themselves (see focus_runs table recreation history, preserved in
---   this file's header note on outputs_009).
+--   is deleted. No orphan rows -- sqlx enables PRAGMA foreign_keys=ON by
+--   default on every connection (items.id=185, schema/keys_001.sql) and
+--   nothing here overrides it, so this CASCADE is live and automatic on
+--   every connection, migrations included (see focus_runs table recreation
+--   history, preserved in this file's header note on outputs_009).
 CREATE TABLE IF NOT EXISTS extract_confirm_candidates (
     id              INTEGER PRIMARY KEY,
     focus_run_id    TEXT    NOT NULL REFERENCES focus_runs(id) ON DELETE CASCADE,
