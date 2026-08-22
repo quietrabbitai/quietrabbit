@@ -110,9 +110,24 @@ impl KeyRegistry {
         *guard = Some(new_value);
     }
 
-    /// Clear the slot entirely -- logout, idle-timeout fire, sleep/suspend
-    /// detection, or rekey completion. Dropping the old Some(..) value
-    /// here is what fires ZeroizeOnDrop on the outgoing UnlockedKey.
+    /// Clear the slot entirely -- logout, idle-timeout fire (items.id=311,
+    /// auth::idle_timeout::run_periodic_check), or rekey completion.
+    /// Dropping the old Some(..) value here is what fires ZeroizeOnDrop on
+    /// the outgoing UnlockedKey.
+    ///
+    /// NO SEPARATE SLEEP/SUSPEND HOOK (items.id=311): investigated and
+    /// deliberately not built. Tauri 2.11.2's WindowEvent::Suspended/Resumed
+    /// are #[cfg(mobile)]-only and Tauri's own docs say so outright --
+    /// "Linux / macOS / Windows: Unsupported" -- and no plugin in this
+    /// dependency tree fills the gap. A platform-specific hook (logind
+    /// D-Bus, WM_POWERBROADCAST, NSWorkstationWillSleepNotification) would
+    /// be a partial, single-OS fix, so it was rejected rather than shipped
+    /// half-built. It's also unnecessary: idle_timeout's elapsed-wall-clock
+    /// check already subsumes sleep/suspend without any event hook -- a
+    /// suspended process's own timer freezes along with it, but wall-clock
+    /// time keeps advancing regardless, so the first check to run after
+    /// resume sees the full elapsed gap (including the sleep duration) and
+    /// fires clear() correctly on that basis alone.
     pub async fn clear(&self) {
         let mut guard = self.slot.lock().await;
         *guard = None;

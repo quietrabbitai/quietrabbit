@@ -285,6 +285,15 @@ export const commands = {
 	role: string,
 	is_primary: boolean,
 } | null, string>(__TAURI_INVOKE("get_session")),
+	/**
+	 *  Record activity on the resident account's live session(s) (items.id=311).
+	 *  Called by a debounced frontend listener (mouse/keyboard/scroll/click),
+	 *  not on every IPC command -- see auth::idle_timeout's own module header
+	 *  for why a frontend-driven activity signal was chosen over a backend-
+	 *  command-tracked one. A no-op, not an error, when nobody is logged in --
+	 *  a stray ping racing a logout is expected, not exceptional.
+	 */
+	recordActivity: () => typedError<null, string>(__TAURI_INVOKE("record_activity")),
 	getHealth: () => typedError<HealthResponse, string>(__TAURI_INVOKE("get_health")),
 	getCapabilityProfile: () => typedError<CapabilityProfileResponse, string>(__TAURI_INVOKE("get_capability_profile")),
 	/**

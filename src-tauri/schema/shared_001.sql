@@ -68,9 +68,11 @@ CREATE TABLE IF NOT EXISTS personas (
 --   tier folded into persona-level functionality and no longer needs its
 --   own role value.
 -- idle_timeout_minutes: Section 3.2 -- per-user idle-lock timer, bounded
---   5-240, default 15. Not admin-lockable (no enforcement/override
---   mechanism exists anywhere in this schema or the codebase, consistent
---   with the doc's "not admin-lockable" framing).
+--   5-240, default 15. Enforced (items.id=311) by
+--   auth::idle_timeout::run_periodic_check, driven by its own timer in
+--   main.rs. Not admin-lockable -- still no per-user override/admin-set
+--   mechanism, consistent with the doc's "not admin-lockable" framing; that
+--   framing was always about who can set the value, not whether it fires.
 CREATE TABLE IF NOT EXISTS users (
     id                          TEXT PRIMARY KEY,
     display_name                TEXT NOT NULL UNIQUE,
@@ -172,7 +174,10 @@ INSERT OR IGNORE INTO instance_config VALUES ('role_enforcement', 'disabled');
 INSERT OR IGNORE INTO instance_config VALUES ('auth_lockout_enabled', 'disabled');
 INSERT OR IGNORE INTO instance_config VALUES ('instance_name', '');
 
--- Auth session tables (Release 1: schema present, NOT enforced)
+-- Auth session tables. idle-timeout enforcement (items.id=311) reads
+-- last_active_at and writes expires_at on a fire, same as logout(); nothing
+-- else in this table is enforced yet (absolute session lifetime is a
+-- constant, not read from here -- see commands::auth::finish_login).
 CREATE TABLE IF NOT EXISTS auth_sessions (
     session_id      TEXT PRIMARY KEY,
     user_id         TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,

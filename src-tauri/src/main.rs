@@ -409,6 +409,27 @@ async fn async_main() {
                         .await;
                 }
             });
+
+            // items.id=311: idle-timeout enforcement. A separate spawn +
+            // interval from the 300s sweep loop just above, deliberately --
+            // users.idle_timeout_minutes can be set as low as 5 minutes, and
+            // sharing that 300s cadence could let a 5-minute setting run up
+            // to 2x over before firing. Isolating it here also means a
+            // panic in this check can't take the persona_sync/group_sync
+            // sweeps above down with it (tauri::async_runtime::spawn is
+            // fire-and-forget with no supervisor -- see
+            // auth::idle_timeout's own module header).
+            let idle_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+                loop {
+                    ticker.tick().await;
+                    let key_registry =
+                        idle_handle.state::<quietrabbit_lib::auth::registry::KeyRegistry>();
+                    quietrabbit_lib::auth::idle_timeout::run_periodic_check(&key_registry).await;
+                }
+            });
+
             Ok(())
         })
         // No Moved/Resized handling here anymore (items.id=202 real

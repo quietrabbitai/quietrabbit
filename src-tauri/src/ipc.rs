@@ -91,11 +91,13 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::notifications::dismiss_notification,
         // Group 11 -- Auth (items.id=205, 2026-08-01; get_recovery_key_display
         // wired items.id=229, 2026-08-09; get_session wired items.id=267,
-        // 2026-08-15 -- none of the four are stubs now)
+        // 2026-08-15; record_activity wired items.id=311, 2026-08-22 --
+        // none of the five are stubs now)
         commands::auth::login,
         commands::auth::logout,
         commands::auth::get_recovery_key_display,
         commands::auth::get_session,
+        commands::auth::record_activity,
         // Group 12 -- System
         commands::system::get_health,
         commands::system::get_capability_profile,

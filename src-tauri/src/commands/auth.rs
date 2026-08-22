@@ -553,6 +553,34 @@ pub async fn logout(key_registry: State<'_, KeyRegistry>) -> Result<(), String> 
     Ok(())
 }
 
+/// Record activity on the resident account's live session(s) (items.id=311).
+/// Called by a debounced frontend listener (mouse/keyboard/scroll/click),
+/// not on every IPC command -- see auth::idle_timeout's own module header
+/// for why a frontend-driven activity signal was chosen over a backend-
+/// command-tracked one. A no-op, not an error, when nobody is logged in --
+/// a stray ping racing a logout is expected, not exceptional.
+#[tauri::command]
+#[specta::specta]
+pub async fn record_activity(key_registry: State<'_, KeyRegistry>) -> Result<(), String> {
+    let user_id = key_registry.with_key(|k| k.user_id.clone()).await;
+    if let Some(user_id) = user_id {
+        let mut conn = open_shared_db().await?;
+        let now = crate::providers::utils::now();
+        sqlx::query(
+            "UPDATE auth_sessions SET last_active_at = ?
+             WHERE user_id = ? AND expires_at > ?",
+        )
+        .bind(&now)
+        .bind(&user_id)
+        .bind(&now)
+        .execute(&mut conn)
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
+
 /// Derive and return the current session's recovery mnemonic for one-time
 /// display. Section 8.5's Option B: `Mnemonic::from_entropy()` on the raw
 /// 32-byte master key directly, not a wrapper key -- `Mnemonic::parse()` on
@@ -724,6 +752,46 @@ mod tests {
         assert_eq!(
             count.0, 1,
             "exactly one session row should exist after bootstrap login"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_activity_updates_last_active_at_for_the_logged_in_user() {
+        let _env = setup().await;
+        let app = mock_app_with_registry();
+        let registry = app.state::<KeyRegistry>();
+        let group_key_registry = app.state::<GroupKeyRegistry>();
+
+        login(
+            "Alice".to_owned(),
+            "correct horse battery staple".to_owned(),
+            registry.clone(),
+            group_key_registry.clone(),
+        )
+        .await
+        .unwrap();
+
+        let mut conn = open_shared_db().await.unwrap();
+        let original: String = sqlx::query_scalar("SELECT last_active_at FROM auth_sessions")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+
+        // Ensure the next timestamp is observably later -- to_rfc3339()
+        // includes sub-second precision, but back the clock off by a
+        // second's worth of margin rather than relying on real-time
+        // granularity between two calls a few microseconds apart.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        record_activity(registry.clone()).await.unwrap();
+
+        let updated: String = sqlx::query_scalar("SELECT last_active_at FROM auth_sessions")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert!(
+            updated > original,
+            "record_activity must bump last_active_at forward"
         );
     }
 

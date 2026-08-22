@@ -38,6 +38,44 @@ function App() {
     })
   }, [])
 
+  // items.id=311: idle-timeout activity signal. Frontend-driven rather than
+  // bumped on every IPC command -- see auth::idle_timeout's own module
+  // header (backend) for why: there's no central command guard to hook,
+  // and mouse/keyboard activity is the more correct proxy for "someone is
+  // actually at the keyboard" than "a command fired" (a long-running
+  // backend call shouldn't reset the idle clock while the user has
+  // genuinely stepped away). Debounced to one ping per interval rather
+  // than one per event -- a dirty flag set by the listeners, drained by
+  // the interval, so a burst of mousemove events costs one IPC call, not
+  // hundreds. 60s matches the backend timer's own check granularity
+  // (main.rs) -- pinging more often than the backend checks would just be
+  // wasted round-trips.
+  useEffect(() => {
+    if (bootState !== 'loggedIn') {
+      return
+    }
+
+    let dirty = false
+    const markDirty = () => {
+      dirty = true
+    }
+    const events = ['mousemove', 'keydown', 'click', 'scroll'] as const
+    events.forEach((event) => window.addEventListener(event, markDirty))
+
+    const interval = window.setInterval(() => {
+      if (!dirty) {
+        return
+      }
+      dirty = false
+      void commands.recordActivity()
+    }, 60_000)
+
+    return () => {
+      events.forEach((event) => window.removeEventListener(event, markDirty))
+      window.clearInterval(interval)
+    }
+  }, [bootState])
+
   if (bootState === 'checking') {
     return <p>{t('auth.checkingSession')}</p>
   }
