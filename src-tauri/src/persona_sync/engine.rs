@@ -72,9 +72,12 @@
 //
 // SCOPE, deliberately narrow (matches this item's own transport framing):
 //   - entity_facts deletion-by-absence (owner cleared a field entirely, not
-//     just changed its value) is not applied -- only entities. voice_profiles
-//     deletion-by-absence (items.id=306) is the same class of gap. Neither
-//     is solved here.
+//     just changed its value) is handled (items.id=307) -- see apply_update's
+//     two absence-retirement passes after the entity_facts value-change loop.
+//     voice_profiles deletion-by-absence remains unsolved -- items.id=306
+//     only closed voice_profiles' local-edit/value-overwrite half of this
+//     same class of gap, not the deletion-by-absence half; that stays a
+//     separate, still-open item.
 //   - entity-identity conflicts (dedup) are out of scope -- matching is
 //     purely by preserved entity id (stable end to end since
 //     accept_persona_share binds the owner's own entity.id, never
@@ -830,8 +833,9 @@ async fn apply_update(
             ids
         };
         let missing: Vec<String> = currently_synced
-            .into_iter()
+            .iter()
             .filter(|id| !incoming_ids.contains(id.as_str()))
+            .cloned()
             .collect();
         source_registry_store::mark_records_deleted_in_source_conn(&mut conn, &source_id, &missing)
             .await?;
@@ -882,6 +886,146 @@ async fn apply_update(
             }
 
             apply_synced_fact(&mut conn, persona_id, fact).await?;
+        }
+
+        // entity_facts deletion-by-absence (items.id=307): the loop above is
+        // push-driven (iterates payload.entity_facts), so it can insert or
+        // supersede a fact but has no way to notice a field_name that used
+        // to have an active fact and no longer appears in the incoming
+        // snapshot at all -- the owner clearing a field entirely produces no
+        // entry to react to. This is a second, comparison-in-the-other-
+        // direction pass, symmetric to the entity-level missing/
+        // mark_records_deleted_in_source_conn pass above. Every push is a
+        // full snapshot, not a diff (push_if_changed sends every currently-
+        // active entity/fact, every time), so absence here is unambiguous --
+        // there's no partial-push explanation to rule out first.
+        //
+        // Entity-scoped fields: reuse currently_synced, narrowed to the
+        // entities still active after the entity-deletion pass above (an
+        // entity that itself just went deleted_in_source doesn't also need
+        // its individual fields retired -- out of scope here, matching this
+        // item's own framing of "field cleared, entity still present").
+        // Gated by the same per-entity refresh_verdict_conn the value-change
+        // loop above uses, for the same reason: mark_record_user_modified_conn
+        // is entity-granular, not field-granular, so a Conflict entity must
+        // hold back a missing field exactly like it holds back a changed
+        // value -- one entity, one verdict, one hold-for-review state, not a
+        // second conflict model.
+        let incoming_entity_fields: std::collections::HashSet<(&str, &str)> = payload
+            .entity_facts
+            .iter()
+            .filter_map(|f| {
+                f.entity_id
+                    .as_deref()
+                    .map(|eid| (eid, f.field_name.as_str()))
+            })
+            .collect();
+
+        let now = crate::providers::utils::now();
+
+        for entity_id in currently_synced
+            .iter()
+            .filter(|id| incoming_ids.contains(id.as_str()))
+        {
+            let local_active_fields: Vec<String> = {
+                let rows = sqlx::query(
+                    "SELECT field_name FROM entity_facts
+                     WHERE entity_id = ? AND valid_until IS NULL",
+                )
+                .bind(entity_id)
+                .fetch_all(&mut conn)
+                .await?;
+                let mut names = Vec::with_capacity(rows.len());
+                for r in &rows {
+                    names.push(r.try_get::<String, _>("field_name")?);
+                }
+                names
+            };
+
+            let missing_fields: Vec<String> = local_active_fields
+                .into_iter()
+                .filter(|fname| {
+                    !incoming_entity_fields.contains(&(entity_id.as_str(), fname.as_str()))
+                })
+                .collect();
+
+            if missing_fields.is_empty() {
+                continue;
+            }
+
+            match source_registry_store::refresh_verdict_conn(&mut conn, entity_id).await? {
+                Some(RefreshVerdict::AutoAccept) => {
+                    for field_name in &missing_fields {
+                        sqlx::query(
+                            "UPDATE entity_facts SET valid_until = ?
+                             WHERE entity_id = ? AND field_name = ? AND valid_until IS NULL",
+                        )
+                        .bind(&now)
+                        .bind(entity_id)
+                        .bind(field_name)
+                        .execute(&mut conn)
+                        .await?;
+                    }
+                }
+                Some(RefreshVerdict::Conflict) => {
+                    source_registry_store::set_source_status_conn(
+                        &mut conn,
+                        &source_id,
+                        "pending_refresh",
+                    )
+                    .await?;
+                }
+                Some(RefreshVerdict::Ignore) | None => {}
+            }
+        }
+
+        // Singleton fields (entity_id NULL): no owning entity to gate on,
+        // so scope by provenance instead -- only a singleton fact this sync
+        // relationship itself previously wrote (source = 'synced_share', the
+        // tag both accept_persona_share's materialization and
+        // apply_synced_fact above use) is eligible for absence-retirement.
+        // Unscoped, this would be wrong: the recipient may have their own,
+        // unrelated local singleton fact that happens to share a field_name
+        // the owner's persona never had -- absence from the owner's payload
+        // says nothing about a field the owner never sent. Applied
+        // unconditionally (no verdict check), matching apply_synced_fact's
+        // own existing unconditional handling of singleton value-changes --
+        // there is no local-edit guard for singletons anywhere in this
+        // framework today (create_entity_fact_with_provenance skips it when
+        // entity_id is None), so this doesn't invent one just for deletion.
+        let incoming_singleton_fields: std::collections::HashSet<&str> = payload
+            .entity_facts
+            .iter()
+            .filter(|f| f.entity_id.is_none())
+            .map(|f| f.field_name.as_str())
+            .collect();
+
+        let local_synced_singletons: Vec<String> = {
+            let rows = sqlx::query(
+                "SELECT field_name FROM entity_facts
+                 WHERE entity_id IS NULL AND valid_until IS NULL AND source = 'synced_share'",
+            )
+            .fetch_all(&mut conn)
+            .await?;
+            let mut names = Vec::with_capacity(rows.len());
+            for r in &rows {
+                names.push(r.try_get::<String, _>("field_name")?);
+            }
+            names
+        };
+
+        for field_name in local_synced_singletons {
+            if incoming_singleton_fields.contains(field_name.as_str()) {
+                continue;
+            }
+            sqlx::query(
+                "UPDATE entity_facts SET valid_until = ?
+                 WHERE entity_id IS NULL AND field_name = ? AND valid_until IS NULL",
+            )
+            .bind(&now)
+            .bind(&field_name)
+            .execute(&mut conn)
+            .await?;
         }
 
         // voice_profile_entries (items.id=306): gated per-row through
@@ -2094,5 +2238,475 @@ mod tests {
 
         let entity = entity_row(&recipient_id, &persona_id, &recipient_key, &entity_id).await;
         assert_eq!(entity.status, "deleted_in_source");
+    }
+
+    #[tokio::test]
+    async fn a_field_missing_from_a_later_push_is_retired_on_the_recipient() {
+        let _env = setup().await;
+        let (owner_id, owner_persona, owner_key, _) = make_user_with_persona("Alice", 0x16).await;
+        let (recipient_id, _, recipient_key, recipient_priv) =
+            make_user_with_persona("Bob", 0x26).await;
+
+        let entity_id = entity_store::create_entity(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            "person",
+            "Contact",
+            &[],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        personal_store::create_entity_fact_with_provenance(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            Some(entity_id.as_str()),
+            "phone",
+            "555-1234",
+            "personal",
+            "interview",
+            &owner_persona,
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let share_id = send_persona_share(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            &recipient_id,
+            ShareType::Synced,
+        )
+            .await
+            .unwrap();
+        let persona_id =
+            accept_and_provision_sync(&share_id, &recipient_id, &recipient_key, &recipient_priv)
+                .await
+                .unwrap();
+
+        let shared_folder = tempfile::tempdir().unwrap();
+        let folder_path = shared_folder.path().to_str().unwrap();
+        settings_store::set_persona_share_sync_folder(
+            &owner_persona,
+            &share_id,
+            settings_store::SyncRole::Owner,
+            folder_path,
+        )
+        .await
+        .unwrap();
+        settings_store::set_persona_share_sync_folder(
+            &persona_id,
+            &share_id,
+            settings_store::SyncRole::Recipient,
+            folder_path,
+        )
+        .await
+        .unwrap();
+
+        // Owner clears the field entirely -- no dedicated "clear" API exists
+        // yet, so simulate it the same way an owner-side entity archive is
+        // simulated in the deletion-by-absence test above: supersede with no
+        // reinsert, directly on the owner's own connection.
+        {
+            let mut owner_conn =
+                personal_store::open_personal_db(&owner_id, &owner_persona, &owner_key)
+                    .await
+                    .unwrap();
+            sqlx::query(
+                "UPDATE entity_facts SET valid_until = ?
+                 WHERE entity_id = ? AND field_name = 'phone' AND valid_until IS NULL",
+            )
+            .bind(crate::providers::utils::now())
+            .bind(&entity_id)
+            .execute(&mut owner_conn)
+            .await
+            .unwrap();
+        }
+
+        let pushed = push_if_changed(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            &share_id,
+            &recipient_id,
+        )
+        .await
+        .expect("push_if_changed must succeed");
+        assert!(pushed);
+
+        let applied = pull_if_newer(
+            &recipient_id,
+            &persona_id,
+            &recipient_key,
+            &share_id,
+            &recipient_priv,
+        )
+        .await
+        .expect("pull_if_newer must succeed");
+        assert!(applied);
+
+        let mut conn =
+            personal_store::open_personal_db(&recipient_id, &persona_id, &recipient_key)
+                .await
+                .unwrap();
+        let still_active: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM entity_facts
+             WHERE entity_id = ? AND field_name = 'phone' AND valid_until IS NULL",
+        )
+        .bind(&entity_id)
+        .fetch_optional(&mut conn)
+        .await
+        .unwrap();
+        assert!(
+            still_active.is_none(),
+            "a field the owner cleared entirely must be retired on the recipient, not linger"
+        );
+
+        // The entity itself is untouched -- this is a field-level gap, not
+        // an entity-level one.
+        let entity = entity_row(&recipient_id, &persona_id, &recipient_key, &entity_id).await;
+        assert_eq!(entity.status, "active");
+    }
+
+    #[tokio::test]
+    async fn a_missing_singleton_field_is_retired_when_source_matches_synced_share() {
+        let _env = setup().await;
+        let (owner_id, owner_persona, owner_key, _) = make_user_with_persona("Alice", 0x17).await;
+        let (recipient_id, _, recipient_key, recipient_priv) =
+            make_user_with_persona("Bob", 0x27).await;
+
+        personal_store::save_personal_field(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            "email",
+            "alice@example.com",
+            "personal",
+            "user",
+            "self",
+            "pass",
+            "pass",
+            "interview",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let share_id = send_persona_share(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            &recipient_id,
+            ShareType::Synced,
+        )
+            .await
+            .unwrap();
+        let persona_id =
+            accept_and_provision_sync(&share_id, &recipient_id, &recipient_key, &recipient_priv)
+                .await
+                .unwrap();
+
+        let shared_folder = tempfile::tempdir().unwrap();
+        let folder_path = shared_folder.path().to_str().unwrap();
+        settings_store::set_persona_share_sync_folder(
+            &owner_persona,
+            &share_id,
+            settings_store::SyncRole::Owner,
+            folder_path,
+        )
+        .await
+        .unwrap();
+        settings_store::set_persona_share_sync_folder(
+            &persona_id,
+            &share_id,
+            settings_store::SyncRole::Recipient,
+            folder_path,
+        )
+        .await
+        .unwrap();
+
+        // The recipient's own, unrelated local singleton fact -- same
+        // field_name as something the owner will later clear, but never
+        // synced (source != 'synced_share'). Must survive untouched: proves
+        // the source-scoping, not just the happy path.
+        personal_store::save_personal_field(
+            &recipient_id,
+            &persona_id,
+            &recipient_key,
+            "local_only_marker",
+            "recipient's own value",
+            "personal",
+            "user",
+            "self",
+            "pass",
+            "pass",
+            "interview",
+            None,
+        )
+        .await
+        .unwrap();
+
+        // First pull: materializes the owner's "email" singleton on the
+        // recipient's side as source = 'synced_share'.
+        push_if_changed(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            &share_id,
+            &recipient_id,
+        )
+        .await
+        .unwrap();
+        pull_if_newer(
+            &recipient_id,
+            &persona_id,
+            &recipient_key,
+            &share_id,
+            &recipient_priv,
+        )
+        .await
+        .unwrap();
+
+        {
+            let mut conn =
+                personal_store::open_personal_db(&recipient_id, &persona_id, &recipient_key)
+                    .await
+                    .unwrap();
+            let synced_value: String = sqlx::query_scalar(
+                "SELECT field_value FROM entity_facts
+                 WHERE entity_id IS NULL AND field_name = 'email' AND valid_until IS NULL",
+            )
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+            assert_eq!(synced_value, "alice@example.com");
+        }
+
+        // Owner clears the singleton field entirely and pushes again.
+        {
+            let mut owner_conn =
+                personal_store::open_personal_db(&owner_id, &owner_persona, &owner_key)
+                    .await
+                    .unwrap();
+            sqlx::query(
+                "UPDATE entity_facts SET valid_until = ?
+                 WHERE entity_id IS NULL AND field_name = 'email' AND valid_until IS NULL",
+            )
+            .bind(crate::providers::utils::now())
+            .execute(&mut owner_conn)
+            .await
+            .unwrap();
+        }
+
+        let pushed = push_if_changed(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            &share_id,
+            &recipient_id,
+        )
+        .await
+        .expect("push_if_changed must succeed");
+        assert!(pushed);
+
+        let applied = pull_if_newer(
+            &recipient_id,
+            &persona_id,
+            &recipient_key,
+            &share_id,
+            &recipient_priv,
+        )
+        .await
+        .expect("pull_if_newer must succeed");
+        assert!(applied);
+
+        let mut conn =
+            personal_store::open_personal_db(&recipient_id, &persona_id, &recipient_key)
+                .await
+                .unwrap();
+        let still_active: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM entity_facts
+             WHERE entity_id IS NULL AND field_name = 'email' AND valid_until IS NULL",
+        )
+        .fetch_optional(&mut conn)
+        .await
+        .unwrap();
+        assert!(
+            still_active.is_none(),
+            "a synced singleton field the owner cleared entirely must be retired"
+        );
+
+        let unrelated_still_active: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM entity_facts
+             WHERE entity_id IS NULL AND field_name = 'local_only_marker'
+             AND valid_until IS NULL",
+        )
+        .fetch_optional(&mut conn)
+        .await
+        .unwrap();
+        assert!(
+            unrelated_still_active.is_some(),
+            "a local singleton fact this sync relationship never wrote must never be touched"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_local_edit_blocks_field_absence_retirement_too() {
+        let _env = setup().await;
+        let (owner_id, owner_persona, owner_key, _) = make_user_with_persona("Alice", 0x18).await;
+        let (recipient_id, _, recipient_key, recipient_priv) =
+            make_user_with_persona("Bob", 0x28).await;
+
+        let entity_id = entity_store::create_entity(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            "person",
+            "Original Name",
+            &[],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        personal_store::create_entity_fact_with_provenance(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            Some(entity_id.as_str()),
+            "phone",
+            "555-1234",
+            "personal",
+            "interview",
+            &owner_persona,
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let share_id = send_persona_share(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            &recipient_id,
+            ShareType::Synced,
+        )
+            .await
+            .unwrap();
+        let persona_id =
+            accept_and_provision_sync(&share_id, &recipient_id, &recipient_key, &recipient_priv)
+                .await
+                .unwrap();
+
+        let shared_folder = tempfile::tempdir().unwrap();
+        let folder_path = shared_folder.path().to_str().unwrap();
+        settings_store::set_persona_share_sync_folder(
+            &owner_persona,
+            &share_id,
+            settings_store::SyncRole::Owner,
+            folder_path,
+        )
+        .await
+        .unwrap();
+        settings_store::set_persona_share_sync_folder(
+            &persona_id,
+            &share_id,
+            settings_store::SyncRole::Recipient,
+            folder_path,
+        )
+        .await
+        .unwrap();
+
+        // The recipient edits the entity locally (a different field/
+        // attribute than the one the owner is about to clear) -- same
+        // entity-granular guard as a_local_edit_after_pull_blocks_a_later_
+        // conflicting_update above (Q2 in the design plan): any local edit
+        // flips the whole entity to user_modified, not just the field that
+        // was touched.
+        entity_store::update_entity(
+            &recipient_id,
+            &persona_id,
+            &recipient_key,
+            &entity_id,
+            &EntityUpdate {
+                display_name: Some("Recipient's Own Name".to_owned()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // The owner clears the (unrelated) phone field and pushes.
+        {
+            let mut owner_conn =
+                personal_store::open_personal_db(&owner_id, &owner_persona, &owner_key)
+                    .await
+                    .unwrap();
+            sqlx::query(
+                "UPDATE entity_facts SET valid_until = ?
+                 WHERE entity_id = ? AND field_name = 'phone' AND valid_until IS NULL",
+            )
+            .bind(crate::providers::utils::now())
+            .bind(&entity_id)
+            .execute(&mut owner_conn)
+            .await
+            .unwrap();
+        }
+        push_if_changed(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            &share_id,
+            &recipient_id,
+        )
+        .await
+        .unwrap();
+
+        let applied = pull_if_newer(
+            &recipient_id,
+            &persona_id,
+            &recipient_key,
+            &share_id,
+            &recipient_priv,
+        )
+        .await
+        .expect("pull_if_newer must succeed even when retirement is held back");
+        assert!(applied);
+
+        let mut conn =
+            personal_store::open_personal_db(&recipient_id, &persona_id, &recipient_key)
+                .await
+                .unwrap();
+        let still_active: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM entity_facts
+             WHERE entity_id = ? AND field_name = 'phone' AND valid_until IS NULL",
+        )
+        .bind(&entity_id)
+        .fetch_optional(&mut conn)
+        .await
+        .unwrap();
+        assert!(
+            still_active.is_some(),
+            "absence-retirement must be held back on a Conflict entity, \
+             same as a value-change would be"
+        );
+
+        let source_id = find_source_registry_id(&mut conn).await.unwrap().unwrap();
+        let source = source_registry_store::get_source_conn(&mut conn, &source_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            source.status, "pending_refresh",
+            "a conflicting absence must flag the source for attention, same as a value change"
+        );
     }
 }
