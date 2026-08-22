@@ -63,15 +63,18 @@
 // time). This engine's own writes go through the *_conn layer directly
 // (entity_store::update_entity_conn, raw entity_facts SQL below) specifically
 // to bypass that guard -- a sync-applied update must never mark itself as a
-// conflicting local edit.
+// conflicting local edit. voice_profiles (items.id=306, personal_007.sql)
+// now carries the same guard: personal_store::save_voice_profile_entry calls
+// source_registry_store::mark_voice_profile_user_modified_conn on a genuine
+// local edit, and this engine's voice_profile_entries loop below writes
+// through voice_profile_refresh_verdict_conn / raw SQL directly, same
+// bypass-the-guard reasoning as the entities/entity_facts paths above.
 //
 // SCOPE, deliberately narrow (matches this item's own transport framing):
 //   - entity_facts deletion-by-absence (owner cleared a field entirely, not
-//     just changed its value) is not applied -- only entities. A real,
-//     flagged gap, not solved here.
-//   - voice_profiles has no modification_state column at all -- an incoming
-//     entry always overwrites by id (upsert), with no local-edit protection
-//     possible for this table today.
+//     just changed its value) is not applied -- only entities. voice_profiles
+//     deletion-by-absence (items.id=306) is the same class of gap. Neither
+//     is solved here.
 //   - entity-identity conflicts (dedup) are out of scope -- matching is
 //     purely by preserved entity id (stable end to end since
 //     accept_persona_share binds the owner's own entity.id, never
@@ -317,6 +320,26 @@ pub async fn provision_sync_relationship(
              WHERE source_registry_id IS NULL AND modification_state = 'user_created'",
         )
         .bind(&source_id)
+        .execute(&mut conn)
+        .await?;
+
+        // voice_profiles (items.id=306): same retroactive user_created ->
+        // pristine flip as entities above, minus the source_registry_id link
+        // -- voice_profiles has no such column (personal_007.sql; not
+        // needed, see that migration's own header). Scoped by persona_id +
+        // modification_state alone rather than an explicit id list from the
+        // materialized share: accept_persona_share's voice_profiles INSERT
+        // (persona_sharing.rs) always stamps 'user_created' on a fresh
+        // persona.db that has no other write path today (personal_store::
+        // save_voice_profile_entry has no caller yet), so this is exactly
+        // the same "provisioning runs immediately after materialization,
+        // before the recipient could plausibly race it" accepted window the
+        // entities UPDATE above already documents and relies on.
+        sqlx::query(
+            "UPDATE voice_profiles SET modification_state = 'pristine'
+             WHERE persona_id = ? AND modification_state = 'user_created'",
+        )
+        .bind(persona_id)
         .execute(&mut conn)
         .await?;
 
@@ -861,35 +884,68 @@ async fn apply_update(
             apply_synced_fact(&mut conn, persona_id, fact).await?;
         }
 
-        // voice_profile_entries: plain upsert by id. voice_profiles has no
-        // modification_state column at all -- there is no local-edit
-        // protection possible here today, a known, flagged gap (see this
-        // module's own header, SCOPE), not solved by this item.
+        // voice_profile_entries (items.id=306): gated per-row through
+        // voice_profile_refresh_verdict_conn, same shape as entities pass 1
+        // above -- a row new since the last sync inserts directly as
+        // 'pristine' (mirrors insert_synced_entity's own entities INSERT,
+        // skipping 'user_created' entirely since this write genuinely is a
+        // sync product, not a QR-native one); an existing row is gated by
+        // its own verdict. This closes the gap this module's own header
+        // (SCOPE) previously flagged: "voice_profiles has no
+        // modification_state column at all".
         for entry in &payload.voice_profile_entries {
             let extra_metadata_json = entry.extra_metadata.to_string();
-            sqlx::query(
-                "INSERT INTO voice_profiles
-                 (id, persona_id, source_id, precedence, attribute, value,
-                  created_at, updated_at, extra_metadata)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(id) DO UPDATE SET
-                    precedence = excluded.precedence,
-                    attribute = excluded.attribute,
-                    value = excluded.value,
-                    updated_at = excluded.updated_at,
-                    extra_metadata = excluded.extra_metadata",
-            )
-            .bind(&entry.id)
-            .bind(persona_id)
-            .bind(&entry.source_id)
-            .bind(entry.precedence)
-            .bind(&entry.attribute)
-            .bind(&entry.value)
-            .bind(&entry.created_at)
-            .bind(&entry.updated_at)
-            .bind(&extra_metadata_json)
-            .execute(&mut conn)
-            .await?;
+            let verdict =
+                source_registry_store::voice_profile_refresh_verdict_conn(&mut conn, &entry.id)
+                    .await?;
+
+            match verdict {
+                None => {
+                    sqlx::query(
+                        "INSERT INTO voice_profiles
+                         (id, persona_id, source_id, precedence, attribute, value,
+                          created_at, updated_at, extra_metadata, modification_state)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pristine')",
+                    )
+                    .bind(&entry.id)
+                    .bind(persona_id)
+                    .bind(&entry.source_id)
+                    .bind(entry.precedence)
+                    .bind(&entry.attribute)
+                    .bind(&entry.value)
+                    .bind(&entry.created_at)
+                    .bind(&entry.updated_at)
+                    .bind(&extra_metadata_json)
+                    .execute(&mut conn)
+                    .await?;
+                }
+                Some(RefreshVerdict::AutoAccept) => {
+                    sqlx::query(
+                        "UPDATE voice_profiles SET
+                            precedence = ?, attribute = ?, value = ?,
+                            updated_at = ?, extra_metadata = ?,
+                            modification_state = 'pristine'
+                         WHERE id = ?",
+                    )
+                    .bind(entry.precedence)
+                    .bind(&entry.attribute)
+                    .bind(&entry.value)
+                    .bind(&entry.updated_at)
+                    .bind(&extra_metadata_json)
+                    .bind(&entry.id)
+                    .execute(&mut conn)
+                    .await?;
+                }
+                Some(RefreshVerdict::Conflict) => {
+                    source_registry_store::set_source_status_conn(
+                        &mut conn,
+                        &source_id,
+                        "pending_refresh",
+                    )
+                    .await?;
+                }
+                Some(RefreshVerdict::Ignore) => {}
+            }
         }
 
         Ok(())
@@ -1678,6 +1734,146 @@ mod tests {
         assert_eq!(
             source.status, "pending_refresh",
             "a conflicting update must flag the source for attention"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_local_voice_profile_edit_after_pull_blocks_a_later_conflicting_update() {
+        let _env = setup().await;
+        let (owner_id, owner_persona, owner_key, _) = make_user_with_persona("Alice", 0x16).await;
+        let (recipient_id, _, recipient_key, recipient_priv) =
+            make_user_with_persona("Bob", 0x26).await;
+
+        // precedence=4 (persona-scoped) matches load_shared_voice_profile_
+        // entries' own filter (persona_id = source_persona_id) -- a global
+        // (precedence=3, persona_id NULL) entry is excluded from sharing.
+        let vp_id = personal_store::save_voice_profile_entry(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            "formality",
+            "casual",
+            4,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let share_id = send_persona_share(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            &recipient_id,
+            ShareType::Synced,
+        )
+            .await
+            .unwrap();
+        let persona_id =
+            accept_and_provision_sync(&share_id, &recipient_id, &recipient_key, &recipient_priv)
+                .await
+                .unwrap();
+
+        let shared_folder = tempfile::tempdir().unwrap();
+        let folder_path = shared_folder.path().to_str().unwrap();
+        settings_store::set_persona_share_sync_folder(
+            &owner_persona,
+            &share_id,
+            settings_store::SyncRole::Owner,
+            folder_path,
+        )
+        .await
+        .unwrap();
+        settings_store::set_persona_share_sync_folder(
+            &persona_id,
+            &share_id,
+            settings_store::SyncRole::Recipient,
+            folder_path,
+        )
+        .await
+        .unwrap();
+
+        // The recipient edits the voice profile locally -- the same guard
+        // items.id=306 wires into personal_store::save_voice_profile_entry.
+        personal_store::save_voice_profile_entry(
+            &recipient_id,
+            &persona_id,
+            &recipient_key,
+            "formality",
+            "recipient's own value",
+            4,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The owner changes the same voice profile and pushes again.
+        personal_store::save_voice_profile_entry(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            "formality",
+            "owner's new value",
+            4,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        push_if_changed(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            &share_id,
+            &recipient_id,
+        )
+        .await
+        .unwrap();
+
+        let applied = pull_if_newer(
+            &recipient_id,
+            &persona_id,
+            &recipient_key,
+            &share_id,
+            &recipient_priv,
+        )
+        .await
+        .expect("pull_if_newer must succeed even when every change conflicts");
+        assert!(
+            applied,
+            "the sweep ran and recorded a newer snapshot, even though nothing was applied"
+        );
+
+        let mut conn =
+            personal_store::open_personal_db(&recipient_id, &persona_id, &recipient_key)
+                .await
+                .unwrap();
+        let value: String = sqlx::query_scalar("SELECT value FROM voice_profiles WHERE id = ?")
+            .bind(&vp_id)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            value, "recipient's own value",
+            "a local voice profile edit must never be silently overwritten by a later sync"
+        );
+        let modification_state: String =
+            sqlx::query_scalar("SELECT modification_state FROM voice_profiles WHERE id = ?")
+                .bind(&vp_id)
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(modification_state, "user_modified");
+
+        let source_id = find_source_registry_id(&mut conn).await.unwrap().unwrap();
+        let source = source_registry_store::get_source_conn(&mut conn, &source_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            source.status, "pending_refresh",
+            "a conflicting voice profile update must flag the source for attention"
         );
     }
 

@@ -610,8 +610,8 @@ pub async fn accept_persona_share(
             sqlx::query(
                 "INSERT INTO voice_profiles
                  (id, persona_id, source_id, precedence, attribute, value,
-                  created_at, updated_at, extra_metadata)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  created_at, updated_at, extra_metadata, modification_state)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'user_created')",
             )
             .bind(&entry.id)
             .bind(&persona_id)

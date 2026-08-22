@@ -1127,6 +1127,20 @@ fn validate_voice_profile_value(attribute: &str, value: &str) -> Result<(), Pers
 /// Write a voice profile entry at the specified precedence level.
 /// VOICE_PRECEDENCE_GLOBAL (3) entries store persona_id = NULL.
 /// Upserts on composite key: (stored_persona_id, source_id, precedence, attribute).
+///
+/// Atomic: SAVEPOINT wraps the upsert and the modification_state flip
+/// together, same guarantee entity_store::update_entity's own wrapper gives
+/// its two statements.
+///
+/// A new row is stamped 'user_created' (matches the column default —
+/// this is a QR-native write, no sync/import origin). An edit of an
+/// existing row flips it pristine -> user_modified (items.id=306) — a
+/// direct call to this function is exactly what decisions.id=502's
+/// modification_state machine means by "the user edited it", same
+/// reasoning update_entity's own doc comment gives. persona_sync::engine's
+/// own sync-applied writes go through raw SQL directly (bypassing this
+/// function entirely) specifically so an incoming sync update never trips
+/// this guard on itself.
 #[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
 pub async fn save_voice_profile_entry(
     user_id: &str,
@@ -1158,57 +1172,92 @@ pub async fn save_voice_profile_entry(
     let timestamp = crate::providers::utils::now();
     let mut conn = open_personal_db(user_id, persona_id, key_hex).await?;
 
-    let existing = sqlx::query(
-        "SELECT id FROM voice_profiles
-         WHERE (persona_id = ? OR (persona_id IS NULL AND ? IS NULL))
-         AND (source_id = ? OR (source_id IS NULL AND ? IS NULL))
-         AND precedence = ? AND attribute = ?",
-    )
-    .bind(stored_persona_id)
-    .bind(stored_persona_id)
-    .bind(source_id)
-    .bind(source_id)
-    .bind(precedence)
-    .bind(attribute)
-    .fetch_optional(&mut conn)
-    .await?;
-
-    let entry_id = if let Some(row) = existing {
-        let id: String = row.try_get("id")?;
-        sqlx::query(
-            "UPDATE voice_profiles SET value = ?, updated_at = ?,
-             extra_metadata = ? WHERE id = ?",
-        )
-        .bind(value)
-        .bind(&timestamp)
-        .bind(&metadata_json)
-        .bind(&id)
+    sqlx::query("SAVEPOINT save_voice_profile_entry")
         .execute(&mut conn)
         .await?;
-        id
-    } else {
-        let new_id = uuid::Uuid::new_v4().to_string();
-        sqlx::query(
-            "INSERT INTO voice_profiles
-             (id, persona_id, source_id, precedence,
-              attribute, value, created_at, updated_at, extra_metadata)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+
+    let step: Result<String, PersonalStoreError> = async {
+        let existing = sqlx::query(
+            "SELECT id FROM voice_profiles
+             WHERE (persona_id = ? OR (persona_id IS NULL AND ? IS NULL))
+             AND (source_id = ? OR (source_id IS NULL AND ? IS NULL))
+             AND precedence = ? AND attribute = ?",
         )
-        .bind(&new_id)
         .bind(stored_persona_id)
+        .bind(stored_persona_id)
+        .bind(source_id)
         .bind(source_id)
         .bind(precedence)
         .bind(attribute)
-        .bind(value)
-        .bind(&timestamp)
-        .bind(&timestamp)
-        .bind(&metadata_json)
-        .execute(&mut conn)
+        .fetch_optional(&mut conn)
         .await?;
-        new_id
-    };
 
-    Ok(entry_id)
+        let entry_id = if let Some(row) = existing {
+            let id: String = row.try_get("id")?;
+            sqlx::query(
+                "UPDATE voice_profiles SET value = ?, updated_at = ?,
+                 extra_metadata = ? WHERE id = ?",
+            )
+            .bind(value)
+            .bind(&timestamp)
+            .bind(&metadata_json)
+            .bind(&id)
+            .execute(&mut conn)
+            .await?;
+
+            crate::persistence::source_registry_store::mark_voice_profile_user_modified_conn(
+                &mut conn, &id,
+            )
+            .await?;
+
+            id
+        } else {
+            let new_id = uuid::Uuid::new_v4().to_string();
+            sqlx::query(
+                "INSERT INTO voice_profiles
+                 (id, persona_id, source_id, precedence,
+                  attribute, value, created_at, updated_at, extra_metadata,
+                  modification_state)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'user_created')",
+            )
+            .bind(&new_id)
+            .bind(stored_persona_id)
+            .bind(source_id)
+            .bind(precedence)
+            .bind(attribute)
+            .bind(value)
+            .bind(&timestamp)
+            .bind(&timestamp)
+            .bind(&metadata_json)
+            .execute(&mut conn)
+            .await?;
+            new_id
+        };
+
+        Ok(entry_id)
+    }
+    .await;
+
+    match step {
+        Ok(id) => {
+            sqlx::query("RELEASE save_voice_profile_entry")
+                .execute(&mut conn)
+                .await?;
+            Ok(id)
+        }
+        Err(e) => {
+            if let Err(rollback_err) = sqlx::query("ROLLBACK TO save_voice_profile_entry")
+                .execute(&mut conn)
+                .await
+            {
+                log::error!("Savepoint rollback failed in save_voice_profile_entry: {rollback_err}");
+            }
+            let _ = sqlx::query("RELEASE save_voice_profile_entry")
+                .execute(&mut conn)
+                .await;
+            Err(e)
+        }
+    }
 }
 
 pub async fn delete_voice_profile_entry(
@@ -1554,5 +1603,147 @@ mod tests {
     #[test]
     fn ordinary_behavioral_descriptor_is_accepted() {
         assert!(validate_voice_profile_value("tone", "professional and direct").is_ok());
+    }
+
+    // items.id=306: save_voice_profile_entry local-edit protection --
+    // mirrors entity_store::update_entity's own modification_state
+    // coverage for voice_profiles.
+
+    async fn voice_profile_modification_state(
+        user_id: &str,
+        persona_id: &str,
+        key_hex: &str,
+        entry_id: &str,
+    ) -> String {
+        let mut conn = open_personal_db(user_id, persona_id, key_hex)
+            .await
+            .unwrap();
+        sqlx::query_scalar("SELECT modification_state FROM voice_profiles WHERE id = ?")
+            .bind(entry_id)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn save_voice_profile_entry_new_row_is_user_created() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "vp-test-user";
+        let persona_id = "vp-test-persona";
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+
+        let entry_id = save_voice_profile_entry(
+            user_id, persona_id, key_hex, "formality", "casual", 4, None, None,
+        )
+        .await
+        .expect("a fresh voice profile write must succeed");
+
+        let state = voice_profile_modification_state(user_id, persona_id, key_hex, &entry_id).await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+
+        assert_eq!(
+            state, "user_created",
+            "a QR-native voice profile write has no sync origin"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_voice_profile_entry_edit_flips_pristine_to_user_modified() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "vp-test-user";
+        let persona_id = "vp-test-persona";
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+
+        let entry_id = save_voice_profile_entry(
+            user_id, persona_id, key_hex, "formality", "casual", 4, None, None,
+        )
+        .await
+        .unwrap();
+
+        // Simulate this row having arrived via sync (items.id=306's own
+        // gating stamps synced rows 'pristine', never 'user_created' --
+        // see persona_sync::engine::apply_update).
+        {
+            let mut conn = open_personal_db(user_id, persona_id, key_hex).await.unwrap();
+            sqlx::query("UPDATE voice_profiles SET modification_state = 'pristine' WHERE id = ?")
+                .bind(&entry_id)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+
+        save_voice_profile_entry(
+            user_id, persona_id, key_hex, "formality", "recipient's own value", 4, None, None,
+        )
+        .await
+        .expect("editing an existing voice profile entry must succeed");
+
+        let state = voice_profile_modification_state(user_id, persona_id, key_hex, &entry_id).await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+
+        assert_eq!(
+            state, "user_modified",
+            "a direct edit through this path is exactly what decisions.id=502's \
+             modification_state machine means by \"the user edited it\""
+        );
+    }
+
+    #[tokio::test]
+    async fn save_voice_profile_entry_edit_leaves_user_created_row_at_user_created() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "vp-test-user";
+        let persona_id = "vp-test-persona";
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+
+        let entry_id = save_voice_profile_entry(
+            user_id, persona_id, key_hex, "formality", "casual", 4, None, None,
+        )
+        .await
+        .unwrap();
+
+        // Row is already 'user_created' (the default for a fresh write,
+        // asserted separately above) -- editing it again must not flip it,
+        // same as marking_record_user_modified_conn's own no-op-for-
+        // user_created behavior.
+        save_voice_profile_entry(
+            user_id, persona_id, key_hex, "formality", "still not synced", 4, None, None,
+        )
+        .await
+        .unwrap();
+
+        let state = voice_profile_modification_state(user_id, persona_id, key_hex, &entry_id).await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+
+        assert_eq!(
+            state, "user_created",
+            "a row that was never sync-derived stays QR-authoritative"
+        );
     }
 }

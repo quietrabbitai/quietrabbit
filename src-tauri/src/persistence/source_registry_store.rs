@@ -655,6 +655,85 @@ pub(crate) async fn mark_record_user_modified_conn(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Voice profile modification-state gating (items.id=306)
+// ---------------------------------------------------------------------------
+// voice_profiles carries the same three-state modification_state column as
+// entities (personal_007.sql) but is not an Entity -- it has no owning
+// record to delegate to the way entity_facts delegates to its entity, so it
+// gets its own pair of gating functions rather than reusing
+// refresh_verdict_conn / mark_record_user_modified_conn, which are hardcoded
+// to the entities table. Same states, same meanings, same fallback-to-
+// Conflict safety behavior on an unreachable/unknown state.
+
+/// What a source/sync update may do to this voice_profiles row, per the same
+/// decisions.id=502 modification_state rules entities use.
+///
+/// Ok(None) when the row does not exist.
+pub(crate) async fn voice_profile_refresh_verdict_conn(
+    conn: &mut SqliteConnection,
+    voice_profile_id: &str,
+) -> Result<Option<RefreshVerdict>, PersonalStoreError> {
+    let state: Option<String> =
+        sqlx::query_scalar("SELECT modification_state FROM voice_profiles WHERE id = ?")
+            .bind(voice_profile_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+
+    let state = match state {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+
+    Ok(Some(match state.as_str() {
+        "pristine" => RefreshVerdict::AutoAccept,
+        "user_modified" => RefreshVerdict::Conflict,
+        "user_created" => RefreshVerdict::Ignore,
+        other => {
+            // The CHECK constraint makes this unreachable through any
+            // supported write path. If it happens anyway, treat it as a
+            // conflict: the safe direction is always "ask the user", never
+            // "overwrite their data".
+            log::warn!(
+                "voice_profiles.modification_state '{other}' on record \
+                 '{voice_profile_id}' is not a known state — treating as Conflict"
+            );
+            RefreshVerdict::Conflict
+        }
+    }))
+}
+
+/// Record that the user has edited a voice_profiles row, moving it
+/// pristine -> user_modified so a future sync surfaces a conflict instead of
+/// silently overwriting the edit. A user_created row stays user_created —
+/// same no-op-not-error reasoning as mark_record_user_modified_conn.
+pub(crate) async fn mark_voice_profile_user_modified_conn(
+    conn: &mut SqliteConnection,
+    voice_profile_id: &str,
+) -> Result<(), PersonalStoreError> {
+    let result = sqlx::query(
+        "UPDATE voice_profiles SET modification_state = 'user_modified'
+         WHERE id = ? AND modification_state = 'pristine'",
+    )
+    .bind(voice_profile_id)
+    .execute(&mut *conn)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        let exists: Option<String> =
+            sqlx::query_scalar("SELECT id FROM voice_profiles WHERE id = ?")
+                .bind(voice_profile_id)
+                .fetch_optional(&mut *conn)
+                .await?;
+        if exists.is_none() {
+            return Err(PersonalStoreError::Validation(format!(
+                "No voice_profiles row with id '{voice_profile_id}' — nothing was updated."
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Mark records the source no longer has. decisions.id=502: QR keeps them,
 /// excludes them from default views, and tells the user on refresh —
 /// "[N] records were removed from [source] — they're still in QR and can be
@@ -756,6 +835,7 @@ mod tests {
     const V1: &str = include_str!("../../schema/personal_001.sql");
     const V2: &str = include_str!("../../schema/personal_002.sql");
     const V3: &str = include_str!("../../schema/personal_003.sql");
+    const V7: &str = include_str!("../../schema/personal_007.sql");
 
     async fn test_db() -> SqliteConnection {
         let mut conn = SqliteConnectOptions::new()
@@ -763,7 +843,7 @@ mod tests {
             .connect()
             .await
             .expect("in-memory connection failed");
-        for schema in [V1, V2, V3] {
+        for schema in [V1, V2, V3, V7] {
             for stmt in parse_statements(schema) {
                 sqlx::query(&stmt)
                     .execute(&mut conn)
@@ -1075,6 +1155,84 @@ mod tests {
                 .await
                 .is_err(),
             "but a nonexistent record is a caller bug"
+        );
+    }
+
+    async fn a_voice_profile(conn: &mut SqliteConnection, id: &str, modification_state: &str) {
+        sqlx::query(
+            "INSERT INTO voice_profiles
+             (id, persona_id, source_id, precedence, attribute, value,
+              created_at, updated_at, modification_state)
+             VALUES (?, 'persona-1', NULL, 4, 'formality', 'casual', ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(crate::providers::utils::now())
+        .bind(crate::providers::utils::now())
+        .bind(modification_state)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn voice_profile_refresh_verdict_follows_modification_state() {
+        let mut conn = test_db().await;
+        a_voice_profile(&mut conn, "vp-pristine", "pristine").await;
+        a_voice_profile(&mut conn, "vp-modified", "user_modified").await;
+        a_voice_profile(&mut conn, "vp-created", "user_created").await;
+
+        assert_eq!(
+            voice_profile_refresh_verdict_conn(&mut conn, "vp-pristine")
+                .await
+                .unwrap(),
+            Some(RefreshVerdict::AutoAccept),
+            "pristine voice_profiles rows accept sync updates"
+        );
+        assert_eq!(
+            voice_profile_refresh_verdict_conn(&mut conn, "vp-modified")
+                .await
+                .unwrap(),
+            Some(RefreshVerdict::Conflict),
+            "an edited voice_profiles row must surface a conflict, never auto-update"
+        );
+        assert_eq!(
+            voice_profile_refresh_verdict_conn(&mut conn, "vp-created")
+                .await
+                .unwrap(),
+            Some(RefreshVerdict::Ignore),
+            "QR is authoritative for user_created voice_profiles rows"
+        );
+        assert!(voice_profile_refresh_verdict_conn(&mut conn, "nope")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn marking_voice_profile_user_modified_never_downgrades_user_created() {
+        let mut conn = test_db().await;
+        a_voice_profile(&mut conn, "vp-created", "user_created").await;
+
+        mark_voice_profile_user_modified_conn(&mut conn, "vp-created")
+            .await
+            .expect("editing a QR-origin voice_profiles row is not an error");
+
+        let state: String =
+            sqlx::query_scalar("SELECT modification_state FROM voice_profiles WHERE id = ?")
+                .bind("vp-created")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(
+            state, "user_created",
+            "a row that was never sync-derived stays QR-authoritative"
+        );
+
+        assert!(
+            mark_voice_profile_user_modified_conn(&mut conn, "no-such-id")
+                .await
+                .is_err(),
+            "but a nonexistent row is a caller bug"
         );
     }
 

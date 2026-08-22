@@ -139,6 +139,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/personal_006.sql"),
     },
     SchemaFile {
+        prefix: "personal",
+        version: 7,
+        sql: include_str!("../../schema/personal_007.sql"),
+    },
+    SchemaFile {
         prefix: "plan_state",
         version: 1,
         sql: include_str!("../../schema/plan_state_001.sql"),
@@ -1341,8 +1346,8 @@ mod tests {
 
         assert_eq!(
             result.expect("migration must apply cleanly to a real encrypted file"),
-            6,
-            "personal_001 + personal_002 + personal_003 + personal_004 + personal_005 + personal_006 must all apply in one pass"
+            7,
+            "personal_001 + personal_002 + personal_003 + personal_004 + personal_005 + personal_006 + personal_007 must all apply in one pass"
         );
 
         let mut conn = open_verify_conn(&db_path, Some(TEST_KEY_HEX)).await;
@@ -1377,6 +1382,18 @@ mod tests {
             column_names.contains(&"hide_from_shared_surfaces"),
             "personal_003's ALTER TABLE must have applied to the real file"
         );
+
+        let voice_profile_columns: Vec<(i64, String, String, i64, Option<String>, i64)> =
+            sqlx::query_as("PRAGMA table_info(voice_profiles)")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        assert!(
+            voice_profile_columns
+                .iter()
+                .any(|c| c.1 == "modification_state"),
+            "personal_007's ALTER TABLE must have applied to the real file"
+        );
     }
 
     #[tokio::test]
@@ -1398,7 +1415,7 @@ mod tests {
             std::env::remove_var("QR_DATA_ROOT");
         }
 
-        assert_eq!(first.expect("first migration must succeed"), 6);
+        assert_eq!(first.expect("first migration must succeed"), 7);
         assert_eq!(
             second.expect("second migration on an already-migrated real file must not error"),
             0,
