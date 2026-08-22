@@ -74,10 +74,16 @@
 //   - entity_facts deletion-by-absence (owner cleared a field entirely, not
 //     just changed its value) is handled (items.id=307) -- see apply_update's
 //     two absence-retirement passes after the entity_facts value-change loop.
-//     voice_profiles deletion-by-absence remains unsolved -- items.id=306
-//     only closed voice_profiles' local-edit/value-overwrite half of this
-//     same class of gap, not the deletion-by-absence half; that stays a
-//     separate, still-open item.
+//     voice_profiles deletion-by-absence is handled too (items.id=309) --
+//     see apply_update's absence-retirement pass after the voice_profile_
+//     entries value-change loop. Unlike entity_facts it needs no
+//     source='synced_share'-style provenance tag: accept_persona_share
+//     always mints a fresh persona_id per share, so persona_id alone
+//     already scopes to one sync relationship (persona_id +
+//     modification_state != 'user_created'), and retirement is a genuine
+//     DELETE, not a supersede -- voice_profiles has no FK pointing at its
+//     id and no immutable-provenance contract the way entity_facts/
+//     disclosure_log do.
 //   - entity-identity conflicts (dedup) are out of scope -- matching is
 //     purely by preserved entity id (stable end to end since
 //     accept_persona_share binds the owner's own entity.id, never
@@ -1089,6 +1095,64 @@ async fn apply_update(
                     .await?;
                 }
                 Some(RefreshVerdict::Ignore) => {}
+            }
+        }
+
+        // voice_profiles deletion-by-absence (items.id=309): mirrors the
+        // entity_facts absence passes above, but voice_profiles has no
+        // owning entity to delegate a verdict through (see
+        // voice_profile_refresh_verdict_conn's own header) and no
+        // source_registry_id column to scope by -- persona_id is
+        // sufficient because accept_persona_share always mints a fresh
+        // persona per share (persona_sharing.rs), so persona_id is already
+        // 1:1 with this sync relationship. modification_state !=
+        // 'user_created' at the SQL level keeps the recipient's own
+        // local-only rows out of the candidate set entirely, on top of the
+        // per-row verdict gate below.
+        let incoming_voice_profile_ids: std::collections::HashSet<&str> = payload
+            .voice_profile_entries
+            .iter()
+            .map(|e| e.id.as_str())
+            .collect();
+
+        let local_synced_voice_profile_ids: Vec<String> = {
+            let rows = sqlx::query(
+                "SELECT id FROM voice_profiles
+                 WHERE persona_id = ? AND modification_state != 'user_created'",
+            )
+            .bind(persona_id)
+            .fetch_all(&mut conn)
+            .await?;
+            let mut ids = Vec::with_capacity(rows.len());
+            for r in &rows {
+                ids.push(r.try_get::<String, _>("id")?);
+            }
+            ids
+        };
+
+        for vp_id in local_synced_voice_profile_ids {
+            if incoming_voice_profile_ids.contains(vp_id.as_str()) {
+                continue;
+            }
+
+            match source_registry_store::voice_profile_refresh_verdict_conn(&mut conn, &vp_id)
+                .await?
+            {
+                Some(RefreshVerdict::AutoAccept) => {
+                    sqlx::query("DELETE FROM voice_profiles WHERE id = ?")
+                        .bind(&vp_id)
+                        .execute(&mut conn)
+                        .await?;
+                }
+                Some(RefreshVerdict::Conflict) => {
+                    source_registry_store::set_source_status_conn(
+                        &mut conn,
+                        &source_id,
+                        "pending_refresh",
+                    )
+                    .await?;
+                }
+                Some(RefreshVerdict::Ignore) | None => {}
             }
         }
 
@@ -2707,6 +2771,374 @@ mod tests {
         assert_eq!(
             source.status, "pending_refresh",
             "a conflicting absence must flag the source for attention, same as a value change"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_voice_profile_entry_missing_from_a_later_push_is_deleted_on_the_recipient() {
+        let _env = setup().await;
+        let (owner_id, owner_persona, owner_key, _) = make_user_with_persona("Alice", 0x19).await;
+        let (recipient_id, _, recipient_key, recipient_priv) =
+            make_user_with_persona("Bob", 0x29).await;
+
+        let vp_id = personal_store::save_voice_profile_entry(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            "formality",
+            "casual",
+            4,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let share_id = send_persona_share(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            &recipient_id,
+            ShareType::Synced,
+        )
+            .await
+            .unwrap();
+        let persona_id =
+            accept_and_provision_sync(&share_id, &recipient_id, &recipient_key, &recipient_priv)
+                .await
+                .unwrap();
+
+        let shared_folder = tempfile::tempdir().unwrap();
+        let folder_path = shared_folder.path().to_str().unwrap();
+        settings_store::set_persona_share_sync_folder(
+            &owner_persona,
+            &share_id,
+            settings_store::SyncRole::Owner,
+            folder_path,
+        )
+        .await
+        .unwrap();
+        settings_store::set_persona_share_sync_folder(
+            &persona_id,
+            &share_id,
+            settings_store::SyncRole::Recipient,
+            folder_path,
+        )
+        .await
+        .unwrap();
+
+        push_if_changed(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            &share_id,
+            &recipient_id,
+        )
+        .await
+        .unwrap();
+        pull_if_newer(
+            &recipient_id,
+            &persona_id,
+            &recipient_key,
+            &share_id,
+            &recipient_priv,
+        )
+        .await
+        .unwrap();
+
+        // Owner deletes the entry entirely (personal_store::delete_voice_
+        // profile_entry -- a real, if previously uncalled, hard delete) and
+        // pushes again.
+        personal_store::delete_voice_profile_entry(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            "formality",
+            4,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let pushed = push_if_changed(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            &share_id,
+            &recipient_id,
+        )
+        .await
+        .expect("push_if_changed must succeed");
+        assert!(pushed);
+
+        let applied = pull_if_newer(
+            &recipient_id,
+            &persona_id,
+            &recipient_key,
+            &share_id,
+            &recipient_priv,
+        )
+        .await
+        .expect("pull_if_newer must succeed");
+        assert!(applied);
+
+        let mut conn =
+            personal_store::open_personal_db(&recipient_id, &persona_id, &recipient_key)
+                .await
+                .unwrap();
+        let still_present: Option<String> =
+            sqlx::query_scalar("SELECT id FROM voice_profiles WHERE id = ?")
+                .bind(&vp_id)
+                .fetch_optional(&mut conn)
+                .await
+                .unwrap();
+        assert!(
+            still_present.is_none(),
+            "a voice profile entry the owner deleted entirely must be deleted on the recipient too"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_local_voice_profile_edit_blocks_absence_retirement_too() {
+        let _env = setup().await;
+        let (owner_id, owner_persona, owner_key, _) = make_user_with_persona("Alice", 0x1a).await;
+        let (recipient_id, _, recipient_key, recipient_priv) =
+            make_user_with_persona("Bob", 0x2a).await;
+
+        let vp_id = personal_store::save_voice_profile_entry(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            "formality",
+            "casual",
+            4,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let share_id = send_persona_share(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            &recipient_id,
+            ShareType::Synced,
+        )
+            .await
+            .unwrap();
+        let persona_id =
+            accept_and_provision_sync(&share_id, &recipient_id, &recipient_key, &recipient_priv)
+                .await
+                .unwrap();
+
+        let shared_folder = tempfile::tempdir().unwrap();
+        let folder_path = shared_folder.path().to_str().unwrap();
+        settings_store::set_persona_share_sync_folder(
+            &owner_persona,
+            &share_id,
+            settings_store::SyncRole::Owner,
+            folder_path,
+        )
+        .await
+        .unwrap();
+        settings_store::set_persona_share_sync_folder(
+            &persona_id,
+            &share_id,
+            settings_store::SyncRole::Recipient,
+            folder_path,
+        )
+        .await
+        .unwrap();
+
+        push_if_changed(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            &share_id,
+            &recipient_id,
+        )
+        .await
+        .unwrap();
+        pull_if_newer(
+            &recipient_id,
+            &persona_id,
+            &recipient_key,
+            &share_id,
+            &recipient_priv,
+        )
+        .await
+        .unwrap();
+
+        // The recipient edits the voice profile locally -- same
+        // items.id=306 guard exercised in a_local_voice_profile_edit_after_
+        // pull_blocks_a_later_conflicting_update above, this time checked
+        // against absence rather than a value change.
+        personal_store::save_voice_profile_entry(
+            &recipient_id,
+            &persona_id,
+            &recipient_key,
+            "formality",
+            "recipient's own value",
+            4,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The owner deletes the entry entirely and pushes.
+        personal_store::delete_voice_profile_entry(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            "formality",
+            4,
+            None,
+        )
+        .await
+        .unwrap();
+        push_if_changed(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            &share_id,
+            &recipient_id,
+        )
+        .await
+        .unwrap();
+
+        let applied = pull_if_newer(
+            &recipient_id,
+            &persona_id,
+            &recipient_key,
+            &share_id,
+            &recipient_priv,
+        )
+        .await
+        .expect("pull_if_newer must succeed even when retirement is held back");
+        assert!(applied);
+
+        let mut conn =
+            personal_store::open_personal_db(&recipient_id, &persona_id, &recipient_key)
+                .await
+                .unwrap();
+        let still_present: Option<String> =
+            sqlx::query_scalar("SELECT id FROM voice_profiles WHERE id = ?")
+                .bind(&vp_id)
+                .fetch_optional(&mut conn)
+                .await
+                .unwrap();
+        assert!(
+            still_present.is_some(),
+            "absence-retirement must be held back on a Conflict voice profile entry, \
+             same as a value-change would be"
+        );
+
+        let source_id = find_source_registry_id(&mut conn).await.unwrap().unwrap();
+        let source = source_registry_store::get_source_conn(&mut conn, &source_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            source.status, "pending_refresh",
+            "a conflicting absence must flag the source for attention, same as a value change"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_user_created_voice_profile_entry_survives_an_absence_push() {
+        let _env = setup().await;
+        let (owner_id, owner_persona, owner_key, _) = make_user_with_persona("Alice", 0x1b).await;
+        let (recipient_id, _, recipient_key, recipient_priv) =
+            make_user_with_persona("Bob", 0x2b).await;
+
+        let share_id = send_persona_share(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            &recipient_id,
+            ShareType::Synced,
+        )
+            .await
+            .unwrap();
+        let persona_id =
+            accept_and_provision_sync(&share_id, &recipient_id, &recipient_key, &recipient_priv)
+                .await
+                .unwrap();
+
+        let shared_folder = tempfile::tempdir().unwrap();
+        let folder_path = shared_folder.path().to_str().unwrap();
+        settings_store::set_persona_share_sync_folder(
+            &owner_persona,
+            &share_id,
+            settings_store::SyncRole::Owner,
+            folder_path,
+        )
+        .await
+        .unwrap();
+        settings_store::set_persona_share_sync_folder(
+            &persona_id,
+            &share_id,
+            settings_store::SyncRole::Recipient,
+            folder_path,
+        )
+        .await
+        .unwrap();
+
+        // The recipient's own, unrelated voice profile entry -- created
+        // directly on the recipient's persona, never synced from the owner
+        // (modification_state = 'user_created'). Regression guard for the
+        // "modification_state != 'user_created'" SQL filter specifically:
+        // without it, this row would wrongly become an absence-retirement
+        // candidate on the very next empty-payload push.
+        let local_vp_id = personal_store::save_voice_profile_entry(
+            &recipient_id,
+            &persona_id,
+            &recipient_key,
+            "local_only_tone",
+            "recipient's own value",
+            4,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        push_if_changed(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            &share_id,
+            &recipient_id,
+        )
+        .await
+        .unwrap();
+        let applied = pull_if_newer(
+            &recipient_id,
+            &persona_id,
+            &recipient_key,
+            &share_id,
+            &recipient_priv,
+        )
+        .await
+        .expect("pull_if_newer must succeed even with an empty owner payload");
+        assert!(applied);
+
+        let mut conn =
+            personal_store::open_personal_db(&recipient_id, &persona_id, &recipient_key)
+                .await
+                .unwrap();
+        let still_present: Option<String> =
+            sqlx::query_scalar("SELECT id FROM voice_profiles WHERE id = ?")
+                .bind(&local_vp_id)
+                .fetch_optional(&mut conn)
+                .await
+                .unwrap();
+        assert!(
+            still_present.is_some(),
+            "a user_created voice profile entry this sync relationship never wrote \
+             must never be touched by absence retirement"
         );
     }
 }
