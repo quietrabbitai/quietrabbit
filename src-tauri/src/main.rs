@@ -34,7 +34,22 @@ fn main() {
     // run despite RUST_LOG being set. Not evaluating whether this should
     // become the project's permanent logging setup -- flagged to Chat-PM
     // rather than decided here.
-    env_logger::init();
+    //
+    // items.id=319: dev builds emitted almost no logging because RUST_LOG
+    // was unset and env_logger defaults to silent with no directive. Give
+    // debug builds a sane default filter (crate name is quietrabbit_lib --
+    // see src-tauri/Cargo.toml's [lib] section -- since that's where the
+    // log:: call sites actually live) so a manual-verification session
+    // doesn't have to rediscover this. RUST_LOG, when set, still wins.
+    // Release builds are untouched -- silent unless RUST_LOG is set.
+    if cfg!(debug_assertions) {
+        env_logger::Builder::from_env(
+            env_logger::Env::default().default_filter_or("info,quietrabbit_lib=debug"),
+        )
+        .init();
+    } else {
+        env_logger::init();
+    }
 
     if quietrabbit_lib::tier3_pane::dispatch_cef_subprocess() {
         // This invocation was a CEF-spawned helper process (renderer, GPU,
