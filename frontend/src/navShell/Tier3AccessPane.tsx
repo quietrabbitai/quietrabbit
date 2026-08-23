@@ -182,7 +182,7 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
           if (result.status !== 'ok') {
             setReviewOutcome('blocked')
             setReviewMessage(
-              t('navShell.content.gate3ReviewError', { message: result.error }),
+              t('navShell.tier3AccessPane.gate3ReviewError', { message: result.error }),
             )
             return
           }
@@ -317,10 +317,10 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
           <p>{t('navShell.tier3AccessPane.loadingProviders')}</p>
         )}
         {reviewOutcome === 'blocked' && (
-          <p role="alert">{reviewMessage ?? t('navShell.content.gate3BlockedFallback')}</p>
+          <p role="alert">{reviewMessage ?? t('navShell.tier3AccessPane.gate3BlockedFallback')}</p>
         )}
         {reviewOutcome === 'withheld' && (
-          <p>{t('navShell.content.gate3Withheld')}</p>
+          <p>{t('navShell.tier3AccessPane.gate3Withheld')}</p>
         )}
         {providers.length > 0 && reviewOutcome === 'approved' && (
           <Tier3Selector providers={providers} onConfirm={handleConfirm} />

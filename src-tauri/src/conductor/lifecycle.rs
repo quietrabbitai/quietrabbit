@@ -762,9 +762,11 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
     }
 
     /// step_content: the just-completed step's real generated content
-    /// (TaskStep.content, via task_track.last_output()). Only the
-    /// step-completion call site in execute() passes Some(...); every other
-    /// caller (including plain emit_status above) passes None.
+    /// (TaskStep.content, via task_track.last_output()). Passed by the
+    /// step-completion call site in execute(), and by the Tier 3 boundary
+    /// pause (items.id=317 -- the last completed step's output is the draft
+    /// awaiting Gate3 review); every other caller (including plain
+    /// emit_status above) passes None.
     ///
     /// crisis_resource_block: R1 crisis-handling floor (items.id=297). Some(...)
     /// only on the same "failed"/"awaiting_user" emit that accompanies a
@@ -1379,17 +1381,28 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                 } else {
                     None
                 };
+                // items.id=317: the draft awaiting Gate3 review is whatever
+                // the last completed step produced -- OUTPUT is never
+                // reached from this pause, so without capturing it here it's
+                // lost and the assistant message's content stays empty
+                // forever (send_message's backfill only pulls from
+                // output_store, which this run never writes to).
+                let draft_content = self
+                    .task_track
+                    .as_ref()
+                    .and_then(|tt| tt.last_output())
+                    .map(|s| s.to_owned());
                 self.emit_status_with_content(
                     "awaiting_user",
                     Some(&step.display_name),
-                    None,
+                    draft_content.as_deref(),
                     crisis_resource_block.as_deref(),
                 );
                 return Ok(Some(RunResult {
                     focus_run_id: self.focus_run_id.clone().unwrap_or_default(),
                     status: "awaiting_user".to_owned(),
                     output_id: None,
-                    output_content: None,
+                    output_content: draft_content,
                     failure: None,
                     crisis_resource_block,
                 }));
@@ -2985,6 +2998,59 @@ mod tests {
             assert!(
                 result.crisis_resource_block.is_none(),
                 "a non-crisis-flagged run must not get the resource block"
+            );
+        })
+        .await;
+    }
+
+    /// items.id=317: the Tier 3 pause must carry the prior step's real
+    /// output as RunResult.output_content -- this is the only place the
+    /// draft awaiting Gate3 review (consent.rs::request_tier3_gate3_review)
+    /// ever gets captured, since execute() returns before reaching output()
+    /// on this path and output_store is never written to for this run.
+    #[tokio::test]
+    async fn tier3_boundary_carries_prior_step_output_as_draft_content() {
+        with_temp_data_root(async {
+            let mut run = tier3_ready_run(false);
+            run.task_track.as_mut().unwrap().add_step(TaskStep {
+                step_id: "step_prior".to_owned(),
+                output_var: None,
+                content: "the draft awaiting gate3 review".to_owned(),
+                sensitivity_severity: 1,
+                routing_tier_used: 1,
+            });
+            let result = run
+                .execute()
+                .await
+                .unwrap()
+                .expect("a Tier 3 first step must return Some(RunResult), not fall through");
+            assert_eq!(result.status, "awaiting_user");
+            assert_eq!(
+                result.output_content.as_deref(),
+                Some("the draft awaiting gate3 review"),
+                "output_content must be the prior step's real content, not None"
+            );
+        })
+        .await;
+    }
+
+    /// Symmetric to the above: with no prior step (single_tier3_step_focus_def's
+    /// Tier 3 step is the very first step), task_track.last_output() is
+    /// legitimately None -- output_content must stay None too, not panic or
+    /// substitute a placeholder.
+    #[tokio::test]
+    async fn tier3_boundary_omits_draft_content_when_no_prior_step_ran() {
+        with_temp_data_root(async {
+            let mut run = tier3_ready_run(false);
+            let result = run
+                .execute()
+                .await
+                .unwrap()
+                .expect("a Tier 3 first step must return Some(RunResult), not fall through");
+            assert_eq!(result.status, "awaiting_user");
+            assert!(
+                result.output_content.is_none(),
+                "no prior step ran, so there is no draft to carry"
             );
         })
         .await;

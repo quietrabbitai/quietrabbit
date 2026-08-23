@@ -123,6 +123,26 @@ fn crisis_block_from_result(
         .and_then(|r| r.crisis_resource_block.as_deref())
 }
 
+/// items.id=317: same Ok(None) gap as crisis_block_from_result above, for the
+/// ordinary (non-crisis) Tier 3 pause -- the assistant placeholder's content
+/// must be backfilled with the draft awaiting Gate3 review, or
+/// request_tier3_gate3_review's content.is_empty() guard fails every time
+/// (consent.rs). RunResult.output_content is only populated by lifecycle.rs
+/// for a Tier 3 boundary pause (status == "awaiting_user"); other paused/failed
+/// statuses leave it None, so this stays a no-op for them.
+fn draft_content_from_result(
+    result: &Result<
+        crate::conductor::lifecycle::RunResult,
+        crate::conductor::lifecycle::LifecycleError,
+    >,
+) -> Option<&str> {
+    result
+        .as_ref()
+        .ok()
+        .filter(|r| r.status == "awaiting_user")
+        .and_then(|r| r.output_content.as_deref())
+}
+
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
@@ -270,8 +290,13 @@ pub async fn send_message(
                 // (items.id=297): if the run was crisis-flagged, persist the
                 // resource block into the placeholder now, so it survives a
                 // reload/reopen even if the live "run-status-update" event
-                // that also carries it was missed by the frontend. Ordinary
-                // (non-crisis) pauses/failures keep today's behavior -- the
+                // that also carries it was missed by the frontend -- this
+                // takes priority over an ordinary draft backfill below.
+                // items.id=317: otherwise, an ordinary Tier 3 pause backfills
+                // the draft awaiting Gate3 review, so
+                // request_tier3_gate3_review's content.is_empty() guard
+                // (consent.rs) doesn't fail on every gate3_track message.
+                // Any other paused/failed status keeps prior behavior -- the
                 // placeholder stays empty, just logged.
                 if let Some(block) = crisis_block_from_result(&result) {
                     if let Err(e) = message_store::update_message_content(
@@ -284,6 +309,18 @@ pub async fn send_message(
                     .await
                     {
                         log::warn!("send_message: failed to backfill crisis resource block: {e}");
+                    }
+                } else if let Some(draft) = draft_content_from_result(&result) {
+                    if let Err(e) = message_store::update_message_content(
+                        &bg_user_id,
+                        &bg_persona_id,
+                        &bg_key_hex,
+                        &bg_message_id,
+                        draft,
+                    )
+                    .await
+                    {
+                        log::warn!("send_message: failed to backfill draft content: {e}");
                     }
                 } else {
                     log::warn!(
@@ -408,6 +445,50 @@ mod tests {
             crate::conductor::lifecycle::LifecycleError::FocusNotFound("quick-ask".to_owned()),
         );
         assert_eq!(crisis_block_from_result(&result), None);
+    }
+
+    // -----------------------------------------------------------------
+    // draft_content_from_result (items.id=317) -- same pure-function
+    // rationale as crisis_block_from_result above.
+    // -----------------------------------------------------------------
+
+    fn run_result_awaiting_user(output_content: Option<&str>) -> crate::conductor::lifecycle::RunResult {
+        crate::conductor::lifecycle::RunResult {
+            focus_run_id: "run-1".to_owned(),
+            status: "awaiting_user".to_owned(),
+            output_id: None,
+            output_content: output_content.map(|s| s.to_owned()),
+            failure: None,
+            crisis_resource_block: None,
+        }
+    }
+
+    #[test]
+    fn draft_content_from_result_present_for_an_awaiting_user_pause_with_output() {
+        let result = Ok(run_result_awaiting_user(Some("the draft text")));
+        assert_eq!(draft_content_from_result(&result), Some("the draft text"));
+    }
+
+    #[test]
+    fn draft_content_from_result_absent_when_no_prior_step_output_exists() {
+        let result = Ok(run_result_awaiting_user(None));
+        assert_eq!(draft_content_from_result(&result), None);
+    }
+
+    #[test]
+    fn draft_content_from_result_absent_for_a_non_awaiting_user_status() {
+        let mut r = run_result_awaiting_user(Some("should not surface"));
+        r.status = "failed".to_owned();
+        let result = Ok(r);
+        assert_eq!(draft_content_from_result(&result), None);
+    }
+
+    #[test]
+    fn draft_content_from_result_absent_when_execute_full_itself_errored() {
+        let result: Result<_, crate::conductor::lifecycle::LifecycleError> = Err(
+            crate::conductor::lifecycle::LifecycleError::FocusNotFound("quick-ask".to_owned()),
+        );
+        assert_eq!(draft_content_from_result(&result), None);
     }
 
     // -----------------------------------------------------------------
