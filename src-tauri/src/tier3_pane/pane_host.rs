@@ -76,9 +76,11 @@ use gtk::prelude::*;
 use indexmap::IndexMap;
 use tauri::Manager;
 
-use cef::{ImplBrowser, ImplBrowserHost, ImplFrame};
+use cef::{ImplBrowser, ImplBrowserHost, ImplFrame, MouseButtonType, MouseEvent};
 
-use crate::commands::tier3_pane::{PaneLayoutState, PaneRectFraction};
+use crate::commands::tier3_pane::{
+    PaneEventModifiers, PaneLayoutState, PaneMouseButton, PaneRectFraction,
+};
 use crate::tier3_pane::render::{ClientBuilder, LogicalSize, PaneRenderHandler, RenderState};
 use crate::tier3_pane::PaneKey;
 
@@ -195,6 +197,36 @@ fn apply_action(browser: &cef::Browser, action: &PendingAction) -> Result<(), St
 pub enum PaneCommand {
     Open { key: PaneKey, url: String },
     Close { key: PaneKey },
+    /// DOM-forwarded mouse press/release (items.id=257 Path B -- see the
+    /// "Pane content click/mouse forwarding" section doc above). `x`/`y`
+    /// arrive already pane-local, in CEF-logical pixels -- see
+    /// `forward_pane_mouse_click`'s own doc (commands/tier3_pane.rs).
+    MouseClick {
+        key: PaneKey,
+        x: f64,
+        y: f64,
+        button: PaneMouseButton,
+        mouseup: bool,
+        click_count: i32,
+        buttons: u16,
+        modifiers: PaneEventModifiers,
+    },
+    MouseMove {
+        key: PaneKey,
+        x: f64,
+        y: f64,
+        leaving: bool,
+        buttons: u16,
+        modifiers: PaneEventModifiers,
+    },
+    MouseWheel {
+        key: PaneKey,
+        x: f64,
+        y: f64,
+        delta_x: f64,
+        delta_y: f64,
+        modifiers: PaneEventModifiers,
+    },
 }
 
 /// Per-pane state. No `window`/per-pane `render_state` fields (one shared
@@ -243,6 +275,18 @@ struct PaneManager {
     /// with main.rs's GLib timeout so it can gate the redraw heartbeat on
     /// whether any pane is actually open right now (items.id=223).
     open_pane_count: Arc<AtomicUsize>,
+    /// Set on pointer-down inside a pane's rect, resolved by the frontend's
+    /// own DOM hit-testing and forwarded via `forward_pane_mouse_click`
+    /// (items.id=257, Path B redesign -- see `PaneHost::dispatch`'s
+    /// `PaneCommand::MouseClick` arm). This field exists
+    /// for the input class hit-testing *can't* resolve on its own: keyboard
+    /// events have no coordinate to test against, so a future
+    /// `send_key_event` forward needs an explicit answer to "which pane."
+    /// Not consumed anywhere yet -- keyboard forwarding is out of this
+    /// session's scope (click/mouse forwarding only); tracked now so wiring
+    /// it later is a small addition, not a redesign.
+    #[allow(dead_code)]
+    focused_pane: Option<PaneKey>,
 }
 
 impl PaneManager {
@@ -349,6 +393,9 @@ impl PaneManager {
         }
         crate::tier3_pane::render::remove_pane_texture(key);
         self.open_pane_count.fetch_sub(1, Ordering::Relaxed);
+        if self.focused_pane.as_ref() == Some(key) {
+            self.focused_pane = None;
+        }
     }
 
     /// Drains any browser CEF's UI thread finished constructing since the
@@ -406,13 +453,17 @@ impl PaneManager {
 /// Converts a pane's `PaneRectFraction` (0..1 of the whole window's content
 /// area) into a physical-pixel `(x, y, width, height)` rect within
 /// `container_size`, clamped to stay inside it. `None` for a degenerate
-/// (zero or negative) result. Shared between `sync_pane_sizes` above and
-/// render.rs's own per-pane viewport computation -- small, intentional
-/// duplication of the same handful of lines rather than a cross-module
-/// dependency between "what size should CEF think this pane is" and "what
-/// rect should wgpu draw this pane's texture into," which are related but
-/// separately-owned concerns (one drives CEF's layout, the other drives
-/// compositing).
+/// (zero or negative) result. Shared between `sync_pane_sizes` above, the
+/// `glarea`-level click/mouse hit-testing and input-shape routing in
+/// `PaneHost::install` (items.id=257, Path A redesign) -- the single source
+/// of truth this project's own pane-rect geometry requirement demands,
+/// used by both rendering and hit-testing rather than two independently
+/// -maintained copies -- and render.rs's own per-pane viewport computation:
+/// small, intentional duplication of the same handful of lines rather than
+/// a cross-module dependency between "what size should CEF think this pane
+/// is" and "what rect should wgpu draw this pane's texture into," which are
+/// related but separately-owned concerns (one drives CEF's layout, the
+/// other drives compositing).
 fn pane_pixel_rect(
     container_size: (u32, u32),
     frac: &PaneRectFraction,
@@ -498,6 +549,403 @@ fn mouse_backforward_mousedown_js(event: &gtk::gdk::EventButton, held: u8) -> St
         button = button,
         buttons = buttons,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Pane content click/mouse forwarding (items.id=257)
+// ---------------------------------------------------------------------------
+//
+// ACTIVE MECHANISM (Path B redesign, 2026-08-22): Path A -- `glarea` itself
+// claiming pointer events via a GDK input shape carved out of its own
+// private `event_window` -- is gone. Confirmed via live `gdb` this session:
+// giving that shape a non-empty region froze the whole client's Wayland
+// pointer input, root-caused to `event_window` being a non-native,
+// client-side-only child `GdkWindow` under GTK3's CSW model -- Wayland's
+// backend never gives non-native child windows a real compositor surface to
+// route input through; only the toplevel has one. `glarea` no longer claims
+// any pointer events at all; it is a pure compositor now, exactly as
+// pass-through as if it weren't there for input purposes (see
+// `connect_realize` below -- `event_window`'s input shape is initialized
+// empty once at realize and never rebuilt afterward).
+//
+// Hit-testing moved into the frontend's own DOM instead: one invisible,
+// precisely-positioned `<div>` per open pane (`PaneHitLayer`, computed from
+// the exact same per-pane pixel rect the frontend already derives before
+// dividing into the `PaneRectFraction` it sends via `set_pane_layout` -- see
+// `paneLayout.ts`), receiving real native pointer events the browser's own
+// hit-testing already scopes correctly -- no GDK-level scoping needed.
+// Those events are forwarded over `forward_pane_mouse_click`/
+// `forward_pane_mouse_move`/`forward_pane_mouse_wheel`
+// (commands/tier3_pane.rs) to `PaneCommand::MouseClick`/`MouseMove`/
+// `MouseWheel`, handled in `PaneHost::dispatch` below -- see
+// `cef_modifiers_from_dom`'s own doc for why event coordinates arrive
+// already pane-local, needing no origin-subtraction or scale-factor
+// division the way the deleted GDK path's `cef_mouse_event` required.
+//
+// This supersedes the sibling-overlay-widget approach immediately below
+// (`build_pane_hit_widget`), which is CONFIRMED BLOCKED, not merely
+// deprioritized: `hit_widget` never once received a `button-press-event`,
+// and its own diagnostic paint never rendered, despite correct positioning
+// and `is_realized`/`is_mapped`/`has_window` all reporting `true` --
+// suspected cause `glarea`'s raw-GL framebuffer write bypassing sibling
+// Cairo compositing and/or `set_overlay_pass_through` routing input only to
+// the overlay's main child. See `build_pane_hit_widget`'s own doc for the
+// full reproduction; that function and its "KNOWN BLOCKER" documentation
+// are kept in place, unused (`#[allow(dead_code)]`), as a preserved
+// investigation artifact -- do not delete: its root cause was never
+// identified, unlike Path A below, whose failure mode is fully documented
+// in items.id=257's own tracking record and this file's git history, so
+// deleting Path A's dead code outright adds no information those don't
+// already preserve.
+
+/// Translates GDK's modifier/button state bitmask into the bitmask CEF's
+/// `MouseEvent.modifiers` expects (`cef::sys::cef_event_flags_t`'s bits --
+/// `MouseEvent.modifiers` is a plain `u32`, not the higher-level `EventFlags`
+/// wrapper type, so this builds the raw bitmask directly). Only the bits
+/// CEF/Chromium actually reads for mouse routing are translated.
+fn cef_modifiers_from_gdk(state: gtk::gdk::ModifierType) -> u32 {
+    use cef::sys::cef_event_flags_t as Flag;
+    let mut flags = Flag::EVENTFLAG_NONE;
+    if state.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
+        flags |= Flag::EVENTFLAG_SHIFT_DOWN;
+    }
+    if state.contains(gtk::gdk::ModifierType::CONTROL_MASK) {
+        flags |= Flag::EVENTFLAG_CONTROL_DOWN;
+    }
+    if state.contains(gtk::gdk::ModifierType::MOD1_MASK) {
+        flags |= Flag::EVENTFLAG_ALT_DOWN;
+    }
+    if state.contains(gtk::gdk::ModifierType::SUPER_MASK) {
+        flags |= Flag::EVENTFLAG_COMMAND_DOWN;
+    }
+    if state.contains(gtk::gdk::ModifierType::BUTTON1_MASK) {
+        flags |= Flag::EVENTFLAG_LEFT_MOUSE_BUTTON;
+    }
+    if state.contains(gtk::gdk::ModifierType::BUTTON2_MASK) {
+        flags |= Flag::EVENTFLAG_MIDDLE_MOUSE_BUTTON;
+    }
+    if state.contains(gtk::gdk::ModifierType::BUTTON3_MASK) {
+        flags |= Flag::EVENTFLAG_RIGHT_MOUSE_BUTTON;
+    }
+    flags.0
+}
+
+/// GDK's button number -> CEF's 3-button model. GDK also reports 8/9
+/// (back/forward), which have no `MouseButtonType` equivalent in CEF and are
+/// not forwarded -- back/forward-in-pane-content is not part of this scope
+/// (contrast `PaneHost::install`'s own back/forward reimplementation, which
+/// operates on QR's own webview widget, not pane content, for items.id=227).
+fn cef_mouse_button_from_gdk(button: u32) -> Option<MouseButtonType> {
+    match button {
+        1 => Some(MouseButtonType::LEFT),
+        2 => Some(MouseButtonType::MIDDLE),
+        3 => Some(MouseButtonType::RIGHT),
+        _ => None,
+    }
+}
+
+/// DOM-sourced counterpart to `cef_modifiers_from_gdk`, for the Path B
+/// click-routing mechanism (items.id=257, see this section's own doc
+/// above). A browser `PointerEvent`/`WheelEvent` reports its modifier keys
+/// as four separate booleans (`shiftKey`/`ctrlKey`/`altKey`/`metaKey`)
+/// rather than GDK's single bitmask, and `buttons` as its own bitmask with a
+/// *different* bit order than GDK's (`MouseEvent.buttons`: bit0=left,
+/// bit1=right, bit2=middle -- see MDN) -- not merged into one function
+/// taking some shared intermediate type, since the two input sources have
+/// no natural common representation and forcing one would just relocate the
+/// conversion rather than remove it. Same `cef::sys::cef_event_flags_t` bits
+/// as the GDK version.
+fn cef_modifiers_from_dom(shift: bool, ctrl: bool, alt: bool, meta: bool, buttons: u16) -> u32 {
+    use cef::sys::cef_event_flags_t as Flag;
+    let mut flags = Flag::EVENTFLAG_NONE;
+    if shift {
+        flags |= Flag::EVENTFLAG_SHIFT_DOWN;
+    }
+    if ctrl {
+        flags |= Flag::EVENTFLAG_CONTROL_DOWN;
+    }
+    if alt {
+        flags |= Flag::EVENTFLAG_ALT_DOWN;
+    }
+    if meta {
+        flags |= Flag::EVENTFLAG_COMMAND_DOWN;
+    }
+    if buttons & 0b001 != 0 {
+        flags |= Flag::EVENTFLAG_LEFT_MOUSE_BUTTON;
+    }
+    if buttons & 0b010 != 0 {
+        flags |= Flag::EVENTFLAG_RIGHT_MOUSE_BUTTON;
+    }
+    if buttons & 0b100 != 0 {
+        flags |= Flag::EVENTFLAG_MIDDLE_MOUSE_BUTTON;
+    }
+    flags.0
+}
+
+/// KNOWN BLOCKER, confirmed by hand this session, not yet root-caused:
+/// clicks never reach this widget's `button-press-event`, and this widget's
+/// own `connect_draw` paint (kept in place below as a diagnostic, not
+/// cosmetic) never becomes visible on screen -- despite `get_child_position`
+/// (in `install()`) resolving a correct, verified-by-log rect for it every
+/// time, and `hit_widget.{is_realized,is_mapped,has_window}()` all reporting
+/// `true` immediately after `show()`. Both symptoms reproduce with a
+/// full-window (0,0,1,1) rect, ruling out a positioning-math bug. Suspected
+/// cause: `glarea` bypasses GTK's normal Cairo compositing entirely, writing
+/// directly into GTK's shared native framebuffer every render tick (see
+/// `RenderState::render`'s own doc, "there is no `wgpu::Surface` here...
+/// GTK already owns presentation") -- plausibly overwriting whatever this
+/// sibling overlay child's ordinary Cairo `draw` composited, and/or
+/// `overlay.set_overlay_pass_through(&glarea, true)` (items.id=225/227)
+/// routes input straight to the overlay's MAIN child (the webview),
+/// bypassing OTHER overlay children like this one entirely rather than
+/// falling through to "whatever's next in the stack." Neither theory is
+/// confirmed against GTK3's actual C source or a WAYLAND_DEBUG capture --
+/// that's the next step, not guessed further here.
+///
+/// A more promising redesign, grounded in this project's OWN prior
+/// confirmed finding rather than a new assumption: items.id=227's own
+/// investigation (see the "ROOT CAUSE FOUND" comment in `connect_realize`
+/// below) explicitly confirmed `glarea`'s *own* `button-press-event` fires
+/// reliably on every real click ("confirmed via a now-removed temporary
+/// widget-level trace"). Routing input handling through `glarea`'s own
+/// event signals directly -- hit-testing each open pane's rect manually
+/// inside that handler, rather than via a separate sibling overlay widget
+/// per pane -- avoids this entire class of problem, at the cost of needing
+/// a manual re-forward (mirroring `mouse_backforward_mousedown_js` below)
+/// for clicks that land outside every open pane's rect, since claiming the
+/// event on `glarea` itself means `overlay.set_overlay_pass_through` can no
+/// longer do that forwarding for free.
+///
+/// Builds one pane's click-catching overlay widget and wires its pointer
+/// signals to forward into that pane's own CEF browser via the same
+/// `pane.browser_lifecycle.browser().and_then(|b| b.host())` accessor
+/// `sync_pane_sizes`/`close_pane` already use for `was_resized()`/
+/// `close_browser()`. Paints nothing -- purely an input target sitting in
+/// front of the shared `glarea`'s composited CEF texture, which remains what
+/// the user actually sees (this widget and the glarea are separate overlay
+/// children of the same `gtk::Overlay`; this one only ever intercepts
+/// events, never pixels).
+///
+/// Coordinates: `event.position()` is already local to this widget's own
+/// allocation (0,0 at its own top-left) since GTK delivers widget-relative
+/// coordinates -- no manual pane-origin subtraction is needed. Scaling by
+/// `glarea.scale_factor()` before handing to CEF matches the exact
+/// convention `sync_pane_sizes` already uses to compute this pane's
+/// `LogicalSize` (`pane_host.rs`'s own physical-pixels -> CEF-logical-pixels
+/// division), so this pane's `PaneRenderHandler::view_rect` and these
+/// forwarded coordinates agree on the same coordinate space.
+///
+/// SUPERSEDED (items.id=257, Path A redesign, 2026-08-22) -- kept in place,
+/// unused, as a preserved investigation artifact per this project's own
+/// forensic-trail discipline; not called from `PaneHost::dispatch` anymore.
+/// See the section doc above for the active mechanism.
+#[allow(dead_code)]
+fn build_pane_hit_widget(
+    key: PaneKey,
+    manager: Rc<RefCell<PaneManager>>,
+    glarea: gtk::GLArea,
+) -> gtk::DrawingArea {
+    let hit_widget = gtk::DrawingArea::new();
+    hit_widget.set_can_focus(true);
+    // Default packing GTK falls back to when `get_child_position` (installed
+    // in `install()`) returns `None` for this widget -- which it does until
+    // `PaneLayoutState` actually has an entry for this pane (a real gap: a
+    // pane opens and its browser starts loading before the frontend's first
+    // `set_pane_layout` call lands). Without this, an unconfigured
+    // `DrawingArea`'s default alignment (`Fill`/`Fill`) makes GTK's overlay
+    // packing give it the WHOLE overlay's allocation in that window --
+    // confirmed by hand this session: an opened-but-not-yet-laid-out pane's
+    // hit_widget silently ate every click and keyboard-focus grab across the
+    // entire app window, including panels unrelated to any pane, until the
+    // pane closed. Pinning it to a zero-size widget anchored at the origin
+    // means "not yet positioned" is inert instead of "covers everything."
+    hit_widget.set_halign(gtk::Align::Start);
+    hit_widget.set_valign(gtk::Align::Start);
+    hit_widget.set_size_request(0, 0);
+    hit_widget.add_events(
+        gtk::gdk::EventMask::BUTTON_PRESS_MASK
+            | gtk::gdk::EventMask::BUTTON_RELEASE_MASK
+            | gtk::gdk::EventMask::POINTER_MOTION_MASK
+            | gtk::gdk::EventMask::LEAVE_NOTIFY_MASK
+            | gtk::gdk::EventMask::SCROLL_MASK,
+    );
+    // DIAG items.id=257: NOT cosmetic -- this is load-bearing evidence for
+    // the open blocker documented on `build_pane_hit_widget` above. Confirmed
+    // by hand this session: this handler fires every frame (hundreds of
+    // times over one manual test), yet the red tint it paints is never once
+    // visible on screen, and this widget's button-press-event never fires
+    // for a real click landing squarely inside its own confirmed-correct
+    // `get_child_position` rect either. Left in place -- along with the RAW
+    // button_press_event log below -- as the reproduction case for whoever
+    // picks up the investigation this doc points at. Do not delete without
+    // first re-confirming the blocker is actually resolved.
+    hit_widget.connect_draw(|_widget, cr| {
+        log::info!("DIAG items.id=257: hit_widget connect_draw FIRED");
+        cr.set_source_rgba(1.0, 0.0, 0.0, 0.25);
+        let _ = cr.paint();
+        glib::Propagation::Proceed
+    });
+
+    fn mouse_event(glarea: &gtk::GLArea, x: f64, y: f64, state: gtk::gdk::ModifierType) -> MouseEvent {
+        let scale = glarea.scale_factor().max(1) as f32;
+        MouseEvent {
+            x: (x as f32 / scale) as i32,
+            y: (y as f32 / scale) as i32,
+            modifiers: cef_modifiers_from_gdk(state),
+        }
+    }
+
+    {
+        let manager = manager.clone();
+        let glarea = glarea.clone();
+        let key = key.clone();
+        hit_widget.connect_button_press_event(move |widget, event| {
+            // Click-to-focus, mirroring ordinary desktop pane/window
+            // behavior -- harmless even though nothing reads
+            // `PaneManager::focused_pane` yet this session (keyboard
+            // forwarding is a separate follow-on).
+            widget.grab_focus();
+            log::info!(
+                "DIAG items.id=257: RAW button_press_event fired, button={} pos={:?}",
+                event.button(), event.position()
+            );
+            let Some(button) = cef_mouse_button_from_gdk(event.button()) else {
+                return glib::Propagation::Proceed;
+            };
+            let (x, y) = event.position();
+            let ev = mouse_event(&glarea, x, y, event.state());
+            let mut mgr = manager.borrow_mut();
+            mgr.focused_pane = Some(key.clone());
+            log::info!(
+                "DIAG items.id=257: button_press pane={key} widget_local=({x},{y}) cef=({},{}) has_host={}",
+                ev.x, ev.y,
+                mgr.panes.get(&key).and_then(|p| p.browser_lifecycle.browser()).and_then(|b| b.host()).is_some()
+            );
+            if let Some(host) = mgr
+                .panes
+                .get(&key)
+                .and_then(|p| p.browser_lifecycle.browser())
+                .and_then(|b| b.host())
+            {
+                host.send_mouse_click_event(
+                    Some(&ev),
+                    button,
+                    false as _,
+                    event.click_count().unwrap_or(1) as _,
+                );
+            }
+            glib::Propagation::Stop
+        });
+    }
+
+    {
+        let manager = manager.clone();
+        let glarea = glarea.clone();
+        let key = key.clone();
+        hit_widget.connect_button_release_event(move |_widget, event| {
+            let Some(button) = cef_mouse_button_from_gdk(event.button()) else {
+                return glib::Propagation::Proceed;
+            };
+            let (x, y) = event.position();
+            let ev = mouse_event(&glarea, x, y, event.state());
+            if let Some(host) = manager
+                .borrow()
+                .panes
+                .get(&key)
+                .and_then(|p| p.browser_lifecycle.browser())
+                .and_then(|b| b.host())
+            {
+                host.send_mouse_click_event(
+                    Some(&ev),
+                    button,
+                    true as _,
+                    event.click_count().unwrap_or(1) as _,
+                );
+            }
+            glib::Propagation::Stop
+        });
+    }
+
+    {
+        let manager = manager.clone();
+        let glarea = glarea.clone();
+        let key = key.clone();
+        hit_widget.connect_motion_notify_event(move |_widget, event| {
+            let (x, y) = event.position();
+            let ev = mouse_event(&glarea, x, y, event.state());
+            if let Some(host) = manager
+                .borrow()
+                .panes
+                .get(&key)
+                .and_then(|p| p.browser_lifecycle.browser())
+                .and_then(|b| b.host())
+            {
+                host.send_mouse_move_event(Some(&ev), false as _);
+            }
+            glib::Propagation::Proceed
+        });
+    }
+
+    {
+        let manager = manager.clone();
+        let glarea = glarea.clone();
+        let key = key.clone();
+        hit_widget.connect_leave_notify_event(move |_widget, event| {
+            let (x, y) = event.position();
+            let ev = mouse_event(&glarea, x, y, event.state());
+            if let Some(host) = manager
+                .borrow()
+                .panes
+                .get(&key)
+                .and_then(|p| p.browser_lifecycle.browser())
+                .and_then(|b| b.host())
+            {
+                host.send_mouse_move_event(Some(&ev), true as _);
+            }
+            glib::Propagation::Proceed
+        });
+    }
+
+    {
+        let manager = manager.clone();
+        let glarea = glarea.clone();
+        let key = key.clone();
+        // Sign/scale not manually verified against a real scroll gesture
+        // this session (click forwarding was this session's actual scope --
+        // wheel support is included since the plan named it, but treat this
+        // one as unverified). CEF/Chromium's convention (positive delta_y ==
+        // content scrolls up) is assumed to match GTK's own delta sign
+        // as-is; flip/rescale here if manual testing shows it's inverted or
+        // mis-scaled.
+        hit_widget.connect_scroll_event(move |_widget, event| {
+            const PIXELS_PER_SCROLL_UNIT: f64 = 40.0;
+            let (dx, dy) = match event.direction() {
+                gtk::gdk::ScrollDirection::Up => (0.0, 1.0),
+                gtk::gdk::ScrollDirection::Down => (0.0, -1.0),
+                gtk::gdk::ScrollDirection::Left => (1.0, 0.0),
+                gtk::gdk::ScrollDirection::Right => (-1.0, 0.0),
+                _ => event.delta(),
+            };
+            let (x, y) = event.position();
+            let ev = mouse_event(&glarea, x, y, event.state());
+            if let Some(host) = manager
+                .borrow()
+                .panes
+                .get(&key)
+                .and_then(|p| p.browser_lifecycle.browser())
+                .and_then(|b| b.host())
+            {
+                host.send_mouse_wheel_event(
+                    Some(&ev),
+                    (dx * PIXELS_PER_SCROLL_UNIT) as i32,
+                    (dy * PIXELS_PER_SCROLL_UNIT) as i32,
+                );
+            }
+            glib::Propagation::Stop
+        });
+    }
+
+    hit_widget
 }
 
 /// Owns the single shared `gtk::GLArea`, the single shared `RenderState`,
@@ -809,9 +1257,9 @@ impl PaneHost {
         let manager = Rc::new(RefCell::new(PaneManager {
             panes: IndexMap::new(),
             open_pane_count: Arc::new(AtomicUsize::new(0)),
+            focused_pane: None,
         }));
         let open_pane_count = manager.borrow().open_pane_count.clone();
-
         {
             let render_state = render_state.clone();
             let gl_context = gl_context.clone();
@@ -856,7 +1304,14 @@ impl PaneHost {
                 // parent. Real fix: find it anyway via the one public GDK
                 // API that can see it (gdk_window_get_children() on the
                 // window pass-through already worked on) and set
-                // pass-through on it directly. gtk_gl_area_realize()
+                // pass-through on it directly. (items.id=257 Path A,
+                // 2026-08-22, refines this further: instead of a blanket
+                // pass-through -- which would make glarea and its panes
+                // unable to receive input at all -- event_window's GDK
+                // input SHAPE is restricted below to just the open panes'
+                // rects, rebuilt as panes open/close/resize; see the
+                // click/mouse-forwarding section doc above
+                // `build_pane_hit_widget`.) gtk_gl_area_realize()
                 // (upstream) only ever creates the one INPUT_ONLY child,
                 // so today that means exactly one match -- but the code
                 // below verifies that rather than assuming it (external
@@ -910,10 +1365,32 @@ impl PaneHost {
                         .collect();
                     match input_only_children.as_slice() {
                         [event_window] => {
-                            event_window.set_pass_through(true);
+                            // pass_through(false) (GTK's own default -- set
+                            // explicitly rather than left implicit, matching
+                            // this codebase's defensive style elsewhere) is
+                            // moot in practice now: this input shape is set
+                            // empty here once and never rebuilt afterward
+                            // (items.id=257 Path B -- pane click routing no
+                            // longer goes through GDK at all, see the "Pane
+                            // content click/mouse forwarding" section doc
+                            // above), so there is no non-empty shape for
+                            // pass-through to ever apply to. Kept explicit,
+                            // and kept as exactly this one confirmed-safe
+                            // `input_shape_combine_region` call (this
+                            // session's own `gdb` work confirmed an EMPTY
+                            // region here does not freeze Wayland pointer
+                            // input; only a non-empty one did) rather than
+                            // removed, since a permanently-empty shape is the
+                            // smallest change that provably avoids the freeze.
+                            event_window.set_pass_through(false);
+                            event_window
+                                .input_shape_combine_region(&gtk::cairo::Region::create(), 0, 0);
                             log::info!(
                                 "tier3_pane::pane_host: GLArea private event_window \
-                                 found and pass-throughed, is_pass_through={} \
+                                 found, input shape set permanently empty (items.id=257 \
+                                 Path B -- glarea is a pure compositor now, pane click \
+                                 routing goes through the frontend's DOM hit-layer \
+                                 instead), is_pass_through={} \
                                  (parent GdkWindow is_pass_through={})",
                                 event_window.is_pass_through(),
                                 window.is_pass_through(),
@@ -923,17 +1400,22 @@ impl PaneHost {
                             "tier3_pane::pane_host: GLArea's parent_window has no \
                              INPUT_ONLY child at realize -- expected \
                              priv->event_window (see gtk_gl_area_realize upstream) \
-                             was not found; pass-through fix did not apply"
+                             was not found. Harmless to pane click/mouse forwarding \
+                             (items.id=257 Path B routes that through the frontend's \
+                             DOM hit-layer, not this window) -- logged in case a \
+                             future GTK version's changed behavior here matters for \
+                             some other reason."
                         ),
                         multiple => log::error!(
                             "tier3_pane::pane_host: GLArea's parent_window has \
                              {} INPUT_ONLY children at realize -- expected exactly \
                              one (priv->event_window). Refusing to guess which one \
-                             is the real event-catching window; pass-through fix did \
-                             NOT apply to any of them. This means GTK's own \
-                             gtk_gl_area_realize() behavior has changed from what \
-                             items.id=227 verified against (GTK 3.24) -- investigate \
-                             before trusting click-through on this widget.",
+                             is the real one; none had their input shape reset to \
+                             empty. This means GTK's own gtk_gl_area_realize() \
+                             behavior has changed from what items.id=227 verified \
+                             against (GTK 3.24) -- investigate. Does not affect pane \
+                             click/mouse forwarding (items.id=257 Path B routes that \
+                             through the frontend's DOM hit-layer, not this window).",
                             multiple.len()
                         ),
                     }
@@ -1087,16 +1569,129 @@ impl PaneHost {
                     }
                 };
                 let (device, queue, scale, size) = render_state;
+                // `open_pane`'s own already-open guard (below) handles a
+                // caller re-`Open`ing an already-open pane -- the frontend
+                // does this routinely, confirmed by hand this session, a
+                // normal, existing occurrence. No pre-check needed here
+                // anymore: unlike the superseded sibling-widget design,
+                // nothing is built or added to any widget tree before
+                // `open_pane` runs, so there's nothing left to orphan.
                 self.manager
                     .borrow_mut()
                     .open_pane(key, url, &device, &queue, scale, size);
-                log::debug!("DIAG items.id=227: dispatch(Open) -> glarea.queue_draw()");
-                self.glarea.queue_draw();
+                log::debug!("DIAG items.id=227: dispatch(Open) -> queue_draw()");
+                self.queue_draw();
             }
             PaneCommand::Close { key } => {
                 self.manager.borrow_mut().close_pane(&key);
-                log::debug!("DIAG items.id=227: dispatch(Close) -> glarea.queue_draw()");
-                self.glarea.queue_draw();
+                log::debug!("DIAG items.id=227: dispatch(Close) -> queue_draw()");
+                self.queue_draw();
+            }
+            PaneCommand::MouseClick {
+                key,
+                x,
+                y,
+                button,
+                mouseup,
+                click_count,
+                buttons,
+                modifiers,
+            } => {
+                let mut mgr = self.manager.borrow_mut();
+                if !mouseup {
+                    mgr.focused_pane = Some(key.clone());
+                }
+                if let Some(host) = mgr
+                    .panes
+                    .get(&key)
+                    .and_then(|p| p.browser_lifecycle.browser())
+                    .and_then(|b| b.host())
+                {
+                    let cef_button = match button {
+                        PaneMouseButton::Left => MouseButtonType::LEFT,
+                        PaneMouseButton::Middle => MouseButtonType::MIDDLE,
+                        PaneMouseButton::Right => MouseButtonType::RIGHT,
+                    };
+                    let ev = MouseEvent {
+                        x: x.round() as i32,
+                        y: y.round() as i32,
+                        modifiers: cef_modifiers_from_dom(
+                            modifiers.shift,
+                            modifiers.ctrl,
+                            modifiers.alt,
+                            modifiers.meta,
+                            buttons,
+                        ),
+                    };
+                    host.send_mouse_click_event(
+                        Some(&ev),
+                        cef_button,
+                        mouseup as _,
+                        click_count as _,
+                    );
+                }
+            }
+            PaneCommand::MouseMove {
+                key,
+                x,
+                y,
+                leaving,
+                buttons,
+                modifiers,
+            } => {
+                let mgr = self.manager.borrow();
+                if let Some(host) = mgr
+                    .panes
+                    .get(&key)
+                    .and_then(|p| p.browser_lifecycle.browser())
+                    .and_then(|b| b.host())
+                {
+                    let ev = MouseEvent {
+                        x: x.round() as i32,
+                        y: y.round() as i32,
+                        modifiers: cef_modifiers_from_dom(
+                            modifiers.shift,
+                            modifiers.ctrl,
+                            modifiers.alt,
+                            modifiers.meta,
+                            buttons,
+                        ),
+                    };
+                    host.send_mouse_move_event(Some(&ev), leaving as _);
+                }
+            }
+            PaneCommand::MouseWheel {
+                key,
+                x,
+                y,
+                delta_x,
+                delta_y,
+                modifiers,
+            } => {
+                let mgr = self.manager.borrow();
+                if let Some(host) = mgr
+                    .panes
+                    .get(&key)
+                    .and_then(|p| p.browser_lifecycle.browser())
+                    .and_then(|b| b.host())
+                {
+                    let ev = MouseEvent {
+                        x: x.round() as i32,
+                        y: y.round() as i32,
+                        modifiers: cef_modifiers_from_dom(
+                            modifiers.shift,
+                            modifiers.ctrl,
+                            modifiers.alt,
+                            modifiers.meta,
+                            0,
+                        ),
+                    };
+                    host.send_mouse_wheel_event(
+                        Some(&ev),
+                        delta_x.round() as i32,
+                        delta_y.round() as i32,
+                    );
+                }
             }
         }
     }
@@ -1138,7 +1733,11 @@ impl PaneHost {
     /// from main.rs's GLib timeout, gated on `open_pane_count() > 0`, and
     /// from `set_pane_layout` (commands/tier3_pane.rs) for an immediate
     /// resync the moment the frontend reports new layout fractions, same
-    /// intent as the old design's immediate `sync_tx` push.
+    /// intent as the old design's immediate `sync_tx` push. No longer also
+    /// rebuilds a GDK input shape (items.id=257 Path A, removed) -- pane
+    /// click/mouse routing is IPC-driven now (Path B, see `dispatch`'s
+    /// `PaneCommand::MouseClick`/`MouseMove`/`MouseWheel` arms), with
+    /// nothing left here for a layout change to resync.
     pub fn queue_draw(&self) {
         log::debug!("DIAG items.id=227: PaneHost::queue_draw() called");
         self.glarea.queue_draw();

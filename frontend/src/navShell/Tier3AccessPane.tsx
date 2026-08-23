@@ -40,7 +40,8 @@ import { ChatPane } from '../chat/ChatPane'
 import { MiddleZone } from '../middleZone/MiddleZone'
 import { DEFAULT_CONVERSATION_PROFILE } from '../middleZone/middleZoneConfig'
 import { requireCurrentUserId } from './navShellConfig'
-import { computePaneLayout } from '../tier3Access/paneLayout'
+import { computePaneRects, pixelRectToFraction, type PanePixelRect } from '../tier3Access/paneLayout'
+import { PaneHitLayer } from '../tier3Access/PaneHitLayer'
 import {
   PrivacyGuardianModal,
   type ConsentRequestPayload,
@@ -74,6 +75,11 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
   const [openPaneIds, setOpenPaneIds] = useState<string[]>([])
   const [openError, setOpenError] = useState<string | null>(null)
   const paneDockRef = useRef<HTMLDivElement>(null)
+  // CSS-pixel-space rects, viewport-relative -- the same numbers
+  // syncPaneLayout divides down into the PaneRectFraction sent to Rust, fed
+  // straight to PaneHitLayer for its invisible per-pane hit-divs' position
+  // (items.id=257 Path B; see paneLayout.ts's module doc).
+  const [paneRects, setPaneRects] = useState<Record<string, PanePixelRect>>({})
 
   const [reviewOutcome, setReviewOutcome] = useState<ReviewOutcome | null>(null)
   const [reviewMessage, setReviewMessage] = useState<string | null>(null)
@@ -86,16 +92,15 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
 
   const syncPaneLayout = useCallback(() => {
     const dock = paneDockRef.current
-    if (!dock || openPaneIds.length === 0) return
-    const layout = computePaneLayout(
-      dock.getBoundingClientRect(),
-      window.innerWidth,
-      window.innerHeight,
-      openPaneIds,
-    )
-    const entries = Object.entries(layout).map(([providerId, rect]) => ({
+    if (!dock || openPaneIds.length === 0) {
+      setPaneRects({})
+      return
+    }
+    const rects = computePaneRects(dock.getBoundingClientRect(), openPaneIds)
+    setPaneRects(rects)
+    const entries = Object.entries(rects).map(([providerId, rect]) => ({
       provider_id: providerId,
-      rect,
+      rect: pixelRectToFraction(rect, window.innerWidth, window.innerHeight),
     }))
     commands.setPaneLayout(entries).then((result) => {
       if (result.status !== 'ok') {
@@ -258,6 +263,7 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
 
   return (
     <div className="tier3-access-pane">
+      <PaneHitLayer rects={paneRects} />
       <div className="tier3-access-pane__conversation">
         <MiddleZone
           contextKey={

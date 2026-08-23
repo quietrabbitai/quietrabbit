@@ -1,7 +1,9 @@
 // src-tauri/src/commands/tier3_pane.rs
 //
 // Group 13 -- Tier 2/Tier 3 pane lifecycle & provider catalog.
-// Commands: list_active_providers, open_tier3_panes, close_tier3_pane.
+// Commands: list_active_providers, open_tier3_panes, close_tier3_pane,
+// set_pane_layout, forward_pane_mouse_click, forward_pane_mouse_move,
+// forward_pane_mouse_wheel.
 //
 // items.id=202 piece 5 / items.id=223 connective tissue: neither item's own
 // description enumerates an IPC command, but on-demand pane creation
@@ -139,6 +141,33 @@ pub struct PaneLayoutEntry {
 /// `render`/`resize` closures via `AppHandle::state()`.
 #[derive(Default)]
 pub struct PaneLayoutState(pub Mutex<HashMap<PaneKey, PaneRectFraction>>);
+
+/// The four modifier keys a browser `PointerEvent`/`WheelEvent` reports as
+/// separate booleans (`shiftKey`/`ctrlKey`/`altKey`/`metaKey`) -- forwarded
+/// as-is by `forward_pane_mouse_click`/`_move`/`_wheel` rather than
+/// pre-converted to CEF's own bit-flag values client-side, so the one place
+/// that knows CEF's actual flag constants stays in pane_host.rs
+/// (`cef_modifiers_from_dom`).
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, specta::Type)]
+pub struct PaneEventModifiers {
+    pub shift: bool,
+    pub ctrl: bool,
+    pub alt: bool,
+    pub meta: bool,
+}
+
+/// Mirrors `cef::MouseButtonType`'s 3-button model -- not reused directly
+/// since that type isn't `specta::Type`. The frontend maps a DOM
+/// `PointerEvent.button` (0/1/2) to this before sending; button values with
+/// no CEF equivalent (DOM also reports 3/4 for back/forward) are simply not
+/// forwarded, same policy `cef_mouse_button_from_gdk` already applied to
+/// GDK's own out-of-range button numbers.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, specta::Type)]
+pub enum PaneMouseButton {
+    Left,
+    Middle,
+    Right,
+}
 
 // ---------------------------------------------------------------------------
 // cef::Cookie <-> StoredCookie conversions
@@ -573,4 +602,118 @@ pub async fn set_pane_layout(
         .run_on_main_thread(pane_host::queue_draw)
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Forwards one mouse-button transition inside an open pane's on-screen
+/// rect, hit-tested natively by the browser's own DOM (items.id=257 Path
+/// B) -- the frontend's invisible per-pane hit-layer, one
+/// absolutely-positioned `<div>` per open pane, kept in sync with the exact
+/// same `PaneRectFraction` geometry `set_pane_layout` already reports (see
+/// `paneLayout.ts`). Replaces the GDK input-shape click-routing mechanism
+/// (items.id=257 Path A), which froze the whole client's Wayland pointer
+/// input the moment it was given a non-empty region -- root-caused this
+/// session (see pane_host.rs's module doc) to GDK's non-native child
+/// windows never getting a real Wayland compositor surface to route input
+/// to.
+///
+/// `x`/`y` arrive already pane-local, in the pane hit-div's own CSS pixel
+/// space (`PointerEvent.offsetX`/`offsetY`) -- CSS pixels are the DOM's
+/// device-independent unit, the same logical-pixel convention CEF's
+/// `MouseEvent` expects, so no origin-subtraction or scale-factor division
+/// is needed here the way the deleted GDK-path `cef_mouse_event` required:
+/// the browser's own hit-testing already did the pane-scoping a GDK-side
+/// `hit_test_pane` used to be needed for.
+///
+/// A no-op (not an error) if `provider_id` names a pane that has already
+/// closed by the time this arrives -- an event racing a close is expected,
+/// not a failure, matching `close_tier3_pane`'s own framing.
+#[tauri::command]
+#[specta::specta]
+pub async fn forward_pane_mouse_click(
+    provider_id: String,
+    x: f64,
+    y: f64,
+    button: PaneMouseButton,
+    mouseup: bool,
+    click_count: i32,
+    buttons: u16,
+    modifiers: PaneEventModifiers,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    app_handle
+        .run_on_main_thread(move || {
+            pane_host::dispatch(PaneCommand::MouseClick {
+                key: provider_id,
+                x,
+                y,
+                button,
+                mouseup,
+                click_count,
+                buttons,
+                modifiers,
+            })
+        })
+        .map_err(|e| e.to_string())
+}
+
+/// Forwards a pointer move (or leave) inside an open pane's on-screen rect.
+/// See `forward_pane_mouse_click`'s doc for the coordinate/no-op contract,
+/// which this shares. The frontend coalesces these to at most one per
+/// animation frame before sending -- the native GDK path this replaces ran
+/// in-process at whatever rate the OS reported; this path crosses an IPC
+/// boundary per call, so batching to the frame rate the compositor can
+/// actually show avoids flooding it without a perceptible behavior change.
+#[tauri::command]
+#[specta::specta]
+pub async fn forward_pane_mouse_move(
+    provider_id: String,
+    x: f64,
+    y: f64,
+    leaving: bool,
+    buttons: u16,
+    modifiers: PaneEventModifiers,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    app_handle
+        .run_on_main_thread(move || {
+            pane_host::dispatch(PaneCommand::MouseMove {
+                key: provider_id,
+                x,
+                y,
+                leaving,
+                buttons,
+                modifiers,
+            })
+        })
+        .map_err(|e| e.to_string())
+}
+
+/// Forwards a wheel/scroll event inside an open pane's on-screen rect. See
+/// `forward_pane_mouse_click`'s doc for the coordinate/no-op contract.
+/// Unlike mouse-move, not throttled by the frontend -- CEF's own
+/// scroll-momentum handling needs per-event delta fidelity, the same reason
+/// the deleted GDK scroll handler forwarded every `scroll-event` unthrottled.
+#[tauri::command]
+#[specta::specta]
+pub async fn forward_pane_mouse_wheel(
+    provider_id: String,
+    x: f64,
+    y: f64,
+    delta_x: f64,
+    delta_y: f64,
+    modifiers: PaneEventModifiers,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    app_handle
+        .run_on_main_thread(move || {
+            pane_host::dispatch(PaneCommand::MouseWheel {
+                key: provider_id,
+                x,
+                y,
+                delta_x,
+                delta_y,
+                modifiers,
+            })
+        })
+        .map_err(|e| e.to_string())
 }

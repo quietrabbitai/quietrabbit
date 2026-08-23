@@ -593,6 +593,7 @@ wrap_client! {
     pub(crate) struct ClientBuilder {
         render_handler: RenderHandler,
         life_span_handler: LifeSpanHandler,
+        load_handler: LoadHandler,
     }
 
     impl Client {
@@ -602,6 +603,10 @@ wrap_client! {
 
         fn life_span_handler(&self) -> Option<cef::LifeSpanHandler> {
             Some(self.life_span_handler.clone())
+        }
+
+        fn load_handler(&self) -> Option<cef::LoadHandler> {
+            Some(self.load_handler.clone())
         }
     }
 }
@@ -614,6 +619,7 @@ impl ClientBuilder {
         Self::new(
             RenderHandlerBuilder::build(render_handler),
             LifeSpanHandlerBuilder::build(PaneLifeSpanHandler::new(browser_ready_tx)),
+            LoadHandlerBuilder::build(PaneLoadHandler),
         )
     }
 }
@@ -666,6 +672,53 @@ wrap_life_span_handler! {
 
 impl LifeSpanHandlerBuilder {
     pub(crate) fn build(handler: PaneLifeSpanHandler) -> cef::LifeSpanHandler {
+        Self::new(handler)
+    }
+}
+
+/// Load diagnostics for a pane's browser. Previously nothing wired a
+/// `LoadHandler` at all -- a stalled or failed pane load (DNS failure, TLS
+/// error, a bad redirect) produced zero log signal, indistinguishable from
+/// a page that was simply still loading. `on_load_error`/`on_load_end` are
+/// the two `ImplLoadHandler` methods with a diagnostic payload worth
+/// logging; `on_load_start`/`on_loading_state_change` are left at their
+/// default no-op bodies (no error/status information to report).
+#[derive(Clone)]
+pub struct PaneLoadHandler;
+
+wrap_load_handler! {
+    pub(crate) struct LoadHandlerBuilder {
+        handler: PaneLoadHandler,
+    }
+
+    impl LoadHandler {
+        fn on_load_error(
+            &self,
+            _browser: Option<&mut cef::Browser>,
+            _frame: Option<&mut cef::Frame>,
+            error_code: cef::Errorcode,
+            error_text: Option<&cef::CefString>,
+            failed_url: Option<&cef::CefString>,
+        ) {
+            log::warn!(
+                "tier3_pane::render: on_load_error: code={error_code:?} url={failed_url:?} \
+                 text={error_text:?}"
+            );
+        }
+
+        fn on_load_end(
+            &self,
+            _browser: Option<&mut cef::Browser>,
+            _frame: Option<&mut cef::Frame>,
+            http_status_code: ::std::os::raw::c_int,
+        ) {
+            log::info!("tier3_pane::render: on_load_end: status={http_status_code}");
+        }
+    }
+}
+
+impl LoadHandlerBuilder {
+    pub(crate) fn build(handler: PaneLoadHandler) -> cef::LoadHandler {
         Self::new(handler)
     }
 }

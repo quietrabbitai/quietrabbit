@@ -100,10 +100,42 @@
 //!   still need their own single-window host mechanism designed, not just
 //!   the old manual-sync behavior this phase originally left them with.
 //! - Popups/dropdowns, IME: still out of scope, unchanged.
-//! - Mouse/keyboard/focus input forwarding into CEF: **not implemented at
-//!   any layer**, old or new design -- a real, pre-existing gap, flagged
-//!   explicitly rather than discovered by surprise later. Panes render but
-//!   cannot currently be clicked or typed into.
+//! - Mouse/keyboard/focus input forwarding into CEF (items.id=257):
+//!   click/mouse forwarding redesigned twice. Path A (2026-08-22, first
+//!   cut) followed the sibling-overlay-widget approach's confirmed-blocked
+//!   finding (see the KNOWN BLOCKER doc on `pane_host::build_pane_hit_widget`,
+//!   kept in place, unused, as a preserved investigation artifact -- not
+//!   deleted) by having `glarea` itself claim pointer events, hit-tested
+//!   against `pane_pixel_rect`, with chrome-area clicks kept out of its
+//!   reach via a GDK input-shape restriction on its own private
+//!   `event_window`. That input shape was confirmed this session, via live
+//!   `gdb`, to freeze the whole client's Wayland pointer input the moment
+//!   it became non-empty -- `event_window` is a non-native, client-side-only
+//!   child `GdkWindow` under GTK3's CSW model, and Wayland's backend never
+//!   gives non-native child windows a real compositor surface to route
+//!   input through. Path A is fully removed as a result (its failure mode
+//!   is documented in items.id=257's own tracking record and this file's
+//!   git history, so no dead code was kept for it, unlike the still-open
+//!   `build_pane_hit_widget` artifact above).
+//!
+//!   Path B (2026-08-22, current) moves hit-testing into the frontend's own
+//!   DOM instead: one invisible, precisely-positioned `<div>` per open pane,
+//!   kept in sync with the exact same geometry `set_pane_layout` already
+//!   reports (see `paneLayout.ts`), receiving real native pointer events the
+//!   browser's own hit-testing scopes correctly -- no GDK involvement at
+//!   all. Those events are forwarded over
+//!   `forward_pane_mouse_click`/`forward_pane_mouse_move`/
+//!   `forward_pane_mouse_wheel` (commands/tier3_pane.rs) to
+//!   `PaneHost::dispatch`, which forwards to CEF via the same
+//!   `send_mouse_click_event`/`send_mouse_move_event`/`send_mouse_wheel_event`
+//!   accessors Path A used. `glarea` itself is a pure compositor now -- it
+//!   claims no pointer events of any kind. Keyboard forwarding remains out
+//!   of scope (click/mouse only); `PaneManager::focused_pane` is updated on
+//!   every mouse press so that scope boundary is a small addition, not a
+//!   redesign, when it's eventually picked up. Implemented but **not yet
+//!   manually verified against a real running app** -- pending a manual
+//!   test pass (real login, seeded provider, click/drag/scroll inside an
+//!   open pane) on a live Wayland session.
 //! - Windows/macOS: entirely untested by any prior spike in this track:
 //!   every proven result (isolation, Wayland, NVIDIA/GBM, single-window
 //!   compositing) is Linux-only.

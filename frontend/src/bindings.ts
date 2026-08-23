@@ -355,6 +355,50 @@ export const commands = {
 	 *  reads `PaneLayoutState` directly), so there is nothing left to query.
 	 */
 	setPaneLayout: (layout: PaneLayoutEntry[]) => typedError<null, string>(__TAURI_INVOKE("set_pane_layout", { layout })),
+	/**
+	 *  Forwards one mouse-button transition inside an open pane's on-screen
+	 *  rect, hit-tested natively by the browser's own DOM (items.id=257 Path
+	 *  B) -- the frontend's invisible per-pane hit-layer, one
+	 *  absolutely-positioned `<div>` per open pane, kept in sync with the exact
+	 *  same `PaneRectFraction` geometry `set_pane_layout` already reports (see
+	 *  `paneLayout.ts`). Replaces the GDK input-shape click-routing mechanism
+	 *  (items.id=257 Path A), which froze the whole client's Wayland pointer
+	 *  input the moment it was given a non-empty region -- root-caused this
+	 *  session (see pane_host.rs's module doc) to GDK's non-native child
+	 *  windows never getting a real Wayland compositor surface to route input
+	 *  to.
+	 * 
+	 *  `x`/`y` arrive already pane-local, in the pane hit-div's own CSS pixel
+	 *  space (`PointerEvent.offsetX`/`offsetY`) -- CSS pixels are the DOM's
+	 *  device-independent unit, the same logical-pixel convention CEF's
+	 *  `MouseEvent` expects, so no origin-subtraction or scale-factor division
+	 *  is needed here the way the deleted GDK-path `cef_mouse_event` required:
+	 *  the browser's own hit-testing already did the pane-scoping a GDK-side
+	 *  `hit_test_pane` used to be needed for.
+	 * 
+	 *  A no-op (not an error) if `provider_id` names a pane that has already
+	 *  closed by the time this arrives -- an event racing a close is expected,
+	 *  not a failure, matching `close_tier3_pane`'s own framing.
+	 */
+	forwardPaneMouseClick: (providerId: string, x: number | null, y: number | null, button: PaneMouseButton, mouseup: boolean, clickCount: number, buttons: number, modifiers: PaneEventModifiers) => typedError<null, string>(__TAURI_INVOKE("forward_pane_mouse_click", { providerId, x, y, button, mouseup, clickCount, buttons, modifiers })),
+	/**
+	 *  Forwards a pointer move (or leave) inside an open pane's on-screen rect.
+	 *  See `forward_pane_mouse_click`'s doc for the coordinate/no-op contract,
+	 *  which this shares. The frontend coalesces these to at most one per
+	 *  animation frame before sending -- the native GDK path this replaces ran
+	 *  in-process at whatever rate the OS reported; this path crosses an IPC
+	 *  boundary per call, so batching to the frame rate the compositor can
+	 *  actually show avoids flooding it without a perceptible behavior change.
+	 */
+	forwardPaneMouseMove: (providerId: string, x: number | null, y: number | null, leaving: boolean, buttons: number, modifiers: PaneEventModifiers) => typedError<null, string>(__TAURI_INVOKE("forward_pane_mouse_move", { providerId, x, y, leaving, buttons, modifiers })),
+	/**
+	 *  Forwards a wheel/scroll event inside an open pane's on-screen rect. See
+	 *  `forward_pane_mouse_click`'s doc for the coordinate/no-op contract.
+	 *  Unlike mouse-move, not throttled by the frontend -- CEF's own
+	 *  scroll-momentum handling needs per-event delta fidelity, the same reason
+	 *  the deleted GDK scroll handler forwarded every `scroll-event` unthrottled.
+	 */
+	forwardPaneMouseWheel: (providerId: string, x: number | null, y: number | null, deltaX: number | null, deltaY: number | null, modifiers: PaneEventModifiers) => typedError<null, string>(__TAURI_INVOKE("forward_pane_mouse_wheel", { providerId, x, y, deltaX, deltaY, modifiers })),
 	sendMessage: (userId: string, personaId: string, contextKey: string, content: string, focusId: string, gate3Track: boolean) => typedError<MessageInfo[], string>(__TAURI_INVOKE("send_message", { userId, personaId, contextKey, content, focusId, gate3Track })),
 	listMessages: (userId: string, personaId: string, contextKey: string) => typedError<MessageInfo[], string>(__TAURI_INVOKE("list_messages", { userId, personaId, contextKey })),
 	/**
@@ -620,6 +664,21 @@ export type OutputInfo = {
 };
 
 /**
+ *  The four modifier keys a browser `PointerEvent`/`WheelEvent` reports as
+ *  separate booleans (`shiftKey`/`ctrlKey`/`altKey`/`metaKey`) -- forwarded
+ *  as-is by `forward_pane_mouse_click`/`_move`/`_wheel` rather than
+ *  pre-converted to CEF's own bit-flag values client-side, so the one place
+ *  that knows CEF's actual flag constants stays in pane_host.rs
+ *  (`cef_modifiers_from_dom`).
+ */
+export type PaneEventModifiers = {
+	shift: boolean,
+	ctrl: boolean,
+	alt: boolean,
+	meta: boolean,
+};
+
+/**
  *  `Vec`, not `HashMap`, to match this codebase's existing IPC-struct
  *  convention -- no command signature anywhere else uses `HashMap`.
  */
@@ -627,6 +686,16 @@ export type PaneLayoutEntry = {
 	provider_id: string,
 	rect: PaneRectFraction,
 };
+
+/**
+ *  Mirrors `cef::MouseButtonType`'s 3-button model -- not reused directly
+ *  since that type isn't `specta::Type`. The frontend maps a DOM
+ *  `PointerEvent.button` (0/1/2) to this before sending; button values with
+ *  no CEF equivalent (DOM also reports 3/4 for back/forward) are simply not
+ *  forwarded, same policy `cef_mouse_button_from_gdk` already applied to
+ *  GDK's own out-of-range button numbers.
+ */
+export type PaneMouseButton = "Left" | "Middle" | "Right";
 
 /**
  *  One pane's target region, as a fraction (0..1) of the main window's own
