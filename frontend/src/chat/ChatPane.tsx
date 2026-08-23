@@ -178,7 +178,11 @@ export function ChatPane({
                     m.focus_run_id === activeRunId &&
                     m.gate3_review_status === 'drafted',
                 )
-              if (drafted) {
+              // Hard guard, not just belt-and-suspenders: never signal
+              // draft-ready for a still-empty placeholder row, even if the
+              // retry below still lands ahead of send_message's background
+              // backfill.
+              if (drafted && drafted.content) {
                 onDraftReady?.(drafted.id)
               }
             }
@@ -197,7 +201,11 @@ export function ChatPane({
           // refetch can race ahead of that write. If we already have the
           // crisis text from this same event but the persisted row hasn't
           // caught up yet, keep showing it and retry once shortly instead of
-          // blanking a correct message down to an empty bubble.
+          // blanking a correct message down to an empty bubble. Same race,
+          // same fix, for the ordinary gate3Track draft-ready path
+          // (items.id=317): finalize()'s onDraftReady signal reads this run's
+          // assistant row too, so it needs the backfilled content to have
+          // landed just as much as the crisis-block case does.
           const liveRow =
             result.status === 'ok'
               ? [...result.data]
@@ -207,7 +215,7 @@ export function ChatPane({
                   )
               : undefined
 
-          if (crisisBlock && !liveRow?.content) {
+          if ((crisisBlock || gate3Track) && !liveRow?.content) {
             if (result.status === 'ok') setMessages(result.data)
             window.setTimeout(() => {
               commands.listMessages(userId, personaId, contextKey).then(finalize)
