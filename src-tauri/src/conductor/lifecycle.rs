@@ -606,6 +606,7 @@ async fn open_outputs_db(
 
     let conn = connect_options_encrypted(&path, key_hex)
         .create_if_missing(false)
+        .pragma("busy_timeout", "5000")
         .connect()
         .await?;
     Ok(conn)
@@ -930,6 +931,30 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         }
 
         Ok(())
+    }
+
+    /// Bounded, logged wrapper around write_focus_run_record() for the failure/
+    /// terminal-status call sites. A stalled DB write (lock contention or raw
+    /// disk I/O latency, e.g. under concurrent backup I/O) must never hang the
+    /// run indefinitely -- 10s is chosen to sit above the 5s busy_timeout so a
+    /// legitimate lock wait can still complete normally.
+    async fn write_focus_run_record_logged(&self, status: &str) {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            self.write_focus_run_record(status),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                log::warn!("lifecycle: write_focus_run_record({status}) failed (non-fatal): {e}");
+            }
+            Err(_) => {
+                log::warn!(
+                    "lifecycle: write_focus_run_record({status}) timed out after 10s (non-fatal)"
+                );
+            }
+        }
     }
 
     // =========================================================================
@@ -1371,7 +1396,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                         log::warn!("lifecycle: Tier 3 checkpoint write failed: {e}");
                     }
                 }
-                let _ = self.write_focus_run_record("awaiting_user").await;
+                self.write_focus_run_record_logged("awaiting_user").await;
                 // R1 crisis-handling floor (items.id=297): Tier 3 is a pause
                 // before OUTPUT, so without this the crisis-flagged run's
                 // resource block would never surface -- see crisis.rs module
@@ -1621,7 +1646,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         };
 
         if failure.action == FailureAction::Stop && !failure.is_recoverable {
-            let _ = self.write_focus_run_record("failed").await;
+            self.write_focus_run_record_logged("failed").await;
             self.emit_status_with_content("failed", None, None, crisis_resource_block.as_deref());
         } else if matches!(
             failure.action,
@@ -1632,7 +1657,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                 | FailureAction::AwaitFloorConsent
                 | FailureAction::AwaitConsent
         ) {
-            let _ = self.write_focus_run_record("awaiting_user").await;
+            self.write_focus_run_record_logged("awaiting_user").await;
             self.emit_status_with_content(
                 "awaiting_user",
                 None,
@@ -1898,7 +1923,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         if matches!(final_status, "complete" | "cancelled" | "failed") {
             self.purge_snapshots().await;
         }
-        let _ = self.write_focus_run_record(final_status).await;
+        self.write_focus_run_record_logged(final_status).await;
         self.emit_status(final_status, None);
     }
 
@@ -1947,7 +1972,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                             metadata: None,
                         }
                     };
-                    let _ = self.write_focus_run_record("failed").await;
+                    self.write_focus_run_record_logged("failed").await;
                     self.personal_track = None;
                     self.task_track = None;
                     self.shared_state = None;
@@ -1969,7 +1994,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
 
                 // Other errors: cleanup state and propagate.
                 if self.focus_run_id.is_some() {
-                    let _ = self.write_focus_run_record("failed").await;
+                    self.write_focus_run_record_logged("failed").await;
                 }
                 self.personal_track = None;
                 self.task_track = None;
