@@ -46,6 +46,21 @@ pub struct MessageInfo {
     pub created_at: String,
 }
 
+/// Push event payload for "message-content-ready" (items.id=320). Emitted
+/// once, unconditionally, after send_message's background backfill task has
+/// finished attempting to write real content into the placeholder assistant
+/// row -- regardless of which branch fired (success, crisis block, Tier
+/// 3/gate3 draft, or genuinely nothing to backfill). This is the only
+/// reliable signal that a re-fetch via list_messages will see the real,
+/// final content: every run-status-update status (including
+/// "awaiting_feedback") is emitted from inside execute_full_inner(), which
+/// completes and returns well before this file's backfill even starts.
+#[derive(Debug, Clone, Serialize, Type)]
+pub struct MessageContentReadyPayload {
+    pub focus_run_id: String,
+    pub message_id: String,
+}
+
 fn to_message_info(r: message_store::MessageRecord) -> MessageInfo {
     MessageInfo {
         id: r.id,
@@ -84,6 +99,33 @@ const HISTORY_WINDOW: usize = 10;
 /// generation hasn't finished/backfilled yet (see send_message) has nothing
 /// useful to thread into context, and an empty "Assistant: \n" line would
 /// just be noise.
+/// Bounded, logged wrapper around message_store::update_message_content --
+/// same rationale as lifecycle.rs's write_focus_run_record_logged (f615f8b),
+/// applied to the one backfill write it doesn't cover: a stalled encrypted-DB
+/// write here would otherwise silently block the "message-content-ready"
+/// emit below forever. Non-fatal: logs and returns on both failure and
+/// timeout, same as its lifecycle.rs sibling.
+async fn update_message_content_logged(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    message_id: &str,
+    content: &str,
+) {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        message_store::update_message_content(user_id, persona_id, key_hex, message_id, content),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => log::warn!("send_message: update_message_content failed (non-fatal): {e}"),
+        Err(_) => {
+            log::warn!("send_message: update_message_content timed out after 10s (non-fatal)")
+        }
+    }
+}
+
 fn build_conversation_prompt(history: &[message_store::MessageRecord]) -> String {
     let start = history.len().saturating_sub(HISTORY_WINDOW);
     let mut prompt = String::new();
@@ -271,17 +313,14 @@ pub async fn send_message(
             .await
         {
             Ok(Some(output)) => {
-                if let Err(e) = message_store::update_message_content(
+                update_message_content_logged(
                     &bg_user_id,
                     &bg_persona_id,
                     &bg_key_hex,
                     &bg_message_id,
                     &output.content,
                 )
-                .await
-                {
-                    log::warn!("send_message: failed to backfill assistant message content: {e}");
-                }
+                .await;
             }
             Ok(None) => {
                 // No saved `outputs` row -- true for every run that paused or
@@ -299,29 +338,23 @@ pub async fn send_message(
                 // Any other paused/failed status keeps prior behavior -- the
                 // placeholder stays empty, just logged.
                 if let Some(block) = crisis_block_from_result(&result) {
-                    if let Err(e) = message_store::update_message_content(
+                    update_message_content_logged(
                         &bg_user_id,
                         &bg_persona_id,
                         &bg_key_hex,
                         &bg_message_id,
                         block,
                     )
-                    .await
-                    {
-                        log::warn!("send_message: failed to backfill crisis resource block: {e}");
-                    }
+                    .await;
                 } else if let Some(draft) = draft_content_from_result(&result) {
-                    if let Err(e) = message_store::update_message_content(
+                    update_message_content_logged(
                         &bg_user_id,
                         &bg_persona_id,
                         &bg_key_hex,
                         &bg_message_id,
                         draft,
                     )
-                    .await
-                    {
-                        log::warn!("send_message: failed to backfill draft content: {e}");
-                    }
+                    .await;
                 } else {
                     log::warn!(
                         "send_message: run {bg_run_id} finished but produced no output to backfill"
@@ -330,6 +363,24 @@ pub async fn send_message(
             }
             Err(e) => {
                 log::warn!("send_message: failed to fetch output for run {bg_run_id}: {e}");
+            }
+        }
+
+        // items.id=320: the sole reliable "safe to re-fetch now" signal --
+        // every run-status-update status above (including
+        // "awaiting_feedback") was already emitted from inside
+        // execute_full_inner()/cleanup(), before this backfill attempt even
+        // started. Fires unconditionally, whichever branch above ran,
+        // including the genuine-no-output case: ChatPane still needs to know
+        // the backfill attempt is over so it can stop waiting.
+        if let Some(handle) = &run.app_handle {
+            use tauri::Emitter;
+            let payload = MessageContentReadyPayload {
+                focus_run_id: bg_run_id.clone(),
+                message_id: bg_message_id.clone(),
+            };
+            if let Err(e) = handle.emit("message-content-ready", &payload) {
+                log::warn!("send_message: emit message-content-ready failed: {e}");
             }
         }
     });

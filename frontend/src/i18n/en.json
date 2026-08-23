@@ -33,7 +33,8 @@
       "notSentNotice": "This isn't saved or sent yet -- secure sign-in isn't wired up in this build. Your text stays on screen for now, but it'll be gone if you reload or navigate away.",
       "pendingReviewNotice": "Pending privacy review",
       "generating": "Generating… ({{elapsed}}s)",
-      "generatingWithStep": "Generating: {{step}}… ({{elapsed}}s)"
+      "generatingWithStep": "Generating: {{step}}… ({{elapsed}}s)",
+      "contentTimeout": "This is taking longer than expected -- the response may be incomplete. Try reopening this conversation in a moment."
     },
     "libraryPane": {
       "listHeading": "Outputs",

@@ -54,13 +54,29 @@ interface RunStatusPayload {
   crisis_resource_block: string | null
 }
 
-const TERMINAL_STATUSES = new Set([
-  'complete',
-  'failed',
-  'cancelled',
-  'awaiting_user',
-  'awaiting_feedback',
-])
+/** Hand-declared, same convention/rationale as RunStatusPayload above --
+ *  matches MessageContentReadyPayload (commands/messages.rs). items.id=320:
+ *  the only reliable "safe to re-fetch now" signal. Every run-status-update
+ *  status (including "awaiting_feedback") is emitted from inside
+ *  execute_full_inner()/cleanup(), which completes and returns well before
+ *  send_message's background backfill task even starts -- so no status on
+ *  that event can be trusted to mean "list_messages will now show real
+ *  content." This event is emitted unconditionally, once, only after that
+ *  backfill attempt (success, crisis block, Tier 3/gate3 draft, or genuinely
+ *  nothing to backfill) has finished. */
+interface MessageContentReadyPayload {
+  focus_run_id: string
+  message_id: string
+}
+
+/** items.id=320 fallback safety net: covers a missed/lost
+ *  "message-content-ready" event (app restart mid-run, IPC hiccup, the
+ *  backend's own bounded DB-write timeout) that the event listener alone
+ *  wouldn't recover from. Poll interval and overall cap are starting points
+ *  -- comfortably clear of the ~2s extraction-pass gap observed in repro,
+ *  with margin for slow-system contention. */
+const CONTENT_POLL_INTERVAL_MS = 2000
+const CONTENT_POLL_TIMEOUT_MS = 25000
 
 export function ChatPane({
   contextKey,
@@ -83,6 +99,10 @@ export function ChatPane({
   >(null)
   const [liveContent, setLiveContent] = useState('')
   const [elapsedSeconds, setElapsedSeconds] = useState(0)
+  /** items.id=320: set only if the CONTENT_POLL_TIMEOUT_MS fallback expires
+   *  with the placeholder row still empty -- surfaces a visible notice
+   *  instead of silently leaving a blank bubble forever. */
+  const [contentTimedOut, setContentTimedOut] = useState(false)
   const elapsedIntervalRef = useRef<number | null>(null)
 
   const isGenerating = activeRunId !== null
@@ -100,6 +120,7 @@ export function ChatPane({
     setActiveRunId(null)
     setLiveContent('')
     setLiveStepDisplayName(null)
+    setContentTimedOut(false)
 
     setLoadError(null)
     commands.listMessages(userId, personaId, contextKey).then(
@@ -118,11 +139,76 @@ export function ChatPane({
   // MiddleZone's debounce-timer cleanup and Tier3AccessPane's ResizeObserver
   // cleanup, per CLAUDE.md's "Tauri event listeners must be explicitly
   // detached on SPA view unmount."
+  //
+  // items.id=320: run-status-update and message-content-ready are two
+  // separate concerns here. run-status-update drives only the live/staged
+  // preview (liveContent/liveStepDisplayName) -- none of its statuses,
+  // including "awaiting_feedback", are trustworthy signals that
+  // list_messages will show real content yet (see this item's plan: every
+  // status is emitted from inside execute_full_inner()/cleanup(), which
+  // completes before send_message's background backfill even starts).
+  // message-content-ready (plus the poll/timeout fallback below, for a
+  // missed event) is the sole trigger for re-fetching and finalizing.
   useEffect(() => {
     if (activeRunId === null) return
 
-    let unlisten: UnlistenFn | undefined
+    let statusUnlisten: UnlistenFn | undefined
+    let contentUnlisten: UnlistenFn | undefined
     let cancelled = false
+    let settled = false
+    let pollIntervalId: number | null = null
+    let pollTimeoutId: number | null = null
+
+    const clearPoll = () => {
+      if (pollIntervalId !== null) {
+        window.clearInterval(pollIntervalId)
+        pollIntervalId = null
+      }
+      if (pollTimeoutId !== null) {
+        window.clearTimeout(pollTimeoutId)
+        pollTimeoutId = null
+      }
+    }
+
+    // Reconciliation point (see this item's plan): re-fetch rather than
+    // trusting liveContent as final -- avoids ChatPane's own live-rendered
+    // text silently diverging from what's actually persisted. Idempotent
+    // via `settled`: the message-content-ready listener and the poll/timeout
+    // fallback both call this, and only the first to arrive should act.
+    const finalize = (result: Awaited<ReturnType<typeof commands.listMessages>>) => {
+      if (cancelled || settled) return
+      settled = true
+      clearPoll()
+      if (result.status === 'ok') {
+        setMessages(result.data)
+        // Draft-ready signal (items.id=233): only for gate3Track usage, and
+        // only the first time this run's assistant row is seen still
+        // 'drafted' -- a later re-fetch (e.g. contextKey unchanged, a second
+        // send on the same mount) would otherwise re-fire for the same
+        // message once its status has already moved past 'drafted'.
+        if (gate3Track) {
+          const drafted = [...result.data]
+            .reverse()
+            .find(
+              (m) =>
+                m.sender === 'assistant' &&
+                m.focus_run_id === activeRunId &&
+                m.gate3_review_status === 'drafted',
+            )
+          // Hard guard, not just belt-and-suspenders: still correct under
+          // the new design too -- a run with genuinely nothing to backfill
+          // (a real failure) still fires message-content-ready, but the
+          // drafted row's content stays empty, and onDraftReady must never
+          // fire for that.
+          if (drafted && drafted.content) {
+            onDraftReady?.(drafted.id)
+          }
+        }
+      }
+      setActiveRunId(null)
+      setLiveContent('')
+      setLiveStepDisplayName(null)
+    }
 
     listen<RunStatusPayload>('run-status-update', (event) => {
       const payload = event.payload
@@ -149,94 +235,64 @@ export function ChatPane({
         setLiveContent(payload.step_content)
       }
       setLiveStepDisplayName(payload.step_display_name)
-
-      if (TERMINAL_STATUSES.has(payload.status)) {
-        const crisisBlock = payload.crisis_resource_block
-
-        // Reconciliation point (see this item's plan): the backend has by
-        // now backfilled the placeholder assistant message's real content
-        // (commands::messages::send_message's background completion hook),
-        // so re-fetch rather than trusting liveContent as final -- avoids
-        // ChatPane's own live-rendered text silently diverging from what's
-        // actually persisted.
-        const finalize = (result: Awaited<ReturnType<typeof commands.listMessages>>) => {
-          if (cancelled) return
-          if (result.status === 'ok') {
-            setMessages(result.data)
-            // Draft-ready signal (items.id=233): only for gate3Track
-            // usage, and only the first time this run's assistant row is
-            // seen still 'drafted' -- a later re-fetch (e.g. contextKey
-            // unchanged, a second send on the same mount) would otherwise
-            // re-fire for the same message once its status has already
-            // moved past 'drafted'.
-            if (gate3Track) {
-              const drafted = [...result.data]
-                .reverse()
-                .find(
-                  (m) =>
-                    m.sender === 'assistant' &&
-                    m.focus_run_id === activeRunId &&
-                    m.gate3_review_status === 'drafted',
-                )
-              // Hard guard, not just belt-and-suspenders: never signal
-              // draft-ready for a still-empty placeholder row, even if the
-              // retry below still lands ahead of send_message's background
-              // backfill.
-              if (drafted && drafted.content) {
-                onDraftReady?.(drafted.id)
-              }
-            }
-          }
-          setActiveRunId(null)
-          setLiveContent('')
-          setLiveStepDisplayName(null)
-        }
-
-        commands.listMessages(userId, personaId, contextKey).then((result) => {
-          if (cancelled) return
-
-          // handle_step_failure()'s emit fires before send_message's
-          // background task gets to backfill the placeholder (unlike
-          // output()'s success path, which saves before it emits) -- so this
-          // refetch can race ahead of that write. If we already have the
-          // crisis text from this same event but the persisted row hasn't
-          // caught up yet, keep showing it and retry once shortly instead of
-          // blanking a correct message down to an empty bubble. Same race,
-          // same fix, for the ordinary gate3Track draft-ready path
-          // (items.id=317): finalize()'s onDraftReady signal reads this run's
-          // assistant row too, so it needs the backfilled content to have
-          // landed just as much as the crisis-block case does.
-          const liveRow =
-            result.status === 'ok'
-              ? [...result.data]
-                  .reverse()
-                  .find(
-                    (m) => m.sender === 'assistant' && m.focus_run_id === activeRunId,
-                  )
-              : undefined
-
-          if ((crisisBlock || gate3Track) && !liveRow?.content) {
-            if (result.status === 'ok') setMessages(result.data)
-            window.setTimeout(() => {
-              commands.listMessages(userId, personaId, contextKey).then(finalize)
-            }, 250)
-            return
-          }
-
-          finalize(result)
-        })
-      }
     }).then((fn) => {
       if (cancelled) {
         fn()
       } else {
-        unlisten = fn
+        statusUnlisten = fn
       }
     })
 
+    listen<MessageContentReadyPayload>('message-content-ready', (event) => {
+      if (event.payload.focus_run_id !== activeRunId) return
+      commands.listMessages(userId, personaId, contextKey).then(finalize)
+    }).then((fn) => {
+      if (cancelled) {
+        fn()
+      } else {
+        contentUnlisten = fn
+      }
+    })
+
+    // Fallback safety net (items.id=320): protects against the event above
+    // being lost outright (app restart mid-run, IPC hiccup, the backend's
+    // own bounded DB-write timeout), not just late.
+    pollIntervalId = window.setInterval(() => {
+      commands.listMessages(userId, personaId, contextKey).then((result) => {
+        if (cancelled || settled) return
+        const liveRow =
+          result.status === 'ok'
+            ? [...result.data]
+                .reverse()
+                .find((m) => m.sender === 'assistant' && m.focus_run_id === activeRunId)
+            : undefined
+        if (liveRow?.content) {
+          finalize(result)
+        }
+      })
+    }, CONTENT_POLL_INTERVAL_MS)
+
+    pollTimeoutId = window.setTimeout(() => {
+      commands.listMessages(userId, personaId, contextKey).then((result) => {
+        if (cancelled || settled) return
+        const liveRow =
+          result.status === 'ok'
+            ? [...result.data]
+                .reverse()
+                .find((m) => m.sender === 'assistant' && m.focus_run_id === activeRunId)
+            : undefined
+        if (!liveRow?.content) {
+          setContentTimedOut(true)
+        }
+        finalize(result)
+      })
+    }, CONTENT_POLL_TIMEOUT_MS)
+
     return () => {
       cancelled = true
-      unlisten?.()
+      clearPoll()
+      statusUnlisten?.()
+      contentUnlisten?.()
     }
   }, [activeRunId, userId, personaId, contextKey, gate3Track, onDraftReady])
 
@@ -329,6 +385,11 @@ export function ChatPane({
         {sendError && (
           <p role="alert" className="chat-pane__send-error">
             {t('navShell.chat.sendError', { message: sendError })}
+          </p>
+        )}
+        {contentTimedOut && (
+          <p role="alert" className="chat-pane__content-timeout">
+            {t('navShell.chat.contentTimeout')}
           </p>
         )}
       </div>
