@@ -449,7 +449,8 @@ async fn async_main() {
                 // Stop the sidecar on window close. kill_on_drop(true) is the
                 // crash-exit safety net; this provides the graceful path with
                 // logging. Spawned without await — window closes immediately.
-                // TODO: handle RunEvent::Exit for headless/multi-window support.
+                // RunEvent::Exit (below, in app.run()'s closure) is now
+                // handled too (items.id=315 — CEF pane/shutdown cleanup).
                 log::info!("main: window close requested — stopping Ollama sidecar");
                 let handle = window.app_handle().clone();
                 tauri::async_runtime::spawn(async move {
@@ -519,6 +520,27 @@ async fn async_main() {
     // started) is the documented, correct point to depend on a window
     // existing. `.build()` returning is not the same milestone.
     app.run(move |app_handle, event| {
+        if let tauri::RunEvent::Exit = event {
+            // items.id=315: crash-on-quit segfault. tao's own event loop
+            // calls std::process::exit() unconditionally right after this
+            // closure returns from RunEvent::Exit (Rust destructors never
+            // run under process::exit(), so a Drop impl could not fix this
+            // even in principle -- it has to be an explicit call here).
+            // Coredump analysis (two independent captures) showed a
+            // SIGSEGV/SEGV_MAPERR inside libc's exit-handler dispatch, at an
+            // address in the unmapped gap immediately next to where CEF's
+            // accelerated_osr GPU/Vulkan libraries were mapped -- the
+            // signature of an atexit-registered callback (most plausibly
+            // registered by CEF's Vulkan/ANGLE stack) firing after its own
+            // library was already unmapped, because CEF was never given the
+            // chance to run its own graceful shutdown first. Closing every
+            // open pane's browser before cef::shutdown() lets CEF release
+            // its GPU resources in the order it expects, instead of having
+            // them torn out from under it.
+            log::info!("main: RunEvent::Exit — closing panes and shutting down CEF");
+            quietrabbit_lib::tier3_pane::pane_host::close_all_panes();
+            cef::shutdown();
+        }
         if let tauri::RunEvent::Ready = event {
             let main_window = app_handle
                 .get_webview_window("main")

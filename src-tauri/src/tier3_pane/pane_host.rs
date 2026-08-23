@@ -1804,3 +1804,21 @@ pub fn queue_draw() {
         }
     });
 }
+
+/// Closes every currently-open pane. Same main-thread-only contract as
+/// `dispatch` -- the intended (only) call site is main.rs's `RunEvent::Exit`
+/// handler (items.id=315), which already runs synchronously on the main
+/// thread, so unlike `dispatch`'s usual callers this does not need
+/// `run_on_main_thread` wrapping. Must run before `cef::shutdown()`: closing
+/// each pane's browser here is what lets CEF release its own GPU/Vulkan
+/// resources cleanly, rather than tao's unconditional `process::exit()`
+/// tearing them down while a browser instance is still alive.
+pub fn close_all_panes() {
+    HOST.with(|h| {
+        if let Some(host) = h.borrow().as_ref() {
+            for key in host.pane_keys() {
+                host.dispatch(PaneCommand::Close { key });
+            }
+        }
+    });
+}
