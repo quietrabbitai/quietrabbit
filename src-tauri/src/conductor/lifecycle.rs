@@ -440,12 +440,20 @@ pub async fn load_focus_definition(focus_id: &str) -> Result<FocusDefinition, Li
 fn find_focus_file(focus_id: &str) -> Result<PathBuf, LifecycleError> {
     // Two search locations. In Tauri production, focuses are embedded via
     // Tauri resources config (bundling TBD). Until bundled, resolve relative
-    // to CWD (dev workflow — matches Python oracle's repo-relative path).
+    // to CARGO_MANIFEST_DIR (src-tauri/) rather than CWD — `cargo tauri dev`
+    // always runs the app with CWD=src-tauri regardless of invocation
+    // directory (items.id=316), which made the plain-CWD-relative form
+    // resolve to a path that only ever existed when the binary happened to
+    // be launched with the repo root as CWD. CARGO_MANIFEST_DIR is baked in
+    // at compile time and is dev-workflow-only (see comment above); the
+    // production/bundled-resources path is unaffected.
     let data_root = crate::providers::utils::get_data_root();
     let filename = format!("{focus_id}.focus");
 
     let candidates = [
-        PathBuf::from("app")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("app")
             .join("core_artifacts")
             .join("focuses")
             .join(&filename),
@@ -1960,9 +1968,27 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         }
     }
 
+    /// Precondition: LOAD and AUTHORIZE have already run (`self.focus_run_id`
+    /// is Some). Both real callers (submit_focus_run, messages::send_message)
+    /// go through `load_and_authorize_run()` synchronously before obtaining a
+    /// `FocusRun` to call `execute_full()` on, specifically so the resulting
+    /// run_id is available immediately (see that function's own doc comment).
+    /// This method used to re-run load()+authorize() unconditionally, which
+    /// silently regenerated focus_run_id with a fresh UUID -- every caller's
+    /// already-returned run_id then pointed at a focus_runs row nothing ever
+    /// wrote output under. In send_message this meant get_output_for_run()
+    /// always missed (wrong run_id), the assistant placeholder was never
+    /// backfilled, and the chat UI's "Generating..." spinner never resolved
+    /// even though the run completed and produced real output under the
+    /// second, orphaned run_id (items.id=314, root-caused via live repro
+    /// 2026-08-23 -- confirmed by log trace showing two distinct focus_run_id
+    /// values for one send_message call, plus the resulting "finished but
+    /// produced no output to backfill" warning).
     async fn execute_full_inner(&mut self) -> Result<RunResult, LifecycleError> {
-        self.load().await?;
-        self.authorize().await?;
+        assert!(
+            self.focus_run_id.is_some(),
+            "execute_full() requires load()+authorize() to have already run"
+        );
         self.initialize().await?;
 
         if let Some(early_result) = self.execute().await? {

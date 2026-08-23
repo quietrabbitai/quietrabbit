@@ -1,4 +1,4 @@
-# Quiet Rabbit — Claude Code Context
+# Quiet Rabbit — Codex Context
 # Last updated: August 8, 2026
 
 ## Session Discipline
@@ -239,9 +239,9 @@ this repo, human or AI.
 
 ## Ending a Session (write the handoff yourself)
 This project runs a multi-chat coordination system outside this repo (a
-SQLite database, not something Claude Code needs to understand fully). The
+SQLite database, not something Codex needs to understand fully). The
 one piece that matters here: before you finish, record what you did so
-Chat-PM (a separate Claude session that reviews all work) can pick it up
+Chat-PM (a separate Codex session that reviews all work) can pick it up
 without Jason re-explaining it.
 
 Run exactly one command, from anywhere (it's not path-sensitive):
@@ -257,7 +257,7 @@ python3 /home/kulaga/QuietRabbit/03_ProjectDocs/scripts/db_utilities/handoff_wri
 
 Rules, enforced by the script itself, not just convention:
 - Always `--chat "Code"` for this repo — hardcoded, don't change it. (This
-  is a distinct chats row from "Chat-DEV" so Chat-PM can tell Claude Code
+  is a distinct chats row from "Chat-DEV" so Chat-PM can tell Codex
   sessions apart from terminal Chat-DEV sessions -- both do the same kind
   of work, this is attribution only.)
 - `--decisions` and `--files` are required and cannot be blank — pass the
@@ -267,7 +267,7 @@ Rules, enforced by the script itself, not just convention:
 - This is the ONLY database write available to you. Don't look for or run
   any other Chat-PM/Chat-DEV workflow, starter script, or process doc —
   they exist for a different, much longer-running session type and are not
-  meant for a Claude Code session. If Jason wants something beyond this,
+  meant for a Codex session. If Jason wants something beyond this,
   he'll tell you directly.
 - After running it, tell Jason the command ran and stop. He'll bring it to
   Chat-PM himself.
