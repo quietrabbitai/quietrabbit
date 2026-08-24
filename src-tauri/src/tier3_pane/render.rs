@@ -40,6 +40,64 @@ use wgpu_hal::Adapter as _;
 use crate::commands::tier3_pane::PaneRectFraction;
 use crate::tier3_pane::PaneKey;
 
+// ---------------------------------------------------------------------------
+// items.id=312: GL-context single-thread-ownership guard
+// ---------------------------------------------------------------------------
+//
+// Originally a diagnostic: `RenderState::render()` (main/GTK thread) and
+// `on_accelerated_paint`/`on_paint` (CEF's own UI thread -- confirmed a
+// genuinely separate OS thread by `multi_threaded_message_loop: 1`, see
+// `bootstrap.rs:159-183`'s own prior investigation notes) both called into
+// the SAME externally-owned GL context via the shared `wgpu::Device`, with
+// nothing serializing GL-context access between those two threads --
+// `PANE_TEXTURES`/`POPUP_TEXTURES`'s mutexes only ever protected the
+// resulting `BindGroup` maps, not the GL calls that produced them. This
+// guard proved that overlap directly (two different thread ids both active
+// at once), which is what confirmed items.id=312's root cause.
+//
+// The fix (see the "CEF-thread paint mailbox" section below) removes the
+// race by construction: none of the four CEF callback functions touch the
+// device/GL context anymore, only `RenderState::render()` does. This guard
+// now wraps that single remaining call site and stays in as a permanent,
+// cheap regression check -- `log::error!` (not `warn`/`debug`) if it ever
+// observes a second thread entering while one is already active, which
+// should now be structurally impossible.
+static DIAG_312_GL_ACTIVE: LazyLock<Mutex<HashMap<std::thread::ThreadId, &'static str>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[must_use]
+struct Diag312GlGuard {
+    tid: std::thread::ThreadId,
+}
+
+impl Diag312GlGuard {
+    fn enter(site: &'static str) -> Self {
+        let tid = std::thread::current().id();
+        let mut active = DIAG_312_GL_ACTIVE.lock().unwrap();
+        let others: Vec<String> = active
+            .iter()
+            .filter(|(t, _)| **t != tid)
+            .map(|(t, s)| format!("{t:?}={s}"))
+            .collect();
+        if others.is_empty() {
+            log::debug!("DIAG items.id=312: GL enter {site} thread={tid:?}");
+        } else {
+            log::error!(
+                "DIAG items.id=312: CONFIRMED CONCURRENT GL ACCESS -- {site} \
+                 entering on thread {tid:?} while already active: {others:?}"
+            );
+        }
+        active.insert(tid, site);
+        Self { tid }
+    }
+}
+
+impl Drop for Diag312GlGuard {
+    fn drop(&mut self) {
+        DIAG_312_GL_ACTIVE.lock().unwrap().remove(&self.tid);
+    }
+}
+
 /// Single shared wgpu render state for the whole app: device/queue (from
 /// GTK's own external GL context, not a `winit`-owned surface), the
 /// single-textured-quad pipeline that draws CEF's paint output, and the
@@ -187,6 +245,15 @@ impl RenderState {
         }
     }
 
+    /// DIAG items.id=312 (temporary): exposes `self.size` so
+    /// `pane_host.rs`'s `connect_render` can cross-check it against the
+    /// `GLArea`'s own live `allocated_width()/height()` at render time.
+    /// Remove alongside the rest of this session's items.id=312
+    /// instrumentation once root cause is confirmed.
+    pub fn size(&self) -> (u32, u32) {
+        self.size
+    }
+
     /// Composites every open pane's current CEF paint texture into its own
     /// `glViewport`/scissor-scoped region of GTK's `GLArea` framebuffer, in
     /// one render pass. `layout` is `PaneLayoutState`'s live contents --
@@ -221,6 +288,47 @@ impl RenderState {
         layout: &HashMap<PaneKey, PaneRectFraction>,
         popup_layout: &HashMap<PaneKey, PaneRectFraction>,
     ) {
+        let _diag_312_guard = Diag312GlGuard::enter("RenderState::render");
+        // DIAG items.id=312 (temporary): this is the exact call site that
+        // panics with "Unable to create Texture object" -- log the size
+        // it's about to wrap immediately beforehand so a crash log always
+        // has the last-known value even if the panic's own backtrace is
+        // hard to symbolize.
+        log::debug!(
+            "DIAG items.id=312: about to create_texture_from_hal size={:?}",
+            self.size
+        );
+        // items.id=312: drain this tick's CEF-thread paint captures into
+        // PANE_TEXTURES/POPUP_TEXTURES *before* the render pass below reads
+        // them -- this is the only place any of that captured data reaches
+        // the device/GL context (see `resolve_bind_group`, `PendingPaint`).
+        // A pane/popup with no new frame this tick simply has no entry
+        // here, so its previous BindGroup is left untouched and reused --
+        // this *is* the dirty tracking, no separate bookkeeping needed.
+        //
+        // `.drain().collect()` into a `Vec`, not a bare `for .. in
+        // MAP.lock().unwrap().drain()`: the latter's `MutexGuard` (a
+        // temporary in the for-loop's head expression) lives for the
+        // *entire* loop body under Rust's temporary-lifetime-extension
+        // rules -- holding PANE_PENDING_PAINT/POPUP_PENDING_PAINT locked
+        // across every iteration's `resolve_bind_group` GPU-import work.
+        // CEF's UI thread needs that same lock on every single paint to
+        // stash the next frame, so a slow import would leave it blocked
+        // for the whole drain, not just a moment -- collecting first keeps
+        // the lock held only as long as it takes to drain the map.
+        let pending_panes: Vec<_> = PANE_PENDING_PAINT.lock().unwrap().drain().collect();
+        for (key, paint) in pending_panes {
+            if let Some(bind_group) = resolve_bind_group(&self.device, &self.queue, paint) {
+                PANE_TEXTURES.lock().unwrap().insert(key, bind_group);
+            }
+        }
+        let pending_popups: Vec<_> = POPUP_PENDING_PAINT.lock().unwrap().drain().collect();
+        for (key, paint) in pending_popups {
+            if let Some(bind_group) = resolve_bind_group(&self.device, &self.queue, paint) {
+                POPUP_TEXTURES.lock().unwrap().insert(key, bind_group);
+            }
+        }
+
         let hal_texture = wgpu_hal::gles::Texture::default_framebuffer(self.surface_format);
         let target = unsafe {
             self.device.create_texture_from_hal::<wgpu_hal::api::Gles>(
@@ -404,6 +512,209 @@ pub fn remove_popup_texture(key: &PaneKey) {
     POPUP_TEXTURES.lock().unwrap().remove(key);
 }
 
+// ---------------------------------------------------------------------------
+// items.id=312: CEF-thread paint mailbox
+// ---------------------------------------------------------------------------
+//
+// CEF's UI thread (on_accelerated_paint/on_paint, both Pane and Popup
+// variants) used to call directly into the shared wgpu::Device/GL context
+// to build each frame's BindGroup -- the confirmed source of items.id=312's
+// crash (see the GL-context single-thread-ownership guard above). Those
+// callbacks now do CPU-only capture (dup the accelerated path's dmabuf
+// fds, memcpy the software path's pixel buffer) and stash it here; only
+// `RenderState::render()`, on the main/GTK thread, ever turns a capture
+// into a `BindGroup`.
+//
+// Latest-value-wins, not a queue: CEF always delivers a complete current
+// frame, never a delta, so an undrained previous entry is simply stale and
+// safe to overwrite -- the same assumption PANE_TEXTURES/POPUP_TEXTURES
+// already make.
+enum PendingPaint {
+    Software {
+        pixels: Vec<u8>,
+        width: u32,
+        height: u32,
+    },
+    Accelerated { info: DupedAcceleratedPaintInfo },
+}
+
+/// `info`'s plane fds have already been `dup()`'d by the capturing
+/// callback -- CEF's raw `AcceleratedPaintInfo::planes[i].fd` is not owned,
+/// it references a buffer CEF's renderer process may recycle the instant
+/// the callback returns -- so this wraps independent copies, valid until
+/// `Drop` closes them. `DmaBufImporter`'s own Vulkan import path
+/// (`osr_texture_import/dmabuf.rs`) `dup()`s its own copy right before
+/// handing it to the driver rather than taking ownership of what we pass
+/// in, so our copies stay ours to close after `import_texture()` returns,
+/// success or failure alike.
+///
+/// A separate newtype, not a `Drop` impl directly on `PendingPaint`
+/// itself: Rust forbids moving fields out of a value whose *own* type
+/// implements `Drop` (E0509), which `resolve_bind_group`'s `match paint {
+/// .. }` needs to do for both variants. Moving this newtype out whole (its
+/// own fields are never individually destructured) has no such
+/// restriction.
+struct DupedAcceleratedPaintInfo {
+    info: cef::AcceleratedPaintInfo,
+}
+
+impl Drop for DupedAcceleratedPaintInfo {
+    fn drop(&mut self) {
+        let plane_count = (self.info.plane_count as usize).min(self.info.planes.len());
+        for plane in &self.info.planes[..plane_count] {
+            if plane.fd >= 0 {
+                unsafe {
+                    libc::close(plane.fd);
+                }
+            }
+        }
+    }
+}
+
+/// Duplicates every populated plane's fd in `info` (`0..info.plane_count`,
+/// not just plane 0 -- multi-plane DRM formats like NV12 populate more)
+/// into a fresh, independently-owned `AcceleratedPaintInfo`, safe to stash
+/// past the end of the CEF callback that received the original borrow. On
+/// a `dup()` failure partway through, closes whatever was already dup'd
+/// and returns `None` -- the frame is dropped, the same degradation CEF's
+/// own paint cadence already tolerates (the next paint simply overwrites).
+///
+/// Checks `SharedTextureHandle::new(info)` for `Unsupported` up front and
+/// bails before touching any fd -- pre-refactor behavior, restored: this
+/// used to be the first thing `on_accelerated_paint` checked, before ever
+/// calling `import_texture`. Without this check here, an unsupported
+/// platform would still pay a full dup()+close() of every plane every
+/// frame only to have `resolve_bind_group`'s `import_texture` reject it
+/// later with a generic import-failure log line.
+fn capture_accelerated_paint(info: &cef::AcceleratedPaintInfo) -> Option<PendingPaint> {
+    use cef::osr_texture_import::shared_texture_handle::SharedTextureHandle;
+    if let SharedTextureHandle::Unsupported = SharedTextureHandle::new(info) {
+        log::warn!("tier3_pane::render: platform does not support accelerated OSR painting");
+        return None;
+    }
+
+    let mut owned = info.clone();
+    let plane_count = (owned.plane_count as usize).min(owned.planes.len());
+    for i in 0..plane_count {
+        let dup_fd = unsafe { libc::dup(owned.planes[i].fd) };
+        if dup_fd < 0 {
+            log::error!(
+                "tier3_pane::render: items.id=312: dup() failed capturing accelerated \
+                 paint plane {i}/{plane_count}, errno={}",
+                std::io::Error::last_os_error()
+            );
+            for plane in &owned.planes[..i] {
+                unsafe {
+                    libc::close(plane.fd);
+                }
+            }
+            return None;
+        }
+        owned.planes[i].fd = dup_fd;
+    }
+    Some(PendingPaint::Accelerated {
+        info: DupedAcceleratedPaintInfo { info: owned },
+    })
+}
+
+/// Turns a captured `PendingPaint` into a `BindGroup` -- the only place any
+/// of this data touches `device`/`queue` (the GL context), always called
+/// from `RenderState::render()` on the main/GTK thread. Consumes `paint`
+/// by value so `PendingPaint::Accelerated`'s dup'd fds are always closed
+/// (via `Drop`) once this returns, whether the import succeeded or not.
+fn resolve_bind_group(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    paint: PendingPaint,
+) -> Option<wgpu::BindGroup> {
+    match paint {
+        PendingPaint::Software {
+            pixels,
+            width,
+            height,
+        } => {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("tier3_pane cef paint texture (software path)"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Bgra8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &pixels,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * width),
+                    rows_per_image: Some(height),
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            Some(build_bind_group(device, &texture))
+        }
+        PendingPaint::Accelerated { info } => {
+            use cef::osr_texture_import::shared_texture_handle::SharedTextureHandle;
+            let shared_handle = SharedTextureHandle::new(&info.info);
+            match shared_handle.import_texture(device) {
+                Ok(texture) => Some(build_bind_group(device, &texture)),
+                Err(e) => {
+                    log::warn!(
+                        "tier3_pane::render: items.id=312: failed to import shared texture: {e:?}"
+                    );
+                    None
+                }
+            }
+            // `info` drops here regardless of which branch was taken above
+            // -- closes the dup'd fds, see `DupedAcceleratedPaintInfo`'s
+            // `Drop` impl.
+        }
+    }
+}
+
+/// Mirrors `PANE_TEXTURES`'s own doc: a plain (not `thread_local!`) static
+/// so CEF's UI thread (writer) and the main/GTK thread (reader, via
+/// `RenderState::render()`) observe the same map.
+static PANE_PENDING_PAINT: LazyLock<Mutex<HashMap<PaneKey, PendingPaint>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Mirrors `POPUP_TEXTURES`'s own doc: keyed by the *parent* pane's
+/// `PaneKey`, same as `POPUP_TEXTURES` itself.
+static POPUP_PENDING_PAINT: LazyLock<Mutex<HashMap<PaneKey, PendingPaint>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Drops a closed pane's not-yet-drained capture, if any -- must be called
+/// as part of that pane's teardown (`pane_host.rs`'s `close_pane`),
+/// alongside `remove_pane_texture`. `PendingPaint::Drop` closes any owned
+/// fds; without this call they'd sit in the map, undrained (the pane no
+/// longer has a live entry in `layout` for `render()`'s dirty-tracking to
+/// pick up), until process exit.
+pub fn remove_pane_pending_paint(key: &PaneKey) {
+    PANE_PENDING_PAINT.lock().unwrap().remove(key);
+}
+
+/// Mirrors `remove_pane_pending_paint` -- must be called as part of a
+/// popup's own teardown (`pane_host.rs`'s `force_close_popup`), alongside
+/// `remove_popup_texture`.
+pub fn remove_popup_pending_paint(key: &PaneKey) {
+    POPUP_PENDING_PAINT.lock().unwrap().remove(key);
+}
+
 /// Replaces `winit::dpi::LogicalSize<f32>` (winit dropped from `tier3_pane`
 /// entirely, items.id=202 real positioning fix, 2026-08-07 -- see
 /// pane_host.rs's module docs) -- same two fields, no winit dependency.
@@ -576,25 +887,18 @@ wrap_render_handler! {
                 return;
             }
 
-            use cef::osr_texture_import::shared_texture_handle::SharedTextureHandle;
-            let shared_handle = SharedTextureHandle::new(info);
-            if let SharedTextureHandle::Unsupported = shared_handle {
-                log::warn!("tier3_pane::render: platform does not support accelerated OSR painting");
+            // items.id=312: CPU-only capture (dup every plane's fd) -- the
+            // actual import into a wgpu texture happens later, on the
+            // main/GTK thread inside RenderState::render(). See
+            // capture_accelerated_paint's own doc for why the dup is
+            // mandatory here rather than deferred.
+            let Some(pending) = capture_accelerated_paint(info) else {
                 return;
-            }
-            let src_texture = match shared_handle.import_texture(&self.handler.device) {
-                Ok(t) => t,
-                Err(e) => {
-                    log::warn!("tier3_pane::render: failed to import shared texture: {e:?}");
-                    return;
-                }
             };
-
-            let bind_group = build_bind_group(&self.handler.device, &src_texture);
-            PANE_TEXTURES
+            PANE_PENDING_PAINT
                 .lock()
                 .unwrap()
-                .insert(self.handler.pane_key.clone(), bind_group);
+                .insert(self.handler.pane_key.clone(), pending);
         }
 
         // items.id=207: on_paint's signature (including the raw `buffer:
@@ -625,45 +929,18 @@ wrap_render_handler! {
             let buffer_size = (width * height * 4) as usize;
             let buffer_slice = unsafe { std::slice::from_raw_parts(buffer, buffer_size) };
 
-            let texture = self.handler.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("tier3_pane cef paint texture (software path)"),
-                size: wgpu::Extent3d {
-                    width: width as u32,
-                    height: height as u32,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Bgra8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
-            self.handler.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                buffer_slice,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(4 * width as u32),
-                    rows_per_image: Some(height as u32),
-                },
-                wgpu::Extent3d {
-                    width: width as u32,
-                    height: height as u32,
-                    depth_or_array_layers: 1,
-                },
-            );
-
-            let bind_group = build_bind_group(&self.handler.device, &texture);
-            PANE_TEXTURES
+            // items.id=312: CPU-only capture (owned memcpy) -- texture
+            // upload happens later, on the main/GTK thread inside
+            // RenderState::render().
+            let pending = PendingPaint::Software {
+                pixels: buffer_slice.to_vec(),
+                width: width as u32,
+                height: height as u32,
+            };
+            PANE_PENDING_PAINT
                 .lock()
                 .unwrap()
-                .insert(self.handler.pane_key.clone(), bind_group);
+                .insert(self.handler.pane_key.clone(), pending);
         }
     }
 }
@@ -802,25 +1079,16 @@ wrap_render_handler! {
             self.handler.maybe_capture(&browser);
 
             let Some(info) = info else { return };
-            use cef::osr_texture_import::shared_texture_handle::SharedTextureHandle;
-            let shared_handle = SharedTextureHandle::new(info);
-            if let SharedTextureHandle::Unsupported = shared_handle {
-                log::warn!("tier3_pane::render: popup: platform does not support accelerated OSR painting");
-                return;
-            }
-            let src_texture = match shared_handle.import_texture(&self.handler.device) {
-                Ok(t) => t,
-                Err(e) => {
-                    log::warn!("tier3_pane::render: popup: failed to import shared texture: {e:?}");
-                    return;
-                }
-            };
 
-            let bind_group = build_bind_group(&self.handler.device, &src_texture);
-            POPUP_TEXTURES
+            // items.id=312: CPU-only capture -- see PaneRenderHandler's
+            // on_accelerated_paint for the full rationale.
+            let Some(pending) = capture_accelerated_paint(info) else {
+                return;
+            };
+            POPUP_PENDING_PAINT
                 .lock()
                 .unwrap()
-                .insert(self.handler.pane_key.clone(), bind_group);
+                .insert(self.handler.pane_key.clone(), pending);
         }
 
         #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -845,45 +1113,17 @@ wrap_render_handler! {
             let buffer_size = (width * height * 4) as usize;
             let buffer_slice = unsafe { std::slice::from_raw_parts(buffer, buffer_size) };
 
-            let texture = self.handler.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("tier3_pane cef popup paint texture (software path)"),
-                size: wgpu::Extent3d {
-                    width: width as u32,
-                    height: height as u32,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Bgra8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
-            self.handler.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                buffer_slice,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(4 * width as u32),
-                    rows_per_image: Some(height as u32),
-                },
-                wgpu::Extent3d {
-                    width: width as u32,
-                    height: height as u32,
-                    depth_or_array_layers: 1,
-                },
-            );
-
-            let bind_group = build_bind_group(&self.handler.device, &texture);
-            POPUP_TEXTURES
+            // items.id=312: CPU-only capture -- see PaneRenderHandler's
+            // on_paint for the full rationale.
+            let pending = PendingPaint::Software {
+                pixels: buffer_slice.to_vec(),
+                width: width as u32,
+                height: height as u32,
+            };
+            POPUP_PENDING_PAINT
                 .lock()
                 .unwrap()
-                .insert(self.handler.pane_key.clone(), bind_group);
+                .insert(self.handler.pane_key.clone(), pending);
         }
     }
 }

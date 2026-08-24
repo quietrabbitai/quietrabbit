@@ -69,8 +69,23 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
+
+// DIAG items.id=312 (temporary -- remove after root-cause diagnosis):
+// resize/render burst investigation. Extends the existing DIAG
+// items.id=227 logging with millisecond-resolution timestamps and a
+// shared monotonic sequence number so a `connect_resize`/`connect_render`
+// burst can be reconstructed in order across both handlers from the log
+// alone.
+static DIAG_312_START: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
+static DIAG_312_SEQ: AtomicU64 = AtomicU64::new(0);
+fn diag_312_tick() -> (u64, u128) {
+    (
+        DIAG_312_SEQ.fetch_add(1, Ordering::Relaxed),
+        DIAG_312_START.elapsed().as_millis(),
+    )
+}
 
 use gtk::prelude::*;
 use indexmap::IndexMap;
@@ -522,6 +537,7 @@ impl PaneManager {
             host.close_browser(true as _);
         }
         crate::tier3_pane::render::remove_pane_texture(key);
+        crate::tier3_pane::render::remove_pane_pending_paint(key);
         self.open_pane_count.fetch_sub(1, Ordering::Relaxed);
         if self.focused_pane.as_ref() == Some(key) {
             self.focused_pane = None;
@@ -623,6 +639,7 @@ impl PaneManager {
             host.close_browser(true as _);
         }
         crate::tier3_pane::render::remove_popup_texture(key);
+        crate::tier3_pane::render::remove_popup_pending_paint(key);
 
         if let Some(host) = self
             .panes
@@ -1801,6 +1818,13 @@ impl PaneHost {
                 log::debug!(
                     "DIAG items.id=227: connect_resize fired width={width} height={height}"
                 );
+                let (seq, elapsed_ms) = diag_312_tick();
+                log::debug!(
+                    "DIAG items.id=312: seq={seq} t={elapsed_ms}ms connect_resize \
+                     width={width} height={height} allocated=({},{})",
+                    area.allocated_width(),
+                    area.allocated_height(),
+                );
                 let (width, height) = (width.max(1) as u32, height.max(1) as u32);
                 if let Some(rs) = render_state.borrow_mut().as_mut() {
                     rs.resize((width, height));
@@ -1830,6 +1854,13 @@ impl PaneHost {
                 log::debug!(
                     "DIAG items.id=227: connect_render fired, open_panes={}",
                     manager.borrow().panes.len()
+                );
+                let (seq, elapsed_ms) = diag_312_tick();
+                log::debug!(
+                    "DIAG items.id=312: seq={seq} t={elapsed_ms}ms connect_render \
+                     allocated=({},{})",
+                    area.allocated_width(),
+                    area.allocated_height(),
                 );
 
                 // CRITICAL (confirmed this session): capture GTK's real
@@ -1910,6 +1941,31 @@ impl PaneHost {
                 }
 
                 if let Some(rs) = render_state.borrow_mut().as_mut() {
+                    // DIAG items.id=312 (temporary): `glarea_size` above is
+                    // GTK *logical* pixels (`allocated_width/height`);
+                    // `rs.size()` is whatever the last `connect_resize`
+                    // call stored, which GTK documents as *physical* GL
+                    // framebuffer pixels -- i.e. already multiplied by the
+                    // device scale factor. Scale `glarea_size` up before
+                    // comparing so this only fires on a genuine staleness
+                    // mismatch (RenderState about to wrap a texture at a
+                    // size GTK's own allocation has already moved past),
+                    // not on the expected HiDPI unit difference.
+                    let scale = area.scale_factor().max(1) as u32;
+                    let glarea_size_physical = (glarea_size.0 * scale, glarea_size.1 * scale);
+                    let rs_size = rs.size();
+                    if rs_size != glarea_size_physical {
+                        log::warn!(
+                            "DIAG items.id=312: seq={seq} t={elapsed_ms}ms SIZE MISMATCH \
+                             glarea_size_physical={glarea_size_physical:?} (logical={glarea_size:?} \
+                             scale={scale}) render_state.size={rs_size:?}"
+                        );
+                    } else {
+                        log::debug!(
+                            "DIAG items.id=312: seq={seq} t={elapsed_ms}ms pre-render \
+                             size={rs_size:?} (matches glarea_size_physical, scale={scale})"
+                        );
+                    }
                     let popup_layout: HashMap<PaneKey, PaneRectFraction> = manager
                         .borrow()
                         .popups
