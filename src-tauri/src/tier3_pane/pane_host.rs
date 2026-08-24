@@ -79,9 +79,13 @@ use tauri::Manager;
 use cef::{ImplBrowser, ImplBrowserHost, ImplFrame, MouseButtonType, MouseEvent};
 
 use crate::commands::tier3_pane::{
-    PaneEventModifiers, PaneLayoutState, PaneMouseButton, PaneRectFraction,
+    PaneEventModifiers, PaneLayoutState, PaneMouseButton, PaneRectFraction, PopupClosedPayload,
+    PopupOpenedPayload,
 };
-use crate::tier3_pane::render::{ClientBuilder, LogicalSize, PaneRenderHandler, RenderState};
+use crate::tier3_pane::render::{
+    ClientBuilder, LogicalSize, PaneRenderHandler, PopupLifecycleEvent, PopupRequested,
+    RenderState,
+};
 use crate::tier3_pane::PaneKey;
 
 /// Lifecycle of one pane's CEF browser -- unchanged from the prior design.
@@ -227,6 +231,37 @@ pub enum PaneCommand {
         delta_y: f64,
         modifiers: PaneEventModifiers,
     },
+    /// items.id=234: same shape as `MouseClick`/`MouseMove`/`MouseWheel`
+    /// above, which are left untouched -- `key` is the *parent* pane's key
+    /// (popups have no separate id-keyspace, see `PaneManager.popups`'s own
+    /// doc), `x`/`y` are local to the popup's own on-screen rect, not the
+    /// parent pane's.
+    PopupMouseClick {
+        key: PaneKey,
+        x: f64,
+        y: f64,
+        button: PaneMouseButton,
+        mouseup: bool,
+        click_count: i32,
+        buttons: u16,
+        modifiers: PaneEventModifiers,
+    },
+    PopupMouseMove {
+        key: PaneKey,
+        x: f64,
+        y: f64,
+        leaving: bool,
+        buttons: u16,
+        modifiers: PaneEventModifiers,
+    },
+    PopupMouseWheel {
+        key: PaneKey,
+        x: f64,
+        y: f64,
+        delta_x: f64,
+        delta_y: f64,
+        modifiers: PaneEventModifiers,
+    },
 }
 
 /// Per-pane state. No `window`/per-pane `render_state` fields (one shared
@@ -261,6 +296,67 @@ struct PaneState {
     last_applied_size: Option<(u32, u32)>,
 }
 
+/// items.id=234: lifecycle of one popup's CEF browser. Unlike
+/// `BrowserLifecycleState` (panes), there is no `Closing`/`Closed`
+/// mid-state here -- a popup goes straight from `Creating` to being removed
+/// from `PaneManager.popups` entirely (`force_close_popup`), same as
+/// `close_pane` already does for panes.
+enum PopupLifecycleState {
+    Creating,
+    Ready(cef::Browser),
+    /// No producer wires this yet (`on_before_popup_aborted`, the CEF
+    /// signal for a popup that failed to construct, is not hooked up in
+    /// this item's scope) -- reserved should that ever be added, same
+    /// forward-compatible-but-currently-dead-code precedent as
+    /// `BrowserLifecycleState::Closing`/`Closed` above.
+    #[allow(dead_code)]
+    Failed(String),
+}
+
+impl PopupLifecycleState {
+    fn browser(&self) -> Option<&cef::Browser> {
+        match self {
+            PopupLifecycleState::Ready(browser) => Some(browser),
+            _ => None,
+        }
+    }
+}
+
+/// items.id=234: one open popup's bookkeeping -- parallel to `PaneState`,
+/// but much simpler (a popup never navigates on the host's behalf, has no
+/// `PendingAction` queue, and is force-closed rather than gracefully torn
+/// down, see `force_close_popup`).
+struct PopupState {
+    lifecycle: PopupLifecycleState,
+    /// Drained once per GTK render tick (`drain_popup_events`), same role
+    /// as `PaneState.browser_ready_rx` -- see `PopupLifecycleEvent`'s own
+    /// doc (render.rs) for why this needs two variants where a pane's
+    /// channel only ever needed one.
+    events_rx: std::sync::mpsc::Receiver<PopupLifecycleEvent>,
+    /// Shared with `PopupRenderHandler`'s `view_rect` (CEF's UI thread) --
+    /// same `Arc<Mutex<>>` reasoning as `PaneState.browser_size`.
+    size: Arc<Mutex<LogicalSize>>,
+    /// This popup's on-screen rect, as a fraction of the whole GLArea --
+    /// resolved once at creation (`resolve_popup_rect`) and never
+    /// recomputed from anything the page itself requests (items.id=234
+    /// plan, Judgment call 6.5: no page-initiated popup resize support).
+    rect: PaneRectFraction,
+    last_applied_size: Option<(u32, u32)>,
+}
+
+/// One notification `drain_popup_requests`/`drain_popup_events`/
+/// `drain_popup_close_requests` produced this tick, for `PaneHost::install`'s
+/// `connect_render` closure (which has `app_handle` in scope) to turn into
+/// an actual `AppHandle::emit` call -- kept out of `PaneManager` itself so
+/// this plain-data struct stays free of any Tauri dependency, matching
+/// `sync_pane_sizes`/`drain_ready_browsers`'s own existing convention of
+/// taking only what they need (never `AppHandle`) and leaving IPC/event
+/// concerns to their caller.
+enum PopupNotification {
+    Opened { key: PaneKey, rect: PaneRectFraction },
+    Closed { key: PaneKey },
+}
+
 /// One shared render target's worth of pane bookkeeping. Not a
 /// `winit::ApplicationHandler` anymore -- a plain struct, driven by GTK's
 /// `GLArea` signals instead of a winit event loop.
@@ -287,6 +383,26 @@ struct PaneManager {
     /// it later is a small addition, not a redesign.
     #[allow(dead_code)]
     focused_pane: Option<PaneKey>,
+    /// items.id=234: one active popup per pane (Judgment call 6.1 -- OAuth
+    /// login is inherently single-popup; opening a second for the same
+    /// pane replaces the first, see `drain_popup_requests`), keyed by the
+    /// *parent* pane's `PaneKey`, not a separate popup-id keyspace.
+    popups: HashMap<PaneKey, PopupState>,
+    /// Fed by `PaneLifeSpanHandler::on_before_popup` (render.rs, CEF's UI
+    /// thread) via `popup_requested_tx`'s paired sender, cloned into each
+    /// pane's `PaneLifeSpanHandler` at `open_pane` time. Drained once per
+    /// GTK render tick (`drain_popup_requests`), which does have the GTK
+    /// main thread's own `glarea_size` needed to resolve the popup's rect.
+    popup_requested_tx: std::sync::mpsc::Sender<PopupRequested>,
+    popup_requested_rx: std::sync::mpsc::Receiver<PopupRequested>,
+    /// Fed by `PaneLoadHandler::on_load_start` (render.rs, CEF's UI thread,
+    /// main-frame navigations of a PARENT pane's own browser only -- see
+    /// that handler's doc for why this is structurally never fed by a
+    /// popup's own navigation) via `popup_close_tx`'s paired sender, cloned
+    /// into each pane's `PaneLoadHandler` at `open_pane` time. Drained once
+    /// per GTK render tick (`drain_popup_close_requests`).
+    popup_close_tx: std::sync::mpsc::Sender<PaneKey>,
+    popup_close_rx: std::sync::mpsc::Receiver<PaneKey>,
 }
 
 impl PaneManager {
@@ -352,7 +468,15 @@ impl PaneManager {
         browser_lifecycle.start_creation();
         let created = cef::browser_host_create_browser(
             Some(&window_info),
-            Some(&mut ClientBuilder::build(render_handler, tx)),
+            Some(&mut ClientBuilder::build(
+                render_handler,
+                tx,
+                key.clone(),
+                self.popup_requested_tx.clone(),
+                self.popup_close_tx.clone(),
+                device.clone(),
+                queue.clone(),
+            )),
             None,
             Some(&browser_settings),
             None,
@@ -382,6 +506,12 @@ impl PaneManager {
     }
 
     fn close_pane(&mut self, key: &PaneKey) {
+        // items.id=234: force-close this pane's own popup, if any, before
+        // its browser goes away -- must run before shift_remove below,
+        // since force_close_popup's own defensive parent-grab-release
+        // still needs to find this pane in self.panes.
+        self.force_close_popup(key);
+
         let Some(pane) = self.panes.shift_remove(key) else {
             return;
         };
@@ -447,6 +577,210 @@ impl PaneManager {
             }
             pane.last_applied_size = Some(size_px);
         }
+    }
+
+    /// items.id=234 counterpart to `sync_pane_sizes`, for open popups --
+    /// same mechanism (a popup's rect is a fixed fraction of the GLArea,
+    /// rescaled proportionally on ordinary window resize; see this item's
+    /// plan, Judgment call 6.5), no new CEF hook needed since a popup is a
+    /// genuinely separate `Browser` (unlike `on_popup_size`, which targets
+    /// the different same-browser dropdown-popup mechanism -- see
+    /// render.rs's "items.id=234" section doc).
+    fn sync_popup_sizes(&mut self, glarea_size: (u32, u32), scale_factor: f32) {
+        for popup in self.popups.values_mut() {
+            let Some((_, _, width, height)) = pane_pixel_rect(glarea_size, &popup.rect) else {
+                continue;
+            };
+            let size_px = (width, height);
+            if popup.last_applied_size == Some(size_px) {
+                continue;
+            }
+            *popup.size.lock().unwrap() = LogicalSize {
+                width: width as f32 / scale_factor,
+                height: height as f32 / scale_factor,
+            };
+            if let Some(host) = popup.lifecycle.browser().and_then(|b| b.host()) {
+                host.was_resized();
+            }
+            popup.last_applied_size = Some(size_px);
+        }
+    }
+
+    /// items.id=234: force-closes `key`'s popup, if one is open -- shared by
+    /// `close_pane` (parent pane closing), `drain_popup_requests` (a second
+    /// popup request replaces the first, Judgment call 6.1), and
+    /// `drain_popup_close_requests` (parent navigate-away). Includes the
+    /// defensive grab-release this item's plan calls for (Judgment call
+    /// 6.6) -- unconditional, not gated on first confirming the
+    /// `ITEMS257_INPUT_FREEZE_INVESTIGATION_20260822.md` stuck-grab
+    /// hypothesis; cheap and idempotent if nothing was actually grabbed.
+    fn force_close_popup(&mut self, key: &PaneKey) {
+        let Some(popup) = self.popups.remove(key) else {
+            return;
+        };
+        if let Some(host) = popup.lifecycle.browser().and_then(|b| b.host()) {
+            host.send_capture_lost_event();
+            host.close_browser(true as _);
+        }
+        crate::tier3_pane::render::remove_popup_texture(key);
+
+        if let Some(host) = self
+            .panes
+            .get(key)
+            .and_then(|p| p.browser_lifecycle.browser())
+            .and_then(|b| b.host())
+        {
+            host.send_capture_lost_event();
+        }
+        if let Some(seat) = gtk::gdk::Display::default().and_then(|d| d.default_seat()) {
+            seat.ungrab();
+        }
+    }
+
+    /// items.id=234: resolves every `PopupRequested` CEF's UI thread queued
+    /// since the last tick into a real `PopupState`, using the GTK main
+    /// thread's own live `glarea_size`/`layout` (unavailable to the
+    /// `on_before_popup` callback that produced the request -- see that
+    /// handler's own doc). `layout` is `PaneLayoutState`'s live contents,
+    /// same as `sync_pane_sizes` already takes, needed here only to look up
+    /// the requesting pane's own current pixel rect for centering.
+    fn drain_popup_requests(
+        &mut self,
+        glarea_size: (u32, u32),
+        layout: &HashMap<PaneKey, PaneRectFraction>,
+    ) -> Vec<PopupNotification> {
+        let mut requests = Vec::new();
+        while let Ok(req) = self.popup_requested_rx.try_recv() {
+            requests.push(req);
+        }
+
+        let mut notifications = Vec::new();
+        for req in requests {
+            // One popup per pane (Judgment call 6.1): a second request for
+            // an already-open popup replaces the first.
+            self.force_close_popup(&req.parent_key);
+
+            let parent_pixel_rect = layout
+                .get(&req.parent_key)
+                .and_then(|frac| pane_pixel_rect(glarea_size, frac));
+            let rect = resolve_popup_rect(glarea_size, parent_pixel_rect, &req.features);
+
+            self.popups.insert(
+                req.parent_key.clone(),
+                PopupState {
+                    lifecycle: PopupLifecycleState::Creating,
+                    events_rx: req.events_rx,
+                    size: req.size,
+                    rect,
+                    last_applied_size: None,
+                },
+            );
+            notifications.push(PopupNotification::Opened {
+                key: req.parent_key,
+                rect,
+            });
+        }
+        notifications
+    }
+
+    /// items.id=234: drains each open popup's own lifecycle channel (`Ready`
+    /// from either capture path -- see `PopupRenderHandler`'s dual-capture
+    /// doc; `Closed` from the popup self-closing, e.g. `window.close()`
+    /// after a completed OAuth login). At most one event per popup per
+    /// tick, same as `drain_ready_browsers`' own per-pane `try_recv` --
+    /// events are infrequent enough that a queued second event simply
+    /// resolves on the next tick.
+    fn drain_popup_events(&mut self) -> Vec<PopupNotification> {
+        let mut closed_keys = Vec::new();
+        for (key, popup) in self.popups.iter_mut() {
+            let Ok(event) = popup.events_rx.try_recv() else {
+                continue;
+            };
+            match event {
+                PopupLifecycleEvent::Ready(browser) => {
+                    log::info!("tier3_pane::pane_host: popup delivered for pane={key}");
+                    popup.lifecycle = PopupLifecycleState::Ready(browser);
+                }
+                PopupLifecycleEvent::Closed => closed_keys.push(key.clone()),
+            }
+        }
+
+        let mut notifications = Vec::new();
+        for key in closed_keys {
+            self.popups.remove(&key);
+            crate::tier3_pane::render::remove_popup_texture(&key);
+            notifications.push(PopupNotification::Closed { key });
+        }
+        notifications
+    }
+
+    /// items.id=234: drains `PaneLoadHandler::on_load_start`'s navigate-away
+    /// close requests (render.rs) -- see that handler's own doc for the
+    /// parent-vs-popup disambiguation this relies on.
+    fn drain_popup_close_requests(&mut self) -> Vec<PopupNotification> {
+        let mut keys = Vec::new();
+        while let Ok(key) = self.popup_close_rx.try_recv() {
+            keys.push(key);
+        }
+
+        let mut notifications = Vec::new();
+        for key in keys {
+            if self.popups.contains_key(&key) {
+                self.force_close_popup(&key);
+                notifications.push(PopupNotification::Closed { key });
+            }
+        }
+        notifications
+    }
+}
+
+/// items.id=234: resolves a newly-requested popup's on-screen rect (as a
+/// `PaneRectFraction` of the whole GLArea, matching every other pane-
+/// geometry consumer's convention) from the size CEF's `PopupFeatures`
+/// requested, if any, and the requesting pane's own current pixel rect, if
+/// resolvable -- centering over it (items.id=234 plan, Judgment call 6.4:
+/// backend-resolved and fixed at creation time, not frontend-measured,
+/// since a `window.open()` call has no corresponding DOM node in QR's own
+/// page to measure). `PopupFeatures`' width/height are treated as physical
+/// pixels directly, not divided by any scale factor -- an accepted
+/// simplification for this item's tunable, non-spec-derived default sizing,
+/// not a precision guarantee. `features.x`/`features.y` are intentionally
+/// unused: centering over the parent pane is this design's whole policy,
+/// not honoring a page-requested position.
+fn resolve_popup_rect(
+    glarea_size: (u32, u32),
+    parent_pixel_rect: Option<(u32, u32, u32, u32)>,
+    features: &crate::tier3_pane::render::PopupFeatureInts,
+) -> PaneRectFraction {
+    const DEFAULT_WIDTH: u32 = 480;
+    const DEFAULT_HEIGHT: u32 = 640;
+    let (glarea_w, glarea_h) = (glarea_size.0.max(1), glarea_size.1.max(1));
+
+    let width = features
+        .width
+        .filter(|w| *w > 0)
+        .map(|w| w as u32)
+        .unwrap_or(DEFAULT_WIDTH)
+        .min(glarea_w);
+    let height = features
+        .height
+        .filter(|h| *h > 0)
+        .map(|h| h as u32)
+        .unwrap_or(DEFAULT_HEIGHT)
+        .min(glarea_h);
+
+    let (center_x, center_y) = match parent_pixel_rect {
+        Some((px, py, pw, ph)) => (px + pw / 2, py + ph / 2),
+        None => (glarea_w / 2, glarea_h / 2),
+    };
+    let x = center_x.saturating_sub(width / 2).min(glarea_w - width);
+    let y = center_y.saturating_sub(height / 2).min(glarea_h - height);
+
+    PaneRectFraction {
+        x: x as f64 / glarea_w as f64,
+        y: y as f64 / glarea_h as f64,
+        width: width as f64 / glarea_w as f64,
+        height: height as f64 / glarea_h as f64,
     }
 }
 
@@ -1254,10 +1588,21 @@ impl PaneHost {
         // below) -- it cannot be constructed before the GLArea is realized.
         let gl_loader: Rc<RefCell<Option<crate::tier3_pane::gl_loader::GlProcLoader>>> =
             Rc::new(RefCell::new(None));
+        // items.id=234: both channel pairs are created once, here, and
+        // their sender halves cloned into each pane's PaneLifeSpanHandler/
+        // PaneLoadHandler at open_pane time -- the receiver halves live on
+        // PaneManager itself, drained once per GTK render tick.
+        let (popup_requested_tx, popup_requested_rx) = std::sync::mpsc::channel();
+        let (popup_close_tx, popup_close_rx) = std::sync::mpsc::channel();
         let manager = Rc::new(RefCell::new(PaneManager {
             panes: IndexMap::new(),
             open_pane_count: Arc::new(AtomicUsize::new(0)),
             focused_pane: None,
+            popups: HashMap::new(),
+            popup_requested_tx,
+            popup_requested_rx,
+            popup_close_tx,
+            popup_close_rx,
         }));
         let open_pane_count = manager.borrow().open_pane_count.clone();
         {
@@ -1467,9 +1812,11 @@ impl PaneHost {
                     .lock()
                     .unwrap()
                     .clone();
-                manager
-                    .borrow_mut()
-                    .sync_pane_sizes((width, height), scale, &layout);
+                let mut mgr = manager.borrow_mut();
+                mgr.sync_pane_sizes((width, height), scale, &layout);
+                // items.id=234: popup rects rescale proportionally on
+                // ordinary window resize too, same mechanism as panes.
+                mgr.sync_popup_sizes((width, height), scale);
             });
         }
 
@@ -1478,7 +1825,7 @@ impl PaneHost {
             let gl_context = gl_context.clone();
             let manager = manager.clone();
             let app_handle = app_handle.clone();
-            glarea.connect_render(move |_area, _gtk_gl_context| {
+            glarea.connect_render(move |area, _gtk_gl_context| {
                 use glow::HasContext as _;
                 log::debug!(
                     "DIAG items.id=227: connect_render fired, open_panes={}",
@@ -1497,22 +1844,79 @@ impl PaneHost {
                     .as_ref()
                     .map(|gl| unsafe { gl.get_parameter_i32(glow::DRAW_FRAMEBUFFER_BINDING) });
 
+                let layout = app_handle
+                    .state::<PaneLayoutState>()
+                    .0
+                    .lock()
+                    .unwrap()
+                    .clone();
+                let glarea_size = (
+                    area.allocated_width().max(1) as u32,
+                    area.allocated_height().max(1) as u32,
+                );
+
                 manager.borrow_mut().drain_ready_browsers();
+
+                // items.id=234: resolve any new popup requests, react to
+                // popup lifecycle events (self-close/first-paint-ready),
+                // and act on any parent-navigate-away close requests --
+                // then forward whatever happened this tick to the
+                // frontend as tier3-popup-opened/-closed events.
+                let popup_notifications = {
+                    let mut mgr = manager.borrow_mut();
+                    let mut n = mgr.drain_popup_requests(glarea_size, &layout);
+                    n.extend(mgr.drain_popup_events());
+                    n.extend(mgr.drain_popup_close_requests());
+                    n
+                };
+                if !popup_notifications.is_empty() {
+                    use tauri::Emitter;
+                    for notification in popup_notifications {
+                        match notification {
+                            PopupNotification::Opened { key, rect } => {
+                                let payload = PopupOpenedPayload {
+                                    provider_id: key,
+                                    rect,
+                                };
+                                if let Err(e) = app_handle.emit("tier3-popup-opened", &payload) {
+                                    log::warn!(
+                                        "tier3_pane::pane_host: failed to emit \
+                                         tier3-popup-opened: {e}"
+                                    );
+                                }
+                            }
+                            PopupNotification::Closed { key } => {
+                                let payload = PopupClosedPayload { provider_id: key };
+                                if let Err(e) = app_handle.emit("tier3-popup-closed", &payload) {
+                                    log::warn!(
+                                        "tier3_pane::pane_host: failed to emit \
+                                         tier3-popup-closed: {e}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
 
                 for pane in manager.borrow().panes.values() {
                     if let Some(host) = pane.browser_lifecycle.browser().and_then(|b| b.host()) {
                         host.send_external_begin_frame();
                     }
                 }
+                for popup in manager.borrow().popups.values() {
+                    if let Some(host) = popup.lifecycle.browser().and_then(|b| b.host()) {
+                        host.send_external_begin_frame();
+                    }
+                }
 
                 if let Some(rs) = render_state.borrow_mut().as_mut() {
-                    let layout = app_handle
-                        .state::<PaneLayoutState>()
-                        .0
-                        .lock()
-                        .unwrap()
-                        .clone();
-                    rs.render(&layout);
+                    let popup_layout: HashMap<PaneKey, PaneRectFraction> = manager
+                        .borrow()
+                        .popups
+                        .iter()
+                        .map(|(k, p)| (k.clone(), p.rect))
+                        .collect();
+                    rs.render(&layout, &popup_layout);
                 }
 
                 if let (Some(gl), Some(fbo)) = (gl_context.borrow().as_ref(), captured_fbo) {
@@ -1673,6 +2077,114 @@ impl PaneHost {
                     .panes
                     .get(&key)
                     .and_then(|p| p.browser_lifecycle.browser())
+                    .and_then(|b| b.host())
+                {
+                    let ev = MouseEvent {
+                        x: x.round() as i32,
+                        y: y.round() as i32,
+                        modifiers: cef_modifiers_from_dom(
+                            modifiers.shift,
+                            modifiers.ctrl,
+                            modifiers.alt,
+                            modifiers.meta,
+                            0,
+                        ),
+                    };
+                    host.send_mouse_wheel_event(
+                        Some(&ev),
+                        delta_x.round() as i32,
+                        delta_y.round() as i32,
+                    );
+                }
+            }
+            // items.id=234: identical to the MouseClick/MouseMove/MouseWheel
+            // arms above, looking up mgr.popups instead of mgr.panes.
+            PaneCommand::PopupMouseClick {
+                key,
+                x,
+                y,
+                button,
+                mouseup,
+                click_count,
+                buttons,
+                modifiers,
+            } => {
+                let mut mgr = self.manager.borrow_mut();
+                if !mouseup {
+                    mgr.focused_pane = Some(key.clone());
+                }
+                if let Some(host) = mgr
+                    .popups
+                    .get(&key)
+                    .and_then(|p| p.lifecycle.browser())
+                    .and_then(|b| b.host())
+                {
+                    let cef_button = match button {
+                        PaneMouseButton::Left => MouseButtonType::LEFT,
+                        PaneMouseButton::Middle => MouseButtonType::MIDDLE,
+                        PaneMouseButton::Right => MouseButtonType::RIGHT,
+                    };
+                    let ev = MouseEvent {
+                        x: x.round() as i32,
+                        y: y.round() as i32,
+                        modifiers: cef_modifiers_from_dom(
+                            modifiers.shift,
+                            modifiers.ctrl,
+                            modifiers.alt,
+                            modifiers.meta,
+                            buttons,
+                        ),
+                    };
+                    host.send_mouse_click_event(
+                        Some(&ev),
+                        cef_button,
+                        mouseup as _,
+                        click_count as _,
+                    );
+                }
+            }
+            PaneCommand::PopupMouseMove {
+                key,
+                x,
+                y,
+                leaving,
+                buttons,
+                modifiers,
+            } => {
+                let mgr = self.manager.borrow();
+                if let Some(host) = mgr
+                    .popups
+                    .get(&key)
+                    .and_then(|p| p.lifecycle.browser())
+                    .and_then(|b| b.host())
+                {
+                    let ev = MouseEvent {
+                        x: x.round() as i32,
+                        y: y.round() as i32,
+                        modifiers: cef_modifiers_from_dom(
+                            modifiers.shift,
+                            modifiers.ctrl,
+                            modifiers.alt,
+                            modifiers.meta,
+                            buttons,
+                        ),
+                    };
+                    host.send_mouse_move_event(Some(&ev), leaving as _);
+                }
+            }
+            PaneCommand::PopupMouseWheel {
+                key,
+                x,
+                y,
+                delta_x,
+                delta_y,
+                modifiers,
+            } => {
+                let mgr = self.manager.borrow();
+                if let Some(host) = mgr
+                    .popups
+                    .get(&key)
+                    .and_then(|p| p.lifecycle.browser())
                     .and_then(|b| b.host())
                 {
                     let ev = MouseEvent {

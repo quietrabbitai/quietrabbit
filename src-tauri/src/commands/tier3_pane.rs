@@ -3,7 +3,8 @@
 // Group 13 -- Tier 2/Tier 3 pane lifecycle & provider catalog.
 // Commands: list_active_providers, open_tier3_panes, close_tier3_pane,
 // set_pane_layout, forward_pane_mouse_click, forward_pane_mouse_move,
-// forward_pane_mouse_wheel.
+// forward_pane_mouse_wheel, forward_popup_mouse_click,
+// forward_popup_mouse_move, forward_popup_mouse_wheel (items.id=234).
 //
 // items.id=202 piece 5 / items.id=223 connective tissue: neither item's own
 // description enumerates an IPC command, but on-demand pane creation
@@ -167,6 +168,31 @@ pub enum PaneMouseButton {
     Left,
     Middle,
     Right,
+}
+
+/// items.id=234: `tier3-popup-opened` event payload -- emitted the moment
+/// `pane_host.rs`'s `drain_popup_requests` resolves and inserts a new
+/// `PopupState` (immediately, not gated on the popup's first paint, so the
+/// frontend can show the overlay promptly). Hand-declared here rather than
+/// added to `collect_commands!` -- it's an event payload, not a command
+/// argument, same convention as consent.rs's `ConsentRequestPayload`.
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+pub struct PopupOpenedPayload {
+    pub provider_id: String,
+    pub rect: PaneRectFraction,
+}
+
+/// items.id=234: `tier3-popup-closed` event payload -- emitted for the two
+/// close paths the frontend has no other way to learn about: the popup
+/// self-closing (`window.close()` after a completed OAuth login) and the
+/// parent pane navigating away. NOT emitted when the parent pane itself
+/// closes (that popup teardown is synchronous inside `close_pane`, not
+/// queued through the same per-tick drain) -- `Tier3AccessPane.tsx`
+/// proactively clears its own popup state on pane-close instead, without
+/// waiting for an event.
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+pub struct PopupClosedPayload {
+    pub provider_id: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -707,6 +733,92 @@ pub async fn forward_pane_mouse_wheel(
     app_handle
         .run_on_main_thread(move || {
             pane_host::dispatch(PaneCommand::MouseWheel {
+                key: provider_id,
+                x,
+                y,
+                delta_x,
+                delta_y,
+                modifiers,
+            })
+        })
+        .map_err(|e| e.to_string())
+}
+
+/// items.id=234: popup counterpart to `forward_pane_mouse_click` -- same
+/// coordinate/no-op contract, except `x`/`y` are local to the popup's own
+/// on-screen rect (`tier3-popup-opened`'s reported `rect`), not the parent
+/// pane's. `provider_id` names the *parent* pane (popups have no separate
+/// id-keyspace, see `PaneManager.popups`'s own doc, pane_host.rs).
+#[tauri::command]
+#[specta::specta]
+pub async fn forward_popup_mouse_click(
+    provider_id: String,
+    x: f64,
+    y: f64,
+    button: PaneMouseButton,
+    mouseup: bool,
+    click_count: i32,
+    buttons: u16,
+    modifiers: PaneEventModifiers,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    app_handle
+        .run_on_main_thread(move || {
+            pane_host::dispatch(PaneCommand::PopupMouseClick {
+                key: provider_id,
+                x,
+                y,
+                button,
+                mouseup,
+                click_count,
+                buttons,
+                modifiers,
+            })
+        })
+        .map_err(|e| e.to_string())
+}
+
+/// items.id=234: popup counterpart to `forward_pane_mouse_move`.
+#[tauri::command]
+#[specta::specta]
+pub async fn forward_popup_mouse_move(
+    provider_id: String,
+    x: f64,
+    y: f64,
+    leaving: bool,
+    buttons: u16,
+    modifiers: PaneEventModifiers,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    app_handle
+        .run_on_main_thread(move || {
+            pane_host::dispatch(PaneCommand::PopupMouseMove {
+                key: provider_id,
+                x,
+                y,
+                leaving,
+                buttons,
+                modifiers,
+            })
+        })
+        .map_err(|e| e.to_string())
+}
+
+/// items.id=234: popup counterpart to `forward_pane_mouse_wheel`.
+#[tauri::command]
+#[specta::specta]
+pub async fn forward_popup_mouse_wheel(
+    provider_id: String,
+    x: f64,
+    y: f64,
+    delta_x: f64,
+    delta_y: f64,
+    modifiers: PaneEventModifiers,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    app_handle
+        .run_on_main_thread(move || {
+            pane_host::dispatch(PaneCommand::PopupMouseWheel {
                 key: provider_id,
                 x,
                 y,

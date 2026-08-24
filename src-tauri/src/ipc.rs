@@ -111,6 +111,10 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::tier3_pane::forward_pane_mouse_click,
         commands::tier3_pane::forward_pane_mouse_move,
         commands::tier3_pane::forward_pane_mouse_wheel,
+        // items.id=234 -- host-owned popup subsystem, OAuth popup click routing
+        commands::tier3_pane::forward_popup_mouse_click,
+        commands::tier3_pane::forward_popup_mouse_move,
+        commands::tier3_pane::forward_popup_mouse_wheel,
         // Group 14 -- Messages/transcript (ChatPane.tsx backing)
         commands::messages::send_message,
         commands::messages::list_messages,

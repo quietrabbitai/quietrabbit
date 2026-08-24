@@ -399,6 +399,18 @@ export const commands = {
 	 *  the deleted GDK scroll handler forwarded every `scroll-event` unthrottled.
 	 */
 	forwardPaneMouseWheel: (providerId: string, x: number | null, y: number | null, deltaX: number | null, deltaY: number | null, modifiers: PaneEventModifiers) => typedError<null, string>(__TAURI_INVOKE("forward_pane_mouse_wheel", { providerId, x, y, deltaX, deltaY, modifiers })),
+	/**
+	 *  items.id=234: popup counterpart to `forward_pane_mouse_click` -- same
+	 *  coordinate/no-op contract, except `x`/`y` are local to the popup's own
+	 *  on-screen rect (`tier3-popup-opened`'s reported `rect`), not the parent
+	 *  pane's. `provider_id` names the *parent* pane (popups have no separate
+	 *  id-keyspace, see `PaneManager.popups`'s own doc, pane_host.rs).
+	 */
+	forwardPopupMouseClick: (providerId: string, x: number | null, y: number | null, button: PaneMouseButton, mouseup: boolean, clickCount: number, buttons: number, modifiers: PaneEventModifiers) => typedError<null, string>(__TAURI_INVOKE("forward_popup_mouse_click", { providerId, x, y, button, mouseup, clickCount, buttons, modifiers })),
+	/**  items.id=234: popup counterpart to `forward_pane_mouse_move`. */
+	forwardPopupMouseMove: (providerId: string, x: number | null, y: number | null, leaving: boolean, buttons: number, modifiers: PaneEventModifiers) => typedError<null, string>(__TAURI_INVOKE("forward_popup_mouse_move", { providerId, x, y, leaving, buttons, modifiers })),
+	/**  items.id=234: popup counterpart to `forward_pane_mouse_wheel`. */
+	forwardPopupMouseWheel: (providerId: string, x: number | null, y: number | null, deltaX: number | null, deltaY: number | null, modifiers: PaneEventModifiers) => typedError<null, string>(__TAURI_INVOKE("forward_popup_mouse_wheel", { providerId, x, y, deltaX, deltaY, modifiers })),
 	sendMessage: (userId: string, personaId: string, contextKey: string, content: string, focusId: string, gate3Track: boolean) => typedError<MessageInfo[], string>(__TAURI_INVOKE("send_message", { userId, personaId, contextKey, content, focusId, gate3Track })),
 	listMessages: (userId: string, personaId: string, contextKey: string) => typedError<MessageInfo[], string>(__TAURI_INVOKE("list_messages", { userId, personaId, contextKey })),
 	/**

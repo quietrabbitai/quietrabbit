@@ -7,8 +7,11 @@
 //! slot and no cookie-jar wiring; Phase B (items.id=202 piece 5 / items.id=
 //! 223) generalized both -- one texture slot per pane, keyed by
 //! `tier3_pane::PaneKey`, and real per-provider `RequestContext` isolation
-//! (see pane_host.rs). Popup handling remains items.id=192's known deferred
-//! cost, still out of scope here.
+//! (see pane_host.rs). items.id=234 (host-owned popup subsystem) added a
+//! second, parallel texture slot per pane (`POPUP_TEXTURES`, keyed by the
+//! *parent* pane's `PaneKey`) for `window.open()`-style OAuth popups --
+//! `<select>` dropdown/same-browser popups remain out of scope (see
+//! `PopupRenderHandler`'s own doc for the scope boundary).
 //!
 //! `RenderState` itself (items.id=202 real positioning fix, 2026-08-07):
 //! previously one instance per pane, each owning its own `winit::Window` and
@@ -27,7 +30,8 @@
 //! `getBoundingClientRect()`, so no axis flip is needed).
 
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use cef::*;
 use wgpu::util::DeviceExt;
@@ -207,7 +211,16 @@ impl RenderState {
     /// afterward -- confirmed this session that wgpu-hal's own internal
     /// calls silently rebind to their own scratch target, so GTK would
     /// otherwise composite from the wrong framebuffer once this returns.
-    pub fn render(&mut self, layout: &HashMap<PaneKey, PaneRectFraction>) {
+    /// `popup_layout` is the analogous live-fraction map for open popups
+    /// (items.id=234), keyed by the *parent* pane's `PaneKey` -- drawn in a
+    /// second pass after every pane's own texture, so a popup always paints
+    /// on top of its parent (no depth buffer exists here; draw order is
+    /// submission order).
+    pub fn render(
+        &mut self,
+        layout: &HashMap<PaneKey, PaneRectFraction>,
+        popup_layout: &HashMap<PaneKey, PaneRectFraction>,
+    ) {
         let hal_texture = wgpu_hal::gles::Texture::default_framebuffer(self.surface_format);
         let target = unsafe {
             self.device.create_texture_from_hal::<wgpu_hal::api::Gles>(
@@ -290,6 +303,29 @@ impl RenderState {
                 pass.set_bind_group(0, bind_group, &[]);
                 pass.draw(0..self.quad.vertex_count, 0..1);
             }
+
+            // items.id=234: open popups, drawn after every pane so they
+            // always composite on top of their parent -- same viewport/
+            // scissor math, reading POPUP_TEXTURES/popup_layout instead.
+            let popup_textures = POPUP_TEXTURES.lock().unwrap();
+            for (key, bind_group) in popup_textures.iter() {
+                let Some(frac) = popup_layout.get(key) else {
+                    continue;
+                };
+                let (w, h) = (self.size.0 as f64, self.size.1 as f64);
+                let x = (frac.x * w).round().clamp(0.0, w) as f32;
+                let y = (frac.y * h).round().clamp(0.0, h) as f32;
+                let width = (frac.width * w).round().clamp(0.0, w - x as f64) as f32;
+                let height = (frac.height * h).round().clamp(0.0, h - y as f64) as f32;
+                if width <= 0.0 || height <= 0.0 {
+                    continue;
+                }
+
+                pass.set_viewport(x, y, width, height, 0.0, 1.0);
+                pass.set_scissor_rect(x as u32, y as u32, width as u32, height as u32);
+                pass.set_bind_group(0, bind_group, &[]);
+                pass.draw(0..self.quad.vertex_count, 0..1);
+            }
         }
         self.queue.submit(std::iter::once(encoder.finish()));
     }
@@ -355,6 +391,19 @@ pub fn remove_pane_texture(key: &PaneKey) {
     PANE_TEXTURES.lock().unwrap().remove(key);
 }
 
+/// items.id=234: mirrors `PANE_TEXTURES` exactly, but for open OAuth
+/// popups -- a separate map, keyed by the *parent* pane's `PaneKey` (one
+/// active popup per pane, see `pane_host::PaneManager.popups`'s own doc),
+/// not a repurposed key scheme on `PANE_TEXTURES`.
+static POPUP_TEXTURES: LazyLock<Mutex<HashMap<PaneKey, wgpu::BindGroup>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Mirrors `remove_pane_texture` -- must be called as part of a popup's own
+/// teardown (`pane_host.rs`'s `force_close_popup`).
+pub fn remove_popup_texture(key: &PaneKey) {
+    POPUP_TEXTURES.lock().unwrap().remove(key);
+}
+
 /// Replaces `winit::dpi::LogicalSize<f32>` (winit dropped from `tier3_pane`
 /// entirely, items.id=202 real positioning fix, 2026-08-07 -- see
 /// pane_host.rs's module docs) -- same two fields, no winit dependency.
@@ -362,6 +411,74 @@ pub fn remove_pane_texture(key: &PaneKey) {
 pub struct LogicalSize {
     pub width: f32,
     pub height: f32,
+}
+
+// ---------------------------------------------------------------------------
+// items.id=234: host-owned popup subsystem
+// ---------------------------------------------------------------------------
+//
+// Scope: `window.open()`-style new-browser-window popups only (CEF
+// `LifeSpanHandler::on_before_popup`, see `PaneLifeSpanHandler::on_before_popup`
+// below) -- used for OAuth provider logins launched from an open Tier 3
+// pane. NOT `<select>` dropdowns/autofill/context menus: those are a
+// structurally different, same-browser CEF mechanism
+// (`RenderHandler::on_popup_show`/`on_popup_size` + `PaintElementType::Popup`
+// on the *parent's own* RenderHandler, not a separate `Browser`) -- the
+// `type_ != PaintElementType::default()` guards in `PaneRenderHandler::
+// on_paint`/`on_accelerated_paint` above stay untouched and still discard
+// that surface; a host-owned dropdown subsystem is a separate future item.
+//
+// Mechanism: on `on_before_popup`, the popup's own `WindowInfo` is forced
+// windowless (`windowless_rendering_enabled = true`, matching the parent
+// pane's own `accelerated_osr` setting) and handed a fresh `PopupClientBuilder`
+// -- so the popup becomes a second, host-managed, windowless `cef::Browser`,
+// composited into the same shared `gtk::GLArea`/wgpu pipeline as regular
+// panes (`POPUP_TEXTURES`, `RenderState::render`'s second draw loop) rather
+// than a real native OS window. This is the design items.id=192's original
+// spike recommended and the ADR's final disposition chose to ship --
+// deliberately not the separate "Views-based popup delegation" avenue
+// (items.id=199/200/201), which hit an unresolved CEF compositor defect
+// specific to constructing a Views browser synchronously inside
+// `on_before_popup` and was parked as non-blocking, deferred future work.
+
+/// Extracted, plain-int copy of the `PopupFeatures` CEF hands to
+/// `on_before_popup` -- not the CEF struct itself, matching this codebase's
+/// established practice (see `commands/tier3_pane.rs`'s `CollectCookiesVisitor`
+/// doc) of never forwarding a CEF-owned type across the CEF-UI-thread ->
+/// GTK-main-thread boundary. `x`/`y` are captured but currently unused --
+/// `pane_host::resolve_popup_rect` centers the popup over its parent pane
+/// rather than honoring a page-requested position, see that function's own
+/// doc.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PopupFeatureInts {
+    pub x: Option<i32>,
+    pub y: Option<i32>,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+}
+
+/// Signals a popup browser's lifecycle to `pane_host.rs`'s per-tick drain --
+/// analogous to `PaneLifeSpanHandler`'s plain `cef::Browser` channel, but a
+/// popup needs two distinct signals where a pane's own channel only ever
+/// needed one ("here is your browser"): a popup can also self-close (a real
+/// browser window navigating away or calling `window.close()`), which a
+/// pane's own channel has no equivalent of.
+#[derive(Clone)]
+pub enum PopupLifecycleEvent {
+    Ready(cef::Browser),
+    Closed,
+}
+
+/// One `on_before_popup` request, handed from CEF's UI thread (where that
+/// callback runs -- see `PaneLifeSpanHandler::on_before_popup`'s own doc for
+/// why it cannot touch `PaneManager`/GTK directly) to `pane_host.rs`'s
+/// per-tick `drain_popup_requests`, which does have GTK-main-thread access
+/// to `glarea_size` for resolving the popup's actual on-screen rect.
+pub struct PopupRequested {
+    pub parent_key: PaneKey,
+    pub events_rx: std::sync::mpsc::Receiver<PopupLifecycleEvent>,
+    pub size: Arc<Mutex<LogicalSize>>,
+    pub features: PopupFeatureInts,
 }
 
 /// CEF `RenderHandler` implementation: receives paint callbacks and imports
@@ -557,6 +674,226 @@ impl RenderHandlerBuilder {
     }
 }
 
+/// items.id=234: near-copy of `PaneRenderHandler`, writing into
+/// `POPUP_TEXTURES` (keyed by the *parent* pane's `PaneKey`) instead of
+/// `PANE_TEXTURES`.
+///
+/// **Dual capture path**, built in from the start rather than as a
+/// follow-up: items.id=199's spike found `on_after_created` never fired for
+/// a naive *windowed* popup attempt. This design uses a windowless/OSR
+/// popup (a materially different CEF code path regular panes already prove
+/// reliable), so `on_after_created` firing here is expected but not yet
+/// separately proven -- see this item's plan, Step 1 ("verification
+/// spike"). Rather than gate the whole feature on that answer, both paths
+/// are wired unconditionally: on this handler's *first* paint callback, it
+/// also sends `PopupLifecycleEvent::Ready` (a fallback capture, using the
+/// `browser` paint callbacks already receive); `PopupLifeSpanHandler::
+/// on_after_created` sends the same event independently. Whichever fires
+/// first wins; a duplicate `Ready` (if both do) is a harmless no-op
+/// transition in `PopupLifecycleState`.
+#[derive(Clone)]
+pub struct PopupRenderHandler {
+    device_scale_factor: f32,
+    size: Arc<Mutex<LogicalSize>>,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    /// The *parent* pane's key -- which `POPUP_TEXTURES` slot this popup's
+    /// paint output belongs to.
+    pane_key: PaneKey,
+    events_tx: std::sync::mpsc::Sender<PopupLifecycleEvent>,
+    /// Guards the dual-capture `Ready` send above (send at most once, on
+    /// this handler's first paint callback) -- `Arc<AtomicBool>`, not a
+    /// plain `bool` field, since this handler is `Clone` (CEF's own
+    /// ref-counting clones it) but every clone must observe the same
+    /// "already sent" state.
+    captured: Arc<AtomicBool>,
+}
+
+impl PopupRenderHandler {
+    pub fn new(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        device_scale_factor: f32,
+        initial_size: LogicalSize,
+        pane_key: PaneKey,
+        events_tx: std::sync::mpsc::Sender<PopupLifecycleEvent>,
+    ) -> (Self, Arc<Mutex<LogicalSize>>) {
+        let size = Arc::new(Mutex::new(initial_size));
+        (
+            Self {
+                device_scale_factor,
+                size: size.clone(),
+                device,
+                queue,
+                pane_key,
+                events_tx,
+                captured: Arc::new(AtomicBool::new(false)),
+            },
+            size,
+        )
+    }
+
+    fn maybe_capture(&self, browser: &Option<&mut Browser>) {
+        if self.captured.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if let Some(browser) = browser {
+            let _ = self
+                .events_tx
+                .send(PopupLifecycleEvent::Ready((*browser).clone()));
+        }
+    }
+}
+
+wrap_render_handler! {
+    pub struct PopupRenderHandlerBuilder {
+        handler: PopupRenderHandler,
+    }
+
+    impl RenderHandler {
+        fn view_rect(&self, _browser: Option<&mut Browser>, rect: Option<&mut Rect>) {
+            if let Some(rect) = rect {
+                let size = self.handler.size.lock().unwrap();
+                if size.width > 0.0 && size.height > 0.0 {
+                    rect.width = size.width as _;
+                    rect.height = size.height as _;
+                }
+            }
+        }
+
+        fn screen_info(
+            &self,
+            _browser: Option<&mut Browser>,
+            screen_info: Option<&mut ScreenInfo>,
+        ) -> ::std::os::raw::c_int {
+            if let Some(screen_info) = screen_info {
+                screen_info.device_scale_factor = self.handler.device_scale_factor;
+                return true as _;
+            }
+            false as _
+        }
+
+        fn screen_point(
+            &self,
+            _browser: Option<&mut Browser>,
+            _view_x: ::std::os::raw::c_int,
+            _view_y: ::std::os::raw::c_int,
+            _screen_x: Option<&mut ::std::os::raw::c_int>,
+            _screen_y: Option<&mut ::std::os::raw::c_int>,
+        ) -> ::std::os::raw::c_int {
+            false as _
+        }
+
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+        fn on_accelerated_paint(
+            &self,
+            browser: Option<&mut Browser>,
+            type_: PaintElementType,
+            _dirty_rects: Option<&[Rect]>,
+            info: Option<&AcceleratedPaintInfo>,
+        ) {
+            // Same defensive guard as PaneRenderHandler -- this popup IS its
+            // own browser (not a same-browser popup-paint-layer surface), so
+            // type_ is expected to always be the default view, but guarding
+            // costs nothing and matches the established pattern.
+            if type_ != PaintElementType::default() {
+                return;
+            }
+            self.handler.maybe_capture(&browser);
+
+            let Some(info) = info else { return };
+            use cef::osr_texture_import::shared_texture_handle::SharedTextureHandle;
+            let shared_handle = SharedTextureHandle::new(info);
+            if let SharedTextureHandle::Unsupported = shared_handle {
+                log::warn!("tier3_pane::render: popup: platform does not support accelerated OSR painting");
+                return;
+            }
+            let src_texture = match shared_handle.import_texture(&self.handler.device) {
+                Ok(t) => t,
+                Err(e) => {
+                    log::warn!("tier3_pane::render: popup: failed to import shared texture: {e:?}");
+                    return;
+                }
+            };
+
+            let bind_group = build_bind_group(&self.handler.device, &src_texture);
+            POPUP_TEXTURES
+                .lock()
+                .unwrap()
+                .insert(self.handler.pane_key.clone(), bind_group);
+        }
+
+        #[allow(clippy::not_unsafe_ptr_arg_deref)]
+        fn on_paint(
+            &self,
+            browser: Option<&mut Browser>,
+            type_: PaintElementType,
+            _dirty_rects: Option<&[Rect]>,
+            buffer: *const u8,
+            width: ::std::os::raw::c_int,
+            height: ::std::os::raw::c_int,
+        ) {
+            if type_ != PaintElementType::default() {
+                return;
+            }
+            self.handler.maybe_capture(&browser);
+
+            if buffer.is_null() || width <= 0 || height <= 0 {
+                return;
+            }
+
+            let buffer_size = (width * height * 4) as usize;
+            let buffer_slice = unsafe { std::slice::from_raw_parts(buffer, buffer_size) };
+
+            let texture = self.handler.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("tier3_pane cef popup paint texture (software path)"),
+                size: wgpu::Extent3d {
+                    width: width as u32,
+                    height: height as u32,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Bgra8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            self.handler.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                buffer_slice,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * width as u32),
+                    rows_per_image: Some(height as u32),
+                },
+                wgpu::Extent3d {
+                    width: width as u32,
+                    height: height as u32,
+                    depth_or_array_layers: 1,
+                },
+            );
+
+            let bind_group = build_bind_group(&self.handler.device, &texture);
+            POPUP_TEXTURES
+                .lock()
+                .unwrap()
+                .insert(self.handler.pane_key.clone(), bind_group);
+        }
+    }
+}
+
+impl PopupRenderHandlerBuilder {
+    pub fn build(handler: PopupRenderHandler) -> RenderHandler {
+        Self::new(handler)
+    }
+}
+
 fn build_bind_group(device: &wgpu::Device, texture: &wgpu::Texture) -> wgpu::BindGroup {
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -612,14 +949,68 @@ wrap_client! {
 }
 
 impl ClientBuilder {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn build(
         render_handler: PaneRenderHandler,
         browser_ready_tx: std::sync::mpsc::Sender<cef::Browser>,
+        pane_key: PaneKey,
+        popup_requested_tx: std::sync::mpsc::Sender<PopupRequested>,
+        popup_close_tx: std::sync::mpsc::Sender<PaneKey>,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
     ) -> Client {
         Self::new(
             RenderHandlerBuilder::build(render_handler),
-            LifeSpanHandlerBuilder::build(PaneLifeSpanHandler::new(browser_ready_tx)),
-            LoadHandlerBuilder::build(PaneLoadHandler),
+            LifeSpanHandlerBuilder::build(PaneLifeSpanHandler::new(
+                browser_ready_tx,
+                pane_key.clone(),
+                popup_requested_tx,
+                device,
+                queue,
+            )),
+            LoadHandlerBuilder::build(PaneLoadHandler::new(pane_key, popup_close_tx)),
+        )
+    }
+}
+
+// items.id=234: mirrors `ClientBuilder`, for a popup's own browser -- wires
+// `PopupRenderHandler`/`PopupLifeSpanHandler`/`PopupLoadHandler`
+// (deliberately *not* the parent's `PaneLoadHandler` -- see
+// `PopupLoadHandler`'s own doc for why reusing it would have been wrong).
+// A plain comment, not a doc comment: `wrap_client!` (a macro invocation in
+// item position) does not forward an outer `///` doc comment to anything,
+// which trips the `unused_doc_comments` lint.
+wrap_client! {
+    pub(crate) struct PopupClientBuilder {
+        render_handler: RenderHandler,
+        life_span_handler: LifeSpanHandler,
+        load_handler: LoadHandler,
+    }
+
+    impl Client {
+        fn render_handler(&self) -> Option<cef::RenderHandler> {
+            Some(self.render_handler.clone())
+        }
+
+        fn life_span_handler(&self) -> Option<cef::LifeSpanHandler> {
+            Some(self.life_span_handler.clone())
+        }
+
+        fn load_handler(&self) -> Option<cef::LoadHandler> {
+            Some(self.load_handler.clone())
+        }
+    }
+}
+
+impl PopupClientBuilder {
+    pub(crate) fn build(
+        render_handler: PopupRenderHandler,
+        events_tx: std::sync::mpsc::Sender<PopupLifecycleEvent>,
+    ) -> Client {
+        Self::new(
+            PopupRenderHandlerBuilder::build(render_handler),
+            PopupLifeSpanHandlerBuilder::build(PopupLifeSpanHandler::new(events_tx)),
+            PopupLoadHandlerBuilder::build(PopupLoadHandler),
         )
     }
 }
@@ -645,11 +1036,35 @@ impl ClientBuilder {
 #[derive(Clone)]
 pub struct PaneLifeSpanHandler {
     browser_ready_tx: std::sync::mpsc::Sender<cef::Browser>,
+    /// This pane's own key -- identifies which pane an `on_before_popup`
+    /// request (items.id=234) belongs to, since `PopupRequested` is
+    /// dispatched to `pane_host.rs`'s per-tick drain rather than handled
+    /// synchronously here (this callback runs on CEF's UI thread, which
+    /// must not touch `PaneManager`/GTK directly).
+    pane_key: PaneKey,
+    popup_requested_tx: std::sync::mpsc::Sender<PopupRequested>,
+    /// items.id=234: needed to construct a fresh `PopupRenderHandler` when
+    /// `on_before_popup` fires -- cheap `Arc`-backed clones (same handles
+    /// `PaneRenderHandler` itself holds), not a new device/queue.
+    device: wgpu::Device,
+    queue: wgpu::Queue,
 }
 
 impl PaneLifeSpanHandler {
-    fn new(browser_ready_tx: std::sync::mpsc::Sender<cef::Browser>) -> Self {
-        Self { browser_ready_tx }
+    fn new(
+        browser_ready_tx: std::sync::mpsc::Sender<cef::Browser>,
+        pane_key: PaneKey,
+        popup_requested_tx: std::sync::mpsc::Sender<PopupRequested>,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+    ) -> Self {
+        Self {
+            browser_ready_tx,
+            pane_key,
+            popup_requested_tx,
+            device,
+            queue,
+        }
     }
 }
 
@@ -667,6 +1082,98 @@ wrap_life_span_handler! {
             // condition worth panicking over.
             let _ = self.handler.browser_ready_tx.send(browser.clone());
         }
+
+        // items.id=234: intercepts `window.open()`-style OAuth popups.
+        // Forces the popup windowless/OSR (matching the parent pane's own
+        // configuration -- see pane_host.rs's `open_pane`) rather than
+        // letting CEF create a real native popup window, and hands it a
+        // fresh `PopupClientBuilder` so its paint output flows into
+        // POPUP_TEXTURES exactly like a regular pane's does. Runs on CEF's
+        // UI thread (multi_threaded_message_loop=true, bootstrap.rs) --
+        // dispatches a `PopupRequested` over a channel rather than touching
+        // `PaneManager`/GTK directly; `pane_host.rs`'s `drain_popup_requests`
+        // (GTK main thread, which does have `glarea_size`) resolves the
+        // popup's actual on-screen rect and inserts its `PopupState`.
+        //
+        // Returns 0 (allow) unconditionally -- every popup this callback
+        // sees is treated as this item's in-scope case (see this file's
+        // "items.id=234" section doc for the scope boundary; dropdown/
+        // context-menu popups never reach `on_before_popup` at all, so
+        // there is nothing to filter by `target_disposition` here for v1).
+        fn on_before_popup(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _popup_id: ::std::os::raw::c_int,
+            target_url: Option<&CefString>,
+            _target_frame_name: Option<&CefString>,
+            _target_disposition: WindowOpenDisposition,
+            _user_gesture: ::std::os::raw::c_int,
+            popup_features: Option<&PopupFeatures>,
+            window_info: Option<&mut WindowInfo>,
+            client: Option<&mut Option<Client>>,
+            _settings: Option<&mut BrowserSettings>,
+            _extra_info: Option<&mut Option<DictionaryValue>>,
+            _no_javascript_access: Option<&mut ::std::os::raw::c_int>,
+        ) -> ::std::os::raw::c_int {
+            log::info!(
+                "tier3_pane::render: on_before_popup fired for pane={} target_url={:?}",
+                self.handler.pane_key,
+                target_url.map(|u| u.to_string()),
+            );
+
+            let accelerated_osr = cfg!(any(
+                target_os = "macos",
+                target_os = "windows",
+                target_os = "linux"
+            ));
+            if let Some(window_info) = window_info {
+                window_info.windowless_rendering_enabled = true as _;
+                window_info.shared_texture_enabled = accelerated_osr as _;
+                window_info.external_begin_frame_enabled = accelerated_osr as _;
+            }
+
+            let features = popup_features
+                .map(|f| PopupFeatureInts {
+                    x: (f.x_set != 0).then_some(f.x),
+                    y: (f.y_set != 0).then_some(f.y),
+                    width: (f.width_set != 0).then_some(f.width),
+                    height: (f.height_set != 0).then_some(f.height),
+                })
+                .unwrap_or_default();
+
+            let (events_tx, events_rx) = std::sync::mpsc::channel();
+            // Initial size is a placeholder -- pane_host.rs's
+            // `drain_popup_requests`/`sync_popup_sizes` apply the real
+            // resolved size (and push it into this same `size` handle) on
+            // the very next GTK render tick, same as a freshly-opened
+            // pane's initial `PaneRenderHandler` size is never load-bearing
+            // for more than one frame.
+            let (render_handler, size) = PopupRenderHandler::new(
+                self.handler.device.clone(),
+                self.handler.queue.clone(),
+                1.0,
+                LogicalSize {
+                    width: 480.0,
+                    height: 640.0,
+                },
+                self.handler.pane_key.clone(),
+                events_tx.clone(),
+            );
+
+            if let Some(client_slot) = client {
+                *client_slot = Some(PopupClientBuilder::build(render_handler, events_tx));
+            }
+
+            let _ = self.handler.popup_requested_tx.send(PopupRequested {
+                parent_key: self.handler.pane_key.clone(),
+                events_rx,
+                size,
+                features,
+            });
+
+            0
+        }
     }
 }
 
@@ -676,15 +1183,78 @@ impl LifeSpanHandlerBuilder {
     }
 }
 
+/// items.id=234: the popup's own `LifeSpanHandler` -- reports its lifecycle
+/// (`on_after_created`, the primary capture path; `on_before_close`, the
+/// only signal for a self-closing popup, e.g. the OAuth page itself calling
+/// `window.close()`) back through the same `events_tx` channel
+/// `PopupRenderHandler`'s dual-capture path also feeds -- see that
+/// handler's own doc for why both are wired.
+#[derive(Clone)]
+pub struct PopupLifeSpanHandler {
+    events_tx: std::sync::mpsc::Sender<PopupLifecycleEvent>,
+}
+
+impl PopupLifeSpanHandler {
+    fn new(events_tx: std::sync::mpsc::Sender<PopupLifecycleEvent>) -> Self {
+        Self { events_tx }
+    }
+}
+
+wrap_life_span_handler! {
+    pub(crate) struct PopupLifeSpanHandlerBuilder {
+        handler: PopupLifeSpanHandler,
+    }
+
+    impl LifeSpanHandler {
+        fn on_after_created(&self, browser: Option<&mut cef::Browser>) {
+            let Some(browser) = browser else { return; };
+            log::info!("tier3_pane::render: popup on_after_created fired");
+            let _ = self
+                .handler
+                .events_tx
+                .send(PopupLifecycleEvent::Ready(browser.clone()));
+        }
+
+        fn on_before_close(&self, _browser: Option<&mut cef::Browser>) {
+            log::info!("tier3_pane::render: popup on_before_close fired (self-closed)");
+            let _ = self.handler.events_tx.send(PopupLifecycleEvent::Closed);
+        }
+    }
+}
+
+impl PopupLifeSpanHandlerBuilder {
+    pub(crate) fn build(handler: PopupLifeSpanHandler) -> cef::LifeSpanHandler {
+        Self::new(handler)
+    }
+}
+
 /// Load diagnostics for a pane's browser. Previously nothing wired a
 /// `LoadHandler` at all -- a stalled or failed pane load (DNS failure, TLS
 /// error, a bad redirect) produced zero log signal, indistinguishable from
 /// a page that was simply still loading. `on_load_error`/`on_load_end` are
 /// the two `ImplLoadHandler` methods with a diagnostic payload worth
-/// logging; `on_load_start`/`on_loading_state_change` are left at their
-/// default no-op bodies (no error/status information to report).
+/// logging.
+///
+/// items.id=234 added `on_load_start`, filtered to the main frame: the
+/// navigate-away popup-close trigger (that item's plan, Judgment call 6.2).
+/// This is deliberately attached ONLY to a parent pane's own browser, never
+/// to a popup's own browser -- see `PopupLoadHandler`'s doc for why a first
+/// draft that reused this same type for both was wrong, and why the fix is
+/// two distinct types rather than a runtime check.
 #[derive(Clone)]
-pub struct PaneLoadHandler;
+pub struct PaneLoadHandler {
+    pane_key: PaneKey,
+    popup_close_tx: std::sync::mpsc::Sender<PaneKey>,
+}
+
+impl PaneLoadHandler {
+    fn new(pane_key: PaneKey, popup_close_tx: std::sync::mpsc::Sender<PaneKey>) -> Self {
+        Self {
+            pane_key,
+            popup_close_tx,
+        }
+    }
+}
 
 wrap_load_handler! {
     pub(crate) struct LoadHandlerBuilder {
@@ -714,11 +1284,83 @@ wrap_load_handler! {
         ) {
             log::info!("tier3_pane::render: on_load_end: status={http_status_code}");
         }
+
+        // items.id=234: unconditional -- any main-frame navigation of this
+        // PANE's own browser closes that pane's popup, if one is open (a
+        // no-op send if none is; pane_host.rs's drain simply finds nothing
+        // to close). Filtered to the main frame only: an iframe navigation
+        // inside the pane's own page must not close an unrelated popup.
+        fn on_load_start(
+            &self,
+            _browser: Option<&mut cef::Browser>,
+            frame: Option<&mut cef::Frame>,
+            _transition_type: cef::TransitionType,
+        ) {
+            let is_main = frame.map(|f| f.is_main() != 0).unwrap_or(false);
+            if is_main {
+                let _ = self.handler.popup_close_tx.send(self.handler.pane_key.clone());
+            }
+        }
     }
 }
 
 impl LoadHandlerBuilder {
     pub(crate) fn build(handler: PaneLoadHandler) -> cef::LoadHandler {
+        Self::new(handler)
+    }
+}
+
+/// items.id=234: the popup's own `LoadHandler` -- same diagnostic-only
+/// `on_load_error`/`on_load_end` behavior as `PaneLoadHandler`, but
+/// deliberately WITHOUT an `on_load_start` close-trigger. A popup's own
+/// internal navigations (an OAuth flow is itself a chain of main-frame
+/// navigations -- the consent screen, redirects, the final callback URL)
+/// must never close the popup they're happening inside; only its PARENT
+/// pane's navigation should. Reusing `PaneLoadHandler` for both roles (this
+/// design's first draft) would have made that impossible to distinguish
+/// safely: main-frame navigation is main-frame navigation regardless of
+/// which browser it fires on, so the close-trigger would have fired on the
+/// popup's own first internal hop and broken every real login. The fix is
+/// structural, not a runtime check: parent-pane browsers and popup browsers
+/// are wired to two different Rust types at two different construction
+/// sites (`PaneManager::open_pane` vs. `PaneLifeSpanHandler::on_before_popup`),
+/// so the close-trigger code path simply does not exist here.
+#[derive(Clone)]
+pub struct PopupLoadHandler;
+
+wrap_load_handler! {
+    pub(crate) struct PopupLoadHandlerBuilder {
+        handler: PopupLoadHandler,
+    }
+
+    impl LoadHandler {
+        fn on_load_error(
+            &self,
+            _browser: Option<&mut cef::Browser>,
+            _frame: Option<&mut cef::Frame>,
+            error_code: cef::Errorcode,
+            error_text: Option<&cef::CefString>,
+            failed_url: Option<&cef::CefString>,
+        ) {
+            log::warn!(
+                "tier3_pane::render: popup on_load_error: code={error_code:?} \
+                 url={failed_url:?} text={error_text:?}"
+            );
+        }
+
+        fn on_load_end(
+            &self,
+            _browser: Option<&mut cef::Browser>,
+            _frame: Option<&mut cef::Frame>,
+            http_status_code: ::std::os::raw::c_int,
+        ) {
+            log::info!("tier3_pane::render: popup on_load_end: status={http_status_code}");
+        }
+    }
+}
+
+impl PopupLoadHandlerBuilder {
+    pub(crate) fn build(handler: PopupLoadHandler) -> cef::LoadHandler {
         Self::new(handler)
     }
 }

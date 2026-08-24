@@ -35,13 +35,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { commands } from '../bindings'
+import { commands, type PaneRectFraction } from '../bindings'
 import { ChatPane } from '../chat/ChatPane'
 import { MiddleZone } from '../middleZone/MiddleZone'
 import { DEFAULT_CONVERSATION_PROFILE } from '../middleZone/middleZoneConfig'
 import { requireCurrentUserId } from './navShellConfig'
 import { computePaneRects, pixelRectToFraction, type PanePixelRect } from '../tier3Access/paneLayout'
 import { PaneHitLayer } from '../tier3Access/PaneHitLayer'
+import { PopupHitLayer } from '../tier3Access/PopupHitLayer'
 import {
   PrivacyGuardianModal,
   type ConsentRequestPayload,
@@ -54,6 +55,19 @@ import {
 } from '../tier3Access/tier3AccessConfig'
 
 type ReviewOutcome = 'pending' | 'approved' | 'withheld' | 'blocked'
+
+// items.id=234 -- host-owned popup subsystem. Hand-declared, not generated:
+// event payloads, not command args, same convention as
+// PrivacyGuardianModal.tsx's own ConsentRequestPayload -- see
+// commands/tier3_pane.rs's PopupOpenedPayload/PopupClosedPayload for the
+// Rust side these mirror.
+interface PopupOpenedPayload {
+  provider_id: string
+  rect: PaneRectFraction
+}
+interface PopupClosedPayload {
+  provider_id: string
+}
 
 export interface Tier3AccessPaneProps {
   /** The persona this Tier 3 session was opened from -- captured by
@@ -80,6 +94,10 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
   // straight to PaneHitLayer for its invisible per-pane hit-divs' position
   // (items.id=257 Path B; see paneLayout.ts's module doc).
   const [paneRects, setPaneRects] = useState<Record<string, PanePixelRect>>({})
+  // items.id=234: backend-authoritative popup rects, keyed by parent
+  // provider id -- see PopupHitLayer's own doc for why this is not
+  // frontend-measured the way paneRects is.
+  const [popupRects, setPopupRects] = useState<Record<string, PaneRectFraction>>({})
 
   const [reviewOutcome, setReviewOutcome] = useState<ReviewOutcome | null>(null)
   const [reviewMessage, setReviewMessage] = useState<string | null>(null)
@@ -153,6 +171,18 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
     commands.closeTier3Pane(providerId).then((result) => {
       if (result.status === 'ok') {
         setOpenPaneIds((ids) => ids.filter((id) => id !== providerId))
+        // items.id=234: close_pane's own popup teardown is synchronous on
+        // the Rust side, not queued through the same per-tick drain that
+        // fires tier3-popup-closed for the other close paths (self-close,
+        // navigate-away) -- see PopupClosedPayload's own doc. Clear
+        // proactively here rather than waiting for an event that never
+        // comes for this specific path.
+        setPopupRects((rects) => {
+          if (!(providerId in rects)) return rects
+          const next = { ...rects }
+          delete next[providerId]
+          return next
+        })
       } else {
         setOpenError(result.error)
       }
@@ -228,6 +258,50 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
     }
   }, [])
 
+  // items.id=234: same cancelled/unlisten idiom as the consent_request
+  // listener above. tier3-popup-opened/-closed are the two popup-close
+  // paths the frontend has no other way to learn about (self-close,
+  // parent navigate-away) -- see PopupClosedPayload's own doc for why the
+  // parent-pane-close path (handleClose above) does not rely on this.
+  useEffect(() => {
+    let unlistenOpened: UnlistenFn | undefined
+    let unlistenClosed: UnlistenFn | undefined
+    let cancelled = false
+
+    listen<PopupOpenedPayload>('tier3-popup-opened', (event) => {
+      const { provider_id, rect } = event.payload
+      setPopupRects((rects) => ({ ...rects, [provider_id]: rect }))
+    }).then((fn) => {
+      if (cancelled) {
+        fn()
+      } else {
+        unlistenOpened = fn
+      }
+    })
+
+    listen<PopupClosedPayload>('tier3-popup-closed', (event) => {
+      const { provider_id } = event.payload
+      setPopupRects((rects) => {
+        if (!(provider_id in rects)) return rects
+        const next = { ...rects }
+        delete next[provider_id]
+        return next
+      })
+    }).then((fn) => {
+      if (cancelled) {
+        fn()
+      } else {
+        unlistenClosed = fn
+      }
+    })
+
+    return () => {
+      cancelled = true
+      unlistenOpened?.()
+      unlistenClosed?.()
+    }
+  }, [])
+
   const handleModalResolve = (decisions: ElementDecision[]) => {
     if (!consentPayload || !personaId || !pendingMessageId) return
     const allKeptPrivate = decisions.every((d) => d.decision === 'keep_private')
@@ -264,6 +338,10 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
   return (
     <div className="tier3-access-pane">
       <PaneHitLayer rects={paneRects} />
+      {/* items.id=234: mounted AFTER PaneHitLayer -- DOM source order alone
+          resolves popup-vs-parent-pane hit-test precedence in any
+          overlapping region (see PopupHitLayer's own doc). */}
+      <PopupHitLayer popups={popupRects} />
       <div className="tier3-access-pane__conversation">
         <MiddleZone
           contextKey={
