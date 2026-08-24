@@ -33,6 +33,7 @@ import { ChatPane } from '../chat/ChatPane'
 import { LibraryPane } from '../library/LibraryPane'
 import { MiddleZone } from '../middleZone/MiddleZone'
 import { DEFAULT_BROWSING_PROFILE } from '../middleZone/middleZoneConfig'
+import { FocusSettingsPane } from './FocusSettingsPane'
 import { PersonaHub } from './PersonaHub'
 import { Tier3AccessPane } from './Tier3AccessPane'
 import {
@@ -105,6 +106,16 @@ export function NavShell() {
         labelKey: 'navShell.library',
         aliasesFixedButton: 'library',
         content: { type: 'library', personaFilter: personaId },
+      }),
+    )
+  }
+
+  const handleOpenFocusSettings = (personaId: string, focusId: string) => {
+    setNavState((prev) =>
+      pushCrumb(prev, {
+        id: `focus-settings-${personaId}-${focusId}`,
+        labelKey: 'navShell.focusSettings.crumbLabel',
+        content: { type: 'focusSettings', personaId, focusId },
       }),
     )
   }
@@ -188,6 +199,7 @@ export function NavShell() {
         <NavShellContent
           content={content}
           onOpenPersonaLibrary={handleOpenPersonaLibrary}
+          onOpenFocusSettings={handleOpenFocusSettings}
           tier3PersonaId={tier3PersonaId}
         />
       </div>
@@ -198,6 +210,7 @@ export function NavShell() {
 interface NavShellContentProps {
   content: ContentDescriptor
   onOpenPersonaLibrary: (personaId: string) => void
+  onOpenFocusSettings: (personaId: string, focusId: string) => void
   tier3PersonaId: string | null
 }
 
@@ -209,6 +222,7 @@ interface NavShellContentProps {
 function NavShellContent({
   content,
   onOpenPersonaLibrary,
+  onOpenFocusSettings,
   tier3PersonaId,
 }: NavShellContentProps) {
   const { t } = useTranslation()
@@ -229,6 +243,9 @@ function NavShellContent({
             userId={requireCurrentUserId()}
             personaId={content.personaId}
             onOpenLibrary={() => onOpenPersonaLibrary(content.personaId)}
+            onOpenFocusSettings={(focusId) =>
+              onOpenFocusSettings(content.personaId, focusId)
+            }
           />
         }
         chatPane={
@@ -241,6 +258,24 @@ function NavShellContent({
             onGenerating={setPersonaHubGenerating}
           />
         }
+      />
+    )
+  }
+
+  if (content.type === 'focusSettings') {
+    return (
+      <MiddleZone
+        contextKey={`focus-settings-${content.personaId}-${content.focusId}`}
+        profile={DEFAULT_BROWSING_PROFILE}
+        isGenerating={false}
+        contextPane={
+          <FocusSettingsPane
+            userId={requireCurrentUserId()}
+            personaId={content.personaId}
+            focusId={content.focusId}
+          />
+        }
+        chatPane={<p>{t('navShell.content.chatPlaceholder')}</p>}
       />
     )
   }

@@ -334,6 +334,10 @@ pub async fn submit_friction_gate_decision(
         .as_deref()
         .map(|p| p == "protected" && existing.focus_profile != "protected")
         .unwrap_or(false);
+    let max_permitted_tier_would_loosen = orig
+        .max_permitted_tier
+        .map(|t| t > existing.max_permitted_tier)
+        .unwrap_or(false);
 
     focus_settings_store::record_friction_gate_decision(
         &orig.persona_id,
@@ -349,8 +353,14 @@ pub async fn submit_friction_gate_decision(
         } else {
             None
         },
+        if max_permitted_tier_would_loosen {
+            orig.max_permitted_tier
+        } else {
+            None
+        },
         existing.privacy_tier,
         &existing.focus_profile,
+        Some(existing.max_permitted_tier),
     )
     .await
     .map_err(|e| e.to_string())?;
@@ -1131,5 +1141,81 @@ mod tests {
             .expect("get_focus_settings must succeed")
             .expect("row must exist");
         assert_eq!(settings.max_permitted_tier, 3);
+    }
+
+    /// items.id=321: submit_friction_gate_decision must accept and apply a
+    /// decision whose only gate-tripping dimension is max_permitted_tier --
+    /// before this item, record_friction_gate_decision's "at least one
+    /// requested_*" validation only knew about privacy_tier/focus_profile
+    /// and would have rejected this call outright.
+    #[tokio::test]
+    async fn submit_friction_gate_decision_max_permitted_tier_only_proceeds() {
+        let _env = setup().await;
+        crate::persistence::migrations::migrate_shared_db()
+            .await
+            .expect("shared.db migration must succeed in test setup");
+        crate::auth::user_store::create_user(
+            USER_ID,
+            "Consent Test User",
+            "user",
+            false,
+            &[0u8; crate::auth::kdf::SALT_LEN],
+            crate::auth::kdf::DEFAULT_ARGON2_MEMORY_KIB,
+            crate::auth::kdf::DEFAULT_ARGON2_ITERATIONS,
+            crate::auth::kdf::DEFAULT_ARGON2_PARALLELISM,
+            &[0u8; 32],
+        )
+        .await
+        .expect("create_user must succeed in test setup");
+        crate::persistence::persona_store::create_persona(
+            PERSONA_ID,
+            "Consent Test Persona",
+            "personal",
+            USER_ID,
+            None,
+        )
+        .await
+        .expect("create_persona must succeed in test setup");
+        focus_settings_store::create_focus_settings(
+            PERSONA_ID,
+            TIER3_DRAFT_FOCUS_ID,
+            "bidirectional",
+            "shared",
+            2,
+            2,
+            "open",
+            None,
+        )
+        .await
+        .expect("create_focus_settings must succeed");
+
+        let original_request = crate::commands::persona::UpdateFocusSettingsRequest {
+            persona_id: PERSONA_ID.to_owned(),
+            focus_id: TIER3_DRAFT_FOCUS_ID.to_owned(),
+            context_flow: None,
+            library_visibility: None,
+            privacy_tier: None,
+            max_permitted_tier: Some(3),
+            focus_profile: None,
+        };
+
+        let applied = submit_friction_gate_decision(SubmitFrictionGateDecisionRequest {
+            decision: "proceed".to_owned(),
+            original_request,
+        })
+        .await
+        .expect("submit_friction_gate_decision must succeed for a max_permitted_tier-only trip")
+        .expect("decision='proceed' must return Some(FocusInfo)");
+
+        assert_eq!(applied.max_permitted_tier, 3);
+
+        let settings = focus_settings_store::get_focus_settings(PERSONA_ID, TIER3_DRAFT_FOCUS_ID)
+            .await
+            .expect("get_focus_settings must succeed")
+            .expect("row must exist");
+        assert_eq!(
+            settings.max_permitted_tier, 3,
+            "the applied change must persist, not just be echoed back"
+        );
     }
 }

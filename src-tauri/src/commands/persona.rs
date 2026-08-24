@@ -137,20 +137,25 @@ pub struct UpdateFocusSettingsRequest {
 /// actually tripped the gate. Both are echoed even though only one may be
 /// gate-relevant, so the frontend can show the complete requested state
 /// without a second get_focus_settings round trip.
-#[derive(Debug, Serialize, Type)]
+#[derive(Debug, Serialize, Deserialize, Type)]
 pub struct FrictionGateDetail {
     pub persona_id: String,
     pub focus_id: String,
     pub requested_privacy_tier: Option<i32>,
     pub requested_focus_profile: Option<String>,
+    pub requested_max_permitted_tier: Option<i32>,
     pub existing_privacy_tier: i32,
     pub existing_focus_profile: String,
+    pub existing_max_permitted_tier: i32,
     /// True when privacy_tier would numerically increase (loosen -- see
     /// module header's TIER DIRECTION NOTE). False when only focus_profile
     /// moving to 'protected' tripped the gate.
     pub privacy_would_loosen: bool,
     /// True when focus_profile would move to 'protected'.
     pub moves_to_protected: bool,
+    /// items.id=321: true when max_permitted_tier would numerically
+    /// increase -- same loosening direction as privacy_tier.
+    pub max_permitted_tier_would_loosen: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -343,8 +348,12 @@ pub async fn update_focus_settings(
         .as_deref()
         .map(|p| p == "protected" && existing.focus_profile != "protected")
         .unwrap_or(false);
+    let max_permitted_tier_would_loosen = request
+        .max_permitted_tier
+        .map(|t| t > existing.max_permitted_tier)
+        .unwrap_or(false);
 
-    if privacy_would_loosen || moves_to_protected {
+    if privacy_would_loosen || moves_to_protected || max_permitted_tier_would_loosen {
         let detail = FrictionGateDetail {
             persona_id: request.persona_id.clone(),
             focus_id: request.focus_id.clone(),
@@ -358,10 +367,17 @@ pub async fn update_focus_settings(
             } else {
                 None
             },
+            requested_max_permitted_tier: if max_permitted_tier_would_loosen {
+                request.max_permitted_tier
+            } else {
+                None
+            },
             existing_privacy_tier: existing.privacy_tier,
             existing_focus_profile: existing.focus_profile.clone(),
+            existing_max_permitted_tier: existing.max_permitted_tier,
             privacy_would_loosen,
             moves_to_protected,
+            max_permitted_tier_would_loosen,
         };
         let detail_json =
             serde_json::to_string(&detail).unwrap_or_else(|_| "friction_gate_blocked".to_owned());
@@ -682,6 +698,57 @@ mod tests {
             focuses[0].last_used.is_some(),
             "list_focuses' batched last_used map must surface the same real value \
              get_focus_settings' single-focus lookup does"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_focus_settings_max_permitted_tier_loosen_trips_gate() {
+        let _env = setup().await;
+        persona_store::create_persona(PERSONA_ID, "Ceiling Gate Persona", "personal", USER_ID, None)
+            .await
+            .expect("create_persona must succeed");
+        focus_settings_store::create_focus_settings(
+            PERSONA_ID,
+            "quick-ask",
+            "bidirectional",
+            "shared",
+            2,
+            2,
+            "open",
+            None,
+        )
+        .await
+        .expect("create_focus_settings must succeed");
+
+        let app = mock_app_with_registry();
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(&registry, USER_ID, MASTER_KEY).await;
+
+        let err = update_focus_settings(
+            USER_ID.to_owned(),
+            registry,
+            UpdateFocusSettingsRequest {
+                persona_id: PERSONA_ID.to_owned(),
+                focus_id: "quick-ask".to_owned(),
+                context_flow: None,
+                library_visibility: None,
+                privacy_tier: None,
+                max_permitted_tier: Some(3),
+                focus_profile: None,
+            },
+        )
+        .await
+        .expect_err("raising max_permitted_tier alone must trip the friction gate");
+
+        let detail: FrictionGateDetail =
+            serde_json::from_str(&err).expect("gate error must be FrictionGateDetail JSON");
+
+        assert!(detail.max_permitted_tier_would_loosen);
+        assert_eq!(detail.requested_max_permitted_tier, Some(3));
+        assert_eq!(detail.existing_max_permitted_tier, 2);
+        assert!(
+            !detail.privacy_would_loosen && !detail.moves_to_protected,
+            "only max_permitted_tier changed -- the other two flags must stay false"
         );
     }
 }

@@ -111,6 +111,8 @@ pub async fn gate3<L: DisclosureLogger>(
                  from this Focus. [Change Focus settings] [Use local only]"
                     .to_string(),
             ),
+            target_tier: Some(target_tier),
+            space_max_permitted_tier: Some(space_max_permitted_tier),
             ..Gate3Result::default()
         });
     }

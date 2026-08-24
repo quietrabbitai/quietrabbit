@@ -39,6 +39,7 @@ import { commands, type PaneRectFraction } from '../bindings'
 import { ChatPane } from '../chat/ChatPane'
 import { MiddleZone } from '../middleZone/MiddleZone'
 import { DEFAULT_CONVERSATION_PROFILE } from '../middleZone/middleZoneConfig'
+import { FocusSettingsControls } from './FocusSettingsControls'
 import { requireCurrentUserId } from './navShellConfig'
 import { computePaneRects, pixelRectToFraction, type PanePixelRect } from '../tier3Access/paneLayout'
 import { PaneHitLayer } from '../tier3Access/PaneHitLayer'
@@ -101,6 +102,15 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
 
   const [reviewOutcome, setReviewOutcome] = useState<ReviewOutcome | null>(null)
   const [reviewMessage, setReviewMessage] = useState<string | null>(null)
+  // items.id=321: set only when the block was Gate3's tier-ceiling check
+  // (Gate3Result.target_tier/.space_max_permitted_tier, populated only on
+  // that one path -- see conductor/privacy/gate3.rs). Drives the inline
+  // "raise it now" affordance that replaces the old dead
+  // "[Change Focus settings]" bracket text.
+  const [reviewCeiling, setReviewCeiling] = useState<{
+    targetTier: number
+    current: number
+  } | null>(null)
   const [consentPayload, setConsentPayload] = useState<ConsentRequestPayload | null>(null)
   // ConsentRequestPayload carries focus_run_id, not message_id -- gate3()
   // only knows about content_key/step_id/focus_run_id, never the
@@ -201,6 +211,7 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
       if (!personaId) return
       setReviewOutcome('pending')
       setReviewMessage(null)
+      setReviewCeiling(null)
       setPendingMessageId(messageId)
       commands
         .requestTier3Gate3Review({
@@ -230,6 +241,12 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
           // surface the plain_language message, no modal.
           setReviewOutcome('blocked')
           setReviewMessage(data.plain_language)
+          if (data.target_tier != null && data.space_max_permitted_tier != null) {
+            setReviewCeiling({
+              targetTier: data.target_tier,
+              current: data.space_max_permitted_tier,
+            })
+          }
         })
     },
     [personaId, t],
@@ -396,6 +413,19 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
         )}
         {reviewOutcome === 'blocked' && (
           <p role="alert">{reviewMessage ?? t('navShell.tier3AccessPane.gate3BlockedFallback')}</p>
+        )}
+        {reviewOutcome === 'blocked' && reviewCeiling && personaId && (
+          <FocusSettingsControls
+            userId={requireCurrentUserId()}
+            personaId={personaId}
+            focusId="quick-ask"
+            mode="ceilingOnly"
+            suggestedMaxPermittedTier={reviewCeiling.targetTier}
+            onSaved={() => {
+              setReviewCeiling(null)
+              if (pendingMessageId) handleDraftReady(pendingMessageId)
+            }}
+          />
         )}
         {reviewOutcome === 'withheld' && (
           <p>{t('navShell.tier3AccessPane.gate3Withheld')}</p>

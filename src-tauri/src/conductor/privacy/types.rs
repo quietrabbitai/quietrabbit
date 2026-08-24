@@ -150,6 +150,14 @@ pub struct Gate3Result {
     /// gate_timeout event written to disclosure_log before returning.
     /// When true: approved=false, blocked=true.
     pub timeout: bool,
+    /// items.id=321: set only by the tier-ceiling block (Check 1) so a
+    /// caller can offer "raise max_permitted_tier to at least this" without
+    /// parsing plain_language's bracketed button text. None on every other
+    /// block/approve path.
+    pub target_tier: Option<u8>,
+    /// items.id=321: the space_max_permitted_tier that failed the ceiling
+    /// check, paired with target_tier above. None outside that one path.
+    pub space_max_permitted_tier: Option<u8>,
 }
 
 /// IPC-safe projection of Gate3Result — Gate3Result itself derives neither
@@ -163,6 +171,8 @@ pub struct Gate3ReviewResult {
     pub pending_consent: bool,
     pub timeout: bool,
     pub plain_language: Option<String>,
+    pub target_tier: Option<u8>,
+    pub space_max_permitted_tier: Option<u8>,
 }
 
 impl From<Gate3Result> for Gate3ReviewResult {
@@ -173,6 +183,8 @@ impl From<Gate3Result> for Gate3ReviewResult {
             pending_consent: r.pending_consent,
             timeout: r.timeout,
             plain_language: r.plain_language,
+            target_tier: r.target_tier,
+            space_max_permitted_tier: r.space_max_permitted_tier,
         }
     }
 }

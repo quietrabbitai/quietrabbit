@@ -26,9 +26,15 @@ export interface PersonaHubProps {
   userId: string
   personaId: string
   onOpenLibrary: () => void
+  onOpenFocusSettings: (focusId: string) => void
 }
 
-export function PersonaHub({ userId, personaId, onOpenLibrary }: PersonaHubProps) {
+export function PersonaHub({
+  userId,
+  personaId,
+  onOpenLibrary,
+  onOpenFocusSettings,
+}: PersonaHubProps) {
   const { t } = useTranslation()
   const [focuses, setFocuses] = useState<FocusInfo[]>([])
   const [error, setError] = useState<string | null>(null)
@@ -59,7 +65,15 @@ export function PersonaHub({ userId, personaId, onOpenLibrary }: PersonaHubProps
       {focuses.length > 0 && (
         <ul className="persona-hub__focus-list">
           {focuses.map((focus) => (
-            <li key={focus.focus_id}>{focus.focus_id}</li>
+            <li key={focus.focus_id}>
+              {focus.focus_id}{' '}
+              <button
+                type="button"
+                onClick={() => onOpenFocusSettings(focus.focus_id)}
+              >
+                {t('navShell.personaHub.focusSettingsButton')}
+              </button>
+            </li>
           ))}
         </ul>
       )}

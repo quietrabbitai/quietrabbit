@@ -436,19 +436,25 @@ pub async fn record_friction_gate_decision(
     decision: &str,
     requested_privacy_tier: Option<i32>,
     requested_focus_profile: Option<&str>,
+    requested_max_permitted_tier: Option<i32>,
     existing_privacy_tier: i32,
     existing_focus_profile: &str,
+    existing_max_permitted_tier: Option<i32>,
 ) -> Result<String, FocusSettingsStoreError> {
     if !matches!(decision, "proceed" | "cancel") {
         return Err(FocusSettingsStoreError::Validation(format!(
             "friction gate decision must be 'proceed' or 'cancel', got '{decision}'."
         )));
     }
-    if requested_privacy_tier.is_none() && requested_focus_profile.is_none() {
+    if requested_privacy_tier.is_none()
+        && requested_focus_profile.is_none()
+        && requested_max_permitted_tier.is_none()
+    {
         return Err(FocusSettingsStoreError::Validation(
             "friction gate decision requires at least one of \
-             requested_privacy_tier / requested_focus_profile -- a gate \
-             trip with neither means nothing actually triggered it."
+             requested_privacy_tier / requested_focus_profile / \
+             requested_max_permitted_tier -- a gate trip with none of them \
+             means nothing actually triggered it."
                 .to_owned(),
         ));
     }
@@ -460,9 +466,10 @@ pub async fn record_friction_gate_decision(
     sqlx::query(
         "INSERT INTO focus_settings_friction_decisions
          (id, persona_id, focus_id, decision, requested_privacy_tier,
-          requested_focus_profile, existing_privacy_tier, existing_focus_profile,
+          requested_focus_profile, requested_max_permitted_tier,
+          existing_privacy_tier, existing_focus_profile, existing_max_permitted_tier,
           created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(persona_id)
@@ -470,8 +477,10 @@ pub async fn record_friction_gate_decision(
     .bind(decision)
     .bind(requested_privacy_tier)
     .bind(requested_focus_profile)
+    .bind(requested_max_permitted_tier)
     .bind(existing_privacy_tier)
     .bind(existing_focus_profile)
+    .bind(existing_max_permitted_tier)
     .bind(&created_at)
     .execute(&mut conn)
     .await?;

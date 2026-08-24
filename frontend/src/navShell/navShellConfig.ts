@@ -38,6 +38,7 @@ export type ContentDescriptor =
   | { type: 'myFacts' }
   | { type: 'tier3' }
   | { type: 'personaHub'; personaId: string }
+  | { type: 'focusSettings'; personaId: string; focusId: string }
 
 /** One entry in the temporary-button chain nested below/alongside the
  *  anchor (Section 2e; Section 4's "tapping a Focus becomes a temporary

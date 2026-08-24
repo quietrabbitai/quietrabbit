@@ -578,6 +578,8 @@ export type Gate3ReviewResult = {
 	pending_consent: boolean,
 	timeout: boolean,
 	plain_language: string | null,
+	target_tier: number | null,
+	space_max_permitted_tier: number | null,
 };
 
 export type GetPendingCrossPersonaConfirmationsRequest = {
