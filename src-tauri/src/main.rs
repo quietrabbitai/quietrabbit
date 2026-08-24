@@ -555,6 +555,26 @@ async fn async_main() {
             log::info!("main: RunEvent::Exit — closing panes and shutting down CEF");
             quietrabbit_lib::tier3_pane::pane_host::close_all_panes();
             cef::shutdown();
+            // items.id=315 (3rd attempt): tao's own event loop calls
+            // std::process::exit() unconditionally right after this closure
+            // returns (tao-0.35.3 platform_impl/linux/event_loop.rs:998), and
+            // every coredump on record segfaults inside libc's atexit
+            // dispatch reached from that call -- in unmapped memory, but not
+            // consistently near the same library across captures, which is
+            // why "sequence CEF's shutdown correctly" (e4ebc79) didn't hold:
+            // the fault isn't specific to CEF's handler, any atexit-
+            // registered C handler in this process can hit it. _exit() skips
+            // the whole atexit chain instead of the one handler we can see.
+            // Confirmed via full-codebase audit that nothing here depends on
+            // that chain running (no atexit/ctor/dtor registrations of our
+            // own, the one production Drop impl lives in a OnceLock that's
+            // never dropped anyway, no DB flush/close logic exists to skip,
+            // key-zeroize-on-drop already doesn't run under tao's current
+            // process::exit() either). Must be the last thing this handler
+            // does.
+            unsafe {
+                libc::_exit(0);
+            }
         }
         if let tauri::RunEvent::Ready = event {
             let main_window = app_handle
