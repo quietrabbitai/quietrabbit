@@ -3860,6 +3860,7 @@ dependencies = [
  "getrandom 0.4.2",
  "glib",
  "glow 0.16.0",
+ "glow 0.17.0",
  "gtk",
  "hkdf",
  "indexmap 2.14.0",

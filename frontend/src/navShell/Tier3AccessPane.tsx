@@ -151,8 +151,19 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
     scheduleSync()
     const observer = new ResizeObserver(scheduleSync)
     observer.observe(dock)
+    // items.id=257 (2026-08-28): ResizeObserver only fires when the dock's
+    // own border-box SIZE changes -- confirmed live that maximizing the
+    // window shifts the dock's on-screen X position (its own column grows)
+    // while its width/height stay byte-identical, so ResizeObserver never
+    // fires and this pane's rect goes stale (Rust keeps compositing against
+    // an old fraction that no longer matches the dock's real position).
+    // window's own 'resize' event fires on any window-size change
+    // regardless of whether this specific element's size happened to
+    // change, so it catches exactly the case ResizeObserver misses.
+    window.addEventListener('resize', scheduleSync)
     return () => {
       observer.disconnect()
+      window.removeEventListener('resize', scheduleSync)
       if (frame !== null) cancelAnimationFrame(frame)
     }
   }, [syncPaneLayout])

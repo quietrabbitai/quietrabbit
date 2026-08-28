@@ -283,10 +283,29 @@ impl RenderState {
     /// second pass after every pane's own texture, so a popup always paints
     /// on top of its parent (no depth buffer exists here; draw order is
     /// submission order).
+    /// `target_fbo`: the GL framebuffer GTK's `GLArea` is actually bound to
+    /// at the moment `render` signal fired (captured via
+    /// `GL_DRAW_FRAMEBUFFER_BINDING`, pane_host.rs's `connect_render`
+    /// handler). items.id=257 root cause (2026-08-28): `wgpu_hal::gles::
+    /// Texture::default_framebuffer()` unconditionally targets GL
+    /// framebuffer 0 (confirmed by reading wgpu-hal's own source --
+    /// `ResetFramebuffer { is_default: true }` always does
+    /// `bind_framebuffer(DRAW_FRAMEBUFFER, None)`, i.e. FBO 0) -- but this
+    /// app's `GtkGLArea` (GTK3, this Wayland/GLES setup) renders into its
+    /// OWN internal FBO (confirmed live: framebuffer 3, never 0). Every
+    /// pane composite was silently drawn into FBO 0, which nothing ever
+    /// presented -- Tier 3 panes have never been visible as a result. Fixed
+    /// by wrapping `target_fbo` directly via wgpu-hal's
+    /// `TextureInner::ExternalNativeFramebuffer` (built for exactly this:
+    /// "Useful when the framebuffer to draw to has a non-zero framebuffer
+    /// ID") instead of assuming 0. Falls back to `default_framebuffer()`
+    /// only if `target_fbo` is `None`/0 (e.g. a GTK/backend combination
+    /// that genuinely does use FBO 0), so this isn't a Wayland-only fix.
     pub fn render(
         &mut self,
         layout: &HashMap<PaneKey, PaneRectFraction>,
         popup_layout: &HashMap<PaneKey, PaneRectFraction>,
+        target_fbo: Option<u32>,
     ) {
         let _diag_312_guard = Diag312GlGuard::enter("RenderState::render");
         // DIAG items.id=312 (temporary): this is the exact call site that
@@ -329,7 +348,16 @@ impl RenderState {
             }
         }
 
-        let hal_texture = wgpu_hal::gles::Texture::default_framebuffer(self.surface_format);
+        let hal_texture = match target_fbo.and_then(std::num::NonZeroU32::new) {
+            Some(fbo) => {
+                let mut tex = wgpu_hal::gles::Texture::default_framebuffer(self.surface_format);
+                tex.inner = wgpu_hal::gles::TextureInner::ExternalNativeFramebuffer {
+                    inner: glow_for_wgpu_hal::NativeFramebuffer(fbo),
+                };
+                tex
+            }
+            None => wgpu_hal::gles::Texture::default_framebuffer(self.surface_format),
+        };
         let target = unsafe {
             self.device.create_texture_from_hal::<wgpu_hal::api::Gles>(
                 hal_texture,
@@ -1369,7 +1397,13 @@ wrap_life_span_handler! {
             ));
             if let Some(window_info) = window_info {
                 window_info.windowless_rendering_enabled = true as _;
-                window_info.shared_texture_enabled = accelerated_osr as _;
+                // items.id=257: matches pane_host.rs's `open_pane` -- the
+                // `cef` crate's DMA-BUF shared-texture import only works for
+                // a Vulkan-backed wgpu Device, never this app's GLES-backed
+                // one, so shared-texture mode always silently produces a
+                // blank placeholder. Forced off so popups use the working
+                // software (`on_paint`) path instead.
+                window_info.shared_texture_enabled = false as _;
                 window_info.external_begin_frame_enabled = accelerated_osr as _;
             }
 
@@ -1636,19 +1670,19 @@ impl Geometry {
         let vertices = [
             Vertex {
                 position: [x, y, z],
-                tex_coords: [0.0, 0.0],
-            },
-            Vertex {
-                position: [x + width, y, z],
-                tex_coords: [1.0, 0.0],
-            },
-            Vertex {
-                position: [x, y - height, z],
                 tex_coords: [0.0, 1.0],
             },
             Vertex {
-                position: [x + width, y - height, z],
+                position: [x + width, y, z],
                 tex_coords: [1.0, 1.0],
+            },
+            Vertex {
+                position: [x, y - height, z],
+                tex_coords: [0.0, 0.0],
+            },
+            Vertex {
+                position: [x + width, y - height, z],
+                tex_coords: [1.0, 0.0],
             },
         ];
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {

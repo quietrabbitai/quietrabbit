@@ -454,7 +454,26 @@ impl PaneManager {
         ));
         let window_info = cef::WindowInfo {
             windowless_rendering_enabled: true as _,
-            shared_texture_enabled: accelerated_osr as _,
+            // items.id=257 root cause (2026-08-28): the `cef` crate's Linux
+            // DMA-BUF importer (osr_texture_import/dmabuf.rs,
+            // `DmaBufImporter::supports_hardware_acceleration`) only ever
+            // succeeds when the wgpu `Device` is Vulkan-backed
+            // (`vulkan::is_vulkan_backend`) -- this app's `Device` is always
+            // GLES-backed (`wgpu_hal::gles::Adapter::new_external`, required
+            // to interop with GTK's own native GL context), so that check
+            // always fails and it silently falls back to
+            // `texture::create_fallback`, a freshly-allocated,
+            // NEVER-WRITTEN-TO (all-zero/black) placeholder texture -- no
+            // error, no warning, just a permanently blank pane. Confirmed
+            // live: forcing the fragment shader's output alpha to 1.0
+            // revealed solid black, not real page content. `shared_texture_
+            // enabled = false` routes CEF into its software OSR path
+            // instead (`on_paint`, real CPU pixel buffer), which this
+            // codebase already fully implements (`PendingPaint::Software` ->
+            // `resolve_bind_group`'s `queue.write_texture` call) -- it was
+            // simply unreachable while shared-texture mode was on, since CEF
+            // never calls `on_paint` once `shared_texture_enabled` is true.
+            shared_texture_enabled: false as _,
             external_begin_frame_enabled: accelerated_osr as _,
             ..Default::default()
         };
@@ -1972,7 +1991,7 @@ impl PaneHost {
                         .iter()
                         .map(|(k, p)| (k.clone(), p.rect))
                         .collect();
-                    rs.render(&layout, &popup_layout);
+                    rs.render(&layout, &popup_layout, captured_fbo.map(|fbo| fbo as u32));
                 }
 
                 if let (Some(gl), Some(fbo)) = (gl_context.borrow().as_ref(), captured_fbo) {
@@ -1980,6 +1999,17 @@ impl PaneHost {
                         std::num::NonZeroU32::new(fbo as u32).map(glow::NativeFramebuffer);
                     unsafe {
                         gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, framebuffer);
+                        // items.id=257: wgpu's render pass leaves
+                        // SCISSOR_TEST enabled and the viewport clamped to
+                        // whichever pane was drawn last -- reset both so
+                        // nothing else sharing this GL context (GTK's own
+                        // subsequent presentation, any other widget drawing
+                        // through it) inherits a stale scissor/viewport rect.
+                        gl.disable(glow::SCISSOR_TEST);
+                        if let Some(rs) = render_state.borrow().as_ref() {
+                            let (w, h) = rs.size();
+                            gl.viewport(0, 0, w as i32, h as i32);
+                        }
                     }
                 }
                 glib::Propagation::Stop
@@ -2306,9 +2336,23 @@ impl PaneHost {
     /// click/mouse routing is IPC-driven now (Path B, see `dispatch`'s
     /// `PaneCommand::MouseClick`/`MouseMove`/`MouseWheel` arms), with
     /// nothing left here for a layout change to resync.
+    ///
+    /// items.id=257 Failure 2 root cause (2026-08-28): `glarea` is
+    /// configured with `set_auto_render(false)` (see its construction
+    /// above), which per GtkGLArea's own documented contract means the
+    /// `render` signal fires ONLY on an explicit `gtk_gl_area_queue_render()`
+    /// call or an actual window resize -- a plain `queue_draw()` just
+    /// re-composites whatever was last rendered. This called `queue_draw()`
+    /// (`GtkWidget`'s generic, unconditional invalidate) instead, so once
+    /// window-resize events stopped, `render` stopped firing permanently,
+    /// confirmed live: 0 `connect_render` firings across 2000+ `queue_draw()`
+    /// calls and 780+ timer ticks with a pane open, resuming instantly only
+    /// for the duration of an interactive resize. `queue_render()` is
+    /// `GtkGLArea`'s own API for exactly this -- it marks the previous
+    /// render invalid AND queues the draw, guaranteeing `render` fires.
     pub fn queue_draw(&self) {
         log::debug!("DIAG items.id=227: PaneHost::queue_draw() called");
-        self.glarea.queue_draw();
+        self.glarea.queue_render();
     }
 }
 

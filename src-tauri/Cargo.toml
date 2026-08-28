@@ -196,6 +196,16 @@ webkit2gtk = { version = "2.0.2", features = ["v2_40"] }
 # confirmed this session).
 libloading = "0.8"
 glow = "0.16"
+# items.id=257 root-cause fix: wgpu-hal 30's own `glow` dependency actually
+# resolves to 0.17.0, NOT the same instance as this crate's own `glow = "0.16"`
+# above (confirmed via `cargo tree -i glow@0.17.0` -- the comment on that line
+# claiming they're "the same already-resolved transitive version" was wrong).
+# Rust treats same-named types from different crate versions as distinct, so
+# constructing a `wgpu_hal::gles::TextureInner::ExternalNativeFramebuffer`'s
+# `glow::NativeFramebuffer` payload (see render.rs's `RenderState::render`)
+# needs this crate's own 0.17 to match wgpu-hal's, not the 0.16 used for this
+# app's own GL_DRAW_FRAMEBUFFER_BINDING capture/rebind calls elsewhere.
+glow-for-wgpu-hal = { package = "glow", version = "0.17" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
