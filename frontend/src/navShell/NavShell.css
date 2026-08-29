@@ -76,12 +76,15 @@
 }
 
 .tier3-access-pane__dock-column {
+  display: flex;
+  flex-direction: column;
   flex: 1 1 45%;
   min-width: 0;
   overflow: auto;
 }
 
 .tier3-access-pane__dock {
+  flex: 1;
   min-height: 200px;
   border-radius: 8px;
   overflow: hidden;

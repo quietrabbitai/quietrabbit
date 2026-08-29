@@ -477,7 +477,14 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
         {reviewOutcome === 'withheld' && (
           <p>{t('navShell.tier3AccessPane.gate3Withheld')}</p>
         )}
-        {providers.length > 0 && reviewOutcome === 'approved' && (
+        {providers.length > 0 && reviewOutcome === 'approved' && openPaneIds.length === 0 && (
+          // items.id=329: gated on openPaneIds too, not just reviewOutcome --
+          // reviewOutcome stays 'approved' for the rest of this component's
+          // life once set, so without this the selector's checkboxes stayed
+          // mounted (and clickable) underneath the dock the whole time a
+          // pane was open, a stray target for any hit-testing gap to fall
+          // through onto. Reappears if the user closes back down to zero
+          // open panes, which is also the correct behavior for opening more.
           <Tier3Selector providers={providers} onConfirm={handleConfirm} />
         )}
         <PrivacyGuardianModal

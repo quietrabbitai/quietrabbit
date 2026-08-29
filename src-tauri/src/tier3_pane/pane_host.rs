@@ -1904,8 +1904,51 @@ impl PaneHost {
                     area.allocated_width().max(1) as u32,
                     area.allocated_height().max(1) as u32,
                 );
+                // `allocated_width`/`allocated_height` are GTK *logical*
+                // pixels; `sync_pane_sizes`/`sync_popup_sizes` (and CEF's
+                // `was_resized()`/browser_size contract generally) expect
+                // *physical* GL framebuffer pixels, same as `connect_resize`
+                // passes them (see the DIAG items.id=312 comment below,
+                // which already draws this same distinction for `rs.size()`
+                // comparison) -- scale up before using for anything CEF-
+                // facing, not just the diagnostic.
+                let scale_u32 = area.scale_factor().max(1) as u32;
+                let glarea_size_physical = (glarea_size.0 * scale_u32, glarea_size.1 * scale_u32);
 
                 manager.borrow_mut().drain_ready_browsers();
+
+                // FIX (items.id=329, click-sync-on-open): `connect_resize`
+                // was the only call site for `sync_pane_sizes`/
+                // `sync_popup_sizes`, so a pane opened between two window
+                // resizes painted at the right spot (Y-flip fix, items.id=257
+                // round 1) but CEF's own notion of that pane's rect stayed
+                // whatever it was initialized to until an incidental resize
+                // finally synced it -- clicks landed up-and-to-the-right of
+                // the visible target until then. `connect_render` already
+                // recomputes `layout`/`glarea_size` every tick and fires on
+                // `queue_render()` (see `PaneHost::queue_draw`'s doc), which
+                // `set_pane_layout` (commands/tier3_pane.rs) already calls
+                // right after a pane's first layout fractions land -- so
+                // syncing here closes the gap on the very next render tick
+                // after open, no new call site needed. Cheap on every other
+                // frame: both syncs no-op via `last_applied_size` once a
+                // pane/popup's CEF-side size already matches.
+                //
+                // Round-2 fix-of-a-fix (items.id=329, same session): this
+                // block's first version passed the *logical* `glarea_size`
+                // here instead of `glarea_size_physical` -- confirmed live,
+                // that made every pane render zoomed in (browser_size came
+                // out smaller than the real canvas by the scale factor, so
+                // CEF laid out a smaller viewport stretched over the actual
+                // larger one) and froze scrolling near the page's true
+                // bottom (CEF's own scroll-clamp math was working off that
+                // wrong, too-small viewport height).
+                {
+                    let scale = scale_u32 as f32;
+                    let mut mgr = manager.borrow_mut();
+                    mgr.sync_pane_sizes(glarea_size_physical, scale, &layout);
+                    mgr.sync_popup_sizes(glarea_size_physical, scale);
+                }
 
                 // items.id=234: resolve any new popup requests, react to
                 // popup lifecycle events (self-close/first-paint-ready),
@@ -1965,24 +2008,24 @@ impl PaneHost {
                     // `rs.size()` is whatever the last `connect_resize`
                     // call stored, which GTK documents as *physical* GL
                     // framebuffer pixels -- i.e. already multiplied by the
-                    // device scale factor. Scale `glarea_size` up before
-                    // comparing so this only fires on a genuine staleness
-                    // mismatch (RenderState about to wrap a texture at a
-                    // size GTK's own allocation has already moved past),
-                    // not on the expected HiDPI unit difference.
-                    let scale = area.scale_factor().max(1) as u32;
-                    let glarea_size_physical = (glarea_size.0 * scale, glarea_size.1 * scale);
+                    // device scale factor. Compare against
+                    // `glarea_size_physical` (computed above, now shared
+                    // with the items.id=329 pane/popup size sync) so this
+                    // only fires on a genuine staleness mismatch (RenderState
+                    // about to wrap a texture at a size GTK's own allocation
+                    // has already moved past), not on the expected HiDPI
+                    // unit difference.
                     let rs_size = rs.size();
                     if rs_size != glarea_size_physical {
                         log::warn!(
                             "DIAG items.id=312: seq={seq} t={elapsed_ms}ms SIZE MISMATCH \
                              glarea_size_physical={glarea_size_physical:?} (logical={glarea_size:?} \
-                             scale={scale}) render_state.size={rs_size:?}"
+                             scale={scale_u32}) render_state.size={rs_size:?}"
                         );
                     } else {
                         log::debug!(
                             "DIAG items.id=312: seq={seq} t={elapsed_ms}ms pre-render \
-                             size={rs_size:?} (matches glarea_size_physical, scale={scale})"
+                             size={rs_size:?} (matches glarea_size_physical, scale={scale_u32})"
                         );
                     }
                     let popup_layout: HashMap<PaneKey, PaneRectFraction> = manager
@@ -2176,10 +2219,19 @@ impl PaneHost {
                             0,
                         ),
                     };
+                    // FIX (items.id=329): CEF's wheel-delta convention is
+                    // inverted relative to the DOM `WheelEvent.deltaY/deltaX`
+                    // this value traces back to (PaneHitLayer.tsx's
+                    // `wheelDeltaPixels` -> `forward_pane_mouse_wheel`) --
+                    // confirmed live on Claude.ai, scroll direction was
+                    // backwards. The superseded Path A code (dead,
+                    // `build_pane_hit_widget`) flagged this exact sign as an
+                    // unverified assumption; nobody had scroll-tested it
+                    // until now.
                     host.send_mouse_wheel_event(
                         Some(&ev),
-                        delta_x.round() as i32,
-                        delta_y.round() as i32,
+                        -delta_x.round() as i32,
+                        -delta_y.round() as i32,
                     );
                 }
             }
@@ -2284,10 +2336,12 @@ impl PaneHost {
                             0,
                         ),
                     };
+                    // FIX (items.id=329): see the `PaneCommand::MouseWheel`
+                    // arm above -- same inverted-sign bug, same fix.
                     host.send_mouse_wheel_event(
                         Some(&ev),
-                        delta_x.round() as i32,
-                        delta_y.round() as i32,
+                        -delta_x.round() as i32,
+                        -delta_y.round() as i32,
                     );
                 }
             }

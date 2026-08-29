@@ -433,9 +433,19 @@ impl RenderState {
                 if width <= 0.0 || height <= 0.0 {
                     continue;
                 }
+                // items.id=329: `y` above is top-down (CSS/DOM convention --
+                // matches the fraction PaneHitLayer's hit-div also uses, see
+                // paneLayout.ts). glViewport/glScissor measure y from the
+                // BOTTOM of the target regardless of framebuffer type
+                // (confirmed against wgpu-hal/wgpu-core 30.0.0 source:
+                // neither applies any Y-flip for either the
+                // default_framebuffer() or ExternalNativeFramebuffer path),
+                // so flip here, once, right before the GL calls -- this is
+                // what was making the pane render far from its hit-div.
+                let gl_y = h as f32 - y - height;
 
-                pass.set_viewport(x, y, width, height, 0.0, 1.0);
-                pass.set_scissor_rect(x as u32, y as u32, width as u32, height as u32);
+                pass.set_viewport(x, gl_y, width, height, 0.0, 1.0);
+                pass.set_scissor_rect(x as u32, gl_y as u32, width as u32, height as u32);
                 pass.set_bind_group(0, bind_group, &[]);
                 pass.draw(0..self.quad.vertex_count, 0..1);
             }
@@ -456,9 +466,12 @@ impl RenderState {
                 if width <= 0.0 || height <= 0.0 {
                     continue;
                 }
+                // items.id=329: same Y-flip as the pane loop above -- see
+                // its comment for why.
+                let gl_y = h as f32 - y - height;
 
-                pass.set_viewport(x, y, width, height, 0.0, 1.0);
-                pass.set_scissor_rect(x as u32, y as u32, width as u32, height as u32);
+                pass.set_viewport(x, gl_y, width, height, 0.0, 1.0);
+                pass.set_scissor_rect(x as u32, gl_y as u32, width as u32, height as u32);
                 pass.set_bind_group(0, bind_group, &[]);
                 pass.draw(0..self.quad.vertex_count, 0..1);
             }
