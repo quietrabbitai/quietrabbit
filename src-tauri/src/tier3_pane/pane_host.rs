@@ -91,11 +91,13 @@ use gtk::prelude::*;
 use indexmap::IndexMap;
 use tauri::Manager;
 
-use cef::{ImplBrowser, ImplBrowserHost, ImplFrame, MouseButtonType, MouseEvent};
+use cef::{
+    ImplBrowser, ImplBrowserHost, ImplFrame, KeyEvent, KeyEventType, MouseButtonType, MouseEvent,
+};
 
 use crate::commands::tier3_pane::{
-    PaneEventModifiers, PaneLayoutState, PaneMouseButton, PaneRectFraction, PopupClosedPayload,
-    PopupOpenedPayload,
+    PaneEventModifiers, PaneKeyEventType, PaneLayoutState, PaneMouseButton, PaneRectFraction,
+    PopupClosedPayload, PopupOpenedPayload,
 };
 use crate::tier3_pane::render::{
     ClientBuilder, LogicalSize, PaneRenderHandler, PopupLifecycleEvent, PopupRequested,
@@ -244,6 +246,17 @@ pub enum PaneCommand {
         y: f64,
         delta_x: f64,
         delta_y: f64,
+        modifiers: PaneEventModifiers,
+    },
+    /// items.id=332: `windows_key_code`/`character` are already resolved
+    /// from the DOM `KeyboardEvent` on the frontend side (see
+    /// `forward_pane_key`'s own doc, commands/tier3_pane.rs) -- this arm's
+    /// job is only to build CEF's `KeyEvent` and call `send_key_event`.
+    KeyEvent {
+        key: PaneKey,
+        event_type: PaneKeyEventType,
+        windows_key_code: i32,
+        character: u16,
         modifiers: PaneEventModifiers,
     },
     /// items.id=234: same shape as `MouseClick`/`MouseMove`/`MouseWheel`
@@ -558,6 +571,11 @@ impl PaneManager {
         // pane close (items.id=223's whole trigger), not a navigation-away
         // the page itself might want to intercept.
         if let Some(host) = pane.browser_lifecycle.browser().and_then(|b| b.host()) {
+            // items.id=313: release CEF's own focus state before the
+            // browser goes away, if this pane was the one holding it.
+            if self.focused_pane.as_ref() == Some(key) {
+                host.set_focus(false as _);
+            }
             host.close_browser(true as _);
         }
         crate::tier3_pane::render::remove_pane_texture(key);
@@ -594,7 +612,6 @@ impl PaneManager {
     fn sync_pane_sizes(
         &mut self,
         glarea_size: (u32, u32),
-        scale_factor: f32,
         layout: &HashMap<PaneKey, PaneRectFraction>,
     ) {
         for (key, pane) in self.panes.iter_mut() {
@@ -608,9 +625,22 @@ impl PaneManager {
             if pane.last_applied_size == Some(size_px) {
                 continue;
             }
+            // items.id=328: `LogicalSize` here feeds CEF's `GetViewRect`
+            // directly (render.rs's `view_rect`) -- confirmed live, via
+            // temporary DIAG logging, that CEF's actual OSR paint buffer
+            // comes back at exactly this reported size, NOT this size x
+            // `device_scale_factor`. Dividing by `scale_factor` before
+            // reporting (the previous behavior) told CEF to render at half
+            // (or 1/scale) the real physical pixel count, which this app's
+            // own draw step then stretched back up to the full destination
+            // rect -- the actual root cause of this item's blur, not a minor
+            // rounding gap. Report the real physical size directly; the
+            // separate `device_scale_factor` reported via `GetScreenInfo`
+            // is what tells the page's own layout/DPI math (not this
+            // buffer's pixel count) to treat it as a scaled display.
             *pane.browser_size.lock().unwrap() = LogicalSize {
-                width: width as f32 / scale_factor,
-                height: height as f32 / scale_factor,
+                width: width as f32,
+                height: height as f32,
             };
             if let Some(host) = pane.browser_lifecycle.browser().and_then(|b| b.host()) {
                 host.was_resized();
@@ -626,7 +656,7 @@ impl PaneManager {
     /// genuinely separate `Browser` (unlike `on_popup_size`, which targets
     /// the different same-browser dropdown-popup mechanism -- see
     /// render.rs's "items.id=234" section doc).
-    fn sync_popup_sizes(&mut self, glarea_size: (u32, u32), scale_factor: f32) {
+    fn sync_popup_sizes(&mut self, glarea_size: (u32, u32)) {
         for popup in self.popups.values_mut() {
             let Some((_, _, width, height)) = pane_pixel_rect(glarea_size, &popup.rect) else {
                 continue;
@@ -635,9 +665,11 @@ impl PaneManager {
             if popup.last_applied_size == Some(size_px) {
                 continue;
             }
+            // items.id=328: same fix as `sync_pane_sizes` above -- see its
+            // comment.
             *popup.size.lock().unwrap() = LogicalSize {
-                width: width as f32 / scale_factor,
-                height: height as f32 / scale_factor,
+                width: width as f32,
+                height: height as f32,
             };
             if let Some(host) = popup.lifecycle.browser().and_then(|b| b.host()) {
                 host.was_resized();
@@ -1854,7 +1886,6 @@ impl PaneHost {
                 if let Some(rs) = render_state.borrow_mut().as_mut() {
                     rs.resize((width, height));
                 }
-                let scale = area.scale_factor().max(1) as f32;
                 let layout = app_handle
                     .state::<PaneLayoutState>()
                     .0
@@ -1862,10 +1893,10 @@ impl PaneHost {
                     .unwrap()
                     .clone();
                 let mut mgr = manager.borrow_mut();
-                mgr.sync_pane_sizes((width, height), scale, &layout);
+                mgr.sync_pane_sizes((width, height), &layout);
                 // items.id=234: popup rects rescale proportionally on
                 // ordinary window resize too, same mechanism as panes.
-                mgr.sync_popup_sizes((width, height), scale);
+                mgr.sync_popup_sizes((width, height));
             });
         }
 
@@ -1950,10 +1981,9 @@ impl PaneHost {
                 // bottom (CEF's own scroll-clamp math was working off that
                 // wrong, too-small viewport height).
                 {
-                    let scale = scale_u32 as f32;
                     let mut mgr = manager.borrow_mut();
-                    mgr.sync_pane_sizes(glarea_size_physical, scale, &layout);
-                    mgr.sync_popup_sizes(glarea_size_physical, scale);
+                    mgr.sync_pane_sizes(glarea_size_physical, &layout);
+                    mgr.sync_popup_sizes(glarea_size_physical);
                 }
 
                 // items.id=234: resolve any new popup requests, react to
@@ -2146,6 +2176,14 @@ impl PaneHost {
                     .and_then(|p| p.browser_lifecycle.browser())
                     .and_then(|b| b.host())
                 {
+                    // items.id=313: signal CEF's own focus state on
+                    // mousedown, folded in alongside items.id=332's keyboard
+                    // forwarding per 313's own deferral note. Only on press,
+                    // not release -- matches the `focused_pane` assignment
+                    // above, which is also press-only.
+                    if !mouseup {
+                        host.set_focus(true as _);
+                    }
                     let cef_button = match button {
                         PaneMouseButton::Left => MouseButtonType::LEFT,
                         PaneMouseButton::Middle => MouseButtonType::MIDDLE,
@@ -2168,6 +2206,51 @@ impl PaneHost {
                         mouseup as _,
                         click_count as _,
                     );
+                }
+            }
+            PaneCommand::KeyEvent {
+                key,
+                event_type,
+                windows_key_code,
+                character,
+                modifiers,
+            } => {
+                let mut mgr = self.manager.borrow_mut();
+                mgr.focused_pane = Some(key.clone());
+                if let Some(host) = mgr
+                    .panes
+                    .get(&key)
+                    .and_then(|p| p.browser_lifecycle.browser())
+                    .and_then(|b| b.host())
+                {
+                    let cef_type = match event_type {
+                        PaneKeyEventType::RawKeyDown => KeyEventType::RAWKEYDOWN,
+                        PaneKeyEventType::Char => KeyEventType::CHAR,
+                        PaneKeyEventType::KeyUp => KeyEventType::KEYUP,
+                    };
+                    let ev = KeyEvent {
+                        size: std::mem::size_of::<KeyEvent>(),
+                        type_: cef_type,
+                        modifiers: cef_modifiers_from_dom(
+                            modifiers.shift,
+                            modifiers.ctrl,
+                            modifiers.alt,
+                            modifiers.meta,
+                            0,
+                        ),
+                        windows_key_code,
+                        // items.id=332: no real native/hardware keycode is
+                        // available here (input arrives over IPC from a DOM
+                        // event, not a native GTK/X11 event) -- mirroring
+                        // windows_key_code is a documented best-effort
+                        // stand-in, not a claim this is a real scancode.
+                        native_key_code: windows_key_code,
+                        is_system_key: 0,
+                        character,
+                        unmodified_character: character,
+                        focus_on_editable_field: 0,
+                    };
+                    host.send_key_event(Some(&ev));
                 }
             }
             PaneCommand::MouseMove {
@@ -2263,6 +2346,11 @@ impl PaneHost {
                     .and_then(|p| p.lifecycle.browser())
                     .and_then(|b| b.host())
                 {
+                    // items.id=313: same focus signal as the pane MouseClick
+                    // arm above.
+                    if !mouseup {
+                        host.set_focus(true as _);
+                    }
                     let cef_button = match button {
                         PaneMouseButton::Left => MouseButtonType::LEFT,
                         PaneMouseButton::Middle => MouseButtonType::MIDDLE,
@@ -2364,8 +2452,19 @@ impl PaneHost {
     /// any pane can be opened), but not assumed.
     fn render_state_for_open(&self) -> Option<(wgpu::Device, wgpu::Queue, f32, LogicalSize)> {
         let scale = self.glarea.scale_factor().max(1) as f32;
-        let width = self.glarea.allocated_width().max(1) as f32 / scale;
-        let height = self.glarea.allocated_height().max(1) as f32 / scale;
+        // items.id=328: the `LogicalSize` returned here becomes this pane's
+        // *initial* `PaneRenderHandler.size`, which feeds CEF's
+        // `GetViewRect` directly -- confirmed live that CEF wants the real
+        // physical pixel size there (see `sync_pane_sizes`'s own comment for
+        // the full finding), not DIP. `allocated_width`/`allocated_height`
+        // are GTK *logical* pixels (`connect_render`'s own comment), so
+        // scale up to physical here, same as `glarea_size_physical`
+        // elsewhere in this file. Self-corrects within this pane's first
+        // `sync_pane_sizes` tick regardless (its `last_applied_size` starts
+        // `None`), but there's no reason to seed CEF's very first
+        // `GetViewRect` with a wrong value on purpose.
+        let width = self.glarea.allocated_width().max(1) as f32 * scale;
+        let height = self.glarea.allocated_height().max(1) as f32 * scale;
         self.render_state.borrow().as_ref().map(|rs| {
             (
                 rs.device(),

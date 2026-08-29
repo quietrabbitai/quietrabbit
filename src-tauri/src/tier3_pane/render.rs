@@ -353,14 +353,14 @@ impl RenderState {
         // the lock held only as long as it takes to drain the map.
         let pending_panes: Vec<_> = PANE_PENDING_PAINT.lock().unwrap().drain().collect();
         for (key, paint) in pending_panes {
-            if let Some(bind_group) = resolve_bind_group(&self.device, &self.queue, paint) {
-                PANE_TEXTURES.lock().unwrap().insert(key, bind_group);
+            if let Some(resolved) = resolve_bind_group(&self.device, &self.queue, paint) {
+                PANE_TEXTURES.lock().unwrap().insert(key, resolved);
             }
         }
         let pending_popups: Vec<_> = POPUP_PENDING_PAINT.lock().unwrap().drain().collect();
         for (key, paint) in pending_popups {
-            if let Some(bind_group) = resolve_bind_group(&self.device, &self.queue, paint) {
-                POPUP_TEXTURES.lock().unwrap().insert(key, bind_group);
+            if let Some(resolved) = resolve_bind_group(&self.device, &self.queue, paint) {
+                POPUP_TEXTURES.lock().unwrap().insert(key, resolved);
             }
         }
 
@@ -437,15 +437,25 @@ impl RenderState {
             pass.set_pipeline(&self.pipeline);
             pass.set_vertex_buffer(0, self.quad.vertex_buffer.slice(..));
 
-            for (key, bind_group) in pane_textures.iter() {
+            for (key, (bind_group, (tex_w, tex_h))) in pane_textures.iter() {
                 let Some(frac) = layout.get(key) else {
                     continue;
                 };
                 let (w, h) = (self.size.0 as f64, self.size.1 as f64);
                 let x = (frac.x * w).round().clamp(0.0, w) as f32;
                 let y = (frac.y * h).round().clamp(0.0, h) as f32;
-                let width = (frac.width * w).round().clamp(0.0, w - x as f64) as f32;
-                let height = (frac.height * h).round().clamp(0.0, h - y as f64) as f32;
+                let frac_width = (frac.width * w).round().clamp(0.0, w - x as f64) as f32;
+                let frac_height = (frac.height * h).round().clamp(0.0, h - y as f64) as f32;
+                // items.id=328: size the draw to whichever is smaller, this
+                // pane's actual texture or its allotted rect -- never more
+                // than the texture's own native size (no upscale-and-blur if
+                // CEF's real buffer came out smaller than expected) and never
+                // more than the allotted rect (no bleeding into a
+                // neighboring pane's row if it came out larger). See
+                // `resolve_bind_group`'s own doc for why this can't just be
+                // trusted to already match.
+                let width = frac_width.min(*tex_w as f32);
+                let height = frac_height.min(*tex_h as f32);
                 if width <= 0.0 || height <= 0.0 {
                     continue;
                 }
@@ -470,15 +480,19 @@ impl RenderState {
             // always composite on top of their parent -- same viewport/
             // scissor math, reading POPUP_TEXTURES/popup_layout instead.
             let popup_textures = POPUP_TEXTURES.lock().unwrap();
-            for (key, bind_group) in popup_textures.iter() {
+            for (key, (bind_group, (tex_w, tex_h))) in popup_textures.iter() {
                 let Some(frac) = popup_layout.get(key) else {
                     continue;
                 };
                 let (w, h) = (self.size.0 as f64, self.size.1 as f64);
                 let x = (frac.x * w).round().clamp(0.0, w) as f32;
                 let y = (frac.y * h).round().clamp(0.0, h) as f32;
-                let width = (frac.width * w).round().clamp(0.0, w - x as f64) as f32;
-                let height = (frac.height * h).round().clamp(0.0, h - y as f64) as f32;
+                let frac_width = (frac.width * w).round().clamp(0.0, w - x as f64) as f32;
+                let frac_height = (frac.height * h).round().clamp(0.0, h - y as f64) as f32;
+                // items.id=328: same texture-vs-allotted-rect clamp as the
+                // pane loop above -- see its own comment.
+                let width = frac_width.min(*tex_w as f32);
+                let height = frac_height.min(*tex_h as f32);
                 if width <= 0.0 || height <= 0.0 {
                     continue;
                 }
@@ -540,7 +554,10 @@ fn texture_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
 // thread_local! here would give each thread its own independent cell, so
 // the main thread would never observe CEF's writes -- found during the
 // items.id=203 thread-safety audit (2026-08-03).
-static PANE_TEXTURES: LazyLock<Mutex<HashMap<PaneKey, wgpu::BindGroup>>> =
+// items.id=328: value also carries the bind group's underlying texture's
+// exact pixel dimensions -- see `resolve_bind_group`'s own doc for why
+// `RenderState::render()` needs this alongside the bind group itself.
+static PANE_TEXTURES: LazyLock<Mutex<HashMap<PaneKey, (wgpu::BindGroup, (u32, u32))>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Drops a closed pane's texture entry. Must be called as part of that
@@ -560,7 +577,7 @@ pub fn remove_pane_texture(key: &PaneKey) {
 /// popups -- a separate map, keyed by the *parent* pane's `PaneKey` (one
 /// active popup per pane, see `pane_host::PaneManager.popups`'s own doc),
 /// not a repurposed key scheme on `PANE_TEXTURES`.
-static POPUP_TEXTURES: LazyLock<Mutex<HashMap<PaneKey, wgpu::BindGroup>>> =
+static POPUP_TEXTURES: LazyLock<Mutex<HashMap<PaneKey, (wgpu::BindGroup, (u32, u32))>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Mirrors `remove_pane_texture` -- must be called as part of a popup's own
@@ -674,16 +691,27 @@ fn capture_accelerated_paint(info: &cef::AcceleratedPaintInfo) -> Option<Pending
     })
 }
 
-/// Turns a captured `PendingPaint` into a `BindGroup` -- the only place any
-/// of this data touches `device`/`queue` (the GL context), always called
-/// from `RenderState::render()` on the main/GTK thread. Consumes `paint`
-/// by value so `PendingPaint::Accelerated`'s dup'd fds are always closed
-/// (via `Drop`) once this returns, whether the import succeeded or not.
+/// Turns a captured `PendingPaint` into a `BindGroup` plus the exact pixel
+/// dimensions of the texture it wraps -- the only place any of this data
+/// touches `device`/`queue` (the GL context), always called from
+/// `RenderState::render()` on the main/GTK thread. Consumes `paint` by value
+/// so `PendingPaint::Accelerated`'s dup'd fds are always closed (via `Drop`)
+/// once this returns, whether the import succeeded or not.
+///
+/// items.id=328: the returned size is CEF's own actual render-buffer
+/// dimensions, not anything recomputed from `PaneRectFraction`/GLArea size --
+/// `RenderState::render()`'s draw loops use it to size the destination
+/// viewport/scissor to match this texture exactly, rather than trusting that
+/// CEF's DIP-quantized buffer size round-trips back to the same physical
+/// pixel count our own layout math independently arrived at (it doesn't
+/// always -- see this item's own investigation notes on `view_rect`/
+/// `sync_pane_sizes`). Guarantees 1:1 sampling regardless of that rounding,
+/// rather than trying to make the two sides agree by construction.
 fn resolve_bind_group(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     paint: PendingPaint,
-) -> Option<wgpu::BindGroup> {
+) -> Option<(wgpu::BindGroup, (u32, u32))> {
     match paint {
         PendingPaint::Software {
             pixels,
@@ -723,13 +751,16 @@ fn resolve_bind_group(
                     depth_or_array_layers: 1,
                 },
             );
-            Some(build_bind_group(device, &texture))
+            Some((build_bind_group(device, &texture), (width, height)))
         }
         PendingPaint::Accelerated { info } => {
             use cef::osr_texture_import::shared_texture_handle::SharedTextureHandle;
             let shared_handle = SharedTextureHandle::new(&info.info);
             match shared_handle.import_texture(device) {
-                Ok(texture) => Some(build_bind_group(device, &texture)),
+                Ok(texture) => {
+                    let size = (texture.width(), texture.height());
+                    Some((build_bind_group(device, &texture), size))
+                }
                 Err(e) => {
                     log::warn!(
                         "tier3_pane::render: items.id=312: failed to import shared texture: {e:?}"
@@ -904,8 +935,17 @@ wrap_render_handler! {
             if let Some(rect) = rect {
                 let size = self.handler.size.lock().unwrap();
                 if size.width > 0.0 && size.height > 0.0 {
-                    rect.width = size.width as _;
-                    rect.height = size.height as _;
+                    // items.id=328: round, not truncate -- CEF reconstructs
+                    // its actual pixel buffer size from this DIP value x
+                    // device_scale_factor, so truncating here (Rust's `as`
+                    // cast for f32->int) silently biases every non-integer
+                    // DIP size down, undersizing the buffer relative to the
+                    // physical pixel rect it gets drawn into. See
+                    // `resolve_bind_group`'s own doc for the belt-and-
+                    // suspenders fix on the draw side, which doesn't depend
+                    // on this rounding being exact.
+                    rect.width = size.width.round() as _;
+                    rect.height = size.height.round() as _;
                 }
             }
         }
@@ -1099,8 +1139,17 @@ wrap_render_handler! {
             if let Some(rect) = rect {
                 let size = self.handler.size.lock().unwrap();
                 if size.width > 0.0 && size.height > 0.0 {
-                    rect.width = size.width as _;
-                    rect.height = size.height as _;
+                    // items.id=328: round, not truncate -- CEF reconstructs
+                    // its actual pixel buffer size from this DIP value x
+                    // device_scale_factor, so truncating here (Rust's `as`
+                    // cast for f32->int) silently biases every non-integer
+                    // DIP size down, undersizing the buffer relative to the
+                    // physical pixel rect it gets drawn into. See
+                    // `resolve_bind_group`'s own doc for the belt-and-
+                    // suspenders fix on the draw side, which doesn't depend
+                    // on this rounding being exact.
+                    rect.width = size.width.round() as _;
+                    rect.height = size.height.round() as _;
                 }
             }
         }
