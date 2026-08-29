@@ -422,6 +422,33 @@ export const commands = {
 	 */
 	forwardPaneMouseWheel: (providerId: string, x: number | null, y: number | null, deltaX: number | null, deltaY: number | null, modifiers: PaneEventModifiers) => typedError<null, string>(__TAURI_INVOKE("forward_pane_mouse_wheel", { providerId, x, y, deltaX, deltaY, modifiers })),
 	/**
+	 *  Forwards one keyboard event into an open pane's CEF browser, once it has
+	 *  DOM focus (`PaneHitLayer.tsx`'s per-pane hit-div already claims focus on
+	 *  pointerdown, same element `forward_pane_mouse_click` fires from -- no
+	 *  separate focus IPC call needed on the frontend side).
+	 * 
+	 *  `windows_key_code` comes from the DOM `KeyboardEvent.keyCode` -- despite
+	 *  being deprecated, it still follows the long-standing web-platform
+	 *  convention of matching Windows virtual-key codes across engines, which is
+	 *  exactly what CEF's `KeyEvent::windows_key_code` expects regardless of
+	 *  platform. There is no real native/hardware keycode available here (input
+	 *  arrives over IPC from a DOM event, not a native GTK/X11 event) --
+	 *  `pane_host.rs`'s dispatch arm mirrors `windows_key_code` into CEF's
+	 *  `native_key_code` as a documented best-effort stand-in rather than
+	 *  leaving it zeroed or building a DOM-`code`-to-X11-keycode lookup table,
+	 *  per items.id=332's scoping: enough to type into a login form, not
+	 *  accelerator-perfect native-scancode fidelity.
+	 * 
+	 *  `character` is 0 for non-printable keys (arrows, Enter, Backspace, ...)
+	 *  and the key's single UTF-16 code unit otherwise -- the frontend sends a
+	 *  `RawKeyDown` for every keydown, followed by a `Char` call only when
+	 *  `character != 0`, mirroring CEF's own RAWKEYDOWN-then-CHAR convention for
+	 *  text input.
+	 * 
+	 *  Same no-op-on-already-closed-pane contract as `forward_pane_mouse_click`.
+	 */
+	forwardPaneKey: (providerId: string, eventType: PaneKeyEventType, windowsKeyCode: number, character: number, modifiers: PaneEventModifiers) => typedError<null, string>(__TAURI_INVOKE("forward_pane_key", { providerId, eventType, windowsKeyCode, character, modifiers })),
+	/**
 	 *  items.id=234: popup counterpart to `forward_pane_mouse_click` -- same
 	 *  coordinate/no-op contract, except `x`/`y` are local to the popup's own
 	 *  on-screen rect (`tier3-popup-opened`'s reported `rect`), not the parent
@@ -715,6 +742,22 @@ export type PaneEventModifiers = {
 };
 
 /**
+ *  Mirrors `cef::MouseButtonType`'s 3-button model -- not reused directly
+ *  since that type isn't `specta::Type`. The frontend maps a DOM
+ *  `PointerEvent.button` (0/1/2) to this before sending; button values with
+ *  no CEF equivalent (DOM also reports 3/4 for back/forward) are simply not
+ *  forwarded, same policy `cef_mouse_button_from_gdk` already applied to
+ *  GDK's own out-of-range button numbers.
+ *  Mirrors `cef::KeyEventType`'s 3 variants used here -- not reused directly
+ *  for the same reason `PaneMouseButton` isn't (that type isn't
+ *  `specta::Type`). No `Char`-vs-`RawKeyDown` ambiguity on the wire: the
+ *  frontend sends both explicitly for a printable keypress (see
+ *  `forward_pane_key`'s own doc), this enum just names which one a given
+ *  call is.
+ */
+export type PaneKeyEventType = "RawKeyDown" | "Char" | "KeyUp";
+
+/**
  *  `Vec`, not `HashMap`, to match this codebase's existing IPC-struct
  *  convention -- no command signature anywhere else uses `HashMap`.
  */
@@ -723,14 +766,6 @@ export type PaneLayoutEntry = {
 	rect: PaneRectFraction,
 };
 
-/**
- *  Mirrors `cef::MouseButtonType`'s 3-button model -- not reused directly
- *  since that type isn't `specta::Type`. The frontend maps a DOM
- *  `PointerEvent.button` (0/1/2) to this before sending; button values with
- *  no CEF equivalent (DOM also reports 3/4 for back/forward) are simply not
- *  forwarded, same policy `cef_mouse_button_from_gdk` already applied to
- *  GDK's own out-of-range button numbers.
- */
 export type PaneMouseButton = "Left" | "Middle" | "Right";
 
 /**

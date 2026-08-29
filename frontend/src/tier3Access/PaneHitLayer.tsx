@@ -8,15 +8,23 @@
 // two independently-maintained ones. The browser's own native hit-testing
 // (a real DOM element, real pointer events, no synthesis) decides which
 // pane a given event belongs to; this component only forwards what already
-// landed on it over the forward_pane_mouse_click/_move/_wheel IPC commands.
+// landed on it over the forward_pane_mouse_click/_move/_wheel/_key IPC
+// commands.
 //
-// Keyboard forwarding into CEF is out of scope here, same as it was for the
-// GDK path this replaces (see PaneManager::focused_pane's own doc,
-// pane_host.rs) -- the tabIndex/.focus() below is only a forward-looking
-// attachment point for that future work, not an implementation of it.
+// Keyboard forwarding (items.id=332): the tabIndex/.focus() below, already
+// in place before keyboard support existed (see onPointerDown), is what
+// gives this div real DOM focus to receive onKeyDown/onKeyUp from -- no
+// separate focus wiring needed. See forward_pane_key's own doc
+// (commands/tier3_pane.rs) for the windows_key_code/native_key_code
+// scoping.
 
 import { useCallback, useEffect, useRef } from 'react'
-import { commands, type PaneEventModifiers, type PaneMouseButton } from '../bindings'
+import {
+  commands,
+  type PaneEventModifiers,
+  type PaneKeyEventType,
+  type PaneMouseButton,
+} from '../bindings'
 import type { PanePixelRect } from './paneLayout'
 
 export interface PaneHitLayerProps {
@@ -62,6 +70,17 @@ function domButton(button: number): PaneMouseButton | null {
 }
 
 const PROVIDER_ID_ATTR = 'data-provider-id'
+
+/** items.id=332: DOM `KeyboardEvent.keyCode` is deprecated but still
+ *  populated by every engine following the long-standing web-platform
+ *  convention of matching Windows virtual-key codes -- exactly what CEF's
+ *  `KeyEvent::windows_key_code` expects regardless of platform. See
+ *  `forward_pane_key`'s own doc (commands/tier3_pane.rs) for why there's no
+ *  real native/hardware code to send alongside it. */
+function forwardKey(providerId: string, e: KeyboardEvent, type: PaneKeyEventType) {
+  const character = e.key.length === 1 ? e.key.charCodeAt(0) : 0
+  void commands.forwardPaneKey(providerId, type, e.keyCode, character, domModifiers(e))
+}
 
 export function PaneHitLayer({ rects }: PaneHitLayerProps) {
   const wrapperRef = useRef<HTMLDivElement | null>(null)
@@ -257,6 +276,17 @@ export function PaneHitLayer({ rects }: PaneHitLayerProps) {
               e.nativeEvent.buttons,
               domModifiers(e.nativeEvent),
             )
+          }}
+          onKeyDown={(e) => {
+            e.preventDefault()
+            forwardKey(providerId, e.nativeEvent, 'RawKeyDown')
+            if (e.key.length === 1) {
+              forwardKey(providerId, e.nativeEvent, 'Char')
+            }
+          }}
+          onKeyUp={(e) => {
+            e.preventDefault()
+            forwardKey(providerId, e.nativeEvent, 'KeyUp')
           }}
         />
       ))}

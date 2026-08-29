@@ -128,6 +128,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::tier3_pane::forward_pane_mouse_click,
         commands::tier3_pane::forward_pane_mouse_move,
         commands::tier3_pane::forward_pane_mouse_wheel,
+        commands::tier3_pane::forward_pane_key,
         // items.id=234 -- host-owned popup subsystem, OAuth popup click routing
         commands::tier3_pane::forward_popup_mouse_click,
         commands::tier3_pane::forward_popup_mouse_move,
@@ -232,6 +233,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::tier3_pane::forward_pane_mouse_click,
         commands::tier3_pane::forward_pane_mouse_move,
         commands::tier3_pane::forward_pane_mouse_wheel,
+        commands::tier3_pane::forward_pane_key,
         // items.id=234 -- host-owned popup subsystem, OAuth popup click routing
         commands::tier3_pane::forward_popup_mouse_click,
         commands::tier3_pane::forward_popup_mouse_move,
