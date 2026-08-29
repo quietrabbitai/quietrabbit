@@ -281,6 +281,26 @@ wrap_app! {
                 format!("{existing},SoftNavigationDetection")
             };
             command_line.append_switch_with_value(Some(&df_switch), Some(&merged.as_str().into()));
+
+            // items.id=327 diagnostic only -- MUST be stripped before any
+            // release build. Confirms whether CEF's OSR compositor is using
+            // hardware WebGL or has fallen back to SwiftShader software
+            // rendering, since Cloudflare Turnstile is known to treat the
+            // software-fallback case as a bot signal.
+            command_line.append_switch_with_value(
+                Some(&cef::CefString::from("enable-logging")),
+                Some(&"stderr".into()),
+            );
+            command_line.append_switch_with_value(
+                Some(&cef::CefString::from("v")),
+                Some(&"1".into()),
+            );
+            command_line.append_switch_with_value(
+                Some(&cef::CefString::from("vmodule")),
+                Some(
+                    &"*gpu*=2,*angle*=2,*gl_context*=2,*gl_surface*=2,*gl_display*=2".into(),
+                ),
+            );
         }
 
         fn browser_process_handler(&self) -> Option<cef::BrowserProcessHandler> {
