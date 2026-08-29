@@ -1,5 +1,7 @@
 # Quiet Rabbit — Claude Code Context
-# Last updated: August 8, 2026
+# Last updated: August 29, 2026 (Chat-PM staleness sweep -- Architecture
+# Reference and IPC command count corrected; see those sections for what
+# changed and why. Sections not touched this pass were not re-verified.)
 
 ## Session Discipline
 - Respond with code only. No preamble, no recap, no explanation unless asked.
@@ -16,10 +18,20 @@ Self-hosted privacy-first AI platform. Engine: Conductor. Version: 0.2.
 Tagline: "Your personal AI. Built to grow, always yours."
 
 ## Architecture Reference
-/docs/QUIET_RABBIT_ARCHITECTURE.md — authoritative for all decisions.
-Read the relevant section before writing code.
-This file wins over all other sources on conflicts.
-When in doubt: stop and ask rather than invent.
+There is no single document that's guaranteed current. Prose architecture docs
+(03_ProjectDocs/Architecture/*.md, readable from here) describe design
+rationale and mostly don't drift, but any specific "is X built" claim in them
+can be stale -- verify against this repo's own live source first, or the
+items/decisions tables in qr_docs.db (03_ProjectDocs/qr_docs.db) if the
+question is about project status rather than code. Do not trust a doc's
+current-state claim without one of those checks.
+Read `Architecture/QUIET_RABBIT_ARCHITECTURE.md` and
+`Architecture/AUTH_MULTIUSER_ARCHITECTURE.md` for design rationale and *why*
+things are built the way they are -- that content doesn't need re-verifying
+the way current-state claims do.
+When genuinely unclear after checking source and the database: note it in
+your end-of-session handoff (see "Ending a Session" below) for Chat-PM to
+resolve, rather than guessing or inventing.
 
 ## Core Tenets (non-negotiable)
 - Privacy-first: no data leaves local without explicit user consent
@@ -219,7 +231,9 @@ SQLCipher linkage: libsqlite3-sys sqlcipher feature (D6-346).
 
 ### Tauri IPC command conventions
 IPC surface defined in HANDOFF_IPC_SURFACE.md — read before building any IPC layer.
-33 typed commands + 4 push events.
+Command count grows regularly (20 groups as of 2026-08-29) -- do not rely on a
+stated number here; count `commands::` entries in src-tauri/src/ipc.rs's
+specta_builder() for the current live surface.
 All command structs derive Serialize, Deserialize, specta::Type.
 TypeScript types via tauri-specta (2.0.0-rc.25).
 Run type export after any command struct change.
