@@ -40,6 +40,22 @@ use wgpu_hal::Adapter as _;
 use crate::commands::tier3_pane::PaneRectFraction;
 use crate::tier3_pane::PaneKey;
 
+/// items.id=334: `on_paint`/`on_accelerated_paint` only ever stashed fresh
+/// pixels into `PANE_PENDING_PAINT`/`POPUP_PENDING_PAINT` -- nothing told
+/// GTK to actually redraw with them. The only things that ever called
+/// `queue_draw()` were pane open/close and the frontend's `set_pane_layout`
+/// IPC call, so after a resize CEF re-renders asynchronously in the
+/// background but the stale, wrong-size texture stays on screen until some
+/// unrelated event happens to force a redraw. Mirrors `set_pane_layout`'s
+/// own `app_handle.run_on_main_thread(pane_host::queue_draw)` pattern --
+/// `queue_draw()` is main-thread-only (a thread-local lookup) and these
+/// paint callbacks run on CEF's own thread, so this marshals across.
+fn request_redraw(app_handle: &tauri::AppHandle) {
+    if let Err(e) = app_handle.run_on_main_thread(crate::tier3_pane::pane_host::queue_draw) {
+        log::warn!("tier3_pane::render: run_on_main_thread(queue_draw) failed: {e}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // items.id=312: GL-context single-thread-ownership guard
 // ---------------------------------------------------------------------------
@@ -850,6 +866,8 @@ pub struct PaneRenderHandler {
     /// UI thread) write into. See PaneKey docs (tier3_pane::mod) -- this is
     /// the provider ID the pane this handler belongs to was opened for.
     pane_key: PaneKey,
+    /// items.id=334: needed for `request_redraw` -- see its own doc.
+    app_handle: tauri::AppHandle,
 }
 
 impl PaneRenderHandler {
@@ -859,6 +877,7 @@ impl PaneRenderHandler {
         device_scale_factor: f32,
         initial_size: LogicalSize,
         pane_key: PaneKey,
+        app_handle: tauri::AppHandle,
     ) -> (Self, std::sync::Arc<std::sync::Mutex<LogicalSize>>) {
         let size = std::sync::Arc::new(std::sync::Mutex::new(initial_size));
         (
@@ -868,6 +887,7 @@ impl PaneRenderHandler {
                 device,
                 queue,
                 pane_key,
+                app_handle,
             },
             size,
         )
@@ -940,6 +960,7 @@ wrap_render_handler! {
                 .lock()
                 .unwrap()
                 .insert(self.handler.pane_key.clone(), pending);
+            request_redraw(&self.handler.app_handle);
         }
 
         // items.id=207: on_paint's signature (including the raw `buffer:
@@ -982,6 +1003,7 @@ wrap_render_handler! {
                 .lock()
                 .unwrap()
                 .insert(self.handler.pane_key.clone(), pending);
+            request_redraw(&self.handler.app_handle);
         }
     }
 }
@@ -1025,6 +1047,8 @@ pub struct PopupRenderHandler {
     /// ref-counting clones it) but every clone must observe the same
     /// "already sent" state.
     captured: Arc<AtomicBool>,
+    /// items.id=334: needed for `request_redraw` -- see its own doc.
+    app_handle: tauri::AppHandle,
 }
 
 impl PopupRenderHandler {
@@ -1035,6 +1059,7 @@ impl PopupRenderHandler {
         initial_size: LogicalSize,
         pane_key: PaneKey,
         events_tx: std::sync::mpsc::Sender<PopupLifecycleEvent>,
+        app_handle: tauri::AppHandle,
     ) -> (Self, Arc<Mutex<LogicalSize>>) {
         let size = Arc::new(Mutex::new(initial_size));
         (
@@ -1046,6 +1071,7 @@ impl PopupRenderHandler {
                 pane_key,
                 events_tx,
                 captured: Arc::new(AtomicBool::new(false)),
+                app_handle,
             },
             size,
         )
@@ -1130,6 +1156,7 @@ wrap_render_handler! {
                 .lock()
                 .unwrap()
                 .insert(self.handler.pane_key.clone(), pending);
+            request_redraw(&self.handler.app_handle);
         }
 
         #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -1165,6 +1192,7 @@ wrap_render_handler! {
                 .lock()
                 .unwrap()
                 .insert(self.handler.pane_key.clone(), pending);
+            request_redraw(&self.handler.app_handle);
         }
     }
 }
@@ -1239,6 +1267,7 @@ impl ClientBuilder {
         popup_close_tx: std::sync::mpsc::Sender<PaneKey>,
         device: wgpu::Device,
         queue: wgpu::Queue,
+        app_handle: tauri::AppHandle,
     ) -> Client {
         Self::new(
             RenderHandlerBuilder::build(render_handler),
@@ -1248,6 +1277,7 @@ impl ClientBuilder {
                 popup_requested_tx,
                 device,
                 queue,
+                app_handle,
             )),
             LoadHandlerBuilder::build(PaneLoadHandler::new(pane_key, popup_close_tx)),
         )
@@ -1329,6 +1359,10 @@ pub struct PaneLifeSpanHandler {
     /// `PaneRenderHandler` itself holds), not a new device/queue.
     device: wgpu::Device,
     queue: wgpu::Queue,
+    /// items.id=334: needed to construct a fresh `PopupRenderHandler` (see
+    /// `request_redraw`'s own doc) when `on_before_popup` fires -- cheap
+    /// clone, same handle `PaneRenderHandler` itself holds.
+    app_handle: tauri::AppHandle,
 }
 
 impl PaneLifeSpanHandler {
@@ -1338,6 +1372,7 @@ impl PaneLifeSpanHandler {
         popup_requested_tx: std::sync::mpsc::Sender<PopupRequested>,
         device: wgpu::Device,
         queue: wgpu::Queue,
+        app_handle: tauri::AppHandle,
     ) -> Self {
         Self {
             browser_ready_tx,
@@ -1345,6 +1380,7 @@ impl PaneLifeSpanHandler {
             popup_requested_tx,
             device,
             queue,
+            app_handle,
         }
     }
 }
@@ -1446,6 +1482,7 @@ wrap_life_span_handler! {
                 },
                 self.handler.pane_key.clone(),
                 events_tx.clone(),
+                self.handler.app_handle.clone(),
             );
 
             if let Some(client_slot) = client {

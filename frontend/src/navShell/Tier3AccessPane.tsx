@@ -41,7 +41,7 @@ import { MiddleZone } from '../middleZone/MiddleZone'
 import { DEFAULT_CONVERSATION_PROFILE } from '../middleZone/middleZoneConfig'
 import { FocusSettingsControls } from './FocusSettingsControls'
 import { requireCurrentUserId } from './navShellConfig'
-import { computePaneRects, pixelRectToFraction, type PanePixelRect } from '../tier3Access/paneLayout'
+import { computePaneRects, pixelRectToFraction, isRowFullyVisible, PANE_ROW_HEIGHT, type PanePixelRect } from '../tier3Access/paneLayout'
 import { PaneHitLayer } from '../tier3Access/PaneHitLayer'
 import { PopupHitLayer } from '../tier3Access/PopupHitLayer'
 import {
@@ -90,6 +90,11 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
   const [openPaneIds, setOpenPaneIds] = useState<string[]>([])
   const [openError, setOpenError] = useState<string | null>(null)
   const paneDockRef = useRef<HTMLDivElement>(null)
+  // items.id=334: the dock column's own visible bounds -- distinct from
+  // paneDockRef, whose element can now be far taller than what's on screen
+  // (PANE_ROW_HEIGHT stacking has no ceiling). syncPaneLayout clips each
+  // pane's row rect against this before it ever reaches paneRects/Rust.
+  const paneColumnRef = useRef<HTMLDivElement>(null)
   // CSS-pixel-space rects, viewport-relative -- the same numbers
   // syncPaneLayout divides down into the PaneRectFraction sent to Rust, fed
   // straight to PaneHitLayer for its invisible per-pane hit-divs' position
@@ -120,11 +125,18 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
 
   const syncPaneLayout = useCallback(() => {
     const dock = paneDockRef.current
-    if (!dock || openPaneIds.length === 0) {
+    const column = paneColumnRef.current
+    if (!dock || !column || openPaneIds.length === 0) {
       setPaneRects({})
       return
     }
-    const rects = computePaneRects(dock.getBoundingClientRect(), openPaneIds)
+    const rawRects = computePaneRects(dock.getBoundingClientRect(), openPaneIds)
+    const columnRect = column.getBoundingClientRect()
+    const viewport = { top: columnRect.top, bottom: columnRect.bottom }
+    const rects: Record<string, PanePixelRect> = {}
+    for (const [id, rect] of Object.entries(rawRects)) {
+      if (isRowFullyVisible(rect, viewport)) rects[id] = rect
+    }
     setPaneRects(rects)
     const entries = Object.entries(rects).map(([providerId, rect]) => ({
       provider_id: providerId,
@@ -139,7 +151,8 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
 
   useEffect(() => {
     const dock = paneDockRef.current
-    if (!dock) return
+    const column = paneColumnRef.current
+    if (!dock || !column) return
     let frame: number | null = null
     const scheduleSync = () => {
       if (frame !== null) return
@@ -161,9 +174,15 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
     // regardless of whether this specific element's size happened to
     // change, so it catches exactly the case ResizeObserver misses.
     window.addEventListener('resize', scheduleSync)
+    // items.id=334: scrolling the column moves the dock's on-screen
+    // position/visible portion without changing its own size or the
+    // window's, so neither of the above fires -- a plain scroll listener
+    // is the only thing that catches it.
+    column.addEventListener('scroll', scheduleSync)
     return () => {
       observer.disconnect()
       window.removeEventListener('resize', scheduleSync)
+      column.removeEventListener('scroll', scheduleSync)
       if (frame !== null) cancelAnimationFrame(frame)
     }
   }, [syncPaneLayout])
@@ -426,19 +445,30 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
         />
       </div>
 
-      <div className="tier3-access-pane__dock-column">
+      <div className="tier3-access-pane__dock-column" ref={paneColumnRef}>
         <div
           ref={paneDockRef}
           className="tier3-access-pane__dock"
           data-has-panes={openPaneIds.length > 0 ? '' : undefined}
+          style={
+            openPaneIds.length > 0
+              ? { height: openPaneIds.length * PANE_ROW_HEIGHT }
+              : undefined
+          }
         >
-          {openPaneIds.length > 0 && (
-            <p>
-              {t('navShell.tier3AccessPane.dockLabel', {
-                count: openPaneIds.length,
-              })}
-            </p>
-          )}
+          {/* items.id=334: invisible per-row anchors, one per open pane --
+              not visual chrome (see the reverted per-row header attempt's
+              own history), just scroll-snap-align targets so the column
+              (scroll-snap-type: y, NavShell.css) can only rest with whole
+              rows visible, never a partial one -- see isRowFullyVisible's
+              own doc for why a partial reveal must never happen. */}
+          {openPaneIds.map((id) => (
+            <div
+              key={id}
+              className="tier3-access-pane__pane-row"
+              style={{ height: PANE_ROW_HEIGHT }}
+            />
+          ))}
         </div>
 
         <h3>{t('navShell.tier3AccessPane.heading')}</h3>

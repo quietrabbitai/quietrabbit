@@ -418,6 +418,9 @@ struct PaneManager {
     /// per GTK render tick (`drain_popup_close_requests`).
     popup_close_tx: std::sync::mpsc::Sender<PaneKey>,
     popup_close_rx: std::sync::mpsc::Receiver<PaneKey>,
+    /// items.id=334: needed to construct each pane/popup's render handler
+    /// with a `request_redraw` (render.rs) capability -- see its own doc.
+    app_handle: tauri::AppHandle,
 }
 
 impl PaneManager {
@@ -488,6 +491,7 @@ impl PaneManager {
             device_scale_factor,
             initial_logical_size,
             key.clone(),
+            self.app_handle.clone(),
         );
 
         // No per-pane RequestContext (items.id=224 resolution,
@@ -510,6 +514,7 @@ impl PaneManager {
                 self.popup_close_tx.clone(),
                 device.clone(),
                 queue.clone(),
+                self.app_handle.clone(),
             )),
             None,
             Some(&browser_settings),
@@ -1639,6 +1644,7 @@ impl PaneHost {
             popup_requested_rx,
             popup_close_tx,
             popup_close_rx,
+            app_handle: app_handle.clone(),
         }));
         let open_pane_count = manager.borrow().open_pane_count.clone();
         {

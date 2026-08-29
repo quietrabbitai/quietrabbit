@@ -65,9 +65,7 @@
 }
 
 #root {
-  width: 1126px;
-  max-width: 100%;
-  margin: 0 auto;
+  width: 100%;
   text-align: center;
   border-inline: 1px solid var(--border);
   height: 100svh;

@@ -80,7 +80,18 @@
   flex-direction: column;
   flex: 1 1 45%;
   min-width: 0;
+  min-height: 0;
   overflow: auto;
+  /* items.id=334: the column may only come to rest with whole pane rows
+   * visible -- isRowFullyVisible (paneLayout.ts) hides a row entirely
+   * rather than resizing its actual CEF viewport when partially scrolled,
+   * so a scroll position that left one at half-visible would show a blank
+   * gap. scroll-snap-align on each row (below) supplies the snap points. */
+  scroll-snap-type: y mandatory;
+}
+
+.tier3-access-pane__pane-row {
+  scroll-snap-align: start;
 }
 
 .tier3-access-pane__dock {
@@ -91,7 +102,28 @@
 }
 
 .tier3-access-pane__dock[data-has-panes] {
+  flex: 0 0 auto;
   border: 1px dashed var(--border);
+}
+
+/* items.id=334: forces a classic, always-visible, gutter-reserving
+ * scrollbar on the dock column instead of GTK/WebKit's default auto-hiding
+ * overlay style (which wasn't appearing/reachable at all). Any
+ * ::-webkit-scrollbar rule switches WebKit off native overlay scrollbars
+ * for that element -- this is what makes the reserved gutter exist, not
+ * just the color/width below. A reserved gutter is excluded from
+ * dockRect.width (paneLayout.ts), so no pane's hit-div ever covers it. */
+.tier3-access-pane__dock-column::-webkit-scrollbar {
+  width: 16px;
+}
+
+.tier3-access-pane__dock-column::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.tier3-access-pane__dock-column::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 6px;
 }
 
 .persona-hub__action-row {
