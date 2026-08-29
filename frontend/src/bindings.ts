@@ -4,6 +4,28 @@ import { invoke as __TAURI_INVOKE } from "@tauri-apps/api/core";
 
 /** Commands */
 export const commands = {
+	/**
+	 *  TEMPORARY dev-only test scaffolding (items.id=329, DIAG_329). Seeds a
+	 *  synthetic "drafted" assistant message directly, skipping real Focus-run
+	 *  execution/model generation, so a debug build can jump straight into
+	 *  request_tier3_gate3_review without the several-seconds-per-iteration
+	 *  manual type-a-message/wait-for-the-model dance. The seeded row still goes
+	 *  through the REAL request_tier3_gate3_review -> gate3() path unmodified --
+	 *  this only fabricates the drafted input Gate3 reviews, not Gate3's own
+	 *  approve/deny decision or the tier-ceiling check ahead of it.
+	 * 
+	 *  focus_run_id is a fresh synthetic id, not a real focus_runs.id -- both
+	 *  places that store it (messages.focus_run_id, disclosure_log.focus_run_id)
+	 *  are plain TEXT columns with no FK, and live in different SQLite files
+	 *  than focus_runs anyway, so this is safe (confirmed 2026-08-28).
+	 * 
+	 *  #[cfg(debug_assertions)]: compiled only into debug builds -- absent
+	 *  entirely from a release binary, not just unreachable. See ipc.rs's
+	 *  specta_builder for the matching debug-only command registration; both
+	 *  halves must be removed together once items.id=329's Tier 3 pane work no
+	 *  longer needs fast iteration.
+	 */
+	devSeedTier3DraftMessage: (userId: string, personaId: string, contextKey: string) => typedError<string, string>(__TAURI_INVOKE("dev_seed_tier3_draft_message", { userId, personaId, contextKey })),
 	submitFocusRun: (request: SubmitFocusRunRequest) => typedError<SubmitFocusRunResponse, string>(__TAURI_INVOKE("submit_focus_run", { request })),
 	getRunOutput: (runId: string, userId: string, personaId: string) => typedError<GetRunOutputResponse, string>(__TAURI_INVOKE("get_run_output", { runId, userId, personaId })),
 	cancelRun: (runId: string, userId: string, personaId: string) => typedError<null, string>(__TAURI_INVOKE("cancel_run", { runId, userId, personaId })),

@@ -396,6 +396,61 @@ pub async fn send_message(
 }
 
 // ---------------------------------------------------------------------------
+// DIAG_329 -- dev-only test scaffolding (items.id=329)
+// ---------------------------------------------------------------------------
+
+/// TEMPORARY dev-only test scaffolding (items.id=329, DIAG_329). Seeds a
+/// synthetic "drafted" assistant message directly, skipping real Focus-run
+/// execution/model generation, so a debug build can jump straight into
+/// request_tier3_gate3_review without the several-seconds-per-iteration
+/// manual type-a-message/wait-for-the-model dance. The seeded row still goes
+/// through the REAL request_tier3_gate3_review -> gate3() path unmodified --
+/// this only fabricates the drafted input Gate3 reviews, not Gate3's own
+/// approve/deny decision or the tier-ceiling check ahead of it.
+///
+/// focus_run_id is a fresh synthetic id, not a real focus_runs.id -- both
+/// places that store it (messages.focus_run_id, disclosure_log.focus_run_id)
+/// are plain TEXT columns with no FK, and live in different SQLite files
+/// than focus_runs anyway, so this is safe (confirmed 2026-08-28).
+///
+/// #[cfg(debug_assertions)]: compiled only into debug builds -- absent
+/// entirely from a release binary, not just unreachable. See ipc.rs's
+/// specta_builder for the matching debug-only command registration; both
+/// halves must be removed together once items.id=329's Tier 3 pane work no
+/// longer needs fast iteration.
+#[cfg(debug_assertions)]
+#[tauri::command]
+#[specta::specta]
+pub async fn dev_seed_tier3_draft_message(
+    key_registry: State<'_, KeyRegistry>,
+    user_id: String,
+    persona_id: String,
+    context_key: String,
+) -> Result<String, String> {
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
+    let synthetic_run_id = format!("dev-seed-{}", uuid::Uuid::new_v4());
+    let record = message_store::save_message(
+        &user_id,
+        &persona_id,
+        &key_hex_str,
+        &context_key,
+        "assistant",
+        "[DIAG_329 dev-seeded draft] Synthetic Tier 3 starter message for \
+         pane-testing -- not real model output.",
+        Some(&synthetic_run_id),
+        Some("drafted"),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(record.id)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

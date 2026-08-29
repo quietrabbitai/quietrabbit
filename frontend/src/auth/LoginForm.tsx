@@ -26,12 +26,11 @@ export function LoginForm({ onLoggedIn }: LoginFormProps) {
   const [error, setError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
 
-  const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault()
+  const performLogin = async (name: string, pass: string) => {
     setError(null)
     setSubmitting(true)
 
-    const loginResult = await commands.login(displayName, password)
+    const loginResult = await commands.login(name, pass)
     if (loginResult.status !== 'ok') {
       setError(loginResult.error)
       setSubmitting(false)
@@ -55,6 +54,24 @@ export function LoginForm({ onLoggedIn }: LoginFormProps) {
 
     setCurrentUserId(sessionResult.data.user_id)
     onLoggedIn()
+  }
+
+  const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    await performLogin(displayName, password)
+  }
+
+  // DIAG_329 (items.id=329): dev-only test scaffolding -- logs straight into
+  // the local dev/test account ("jason"/"jason", auto-created by login()'s
+  // own bootstrap-on-first-call branch same as any other display name) with
+  // no typing, so Tier 3 pane-testing iterations don't each pay for a manual
+  // login. import.meta.env.DEV is Vite's build-time flag (false, and this
+  // whole branch dead-code-eliminated, in a production build -- see
+  // MiddleZone.tsx:59 for the only other use of this convention in the
+  // codebase). Remove once items.id=329's Tier 3 pane work no longer needs
+  // fast iteration.
+  const handleDevLogin = () => {
+    void performLogin('jason', 'jason')
   }
 
   return (
@@ -88,6 +105,13 @@ export function LoginForm({ onLoggedIn }: LoginFormProps) {
       <button type="submit" disabled={submitting}>
         {t('auth.submitButton')}
       </button>
+
+      {/* DIAG_329 (items.id=329): dev-only, see handleDevLogin's own comment. */}
+      {import.meta.env.DEV && (
+        <button type="button" onClick={handleDevLogin} disabled={submitting}>
+          Dev login
+        </button>
+      )}
 
       {error && <p role="alert">{t('auth.loginError', { message: error })}</p>}
     </form>

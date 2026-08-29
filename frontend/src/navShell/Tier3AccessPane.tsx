@@ -357,6 +357,36 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
       })
   }
 
+  // DIAG_329 (items.id=329): dev-only test scaffolding -- jumps straight to
+  // the Tier3Selector/pane-open state by seeding a synthetic drafted message
+  // (commands.devSeedTier3DraftMessage, debug builds only -- see its Rust
+  // doc comment) instead of typing a message and waiting several seconds for
+  // the local model's response. From there it calls the exact same
+  // handleDraftReady this pane already uses for a real ChatPane draft, so
+  // the seeded message runs through the real requestTier3Gate3Review ->
+  // gate3() approve/deny path unmodified -- this button only fabricates the
+  // input Gate3 reviews, not Gate3's own decision. If focus_settings'
+  // max_permitted_tier for this persona's quick-ask Focus is below 3, this
+  // hits the same real tier-ceiling block (and "raise it now" affordance,
+  // FocusSettingsControls below) a real message would. Remove once
+  // items.id=329's Tier 3 pane work no longer needs fast iteration.
+  const handleDevForceTier3 = () => {
+    if (!personaId) return
+    commands
+      .devSeedTier3DraftMessage(
+        requireCurrentUserId(),
+        personaId,
+        `tier3-access-${personaId}`,
+      )
+      .then((result) => {
+        if (result.status === 'ok') {
+          handleDraftReady(result.data)
+        } else {
+          setOpenError(result.error)
+        }
+      })
+  }
+
   const handleModalCancel = () => {
     setConsentPayload(null)
     setPendingMessageId(null)
@@ -412,6 +442,12 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
         </div>
 
         <h3>{t('navShell.tier3AccessPane.heading')}</h3>
+        {/* DIAG_329 (items.id=329): dev-only, see handleDevForceTier3's own comment. */}
+        {import.meta.env.DEV && personaId && (
+          <button type="button" onClick={handleDevForceTier3}>
+            Dev: force Tier 3 escalation
+          </button>
+        )}
         {providerError && (
           <p role="alert">
             {t('navShell.tier3AccessPane.providerError', {
