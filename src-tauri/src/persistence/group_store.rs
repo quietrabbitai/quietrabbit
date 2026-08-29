@@ -909,32 +909,36 @@ async fn checkout_document_conn(
     // Owner-or-write bar: a read_only holder can't usefully hold an edit
     // lock (they can't call update_document regardless), and letting them
     // claim one anyway could strand real editors without any way to know
-    // why they can't write.
+    // why they can't write. Also confirms document_id exists, so a 0-row
+    // result from the conditional UPDATE below is unambiguous: not missing,
+    // just held by someone else -- same reasoning as migrations.rs::
+    // acquire_lock's seeded id=1 row.
     require_write_access_conn(conn, document_id, persona_id).await?;
 
-    let row = sqlx::query("SELECT checked_out_by_persona_id FROM documents WHERE id = ?")
-        .bind(document_id)
-        .fetch_one(&mut *conn)
-        .await?;
-    let current: Option<String> = row.try_get("checked_out_by_persona_id")?;
-
-    if let Some(holder) = &current {
-        if holder != persona_id {
-            return Err(GroupStoreError::AlreadyCheckedOut(document_id.to_owned()));
-        }
-    }
-
+    // Atomic conditional UPDATE, mirroring migrations.rs::acquire_lock:
+    // a separate SELECT-then-UPDATE here would leave a gap where two
+    // concurrent checkout attempts can both pass the check and both write,
+    // with the loser silently believing it holds the lock (items.id=352,
+    // external schema review F4). Folding the holder check into the
+    // UPDATE's WHERE clause makes the read-then-write a single atomic
+    // statement instead.
     let now = crate::providers::utils::now();
-    sqlx::query(
-        "UPDATE documents SET checked_out_by_persona_id = ?, checked_out_at = ? WHERE id = ?",
+    let result = sqlx::query(
+        "UPDATE documents SET checked_out_by_persona_id = ?, checked_out_at = ? \
+         WHERE id = ? AND (checked_out_by_persona_id IS NULL OR checked_out_by_persona_id = ?)",
     )
     .bind(persona_id)
     .bind(&now)
     .bind(document_id)
+    .bind(persona_id)
     .execute(&mut *conn)
     .await?;
 
-    Ok(())
+    if result.rows_affected() == 1 {
+        Ok(())
+    } else {
+        Err(GroupStoreError::AlreadyCheckedOut(document_id.to_owned()))
+    }
 }
 
 /// Check out a document for editing. Fails with AlreadyCheckedOut if held
@@ -1395,6 +1399,80 @@ mod tests {
         checkout_document_conn(&mut conn, &doc_id, "owner-1")
             .await
             .expect("checkout after force-unlock must succeed");
+    }
+
+    #[tokio::test]
+    async fn checkout_document_conn_atomic_update_rejects_a_losing_concurrent_checkout() {
+        // items.id=352 (external schema review F4): checkout_document_conn
+        // used to be a SELECT-to-check followed by an unconditional UPDATE
+        // with no atomicity between them -- two concurrent attempts could
+        // both pass the SELECT and both write, with the loser silently
+        // believing it holds the lock. Proving that requires two
+        // independent connections racing against one real on-disk file; a
+        // single in-memory connection (as test_db() above uses) can't race
+        // against itself.
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        let db_path = tempdir.path().join("group.db");
+
+        async fn reopen(db_path: &std::path::Path) -> SqliteConnection {
+            SqliteConnectOptions::new()
+                .filename(db_path)
+                .create_if_missing(true)
+                .connect()
+                .await
+                .expect("file-backed connection failed")
+        }
+
+        let doc_id = {
+            let mut conn = reopen(&db_path).await;
+            for stmt in parse_statements(GROUP_SCHEMA) {
+                sqlx::query(&stmt).execute(&mut conn).await.unwrap();
+            }
+            let doc_id = create_document_conn(&mut conn, "owner-1", "Doc", "v1")
+                .await
+                .unwrap();
+            grant_permission_conn(&mut conn, &doc_id, "owner-1", "editor-1", "write")
+                .await
+                .unwrap();
+            doc_id
+        };
+
+        let mut conn_a = reopen(&db_path).await;
+        let mut conn_b = reopen(&db_path).await;
+
+        let (result_a, result_b) = tokio::join!(
+            checkout_document_conn(&mut conn_a, &doc_id, "owner-1"),
+            checkout_document_conn(&mut conn_b, &doc_id, "editor-1"),
+        );
+
+        let a_won = result_a.is_ok();
+        let b_won = result_b.is_ok();
+        assert!(
+            a_won ^ b_won,
+            "exactly one concurrent checkout attempt must win, not both or neither: a={:?} b={:?}",
+            result_a,
+            result_b
+        );
+        assert!(matches!(
+            if a_won { &result_b } else { &result_a },
+            Err(GroupStoreError::AlreadyCheckedOut(_))
+        ));
+
+        // Confirm the DB agrees with whichever attempt actually won -- no
+        // split-brain state where both connections believe they hold it.
+        let expected_holder = if a_won { "owner-1" } else { "editor-1" };
+        let mut verify_conn = reopen(&db_path).await;
+        let (holder,): (Option<String>,) =
+            sqlx::query_as("SELECT checked_out_by_persona_id FROM documents WHERE id = ?")
+                .bind(&doc_id)
+                .fetch_one(&mut verify_conn)
+                .await
+                .unwrap();
+        assert_eq!(
+            holder.as_deref(),
+            Some(expected_holder),
+            "the DB's recorded holder must match whichever attempt actually won"
+        );
     }
 
     // -- get_document_unchecked (items.id=287 pull side) -------------------------

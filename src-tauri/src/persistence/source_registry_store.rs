@@ -467,8 +467,13 @@ pub(crate) async fn import_record_conn(
     source_url: Option<&str>,
     extra_metadata: Option<serde_json::Value>,
 ) -> Result<String, PersonalStoreError> {
-    // Referential integrity by hand — PRAGMA foreign_keys is off codebase
-    // wide, so a declared FK would not catch this.
+    // entities.source_registry_id already declares REFERENCES
+    // source_registry(id) ON DELETE SET NULL (schema/personal_002.sql), and
+    // PRAGMA foreign_keys is ON by default (sqlx's default, never overridden
+    // here -- items.id=185/305) so that FK is genuinely enforced. This check
+    // is not a substitute for it -- it exists to surface a clear
+    // Validation error before the INSERT, instead of letting the caller
+    // see a raw FOREIGN KEY constraint failed error from create_entity_conn.
     if get_source_conn(conn, source_id).await?.is_none() {
         return Err(PersonalStoreError::Validation(format!(
             "No source with id '{source_id}' — register the source before \

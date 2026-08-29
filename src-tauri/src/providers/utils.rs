@@ -163,6 +163,12 @@ pub fn connect_options_encrypted(path: &Path, key_hex: &str) -> SqliteConnectOpt
         .pragma("key", format!("\"x'{key_hex}'\"")) // FIRST — SQLCipher requirement
         .pragma("cipher_compatibility", "4") // pin SQLCipher 4.x KDF/page/HMAC defaults
         .pragma("journal_mode", journal_mode_value()) // AFTER key
+        // Pinned explicitly rather than left to sqlx's default (items.id=
+        // 185/305/352) -- zero behavior change today, removes the latent
+        // risk of a future sqlx upgrade or an unpinned connection path
+        // silently changing the default this codebase's FK-declared tables
+        // (personal_002.sql, outputs_001.sql) rely on.
+        .foreign_keys(true)
 }
 
 // ---------------------------------------------------------------------------

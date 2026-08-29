@@ -371,7 +371,13 @@ fn process_id() -> String {
 async fn open_raw(path: &Path) -> Result<SqliteConnection, MigrationError> {
     let opts = SqliteConnectOptions::new()
         .filename(path)
-        .create_if_missing(true);
+        .create_if_missing(true)
+        // Pinned explicitly rather than left to sqlx's default (items.id=
+        // 185/305/352) -- zero behavior change today, removes the latent
+        // risk of a future sqlx upgrade or an unpinned connection path
+        // silently changing the default this codebase's FK-declared tables
+        // (personal_002.sql, outputs_001.sql) rely on.
+        .foreign_keys(true);
     Ok(opts.connect().await?)
 }
 
