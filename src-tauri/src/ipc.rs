@@ -124,6 +124,8 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::tier3_pane::open_tier3_panes,
         commands::tier3_pane::close_tier3_pane,
         commands::tier3_pane::set_pane_layout,
+        // items.id=359 pieces 4/5 -- rail+content-pane single-active-pane model
+        commands::tier3_pane::set_active_pane,
         // items.id=257 Path B -- DOM-based pane click routing
         commands::tier3_pane::forward_pane_mouse_click,
         commands::tier3_pane::forward_pane_mouse_move,
@@ -229,6 +231,8 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::tier3_pane::open_tier3_panes,
         commands::tier3_pane::close_tier3_pane,
         commands::tier3_pane::set_pane_layout,
+        // items.id=359 pieces 4/5 -- rail+content-pane single-active-pane model
+        commands::tier3_pane::set_active_pane,
         // items.id=257 Path B -- DOM-based pane click routing
         commands::tier3_pane::forward_pane_mouse_click,
         commands::tier3_pane::forward_pane_mouse_move,

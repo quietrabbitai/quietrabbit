@@ -352,10 +352,19 @@ export const commands = {
 	 *  (pane_host.rs), and a caller racing a close against an already-closed
 	 *  pane is a normal condition, not a failure. See open_tier3_panes' doc on
 	 *  why a single `run_on_main_thread` call is dispatch and guaranteed-prompt
-	 *  delivery in one step now. Cookie persist (items.id=224 resolution) runs
-	 *  before the close is dispatched -- see persist_cookies_from_jar's own
-	 *  doc; its failure is logged, never a reason this command returns an
-	 *  error (the pane must still close).
+	 *  delivery in one step now.
+	 * 
+	 *  items.id=330: the close dispatch runs FIRST, cookie persist (items.id=224
+	 *  resolution) after -- confirmed live this session (visible ~1s delay
+	 *  before a closed pane actually stopped compositing on a newly-navigated-to
+	 *  tab) that the previous persist-then-close ordering held the pane
+	 *  on-screen for however long `persist_cookies_from_jar`'s cookie-jar round
+	 *  trip took (up to `COOKIE_OP_TIMEOUT`, 500ms, per pane). Safe to reorder:
+	 *  `persist_cookies_from_jar` reads CEF's *global* cookie manager by URL
+	 *  (`cookie_manager_get_global_manager`), not anything tied to this specific
+	 *  pane's `Browser` instance, so it works identically whether the browser
+	 *  has already been torn down or not. Its failure is still only ever
+	 *  logged, never a reason this command returns an error.
 	 */
 	closeTier3Pane: (providerId: string) => typedError<null, string>(__TAURI_INVOKE("close_tier3_pane", { providerId })),
 	/**
@@ -377,6 +386,18 @@ export const commands = {
 	 *  reads `PaneLayoutState` directly), so there is nothing left to query.
 	 */
 	setPaneLayout: (layout: PaneLayoutEntry[]) => typedError<null, string>(__TAURI_INVOKE("set_pane_layout", { layout })),
+	/**
+	 *  items.id=359 pieces 4/5: makes `provider_id` (or none, to collapse to
+	 *  the empty state) the one pane actually composited in the content
+	 *  pane -- the rail+content-pane model's core mechanic. `None` no-ops if
+	 *  nothing is active; a `provider_id` naming a pane that isn't currently
+	 *  open (e.g. a race against a just-closed pane) is likewise a no-op at
+	 *  the `pane_host::PaneManager::set_active_pane` layer (`panes.get_mut`
+	 *  simply finds nothing), not an error -- same "a stale reference to a
+	 *  pane is a normal race, not a failure" framing `close_tier3_pane`
+	 *  already documents.
+	 */
+	setActivePane: (providerId: string | null) => typedError<null, string>(__TAURI_INVOKE("set_active_pane", { providerId })),
 	/**
 	 *  Forwards one mouse-button transition inside an open pane's on-screen
 	 *  rect, hit-tested natively by the browser's own DOM (items.id=257 Path

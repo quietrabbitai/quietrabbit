@@ -132,6 +132,21 @@ enum BrowserLifecycleState {
 enum PendingAction {
     Navigate(String),
     SetCookie { name: String, value: String },
+    /// items.id=359 piece 5: fire-and-forget JS run via
+    /// `Frame::execute_java_script` -- currently only used for the blind
+    /// scroll-to-bottom-on-deactivation trigger (a generic
+    /// `window.scrollTo`, no per-provider knowledge), but kept as a
+    /// general string-of-JS variant rather than a single-purpose
+    /// `ScrollToBottom` marker, matching `Navigate`'s own precedent of
+    /// carrying the actual payload rather than a symbolic action name.
+    ExecuteScript(String),
+    /// items.id=359 piece 4: the actual "deactivated/minimized pane"
+    /// mechanism -- CEF's own hook for "keep this browser's state alive
+    /// but stop painting/compositing it" (`ImplBrowserHost::was_hidden`).
+    /// Distinct from `Close`: a hidden pane keeps its `BrowserLifecycle`,
+    /// its CEF `Browser`, and (per `PaneManager::active_pane`'s own doc)
+    /// stays reachable to reactivate without reloading.
+    SetHidden(bool),
 }
 
 struct BrowserLifecycle {
@@ -205,8 +220,32 @@ fn apply_action(browser: &cef::Browser, action: &PendingAction) -> Result<(), St
         PendingAction::SetCookie { .. } => {
             Err("SetCookie not yet supported at this layer".to_string())
         }
+        PendingAction::ExecuteScript(code) => {
+            let Some(frame) = browser.main_frame() else {
+                return Err("browser has no main_frame yet".to_string());
+            };
+            frame.execute_java_script(Some(&cef::CefString::from(code.as_str())), None, 0);
+            Ok(())
+        }
+        PendingAction::SetHidden(hidden) => {
+            let Some(host) = browser.host() else {
+                return Err("browser has no host yet".to_string());
+            };
+            host.was_hidden(*hidden as _);
+            Ok(())
+        }
     }
 }
+
+/// items.id=359 piece 5: the blind scroll-to-bottom trigger fired on a
+/// pane's own deactivation (`PaneManager::set_active_pane`) -- generic,
+/// no per-provider DOM knowledge, confirmed feasible via
+/// `Frame::execute_java_script` (items.id=358, handoff id=245). "Blind"
+/// deliberately: landing precisely on the last chat response (rather
+/// than just the bottom of the page) shares the response-detection
+/// question's DOM-introspection dependency, which is explicitly NOT part
+/// of this item's scope (see items.id=360).
+const SCROLL_TO_BOTTOM_JS: &str = "window.scrollTo(0, document.body.scrollHeight);";
 
 /// The two operations `PaneHost::open_pane`/`close_pane` perform, dispatched
 /// via `AppHandle::run_on_main_thread` from `commands::tier3_pane`'s async
@@ -218,6 +257,12 @@ fn apply_action(browser: &cef::Browser, action: &PendingAction) -> Result<(), St
 pub enum PaneCommand {
     Open { key: PaneKey, url: String },
     Close { key: PaneKey },
+    /// items.id=359 pieces 4/5: makes `key` (or none) the one pane that's
+    /// actually composited/painted -- see `PaneManager::active_pane`'s own
+    /// doc for the single-active-pane invariant this enforces. The
+    /// outgoing active pane (if any, and if different from `key`) gets a
+    /// scroll-to-bottom trigger fired just before it's hidden.
+    SetActivePane { key: Option<PaneKey> },
     /// DOM-forwarded mouse press/release (items.id=257 Path B -- see the
     /// "Pane content click/mouse forwarding" section doc above). `x`/`y`
     /// arrive already pane-local, in CEF-logical pixels -- see
@@ -431,6 +476,17 @@ struct PaneManager {
     /// per GTK render tick (`drain_popup_close_requests`).
     popup_close_tx: std::sync::mpsc::Sender<PaneKey>,
     popup_close_rx: std::sync::mpsc::Receiver<PaneKey>,
+    /// items.id=359 (rail+content-pane redesign): the one pane, if any,
+    /// that is actually composited/painted right now -- every other open
+    /// pane is "loaded" (browser alive, `was_hidden(true)`, reachable
+    /// without a reload) but shown nowhere. This is the real invariant
+    /// the rail model enforces ("only one provider is ever rendered at
+    /// full size at a time"), tracked centrally here rather than as a
+    /// per-`PaneState` boolean, since "which one" is the whole point, not
+    /// an independent per-pane fact. Updated only by `set_active_pane`
+    /// and, defensively, by `close_pane` (closing the active pane clears
+    /// this rather than leaving it dangling).
+    active_pane: Option<PaneKey>,
     /// items.id=334: needed to construct each pane/popup's render handler
     /// with a `request_redraw` (render.rs) capability -- see its own doc.
     app_handle: tauri::AppHandle,
@@ -539,6 +595,17 @@ impl PaneManager {
         );
         if created != 0 {
             browser_lifecycle.enqueue(PendingAction::Navigate(url));
+            // items.id=359 piece 4: a newly-opened pane starts deactivated
+            // by default -- the caller (commands::tier3_pane::open_tier3_panes)
+            // always follows Open with an explicit set_active_pane call for
+            // the "idle row -> load and activate in one step" case, but
+            // defaulting to hidden here (rather than assuming the caller's
+            // next call arrives before this pane's first paint) means there
+            // is no window where a pane composites before this item's rail
+            // model has actually decided it should. Queued the same way
+            // Navigate is -- applied immediately if the browser is already
+            // Ready, deferred otherwise.
+            browser_lifecycle.enqueue(PendingAction::SetHidden(true));
         } else {
             browser_lifecycle.fail(
                 "browser_host_create_browser returned false (async creation dispatch failed)",
@@ -584,6 +651,45 @@ impl PaneManager {
         if self.focused_pane.as_ref() == Some(key) {
             self.focused_pane = None;
         }
+        // items.id=359: a closed active pane must not leave active_pane
+        // dangling -- no scroll-to-bottom trigger needed here (unlike
+        // set_active_pane's own deactivation path), since this pane is
+        // gone, not being minimized for later reactivation.
+        if self.active_pane.as_ref() == Some(key) {
+            self.active_pane = None;
+        }
+    }
+
+    /// items.id=359 pieces 4/5: makes `key` (or `None`) the one pane that's
+    /// actually composited -- see `active_pane`'s own doc for the
+    /// single-active-pane invariant. A no-op if `key` already equals the
+    /// current `active_pane` (switching a pane to itself, e.g. the content
+    /// pane's own click-to-reclaim-focus gesture, still needs `was_hidden`
+    /// re-asserted false in case QR's own re-expand had hidden it in the
+    /// meantime -- so this is NOT gated on equality; see below).
+    fn set_active_pane(&mut self, key: Option<PaneKey>) {
+        let previous = self.active_pane.clone();
+        if previous != key {
+            if let Some(old_key) = previous {
+                if let Some(pane) = self.panes.get_mut(&old_key) {
+                    // Scroll-to-bottom fires on the OUTGOING pane, before
+                    // it's hidden, so reactivating it later lands back on
+                    // its last response rather than wherever it was
+                    // scrolled (items.id=359 piece 5).
+                    pane.browser_lifecycle
+                        .enqueue(PendingAction::ExecuteScript(SCROLL_TO_BOTTOM_JS.to_string()));
+                    pane.browser_lifecycle
+                        .enqueue(PendingAction::SetHidden(true));
+                }
+            }
+        }
+        if let Some(new_key) = &key {
+            if let Some(pane) = self.panes.get_mut(new_key) {
+                pane.browser_lifecycle
+                    .enqueue(PendingAction::SetHidden(false));
+            }
+        }
+        self.active_pane = key;
     }
 
     /// Drains any browser CEF's UI thread finished constructing since the
@@ -1676,6 +1782,7 @@ impl PaneHost {
             popup_requested_rx,
             popup_close_tx,
             popup_close_rx,
+            active_pane: None,
             app_handle: app_handle.clone(),
         }));
         let open_pane_count = manager.borrow().open_pane_count.clone();
@@ -2154,6 +2261,11 @@ impl PaneHost {
             PaneCommand::Close { key } => {
                 self.manager.borrow_mut().close_pane(&key);
                 log::debug!("DIAG items.id=227: dispatch(Close) -> queue_draw()");
+                self.queue_draw();
+            }
+            PaneCommand::SetActivePane { key } => {
+                self.manager.borrow_mut().set_active_pane(key);
+                log::debug!("DIAG items.id=359: dispatch(SetActivePane) -> queue_draw()");
                 self.queue_draw();
             }
             PaneCommand::MouseClick {

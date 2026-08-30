@@ -622,6 +622,28 @@ pub async fn close_tier3_pane(
     Ok(())
 }
 
+/// items.id=359 pieces 4/5: makes `provider_id` (or none, to collapse to
+/// the empty state) the one pane actually composited in the content
+/// pane -- the rail+content-pane model's core mechanic. `None` no-ops if
+/// nothing is active; a `provider_id` naming a pane that isn't currently
+/// open (e.g. a race against a just-closed pane) is likewise a no-op at
+/// the `pane_host::PaneManager::set_active_pane` layer (`panes.get_mut`
+/// simply finds nothing), not an error -- same "a stale reference to a
+/// pane is a normal race, not a failure" framing `close_tier3_pane`
+/// already documents.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_active_pane(
+    provider_id: Option<String>,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    app_handle
+        .run_on_main_thread(move || {
+            pane_host::dispatch(PaneCommand::SetActivePane { key: provider_id })
+        })
+        .map_err(|e| e.to_string())
+}
+
 /// items.id=202 piece 4, real positioning fix 2026-08-07 -- stores the
 /// frontend's live layout fractions (unchanged `PaneRectFraction` semantics:
 /// fraction of the whole window's content area) and requests a redraw so the
