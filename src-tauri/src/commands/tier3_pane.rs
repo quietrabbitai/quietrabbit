@@ -5,7 +5,8 @@
 // set_pane_layout, forward_pane_mouse_click, forward_pane_mouse_move,
 // forward_pane_mouse_wheel, forward_popup_mouse_click,
 // forward_popup_mouse_move, forward_popup_mouse_wheel (items.id=234),
-// forward_pane_key (items.id=332).
+// forward_pane_key (items.id=332), adjust_pane_zoom (items.id=364),
+// forward_popup_key (items.id=367).
 //
 // items.id=202 piece 5 / items.id=223 connective tissue: neither item's own
 // description enumerates an IPC command, but on-demand pane creation
@@ -182,6 +183,20 @@ pub enum PaneMouseButton {
     Left,
     Middle,
     Right,
+}
+
+/// items.id=364: a pane's own Ctrl+=/Ctrl+-/Ctrl+0 shortcuts, intercepted by
+/// the frontend (`PaneHitLayer.tsx`) before they'd otherwise reach CEF as
+/// ordinary forwarded key events -- CEF's Chrome-runtime browser has no
+/// window chrome of its own to interpret these as a zoom accelerator (that's
+/// normally a browser-UI concern, not something Blink handles unprompted),
+/// so the host app applies the zoom explicitly via
+/// `BrowserHost::set_zoom_level` instead (see `adjust_pane_zoom`'s own doc).
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, specta::Type)]
+pub enum ZoomDirection {
+    In,
+    Out,
+    Reset,
 }
 
 /// items.id=234: `tier3-popup-opened` event payload -- emitted the moment
@@ -832,6 +847,66 @@ pub async fn forward_pane_key(
     app_handle
         .run_on_main_thread(move || {
             pane_host::dispatch(PaneCommand::KeyEvent {
+                key: provider_id,
+                event_type,
+                windows_key_code,
+                character,
+                modifiers,
+            })
+        })
+        .map_err(|e| e.to_string())
+}
+
+/// items.id=364: steps an open pane's CEF zoom level up/down/reset (a
+/// per-pane `f64` tracked in `PaneState`, see `pane_host.rs`) by forwarding
+/// straight to `BrowserHost::set_zoom_level` -- the same mechanism a normal
+/// browser's own Ctrl+=/Ctrl+-/Ctrl+0 accelerator would use, just driven from
+/// this app's own frontend since CEF's Chrome-runtime browser has no browser
+/// chrome of its own to bind that accelerator (see `ZoomDirection`'s own
+/// doc). Does not reach a pane's popup, if it has one open -- popups get the
+/// same `DEFAULT_ZOOM_LEVEL` applied once at creation (pane_host.rs's
+/// `drain_popup_events`, items.id=366), but aren't wired to this command's
+/// live in/out/reset stepping: they're short-lived OAuth login surfaces
+/// (items.id=234), not something a user is expected to sit and adjust.
+#[tauri::command]
+#[specta::specta]
+pub async fn adjust_pane_zoom(
+    provider_id: String,
+    direction: ZoomDirection,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    app_handle
+        .run_on_main_thread(move || {
+            pane_host::dispatch(PaneCommand::AdjustZoom {
+                key: provider_id,
+                direction,
+            })
+        })
+        .map_err(|e| e.to_string())
+}
+
+/// items.id=367: popup counterpart to `forward_pane_key` -- same
+/// windows_key_code/character/RawKeyDown-then-Char contract, see that
+/// command's own doc. Missing entirely until now: `PopupHitLayer.tsx` only
+/// ever forwarded mouse click/move/wheel (items.id=234's original scope),
+/// so a popup could be clicked into and focused but never actually typed
+/// into -- confirmed by Jason live, 2026-08-30 (Claude's Google sign-in
+/// popup accepted focus/clicks but no keystrokes reached it, reproducing
+/// even via a plain in-app pane switch away and back, not just after an
+/// OS-level focus round-trip).
+#[tauri::command]
+#[specta::specta]
+pub async fn forward_popup_key(
+    provider_id: String,
+    event_type: PaneKeyEventType,
+    windows_key_code: i32,
+    character: u16,
+    modifiers: PaneEventModifiers,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    app_handle
+        .run_on_main_thread(move || {
+            pane_host::dispatch(PaneCommand::PopupKeyEvent {
                 key: provider_id,
                 event_type,
                 windows_key_code,

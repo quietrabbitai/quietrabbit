@@ -4,28 +4,6 @@ import { invoke as __TAURI_INVOKE } from "@tauri-apps/api/core";
 
 /** Commands */
 export const commands = {
-	/**
-	 *  TEMPORARY dev-only test scaffolding (items.id=329, DIAG_329). Seeds a
-	 *  synthetic "drafted" assistant message directly, skipping real Focus-run
-	 *  execution/model generation, so a debug build can jump straight into
-	 *  request_tier3_gate3_review without the several-seconds-per-iteration
-	 *  manual type-a-message/wait-for-the-model dance. The seeded row still goes
-	 *  through the REAL request_tier3_gate3_review -> gate3() path unmodified --
-	 *  this only fabricates the drafted input Gate3 reviews, not Gate3's own
-	 *  approve/deny decision or the tier-ceiling check ahead of it.
-	 * 
-	 *  focus_run_id is a fresh synthetic id, not a real focus_runs.id -- both
-	 *  places that store it (messages.focus_run_id, disclosure_log.focus_run_id)
-	 *  are plain TEXT columns with no FK, and live in different SQLite files
-	 *  than focus_runs anyway, so this is safe (confirmed 2026-08-28).
-	 * 
-	 *  #[cfg(debug_assertions)]: compiled only into debug builds -- absent
-	 *  entirely from a release binary, not just unreachable. See ipc.rs's
-	 *  specta_builder for the matching debug-only command registration; both
-	 *  halves must be removed together once items.id=329's Tier 3 pane work no
-	 *  longer needs fast iteration.
-	 */
-	devSeedTier3DraftMessage: (userId: string, personaId: string, contextKey: string) => typedError<string, string>(__TAURI_INVOKE("dev_seed_tier3_draft_message", { userId, personaId, contextKey })),
 	submitFocusRun: (request: SubmitFocusRunRequest) => typedError<SubmitFocusRunResponse, string>(__TAURI_INVOKE("submit_focus_run", { request })),
 	getRunOutput: (runId: string, userId: string, personaId: string) => typedError<GetRunOutputResponse, string>(__TAURI_INVOKE("get_run_output", { runId, userId, personaId })),
 	cancelRun: (runId: string, userId: string, personaId: string) => typedError<null, string>(__TAURI_INVOKE("cancel_run", { runId, userId, personaId })),
@@ -470,6 +448,20 @@ export const commands = {
 	 */
 	forwardPaneKey: (providerId: string, eventType: PaneKeyEventType, windowsKeyCode: number, character: number, modifiers: PaneEventModifiers) => typedError<null, string>(__TAURI_INVOKE("forward_pane_key", { providerId, eventType, windowsKeyCode, character, modifiers })),
 	/**
+	 *  items.id=364: steps an open pane's CEF zoom level up/down/reset (a
+	 *  per-pane `f64` tracked in `PaneState`, see `pane_host.rs`) by forwarding
+	 *  straight to `BrowserHost::set_zoom_level` -- the same mechanism a normal
+	 *  browser's own Ctrl+=/Ctrl+-/Ctrl+0 accelerator would use, just driven from
+	 *  this app's own frontend since CEF's Chrome-runtime browser has no browser
+	 *  chrome of its own to bind that accelerator (see `ZoomDirection`'s own
+	 *  doc). Does not reach a pane's popup, if it has one open -- popups get the
+	 *  same `DEFAULT_ZOOM_LEVEL` applied once at creation (pane_host.rs's
+	 *  `drain_popup_events`, items.id=366), but aren't wired to this command's
+	 *  live in/out/reset stepping: they're short-lived OAuth login surfaces
+	 *  (items.id=234), not something a user is expected to sit and adjust.
+	 */
+	adjustPaneZoom: (providerId: string, direction: ZoomDirection) => typedError<null, string>(__TAURI_INVOKE("adjust_pane_zoom", { providerId, direction })),
+	/**
 	 *  items.id=234: popup counterpart to `forward_pane_mouse_click` -- same
 	 *  coordinate/no-op contract, except `x`/`y` are local to the popup's own
 	 *  on-screen rect (`tier3-popup-opened`'s reported `rect`), not the parent
@@ -481,6 +473,18 @@ export const commands = {
 	forwardPopupMouseMove: (providerId: string, x: number | null, y: number | null, leaving: boolean, buttons: number, modifiers: PaneEventModifiers) => typedError<null, string>(__TAURI_INVOKE("forward_popup_mouse_move", { providerId, x, y, leaving, buttons, modifiers })),
 	/**  items.id=234: popup counterpart to `forward_pane_mouse_wheel`. */
 	forwardPopupMouseWheel: (providerId: string, x: number | null, y: number | null, deltaX: number | null, deltaY: number | null, modifiers: PaneEventModifiers) => typedError<null, string>(__TAURI_INVOKE("forward_popup_mouse_wheel", { providerId, x, y, deltaX, deltaY, modifiers })),
+	/**
+	 *  items.id=367: popup counterpart to `forward_pane_key` -- same
+	 *  windows_key_code/character/RawKeyDown-then-Char contract, see that
+	 *  command's own doc. Missing entirely until now: `PopupHitLayer.tsx` only
+	 *  ever forwarded mouse click/move/wheel (items.id=234's original scope),
+	 *  so a popup could be clicked into and focused but never actually typed
+	 *  into -- confirmed by Jason live, 2026-08-30 (Claude's Google sign-in
+	 *  popup accepted focus/clicks but no keystrokes reached it, reproducing
+	 *  even via a plain in-app pane switch away and back, not just after an
+	 *  OS-level focus round-trip).
+	 */
+	forwardPopupKey: (providerId: string, eventType: PaneKeyEventType, windowsKeyCode: number, character: number, modifiers: PaneEventModifiers) => typedError<null, string>(__TAURI_INVOKE("forward_popup_key", { providerId, eventType, windowsKeyCode, character, modifiers })),
 	sendMessage: (userId: string, personaId: string, contextKey: string, content: string, focusId: string, gate3Track: boolean) => typedError<MessageInfo[], string>(__TAURI_INVOKE("send_message", { userId, personaId, contextKey, content, focusId, gate3Track })),
 	listMessages: (userId: string, personaId: string, contextKey: string) => typedError<MessageInfo[], string>(__TAURI_INVOKE("list_messages", { userId, personaId, contextKey })),
 	/**
@@ -1092,6 +1096,17 @@ export type VoiceProfileInfo = {
 	formality: string,
 	length_preference: string,
 };
+
+/**
+ *  items.id=364: a pane's own Ctrl+=/Ctrl+-/Ctrl+0 shortcuts, intercepted by
+ *  the frontend (`PaneHitLayer.tsx`) before they'd otherwise reach CEF as
+ *  ordinary forwarded key events -- CEF's Chrome-runtime browser has no
+ *  window chrome of its own to interpret these as a zoom accelerator (that's
+ *  normally a browser-UI concern, not something Blink handles unprompted),
+ *  so the host app applies the zoom explicitly via
+ *  `BrowserHost::set_zoom_level` instead (see `adjust_pane_zoom`'s own doc).
+ */
+export type ZoomDirection = "In" | "Out" | "Reset";
 
 /* Tauri Specta runtime */
 async function typedError<T, E>(result: Promise<T>): Promise<{ status: "ok"; data: T } | { status: "error"; error: E }> {

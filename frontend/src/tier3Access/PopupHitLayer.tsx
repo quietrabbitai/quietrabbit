@@ -20,7 +20,13 @@
 // live outside the popup's rect (see this item's plan, Judgment call 6.3).
 
 import { useCallback, useEffect, useRef } from 'react'
-import { commands, type PaneEventModifiers, type PaneMouseButton, type PaneRectFraction } from '../bindings'
+import {
+  commands,
+  type PaneEventModifiers,
+  type PaneKeyEventType,
+  type PaneMouseButton,
+  type PaneRectFraction,
+} from '../bindings'
 
 export interface PopupHitLayerProps {
   popups: Record<string, PaneRectFraction>
@@ -58,6 +64,15 @@ function domButton(button: number): PaneMouseButton | null {
 }
 
 const PROVIDER_ID_ATTR = 'data-popup-provider-id'
+
+/** items.id=367: popup counterpart to PaneHitLayer's own `forwardKey` --
+ *  see that file's doc for why `windows_key_code`/no-native-code. Missing
+ *  entirely until now (see `forward_popup_key`'s own doc,
+ *  commands/tier3_pane.rs, for the confirmed symptom this fixes). */
+function forwardKey(providerId: string, e: KeyboardEvent, type: PaneKeyEventType) {
+  const character = e.key.length === 1 ? e.key.charCodeAt(0) : 0
+  void commands.forwardPopupKey(providerId, type, e.keyCode, character, domModifiers(e))
+}
 
 export function PopupHitLayer({ popups }: PopupHitLayerProps) {
   const wrapperRef = useRef<HTMLDivElement | null>(null)
@@ -229,6 +244,17 @@ export function PopupHitLayer({ popups }: PopupHitLayerProps) {
               e.nativeEvent.buttons,
               domModifiers(e.nativeEvent),
             )
+          }}
+          onKeyDown={(e) => {
+            e.preventDefault()
+            forwardKey(providerId, e.nativeEvent, 'RawKeyDown')
+            if (e.key.length === 1) {
+              forwardKey(providerId, e.nativeEvent, 'Char')
+            }
+          }}
+          onKeyUp={(e) => {
+            e.preventDefault()
+            forwardKey(providerId, e.nativeEvent, 'KeyUp')
           }}
         />
       ))}

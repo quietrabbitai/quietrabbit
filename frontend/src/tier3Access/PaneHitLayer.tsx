@@ -24,6 +24,7 @@ import {
   type PaneEventModifiers,
   type PaneKeyEventType,
   type PaneMouseButton,
+  type ZoomDirection,
 } from '../bindings'
 import type { PanePixelRect } from './paneLayout'
 
@@ -80,6 +81,29 @@ const PROVIDER_ID_ATTR = 'data-provider-id'
 function forwardKey(providerId: string, e: KeyboardEvent, type: PaneKeyEventType) {
   const character = e.key.length === 1 ? e.key.charCodeAt(0) : 0
   void commands.forwardPaneKey(providerId, type, e.keyCode, character, domModifiers(e))
+}
+
+/** items.id=364: Ctrl+=/Ctrl+-/Ctrl+0 are intercepted here rather than
+ *  forwarded to CEF as ordinary keys -- a Chrome-runtime CEF browser has no
+ *  window chrome of its own to bind these as a zoom accelerator (that's
+ *  normally a browser-UI concern), so this app applies the zoom itself via
+ *  `adjustPaneZoom` (see `ZoomDirection`'s own doc, commands/tier3_pane.rs).
+ *  `'='`/`'+'` both map to zoom-in since the physical key that types '+' on
+ *  a US layout requires Shift, and browsers report that combo's `e.key` as
+ *  `'+'`, not `'='`. */
+function zoomDirectionForKey(e: KeyboardEvent): ZoomDirection | null {
+  if (!e.ctrlKey) return null
+  switch (e.key) {
+    case '=':
+    case '+':
+      return 'In'
+    case '-':
+      return 'Out'
+    case '0':
+      return 'Reset'
+    default:
+      return null
+  }
 }
 
 export function PaneHitLayer({ rects }: PaneHitLayerProps) {
@@ -279,6 +303,11 @@ export function PaneHitLayer({ rects }: PaneHitLayerProps) {
           }}
           onKeyDown={(e) => {
             e.preventDefault()
+            const zoomDirection = zoomDirectionForKey(e.nativeEvent)
+            if (zoomDirection) {
+              void commands.adjustPaneZoom(providerId, zoomDirection)
+              return
+            }
             forwardKey(providerId, e.nativeEvent, 'RawKeyDown')
             if (e.key.length === 1) {
               forwardKey(providerId, e.nativeEvent, 'Char')

@@ -97,7 +97,7 @@ use cef::{
 
 use crate::commands::tier3_pane::{
     PaneEventModifiers, PaneKeyEventType, PaneLayoutState, PaneMouseButton, PaneRectFraction,
-    PopupClosedPayload, PopupOpenedPayload,
+    PopupClosedPayload, PopupOpenedPayload, ZoomDirection,
 };
 use crate::tier3_pane::render::{
     ClientBuilder, LogicalSize, PaneRenderHandler, PopupLifecycleEvent, PopupRequested,
@@ -147,6 +147,12 @@ enum PendingAction {
     /// its CEF `Browser`, and (per `PaneManager::active_pane`'s own doc)
     /// stays reachable to reactivate without reloading.
     SetHidden(bool),
+    /// items.id=364: absolute CEF zoom level (Chromium's own `1.2^level`
+    /// convention, 0.0 = 100%) -- `PaneManager::dispatch`'s `AdjustZoom` arm
+    /// computes the new absolute value from the pane's tracked
+    /// `PaneState.zoom_level` before enqueueing this, so this variant itself
+    /// carries no notion of "in"/"out"/"reset".
+    SetZoomLevel(f64),
 }
 
 struct BrowserLifecycle {
@@ -234,6 +240,13 @@ fn apply_action(browser: &cef::Browser, action: &PendingAction) -> Result<(), St
             host.was_hidden(*hidden as _);
             Ok(())
         }
+        PendingAction::SetZoomLevel(level) => {
+            let Some(host) = browser.host() else {
+                return Err("browser has no host yet".to_string());
+            };
+            host.set_zoom_level(*level);
+            Ok(())
+        }
     }
 }
 
@@ -246,6 +259,22 @@ fn apply_action(browser: &cef::Browser, action: &PendingAction) -> Result<(), St
 /// question's DOM-introspection dependency, which is explicitly NOT part
 /// of this item's scope (see items.id=360).
 const SCROLL_TO_BOTTOM_JS: &str = "window.scrollTo(0, document.body.scrollHeight);";
+
+/// items.id=364: see `PaneManager::adjust_zoom`'s own doc for why 0.5.
+const ZOOM_LEVEL_STEP: f64 = 0.5;
+/// `1.2^-6 ~= 33%` -- far enough out to be clearly a deliberate floor, not a
+/// value anyone would reach by mis-clicking a few times.
+const ZOOM_LEVEL_MIN: f64 = -6.0;
+/// `1.2^6 ~= 299%` -- symmetric ceiling, same reasoning as `ZOOM_LEVEL_MIN`.
+const ZOOM_LEVEL_MAX: f64 = 6.0;
+/// Every newly-opened pane starts here rather than at 0.0 (100%) -- Jason's
+/// own manual verification this session (items.id=364) found 5 Ctrl+= steps
+/// (5 * `ZOOM_LEVEL_STEP`) a comfortable default reading size across the
+/// providers tried. `open_pane` seeds `PaneState.zoom_level` with this value
+/// directly and enqueues the matching `SetZoomLevel`, rather than routing
+/// through `adjust_zoom`'s in/out stepping -- there is no prior zoom_level to
+/// step from at creation time.
+const DEFAULT_ZOOM_LEVEL: f64 = 5.0 * ZOOM_LEVEL_STEP;
 
 /// The two operations `PaneHost::open_pane`/`close_pane` perform, dispatched
 /// via `AppHandle::run_on_main_thread` from `commands::tier3_pane`'s async
@@ -335,6 +364,27 @@ pub enum PaneCommand {
         delta_y: f64,
         modifiers: PaneEventModifiers,
     },
+    /// items.id=364: steps `key`'s tracked `PaneState.zoom_level` up/down/to
+    /// zero and applies the resulting absolute level via
+    /// `PendingAction::SetZoomLevel`. Not wired to a pane's popup, if it has
+    /// one open -- see `adjust_pane_zoom`'s own doc (commands/tier3_pane.rs)
+    /// for why, and `drain_popup_events` (items.id=366) for how a popup
+    /// still gets `DEFAULT_ZOOM_LEVEL` applied once, just not via this path.
+    AdjustZoom {
+        key: PaneKey,
+        direction: ZoomDirection,
+    },
+    /// items.id=367: popup counterpart to `KeyEvent` above -- same shape,
+    /// `key` is the *parent* pane's key (see `PopupMouseClick`'s own doc for
+    /// why). Previously missing entirely -- see `forward_popup_key`'s own
+    /// doc (commands/tier3_pane.rs) for the confirmed symptom this fixes.
+    PopupKeyEvent {
+        key: PaneKey,
+        event_type: PaneKeyEventType,
+        windows_key_code: i32,
+        character: u16,
+        modifiers: PaneEventModifiers,
+    },
 }
 
 /// Per-pane state. No `window`/per-pane `render_state` fields (one shared
@@ -367,6 +417,13 @@ struct PaneState {
     /// than a timer: there is no external window-manager gesture to
     /// coalesce here, just this app's own layout math re-running each tick.
     last_applied_size: Option<(u32, u32)>,
+    /// items.id=364: this pane's current absolute CEF zoom level (0.0 =
+    /// 100%, Chromium's own `1.2^level` convention) -- tracked here rather
+    /// than read back from CEF, since `AdjustZoom`'s in/out/reset steps need
+    /// a value to compute *from* even while `browser_lifecycle` is still
+    /// `Creating`/`Uninitialized` (mirrors why `active_pane` is tracked on
+    /// `PaneManager` rather than queried from GTK/CEF state each time).
+    zoom_level: f64,
 }
 
 /// items.id=234: lifecycle of one popup's CEF browser. Unlike
@@ -606,6 +663,9 @@ impl PaneManager {
             // Navigate is -- applied immediately if the browser is already
             // Ready, deferred otherwise.
             browser_lifecycle.enqueue(PendingAction::SetHidden(true));
+            // items.id=364: see DEFAULT_ZOOM_LEVEL's own doc -- queued the
+            // same deferred-if-not-Ready way as Navigate/SetHidden above.
+            browser_lifecycle.enqueue(PendingAction::SetZoomLevel(DEFAULT_ZOOM_LEVEL));
         } else {
             browser_lifecycle.fail(
                 "browser_host_create_browser returned false (async creation dispatch failed)",
@@ -619,6 +679,7 @@ impl PaneManager {
                 browser_size,
                 browser_ready_rx: Some(rx),
                 last_applied_size: None,
+                zoom_level: DEFAULT_ZOOM_LEVEL,
             },
         );
         self.open_pane_count.fetch_add(1, Ordering::Relaxed);
@@ -681,6 +742,24 @@ impl PaneManager {
                     pane.browser_lifecycle
                         .enqueue(PendingAction::SetHidden(true));
                 }
+                // items.id=361: an open OAuth popup (items.id=234) is a
+                // separate `Browser` from its parent pane -- hiding the
+                // pane alone leaves the popup compositing in the
+                // background. `PopupState` has no `PendingAction` queue
+                // (unlike `BrowserLifecycle`, see its own doc), so this is
+                // best-effort/immediate only, same as `force_close_popup`'s
+                // own `popup.lifecycle.browser()` access -- a popup still
+                // `Creating` at this exact instant is not caught, matching
+                // that existing precedent rather than introducing a new
+                // deferred-queue mechanism for this one case.
+                if let Some(host) = self
+                    .popups
+                    .get(&old_key)
+                    .and_then(|p| p.lifecycle.browser())
+                    .and_then(|b| b.host())
+                {
+                    host.was_hidden(true as _);
+                }
             }
         }
         if let Some(new_key) = &key {
@@ -690,6 +769,26 @@ impl PaneManager {
             }
         }
         self.active_pane = key;
+    }
+
+    /// items.id=364: `ZOOM_LEVEL_STEP`/`ZOOM_LEVEL_MIN`/`ZOOM_LEVEL_MAX` are
+    /// this method's own tuning constants (module-level consts below) --
+    /// Chromium's `1.2^level` convention means +-1.0 level is roughly a
+    /// +-20% step, so +-0.5 (this method's step) lands close to a normal
+    /// browser's own Ctrl+= granularity. A no-op if `key` isn't an open
+    /// pane.
+    fn adjust_zoom(&mut self, key: &PaneKey, direction: ZoomDirection) {
+        let Some(pane) = self.panes.get_mut(key) else {
+            return;
+        };
+        let new_level = match direction {
+            ZoomDirection::In => (pane.zoom_level + ZOOM_LEVEL_STEP).min(ZOOM_LEVEL_MAX),
+            ZoomDirection::Out => (pane.zoom_level - ZOOM_LEVEL_STEP).max(ZOOM_LEVEL_MIN),
+            ZoomDirection::Reset => 0.0,
+        };
+        pane.zoom_level = new_level;
+        pane.browser_lifecycle
+            .enqueue(PendingAction::SetZoomLevel(new_level));
     }
 
     /// Drains any browser CEF's UI thread finished constructing since the
@@ -878,6 +977,14 @@ impl PaneManager {
             match event {
                 PopupLifecycleEvent::Ready(browser) => {
                     log::info!("tier3_pane::pane_host: popup delivered for pane={key}");
+                    // items.id=364/366: applied once, right here, rather
+                    // than via BrowserLifecycle's pending-queue mechanism --
+                    // popups have no such queue (see PopupState's own doc),
+                    // and this is the one point a popup's Browser is known
+                    // to exist, so there is nothing to defer.
+                    if let Some(host) = browser.host() {
+                        host.set_zoom_level(DEFAULT_ZOOM_LEVEL);
+                    }
                     popup.lifecycle = PopupLifecycleState::Ready(browser);
                 }
                 PopupLifecycleEvent::Closed => closed_keys.push(key.clone()),
@@ -2171,12 +2278,35 @@ impl PaneHost {
                              size={rs_size:?} (matches glarea_size_physical, scale={scale_u32})"
                         );
                     }
-                    let popup_layout: HashMap<PaneKey, PaneRectFraction> = manager
-                        .borrow()
-                        .popups
-                        .iter()
-                        .map(|(k, p)| (k.clone(), p.rect))
-                        .collect();
+                    // items.id=366: unlike the pane loop above (which only
+                    // ever draws a pane whose key has a `layout` entry --
+                    // the frontend only reports one for the currently-
+                    // visible pane, which is what actually enforces the
+                    // single-active-pane model at paint time, not
+                    // `was_hidden` itself), this map used to be built from
+                    // *every* open popup unconditionally. `was_hidden(true)`
+                    // (items.id=361) stops a deactivated pane's popup from
+                    // producing new frames, but does nothing about the
+                    // frame it already produced -- `POPUP_TEXTURES` keeps
+                    // that last-painted texture until `force_close_popup`
+                    // explicitly removes it, so with no filter here the
+                    // stale texture kept compositing every frame regardless
+                    // of which pane was actually active (confirmed live,
+                    // 2026-08-30: a Claude login popup stayed on screen
+                    // after switching to ChatGPT's pane). Filtering to only
+                    // the active pane's own popup matches the pane loop's
+                    // own filtering, just done here instead of on the
+                    // frontend side since popups have no frontend-owned
+                    // layout state to omit an entry from.
+                    let popup_layout: HashMap<PaneKey, PaneRectFraction> = {
+                        let mgr = manager.borrow();
+                        let active = mgr.active_pane.clone();
+                        mgr.popups
+                            .iter()
+                            .filter(|(k, _)| Some(*k) == active.as_ref())
+                            .map(|(k, p)| (k.clone(), p.rect))
+                            .collect()
+                    };
                     rs.render(&layout, &popup_layout, captured_fbo.map(|fbo| fbo as u32));
                 }
 
@@ -2293,6 +2423,9 @@ impl PaneHost {
                 log::debug!("DIAG items.id=359: dispatch(SetActivePane) -> queue_draw()");
                 self.queue_draw();
             }
+            PaneCommand::AdjustZoom { key, direction } => {
+                self.manager.borrow_mut().adjust_zoom(&key, direction);
+            }
             PaneCommand::MouseClick {
                 key,
                 x,
@@ -2306,6 +2439,30 @@ impl PaneHost {
                 let mut mgr = self.manager.borrow_mut();
                 if !mouseup {
                     mgr.focused_pane = Some(key.clone());
+                }
+                // DIAG items.id=365 (temporary -- remove once the
+                // first-click-unresponsive investigation concludes):
+                // distinguishes "pane not open", "browser still Creating"
+                // (the async browser_host_create_browser race), and "host
+                // missing though Ready" (shouldn't happen) as three
+                // different reasons a click can be silently dropped below --
+                // narrows which of those is actually occurring when a
+                // freshly-opened pane's first click does nothing.
+                if !mouseup {
+                    match mgr.panes.get(&key) {
+                        None => log::warn!(
+                            "DIAG items.id=365: MouseClick dropped, pane={key} not open"
+                        ),
+                        Some(p) if p.browser_lifecycle.browser().is_none() => log::warn!(
+                            "DIAG items.id=365: MouseClick dropped, pane={key} browser not Ready yet"
+                        ),
+                        Some(p) if p.browser_lifecycle.browser().and_then(|b| b.host()).is_none() => {
+                            log::warn!(
+                                "DIAG items.id=365: MouseClick dropped, pane={key} browser Ready but host() is None"
+                            )
+                        }
+                        _ => {}
+                    }
                 }
                 if let Some(host) = mgr
                     .panes
@@ -2355,6 +2512,24 @@ impl PaneHost {
             } => {
                 let mut mgr = self.manager.borrow_mut();
                 mgr.focused_pane = Some(key.clone());
+                // DIAG items.id=365 (temporary, see MouseClick's own DIAG
+                // comment above for what this is investigating).
+                if matches!(event_type, PaneKeyEventType::RawKeyDown) {
+                    match mgr.panes.get(&key) {
+                        None => {
+                            log::warn!("DIAG items.id=365: KeyEvent dropped, pane={key} not open")
+                        }
+                        Some(p) if p.browser_lifecycle.browser().is_none() => log::warn!(
+                            "DIAG items.id=365: KeyEvent dropped, pane={key} browser not Ready yet"
+                        ),
+                        Some(p) if p.browser_lifecycle.browser().and_then(|b| b.host()).is_none() => {
+                            log::warn!(
+                                "DIAG items.id=365: KeyEvent dropped, pane={key} browser Ready but host() is None"
+                            )
+                        }
+                        _ => {}
+                    }
+                }
                 if let Some(host) = mgr
                     .panes
                     .get(&key)
@@ -2582,6 +2757,45 @@ impl PaneHost {
                         -cdx.round() as i32,
                         -cdy.round() as i32,
                     );
+                }
+            }
+            PaneCommand::PopupKeyEvent {
+                key,
+                event_type,
+                windows_key_code,
+                character,
+                modifiers,
+            } => {
+                let mgr = self.manager.borrow();
+                if let Some(host) = mgr
+                    .popups
+                    .get(&key)
+                    .and_then(|p| p.lifecycle.browser())
+                    .and_then(|b| b.host())
+                {
+                    let cef_type = match event_type {
+                        PaneKeyEventType::RawKeyDown => KeyEventType::RAWKEYDOWN,
+                        PaneKeyEventType::Char => KeyEventType::CHAR,
+                        PaneKeyEventType::KeyUp => KeyEventType::KEYUP,
+                    };
+                    let ev = KeyEvent {
+                        size: std::mem::size_of::<KeyEvent>(),
+                        type_: cef_type,
+                        modifiers: cef_modifiers_from_dom(
+                            modifiers.shift,
+                            modifiers.ctrl,
+                            modifiers.alt,
+                            modifiers.meta,
+                            0,
+                        ),
+                        windows_key_code,
+                        native_key_code: windows_key_code,
+                        is_system_key: 0,
+                        character,
+                        unmodified_character: character,
+                        focus_on_editable_field: 0,
+                    };
+                    host.send_key_event(Some(&ev));
                 }
             }
         }
