@@ -609,7 +609,9 @@ enum PendingPaint {
         width: u32,
         height: u32,
     },
-    Accelerated { info: DupedAcceleratedPaintInfo },
+    Accelerated {
+        info: DupedAcceleratedPaintInfo,
+    },
 }
 
 /// `info`'s plane fds have already been `dup()`'d by the capturing

@@ -177,7 +177,8 @@ pub(crate) async fn replace_content_conn(
         .await?;
 
     for entity in entities {
-        let aliases_json = serde_json::to_string(&entity.aliases).unwrap_or_else(|_| "[]".to_owned());
+        let aliases_json =
+            serde_json::to_string(&entity.aliases).unwrap_or_else(|_| "[]".to_owned());
         let extra_metadata_json = entity.extra_metadata.to_string();
         sqlx::query(
             "INSERT INTO view_cache_entities
@@ -274,13 +275,11 @@ pub(crate) async fn mark_ended_conn(
         .execute(&mut *conn)
         .await?;
 
-    sqlx::query(
-        "UPDATE view_cache_meta SET status = 'ended', ended_at = ?, last_synced_at = ?",
-    )
-    .bind(emitted_at)
-    .bind(emitted_at)
-    .execute(&mut *conn)
-    .await?;
+    sqlx::query("UPDATE view_cache_meta SET status = 'ended', ended_at = ?, last_synced_at = ?")
+        .bind(emitted_at)
+        .bind(emitted_at)
+        .execute(&mut *conn)
+        .await?;
 
     Ok(())
 }
@@ -383,7 +382,9 @@ mod tests {
         let mut conn = open_view_cache_db("user-1", "share-1", &key_hex)
             .await
             .expect("open_view_cache_db must succeed");
-        let meta = get_meta_conn(&mut conn).await.expect("get_meta must succeed");
+        let meta = get_meta_conn(&mut conn)
+            .await
+            .expect("get_meta must succeed");
         assert!(meta.is_none());
     }
 
@@ -452,7 +453,9 @@ mod tests {
             .await
             .unwrap();
 
-        mark_ended_conn(&mut conn, "t2").await.expect("mark_ended_conn must succeed");
+        mark_ended_conn(&mut conn, "t2")
+            .await
+            .expect("mark_ended_conn must succeed");
 
         let meta = get_meta_conn(&mut conn).await.unwrap().unwrap();
         assert_eq!(meta.status, ViewCacheStatus::Ended);

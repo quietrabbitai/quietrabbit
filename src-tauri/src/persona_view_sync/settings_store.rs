@@ -309,7 +309,9 @@ mod tests {
     #[tokio::test]
     async fn record_result_on_unconfigured_pair_is_a_noop_not_an_error() {
         let _env = setup().await;
-        assert!(record_pull_result("user-1", "share-1", Ok(())).await.is_ok());
+        assert!(record_pull_result("user-1", "share-1", Ok(()))
+            .await
+            .is_ok());
         assert!(get_persona_view_share_sync_settings("user-1", "share-1")
             .await
             .unwrap()

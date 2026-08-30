@@ -291,9 +291,12 @@ pub async fn accept_persona_view_share(
         ))
     })?;
 
-    let mut cache_conn =
-        view_cache_store::open_view_cache_db(recipient_user_id, share_id, recipient_personal_key_hex)
-            .await?;
+    let mut cache_conn = view_cache_store::open_view_cache_db(
+        recipient_user_id,
+        share_id,
+        recipient_personal_key_hex,
+    )
+    .await?;
 
     sqlx::query("SAVEPOINT accept_persona_view_share")
         .execute(&mut cache_conn)
@@ -331,7 +334,9 @@ pub async fn accept_persona_view_share(
                 .execute(&mut cache_conn)
                 .await
             {
-                log::error!("Savepoint rollback failed in accept_persona_view_share: {rollback_err}");
+                log::error!(
+                    "Savepoint rollback failed in accept_persona_view_share: {rollback_err}"
+                );
             }
             let _ = sqlx::query("RELEASE accept_persona_view_share")
                 .execute(&mut cache_conn)
@@ -429,7 +434,9 @@ async fn list_outbound_view_shares(
 /// share_id for every accepted VIEW-ONLY share `recipient_user_id` has
 /// accepted. No materialized_persona_id equivalent -- there is nothing
 /// analogous to look up (decisions.id=723).
-async fn list_inbound_view_shares(recipient_user_id: &str) -> Result<Vec<String>, PersonaViewSyncError> {
+async fn list_inbound_view_shares(
+    recipient_user_id: &str,
+) -> Result<Vec<String>, PersonaViewSyncError> {
     let mut conn = open_shared_db().await?;
     let rows = sqlx::query(
         "SELECT id FROM pending_persona_shares
@@ -624,9 +631,12 @@ async fn pull_all_accepted_view_shares(
 
         if let Err(e) = result {
             log::warn!("persona_view_sync: pull failed for share={share_id}: {e}");
-            if let Err(e2) =
-                settings_store::record_pull_result(recipient_user_id, &share_id, Err(&e.to_string()))
-                    .await
+            if let Err(e2) = settings_store::record_pull_result(
+                recipient_user_id,
+                &share_id,
+                Err(&e.to_string()),
+            )
+            .await
             {
                 log::warn!("persona_view_sync: could not record pull failure: {e2}");
             }
@@ -651,9 +661,12 @@ async fn pull_if_newer_view(
         return Ok(false);
     };
 
-    let mut cache_conn =
-        view_cache_store::open_view_cache_db(recipient_user_id, share_id, recipient_personal_key_hex)
-            .await?;
+    let mut cache_conn = view_cache_store::open_view_cache_db(
+        recipient_user_id,
+        share_id,
+        recipient_personal_key_hex,
+    )
+    .await?;
     let meta = view_cache_store::get_meta_conn(&mut cache_conn).await?;
 
     if let Some(m) = &meta {
@@ -860,7 +873,10 @@ mod tests {
 
     /// Recipient side of VIEW-ONLY needs only an account -- no Persona
     /// (decisions.id=723).
-    async fn make_recipient_user(display_name: &str, master_key_fill: u8) -> (String, String, StaticSecret) {
+    async fn make_recipient_user(
+        display_name: &str,
+        master_key_fill: u8,
+    ) -> (String, String, StaticSecret) {
         let user_id = uuid::Uuid::new_v4().to_string();
         let master_key = [master_key_fill; kdf::MASTER_KEY_LEN];
         let (sharing_private_key, sharing_public_key) =
@@ -888,8 +904,7 @@ mod tests {
     async fn accept_populates_cache_and_flips_status_without_creating_a_persona() {
         let _env = setup().await;
         let (owner_id, owner_persona, owner_key, _) = make_user_with_persona("Alice", 0x30).await;
-        let (recipient_id, recipient_key, recipient_priv) =
-            make_recipient_user("Bob", 0x40).await;
+        let (recipient_id, recipient_key, recipient_priv) = make_recipient_user("Bob", 0x40).await;
 
         entity_store::create_entity(
             &owner_id,
@@ -918,9 +933,10 @@ mod tests {
             .await
             .expect("accept_persona_view_share must succeed");
 
-        let mut cache_conn = view_cache_store::open_view_cache_db(&recipient_id, &share_id, &recipient_key)
-            .await
-            .unwrap();
+        let mut cache_conn =
+            view_cache_store::open_view_cache_db(&recipient_id, &share_id, &recipient_key)
+                .await
+                .unwrap();
         let meta = view_cache_store::get_meta_conn(&mut cache_conn)
             .await
             .unwrap()
@@ -929,11 +945,12 @@ mod tests {
         assert_eq!(meta.source_persona_display_name, "Shared Persona");
 
         let mut shared_conn = open_shared_db().await.unwrap();
-        let status: String = sqlx::query_scalar("SELECT status FROM pending_persona_shares WHERE id = ?")
-            .bind(&share_id)
-            .fetch_one(&mut shared_conn)
-            .await
-            .unwrap();
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM pending_persona_shares WHERE id = ?")
+                .bind(&share_id)
+                .fetch_one(&mut shared_conn)
+                .await
+                .unwrap();
         assert_eq!(status, "accepted");
 
         // No Persona/user_personas row was ever created for the recipient.
@@ -950,8 +967,7 @@ mod tests {
     async fn accept_rejects_a_synced_share() {
         let _env = setup().await;
         let (owner_id, owner_persona, owner_key, _) = make_user_with_persona("Alice", 0x31).await;
-        let (recipient_id, recipient_key, recipient_priv) =
-            make_recipient_user("Bob", 0x41).await;
+        let (recipient_id, recipient_key, recipient_priv) = make_recipient_user("Bob", 0x41).await;
 
         let share_id = send_persona_share(
             &owner_id,
@@ -964,7 +980,8 @@ mod tests {
         .unwrap();
 
         let result =
-            accept_persona_view_share(&share_id, &recipient_id, &recipient_key, &recipient_priv).await;
+            accept_persona_view_share(&share_id, &recipient_id, &recipient_key, &recipient_priv)
+                .await;
         assert!(matches!(result, Err(PersonaViewSyncError::Validation(_))));
     }
 
@@ -972,8 +989,7 @@ mod tests {
     async fn push_then_pull_round_trips_content_into_the_read_only_cache() {
         let _env = setup().await;
         let (owner_id, owner_persona, owner_key, _) = make_user_with_persona("Alice", 0x32).await;
-        let (recipient_id, recipient_key, recipient_priv) =
-            make_recipient_user("Bob", 0x42).await;
+        let (recipient_id, recipient_key, recipient_priv) = make_recipient_user("Bob", 0x42).await;
 
         let entity_id = entity_store::create_entity(
             &owner_id,
@@ -1063,22 +1079,25 @@ mod tests {
         .expect("push_if_changed_view must succeed");
         assert!(pushed);
 
-        let applied =
-            pull_if_newer_view(&recipient_id, &recipient_key, &share_id, &recipient_priv)
-                .await
-                .expect("pull_if_newer_view must succeed");
+        let applied = pull_if_newer_view(&recipient_id, &recipient_key, &share_id, &recipient_priv)
+            .await
+            .expect("pull_if_newer_view must succeed");
         assert!(applied);
 
-        let mut cache_conn = view_cache_store::open_view_cache_db(&recipient_id, &share_id, &recipient_key)
-            .await
-            .unwrap();
+        let mut cache_conn =
+            view_cache_store::open_view_cache_db(&recipient_id, &share_id, &recipient_key)
+                .await
+                .unwrap();
         let value: String = sqlx::query_scalar(
             "SELECT field_value FROM view_cache_entity_facts WHERE field_name = 'phone'",
         )
         .fetch_one(&mut cache_conn)
         .await
         .unwrap();
-        assert_eq!(value, "555-9999", "the post-grant fact update must have applied");
+        assert_eq!(
+            value, "555-9999",
+            "the post-grant fact update must have applied"
+        );
     }
 
     #[tokio::test]
@@ -1137,8 +1156,7 @@ mod tests {
     async fn revoke_then_push_then_pull_ends_the_share_and_clears_the_cache() {
         let _env = setup().await;
         let (owner_id, owner_persona, owner_key, _) = make_user_with_persona("Alice", 0x34).await;
-        let (recipient_id, recipient_key, recipient_priv) =
-            make_recipient_user("Bob", 0x44).await;
+        let (recipient_id, recipient_key, recipient_priv) = make_recipient_user("Bob", 0x44).await;
 
         entity_store::create_entity(
             &owner_id,
@@ -1211,22 +1229,27 @@ mod tests {
         .expect("tombstone push must succeed");
         assert!(tombstone_pushed);
 
-        let applied =
-            pull_if_newer_view(&recipient_id, &recipient_key, &share_id, &recipient_priv)
-                .await
-                .expect("tombstone pull must succeed");
+        let applied = pull_if_newer_view(&recipient_id, &recipient_key, &share_id, &recipient_priv)
+            .await
+            .expect("tombstone pull must succeed");
         assert!(applied);
 
-        let mut cache_conn = view_cache_store::open_view_cache_db(&recipient_id, &share_id, &recipient_key)
-            .await
-            .unwrap();
+        let mut cache_conn =
+            view_cache_store::open_view_cache_db(&recipient_id, &share_id, &recipient_key)
+                .await
+                .unwrap();
         let meta = view_cache_store::get_meta_conn(&mut cache_conn)
             .await
             .unwrap()
             .expect("meta must still exist");
         assert_eq!(meta.status, ViewCacheStatus::Ended);
         assert!(meta.ended_at.is_some());
-        assert_eq!(view_cache_store::count_entities_conn(&mut cache_conn).await.unwrap(), 0);
+        assert_eq!(
+            view_cache_store::count_entities_conn(&mut cache_conn)
+                .await
+                .unwrap(),
+            0
+        );
 
         // A terminal share must not be re-pulled even if somehow the folder
         // still holds a file -- pull_if_newer_view short-circuits on status.

@@ -579,7 +579,9 @@ pub async fn update_entity(
             {
                 log::error!("Savepoint rollback failed in update_entity: {rollback_err}");
             }
-            let _ = sqlx::query("RELEASE update_entity").execute(&mut conn).await;
+            let _ = sqlx::query("RELEASE update_entity")
+                .execute(&mut conn)
+                .await;
             Err(e)
         }
     }

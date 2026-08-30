@@ -226,7 +226,10 @@ async fn open_shared_db() -> Result<SqliteConnection, PersonaSyncError> {
 /// Write `bytes` to `path` via a temp-file-then-rename, creating parent
 /// directories as needed. See this module's own header (DELIVERY FORMAT) on
 /// why this format gets atomicity group_sync::engine's own artifacts don't.
-async fn write_envelope_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), PersonaSyncError> {
+async fn write_envelope_atomic(
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> Result<(), PersonaSyncError> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -368,7 +371,9 @@ pub async fn provision_sync_relationship(
                 .execute(&mut conn)
                 .await
             {
-                log::error!("Savepoint rollback failed in provision_sync_relationship: {rollback_err}");
+                log::error!(
+                    "Savepoint rollback failed in provision_sync_relationship: {rollback_err}"
+                );
             }
             let _ = sqlx::query("RELEASE provision_sync_relationship")
                 .execute(&mut conn)
@@ -470,7 +475,9 @@ async fn list_outbound_shares(
 /// provisioned is not expected to persist (accept_and_provision_sync does
 /// both together), but a row in that transient state has nothing this sweep
 /// could act on yet.
-async fn list_inbound_shares(recipient_user_id: &str) -> Result<Vec<(String, String)>, PersonaSyncError> {
+async fn list_inbound_shares(
+    recipient_user_id: &str,
+) -> Result<Vec<(String, String)>, PersonaSyncError> {
     let mut conn = open_shared_db().await?;
     let rows = sqlx::query(
         "SELECT id, materialized_persona_id FROM pending_persona_shares
@@ -668,9 +675,7 @@ async fn pull_all_accepted_shares(
         .await;
 
         if let Err(e) = result {
-            log::warn!(
-                "persona_sync: pull failed for share={share_id} persona={persona_id}: {e}"
-            );
+            log::warn!("persona_sync: pull failed for share={share_id} persona={persona_id}: {e}");
             if let Err(e2) =
                 settings_store::record_pull_result(&persona_id, &share_id, Err(&e.to_string()))
                     .await
@@ -765,7 +770,9 @@ async fn apply_update(
         // untouched on update) -- see pass 2, same two-pass FK-ordering
         // reasoning accept_persona_share's own materialization already uses.
         for entity in &payload.entities {
-            let exists = entity_store::get_entity_conn(&mut conn, &entity.id).await?.is_some();
+            let exists = entity_store::get_entity_conn(&mut conn, &entity.id)
+                .await?
+                .is_some();
             if !exists {
                 insert_synced_entity(&mut conn, entity, &source_id).await?;
                 continue;
@@ -827,11 +834,12 @@ async fn apply_update(
         // and already source-scoped so this source can never tombstone
         // another source's records.
         let currently_synced: Vec<String> = {
-            let rows =
-                sqlx::query("SELECT id FROM entities WHERE source_registry_id = ? AND status = 'active'")
-                    .bind(&source_id)
-                    .fetch_all(&mut conn)
-                    .await?;
+            let rows = sqlx::query(
+                "SELECT id FROM entities WHERE source_registry_id = ? AND status = 'active'",
+            )
+            .bind(&source_id)
+            .fetch_all(&mut conn)
+            .await?;
             let mut ids = Vec::with_capacity(rows.len());
             for r in &rows {
                 ids.push(r.try_get::<String, _>("id")?);
@@ -1172,7 +1180,9 @@ async fn apply_update(
                 .execute(&mut conn)
                 .await
             {
-                log::error!("Savepoint rollback failed in persona_sync apply_update: {rollback_err}");
+                log::error!(
+                    "Savepoint rollback failed in persona_sync apply_update: {rollback_err}"
+                );
             }
             let _ = sqlx::query("RELEASE persona_sync_apply_update")
                 .execute(&mut conn)
@@ -1389,12 +1399,7 @@ mod tests {
         (user_id, persona_id, key_hex, sharing_private_key)
     }
 
-    async fn entity_row(
-        user_id: &str,
-        persona_id: &str,
-        key_hex: &str,
-        entity_id: &str,
-    ) -> Entity {
+    async fn entity_row(user_id: &str, persona_id: &str, key_hex: &str, entity_id: &str) -> Entity {
         entity_store::get_entity(user_id, persona_id, key_hex, entity_id)
             .await
             .unwrap()
@@ -1428,17 +1433,16 @@ mod tests {
             &recipient_id,
             ShareType::Synced,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let persona_id =
             accept_and_provision_sync(&share_id, &recipient_id, &recipient_key, &recipient_priv)
                 .await
                 .expect("accept_and_provision_sync must succeed");
 
-        let mut conn =
-            personal_store::open_personal_db(&recipient_id, &persona_id, &recipient_key)
-                .await
-                .unwrap();
+        let mut conn = personal_store::open_personal_db(&recipient_id, &persona_id, &recipient_key)
+            .await
+            .unwrap();
         let source_id = find_source_registry_id(&mut conn)
             .await
             .unwrap()
@@ -1489,17 +1493,16 @@ mod tests {
             &recipient_id,
             ShareType::Synced,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let persona_id =
             accept_and_provision_sync(&share_id, &recipient_id, &recipient_key, &recipient_priv)
                 .await
                 .unwrap();
 
-        let mut conn =
-            personal_store::open_personal_db(&recipient_id, &persona_id, &recipient_key)
-                .await
-                .unwrap();
+        let mut conn = personal_store::open_personal_db(&recipient_id, &persona_id, &recipient_key)
+            .await
+            .unwrap();
         let first_source_id = find_source_registry_id(&mut conn).await.unwrap().unwrap();
         let (entity_id,): (String,) = sqlx::query_as("SELECT id FROM entities LIMIT 1")
             .fetch_one(&mut conn)
@@ -1555,8 +1558,8 @@ mod tests {
             &recipient_id,
             ShareType::Synced,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         let shared_folder = tempfile::tempdir().unwrap();
         let folder_path = shared_folder.path().to_str().unwrap();
@@ -1578,7 +1581,10 @@ mod tests {
         )
         .await
         .expect("push_if_changed must succeed");
-        assert!(pushed, "content changed since the last push (there was none) -- must write");
+        assert!(
+            pushed,
+            "content changed since the last push (there was none) -- must write"
+        );
 
         let final_path = sync_file_path(folder_path, &share_id);
         assert!(
@@ -1603,11 +1609,10 @@ mod tests {
         assert_eq!(payload.entities[0].display_name, "Contact");
 
         // Settings must reflect the write actually happened, not a skip.
-        let settings =
-            settings_store::get_persona_share_sync_settings(&owner_persona, &share_id)
-                .await
-                .unwrap()
-                .unwrap();
+        let settings = settings_store::get_persona_share_sync_settings(&owner_persona, &share_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(settings.last_pushed_at.is_some());
         assert!(settings.last_content_hash.is_some());
     }
@@ -1673,8 +1678,8 @@ mod tests {
             &recipient_id,
             ShareType::Synced,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let persona_id =
             accept_and_provision_sync(&share_id, &recipient_id, &recipient_key, &recipient_priv)
                 .await
@@ -1741,10 +1746,9 @@ mod tests {
         .expect("pull_if_newer must succeed");
         assert!(applied);
 
-        let mut conn =
-            personal_store::open_personal_db(&recipient_id, &persona_id, &recipient_key)
-                .await
-                .unwrap();
+        let mut conn = personal_store::open_personal_db(&recipient_id, &persona_id, &recipient_key)
+            .await
+            .unwrap();
         let value: String = sqlx::query_scalar(
             "SELECT field_value FROM entity_facts
              WHERE entity_id = ? AND field_name = 'phone' AND valid_until IS NULL",
@@ -1753,7 +1757,10 @@ mod tests {
         .fetch_one(&mut conn)
         .await
         .unwrap();
-        assert_eq!(value, "555-9999", "the post-share fact update must have applied");
+        assert_eq!(
+            value, "555-9999",
+            "the post-share fact update must have applied"
+        );
     }
 
     #[tokio::test]
@@ -1791,8 +1798,8 @@ mod tests {
             &recipient_id,
             ShareType::Synced,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let persona_id =
             accept_and_provision_sync(&share_id, &recipient_id, &recipient_key, &recipient_priv)
                 .await
@@ -1866,10 +1873,9 @@ mod tests {
         .expect("pull_if_newer must succeed despite child-before-parent payload order");
         assert!(applied);
 
-        let mut conn =
-            personal_store::open_personal_db(&recipient_id, &persona_id, &recipient_key)
-                .await
-                .unwrap();
+        let mut conn = personal_store::open_personal_db(&recipient_id, &persona_id, &recipient_key)
+            .await
+            .unwrap();
         let linked_parent_id: Option<String> =
             sqlx::query_scalar("SELECT parent_entity_id FROM entities WHERE id = ?")
                 .bind(&child_id)
@@ -1910,8 +1916,8 @@ mod tests {
             &recipient_id,
             ShareType::Synced,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         let shared_folder = tempfile::tempdir().unwrap();
         settings_store::set_persona_share_sync_folder(
@@ -1943,7 +1949,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(!second, "nothing changed since the last push -- must be skipped");
+        assert!(
+            !second,
+            "nothing changed since the last push -- must be skipped"
+        );
     }
 
     #[tokio::test]
@@ -1973,8 +1982,8 @@ mod tests {
             &recipient_id,
             ShareType::Synced,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let persona_id =
             accept_and_provision_sync(&share_id, &recipient_id, &recipient_key, &recipient_priv)
                 .await
@@ -2059,10 +2068,9 @@ mod tests {
         );
         assert_eq!(entity.modification_state, "user_modified");
 
-        let mut conn =
-            personal_store::open_personal_db(&recipient_id, &persona_id, &recipient_key)
-                .await
-                .unwrap();
+        let mut conn = personal_store::open_personal_db(&recipient_id, &persona_id, &recipient_key)
+            .await
+            .unwrap();
         let source_id = find_source_registry_id(&mut conn).await.unwrap().unwrap();
         let source = source_registry_store::get_source_conn(&mut conn, &source_id)
             .await
@@ -2104,8 +2112,8 @@ mod tests {
             &recipient_id,
             ShareType::Synced,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let persona_id =
             accept_and_provision_sync(&share_id, &recipient_id, &recipient_key, &recipient_priv)
                 .await
@@ -2182,10 +2190,9 @@ mod tests {
             "the sweep ran and recorded a newer snapshot, even though nothing was applied"
         );
 
-        let mut conn =
-            personal_store::open_personal_db(&recipient_id, &persona_id, &recipient_key)
-                .await
-                .unwrap();
+        let mut conn = personal_store::open_personal_db(&recipient_id, &persona_id, &recipient_key)
+            .await
+            .unwrap();
         let value: String = sqlx::query_scalar("SELECT value FROM voice_profiles WHERE id = ?")
             .bind(&vp_id)
             .fetch_one(&mut conn)
@@ -2241,8 +2248,8 @@ mod tests {
             &recipient_id,
             ShareType::Synced,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let persona_id =
             accept_and_provision_sync(&share_id, &recipient_id, &recipient_key, &recipient_priv)
                 .await
@@ -2347,8 +2354,8 @@ mod tests {
             &recipient_id,
             ShareType::Synced,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let persona_id =
             accept_and_provision_sync(&share_id, &recipient_id, &recipient_key, &recipient_priv)
                 .await
@@ -2415,10 +2422,9 @@ mod tests {
         .expect("pull_if_newer must succeed");
         assert!(applied);
 
-        let mut conn =
-            personal_store::open_personal_db(&recipient_id, &persona_id, &recipient_key)
-                .await
-                .unwrap();
+        let mut conn = personal_store::open_personal_db(&recipient_id, &persona_id, &recipient_key)
+            .await
+            .unwrap();
         let still_active: Option<String> = sqlx::query_scalar(
             "SELECT id FROM entity_facts
              WHERE entity_id = ? AND field_name = 'phone' AND valid_until IS NULL",
@@ -2469,8 +2475,8 @@ mod tests {
             &recipient_id,
             ShareType::Synced,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let persona_id =
             accept_and_provision_sync(&share_id, &recipient_id, &recipient_key, &recipient_priv)
                 .await
@@ -2590,10 +2596,9 @@ mod tests {
         .expect("pull_if_newer must succeed");
         assert!(applied);
 
-        let mut conn =
-            personal_store::open_personal_db(&recipient_id, &persona_id, &recipient_key)
-                .await
-                .unwrap();
+        let mut conn = personal_store::open_personal_db(&recipient_id, &persona_id, &recipient_key)
+            .await
+            .unwrap();
         let still_active: Option<String> = sqlx::query_scalar(
             "SELECT id FROM entity_facts
              WHERE entity_id IS NULL AND field_name = 'email' AND valid_until IS NULL",
@@ -2663,8 +2668,8 @@ mod tests {
             &recipient_id,
             ShareType::Synced,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let persona_id =
             accept_and_provision_sync(&share_id, &recipient_id, &recipient_key, &recipient_priv)
                 .await
@@ -2745,10 +2750,9 @@ mod tests {
         .expect("pull_if_newer must succeed even when retirement is held back");
         assert!(applied);
 
-        let mut conn =
-            personal_store::open_personal_db(&recipient_id, &persona_id, &recipient_key)
-                .await
-                .unwrap();
+        let mut conn = personal_store::open_personal_db(&recipient_id, &persona_id, &recipient_key)
+            .await
+            .unwrap();
         let still_active: Option<String> = sqlx::query_scalar(
             "SELECT id FROM entity_facts
              WHERE entity_id = ? AND field_name = 'phone' AND valid_until IS NULL",
@@ -2801,8 +2805,8 @@ mod tests {
             &recipient_id,
             ShareType::Synced,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let persona_id =
             accept_and_provision_sync(&share_id, &recipient_id, &recipient_key, &recipient_priv)
                 .await
@@ -2882,10 +2886,9 @@ mod tests {
         .expect("pull_if_newer must succeed");
         assert!(applied);
 
-        let mut conn =
-            personal_store::open_personal_db(&recipient_id, &persona_id, &recipient_key)
-                .await
-                .unwrap();
+        let mut conn = personal_store::open_personal_db(&recipient_id, &persona_id, &recipient_key)
+            .await
+            .unwrap();
         let still_present: Option<String> =
             sqlx::query_scalar("SELECT id FROM voice_profiles WHERE id = ?")
                 .bind(&vp_id)
@@ -2925,8 +2928,8 @@ mod tests {
             &recipient_id,
             ShareType::Synced,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let persona_id =
             accept_and_provision_sync(&share_id, &recipient_id, &recipient_key, &recipient_priv)
                 .await
@@ -3019,10 +3022,9 @@ mod tests {
         .expect("pull_if_newer must succeed even when retirement is held back");
         assert!(applied);
 
-        let mut conn =
-            personal_store::open_personal_db(&recipient_id, &persona_id, &recipient_key)
-                .await
-                .unwrap();
+        let mut conn = personal_store::open_personal_db(&recipient_id, &persona_id, &recipient_key)
+            .await
+            .unwrap();
         let still_present: Option<String> =
             sqlx::query_scalar("SELECT id FROM voice_profiles WHERE id = ?")
                 .bind(&vp_id)
@@ -3060,8 +3062,8 @@ mod tests {
             &recipient_id,
             ShareType::Synced,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let persona_id =
             accept_and_provision_sync(&share_id, &recipient_id, &recipient_key, &recipient_priv)
                 .await
@@ -3125,10 +3127,9 @@ mod tests {
         .expect("pull_if_newer must succeed even with an empty owner payload");
         assert!(applied);
 
-        let mut conn =
-            personal_store::open_personal_db(&recipient_id, &persona_id, &recipient_key)
-                .await
-                .unwrap();
+        let mut conn = personal_store::open_personal_db(&recipient_id, &persona_id, &recipient_key)
+            .await
+            .unwrap();
         let still_present: Option<String> =
             sqlx::query_scalar("SELECT id FROM voice_profiles WHERE id = ?")
                 .bind(&local_vp_id)

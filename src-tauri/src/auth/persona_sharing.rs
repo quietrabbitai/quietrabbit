@@ -876,8 +876,8 @@ mod tests {
             recipient_id,
             ShareType::Synced,
         )
-            .await
-            .expect("send_persona_share must succeed");
+        .await
+        .expect("send_persona_share must succeed");
 
         (share_id, entity_id)
     }
@@ -938,8 +938,8 @@ mod tests {
             &recipient_id,
             ShareType::Synced,
         )
-            .await
-            .expect("send_persona_share must succeed");
+        .await
+        .expect("send_persona_share must succeed");
 
         let mut shared_conn = open_shared_db().await.unwrap();
         let row = sqlx::query(
@@ -1024,8 +1024,8 @@ mod tests {
             &recipient_id,
             ShareType::Synced,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         let mut shared_conn = open_shared_db().await.unwrap();
         let encrypted_payload: String =
@@ -1077,8 +1077,8 @@ mod tests {
             &recipient_id,
             ShareType::Synced,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         let mut shared_conn = open_shared_db().await.unwrap();
         let encrypted_payload: String =
@@ -1121,8 +1121,8 @@ mod tests {
             &recipient_id,
             ShareType::Synced,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         let mut shared_conn = open_shared_db().await.unwrap();
         let encrypted_payload: String =
@@ -1188,8 +1188,7 @@ mod tests {
             make_user_with_persona("Bob", 0x32).await;
 
         let (share_id, entity_id) =
-            send_share_with_content(&owner_id, &owner_persona, &owner_key_hex, &recipient_id)
-                .await;
+            send_share_with_content(&owner_id, &owner_persona, &owner_key_hex, &recipient_id).await;
 
         let new_persona_id = accept_persona_share(
             &share_id,
@@ -1247,7 +1246,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accept_persona_share_materializes_parent_child_hierarchy_regardless_of_payload_order() {
+    async fn accept_persona_share_materializes_parent_child_hierarchy_regardless_of_payload_order()
+    {
         // Regression test for items.id=302's two-pass insert
         // (accept_persona_share, entities.parent_entity_id is a real,
         // enforced FK). list_entities orders payload.entities by
@@ -1333,8 +1333,7 @@ mod tests {
             make_user_with_persona("Bob", 0x42).await;
 
         let (share_id, _) =
-            send_share_with_content(&owner_id, &owner_persona, &owner_key_hex, &recipient_id)
-                .await;
+            send_share_with_content(&owner_id, &owner_persona, &owner_key_hex, &recipient_id).await;
 
         let new_persona_id = accept_persona_share(
             &share_id,
@@ -1380,8 +1379,7 @@ mod tests {
         drop(conn);
 
         let (share_id, _) =
-            send_share_with_content(&owner_id, &owner_persona, &owner_key_hex, &recipient_id)
-                .await;
+            send_share_with_content(&owner_id, &owner_persona, &owner_key_hex, &recipient_id).await;
 
         let new_persona_id = accept_persona_share(
             &share_id,
@@ -1456,8 +1454,8 @@ mod tests {
             &recipient_id,
             ShareType::Synced,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         let new_persona_id = accept_persona_share(
             &share_id,
@@ -1472,15 +1470,14 @@ mod tests {
             personal_store::open_personal_db(&recipient_id, &new_persona_id, &recipient_key_hex)
                 .await
                 .unwrap();
-        let row = sqlx::query("SELECT modification_state, source_registry_id FROM entities WHERE id = ?")
-            .bind(&entity_id)
-            .fetch_one(&mut conn)
-            .await
-            .unwrap();
+        let row =
+            sqlx::query("SELECT modification_state, source_registry_id FROM entities WHERE id = ?")
+                .bind(&entity_id)
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
         assert_eq!(row.get::<String, _>("modification_state"), "user_created");
-        assert!(row
-            .get::<Option<String>, _>("source_registry_id")
-            .is_none());
+        assert!(row.get::<Option<String>, _>("source_registry_id").is_none());
     }
 
     #[tokio::test]
@@ -1509,8 +1506,7 @@ mod tests {
             make_user_with_persona("Bob", 0x82).await;
 
         let (share_id, _) =
-            send_share_with_content(&owner_id, &owner_persona, &owner_key_hex, &recipient_id)
-                .await;
+            send_share_with_content(&owner_id, &owner_persona, &owner_key_hex, &recipient_id).await;
 
         accept_persona_share(
             &share_id,
@@ -1542,8 +1538,7 @@ mod tests {
             make_user_with_persona("Carol", 0x93).await;
 
         let (share_id, _) =
-            send_share_with_content(&owner_id, &owner_persona, &owner_key_hex, &recipient_id)
-                .await;
+            send_share_with_content(&owner_id, &owner_persona, &owner_key_hex, &recipient_id).await;
 
         let result =
             accept_persona_share(&share_id, &other_id, &other_key_hex, &other_private_key).await;
@@ -1560,8 +1555,7 @@ mod tests {
             make_user_with_persona("Bob", 0xA2).await;
 
         let (share_id, _) =
-            send_share_with_content(&owner_id, &owner_persona, &owner_key_hex, &recipient_id)
-                .await;
+            send_share_with_content(&owner_id, &owner_persona, &owner_key_hex, &recipient_id).await;
 
         let mut conn = open_shared_db().await.unwrap();
         let encrypted_hex: String =
@@ -1606,6 +1600,9 @@ mod tests {
                 .fetch_one(&mut conn)
                 .await
                 .unwrap();
-        assert_eq!(status, "pending", "tampered accept must leave share pending");
+        assert_eq!(
+            status, "pending",
+            "tampered accept must leave share pending"
+        );
     }
 }

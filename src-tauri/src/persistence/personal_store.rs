@@ -1250,7 +1250,9 @@ pub async fn save_voice_profile_entry(
                 .execute(&mut conn)
                 .await
             {
-                log::error!("Savepoint rollback failed in save_voice_profile_entry: {rollback_err}");
+                log::error!(
+                    "Savepoint rollback failed in save_voice_profile_entry: {rollback_err}"
+                );
             }
             let _ = sqlx::query("RELEASE save_voice_profile_entry")
                 .execute(&mut conn)
@@ -1637,7 +1639,14 @@ mod tests {
         let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
 
         let entry_id = save_voice_profile_entry(
-            user_id, persona_id, key_hex, "formality", "casual", 4, None, None,
+            user_id,
+            persona_id,
+            key_hex,
+            "formality",
+            "casual",
+            4,
+            None,
+            None,
         )
         .await
         .expect("a fresh voice profile write must succeed");
@@ -1668,7 +1677,14 @@ mod tests {
         let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
 
         let entry_id = save_voice_profile_entry(
-            user_id, persona_id, key_hex, "formality", "casual", 4, None, None,
+            user_id,
+            persona_id,
+            key_hex,
+            "formality",
+            "casual",
+            4,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1677,7 +1693,9 @@ mod tests {
         // gating stamps synced rows 'pristine', never 'user_created' --
         // see persona_sync::engine::apply_update).
         {
-            let mut conn = open_personal_db(user_id, persona_id, key_hex).await.unwrap();
+            let mut conn = open_personal_db(user_id, persona_id, key_hex)
+                .await
+                .unwrap();
             sqlx::query("UPDATE voice_profiles SET modification_state = 'pristine' WHERE id = ?")
                 .bind(&entry_id)
                 .execute(&mut conn)
@@ -1686,7 +1704,14 @@ mod tests {
         }
 
         save_voice_profile_entry(
-            user_id, persona_id, key_hex, "formality", "recipient's own value", 4, None, None,
+            user_id,
+            persona_id,
+            key_hex,
+            "formality",
+            "recipient's own value",
+            4,
+            None,
+            None,
         )
         .await
         .expect("editing an existing voice profile entry must succeed");
@@ -1718,7 +1743,14 @@ mod tests {
         let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
 
         let entry_id = save_voice_profile_entry(
-            user_id, persona_id, key_hex, "formality", "casual", 4, None, None,
+            user_id,
+            persona_id,
+            key_hex,
+            "formality",
+            "casual",
+            4,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1728,7 +1760,14 @@ mod tests {
         // same as marking_record_user_modified_conn's own no-op-for-
         // user_created behavior.
         save_voice_profile_entry(
-            user_id, persona_id, key_hex, "formality", "still not synced", 4, None, None,
+            user_id,
+            persona_id,
+            key_hex,
+            "formality",
+            "still not synced",
+            4,
+            None,
+            None,
         )
         .await
         .unwrap();

@@ -558,7 +558,9 @@ mod tests {
     // rationale as crisis_block_from_result above.
     // -----------------------------------------------------------------
 
-    fn run_result_awaiting_user(output_content: Option<&str>) -> crate::conductor::lifecycle::RunResult {
+    fn run_result_awaiting_user(
+        output_content: Option<&str>,
+    ) -> crate::conductor::lifecycle::RunResult {
         crate::conductor::lifecycle::RunResult {
             focus_run_id: "run-1".to_owned(),
             status: "awaiting_user".to_owned(),

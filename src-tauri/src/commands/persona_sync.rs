@@ -115,10 +115,9 @@ mod tests {
     #[tokio::test]
     async fn get_persona_share_sync_folder_is_none_before_any_configuration() {
         let _env = setup().await;
-        let result =
-            get_persona_share_sync_folder("persona-1".to_owned(), "share-1".to_owned())
-                .await
-                .expect("get_persona_share_sync_folder must succeed");
+        let result = get_persona_share_sync_folder("persona-1".to_owned(), "share-1".to_owned())
+            .await
+            .expect("get_persona_share_sync_folder must succeed");
         assert!(result.is_none());
     }
 

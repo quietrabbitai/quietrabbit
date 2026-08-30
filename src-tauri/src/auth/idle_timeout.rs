@@ -297,13 +297,12 @@ mod tests {
         );
 
         let now = crate::providers::utils::now();
-        let still_live: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM auth_sessions WHERE expires_at > ?",
-        )
-        .bind(&now)
-        .fetch_one(&mut conn)
-        .await
-        .unwrap();
+        let still_live: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM auth_sessions WHERE expires_at > ?")
+                .bind(&now)
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
         assert_eq!(
             still_live.0, 0,
             "an idle-timeout fire must soft-expire the session too, same as logout()"
@@ -343,13 +342,12 @@ mod tests {
         );
 
         let now = crate::providers::utils::now();
-        let still_live: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM auth_sessions WHERE expires_at > ?",
-        )
-        .bind(&now)
-        .fetch_one(&mut conn)
-        .await
-        .unwrap();
+        let still_live: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM auth_sessions WHERE expires_at > ?")
+                .bind(&now)
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
         assert_eq!(still_live.0, 1, "the session must remain live too");
     }
 

@@ -704,9 +704,15 @@ mod tests {
     #[tokio::test]
     async fn update_focus_settings_max_permitted_tier_loosen_trips_gate() {
         let _env = setup().await;
-        persona_store::create_persona(PERSONA_ID, "Ceiling Gate Persona", "personal", USER_ID, None)
-            .await
-            .expect("create_persona must succeed");
+        persona_store::create_persona(
+            PERSONA_ID,
+            "Ceiling Gate Persona",
+            "personal",
+            USER_ID,
+            None,
+        )
+        .await
+        .expect("create_persona must succeed");
         focus_settings_store::create_focus_settings(
             PERSONA_ID,
             "quick-ask",

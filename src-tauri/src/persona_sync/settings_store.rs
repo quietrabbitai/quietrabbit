@@ -483,9 +483,11 @@ mod tests {
     #[tokio::test]
     async fn record_result_on_unconfigured_pair_is_a_noop_not_an_error() {
         let _env = setup().await;
-        assert!(record_pull_result("persona-1", "share-1", Ok("2026-01-01T00:00:00Z"))
-            .await
-            .is_ok());
+        assert!(
+            record_pull_result("persona-1", "share-1", Ok("2026-01-01T00:00:00Z"))
+                .await
+                .is_ok()
+        );
         assert!(record_push_result("persona-1", "share-1", Ok(Some("x")))
             .await
             .is_ok());

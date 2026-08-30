@@ -100,8 +100,7 @@ use crate::commands::tier3_pane::{
     PopupClosedPayload, PopupOpenedPayload, ZoomDirection,
 };
 use crate::tier3_pane::render::{
-    ClientBuilder, LogicalSize, PaneRenderHandler, PopupLifecycleEvent, PopupRequested,
-    RenderState,
+    ClientBuilder, LogicalSize, PaneRenderHandler, PopupLifecycleEvent, PopupRequested, RenderState,
 };
 use crate::tier3_pane::PaneKey;
 
@@ -131,7 +130,10 @@ enum BrowserLifecycleState {
                     // open/close, not per-action here).
 enum PendingAction {
     Navigate(String),
-    SetCookie { name: String, value: String },
+    SetCookie {
+        name: String,
+        value: String,
+    },
     /// items.id=359 piece 5: fire-and-forget JS run via
     /// `Frame::execute_java_script` -- currently only used for the blind
     /// scroll-to-bottom-on-deactivation trigger (a generic
@@ -284,14 +286,21 @@ const DEFAULT_ZOOM_LEVEL: f64 = 5.0 * ZOOM_LEVEL_STEP;
 /// to dispatch through anymore.
 #[derive(Debug, Clone)]
 pub enum PaneCommand {
-    Open { key: PaneKey, url: String },
-    Close { key: PaneKey },
+    Open {
+        key: PaneKey,
+        url: String,
+    },
+    Close {
+        key: PaneKey,
+    },
     /// items.id=359 pieces 4/5: makes `key` (or none) the one pane that's
     /// actually composited/painted -- see `PaneManager::active_pane`'s own
     /// doc for the single-active-pane invariant this enforces. The
     /// outgoing active pane (if any, and if different from `key`) gets a
     /// scroll-to-bottom trigger fired just before it's hidden.
-    SetActivePane { key: Option<PaneKey> },
+    SetActivePane {
+        key: Option<PaneKey>,
+    },
     /// DOM-forwarded mouse press/release (items.id=257 Path B -- see the
     /// "Pane content click/mouse forwarding" section doc above). `x`/`y`
     /// arrive already pane-local, in CEF-logical pixels -- see
@@ -483,8 +492,13 @@ struct PopupState {
 /// taking only what they need (never `AppHandle`) and leaving IPC/event
 /// concerns to their caller.
 enum PopupNotification {
-    Opened { key: PaneKey, rect: PaneRectFraction },
-    Closed { key: PaneKey },
+    Opened {
+        key: PaneKey,
+        rect: PaneRectFraction,
+    },
+    Closed {
+        key: PaneKey,
+    },
 }
 
 /// One shared render target's worth of pane bookkeeping. Not a
@@ -737,8 +751,9 @@ impl PaneManager {
                     // it's hidden, so reactivating it later lands back on
                     // its last response rather than wherever it was
                     // scrolled (items.id=359 piece 5).
-                    pane.browser_lifecycle
-                        .enqueue(PendingAction::ExecuteScript(SCROLL_TO_BOTTOM_JS.to_string()));
+                    pane.browser_lifecycle.enqueue(PendingAction::ExecuteScript(
+                        SCROLL_TO_BOTTOM_JS.to_string(),
+                    ));
                     pane.browser_lifecycle
                         .enqueue(PendingAction::SetHidden(true));
                 }
@@ -1406,7 +1421,12 @@ fn build_pane_hit_widget(
         glib::Propagation::Proceed
     });
 
-    fn mouse_event(glarea: &gtk::GLArea, x: f64, y: f64, state: gtk::gdk::ModifierType) -> MouseEvent {
+    fn mouse_event(
+        glarea: &gtk::GLArea,
+        x: f64,
+        y: f64,
+        state: gtk::gdk::ModifierType,
+    ) -> MouseEvent {
         let scale = glarea.scale_factor().max(1) as f32;
         MouseEvent {
             x: (x as f32 / scale) as i32,
@@ -2522,7 +2542,12 @@ impl PaneHost {
                         Some(p) if p.browser_lifecycle.browser().is_none() => log::warn!(
                             "DIAG items.id=365: KeyEvent dropped, pane={key} browser not Ready yet"
                         ),
-                        Some(p) if p.browser_lifecycle.browser().and_then(|b| b.host()).is_none() => {
+                        Some(p)
+                            if p.browser_lifecycle
+                                .browser()
+                                .and_then(|b| b.host())
+                                .is_none() =>
+                        {
                             log::warn!(
                                 "DIAG items.id=365: KeyEvent dropped, pane={key} browser Ready but host() is None"
                             )
