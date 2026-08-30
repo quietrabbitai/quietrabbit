@@ -465,13 +465,32 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
 
   const activeProvider = providers.find((p) => p.id === activeProviderId) ?? null
 
+  // items.id=368: switching the active pane (setActivePane, Rust) hides the
+  // OUTGOING pane's own popup CEF-side (was_hidden(true)) but does not close
+  // it -- it stays alive/tracked (PaneManager::popups, "one active popup per
+  // pane", not cleared until a real tier3-popup-closed event) so it can be
+  // reactivated without reloading. This app never emits that close event
+  // just because a pane got deactivated, so popupRects (state, keyed by
+  // parent pane id) still carried that now-hidden popup's rect -- and its
+  // PopupHitLayer div, still pointer-events:auto at its last-known screen
+  // position, kept absorbing clicks/keys meant for whichever pane is
+  // actually active now, making that pane look frozen (confirmed live,
+  // Jason, 2026-08-30: a popup left open on one pane while switching to a
+  // different one silently ate input meant for the new pane). Scoping to
+  // only the active pane's own popup entry is the fix -- no Rust change
+  // needed, this was never a backend focus/activation problem.
+  const activePopupRects =
+    activeProviderId !== null && activeProviderId in popupRects
+      ? { [activeProviderId]: popupRects[activeProviderId] }
+      : {}
+
   return (
     <div className="tier3-access-pane">
       <PaneHitLayer rects={paneRects} />
       {/* items.id=234: mounted AFTER PaneHitLayer -- DOM source order alone
           resolves popup-vs-parent-pane hit-test precedence in any
           overlapping region (see PopupHitLayer's own doc). */}
-      <PopupHitLayer popups={popupRects} />
+      <PopupHitLayer popups={activePopupRects} />
 
       <div
         className="tier3-access-pane__qr"

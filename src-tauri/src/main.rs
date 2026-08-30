@@ -457,10 +457,9 @@ async fn async_main() {
         // rewrite deletes rather than patches. Every open pane now lives
         // inside GTK's own GLArea widget, in the SAME window -- GTK
         // relayouts it for free on window move/resize, no Rust-side
-        // geometry query needed. Only CloseRequested is left to handle, so
-        // this is an `if let`, not a `match` (clippy::single_match).
-        .on_window_event(move |window, event| {
-            if let tauri::WindowEvent::CloseRequested { .. } = event {
+        // geometry query needed.
+        .on_window_event(move |window, event| match event {
+            tauri::WindowEvent::CloseRequested { .. } => {
                 // Stop the sidecar on window close. kill_on_drop(true) is the
                 // crash-exit safety net; this provides the graceful path with
                 // logging. Spawned without await — window closes immediately.
@@ -474,6 +473,20 @@ async fn async_main() {
                     sidecar.stop().await;
                 });
             }
+            // items.id=368: reasserts activation on whichever pane/popup
+            // last held focus after the whole app's OS-level window regains
+            // focus -- see PaneCommand::ReassertOsFocus's own doc
+            // (pane_host.rs) for why this is needed. on_window_event
+            // callbacks run on the same GTK main thread dispatch()'s
+            // thread-local HOST requires, so no run_on_main_thread wrapper
+            // is needed here -- matches how queue_draw() is already called
+            // bare elsewhere in this file.
+            tauri::WindowEvent::Focused(true) => {
+                quietrabbit_lib::tier3_pane::pane_host::dispatch(
+                    quietrabbit_lib::tier3_pane::pane_host::PaneCommand::ReassertOsFocus,
+                );
+            }
+            _ => {}
         })
         // Command surface + generated TypeScript contract: see
         // quietrabbit_lib::ipc::specta_builder(). The authoritative command

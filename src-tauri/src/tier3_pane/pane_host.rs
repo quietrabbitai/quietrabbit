@@ -394,6 +394,33 @@ pub enum PaneCommand {
         character: u16,
         modifiers: PaneEventModifiers,
     },
+    /// items.id=368: reasserts activation on whichever single browser
+    /// `PaneManager::last_focus` (a `FocusTarget`, not a bare `PaneKey`)
+    /// says actually last held focus -- the active pane, OR its popup, never
+    /// both -- after the whole app's OS-level window regains focus. Fired
+    /// from `main.rs`'s `WindowEvent::Focused(true)` handler, not from any
+    /// pane-local event, so no `key` field: unlike every other variant
+    /// above, the target isn't known at the call site, only resolved here
+    /// from `last_focus`.
+    ///
+    /// First attempt at this variant (2026-08-30) reasserted `active_pane`'s
+    /// host AND its popup's host unconditionally, both every time -- Jason's
+    /// live testing confirmed that fared worse specifically when a popup was
+    /// the thing actually focused (see `FocusTarget`'s own doc), so this
+    /// resolves to exactly one target instead. Same two calls, same order,
+    /// as `set_active_pane`'s own "reclaim after being hidden" path
+    /// (`was_hidden(false)` then `set_focus(true)`) -- that path already
+    /// re-asserts unconditionally for an in-app click-to-reclaim-focus
+    /// gesture (see its own doc for why it's not gated on equality); this is
+    /// the same reclaim, just triggered by an OS-level focus round-trip
+    /// instead of an in-app pane switch. Diagnostic logging elsewhere in
+    /// this session (commands/tier3_pane.rs, PaneCommand::MouseClick/
+    /// KeyEvent above) already confirmed the click/key IPC path itself
+    /// reaches CEF fine after such a round-trip -- this targets CEF's own
+    /// browser-side activation state instead, since `set_focus(true)` alone
+    /// (already fired on every mousedown, items.id=313) does not resolve the
+    /// bug on its own.
+    ReassertOsFocus,
 }
 
 /// Per-pane state. No `window`/per-pane `render_state` fields (one shared
@@ -501,6 +528,28 @@ enum PopupNotification {
     },
 }
 
+/// items.id=368: which single CEF `Browser` -- a pane's own, or its open
+/// popup's -- last received a real user interaction (mousedown or a key
+/// event). A pane and its popup are two independent `Browser`s (see
+/// `PopupState`'s own doc), and only one of them should ever be told it's
+/// focused at a time; `PaneKey` alone (this codebase's existing
+/// `focused_pane` field, before this) can't distinguish the two, since a
+/// popup has no separate id-keyspace and both `MouseClick`/`PopupMouseClick`
+/// wrote the same parent-pane key into it. That ambiguity was confirmed live
+/// (Jason, 2026-08-30): reasserting `was_hidden(false)`/`set_focus(true)` on
+/// *both* the pane's and the popup's host unconditionally on OS-level window
+/// refocus (this fix's first attempt) worked worse specifically when a popup
+/// was the thing that had actually been interacted with -- the two browsers
+/// contending for focus, rather than only the one that should hold it being
+/// reasserted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FocusTarget {
+    Pane(PaneKey),
+    /// `PaneKey` here is the *parent* pane's key, same convention as
+    /// `PopupMouseClick`/`PopupKeyEvent`'s own `key` field.
+    Popup(PaneKey),
+}
+
 /// One shared render target's worth of pane bookkeeping. Not a
 /// `winit::ApplicationHandler` anymore -- a plain struct, driven by GTK's
 /// `GLArea` signals instead of a winit event loop.
@@ -518,15 +567,17 @@ struct PaneManager {
     /// Set on pointer-down inside a pane's rect, resolved by the frontend's
     /// own DOM hit-testing and forwarded via `forward_pane_mouse_click`
     /// (items.id=257, Path B redesign -- see `PaneHost::dispatch`'s
-    /// `PaneCommand::MouseClick` arm). This field exists
-    /// for the input class hit-testing *can't* resolve on its own: keyboard
-    /// events have no coordinate to test against, so a future
-    /// `send_key_event` forward needs an explicit answer to "which pane."
-    /// Not consumed anywhere yet -- keyboard forwarding is out of this
-    /// session's scope (click/mouse forwarding only); tracked now so wiring
-    /// it later is a small addition, not a redesign.
-    #[allow(dead_code)]
-    focused_pane: Option<PaneKey>,
+    /// `PaneCommand::MouseClick` arm). Originally just `Option<PaneKey>`
+    /// (keyboard-routing bookkeeping, items.id=332) -- widened to
+    /// `FocusTarget` (items.id=368) so a pane and its open popup, two
+    /// independent `Browser`s, are distinguishable: see `FocusTarget`'s own
+    /// doc for why that distinction turned out to matter. Set on every
+    /// mousedown/key event in `PaneCommand::MouseClick`/`KeyEvent`/
+    /// `PopupMouseClick`/`PopupKeyEvent`, read by `close_pane` (to release
+    /// CEF focus before a focus-holding pane closes) and by
+    /// `PaneCommand::ReassertOsFocus` (to know which single browser to
+    /// reassert on OS-level window refocus).
+    last_focus: Option<FocusTarget>,
     /// items.id=234: one active popup per pane (Judgment call 6.1 -- OAuth
     /// login is inherently single-popup; opening a second for the same
     /// pane replaces the first, see `drain_popup_requests`), keyed by the
@@ -715,7 +766,7 @@ impl PaneManager {
         if let Some(host) = pane.browser_lifecycle.browser().and_then(|b| b.host()) {
             // items.id=313: release CEF's own focus state before the
             // browser goes away, if this pane was the one holding it.
-            if self.focused_pane.as_ref() == Some(key) {
+            if self.last_focus == Some(FocusTarget::Pane(key.clone())) {
                 host.set_focus(false as _);
             }
             host.close_browser(true as _);
@@ -723,8 +774,15 @@ impl PaneManager {
         crate::tier3_pane::render::remove_pane_texture(key);
         crate::tier3_pane::render::remove_pane_pending_paint(key);
         self.open_pane_count.fetch_sub(1, Ordering::Relaxed);
-        if self.focused_pane.as_ref() == Some(key) {
-            self.focused_pane = None;
+        // force_close_popup above already dropped this pane's own popup, if
+        // any -- clear last_focus for either variant keyed to this pane
+        // (Pane or Popup), not just Pane, so a stale reference to a
+        // now-closed popup can't linger.
+        match &self.last_focus {
+            Some(FocusTarget::Pane(k)) | Some(FocusTarget::Popup(k)) if k == key => {
+                self.last_focus = None;
+            }
+            _ => {}
         }
         // items.id=359: a closed active pane must not leave active_pane
         // dangling -- no scroll-to-bottom trigger needed here (unlike
@@ -782,7 +840,55 @@ impl PaneManager {
                 pane.browser_lifecycle
                     .enqueue(PendingAction::SetHidden(false));
             }
+            // items.id=368: mirrors the OUTGOING branch's popup
+            // `was_hidden(true)` above -- that branch hides an outgoing
+            // pane's own popup, but nothing previously re-showed the
+            // INCOMING pane's popup on the way back in, if it has one still
+            // open from before. Confirmed live (Jason, 2026-08-30): with a
+            // popup open on pane A, switching away to pane B (correctly
+            // hides A's popup) then back to A via the rail left A's popup
+            // stuck hidden/unresponsive -- only an OS-level focus round-trip
+            // (which goes through PaneCommand::ReassertOsFocus, a completely
+            // different code path) could revive it. Same best-effort/
+            // immediate reasoning as the outgoing branch (no PendingAction
+            // queue for popups).
+            if let Some(host) = self
+                .popups
+                .get(new_key)
+                .and_then(|p| p.lifecycle.browser())
+                .and_then(|b| b.host())
+            {
+                host.was_hidden(false as _);
+            }
         }
+        // items.id=368: without this, switching the active pane via this
+        // method (the rail's own pane-select click, which goes through
+        // SetActivePane, never through MouseClick/PopupMouseClick) left
+        // last_focus stale -- still pointing at whatever was last directly
+        // clicked/typed into (e.g. a popup on the OUTGOING pane, just
+        // hidden above), even though a DIFFERENT pane is now the one
+        // actually visible. Confirmed live (Jason, 2026-08-30): with a
+        // popup left open on one pane, switching the active pane to another
+        // and then doing an OS-level focus round-trip made
+        // PaneCommand::ReassertOsFocus reassert the wrong (hidden, stale)
+        // popup instead of the newly-active pane, leaving the pane the user
+        // was actually looking at frozen. Set unconditionally, matching the
+        // SetHidden(false) reassertion above (not gated on previous == key,
+        // same "reclaim" reasoning as this method's own doc) -- a genuine
+        // direct interaction with the new pane's content still overwrites
+        // this immediately via MouseClick/KeyEvent, same as always. If the
+        // new active pane has an open popup (just re-shown above), that
+        // popup -- not the pane underneath it -- is what the user almost
+        // certainly wants to interact with next (popups exist because the
+        // pane opened one expecting real input, e.g. an OAuth login), so it
+        // takes precedence here the same way a direct click into it would.
+        self.last_focus = key.clone().map(|k| {
+            if self.popups.contains_key(&k) {
+                FocusTarget::Popup(k)
+            } else {
+                FocusTarget::Pane(k)
+            }
+        });
         self.active_pane = key;
     }
 
@@ -1441,9 +1547,9 @@ fn build_pane_hit_widget(
         let key = key.clone();
         hit_widget.connect_button_press_event(move |widget, event| {
             // Click-to-focus, mirroring ordinary desktop pane/window
-            // behavior -- harmless even though nothing reads
-            // `PaneManager::focused_pane` yet this session (keyboard
-            // forwarding is a separate follow-on).
+            // behavior -- harmless even though this whole function is
+            // unused dead code (see its own doc, Path A's preserved
+            // investigation artifact).
             widget.grab_focus();
             log::info!(
                 "DIAG items.id=257: RAW button_press_event fired, button={} pos={:?}",
@@ -1455,7 +1561,7 @@ fn build_pane_hit_widget(
             let (x, y) = event.position();
             let ev = mouse_event(&glarea, x, y, event.state());
             let mut mgr = manager.borrow_mut();
-            mgr.focused_pane = Some(key.clone());
+            mgr.last_focus = Some(FocusTarget::Pane(key.clone()));
             log::info!(
                 "DIAG items.id=257: button_press pane={key} widget_local=({x},{y}) cef=({},{}) has_host={}",
                 ev.x, ev.y,
@@ -1903,7 +2009,7 @@ impl PaneHost {
         let manager = Rc::new(RefCell::new(PaneManager {
             panes: IndexMap::new(),
             open_pane_count: Arc::new(AtomicUsize::new(0)),
-            focused_pane: None,
+            last_focus: None,
             popups: HashMap::new(),
             popup_requested_tx,
             popup_requested_rx,
@@ -2458,7 +2564,7 @@ impl PaneHost {
             } => {
                 let mut mgr = self.manager.borrow_mut();
                 if !mouseup {
-                    mgr.focused_pane = Some(key.clone());
+                    mgr.last_focus = Some(FocusTarget::Pane(key.clone()));
                 }
                 // DIAG items.id=365 (temporary -- remove once the
                 // first-click-unresponsive investigation concludes):
@@ -2493,7 +2599,7 @@ impl PaneHost {
                     // items.id=313: signal CEF's own focus state on
                     // mousedown, folded in alongside items.id=332's keyboard
                     // forwarding per 313's own deferral note. Only on press,
-                    // not release -- matches the `focused_pane` assignment
+                    // not release -- matches the `last_focus` assignment
                     // above, which is also press-only.
                     if !mouseup {
                         host.set_focus(true as _);
@@ -2531,7 +2637,7 @@ impl PaneHost {
                 modifiers,
             } => {
                 let mut mgr = self.manager.borrow_mut();
-                mgr.focused_pane = Some(key.clone());
+                mgr.last_focus = Some(FocusTarget::Pane(key.clone()));
                 // DIAG items.id=365 (temporary, see MouseClick's own DIAG
                 // comment above for what this is investigating).
                 if matches!(event_type, PaneKeyEventType::RawKeyDown) {
@@ -2679,7 +2785,7 @@ impl PaneHost {
             } => {
                 let mut mgr = self.manager.borrow_mut();
                 if !mouseup {
-                    mgr.focused_pane = Some(key.clone());
+                    mgr.last_focus = Some(FocusTarget::Popup(key.clone()));
                 }
                 if let Some(host) = mgr
                     .popups
@@ -2791,7 +2897,13 @@ impl PaneHost {
                 character,
                 modifiers,
             } => {
-                let mgr = self.manager.borrow();
+                let mut mgr = self.manager.borrow_mut();
+                // items.id=368: was entirely missing before -- PopupKeyEvent
+                // never wrote last_focus (or its old focused_pane
+                // predecessor), so typing into an already-open popup without
+                // a fresh click first left last_focus stale/wrong. Matches
+                // KeyEvent's own unconditional-per-event pattern above.
+                mgr.last_focus = Some(FocusTarget::Popup(key.clone()));
                 if let Some(host) = mgr
                     .popups
                     .get(&key)
@@ -2821,6 +2933,46 @@ impl PaneHost {
                         focus_on_editable_field: 0,
                     };
                     host.send_key_event(Some(&ev));
+                }
+            }
+            PaneCommand::ReassertOsFocus => {
+                let mgr = self.manager.borrow();
+                let Some(target) = mgr.last_focus.clone() else {
+                    return;
+                };
+                // Reasserts exactly the ONE browser (pane XOR popup) that
+                // last_focus says actually held focus -- see FocusTarget's
+                // own doc: this fix's first attempt reasserted active_pane's
+                // host AND its popup's host unconditionally, which fared
+                // worse specifically when a popup was the thing actually
+                // focused (the two browsers contending). Falls back from
+                // Popup to its parent Pane if that popup has since closed
+                // (force_close_popup doesn't eagerly clear last_focus for
+                // the popup-closed-but-pane-still-open case).
+                let host = match &target {
+                    FocusTarget::Popup(key) => mgr
+                        .popups
+                        .get(key)
+                        .and_then(|p| p.lifecycle.browser())
+                        .and_then(|b| b.host())
+                        .or_else(|| {
+                            mgr.panes
+                                .get(key)
+                                .and_then(|p| p.browser_lifecycle.browser())
+                                .and_then(|b| b.host())
+                        }),
+                    FocusTarget::Pane(key) => mgr
+                        .panes
+                        .get(key)
+                        .and_then(|p| p.browser_lifecycle.browser())
+                        .and_then(|b| b.host()),
+                };
+                if let Some(host) = host {
+                    // Same order/semantics as set_active_pane's own
+                    // "reclaim after hidden" path -- see PaneCommand's own
+                    // doc for why this variant exists.
+                    host.was_hidden(false as _);
+                    host.set_focus(true as _);
                 }
             }
         }
