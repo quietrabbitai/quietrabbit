@@ -90,6 +90,7 @@ fn diag_312_tick() -> (u64, u128) {
 use gtk::prelude::*;
 use indexmap::IndexMap;
 use tauri::Manager;
+use tauri_plugin_clipboard_manager::ClipboardExt;
 
 use cef::{
     ImplBrowser, ImplBrowserHost, ImplFrame, KeyEvent, KeyEventType, MouseButtonType, MouseEvent,
@@ -773,6 +774,7 @@ impl PaneManager {
         }
         crate::tier3_pane::render::remove_pane_texture(key);
         crate::tier3_pane::render::remove_pane_pending_paint(key);
+        crate::tier3_pane::render::remove_pane_selected_text(key);
         self.open_pane_count.fetch_sub(1, Ordering::Relaxed);
         // force_close_popup above already dropped this pane's own popup, if
         // any -- clear last_focus for either variant keyed to this pane
@@ -2695,6 +2697,35 @@ impl PaneHost {
                         focus_on_editable_field: 0,
                     };
                     host.send_key_event(Some(&ev));
+
+                    // items.id=369: bridge CEF's own selected-text cache
+                    // (fed by `on_text_selection_changed`, render.rs) onto
+                    // the OS clipboard via QR's own already-working native
+                    // clipboard write -- see `PANE_SELECTED_TEXT`'s own doc
+                    // for why this pane can't reach the platform clipboard
+                    // on its own under Wayland. RawKeyDown only (matches
+                    // the DIAG check above): CEF still gets Char/KeyUp for
+                    // this same physical keypress as usual, this is purely
+                    // additive. Ctrl+X (Cut) is included -- CEF's own
+                    // in-page removal of the selection proceeds
+                    // independently of this write, same as Ctrl+C leaves
+                    // the in-page selection untouched.
+                    const VK_C: i32 = 0x43;
+                    const VK_X: i32 = 0x58;
+                    if matches!(event_type, PaneKeyEventType::RawKeyDown)
+                        && modifiers.ctrl
+                        && matches!(windows_key_code, VK_C | VK_X)
+                    {
+                        if let Some(text) = crate::tier3_pane::render::pane_selected_text(&key) {
+                            if !text.is_empty() {
+                                if let Err(e) = mgr.app_handle.clipboard().write_text(text) {
+                                    log::warn!(
+                                        "tier3_pane::pane_host: items.id=369 clipboard write failed, pane={key}: {e}"
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
             }
             PaneCommand::MouseMove {

@@ -785,6 +785,33 @@ fn resolve_bind_group(
 static PANE_PENDING_PAINT: LazyLock<Mutex<HashMap<PaneKey, PendingPaint>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// items.id=369: the OS clipboard has no route into a windowless/OSR CEF
+/// pane on Wayland -- `wl_data_device.set_selection` requires the serial of
+/// a real input event delivered to a focused `wl_surface`, which this pane
+/// structurally never has (see this item's own research writeup). This
+/// caches each pane's current in-page text selection, fed by CEF's
+/// `on_text_selection_changed` (below) purely as a side channel independent
+/// of the platform clipboard -- `pane_host.rs`'s `KeyEvent` dispatch reads
+/// this on Ctrl+C/Ctrl+X and writes it to the OS clipboard itself via
+/// QR's own already-working native clipboard path (a real, focused GTK/
+/// Tauri surface, unlike the pane). Same plain-static/writer-thread-vs-
+/// reader-thread shape as `PANE_PENDING_PAINT` above.
+static PANE_SELECTED_TEXT: LazyLock<Mutex<HashMap<PaneKey, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Read by `pane_host.rs`'s `KeyEvent` dispatch on Ctrl+C/Ctrl+X.
+pub fn pane_selected_text(key: &PaneKey) -> Option<String> {
+    PANE_SELECTED_TEXT.lock().unwrap().get(key).cloned()
+}
+
+/// Mirrors `remove_pane_pending_paint` -- must be called as part of a
+/// pane's own teardown (`pane_host.rs`'s `close_pane`), so a later reopen of
+/// the same `PaneKey` doesn't inherit a stale selection from the pane that
+/// used to hold it.
+pub fn remove_pane_selected_text(key: &PaneKey) {
+    PANE_SELECTED_TEXT.lock().unwrap().remove(key);
+}
+
 /// Mirrors `POPUP_TEXTURES`'s own doc: keyed by the *parent* pane's
 /// `PaneKey`, same as `POPUP_TEXTURES` itself.
 static POPUP_PENDING_PAINT: LazyLock<Mutex<HashMap<PaneKey, PendingPaint>>> =
@@ -1054,6 +1081,26 @@ wrap_render_handler! {
                 .unwrap()
                 .insert(self.handler.pane_key.clone(), pending);
             request_redraw(&self.handler.app_handle);
+        }
+
+        // items.id=369: fires on every in-page selection change, independent
+        // of the platform clipboard -- see `PANE_SELECTED_TEXT`'s own doc
+        // for why this pane needs a non-clipboard side channel at all.
+        // Cache-only: no clipboard write happens here, since CEF's own UI
+        // thread should never block on/reach across into GTK's clipboard
+        // APIs. `pane_host.rs`'s `KeyEvent` dispatch (main thread) does the
+        // actual write, on Ctrl+C/Ctrl+X.
+        fn on_text_selection_changed(
+            &self,
+            _browser: Option<&mut Browser>,
+            selected_text: Option<&CefString>,
+            _selected_range: Option<&Range>,
+        ) {
+            let text = selected_text.map(|s| s.to_string()).unwrap_or_default();
+            PANE_SELECTED_TEXT
+                .lock()
+                .unwrap()
+                .insert(self.handler.pane_key.clone(), text);
         }
     }
 }
