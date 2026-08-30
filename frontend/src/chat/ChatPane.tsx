@@ -28,6 +28,20 @@ export interface ChatPaneProps {
    *  Persona-hub usage. The caller (Tier3AccessPane) is responsible for
    *  invoking commands.requestTier3Gate3Review with the given messageId. */
   onDraftReady?: (messageId: string) => void
+  /** items.id=359 (decisions.id=731): when true, renders only a minimal
+   *  floor -- QR's mark, the latest assistant response as a snippet, and
+   *  the existing entry bar below (kept mounted and focusable either
+   *  way) -- instead of the full transcript. Driven by the caller
+   *  (Tier3AccessPane), never by this component's own state: this
+   *  component owns message data, not the layout decision of whether a
+   *  Tier 3 provider currently has focus. Omitted/false renders exactly
+   *  as before this prop existed. */
+  collapsed?: boolean
+  /** Fires when the collapsed strip is clicked, or its entry input
+   *  receives focus while collapsed -- the caller re-expands and returns
+   *  whichever provider was active back to loaded (decisions.id=731's
+   *  symmetric transition). Ignored when collapsed is false/omitted. */
+  onExpand?: () => void
 }
 
 /** Hand-declared, not generated: RunStatusPayload (conductor/lifecycle.rs)
@@ -86,12 +100,18 @@ export function ChatPane({
   gate3Track,
   onGenerating,
   onDraftReady,
+  collapsed = false,
+  onExpand,
 }: ChatPaneProps) {
   const { t } = useTranslation()
   const [messages, setMessages] = useState<MessageInfo[]>([])
   const [loadError, setLoadError] = useState<string | null>(null)
   const [draft, setDraft] = useState('')
   const [sendError, setSendError] = useState<string | null>(null)
+  /** items.id=359 piece 6: which starter message's copy button most
+   *  recently fired, for the transient "Copied" label swap -- cleared by
+   *  its own timeout, not on every render. */
+  const [copiedStarterId, setCopiedStarterId] = useState<string | null>(null)
 
   const [activeRunId, setActiveRunId] = useState<string | null>(null)
   const [liveStepDisplayName, setLiveStepDisplayName] = useState<
@@ -347,52 +367,117 @@ export function ChatPane({
           .find((m) => m.sender === 'assistant' && m.focus_run_id === activeRunId)
           ?.id ?? null
 
+  // items.id=359 piece 3: the collapsed floor's snippet -- the real last
+  // response, not a placeholder (Jason's explicit build-time preference,
+  // recorded in decisions.id=731). Same live-content substitution
+  // liveMessageId already drives for the full transcript, so a
+  // still-streaming response shows up here too, not just a finished one.
+  const lastAssistantMessage = [...messages].reverse().find((m) => m.sender === 'assistant')
+  const lastAssistantSnippet = lastAssistantMessage
+    ? lastAssistantMessage.id === liveMessageId && liveContent
+      ? liveContent
+      : lastAssistantMessage.content
+    : null
+
+  // items.id=359 piece 6: click-initiated only, per the locked
+  // no-passive-clipboard-monitoring rule -- this IS the click.
+  const handleCopyStarter = useCallback((messageId: string, content: string) => {
+    void navigator.clipboard.writeText(content)
+    setCopiedStarterId(messageId)
+    window.setTimeout(() => {
+      setCopiedStarterId((current) => (current === messageId ? null : current))
+    }, 1400)
+  }, [])
+
   return (
-    <div className="chat-pane">
-      <div className="chat-pane__transcript">
-        {loadError && (
-          <p role="alert">
-            {t('navShell.chat.loadError', { message: loadError })}
-          </p>
-        )}
-        {messages.length === 0 && !loadError && (
-          <p>{t('navShell.chat.emptyTranscript')}</p>
-        )}
-        <ul className="chat-pane__message-list">
-          {messages.map((m) => (
-            <li key={m.id} className={`chat-pane__message chat-pane__message--${m.sender}`}>
-              <span className="chat-pane__message-content">
-                {m.id === liveMessageId && liveContent ? liveContent : m.content}
-              </span>
-              {m.gate3_review_status === 'pending-review' && (
-                <span className="chat-pane__pending-review-notice">
-                  {t('navShell.chat.pendingReviewNotice')}
-                </span>
-              )}
-            </li>
-          ))}
-        </ul>
-        {isGenerating && (
-          <p className="chat-pane__generating" aria-live="polite">
-            {liveStepDisplayName
-              ? t('navShell.chat.generatingWithStep', {
-                  step: liveStepDisplayName,
-                  elapsed: elapsedSeconds,
-                })
-              : t('navShell.chat.generating', { elapsed: elapsedSeconds })}
-          </p>
-        )}
-        {sendError && (
-          <p role="alert" className="chat-pane__send-error">
-            {t('navShell.chat.sendError', { message: sendError })}
-          </p>
-        )}
-        {contentTimedOut && (
-          <p role="alert" className="chat-pane__content-timeout">
-            {t('navShell.chat.contentTimeout')}
-          </p>
-        )}
-      </div>
+    <div className="chat-pane" data-collapsed={collapsed ? '' : undefined}>
+      {collapsed ? (
+        <button
+          type="button"
+          className="chat-pane__collapsed-strip"
+          onClick={() => onExpand?.()}
+        >
+          <span className="chat-pane__collapsed-mark" aria-hidden="true" />
+          <span className="chat-pane__collapsed-snippet">
+            {lastAssistantSnippet ?? t('navShell.chat.collapsedEmptySnippet')}
+          </span>
+          <span className="chat-pane__collapsed-expand" aria-hidden="true">
+            {t('navShell.chat.collapsedExpandLabel')}
+          </span>
+        </button>
+      ) : (
+        <div className="chat-pane__transcript">
+          {loadError && (
+            <p role="alert">
+              {t('navShell.chat.loadError', { message: loadError })}
+            </p>
+          )}
+          {messages.length === 0 && !loadError && (
+            <p>{t('navShell.chat.emptyTranscript')}</p>
+          )}
+          <ul className="chat-pane__message-list">
+            {messages.map((m) => {
+              // items.id=359 piece 6: an approved gate3 draft is a
+              // visually distinct message type, not another plain bubble
+              // -- the thing meant to leave the device gets its own
+              // explicit copy affordance. 'pending-review' (pre-gate,
+              // below) deliberately keeps the plain-bubble rendering: no
+              // copy affordance exists before the gate clears.
+              if (m.gate3_review_status === 'approved') {
+                return (
+                  <li key={m.id} className="chat-pane__message chat-pane__message--starter">
+                    <span className="chat-pane__starter-label">
+                      {t('navShell.chat.starterLabel')}
+                    </span>
+                    <span className="chat-pane__message-content">{m.content}</span>
+                    <button
+                      type="button"
+                      className="chat-pane__starter-copy-button"
+                      onClick={() => handleCopyStarter(m.id, m.content)}
+                    >
+                      {copiedStarterId === m.id
+                        ? t('navShell.chat.starterCopiedLabel')
+                        : t('navShell.chat.starterCopyButton')}
+                    </button>
+                  </li>
+                )
+              }
+              return (
+                <li key={m.id} className={`chat-pane__message chat-pane__message--${m.sender}`}>
+                  <span className="chat-pane__message-content">
+                    {m.id === liveMessageId && liveContent ? liveContent : m.content}
+                  </span>
+                  {m.gate3_review_status === 'pending-review' && (
+                    <span className="chat-pane__pending-review-notice">
+                      {t('navShell.chat.pendingReviewNotice')}
+                    </span>
+                  )}
+                </li>
+              )
+            })}
+          </ul>
+          {isGenerating && (
+            <p className="chat-pane__generating" aria-live="polite">
+              {liveStepDisplayName
+                ? t('navShell.chat.generatingWithStep', {
+                    step: liveStepDisplayName,
+                    elapsed: elapsedSeconds,
+                  })
+                : t('navShell.chat.generating', { elapsed: elapsedSeconds })}
+            </p>
+          )}
+          {sendError && (
+            <p role="alert" className="chat-pane__send-error">
+              {t('navShell.chat.sendError', { message: sendError })}
+            </p>
+          )}
+          {contentTimedOut && (
+            <p role="alert" className="chat-pane__content-timeout">
+              {t('navShell.chat.contentTimeout')}
+            </p>
+          )}
+        </div>
+      )}
       <form
         className="chat-pane__input-row"
         onSubmit={(e) => {
@@ -410,6 +495,9 @@ export function ChatPane({
           value={draft}
           placeholder={t('navShell.chat.inputPlaceholder')}
           onChange={(e) => setDraft(e.target.value)}
+          onFocus={() => {
+            if (collapsed) onExpand?.()
+          }}
         />
         <button type="submit" disabled={draft.trim().length === 0}>
           {t('navShell.chat.sendButton')}

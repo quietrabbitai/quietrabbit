@@ -60,7 +60,42 @@
   min-width: 0;
 }
 
+/* items.id=359 (rail+content-pane redesign, 2026-08-30): replaces the
+ * former items.id=334 side-by-side QR/dock-column split entirely. QR
+ * stacks ABOVE the rail+content split area now (not beside it) --
+ * TIER3_PANE_RAIL_MOCKUP_20260829.html's own layout, the approved Session
+ * 3 design reference. QR takes a resting share of the height when
+ * expanded and collapses toward its own content's natural (small)
+ * height when a provider is active -- driven by data-collapsed, set from
+ * ChatPane's own `collapsed` prop's caller (Tier3AccessPane.tsx), not by
+ * anything in this file. */
 .tier3-access-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+}
+
+.tier3-access-pane__qr {
+  flex: 0 0 34%;
+  min-height: 170px;
+  display: flex;
+  transition: flex-basis 220ms ease, min-height 220ms ease;
+}
+
+.tier3-access-pane__qr[data-collapsed] {
+  flex: 0 0 auto;
+  min-height: 0;
+}
+
+.tier3-access-pane__qr > * {
+  flex: 1;
+  min-width: 0;
+}
+
+.tier3-access-pane__split-area {
   display: flex;
   flex-direction: row;
   gap: 8px;
@@ -69,61 +104,88 @@
   min-width: 0;
 }
 
-.tier3-access-pane__conversation {
-  flex: 1 1 55%;
+/* Deliberately narrow -- well under 1/4 of the split area's width, so the
+ * content pane beside it is much closer to square than a full-width short
+ * strip (TIER3_ACCESS_MODEL.md States section 3's own stated rationale:
+ * helps each provider's own page layout, which is its ENTIRE webpage --
+ * sidebar, history, menus, not just a chat transcript -- render sensibly
+ * instead of being squeezed). */
+.tier3-access-pane__rail-col {
+  flex: 0 0 220px;
   min-width: 0;
-  display: flex;
+  overflow-y: auto;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  padding: 4px;
 }
 
-.tier3-access-pane__dock-column {
-  display: flex;
-  flex-direction: column;
-  flex: 1 1 45%;
+.tier3-access-pane__content-pane {
+  flex: 1;
   min-width: 0;
   min-height: 0;
-  overflow: auto;
-  /* items.id=334: the column may only come to rest with whole pane rows
-   * visible -- isRowFullyVisible (paneLayout.ts) hides a row entirely
-   * rather than resizing its actual CEF viewport when partially scrolled,
-   * so a scroll position that left one at half-visible would show a blank
-   * gap. scroll-snap-align on each row (below) supplies the snap points. */
-  scroll-snap-type: y mandatory;
-}
-
-.tier3-access-pane__pane-row {
-  scroll-snap-align: start;
-}
-
-.tier3-access-pane__dock {
-  flex: 1;
-  min-height: 200px;
+  display: flex;
+  flex-direction: column;
   border-radius: 8px;
+  border: 1px solid var(--border);
   overflow: hidden;
 }
 
-.tier3-access-pane__dock[data-has-panes] {
+.tier3-access-pane__content-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
   flex: 0 0 auto;
-  border: 1px dashed var(--border);
 }
 
-/* items.id=334: forces a classic, always-visible, gutter-reserving
- * scrollbar on the dock column instead of GTK/WebKit's default auto-hiding
- * overlay style (which wasn't appearing/reachable at all). Any
- * ::-webkit-scrollbar rule switches WebKit off native overlay scrollbars
- * for that element -- this is what makes the reserved gutter exist, not
- * just the color/width below. A reserved gutter is excluded from
- * dockRect.width (paneLayout.ts), so no pane's hit-div ever covers it. */
-.tier3-access-pane__dock-column::-webkit-scrollbar {
-  width: 16px;
+.tier3-access-pane__content-head-name {
+  font-size: 13px;
+  font-weight: 500;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.tier3-access-pane__dock-column::-webkit-scrollbar-track {
-  background: transparent;
-}
-
-.tier3-access-pane__dock-column::-webkit-scrollbar-thumb {
-  background: var(--border);
+.tier3-access-pane__content-head-close {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
   border-radius: 6px;
+  border: none;
+  background: var(--code-bg);
+  color: inherit;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+}
+
+.tier3-access-pane__content-head-close:hover {
+  background: var(--border);
+}
+
+/* This element's own bounding rect IS the active pane's on-screen rect
+ * (paneLayout.ts's computeActivePaneRect) -- Rust composites CEF's
+ * texture directly into exactly this box, so nothing meant to stay
+ * visible on top of it (the header above) may live inside it. Only ever
+ * has DOM content (the empty-state prompt) when NO pane is active, since
+ * that's the only time nothing is composited into this rect. */
+.tier3-access-pane__content-body {
+  flex: 1;
+  min-height: 0;
+}
+
+.tier3-access-pane__content-empty {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 24px;
+  color: var(--text);
+  font-size: 13px;
 }
 
 .persona-hub__action-row {

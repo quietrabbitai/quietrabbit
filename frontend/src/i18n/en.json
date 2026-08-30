@@ -19,7 +19,6 @@
       "activeBoardPlaceholder": "Active Board -- not yet built.",
       "myFactsPlaceholder": "My Facts -- not yet built.",
       "chatPlaceholder": "Chat -- not yet wired for this screen.",
-      "tier3ContextPlaceholder": "QR's own conversation stays visible here alongside Tier 3 (Section 9) -- not yet wired.",
       "tier3ChatUnavailable": "Chat is unavailable -- no Persona is associated with this Tier 3 session."
     },
     "chat": {
@@ -34,7 +33,12 @@
       "pendingReviewNotice": "Pending privacy review",
       "generating": "Generating… ({{elapsed}}s)",
       "generatingWithStep": "Generating: {{step}}… ({{elapsed}}s)",
-      "contentTimeout": "This is taking longer than expected -- the response may be incomplete. Try reopening this conversation in a moment."
+      "contentTimeout": "This is taking longer than expected -- the response may be incomplete. Try reopening this conversation in a moment.",
+      "collapsedEmptySnippet": "No response yet.",
+      "collapsedExpandLabel": "Expand",
+      "starterLabel": "Drafted starter — cleared, ready to send",
+      "starterCopyButton": "Copy starter",
+      "starterCopiedLabel": "Copied"
     },
     "libraryPane": {
       "listHeading": "Outputs",
@@ -58,14 +62,12 @@
       "focusSettingsButton": "Settings"
     },
     "tier3AccessPane": {
-      "heading": "Tier 3 providers",
+      "heading": "Second opinion",
       "loadingProviders": "Loading providers…",
       "providerError": "Could not load providers: {{message}}",
       "openError": "Could not open pane(s): {{message}}",
-      "confirmedLabel": "Confirmed: {{names}}",
-      "openPanesLabel": "Open panes",
-      "noPanesOpen": "No panes open",
-      "closeButton": "Close",
+      "contentEmptyPrompt": "Select a provider to start a second opinion.",
+      "contentCloseButton": "Close this session",
       "gate3BlockedFallback": "This content can't be shared with Tier 3 right now.",
       "gate3Withheld": "Kept private — nothing was sent to Tier 3.",
       "gate3ReviewError": "Could not start the privacy review: {{message}}"
@@ -92,10 +94,16 @@
     }
   },
   "tier3Selector": {
-    "tier2BoxLabel": "No login required",
-    "tier3BoxLabel": "Account required, data retained",
-    "selectionCount": "{{selected}} / {{max}} selected",
-    "continueButton": "Continue"
+    "railLabel": "Second opinion providers",
+    "rowState": {
+      "idle": "Not loaded",
+      "loaded": "Loaded — tap to view",
+      "active": "Active"
+    },
+    "hopIndicatorTitle": "Internet-facing",
+    "tier2BadgeTitle": "No login required",
+    "tier3BadgeTitle": "Account required, data retained",
+    "closeRowTitle": "Close {{name}}"
   },
   "privacyGuardianModal": {
     "headerTitle": "PRIVACY GUARDIAN",

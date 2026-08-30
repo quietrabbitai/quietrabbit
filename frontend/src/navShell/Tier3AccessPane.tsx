@@ -1,47 +1,45 @@
-// Tier 3 access -- pane hosting, re-hosted from the former App.tsx harness
-// (items.id=3/202/223) behind the real Tier 3 access button (items.id=232).
-// The state/effects/handlers below are the same mechanism the harness
-// proved, relocated here rather than rebuilt -- see paneLayout.ts,
-// tier3AccessConfig.ts, Tier3Selector.tsx, none of which changed.
+// Tier 2/Tier 3 access -- rail + content-pane hosting (items.id=359,
+// replacing the former two-box selector + fixed-split-column model,
+// items.id=3/202/223's original harness-derived layout).
 //
-// Section 9's hard requirement: QR's own conversation and a Tier 3
-// exchange must remain simultaneously visible (so content can be copied
-// between them), not swapped in place of each other -- hence MiddleZone
-// stays mounted alongside the selector/pane dock here, same split this
-// item's harness predecessor used.
+// TIER3_ACCESS_MODEL.md Session 3 (decisions.id=731-733): the rail lists
+// every candidate provider (no cap); at most one pane is ever composited
+// at a time (activeProviderId below, mirrored to Rust's own
+// PaneManager.active_pane via commands.setActivePane -- see
+// pane_host.rs); QR's own conversation collapses to a minimal floor
+// whenever a provider is active, freeing near-full height for that
+// provider's own page. This last piece is NEW behavior (see this item's
+// plan file / session handoff for why: MiddleZone's existing resting/
+// active-ratio mechanism is a side-by-side two-slot WIDTH splitter, never
+// actually wired to Tier 3 panes in the live code, and can't do a
+// collapse-a-whole-panel-to-a-floor-beside-an-unrelated-sibling-block
+// the way this design needs -- so this is built fresh here, following
+// IA Section 3's own principles (focus-location trigger, not a timer)
+// rather than literally reusing MiddleZone's code). MiddleZone itself is
+// untouched.
 //
-// MiddleZone's chatPane is now ChatPane -- the real starter-drafting
-// component (items.id=245-ish), not a placeholder. It reuses the same
-// "quick-ask" Focus path Persona hub chat uses: FOCUS_ROADMAP.md states
-// plainly (line 346) "Tier 3 -- shared infrastructure, built on-demand,
-// not standalone Focuses," and TIER3_ACCESS_MODEL.md (line 413) confirms
-// the starter-drafting pre-conversation uses "the same context-assembly
-// mechanism QR already uses for its own responses" -- no dedicated
-// starter-drafting Focus exists or should exist. gate3Track=true is the
-// only thing that differs from Persona hub's ChatPane usage: it marks the
-// assistant reply's gate3_review_status="drafted", the row the outbound
-// Privacy Guardian review below transitions further.
+// Section 9's hard requirement (relaxed by decisions.id=731 specifically
+// for the provider-active case): QR's own conversation and a Tier 3
+// exchange must remain simultaneously visible where possible. QR is
+// collapsed, not unmounted, while a provider is active -- ChatPane's own
+// `collapsed` prop keeps its message state (and live entry bar) mounted
+// throughout, per Jason's explicit build-time preference for showing the
+// real last response in the collapsed floor, not a placeholder.
 //
-// items.id=233's remaining stub, now built: the outbound Privacy Guardian
-// gate (PG_GATE_3, conductor/privacy/gate3.rs) ahead of the Selector
-// screen. handleDraftReady calls commands.requestTier3Gate3Review the
-// moment ChatPane signals a real drafted message; on pending_consent the
-// consent_request listener below picks up the payload (already emitted by
-// the time the command's promise resolves -- gate3()'s write-before-surface
-// invariant writes the disclosure_log entry and emits synchronously before
-// returning) and mounts PrivacyGuardianModal. The Selector only renders
-// once reviewOutcome === 'approved'.
+// items.id=233's outbound Privacy Guardian gate (PG_GATE_3,
+// conductor/privacy/gate3.rs) ahead of the rail appearing at all is
+// unchanged by this item -- see handleDraftReady/the consent_request
+// listener below, carried over from the prior selector-screen version of
+// this file.
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { commands, type PaneRectFraction } from '../bindings'
 import { ChatPane } from '../chat/ChatPane'
-import { MiddleZone } from '../middleZone/MiddleZone'
-import { DEFAULT_CONVERSATION_PROFILE } from '../middleZone/middleZoneConfig'
 import { FocusSettingsControls } from './FocusSettingsControls'
 import { requireCurrentUserId } from './navShellConfig'
-import { computePaneRects, pixelRectToFraction, isRowFullyVisible, PANE_ROW_HEIGHT, type PanePixelRect } from '../tier3Access/paneLayout'
+import { computeActivePaneRect, pixelRectToFraction, type PanePixelRect } from '../tier3Access/paneLayout'
 import { PaneHitLayer } from '../tier3Access/PaneHitLayer'
 import { PopupHitLayer } from '../tier3Access/PopupHitLayer'
 import {
@@ -81,24 +79,27 @@ export interface Tier3AccessPaneProps {
 
 export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
   const { t } = useTranslation()
-  const [chatGenerating, setChatGenerating] = useState(false)
   const [providers, setProviders] = useState<Provider[]>([])
   const [providerError, setProviderError] = useState<string | null>(null)
-  const [confirmedProviders, setConfirmedProviders] = useState<
-    Provider[] | null
-  >(null)
+  /** Providers with an open (loaded) pane in Rust -- may or may not
+   *  include activeProviderId (loaded-but-inactive rows show nowhere
+   *  except their own rail row, per the rail model). */
   const [openPaneIds, setOpenPaneIds] = useState<string[]>([])
+  /** The one provider currently shown in the content pane, or null when
+   *  QR is expanded / nothing has been activated yet. Mirrored to Rust's
+   *  PaneManager.active_pane via commands.setActivePane -- see that
+   *  command's own doc (commands/tier3_pane.rs) for the deactivation
+   *  side-effects (scroll-to-bottom, was_hidden) this triggers there. */
+  const [activeProviderId, setActiveProviderId] = useState<string | null>(null)
   const [openError, setOpenError] = useState<string | null>(null)
-  const paneDockRef = useRef<HTMLDivElement>(null)
-  // items.id=334: the dock column's own visible bounds -- distinct from
-  // paneDockRef, whose element can now be far taller than what's on screen
-  // (PANE_ROW_HEIGHT stacking has no ceiling). syncPaneLayout clips each
-  // pane's row rect against this before it ever reaches paneRects/Rust.
-  const paneColumnRef = useRef<HTMLDivElement>(null)
-  // CSS-pixel-space rects, viewport-relative -- the same numbers
-  // syncPaneLayout divides down into the PaneRectFraction sent to Rust, fed
-  // straight to PaneHitLayer for its invisible per-pane hit-divs' position
-  // (items.id=257 Path B; see paneLayout.ts's module doc).
+  /** The content pane's own placeholder body -- its bounding rect IS the
+   *  active pane's on-screen rect (computeActivePaneRect). Deliberately
+   *  NOT the same element as the content-pane header (see this file's
+   *  module doc / the session handoff): Rust composites CEF's texture
+   *  directly into exactly this rect, so any DOM chrome meant to stay
+   *  visibly on top (the header/close button) must live in a sibling
+   *  element outside it, never inside. */
+  const contentBodyRef = useRef<HTMLDivElement>(null)
   const [paneRects, setPaneRects] = useState<Record<string, PanePixelRect>>({})
   // items.id=234: backend-authoritative popup rects, keyed by parent
   // provider id -- see PopupHitLayer's own doc for why this is not
@@ -124,19 +125,12 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
   const [pendingMessageId, setPendingMessageId] = useState<string | null>(null)
 
   const syncPaneLayout = useCallback(() => {
-    const dock = paneDockRef.current
-    const column = paneColumnRef.current
-    if (!dock || !column || openPaneIds.length === 0) {
+    const body = contentBodyRef.current
+    if (!body) {
       setPaneRects({})
       return
     }
-    const rawRects = computePaneRects(dock.getBoundingClientRect(), openPaneIds)
-    const columnRect = column.getBoundingClientRect()
-    const viewport = { top: columnRect.top, bottom: columnRect.bottom }
-    const rects: Record<string, PanePixelRect> = {}
-    for (const [id, rect] of Object.entries(rawRects)) {
-      if (isRowFullyVisible(rect, viewport)) rects[id] = rect
-    }
+    const rects = computeActivePaneRect(body.getBoundingClientRect(), activeProviderId)
     setPaneRects(rects)
     const entries = Object.entries(rects).map(([providerId, rect]) => ({
       provider_id: providerId,
@@ -147,12 +141,11 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
         setOpenError(result.error)
       }
     })
-  }, [openPaneIds])
+  }, [activeProviderId])
 
   useEffect(() => {
-    const dock = paneDockRef.current
-    const column = paneColumnRef.current
-    if (!dock || !column) return
+    const body = contentBodyRef.current
+    if (!body) return
     let frame: number | null = null
     const scheduleSync = () => {
       if (frame !== null) return
@@ -163,26 +156,15 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
     }
     scheduleSync()
     const observer = new ResizeObserver(scheduleSync)
-    observer.observe(dock)
-    // items.id=257 (2026-08-28): ResizeObserver only fires when the dock's
-    // own border-box SIZE changes -- confirmed live that maximizing the
-    // window shifts the dock's on-screen X position (its own column grows)
-    // while its width/height stay byte-identical, so ResizeObserver never
-    // fires and this pane's rect goes stale (Rust keeps compositing against
-    // an old fraction that no longer matches the dock's real position).
-    // window's own 'resize' event fires on any window-size change
-    // regardless of whether this specific element's size happened to
-    // change, so it catches exactly the case ResizeObserver misses.
+    observer.observe(body)
+    // items.id=257 (2026-08-28): ResizeObserver only fires when the
+    // observed element's own border-box SIZE changes -- a window move (or
+    // QR's own expand/collapse, which shifts the content pane's position
+    // without necessarily changing its size) needs this too.
     window.addEventListener('resize', scheduleSync)
-    // items.id=334: scrolling the column moves the dock's on-screen
-    // position/visible portion without changing its own size or the
-    // window's, so neither of the above fires -- a plain scroll listener
-    // is the only thing that catches it.
-    column.addEventListener('scroll', scheduleSync)
     return () => {
       observer.disconnect()
       window.removeEventListener('resize', scheduleSync)
-      column.removeEventListener('scroll', scheduleSync)
       if (frame !== null) cancelAnimationFrame(frame)
     }
   }, [syncPaneLayout])
@@ -231,15 +213,36 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
     }
   }, [])
 
-  const handleConfirm = (selected: Provider[]) => {
-    setConfirmedProviders(selected)
+  /** Idle row -> load then activate in one step; loaded row -> just
+   *  switch the content pane (no reload). The doc's "the large content
+   *  pane itself is clickable, not only the rail row" is already
+   *  satisfied structurally, not by a second handler here: PaneHitLayer's
+   *  hit-div sits on top of the content pane's exact rect (position:
+   *  fixed, no z-index needed -- painted after ordinary in-flow content
+   *  regardless of DOM order) and already calls CEF's set_focus(true) on
+   *  every real click that lands there (pane_host.rs's MouseClick dispatch
+   *  arm) -- and "provider active" and "QR collapsed" are the same
+   *  boolean in this design, so there is no separate "QR re-expanded
+   *  while a pane still shows" state left to reclaim from. */
+  const handleActivate = (providerId: string) => {
     setOpenError(null)
-    commands.openTier3Panes(selected.map((p) => p.id)).then((result) => {
-      if (result.status === 'ok') {
-        setOpenPaneIds(selected.map((p) => p.id))
-      } else {
+    if (openPaneIds.includes(providerId)) {
+      setActiveProviderId(providerId)
+      commands.setActivePane(providerId).then((result) => {
+        if (result.status !== 'ok') setOpenError(result.error)
+      })
+      return
+    }
+    commands.openTier3Panes([providerId]).then((result) => {
+      if (result.status !== 'ok') {
         setOpenError(result.error)
+        return
       }
+      setOpenPaneIds((ids) => (ids.includes(providerId) ? ids : [...ids, providerId]))
+      setActiveProviderId(providerId)
+      commands.setActivePane(providerId).then((setResult) => {
+        if (setResult.status !== 'ok') setOpenError(setResult.error)
+      })
     })
   }
 
@@ -247,6 +250,7 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
     commands.closeTier3Pane(providerId).then((result) => {
       if (result.status === 'ok') {
         setOpenPaneIds((ids) => ids.filter((id) => id !== providerId))
+        if (activeProviderId === providerId) setActiveProviderId(null)
         // items.id=234: close_pane's own popup teardown is synchronous on
         // the Rust side, not queued through the same per-tick drain that
         // fires tier3-popup-closed for the other close paths (self-close,
@@ -264,6 +268,17 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
       }
     })
   }
+
+  /** decisions.id=731's symmetric transition: clicking the collapsed QR
+   *  strip, or focusing its entry input, re-expands QR and returns the
+   *  currently-active provider to loaded (its row, no longer active) --
+   *  nothing is closed. */
+  const handleExpandQR = useCallback(() => {
+    setActiveProviderId(null)
+    commands.setActivePane(null).then((result) => {
+      if (result.status !== 'ok') setOpenError(result.error)
+    })
+  }, [])
 
   // items.id=233: fires once ChatPane has a real drafted message ready for
   // outbound Privacy Guardian review. On pending_consent, the
@@ -413,7 +428,7 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
   }
 
   // DIAG_329 (items.id=329): dev-only test scaffolding -- jumps straight to
-  // the Tier3Selector/pane-open state by seeding a synthetic drafted message
+  // the rail/pane-open state by seeding a synthetic drafted message
   // (commands.devSeedTier3DraftMessage, debug builds only -- see its Rust
   // doc comment) instead of typing a message and waiting several seconds for
   // the local model's response. From there it calls the exact same
@@ -448,6 +463,8 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
     setReviewOutcome(null)
   }
 
+  const activeProvider = providers.find((p) => p.id === activeProviderId) ?? null
+
   return (
     <div className="tier3-access-pane">
       <PaneHitLayer rects={paneRects} />
@@ -455,138 +472,117 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
           resolves popup-vs-parent-pane hit-test precedence in any
           overlapping region (see PopupHitLayer's own doc). */}
       <PopupHitLayer popups={popupRects} />
-      <div className="tier3-access-pane__conversation">
-        <MiddleZone
-          contextKey={
-            personaId ? `tier3-access-${personaId}` : 'tier3-access'
-          }
-          profile={DEFAULT_CONVERSATION_PROFILE}
-          isGenerating={chatGenerating}
-          contextPane={<p>{t('navShell.content.tier3ContextPlaceholder')}</p>}
-          chatPane={
-            personaId ? (
-              <ChatPane
-                contextKey={`tier3-access-${personaId}`}
-                userId={requireCurrentUserId()}
-                personaId={personaId}
-                focusId="quick-ask"
-                gate3Track={true}
-                onGenerating={setChatGenerating}
-                onDraftReady={handleDraftReady}
-              />
-            ) : (
-              <p>{t('navShell.content.tier3ChatUnavailable')}</p>
-            )
-          }
-        />
-      </div>
 
-      <div className="tier3-access-pane__dock-column" ref={paneColumnRef}>
-        <div
-          ref={paneDockRef}
-          className="tier3-access-pane__dock"
-          data-has-panes={openPaneIds.length > 0 ? '' : undefined}
-          style={
-            openPaneIds.length > 0
-              ? { height: openPaneIds.length * PANE_ROW_HEIGHT }
-              : undefined
-          }
-        >
-          {/* items.id=334: invisible per-row anchors, one per open pane --
-              not visual chrome (see the reverted per-row header attempt's
-              own history), just scroll-snap-align targets so the column
-              (scroll-snap-type: y, NavShell.css) can only rest with whole
-              rows visible, never a partial one -- see isRowFullyVisible's
-              own doc for why a partial reveal must never happen. */}
-          {openPaneIds.map((id) => (
-            <div
-              key={id}
-              className="tier3-access-pane__pane-row"
-              style={{ height: PANE_ROW_HEIGHT }}
-            />
-          ))}
-        </div>
-
-        <h3>{t('navShell.tier3AccessPane.heading')}</h3>
-        {/* DIAG_329 (items.id=329): dev-only, see handleDevForceTier3's own comment. */}
-        {import.meta.env.DEV && personaId && (
-          <button type="button" onClick={handleDevForceTier3}>
-            Dev: force Tier 3 escalation
-          </button>
-        )}
-        {providerError && (
-          <p role="alert">
-            {t('navShell.tier3AccessPane.providerError', {
-              message: providerError,
-            })}
-          </p>
-        )}
-        {providers.length === 0 && !providerError && (
-          <p>{t('navShell.tier3AccessPane.loadingProviders')}</p>
-        )}
-        {reviewOutcome === 'blocked' && (
-          <p role="alert">{reviewMessage ?? t('navShell.tier3AccessPane.gate3BlockedFallback')}</p>
-        )}
-        {reviewOutcome === 'blocked' && reviewCeiling && personaId && (
-          <FocusSettingsControls
+      <div
+        className="tier3-access-pane__qr"
+        data-collapsed={activeProviderId !== null ? '' : undefined}
+      >
+        {personaId ? (
+          <ChatPane
+            contextKey={`tier3-access-${personaId}`}
             userId={requireCurrentUserId()}
             personaId={personaId}
             focusId="quick-ask"
-            mode="ceilingOnly"
-            suggestedMaxPermittedTier={reviewCeiling.targetTier}
-            onSaved={() => {
-              setReviewCeiling(null)
-              if (pendingMessageId) handleDraftReady(pendingMessageId)
-            }}
+            gate3Track={true}
+            onDraftReady={handleDraftReady}
+            collapsed={activeProviderId !== null}
+            onExpand={handleExpandQR}
           />
-        )}
-        {reviewOutcome === 'withheld' && (
-          <p>{t('navShell.tier3AccessPane.gate3Withheld')}</p>
-        )}
-        {providers.length > 0 && reviewOutcome === 'approved' && openPaneIds.length === 0 && (
-          // items.id=329: gated on openPaneIds too, not just reviewOutcome --
-          // reviewOutcome stays 'approved' for the rest of this component's
-          // life once set, so without this the selector's checkboxes stayed
-          // mounted (and clickable) underneath the dock the whole time a
-          // pane was open, a stray target for any hit-testing gap to fall
-          // through onto. Reappears if the user closes back down to zero
-          // open panes, which is also the correct behavior for opening more.
-          <Tier3Selector providers={providers} onConfirm={handleConfirm} />
-        )}
-        <PrivacyGuardianModal
-          open={reviewOutcome === 'pending'}
-          payload={consentPayload}
-          onResolve={handleModalResolve}
-          onCancel={handleModalCancel}
-        />
-        {confirmedProviders && (
-          <p>
-            {t('navShell.tier3AccessPane.confirmedLabel', {
-              names: confirmedProviders.map((p) => p.name).join(', '),
-            })}
-          </p>
-        )}
-        {openError && (
-          <p role="alert">
-            {t('navShell.tier3AccessPane.openError', { message: openError })}
-          </p>
-        )}
-
-        <h4>{t('navShell.tier3AccessPane.openPanesLabel')}</h4>
-        {openPaneIds.length === 0 ? (
-          <p>{t('navShell.tier3AccessPane.noPanesOpen')}</p>
         ) : (
-          <ul>
-            {openPaneIds.map((id) => (
-              <li key={id}>
-                {providers.find((p) => p.id === id)?.name ?? id}{' '}
-                <button type="button" onClick={() => handleClose(id)}>
-                  {t('navShell.tier3AccessPane.closeButton')}
-                </button>
-              </li>
-            ))}
-          </ul>
+          <p>{t('navShell.content.tier3ChatUnavailable')}</p>
         )}
+      </div>
+
+      <div className="tier3-access-pane__split-area">
+        <div className="tier3-access-pane__rail-col">
+          <h3>{t('navShell.tier3AccessPane.heading')}</h3>
+          {/* DIAG_329 (items.id=329): dev-only, see handleDevForceTier3's own comment. */}
+          {import.meta.env.DEV && personaId && (
+            <button type="button" onClick={handleDevForceTier3}>
+              Dev: force Tier 3 escalation
+            </button>
+          )}
+          {providerError && (
+            <p role="alert">
+              {t('navShell.tier3AccessPane.providerError', {
+                message: providerError,
+              })}
+            </p>
+          )}
+          {providers.length === 0 && !providerError && (
+            <p>{t('navShell.tier3AccessPane.loadingProviders')}</p>
+          )}
+          {reviewOutcome === 'blocked' && (
+            <p role="alert">{reviewMessage ?? t('navShell.tier3AccessPane.gate3BlockedFallback')}</p>
+          )}
+          {reviewOutcome === 'blocked' && reviewCeiling && personaId && (
+            <FocusSettingsControls
+              userId={requireCurrentUserId()}
+              personaId={personaId}
+              focusId="quick-ask"
+              mode="ceilingOnly"
+              suggestedMaxPermittedTier={reviewCeiling.targetTier}
+              onSaved={() => {
+                setReviewCeiling(null)
+                if (pendingMessageId) handleDraftReady(pendingMessageId)
+              }}
+            />
+          )}
+          {reviewOutcome === 'withheld' && (
+            <p>{t('navShell.tier3AccessPane.gate3Withheld')}</p>
+          )}
+          {providers.length > 0 && reviewOutcome === 'approved' && (
+            // items.id=359: the rail is persistent once the gate clears --
+            // unlike the retired selector screen, it does not disappear
+            // once a pane opens (TIER3_ACCESS_MODEL.md States section 3).
+            <Tier3Selector
+              providers={providers}
+              openPaneIds={openPaneIds}
+              activeProviderId={activeProviderId}
+              onActivate={handleActivate}
+              onClose={handleClose}
+            />
+          )}
+          <PrivacyGuardianModal
+            open={reviewOutcome === 'pending'}
+            payload={consentPayload}
+            onResolve={handleModalResolve}
+            onCancel={handleModalCancel}
+          />
+          {openError && (
+            <p role="alert">
+              {t('navShell.tier3AccessPane.openError', { message: openError })}
+            </p>
+          )}
+        </div>
+
+        <div className="tier3-access-pane__content-pane">
+          {activeProviderId !== null && (
+            <div className="tier3-access-pane__content-head">
+              <span className="tier3-access-pane__content-head-name">
+                {activeProvider?.name ?? activeProviderId}
+              </span>
+              <button
+                type="button"
+                className="tier3-access-pane__content-head-close"
+                title={t('navShell.tier3AccessPane.contentCloseButton')}
+                onClick={(e) => {
+                  e.stopPropagation()
+                  handleClose(activeProviderId)
+                }}
+              >
+                &times;
+              </button>
+            </div>
+          )}
+          <div ref={contentBodyRef} className="tier3-access-pane__content-body">
+            {activeProviderId === null && (
+              <p className="tier3-access-pane__content-empty">
+                {t('navShell.tier3AccessPane.contentEmptyPrompt')}
+              </p>
+            )}
+          </div>
+        </div>
       </div>
     </div>
   )

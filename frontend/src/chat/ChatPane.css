@@ -88,6 +88,76 @@
   align-self: flex-start;
 }
 
+/* items.id=359 piece 6: the drafted-starter message type -- outlined,
+ * distinct from a plain reply, with its own explicit copy affordance. */
+.chat-pane__message--starter {
+  align-self: flex-start;
+  background: var(--bg);
+  border: 1.5px solid var(--accent-border);
+  gap: 6px;
+}
+
+.chat-pane__starter-label {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.chat-pane__starter-copy-button {
+  align-self: flex-start;
+  padding: 5px 10px;
+  border: none;
+  border-radius: 6px;
+  background: var(--accent);
+  color: var(--bg);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+/* items.id=359 piece 3 (decisions.id=731): QR's collapsed floor -- mark +
+ * last-response snippet + (below, unchanged) the still-mounted entry bar. */
+.chat-pane__collapsed-strip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border: none;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.chat-pane__collapsed-mark {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  opacity: 0.7;
+}
+
+.chat-pane__collapsed-snippet {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.5px;
+  color: var(--text);
+}
+
+.chat-pane__collapsed-expand {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  color: var(--accent);
+  font-weight: 500;
+}
+
 .chat-pane__input-row {
   display: flex;
   align-items: center;
