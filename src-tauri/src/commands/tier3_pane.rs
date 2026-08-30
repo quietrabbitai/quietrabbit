@@ -721,6 +721,10 @@ pub async fn set_pane_layout(
 /// not a failure, matching `close_tier3_pane`'s own framing.
 #[tauri::command]
 #[specta::specta]
+// IPC command signature mirrors the DOM event shape 1:1 (see doc above) --
+// a wrapper struct would just move the sprawl, and would also touch the
+// frontend's paneLayout.ts call site for no readability gain.
+#[allow(clippy::too_many_arguments)]
 pub async fn forward_pane_mouse_click(
     provider_id: String,
     x: f64,
@@ -924,6 +928,9 @@ pub async fn forward_popup_key(
 /// id-keyspace, see `PaneManager.popups`'s own doc, pane_host.rs).
 #[tauri::command]
 #[specta::specta]
+// Same rationale as forward_pane_mouse_click's own allow: signature mirrors
+// the DOM event shape 1:1, a wrapper struct would just move the sprawl.
+#[allow(clippy::too_many_arguments)]
 pub async fn forward_popup_mouse_click(
     provider_id: String,
     x: f64,

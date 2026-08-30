@@ -557,7 +557,9 @@ fn texture_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
 // items.id=328: value also carries the bind group's underlying texture's
 // exact pixel dimensions -- see `resolve_bind_group`'s own doc for why
 // `RenderState::render()` needs this alongside the bind group itself.
-static PANE_TEXTURES: LazyLock<Mutex<HashMap<PaneKey, (wgpu::BindGroup, (u32, u32))>>> =
+type PaneTextureEntry = (wgpu::BindGroup, (u32, u32));
+
+static PANE_TEXTURES: LazyLock<Mutex<HashMap<PaneKey, PaneTextureEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Drops a closed pane's texture entry. Must be called as part of that
@@ -577,7 +579,7 @@ pub fn remove_pane_texture(key: &PaneKey) {
 /// popups -- a separate map, keyed by the *parent* pane's `PaneKey` (one
 /// active popup per pane, see `pane_host::PaneManager.popups`'s own doc),
 /// not a repurposed key scheme on `PANE_TEXTURES`.
-static POPUP_TEXTURES: LazyLock<Mutex<HashMap<PaneKey, (wgpu::BindGroup, (u32, u32))>>> =
+static POPUP_TEXTURES: LazyLock<Mutex<HashMap<PaneKey, PaneTextureEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Mirrors `remove_pane_texture` -- must be called as part of a popup's own
@@ -713,7 +715,7 @@ fn resolve_bind_group(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     paint: PendingPaint,
-) -> Option<(wgpu::BindGroup, (u32, u32))> {
+) -> Option<PaneTextureEntry> {
     match paint {
         PendingPaint::Software {
             pixels,
@@ -893,7 +895,13 @@ pub struct PaneRenderHandler {
     // multi_threaded_message_loop=true. Found during the items.id=203
     // thread-safety audit (2026-08-03).
     size: std::sync::Arc<std::sync::Mutex<LogicalSize>>,
+    // Captured at construction alongside RenderState's own device/queue, but
+    // never read here: items.id=312 moved the actual GPU texture import to
+    // RenderState::render (see resolve_bind_group), so this handler only
+    // ever produces a PendingPaint for that central pass to consume.
+    #[allow(dead_code)]
     device: wgpu::Device,
+    #[allow(dead_code)]
     queue: wgpu::Queue,
     /// Which `PANE_TEXTURES` slot on_paint/on_accelerated_paint (CEF's own
     /// UI thread) write into. See PaneKey docs (tier3_pane::mod) -- this is
@@ -1077,7 +1085,11 @@ impl RenderHandlerBuilder {
 pub struct PopupRenderHandler {
     device_scale_factor: f32,
     size: Arc<Mutex<LogicalSize>>,
+    // Same as PaneRenderHandler's own device/queue: unread here, since
+    // items.id=312 centralized GPU texture import into RenderState::render.
+    #[allow(dead_code)]
     device: wgpu::Device,
+    #[allow(dead_code)]
     queue: wgpu::Queue,
     /// The *parent* pane's key -- which `POPUP_TEXTURES` slot this popup's
     /// paint output belongs to.
