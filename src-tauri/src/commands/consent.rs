@@ -811,6 +811,86 @@ pub async fn request_tier3_gate3_review(
     Ok(result.into())
 }
 
+// ---------------------------------------------------------------------------
+// DIAG_356 -- dev-only test scaffolding (items.id=356)
+// ---------------------------------------------------------------------------
+
+/// TEMPORARY dev-only bypass for the "Dev: force Tier 3 escalation" button
+/// (items.id=356, Tier3AccessPane.tsx's handleDevForceTier3). Skips gate3()
+/// entirely -- unlike dev_seed_tier3_draft_message above (which fabricates
+/// only the drafted INPUT gate3 reviews, still routing through the real
+/// gate), this command skips the real gate decision itself.
+///
+/// Why: gate3's own zero-spans-forced-High branch (D6-362/decisions.id=405,
+/// see gate3.rs's header comment) reliably fires for this synthetic
+/// dev-seeded message and surfaces a Privacy Guardian modal with nothing in
+/// it to review -- a real, separately-tracked UX gap (items.id=356) that
+/// this command works around for dev testing, not fixes. Whether that
+/// empty-modal branch should exist at all, and what it should show instead,
+/// is deferred design work -- gate3.rs is untouched by this item. Real user
+/// messages never call this command; they still go through the unmodified
+/// request_tier3_gate3_review -> gate3() path above, unchanged.
+///
+/// Marks the message approved directly (mirroring
+/// request_tier3_gate3_review's own gate3_review_status transition on its
+/// approved branch) without ever constructing a PrivacyGateway or calling
+/// gateway.gate3().
+///
+/// #[cfg(debug_assertions)]: compiled only into debug builds, same
+/// discipline as dev_seed_tier3_draft_message -- see ipc.rs's specta_builder
+/// for the matching debug-only registration; both halves must be removed
+/// together once items.id=356's Privacy Guardian empty-modal design work
+/// lands and this workaround is no longer needed.
+#[cfg(debug_assertions)]
+#[tauri::command]
+#[specta::specta]
+pub async fn dev_bypass_tier3_gate3_review(
+    request: RequestTier3Gate3ReviewRequest,
+    key_registry: State<'_, KeyRegistry>,
+) -> Result<Gate3ReviewResult, String> {
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
+    let message = message_store::get_message(
+        &request.user_id,
+        &request.persona_id,
+        &key_hex_str,
+        &request.message_id,
+    )
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| "not_found".to_string())?;
+
+    if message.gate3_review_status.as_deref() != Some("drafted") {
+        return Err(format!(
+            "message {} is not awaiting gate3 review (gate3_review_status: {:?})",
+            request.message_id, message.gate3_review_status
+        ));
+    }
+
+    message_store::update_gate3_review_status(
+        &request.user_id,
+        &request.persona_id,
+        &key_hex_str,
+        &request.message_id,
+        "approved",
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(Gate3ReviewResult {
+        approved: true,
+        blocked: false,
+        pending_consent: false,
+        timeout: false,
+        plain_language: None,
+        target_tier: None,
+        space_max_permitted_tier: None,
+    })
+}
+
 /// Records the user's resolution of a Privacy Guardian consent review
 /// (pending-review -> approved | withheld). Separate from
 /// submit_element_consent_decision: that command writes the per-span audit

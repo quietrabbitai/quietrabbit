@@ -51,8 +51,9 @@ pub const BINDINGS_PATH: &str = "../frontend/src/bindings.ts";
 /// is the only way to guarantee dev_seed_tier3_draft_message is textually
 /// absent from a release build's command surface, not merely unreachable.
 /// Keep both lists in sync when adding/removing a real (non-dev-only)
-/// command; collapse back to one function when items.id=329's dev-only
-/// scaffolding is removed.
+/// command; collapse back to one function once every dev-only command using
+/// this pattern (currently dev_seed_tier3_draft_message, items.id=329, and
+/// dev_bypass_tier3_gate3_review, items.id=356) is removed.
 #[cfg(debug_assertions)]
 pub fn specta_builder() -> Builder<tauri::Wry> {
     Builder::<tauri::Wry>::new().commands(collect_commands![
@@ -60,6 +61,10 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         // only. See commands::messages::dev_seed_tier3_draft_message's own
         // doc comment.
         commands::messages::dev_seed_tier3_draft_message,
+        // DIAG_356 (items.id=356) -- dev-only test scaffolding, debug builds
+        // only. See commands::consent::dev_bypass_tier3_gate3_review's own
+        // doc comment.
+        commands::consent::dev_bypass_tier3_gate3_review,
         // Group 1 -- Focus execution
         commands::execution::submit_focus_run,
         commands::execution::get_run_output,
@@ -161,10 +166,11 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
 }
 
 /// Release-build counterpart of the function above -- identical except it
-/// has no dev_seed_tier3_draft_message entry (that item doesn't even exist
-/// in a release build; see its #[cfg(debug_assertions)] in
-/// commands/messages.rs). See the debug-build specta_builder's own doc
-/// comment for why this is a second full function rather than one shared
+/// has no dev_seed_tier3_draft_message or dev_bypass_tier3_gate3_review
+/// entry (neither item exists in a release build; see their respective
+/// #[cfg(debug_assertions)] in commands/messages.rs and commands/consent.rs).
+/// See the debug-build specta_builder's own doc comment for why this is a
+/// second full function rather than one shared
 /// list with a per-entry #[cfg].
 #[cfg(not(debug_assertions))]
 pub fn specta_builder() -> Builder<tauri::Wry> {

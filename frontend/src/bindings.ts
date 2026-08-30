@@ -26,6 +26,35 @@ export const commands = {
 	 *  longer needs fast iteration.
 	 */
 	devSeedTier3DraftMessage: (userId: string, personaId: string, contextKey: string) => typedError<string, string>(__TAURI_INVOKE("dev_seed_tier3_draft_message", { userId, personaId, contextKey })),
+	/**
+	 *  TEMPORARY dev-only bypass for the "Dev: force Tier 3 escalation" button
+	 *  (items.id=356, Tier3AccessPane.tsx's handleDevForceTier3). Skips gate3()
+	 *  entirely -- unlike dev_seed_tier3_draft_message above (which fabricates
+	 *  only the drafted INPUT gate3 reviews, still routing through the real
+	 *  gate), this command skips the real gate decision itself.
+	 * 
+	 *  Why: gate3's own zero-spans-forced-High branch (D6-362/decisions.id=405,
+	 *  see gate3.rs's header comment) reliably fires for this synthetic
+	 *  dev-seeded message and surfaces a Privacy Guardian modal with nothing in
+	 *  it to review -- a real, separately-tracked UX gap (items.id=356) that
+	 *  this command works around for dev testing, not fixes. Whether that
+	 *  empty-modal branch should exist at all, and what it should show instead,
+	 *  is deferred design work -- gate3.rs is untouched by this item. Real user
+	 *  messages never call this command; they still go through the unmodified
+	 *  request_tier3_gate3_review -> gate3() path above, unchanged.
+	 * 
+	 *  Marks the message approved directly (mirroring
+	 *  request_tier3_gate3_review's own gate3_review_status transition on its
+	 *  approved branch) without ever constructing a PrivacyGateway or calling
+	 *  gateway.gate3().
+	 * 
+	 *  #[cfg(debug_assertions)]: compiled only into debug builds, same
+	 *  discipline as dev_seed_tier3_draft_message -- see ipc.rs's specta_builder
+	 *  for the matching debug-only registration; both halves must be removed
+	 *  together once items.id=356's Privacy Guardian empty-modal design work
+	 *  lands and this workaround is no longer needed.
+	 */
+	devBypassTier3Gate3Review: (request: RequestTier3Gate3ReviewRequest) => typedError<Gate3ReviewResult, string>(__TAURI_INVOKE("dev_bypass_tier3_gate3_review", { request })),
 	submitFocusRun: (request: SubmitFocusRunRequest) => typedError<SubmitFocusRunResponse, string>(__TAURI_INVOKE("submit_focus_run", { request })),
 	getRunOutput: (runId: string, userId: string, personaId: string) => typedError<GetRunOutputResponse, string>(__TAURI_INVOKE("get_run_output", { runId, userId, personaId })),
 	cancelRun: (runId: string, userId: string, personaId: string) => typedError<null, string>(__TAURI_INVOKE("cancel_run", { runId, userId, personaId })),

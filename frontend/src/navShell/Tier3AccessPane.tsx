@@ -440,6 +440,18 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
   // hits the same real tier-ceiling block (and "raise it now" affordance,
   // FocusSettingsControls below) a real message would. Remove once
   // items.id=329's Tier 3 pane work no longer needs fast iteration.
+  // DIAG_356 (items.id=356): bypasses gate3() entirely via the dev-only
+  // dev_bypass_tier3_gate3_review command instead of routing the seeded
+  // message through handleDraftReady's real requestTier3Gate3Review call --
+  // see that Rust command's own doc comment (commands/consent.rs) for why.
+  // gate3's own zero-spans-forced-High branch (D6-362/decisions.id=405)
+  // reliably fires for this synthetic message and surfaces a Privacy
+  // Guardian modal with nothing in it to review, which must not block
+  // otherwise-unrelated Tier 3 pane testing -- that empty-modal branch is a
+  // real, separately-tracked UX gap (items.id=356), deliberately NOT
+  // redesigned by this workaround. reviewOutcome is never set to 'pending'
+  // here, so the modal never mounts, not even momentarily. Real ChatPane
+  // drafts still go through handleDraftReady, unchanged.
   const handleDevForceTier3 = () => {
     if (!personaId) return
     commands
@@ -448,12 +460,24 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
         personaId,
         `tier3-access-${personaId}`,
       )
-      .then((result) => {
-        if (result.status === 'ok') {
-          handleDraftReady(result.data)
-        } else {
-          setOpenError(result.error)
+      .then((seedResult) => {
+        if (seedResult.status !== 'ok') {
+          setOpenError(seedResult.error)
+          return
         }
+        commands
+          .devBypassTier3Gate3Review({
+            user_id: requireCurrentUserId(),
+            persona_id: personaId,
+            message_id: seedResult.data,
+          })
+          .then((bypassResult) => {
+            if (bypassResult.status === 'ok') {
+              setReviewOutcome('approved')
+            } else {
+              setOpenError(bypassResult.error)
+            }
+          })
       })
   }
 
