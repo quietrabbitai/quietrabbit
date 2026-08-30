@@ -567,10 +567,19 @@ pub async fn open_tier3_panes(
 /// (pane_host.rs), and a caller racing a close against an already-closed
 /// pane is a normal condition, not a failure. See open_tier3_panes' doc on
 /// why a single `run_on_main_thread` call is dispatch and guaranteed-prompt
-/// delivery in one step now. Cookie persist (items.id=224 resolution) runs
-/// before the close is dispatched -- see persist_cookies_from_jar's own
-/// doc; its failure is logged, never a reason this command returns an
-/// error (the pane must still close).
+/// delivery in one step now.
+///
+/// items.id=330: the close dispatch runs FIRST, cookie persist (items.id=224
+/// resolution) after -- confirmed live this session (visible ~1s delay
+/// before a closed pane actually stopped compositing on a newly-navigated-to
+/// tab) that the previous persist-then-close ordering held the pane
+/// on-screen for however long `persist_cookies_from_jar`'s cookie-jar round
+/// trip took (up to `COOKIE_OP_TIMEOUT`, 500ms, per pane). Safe to reorder:
+/// `persist_cookies_from_jar` reads CEF's *global* cookie manager by URL
+/// (`cookie_manager_get_global_manager`), not anything tied to this specific
+/// pane's `Browser` instance, so it works identically whether the browser
+/// has already been torn down or not. Its failure is still only ever
+/// logged, never a reason this command returns an error.
 #[tauri::command]
 #[specta::specta]
 pub async fn close_tier3_pane(
@@ -578,6 +587,15 @@ pub async fn close_tier3_pane(
     key_registry: State<'_, KeyRegistry>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
+    {
+        let provider_id = provider_id.clone();
+        app_handle
+            .run_on_main_thread(move || {
+                pane_host::dispatch(PaneCommand::Close { key: provider_id })
+            })
+            .map_err(|e| e.to_string())?;
+    }
+
     let session = key_registry
         .with_key(|k| (k.user_id.clone(), key_hex(&k.master_key)))
         .await;
@@ -589,11 +607,11 @@ pub async fn close_tier3_pane(
             }
         }
         (None, _) => log::warn!(
-            "tier3_pane: no resident session key -- closing provider={provider_id} \
+            "tier3_pane: no resident session key -- closed provider={provider_id} \
              without cookie persist"
         ),
         (_, Ok(None)) => log::warn!(
-            "tier3_pane: provider={provider_id} not found in catalog -- closing without \
+            "tier3_pane: provider={provider_id} not found in catalog -- closed without \
              cookie persist"
         ),
         (_, Err(e)) => log::warn!(
@@ -601,9 +619,6 @@ pub async fn close_tier3_pane(
         ),
     }
 
-    app_handle
-        .run_on_main_thread(move || pane_host::dispatch(PaneCommand::Close { key: provider_id }))
-        .map_err(|e| e.to_string())?;
     Ok(())
 }
 

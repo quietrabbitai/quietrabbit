@@ -195,6 +195,42 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
       )
   }, [])
 
+  // items.id=330: `PaneManager` (Rust) has no way to know this component
+  // lost track of a pane -- the only other caller of closeTier3Pane is
+  // handleClose's own manual "Close" button below. Without this, navigating
+  // to a different top-level tab (a real unmount -- NavShell.tsx returns an
+  // entirely different JSX branch per content.type, this isn't just
+  // CSS-hidden) leaves the pane compositing with nothing left to route
+  // input to it or ever close it, short of quitting the whole app
+  // (RunEvent::Exit's close_all_panes(), main.rs -- and even that bypasses
+  // cookie persistence, unlike closeTier3Pane).
+  //
+  // openPaneIdsRef mirrors openPaneIds into a ref: the effect below has `[]`
+  // deps (must run its cleanup exactly once, on this component's actual
+  // unmount) and would otherwise close over whatever openPaneIds was at
+  // mount time -- empty, always -- not whatever's actually open when the
+  // unmount happens.
+  const openPaneIdsRef = useRef<string[]>([])
+  useEffect(() => {
+    openPaneIdsRef.current = openPaneIds
+  }, [openPaneIds])
+
+  useEffect(() => {
+    // Also covers an actual page/webview reload, not just in-app
+    // navigation: RunEvent::Exit only fires on real app-process exit, not a
+    // reload that leaves the Rust process (and this pane) running.
+    const closeAllOpenPanes = () => {
+      for (const id of openPaneIdsRef.current) {
+        void commands.closeTier3Pane(id)
+      }
+    }
+    window.addEventListener('beforeunload', closeAllOpenPanes)
+    return () => {
+      window.removeEventListener('beforeunload', closeAllOpenPanes)
+      closeAllOpenPanes()
+    }
+  }, [])
+
   const handleConfirm = (selected: Provider[]) => {
     setConfirmedProviders(selected)
     setOpenError(null)
