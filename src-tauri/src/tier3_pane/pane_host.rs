@@ -2222,6 +2222,31 @@ impl PaneHost {
         }
     }
 
+    /// items.id=328 left a coordinate-space mismatch behind: `sync_pane_sizes`
+    /// (and `render_state_for_open`) now report each pane's `GetViewRect` in
+    /// real physical pixels (that fix's own finding -- CEF's OSR paint buffer
+    /// comes back at exactly the reported size, not size x
+    /// `device_scale_factor`), but `forward_pane_mouse_click`/`_move`/`_wheel`
+    /// (commands/tier3_pane.rs) still forward the DOM hit-div's
+    /// `PointerEvent.offsetX`/`offsetY` verbatim -- CSS pixels, per that
+    /// command's own (now-stale) doc comment claiming CSS pixels are "the
+    /// same logical-pixel convention CEF's `MouseEvent` expects". On any
+    /// display with `scale_factor() != 1` this under-reports every
+    /// coordinate by exactly that factor: a click meant for the visual
+    /// center of a pane lands near CEF's own top-left quadrant instead,
+    /// missing whatever DOM element was actually under the pointer --
+    /// confirmed live on Claude.ai's login page at scale=2 (2026-08-30): the
+    /// email field never received focus, so keyboard forwarding (which only
+    /// carries key codes, no coordinates, and was otherwise unchanged) had
+    /// nothing focused to type into. Scaling here, not in `commands::
+    /// tier3_pane` or the frontend, matches this file's existing precedent
+    /// (`cef_modifiers_from_dom`'s own doc: "the one place that knows CEF's
+    /// actual flag constants stays in pane_host.rs").
+    fn dom_pixels_to_cef(&self, x: f64, y: f64) -> (f64, f64) {
+        let scale = self.glarea.scale_factor().max(1) as f64;
+        (x * scale, y * scale)
+    }
+
     /// Dispatches one `PaneCommand` -- called from `commands::tier3_pane`'s
     /// async IPC handlers via `AppHandle::run_on_main_thread`, which is the
     /// real cross-thread mechanism now (previously a fire-and-forget
@@ -2301,9 +2326,10 @@ impl PaneHost {
                         PaneMouseButton::Middle => MouseButtonType::MIDDLE,
                         PaneMouseButton::Right => MouseButtonType::RIGHT,
                     };
+                    let (cx, cy) = self.dom_pixels_to_cef(x, y);
                     let ev = MouseEvent {
-                        x: x.round() as i32,
-                        y: y.round() as i32,
+                        x: cx.round() as i32,
+                        y: cy.round() as i32,
                         modifiers: cef_modifiers_from_dom(
                             modifiers.shift,
                             modifiers.ctrl,
@@ -2380,9 +2406,10 @@ impl PaneHost {
                     .and_then(|p| p.browser_lifecycle.browser())
                     .and_then(|b| b.host())
                 {
+                    let (cx, cy) = self.dom_pixels_to_cef(x, y);
                     let ev = MouseEvent {
-                        x: x.round() as i32,
-                        y: y.round() as i32,
+                        x: cx.round() as i32,
+                        y: cy.round() as i32,
                         modifiers: cef_modifiers_from_dom(
                             modifiers.shift,
                             modifiers.ctrl,
@@ -2409,9 +2436,10 @@ impl PaneHost {
                     .and_then(|p| p.browser_lifecycle.browser())
                     .and_then(|b| b.host())
                 {
+                    let (cx, cy) = self.dom_pixels_to_cef(x, y);
                     let ev = MouseEvent {
-                        x: x.round() as i32,
-                        y: y.round() as i32,
+                        x: cx.round() as i32,
+                        y: cy.round() as i32,
                         modifiers: cef_modifiers_from_dom(
                             modifiers.shift,
                             modifiers.ctrl,
@@ -2429,10 +2457,11 @@ impl PaneHost {
                     // `build_pane_hit_widget`) flagged this exact sign as an
                     // unverified assumption; nobody had scroll-tested it
                     // until now.
+                    let (cdx, cdy) = self.dom_pixels_to_cef(delta_x, delta_y);
                     host.send_mouse_wheel_event(
                         Some(&ev),
-                        -delta_x.round() as i32,
-                        -delta_y.round() as i32,
+                        -cdx.round() as i32,
+                        -cdy.round() as i32,
                     );
                 }
             }
@@ -2468,9 +2497,10 @@ impl PaneHost {
                         PaneMouseButton::Middle => MouseButtonType::MIDDLE,
                         PaneMouseButton::Right => MouseButtonType::RIGHT,
                     };
+                    let (cx, cy) = self.dom_pixels_to_cef(x, y);
                     let ev = MouseEvent {
-                        x: x.round() as i32,
-                        y: y.round() as i32,
+                        x: cx.round() as i32,
+                        y: cy.round() as i32,
                         modifiers: cef_modifiers_from_dom(
                             modifiers.shift,
                             modifiers.ctrl,
@@ -2502,9 +2532,10 @@ impl PaneHost {
                     .and_then(|p| p.lifecycle.browser())
                     .and_then(|b| b.host())
                 {
+                    let (cx, cy) = self.dom_pixels_to_cef(x, y);
                     let ev = MouseEvent {
-                        x: x.round() as i32,
-                        y: y.round() as i32,
+                        x: cx.round() as i32,
+                        y: cy.round() as i32,
                         modifiers: cef_modifiers_from_dom(
                             modifiers.shift,
                             modifiers.ctrl,
@@ -2531,9 +2562,10 @@ impl PaneHost {
                     .and_then(|p| p.lifecycle.browser())
                     .and_then(|b| b.host())
                 {
+                    let (cx, cy) = self.dom_pixels_to_cef(x, y);
                     let ev = MouseEvent {
-                        x: x.round() as i32,
-                        y: y.round() as i32,
+                        x: cx.round() as i32,
+                        y: cy.round() as i32,
                         modifiers: cef_modifiers_from_dom(
                             modifiers.shift,
                             modifiers.ctrl,
@@ -2544,10 +2576,11 @@ impl PaneHost {
                     };
                     // FIX (items.id=329): see the `PaneCommand::MouseWheel`
                     // arm above -- same inverted-sign bug, same fix.
+                    let (cdx, cdy) = self.dom_pixels_to_cef(delta_x, delta_y);
                     host.send_mouse_wheel_event(
                         Some(&ev),
-                        -delta_x.round() as i32,
-                        -delta_y.round() as i32,
+                        -cdx.round() as i32,
+                        -cdy.round() as i32,
                     );
                 }
             }
