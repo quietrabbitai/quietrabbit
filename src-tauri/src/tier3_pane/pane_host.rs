@@ -2194,7 +2194,57 @@ impl PaneHost {
         // side-button click; accepted as-is rather than reaching into
         // wry's private state to unify it.
         if let Ok(webview) = webview_widget.clone().downcast::<webkit2gtk::WebView>() {
-            use webkit2gtk::WebViewExt;
+            use webkit2gtk::{ContextMenuExt, HitTestResultExt, WebViewExt};
+
+            // items.id=379 follow-up: custom right-click menu for the main
+            // chat UI -- mirrors the Tier 3 pane behavior (Copy when
+            // selected, Cut/Paste/Select-All when editable) by trimming
+            // WebKit's own already-correctly-positioned/dismissed
+            // `ContextMenu` in place, rather than reimplementing any of
+            // that. Unlike the Tier 3 CEF case (items.id=379's own
+            // `run_context_menu`), this is a real windowed webview
+            // receiving a real triggering `gdk::Event` synchronously, on
+            // this same GTK main thread -- none of that item's async/OSR
+            // workarounds (channel handoff, HiDPI scale-factor math,
+            // deferring until no pointer button is held) apply here. Each
+            // `ContextMenuItem::from_stock_action` is a genuine native
+            // WebKit action -- picking one runs it directly (WebKit's own
+            // Copy/Cut/Paste/Select-All/Inspect-Element implementations),
+            // so no `connect_activate`/`execute_editing_command` wiring is
+            // needed, unlike the hand-built `gtk::Menu` items.id=379 needed
+            // for the CEF case. Returns `false` (not handled) so WebKit
+            // still displays/positions/dismisses its own menu exactly as
+            // it already does today -- only its item list changes. Back/
+            // Forward/Stop/Reload are dropped unconditionally (this is a
+            // single-page app, no page-navigation model applies); Inspect
+            // Element is debug-only, matching this codebase's existing
+            // dev-only-surface convention (ipc.rs's specta_builder,
+            // commands/messages.rs, commands/consent.rs).
+            webview.connect_context_menu(|_webview, menu, _event, hit_test_result| {
+                menu.remove_all();
+                if hit_test_result.context_is_selection() {
+                    menu.append(&webkit2gtk::ContextMenuItem::from_stock_action(
+                        webkit2gtk::ContextMenuAction::Copy,
+                    ));
+                }
+                if hit_test_result.context_is_editable() {
+                    menu.append(&webkit2gtk::ContextMenuItem::from_stock_action(
+                        webkit2gtk::ContextMenuAction::Cut,
+                    ));
+                    menu.append(&webkit2gtk::ContextMenuItem::from_stock_action(
+                        webkit2gtk::ContextMenuAction::Paste,
+                    ));
+                    menu.append(&webkit2gtk::ContextMenuItem::from_stock_action(
+                        webkit2gtk::ContextMenuAction::SelectAll,
+                    ));
+                }
+                #[cfg(debug_assertions)]
+                menu.append(&webkit2gtk::ContextMenuItem::from_stock_action(
+                    webkit2gtk::ContextMenuAction::InspectElement,
+                ));
+                false
+            });
+
             webview_widget.add_events(
                 gtk::gdk::EventMask::BUTTON1_MOTION_MASK | gtk::gdk::EventMask::BUTTON_PRESS_MASK,
             );
