@@ -34,6 +34,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use cef::*;
+// items.id=379: explicit, not just relied on via the glob above -- matches
+// this codebase's established practice elsewhere (pane_host.rs's own
+// `use cef::{ImplBrowser, ImplBrowserHost, ImplFrame, ...}`) of naming the
+// trait a method call actually needs. `RunContextMenuCallback::cont`/
+// `cancel` (ImplRunContextMenuCallback) are only ever called from
+// pane_host.rs, which imports that trait itself -- this file only clones
+// the callback.
+use cef::ImplContextMenuParams;
 use wgpu::util::DeviceExt;
 use wgpu_hal::Adapter as _;
 
@@ -804,6 +812,27 @@ pub fn remove_pane_selected_text(key: &PaneKey) {
     PANE_SELECTED_TEXT.lock().unwrap().remove(key);
 }
 
+/// items.id=379: mirrors `PANE_SELECTED_TEXT` exactly, but for an open
+/// popup's own in-page selection -- keyed by the *parent* pane's `PaneKey`,
+/// same convention as `POPUP_TEXTURES`. Needed so the context menu's Copy/
+/// Cut items can write a popup's selection to the OS clipboard the same
+/// (Wayland-safe) way a pane's own selection already does -- see
+/// `PaneContextMenuHandler`'s own doc for why CEF's internal clipboard
+/// write can't be trusted here.
+static POPUP_SELECTED_TEXT: LazyLock<Mutex<HashMap<PaneKey, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Read by `pane_host.rs`'s context-menu Copy/Cut handling.
+pub fn popup_selected_text(key: &PaneKey) -> Option<String> {
+    POPUP_SELECTED_TEXT.lock().unwrap().get(key).cloned()
+}
+
+/// Mirrors `remove_pane_selected_text` -- must be called as part of a
+/// popup's own teardown (`pane_host.rs`'s `force_close_popup`).
+pub fn remove_popup_selected_text(key: &PaneKey) {
+    POPUP_SELECTED_TEXT.lock().unwrap().remove(key);
+}
+
 /// Mirrors `POPUP_TEXTURES`'s own doc: keyed by the *parent* pane's
 /// `PaneKey`, same as `POPUP_TEXTURES` itself.
 static POPUP_PENDING_PAINT: LazyLock<Mutex<HashMap<PaneKey, PendingPaint>>> =
@@ -1274,6 +1303,22 @@ wrap_render_handler! {
                 .insert(self.handler.pane_key.clone(), pending);
             request_redraw(&self.handler.app_handle);
         }
+
+        // items.id=379: mirrors PaneRenderHandler's own
+        // on_text_selection_changed -- see POPUP_SELECTED_TEXT's own doc
+        // for why a popup needs this same cache.
+        fn on_text_selection_changed(
+            &self,
+            _browser: Option<&mut Browser>,
+            selected_text: Option<&CefString>,
+            _selected_range: Option<&Range>,
+        ) {
+            let text = selected_text.map(|s| s.to_string()).unwrap_or_default();
+            POPUP_SELECTED_TEXT
+                .lock()
+                .unwrap()
+                .insert(self.handler.pane_key.clone(), text);
+        }
     }
 }
 
@@ -1320,6 +1365,7 @@ wrap_client! {
         render_handler: RenderHandler,
         life_span_handler: LifeSpanHandler,
         load_handler: LoadHandler,
+        context_menu_handler: ContextMenuHandler,
     }
 
     impl Client {
@@ -1334,6 +1380,10 @@ wrap_client! {
         fn load_handler(&self) -> Option<cef::LoadHandler> {
             Some(self.load_handler.clone())
         }
+
+        fn context_menu_handler(&self) -> Option<cef::ContextMenuHandler> {
+            Some(self.context_menu_handler.clone())
+        }
     }
 }
 
@@ -1344,6 +1394,7 @@ impl ClientBuilder {
         pane_key: PaneKey,
         popup_requested_tx: std::sync::mpsc::Sender<PopupRequested>,
         popup_close_tx: std::sync::mpsc::Sender<PaneKey>,
+        context_menu_tx: std::sync::mpsc::Sender<ContextMenuRequested>,
         app_handle: tauri::AppHandle,
     ) -> Client {
         Self::new(
@@ -1352,9 +1403,14 @@ impl ClientBuilder {
                 browser_ready_tx,
                 pane_key.clone(),
                 popup_requested_tx,
+                context_menu_tx.clone(),
                 app_handle,
             )),
-            LoadHandlerBuilder::build(PaneLoadHandler::new(pane_key, popup_close_tx)),
+            LoadHandlerBuilder::build(PaneLoadHandler::new(pane_key.clone(), popup_close_tx)),
+            ContextMenuHandlerBuilder::build(PaneContextMenuHandler::new(
+                pane_key,
+                context_menu_tx,
+            )),
         )
     }
 }
@@ -1371,6 +1427,7 @@ wrap_client! {
         render_handler: RenderHandler,
         life_span_handler: LifeSpanHandler,
         load_handler: LoadHandler,
+        context_menu_handler: ContextMenuHandler,
     }
 
     impl Client {
@@ -1385,6 +1442,10 @@ wrap_client! {
         fn load_handler(&self) -> Option<cef::LoadHandler> {
             Some(self.load_handler.clone())
         }
+
+        fn context_menu_handler(&self) -> Option<cef::ContextMenuHandler> {
+            Some(self.context_menu_handler.clone())
+        }
     }
 }
 
@@ -1392,11 +1453,17 @@ impl PopupClientBuilder {
     pub(crate) fn build(
         render_handler: PopupRenderHandler,
         events_tx: std::sync::mpsc::Sender<PopupLifecycleEvent>,
+        parent_key: PaneKey,
+        context_menu_tx: std::sync::mpsc::Sender<ContextMenuRequested>,
     ) -> Client {
         Self::new(
             PopupRenderHandlerBuilder::build(render_handler),
             PopupLifeSpanHandlerBuilder::build(PopupLifeSpanHandler::new(events_tx)),
             PopupLoadHandlerBuilder::build(PopupLoadHandler),
+            PopupContextMenuHandlerBuilder::build(PopupContextMenuHandler::new(
+                parent_key,
+                context_menu_tx,
+            )),
         )
     }
 }
@@ -1429,6 +1496,10 @@ pub struct PaneLifeSpanHandler {
     /// must not touch `PaneManager`/GTK directly).
     pane_key: PaneKey,
     popup_requested_tx: std::sync::mpsc::Sender<PopupRequested>,
+    /// items.id=379: threaded through to a popup's own `PopupContextMenuHandler`
+    /// (via `PopupClientBuilder::build`) when `on_before_popup` fires -- see
+    /// `PaneContextMenuHandler`'s own doc.
+    context_menu_tx: std::sync::mpsc::Sender<ContextMenuRequested>,
     /// items.id=334: needed to construct a fresh `PopupRenderHandler` (see
     /// `request_redraw`'s own doc) when `on_before_popup` fires -- cheap
     /// clone, same handle `PaneRenderHandler` itself holds.
@@ -1440,12 +1511,14 @@ impl PaneLifeSpanHandler {
         browser_ready_tx: std::sync::mpsc::Sender<cef::Browser>,
         pane_key: PaneKey,
         popup_requested_tx: std::sync::mpsc::Sender<PopupRequested>,
+        context_menu_tx: std::sync::mpsc::Sender<ContextMenuRequested>,
         app_handle: tauri::AppHandle,
     ) -> Self {
         Self {
             browser_ready_tx,
             pane_key,
             popup_requested_tx,
+            context_menu_tx,
             app_handle,
         }
     }
@@ -1550,7 +1623,12 @@ wrap_life_span_handler! {
             );
 
             if let Some(client_slot) = client {
-                *client_slot = Some(PopupClientBuilder::build(render_handler, events_tx));
+                *client_slot = Some(PopupClientBuilder::build(
+                    render_handler,
+                    events_tx,
+                    self.handler.pane_key.clone(),
+                    self.handler.context_menu_tx.clone(),
+                ));
             }
 
             let _ = self.handler.popup_requested_tx.send(PopupRequested {
@@ -1749,6 +1827,202 @@ wrap_load_handler! {
 
 impl PopupLoadHandlerBuilder {
     pub(crate) fn build(handler: PopupLoadHandler) -> cef::LoadHandler {
+        Self::new(handler)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// items.id=379: custom context menu (`run_context_menu`)
+// ---------------------------------------------------------------------------
+//
+// CEF's built-in default-display context menu never renders in this app's
+// windowless/OSR Linux setup -- a prior, reverted investigation confirmed
+// `ContextMenuHandler` itself wires correctly and receives a live
+// `MenuModel`, the on-screen menu is simply never drawn by whatever
+// fallback the OSR pipeline falls back to. The fix implemented here is
+// CEF's *custom-display* callback (`run_context_menu`, not
+// `on_before_context_menu`): return 1 (handled) immediately, without
+// blocking, and draw the menu ourselves -- a real `gtk::Menu` (see
+// `pane_host.rs`'s `show_context_menu`), not a texture composited into the
+// shared wgpu/GLArea pipeline the way items.id=234's popups are. A context
+// menu is ~4 static text rows this app draws, never CEF-rendered content,
+// so mirroring the popup subsystem's browser-compositing approach would be
+// substantial unnecessary work; `gtk::Menu` is a real native popup surface
+// (`xdg_popup` under Wayland) GTK already owns positioning/dismissal/
+// keyboard-nav for, unlike the abandoned CSW-child-window hit-testing
+// overlay (items.id=257 Path A) that froze pointer input -- a structurally
+// different, GTK-sanctioned mechanism that failure does not apply to.
+//
+// Same CEF-UI-thread -> GTK-main-thread channel handoff every other
+// callback in this file uses (`run_context_menu` fires on CEF's UI thread
+// and must not touch GTK directly): `ContextMenuRequested` carries only
+// plain data plus the `RunContextMenuCallback` itself, which is safe to
+// hold past this call's return -- it's a newtype over
+// `RefGuard<_cef_run_context_menu_callback_t>`, and `RefGuard<T: Rc>` has a
+// blanket `unsafe impl Send + Sync` in the `cef` crate, the same fact that
+// already lets `PopupLifecycleEvent::Ready` carry a `cef::Browser` across
+// this same kind of channel.
+//
+// Two handler types, not one with a runtime flag, mirroring
+// `PaneLoadHandler`/`PopupLoadHandler`'s own precedent (two structurally
+// different roles: a pane's own key vs. a popup's *parent* key) -- both
+// funnel into the one `context_menu_requested_tx/rx` channel pair on
+// `PaneManager`.
+
+/// Which open surface a `ContextMenuRequested` belongs to -- `Popup`'s
+/// `PaneKey` is the *parent* pane's key, same convention as
+/// `PopupMouseClick`/`FocusTarget::Popup`, not a separate popup-id
+/// keyspace (a pane has at most one open popup, see `PopupState`'s own
+/// doc).
+#[derive(Debug, Clone)]
+pub enum ContextMenuSurface {
+    Pane(PaneKey),
+    Popup(PaneKey),
+}
+
+/// Extracted, plain-data copy of what `run_context_menu` needs from
+/// `ContextMenuParams` -- not the CEF type itself, matching this
+/// codebase's established practice (see `PopupFeatureInts`'s own doc) of
+/// never forwarding a CEF-owned type across the CEF-UI-thread -> GTK-
+/// main-thread boundary. `x`/`y` are `ContextMenuParams::xcoord()`/
+/// `ycoord()` verbatim -- CEF's OSR view coordinate space, which this app
+/// already reports/consumes in real physical pixels rather than DIPs (see
+/// `sync_pane_sizes`'s items.id=328 doc), so no additional scale-factor
+/// multiplication is applied here; confirm against a real right-click
+/// during manual testing rather than trusting that by construction.
+/// `callback` is *not* invoked here -- `pane_host.rs`'s
+/// `drain_context_menu_requests`/`show_context_menu` call `.cont()`/
+/// `.cancel()` on it once the GTK menu is actually dismissed.
+pub struct ContextMenuRequested {
+    pub surface: ContextMenuSurface,
+    pub x: i32,
+    pub y: i32,
+    pub is_editable: bool,
+    pub has_selection: bool,
+    pub callback: RunContextMenuCallback,
+}
+
+/// A pane's own `ContextMenuHandler` -- wired into `ClientBuilder`.
+#[derive(Clone)]
+pub struct PaneContextMenuHandler {
+    pane_key: PaneKey,
+    context_menu_tx: std::sync::mpsc::Sender<ContextMenuRequested>,
+}
+
+impl PaneContextMenuHandler {
+    fn new(
+        pane_key: PaneKey,
+        context_menu_tx: std::sync::mpsc::Sender<ContextMenuRequested>,
+    ) -> Self {
+        Self {
+            pane_key,
+            context_menu_tx,
+        }
+    }
+}
+
+wrap_context_menu_handler! {
+    pub(crate) struct ContextMenuHandlerBuilder {
+        handler: PaneContextMenuHandler,
+    }
+
+    impl ContextMenuHandler {
+        fn run_context_menu(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            params: Option<&mut ContextMenuParams>,
+            _model: Option<&mut MenuModel>,
+            callback: Option<&mut RunContextMenuCallback>,
+        ) -> ::std::os::raw::c_int {
+            let (Some(params), Some(callback)) = (params, callback) else {
+                return 0;
+            };
+            // `selection_text()` returns an owned `CefStringUserfree`, which
+            // has no `Display` impl of its own -- `CefString::from(&_)`
+            // (i.e. `CefStringUtf16`) does.
+            let selection_text = params.selection_text();
+            let has_selection = !CefString::from(&selection_text).to_string().is_empty();
+            let is_editable = params.is_editable() != 0;
+            let request = ContextMenuRequested {
+                surface: ContextMenuSurface::Pane(self.handler.pane_key.clone()),
+                x: params.xcoord(),
+                y: params.ycoord(),
+                is_editable,
+                has_selection,
+                callback: callback.clone(),
+            };
+            let _ = self.handler.context_menu_tx.send(request);
+            1
+        }
+    }
+}
+
+impl ContextMenuHandlerBuilder {
+    pub(crate) fn build(handler: PaneContextMenuHandler) -> cef::ContextMenuHandler {
+        Self::new(handler)
+    }
+}
+
+/// items.id=379: popup counterpart to `PaneContextMenuHandler` -- `pane_key`
+/// here is the *parent* pane's key, same convention as
+/// `PopupMouseClick`/`PopupKeyEvent`.
+#[derive(Clone)]
+pub struct PopupContextMenuHandler {
+    pane_key: PaneKey,
+    context_menu_tx: std::sync::mpsc::Sender<ContextMenuRequested>,
+}
+
+impl PopupContextMenuHandler {
+    fn new(
+        pane_key: PaneKey,
+        context_menu_tx: std::sync::mpsc::Sender<ContextMenuRequested>,
+    ) -> Self {
+        Self {
+            pane_key,
+            context_menu_tx,
+        }
+    }
+}
+
+wrap_context_menu_handler! {
+    pub(crate) struct PopupContextMenuHandlerBuilder {
+        handler: PopupContextMenuHandler,
+    }
+
+    impl ContextMenuHandler {
+        fn run_context_menu(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            params: Option<&mut ContextMenuParams>,
+            _model: Option<&mut MenuModel>,
+            callback: Option<&mut RunContextMenuCallback>,
+        ) -> ::std::os::raw::c_int {
+            let (Some(params), Some(callback)) = (params, callback) else {
+                return 0;
+            };
+            // `selection_text()` returns an owned `CefStringUserfree`, which
+            // has no `Display` impl of its own -- `CefString::from(&_)`
+            // (i.e. `CefStringUtf16`) does.
+            let selection_text = params.selection_text();
+            let has_selection = !CefString::from(&selection_text).to_string().is_empty();
+            let request = ContextMenuRequested {
+                surface: ContextMenuSurface::Popup(self.handler.pane_key.clone()),
+                x: params.xcoord(),
+                y: params.ycoord(),
+                is_editable: params.is_editable() != 0,
+                has_selection,
+                callback: callback.clone(),
+            };
+            let _ = self.handler.context_menu_tx.send(request);
+            1
+        }
+    }
+}
+
+impl PopupContextMenuHandlerBuilder {
+    pub(crate) fn build(handler: PopupContextMenuHandler) -> cef::ContextMenuHandler {
         Self::new(handler)
     }
 }

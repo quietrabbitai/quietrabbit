@@ -174,6 +174,17 @@ export function PopupHitLayer({ popups }: PopupHitLayerProps) {
             pointerEvents: 'auto',
             touchAction: 'none',
           }}
+          onContextMenu={(e) => {
+            // items.id=379: mirrors PaneHitLayer's own onContextMenu --
+            // without this, the right-click still reaches CEF fine (via
+            // onPointerDown/onPointerUp below) and its own context menu
+            // pipeline runs correctly, but the browser's native
+            // `contextmenu` DOM event for this same click also fires,
+            // unprevented, on the *outer* Tauri webview (WebKitGTK, a
+            // completely different browser than CEF) -- confirmed live,
+            // same symptom as the parent-pane case this was first found on.
+            e.preventDefault()
+          }}
           onPointerDown={(e) => {
             const button = domButton(e.nativeEvent.button)
             if (button === null) return

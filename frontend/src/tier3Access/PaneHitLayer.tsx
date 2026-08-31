@@ -249,6 +249,20 @@ export function PaneHitLayer({ rects }: PaneHitLayerProps) {
               domModifiers(e.nativeEvent),
             )
           }}
+          onContextMenu={(e) => {
+            // items.id=379: without this, a right-click still reaches CEF
+            // fine (forwarded via onPointerDown/onPointerUp below, same as
+            // any other button) and its own context menu pipeline runs
+            // correctly -- but the browser's native `contextmenu` DOM event
+            // for this same click also fires, unprevented, on the *outer*
+            // Tauri webview (WebKitGTK, a completely different browser than
+            // CEF). Confirmed live: WebKitGTK's own default menu (Back/
+            // Forward/Reload/Inspect Element) was what actually appeared on
+            // screen, not the new custom gtk::Menu -- diagnostic logging
+            // confirmed run_context_menu/show_context_menu were reached and
+            // building the right menu the whole time.
+            e.preventDefault()
+          }}
           onPointerUp={(e) => {
             const button = domButton(e.nativeEvent.button)
             if (button === null) return

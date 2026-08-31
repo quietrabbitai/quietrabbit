@@ -93,7 +93,8 @@ use tauri::Manager;
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
 use cef::{
-    ImplBrowser, ImplBrowserHost, ImplFrame, KeyEvent, KeyEventType, MouseButtonType, MouseEvent,
+    ImplBrowser, ImplBrowserHost, ImplFrame, ImplRunContextMenuCallback, KeyEvent, KeyEventType,
+    MenuId, MouseButtonType, MouseEvent,
 };
 
 use crate::commands::tier3_pane::{
@@ -101,7 +102,8 @@ use crate::commands::tier3_pane::{
     PopupClosedPayload, PopupOpenedPayload, ZoomDirection,
 };
 use crate::tier3_pane::render::{
-    ClientBuilder, LogicalSize, PaneRenderHandler, PopupLifecycleEvent, PopupRequested, RenderState,
+    ClientBuilder, ContextMenuRequested, ContextMenuSurface, LogicalSize, PaneRenderHandler,
+    PopupLifecycleEvent, PopupRequested, RenderState,
 };
 use crate::tier3_pane::PaneKey;
 
@@ -599,6 +601,16 @@ struct PaneManager {
     /// per GTK render tick (`drain_popup_close_requests`).
     popup_close_tx: std::sync::mpsc::Sender<PaneKey>,
     popup_close_rx: std::sync::mpsc::Receiver<PaneKey>,
+    /// items.id=379: mirrors `popup_requested_tx/rx` exactly -- fed by
+    /// `PaneContextMenuHandler`/`PopupContextMenuHandler::run_context_menu`
+    /// (render.rs, CEF's UI thread) via this sender's paired clone, threaded
+    /// into each pane's `ClientBuilder::build` call (and, for a popup, its
+    /// parent's `PaneLifeSpanHandler::on_before_popup`) at construction
+    /// time. Drained once per GTK render tick (`drain_context_menu_requests`),
+    /// which does have the GTK main thread's own `glarea`/`layout` needed to
+    /// resolve an on-screen rect and pop a native `gtk::Menu`.
+    context_menu_requested_tx: std::sync::mpsc::Sender<ContextMenuRequested>,
+    context_menu_requested_rx: std::sync::mpsc::Receiver<ContextMenuRequested>,
     /// items.id=359 (rail+content-pane redesign): the one pane, if any,
     /// that is actually composited/painted right now -- every other open
     /// pane is "loaded" (browser alive, `was_hidden(true)`, reachable
@@ -700,6 +712,7 @@ impl PaneManager {
                 key.clone(),
                 self.popup_requested_tx.clone(),
                 self.popup_close_tx.clone(),
+                self.context_menu_requested_tx.clone(),
                 self.app_handle.clone(),
             )),
             None,
@@ -1018,6 +1031,7 @@ impl PaneManager {
         }
         crate::tier3_pane::render::remove_popup_texture(key);
         crate::tier3_pane::render::remove_popup_pending_paint(key);
+        crate::tier3_pane::render::remove_popup_selected_text(key);
 
         if let Some(host) = self
             .panes
@@ -1135,6 +1149,305 @@ impl PaneManager {
         }
         notifications
     }
+
+    /// items.id=379: drains `PaneContextMenuHandler`/`PopupContextMenuHandler
+    /// ::run_context_menu`'s requests (render.rs, CEF's UI thread) queued
+    /// since the last tick, resolving each one's requesting pane/popup to
+    /// its current on-screen pixel offset *within the GLArea* -- the caller
+    /// (`PaneHost::install`'s `connect_render` closure) has the GLArea's own
+    /// screen-space window origin, which this method (no GTK widget access)
+    /// does not, so it adds that on top of what's returned here before
+    /// actually popping a `gtk::Menu`. A request for a pane/popup whose rect
+    /// isn't resolvable right now (closed in the meantime, or -- for a
+    /// pane -- has no `layout` entry yet) is dropped with its callback
+    /// cancelled, rather than left to answer CEF at some later, no-longer-
+    /// meaningful tick.
+    fn drain_context_menu_requests(
+        &mut self,
+        glarea_size: (u32, u32),
+        layout: &HashMap<PaneKey, PaneRectFraction>,
+    ) -> Vec<ResolvedContextMenuRequest> {
+        let mut requests = Vec::new();
+        while let Ok(req) = self.context_menu_requested_rx.try_recv() {
+            requests.push(req);
+        }
+
+        let mut resolved = Vec::new();
+        for req in requests {
+            let offset = match &req.surface {
+                ContextMenuSurface::Pane(key) => layout
+                    .get(key)
+                    .and_then(|frac| pane_pixel_rect(glarea_size, frac)),
+                ContextMenuSurface::Popup(key) => self
+                    .popups
+                    .get(key)
+                    .and_then(|popup| pane_pixel_rect(glarea_size, &popup.rect)),
+            };
+            match offset {
+                Some((x, y, _, _)) => resolved.push(ResolvedContextMenuRequest {
+                    request: req,
+                    pane_offset: (x, y),
+                }),
+                None => req.callback.cancel(),
+            }
+        }
+        resolved
+    }
+}
+
+/// items.id=379: one `ContextMenuRequested` plus its requesting pane/popup's
+/// current pixel offset *within the GLArea* -- see
+/// `drain_context_menu_requests`'s own doc for why the GLArea's further
+/// screen-space origin is added by the caller instead of here.
+struct ResolvedContextMenuRequest {
+    request: ContextMenuRequested,
+    pane_offset: (u32, u32),
+}
+
+/// Any pointer button held right now -- checked live via
+/// `gdk::Window::device_position` (queries the device's actual current
+/// state, unlike anything derived from a stored/past event), not inferred
+/// from this app's own forwarded-mouse-event bookkeeping. See
+/// `show_context_menu`'s own doc for why this matters.
+fn any_pointer_button_held(window: &gtk::gdk::Window, pointer: &gtk::gdk::Device) -> bool {
+    let (_, _, _, state) = window.device_position(pointer);
+    state.intersects(
+        gtk::gdk::ModifierType::BUTTON1_MASK
+            | gtk::gdk::ModifierType::BUTTON2_MASK
+            | gtk::gdk::ModifierType::BUTTON3_MASK,
+    )
+}
+
+/// items.id=379: decides *when* it's safe to actually build and pop the
+/// `gtk::Menu` for `resolved`, then hands off to `present_context_menu`.
+///
+/// CEF fires `run_context_menu` on right-button *mousedown* on this
+/// platform, not mouseup (confirmed live, 2026-08-31, via the round-trip
+/// timing -- the request reaches here while the triggering right button is
+/// still physically held for an ordinary quick click). Popping a GTK menu
+/// while ANY pointer button is down makes `gtk_menu_shell` enter its
+/// legacy press-drag-release grab mode -- baked into `gtk_menu_shell_grab`
+/// itself via a live device-state check at grab time, independent of which
+/// popup_* wrapper is used or whether a `trigger_event` is passed (tried
+/// both `GtkMenuExtManual::popup` and `popup_at_rect` here, same result
+/// either way) -- which ties the grab's entire lifetime to that button:
+/// releasing it anywhere (not just over an item) ends the grab and closes
+/// the menu, confirmed live via a `deactivate`/`hide`/`unmap`/
+/// `selection-done` signal trace that fired in that exact order the
+/// instant the button came up, after the menu had already sat open and
+/// idle for seconds while the button stayed down.
+///
+/// The fix is to simply not take the grab while a button is still held:
+/// poll `any_pointer_button_held` (20ms, capped at ~3s as a safety net in
+/// case the device state genuinely never clears) and defer
+/// `present_context_menu` until it reports clear -- at which point GTK's
+/// own grab-mode check sees no active button and the popup behaves as an
+/// ordinary click-to-open, stays-open-until-dismissed menu. The common
+/// case (the human has already released by the time this whole CEF ->
+/// channel -> GTK-render-tick round trip completes) skips the poll
+/// entirely and shows immediately.
+fn show_context_menu(
+    glarea: &gtk::GLArea,
+    app_handle: &tauri::AppHandle,
+    resolved: ResolvedContextMenuRequest,
+) {
+    let ResolvedContextMenuRequest {
+        request,
+        pane_offset,
+    } = resolved;
+    let ContextMenuRequested {
+        surface,
+        x,
+        y,
+        is_editable,
+        has_selection,
+        callback,
+    } = request;
+
+    if !has_selection && !is_editable {
+        callback.cancel();
+        return;
+    }
+
+    let Some(window) = glarea.window() else {
+        log::warn!(
+            "tier3_pane::pane_host: items.id=379: GLArea has no GdkWindow yet, \
+             cannot position context menu"
+        );
+        callback.cancel();
+        return;
+    };
+    // items.id=379: `x`/`y` (ContextMenuParams::xcoord()/ycoord()) and
+    // `pane_offset` are both real physical pixels (items.id=328's
+    // established CEF-facing convention) -- but `popup_at_rect`'s `rect` is
+    // in `window`'s own *logical* "application pixel" coordinate space (1
+    // GTK pixel = `scale-factor` physical pixels), same as every other GTK3
+    // widget-geometry/event-coordinate API. Confirmed live (2026-08-31):
+    // skipping this divide landed the menu far past the actual click point
+    // on this 2x HiDPI display -- the inverse of `dom_pixels_to_cef`'s own
+    // logical-to-physical multiply.
+    let scale = glarea.scale_factor().max(1);
+    let rect_x = (pane_offset.0 as i32 + x) / scale;
+    let rect_y = (pane_offset.1 as i32 + y) / scale;
+
+    let (key, is_popup) = match surface {
+        ContextMenuSurface::Pane(key) => (key, false),
+        ContextMenuSurface::Popup(key) => (key, true),
+    };
+
+    let pointer = gtk::gdk::Display::default()
+        .and_then(|d| d.default_seat())
+        .and_then(|s| s.pointer());
+    let Some(pointer) = pointer else {
+        // No pointer device to check -- proceed rather than block forever.
+        present_context_menu(
+            &window,
+            rect_x,
+            rect_y,
+            &key,
+            is_popup,
+            is_editable,
+            has_selection,
+            &callback,
+            app_handle,
+        );
+        return;
+    };
+
+    if !any_pointer_button_held(&window, &pointer) {
+        present_context_menu(
+            &window,
+            rect_x,
+            rect_y,
+            &key,
+            is_popup,
+            is_editable,
+            has_selection,
+            &callback,
+            app_handle,
+        );
+        return;
+    }
+
+    log::debug!(
+        "tier3_pane::pane_host: items.id=379: pointer button still held, \
+         deferring context menu until release"
+    );
+    let app_handle = app_handle.clone();
+    let attempts = Rc::new(std::cell::Cell::new(0u32));
+    glib::source::timeout_add_local(std::time::Duration::from_millis(20), move || {
+        attempts.set(attempts.get() + 1);
+        // ~3s safety cap -- show it anyway rather than silently never
+        // resolving `callback` if the device state somehow never clears.
+        if any_pointer_button_held(&window, &pointer) && attempts.get() < 150 {
+            return glib::ControlFlow::Continue;
+        }
+        present_context_menu(
+            &window,
+            rect_x,
+            rect_y,
+            &key,
+            is_popup,
+            is_editable,
+            has_selection,
+            &callback,
+            &app_handle,
+        );
+        glib::ControlFlow::Break
+    });
+}
+
+/// items.id=379: builds and pops a native `gtk::Menu` at the given
+/// (already-resolved, already scale-adjusted) `rect_x`/`rect_y`, then
+/// resolves `callback` once the menu is actually dismissed -- either an
+/// item chosen (that item's own `activate` handler calls `.cont()`) or
+/// closed with nothing chosen (`.cancel()`, from the `selection-done`
+/// fallback below). See render.rs's own "items.id=379" section doc for why
+/// this is a real GTK popup surface, not anything composited into the
+/// wgpu/GLArea pipeline the way panes/popups themselves are. Callers must
+/// only invoke this once no pointer button is held -- see
+/// `show_context_menu`'s own doc for why.
+#[allow(clippy::too_many_arguments)]
+fn present_context_menu(
+    window: &gtk::gdk::Window,
+    rect_x: i32,
+    rect_y: i32,
+    key: &PaneKey,
+    is_popup: bool,
+    is_editable: bool,
+    has_selection: bool,
+    callback: &cef::RunContextMenuCallback,
+    app_handle: &tauri::AppHandle,
+) {
+    let menu = gtk::Menu::new();
+    // Set by whichever item's `activate` fires first (at most one ever
+    // will, GTK's own menu-item activation is exclusive) -- read by the
+    // `selection-done` fallback below to tell "an item was chosen" apart
+    // from "the menu was dismissed with nothing chosen" (click outside,
+    // Escape), which only the latter should `.cancel()`.
+    let handled = Rc::new(std::cell::Cell::new(false));
+
+    let add_item = |label: &str, action: MenuId| {
+        let item = gtk::MenuItem::with_label(label);
+        let app_handle = app_handle.clone();
+        let key = key.clone();
+        let callback = callback.clone();
+        let handled = handled.clone();
+        item.connect_activate(move |_| {
+            handled.set(true);
+            if matches!(action, MenuId::COPY | MenuId::CUT) {
+                // items.id=369: CEF's own Wayland clipboard *write* path is
+                // structurally broken for this OSR embedding -- write
+                // through Tauri's own clipboard on this real, focused
+                // surface ourselves, the same workaround the existing
+                // Ctrl+C/Ctrl+X key handler already applies (see its own
+                // doc, `PaneCommand::KeyEvent`). CEF's own attempt, via
+                // `cont` below, proceeds independently and is harmless if
+                // it silently no-ops.
+                let selected = if is_popup {
+                    crate::tier3_pane::render::popup_selected_text(&key)
+                } else {
+                    crate::tier3_pane::render::pane_selected_text(&key)
+                };
+                if let Some(text) = selected.filter(|t| !t.is_empty()) {
+                    if let Err(e) = app_handle.clipboard().write_text(text) {
+                        log::warn!(
+                            "tier3_pane::pane_host: items.id=379 clipboard write \
+                             failed, pane={key}: {e}"
+                        );
+                    }
+                }
+            }
+            callback.cont(action.get_raw() as i32, cef::EventFlags::default());
+        });
+        menu.add(&item);
+    };
+
+    if has_selection {
+        add_item("Copy", MenuId::COPY);
+    }
+    if is_editable {
+        add_item("Cut", MenuId::CUT);
+        add_item("Paste", MenuId::PASTE);
+        add_item("Select All", MenuId::SELECT_ALL);
+    }
+
+    let callback_for_dismiss = callback.clone();
+    menu.connect_selection_done(move |_| {
+        if !handled.get() {
+            callback_for_dismiss.cancel();
+        }
+    });
+
+    menu.show_all();
+    let rect = gtk::gdk::Rectangle::new(rect_x, rect_y, 1, 1);
+    menu.popup_at_rect(
+        window,
+        &rect,
+        gtk::gdk::Gravity::NorthWest,
+        gtk::gdk::Gravity::NorthWest,
+        None,
+    );
 }
 
 /// items.id=234: resolves a newly-requested popup's on-screen rect (as a
@@ -2002,6 +2315,9 @@ impl PaneHost {
         // PaneManager itself, drained once per GTK render tick.
         let (popup_requested_tx, popup_requested_rx) = std::sync::mpsc::channel();
         let (popup_close_tx, popup_close_rx) = std::sync::mpsc::channel();
+        // items.id=379: same one-pair-for-the-whole-app-lifetime shape as
+        // the two channels above.
+        let (context_menu_requested_tx, context_menu_requested_rx) = std::sync::mpsc::channel();
         let manager = Rc::new(RefCell::new(PaneManager {
             panes: IndexMap::new(),
             open_pane_count: Arc::new(AtomicUsize::new(0)),
@@ -2011,6 +2327,8 @@ impl PaneHost {
             popup_requested_rx,
             popup_close_tx,
             popup_close_rx,
+            context_menu_requested_tx,
+            context_menu_requested_rx,
             active_pane: None,
             app_handle: app_handle.clone(),
         }));
@@ -2361,6 +2679,26 @@ impl PaneHost {
                             }
                         }
                     }
+                }
+
+                // items.id=379: resolve any pending right-click requests and
+                // pop a native gtk::Menu for each -- see
+                // `drain_context_menu_requests`'s own doc for why this
+                // doesn't reuse the popup_notifications emit pattern above
+                // (nothing here is frontend-visible state, just a GTK
+                // widget this function pops directly). `glarea_size_physical`,
+                // not the logical `glarea_size` `drain_popup_requests` above
+                // uses (that call's own fractional result cancels the unit
+                // out either way, this one doesn't) -- `show_context_menu`
+                // adds this offset directly to `ContextMenuParams::xcoord()`/
+                // `ycoord()`, which are real physical pixels per items.id=328's
+                // established convention, so the units must match.
+                let context_menu_requests = {
+                    let mut mgr = manager.borrow_mut();
+                    mgr.drain_context_menu_requests(glarea_size_physical, &layout)
+                };
+                for resolved in context_menu_requests {
+                    show_context_menu(area, &app_handle, resolved);
                 }
 
                 for pane in manager.borrow().panes.values() {
