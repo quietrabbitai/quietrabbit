@@ -627,8 +627,6 @@ impl PaneManager {
         &mut self,
         key: PaneKey,
         url: String,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
         device_scale_factor: f32,
         initial_logical_size: LogicalSize,
     ) {
@@ -678,8 +676,6 @@ impl PaneManager {
         };
 
         let (render_handler, browser_size) = PaneRenderHandler::new(
-            device.clone(),
-            queue.clone(),
             device_scale_factor,
             initial_logical_size,
             key.clone(),
@@ -704,8 +700,6 @@ impl PaneManager {
                 key.clone(),
                 self.popup_requested_tx.clone(),
                 self.popup_close_tx.clone(),
-                device.clone(),
-                queue.clone(),
                 self.app_handle.clone(),
             )),
             None,
@@ -2527,7 +2521,7 @@ impl PaneHost {
                         return;
                     }
                 };
-                let (device, queue, scale, size) = render_state;
+                let (scale, size) = render_state;
                 // `open_pane`'s own already-open guard (below) handles a
                 // caller re-`Open`ing an already-open pane -- the frontend
                 // does this routinely, confirmed by hand this session, a
@@ -2535,9 +2529,7 @@ impl PaneHost {
                 // anymore: unlike the superseded sibling-widget design,
                 // nothing is built or added to any widget tree before
                 // `open_pane` runs, so there's nothing left to orphan.
-                self.manager
-                    .borrow_mut()
-                    .open_pane(key, url, &device, &queue, scale, size);
+                self.manager.borrow_mut().open_pane(key, url, scale, size);
                 log::debug!("DIAG items.id=227: dispatch(Open) -> queue_draw()");
                 self.queue_draw();
             }
@@ -3009,15 +3001,13 @@ impl PaneHost {
         }
     }
 
-    /// Pulls what `open_pane` needs from the shared `RenderState`
-    /// (device/queue clones -- both cheap, `wgpu::Device`/`Queue` are
-    /// themselves `Arc`-backed handles) plus the GLArea's own current
-    /// scale/size for this new pane's initial `PaneRenderHandler` size.
-    /// `None` if the GLArea hasn't realized yet (its GL context, and
-    /// therefore the shared `RenderState`, doesn't exist until then) --
-    /// shouldn't happen in practice (the main window realizes long before
-    /// any pane can be opened), but not assumed.
-    fn render_state_for_open(&self) -> Option<(wgpu::Device, wgpu::Queue, f32, LogicalSize)> {
+    /// Pulls what `open_pane` needs: the GLArea's own current scale/size for
+    /// this new pane's initial `PaneRenderHandler` size. `None` if the
+    /// GLArea hasn't realized yet (its GL context, and therefore the shared
+    /// `RenderState`, doesn't exist until then) -- shouldn't happen in
+    /// practice (the main window realizes long before any pane can be
+    /// opened), but not assumed.
+    fn render_state_for_open(&self) -> Option<(f32, LogicalSize)> {
         let scale = self.glarea.scale_factor().max(1) as f32;
         // items.id=328: the `LogicalSize` returned here becomes this pane's
         // *initial* `PaneRenderHandler.size`, which feeds CEF's
@@ -3032,14 +3022,10 @@ impl PaneHost {
         // `GetViewRect` with a wrong value on purpose.
         let width = self.glarea.allocated_width().max(1) as f32 * scale;
         let height = self.glarea.allocated_height().max(1) as f32 * scale;
-        self.render_state.borrow().as_ref().map(|rs| {
-            (
-                rs.device(),
-                rs.queue(),
-                scale,
-                LogicalSize { width, height },
-            )
-        })
+        self.render_state
+            .borrow()
+            .is_some()
+            .then_some((scale, LogicalSize { width, height }))
     }
 
     /// Every currently-open pane's key, in open order.

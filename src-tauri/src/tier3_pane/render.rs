@@ -508,14 +508,6 @@ impl RenderState {
         }
         self.queue.submit(std::iter::once(encoder.finish()));
     }
-
-    pub fn device(&self) -> wgpu::Device {
-        self.device.clone()
-    }
-
-    pub fn queue(&self) -> wgpu::Queue {
-        self.queue.clone()
-    }
 }
 
 fn texture_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
@@ -922,14 +914,6 @@ pub struct PaneRenderHandler {
     // multi_threaded_message_loop=true. Found during the items.id=203
     // thread-safety audit (2026-08-03).
     size: std::sync::Arc<std::sync::Mutex<LogicalSize>>,
-    // Captured at construction alongside RenderState's own device/queue, but
-    // never read here: items.id=312 moved the actual GPU texture import to
-    // RenderState::render (see resolve_bind_group), so this handler only
-    // ever produces a PendingPaint for that central pass to consume.
-    #[allow(dead_code)]
-    device: wgpu::Device,
-    #[allow(dead_code)]
-    queue: wgpu::Queue,
     /// Which `PANE_TEXTURES` slot on_paint/on_accelerated_paint (CEF's own
     /// UI thread) write into. See PaneKey docs (tier3_pane::mod) -- this is
     /// the provider ID the pane this handler belongs to was opened for.
@@ -940,8 +924,6 @@ pub struct PaneRenderHandler {
 
 impl PaneRenderHandler {
     pub fn new(
-        device: wgpu::Device,
-        queue: wgpu::Queue,
         device_scale_factor: f32,
         initial_size: LogicalSize,
         pane_key: PaneKey,
@@ -952,8 +934,6 @@ impl PaneRenderHandler {
             Self {
                 device_scale_factor,
                 size: size.clone(),
-                device,
-                queue,
                 pane_key,
                 app_handle,
             },
@@ -1132,12 +1112,6 @@ impl RenderHandlerBuilder {
 pub struct PopupRenderHandler {
     device_scale_factor: f32,
     size: Arc<Mutex<LogicalSize>>,
-    // Same as PaneRenderHandler's own device/queue: unread here, since
-    // items.id=312 centralized GPU texture import into RenderState::render.
-    #[allow(dead_code)]
-    device: wgpu::Device,
-    #[allow(dead_code)]
-    queue: wgpu::Queue,
     /// The *parent* pane's key -- which `POPUP_TEXTURES` slot this popup's
     /// paint output belongs to.
     pane_key: PaneKey,
@@ -1154,8 +1128,6 @@ pub struct PopupRenderHandler {
 
 impl PopupRenderHandler {
     pub fn new(
-        device: wgpu::Device,
-        queue: wgpu::Queue,
         device_scale_factor: f32,
         initial_size: LogicalSize,
         pane_key: PaneKey,
@@ -1167,8 +1139,6 @@ impl PopupRenderHandler {
             Self {
                 device_scale_factor,
                 size: size.clone(),
-                device,
-                queue,
                 pane_key,
                 events_tx,
                 captured: Arc::new(AtomicBool::new(false)),
@@ -1368,15 +1338,12 @@ wrap_client! {
 }
 
 impl ClientBuilder {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn build(
         render_handler: PaneRenderHandler,
         browser_ready_tx: std::sync::mpsc::Sender<cef::Browser>,
         pane_key: PaneKey,
         popup_requested_tx: std::sync::mpsc::Sender<PopupRequested>,
         popup_close_tx: std::sync::mpsc::Sender<PaneKey>,
-        device: wgpu::Device,
-        queue: wgpu::Queue,
         app_handle: tauri::AppHandle,
     ) -> Client {
         Self::new(
@@ -1385,8 +1352,6 @@ impl ClientBuilder {
                 browser_ready_tx,
                 pane_key.clone(),
                 popup_requested_tx,
-                device,
-                queue,
                 app_handle,
             )),
             LoadHandlerBuilder::build(PaneLoadHandler::new(pane_key, popup_close_tx)),
@@ -1464,11 +1429,6 @@ pub struct PaneLifeSpanHandler {
     /// must not touch `PaneManager`/GTK directly).
     pane_key: PaneKey,
     popup_requested_tx: std::sync::mpsc::Sender<PopupRequested>,
-    /// items.id=234: needed to construct a fresh `PopupRenderHandler` when
-    /// `on_before_popup` fires -- cheap `Arc`-backed clones (same handles
-    /// `PaneRenderHandler` itself holds), not a new device/queue.
-    device: wgpu::Device,
-    queue: wgpu::Queue,
     /// items.id=334: needed to construct a fresh `PopupRenderHandler` (see
     /// `request_redraw`'s own doc) when `on_before_popup` fires -- cheap
     /// clone, same handle `PaneRenderHandler` itself holds.
@@ -1480,16 +1440,12 @@ impl PaneLifeSpanHandler {
         browser_ready_tx: std::sync::mpsc::Sender<cef::Browser>,
         pane_key: PaneKey,
         popup_requested_tx: std::sync::mpsc::Sender<PopupRequested>,
-        device: wgpu::Device,
-        queue: wgpu::Queue,
         app_handle: tauri::AppHandle,
     ) -> Self {
         Self {
             browser_ready_tx,
             pane_key,
             popup_requested_tx,
-            device,
-            queue,
             app_handle,
         }
     }
@@ -1583,8 +1539,6 @@ wrap_life_span_handler! {
             // pane's initial `PaneRenderHandler` size is never load-bearing
             // for more than one frame.
             let (render_handler, size) = PopupRenderHandler::new(
-                self.handler.device.clone(),
-                self.handler.queue.clone(),
                 1.0,
                 LogicalSize {
                     width: 480.0,
