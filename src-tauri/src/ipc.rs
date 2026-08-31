@@ -285,8 +285,30 @@ mod tests {
     /// file. Drift shows up as an uncommitted change to bindings.ts, which
     /// the session-boundary commit surfaces -- rather than as a silently
     /// stale contract the frontend would compile against.
+    ///
+    /// items.id=372: `specta_builder()` itself is `#[cfg(debug_assertions)]`
+    /// gated (two full bodies above -- see that doc for why) specifically so
+    /// dev-only commands like dev_seed_tier3_draft_message are textually
+    /// absent from a release build's command surface. That same cfg means
+    /// `cargo test --release` (debug_assertions off) silently picks the
+    /// *release* body here and regenerates bindings.ts missing every
+    /// dev-only command -- no error, just a quietly stale bindings.ts
+    /// committed as if it were the real drift check. Confirmed recurring
+    /// three times, most recently via a routine `cargo build --release`
+    /// commit-verification pass. The assertion below turns that silent
+    /// truncation into a loud failure instead of catching it by hand again.
     #[test]
     fn export_typescript_bindings() {
+        assert!(
+            cfg!(debug_assertions),
+            "export_typescript_bindings must run under a debug/dev build -- \
+             invoked under release (debug_assertions off), which would silently \
+             regenerate {BINDINGS_PATH} from the release-profile command list \
+             (specta_builder's #[cfg(not(debug_assertions))] body above), \
+             stripping every dev-only command (dev_seed_tier3_draft_message, \
+             dev_bypass_tier3_gate3_review, ...). Run `cargo test --lib` \
+             (debug profile) instead of `cargo test --release`."
+        );
         specta_builder()
             .export(specta_typescript::Typescript::default(), BINDINGS_PATH)
             .expect("failed to export TypeScript bindings");
