@@ -47,6 +47,7 @@ import {
   type ConsentRequestPayload,
   type ElementDecision,
 } from '../tier3Access/PrivacyGuardianModal'
+import { isAllKeptPrivate } from '../tier3Access/consentDecisions'
 import { Tier3Selector } from '../tier3Access/Tier3Selector'
 import {
   fetchActiveProviders,
@@ -402,8 +403,7 @@ export function Tier3AccessPane({ personaId }: Tier3AccessPaneProps) {
 
   const handleModalResolve = (decisions: ElementDecision[]) => {
     if (!consentPayload || !personaId || !pendingMessageId) return
-    const allKeptPrivate = decisions.every((d) => d.decision === 'keep_private')
-    const status = allKeptPrivate ? 'withheld' : 'approved'
+    const status = isAllKeptPrivate(decisions) ? 'withheld' : 'approved'
 
     commands
       .submitElementConsentDecision({

@@ -45,6 +45,7 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
+import { isAllKeptPrivate, type ElementDecision, type ElementDecisionKind } from './consentDecisions'
 import './PrivacyGuardianModal.css'
 
 export type ReviewTier = 'easy' | 'medium' | 'high'
@@ -67,14 +68,7 @@ export interface ConsentRequestPayload {
   spans: ConsentSpanItem[]
 }
 
-export type ElementDecisionKind = 'generalize' | 'keep_private' | 'release_original'
-
-export interface ElementDecision {
-  span_id: string
-  decision: ElementDecisionKind
-  suggestion_text: string | null
-  user_modified_text: string | null
-}
+export type { ElementDecisionKind, ElementDecision } from './consentDecisions'
 
 export interface PrivacyGuardianModalProps {
   /** True from the moment gate3 review was requested until it resolves or
@@ -275,10 +269,9 @@ export function PrivacyGuardianModal({
   const handleSend = () => {
     const decisions = buildDecisions(rows)
     const { generalized, keptPrivate, released } = countsByDecision(decisions)
-    const message =
-      keptPrivate === decisions.length
-        ? t('privacyGuardianModal.confirmAllKeptPrivate')
-        : t('privacyGuardianModal.confirmMixed', { generalized, keptPrivate, released })
+    const message = isAllKeptPrivate(decisions)
+      ? t('privacyGuardianModal.confirmAllKeptPrivate')
+      : t('privacyGuardianModal.confirmMixed', { generalized, keptPrivate, released })
     finishAndResolve(decisions, message)
   }
 
