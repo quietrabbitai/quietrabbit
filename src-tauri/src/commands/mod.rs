@@ -50,6 +50,7 @@ pub struct NotImplementedPlaceholder {}
 
 pub mod active_board;
 pub mod auth;
+pub mod chats;
 pub mod consent;
 pub mod execution;
 pub mod focus_builder;

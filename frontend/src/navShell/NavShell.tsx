@@ -7,18 +7,13 @@
 // switching, and routing the middle zone to whatever the strip (or a
 // deeper navigation action) has dispatched (Section 1). MiddleZone and
 // Tier3Selector are re-hosted, not rebuilt -- see Tier3AccessPane.tsx and
-// PersonaHub.tsx for where each actually mounts.
+// PersonaHub.tsx for where each actually mounts. The merged Board/Chat/
+// Tier3 workspace (items.id=384, decisions.id=734-743) is WorkspaceShell.tsx,
+// mounted here exactly like any other content branch.
 //
 // Explicitly NOT built here (flagged, not silently skipped):
 // - The outbound Privacy Guardian gate that must precede Tier 3 access
 //   in the real flow (items.id=233) -- separate item, blocked on this one.
-// - Active Board's real screen (high-priority section + full list,
-//   Section 2a/2b) -- a genuine, separately-scoped feature. Additionally
-//   cannot be real yet regardless of scope: commands.getActiveBoard
-//   requires key_hex, which has no placeholder equivalent to
-//   getCurrentUserId() (see navShellConfig.ts's note on why that gap
-//   is deliberately NOT bridged the same way). Renders as flagged
-//   placeholder content below.
 // - My Facts' real screen (items.id=176, Chat-BRAND's design).
 // - Onboarding's strip-wide gating (Section 11b) -- not built because
 //   nothing in this pass triggers Onboarding at all.
@@ -35,7 +30,7 @@ import { MiddleZone } from '../middleZone/MiddleZone'
 import { DEFAULT_BROWSING_PROFILE } from '../middleZone/middleZoneConfig'
 import { FocusSettingsPane } from './FocusSettingsPane'
 import { PersonaHub } from './PersonaHub'
-import { Tier3AccessPane } from './Tier3AccessPane'
+import { WorkspaceShell } from './WorkspaceShell'
 import {
   DEFAULT_NAV_STATE,
   FIXED_BUTTON_ORDER,
@@ -44,11 +39,16 @@ import {
   getCurrentUserId,
   requireCurrentUserId,
   isPersonaAnchor,
-  isTier3Enabled,
   pushCrumb,
-  selectAnchor,
+  selectFixed,
+  selectPersona,
   selectCrumb,
+  setActivePersonaId,
+  setBoardSize,
+  updateWorkspacePair,
+  type BoardSizeState,
   type ContentDescriptor,
+  type DominancePairState,
   type FixedButtonId,
   type NavState,
 } from './navShellConfig'
@@ -58,15 +58,6 @@ export function NavShell() {
   const [navState, setNavState] = useState<NavState>(DEFAULT_NAV_STATE)
   const [personas, setPersonas] = useState<PersonaInfo[]>([])
   const [personaError, setPersonaError] = useState<string | null>(null)
-  // The persona a Tier 3 session was opened from. isTier3Enabled requires
-  // the CURRENT anchor to be a Persona, but selectAnchor({kind:'fixed',
-  // id:'tier3'}) discards that persona from navState.anchor on the very
-  // same transition -- NavState has no room to carry it through (AnchorId's
-  // 'fixed' variant isn't per-button-parameterized). Tier3AccessPane needs
-  // a real personaId for persistence (every store in this codebase is
-  // opened per user/persona -- no exceptions), so this is captured here,
-  // once, right before the anchor switches.
-  const [tier3PersonaId, setTier3PersonaId] = useState<string | null>(null)
 
   useEffect(() => {
     // NavShell only mounts once App.tsx's login gate has confirmed a
@@ -85,18 +76,25 @@ export function NavShell() {
   }, [])
 
   const handleSelectFixed = (id: FixedButtonId) => {
-    if (id === 'tier3') {
-      if (!isTier3Enabled(navState)) return
-      // isTier3Enabled guarantees anchor.kind === 'persona' here.
-      if (navState.anchor.kind === 'persona') {
-        setTier3PersonaId(navState.anchor.personaId)
-      }
-    }
-    setNavState(selectAnchor({ kind: 'fixed', id }))
+    setNavState(selectFixed(id))
   }
 
   const handleSelectPersona = (personaId: string) => {
-    setNavState(selectAnchor({ kind: 'persona', personaId }))
+    setNavState(selectPersona(personaId))
+  }
+
+  const handleSetActivePersonaId = (personaId: string) => {
+    setNavState(setActivePersonaId(personaId))
+  }
+
+  const handleSetBoardSize = (size: BoardSizeState) => {
+    setNavState(setBoardSize(size))
+  }
+
+  const handleUpdatePair = (
+    updater: (prev: DominancePairState) => DominancePairState,
+  ) => {
+    setNavState(updateWorkspacePair(updater))
   }
 
   const handleOpenPersonaLibrary = (personaId: string) => {
@@ -134,14 +132,12 @@ export function NavShell() {
       >
         {FIXED_BUTTON_ORDER.map((id) => {
           const lit = fixedButtonLitState(navState, id)
-          const disabled = id === 'tier3' && !isTier3Enabled(navState)
           return (
             <button
               key={id}
               type="button"
               className="nav-shell__button"
               data-selected={lit === 'none' ? undefined : lit}
-              disabled={disabled}
               onClick={() => handleSelectFixed(id)}
             >
               {t(`navShell.${id}`)}
@@ -200,7 +196,13 @@ export function NavShell() {
           content={content}
           onOpenPersonaLibrary={handleOpenPersonaLibrary}
           onOpenFocusSettings={handleOpenFocusSettings}
-          tier3PersonaId={tier3PersonaId}
+          activePersonaId={navState.activePersonaId}
+          onActivePersonaIdChange={handleSetActivePersonaId}
+          personas={personas}
+          boardSize={navState.workspace.boardSize}
+          onBoardSizeChange={handleSetBoardSize}
+          pair={navState.workspace.pair}
+          onUpdatePair={handleUpdatePair}
         />
       </div>
     </main>
@@ -211,25 +213,59 @@ interface NavShellContentProps {
   content: ContentDescriptor
   onOpenPersonaLibrary: (personaId: string) => void
   onOpenFocusSettings: (personaId: string, focusId: string) => void
-  tier3PersonaId: string | null
+  /** items.id=384 slice 1: replaces the old tier3PersonaId capture --
+   *  activePersonaId is now a standing NavState field that survives the
+   *  switch into the merged workspace on its own, so there's nothing
+   *  left to capture-on-transition here. */
+  activePersonaId: string | null
+  /** items.id=384 slice 7: the new-chat persona dot-picker's "quiet"
+   *  switch (setActivePersonaId, not selectPersona) -- see that
+   *  function's own doc comment in navShellConfig.ts. */
+  onActivePersonaIdChange: (personaId: string) => void
+  /** Already fetched once at NavShell's own top level for the persona
+   *  cluster buttons -- threaded down here rather than having
+   *  Tier3AccessPane re-fetch the same list a second time. */
+  personas: PersonaInfo[]
+  boardSize: BoardSizeState
+  onBoardSizeChange: (size: BoardSizeState) => void
+  pair: DominancePairState
+  onUpdatePair: (updater: (prev: DominancePairState) => DominancePairState) => void
 }
 
 /** Resolves the current ContentDescriptor to what actually mounts in the
  *  middle zone. Section 3: content and its chat share one MiddleZone
  *  instance, keyed by contextKey so switching content switches which
- *  transcript is showing (3b) -- except 'tier3', which has its own
- *  side-by-side layout requirement (Section 9); see Tier3AccessPane. */
+ *  transcript is showing (3b) -- except 'workspace', which has its own
+ *  layout requirement (Section 9, decisions.id=734-737); see
+ *  WorkspaceShell. */
 function NavShellContent({
   content,
   onOpenPersonaLibrary,
   onOpenFocusSettings,
-  tier3PersonaId,
+  activePersonaId,
+  onActivePersonaIdChange,
+  personas,
+  boardSize,
+  onBoardSizeChange,
+  pair,
+  onUpdatePair,
 }: NavShellContentProps) {
   const { t } = useTranslation()
   const [personaHubGenerating, setPersonaHubGenerating] = useState(false)
 
-  if (content.type === 'tier3') {
-    return <Tier3AccessPane personaId={tier3PersonaId} />
+  if (content.type === 'workspace') {
+    return (
+      <WorkspaceShell
+        userId={requireCurrentUserId()}
+        activePersonaId={activePersonaId}
+        onActivePersonaIdChange={onActivePersonaIdChange}
+        personas={personas}
+        boardSize={boardSize}
+        onBoardSizeChange={onBoardSizeChange}
+        pair={pair}
+        onUpdatePair={onUpdatePair}
+      />
+    )
   }
 
   if (content.type === 'personaHub') {
@@ -315,8 +351,6 @@ function describePlaceholder(
   t: (key: string) => string,
 ): string {
   switch (content.type) {
-    case 'activeBoard':
-      return t('navShell.content.activeBoardPlaceholder')
     case 'myFacts':
       return t('navShell.content.myFactsPlaceholder')
     default:

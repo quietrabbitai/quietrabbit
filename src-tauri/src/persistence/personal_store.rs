@@ -158,9 +158,20 @@ pub(crate) async fn open_personal_db(
 ) -> Result<SqliteConnection, PersonalStoreError> {
     let db_path = get_personal_db_path(user_id, persona_id);
 
-    if !db_path.exists() {
-        crate::persistence::migrations::migrate_personal_db(user_id, persona_id, key_hex).await?;
-    }
+    // BUG FOUND + FIXED (items.id=389, same class as items.id=384 slice 7's
+    // message_store.rs fix): this used to be `if !db_path.exists()`, which
+    // only ever ran migrations against a brand-new file. Any personal.db
+    // created before its most recent schema version shipped stays stuck on
+    // whatever version it was created at forever, no matter how many times
+    // the app reopens it -- personal.db has genuinely shipped 7 schema
+    // versions (personal_001 through personal_007), so this was a live risk
+    // on real data, not a hypothetical one messages.db merely exposed first.
+    //
+    // Fix: always call migrate_personal_db, relying on run_migrations' own
+    // idempotent/pending-only behavior (schema_version-tracked, already
+    // exercised by migrate_personal_db_is_idempotent_on_real_file) rather
+    // than a file-existence guess about whether anything is pending.
+    crate::persistence::migrations::migrate_personal_db(user_id, persona_id, key_hex).await?;
 
     let network_storage = std::env::var("QR_NETWORK_STORAGE")
         .map(|v| v.to_lowercase() == "true")
@@ -1547,6 +1558,90 @@ mod tests {
         } else {
             std::env::remove_var("QR_DATA_ROOT");
         }
+    }
+
+    /// Regression test for items.id=389 -- the same bug class items.id=384
+    /// slice 7 found and fixed in message_store.rs's open_messages_db:
+    /// open_personal_db used to call migrate_personal_db ONLY when the
+    /// file didn't exist yet ("if !db_path.exists()"), so a personal.db
+    /// created before a later schema version shipped stayed stuck on that
+    /// old version forever, no matter how many times the app reopened it.
+    /// Unlike messages.db (which had exactly one version until slice 6),
+    /// personal.db has genuinely shipped 7 schema versions (personal_001
+    /// through personal_007) -- a live risk on real data, not a
+    /// hypothetical messages.db merely surfaced first. Hand-builds a stale
+    /// v1-only shape directly against a real encrypted file (SCHEMA_FILES
+    /// is a compile-time static that always includes every version now,
+    /// so migrate_personal_db itself can't produce a deliberately-stale
+    /// fixture -- same constraint migrations.rs's own
+    /// run_pending_heals_content_drift_in_stale_v1_database and
+    /// message_store.rs's own
+    /// open_messages_db_heals_a_pre_existing_v1_only_database document).
+    #[tokio::test]
+    async fn open_personal_db_heals_a_pre_existing_v1_only_database() {
+        const PERSONAL_001_SCHEMA: &str = include_str!("../../schema/personal_001.sql");
+
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "stale-v1-user";
+        let persona_id = "stale-v1-persona";
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+        let db_path = get_personal_db_path(user_id, persona_id);
+        std::fs::create_dir_all(db_path.parent().unwrap())
+            .expect("failed to create parent dirs for test db");
+
+        {
+            let mut conn = SqliteConnectOptions::new()
+                .filename(&db_path)
+                .create_if_missing(true)
+                .pragma("key", format!("\"x'{key_hex}'\""))
+                .connect()
+                .await
+                .expect("stale fixture connect failed");
+            for stmt in crate::persistence::migrations::parse_statements(PERSONAL_001_SCHEMA) {
+                sqlx::query(&stmt)
+                    .execute(&mut conn)
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("stale fixture schema statement failed: {e}\n{stmt}")
+                    });
+            }
+        }
+        assert!(db_path.exists(), "stale v1-only fixture file must exist");
+
+        // The real function under test -- must heal the stale file, not
+        // just successfully connect to it as-is.
+        let heal_result = open_personal_db(user_id, persona_id, key_hex).await;
+        assert!(
+            heal_result.is_ok(),
+            "open_personal_db must heal the stale v1 database, not error: {heal_result:?}"
+        );
+
+        let mut verify_conn = open_personal_db(user_id, persona_id, key_hex)
+            .await
+            .expect("re-open must succeed");
+        let exists: Option<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='dedup_candidates'",
+        )
+        .fetch_optional(&mut verify_conn)
+        .await
+        .unwrap();
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+
+        assert!(
+            exists.is_some(),
+            "dedup_candidates (added in personal_002.sql) must exist after opening a \
+             pre-existing v1-only personal.db -- open_personal_db must run pending \
+             migrations on every open, not only when the file doesn't exist yet"
+        );
     }
 
     // D5-151 / items.id=229: phone_pattern() replaced a raw digit_count >= 8

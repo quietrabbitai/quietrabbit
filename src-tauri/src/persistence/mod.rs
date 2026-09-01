@@ -1,5 +1,6 @@
 // src-tauri/src/persistence/mod.rs
 
+pub mod chat_store;
 pub mod dedup_store;
 pub mod disclosure_log_store;
 pub mod document_fork_store;

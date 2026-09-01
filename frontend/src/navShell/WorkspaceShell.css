@@ -1,0 +1,68 @@
+/* WorkspaceShell -- visual treatment. Same convention as
+ * ActiveBoardPane.css/LibraryPane.css: consumes index.css's custom
+ * properties rather than declaring its own colors. */
+
+.workspace-shell {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  gap: 10px;
+  padding: 8px 12px;
+}
+
+.workspace-shell--compact {
+  flex-direction: row;
+}
+
+.workspace-shell__board-row,
+.workspace-shell__pair-row {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-h);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.workspace-shell__board-row:hover,
+.workspace-shell__pair-row:hover {
+  border-color: var(--accent-border);
+}
+
+.workspace-shell__board-region,
+.workspace-shell__pair-region {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.workspace-shell--compact .workspace-shell__board-region {
+  flex: 0 0 320px;
+}
+
+.workspace-shell--compact .workspace-shell__pair-region {
+  flex: 1;
+}
+
+.workspace-shell__board-size-button {
+  align-self: flex-start;
+  flex: 0 0 auto;
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--code-bg);
+  color: var(--text);
+  cursor: pointer;
+}

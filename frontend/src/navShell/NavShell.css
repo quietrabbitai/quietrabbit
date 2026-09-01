@@ -82,6 +82,7 @@
   flex: 0 0 34%;
   min-height: 170px;
   display: flex;
+  flex-direction: column;
   transition: flex-basis 220ms ease, min-height 220ms ease;
 }
 
@@ -90,9 +91,67 @@
   min-height: 0;
 }
 
+/* items.id=384 slice 4: when Chat is dominant, there's no split-area
+ * sibling to share height with any more (Tier3CollapsedStrip is a small
+ * fixed-height row, not a flex:1 region) -- QR needs to actually fill the
+ * remaining space instead of keeping its old 34% resting share. */
+.tier3-access-pane[data-dominant='chat'] .tier3-access-pane__qr {
+  flex: 1;
+  min-height: 0;
+}
+
 .tier3-access-pane__qr > * {
   flex: 1;
   min-width: 0;
+  min-height: 0;
+}
+
+/* items.id=384 slice 5, decisions.id=743: QR's own identity banner --
+ * shown only when QR is expanded (not collapsed to its own floor, which
+ * already has its own compact QR-mark treatment via ChatPane's collapsed
+ * strip -- see its own collapsed-mark). Needed because a Tier3 provider's
+ * own header can appear above QR in this merged layout (WorkspaceShell's
+ * 'compact' state), and QR previously had no banner of its own to
+ * disambiguate which panel is QR's.
+ *
+ * Uses the app's existing --accent tokens, not a new brand-specific
+ * color: Palette v3 hasn't been applied live anywhere else in this app
+ * (see tier3AccessConfig.ts's own note on that), and the one other place
+ * QR gets a placeholder color today (ChatPane.css's collapsed-mark dot)
+ * already uses var(--accent) for the same reason -- a real Chat-BRAND
+ * visual pass is explicitly out of scope for this item. Overrides the
+ * flex:1 the sibling rule above gives every direct child of
+ * .tier3-access-pane__qr -- same specificity, later in the cascade, no
+ * !important needed. */
+.tier3-access-pane__qr-banner {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 10px;
+  border-bottom: 2px solid var(--accent-border);
+  background: var(--accent-bg);
+}
+
+.tier3-access-pane__qr-banner-name {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-h);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+/* items.id=384 slice 7: houses ChatHistoryList + NewChatPersonaPicker --
+ * flex:0 0 auto so they never lose their own width to the name's
+ * ellipsis truncation above. */
+.tier3-access-pane__qr-banner-tools {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
 }
 
 .tier3-access-pane__split-area {

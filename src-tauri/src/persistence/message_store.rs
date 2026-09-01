@@ -60,7 +60,7 @@ pub enum MessageStoreError {
 // Path helper
 // ---------------------------------------------------------------------------
 
-fn get_messages_db_path(user_id: &str, persona_id: &str) -> PathBuf {
+pub(crate) fn get_messages_db_path(user_id: &str, persona_id: &str) -> PathBuf {
     crate::persistence::migrations::get_data_root()
         .join("users")
         .join(user_id)
@@ -84,7 +84,14 @@ fn get_messages_db_path(user_id: &str, persona_id: &str) -> PathBuf {
 /// supply yet (Layer 8 auth unbuilt; see ChatPane.tsx), so this is defense-
 /// in-depth for any future caller that reaches here without one, not
 /// something this item's own code paths are expected to trigger.
-async fn open_messages_db(
+///
+/// pub(crate), not private: items.id=384 slice 6's chat_store.rs (the
+/// `chats` table, messages_002.sql) lives in this same messages.db and
+/// reuses this opener rather than duplicating the SQLCipher-open sequence
+/// -- one opener for one physical database, matching CLAUDE.md's own
+/// emphasis on this exact invariant (PRAGMA key before journal_mode) not
+/// being something to risk two copies drifting apart on.
+pub(crate) async fn open_messages_db(
     user_id: &str,
     persona_id: &str,
     key_hex: &str,
@@ -97,9 +104,25 @@ async fn open_messages_db(
 
     let db_path = get_messages_db_path(user_id, persona_id);
 
-    if !db_path.exists() {
-        crate::persistence::migrations::migrate_messages_db(user_id, persona_id, key_hex).await?;
-    }
+    // BUG FOUND + FIXED (2026-09-01 live verification pass, items.id=384
+    // slice 7): this used to be `if !db_path.exists()`, which only ever
+    // ran migrations against a brand-new file. That was silently correct
+    // as long as "messages" had exactly one schema version ever (there
+    // was nothing pending for an existing file to miss) -- but it stopped
+    // being correct the moment messages_002.sql (the `chats` table) landed:
+    // every messages.db created before that file existed now opens
+    // forever stuck on schema v1, `chats` never created, `list_chats`
+    // failing with "no such table: chats" on real, pre-existing user data.
+    // Confirmed live against this dev machine's own test account.
+    //
+    // Fix: always call migrate_messages_db, relying on run_migrations'
+    // own idempotent/pending-only behavior (schema_version-tracked,
+    // already exercised by e.g. migrate_personal_db_is_idempotent_on_real_file)
+    // rather than a file-existence guess about whether anything is
+    // pending. The same `if !db_path.exists()` pattern was ALSO present in
+    // personal_store.rs's open_personal_db -- fixed separately as
+    // items.id=389, same pattern applied there.
+    crate::persistence::migrations::migrate_messages_db(user_id, persona_id, key_hex).await?;
 
     let conn = crate::providers::utils::connect_options_encrypted(&db_path, key_hex)
         .create_if_missing(false)
@@ -684,6 +707,76 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(MessageStoreError::Validation(_))));
+    }
+
+    #[tokio::test]
+    async fn open_messages_db_heals_a_pre_existing_v1_only_database() {
+        // Regression test for the bug found live 2026-09-01 (items.id=384
+        // slice 7): open_messages_db used to call migrate_messages_db ONLY
+        // when the file didn't exist yet ("if !db_path.exists()"), so a
+        // messages.db created before messages_002.sql existed stayed
+        // stuck on schema v1 forever, no matter how many times the app
+        // reopened it -- confirmed live against a real pre-existing dev
+        // account (list_chats failing with "no such table: chats"). Hand-
+        // builds that stale v1-only shape directly against a real
+        // encrypted file (SCHEMA_FILES is a compile-time static that
+        // always includes v2 now, so migrate_messages_db itself can't
+        // produce a deliberately-stale fixture -- same constraint
+        // migrations.rs's own
+        // run_pending_heals_content_drift_in_stale_v1_database documents).
+        let lock = ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "user-stale-v1-test";
+        let persona_id = "persona-stale-v1-test";
+        let db_path = get_messages_db_path(user_id, persona_id);
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+
+        {
+            let mut conn = crate::providers::utils::connect_options_encrypted(&db_path, KEY_HEX)
+                .create_if_missing(true)
+                .connect()
+                .await
+                .expect("stale fixture connect failed");
+            for stmt in parse_statements(MESSAGES_SCHEMA) {
+                sqlx::query(&stmt)
+                    .execute(&mut conn)
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("stale fixture schema statement failed: {e}\n{stmt}")
+                    });
+            }
+        }
+        assert!(db_path.exists(), "stale v1-only fixture file must exist");
+
+        // The real function under test -- must heal the stale file, not
+        // just successfully connect to it as-is.
+        open_messages_db(user_id, persona_id, KEY_HEX)
+            .await
+            .expect("open_messages_db must heal the stale v1 database, not error");
+
+        let mut verify_conn = open_messages_db(user_id, persona_id, KEY_HEX)
+            .await
+            .expect("re-open must succeed");
+        let exists: Option<(String,)> =
+            sqlx::query_as("SELECT name FROM sqlite_master WHERE type='table' AND name='chats'")
+                .fetch_optional(&mut verify_conn)
+                .await
+                .unwrap();
+        assert!(
+            exists.is_some(),
+            "chats table must exist after opening a pre-existing v1-only messages.db -- \
+             open_messages_db must run pending migrations on every open, not only when \
+             the file doesn't exist yet"
+        );
+
+        match saved_root {
+            Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+            None => std::env::remove_var("QR_DATA_ROOT"),
+        }
+        drop(lock);
     }
 
     #[tokio::test]

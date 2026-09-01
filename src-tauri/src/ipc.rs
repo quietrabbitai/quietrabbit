@@ -167,6 +167,11 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         // 491) -- see commands::ingest's own module header for why.
         commands::ingest::store_ingested_document,
         commands::ingest::get_ingested_document_bytes,
+        // Group 22 -- Persona-scoped chat history (items.id=384 slice 6,
+        // decisions.id=739/740)
+        commands::chats::create_chat,
+        commands::chats::list_chats,
+        commands::chats::archive_chat,
     ])
 }
 
@@ -282,6 +287,11 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         // 491) -- see commands::ingest's own module header for why.
         commands::ingest::store_ingested_document,
         commands::ingest::get_ingested_document_bytes,
+        // Group 22 -- Persona-scoped chat history (items.id=384 slice 6,
+        // decisions.id=739/740)
+        commands::chats::create_chat,
+        commands::chats::list_chats,
+        commands::chats::archive_chat,
     ])
 }
 

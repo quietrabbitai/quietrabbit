@@ -1,0 +1,133 @@
+/* Real Active Board screen -- visual treatment.
+ *
+ * Same convention as LibraryPane.css/ChatPane.css: consumes index.css's
+ * custom properties rather than declaring its own colors, so it tracks
+ * the app's light/dark theme automatically. Persona-color accents
+ * (left-border on cards, filter-pill dots) are the one deliberate
+ * exception -- same carve-out rationale as tier3AccessConfig.ts's
+ * PROVIDER_BRAND_COLORS (decisions.id=732): these identify something
+ * that isn't QR's own palette (here, which Persona a card belongs to),
+ * not a Palette v3 violation. */
+
+.active-board-pane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+  gap: 12px;
+  padding: 8px 12px;
+  overflow-y: auto;
+  text-align: left;
+}
+
+.active-board-pane__heading {
+  margin: 0;
+}
+
+.active-board-pane__persona-filter {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  border: none;
+  padding: 0;
+  margin: 0;
+}
+
+.active-board-pane__persona-filter legend {
+  font-size: 12px;
+  color: var(--text);
+  padding: 0 6px 0 0;
+}
+
+.active-board-pane__filter-pill {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--bg);
+  cursor: pointer;
+}
+
+.active-board-pane__filter-pill[data-selected] {
+  color: var(--text-h);
+  background: var(--code-bg);
+  border-color: var(--accent-border);
+}
+
+.active-board-pane__persona-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text);
+  flex: 0 0 auto;
+}
+
+.active-board-pane__high-priority {
+  border: 1.5px solid var(--accent-border);
+  background: var(--accent-bg);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+
+.active-board-pane__section-label {
+  margin: 0 0 8px;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.active-board-pane__grid {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 10px;
+}
+
+.active-board-pane__card {
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  border-radius: 9px;
+  padding: 8px 10px;
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.active-board-pane__card-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-h);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.active-board-pane__card-sub {
+  font-size: 11px;
+  color: var(--text);
+}
+
+/* decisions.id=737's 'compact' Board size state -- single-column row
+ * list instead of a card grid, matching the reference mockup's
+ * board-full.compact treatment. */
+.active-board-pane__grid--dense {
+  grid-template-columns: 1fr;
+}
+
+.active-board-pane__grid--dense .active-board-pane__card {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}

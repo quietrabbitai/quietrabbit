@@ -11,12 +11,10 @@
     "topStripLabel": "Top navigation",
     "personaClusterLabel": "Personas",
     "personaLoadError": "Could not load personas: {{message}}",
-    "activeBoard": "Active Board",
+    "workspace": "Board / Chat",
     "library": "Library",
     "myFacts": "My Facts",
-    "tier3": "Tier 3 access",
     "content": {
-      "activeBoardPlaceholder": "Active Board -- not yet built.",
       "myFactsPlaceholder": "My Facts -- not yet built.",
       "chatPlaceholder": "Chat -- not yet wired for this screen.",
       "tier3ChatUnavailable": "Chat is unavailable -- no Persona is associated with this Tier 3 session."
@@ -52,6 +50,25 @@
       "copyButton": "Copy to clipboard",
       "copySuccess": "Copied to clipboard."
     },
+    "activeBoardPane": {
+      "heading": "Active Board",
+      "filterLabel": "Persona",
+      "filterAll": "All",
+      "loadError": "Could not load the board: {{message}}",
+      "empty": "Nothing on the board yet.",
+      "highPriorityLabel": "High priority",
+      "cardSub": "{{persona}} · {{state}}"
+    },
+    "workspaceShell": {
+      "boardRowLabel": "Active Board -- tap to view",
+      "minimizeBoardButton": "Minimize board",
+      "pairRowLabel": "Chat & Tier 3 -- tap to view",
+      "pairRowLabelWithCount": "Chat & Tier 3 -- {{count}} loaded, tap to view"
+    },
+    "tier3CollapsedStrip": {
+      "expandLabel": "Tap to view",
+      "extraCount": "+{{count}} more loaded"
+    },
     "personaHub": {
       "focusesHeading": "Focuses",
       "noFocuses": "No Focuses yet.",
@@ -61,8 +78,19 @@
       "forkDuplicate": "Fork / duplicate",
       "focusSettingsButton": "Settings"
     },
+    "chatHistoryList": {
+      "toggleLabel": "Chat history",
+      "loadError": "Could not load chat history: {{message}}",
+      "empty": "No past chats yet.",
+      "untitled": "Untitled chat"
+    },
+    "newChatPersonaPicker": {
+      "groupLabel": "New chat as…",
+      "buttonTitle": "Start a new chat as {{persona}}"
+    },
     "tier3AccessPane": {
       "heading": "Second opinion",
+      "qrBannerName": "Quiet Rabbit — this conversation",
       "loadingProviders": "Loading providers…",
       "providerError": "Could not load providers: {{message}}",
       "openError": "Could not open pane(s): {{message}}",
