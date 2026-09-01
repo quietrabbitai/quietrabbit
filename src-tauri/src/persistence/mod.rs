@@ -10,6 +10,7 @@ pub mod group_fact_sources_store;
 pub mod group_fact_store;
 pub mod group_key_store;
 pub mod group_store;
+pub mod ingest_blob;
 pub mod integration_keys_store;
 pub mod message_store;
 pub mod migrations;

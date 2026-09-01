@@ -313,12 +313,15 @@ pub async fn send_message(
             .await
         {
             Ok(Some(output)) => {
+                // content is only NULL for an ingested-document row
+                // (items.id=383) -- a Focus run's own output always has
+                // real text content, so this is never actually reached here.
                 update_message_content_logged(
                     &bg_user_id,
                     &bg_persona_id,
                     &bg_key_hex,
                     &bg_message_id,
-                    &output.content,
+                    output.content.as_deref().unwrap_or_default(),
                 )
                 .await;
             }

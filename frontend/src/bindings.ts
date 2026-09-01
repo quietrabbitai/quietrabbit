@@ -260,11 +260,18 @@ export const commands = {
 	 *  Lists active outputs, optionally filtered by focus_id, topic_id, and/or
 	 *  output_type. Wired to output_store::list_outputs() (items.id=91, part 1).
 	 * 
+	 *  `source`: None defaults to 'qr_generated' -- this is decisions.id=486's
+	 *  "excluded from default Library view" rule (items.id=383): an ingested
+	 *  document only appears when the caller explicitly asks for
+	 *  source=Some("external_ingested") (the future Imported view). This default
+	 *  is applied here, not in output_store::list_outputs, which treats None as
+	 *  "no filter" like its other parameters.
+	 * 
 	 *  Enforces focus_settings.focus_profile visibility on top of output_store's
 	 *  results -- outputs owned by a 'protected' Focus are excluded (items.id=230).
 	 *  See module header.
 	 */
-	listOutputs: (userId: string, personaId: string, focusId: string | null, topicId: string | null, outputType: string | null) => typedError<OutputInfo[], string>(__TAURI_INVOKE("list_outputs", { userId, personaId, focusId, topicId, outputType })),
+	listOutputs: (userId: string, personaId: string, focusId: string | null, topicId: string | null, outputType: string | null, source: string | null) => typedError<OutputInfo[], string>(__TAURI_INVOKE("list_outputs", { userId, personaId, focusId, topicId, outputType, source })),
 	/**
 	 *  Enforces focus_settings.focus_profile visibility -- an output owned by a
 	 *  'protected' Focus returns the same "not_found" error a genuinely missing
@@ -635,6 +642,39 @@ export const commands = {
 	last_error: string | null,
 	updated_at: string,
 } | null, string>(__TAURI_INVOKE("get_persona_view_share_sync_folder", { recipientUserId, shareId })),
+	/**
+	 *  Store an uploaded/ingested document: writes its bytes to an encrypted
+	 *  blob on disk (ingest_blob), creates a lightweight ingest-only focus_run,
+	 *  and writes the outputs.db row (source='external_ingested').
+	 * 
+	 *  Exactly one of `content` (direct paste) or `file_path` (from an OS file
+	 *  picker -- the frontend resolves the path, this command just reads it) is
+	 *  required, mirroring decisions.id=491's own validation rule for the
+	 *  future `ingest_document`.
+	 * 
+	 *  `focus_slug`: the real Focus the user filed this document under (may be
+	 *  any string the frontend supplies -- focus_id/focus_slug carry no FK in
+	 *  this codebase, see output_store::INGEST_PSEUDO_FOCUS_ID's own doc
+	 *  comment). `sensitivity`: required, no default -- see
+	 *  output_store::save_ingested_output's VALID_SENSITIVITY check; this build
+	 *  does no automatic content classification (that is decisions.id=488's
+	 *  extraction pass, out of scope here), so silently defaulting to "general"
+	 *  for a potentially sensitive upload would be the wrong failure direction.
+	 */
+	storeIngestedDocument: (userId: string, personaId: string, focusSlug: string, projectEntityId: string | null, sensitivity: string, content: string | null, filePath: string | null) => typedError<StoreIngestedDocumentResponse, string>(__TAURI_INVOKE("store_ingested_document", { userId, personaId, focusSlug, projectEntityId, sensitivity, content, filePath })),
+	/**
+	 *  Retrieve an ingested document's current-version bytes, decrypted.
+	 *  Applies the same Focus-profile visibility check as
+	 *  commands::library::get_output (see visibility_focus_id there) -- a
+	 *  Protected-Focus ingested document must be exactly as unreachable as a
+	 *  Protected-Focus QR-generated output.
+	 * 
+	 *  No chunking/streaming -- returns the whole file as a JSON byte array (no
+	 *  base64 crate is in Cargo.toml today). Acceptable for typical document
+	 *  sizes; a known, accepted efficiency tradeoff for larger files, not fixed
+	 *  here.
+	 */
+	getIngestedDocumentBytes: (outputId: string, userId: string, personaId: string) => typedError<number[], string>(__TAURI_INVOKE("get_ingested_document_bytes", { outputId, userId, personaId })),
 };
 
 /* Types */
@@ -796,10 +836,25 @@ export type OutputInfo = {
 	id: string,
 	focus_run_id: string,
 	output_type: string,
-	content: string,
+	/**
+	 *  NULL for an ingested document stored as opaque bytes -- see
+	 *  has_original_document. See output_store::OutputRecord's own doc
+	 *  comment.
+	 */
+	content: string | null,
 	sensitivity: string,
 	status: string,
 	created_at: string,
+	/**  'qr_generated' | 'external_ingested' (items.id=383). */
+	source: string,
+	project_entity_id: string | null,
+	focus_slug: string | null,
+	original_filename: string | null,
+	/**
+	 *  Derived from storage_path.is_some() -- whether get_ingested_document_bytes
+	 *  (commands/ingest.rs) can retrieve a real original file for this output.
+	 */
+	has_original_document: boolean,
 };
 
 /**
@@ -987,6 +1042,10 @@ export type SessionInfo = {
 	display_name: string,
 	role: string,
 	is_primary: boolean,
+};
+
+export type StoreIngestedDocumentResponse = {
+	output_id: string,
 };
 
 export type SubmitConsentDecisionRequest = {

@@ -109,6 +109,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/outputs_003.sql"),
     },
     SchemaFile {
+        prefix: "outputs",
+        version: 4,
+        sql: include_str!("../../schema/outputs_004.sql"),
+    },
+    SchemaFile {
         prefix: "personal",
         version: 1,
         sql: include_str!("../../schema/personal_001.sql"),
@@ -1624,8 +1629,8 @@ mod tests {
 
         assert_eq!(
             result.expect("migration must apply cleanly"),
-            3,
-            "outputs_001 + outputs_002 + outputs_003 must all apply in one pass"
+            4,
+            "outputs_001 + outputs_002 + outputs_003 + outputs_004 must all apply in one pass"
         );
 
         let mut conn = open_verify_conn(&db_path, Some(TEST_KEY_HEX)).await;

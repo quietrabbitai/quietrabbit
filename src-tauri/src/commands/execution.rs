@@ -213,7 +213,13 @@ pub async fn get_run_output(
         .ok_or_else(|| "not_found".to_string())?;
 
     Ok(GetRunOutputResponse {
-        content: record.content,
+        // content is only NULL for an ingested-document row with an opaque
+        // binary upload (items.id=383) -- a Focus run's own output always
+        // has real text content set by save_output, so this is never
+        // actually reached for a normal run. unwrap_or_default() rather
+        // than an error, matching this endpoint's existing "return what we
+        // have" posture.
+        content: record.content.unwrap_or_default(),
         output_type: record.output_type,
         sensitivity: record.sensitivity,
     })

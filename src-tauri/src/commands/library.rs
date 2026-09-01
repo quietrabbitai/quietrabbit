@@ -68,7 +68,7 @@ fn sensitivity_severity(sensitivity: &str) -> u8 {
 /// is treated as not-protected -- the confirmed rule only suppresses a
 /// *confirmed* 'protected', it does not invent behavior for the unknown
 /// case (items.id=230).
-async fn is_protected(persona_id: &str, focus_id: &str) -> Result<bool, String> {
+pub(crate) async fn is_protected(persona_id: &str, focus_id: &str) -> Result<bool, String> {
     Ok(
         focus_settings_store::get_focus_settings(persona_id, focus_id)
             .await
@@ -87,10 +87,21 @@ pub struct OutputInfo {
     pub id: String,
     pub focus_run_id: String,
     pub output_type: String,
-    pub content: String,
+    /// NULL for an ingested document stored as opaque bytes -- see
+    /// has_original_document. See output_store::OutputRecord's own doc
+    /// comment.
+    pub content: Option<String>,
     pub sensitivity: String,
     pub status: String,
     pub created_at: String,
+    /// 'qr_generated' | 'external_ingested' (items.id=383).
+    pub source: String,
+    pub project_entity_id: Option<String>,
+    pub focus_slug: Option<String>,
+    pub original_filename: Option<String>,
+    /// Derived from storage_path.is_some() -- whether get_ingested_document_bytes
+    /// (commands/ingest.rs) can retrieve a real original file for this output.
+    pub has_original_document: bool,
 }
 
 fn to_output_info(record: output_store::OutputRecord) -> OutputInfo {
@@ -102,6 +113,32 @@ fn to_output_info(record: output_store::OutputRecord) -> OutputInfo {
         sensitivity: record.sensitivity,
         status: record.status,
         created_at: record.created_at,
+        source: record.source,
+        project_entity_id: record.project_entity_id,
+        focus_slug: record.focus_slug,
+        original_filename: record.original_filename,
+        has_original_document: record.storage_path.is_some(),
+    }
+}
+
+/// Which Focus id to use for focus_settings.focus_profile visibility checks
+/// (is_protected). For an ingested row (source='external_ingested') the
+/// owning focus_run's own focus_id is the "system-ingest" pseudo-Focus
+/// sentinel (create_ingest_focus_run), not the real Focus the document was
+/// filed under -- record.focus_slug carries that instead. Falling through to
+/// the sentinel when focus_slug is itself NULL (upload not filed under any
+/// specific Focus) is intentional and safe: no focus_settings row exists for
+/// "system-ingest", so is_protected resolves to "not protected" the same way
+/// it already does for any other Focus with no focus_settings row
+/// (items.id=230's own documented rule, see is_protected below).
+///
+/// pub(crate): also called from commands::ingest::get_ingested_document_bytes,
+/// which needs the identical visibility check this file's own commands apply.
+pub(crate) fn visibility_focus_id(record: &output_store::OutputRecord) -> &str {
+    if record.source == "external_ingested" {
+        record.focus_slug.as_deref().unwrap_or(&record.focus_id)
+    } else {
+        &record.focus_id
     }
 }
 
@@ -111,6 +148,13 @@ fn to_output_info(record: output_store::OutputRecord) -> OutputInfo {
 
 /// Lists active outputs, optionally filtered by focus_id, topic_id, and/or
 /// output_type. Wired to output_store::list_outputs() (items.id=91, part 1).
+///
+/// `source`: None defaults to 'qr_generated' -- this is decisions.id=486's
+/// "excluded from default Library view" rule (items.id=383): an ingested
+/// document only appears when the caller explicitly asks for
+/// source=Some("external_ingested") (the future Imported view). This default
+/// is applied here, not in output_store::list_outputs, which treats None as
+/// "no filter" like its other parameters.
 ///
 /// Enforces focus_settings.focus_profile visibility on top of output_store's
 /// results -- outputs owned by a 'protected' Focus are excluded (items.id=230).
@@ -124,11 +168,14 @@ pub async fn list_outputs(
     focus_id: Option<String>,
     topic_id: Option<String>,
     output_type: Option<String>,
+    source: Option<String>,
 ) -> Result<Vec<OutputInfo>, String> {
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.master_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
+
+    let source_filter = source.as_deref().or(Some("qr_generated"));
 
     let records = output_store::list_outputs(
         &user_id,
@@ -137,21 +184,23 @@ pub async fn list_outputs(
         focus_id.as_deref(),
         topic_id.as_deref(),
         output_type.as_deref(),
+        source_filter,
     )
     .await
     .map_err(|e| e.to_string())?;
 
-    // Cache focus_settings lookups per focus_id within this call -- a single
-    // Library listing typically spans a handful of Focuses, not one lookup
-    // per output.
+    // Cache focus_settings lookups per visibility-focus-id within this call
+    // -- a single Library listing typically spans a handful of Focuses, not
+    // one lookup per output.
     let mut protected_cache: HashMap<String, bool> = HashMap::new();
     let mut visible = Vec::with_capacity(records.len());
     for record in records {
-        let protected = match protected_cache.get(&record.focus_id) {
+        let vis_focus_id = visibility_focus_id(&record).to_owned();
+        let protected = match protected_cache.get(&vis_focus_id) {
             Some(v) => *v,
             None => {
-                let v = is_protected(&persona_id, &record.focus_id).await?;
-                protected_cache.insert(record.focus_id.clone(), v);
+                let v = is_protected(&persona_id, &vis_focus_id).await?;
+                protected_cache.insert(vis_focus_id.clone(), v);
                 v
             }
         };
@@ -185,7 +234,7 @@ pub async fn get_output(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "not_found".to_string())?;
 
-    if is_protected(&persona_id, &record.focus_id).await? {
+    if is_protected(&persona_id, visibility_focus_id(&record)).await? {
         return Err("not_found".to_string());
     }
 
@@ -242,9 +291,17 @@ async fn prepare_clipboard_copy(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "not_found".to_string())?;
 
-    if is_protected(persona_id, &record.focus_id).await? {
+    if is_protected(persona_id, visibility_focus_id(&record)).await? {
         return Err("not_found".to_string());
     }
+
+    // An ingested document with no text content (opaque binary upload --
+    // see OutputRecord::content's own doc comment) has nothing to put on
+    // the clipboard. Explicit error rather than silently coercing to "".
+    let content = record.content.as_deref().ok_or_else(|| {
+        "This document has no text content to copy -- open it to view the original file."
+            .to_string()
+    })?;
 
     let execution_tier = output_store::get_focus_run_routing_tier(
         user_id,
@@ -263,7 +320,7 @@ async fn prepare_clipboard_copy(
         &logger,
         &format!("clipboard-copy-{output_id}"),
         &record.focus_run_id,
-        &record.content,
+        content,
         execution_tier,
         severity,
         ScanIntensity::Full,
@@ -285,7 +342,7 @@ async fn prepare_clipboard_copy(
         );
     }
 
-    Ok(record.content)
+    Ok(content.to_string())
 }
 
 /// Thin IPC wrapper -- the actual system-clipboard write via
@@ -455,12 +512,13 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("list_outputs must succeed");
 
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].content, "visible content");
+        assert_eq!(results[0].content.as_deref(), Some("visible content"));
     }
 
     #[tokio::test]
@@ -480,12 +538,13 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("list_outputs must succeed");
 
         assert_eq!(results.len(), 1, "protected output must be filtered out");
-        assert_eq!(results[0].content, "open content");
+        assert_eq!(results[0].content.as_deref(), Some("open content"));
     }
 
     #[tokio::test]
@@ -506,7 +565,7 @@ mod tests {
         .await
         .expect("get_output must succeed for an open-profile output");
 
-        assert_eq!(result.content, "visible content");
+        assert_eq!(result.content.as_deref(), Some("visible content"));
     }
 
     #[tokio::test]
@@ -570,12 +629,13 @@ mod tests {
             Some("focus-a".to_owned()),
             None,
             None,
+            None,
         )
         .await
         .expect("list_outputs must succeed");
 
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].content, "a content");
+        assert_eq!(results[0].content.as_deref(), Some("a content"));
     }
 
     // -----------------------------------------------------------------------
@@ -698,5 +758,151 @@ mod tests {
             prepare_clipboard_copy("does-not-exist", USER_ID, PERSONA_ID, &key_hex_str()).await;
 
         assert_eq!(result.unwrap_err(), "not_found");
+    }
+
+    // -----------------------------------------------------------------------
+    // Ingestion (items.id=383, decisions.id=486)
+    // -----------------------------------------------------------------------
+
+    /// Seeds an ingested output (source='external_ingested') filed under
+    /// `focus_slug` via a lightweight ingest-only focus_run -- mirrors
+    /// output_store::create_ingest_focus_run's real shape rather than a
+    /// qr_generated focus_run, since that's exactly the case
+    /// visibility_focus_id exists to handle correctly. Also seeds a
+    /// focus_settings row for `focus_slug` (not for the pseudo-Focus) with
+    /// the given focus_profile, so is_protected has something real to find.
+    /// Returns the output id.
+    async fn seed_ingested_output_for_focus_slug(focus_slug: &str, focus_profile: &str) -> String {
+        focus_settings_store::create_focus_settings(
+            PERSONA_ID,
+            focus_slug,
+            "bidirectional",
+            "shared",
+            2,
+            2,
+            focus_profile,
+            None,
+        )
+        .await
+        .expect("create_focus_settings must succeed in test setup");
+
+        let focus_run_id = output_store::create_ingest_focus_run(USER_ID, PERSONA_ID, &key_hex_str())
+            .await
+            .expect("create_ingest_focus_run must succeed in test setup");
+
+        output_store::save_ingested_output(
+            USER_ID,
+            PERSONA_ID,
+            &key_hex_str(),
+            &format!("ingested-{focus_slug}"),
+            &focus_run_id,
+            "ingested_document",
+            "general",
+            focus_slug,
+            None,
+            "/fake/storage/v1.enc",
+            "doc.txt",
+            Some("ingested content"),
+        )
+        .await
+        .expect("save_ingested_output must succeed in test setup")
+    }
+
+    #[tokio::test]
+    async fn get_output_blocks_ingested_document_filed_under_a_protected_focus() {
+        let _env = setup().await;
+        let output_id = seed_ingested_output_for_focus_slug("focus-protected-slug", "protected").await;
+
+        let app = mock_app_with_registry();
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(&registry, USER_ID, MASTER_KEY).await;
+
+        let result = get_output(
+            output_id,
+            USER_ID.to_owned(),
+            PERSONA_ID.to_owned(),
+            registry,
+        )
+        .await;
+
+        assert_eq!(
+            result.unwrap_err(),
+            "not_found",
+            "an ingested document filed under a Protected Focus (via focus_slug) must be \
+             blocked exactly like a qr_generated output would be -- the ingest-only run's \
+             own pseudo-Focus id must not bypass this check"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_output_allows_ingested_document_filed_under_an_open_focus() {
+        let _env = setup().await;
+        let output_id = seed_ingested_output_for_focus_slug("focus-open-slug", "open").await;
+
+        let app = mock_app_with_registry();
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(&registry, USER_ID, MASTER_KEY).await;
+
+        let result = get_output(
+            output_id,
+            USER_ID.to_owned(),
+            PERSONA_ID.to_owned(),
+            registry,
+        )
+        .await
+        .expect("an ingested document under an open Focus must be reachable");
+
+        assert_eq!(result.source, "external_ingested");
+        assert_eq!(result.focus_slug.as_deref(), Some("focus-open-slug"));
+    }
+
+    #[tokio::test]
+    async fn list_outputs_defaults_to_excluding_ingested_documents() {
+        let _env = setup().await;
+        seed_output_for_focus("focus-open", "open", "a qr-generated note").await;
+        seed_ingested_output_for_focus_slug("focus-open-slug", "open").await;
+
+        let app = mock_app_with_registry();
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(&registry, USER_ID, MASTER_KEY).await;
+
+        let default_view = list_outputs(
+            USER_ID.to_owned(),
+            PERSONA_ID.to_owned(),
+            registry,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("list_outputs must succeed");
+
+        assert_eq!(
+            default_view.len(),
+            1,
+            "source omitted must default to the Library view (qr_generated only) -- \
+             decisions.id=486's 'excluded from default Library view' rule"
+        );
+        assert_eq!(default_view[0].source, "qr_generated");
+
+        let app2 = mock_app_with_registry();
+        let registry2 = app2.state::<KeyRegistry>();
+        populate_registry(&registry2, USER_ID, MASTER_KEY).await;
+
+        let imported_view = list_outputs(
+            USER_ID.to_owned(),
+            PERSONA_ID.to_owned(),
+            registry2,
+            None,
+            None,
+            None,
+            Some("external_ingested".to_owned()),
+        )
+        .await
+        .expect("list_outputs must succeed");
+
+        assert_eq!(imported_view.len(), 1);
+        assert_eq!(imported_view[0].source, "external_ingested");
     }
 }

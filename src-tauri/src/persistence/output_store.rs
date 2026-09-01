@@ -53,13 +53,38 @@ pub struct OutputRecord {
     /// NOT NULL REFERENCES focus_runs(id) FK, so this join can never drop a
     /// row. Needed by commands/library.rs to look up focus_settings.
     /// focus_profile for Library visibility enforcement (items.id=230).
+    ///
+    /// For an ingested row (source='external_ingested') this is the
+    /// "system-ingest" pseudo-Focus sentinel (see create_ingest_focus_run),
+    /// NOT the real Focus the document was filed under -- callers doing
+    /// Focus-profile visibility checks must use `focus_slug` instead for
+    /// those rows. See commands/library.rs's is_protected call sites.
     pub focus_id: String,
     pub output_type: String,
-    pub content: String,
+    /// NULL for an ingested document stored as opaque bytes (storage_path
+    /// holds the real file) -- see items.id=383. Non-NULL for every
+    /// qr_generated output (unchanged) and for ingested uploads whose
+    /// content was plain-text-decodable (mirrored here for FTS5
+    /// searchability).
+    pub content: Option<String>,
     pub sensitivity: String,
     pub status: String,
     pub created_at: String,
     pub updated_at: String,
+    /// 'qr_generated' (default, existing behavior) | 'external_ingested'
+    /// (items.id=383, decisions.id=486).
+    pub source: String,
+    pub project_entity_id: Option<String>,
+    /// The REAL Focus an ingested document was filed under -- see the
+    /// `focus_id` doc comment above. NULL for qr_generated rows (the real
+    /// Focus is already reachable via focus_id) and for an ingested
+    /// document not filed under any specific Focus.
+    pub focus_slug: Option<String>,
+    /// Path to the current version's encrypted blob on disk
+    /// (persistence/ingest_blob.rs). NULL for qr_generated rows.
+    pub storage_path: Option<String>,
+    pub storage_version: i32,
+    pub original_filename: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +197,12 @@ fn row_to_output_record(r: &sqlx::sqlite::SqliteRow) -> Result<OutputRecord, sql
         status: r.try_get("status")?,
         created_at: r.try_get("created_at")?,
         updated_at: r.try_get("updated_at")?,
+        source: r.try_get("source")?,
+        project_entity_id: r.try_get("project_entity_id")?,
+        focus_slug: r.try_get("focus_slug")?,
+        storage_path: r.try_get("storage_path")?,
+        storage_version: r.try_get("storage_version")?,
+        original_filename: r.try_get("original_filename")?,
     })
 }
 
@@ -245,7 +276,9 @@ pub async fn get_output(
 
     let row = sqlx::query(
         "SELECT o.id, o.focus_run_id, r.focus_id, o.output_type, o.content,
-                o.sensitivity, o.status, o.created_at, o.updated_at
+                o.sensitivity, o.status, o.created_at, o.updated_at,
+                o.source, o.project_entity_id, o.focus_slug, o.storage_path,
+                o.storage_version, o.original_filename
          FROM outputs o
          JOIN focus_runs r ON r.id = o.focus_run_id
          WHERE o.id = ? AND o.status = 'active'",
@@ -275,7 +308,9 @@ pub async fn get_output_for_run(
 
     let row = sqlx::query(
         "SELECT o.id, o.focus_run_id, r.focus_id, o.output_type, o.content,
-                o.sensitivity, o.status, o.created_at, o.updated_at
+                o.sensitivity, o.status, o.created_at, o.updated_at,
+                o.source, o.project_entity_id, o.focus_slug, o.storage_path,
+                o.storage_version, o.original_filename
          FROM outputs o
          JOIN focus_runs r ON r.id = o.focus_run_id
          WHERE o.focus_run_id = ? AND o.status = 'active'
@@ -476,6 +511,13 @@ pub async fn get_last_used_map(
 /// shared.db lookup, not something this outputs.db query can join against)
 /// and is enforced by the caller. See commands::library::list_outputs
 /// (items.id=230), which applies it on top of this function's results.
+///
+/// `source`: None = no filter (matches focus_id/topic_id/output_type's own
+/// convention). The "default to Library view only" business rule --
+/// defaulting to source='qr_generated' when the frontend passes nothing --
+/// is deliberately NOT this function's job; it lives in
+/// commands::library::list_outputs (items.id=383), same layering as the
+/// focus_profile visibility check above.
 pub async fn list_outputs(
     user_id: &str,
     persona_id: &str,
@@ -483,12 +525,15 @@ pub async fn list_outputs(
     focus_id: Option<&str>,
     topic_id: Option<&str>,
     output_type: Option<&str>,
+    source: Option<&str>,
 ) -> Result<Vec<OutputRecord>, OutputStoreError> {
     let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
 
     let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
         "SELECT o.id, o.focus_run_id, r.focus_id, o.output_type, o.content,
-                o.sensitivity, o.status, o.created_at, o.updated_at
+                o.sensitivity, o.status, o.created_at, o.updated_at,
+                o.source, o.project_entity_id, o.focus_slug, o.storage_path,
+                o.storage_version, o.original_filename
          FROM outputs o
          JOIN focus_runs r ON r.id = o.focus_run_id
          WHERE o.status = 'active'",
@@ -504,6 +549,10 @@ pub async fn list_outputs(
     if let Some(otype) = output_type {
         qb.push(" AND o.output_type = ");
         qb.push_bind(otype);
+    }
+    if let Some(src) = source {
+        qb.push(" AND o.source = ");
+        qb.push_bind(src);
     }
     qb.push(" ORDER BY o.created_at DESC");
 
@@ -798,6 +847,149 @@ async fn write_element_consent_decisions_conn(
         .await?;
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Ingestion (items.id=383, decisions.id=486)
+// ---------------------------------------------------------------------------
+
+/// Fixed system pseudo-Focus id for ingest-only focus_runs. There is no
+/// "active Focus" concept anywhere in this codebase (confirmed: no
+/// current_focus/active_focus tracking exists -- Active Board is a list of
+/// topic-cards, not a single-selection pointer) and focus_runs.focus_id has
+/// no FK, so this sentinel is both the only workable attachment point and
+/// free to invent. Real Focus association for an ingested document is
+/// carried separately on outputs.focus_slug, not through this run's
+/// focus_id -- see OutputRecord's own doc comment.
+pub const INGEST_PSEUDO_FOCUS_ID: &str = "system-ingest";
+
+/// Create a lightweight ingest-only focus_run to satisfy outputs.
+/// focus_run_id's NOT NULL REFERENCES focus_runs(id) constraint for a
+/// document that didn't come from running a Focus. One new row per upload
+/// (not a shared singleton) -- keeps a clean 1:1 audit trail between an
+/// ingest event and its resulting output row.
+///
+/// Deliberately bypasses conductor::lifecycle::FocusRun::authorize()
+/// entirely -- that path loads a .focus file and requires a matching
+/// focus_settings row for (persona_id, focus_id), neither of which exists
+/// for INGEST_PSEUDO_FOCUS_ID. Direct INSERT instead, same shape as this
+/// file's own test-only test_seed_focus_run helper. status='complete'
+/// immediately -- an ingest-only run never actually executes.
+pub async fn create_ingest_focus_run(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+) -> Result<String, OutputStoreError> {
+    let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
+    let run_id = uuid::Uuid::new_v4().to_string();
+
+    sqlx::query(
+        "INSERT INTO focus_runs (id, focus_id, status, started_at)
+         VALUES (?, ?, 'complete', ?)",
+    )
+    .bind(&run_id)
+    .bind(INGEST_PSEUDO_FOCUS_ID)
+    .bind(crate::providers::utils::now())
+    .execute(&mut conn)
+    .await?;
+
+    Ok(run_id)
+}
+
+/// Write an ingested document's row to outputs.db. source='external_ingested',
+/// storage_version=1. `content` is the plain-text mirror for FTS5
+/// searchability when the upload was text-decodable -- NULL for opaque
+/// binary formats whose real bytes live only at `storage_path`.
+///
+/// `output_id` is caller-supplied (unlike save_output's optional id) --
+/// the caller (commands/ingest.rs) needs the id before this call, to derive
+/// `storage_path` via ingest_blob::ingest_blob_path() and write the
+/// encrypted blob before the DB row referencing that path exists.
+#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
+pub async fn save_ingested_output(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    output_id: &str,
+    focus_run_id: &str,
+    output_type: &str,
+    sensitivity: &str,
+    focus_slug: &str,
+    project_entity_id: Option<&str>,
+    storage_path: &str,
+    original_filename: &str,
+    content: Option<&str>,
+) -> Result<String, OutputStoreError> {
+    if !VALID_SENSITIVITY.contains(&sensitivity) {
+        return Err(OutputStoreError::Validation(format!(
+            "Invalid sensitivity '{}'. Must be one of: {}",
+            sensitivity,
+            VALID_SENSITIVITY.join(", ")
+        )));
+    }
+
+    let timestamp = crate::providers::utils::now();
+    let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
+
+    sqlx::query(
+        "INSERT INTO outputs
+         (id, focus_run_id, output_type, content, sensitivity,
+          status, created_at, updated_at, source, focus_slug,
+          project_entity_id, storage_path, storage_version, original_filename)
+         VALUES (?, ?, ?, ?, ?, 'active', ?, ?, 'external_ingested', ?, ?, ?, 1, ?)",
+    )
+    .bind(output_id)
+    .bind(focus_run_id)
+    .bind(output_type)
+    .bind(content)
+    .bind(sensitivity)
+    .bind(&timestamp)
+    .bind(&timestamp)
+    .bind(focus_slug)
+    .bind(project_entity_id)
+    .bind(storage_path)
+    .bind(original_filename)
+    .execute(&mut conn)
+    .await?;
+
+    Ok(output_id.to_string())
+}
+
+/// Record an edited version of an ingested document: bumps storage_version
+/// and repoints storage_path at the new file. Prior version files are NOT
+/// deleted here -- the caller (commands/ingest.rs) writes the new encrypted
+/// blob to its own v{n}.enc path before calling this; old version files
+/// stay on disk as history. Returns the new storage_version.
+pub async fn bump_ingested_document_version(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    output_id: &str,
+    new_storage_path: &str,
+) -> Result<i32, OutputStoreError> {
+    let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
+    let timestamp = crate::providers::utils::now();
+
+    let row = sqlx::query(
+        "UPDATE outputs
+         SET storage_version = storage_version + 1,
+             storage_path = ?,
+             updated_at = ?
+         WHERE id = ? AND source = 'external_ingested'
+         RETURNING storage_version",
+    )
+    .bind(new_storage_path)
+    .bind(&timestamp)
+    .bind(output_id)
+    .fetch_optional(&mut conn)
+    .await?;
+
+    match row {
+        Some(r) => Ok(r.try_get::<i64, _>("storage_version")? as i32),
+        None => Err(OutputStoreError::Validation(format!(
+            "no ingested document with id '{output_id}' to version"
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1126,6 +1318,312 @@ mod tests {
             let n: i64 = row.try_get("n").unwrap();
             assert_eq!(n, 0);
         }
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    // -- Ingestion (items.id=383, decisions.id=486) -------------------------
+
+    const INGEST_KEY_HEX: &str =
+        "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+
+    /// Real on-disk outputs.db via the actual migration path (matches
+    /// open_outputs_db_self_heals_a_never_created_file's own real-file
+    /// pattern) -- create_ingest_focus_run/save_ingested_output both
+    /// self-heal via open_outputs_db exactly like every other public fn in
+    /// this file, so no separate schema bootstrap is needed here.
+    #[tokio::test]
+    async fn create_ingest_focus_run_then_save_ingested_output_round_trips() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "ingest-user";
+        let persona_id = "ingest-persona";
+
+        let verify = async {
+            let focus_run_id = create_ingest_focus_run(user_id, persona_id, INGEST_KEY_HEX)
+                .await
+                .expect("create_ingest_focus_run must satisfy outputs.focus_run_id's FK");
+
+            let status =
+                get_focus_run_status(user_id, persona_id, INGEST_KEY_HEX, &focus_run_id)
+                    .await
+                    .expect("query must succeed")
+                    .expect("the ingest-only run must exist");
+            assert_eq!(
+                status, "complete",
+                "an ingest-only run never executes -- it starts and stays complete"
+            );
+
+            let output_id = save_ingested_output(
+                user_id,
+                persona_id,
+                INGEST_KEY_HEX,
+                "output-1",
+                &focus_run_id,
+                "ingested_document",
+                "general",
+                "travel",
+                Some("entity-1"),
+                "/fake/storage/path/v1.enc",
+                "ryanair-confirmation.pdf",
+                None, // opaque binary upload -- no text mirror
+            )
+            .await
+            .expect("save_ingested_output must succeed with a real focus_run_id");
+            assert_eq!(output_id, "output-1");
+
+            let record = get_output(user_id, persona_id, INGEST_KEY_HEX, "output-1")
+                .await
+                .expect("query must succeed")
+                .expect("the ingested row must be readable back via get_output");
+
+            assert_eq!(record.source, "external_ingested");
+            assert_eq!(record.focus_id, INGEST_PSEUDO_FOCUS_ID);
+            assert_eq!(record.focus_slug.as_deref(), Some("travel"));
+            assert_eq!(record.project_entity_id.as_deref(), Some("entity-1"));
+            assert_eq!(
+                record.storage_path.as_deref(),
+                Some("/fake/storage/path/v1.enc")
+            );
+            assert_eq!(record.storage_version, 1);
+            assert_eq!(
+                record.original_filename.as_deref(),
+                Some("ryanair-confirmation.pdf")
+            );
+            assert_eq!(
+                record.content, None,
+                "opaque binary uploads have no text mirror"
+            );
+        };
+        verify.await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    #[tokio::test]
+    async fn each_ingest_upload_gets_its_own_focus_run_not_a_shared_singleton() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "ingest-user-2";
+        let persona_id = "ingest-persona-2";
+
+        let verify = async {
+            let run_a = create_ingest_focus_run(user_id, persona_id, INGEST_KEY_HEX)
+                .await
+                .unwrap();
+            let run_b = create_ingest_focus_run(user_id, persona_id, INGEST_KEY_HEX)
+                .await
+                .unwrap();
+            assert_ne!(
+                run_a, run_b,
+                "one new ingest-only focus_run per upload, not a shared singleton"
+            );
+        };
+        verify.await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    #[tokio::test]
+    async fn bump_ingested_document_version_increments_and_repoints_storage_path() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "ingest-user-3";
+        let persona_id = "ingest-persona-3";
+
+        let verify = async {
+            let focus_run_id = create_ingest_focus_run(user_id, persona_id, INGEST_KEY_HEX)
+                .await
+                .unwrap();
+            save_ingested_output(
+                user_id,
+                persona_id,
+                INGEST_KEY_HEX,
+                "output-v",
+                &focus_run_id,
+                "ingested_document",
+                "general",
+                "travel",
+                None,
+                "/fake/v1.enc",
+                "doc.txt",
+                Some("v1 text"),
+            )
+            .await
+            .unwrap();
+
+            let new_version = bump_ingested_document_version(
+                user_id,
+                persona_id,
+                INGEST_KEY_HEX,
+                "output-v",
+                "/fake/v2.enc",
+            )
+            .await
+            .expect("bump must succeed for an existing ingested row");
+            assert_eq!(new_version, 2);
+
+            let record = get_output(user_id, persona_id, INGEST_KEY_HEX, "output-v")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.storage_version, 2);
+            assert_eq!(record.storage_path.as_deref(), Some("/fake/v2.enc"));
+        };
+        verify.await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    #[tokio::test]
+    async fn bump_ingested_document_version_rejects_a_nonexistent_id() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "ingest-user-4";
+        let persona_id = "ingest-persona-4";
+
+        let verify = async {
+            let result = bump_ingested_document_version(
+                user_id,
+                persona_id,
+                INGEST_KEY_HEX,
+                "does-not-exist",
+                "/fake/v2.enc",
+            )
+            .await;
+            assert!(matches!(result, Err(OutputStoreError::Validation(_))));
+        };
+        verify.await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    #[tokio::test]
+    async fn list_outputs_source_filter_isolates_ingested_from_qr_generated() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "ingest-user-5";
+        let persona_id = "ingest-persona-5";
+
+        let verify = async {
+            let qr_run_id = "run-qr";
+            test_seed_focus_run(user_id, persona_id, INGEST_KEY_HEX, qr_run_id, "focus-1")
+                .await
+                .unwrap();
+            save_output(
+                user_id,
+                persona_id,
+                INGEST_KEY_HEX,
+                qr_run_id,
+                "note",
+                "a qr-generated note",
+                "general",
+                None,
+            )
+            .await
+            .unwrap();
+
+            let ingest_run_id = create_ingest_focus_run(user_id, persona_id, INGEST_KEY_HEX)
+                .await
+                .unwrap();
+            save_ingested_output(
+                user_id,
+                persona_id,
+                INGEST_KEY_HEX,
+                "output-ingested",
+                &ingest_run_id,
+                "ingested_document",
+                "general",
+                "focus-1",
+                None,
+                "/fake/v1.enc",
+                "doc.txt",
+                Some("ingested text"),
+            )
+            .await
+            .unwrap();
+
+            let qr_only = list_outputs(
+                user_id,
+                persona_id,
+                INGEST_KEY_HEX,
+                None,
+                None,
+                None,
+                Some("qr_generated"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(qr_only.len(), 1);
+            assert_eq!(qr_only[0].source, "qr_generated");
+
+            let ingested_only = list_outputs(
+                user_id,
+                persona_id,
+                INGEST_KEY_HEX,
+                None,
+                None,
+                None,
+                Some("external_ingested"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(ingested_only.len(), 1);
+            assert_eq!(ingested_only[0].source, "external_ingested");
+
+            let all = list_outputs(
+                user_id,
+                persona_id,
+                INGEST_KEY_HEX,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                all.len(),
+                2,
+                "source: None must mean no filter, same convention as focus_id/topic_id/output_type"
+            );
+        };
+        verify.await;
 
         if let Some(v) = saved_root {
             std::env::set_var("QR_DATA_ROOT", v);

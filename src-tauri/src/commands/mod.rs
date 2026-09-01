@@ -54,6 +54,7 @@ pub mod consent;
 pub mod execution;
 pub mod focus_builder;
 pub mod group;
+pub mod ingest;
 pub mod library;
 pub mod messages;
 pub mod notifications;

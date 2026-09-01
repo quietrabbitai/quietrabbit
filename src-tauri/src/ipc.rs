@@ -162,6 +162,11 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         // decisions.id=723)
         commands::persona_view_sync::set_persona_view_share_sync_folder,
         commands::persona_view_sync::get_persona_view_share_sync_folder,
+        // Group 21 -- Document ingestion storage model (items.id=383,
+        // decisions.id=486). NOT the future ingest_document (decisions.id=
+        // 491) -- see commands::ingest's own module header for why.
+        commands::ingest::store_ingested_document,
+        commands::ingest::get_ingested_document_bytes,
     ])
 }
 
@@ -272,6 +277,11 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         // decisions.id=723)
         commands::persona_view_sync::set_persona_view_share_sync_folder,
         commands::persona_view_sync::get_persona_view_share_sync_folder,
+        // Group 21 -- Document ingestion storage model (items.id=383,
+        // decisions.id=486). NOT the future ingest_document (decisions.id=
+        // 491) -- see commands::ingest's own module header for why.
+        commands::ingest::store_ingested_document,
+        commands::ingest::get_ingested_document_bytes,
     ])
 }
 
