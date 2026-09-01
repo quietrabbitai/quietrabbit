@@ -228,12 +228,16 @@ mod tests {
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         let path = tempdir.path().join("v1.enc");
 
-        write_encrypted_blob(&path, &[0x66u8; kdf::MASTER_KEY_LEN], "persona-a", b"secret")
-            .await
-            .unwrap();
+        write_encrypted_blob(
+            &path,
+            &[0x66u8; kdf::MASTER_KEY_LEN],
+            "persona-a",
+            b"secret",
+        )
+        .await
+        .unwrap();
 
-        let result =
-            read_encrypted_blob(&path, &[0x77u8; kdf::MASTER_KEY_LEN], "persona-a").await;
+        let result = read_encrypted_blob(&path, &[0x77u8; kdf::MASTER_KEY_LEN], "persona-a").await;
         assert!(matches!(result, Err(IngestBlobError::DecryptionFailed)));
     }
 

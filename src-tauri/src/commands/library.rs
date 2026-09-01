@@ -786,9 +786,10 @@ mod tests {
         .await
         .expect("create_focus_settings must succeed in test setup");
 
-        let focus_run_id = output_store::create_ingest_focus_run(USER_ID, PERSONA_ID, &key_hex_str())
-            .await
-            .expect("create_ingest_focus_run must succeed in test setup");
+        let focus_run_id =
+            output_store::create_ingest_focus_run(USER_ID, PERSONA_ID, &key_hex_str())
+                .await
+                .expect("create_ingest_focus_run must succeed in test setup");
 
         output_store::save_ingested_output(
             USER_ID,
@@ -811,7 +812,8 @@ mod tests {
     #[tokio::test]
     async fn get_output_blocks_ingested_document_filed_under_a_protected_focus() {
         let _env = setup().await;
-        let output_id = seed_ingested_output_for_focus_slug("focus-protected-slug", "protected").await;
+        let output_id =
+            seed_ingested_output_for_focus_slug("focus-protected-slug", "protected").await;
 
         let app = mock_app_with_registry();
         let registry = app.state::<KeyRegistry>();

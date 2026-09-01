@@ -1328,8 +1328,7 @@ mod tests {
 
     // -- Ingestion (items.id=383, decisions.id=486) -------------------------
 
-    const INGEST_KEY_HEX: &str =
-        "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+    const INGEST_KEY_HEX: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
 
     /// Real on-disk outputs.db via the actual migration path (matches
     /// open_outputs_db_self_heals_a_never_created_file's own real-file
@@ -1351,11 +1350,10 @@ mod tests {
                 .await
                 .expect("create_ingest_focus_run must satisfy outputs.focus_run_id's FK");
 
-            let status =
-                get_focus_run_status(user_id, persona_id, INGEST_KEY_HEX, &focus_run_id)
-                    .await
-                    .expect("query must succeed")
-                    .expect("the ingest-only run must exist");
+            let status = get_focus_run_status(user_id, persona_id, INGEST_KEY_HEX, &focus_run_id)
+                .await
+                .expect("query must succeed")
+                .expect("the ingest-only run must exist");
             assert_eq!(
                 status, "complete",
                 "an ingest-only run never executes -- it starts and stays complete"
@@ -1606,17 +1604,9 @@ mod tests {
             assert_eq!(ingested_only.len(), 1);
             assert_eq!(ingested_only[0].source, "external_ingested");
 
-            let all = list_outputs(
-                user_id,
-                persona_id,
-                INGEST_KEY_HEX,
-                None,
-                None,
-                None,
-                None,
-            )
-            .await
-            .unwrap();
+            let all = list_outputs(user_id, persona_id, INGEST_KEY_HEX, None, None, None, None)
+                .await
+                .unwrap();
             assert_eq!(
                 all.len(),
                 2,
