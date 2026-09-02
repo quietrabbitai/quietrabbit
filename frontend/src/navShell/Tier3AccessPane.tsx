@@ -20,14 +20,18 @@
 // response in the collapsed floor, not a placeholder.
 //
 // decisions.id=735/738 (items.id=384 slice 4): the pair is now
-// symmetric. When Tier 3 is dominant, the layout is exactly what it
-// always was (QR collapsed beside the rail+content-pane). When Chat is
-// dominant, QR renders full-size and the ENTIRE rail+content-pane is
-// replaced by Tier3CollapsedStrip -- a small click-to-expand row, no
-// live entry field (that's the resolved answer to decisions.id=738's
-// flagged question: only QR's own collapsed floor gets a live entry
-// field, since only QR has a QR-owned conversation to keep live).
-// Gate3 review UI (PrivacyGuardianModal and the blocked/withheld/
+// symmetric. When Tier 3 is the expanded region (dominant === 'tier3' and
+// Board isn't expanded either), the layout is the rail+content-pane, QR
+// collapsed to its own row above it. Whenever Tier 3 is NOT the expanded
+// region -- Chat dominant, or Board expanded (floor) -- the rail+
+// content-pane is replaced by Tier3CollapsedStrip, an always-present
+// click-to-expand bar (items.id=391 tenth pass: never hidden outright any
+// more, just one of the three peer rows -- see WorkspaceShell.tsx's own
+// header comment on the "three bars, one expanded" model). No live entry
+// field on Tier3CollapsedStrip regardless (that's the resolved answer to
+// decisions.id=738's flagged question: only QR's own collapsed floor gets
+// a live entry field, since only QR has a QR-owned conversation to keep
+// live). Gate3 review UI (PrivacyGuardianModal and the blocked/withheld/
 // ceiling-raise messaging) is rendered OUTSIDE this dominant-conditional
 // -- deliberately: a draft can enter Gate3 review from a full-screen
 // Chat send regardless of whether Tier 3 currently has any pane loaded,
@@ -107,6 +111,29 @@ export interface Tier3AccessPaneProps {
   /** NavState.workspace.pair -- see useDominancePair.ts. */
   pair: DominancePairState
   onUpdatePair: (updater: (prev: DominancePairState) => DominancePairState) => void
+  /** items.id=391 (tenth pass): true while Board is the expanded region
+   *  (WorkspaceShell's boardSize !== 'minimized') -- collapses QR to a
+   *  one-row floor (ChatPane's own collapsed strip: mark + last-message
+   *  snippet + a real, focusable entry bar, matching the mockup's
+   *  chat-floor) instead of unmounting it. No CEF-lifecycle reason to
+   *  unmount: the concern was always about Tier 3's own open panes, and
+   *  Board becoming expanded already forces dominant back to 'chat' first
+   *  (WorkspaceShell's board-bar reclaims chat before setting boardSize),
+   *  so there's never an open pane actively compositing while floor is
+   *  true. Board's own bar and the second-opinion bar (below) both still
+   *  render while floor is true -- see this file's header comment on the
+   *  tenth-pass "three bars, one expanded" model; floor only collapses
+   *  QR's own row, not the other two. */
+  floor?: boolean
+  /** items.id=391: fires when the floor (above) is clicked or its entry
+   *  bar focused -- WorkspaceShell's own onBoardSizeChange('minimized'),
+   *  making Chat the expanded region (a one-step swap as of the tenth
+   *  pass, not a multi-stage growth -- see WorkspaceShell.tsx's own
+   *  header comment). Distinct from reclaimChat (which this component
+   *  uses for its OTHER collapse case, dominant === 'tier3'): dominant is
+   *  already 'chat' whenever floor is true, so reclaiming it again would
+   *  be a no-op. */
+  onFloorExpand?: () => void
 }
 
 export function Tier3AccessPane({
@@ -115,6 +142,8 @@ export function Tier3AccessPane({
   personas,
   pair,
   onUpdatePair,
+  floor = false,
+  onFloorExpand,
 }: Tier3AccessPaneProps) {
   const { t } = useTranslation()
   const [providers, setProviders] = useState<Provider[]>([])
@@ -129,6 +158,18 @@ export function Tier3AccessPane({
   // way a live CEF pane would be).
   const [activeChat, setActiveChat] = useState<ChatInfo | null>(null)
 
+  // items.id=391: mirrors ChatPane's own lastAssistantMessage lookup --
+  // see ChatPane.tsx's onLastAssistantMessageChange doc comment for why
+  // it's pushed up (id AND gate3_review_status, not just the id) rather
+  // than duplicated here. Drives the chat toolbar's "2nd opinion" button:
+  // on-demand, real Gate3 review of the most recent response, without
+  // composing a new message. Reset on personaId change for the same
+  // reason activeChat is, just below.
+  const [lastAssistantMessage, setLastAssistantMessage] = useState<{
+    id: string
+    gate3_review_status: string | null
+  } | null>(null)
+
   // A chat belongs to exactly one Persona (decisions.id=741) -- if
   // personaId changes out from under this component (the Persona hub's
   // own Persona buttons still work independently of this pane, per
@@ -138,6 +179,7 @@ export function Tier3AccessPane({
   // same as a fresh mount would.
   useEffect(() => {
     setActiveChat(null)
+    setLastAssistantMessage(null)
   }, [personaId])
 
   const {
@@ -193,10 +235,10 @@ export function Tier3AccessPane({
   // moment (see useDominancePair.ts's own header comment for why
   // markTier3Ready is a distinct trigger from activate/reclaimChat, and
   // why dominant is no longer purely derived from activeProviderId).
-  // Fires from all three paths that can set reviewOutcome to 'approved'
-  // (handleDraftReady, handleModalResolve, handleDevForceTier3) via this
-  // one effect rather than duplicating the call at each of those three
-  // sites.
+  // Fires from both paths that can set reviewOutcome to 'approved'
+  // (handleDraftReady, handleModalResolve -- handleSecondOpinion below
+  // reuses handleDraftReady rather than setting reviewOutcome itself) via
+  // this one effect rather than duplicating the call at each site.
   //
   // BUG FOUND + FIXED (2026-09-01 live verification pass, items.id=384
   // slice 7): the original version of this effect fired
@@ -236,7 +278,13 @@ export function Tier3AccessPane({
   const syncPaneLayout = useCallback(() => {
     const body = contentBodyRef.current
     if (!body) {
+      // items.id=391: reachable via the ResizeObserver effect's own
+      // requestAnimationFrame callback (below) if .content-body unmounts
+      // in the gap between scheduling and the frame actually firing --
+      // same stale-rect risk as the effect's own early return just above
+      // it, so the same fix applies here too.
       setPaneRects({})
+      void commands.setPaneLayout([])
       return
     }
     const rects = computeActivePaneRect(body.getBoundingClientRect(), activeProviderId)
@@ -254,7 +302,28 @@ export function Tier3AccessPane({
 
   useEffect(() => {
     const body = contentBodyRef.current
-    if (!body) return
+    if (!body) {
+      // BUG FOUND + FIXED (2026-09-02, live-verification pass): reclaiming
+      // Chat (or otherwise leaving Tier3 dominant) unmounts .content-body
+      // -- syncPaneLayout itself never runs in that case (this early
+      // return used to skip even calling it), so nothing ever told Rust
+      // the active pane's rect was gone. Confirmed live (Jason): the
+      // Tier3 pane visually stayed on screen after reclaiming ("not
+      // closing"), even though reclaimChat's own setActivePane(null) call
+      // already fires was_hidden(true) CEF-side -- that alone was never
+      // enough. This mirrors exactly what the mount/unmount effect
+      // further below already had to learn the hard way (its own comment
+      // there): was_hidden only pauses CEF's internal repaint; render()
+      // decides WHERE to draw purely from PaneLayoutState, and a pane
+      // with a stale-but-still-registered rect keeps getting composited
+      // there regardless of hidden state. Push one final empty layout --
+      // same call that effect's own cleanup already uses for the
+      // full-component-unmount case, just reached from this internal,
+      // still-mounted transition too.
+      setPaneRects({})
+      void commands.setPaneLayout([])
+      return
+    }
     let frame: number | null = null
     const scheduleSync = () => {
       if (frame !== null) return
@@ -463,6 +532,45 @@ export function Tier3AccessPane({
     [personaId, t],
   )
 
+  /** items.id=391: an on-demand real Gate3 review of the current
+   *  transcript's most recent response, without composing a new message.
+   *  Originally the mockup's "2nd opinion" chat-toolbar button; as of the
+   *  tenth pass ("three bars, one expanded" redesign) it's invoked from
+   *  Tier3CollapsedStrip's always-visible bar instead (its 'reviewable'
+   *  empty state, WorkspaceShell.tsx/Tier3CollapsedStrip.tsx) -- same
+   *  handler, new caller, the toolbar button itself is removed as
+   *  redundant with that bar.
+   *
+   *  BUG FOUND + FIXED (2026-09-02 live verification pass): the first
+   *  version of this handler called handleDraftReady unconditionally,
+   *  which just resends requestTier3Gate3Review -- confirmed live this
+   *  hard-errors ("... is not awaiting gate3 review") the moment the last
+   *  message's status is already terminal, exactly the common case this
+   *  button exists for (a message approved before an earlier trip to
+   *  Board). Branches on the message's own gate3_review_status instead
+   *  (VALID_GATE3_REVIEW_STATUS, message_store.rs): 'approved' just needs
+   *  Tier 3 dominant again, no new review request; 'withheld' was an
+   *  explicit privacy choice, not something to silently retry -- surfaces
+   *  the same "kept private" banner a real withheld outcome shows;
+   *  anything else (drafted, or a client-side "blocked" outcome, which
+   *  message_store.rs's own doc confirms leaves gate3_review_status at
+   *  'drafted' server-side) is a genuine not-yet-resolved case, so only
+   *  THAT path calls handleDraftReady -- the real first-review flow,
+   *  unchanged. */
+  const handleSecondOpinion = useCallback(() => {
+    if (!lastAssistantMessage) return
+    switch (lastAssistantMessage.gate3_review_status) {
+      case 'approved':
+        markTier3Ready()
+        return
+      case 'withheld':
+        setReviewOutcome('withheld')
+        return
+      default:
+        handleDraftReady(lastAssistantMessage.id)
+    }
+  }, [lastAssistantMessage, handleDraftReady, markTier3Ready])
+
   // Same cancelled/unlisten cleanup idiom as ChatPane's own first listen()
   // effect (run-status-update), per CLAUDE.md's "Tauri event listeners must
   // be explicitly detached on SPA view unmount."
@@ -556,59 +664,16 @@ export function Tier3AccessPane({
       })
   }
 
-  // DIAG_329 (items.id=329): dev-only test scaffolding -- jumps straight to
-  // the rail/pane-open state by seeding a synthetic drafted message
-  // (commands.devSeedTier3DraftMessage, debug builds only -- see its Rust
-  // doc comment) instead of typing a message and waiting several seconds for
-  // the local model's response. From there it calls the exact same
-  // handleDraftReady this pane already uses for a real ChatPane draft, so
-  // the seeded message runs through the real requestTier3Gate3Review ->
-  // gate3() approve/deny path unmodified -- this button only fabricates the
-  // input Gate3 reviews, not Gate3's own decision. If focus_settings'
-  // max_permitted_tier for this persona's quick-ask Focus is below 3, this
-  // hits the same real tier-ceiling block (and "raise it now" affordance,
-  // FocusSettingsControls below) a real message would. Remove once
-  // items.id=329's Tier 3 pane work no longer needs fast iteration.
-  // DIAG_356 (items.id=356): bypasses gate3() entirely via the dev-only
-  // dev_bypass_tier3_gate3_review command instead of routing the seeded
-  // message through handleDraftReady's real requestTier3Gate3Review call --
-  // see that Rust command's own doc comment (commands/consent.rs) for why.
-  // gate3's own zero-spans-forced-High branch (D6-362/decisions.id=405)
-  // reliably fires for this synthetic message and surfaces a Privacy
-  // Guardian modal with nothing in it to review, which must not block
-  // otherwise-unrelated Tier 3 pane testing -- that empty-modal branch is a
-  // real, separately-tracked UX gap (items.id=356), deliberately NOT
-  // redesigned by this workaround. reviewOutcome is never set to 'pending'
-  // here, so the modal never mounts, not even momentarily. Real ChatPane
-  // drafts still go through handleDraftReady, unchanged.
-  const handleDevForceTier3 = () => {
-    if (!personaId) return
-    commands
-      .devSeedTier3DraftMessage(
-        requireCurrentUserId(),
-        personaId,
-        `tier3-access-${personaId}`,
-      )
-      .then((seedResult) => {
-        if (seedResult.status !== 'ok') {
-          setOpenError(seedResult.error)
-          return
-        }
-        commands
-          .devBypassTier3Gate3Review({
-            user_id: requireCurrentUserId(),
-            persona_id: personaId,
-            message_id: seedResult.data,
-          })
-          .then((bypassResult) => {
-            if (bypassResult.status === 'ok') {
-              setReviewOutcome('approved')
-            } else {
-              setOpenError(bypassResult.error)
-            }
-          })
-      })
-  }
+  // items.id=391 (Jason, 2026-09-02): the dev-only force-escalation
+  // scaffolding that used to live here (DIAG_329/items.id=329,
+  // DIAG_356/items.id=356 -- devSeedTier3DraftMessage +
+  // devBypassTier3Gate3Review) is REMOVED, not just hidden -- the chat
+  // toolbar's real "2nd opinion" button (below, handleSecondOpinion) now
+  // covers the same fast-iteration need through the real
+  // requestTier3Gate3Review path, on the real last message, no synthetic
+  // seed or gate3() bypass required. The Rust-side dev-only commands
+  // themselves are untouched (out of scope here; a separate cleanup if
+  // nothing else ever calls them).
 
   const handleModalCancel = () => {
     setConsentPayload(null)
@@ -692,8 +757,24 @@ export function Tier3AccessPane({
   // used verbatim, not reconstructed client-side.
   const chatContextKey = activeChat ? activeChat.context_key : `tier3-access-${personaId}`
 
+  // items.id=391 (tenth pass): drives Tier3CollapsedStrip's own
+  // `emptyState` prop, consulted only when openProviderIds is empty --
+  // see that component's header comment for what each value means. This
+  // used to gate a separate chat-toolbar "2nd opinion" button (removed --
+  // the always-visible bar below now covers the same action).
+  const secondOpinionEmptyState: 'approved' | 'reviewable' | 'none' =
+    lastAssistantMessage?.gate3_review_status === 'approved'
+      ? 'approved'
+      : lastAssistantMessage
+        ? 'reviewable'
+        : 'none'
+
   return (
-    <div className="tier3-access-pane" data-dominant={dominant}>
+    <div
+      className="tier3-access-pane"
+      data-dominant={dominant}
+      data-floor={floor ? '' : undefined}
+    >
       <PaneHitLayer rects={paneRects} />
       {/* items.id=234: mounted AFTER PaneHitLayer -- DOM source order alone
           resolves popup-vs-parent-pane hit-test precedence in any
@@ -702,46 +783,92 @@ export function Tier3AccessPane({
 
       <div
         className="tier3-access-pane__qr"
-        data-collapsed={dominant === 'tier3' ? '' : undefined}
+        data-collapsed={floor || dominant === 'tier3' ? '' : undefined}
+        data-floor={floor ? '' : undefined}
       >
-        {personaId ? (
-          <>
-            {/* decisions.id=743: QR's own identity banner -- only while
-                expanded. QR's collapsed floor (dominant === 'tier3') has
-                its own compact mark via ChatPane's collapsed strip
-                already; this banner would be redundant chrome on top of
-                that, and the mockup this decision traces to only ever
-                shows it alongside the full transcript view. items.id=384
-                slice 7: the chat-history/new-chat tools share this same
-                row -- the reference mockup shows them in the collapsed
-                floor too, but building that means reaching into
-                ChatPane's own collapsed-strip markup, which this item's
-                plan explicitly keeps unchanged; deferred, not silently
-                dropped. Both disabled while a Gate3 review is pending --
-                see resetGate3State's own comment on why switching mid-
-                review is avoided rather than handled. */}
-            {dominant === 'chat' && (
-              <div className="tier3-access-pane__qr-banner">
-                <span className="tier3-access-pane__qr-banner-name">
-                  {t('navShell.tier3AccessPane.qrBannerName')}
-                </span>
-                <div className="tier3-access-pane__qr-banner-tools">
-                  <ChatHistoryList
-                    userId={requireCurrentUserId()}
-                    personaId={personaId}
-                    activeChatId={activeChat?.id ?? null}
-                    onSelectChat={handleSelectChat}
-                    disabled={reviewOutcome === 'pending'}
-                  />
-                  <NewChatPersonaPicker
-                    personas={personas}
-                    activePersonaId={personaId}
-                    onStartNewChat={handleStartNewChat}
-                    disabled={reviewOutcome === 'pending'}
-                  />
-                </div>
-              </div>
-            )}
+        {/* items.id=391 (tenth pass -- "three bars, one expanded"
+            redesign): the mockup's chat-toolbar (History, persona list)
+            no longer lives in its own bordered side column -- confirmed
+            live (Jason): a separate boxed toolbar beside the chat panel
+            read as "three slightly different screens" bolted together,
+            not one consistent design. Folded into THIS bar instead --
+            same row that used to carry only the "Quiet Rabbit -- this
+            conversation" title, restyled (NavShell.css) to match Board's
+            and Tier3's own bars (WorkspaceShell.tsx / Tier3CollapsedStrip)
+            so all three read as the same kind of row. Un-gated from
+            personaId, same as the toolbar it replaces -- the persona
+            picker inside it is how a user with no Persona yet picks
+            their first one, so the bar itself (with a fallback label)
+            must render even then, not just once personaId is set.
+            ChatHistoryList is the one piece that still needs a real
+            personaId (list_chats is Persona-scoped) -- guarded inline.
+            Only while QR is fully expanded (dominant === 'chat') AND not
+            floored: QR's collapsed floor (dominant === 'tier3', or floor
+            === true) has its own compact mark via ChatPane's collapsed
+            strip already, which has no room for this bar beside it.
+            Lives as a SIBLING of .qr-panel (below), never an ancestor of
+            ChatPane -- ChatPane's own direct parent must stay constant
+            across the dominant toggle so React never remounts it (see
+            this pane's own header comment on why: ChatPane's collapsed
+            prop is what's supposed to preserve message state, not a
+            fresh mount). */}
+        {!floor && dominant === 'chat' && (
+          <div className="tier3-access-pane__section-header">
+            <span className="tier3-access-pane__section-header-name">
+              {personaId
+                ? t('navShell.tier3AccessPane.qrBannerName')
+                : t('navShell.content.tier3ChatUnavailable')}
+            </span>
+            <div className="tier3-access-pane__section-header-controls">
+              {personaId && (
+                <ChatHistoryList
+                  userId={requireCurrentUserId()}
+                  personaId={personaId}
+                  activeChatId={activeChat?.id ?? null}
+                  onSelectChat={handleSelectChat}
+                  disabled={reviewOutcome === 'pending'}
+                />
+              )}
+              <NewChatPersonaPicker
+                personas={personas}
+                activePersonaId={personaId}
+                onStartNewChat={handleStartNewChat}
+                disabled={reviewOutcome === 'pending'}
+                layout="pills"
+              />
+            </div>
+          </div>
+        )}
+        {floor && (
+          // items.id=391 (Jason, 2026-09-02): "compressed" doesn't mean
+          // "just a snippet" -- confirmed live, the floor needs the same
+          // persona picker the compact/minimized toolbar has, the
+          // compact pills treatment (no room for anything wider in a
+          // one-row floor) so switching/starting a chat as a different
+          // Persona doesn't require expanding Chat first. Sits beside
+          // .qr-panel -- .qr switches to row direction specifically
+          // while floor is true (NavShell.css's own [data-floor] rule),
+          // unlike the banner case above, which needs .qr in its default
+          // column direction (bar on top, .qr-panel's real content
+          // below).
+          <div className="tier3-access-pane__floor-picker">
+            <NewChatPersonaPicker
+              personas={personas}
+              activePersonaId={personaId}
+              onStartNewChat={handleStartNewChat}
+              disabled={reviewOutcome === 'pending'}
+              layout="pills"
+            />
+          </div>
+        )}
+        <div className="tier3-access-pane__qr-panel">
+          {personaId ? (
+            // decisions.id=743: QR's own identity header now lives above
+            // this element (.section-header, this file's own comment on
+            // that class) rather than nested inside this branch -- it needs to
+            // render even when personaId is null (the persona-picker's
+            // "pick your first Persona" case), which this branch by
+            // definition never is.
             <ChatPane
               contextKey={chatContextKey}
               userId={requireCurrentUserId()}
@@ -749,32 +876,154 @@ export function Tier3AccessPane({
               focusId="quick-ask"
               gate3Track={true}
               onDraftReady={handleDraftReady}
-              collapsed={dominant === 'tier3'}
-              onExpand={reclaimChat}
+              collapsed={floor || dominant === 'tier3'}
+              onExpand={floor ? onFloorExpand : reclaimChat}
+              onLastAssistantMessageChange={setLastAssistantMessage}
             />
-          </>
-        ) : (
-          <p>{t('navShell.content.tier3ChatUnavailable')}</p>
-        )}
+          ) : floor ? (
+            // items.id=391 (Jason, 2026-09-02, second pass): "compressed"
+            // doesn't mean "just a snippet with nothing else" -- reuses
+            // ChatPane's own collapsed-strip AND input-row classes
+            // (ChatPane.css) together, matching what a real collapsed
+            // ChatPane renders below its own strip, so this reads as the
+            // same kind of floor, just with nothing to click through to
+            // yet. The persona picker lives beside this in the row-level
+            // .floor-picker sibling above, not duplicated here.
+            //
+            // items.id=391 (Jason, 2026-09-02, ninth pass): the input/send
+            // used to be plain `disabled` -- confirmed live, that read as
+            // genuinely inert instead of as another way to reach the same
+            // "pick a Persona" action the collapsed strip and floor-picker
+            // already offer. readOnly instead of disabled: still not
+            // actually typeable (nothing here is wired to a draft, so
+            // picking a Persona -- which drops this component into the
+            // real ChatPane branch above -- has nothing that needs to
+            // carry over), but focusable/clickable, so clicking or
+            // tabbing into the input (or clicking Send) triggers
+            // onFloorExpand exactly like clicking the strip does --
+            // matching ChatPane's own real collapsed-input onFocus
+            // behavior, not a separate mechanism.
+            <div className="chat-pane" data-collapsed="">
+              <button
+                type="button"
+                className="chat-pane__collapsed-strip"
+                onClick={onFloorExpand}
+              >
+                <span className="chat-pane__collapsed-mark" aria-hidden="true" />
+                {/* items.id=391 (eleventh pass): matches ChatPane.tsx's own
+                    real collapsed-strip -- see its comment on why this
+                    name is needed at all ("no qr chat bar"). */}
+                <span className="chat-pane__collapsed-name">
+                  {t('navShell.tier3AccessPane.qrBannerName')}
+                </span>
+                <span className="chat-pane__collapsed-snippet">
+                  {t('navShell.content.tier3ChatUnavailable')}
+                </span>
+                <span className="chat-pane__collapsed-expand" aria-hidden="true">
+                  {t('navShell.tier3CollapsedStrip.expandLabel')}
+                </span>
+              </button>
+              <div className="chat-pane__input-row">
+                <label
+                  className="chat-pane__input-label"
+                  htmlFor="tier3-access-pane-floor-empty-input"
+                >
+                  {t('navShell.chat.inputLabel')}
+                </label>
+                <input
+                  id="tier3-access-pane-floor-empty-input"
+                  type="text"
+                  className="chat-pane__input"
+                  placeholder={t('navShell.chat.inputPlaceholder')}
+                  readOnly
+                  onFocus={() => onFloorExpand?.()}
+                  onClick={() => onFloorExpand?.()}
+                />
+                <button type="button" onClick={() => onFloorExpand?.()}>
+                  {t('navShell.chat.sendButton')}
+                </button>
+              </div>
+            </div>
+          ) : (
+            // items.id=391 (Jason, 2026-09-02 live-verification pass): a
+            // bare banner here still read as an error, not an invitation
+            // to act -- reusing ChatPane's own message-bubble/input-row
+            // classes (ChatPane.css, plain global classnames, no CSS
+            // Modules -- safe to reuse directly) makes this render as a
+            // real chat response ("Select a Persona to begin chatting")
+            // instead, with the SAME input row shape a real chat has,
+            // just disabled -- there is nowhere to send a message to yet.
+            // No picker down here any more (a second copy of it, right
+            // above -- see the section-header's own comment on why it's
+            // un-gated from personaId now): one picker, not two. Picking a Persona
+            // there calls handleStartNewChat, which sets personaId via
+            // onPersonaChange and creates a real chat, dropping this
+            // component into the normal ChatPane branch above on the next
+            // render -- the disabled input here is never wired to a
+            // draft, so nothing needs to carry over.
+            <div className="chat-pane">
+              <div className="chat-pane__transcript">
+                <ul className="chat-pane__message-list">
+                  <li className="chat-pane__message chat-pane__message--assistant">
+                    <span className="chat-pane__message-content">
+                      {t('navShell.content.tier3ChatUnavailable')}
+                    </span>
+                  </li>
+                </ul>
+              </div>
+              <div className="chat-pane__input-row">
+                <label
+                  className="chat-pane__input-label"
+                  htmlFor="tier3-access-pane-empty-input"
+                >
+                  {t('navShell.chat.inputLabel')}
+                </label>
+                <input
+                  id="tier3-access-pane-empty-input"
+                  type="text"
+                  className="chat-pane__input"
+                  placeholder={t('navShell.chat.inputPlaceholder')}
+                  disabled
+                />
+                <button type="button" disabled>
+                  {t('navShell.chat.sendButton')}
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
       </div>
 
-      {/* DIAG_329 (items.id=329): dev-only, see handleDevForceTier3's own
-          comment. Deliberately OUTSIDE the dominant branches below -- it
-          needs to be clickable from a fresh dominant:'chat' session too
-          (that's the whole point: skip straight to the approved/rail
-          state without typing a message first). Its own success path
-          sets reviewOutcome to 'approved', which the effect above turns
-          into dominant:'tier3' on its own -- no direct call needed here. */}
-      {import.meta.env.DEV && personaId && (
-        <button type="button" onClick={handleDevForceTier3}>
-          Dev: force Tier 3 escalation
-        </button>
-      )}
-
-      {dominant === 'tier3' ? (
-        <div className="tier3-access-pane__split-area">
+      {/* items.id=391 (tenth pass): this is the SECOND of the three peer
+          bars/regions (Board's own bar/region lives in WorkspaceShell.tsx,
+          above this component; QR's row is above, within .qr). Exactly
+          one of the three is ever the fully-expanded region -- Tier3 gets
+          the rail+content-pane split ONLY while it's the expanded one
+          (!floor && dominant === 'tier3'); every other combination
+          (floor, or dominant === 'chat') renders Tier3CollapsedStrip
+          instead, unconditionally -- Jason's own framing for this pass:
+          "a second opinion bar always visible." No redundant "back to
+          Board" button here any more either -- WorkspaceShell's own
+          board-bar already covers that whenever Board isn't expanded,
+          which is exactly whenever Tier3 CAN be the expanded region. */}
+      {!floor && dominant === 'tier3' ? (
+        <>
+          {/* items.id=391 (eleventh pass): promoted out of the rail
+              column's own <h3> -- confirmed live (Jason): "the QR chat
+              and second opinion need consistent headers... expanded
+              partially or fully." A heading buried inside the narrow
+              220px rail column couldn't visually match QR's own
+              full-width header bar no matter how it was styled; this bar
+              is the SAME .section-header class QR's own header uses
+              (NavShell.css), just title-only -- no controls, unlike QR's
+              (History/persona picker have no Tier3 equivalent). */}
+          <div className="tier3-access-pane__section-header">
+            <span className="tier3-access-pane__section-header-name">
+              {t('navShell.tier3AccessPane.heading')}
+            </span>
+          </div>
+          <div className="tier3-access-pane__split-area">
           <div className="tier3-access-pane__rail-col">
-            <h3>{t('navShell.tier3AccessPane.heading')}</h3>
             {providerError && (
               <p role="alert">
                 {t('navShell.tier3AccessPane.providerError', {
@@ -817,7 +1066,37 @@ export function Tier3AccessPane({
 
           <div className="tier3-access-pane__content-pane">
             {activeProviderId !== null && (
-              <div className="tier3-access-pane__content-head">
+              // items.id=391 (Jason, 2026-09-02): the mockup's own
+              // content-head/content-body both carry "click to collapse
+              // Tier 3, bring QR chat forward" -- reclaimChat, the SAME
+              // action the QR floor's own collapsed strip already
+              // triggers, just from a second, more discoverable spot.
+              // Only the head (not content-body) gets this here: the
+              // active pane's own CEF texture composites directly into
+              // .content-body's bounding rect (that element's own doc
+              // comment), so a click handler there would fight the real
+              // page's own interactivity -- every click meant for the
+              // external provider's page would also collapse Tier 3.
+              // The head is plain DOM chrome, nothing composited over it,
+              // so it's a safe, always-available "back to chat" target.
+              // This does NOT touch boardSize -- reclaimChat only ever
+              // sets dominant back to 'chat'; Board stays exactly however
+              // it was (minimized bar if that's where this session
+              // started), never jumping to full/dominant the way the
+              // rail's separate "Active Board" button deliberately does.
+              <div
+                className="tier3-access-pane__content-head"
+                onClick={reclaimChat}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault()
+                    reclaimChat()
+                  }
+                }}
+                role="button"
+                tabIndex={0}
+                title={t('navShell.tier3AccessPane.contentHeadReclaimTitle')}
+              >
                 <span className="tier3-access-pane__content-head-name">
                   {activeProvider?.name ?? activeProviderId}
                 </span>
@@ -842,13 +1121,18 @@ export function Tier3AccessPane({
               )}
             </div>
           </div>
-        </div>
+          </div>
+        </>
       ) : (
         <Tier3CollapsedStrip
           providers={providers}
           openProviderIds={openProviderIds}
           activeProviderId={activeProviderId}
           onExpand={activate}
+          emptyState={secondOpinionEmptyState}
+          onExpandRail={markTier3Ready}
+          onReview={handleSecondOpinion}
+          reviewDisabled={reviewOutcome === 'pending'}
         />
       )}
 

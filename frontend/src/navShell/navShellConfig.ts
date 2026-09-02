@@ -95,7 +95,20 @@ export interface DominancePairState {
 
 /** decisions.id=737: Active Board's three discrete size states (its card
  *  grid doesn't reflow continuously, unlike Chat) -- live as of slice 3,
- *  read/written by WorkspaceShell.tsx. */
+ *  read/written by WorkspaceShell.tsx.
+ *
+ *  items.id=391 (tenth pass, the "three bars, one expanded" redesign):
+ *  'full' and 'compact' both mean Board is the EXPANDED region -- they
+ *  differ only in density (ActiveBoardPane's `dense` prop), a pure
+ *  Board-owned preference, independent of anything else on screen.
+ *  'minimized' means Board is NOT expanded -- it renders as a bar instead
+ *  (WorkspaceShell.tsx), and the Chat<->Tier3 pair (Tier3AccessPane)
+ *  occupies the expanded region instead. This value no longer encodes a
+ *  growth STAGE (an earlier version of this type drove a three-step
+ *  Board-shrinks/Chat-grows sequence through 'full' -> 'compact' ->
+ *  'minimized' -- removed, see WorkspaceShell.tsx's own header comment)
+ *  -- just "is Board expanded, and if so how dense." See
+ *  WorkspaceShell.tsx's own header comment for the full mapping. */
 export type BoardSizeState = 'full' | 'compact' | 'minimized'
 
 export interface NavState {
@@ -138,6 +151,27 @@ export const DEFAULT_NAV_STATE: NavState = {
  *  fixed variant, which used to discard a Persona anchor outright). */
 export function selectFixed(id: FixedButtonId): (state: NavState) => NavState {
   return (state) => ({ ...state, topLevel: { kind: 'fixed', id }, chain: [] })
+}
+
+/** items.id=391 (Jason, 2026-09-01 live-verification pass): re-tapping the
+ *  'workspace' fixed button ("Board / Chat") is a "go home" gesture, not
+ *  just a plain return to whatever Board/Chat/Tier3 state was left --
+ *  unlike every other fixed button (and unlike navigating to 'workspace'
+ *  any other way), it always resets to the canonical Board full-size +
+ *  Chat pairing, never landing on a still-dominant Tier 3. This is the
+ *  ONE deliberate exception to workspace state persisting across
+ *  navigation (see DominancePairState's own doc comment on why it
+ *  persists in general) -- composed as a single state transform, not
+ *  three separate setNavState calls, so NavShell.tsx's handler applies it
+ *  atomically against one prior state. */
+export function selectWorkspaceHome(): (state: NavState) => NavState {
+  return (state) => ({
+    ...selectFixed('workspace')(state),
+    workspace: {
+      boardSize: 'full',
+      pair: { ...state.workspace.pair, dominant: 'chat', activeProviderId: null },
+    },
+  })
 }
 
 /** Tapping a Persona button enters the Persona hub for it and clears the

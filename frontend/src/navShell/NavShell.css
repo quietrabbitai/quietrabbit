@@ -78,12 +78,35 @@
   min-width: 0;
 }
 
+/* items.id=391: floor mode (WorkspaceShell's boardSize 'full') mounts
+ * this component directly as a flex child of the board-dominant column --
+ * it must size to its one-row floor content, not grow to fill whatever's
+ * left the way the base rule above (flex:1, for every other boardSize)
+ * does. One extra attribute selector vs the base rule -- wins on
+ * specificity regardless of source order. */
+.tier3-access-pane[data-floor] {
+  flex: 0 0 auto;
+  min-height: 0;
+}
+
 .tier3-access-pane__qr {
   flex: 0 0 34%;
   min-height: 170px;
   display: flex;
+  /* items.id=391 (tenth pass): column by default -- the chat-history/
+   * new-chat tools no longer sit in their own side column (folded into
+   * .qr-banner, this file's own comment on that rule), so the default
+   * arrangement is that bar ON TOP of .qr-panel's real content, not
+   * beside it. Only the floor case still needs a row: the floor-picker
+   * sits BESIDE the one-row collapsed floor (Tier3AccessPane.tsx), see
+   * the [data-floor] override just below. */
   flex-direction: column;
+  gap: 10px;
   transition: flex-basis 220ms ease, min-height 220ms ease;
+}
+
+.tier3-access-pane__qr[data-floor] {
+  flex-direction: row;
 }
 
 .tier3-access-pane__qr[data-collapsed] {
@@ -100,41 +123,74 @@
   min-height: 0;
 }
 
-.tier3-access-pane__qr > * {
+/* items.id=391: floor mode (WorkspaceShell's boardSize 'full') is ALSO
+ * dominant === 'chat' (by construction -- Board always forces Chat
+ * dominance first), so the rule above would otherwise override
+ * .qr[data-collapsed]'s own flex:0 0 auto and stretch the one-row floor
+ * to fill Tier3AccessPane's entire height. Four class-level selectors
+ * here vs three above -- wins on specificity regardless of source order. */
+.tier3-access-pane[data-dominant='chat'] .tier3-access-pane__qr[data-collapsed] {
+  flex: 0 0 auto;
+  min-height: 0;
+}
+
+/* items.id=391 (Jason, 2026-09-02, second pass): floor mode's own compact
+ * persona picker -- sits beside .qr-panel in the row-direction .qr
+ * (.qr[data-floor], above), vertically centered since a floor row is
+ * much shorter than a full bar. */
+.tier3-access-pane__floor-picker {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+}
+
+.tier3-access-pane__qr-panel {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.tier3-access-pane__qr-panel > * {
   flex: 1;
   min-width: 0;
   min-height: 0;
 }
 
-/* items.id=384 slice 5, decisions.id=743: QR's own identity banner --
- * shown only when QR is expanded (not collapsed to its own floor, which
- * already has its own compact QR-mark treatment via ChatPane's collapsed
- * strip -- see its own collapsed-mark). Needed because a Tier3 provider's
- * own header can appear above QR in this merged layout (WorkspaceShell's
- * 'compact' state), and QR previously had no banner of its own to
- * disambiguate which panel is QR's.
- *
- * Uses the app's existing --accent tokens, not a new brand-specific
- * color: Palette v3 hasn't been applied live anywhere else in this app
- * (see tier3AccessConfig.ts's own note on that), and the one other place
- * QR gets a placeholder color today (ChatPane.css's collapsed-mark dot)
- * already uses var(--accent) for the same reason -- a real Chat-BRAND
- * visual pass is explicitly out of scope for this item. Overrides the
- * flex:1 the sibling rule above gives every direct child of
- * .tier3-access-pane__qr -- same specificity, later in the cascade, no
- * !important needed. */
-.tier3-access-pane__qr-banner {
+/* items.id=384 slice 5, decisions.id=743 / items.id=391 (eleventh pass):
+ * the shared "expanded region header" bar -- ONE class, used by every
+ * region's own full-content header, not just QR's: QR's own title+
+ * History+persona-picker row (Tier3AccessPane.tsx, below .qr), Tier3's
+ * own "Second opinion" title row (same file, above .split-area), AND
+ * Board's own "Active Board"+density-toggle row (WorkspaceShell.tsx,
+ * which imports this stylesheet for exactly this class). Confirmed live
+ * (Jason, two rounds): first, that QR's banner and the other two bars
+ * needed the SAME bordered-strip look when COLLAPSED (fixed the round
+ * before this one -- matched properties against .tier3-collapsed-strip,
+ * not a shared class, since collapsed bars are standalone clickable rows
+ * while this is a static header sitting above real content); second,
+ * that "the active bar needs a header when it's fully expanded and the
+ * QR chat and second opinion need consistent headers when they are
+ * expanded partially or fully" -- i.e. the EXPANDED-state headers needed
+ * to match EACH OTHER too, not just match the collapsed bars. A literal
+ * shared class (this rule) is what actually guarantees that for the
+ * expanded case, the way importing Tier3CollapsedStrip.css directly
+ * (rather than re-declaring matched values) guarantees it for Board's and
+ * Tier3's own collapsed bars. */
+.tier3-access-pane__section-header {
   flex: 0 0 auto;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  padding: 6px 10px;
-  border-bottom: 2px solid var(--accent-border);
-  background: var(--accent-bg);
+  padding: 9px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg);
 }
 
-.tier3-access-pane__qr-banner-name {
+.tier3-access-pane__section-header-name {
   font-size: 13px;
   font-weight: 500;
   color: var(--text-h);
@@ -144,14 +200,11 @@
   min-width: 0;
 }
 
-/* items.id=384 slice 7: houses ChatHistoryList + NewChatPersonaPicker --
- * flex:0 0 auto so they never lose their own width to the name's
- * ellipsis truncation above. */
-.tier3-access-pane__qr-banner-tools {
+.tier3-access-pane__section-header-controls {
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
-  gap: 6px;
-  flex: 0 0 auto;
+  gap: 8px;
 }
 
 .tier3-access-pane__split-area {
@@ -196,6 +249,9 @@
   padding: 6px 10px;
   border-bottom: 1px solid var(--border);
   flex: 0 0 auto;
+  /* items.id=391: clickable -- reclaims Chat dominance, mockup's own
+   * "click to collapse Tier 3, bring QR chat forward" gesture. */
+  cursor: pointer;
 }
 
 .tier3-access-pane__content-head-name {

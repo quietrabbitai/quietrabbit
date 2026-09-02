@@ -20,10 +20,6 @@
   text-align: left;
 }
 
-.active-board-pane__heading {
-  margin: 0;
-}
-
 .active-board-pane__persona-filter {
   display: flex;
   align-items: center;

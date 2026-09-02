@@ -20,6 +20,14 @@
 .chat-history-list__panel {
   position: absolute;
   top: 100%;
+  /* items.id=391 (tenth pass): right, not left -- this toggle moved back
+   * into a wide top bar (.qr-banner-controls, Tier3AccessPane.tsx),
+   * sitting immediately left of the persona picker. A left-anchored panel
+   * (this rule's own prior version, from when the toggle briefly lived in
+   * a cramped 118px toolbar column) would expand rightward into that
+   * picker instead. Right-anchoring expands leftward, into the open space
+   * under the banner's own name label, which always has room now that
+   * this toggle is back in a full-width bar. */
   right: 0;
   z-index: 5;
   margin-top: 4px;

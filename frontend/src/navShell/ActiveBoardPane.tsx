@@ -55,6 +55,11 @@ export interface ActiveBoardPaneProps {
   dense?: boolean
 }
 
+// items.id=391 (eleventh pass): this component no longer renders its own
+// "Active Board" heading -- WorkspaceShell.tsx now renders a
+// .section-header bar above this component whenever Board is expanded
+// (matching QR's and Tier3's own expanded headers, NavShell.css), so an
+// internal heading here would just duplicate it under a different style.
 export function ActiveBoardPane({ userId, dense = false }: ActiveBoardPaneProps) {
   const { t } = useTranslation()
   const [personas, setPersonas] = useState<PersonaInfo[]>([])
@@ -119,10 +124,6 @@ export function ActiveBoardPane({ userId, dense = false }: ActiveBoardPaneProps)
 
   return (
     <div className="active-board-pane">
-      <h2 className="active-board-pane__heading">
-        {t('navShell.activeBoardPane.heading')}
-      </h2>
-
       {personas.length > 1 && (
         <fieldset className="active-board-pane__persona-filter">
           <legend>{t('navShell.activeBoardPane.filterLabel')}</legend>

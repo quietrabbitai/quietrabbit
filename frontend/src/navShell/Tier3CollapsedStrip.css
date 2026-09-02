@@ -17,6 +17,37 @@
   border-color: var(--accent-border);
 }
 
+.tier3-collapsed-strip:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.tier3-collapsed-strip:disabled:hover {
+  border-color: var(--border);
+}
+
+/* items.id=391 (tenth pass): the 'none' empty state -- a plain div, not a
+ * button, since there's genuinely nothing to act on yet. Muted TEXT only
+ * (regular --text instead of the bold --text-h the interactive states
+ * use) -- confirmed live (Jason): dimming the whole row via opacity took
+ * the border down with it, so this bar read as having no border/background
+ * at all next to Board's and QR's own bars, undermining exactly the "look
+ * like one consistent bar" fix this pass is about. The border/background
+ * stay at full strength; only the label's own color communicates "nothing
+ * to act on here." */
+.tier3-collapsed-strip--empty {
+  cursor: default;
+  color: var(--text);
+}
+
+.tier3-collapsed-strip--empty:hover {
+  border-color: var(--border);
+}
+
+.tier3-collapsed-strip--empty .tier3-collapsed-strip__name {
+  font-weight: 400;
+}
+
 .tier3-collapsed-strip__name {
   font-weight: 500;
 }

@@ -117,6 +117,24 @@
   cursor: pointer;
 }
 
+/* items.id=391 (tenth pass -- "three bars, one expanded" redesign):
+ * QR's own collapsed floor is one of the three peer bars (Board's own
+ * bar, WorkspaceShell.tsx; the second-opinion bar, Tier3CollapsedStrip.
+ * css) whenever Chat isn't the expanded region -- confirmed live (Jason):
+ * this row rendering with no border/background at all (its own prior
+ * `border: none; background: none`) while the other two are bordered
+ * pills was a big part of "it still looks like three different screens."
+ * Wraps BOTH rows this state renders (the strip below, and the still-
+ * live .chat-pane__input-row beneath it) in one bordered card matching
+ * .tier3-collapsed-strip's own border/radius/background exactly -- a
+ * divider between the two takes the place of the strip's own border. */
+.chat-pane[data-collapsed] {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+  gap: 0;
+}
+
 /* items.id=359 piece 3 (decisions.id=731): QR's collapsed floor -- mark +
  * last-response snippet + (below, unchanged) the still-mounted entry bar. */
 .chat-pane__collapsed-strip {
@@ -130,6 +148,11 @@
   font: inherit;
   text-align: left;
   cursor: pointer;
+  width: 100%;
+}
+
+.chat-pane[data-collapsed] .chat-pane__collapsed-strip {
+  border-bottom: 1px solid var(--border);
 }
 
 .chat-pane__collapsed-mark {
@@ -139,6 +162,18 @@
   border-radius: 50%;
   background: var(--accent);
   opacity: 0.7;
+}
+
+/* items.id=391 (eleventh pass): same name/weight/color as
+ * .tier3-collapsed-strip__name and .tier3-access-pane__section-header-name
+ * (NavShell.css/Tier3CollapsedStrip.css) -- QR's own collapsed bar needed
+ * the same "name leads the row" shape Board's and Tier3's bars already
+ * have, not just a snippet with nothing identifying whose bar it is. */
+.chat-pane__collapsed-name {
+  flex: 0 0 auto;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-h);
 }
 
 .chat-pane__collapsed-snippet {
@@ -165,6 +200,14 @@
   padding: 8px 12px;
   border-top: 1px solid var(--border);
   flex-shrink: 0;
+}
+
+/* items.id=391 (tenth pass): the collapsed card's own outer border
+ * (above) plus .collapsed-strip's own border-bottom already draw the
+ * divider between the two rows -- this rule's border-top would double
+ * it. */
+.chat-pane[data-collapsed] .chat-pane__input-row {
+  border-top: none;
 }
 
 .chat-pane__input-label {

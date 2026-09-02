@@ -17,7 +17,7 @@
     "content": {
       "myFactsPlaceholder": "My Facts -- not yet built.",
       "chatPlaceholder": "Chat -- not yet wired for this screen.",
-      "tier3ChatUnavailable": "Chat is unavailable -- no Persona is associated with this Tier 3 session."
+      "tier3ChatUnavailable": "Choose a Persona to start chatting."
     },
     "chat": {
       "emptyTranscript": "No messages yet.",
@@ -51,7 +51,6 @@
       "copySuccess": "Copied to clipboard."
     },
     "activeBoardPane": {
-      "heading": "Active Board",
       "filterLabel": "Persona",
       "filterAll": "All",
       "loadError": "Could not load the board: {{message}}",
@@ -60,14 +59,15 @@
       "cardSub": "{{persona}} · {{state}}"
     },
     "workspaceShell": {
-      "boardRowLabel": "Active Board -- tap to view",
-      "minimizeBoardButton": "Minimize board",
-      "pairRowLabel": "Chat & Tier 3 -- tap to view",
-      "pairRowLabelWithCount": "Chat & Tier 3 -- {{count}} loaded, tap to view"
+      "compactBoardButton": "Compact view",
+      "fullBoardButton": "Full view",
+      "boardBarLabel": "Active Board"
     },
     "tier3CollapsedStrip": {
       "expandLabel": "Tap to view",
-      "extraCount": "+{{count}} more loaded"
+      "extraCount": "+{{count}} more loaded",
+      "readyLabel": "Second opinion ready",
+      "emptyLabel": "No second opinion yet"
     },
     "personaHub": {
       "focusesHeading": "Focuses",
@@ -89,6 +89,7 @@
       "buttonTitle": "Start a new chat as {{persona}}"
     },
     "tier3AccessPane": {
+      "secondOpinionButton": "2nd opinion",
       "heading": "Second opinion",
       "qrBannerName": "Quiet Rabbit — this conversation",
       "loadingProviders": "Loading providers…",
@@ -96,6 +97,7 @@
       "openError": "Could not open pane(s): {{message}}",
       "contentEmptyPrompt": "Select a provider to start a second opinion.",
       "contentCloseButton": "Close this session",
+      "contentHeadReclaimTitle": "Click to collapse Tier 3 and bring QR chat forward",
       "gate3BlockedFallback": "This content can't be shared with Tier 3 right now.",
       "gate3Withheld": "Kept private — nothing was sent to Tier 3.",
       "gate3ReviewError": "Could not start the privacy review: {{message}}"

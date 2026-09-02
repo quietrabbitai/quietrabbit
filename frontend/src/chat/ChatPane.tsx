@@ -42,6 +42,21 @@ export interface ChatPaneProps {
    *  whichever provider was active back to loaded (decisions.id=731's
    *  symmetric transition). Ignored when collapsed is false/omitted. */
   onExpand?: () => void
+  /** items.id=391: fires whenever the latest assistant message changes
+   *  (including to null, on mount/contextKey change before any messages
+   *  have loaded, or for a transcript with no assistant turns yet) --
+   *  lets the caller (Tier3AccessPane's chat toolbar) offer an on-demand
+   *  "2nd opinion" action against the real last response, reusing this
+   *  component's own existing lastAssistantMessage lookup rather than
+   *  duplicating message-list tracking one level up. Carries
+   *  gate3_review_status alongside the id -- confirmed live (Jason,
+   *  2026-09-02): requestTier3Gate3Review hard-rejects a message whose
+   *  status is already terminal ("not awaiting gate3 review"), so the
+   *  caller needs the status to decide whether "2nd opinion" should
+   *  re-request review at all, not just which id to send. */
+  onLastAssistantMessageChange?: (
+    message: { id: string; gate3_review_status: string | null } | null,
+  ) => void
 }
 
 /** Hand-declared, not generated: RunStatusPayload (conductor/lifecycle.rs)
@@ -102,6 +117,7 @@ export function ChatPane({
   onDraftReady,
   collapsed = false,
   onExpand,
+  onLastAssistantMessageChange,
 }: ChatPaneProps) {
   const { t } = useTranslation()
   const [messages, setMessages] = useState<MessageInfo[]>([])
@@ -373,6 +389,21 @@ export function ChatPane({
   // liveMessageId already drives for the full transcript, so a
   // still-streaming response shows up here too, not just a finished one.
   const lastAssistantMessage = [...messages].reverse().find((m) => m.sender === 'assistant')
+
+  const lastAssistantMessageId = lastAssistantMessage?.id ?? null
+  const lastAssistantMessageReviewStatus = lastAssistantMessage?.gate3_review_status ?? null
+  useEffect(() => {
+    onLastAssistantMessageChange?.(
+      lastAssistantMessageId === null
+        ? null
+        : { id: lastAssistantMessageId, gate3_review_status: lastAssistantMessageReviewStatus },
+    )
+  }, [
+    lastAssistantMessageId,
+    lastAssistantMessageReviewStatus,
+    onLastAssistantMessageChange,
+  ])
+
   const lastAssistantSnippet = lastAssistantMessage
     ? lastAssistantMessage.id === liveMessageId && liveContent
       ? liveContent
@@ -389,6 +420,27 @@ export function ChatPane({
     }, 1400)
   }, [])
 
+  // items.id=391 (Jason, 2026-09-02): the transcript never auto-scrolled
+  // to the newest message at all -- confirmed as the actual blocker
+  // behind "click 2nd opinion, forget to copy the QR chat message, quickly
+  // click QR chat to copy it and go back to the Tier 3 screen": the
+  // approved starter message (this transcript's own copy affordance,
+  // above) is always the LATEST message when it exists, but reclaiming
+  // Chat re-expands the transcript wherever it happened to be scrolled --
+  // top, on a fresh mount -- not to that message, so it could be scrolled
+  // well out of view in anything but a short conversation. Scrolls to the
+  // bottom whenever new messages arrive AND whenever re-expanding from
+  // collapsed, so the thing the user almost certainly came back to look
+  // at (the newest message) is immediately visible, no manual scrolling
+  // needed before they can even find the copy button.
+  const transcriptRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (collapsed) return
+    const el = transcriptRef.current
+    if (!el) return
+    el.scrollTop = el.scrollHeight
+  }, [collapsed, messages])
+
   return (
     <div className="chat-pane" data-collapsed={collapsed ? '' : undefined}>
       {collapsed ? (
@@ -398,6 +450,18 @@ export function ChatPane({
           onClick={() => onExpand?.()}
         >
           <span className="chat-pane__collapsed-mark" aria-hidden="true" />
+          {/* items.id=391 (eleventh pass): confirmed live (Jason) -- "on
+              the second opinion screen, there is no qr chat bar." Board's
+              and Tier3's own collapsed bars both lead with a name
+              (tier3-collapsed-strip__name -- "Active Board", "Second
+              opinion ready"/a provider name); this row led with the
+              snippet instead, with nothing identifying it as QR's own bar
+              at all. Same name QR's own expanded header uses
+              (tier3AccessPane.qrBannerName) -- one string, reused, not a
+              shorter alternate that could drift from it. */}
+          <span className="chat-pane__collapsed-name">
+            {t('navShell.tier3AccessPane.qrBannerName')}
+          </span>
           <span className="chat-pane__collapsed-snippet">
             {lastAssistantSnippet ?? t('navShell.chat.collapsedEmptySnippet')}
           </span>
@@ -406,7 +470,7 @@ export function ChatPane({
           </span>
         </button>
       ) : (
-        <div className="chat-pane__transcript">
+        <div className="chat-pane__transcript" ref={transcriptRef}>
           {loadError && (
             <p role="alert">
               {t('navShell.chat.loadError', { message: loadError })}

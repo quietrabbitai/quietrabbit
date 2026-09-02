@@ -22,8 +22,9 @@
 // LOCK IDENTITY: hostname:pid:uuid (uuid generated once per process startup
 // via OnceLock). The UUID component eliminates PID-reuse false ownership.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::ConnectOptions;
@@ -455,6 +456,52 @@ async fn acquire_lock(conn: &mut SqliteConnection) -> Result<bool, MigrationErro
     Ok(result.rows_affected() == 1)
 }
 
+/// Acquire migration_lock, retrying with a short bounded backoff if it's
+/// currently held. items.id=391: React 18 StrictMode (frontend/src/main.tsx)
+/// double-invokes mount effects in dev builds -- ChatPane's own
+/// `listMessages` effect is one of them, and since items.id=384/389 made
+/// every DB open call migrate_messages_db/migrate_personal_db
+/// unconditionally (previously gated on the file not yet existing), two
+/// concurrent opens of the SAME db file now reliably race on this lock:
+/// confirmed live, 2026-09-01/02 verification passes ("database is
+/// locked" on message loading, "Migration lock held by another process"
+/// on the Tier3 dev-force-escalation path -- both are the same race
+/// hitting different callers of open_messages_db). Before 384/389 this
+/// never mattered: the loser's migration path was skipped entirely once
+/// the file already existed, so nothing ever contended for this lock in
+/// the same millisecond.
+///
+/// acquire_lock's own UPDATE is a single atomic statement -- it never
+/// blocks, it just reports whether THIS call won. The lock is only ever
+/// held for the duration of an in-process migration run (sub-millisecond
+/// once a database is already at its latest version, since every
+/// already-applied migration is a cheap version-number skip -- see
+/// run_pending), so a short bounded retry resolves both this in-process
+/// race and genuine cross-process contention (the lock's own
+/// "hostname:pid:uuid" identity, this file's header comment, already
+/// anticipates the latter) without masking a real stuck lock: exhausting
+/// every retry still returns false, same as before, and run_migrations
+/// still surfaces MigrationError::Locked's existing "try again in a
+/// moment" message in that case.
+async fn acquire_lock_with_retry(conn: &mut SqliteConnection) -> Result<bool, MigrationError> {
+    const MAX_ATTEMPTS: u32 = 8;
+    const INITIAL_DELAY_MS: u64 = 50;
+    const MAX_DELAY_MS: u64 = 500;
+
+    let mut delay_ms = INITIAL_DELAY_MS;
+    for attempt in 0..MAX_ATTEMPTS {
+        if acquire_lock(conn).await? {
+            return Ok(true);
+        }
+        if attempt + 1 == MAX_ATTEMPTS {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
+    }
+    Ok(false)
+}
+
 /// Release migration_lock unconditionally. Errors are swallowed — mirrors
 /// Python release_lock() which uses bare except pass.
 async fn release_lock(conn: &mut SqliteConnection) {
@@ -549,7 +596,7 @@ pub async fn run_migrations(
 
     bootstrap_lock_table(conn).await?;
 
-    if !acquire_lock(conn).await? {
+    if !acquire_lock_with_retry(conn).await? {
         return Err(MigrationError::Locked);
     }
 
@@ -676,15 +723,83 @@ pub fn get_data_root() -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
+// Per-file migration serialization
+// ---------------------------------------------------------------------------
+
+/// Per-db-file async mutex, created on first use and reused thereafter.
+///
+/// items.id=391: the real fix for the StrictMode double-mount race
+/// (React 18's dev-mode double-invoked mount effects -- see
+/// ChatPane.tsx's `listMessages` effect -- calling e.g. migrate_messages_db
+/// twice within the same file nearly simultaneously, reliably since
+/// items.id=384/389 made every DB open call it unconditionally). This
+/// session's first attempt (acquire_lock_with_retry, above) only wrapped
+/// the app-level `migration_lock` row check and turned out NOT to be
+/// enough: confirmed live (Jason, 2026-09-02) still hitting
+/// `(code: 5) database is locked` -- a raw SQLite SQLITE_BUSY, not this
+/// module's own `MigrationError::Locked`, meaning the actual contention
+/// is happening somewhere earlier/elsewhere in the sequence:
+/// bootstrap_lock_table's own CREATE TABLE/SAVEPOINT, or run_pending's
+/// per-migration SAVEPOINT (v1 files are ALWAYS re-run in full, even on
+/// an already-migrated database -- see run_pending's own comment), or the
+/// unconditional trailing `PRAGMA integrity_check` -- none of which
+/// acquire_lock_with_retry's loop ever touches. This matters more than it
+/// would under WAL: `QR_NETWORK_STORAGE=true` in this dev environment
+/// forces `journal_mode=DELETE` for every migration connection regardless
+/// of whether that particular file is actually on network storage (the
+/// choice is a single global env var, not per-path), and DELETE mode
+/// allows only one writer at a time file-wide.
+///
+/// Retrying around a specific query assumes we know where contention can
+/// occur; serializing in-process callers up front doesn't need that
+/// assumption and closes the gap for every current and future statement
+/// in the sequence at once. This does NOT replace acquire_lock_with_retry
+/// -- that still matters for genuine cross-process contention (a second
+/// QR process instance, which the lock table's own "hostname:pid:uuid"
+/// identity already anticipates and this in-process mutex can't see at
+/// all) -- the two are complementary, not redundant.
+///
+/// A std::sync::Mutex guards the HashMap itself (held only for the brief
+/// entry lookup/insert, never across an await); each entry is a
+/// tokio::sync::Mutex so a waiting caller yields instead of blocking a
+/// worker thread.
+fn path_lock(path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    static PATH_LOCKS: OnceLock<std::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> =
+        OnceLock::new();
+    let map = PATH_LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .entry(path.to_path_buf())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+/// Shared body for every typed migrate_*_db helper below: ensures the
+/// parent directory exists, serializes concurrent in-process callers
+/// against this exact file (see path_lock's own doc comment), opens a
+/// fresh connection, and runs the migration chain. One place for this
+/// sequence rather than each typed helper repeating it (which is also
+/// how items.id=391's fix reaches every one of them at once).
+async fn migrate_db_file(
+    db_path: &Path,
+    prefix: &str,
+    key_hex: Option<&str>,
+) -> Result<u32, MigrationError> {
+    std::fs::create_dir_all(db_path.parent().unwrap())?;
+    let lock = path_lock(db_path);
+    let _guard = lock.lock().await;
+    let mut conn = open_raw(db_path).await?;
+    run_migrations(&mut conn, prefix, key_hex).await
+}
+
+// ---------------------------------------------------------------------------
 // Typed migration helpers
 // ---------------------------------------------------------------------------
 
 /// Migrate instance/shared.db (unencrypted).
 pub async fn migrate_shared_db() -> Result<u32, MigrationError> {
     let db_path = get_data_root().join("instance").join("shared.db");
-    std::fs::create_dir_all(db_path.parent().unwrap())?;
-    let mut conn = open_raw(&db_path).await?;
-    run_migrations(&mut conn, "shared", None).await
+    migrate_db_file(&db_path, "shared", None).await
 }
 
 /// Migrate a user's personal.db (encrypted). key_hex: bare hex bytes only.
@@ -699,9 +814,7 @@ pub async fn migrate_personal_db(
         .join("personas")
         .join(persona_id)
         .join("personal.db");
-    std::fs::create_dir_all(db_path.parent().unwrap())?;
-    let mut conn = open_raw(&db_path).await?;
-    run_migrations(&mut conn, "personal", Some(key_hex)).await
+    migrate_db_file(&db_path, "personal", Some(key_hex)).await
 }
 
 /// Migrate a group's group.db (encrypted). key_hex: bare hex bytes only.
@@ -724,9 +837,7 @@ pub async fn migrate_group_db(
         .join(persona_id)
         .join(group_id)
         .join("group.db");
-    std::fs::create_dir_all(db_path.parent().unwrap())?;
-    let mut conn = open_raw(&db_path).await?;
-    run_migrations(&mut conn, "group", Some(key_hex)).await
+    migrate_db_file(&db_path, "group", Some(key_hex)).await
 }
 
 /// Migrate a user's outputs.db (encrypted). key_hex: bare hex bytes only.
@@ -741,9 +852,7 @@ pub async fn migrate_outputs_db(
         .join("personas")
         .join(persona_id)
         .join("outputs.db");
-    std::fs::create_dir_all(db_path.parent().unwrap())?;
-    let mut conn = open_raw(&db_path).await?;
-    run_migrations(&mut conn, "outputs", Some(key_hex)).await
+    migrate_db_file(&db_path, "outputs", Some(key_hex)).await
 }
 
 /// Migrate a user's messages.db (encrypted). key_hex: bare hex bytes only.
@@ -758,9 +867,7 @@ pub async fn migrate_messages_db(
         .join("personas")
         .join(persona_id)
         .join("messages.db");
-    std::fs::create_dir_all(db_path.parent().unwrap())?;
-    let mut conn = open_raw(&db_path).await?;
-    run_migrations(&mut conn, "messages", Some(key_hex)).await
+    migrate_db_file(&db_path, "messages", Some(key_hex)).await
 }
 
 /// Migrate a VIEW-ONLY persona share's recipient-side read-only cache
@@ -787,9 +894,7 @@ pub async fn migrate_view_cache_db(
         .join("persona_view_shares")
         .join(share_id)
         .join("view_cache.db");
-    std::fs::create_dir_all(db_path.parent().unwrap())?;
-    let mut conn = open_raw(&db_path).await?;
-    run_migrations(&mut conn, "view_cache", Some(key_hex)).await
+    migrate_db_file(&db_path, "view_cache", Some(key_hex)).await
 }
 
 /// Migrate a user's integration_keys.db (encrypted). key_hex: bare hex bytes only.
@@ -798,9 +903,7 @@ pub async fn migrate_keys_db(user_id: &str, key_hex: &str) -> Result<u32, Migrat
         .join("users")
         .join(user_id)
         .join("integration_keys.db");
-    std::fs::create_dir_all(db_path.parent().unwrap())?;
-    let mut conn = open_raw(&db_path).await?;
-    run_migrations(&mut conn, "keys", Some(key_hex)).await
+    migrate_db_file(&db_path, "keys", Some(key_hex)).await
 }
 
 /// Migrate a user's tier3_cookies.db (encrypted). key_hex: bare hex bytes
@@ -813,17 +916,13 @@ pub async fn migrate_tier3_cookies_db(user_id: &str, key_hex: &str) -> Result<u3
         .join("users")
         .join(user_id)
         .join("tier3_cookies.db");
-    std::fs::create_dir_all(db_path.parent().unwrap())?;
-    let mut conn = open_raw(&db_path).await?;
-    run_migrations(&mut conn, "tier3_cookies", Some(key_hex)).await
+    migrate_db_file(&db_path, "tier3_cookies", Some(key_hex)).await
 }
 
 /// Migrate models/scores.db (unencrypted).
 pub async fn migrate_scores_db() -> Result<u32, MigrationError> {
     let db_path = get_data_root().join("models").join("scores.db");
-    std::fs::create_dir_all(db_path.parent().unwrap())?;
-    let mut conn = open_raw(&db_path).await?;
-    run_migrations(&mut conn, "scores", None).await
+    migrate_db_file(&db_path, "scores", None).await
 }
 
 /// Migrate a focus's domain_context.db (encrypted). key_hex: bare hex bytes only.
@@ -842,9 +941,7 @@ pub async fn migrate_domain_context_db(
         .join("focuses")
         .join(focus_id)
         .join("domain_context.db");
-    std::fs::create_dir_all(db_path.parent().unwrap())?;
-    let mut conn = open_raw(&db_path).await?;
-    run_migrations(&mut conn, "domain_context", Some(key_hex)).await
+    migrate_db_file(&db_path, "domain_context", Some(key_hex)).await
 }
 
 /// Migrate a topic's plan_state.db (encrypted). key_hex: bare hex bytes only.
@@ -866,9 +963,7 @@ pub async fn migrate_plan_state_db(
         .join("topics")
         .join(topic_id)
         .join("plan_state.db");
-    std::fs::create_dir_all(db_path.parent().unwrap())?;
-    let mut conn = open_raw(&db_path).await?;
-    run_migrations(&mut conn, "plan_state", Some(key_hex)).await
+    migrate_db_file(&db_path, "plan_state", Some(key_hex)).await
 }
 
 /// Migrate both focus-level databases in one call.
@@ -1048,6 +1143,100 @@ mod tests {
             acquire_lock(&mut conn).await.unwrap(),
             "should acquire after release"
         );
+    }
+
+    #[tokio::test]
+    async fn test_acquire_lock_with_retry_succeeds_after_contender_releases() {
+        // items.id=391: regression test for the StrictMode double-mount-
+        // effect race (this function's own doc comment) -- two real
+        // connections to the SAME on-disk file (a :memory: connection
+        // can't model this: each :memory: connection is its own isolated
+        // database), one holding the lock while the other retries.
+        // Confirms acquire_lock_with_retry actually waits out a transient
+        // holder instead of failing on first contact the way plain
+        // acquire_lock (test_acquire_and_release_lock above) does.
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        let db_path = tempdir.path().join("lock_retry_test.db");
+
+        let mut conn1 = open_raw(&db_path).await.expect("conn1 open failed");
+        bootstrap_lock_table(&mut conn1).await.unwrap();
+        assert!(
+            acquire_lock(&mut conn1).await.unwrap(),
+            "conn1 must win the initial acquire"
+        );
+
+        let mut conn2 = open_raw(&db_path).await.expect("conn2 open failed");
+        bootstrap_lock_table(&mut conn2).await.unwrap();
+
+        let retry_handle = tokio::spawn(async move { acquire_lock_with_retry(&mut conn2).await });
+
+        // Give the retry loop a couple of failed attempts before releasing
+        // conn1's hold, so this test actually exercises the retry path
+        // rather than winning on a lucky first attempt.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        release_lock(&mut conn1).await;
+
+        let acquired = retry_handle
+            .await
+            .expect("retry task panicked")
+            .expect("acquire_lock_with_retry must not error");
+        assert!(
+            acquired,
+            "conn2 must eventually acquire the lock after conn1 releases"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_migrate_calls_to_the_same_file_do_not_race() {
+        // items.id=391: reproduces the actual StrictMode double-mount
+        // scenario -- two truly concurrent calls into the SAME typed
+        // helper (migrate_personal_db, chosen since it already exercises
+        // three real migration versions) against the SAME on-disk file,
+        // fired via tokio::join! rather than sequenced. Before path_lock
+        // (this module's migrate_db_file), this occasionally raced --
+        // confirmed live (Jason, 2026-09-02) as a raw SQLITE_BUSY
+        // ("(code: 5) database is locked"), not MigrationError::Locked,
+        // meaning acquire_lock_with_retry's own fix (which only wraps the
+        // app-level lock row -- see test above) doesn't cover it on its
+        // own. Forces journal_mode=DELETE via QR_NETWORK_STORAGE=true,
+        // matching this dev environment's real config -- WAL's
+        // readers-don't-block-writers behavior would mask the bug this
+        // test exists to catch.
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let saved_network = std::env::var("QR_NETWORK_STORAGE").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+        std::env::set_var("QR_NETWORK_STORAGE", "true");
+
+        let user_id = "concurrent-test-user";
+        let persona_id = "concurrent-test-persona";
+
+        // Prime the file once so both concurrent calls below hit the
+        // "already migrated, v1 always re-runs + trailing integrity_check"
+        // path -- the actual steady-state shape of every real ChatPane
+        // mount, not a fresh-file race that would resolve differently.
+        let primed = migrate_personal_db(user_id, persona_id, TEST_KEY_HEX).await;
+
+        let (r1, r2) = tokio::join!(
+            migrate_personal_db(user_id, persona_id, TEST_KEY_HEX),
+            migrate_personal_db(user_id, persona_id, TEST_KEY_HEX),
+        );
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+        if let Some(v) = saved_network {
+            std::env::set_var("QR_NETWORK_STORAGE", v);
+        } else {
+            std::env::remove_var("QR_NETWORK_STORAGE");
+        }
+
+        primed.expect("priming migration must succeed");
+        r1.expect("first concurrent call must not hit a database-locked race");
+        r2.expect("second concurrent call must not hit a database-locked race");
     }
 
     // -- items.id=205: auth foundation migration tests ---------------------

@@ -43,6 +43,7 @@ import {
   selectFixed,
   selectPersona,
   selectCrumb,
+  selectWorkspaceHome,
   setActivePersonaId,
   setBoardSize,
   updateWorkspacePair,
@@ -76,7 +77,10 @@ export function NavShell() {
   }, [])
 
   const handleSelectFixed = (id: FixedButtonId) => {
-    setNavState(selectFixed(id))
+    // items.id=391: 'workspace' ("Board / Chat") is a "go home" gesture --
+    // see selectWorkspaceHome's own doc comment for why it's not just
+    // selectFixed like every other fixed button.
+    setNavState(id === 'workspace' ? selectWorkspaceHome() : selectFixed(id))
   }
 
   const handleSelectPersona = (personaId: string) => {
