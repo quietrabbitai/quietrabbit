@@ -605,6 +605,18 @@ export const commands = {
 	/**  Every group_id `persona_id` is currently opted into. */
 	getGroupFactSources: (personaId: string) => typedError<string[], string>(__TAURI_INVOKE("get_group_fact_sources", { personaId })),
 	/**
+	 *  Group 23 -- History screen's Group row (items.id=404). Every group_id
+	 *  `persona_id` currently holds a durable key for -- actual group
+	 *  membership, distinct from get_group_fact_sources' opt-in-to-facts
+	 *  subset above (a persona can be a group member without having opted
+	 *  that group's facts into its own context assembly). Frontend-facing
+	 *  existence/count check only: deliberately strips group_key_hex (key
+	 *  material) and created_at, returning bare ids -- see GroupKeyRow's own
+	 *  fields. No group-metadata table exists anywhere to resolve these ids
+	 *  to a real display name -- that's items.id=407's scope, not this one's.
+	 */
+	listPersonaGroupIds: (personaId: string) => typedError<string[], string>(__TAURI_INVOKE("list_persona_group_ids", { personaId })),
+	/**
 	 *  Configure (or reconfigure) this install's folder-sync destination for a
 	 *  (persona_id, share_id) pair. `role` is "owner" or "recipient" -- see
 	 *  settings_store::set_persona_share_sync_folder's own doc comment on why a

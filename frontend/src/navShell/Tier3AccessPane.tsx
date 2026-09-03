@@ -111,22 +111,26 @@ export interface Tier3AccessPaneProps {
   /** NavState.workspace.pair -- see useDominancePair.ts. */
   pair: DominancePairState
   onUpdatePair: (updater: (prev: DominancePairState) => DominancePairState) => void
-  /** items.id=391 (tenth pass): true while Board is the expanded region
-   *  (WorkspaceShell's boardSize !== 'minimized') -- collapses QR to a
-   *  one-row floor (ChatPane's own collapsed strip: mark + last-message
-   *  snippet + a real, focusable entry bar, matching the mockup's
-   *  chat-floor) instead of unmounting it. No CEF-lifecycle reason to
-   *  unmount: the concern was always about Tier 3's own open panes, and
-   *  Board becoming expanded already forces dominant back to 'chat' first
-   *  (WorkspaceShell's board-bar reclaims chat before setting boardSize),
-   *  so there's never an open pane actively compositing while floor is
-   *  true. Board's own bar and the second-opinion bar (below) both still
-   *  render while floor is true -- see this file's header comment on the
-   *  tenth-pass "three bars, one expanded" model; floor only collapses
-   *  QR's own row, not the other two. */
+  /** items.id=391 (tenth pass), generalized by items.id=404: true whenever
+   *  neither Chat nor Tier3 is the outer 5-rail dock's dominant rail
+   *  (WorkspaceShell's `dominantRail !== 'chat' && dominantRail !== 'tier3'`
+   *  -- Board, Library, or History being dominant all set this now, not
+   *  just Board as pre-404). Collapses QR to a one-row floor (ChatPane's
+   *  own collapsed strip: mark + last-message snippet + a real, focusable
+   *  entry bar, matching the mockup's chat-floor) instead of unmounting
+   *  it. No CEF-lifecycle reason to unmount: the concern was always about
+   *  Tier 3's own open panes, and Board/Library/History becoming dominant
+   *  already forces dominantRail away from 'tier3' first (each of their
+   *  own dock-bar click handlers sets dominantRail directly, never
+   *  through pair.dominant), so there's never an open pane actively
+   *  compositing while floor is true. The dominant rail's own bar and the
+   *  second-opinion bar (below) both still render while floor is true --
+   *  see this file's header comment on the tenth-pass "three bars, one
+   *  expanded" model, now five; floor only collapses QR's own row, not
+   *  the others. */
   floor?: boolean
   /** items.id=391: fires when the floor (above) is clicked or its entry
-   *  bar focused -- WorkspaceShell's own onBoardSizeChange('minimized'),
+   *  bar focused -- WorkspaceShell's own onDominantRailChange('chat'),
    *  making Chat the expanded region (a one-step swap as of the tenth
    *  pass, not a multi-stage growth -- see WorkspaceShell.tsx's own
    *  header comment). Distinct from reclaimChat (which this component
@@ -134,6 +138,25 @@ export interface Tier3AccessPaneProps {
    *  already 'chat' whenever floor is true, so reclaiming it again would
    *  be a no-op. */
   onFloorExpand?: () => void
+  /** items.id=404: fires whenever an action INSIDE this component means
+   *  "make Chat or Tier3 the outer 5-rail dock's dominant rail" --
+   *  Tier3CollapsedStrip's own expand, the Tier3 content-head's "back to
+   *  chat" click, and ChatPane's own non-floor collapsed-strip click (the
+   *  dominant === 'tier3' case). See WorkspaceShell.tsx's own header
+   *  comment for why this is a set of direct calls at those specific
+   *  sites rather than a generic effect mirroring pair.dominant. */
+  onDominantRailChange: (rail: 'chat' | 'tier3') => void
+  /** items.id=404: ChatHistoryList's toggle no longer opens its own
+   *  dropdown -- it calls this instead, which WorkspaceShell wires to
+   *  make the History rail dominant with this Persona pre-selected. */
+  onOpenHistory: (target: { personaId: string }) => void
+  /** items.id=404: History's "resume this chat" row-action -- set by
+   *  WorkspaceShell when a specific past chat is picked from History's
+   *  action-pane. Consumed once (same shape as onFloorExpand): this
+   *  effect switches to it, then calls onPendingChatSelectionConsumed so
+   *  WorkspaceShell clears it and the effect doesn't refire. */
+  pendingChatSelection?: ChatInfo | null
+  onPendingChatSelectionConsumed?: () => void
 }
 
 export function Tier3AccessPane({
@@ -144,6 +167,10 @@ export function Tier3AccessPane({
   onUpdatePair,
   floor = false,
   onFloorExpand,
+  onDominantRailChange,
+  onOpenHistory,
+  pendingChatSelection = null,
+  onPendingChatSelectionConsumed,
 }: Tier3AccessPaneProps) {
   const { t } = useTranslation()
   const [providers, setProviders] = useState<Provider[]>([])
@@ -193,6 +220,26 @@ export function Tier3AccessPane({
     reclaimChat,
     markTier3Ready,
   } = useDominancePair(pair, onUpdatePair)
+
+  // items.id=404: the three internal actions that mean "make Tier3/Chat
+  // the outer dock's dominant rail" -- see this component's own
+  // onDominantRailChange doc comment and WorkspaceShell.tsx's header
+  // comment for why these are direct wraps, not a generic effect.
+  const activateAndPromote = useCallback(
+    (providerId: string) => {
+      onDominantRailChange('tier3')
+      activate(providerId)
+    },
+    [activate, onDominantRailChange],
+  )
+  const markTier3ReadyAndPromote = useCallback(() => {
+    onDominantRailChange('tier3')
+    markTier3Ready()
+  }, [markTier3Ready, onDominantRailChange])
+  const reclaimChatAndPromote = useCallback(() => {
+    onDominantRailChange('chat')
+    reclaimChat()
+  }, [reclaimChat, onDominantRailChange])
 
   /** The content pane's own placeholder body -- its bounding rect IS the
    *  active pane's on-screen rect (computeActivePaneRect). Deliberately
@@ -270,10 +317,15 @@ export function Tier3AccessPane({
   const prevReviewOutcomeRef = useRef<ReviewOutcome | null>(null)
   useEffect(() => {
     if (reviewOutcome === 'approved' && prevReviewOutcomeRef.current !== 'approved') {
-      markTier3Ready()
+      // items.id=404: preserves pre-existing behavior -- pre-404, this
+      // pair.dominant flip would already force Board (if expanded) back
+      // to a bar next render via the old effectiveBoardSize guard. The
+      // 5-rail model needs the promotion made explicit since there's no
+      // such guard any more (dominantRail is set directly, not derived).
+      markTier3ReadyAndPromote()
     }
     prevReviewOutcomeRef.current = reviewOutcome
-  }, [reviewOutcome, markTier3Ready])
+  }, [reviewOutcome, markTier3ReadyAndPromote])
 
   const syncPaneLayout = useCallback(() => {
     const body = contentBodyRef.current
@@ -561,7 +613,7 @@ export function Tier3AccessPane({
     if (!lastAssistantMessage) return
     switch (lastAssistantMessage.gate3_review_status) {
       case 'approved':
-        markTier3Ready()
+        markTier3ReadyAndPromote()
         return
       case 'withheld':
         setReviewOutcome('withheld')
@@ -569,7 +621,7 @@ export function Tier3AccessPane({
       default:
         handleDraftReady(lastAssistantMessage.id)
     }
-  }, [lastAssistantMessage, handleDraftReady, markTier3Ready])
+  }, [lastAssistantMessage, handleDraftReady, markTier3ReadyAndPromote])
 
   // Same cancelled/unlisten cleanup idiom as ChatPane's own first listen()
   // effect (run-status-update), per CLAUDE.md's "Tauri event listeners must
@@ -726,6 +778,18 @@ export function Tier3AccessPane({
     setActiveChat(chat)
   }, [])
 
+  // items.id=404: History's "resume this chat" row-action lands here --
+  // WorkspaceShell sets pendingChatSelection and dominantRail='chat' in
+  // the same handler tick (and onActivePersonaIdChange first, if needed),
+  // so by the time this effect runs, `personaId` above already matches
+  // the chat's own owning Persona. Reuses handleSelectChat's own logic
+  // rather than duplicating it.
+  useEffect(() => {
+    if (!pendingChatSelection) return
+    handleSelectChat(pendingChatSelection)
+    onPendingChatSelectionConsumed?.()
+  }, [pendingChatSelection, handleSelectChat, onPendingChatSelectionConsumed])
+
   const activeProvider = providers.find((p) => p.id === activeProviderId) ?? null
 
   // items.id=368: switching the active pane (setActivePane, Rust) hides the
@@ -822,10 +886,7 @@ export function Tier3AccessPane({
             <div className="tier3-access-pane__section-header-controls">
               {personaId && (
                 <ChatHistoryList
-                  userId={requireCurrentUserId()}
-                  personaId={personaId}
-                  activeChatId={activeChat?.id ?? null}
-                  onSelectChat={handleSelectChat}
+                  onOpenHistory={() => onOpenHistory({ personaId })}
                   disabled={reviewOutcome === 'pending'}
                 />
               )}
@@ -834,7 +895,6 @@ export function Tier3AccessPane({
                 activePersonaId={personaId}
                 onStartNewChat={handleStartNewChat}
                 disabled={reviewOutcome === 'pending'}
-                layout="pills"
               />
             </div>
           </div>
@@ -857,7 +917,6 @@ export function Tier3AccessPane({
               activePersonaId={personaId}
               onStartNewChat={handleStartNewChat}
               disabled={reviewOutcome === 'pending'}
-              layout="pills"
             />
           </div>
         )}
@@ -877,7 +936,7 @@ export function Tier3AccessPane({
               gate3Track={true}
               onDraftReady={handleDraftReady}
               collapsed={floor || dominant === 'tier3'}
-              onExpand={floor ? onFloorExpand : reclaimChat}
+              onExpand={floor ? onFloorExpand : reclaimChatAndPromote}
               onLastAssistantMessageChange={setLastAssistantMessage}
             />
           ) : floor ? (
@@ -1058,7 +1117,7 @@ export function Tier3AccessPane({
                 providers={providers}
                 openPaneIds={openProviderIds}
                 activeProviderId={activeProviderId}
-                onActivate={activate}
+                onActivate={activateAndPromote}
                 onClose={handleClose}
               />
             )}
@@ -1086,11 +1145,11 @@ export function Tier3AccessPane({
               // rail's separate "Active Board" button deliberately does.
               <div
                 className="tier3-access-pane__content-head"
-                onClick={reclaimChat}
+                onClick={reclaimChatAndPromote}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' || e.key === ' ') {
                     e.preventDefault()
-                    reclaimChat()
+                    reclaimChatAndPromote()
                   }
                 }}
                 role="button"
@@ -1128,9 +1187,9 @@ export function Tier3AccessPane({
           providers={providers}
           openProviderIds={openProviderIds}
           activeProviderId={activeProviderId}
-          onExpand={activate}
+          onExpand={activateAndPromote}
           emptyState={secondOpinionEmptyState}
-          onExpandRail={markTier3Ready}
+          onExpandRail={markTier3ReadyAndPromote}
           onReview={handleSecondOpinion}
           reviewDisabled={reviewOutcome === 'pending'}
         />

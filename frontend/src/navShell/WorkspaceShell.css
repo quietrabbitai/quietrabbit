@@ -14,12 +14,15 @@
  * is a direct flex child of .workspace-shell now (its own [data-floor]
  * rule in NavShell.css governs its size), no wrapper needed.
  *
- * The root element's own boardSize modifier is data-board-size, not a
- * className -- WorkspaceShell.tsx renders stable JSX shapes across every
- * boardSize (a React remount bug fix, see that file's own header
- * comment), so there's no separate className per state to hang a
- * selector off. Nothing here currently targets data-board-size directly;
- * it's there for any future rule that needs to. */
+ * items.id=404: generalized from 3 peer bars to 5 (Board/Chat/Tier3/
+ * Library/History) -- the root element's own dominance modifier is now
+ * data-dominant-rail (was data-board-size), still not a className for the
+ * same reason as before (Tier3AccessPane and, now, Library/History all
+ * render non-stable JSX shapes across dominance changes -- fine for them,
+ * per this file's own header comment on why only Tier3AccessPane itself
+ * needs positional stability). Nothing here currently targets
+ * data-dominant-rail directly; it's there for any future rule that needs
+ * to. */
 
 .workspace-shell {
   display: flex;
@@ -31,7 +34,9 @@
   padding: 8px 12px;
 }
 
-.workspace-shell__board-region {
+.workspace-shell__board-region,
+.workspace-shell__library-region,
+.workspace-shell__history-region {
   flex: 1;
   min-height: 0;
   min-width: 0;

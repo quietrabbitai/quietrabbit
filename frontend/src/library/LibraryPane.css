@@ -30,9 +30,24 @@
   gap: 4px;
 }
 
-.library-pane__list-item button {
-  width: 100%;
-  text-align: left;
+.library-pane__list-item {
+  display: flex;
+  flex-direction: column;
+}
+
+.library-pane__row-actions {
+  display: flex;
+  gap: 6px;
+  padding: 4px 8px 8px 16px;
+}
+
+.library-pane__action-pane {
+  margin-top: 4px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--code-bg);
+  overflow-y: auto;
 }
 
 .library-pane__notice,

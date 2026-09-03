@@ -1,7 +1,3 @@
-.chat-history-list {
-  position: relative;
-}
-
 .chat-history-list__toggle {
   font-size: 12px;
   padding: 4px 10px;
@@ -17,29 +13,14 @@
   cursor: not-allowed;
 }
 
-.chat-history-list__panel {
-  position: absolute;
-  top: 100%;
-  /* items.id=391 (tenth pass): right, not left -- this toggle moved back
-   * into a wide top bar (.qr-banner-controls, Tier3AccessPane.tsx),
-   * sitting immediately left of the persona picker. A left-anchored panel
-   * (this rule's own prior version, from when the toggle briefly lived in
-   * a cramped 118px toolbar column) would expand rightward into that
-   * picker instead. Right-anchoring expands leftward, into the open space
-   * under the banner's own name label, which always has room now that
-   * this toggle is back in a full-width bar. */
-  right: 0;
-  z-index: 5;
-  margin-top: 4px;
-  min-width: 220px;
-  max-height: 280px;
-  overflow-y: auto;
-  padding: 6px;
-  border-radius: 10px;
-  border: 1px solid var(--border);
-  background: var(--bg);
-  box-shadow: var(--shadow);
-}
+/* items.id=404: the rest of this file (item/title/time row styling) is no
+ * longer consumed by ChatHistoryList.tsx itself (that dropdown is gone --
+ * see this file's own header comment) but stays, and stays imported here,
+ * because HistoryScreen.tsx now reuses these exact class names for its
+ * Persona row's Chat History action-pane rows, so the two "past chat" row
+ * renderings can't visually drift apart -- same discipline as
+ * WorkspaceShell.tsx importing Tier3CollapsedStrip.css rather than
+ * duplicating it. */
 
 .chat-history-list__empty {
   padding: 8px;

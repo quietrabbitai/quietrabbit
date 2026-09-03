@@ -43,6 +43,7 @@ use crate::auth::group_membership::{self, DepartureReason};
 use crate::auth::registry::{key_hex, GroupKeyRegistry, KeyRegistry};
 use crate::group_sync::settings_store;
 use crate::persistence::group_fact_sources_store;
+use crate::persistence::group_key_store;
 
 #[derive(Debug, Serialize, Type)]
 pub struct GroupSyncSettingsInfo {
@@ -229,6 +230,32 @@ pub async fn get_group_fact_sources(
         .map_err(|e| e.to_string())
 }
 
+/// Group 23 -- History screen's Group row (items.id=404). Every group_id
+/// `persona_id` currently holds a durable key for -- actual group
+/// membership, distinct from get_group_fact_sources' opt-in-to-facts
+/// subset above (a persona can be a group member without having opted
+/// that group's facts into its own context assembly). Frontend-facing
+/// existence/count check only: deliberately strips group_key_hex (key
+/// material) and created_at, returning bare ids -- see GroupKeyRow's own
+/// fields. No group-metadata table exists anywhere to resolve these ids
+/// to a real display name -- that's items.id=407's scope, not this one's.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_persona_group_ids(
+    persona_id: String,
+    key_registry: State<'_, KeyRegistry>,
+) -> Result<Vec<String>, String> {
+    let (user_id, key_hex_str) = key_registry
+        .with_key(|k| (k.user_id.clone(), key_hex(&k.master_key)))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
+    group_key_store::list_group_keys(&user_id, &persona_id, &key_hex_str)
+        .await
+        .map(|rows| rows.into_iter().map(|row| row.group_id).collect())
+        .map_err(|e| e.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -392,6 +419,52 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_empty());
+    }
+
+    // -- Group 23: History screen's Group row (items.id=404) -----------------
+
+    #[tokio::test]
+    async fn list_persona_group_ids_is_empty_on_a_fresh_persona() {
+        let _env = setup().await;
+        let app = mock_app_with_registry();
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(
+            &registry,
+            "user-1",
+            [0x44u8; crate::auth::kdf::MASTER_KEY_LEN],
+        )
+        .await;
+
+        let result = list_persona_group_ids("persona-1".to_owned(), registry)
+            .await
+            .expect("list_persona_group_ids must succeed");
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_persona_group_ids_reflects_saved_group_keys_without_leaking_key_material() {
+        let _env = setup().await;
+        let app = mock_app_with_registry();
+        let registry = app.state::<KeyRegistry>();
+        let master_key = [0x55u8; crate::auth::kdf::MASTER_KEY_LEN];
+        populate_registry(&registry, "user-1", master_key).await;
+        let key_hex_str = key_hex(&master_key);
+
+        group_key_store::save_group_key(
+            "user-1",
+            "persona-1",
+            &key_hex_str,
+            "group-abc",
+            "deadbeef",
+            "2026-09-02T00:00:00Z",
+        )
+        .await
+        .expect("save_group_key must succeed");
+
+        let result = list_persona_group_ids("persona-1".to_owned(), registry)
+            .await
+            .expect("list_persona_group_ids must succeed");
+        assert_eq!(result, vec!["group-abc".to_owned()]);
     }
 
     #[tokio::test]

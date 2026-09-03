@@ -1,212 +1,129 @@
-// Top-strip / navigation-shell -- structural types and constants.
+// Navigation-shell structural types and constants -- the 5-rail dock model.
 //
-// Traces to: 03_ProjectDocs/Specifications/INFORMATION_ARCHITECTURE_SPEC.md
-// Section 2 (Top strip structure), Section 2e (temporary buttons + chain
-// truncation), Section 4 (Persona hub), adopted 2026-07-27,
-// decisions.id=652-656 -- and 658/659, which set the PRIOR slot set (My
-// Facts as the 4th global button, Tier 3 access as a persona-gated 5th).
-// items.id=384 (decisions.id=734-735) supersedes that 5-button layout:
-// Active Board and Tier 3 access are no longer separate top-strip
-// buttons -- both live inside one merged 'workspace' button/screen now
-// (see WorkspaceShell.tsx), matching the reference mockup's single
-// "Board / Chat" top-strip entry.
+// Traces to: 03_ProjectDocs/Specifications/HIERARCHICAL_NAV_SHELL_DESIGN_20260902.md
+// (items.id=404, decisions.id=748-752), which supersedes
+// 03_ProjectDocs/Specifications/INFORMATION_ARCHITECTURE_SPEC.md Section 2
+// (top strip structure, superseded in full) and partially supersedes
+// Section 4 (Persona hub screen). Prior history: adopted 2026-07-27
+// (decisions.id=652-656, then 658/659), then items.id=384's 3-button merge
+// (decisions.id=734-743, "workspace"/"library"/"myFacts"), which this file
+// used to encode as FixedButtonId/TopLevel/ContentDescriptor/chain. All of
+// that is gone now -- there is no flat top strip in the target design at
+// all; Persona selection happens inside the History rail's row-stack, not
+// via a separate button cluster.
+//
+// items.id=404: the 3-peer accordion (Board/Chat/Tier3, decisions.id=747's
+// "three peer bars, exactly one expanded") generalizes to 5 peer rails
+// (Board/Chat/Tier3/Library/History) under ONE dominance field --
+// `dominantRail` below -- replacing the old two-axis
+// boardSize/pair.dominant split. See WorkspaceShell.tsx's own header
+// comment for the full mechanics (in particular the two-way sync between
+// `dominantRail` and `pair.dominant`, needed because Tier3AccessPane's
+// internal chat<->tier3 split still keys off `pair.dominant` and isn't
+// being rewritten).
+//
+// What got deleted, not just left unwired, and why: FixedButtonId,
+// FIXED_BUTTON_ORDER, TopLevel, TemporaryCrumb, chain,
+// selectFixed/selectWorkspaceHome/selectPersona/isPersonaAnchor/pushCrumb/
+// selectCrumb/fixedButtonLitState/fixedButtonContent/currentContent are all
+// removed -- once the top strip and its Persona-button cluster are gone,
+// nothing in the new UI can ever construct a non-default TopLevel again
+// (PersonaHub.tsx's own action-row callbacks were the only thing that ever
+// pushed a chain crumb, and nothing can reach PersonaHub any more either).
+// Per CLAUDE.md's "if you're certain something is unused, delete it
+// completely" -- this is navigation PLUMBING, confirmed dead.
+//
+// What did NOT get deleted: PersonaHub.tsx and FocusSettingsPane.tsx
+// themselves. Both are real, working feature code (a working Focus list
+// via listFocuses, a Library action-row button) whose disposition is
+// items.id=400's scope, not this item's -- deleting them would destroy
+// that item's starting point. They're left on disk, simply unimported by
+// NavShell.tsx now. Concrete, user-visible consequence: there is currently
+// no UI path to view a Persona's Focus list at all (flagged in this item's
+// session handoff, not silently absorbed).
 
-export type FixedButtonId = 'library' | 'myFacts' | 'workspace'
-
-/** Left-to-right slot order ahead of the Persona cluster. 'workspace'
- *  takes the leading slot the old 'activeBoard' button held -- see this
- *  file's header comment. */
-export const FIXED_BUTTON_ORDER: FixedButtonId[] = [
-  'workspace',
-  'library',
-  'myFacts',
-]
-
-/** The top of the navigation chain at any moment -- exactly one at a
- *  time, either a fixed global button or the Persona hub (Section 2d).
- *  Selecting either is what Section 2e's chain-truncation rule clears
- *  the temporary chain against.
- *
- *  items.id=384 (decisions.id=734-743): this used to be `AnchorId`, a
- *  union that folded the active Persona's id INTO the fixed/persona
- *  choice itself -- `{kind:'persona', personaId}` -- which meant
- *  switching to any fixed button (e.g. the old separate 'tier3' button)
- *  discarded whatever Persona had been selected, with no room in the
- *  type to carry it through. NavShell.tsx's own tier3PersonaId
- *  workaround (now removed) existed only to paper over that gap.
- *  TopLevel now carries no persona id at all -- NavState.activePersonaId
- *  below is a standing field, independent of which screen is showing,
- *  so a Persona chosen via the hub survives a switch to the merged
- *  Chat/Tier3 workspace without any capture-on-transition hack. */
-export type TopLevel =
-  | { kind: 'fixed'; id: FixedButtonId }
-  | { kind: 'personaHub' }
-
-/** Content this shell can actually resolve to real or placeholder panes.
- *  'workspace' (items.id=384 slice 3) covers what used to be the separate
- *  'activeBoard' and 'tier3' content types -- see WorkspaceShell.tsx.
- *  Library has a real screen; My Facts (items.id=176, Chat-BRAND's
- *  design) is still a placeholder -- see NavShell.tsx's content
- *  resolution for how each renders. */
-export type ContentDescriptor =
-  | { type: 'workspace' }
-  | { type: 'library'; personaFilter?: string }
-  | { type: 'myFacts' }
-  | { type: 'personaHub'; personaId: string }
-  | { type: 'focusSettings'; personaId: string; focusId: string }
-
-/** One entry in the temporary-button chain nested below/alongside the
- *  anchor (Section 2e; Section 4's "tapping a Focus becomes a temporary
- *  button nested one level below the Persona button").
- *
- *  aliasesFixedButton: set when this temporary navigation re-enters an
- *  existing fixed button's own screen in a narrowed context -- e.g.
- *  Library opened from a Persona hub's action row (Section 2c: "the same
- *  underlying view entered a second way, not a second implementation").
- *  When set, the fixed button itself is ALSO shown lit alongside the
- *  anchor -- Section 2e's deliberate two-buttons-lit state ("Work lit +
- *  a document opened from Work's Library also lit... not an error
- *  case") -- rather than this crumb rendering a redundant second
- *  Library-labeled button. */
-export interface TemporaryCrumb {
-  id: string
-  labelKey: string
-  aliasesFixedButton?: FixedButtonId
-  content: ContentDescriptor
-}
+/** One of the five peer rails, exactly one dominant (fills the majority of
+ *  the screen) at a time -- see WorkspaceShell.tsx. Direct generalization
+ *  of decisions.id=747's three-peer-bar model. */
+export type DockRailId = 'board' | 'chat' | 'tier3' | 'library' | 'history'
 
 /** decisions.id=735: the QR Chat <-> Tier 3 dominance pair. Which side
- *  fills the main slot, and Tier 3's own rail/pane bookkeeping -- lifted
- *  here (rather than left local to Tier3AccessPane's component state) so
- *  it survives navigating away to Board/Library/My Facts and back
- *  (Jason, 2026-09-01 scoping session for this item: the pair persists
- *  across such navigation rather than resetting to Chat-dominant, which
- *  also removes any need for a separate "jump straight to Tier 3 from
- *  Board" affordance -- returning from Board lands wherever the pair
- *  last was). Live as of slice 4 -- read/written via useDominancePair.ts,
- *  the only place that constructs a new value of this shape (its own
- *  withDominance() keeps `dominant` in sync with `activeProviderId` in
- *  one place, rather than each call site setting it separately). */
+ *  fills the main slot (when the pair itself is dominant -- see
+ *  WorkspaceShell.tsx's sync effects), and Tier 3's own rail/pane
+ *  bookkeeping -- lifted here (rather than left local to Tier3AccessPane's
+ *  component state) so it survives navigating to Board/Library/History and
+ *  back. Live as of slice 4 -- read/written via useDominancePair.ts, the
+ *  only place that constructs a new value of this shape (its own
+ *  withDominance() keeps `dominant` in sync with `activeProviderId` in one
+ *  place, rather than each call site setting it separately).
+ *
+ *  items.id=404: `dominant` here is a narrower, Tier3AccessPane-internal
+ *  echo of the real source of truth (`workspace.dominantRail` below), kept
+ *  in sync by WorkspaceShell.tsx rather than read directly by anything
+ *  outside Tier3AccessPane. Not collapsed into one field because
+ *  Tier3AccessPane's internals key off `pair.dominant` in enough places
+ *  that rewriting them wasn't worth the risk for this item. */
 export interface DominancePairState {
   dominant: 'chat' | 'tier3'
   openProviderIds: string[]
   activeProviderId: string | null
 }
 
-/** decisions.id=737: Active Board's three discrete size states (its card
- *  grid doesn't reflow continuously, unlike Chat) -- live as of slice 3,
- *  read/written by WorkspaceShell.tsx.
- *
- *  items.id=391 (tenth pass, the "three bars, one expanded" redesign):
- *  'full' and 'compact' both mean Board is the EXPANDED region -- they
- *  differ only in density (ActiveBoardPane's `dense` prop), a pure
- *  Board-owned preference, independent of anything else on screen.
- *  'minimized' means Board is NOT expanded -- it renders as a bar instead
- *  (WorkspaceShell.tsx), and the Chat<->Tier3 pair (Tier3AccessPane)
- *  occupies the expanded region instead. This value no longer encodes a
- *  growth STAGE (an earlier version of this type drove a three-step
- *  Board-shrinks/Chat-grows sequence through 'full' -> 'compact' ->
- *  'minimized' -- removed, see WorkspaceShell.tsx's own header comment)
- *  -- just "is Board expanded, and if so how dense." See
- *  WorkspaceShell.tsx's own header comment for the full mapping. */
-export type BoardSizeState = 'full' | 'compact' | 'minimized'
-
 export interface NavState {
-  topLevel: TopLevel
-  /** Which Persona is currently active, independent of `topLevel` --
-   *  set by the Persona hub buttons, read by both the Persona hub itself
-   *  and (once slice 3+ lands) the merged workspace's Chat/Tier3 side.
-   *  Replaces AnchorId's old `persona.personaId`, which only existed
-   *  while a Persona anchor was itself selected. */
+  /** Which Persona is currently active -- read by Chat, Library, and
+   *  History's Persona-row selection alike. Set via setActivePersonaId
+   *  (the "quiet" switch, reused by items.id=404's two cross-navigation
+   *  actions) -- there is no other way to change it any more now that the
+   *  Persona-button cluster is gone. */
   activePersonaId: string | null
-  chain: TemporaryCrumb[]
-  /** decisions.id=735-737: state for the merged Chat/Tier3/Board
-   *  workspace. See DominancePairState/BoardSizeState above. */
   workspace: {
-    boardSize: BoardSizeState
+    dominantRail: DockRailId
+    /** Board's own density preference (ActiveBoardPane's `dense` prop),
+     *  independent of dominance -- was folded into the old
+     *  BoardSizeState's 'full'/'compact' values alongside a 'minimized'
+     *  state that `dominantRail !== 'board'` now covers instead. */
+    boardDensity: 'full' | 'compact'
     pair: DominancePairState
   }
 }
 
 export const DEFAULT_NAV_STATE: NavState = {
-  // Section 2a: "Likely the default landing view when QR opens (not
-  // formally locked here -- flagged as the working assumption; Chat-PM
-  // should confirm before treating as final)." Taken as the working
-  // default here on that same explicit hedge, not as a locked decision --
-  // boardSize:'full' preserves that same default (Board shown first)
-  // now that 'activeBoard' isn't its own topLevel value any more.
-  topLevel: { kind: 'fixed', id: 'workspace' },
   activePersonaId: null,
-  chain: [],
   workspace: {
-    boardSize: 'full',
+    // Section 2a (IA_SPEC, historical): "Likely the default landing view
+    // when QR opens (not formally locked here)." Chat dominant preserves
+    // that same working default (today's WorkspaceShell default) now that
+    // there's no separate 'workspace' vs. 'library'/'myFacts' choice to
+    // make first.
+    dominantRail: 'chat',
+    boardDensity: 'full',
     pair: { dominant: 'chat', openProviderIds: [], activeProviderId: null },
   },
 }
 
-/** Tapping a fixed button sets it as the new top-level screen and clears
- *  the temporary chain -- Section 2e's chain-truncation rule. Does NOT
- *  touch activePersonaId or workspace (see their own doc comments on why
- *  those persist across this transition, unlike the old selectAnchor's
- *  fixed variant, which used to discard a Persona anchor outright). */
-export function selectFixed(id: FixedButtonId): (state: NavState) => NavState {
-  return (state) => ({ ...state, topLevel: { kind: 'fixed', id }, chain: [] })
-}
-
-/** items.id=391 (Jason, 2026-09-01 live-verification pass): re-tapping the
- *  'workspace' fixed button ("Board / Chat") is a "go home" gesture, not
- *  just a plain return to whatever Board/Chat/Tier3 state was left --
- *  unlike every other fixed button (and unlike navigating to 'workspace'
- *  any other way), it always resets to the canonical Board full-size +
- *  Chat pairing, never landing on a still-dominant Tier 3. This is the
- *  ONE deliberate exception to workspace state persisting across
- *  navigation (see DominancePairState's own doc comment on why it
- *  persists in general) -- composed as a single state transform, not
- *  three separate setNavState calls, so NavShell.tsx's handler applies it
- *  atomically against one prior state. */
-export function selectWorkspaceHome(): (state: NavState) => NavState {
-  return (state) => ({
-    ...selectFixed('workspace')(state),
-    workspace: {
-      boardSize: 'full',
-      pair: { ...state.workspace.pair, dominant: 'chat', activeProviderId: null },
-    },
-  })
-}
-
-/** Tapping a Persona button enters the Persona hub for it and clears the
- *  temporary chain -- same chain-truncation rule as selectFixed. Section
- *  4's "tapping the Persona button again truncates back to the hub"
- *  falls out of this uniformly (re-selecting the same Persona still
- *  clears the chain), rather than needing its own special case. */
-export function selectPersona(personaId: string): (state: NavState) => NavState {
-  return (state) => ({
-    ...state,
-    topLevel: { kind: 'personaHub' },
-    activePersonaId: personaId,
-    chain: [],
-  })
-}
-
 /** decisions.id=740 (items.id=384 slice 7): a "quiet" persona switch --
- *  updates activePersonaId only, unlike selectPersona above, which ALSO
- *  navigates to the Persona hub. The new-chat persona dot-picker inside
- *  the merged workspace (Tier3AccessPane) needs to change which Persona
- *  a fresh chat belongs to without leaving the workspace -- selectPersona
- *  would incorrectly bounce the user out to the Persona hub screen just
- *  for picking who a new chat is for. Does not touch topLevel/chain at
- *  all, unlike every other setter in this file that changes
- *  activePersonaId. */
+ *  updates activePersonaId only, without navigating anywhere. Originally
+ *  built for the new-chat persona dot-picker inside Tier3AccessPane;
+ *  items.id=404 reuses it unchanged for both of its cross-navigation
+ *  actions (History's Persona-row "Chat" action, and Chat's own "Chat
+ *  history" toggle jumping into History) -- exactly the "already wired"
+ *  mechanism the design doc calls for. */
 export function setActivePersonaId(personaId: string): (state: NavState) => NavState {
   return (state) => ({ ...state, activePersonaId: personaId })
 }
 
-/** decisions.id=737: switches the merged workspace's Board region among
- *  its three discrete size states -- see WorkspaceShell.tsx, the only
- *  caller. Does not touch `pair` (independent axis, per decisions.id=735's
- *  own note that Board is not part of the Chat<->Tier3 dominance pair). */
-export function setBoardSize(size: BoardSizeState): (state: NavState) => NavState {
-  return (state) => ({ ...state, workspace: { ...state.workspace, boardSize: size } })
+export function setDominantRail(rail: DockRailId): (state: NavState) => NavState {
+  return (state) => ({
+    ...state,
+    workspace: { ...state.workspace, dominantRail: rail },
+  })
+}
+
+export function setBoardDensity(density: 'full' | 'compact'): (state: NavState) => NavState {
+  return (state) => ({
+    ...state,
+    workspace: { ...state.workspace, boardDensity: density },
+  })
 }
 
 /** items.id=384 slice 4: updates NavState.workspace.pair via a functional
@@ -215,8 +132,11 @@ export function setBoardSize(size: BoardSizeState): (state: NavState) => NavStat
  *  the next pair against whatever it is at the moment their async Rust
  *  command resolves, not whatever it was when the click happened. See
  *  that hook's own header comment for why a plain-value setter would
- *  reintroduce a stale-closure race. NavShell.tsx is the only caller --
- *  it wraps setNavState's own functional-updater form around this. */
+ *  reintroduce a stale-closure race. WorkspaceShell.tsx is the only
+ *  caller now (previously NavShell.tsx) -- it wraps setNavState's own
+ *  functional-updater form around this, and additionally syncs
+ *  `dominantRail` when `pair.dominant` changes underneath it (see that
+ *  file's own header comment). */
 export function updateWorkspacePair(
   updater: (prev: DominancePairState) => DominancePairState,
 ): (state: NavState) => NavState {
@@ -225,83 +145,6 @@ export function updateWorkspacePair(
     workspace: { ...state.workspace, pair: updater(state.workspace.pair) },
   })
 }
-
-/** Opening a Focus, or (this pass) a Persona-filtered Library view from
- *  the hub's action row, becomes a temporary button appended below the
- *  current anchor -- not a replacement of it. */
-export function pushCrumb(state: NavState, crumb: TemporaryCrumb): NavState {
-  return { ...state, chain: [...state.chain, crumb] }
-}
-
-/** Tapping a temporary button truncates the chain to end at it (standard
- *  breadcrumb semantics) -- "closes/clears every temporary button below
- *  it," Section 2e. */
-export function selectCrumb(state: NavState, crumbId: string): NavState {
-  const index = state.chain.findIndex((c) => c.id === crumbId)
-  if (index === -1) return state
-  return { ...state, chain: state.chain.slice(0, index + 1) }
-}
-
-/** What the middle zone should be showing right now: the deepest
- *  temporary crumb if any are open, otherwise the anchor's own content
- *  (Section 4: the Persona hub itself, not a Focus or chat, is what a
- *  bare Persona-button tap opens). */
-export function currentContent(state: NavState): ContentDescriptor {
-  if (state.chain.length > 0) {
-    return state.chain[state.chain.length - 1].content
-  }
-  if (state.topLevel.kind === 'fixed') return fixedButtonContent(state.topLevel.id)
-  // topLevel.kind === 'personaHub': activePersonaId is guaranteed non-null
-  // here by construction -- selectPersona() is the only way to reach
-  // personaHub, and it always sets activePersonaId in the same update.
-  return { type: 'personaHub', personaId: state.activePersonaId as string }
-}
-
-function fixedButtonContent(id: FixedButtonId): ContentDescriptor {
-  switch (id) {
-    case 'workspace':
-      return { type: 'workspace' }
-    case 'library':
-      return { type: 'library' }
-    case 'myFacts':
-      return { type: 'myFacts' }
-  }
-}
-
-/** Section 2e: a fixed button reads as lit both when it IS the current
- *  anchor, and when a temporary chain entry aliases it -- the deliberate
- *  two-buttons-lit state. Kept as two distinct reasons rather than one
- *  boolean so a future styling pass can differentiate "ambient scope"
- *  from "current focus" per Section 2e's own open visual-design question
- *  ("not finalized in this draft -- flagged as an open visual-design
- *  question, not a structural one"). This structural distinction is
- *  decided; only its visual treatment isn't, and that's out of scope
- *  here regardless (no Chat-BRAND visual pass this item). */
-export function fixedButtonLitState(
-  state: NavState,
-  id: FixedButtonId,
-): 'anchor' | 'alias' | 'none' {
-  if (state.topLevel.kind === 'fixed' && state.topLevel.id === id) return 'anchor'
-  if (state.chain.some((c) => c.aliasesFixedButton === id)) return 'alias'
-  return 'none'
-}
-
-export function isPersonaAnchor(state: NavState, personaId: string): boolean {
-  return state.topLevel.kind === 'personaHub' && state.activePersonaId === personaId
-}
-
-// items.id=384 slice 3: the old decisions.id=659 gate ("Tier 3 access
-// disabled until a Persona is selected") -- isTier3Enabled(), formerly
-// here -- is REMOVED, not just loosened. Board and the Chat/Tier3 pair
-// merged into one 'workspace' button (see FIXED_BUTTON_ORDER's own
-// comment above), and decisions.id=735 requires Board to be "a separate,
-// always-reachable anchor" -- gating the shared button on activePersonaId
-// would have blocked Board along with the pair, which D735 explicitly
-// rules out. The pair side still needs a Persona to actually chat (D741)
-// -- that's handled downstream, unchanged: Tier3AccessPane already
-// renders navShell.content.tier3ChatUnavailable when personaId is null,
-// exactly the same component-local null-handling LibraryPane already
-// uses for its own personaId===null case. Nothing new was needed there.
 
 // ---------------------------------------------------------------------------
 // Real session identity -- items.id=267, 2026-08-15

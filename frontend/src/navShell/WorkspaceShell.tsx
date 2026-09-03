@@ -1,99 +1,70 @@
-// The merged Active Board / QR Chat / Tier 3 screen -- items.id=384
-// slice 3/4, rebuilt for items.id=391.
+// The 5-rail navigation dock -- Board / Chat / Tier 3 / Library / History,
+// exactly one dominant (fills the majority of the screen) at a time.
+// items.id=404, generalizing items.id=391's "three peer bars, exactly one
+// expanded" model (decisions.id=747) from 3 rails to 5. Full design:
+// 03_ProjectDocs/Specifications/HIERARCHICAL_NAV_SHELL_DESIGN_20260902.md.
 //
-// items.id=391 (Jason, 2026-09-02, tenth pass -- the "three bars, one
-// expanded" redesign): supersedes this file's own prior model (a fixed
-// vertical Board/Chat/Tier3 order with exactly TWO of three ever visible,
-// the third fully hidden). Jason's own words, reacting to the bottom
-// second-opinion bar built the pass before this one: "What you did on the
-// main screen listing the second opinion bar was not what I was
-// expecting, but I like it better than the buttons. What if instead of an
-// active board button, we added a row at the top for active board (like
-// the second opinion bar at the bottom) and extended the Quiet Rabbit --
-// this conversation header to be the same size as the other two bars...
-// three rows with the chat expanded and the ability to select either of
-// the other two rows to expand that instead." Confirmed for all three
-// starting points (chat expanded, second-opinion expanded, board
-// expanded) -- in every case, the OTHER TWO of {Board, Chat, Tier3} show
-// as a bar, never hidden outright.
+// The fixed vertical order (Board / Chat+Tier3 / Library / History, top to
+// bottom) mirrors the old file's Board/Chat/Tier3 order, with Library and
+// History appended below. Exactly one region is "dominant" (gets the big
+// remaining space) at a time -- the rest render as compact bars, reusing
+// `.tier3-collapsed-strip` verbatim (Tier3CollapsedStrip.css) the same way
+// Board's own bar already did pre-404, so all four non-dominant bars read
+// as the same kind of row.
 //
-// The fixed vertical order (Board / Chat / Tier3, top to bottom) is
-// UNCHANGED -- Jason's original correction from the first rebuild still
-// holds, this pass only changes what a non-expanded region looks like
-// (a full-width bar, always present) instead of whether it's there at
-// all. Concretely, exactly ONE of the three is "expanded" (gets the big
-// remaining space) at a time:
-//   - Board expanded  -- boardSize !== 'minimized'. ActiveBoardPane fills
-//     the region (density from boardSize, 'full' vs 'compact' -- now
-//     purely a Board-owned density preference, no longer a distinct
-//     growth stage; see BoardSizeState's own doc comment). Chat is
-//     compressed to its own floor row (Tier3AccessPane's `floor` prop),
-//     AND the second-opinion bar renders below it, unconditionally --
-//     the two "other" rows, both present as bars.
-//   - Chat expanded   -- boardSize === 'minimized' AND pair.dominant ===
-//     'chat'. QR renders full-size inside Tier3AccessPane; Board's own
-//     bar (this file, below) and the second-opinion bar (Tier3AccessPane)
-//     both show.
-//   - Tier3 expanded  -- boardSize === 'minimized' AND pair.dominant ===
-//     'tier3'. The rail+content-pane fills the region; Board's own bar
-//     (this file) and QR's own compressed row (Tier3AccessPane) both show.
+// Chat and Tier3 are NOT two separate top-level regions in this file's own
+// JSX -- they stay nested inside one Tier3AccessPane mount, exactly as
+// pre-404 (never unmounted, see that component's own header comment on
+// why). What changes is what drives their split:
+//   - `floor` (Chat's own passive-but-functional compact form) generalizes
+//     from "true only while Board is expanded" to "true whenever neither
+//     Chat nor Tier3 is the outer-dominant rail" -- Library or History
+//     being dominant now ALSO floors Chat, which pre-404 was impossible
+//     (there was no Library/History rail to be dominant instead).
+//   - Tier3's own compact form needed ZERO changes: Tier3CollapsedStrip
+//     already rendered unconditionally whenever Tier3 wasn't the expanded
+//     region, regardless of floor -- that already IS the "plain inert
+//     dock bar" the design doc asks for, just previously only reachable
+//     via the Board/pair split.
 //
-// The three-step Board/Chat GROWTH sequence this file used to implement
-// (decisions.id=737's three sizes driving full -> compact -> minimized as
-// successive "chat grows, board shrinks" stages) is REMOVED, not just
-// renamed -- Jason's own description of this pass is a single-step swap
-// ("select ... the other row to expand that instead"), not a multi-stage
-// growth. 'compact' now means only "Board expanded, dense density" --
-// see BoardSizeState's own updated doc comment.
-//
-// Board's own bar (rendered directly in this file, not inside
-// Tier3AccessPane) reuses Tier3CollapsedStrip.css's `.tier3-collapsed-
-// strip` class verbatim -- Jason's own comparison ("like the second
-// opinion bar") is the literal spec here, and importing the same
-// stylesheet rather than duplicating it means the two can never visually
-// drift apart. Clicking it must both reclaim Chat dominance (in case
-// Tier3 was the expanded region -- reclaimChat, from a second instance of
-// useDominancePair, see this file's own note on that below) AND set
-// boardSize to 'full' in the SAME event handler tick, matching what the
-// pre-tenth-pass rail-board-btn already had to do for the same reason:
-// effectiveBoardSize (below) forces boardSize back to 'minimized' on any
-// render where boardSize !== 'minimized' but pair.dominant is still
-// 'tier3' -- reclaiming first (in the same React 18 batched update) is
-// what keeps that correction from immediately undoing the click.
-//
-// Tier3AccessPane is mounted continuously across every boardSize -- never
-// unmounted while this screen itself is mounted, just resized (floor vs
-// full) by whichever branch below renders alongside it. See this file's
-// git history (items.id=384/391) for why: earlier designs that unmounted
-// it whenever Board was dominant were reasoned from CEF pane lifecycle
-// concerns that don't actually apply once Board becoming the expanded
-// region already forces dominant back to 'chat' first (no pane is ever
-// actively compositing while Board fills the screen).
-//
-// BUG FOUND + FIXED (2026-09-02, fourth pass, still relevant to this
-// pass's rewrite): this file used to have THREE separate
-// `if (boardSize === ...) return (...)` blocks, each a differently-SHAPED
-// JSX tree -- React's reconciliation compares trees structurally, so this
-// unmounted and remounted Tier3AccessPane on every boardSize transition,
-// silently resetting its local state. Fixed then, and preserved by this
-// rewrite, by keeping Tier3AccessPane at the SAME JSX position across
-// every boardSize -- this pass's simplification (Board is either a bar or
-// a region, never a third shape sharing the screen with a "medium" pair)
-// only reduces the number of distinct shapes further, it doesn't
-// reintroduce variation in Tier3AccessPane's own position.
+// Two dominance REPRESENTATIONS now coexist and must be kept from
+// drifting: `dominantRail` (this file's own prop, the one true source of
+// truth for the outer 5-way choice) and `pair.dominant` (Tier3AccessPane's
+// own internal 'chat'|'tier3' echo, which its ~10 existing internal call
+// sites still key off -- not rewritten for this item, too much surface for
+// the value). The two are kept in sync by TWO complementary mechanisms,
+// not one bidirectional effect (an earlier draft of this file tried a
+// single effect mirroring pair.dominant back into dominantRail and it
+// actively fought Board's-bar-reclaimChat, which sets pair.dominant='chat'
+// as pure cleanup while deliberately promoting Board, not Chat, to
+// dominant -- confirmed by tracing the click through by hand):
+//   1. Tier3AccessPane calls the new `onDominantRailChange` prop directly,
+//      at the exact handful of ITS OWN internal call sites where a user
+//      action genuinely means "make Chat/Tier3 the outer-dominant rail"
+//      (Tier3CollapsedStrip's expand, the content-head's reclaim click,
+//      ChatPane's own non-floor collapsed-strip click) -- see that file's
+//      own header comment for the full list. Board's bar (below, this
+//      file) does the same directly for its own reclaimChat+dominantRail
+//      pairing.
+//   2. A one-directional correction effect (below): whenever
+//      `dominantRail` IS 'chat' or 'tier3' but `pair.dominant` disagrees,
+//      force `pair.dominant` to match. This is real, load-bearing
+//      correctness, not just tidiness -- it's what stops a stale
+//      pair.dominant='tier3' from silently showing Tier3's rail+content
+//      instead of Chat right after an EXTERNAL jump into Chat (History's
+//      "Chat" row-action, or Chat's own floor-click), neither of which
+//      goes through Tier3AccessPane's own wrapped call sites.
 
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import type { PersonaInfo } from '../bindings'
+import type { ChatInfo, PersonaInfo } from '../bindings'
 import { ActiveBoardPane } from './ActiveBoardPane'
+import { HistoryScreen, type HistoryOpenTarget } from './HistoryScreen'
+import { LibraryPane } from '../library/LibraryPane'
 import { Tier3AccessPane } from './Tier3AccessPane'
 import { useDominancePair } from './useDominancePair'
-import type { BoardSizeState, DominancePairState } from './navShellConfig'
+import type { DockRailId, DominancePairState } from './navShellConfig'
 import './Tier3CollapsedStrip.css'
-// items.id=391 (eleventh pass): for .tier3-access-pane__section-header --
-// Board's own expanded header (below) reuses that class verbatim so it's
-// guaranteed to match QR's and Tier3's own expanded headers (Tier3AccessPane.tsx),
-// not just visually similar values re-declared here.
 import './NavShell.css'
 import './WorkspaceShell.css'
 
@@ -102,8 +73,10 @@ export interface WorkspaceShellProps {
   activePersonaId: string | null
   onActivePersonaIdChange: (personaId: string) => void
   personas: PersonaInfo[]
-  boardSize: BoardSizeState
-  onBoardSizeChange: (size: BoardSizeState) => void
+  dominantRail: DockRailId
+  onDominantRailChange: (rail: DockRailId) => void
+  boardDensity: 'full' | 'compact'
+  onBoardDensityChange: (density: 'full' | 'compact') => void
   pair: DominancePairState
   onUpdatePair: (updater: (prev: DominancePairState) => DominancePairState) => void
 }
@@ -113,57 +86,46 @@ export function WorkspaceShell({
   activePersonaId,
   onActivePersonaIdChange,
   personas,
-  boardSize: persistedBoardSize,
-  onBoardSizeChange,
+  dominantRail,
+  onDominantRailChange,
+  boardDensity,
+  onBoardDensityChange,
   pair,
   onUpdatePair,
 }: WorkspaceShellProps) {
   const { t } = useTranslation()
 
-  // items.id=391 (third pass, preserved by this rewrite): Board expanded
-  // (boardSize !== 'minimized') and a dominant Tier3 must never coexist as
-  // both "expanded" at once -- computed synchronously during render so
-  // there is never a committed frame where that's true, not even briefly.
-  // The effect below only persists the correction into NavState afterward.
-  const effectiveBoardSize: BoardSizeState =
-    persistedBoardSize !== 'minimized' && pair.dominant === 'tier3'
-      ? 'minimized'
-      : persistedBoardSize
-
+  // See this file's own header comment (mechanism 2): one-directional only
+  // -- corrects pair.dominant to match dominantRail, never the reverse.
   useEffect(() => {
-    if (effectiveBoardSize !== persistedBoardSize) {
-      onBoardSizeChange(effectiveBoardSize)
+    if (dominantRail === 'chat' && pair.dominant !== 'chat') {
+      onUpdatePair((prev) => ({ ...prev, dominant: 'chat' }))
+    } else if (dominantRail === 'tier3' && pair.dominant !== 'tier3') {
+      onUpdatePair((prev) => ({ ...prev, dominant: 'tier3' }))
     }
-  }, [effectiveBoardSize, persistedBoardSize, onBoardSizeChange])
+  }, [dominantRail, pair.dominant, onUpdatePair])
 
-  const boardSize = effectiveBoardSize
-  const boardExpanded = boardSize !== 'minimized'
-
-  // items.id=391 (tenth pass): a second, independent instance of this hook
-  // -- see useDominancePair.ts's own shape: it has no internal state of
-  // its own besides a local `openError` this file never reads, every
-  // other value is a pure function of the `pair`/`onUpdatePair` args both
-  // this component and Tier3AccessPane are already handed. Two instances
-  // reading/writing the same external pair behave identically to one;
-  // this avoids lifting the hook (and Tier3AccessPane's whole rail/
-  // content-pane prop surface) up into this file just so Board's own bar
-  // (below) can call reclaimChat before setting boardSize to 'full'.
+  // items.id=391 (tenth pass, preserved): a second, independent instance of
+  // this hook -- see useDominancePair.ts's own shape, no internal state of
+  // its own besides a local `openError` this file never reads. Lets
+  // Board's own bar (below) call reclaimChat without lifting
+  // Tier3AccessPane's whole prop surface up into this file.
   const { reclaimChat } = useDominancePair(pair, onUpdatePair)
 
+  // items.id=404's two cross-navigation bridges (design doc's Q1: "a
+  // deliberate, context-derived jump action in both directions, not a
+  // generic back-stack"). Both are one-shot signals, not persistent
+  // NavState -- consumed once by the receiving side, then cleared, same
+  // shape as the pre-existing onFloorExpand callback convention.
+  const [pendingChatSelection, setPendingChatSelection] = useState<ChatInfo | null>(null)
+  const [pendingHistoryTarget, setPendingHistoryTarget] = useState<HistoryOpenTarget | null>(null)
+
+  const boardExpanded = dominantRail === 'board'
+
   return (
-    <div className="workspace-shell" data-board-size={boardSize}>
+    <div className="workspace-shell" data-dominant-rail={dominantRail}>
       {boardExpanded ? (
         <div key="board-region" className="workspace-shell__board-region">
-          {/* items.id=391 (eleventh pass): Board's own expanded header --
-              the SAME .section-header class QR's and Tier3's own expanded
-              headers use (NavShell.css, imported below for it) -- confirmed
-              live (Jason): "the active bar needs a header when it's fully
-              expanded," matching the other two rather than a plain
-              standalone density-toggle pill floating above a bare <h2>
-              (ActiveBoardPane's own internal heading, now removed as
-              redundant with this). The density toggle folds into this
-              header's own controls slot, same position QR's History/
-              persona-picker controls sit in. */}
           <div className="tier3-access-pane__section-header">
             <span className="tier3-access-pane__section-header-name">
               {t('navShell.workspaceShell.boardBarLabel')}
@@ -172,15 +134,17 @@ export function WorkspaceShell({
               <button
                 type="button"
                 className="workspace-shell__board-density-button"
-                onClick={() => onBoardSizeChange(boardSize === 'compact' ? 'full' : 'compact')}
+                onClick={() =>
+                  onBoardDensityChange(boardDensity === 'compact' ? 'full' : 'compact')
+                }
               >
-                {boardSize === 'compact'
+                {boardDensity === 'compact'
                   ? t('navShell.workspaceShell.fullBoardButton')
                   : t('navShell.workspaceShell.compactBoardButton')}
               </button>
             </div>
           </div>
-          <ActiveBoardPane userId={userId} dense={boardSize === 'compact'} />
+          <ActiveBoardPane userId={userId} dense={boardDensity === 'compact'} />
         </div>
       ) : (
         <button
@@ -189,7 +153,7 @@ export function WorkspaceShell({
           className="tier3-collapsed-strip"
           onClick={() => {
             reclaimChat()
-            onBoardSizeChange('full')
+            onDominantRailChange('board')
           }}
         >
           <span className="tier3-collapsed-strip__name">
@@ -208,9 +172,77 @@ export function WorkspaceShell({
         personas={personas}
         pair={pair}
         onUpdatePair={onUpdatePair}
-        floor={boardExpanded}
-        onFloorExpand={() => onBoardSizeChange('minimized')}
+        floor={dominantRail !== 'chat' && dominantRail !== 'tier3'}
+        onFloorExpand={() => onDominantRailChange('chat')}
+        onDominantRailChange={onDominantRailChange}
+        onOpenHistory={(target) => {
+          setPendingHistoryTarget({ ...target, action: 'chatHistory' })
+          onDominantRailChange('history')
+        }}
+        pendingChatSelection={pendingChatSelection}
+        onPendingChatSelectionConsumed={() => setPendingChatSelection(null)}
       />
+
+      {dominantRail === 'library' ? (
+        <div key="library-region" className="workspace-shell__library-region">
+          <div className="tier3-access-pane__section-header">
+            <span className="tier3-access-pane__section-header-name">
+              {t('navShell.library')}
+            </span>
+          </div>
+          <LibraryPane userId={userId} personaId={activePersonaId} />
+        </div>
+      ) : (
+        <button
+          key="library-bar"
+          type="button"
+          className="tier3-collapsed-strip"
+          onClick={() => onDominantRailChange('library')}
+        >
+          <span className="tier3-collapsed-strip__name">{t('navShell.library')}</span>
+          <span className="tier3-collapsed-strip__expand">
+            {t('navShell.tier3CollapsedStrip.expandLabel')}
+          </span>
+        </button>
+      )}
+
+      {dominantRail === 'history' ? (
+        <div key="history-region" className="workspace-shell__history-region">
+          <div className="tier3-access-pane__section-header">
+            <span className="tier3-access-pane__section-header-name">
+              {t('navShell.history')}
+            </span>
+          </div>
+          <HistoryScreen
+            userId={userId}
+            personas={personas}
+            activePersonaId={activePersonaId}
+            onOpenPersonaChat={(personaId, chat) => {
+              onActivePersonaIdChange(personaId)
+              if (chat) setPendingChatSelection(chat)
+              onDominantRailChange('chat')
+            }}
+            onOpenFullLibrary={(personaId) => {
+              onActivePersonaIdChange(personaId)
+              onDominantRailChange('library')
+            }}
+            openTarget={pendingHistoryTarget}
+            onOpenTargetConsumed={() => setPendingHistoryTarget(null)}
+          />
+        </div>
+      ) : (
+        <button
+          key="history-bar"
+          type="button"
+          className="tier3-collapsed-strip"
+          onClick={() => onDominantRailChange('history')}
+        >
+          <span className="tier3-collapsed-strip__name">{t('navShell.history')}</span>
+          <span className="tier3-collapsed-strip__expand">
+            {t('navShell.tier3CollapsedStrip.expandLabel')}
+          </span>
+        </button>
+      )}
     </div>
   )
 }

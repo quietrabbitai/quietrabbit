@@ -8,12 +8,9 @@
     "sessionMissingAfterLogin": "Logged in, but no session was returned. Try again."
   },
   "navShell": {
-    "topStripLabel": "Top navigation",
-    "personaClusterLabel": "Personas",
     "personaLoadError": "Could not load personas: {{message}}",
-    "workspace": "Board / Chat",
     "library": "Library",
-    "myFacts": "My Facts",
+    "history": "History",
     "content": {
       "myFactsPlaceholder": "My Facts -- not yet built.",
       "chatPlaceholder": "Chat -- not yet wired for this screen.",
@@ -41,14 +38,23 @@
     "libraryPane": {
       "listHeading": "Outputs",
       "noPersonaContext": "Open Library from a Persona to see its outputs -- there's no Persona selected here yet.",
-      "notAvailable": "Not available in this build yet -- secure sign-in isn't wired up.",
       "listLoadError": "Could not load outputs: {{message}}",
       "emptyList": "No outputs yet.",
       "itemLabel": "{{type}} -- {{date}}",
-      "backButton": "Back to outputs",
       "detailLoadError": "Could not load this output: {{message}}",
+      "viewButton": "View",
       "copyButton": "Copy to clipboard",
       "copySuccess": "Copied to clipboard."
+    },
+    "history": {
+      "userRowLabel": "User",
+      "groupRowLabel": "Group",
+      "groupRowLabelCount": "{{count}} Groups",
+      "factsAction": "Facts",
+      "chatHistoryAction": "Chat History",
+      "libraryAction": "Library",
+      "chatAction": "Chat",
+      "openFullLibrary": "Open full Library →"
     },
     "activeBoardPane": {
       "filterLabel": "Persona",
