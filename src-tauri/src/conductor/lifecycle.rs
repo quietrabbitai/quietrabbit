@@ -1235,6 +1235,8 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                     )],
                     override_declined: false,
                     event_type: "provenance_cross_persona_omitted".to_string(),
+                    category: None,
+                    fact_key: None,
                 };
                 // Non-fatal at execution_tier 1, matching the gates' own
                 // fatality split. The fact is omitted either way; a failed
@@ -1603,6 +1605,9 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                 .as_ref()
                 .map(|d| d.display_name.clone())
                 .unwrap_or_default(),
+            user_id: self.user_id.clone(),
+            persona_id: self.persona_id.clone(),
+            key_hex: self.key_hex.clone().unwrap_or_default(),
         };
 
         // Borrow distinct fields of self simultaneously — Rust borrow checker allows

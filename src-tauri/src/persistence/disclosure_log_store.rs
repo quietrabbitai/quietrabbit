@@ -162,8 +162,8 @@ pub(crate) async fn write_conn(
          (id, user_id, persona_id, focus_run_id, step_id, routing_tier,
           provider, fields_shared, fields_abstracted, fields_withheld,
           override_declined, declined_at, created_at, extra_metadata,
-          execution_tier, abstraction_tier)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          execution_tier, abstraction_tier, category, fact_key)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(user_id)
@@ -181,6 +181,8 @@ pub(crate) async fn write_conn(
     .bind(&extra_metadata_json)
     .bind(entry.execution_tier as i64)
     .bind(entry.abstraction_tier.map(|t| t as i64))
+    .bind(&entry.category)
+    .bind(&entry.fact_key)
     .execute(&mut *conn)
     .await?;
 
@@ -207,6 +209,10 @@ mod tests {
     use sqlx::Row;
 
     const PERSONAL_SCHEMA_V1: &str = include_str!("../../schema/personal_001.sql");
+    // items.id=406: disclosure_log.category/fact_key are added in
+    // personal_008.sql, not personal_001.sql -- this in-memory test DB must
+    // apply both or write_conn's now-wider INSERT fails against a stale shape.
+    const PERSONAL_SCHEMA_V8: &str = include_str!("../../schema/personal_008.sql");
 
     async fn test_db() -> sqlx::SqliteConnection {
         let mut conn = SqliteConnectOptions::new()
@@ -215,7 +221,10 @@ mod tests {
             .await
             .expect("in-memory connection failed");
 
-        for stmt in parse_statements(PERSONAL_SCHEMA_V1) {
+        for stmt in parse_statements(PERSONAL_SCHEMA_V1)
+            .into_iter()
+            .chain(parse_statements(PERSONAL_SCHEMA_V8))
+        {
             sqlx::query(&stmt)
                 .execute(&mut conn)
                 .await
@@ -236,6 +245,8 @@ mod tests {
             fields_withheld: vec!["field_b".to_owned()],
             override_declined: false,
             event_type: event_type.to_owned(),
+            category: None,
+            fact_key: None,
         }
     }
 

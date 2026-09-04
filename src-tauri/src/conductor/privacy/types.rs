@@ -201,16 +201,23 @@ impl From<Gate3Result> for Gate3ReviewResult {
 // (Deserialize + specta::Type).
 
 /// Review tier assigned by gate3 based on confidence scores, sensitivity, and
-/// target execution tier. Determines the visual weight of the consent modal.
-/// Serialises as "easy" | "medium" | "high".
+/// destination risk. Determines the visual weight of the consent modal
+/// section a span is grouped into.
+/// Serialises as "low" | "medium" | "high".
+///
+/// items.id=406 (decisions.id=754): renamed from Easy/Medium/High to
+/// Low/Medium/High -- Jason approved this as the full terminology (not just
+/// a display-string swap) so code doesn't say "easy" while the UI says "Low
+/// risk". Now assigned per-span (see gate3.rs::assign_review_tier_for_span),
+/// not once for a whole batch of spans.
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "lowercase")]
 pub enum ReviewTier {
     /// High-confidence structural PII (score >= 0.90). Minimal friction.
-    Easy,
+    Low,
     /// Moderate confidence or contextual content (score >= 0.70).
     Medium,
-    /// Low confidence, Medical-mapped category, or Tier 3 target.
+    /// Low confidence, Medical-mapped category, or high destination risk.
     /// Err toward High when uncertain (D6-362).
     High,
 }
@@ -239,6 +246,21 @@ pub struct ConsentSpanItem {
     pub end_byte: usize,
     /// Confidence score from the Privacy Filter in [0.0, 1.0].
     pub score: f32,
+    /// items.id=406 (decisions.id=754): this span's own review tier --
+    /// independently assigned per span (fact profile x destination risk),
+    /// not shared across the whole payload. The frontend groups spans into
+    /// three sections (Low/Medium/High) keyed on this field.
+    pub review_tier: ReviewTier,
+    /// items.id=406 (decisions.id=756/757): the stable fact identity gate3
+    /// resolved for this span (Layer 1 content-hash, Layer 2 within-
+    /// conversation coreference, or Layer 3 entity_facts match) -- `None`
+    /// when none of the three deterministic layers resolved it. Echoed back
+    /// unchanged by the frontend in the matching ElementDecision so the
+    /// user's decision can be persisted and reapplied later (conversation-
+    /// scoped by default, Persona-scoped only if the user explicitly opts
+    /// in) -- this round-trip is what makes silent reapplication possible;
+    /// gate3 never re-derives it from the frontend's own say-so.
+    pub fact_key: Option<String>,
 }
 
 /// Full payload for the consent_request push event emitted by gate3.
@@ -250,7 +272,13 @@ pub struct ConsentRequestPayload {
     pub focus_run_id: String,
     /// Display name of the Focus being executed (shown in the modal header).
     pub focus_name: String,
-    /// Review tier for the modal. Controls visual weight and friction level.
+    /// items.id=406: NOT used for per-row layout anymore -- each span now
+    /// carries its own `review_tier` (see ConsentSpanItem), and the frontend
+    /// groups rows into sections by that field. This top-level field is kept
+    /// only for the documented empty-spans-forced-High edge case (gate3.rs:
+    /// severity/destination-risk forces High with zero PF detections) --
+    /// there's no span to carry a tier in that case, so the frontend falls
+    /// back to this field to know which section chrome to show.
     pub review_tier: ReviewTier,
     /// Identified spans. May be empty — see gate3.rs zero-span handling.
     pub spans: Vec<ConsentSpanItem>,
@@ -283,6 +311,26 @@ pub struct ElementDecision {
     /// The text the user actually entered, if they edited the suggestion.
     /// None if the user accepted the suggestion without modification.
     pub user_modified_text: Option<String>,
+    /// items.id=406: echoed back unchanged from the matching
+    /// ConsentSpanItem.category -- persisted alongside the decision so a
+    /// LATER gate3 call has something to query against even for facts that
+    /// never resolved a fact_key (category alone isn't a resolvable
+    /// identity, but is retained for audit/debugging parity with
+    /// disclosure_log's own category column).
+    pub category: String,
+    /// items.id=406: echoed back unchanged from the matching
+    /// ConsentSpanItem.fact_key. `None` when gate3 couldn't resolve a
+    /// stable identity for this span -- such a decision is still recorded
+    /// (audit trail) but can never be found again by a future prior-
+    /// decision query, so it will always re-ask next time.
+    pub fact_key: Option<String>,
+    /// items.id=406 (decisions.id=756): the "remember this for [Persona]"
+    /// affordance -- off by default, D5-152 pattern reuse (an explicit
+    /// opt-in boolean triggering a second, separate write). Ignored (no
+    /// standing preference written) when `fact_key` is None, since there is
+    /// nothing stable to key a standing preference on.
+    #[serde(default)]
+    pub save_for_persona: bool,
 }
 
 // -- Extract-and-confirm IPC types --------------------------------------------

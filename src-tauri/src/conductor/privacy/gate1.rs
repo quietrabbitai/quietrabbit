@@ -99,6 +99,8 @@ pub async fn gate1<L: DisclosureLogger>(
                 fields_withheld: withheld.clone(),
                 override_declined: false,
                 event_type: "gate1_pass".to_string(),
+                category: None,
+                fact_key: None,
             })
             .await;
 

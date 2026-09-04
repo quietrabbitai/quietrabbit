@@ -19,6 +19,14 @@ export interface ElementDecision {
   decision: ElementDecisionKind
   suggestion_text: string | null
   user_modified_text: string | null
+  /** items.id=406: echoed back unchanged from the matching ConsentSpanItem.category. */
+  category: string
+  /** items.id=406: echoed back unchanged from the matching ConsentSpanItem.fact_key --
+   *  null when gate3 couldn't resolve a stable identity for this span. */
+  fact_key: string | null
+  /** items.id=406 (decisions.id=756): "remember this for [Persona]" opt-in,
+   *  off by default. Ignored server-side when fact_key is null. */
+  save_for_persona: boolean
 }
 
 export function isAllKeptPrivate(decisions: ElementDecision[]): boolean {

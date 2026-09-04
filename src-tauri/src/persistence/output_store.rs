@@ -136,7 +136,12 @@ fn get_outputs_db_path(user_id: &str, persona_id: &str) -> PathBuf {
 /// key_hex from auth::registry::KeyRegistry server-side (see
 /// commands/tier2.rs for the reference pattern) instead of accepting it as
 /// a bare IPC parameter from the frontend.
-async fn open_outputs_db(
+// items.id=406: bumped from private to pub(crate) -- the fact-identity
+// persistence cascade (conductor/privacy/gate3.rs) needs its own outputs.db
+// connection for consent_decisions prior-decision lookups and
+// pf_fact_mentions reads/writes, matching personal_store::open_personal_db's
+// existing pub(crate) visibility (already cross-imported by 3+ modules).
+pub(crate) async fn open_outputs_db(
     user_id: &str,
     persona_id: &str,
     key_hex: &str,
@@ -787,14 +792,51 @@ pub async fn write_element_consent_decisions(
     decisions_json: &str,
 ) -> Result<(), OutputStoreError> {
     let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
-    write_element_consent_decisions_conn(&mut conn, run_id, decisions_json).await
+    let decisions = write_element_consent_decisions_conn(&mut conn, run_id, decisions_json).await?;
+
+    // items.id=406 (decisions.id=756): "remember this for [Persona]" --
+    // explicit, off-by-default opt-in (D5-152 pattern reuse). Written here,
+    // after the primary consent_decisions rows are safely committed, same
+    // ordering `submit_floor_consent_decision` already uses for its own
+    // secondary write. Silently skipped (not an error) when fact_key is
+    // None -- there is nothing stable to key a standing preference on for a
+    // fact none of the three deterministic layers resolved.
+    for d in &decisions {
+        if !d.save_for_persona {
+            continue;
+        }
+        let Some(fact_key) = &d.fact_key else {
+            continue;
+        };
+        let decision_str = match d.decision {
+            ElementDecisionKind::Generalize => "generalize",
+            ElementDecisionKind::KeepPrivate => "keep_private",
+            ElementDecisionKind::ReleaseOriginal => "release_original",
+        };
+        if let Err(e) = crate::persistence::personal_store::write_standing_preference(
+            user_id,
+            persona_id,
+            key_hex,
+            fact_key,
+            &d.category,
+            decision_str,
+            d.suggestion_text.as_deref(),
+            d.user_modified_text.as_deref(),
+        )
+        .await
+        {
+            log::warn!("failed to write standing preference for fact_key={fact_key}: {e}");
+        }
+    }
+
+    Ok(())
 }
 
 async fn write_element_consent_decisions_conn(
     conn: &mut SqliteConnection,
     run_id: &str,
     decisions_json: &str,
-) -> Result<(), OutputStoreError> {
+) -> Result<Vec<ElementDecision>, OutputStoreError> {
     let decisions: Vec<ElementDecision> = serde_json::from_str(decisions_json)
         .map_err(|e| OutputStoreError::Validation(format!("decisions_json parse error: {e}")))?;
 
@@ -821,16 +863,27 @@ async fn write_element_consent_decisions_conn(
         let result = sqlx::query(
             "INSERT INTO consent_decisions
                  (id, focus_run_id, decision_type, decision, abstraction_tier,
-                  save_preference, span_id, suggestion_text, user_modified_text, created_at)
-             VALUES (?, ?, 'element_consent', ?, NULL, NULL, ?, ?, ?, ?)",
+                  save_preference, span_id, suggestion_text, user_modified_text, created_at,
+                  category, fact_key)
+             VALUES (?, ?, 'element_consent', ?, NULL, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(run_id)
         .bind(decision_str)
+        // items.id=406: save_preference now carries ElementDecision's own
+        // save_for_persona flag for element_consent rows (previously always
+        // NULL here -- 'floor' rows are the only other user of this column
+        // and are unaffected). The actual standing-preference write happens
+        // in write_element_consent_decisions (the caller of this function),
+        // after this SAVEPOINT commits -- this bound value is audit-trail
+        // parity, not the write path itself.
+        .bind(d.save_for_persona as i64)
         .bind(&d.span_id)
         .bind(&d.suggestion_text)
         .bind(&d.user_modified_text)
         .bind(&now)
+        .bind(&d.category)
+        .bind(&d.fact_key)
         .execute(&mut *conn)
         .await;
 
@@ -846,7 +899,185 @@ async fn write_element_consent_decisions_conn(
         .execute(&mut *conn)
         .await?;
 
+    Ok(decisions)
+}
+
+// ---------------------------------------------------------------------------
+// items.id=406 (decisions.id=756/757) -- Privacy Guardian persistence
+// cascade: conversation-scoped prior-decision lookup, auto-reapplication
+// audit rows, and within-conversation coreference state. All outputs.db --
+// consent_decisions/pf_fact_mentions live here, not personal.db.
+// ---------------------------------------------------------------------------
+
+/// A previously-recorded decision for a resolved fact, as read back for
+/// silent reapplication. Deliberately narrower than the full
+/// `consent_decisions` row -- only what gate3 needs to reapply a decision
+/// without a frontend round-trip.
+#[derive(Debug, Clone)]
+pub struct PriorFactDecision {
+    /// "generalize" | "keep_private" | "release_original"
+    pub decision: String,
+    pub suggestion_text: Option<String>,
+    pub user_modified_text: Option<String>,
+}
+
+/// Conversation-scoped prior-decision query (decisions.id=756's default,
+/// no-opt-in-required tier): has `fact_key` already been decided earlier in
+/// THIS `focus_run_id`? Latest decision wins if (implausibly) more than one
+/// exists for the same fact_key within a run. `None` -- including on a
+/// gracefully-degraded empty `key_hex` -- means "ask the user", the safe
+/// fallback (this is an optimization layer, not a privacy control).
+pub async fn find_consent_decision_for_fact(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    focus_run_id: &str,
+    fact_key: &str,
+) -> Result<Option<PriorFactDecision>, OutputStoreError> {
+    if key_hex.is_empty() {
+        return Ok(None);
+    }
+    let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
+
+    let row = sqlx::query(
+        "SELECT decision, suggestion_text, user_modified_text
+         FROM consent_decisions
+         WHERE focus_run_id = ? AND fact_key = ? AND decision_type = 'element_consent'
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(focus_run_id)
+    .bind(fact_key)
+    .fetch_optional(&mut conn)
+    .await?;
+
+    match row {
+        None => Ok(None),
+        Some(r) => Ok(Some(PriorFactDecision {
+            decision: r.try_get("decision")?,
+            suggestion_text: r.try_get("suggestion_text")?,
+            user_modified_text: r.try_get("user_modified_text")?,
+        })),
+    }
+}
+
+/// Writes the audit-trail row for a fact silently reapplied without a
+/// frontend round-trip (gate3.rs's partition_by_prior_decision). Mirrors
+/// write_element_consent_decisions_conn's INSERT shape but for exactly one
+/// row, with a freshly-generated span_id (this invocation's own ephemeral
+/// id, same convention as an interactively-reviewed row) and a real
+/// original_text -- available here because gate3 already has the entity in
+/// hand, unlike the interactive path where the frontend doesn't echo it back.
+#[allow(clippy::too_many_arguments)]
+pub async fn write_auto_reapplied_consent_decision(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    focus_run_id: &str,
+    decision: &str,
+    suggestion_text: Option<&str>,
+    user_modified_text: Option<&str>,
+    category: &str,
+    fact_key: &str,
+    original_text: &str,
+) -> Result<(), OutputStoreError> {
+    let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let span_id = uuid::Uuid::new_v4().to_string();
+    let now = crate::providers::utils::now();
+
+    sqlx::query(
+        "INSERT INTO consent_decisions
+             (id, focus_run_id, decision_type, decision, abstraction_tier,
+              save_preference, span_id, suggestion_text, user_modified_text, created_at,
+              category, fact_key, original_text)
+         VALUES (?, ?, 'element_consent', ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(focus_run_id)
+    .bind(decision)
+    .bind(&span_id)
+    .bind(suggestion_text)
+    .bind(user_modified_text)
+    .bind(&now)
+    .bind(category)
+    .bind(fact_key)
+    .bind(original_text)
+    .execute(&mut conn)
+    .await?;
+
     Ok(())
+}
+
+/// Records one span mention for Layer 2 (within-conversation coreference,
+/// coref.rs) -- inserted regardless of whether this span ended up needing
+/// interactive review, so a LATER span in the same conversation can coref
+/// against it even before this one has a decision. Only called when a
+/// `fact_key` was actually resolved (Layer 1 or Layer 2 itself) -- an
+/// unresolved span contributes nothing for a future span to match against.
+pub async fn insert_fact_mention(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    focus_run_id: &str,
+    category: &str,
+    fact_key: &str,
+    original_text: &str,
+) -> Result<(), OutputStoreError> {
+    if key_hex.is_empty() {
+        return Ok(());
+    }
+    let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = crate::providers::utils::now();
+
+    sqlx::query(
+        "INSERT INTO pf_fact_mentions (id, focus_run_id, category, fact_key, original_text, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(focus_run_id)
+    .bind(category)
+    .bind(fact_key)
+    .bind(original_text)
+    .bind(&now)
+    .execute(&mut conn)
+    .await?;
+
+    Ok(())
+}
+
+/// Loads every span mention recorded so far in this conversation, for Layer
+/// 2's coreference resolution (coref.rs::resolve_within_conversation).
+/// Empty (including on a gracefully-degraded empty `key_hex`) simply means
+/// Layer 2 has nothing to resolve against yet -- not an error.
+pub async fn load_fact_mentions_for_run(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    focus_run_id: &str,
+) -> Result<Vec<crate::conductor::privacy::coref::PfFactMention>, OutputStoreError> {
+    if key_hex.is_empty() {
+        return Ok(vec![]);
+    }
+    let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
+
+    let rows = sqlx::query(
+        "SELECT category, fact_key, original_text FROM pf_fact_mentions
+         WHERE focus_run_id = ? ORDER BY created_at ASC",
+    )
+    .bind(focus_run_id)
+    .fetch_all(&mut conn)
+    .await?;
+
+    let mut mentions = Vec::with_capacity(rows.len());
+    for r in rows {
+        mentions.push(crate::conductor::privacy::coref::PfFactMention {
+            category: r.try_get("category")?,
+            fact_key: r.try_get("fact_key")?,
+            original_text: r.try_get("original_text")?,
+        });
+    }
+    Ok(mentions)
 }
 
 // ---------------------------------------------------------------------------
@@ -1003,6 +1234,11 @@ mod tests {
     use sqlx::sqlite::SqliteConnectOptions;
 
     const OUTPUTS_SCHEMA: &str = include_str!("../../schema/outputs_001.sql");
+    // items.id=406: consent_decisions.category/fact_key/original_text and
+    // pf_fact_mentions are added in outputs_005.sql, not outputs_001.sql --
+    // this in-memory test DB must apply both (005 only touches tables 001
+    // already defines, so no need for 002/003/004 in between).
+    const OUTPUTS_SCHEMA_V5: &str = include_str!("../../schema/outputs_005.sql");
 
     async fn test_db() -> SqliteConnection {
         let mut conn = SqliteConnectOptions::new()
@@ -1010,7 +1246,10 @@ mod tests {
             .connect()
             .await
             .expect("in-memory connection failed");
-        for stmt in parse_statements(OUTPUTS_SCHEMA) {
+        for stmt in parse_statements(OUTPUTS_SCHEMA)
+            .into_iter()
+            .chain(parse_statements(OUTPUTS_SCHEMA_V5))
+        {
             sqlx::query(&stmt)
                 .execute(&mut conn)
                 .await
@@ -1133,15 +1372,17 @@ mod tests {
         let mut conn = test_db().await;
         let run_id = seed_focus_run(&mut conn).await;
 
-        // Third element deliberately omits suggestion_text/user_modified_text --
-        // the fully-NULL-optionals shape must be accepted, not just the
-        // all-fields-populated case.
+        // Third element deliberately omits suggestion_text/user_modified_text/
+        // fact_key -- the fully-NULL-optionals shape must be accepted, not
+        // just the all-fields-populated case. save_for_persona relies on its
+        // #[serde(default)] (false) when omitted, same reasoning.
         let decisions_json = r#"[
-            {"span_id": "span-1", "decision": "generalize",
-             "suggestion_text": "[person]", "user_modified_text": null},
-            {"span_id": "span-2", "decision": "release_original",
-             "suggestion_text": null, "user_modified_text": "edited value"},
-            {"span_id": "span-3", "decision": "keep_private",
+            {"span_id": "span-1", "decision": "generalize", "category": "private_person",
+             "suggestion_text": "[person]", "user_modified_text": null, "fact_key": null},
+            {"span_id": "span-2", "decision": "release_original", "category": "private_email",
+             "suggestion_text": null, "user_modified_text": "edited value",
+             "fact_key": "abc123", "save_for_persona": true},
+            {"span_id": "span-3", "decision": "keep_private", "category": "secret",
              "suggestion_text": null, "user_modified_text": null}
         ]"#;
 
@@ -1151,7 +1392,7 @@ mod tests {
 
         let rows = sqlx::query(
             "SELECT decision, span_id, suggestion_text, user_modified_text,
-                    abstraction_tier, save_preference
+                    abstraction_tier, save_preference, category, fact_key
              FROM consent_decisions WHERE focus_run_id = ? ORDER BY span_id",
         )
         .bind(&run_id)
@@ -1164,16 +1405,39 @@ mod tests {
         let decision: String = rows[0].try_get("decision").unwrap();
         let span_id: String = rows[0].try_get("span_id").unwrap();
         let suggestion_text: Option<String> = rows[0].try_get("suggestion_text").unwrap();
+        let category_1: String = rows[0].try_get("category").unwrap();
+        let fact_key_1: Option<String> = rows[0].try_get("fact_key").unwrap();
         assert_eq!(decision, "generalize");
         assert_eq!(span_id, "span-1");
         assert_eq!(suggestion_text.as_deref(), Some("[person]"));
+        assert_eq!(category_1, "private_person");
+        assert!(
+            fact_key_1.is_none(),
+            "span-1 omitted fact_key -- must persist as NULL"
+        );
+
+        // items.id=406: save_preference now carries ElementDecision's own
+        // save_for_persona flag for element_consent rows (previously always
+        // NULL) -- span-2 opted in, span-3 didn't specify (defaults false).
+        let save_preference_2: Option<i64> = rows[1].try_get("save_preference").unwrap();
+        let fact_key_2: Option<String> = rows[1].try_get("fact_key").unwrap();
+        assert_eq!(
+            save_preference_2,
+            Some(1),
+            "span-2 set save_for_persona: true"
+        );
+        assert_eq!(fact_key_2.as_deref(), Some("abc123"));
 
         let abstraction_tier: Option<i64> = rows[2].try_get("abstraction_tier").unwrap();
         let save_preference: Option<i64> = rows[2].try_get("save_preference").unwrap();
         let suggestion_text_3: Option<String> = rows[2].try_get("suggestion_text").unwrap();
         let user_modified_text_3: Option<String> = rows[2].try_get("user_modified_text").unwrap();
         assert!(abstraction_tier.is_none(), "abstraction_tier must be NULL");
-        assert!(save_preference.is_none(), "save_preference must be NULL");
+        assert_eq!(
+            save_preference,
+            Some(0),
+            "span-3 omitted save_for_persona -- defaults false, not NULL"
+        );
         assert!(
             suggestion_text_3.is_none() && user_modified_text_3.is_none(),
             "fully-NULL optional fields must be accepted"
@@ -1614,6 +1878,162 @@ mod tests {
             );
         };
         verify.await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    // -- items.id=406: fact-identity persistence cascade ---------------------
+
+    #[tokio::test]
+    async fn fact_mentions_and_prior_decision_round_trip_against_a_real_encrypted_file() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "fact-cascade-user";
+        let persona_id = "fact-cascade-persona";
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+        let focus_run_id = "run-fact-cascade-1";
+
+        test_seed_focus_run(user_id, persona_id, key_hex, focus_run_id, "quick-ask")
+            .await
+            .expect("seed focus_run must succeed");
+
+        // load_fact_mentions_for_run on an empty conversation: no mentions yet.
+        let empty = load_fact_mentions_for_run(user_id, persona_id, key_hex, focus_run_id)
+            .await
+            .expect("query must succeed even with zero rows");
+        assert!(empty.is_empty());
+
+        // Record one mention, then read it back.
+        insert_fact_mention(
+            user_id,
+            persona_id,
+            key_hex,
+            focus_run_id,
+            "private_email",
+            "hash-abc",
+            "jane@example.com",
+        )
+        .await
+        .expect("insert_fact_mention must succeed");
+
+        let mentions = load_fact_mentions_for_run(user_id, persona_id, key_hex, focus_run_id)
+            .await
+            .expect("query must succeed");
+        assert_eq!(mentions.len(), 1);
+        assert_eq!(mentions[0].category, "private_email");
+        assert_eq!(mentions[0].fact_key, "hash-abc");
+        assert_eq!(mentions[0].original_text, "jane@example.com");
+
+        // No decision exists yet for this fact_key.
+        let none_yet =
+            find_consent_decision_for_fact(user_id, persona_id, key_hex, focus_run_id, "hash-abc")
+                .await
+                .expect("query must succeed");
+        assert!(none_yet.is_none());
+
+        // Auto-reapply writes a consent_decisions row keyed by the SAME
+        // fact_key -- a later call in this same conversation must find it.
+        write_auto_reapplied_consent_decision(
+            user_id,
+            persona_id,
+            key_hex,
+            focus_run_id,
+            "generalize",
+            Some("[email address]"),
+            None,
+            "private_email",
+            "hash-abc",
+            "jane@example.com",
+        )
+        .await
+        .expect("write_auto_reapplied_consent_decision must succeed");
+
+        let found =
+            find_consent_decision_for_fact(user_id, persona_id, key_hex, focus_run_id, "hash-abc")
+                .await
+                .expect("query must succeed")
+                .expect("prior decision must now be found");
+        assert_eq!(found.decision, "generalize");
+        assert_eq!(found.suggestion_text.as_deref(), Some("[email address]"));
+        assert!(found.user_modified_text.is_none());
+
+        // A DIFFERENT fact_key in the same run must not match.
+        let different = find_consent_decision_for_fact(
+            user_id,
+            persona_id,
+            key_hex,
+            focus_run_id,
+            "hash-unrelated",
+        )
+        .await
+        .expect("query must succeed");
+        assert!(different.is_none());
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    #[tokio::test]
+    async fn find_consent_decision_for_fact_is_scoped_to_focus_run_id() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "fact-scope-user";
+        let persona_id = "fact-scope-persona";
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+
+        test_seed_focus_run(user_id, persona_id, key_hex, "run-a", "quick-ask")
+            .await
+            .unwrap();
+        test_seed_focus_run(user_id, persona_id, key_hex, "run-b", "quick-ask")
+            .await
+            .unwrap();
+
+        write_auto_reapplied_consent_decision(
+            user_id,
+            persona_id,
+            key_hex,
+            "run-a",
+            "keep_private",
+            None,
+            None,
+            "private_person",
+            "hash-person-1",
+            "Jane Doe",
+        )
+        .await
+        .unwrap();
+
+        // Same fact_key, but a DIFFERENT conversation -- conversation-scoped
+        // persistence must not leak across focus_run_id (decisions.id=756:
+        // cross-conversation reuse requires the explicit Persona-scoped
+        // opt-in, a separate table entirely -- never this one).
+        let cross_run =
+            find_consent_decision_for_fact(user_id, persona_id, key_hex, "run-b", "hash-person-1")
+                .await
+                .unwrap();
+        assert!(
+            cross_run.is_none(),
+            "consent_decisions lookup must be scoped to focus_run_id, not leak across conversations"
+        );
+
+        let same_run =
+            find_consent_decision_for_fact(user_id, persona_id, key_hex, "run-a", "hash-person-1")
+                .await
+                .unwrap();
+        assert!(same_run.is_some());
 
         if let Some(v) = saved_root {
             std::env::set_var("QR_DATA_ROOT", v);

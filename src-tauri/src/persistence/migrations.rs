@@ -100,6 +100,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/messages_002.sql"),
     },
     SchemaFile {
+        prefix: "messages",
+        version: 3,
+        sql: include_str!("../../schema/messages_003.sql"),
+    },
+    SchemaFile {
         prefix: "outputs",
         version: 1,
         sql: include_str!("../../schema/outputs_001.sql"),
@@ -118,6 +123,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         prefix: "outputs",
         version: 4,
         sql: include_str!("../../schema/outputs_004.sql"),
+    },
+    SchemaFile {
+        prefix: "outputs",
+        version: 5,
+        sql: include_str!("../../schema/outputs_005.sql"),
     },
     SchemaFile {
         prefix: "personal",
@@ -153,6 +163,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         prefix: "personal",
         version: 7,
         sql: include_str!("../../schema/personal_007.sql"),
+    },
+    SchemaFile {
+        prefix: "personal",
+        version: 8,
+        sql: include_str!("../../schema/personal_008.sql"),
     },
     SchemaFile {
         prefix: "plan_state",
@@ -218,6 +233,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         prefix: "shared",
         version: 11,
         sql: include_str!("../../schema/shared_011.sql"),
+    },
+    SchemaFile {
+        prefix: "shared",
+        version: 12,
+        sql: include_str!("../../schema/shared_012.sql"),
     },
     SchemaFile {
         prefix: "tier3_cookies",
@@ -1255,15 +1275,15 @@ mod tests {
             .await
             .expect("shared migration chain must apply cleanly on a fresh db");
         assert_eq!(
-            applied, 11,
-            "expected all eleven shared schema versions to apply"
+            applied, 12,
+            "expected all twelve shared schema versions to apply"
         );
 
         let version: (i64,) = sqlx::query_as("SELECT MAX(version) FROM schema_version")
             .fetch_one(&mut conn)
             .await
             .unwrap();
-        assert_eq!(version.0, 11);
+        assert_eq!(version.0, 12);
     }
 
     #[tokio::test]
@@ -1334,8 +1354,8 @@ mod tests {
             .expect("drift-healing run must succeed");
 
         assert_eq!(
-            applied, 10,
-            "shared v2, v3, v4, v5, v6, v7, v8, v9, v10, and v11 should count as newly applied from a stale v1 database"
+            applied, 11,
+            "shared v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, and v12 should count as newly applied from a stale v1 database"
         );
 
         let exists: Option<(String,)> = sqlx::query_as(
@@ -1556,8 +1576,8 @@ mod tests {
 
         assert_eq!(
             result.expect("migration must apply cleanly to a real encrypted file"),
-            7,
-            "personal_001 + personal_002 + personal_003 + personal_004 + personal_005 + personal_006 + personal_007 must all apply in one pass"
+            8,
+            "personal_001 + personal_002 + personal_003 + personal_004 + personal_005 + personal_006 + personal_007 + personal_008 must all apply in one pass"
         );
 
         let mut conn = open_verify_conn(&db_path, Some(TEST_KEY_HEX)).await;
@@ -1625,7 +1645,7 @@ mod tests {
             std::env::remove_var("QR_DATA_ROOT");
         }
 
-        assert_eq!(first.expect("first migration must succeed"), 7);
+        assert_eq!(first.expect("first migration must succeed"), 8);
         assert_eq!(
             second.expect("second migration on an already-migrated real file must not error"),
             0,
@@ -1823,8 +1843,8 @@ mod tests {
 
         assert_eq!(
             result.expect("migration must apply cleanly"),
-            4,
-            "outputs_001 + outputs_002 + outputs_003 + outputs_004 must all apply in one pass"
+            5,
+            "outputs_001 + outputs_002 + outputs_003 + outputs_004 + outputs_005 must all apply in one pass"
         );
 
         let mut conn = open_verify_conn(&db_path, Some(TEST_KEY_HEX)).await;

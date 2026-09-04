@@ -79,6 +79,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::consent::get_pending_cross_persona_confirmations,
         commands::consent::request_tier3_gate3_review,
         commands::consent::resolve_tier3_gate3_review,
+        commands::consent::recheck_tier3_provider_selection,
         // Group 3 -- Onboarding
         commands::onboarding::get_onboarding_focus_suggestions,
         commands::onboarding::submit_onboarding_persona_selection,
@@ -201,6 +202,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::consent::get_pending_cross_persona_confirmations,
         commands::consent::request_tier3_gate3_review,
         commands::consent::resolve_tier3_gate3_review,
+        commands::consent::recheck_tier3_provider_selection,
         // Group 3 -- Onboarding
         commands::onboarding::get_onboarding_focus_suggestions,
         commands::onboarding::submit_onboarding_persona_selection,

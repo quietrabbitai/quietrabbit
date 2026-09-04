@@ -162,7 +162,7 @@
     "sendButton": "Send →",
     "confirmAllKeptPrivate": "Kept private. Stopping here.",
     "confirmMixed": "{{generalized}} generalized, {{keptPrivate}} kept private, {{released}} released original. Logged.",
-    "easy": {
+    "low": {
       "heading": "The following information is about to leave your device."
     },
     "medium": {
@@ -172,6 +172,12 @@
     "high": {
       "heading": "Review carefully before anything leaves your device.",
       "subline": "Each item needs a decision. Nothing is pre-authorized."
-    }
+    },
+    "sectionLabel": {
+      "low": "Low risk",
+      "medium": "Medium risk",
+      "high": "High risk"
+    },
+    "rememberForPersona": "Remember this decision"
   }
 }

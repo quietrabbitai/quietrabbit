@@ -28,6 +28,12 @@ pub struct DisclosureLogEntry {
     pub fields_withheld: Vec<String>,
     pub override_declined: bool,
     pub event_type: String,
+    /// items.id=406 (decisions.id=756/757): populated only by the fact-
+    /// identity persistence cascade (gate3.rs's silent-reapplication path
+    /// and its `gate3_fact_reapplied` event) -- `None` on every other event
+    /// type, unchanged from before this column existed.
+    pub category: Option<String>,
+    pub fact_key: Option<String>,
 }
 
 #[async_trait]

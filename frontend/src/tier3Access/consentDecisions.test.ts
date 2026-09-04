@@ -10,7 +10,15 @@ import assert from 'node:assert/strict'
 import { isAllKeptPrivate, type ElementDecision } from './consentDecisions.ts'
 
 function decision(kind: ElementDecision['decision']): ElementDecision {
-  return { span_id: 'x', decision: kind, suggestion_text: null, user_modified_text: null }
+  return {
+    span_id: 'x',
+    decision: kind,
+    suggestion_text: null,
+    user_modified_text: null,
+    category: 'private_person',
+    fact_key: null,
+    save_for_persona: false,
+  }
 }
 
 // The regression: zero spans to review must not read as "all kept private".

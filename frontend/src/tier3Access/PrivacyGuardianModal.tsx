@@ -1,8 +1,10 @@
-// Privacy Guardian consent modal -- PRIVACY_GUARDIAN_GATE_SPEC.md (LOCKED,
-// Chat-BRAND session June 22 2026, item 19c, D6-362). No modal component
-// existed anywhere in this codebase before this file -- built from the spec
-// directly, following this codebase's plain-global-CSS / useState / t()
-// conventions (Tier3Selector.tsx is the closest sibling for those idioms).
+// Privacy Guardian consent modal -- PRIVACY_GUARDIAN_GATE_SPEC.md (originally
+// LOCKED, Chat-BRAND session June 22 2026, item 19c, D6-362; its tier-routing
+// rule and Easy/Medium/High naming were superseded in direction 2026-09-03,
+// decisions.id=753/754, and built out here, items.id=406). No modal component
+// existed anywhere in this codebase before the original build -- built from
+// the spec directly, following this codebase's plain-global-CSS / useState /
+// t() conventions (Tier3Selector.tsx is the closest sibling for those idioms).
 //
 // Mounted by Tier3AccessPane.tsx once request_tier3_gate3_review reports
 // pending_consent=true. `open` covers both the pre-payload scanning state
@@ -17,6 +19,29 @@
 // though the Rust types derive specta::Type -- same treatment ChatPane.tsx
 // gives RunStatusPayload, for the same reason (see that file's header
 // comment). Keep these in sync by hand with conductor/privacy/types.rs.
+//
+// items.id=406 (decisions.id=754): THREE-SECTION REDESIGN. The single-tier-
+// for-the-whole-modal model is replaced by three simultaneous sections
+// (Low/Medium/High), each independently populated by each span's own
+// review_tier (gate3.rs::assign_review_tier_for_span, no longer a single
+// batch-wide tier). Blank sections are hidden entirely. Per-tier behavior
+// (default selection, select-all availability, CTA options) is otherwise
+// UNCHANGED from the original locked spec -- reused as-is, per-section,
+// rather than redesigned. This build ships the MECHANISM (grouping,
+// hidden-if-empty, a single bottom Send gated by the High section's own
+// existing rule) reusing the *current* per-tier visual treatment unchanged,
+// stacked -- modal height/spacing/collapse behavior for three simultaneous
+// sections is explicitly a follow-up Chat-BRAND visual-design pass, not
+// decided here (this document's own scope boundary, per the item that
+// dispatched this build).
+//
+// Behavior adaptation required by having multiple sections at once (not
+// specified by the single-tier original, since only one tier ever existed
+// per modal before): "Keep everything private" for one section now only
+// sets THAT section's rows to keep_private locally -- it no longer
+// immediately submits the whole modal, since other sections (particularly
+// an unreviewed High section) may still need attention. The user still
+// presses the single bottom Send once every section they care about is set.
 //
 // Scope trims from the spec, called out rather than silently dropped:
 //   - The live "[N rows remaining]" scroll indicator is not implemented --
@@ -46,9 +71,10 @@
 import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { isAllKeptPrivate, type ElementDecision, type ElementDecisionKind } from './consentDecisions'
+import { groupSpansByTier, REVIEW_TIER_ORDER, type ReviewTier } from './reviewSections'
 import './PrivacyGuardianModal.css'
 
-export type ReviewTier = 'easy' | 'medium' | 'high'
+export type { ReviewTier } from './reviewSections'
 
 export interface ConsentSpanItem {
   span_id: string
@@ -59,11 +85,21 @@ export interface ConsentSpanItem {
   start_byte: number
   end_byte: number
   score: number
+  /** items.id=406: this span's own review tier -- independently assigned,
+   *  not shared across the whole payload. Drives which section it renders in. */
+  review_tier: ReviewTier
+  /** items.id=406: the stable fact identity gate3 resolved for this span
+   *  (or null if none of the three deterministic layers resolved it).
+   *  Echoed back unchanged in the matching ElementDecision. */
+  fact_key: string | null
 }
 
 export interface ConsentRequestPayload {
   focus_run_id: string
   focus_name: string
+  /** items.id=406: no longer used for per-row layout -- each span carries
+   *  its own review_tier. Kept only for the documented empty-spans-forced-
+   *  High edge case (no span exists to carry a tier in that case). */
   review_tier: ReviewTier
   spans: ConsentSpanItem[]
 }
@@ -88,7 +124,13 @@ interface RowState {
   decision: ElementDecisionKind | null
   editing: boolean
   editedText: string | null
+  /** items.id=406 (decisions.id=756): "remember this for [Persona]",
+   *  off by default -- only meaningful (and only shown) when the span has
+   *  a fact_key; ignored server-side otherwise. */
+  saveForPersona: boolean
 }
+
+const EMPTY_ROW: RowState = { decision: null, editing: false, editedText: null, saveForPersona: false }
 
 const SCANNING_SLOW_AFTER_MS = 10_000
 const CONFIRMATION_DISMISS_MS = 1_500
@@ -131,13 +173,14 @@ export function PrivacyGuardianModal({
   const { t } = useTranslation()
   const [rows, setRows] = useState<Record<string, RowState>>({})
   const [scanningSlow, setScanningSlow] = useState(false)
-  const [twoStepArm, setTwoStepArm] = useState<'keepAllPrivate' | 'selectAllGeneralize' | null>(null)
+  const [twoStepArm, setTwoStepArm] = useState<string | null>(null)
   const [confirmationMessage, setConfirmationMessage] = useState<string | null>(null)
   const twoStepTimerRef = useRef<number | null>(null)
   const confirmTimerRef = useRef<number | null>(null)
 
-  // Reset per-open, and initialize row state once the payload (and its
-  // tier) is known -- tier determines each row's starting selection.
+  // Reset per-open, and initialize row state once the payload is known --
+  // each span's OWN review_tier determines that row's starting selection
+  // (items.id=406: no longer one shared tier for every row).
   useEffect(() => {
     if (!open) {
       setRows({})
@@ -150,9 +193,10 @@ export function PrivacyGuardianModal({
     const initial: Record<string, RowState> = {}
     for (const span of payload.spans) {
       initial[span.span_id] = {
-        decision: defaultDecisionForTier(payload.review_tier),
+        decision: defaultDecisionForTier(span.review_tier),
         editing: false,
         editedText: null,
+        saveForPersona: false,
       }
     }
     setRows(initial)
@@ -177,15 +221,11 @@ export function PrivacyGuardianModal({
 
   if (!open) return null
 
-  const armTwoStep = (which: 'keepAllPrivate' | 'selectAllGeneralize') => {
+  const armTwoStep = (which: string, onConfirm: () => void) => {
     if (twoStepArm === which) {
       if (twoStepTimerRef.current !== null) window.clearTimeout(twoStepTimerRef.current)
       setTwoStepArm(null)
-      if (which === 'keepAllPrivate') {
-        finishWithAllKeptPrivate()
-      } else {
-        selectAllGeneralize()
-      }
+      onConfirm()
       return
     }
     setTwoStepArm(which)
@@ -193,11 +233,24 @@ export function PrivacyGuardianModal({
     twoStepTimerRef.current = window.setTimeout(() => setTwoStepArm(null), TWO_STEP_RESET_MS)
   }
 
-  const selectAllGeneralize = () => {
+  const selectAllGeneralizeInSection = (spanIds: string[]) => {
     setRows((prev) => {
-      const next: Record<string, RowState> = {}
-      for (const [id, row] of Object.entries(prev)) {
-        next[id] = { ...row, decision: 'generalize' }
+      const next = { ...prev }
+      for (const id of spanIds) {
+        next[id] = { ...next[id], decision: 'generalize' }
+      }
+      return next
+    })
+  }
+
+  // items.id=406: sets only THIS section's rows to keep_private -- does NOT
+  // submit the whole modal (see file header: a behavior adaptation required
+  // once more than one section can be present at once).
+  const keepSectionPrivate = (spanIds: string[]) => {
+    setRows((prev) => {
+      const next = { ...prev }
+      for (const id of spanIds) {
+        next[id] = { ...next[id], decision: 'keep_private', editing: false }
       }
       return next
     })
@@ -207,6 +260,13 @@ export function PrivacyGuardianModal({
     setRows((prev) => ({
       ...prev,
       [spanId]: { ...prev[spanId], decision, editing: false },
+    }))
+  }
+
+  const toggleSaveForPersona = (spanId: string) => {
+    setRows((prev) => ({
+      ...prev,
+      [spanId]: { ...prev[spanId], saveForPersona: !prev[spanId].saveForPersona },
     }))
   }
 
@@ -231,6 +291,9 @@ export function PrivacyGuardianModal({
         decision: row.decision ?? 'keep_private',
         suggestion_text: span.suggestion,
         user_modified_text: row.editedText,
+        category: span.category,
+        fact_key: span.fact_key,
+        save_for_persona: span.fact_key !== null && row.saveForPersona,
       }
     })
   }
@@ -253,17 +316,6 @@ export function PrivacyGuardianModal({
     confirmTimerRef.current = window.setTimeout(() => {
       onResolve(decisions)
     }, CONFIRMATION_DISMISS_MS)
-  }
-
-  const finishWithAllKeptPrivate = () => {
-    if (!payload) return
-    const allPrivate: Record<string, RowState> = {}
-    for (const span of payload.spans) {
-      allPrivate[span.span_id] = { decision: 'keep_private', editing: false, editedText: null }
-    }
-    setRows(allPrivate)
-    const decisions = buildDecisions(allPrivate)
-    finishAndResolve(decisions, t('privacyGuardianModal.confirmAllKeptPrivate'))
   }
 
   const handleSend = () => {
@@ -311,12 +363,18 @@ export function PrivacyGuardianModal({
     )
   }
 
-  const tier = payload.review_tier
-  const { defaultKind, overrideTop, overrideBottom } = cellLayoutForTier(tier)
-  const reviewedCount = payload.spans.filter((s) => isRowValid(s, rows[s.span_id] ?? { decision: null, editing: false, editedText: null })).length
-  const totalCount = payload.spans.length
-  const allReviewed = reviewedCount === totalCount
-  const sendDisabled = tier === 'high' ? !allReviewed : reviewedCount !== totalCount
+  const grouped = groupSpansByTier(payload.spans)
+  const highSpans = grouped.high
+  const highReviewedCount = highSpans.filter((s) =>
+    isRowValid(s, rows[s.span_id] ?? EMPTY_ROW),
+  ).length
+  const highAllReviewed = highReviewedCount === highSpans.length
+  // items.id=406: Send is gated by the High section's own existing rule
+  // (every row must be individually selected) when a High section is
+  // present. With no High section, Send stays active immediately -- Low/
+  // Medium rows arrive pre-selected, matching their original single-tier
+  // behavior.
+  const sendDisabled = highSpans.length > 0 && !highAllReviewed
 
   return (
     <div className="pg-modal-overlay">
@@ -326,64 +384,37 @@ export function PrivacyGuardianModal({
           {t('privacyGuardianModal.focusContext', { focusName: payload.focus_name })}
         </div>
         <div className="pg-modal__body">
-          <p className="pg-modal__heading">{t(`privacyGuardianModal.${tier}.heading`)}</p>
-          {tier !== 'easy' && (
-            <p className="pg-modal__subline">{t(`privacyGuardianModal.${tier}.subline`)}</p>
-          )}
-          {tier === 'medium' && (
-            <button
-              type="button"
-              className="pg-modal__select-all"
-              onClick={() => armTwoStep('selectAllGeneralize')}
-            >
-              {twoStepArm === 'selectAllGeneralize'
-                ? t('privacyGuardianModal.confirmSelectAll')
-                : t('privacyGuardianModal.selectAllGeneralize')}
-            </button>
-          )}
-          <ul className="pg-modal__row-list">
-            {payload.spans.map((span) => {
-              const row = rows[span.span_id] ?? { decision: null, editing: false, editedText: null }
-              return (
-                <PgRow
-                  key={span.span_id}
-                  span={span}
-                  row={row}
-                  tier={tier}
-                  defaultKind={defaultKind}
-                  overrideTop={overrideTop}
-                  overrideBottom={overrideBottom}
-                  onSelect={(kind) => setRowDecision(span.span_id, kind)}
-                  onStartEditing={() => startEditing(span.span_id)}
-                  onCancelEditing={() => cancelEditing(span.span_id)}
-                  onCommitEditing={(text) => commitEditing(span.span_id, text)}
-                  t={t}
-                />
-              )
-            })}
-          </ul>
+          {REVIEW_TIER_ORDER.map((tier) => {
+            const spans = grouped[tier]
+            if (spans.length === 0) return null
+            return (
+              <PgSection
+                key={tier}
+                tier={tier}
+                spans={spans}
+                rows={rows}
+                twoStepArm={twoStepArm}
+                onArmTwoStep={armTwoStep}
+                onSelectAllGeneralize={() => selectAllGeneralizeInSection(spans.map((s) => s.span_id))}
+                onKeepSectionPrivate={() => keepSectionPrivate(spans.map((s) => s.span_id))}
+                onSelect={setRowDecision}
+                onStartEditing={startEditing}
+                onCancelEditing={cancelEditing}
+                onCommitEditing={commitEditing}
+                onToggleSaveForPersona={toggleSaveForPersona}
+                t={t}
+              />
+            )
+          })}
         </div>
         <div className="pg-modal__cta-row">
-          {tier !== 'easy' && (
+          {highSpans.length > 0 && (
             <span className="pg-modal__cta-count" aria-live="polite">
-              {t(
-                tier === 'high'
-                  ? 'privacyGuardianModal.reviewedCount'
-                  : 'privacyGuardianModal.selectedCount',
-                { count: reviewedCount, total: totalCount },
-              )}
+              {t('privacyGuardianModal.reviewedCount', {
+                count: highReviewedCount,
+                total: highSpans.length,
+              })}
             </span>
-          )}
-          {tier !== 'high' && (
-            <button
-              type="button"
-              className="pg-modal__keep-all-private"
-              onClick={() => armTwoStep('keepAllPrivate')}
-            >
-              {twoStepArm === 'keepAllPrivate'
-                ? t('privacyGuardianModal.confirmKeepAllPrivate')
-                : t('privacyGuardianModal.keepEverythingPrivate')}
-            </button>
           )}
           <button
             type="button"
@@ -409,6 +440,96 @@ function PgHeader() {
   )
 }
 
+interface PgSectionProps {
+  tier: ReviewTier
+  spans: ConsentSpanItem[]
+  rows: Record<string, RowState>
+  twoStepArm: string | null
+  onArmTwoStep: (which: string, onConfirm: () => void) => void
+  onSelectAllGeneralize: () => void
+  onKeepSectionPrivate: () => void
+  onSelect: (spanId: string, kind: ElementDecisionKind) => void
+  onStartEditing: (spanId: string) => void
+  onCancelEditing: (spanId: string) => void
+  onCommitEditing: (spanId: string, text: string) => void
+  onToggleSaveForPersona: (spanId: string) => void
+  t: (key: string, opts?: Record<string, unknown>) => string
+}
+
+function PgSection({
+  tier,
+  spans,
+  rows,
+  twoStepArm,
+  onArmTwoStep,
+  onSelectAllGeneralize,
+  onKeepSectionPrivate,
+  onSelect,
+  onStartEditing,
+  onCancelEditing,
+  onCommitEditing,
+  onToggleSaveForPersona,
+  t,
+}: PgSectionProps) {
+  const { defaultKind, overrideTop, overrideBottom } = cellLayoutForTier(tier)
+  const keepPrivateArmKey = `keepAllPrivate-${tier}`
+  const selectAllArmKey = `selectAllGeneralize-${tier}`
+
+  return (
+    <section className="pg-modal__section" data-tier={tier}>
+      <p className="pg-modal__section-label">{t(`privacyGuardianModal.sectionLabel.${tier}`)}</p>
+      <p className="pg-modal__heading">{t(`privacyGuardianModal.${tier}.heading`)}</p>
+      {tier !== 'low' && (
+        <p className="pg-modal__subline">{t(`privacyGuardianModal.${tier}.subline`)}</p>
+      )}
+      {tier === 'medium' && (
+        <button
+          type="button"
+          className="pg-modal__select-all"
+          onClick={() => onArmTwoStep(selectAllArmKey, onSelectAllGeneralize)}
+        >
+          {twoStepArm === selectAllArmKey
+            ? t('privacyGuardianModal.confirmSelectAll')
+            : t('privacyGuardianModal.selectAllGeneralize')}
+        </button>
+      )}
+      <ul className="pg-modal__row-list">
+        {spans.map((span) => {
+          const row = rows[span.span_id] ?? EMPTY_ROW
+          return (
+            <PgRow
+              key={span.span_id}
+              span={span}
+              row={row}
+              tier={tier}
+              defaultKind={defaultKind}
+              overrideTop={overrideTop}
+              overrideBottom={overrideBottom}
+              onSelect={(kind) => onSelect(span.span_id, kind)}
+              onStartEditing={() => onStartEditing(span.span_id)}
+              onCancelEditing={() => onCancelEditing(span.span_id)}
+              onCommitEditing={(text) => onCommitEditing(span.span_id, text)}
+              onToggleSaveForPersona={() => onToggleSaveForPersona(span.span_id)}
+              t={t}
+            />
+          )
+        })}
+      </ul>
+      {tier !== 'high' && (
+        <button
+          type="button"
+          className="pg-modal__keep-all-private"
+          onClick={() => onArmTwoStep(keepPrivateArmKey, onKeepSectionPrivate)}
+        >
+          {twoStepArm === keepPrivateArmKey
+            ? t('privacyGuardianModal.confirmKeepAllPrivate')
+            : t('privacyGuardianModal.keepEverythingPrivate')}
+        </button>
+      )}
+    </section>
+  )
+}
+
 interface PgRowProps {
   span: ConsentSpanItem
   row: RowState
@@ -420,6 +541,7 @@ interface PgRowProps {
   onStartEditing: () => void
   onCancelEditing: () => void
   onCommitEditing: (text: string) => void
+  onToggleSaveForPersona: () => void
   t: (key: string, opts?: Record<string, unknown>) => string
 }
 
@@ -434,6 +556,7 @@ function PgRow({
   onStartEditing,
   onCancelEditing,
   onCommitEditing,
+  onToggleSaveForPersona,
   t,
 }: PgRowProps) {
   return (
@@ -479,6 +602,15 @@ function PgRow({
           />
         </div>
       </div>
+      {/* items.id=406 (decisions.id=756): "remember this for [Persona]" --
+          only shown when gate3 resolved a stable fact_key for this span;
+          a plain checkbox for now, visual placement is a Chat-BRAND pass. */}
+      {span.fact_key !== null && row.decision !== null && (
+        <label className="pg-modal__remember-for-persona">
+          <input type="checkbox" checked={row.saveForPersona} onChange={onToggleSaveForPersona} />
+          {t('privacyGuardianModal.rememberForPersona')}
+        </label>
+      )}
     </li>
   )
 }

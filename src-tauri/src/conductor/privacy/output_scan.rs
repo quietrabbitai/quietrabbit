@@ -186,6 +186,8 @@ async fn scan_with_pf<L: DisclosureLogger>(
                     fields_withheld: vec![],
                     override_declined: intensity == ScanIntensity::Full,
                     event_type: "output_scan_timeout".to_string(),
+                    category: None,
+                    fact_key: None,
                 })
                 .await?;
 
@@ -244,6 +246,8 @@ async fn scan_with_pf<L: DisclosureLogger>(
                 ScanIntensity::Light => "output_scan_light".to_string(),
                 ScanIntensity::Full => "output_scan_full".to_string(),
             },
+            category: None,
+            fact_key: None,
         })
         .await?;
 
@@ -299,6 +303,8 @@ async fn scan_legacy_fallback<L: DisclosureLogger>(
                 ScanIntensity::Light => "output_scan_light_legacy".to_string(),
                 ScanIntensity::Full => "output_scan_full_legacy".to_string(),
             },
+            category: None,
+            fact_key: None,
         })
         .await?;
 

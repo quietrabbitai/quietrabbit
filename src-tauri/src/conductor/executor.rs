@@ -158,6 +158,18 @@ pub struct StepContext {
     pub focus_run_id: String,
     pub user_input: String,
     pub persona_context: String, // rendered MemoryBroker output (Phase 3)
+    /// items.id=406: identity fields PG_GATE_3 needs to open outputs.db/
+    /// personal.db for the fact-identity persistence cascade (prior-decision
+    /// query, pf_fact_mentions, pf_standing_preferences). Already present on
+    /// FocusRun (lifecycle.rs) — StepContext previously carried "step
+    /// metadata only" and left identity to be borrowed separately alongside
+    /// it, but gate3 itself now needs these directly, not just the logger
+    /// built from them. key_hex is "" when FocusRun.key_hex is None, matching
+    /// the empty-string-when-absent convention SqliteDisclosureLogger's own
+    /// callers already use.
+    pub user_id: String,
+    pub persona_id: String,
+    pub key_hex: String,
     pub space_max_permitted_tier: u8,
     pub execution_tier: u8,
     pub abstraction_tier: u8,
@@ -428,6 +440,8 @@ impl StepExecutor {
                         fields_withheld: g1.withheld_fields.clone(),
                         override_declined: false,
                         event_type: "floor_consent_auto".to_owned(),
+                        category: None,
+                        fact_key: None,
                     })
                     .await;
             } else {
@@ -680,6 +694,13 @@ impl StepExecutor {
                         ctx.space_max_permitted_tier,
                         execution_tier,
                         app_handle,
+                        // items.id=406: no specific-provider selection concept
+                        // at this generic Focus-step-promotion layer -- falls
+                        // back to target_tier itself, unchanged behavior.
+                        None,
+                        &ctx.user_id,
+                        &ctx.persona_id,
+                        &ctx.key_hex,
                     )
                     .await
                     .map_err(|e| ConductorError::DisclosureLogWrite {
@@ -894,6 +915,8 @@ async fn scan_voice_profile<L: DisclosureLogger>(
                     fields_withheld: vec![attr.to_string()],
                     override_declined: false,
                     event_type: "voice_profile_contamination".to_owned(),
+                    category: None,
+                    fact_key: None,
                 })
                 .await;
 
@@ -1666,6 +1689,9 @@ mod tests {
             next_execution_tier: None,
             retry_count: 0,
             focus_name: "test".to_owned(),
+            user_id: "u".to_owned(),
+            persona_id: "p".to_owned(),
+            key_hex: String::new(),
         };
         let mut projected = HashMap::new();
         projected.insert("name".to_owned(), "Alice (abstracted)".to_owned());
@@ -1714,6 +1740,9 @@ mod tests {
             next_execution_tier: None,
             retry_count: 0,
             focus_name: "test".to_owned(),
+            user_id: "u".to_owned(),
+            persona_id: "p".to_owned(),
+            key_hex: String::new(),
         };
         assert_eq!(compute_step_sensitivity(&ctx, &pt, &HashMap::new(), 1), 2);
     }
@@ -1748,6 +1777,9 @@ mod tests {
             next_execution_tier: None,
             retry_count: 0,
             focus_name: "test".to_owned(),
+            user_id: "u".to_owned(),
+            persona_id: "p".to_owned(),
+            key_hex: String::new(),
         };
         assert_eq!(compute_step_sensitivity(&ctx, &pt, &HashMap::new(), 1), 1);
     }

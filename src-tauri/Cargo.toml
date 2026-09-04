@@ -206,6 +206,7 @@ glow = "0.16"
 # needs this crate's own 0.17 to match wgpu-hal's, not the 0.16 used for this
 # app's own GL_DRAW_FRAMEBUFFER_BINDING capture/rebind calls elsewhere.
 glow-for-wgpu-hal = { package = "glow", version = "0.17" }
+anno = { version = "=0.11.0", default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

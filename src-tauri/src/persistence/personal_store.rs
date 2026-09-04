@@ -943,6 +943,109 @@ pub async fn load_entity_facts_for_context(
     Ok(facts)
 }
 
+// ---------------------------------------------------------------------------
+// items.id=406 (decisions.id=756) -- Privacy Guardian Persona-scoped
+// standing preference ("remember this for [Persona]", opt-in, off by
+// default). Deliberately its own encrypted table (pf_standing_preferences,
+// personal_008.sql) rather than personas.extra_metadata (shared.db,
+// UNENCRYPTED) -- see that migration's header for why: a fact-linked
+// preference can be pinned to a specific email/phone/person, unlike floor
+// consent's bare abstraction_tier integer.
+// ---------------------------------------------------------------------------
+
+/// A standing preference previously saved for this persona+fact, as read
+/// back for silent Persona-scoped reapplication.
+#[derive(Debug, Clone)]
+pub struct StandingPreference {
+    pub decision: String,
+    pub suggestion_text: Option<String>,
+    pub user_modified_text: Option<String>,
+}
+
+/// Persona-scoped prior-decision query (decisions.id=756's opt-in tier):
+/// has the user explicitly chosen to always apply the same decision to this
+/// fact for this Persona, in ANY conversation? Takes priority over the
+/// conversation-scoped `consent_decisions` lookup when both exist -- it's
+/// the more deliberate, explicit choice. `None` -- including on a
+/// gracefully-degraded empty `key_hex` -- means "no standing preference,
+/// fall through to conversation-scoped or ask", never a privacy-loosening
+/// default.
+pub async fn find_standing_preference(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    fact_key: &str,
+) -> Result<Option<StandingPreference>, PersonalStoreError> {
+    if key_hex.is_empty() {
+        return Ok(None);
+    }
+    let mut conn = open_personal_db(user_id, persona_id, key_hex).await?;
+
+    let row = sqlx::query(
+        "SELECT decision, suggestion_text, user_modified_text
+         FROM pf_standing_preferences WHERE persona_id = ? AND fact_key = ?",
+    )
+    .bind(persona_id)
+    .bind(fact_key)
+    .fetch_optional(&mut conn)
+    .await?;
+
+    match row {
+        None => Ok(None),
+        Some(r) => Ok(Some(StandingPreference {
+            decision: r.try_get("decision")?,
+            suggestion_text: r.try_get("suggestion_text")?,
+            user_modified_text: r.try_get("user_modified_text")?,
+        })),
+    }
+}
+
+/// Writes (or replaces -- UNIQUE(persona_id, fact_key), matching D5-152's
+/// own "reconfigure rather than error" precedent) a standing preference.
+/// Called only from the explicit, off-by-default "remember this for
+/// [Persona]" affordance (ElementDecision.save_for_persona) -- never
+/// silently, never as a side effect of ordinary review.
+#[allow(clippy::too_many_arguments)]
+pub async fn write_standing_preference(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    fact_key: &str,
+    category: &str,
+    decision: &str,
+    suggestion_text: Option<&str>,
+    user_modified_text: Option<&str>,
+) -> Result<(), PersonalStoreError> {
+    let mut conn = open_personal_db(user_id, persona_id, key_hex).await?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = crate::providers::utils::now();
+
+    sqlx::query(
+        "INSERT INTO pf_standing_preferences
+             (id, persona_id, fact_key, category, decision, suggestion_text,
+              user_modified_text, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(persona_id, fact_key) DO UPDATE SET
+             category = excluded.category,
+             decision = excluded.decision,
+             suggestion_text = excluded.suggestion_text,
+             user_modified_text = excluded.user_modified_text,
+             created_at = excluded.created_at",
+    )
+    .bind(&id)
+    .bind(persona_id)
+    .bind(fact_key)
+    .bind(category)
+    .bind(decision)
+    .bind(suggestion_text)
+    .bind(user_modified_text)
+    .bind(&now)
+    .execute(&mut conn)
+    .await?;
+
+    Ok(())
+}
+
 /// Load active (valid_until IS NULL) entity_facts rows with
 /// cross_persona_export = 1 for a user+persona — the set of facts that
 /// require per-session user confirmation before a Focus run may include
@@ -1879,5 +1982,125 @@ mod tests {
             state, "user_created",
             "a row that was never sync-derived stays QR-authoritative"
         );
+    }
+
+    // -- items.id=406: Persona-scoped standing preference --------------------
+
+    #[tokio::test]
+    async fn standing_preference_round_trips_against_a_real_encrypted_file() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "standing-pref-user";
+        let persona_id = "standing-pref-persona";
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+
+        let none_yet = find_standing_preference(user_id, persona_id, key_hex, "hash-abc")
+            .await
+            .expect("query must succeed against a self-healed fresh personal.db");
+        assert!(none_yet.is_none());
+
+        write_standing_preference(
+            user_id,
+            persona_id,
+            key_hex,
+            "hash-abc",
+            "private_email",
+            "generalize",
+            Some("[email address]"),
+            None,
+        )
+        .await
+        .expect("write_standing_preference must succeed");
+
+        let found = find_standing_preference(user_id, persona_id, key_hex, "hash-abc")
+            .await
+            .expect("query must succeed")
+            .expect("standing preference must now be found");
+        assert_eq!(found.decision, "generalize");
+        assert_eq!(found.suggestion_text.as_deref(), Some("[email address]"));
+        assert!(found.user_modified_text.is_none());
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    #[tokio::test]
+    async fn standing_preference_write_replaces_not_duplicates() {
+        // UNIQUE(persona_id, fact_key) + ON CONFLICT DO UPDATE -- matches
+        // D5-152's own "reconfigure rather than error" precedent
+        // (write_floor_consent_preference's own personas.extra_metadata
+        // merge-not-append behavior).
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "standing-pref-user-2";
+        let persona_id = "standing-pref-persona-2";
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+
+        write_standing_preference(
+            user_id,
+            persona_id,
+            key_hex,
+            "hash-xyz",
+            "private_phone",
+            "generalize",
+            Some("[phone number]"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The user changes their mind later -- same fact_key, new decision.
+        write_standing_preference(
+            user_id,
+            persona_id,
+            key_hex,
+            "hash-xyz",
+            "private_phone",
+            "keep_private",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let found = find_standing_preference(user_id, persona_id, key_hex, "hash-xyz")
+            .await
+            .unwrap()
+            .expect("standing preference must exist");
+        assert_eq!(
+            found.decision, "keep_private",
+            "second write must replace, not add a row"
+        );
+
+        let mut conn = open_personal_db(user_id, persona_id, key_hex)
+            .await
+            .unwrap();
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM pf_standing_preferences WHERE persona_id = ? AND fact_key = ?",
+        )
+        .bind(persona_id)
+        .bind("hash-xyz")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            count.0, 1,
+            "exactly one row must exist per (persona_id, fact_key)"
+        );
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
     }
 }

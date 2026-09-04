@@ -88,6 +88,8 @@ pub async fn gate2<L: DisclosureLogger>(
                 fields_withheld: matched.clone(),
                 override_declined: false,
                 event_type: "gate2_contamination_detected".to_string(),
+                category: None,
+                fact_key: None,
             })
             .await;
         if let Err(e) = write_result {

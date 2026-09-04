@@ -1,7 +1,9 @@
 // src-tauri/src/conductor/privacy/mod.rs
 
 pub mod abstraction;
+pub mod coref;
 pub mod errors;
+pub mod fact_identity;
 pub mod gate1;
 pub mod gate2;
 pub mod gate3;
@@ -90,6 +92,10 @@ impl<L: DisclosureLogger> PrivacyGateway<L> {
         space_max_permitted_tier: u8,
         execution_tier: u8,
         app_handle: Option<&tauri::AppHandle<tauri::Wry>>,
+        destination_risk_rating: Option<u8>,
+        user_id: &str,
+        persona_id: &str,
+        key_hex: &str,
     ) -> Result<Gate3Result, DisclosureLogWriteError> {
         gate3::gate3(
             &self.logger,
@@ -103,6 +109,10 @@ impl<L: DisclosureLogger> PrivacyGateway<L> {
             space_max_permitted_tier,
             execution_tier,
             app_handle,
+            destination_risk_rating,
+            user_id,
+            persona_id,
+            key_hex,
         )
         .await
     }

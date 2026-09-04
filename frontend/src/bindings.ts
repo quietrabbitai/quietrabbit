@@ -222,6 +222,23 @@ export const commands = {
 	 *  first, then this).
 	 */
 	resolveTier3Gate3Review: (request: ResolveTier3Gate3ReviewRequest) => typedError<null, string>(__TAURI_INVOKE("resolve_tier3_gate3_review", { request })),
+	/**
+	 *  items.id=406 (decisions.id=755) -- the provider-selection re-check
+	 *  trigger. Fires when the user activates a rail provider not covered by
+	 *  the message's original copy-time review (Tier3AccessPane.tsx, provider
+	 *  row activation -- a QR-owned UI event, unlike paste inside an embedded
+	 *  CEF pane, which QR cannot observe). Frontend-side clipboard provenance
+	 *  (only re-checking content QR can prove it wrote itself) gates whether
+	 *  this command is even called -- not re-validated here, since gate3's own
+	 *  fact-identity cascade only ever concerns itself with message.content,
+	 *  never the OS clipboard.
+	 * 
+	 *  No-ops (returns approved, no new review) when the newly-active provider
+	 *  set's max risk is not STRICTLY HIGHER than what the original review
+	 *  already covered (messages.reviewed_at_risk_rating) -- a same-or-lower-
+	 *  risk destination needs no re-check.
+	 */
+	recheckTier3ProviderSelection: (request: RecheckTier3ProviderSelectionRequest) => typedError<Gate3ReviewResult, string>(__TAURI_INVOKE("recheck_tier3_provider_selection", { request })),
 	getOnboardingFocusSuggestions: (personas: string[]) => typedError<NotImplementedPlaceholder, string>(__TAURI_INVOKE("get_onboarding_focus_suggestions", { personas })),
 	submitOnboardingPersonaSelection: (personas: string[]) => typedError<string[], string>(__TAURI_INVOKE("submit_onboarding_persona_selection", { personas })),
 	submitOnboardingFocusSelection: (focusSelections: NotImplementedPlaceholder[]) => typedError<string[], string>(__TAURI_INVOKE("submit_onboarding_focus_selection", { focusSelections })),
@@ -1035,6 +1052,21 @@ export type ProviderHealth = {
 };
 
 export type ProviderStatus = "available" | "degraded" | "unavailable";
+
+/**
+ *  items.id=406 (decisions.id=755): the provider-selection re-check
+ *  trigger's request. `newly_active_provider_ids` is whatever the rail
+ *  reports as active/laid-out at the moment of this call -- same
+ *  PaneLayoutState-backed source of truth request_tier3_gate3_review
+ *  itself reads, just supplied here explicitly since this command fires
+ *  from a provider-activation event, not a fresh gate3 draft-review pass.
+ */
+export type RecheckTier3ProviderSelectionRequest = {
+	user_id: string,
+	persona_id: string,
+	message_id: string,
+	newly_active_provider_ids: string[],
+};
 
 /**
  *  One-time recovery mnemonic display. Never persisted anywhere past this

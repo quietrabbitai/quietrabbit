@@ -57,6 +57,14 @@ export interface ChatPaneProps {
   onLastAssistantMessageChange?: (
     message: { id: string; gate3_review_status: string | null } | null,
   ) => void
+  /** items.id=406 (decisions.id=755): fires on every "Copy starter" click,
+   *  after the clipboard write -- lets the caller (Tier3AccessPane) record
+   *  which message/text was last copied, for the provider-selection
+   *  re-check trigger's clipboard-provenance check (QR only ever evaluates
+   *  clipboard content it can prove it wrote itself). Purely an
+   *  observation of this component's own existing click-initiated copy
+   *  action -- does not change what handleCopyStarter itself does. */
+  onCopyStarter?: (messageId: string, content: string) => void
 }
 
 /** Hand-declared, not generated: RunStatusPayload (conductor/lifecycle.rs)
@@ -118,6 +126,7 @@ export function ChatPane({
   collapsed = false,
   onExpand,
   onLastAssistantMessageChange,
+  onCopyStarter,
 }: ChatPaneProps) {
   const { t } = useTranslation()
   const [messages, setMessages] = useState<MessageInfo[]>([])
@@ -412,13 +421,17 @@ export function ChatPane({
 
   // items.id=359 piece 6: click-initiated only, per the locked
   // no-passive-clipboard-monitoring rule -- this IS the click.
-  const handleCopyStarter = useCallback((messageId: string, content: string) => {
-    void navigator.clipboard.writeText(content)
-    setCopiedStarterId(messageId)
-    window.setTimeout(() => {
-      setCopiedStarterId((current) => (current === messageId ? null : current))
-    }, 1400)
-  }, [])
+  const handleCopyStarter = useCallback(
+    (messageId: string, content: string) => {
+      void navigator.clipboard.writeText(content)
+      setCopiedStarterId(messageId)
+      onCopyStarter?.(messageId, content)
+      window.setTimeout(() => {
+        setCopiedStarterId((current) => (current === messageId ? null : current))
+      }, 1400)
+    },
+    [onCopyStarter],
+  )
 
   // items.id=391 (Jason, 2026-09-02): the transcript never auto-scrolled
   // to the newest message at all -- confirmed as the actual blocker

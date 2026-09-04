@@ -38,6 +38,11 @@ pub struct MessageRecord {
     pub focus_run_id: Option<String>,
     pub gate3_review_status: Option<String>,
     pub created_at: String,
+    /// items.id=406 (decisions.id=755): the destination risk rating this
+    /// message's Tier-3 approval was scored against -- None until the
+    /// approval write path (request_tier3_gate3_review) populates it, and
+    /// for every message that predates messages_003.sql.
+    pub reviewed_at_risk_rating: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -146,6 +151,7 @@ fn row_to_message_record(r: &sqlx::sqlite::SqliteRow) -> Result<MessageRecord, s
         focus_run_id: r.try_get("focus_run_id")?,
         gate3_review_status: r.try_get("gate3_review_status")?,
         created_at: r.try_get("created_at")?,
+        reviewed_at_risk_rating: r.try_get("reviewed_at_risk_rating")?,
     })
 }
 
@@ -210,6 +216,7 @@ pub async fn save_message(
         focus_run_id: focus_run_id.map(|s| s.to_owned()),
         gate3_review_status: gate3_review_status.map(|s| s.to_owned()),
         created_at: timestamp,
+        reviewed_at_risk_rating: None,
     })
 }
 
@@ -229,7 +236,7 @@ pub async fn list_messages(
     let mut conn = open_messages_db(user_id, persona_id, key_hex).await?;
 
     let rows = sqlx::query(
-        "SELECT id, context_key, sender, content, focus_run_id, gate3_review_status, created_at
+        "SELECT id, context_key, sender, content, focus_run_id, gate3_review_status, created_at, reviewed_at_risk_rating
          FROM messages
          WHERE context_key = ?
          ORDER BY created_at ASC",
@@ -259,7 +266,7 @@ pub async fn get_message(
     let mut conn = open_messages_db(user_id, persona_id, key_hex).await?;
 
     let row = sqlx::query(
-        "SELECT id, context_key, sender, content, focus_run_id, gate3_review_status, created_at
+        "SELECT id, context_key, sender, content, focus_run_id, gate3_review_status, created_at, reviewed_at_risk_rating
          FROM messages
          WHERE id = ?",
     )
@@ -332,6 +339,30 @@ pub async fn update_gate3_review_status(
     Ok(())
 }
 
+/// items.id=406 (decisions.id=755): records the destination risk rating a
+/// Tier-3 approval was actually scored against -- written by
+/// request_tier3_gate3_review on approval, and re-written by
+/// recheck_tier3_provider_selection when a later re-check broadens the
+/// covered risk. Narrow single-column update, same shape as
+/// update_gate3_review_status.
+pub async fn update_reviewed_at_risk_rating(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    message_id: &str,
+    risk_rating: u8,
+) -> Result<(), MessageStoreError> {
+    let mut conn = open_messages_db(user_id, persona_id, key_hex).await?;
+
+    sqlx::query("UPDATE messages SET reviewed_at_risk_rating = ? WHERE id = ?")
+        .bind(risk_rating as i64)
+        .bind(message_id)
+        .execute(&mut conn)
+        .await?;
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -343,6 +374,11 @@ mod tests {
     use sqlx::sqlite::SqliteConnectOptions;
 
     const MESSAGES_SCHEMA: &str = include_str!("../../schema/messages_001.sql");
+    // items.id=406: reviewed_at_risk_rating is added in messages_003.sql --
+    // this in-memory test DB must apply it too (002's chat_id column is
+    // untouched by this module's own queries, but harmless to include).
+    const MESSAGES_SCHEMA_V2: &str = include_str!("../../schema/messages_002.sql");
+    const MESSAGES_SCHEMA_V3: &str = include_str!("../../schema/messages_003.sql");
 
     async fn test_db() -> SqliteConnection {
         let mut conn = SqliteConnectOptions::new()
@@ -350,7 +386,11 @@ mod tests {
             .connect()
             .await
             .expect("in-memory connection failed");
-        for stmt in parse_statements(MESSAGES_SCHEMA) {
+        for stmt in parse_statements(MESSAGES_SCHEMA)
+            .into_iter()
+            .chain(parse_statements(MESSAGES_SCHEMA_V2))
+            .chain(parse_statements(MESSAGES_SCHEMA_V3))
+        {
             sqlx::query(&stmt)
                 .execute(&mut conn)
                 .await
@@ -466,7 +506,7 @@ mod tests {
         let id = seed_message(&mut conn, "ctx-1", "user", "hello", "2026-08-09T00:00:00Z").await;
 
         let row = sqlx::query(
-            "SELECT id, context_key, sender, content, focus_run_id, gate3_review_status, created_at
+            "SELECT id, context_key, sender, content, focus_run_id, gate3_review_status, created_at, reviewed_at_risk_rating
              FROM messages WHERE id = ?",
         )
         .bind(&id)
@@ -482,6 +522,7 @@ mod tests {
         assert_eq!(record.focus_run_id, None);
         assert_eq!(record.gate3_review_status, None);
         assert_eq!(record.created_at, "2026-08-09T00:00:00Z");
+        assert_eq!(record.reviewed_at_risk_rating, None);
     }
 
     // -----------------------------------------------------------------

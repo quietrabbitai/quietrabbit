@@ -479,6 +479,7 @@ mod tests {
             focus_run_id: None,
             gate3_review_status: None,
             created_at: "2026-08-09T00:00:00Z".to_owned(),
+            reviewed_at_risk_rating: None,
         }
     }
 
@@ -719,6 +720,7 @@ mod tests {
             focus_run_id: Some("run-1".to_owned()),
             gate3_review_status: Some("drafted".to_owned()),
             created_at: "2026-08-09T00:00:00Z".to_owned(),
+            reviewed_at_risk_rating: None,
         };
         let info = to_message_info(record);
         assert_eq!(info.id, "id-1");

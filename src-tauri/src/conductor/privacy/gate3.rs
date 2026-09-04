@@ -42,7 +42,9 @@ use tauri::Emitter;
 use uuid::Uuid;
 
 use super::{
+    coref,
     errors::DisclosureLogWriteError,
+    fact_identity,
     logger::{DisclosureLogEntry, DisclosureLogger},
     privacy_filter::{self, PfEntityDecoded},
     types::{ConsentRequestPayload, ConsentSpanItem, Gate3Result, ReviewTier},
@@ -56,18 +58,19 @@ use super::{
 /// IPC flag: timeout → gate_timeout event written to disclosure_log (D6-362).
 const PF_TIMEOUT_SECS: u64 = 10;
 
-/// Minimum confidence score for Easy tier. ALL spans must meet this threshold
-/// AND be in EASY_TIER_CATEGORIES.
-const EASY_SCORE_THRESHOLD: f32 = 0.90;
+/// Minimum confidence score for Low tier. The span must meet this threshold
+/// AND be in LOW_TIER_CATEGORIES. items.id=406: renamed from
+/// EASY_SCORE_THRESHOLD (ReviewTier::Easy -> Low, decisions.id=754).
+const LOW_SCORE_THRESHOLD: f32 = 0.90;
 
 /// Minimum confidence for Medium tier. Any span below this forces High.
 /// Errs toward High per D6-362.
 const MEDIUM_SCORE_THRESHOLD: f32 = 0.70;
 
-/// Categories that qualify for Easy tier when all spans exceed EASY_SCORE_THRESHOLD.
+/// Categories that qualify for Low tier when a span exceeds LOW_SCORE_THRESHOLD.
 /// Contextual categories (private_date, private_url, secret) default to Medium
-/// even at high confidence.
-const EASY_TIER_CATEGORIES: &[&str] = &["private_email", "private_phone", "account_number"];
+/// even at high confidence. items.id=406: renamed from EASY_TIER_CATEGORIES.
+const LOW_TIER_CATEGORIES: &[&str] = &["private_email", "private_phone", "account_number"];
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -86,6 +89,27 @@ pub async fn gate3<L: DisclosureLogger>(
     space_max_permitted_tier: u8,
     execution_tier: u8,
     app_handle: Option<&tauri::AppHandle<tauri::Wry>>,
+    // items.id=406 (decisions.id=753): live per-provider destination risk
+    // (1=Low/2=Medium/3=High, from tier3_providers.risk_rating), MAX across
+    // whatever destinations are currently active/selected. None when the
+    // caller has no specific-provider context (e.g. executor.rs's generic
+    // Focus-step promotion) -- falls back to target_tier itself, exactly
+    // today's behavior. Replaces the old category-only "target_tier >= 3
+    // always means High" assumption for callers that DO know their actual
+    // destination set; the OR-condition structure itself is unchanged.
+    destination_risk_rating: Option<u8>,
+    // items.id=406 (decisions.id=756/757): identity needed to open
+    // outputs.db/personal.db for the fact-identity persistence cascade
+    // (prior-decision query, pf_fact_mentions, pf_standing_preferences).
+    // Neither was available inside gate3 before this -- only inside the
+    // DisclosureLogger passed in as `logger`, which stays scoped to just
+    // disclosure_log writes. Both real call sites (request_tier3_gate3_review
+    // and executor.rs's Step 13, via StepContext) always have real values;
+    // an empty key_hex gracefully degrades the persistence cascade to
+    // "always ask" (see partition_by_prior_decision), never a hard error.
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
 ) -> Result<Gate3Result, DisclosureLogWriteError> {
     // Check 1: tier ceiling block — fires first, before any other check.
     if target_tier > space_max_permitted_tier {
@@ -101,6 +125,8 @@ pub async fn gate3<L: DisclosureLogger>(
                 fields_withheld: vec![content_key.to_string()],
                 override_declined: true,
                 event_type: "gate3_tier_ceiling_block".to_string(),
+                category: None,
+                fact_key: None,
             })
             .await?;
 
@@ -133,6 +159,10 @@ pub async fn gate3<L: DisclosureLogger>(
                 target_tier,
                 execution_tier,
                 handle,
+                destination_risk_rating,
+                user_id,
+                persona_id,
+                key_hex,
             )
             .await;
         }
@@ -154,6 +184,8 @@ pub async fn gate3<L: DisclosureLogger>(
                 fields_withheld: vec![content_key.to_string()],
                 override_declined: true,
                 event_type: "gate3_sensitivity_block".to_string(),
+                category: None,
+                fact_key: None,
             })
             .await?;
 
@@ -182,6 +214,8 @@ pub async fn gate3<L: DisclosureLogger>(
             fields_withheld: vec![],
             override_declined: false,
             event_type: "gate3_promotion_approved".to_string(),
+            category: None,
+            fact_key: None,
         })
         .await?;
 
@@ -207,7 +241,16 @@ async fn gate3_with_pf<L: DisclosureLogger>(
     target_tier: u8,
     execution_tier: u8,
     handle: &tauri::AppHandle<tauri::Wry>,
+    destination_risk_rating: Option<u8>,
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
 ) -> Result<Gate3Result, DisclosureLogWriteError> {
+    // items.id=406: the value that actually feeds the High-forcing side of
+    // assign_review_tier_for_span's OR-condition -- a live per-provider risk
+    // rating when the caller knows its destination set, else target_tier
+    // itself (today's exact behavior, unchanged).
+    let destination_risk = destination_risk_rating.unwrap_or(target_tier);
     let text = content_text.to_owned();
 
     // spawn_blocking: FFI call is synchronous C library — must not block async executor.
@@ -232,6 +275,8 @@ async fn gate3_with_pf<L: DisclosureLogger>(
                     fields_withheld: vec![content_key.to_string()],
                     override_declined: true,
                     event_type: "gate_timeout".to_string(),
+                    category: None,
+                    fact_key: None,
                 })
                 .await?;
             let _ = handle.emit(
@@ -263,6 +308,8 @@ async fn gate3_with_pf<L: DisclosureLogger>(
                     fields_withheld: vec![content_key.to_string()],
                     override_declined: true,
                     event_type: "gate_timeout".to_string(),
+                    category: None,
+                    fact_key: None,
                 })
                 .await?;
             let _ = handle.emit(
@@ -299,6 +346,8 @@ async fn gate3_with_pf<L: DisclosureLogger>(
                         fields_withheld: vec![content_key.to_string()],
                         override_declined: true,
                         event_type: "gate3_sensitivity_block".to_string(),
+                        category: None,
+                        fact_key: None,
                     })
                     .await?;
                 return Ok(Gate3Result {
@@ -324,6 +373,8 @@ async fn gate3_with_pf<L: DisclosureLogger>(
                     fields_withheld: vec![],
                     override_declined: false,
                     event_type: "gate3_promotion_approved".to_string(),
+                    category: None,
+                    fact_key: None,
                 })
                 .await?;
             return Ok(Gate3Result {
@@ -335,6 +386,29 @@ async fn gate3_with_pf<L: DisclosureLogger>(
         // PF succeeded: process the entity list.
         Ok(Ok(Ok(entities))) => entities,
     };
+
+    // items.id=406 (decisions.id=756/757): partition entities into those
+    // with an already-made prior decision (silently reapplied, still
+    // disclosure-logged) and those that genuinely need interactive review.
+    // Must happen BEFORE the zero-spans check and span/tier assembly below
+    // -- only the needs-review subset should ever become a ConsentSpanItem
+    // in the emitted payload, and an all-auto-resolved batch may mean
+    // nothing left to review even when PF returned entities.
+    let partition = partition_by_prior_decision(
+        logger,
+        user_id,
+        persona_id,
+        key_hex,
+        step_id,
+        focus_run_id,
+        execution_tier,
+        entities,
+    )
+    .await?;
+    if let Some(result) = partition.early_result {
+        return Ok(result);
+    }
+    let entities = partition.needs_review;
 
     // Zero spans, NOT severity/tier-forced: PF found nothing identifiable and
     // there's no independent reason to force review — approve directly.
@@ -348,7 +422,7 @@ async fn gate3_with_pf<L: DisclosureLogger>(
     // regardless of PF confidence" rule. The severity/target_tier guard below
     // must stay in sync with assign_review_tier's forced-High condition.
     if entities.is_empty()
-        && zero_spans_safe_to_auto_approve(content_sensitivity_severity, target_tier)
+        && zero_spans_safe_to_auto_approve(content_sensitivity_severity, destination_risk)
     {
         logger
             .write(DisclosureLogEntry {
@@ -362,6 +436,8 @@ async fn gate3_with_pf<L: DisclosureLogger>(
                 fields_withheld: vec![],
                 override_declined: false,
                 event_type: "gate3_pf_no_spans".to_string(),
+                category: None,
+                fact_key: None,
             })
             .await?;
         return Ok(Gate3Result {
@@ -377,14 +453,25 @@ async fn gate3_with_pf<L: DisclosureLogger>(
     // show), write audit record, THEN emit event.
     // Write-before-surface invariant: log write must precede emit() — if the write
     // fails (fatal DisclosureLogWriteError), the frontend must not receive the event.
-    let spans = build_consent_spans(&entities);
-    let review_tier = assign_review_tier(&entities, content_sensitivity_severity, target_tier);
+    let spans = build_consent_spans(&entities, content_sensitivity_severity, destination_risk);
     let no_spans_forced_high = spans.is_empty();
+
+    // items.id=406: payload-level review_tier is now only meaningful for the
+    // empty-spans-forced-High case above (no span exists to carry a tier).
+    // When spans is non-empty, this is just the worst (most restrictive)
+    // tier among them -- the frontend groups rows by each span's own
+    // review_tier, not this field, for everything except that edge case.
+    let overall_review_tier = spans
+        .iter()
+        .map(|s| tier_rank(&s.review_tier))
+        .max()
+        .map(rank_to_tier)
+        .unwrap_or(ReviewTier::High); // reaching here with empty spans is always forced-High
 
     let payload = ConsentRequestPayload {
         focus_run_id: focus_run_id.to_owned(),
         focus_name: focus_name.to_owned(),
-        review_tier,
+        review_tier: overall_review_tier,
         spans,
     };
 
@@ -404,6 +491,8 @@ async fn gate3_with_pf<L: DisclosureLogger>(
             } else {
                 "gate3_consent_pending".to_string()
             },
+            category: None,
+            fact_key: None,
         })
         .await?;
 
@@ -416,13 +505,276 @@ async fn gate3_with_pf<L: DisclosureLogger>(
 }
 
 // ---------------------------------------------------------------------------
+// items.id=406 (decisions.id=756/757): fact-identity persistence cascade
+// ---------------------------------------------------------------------------
+
+/// Result of partitioning one PF pass's entities by prior-decision lookup.
+struct PartitionOutcome {
+    /// Entities that still need interactive review, paired with whatever
+    /// fact_key (if any) gate3 resolved for them -- carried into
+    /// `ConsentSpanItem.fact_key` so a future decision can be found again.
+    needs_review: Vec<(PfEntityDecoded, Option<String>)>,
+    /// `Some` only when EVERY entity in this pass was silently reapplied
+    /// (never `Some` when `entities` was empty to begin with -- that case
+    /// is left to gate3_with_pf's existing zero-spans handling unchanged).
+    early_result: Option<Gate3Result>,
+}
+
+/// Resolves one entity's stable fact identity via the three-layer
+/// deterministic cascade (decisions.id=757): Layer 1 content-hash -> Layer 2
+/// within-conversation coreference -> Layer 3 entity_facts match. `None` if
+/// none of the three resolve it -- the fact is treated as brand new
+/// (unchanged fallback: always ask).
+async fn resolve_fact_key(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    entity: &PfEntityDecoded,
+    prior_mentions: &[coref::PfFactMention],
+) -> Option<String> {
+    // Layer 1: stable content-hash identity (fact_identity.rs).
+    if let Some(canonical) = fact_identity::canonicalize_fact(&entity.label, &entity.span_text) {
+        return Some(fact_identity::fact_hash(&entity.label, &canonical));
+    }
+
+    // Layer 2: within-conversation coreference (coref.rs), scoped to this
+    // focus_run_id via `prior_mentions` (already loaded by the caller).
+    if let Some(fact_key) =
+        coref::resolve_within_conversation(prior_mentions, &entity.label, &entity.span_text)
+    {
+        return Some(fact_key);
+    }
+
+    // Layer 3: entity_facts value match (fact_identity.rs). Gracefully
+    // degrades to unresolved on any DB error -- this is an optimization
+    // layer, not a privacy control; "ask" is always the safe fallback.
+    match fact_identity::resolve_against_entity_facts(
+        user_id,
+        persona_id,
+        key_hex,
+        &entity.label,
+        &entity.span_text,
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            log::warn!(
+                "gate3: Layer 3 entity_facts resolution failed, treating as unresolved: {e}"
+            );
+            None
+        }
+    }
+}
+
+/// True if `decision` is the blocking choice ("nothing leaves for this
+/// fact"). Matches the string values write_element_consent_decisions_conn
+/// and this module's own auto-reapply writer both use.
+fn is_keep_private(decision: &str) -> bool {
+    decision == "keep_private"
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn partition_by_prior_decision<L: DisclosureLogger>(
+    logger: &L,
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    step_id: &str,
+    focus_run_id: &str,
+    execution_tier: u8,
+    entities: Vec<PfEntityDecoded>,
+) -> Result<PartitionOutcome, DisclosureLogWriteError> {
+    if entities.is_empty() {
+        return Ok(PartitionOutcome {
+            needs_review: vec![],
+            early_result: None,
+        });
+    }
+
+    let prior_mentions = crate::persistence::output_store::load_fact_mentions_for_run(
+        user_id,
+        persona_id,
+        key_hex,
+        focus_run_id,
+    )
+    .await
+    .unwrap_or_else(|e| {
+        log::warn!("gate3: failed to load prior fact mentions, Layer 2 has nothing to resolve against this call: {e}");
+        vec![]
+    });
+
+    let mut needs_review = Vec::with_capacity(entities.len());
+    let mut auto_resolved_decisions: Vec<String> = Vec::new();
+
+    for entity in entities {
+        let fact_key =
+            resolve_fact_key(user_id, persona_id, key_hex, &entity, &prior_mentions).await;
+
+        let prior_decision = match &fact_key {
+            None => None,
+            Some(fk) => {
+                // Persona-scoped standing preference takes priority over the
+                // conversation-scoped decision when both exist -- it's the
+                // more deliberate, explicit choice (decisions.id=756).
+                match crate::persistence::personal_store::find_standing_preference(
+                    user_id, persona_id, key_hex, fk,
+                )
+                .await
+                {
+                    Ok(Some(pref)) => {
+                        Some((pref.decision, pref.suggestion_text, pref.user_modified_text))
+                    }
+                    Ok(None) => {
+                        match crate::persistence::output_store::find_consent_decision_for_fact(
+                            user_id,
+                            persona_id,
+                            key_hex,
+                            focus_run_id,
+                            fk,
+                        )
+                        .await
+                        {
+                            Ok(Some(prior)) => Some((
+                                prior.decision,
+                                prior.suggestion_text,
+                                prior.user_modified_text,
+                            )),
+                            Ok(None) => None,
+                            Err(e) => {
+                                log::warn!(
+                                    "gate3: conversation-scoped prior-decision query failed, \
+                                     treating as unresolved: {e}"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "gate3: standing-preference query failed, treating as unresolved: {e}"
+                        );
+                        None
+                    }
+                }
+            }
+        };
+
+        match prior_decision {
+            Some((decision, suggestion_text, user_modified_text)) => {
+                // Silent reapplication -- still logged, every time (D6-198
+                // append-only invariant; NOT skipping the check).
+                logger
+                    .write(DisclosureLogEntry {
+                        step_id: step_id.to_string(),
+                        focus_run_id: focus_run_id.to_string(),
+                        execution_tier,
+                        abstraction_tier: None,
+                        provider: None,
+                        fields_shared: vec![],
+                        fields_abstracted: IndexMap::new(),
+                        fields_withheld: vec![],
+                        override_declined: false,
+                        event_type: "gate3_fact_reapplied".to_string(),
+                        category: Some(entity.label.clone()),
+                        fact_key: fact_key.clone(),
+                    })
+                    .await?;
+
+                // Best-effort audit row -- disclosure_log above is the
+                // fatal-path write; a failure here doesn't block the gate.
+                if let Some(fk) = &fact_key {
+                    if let Err(e) =
+                        crate::persistence::output_store::write_auto_reapplied_consent_decision(
+                            user_id,
+                            persona_id,
+                            key_hex,
+                            focus_run_id,
+                            &decision,
+                            suggestion_text.as_deref(),
+                            user_modified_text.as_deref(),
+                            &entity.label,
+                            fk,
+                            &entity.span_text,
+                        )
+                        .await
+                    {
+                        log::warn!("gate3: failed to write auto-reapplied consent_decisions audit row: {e}");
+                    }
+                }
+
+                auto_resolved_decisions.push(decision);
+            }
+            None => {
+                // Genuinely new (or unresolved) fact -- record a mention
+                // (best-effort) so a LATER span in this same conversation
+                // can coref against it even before this one is decided,
+                // then surface it for interactive review.
+                if let Some(fk) = &fact_key {
+                    if let Err(e) = crate::persistence::output_store::insert_fact_mention(
+                        user_id,
+                        persona_id,
+                        key_hex,
+                        focus_run_id,
+                        &entity.label,
+                        fk,
+                        &entity.span_text,
+                    )
+                    .await
+                    {
+                        log::warn!("gate3: failed to record pf_fact_mentions row: {e}");
+                    }
+                }
+                needs_review.push((entity, fact_key));
+            }
+        }
+    }
+
+    let early_result = if needs_review.is_empty() {
+        // Every entity in this pass was silently reapplied. Mirrors the
+        // interactive flow's own "run stops if ALL kept private, continues
+        // otherwise" rule (PRIVACY_GUARDIAN_GATE_SPEC.md post-decision
+        // state) -- applied here since there is no interactive summary to
+        // show for an all-auto-resolved pass.
+        let all_kept_private = auto_resolved_decisions.iter().all(|d| is_keep_private(d));
+        Some(if all_kept_private {
+            Gate3Result {
+                blocked: true,
+                plain_language: Some(
+                    "This content was kept private based on your earlier decision for this \
+                     information. [Use local only]"
+                        .to_string(),
+                ),
+                ..Gate3Result::default()
+            }
+        } else {
+            Gate3Result {
+                approved: true,
+                ..Gate3Result::default()
+            }
+        })
+    } else {
+        None
+    };
+
+    Ok(PartitionOutcome {
+        needs_review,
+        early_result,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Span assembly helpers
 // ---------------------------------------------------------------------------
 
-fn build_consent_spans(entities: &[PfEntityDecoded]) -> Vec<ConsentSpanItem> {
+fn build_consent_spans(
+    entities: &[(PfEntityDecoded, Option<String>)],
+    content_sensitivity_severity: u8,
+    destination_risk: u8,
+) -> Vec<ConsentSpanItem> {
     entities
         .iter()
-        .map(|e| ConsentSpanItem {
+        .map(|(e, fact_key)| ConsentSpanItem {
             span_id: Uuid::new_v4().to_string(),
             category: e.label.clone(),
             user_label: taxonomy_label(&e.label),
@@ -431,40 +783,75 @@ fn build_consent_spans(entities: &[PfEntityDecoded]) -> Vec<ConsentSpanItem> {
             start_byte: e.start_byte,
             end_byte: e.end_byte,
             score: e.score,
+            review_tier: assign_review_tier_for_span(
+                e,
+                content_sensitivity_severity,
+                destination_risk,
+            ),
+            // items.id=406: resolved by partition_by_prior_decision before
+            // this span was ever created (a resolved-and-matched fact would
+            // have been auto-reapplied there instead, never reaching here)
+            // -- echoed to the frontend so a future decision can be found.
+            fact_key: fact_key.clone(),
         })
         .collect()
 }
 
 /// True only when PF returning zero spans is safe to auto-approve without a
-/// consent gate: severity and target_tier must both be below the High-forcing
-/// thresholds used by `assign_review_tier`. Kept in sync with that function's
-/// `target_tier >= 3 || content_sensitivity_severity >= 3` condition — this is
-/// the entities-independent half of the same rule (items.id=36).
-fn zero_spans_safe_to_auto_approve(content_sensitivity_severity: u8, target_tier: u8) -> bool {
-    !(content_sensitivity_severity >= 3 || target_tier >= 3)
+/// consent gate: severity and destination_risk must both be below the
+/// High-forcing thresholds used by `assign_review_tier_for_span`. Kept in
+/// sync with that function's `destination_risk >= 3 ||
+/// content_sensitivity_severity >= 3` condition — this is the
+/// entities-independent half of the same rule (items.id=36).
+fn zero_spans_safe_to_auto_approve(content_sensitivity_severity: u8, destination_risk: u8) -> bool {
+    !(content_sensitivity_severity >= 3 || destination_risk >= 3)
 }
 
-fn assign_review_tier(
-    entities: &[PfEntityDecoded],
+/// items.id=406 (decisions.id=754): assigns ONE span's own review tier,
+/// independent of every other span in the same batch. Previously
+/// (`assign_review_tier`) this was computed once for the whole entity slice
+/// -- Low tier required EVERY span to individually clear the threshold, so
+/// one Medium-confidence span silently downgraded every other span's
+/// section too. The three-section review screen needs each fact
+/// independently assigned (fact profile x destination profile), so each
+/// span is now evaluated entirely on its own, sharing only the two
+/// call-level inputs (content severity, destination risk) that are
+/// genuinely shared across the whole piece of content.
+fn assign_review_tier_for_span(
+    entity: &PfEntityDecoded,
     content_sensitivity_severity: u8,
-    target_tier: u8,
+    destination_risk: u8,
 ) -> ReviewTier {
-    // High: Medical/Financial context, Tier 3 target, or any low-confidence span.
-    if target_tier >= 3 || content_sensitivity_severity >= 3 {
+    // High: Medical/Financial context, high-risk destination, or low-confidence span.
+    if destination_risk >= 3 || content_sensitivity_severity >= 3 {
         return ReviewTier::High;
     }
-    for e in entities {
-        if e.score < MEDIUM_SCORE_THRESHOLD {
-            return ReviewTier::High;
-        }
+    if entity.score < MEDIUM_SCORE_THRESHOLD {
+        return ReviewTier::High;
     }
-    // Easy: all spans high-confidence AND structural PII categories.
-    if entities.iter().all(|e| {
-        e.score >= EASY_SCORE_THRESHOLD && EASY_TIER_CATEGORIES.contains(&e.label.as_str())
-    }) {
-        return ReviewTier::Easy;
+    // Low: high-confidence AND a structural PII category.
+    if entity.score >= LOW_SCORE_THRESHOLD && LOW_TIER_CATEGORIES.contains(&entity.label.as_str()) {
+        return ReviewTier::Low;
     }
     ReviewTier::Medium
+}
+
+/// Ordering helper for `ConsentRequestPayload.review_tier`'s "worst tier
+/// across all spans" fallback (items.id=406) -- Low < Medium < High.
+fn tier_rank(tier: &ReviewTier) -> u8 {
+    match tier {
+        ReviewTier::Low => 0,
+        ReviewTier::Medium => 1,
+        ReviewTier::High => 2,
+    }
+}
+
+fn rank_to_tier(rank: u8) -> ReviewTier {
+    match rank {
+        0 => ReviewTier::Low,
+        1 => ReviewTier::Medium,
+        _ => ReviewTier::High,
+    }
 }
 
 /// Human-readable display label for a Privacy Filter category. Must match
@@ -552,57 +939,91 @@ mod tests {
         assert!(!zero_spans_safe_to_auto_approve(1, 3));
     }
 
-    // -- assign_review_tier --------------------------------------------------
+    // -- assign_review_tier_for_span ------------------------------------------
+    // items.id=406: refactored from a whole-batch assign_review_tier(entities)
+    // to a per-entity assign_review_tier_for_span(entity) -- each span is now
+    // evaluated entirely on its own, sharing only the two call-level inputs
+    // (content severity, destination risk). "target_tier" in the old tests
+    // below is now "destination_risk" -- same >= 3 forced-High semantics,
+    // just fed a live per-provider rating instead of a raw category constant.
 
     #[test]
-    fn tier3_target_forces_high() {
-        let e = vec![entity(0.99, "private_email")];
-        assert!(matches!(assign_review_tier(&e, 1, 3), ReviewTier::High));
+    fn high_destination_risk_forces_high() {
+        let e = entity(0.99, "private_email");
+        assert!(matches!(
+            assign_review_tier_for_span(&e, 1, 3),
+            ReviewTier::High
+        ));
     }
 
     #[test]
     fn medical_severity_forces_high() {
-        let e = vec![entity(0.99, "private_email")];
-        assert!(matches!(assign_review_tier(&e, 3, 2), ReviewTier::High));
-    }
-
-    #[test]
-    fn tier3_target_forces_high_even_with_zero_entities() {
-        // Guards against the vacuous-truth trap: entities.iter().all(...) on an
-        // empty slice is vacuously true, which would wrongly resolve to Easy if
-        // the severity/target_tier check didn't short-circuit first (items.id=36).
-        let e: Vec<PfEntityDecoded> = vec![];
-        assert!(matches!(assign_review_tier(&e, 1, 3), ReviewTier::High));
-    }
-
-    #[test]
-    fn medical_severity_forces_high_even_with_zero_entities() {
-        let e: Vec<PfEntityDecoded> = vec![];
-        assert!(matches!(assign_review_tier(&e, 3, 2), ReviewTier::High));
+        let e = entity(0.99, "private_email");
+        assert!(matches!(
+            assign_review_tier_for_span(&e, 3, 2),
+            ReviewTier::High
+        ));
     }
 
     #[test]
     fn low_confidence_forces_high() {
-        let e = vec![entity(0.65, "private_email")];
-        assert!(matches!(assign_review_tier(&e, 1, 2), ReviewTier::High));
+        let e = entity(0.65, "private_email");
+        assert!(matches!(
+            assign_review_tier_for_span(&e, 1, 2),
+            ReviewTier::High
+        ));
     }
 
     #[test]
-    fn all_high_confidence_easy_category_is_easy() {
-        let e = vec![entity(0.95, "private_email"), entity(0.92, "private_phone")];
-        assert!(matches!(assign_review_tier(&e, 1, 2), ReviewTier::Easy));
+    fn high_confidence_low_tier_category_is_low() {
+        let e = entity(0.95, "private_email");
+        assert!(matches!(
+            assign_review_tier_for_span(&e, 1, 2),
+            ReviewTier::Low
+        ));
     }
 
     #[test]
-    fn easy_category_but_one_medium_score_is_medium() {
-        let e = vec![entity(0.95, "private_email"), entity(0.75, "private_phone")];
-        assert!(matches!(assign_review_tier(&e, 1, 2), ReviewTier::Medium));
+    fn each_span_independent_one_medium_score_does_not_downgrade_a_sibling() {
+        // items.id=406's core behavior change: under the old whole-batch
+        // assign_review_tier, one Medium-confidence sibling span silently
+        // pulled a High-confidence Low-tier-category span down to Medium too
+        // (entities.iter().all(...) required EVERY span to individually
+        // clear the Low threshold). Each span must now be judged only on its
+        // own score/category -- a High-confidence email is Low regardless of
+        // what else is in the same PF pass.
+        let high_conf_email = entity(0.95, "private_email");
+        let medium_conf_phone = entity(0.75, "private_phone");
+        assert!(matches!(
+            assign_review_tier_for_span(&high_conf_email, 1, 2),
+            ReviewTier::Low
+        ));
+        assert!(matches!(
+            assign_review_tier_for_span(&medium_conf_phone, 1, 2),
+            ReviewTier::Medium
+        ));
     }
 
     #[test]
     fn contextual_category_is_medium_even_at_high_confidence() {
-        let e = vec![entity(0.99, "private_date")];
-        assert!(matches!(assign_review_tier(&e, 1, 2), ReviewTier::Medium));
+        let e = entity(0.99, "private_date");
+        assert!(matches!(
+            assign_review_tier_for_span(&e, 1, 2),
+            ReviewTier::Medium
+        ));
+    }
+
+    #[test]
+    fn low_destination_risk_does_not_force_high() {
+        // items.id=406 (decisions.id=753): a Low-rated destination (e.g. an
+        // anonymous Tier 2 provider) must not force High the way the old
+        // hardcoded target_tier>=3 assumption did for every Tier 3 provider
+        // regardless of its actual posture.
+        let e = entity(0.95, "private_email");
+        assert!(matches!(
+            assign_review_tier_for_span(&e, 1, 1),
+            ReviewTier::Low
+        ));
     }
 
     // -- taxonomy_label ------------------------------------------------------

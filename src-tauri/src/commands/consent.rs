@@ -153,6 +153,20 @@ pub struct RequestTier3Gate3ReviewRequest {
     pub message_id: String,
 }
 
+/// items.id=406 (decisions.id=755): the provider-selection re-check
+/// trigger's request. `newly_active_provider_ids` is whatever the rail
+/// reports as active/laid-out at the moment of this call -- same
+/// PaneLayoutState-backed source of truth request_tier3_gate3_review
+/// itself reads, just supplied here explicitly since this command fires
+/// from a provider-activation event, not a fresh gate3 draft-review pass.
+#[derive(Debug, Deserialize, Type)]
+pub struct RecheckTier3ProviderSelectionRequest {
+    pub user_id: String,
+    pub persona_id: String,
+    pub message_id: String,
+    pub newly_active_provider_ids: Vec<String>,
+}
+
 #[derive(Debug, Deserialize, Type)]
 pub struct ResolveTier3Gate3ReviewRequest {
     pub user_id: String,
@@ -719,6 +733,7 @@ pub async fn request_tier3_gate3_review(
     app_handle: tauri::AppHandle,
     request: RequestTier3Gate3ReviewRequest,
     key_registry: State<'_, KeyRegistry>,
+    layout_state: State<'_, crate::commands::tier3_pane::PaneLayoutState>,
 ) -> Result<Gate3ReviewResult, String> {
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.master_key))
@@ -773,6 +788,28 @@ pub async fn request_tier3_gate3_review(
         &key_hex_str,
     ));
 
+    // items.id=406 (decisions.id=753): destination risk is now read live
+    // from whatever providers are actually active/selected in the rail at
+    // review time, rather than assumed always-High from target_tier=3
+    // alone. `PaneLayoutState` (commands/tier3_pane.rs) is the backend-truth
+    // mirror of "providers currently laid out on screen" -- the frontend
+    // keeps it current via set_pane_layout on every openPaneIds/layout
+    // change, and unlike PaneManager/PaneHost it's plain Send+Sync state
+    // reachable from a #[tauri::command] via State<'_, _> directly, no
+    // main-thread hop needed. Worst case (MAX) across everything currently
+    // active covers "reviewed at copy time against every destination
+    // selected then" per the design doc's trigger model. Empty (no panes
+    // open yet) -> None -> gate3 falls back to target_tier=3 -- today's
+    // exact always-High behavior, conservative by construction.
+    let active_provider_ids: Vec<String> = {
+        let map = layout_state.0.lock().unwrap();
+        map.keys().cloned().collect()
+    };
+    let destination_risk_rating =
+        crate::persistence::provider_store::max_risk_rating_for_providers(&active_provider_ids)
+            .await
+            .map_err(|e| e.to_string())?;
+
     let result = gateway
         .gate3(
             "draft",
@@ -781,10 +818,14 @@ pub async fn request_tier3_gate3_review(
             &message.id,
             &message.content,
             1, // content_sensitivity_severity
-            3, // target_tier
+            3, // target_tier -- unchanged, still the tier-ceiling check's input
             settings.max_permitted_tier as u8,
             1, // execution_tier
             Some(&app_handle),
+            destination_risk_rating,
+            &request.user_id,
+            &request.persona_id,
+            &key_hex_str,
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -803,6 +844,176 @@ pub async fn request_tier3_gate3_review(
             &key_hex_str,
             &request.message_id,
             status,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+        // items.id=406 (decisions.id=755): record what this review was
+        // actually scored against -- fixed at copy-time (this call), not at
+        // whatever point the user later finishes resolving the modal (if
+        // one was even surfaced). recheck_tier3_provider_selection compares
+        // a newly-activated provider's risk against this value.
+        message_store::update_reviewed_at_risk_rating(
+            &request.user_id,
+            &request.persona_id,
+            &key_hex_str,
+            &request.message_id,
+            destination_risk_rating.unwrap_or(3),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+
+    Ok(result.into())
+}
+
+/// items.id=406 (decisions.id=755) -- the provider-selection re-check
+/// trigger. Fires when the user activates a rail provider not covered by
+/// the message's original copy-time review (Tier3AccessPane.tsx, provider
+/// row activation -- a QR-owned UI event, unlike paste inside an embedded
+/// CEF pane, which QR cannot observe). Frontend-side clipboard provenance
+/// (only re-checking content QR can prove it wrote itself) gates whether
+/// this command is even called -- not re-validated here, since gate3's own
+/// fact-identity cascade only ever concerns itself with message.content,
+/// never the OS clipboard.
+///
+/// No-ops (returns approved, no new review) when the newly-active provider
+/// set's max risk is not STRICTLY HIGHER than what the original review
+/// already covered (messages.reviewed_at_risk_rating) -- a same-or-lower-
+/// risk destination needs no re-check.
+#[tauri::command]
+#[specta::specta]
+pub async fn recheck_tier3_provider_selection(
+    app_handle: tauri::AppHandle,
+    request: RecheckTier3ProviderSelectionRequest,
+    key_registry: State<'_, KeyRegistry>,
+) -> Result<Gate3ReviewResult, String> {
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
+    let message = message_store::get_message(
+        &request.user_id,
+        &request.persona_id,
+        &key_hex_str,
+        &request.message_id,
+    )
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| "not_found".to_string())?;
+
+    if message.gate3_review_status.as_deref() != Some("approved") {
+        return Err(format!(
+            "message {} is not yet approved (gate3_review_status: {:?}) -- \
+             the provider-selection re-check only applies after the initial \
+             copy-time review has cleared",
+            request.message_id, message.gate3_review_status
+        ));
+    }
+    let focus_run_id = message.focus_run_id.clone().ok_or_else(|| {
+        format!(
+            "message {} is approved but has no focus_run_id -- invariant violated",
+            request.message_id
+        )
+    })?;
+
+    let no_op_result = || Gate3ReviewResult {
+        approved: true,
+        blocked: false,
+        pending_consent: false,
+        timeout: false,
+        plain_language: None,
+        target_tier: None,
+        space_max_permitted_tier: None,
+    };
+
+    let new_max_risk = crate::persistence::provider_store::max_risk_rating_for_providers(
+        &request.newly_active_provider_ids,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let Some(new_risk) = new_max_risk else {
+        // No providers given (or none rated) -- nothing to compare against.
+        return Ok(no_op_result());
+    };
+    let already_covered = message
+        .reviewed_at_risk_rating
+        .map(|r| r as u8)
+        .unwrap_or(0);
+    if new_risk <= already_covered {
+        return Ok(no_op_result());
+    }
+
+    let settings =
+        focus_settings_store::get_focus_settings(&request.persona_id, TIER3_DRAFT_FOCUS_ID)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| {
+                format!(
+                    "no focus_settings row for persona='{}' focus='{}'",
+                    request.persona_id, TIER3_DRAFT_FOCUS_ID
+                )
+            })?;
+
+    let gateway = PrivacyGateway::new(SqliteDisclosureLogger::new(
+        &request.user_id,
+        &request.persona_id,
+        &key_hex_str,
+    ));
+
+    // Distinct content_key from the primary review's ("draft") -- this is a
+    // re-check against a stricter destination context, not a duplicate of
+    // the original pass. Fact-identity persistence (gate3.rs) is keyed by
+    // focus_run_id + fact_key, NOT content_key, so a fact already decided
+    // under the original review still auto-resolves here; only facts that
+    // never got a stable identity, or were never decided, interrupt again.
+    let content_key = format!("{}::recheck", message.id);
+
+    let result = gateway
+        .gate3(
+            "draft-recheck",
+            &focus_run_id,
+            "Quick Ask",
+            &content_key,
+            &message.content,
+            1, // content_sensitivity_severity
+            3, // target_tier -- unchanged, still the tier-ceiling check's input
+            settings.max_permitted_tier as u8,
+            1, // execution_tier
+            Some(&app_handle),
+            Some(new_risk),
+            &request.user_id,
+            &request.persona_id,
+            &key_hex_str,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let new_status = if result.pending_consent {
+        Some("pending-review")
+    } else if result.approved {
+        Some("approved")
+    } else {
+        None
+    };
+    if let Some(status) = new_status {
+        message_store::update_gate3_review_status(
+            &request.user_id,
+            &request.persona_id,
+            &key_hex_str,
+            &request.message_id,
+            status,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        message_store::update_reviewed_at_risk_rating(
+            &request.user_id,
+            &request.persona_id,
+            &key_hex_str,
+            &request.message_id,
+            new_risk,
         )
         .await
         .map_err(|e| e.to_string())?;

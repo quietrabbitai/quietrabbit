@@ -221,6 +221,19 @@ export function Tier3AccessPane({
     markTier3Ready,
   } = useDominancePair(pair, onUpdatePair)
 
+  // items.id=406 (decisions.id=755): the provider-selection re-check
+  // trigger's own memory of what was last copied -- QR only ever evaluates
+  // clipboard content it can prove it wrote itself (the hard provenance
+  // boundary from the design doc), never arbitrary/external clipboard
+  // contents. Cleared implicitly by comparison at check time, not on a
+  // timer -- a stale entry is harmless: if the clipboard no longer holds
+  // this exact text (the user copied something else, or pasted already),
+  // the provenance check below simply won't match and no re-check fires.
+  const [lastCopiedStarter, setLastCopiedStarter] = useState<{
+    messageId: string
+    content: string
+  } | null>(null)
+
   // items.id=404: the three internal actions that mean "make Tier3/Chat
   // the outer dock's dominant rail" -- see this component's own
   // onDominantRailChange doc comment and WorkspaceShell.tsx's header
@@ -229,8 +242,67 @@ export function Tier3AccessPane({
     (providerId: string) => {
       onDominantRailChange('tier3')
       activate(providerId)
+
+      // items.id=406 (decisions.id=755): provider-selection re-check --
+      // fires alongside activation (not blocking it; see design doc's own
+      // "achievable version" framing -- QR cannot observe paste itself,
+      // only the two moments it CAN observe: copy, and selecting a new
+      // destination). Mirrors handleDraftReady's own shape: reviewOutcome
+      // is set to 'pending' BEFORE the command resolves so the modal is
+      // already primed if the independent consent_request listener (below)
+      // delivers a payload for it.
+      if (lastCopiedStarter && personaId) {
+        const activeIds = openProviderIds.includes(providerId)
+          ? openProviderIds
+          : [...openProviderIds, providerId]
+        const messageId = lastCopiedStarter.messageId
+        void navigator.clipboard
+          .readText()
+          .then((clipboardText) => {
+            if (clipboardText !== lastCopiedStarter.content) return
+            setReviewOutcome('pending')
+            setReviewMessage(null)
+            setReviewCeiling(null)
+            setPendingMessageId(messageId)
+            return commands.recheckTier3ProviderSelection({
+              user_id: requireCurrentUserId(),
+              persona_id: personaId,
+              message_id: messageId,
+              newly_active_provider_ids: activeIds,
+            })
+          })
+          .then((result) => {
+            if (!result) return // provenance mismatch -- nothing was fired
+            if (result.status !== 'ok') {
+              setReviewOutcome('blocked')
+              setReviewMessage(
+                t('navShell.tier3AccessPane.gate3ReviewError', { message: result.error }),
+              )
+              return
+            }
+            const data = result.data
+            if (data.pending_consent) {
+              // Payload arrives via the consent_request listener.
+              return
+            }
+            if (data.approved) {
+              // No new review was actually needed (no-op path, or every
+              // fact auto-resolved) -- back to whatever it was before this
+              // check, not stuck showing 'pending'.
+              setReviewOutcome('approved')
+              return
+            }
+            setReviewOutcome('blocked')
+            setReviewMessage(data.plain_language)
+          })
+          .catch(() => {
+            // Clipboard read can reject (permissions, focus) -- a re-check
+            // we can't confirm provenance for must not fire, so failing
+            // closed (skip) is correct, not swallowed-error negligence.
+          })
+      }
     },
-    [activate, onDominantRailChange],
+    [activate, onDominantRailChange, lastCopiedStarter, personaId, openProviderIds, t],
   )
   const markTier3ReadyAndPromote = useCallback(() => {
     onDominantRailChange('tier3')
@@ -938,6 +1010,7 @@ export function Tier3AccessPane({
               collapsed={floor || dominant === 'tier3'}
               onExpand={floor ? onFloorExpand : reclaimChatAndPromote}
               onLastAssistantMessageChange={setLastAssistantMessage}
+              onCopyStarter={(messageId, content) => setLastCopiedStarter({ messageId, content })}
             />
           ) : floor ? (
             // items.id=391 (Jason, 2026-09-02, second pass): "compressed"
