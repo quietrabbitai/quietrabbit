@@ -210,7 +210,7 @@ export function WorkspaceShell({
         <div key="history-region" className="workspace-shell__history-region">
           <div className="tier3-access-pane__section-header">
             <span className="tier3-access-pane__section-header-name">
-              {t('navShell.history')}
+              {t('navShell.historyLabel')}
             </span>
           </div>
           <HistoryScreen
@@ -237,7 +237,7 @@ export function WorkspaceShell({
           className="tier3-collapsed-strip"
           onClick={() => onDominantRailChange('history')}
         >
-          <span className="tier3-collapsed-strip__name">{t('navShell.history')}</span>
+          <span className="tier3-collapsed-strip__name">{t('navShell.historyLabel')}</span>
           <span className="tier3-collapsed-strip__expand">
             {t('navShell.tier3CollapsedStrip.expandLabel')}
           </span>

@@ -148,9 +148,22 @@ pub(crate) async fn open_outputs_db(
 ) -> Result<SqliteConnection, OutputStoreError> {
     let db_path = get_outputs_db_path(user_id, persona_id);
 
-    if !db_path.exists() {
-        crate::persistence::migrations::migrate_outputs_db(user_id, persona_id, key_hex).await?;
-    }
+    // BUG FOUND + FIXED (items.id=412 live verification pass, same class as
+    // items.id=384 slice 7's message_store.rs fix and items.id=389's
+    // personal_store.rs fix): this used to be `if !db_path.exists()`, which
+    // only ever ran migrations against a brand-new file. Any outputs.db
+    // created before outputs_004.sql/outputs_005.sql shipped (source,
+    // project_entity_id, focus_slug, storage_path, storage_version,
+    // original_filename, plus the Privacy Guardian persistence-cascade
+    // columns) stays stuck on whatever version it was created at forever,
+    // no matter how many times the app reopens it -- confirmed live
+    // (Jason, 2026-09-04) as "no such column: o.source" from
+    // output_store::list_outputs against a real pre-existing dev account.
+    //
+    // Fix: always call migrate_outputs_db, relying on run_migrations' own
+    // idempotent/pending-only behavior (schema_version-tracked) rather than
+    // a file-existence guess about whether anything is pending.
+    crate::persistence::migrations::migrate_outputs_db(user_id, persona_id, key_hex).await?;
 
     let conn = crate::providers::utils::connect_options_encrypted(&db_path, key_hex)
         .create_if_missing(false)
@@ -1588,6 +1601,86 @@ mod tests {
         } else {
             std::env::remove_var("QR_DATA_ROOT");
         }
+    }
+
+    /// Regression test for items.id=412 (live verification pass, same bug
+    /// class as message_store.rs's open_messages_db_heals_a_pre_existing_v1_
+    /// only_database and personal_store.rs's open_personal_db_heals_a_pre_
+    /// existing_v1_only_database): open_outputs_db used to call
+    /// migrate_outputs_db ONLY when the file didn't exist yet
+    /// ("if !db_path.exists()"), so an outputs.db created before
+    /// outputs_004.sql's `source` column landed stayed stuck on its
+    /// original schema forever, no matter how many times the app reopened
+    /// it -- confirmed live against a real pre-existing dev account
+    /// ("no such column: o.source" from list_outputs). Hand-builds that
+    /// stale pre-outputs_004 shape directly against a real encrypted file
+    /// (SCHEMA_FILES is a compile-time static that always includes v4+ now,
+    /// so migrate_outputs_db itself can't produce a deliberately-stale
+    /// fixture).
+    #[tokio::test]
+    async fn open_outputs_db_heals_a_pre_existing_database_missing_the_source_column() {
+        const OUTPUTS_001_SCHEMA: &str = include_str!("../../schema/outputs_001.sql");
+
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "stale-pre-source-user";
+        let persona_id = "stale-pre-source-persona";
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+        let db_path = get_outputs_db_path(user_id, persona_id);
+        std::fs::create_dir_all(db_path.parent().unwrap())
+            .expect("failed to create parent dirs for test db");
+
+        {
+            let mut conn = SqliteConnectOptions::new()
+                .filename(&db_path)
+                .create_if_missing(true)
+                .pragma("key", format!("\"x'{key_hex}'\""))
+                .connect()
+                .await
+                .expect("stale fixture connect failed");
+            for stmt in crate::persistence::migrations::parse_statements(OUTPUTS_001_SCHEMA) {
+                sqlx::query(&stmt)
+                    .execute(&mut conn)
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("stale fixture schema statement failed: {e}\n{stmt}")
+                    });
+            }
+        }
+        assert!(db_path.exists(), "stale pre-source fixture file must exist");
+
+        // The real function under test -- must heal the stale file, not
+        // just successfully connect to it as-is.
+        let heal_result = open_outputs_db(user_id, persona_id, key_hex).await;
+        assert!(
+            heal_result.is_ok(),
+            "open_outputs_db must heal the stale pre-outputs_004 database, not error: {heal_result:?}"
+        );
+
+        let mut verify_conn = open_outputs_db(user_id, persona_id, key_hex)
+            .await
+            .expect("re-open must succeed");
+        let row_err = sqlx::query("SELECT source FROM outputs LIMIT 0")
+            .fetch_optional(&mut verify_conn)
+            .await
+            .err()
+            .map(|e| e.to_string());
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+
+        assert!(
+            row_err.is_none(),
+            "outputs.source (added in outputs_004.sql) must be queryable after opening a \
+             pre-existing pre-outputs_004 outputs.db -- open_outputs_db must run pending \
+             migrations on every open, not only when the file doesn't exist yet: {row_err:?}"
+        );
     }
 
     // -- Ingestion (items.id=383, decisions.id=486) -------------------------

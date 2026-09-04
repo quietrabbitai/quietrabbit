@@ -10,7 +10,7 @@
   "navShell": {
     "personaLoadError": "Could not load personas: {{message}}",
     "library": "Library",
-    "history": "History",
+    "historyLabel": "History",
     "content": {
       "myFactsPlaceholder": "My Facts -- not yet built.",
       "chatPlaceholder": "Chat -- not yet wired for this screen.",
