@@ -4,7 +4,7 @@
 // component for both: gate3Track is the only behavioral difference (whether
 // the assistant reply gets gate3_review_status="drafted").
 
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, type ClipboardEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { commands, type MessageInfo } from '../bindings'
@@ -115,6 +115,60 @@ interface MessageContentReadyPayload {
 const CONTENT_POLL_INTERVAL_MS = 2000
 const CONTENT_POLL_TIMEOUT_MS = 25000
 
+// items.id=416 (decisions.id=766): speed-conditional copy-review UX
+// constants. EMPIRICALLY MEASURED 2026-09-04 against this app's real
+// installed webkit2gtk-4.1 2.52.6 (confirmed via `pacman -Q webkit2gtk-4.1`
+// -- the Rust `webkit2gtk` crate version 2.0.2 in Cargo.lock is an unrelated
+// binding-crate version, not the engine): a throwaway diagnostic screen
+// swapped into main.tsx (reverted immediately after) ran
+// navigator.clipboard.writeText() at increasing delays after a real click
+// gesture, in the actual running dev window. Result: PASS through 4900ms,
+// FAIL (NotAllowedError) at 5000ms -- i.e. this webkit2gtk build's real
+// transient-activation window is essentially the commonly-cited ~5s
+// Chromium/Firefox figure, NOT the ~1s-class WebKit-family failure this
+// item's own research had flagged as a real risk (that risk does not
+// materialize on this engine/version). REVEAL_THRESHOLD_MS +
+// COPY_REVIEW_MIN_HOLD_MS (825ms total) has wide headroom under the ~4.9s
+// real deadline as a result -- the tight coupling decisions.id=766 worried
+// about does not bind here.
+/** Below this, no "Scanning..." indicator shows at all -- Nielsen's
+ *  ~0.1s "feels instantaneous" threshold, converged on ~140-200ms by
+ *  several independent 2024-2026 UX sources as the point below which a
+ *  loading indicator is pure noise. */
+const COPY_REVIEW_REVEAL_THRESHOLD_MS = 175
+/** Once "Scanning..." is shown, it stays up at least this long before
+ *  flipping to the outcome -- prevents a several-frames-only flash reading
+ *  as a glitch rather than information. */
+const COPY_REVIEW_MIN_HOLD_MS = 650
+/** How long a resolved outcome (passed/blocked/needs-review/failed) stays
+ *  visible before auto-clearing back to idle. */
+const COPY_REVIEW_DISPLAY_HOLD_MS = 2500
+/** Gap 2 (transient activation expiry): rather than waiting out the full
+ *  PF_TIMEOUT_SECS=10 backend budget only to fail anyway, give up and
+ *  surface "Copy failed" once this elapses -- gives the scanning UI a
+ *  clean, honest place to terminate. Set with a ~20% safety margin below
+ *  the empirically measured ~4900ms real pass/fail boundary (see comment
+ *  above) -- not the full measured ceiling, since gate3's own remaining
+ *  network/processing time still has to fit inside this budget too. */
+const COPY_REVIEW_TRANSIENT_ACTIVATION_CAP_MS = 4000
+
+type CopyReviewState =
+  | { phase: 'idle' }
+  | { phase: 'scanning' }
+  | { phase: 'passed'; includesWithheld: boolean }
+  | { phase: 'blocked'; message: string | null }
+  /** Gap 3's resolved simple fallback -- gate3 already runs automatically
+   *  before content is ever visible/selectable (handleDraftReady), so a
+   *  copy-triggered re-run reaching pending_consent here is the rare
+   *  persistence-cascade-miss case, not the common path. A light prompt,
+   *  not the full PrivacyGuardianModal. */
+  | { phase: 'needs-review' }
+  | { phase: 'failed' }
+  /** decisions.id=766's standalone-withheld carve-out: copying exactly one
+   *  previously-withheld message needs a harder re-confirmation, not the
+   *  same pass/fail scan a fresh composition gets. */
+  | { phase: 'confirm-withheld'; text: string }
+
 export function ChatPane({
   contextKey,
   userId,
@@ -137,6 +191,10 @@ export function ChatPane({
    *  recently fired, for the transient "Copied" label swap -- cleared by
    *  its own timeout, not on every render. */
   const [copiedStarterId, setCopiedStarterId] = useState<string | null>(null)
+  /** items.id=416: state machine for the native-copy Gate3 review UX --
+   *  see the CopyReviewState/COPY_REVIEW_* constants above this component. */
+  const [copyReview, setCopyReview] = useState<CopyReviewState>({ phase: 'idle' })
+  const copyReviewClearRef = useRef<number | null>(null)
 
   const [activeRunId, setActiveRunId] = useState<string | null>(null)
   const [liveStepDisplayName, setLiveStepDisplayName] = useState<
@@ -433,6 +491,171 @@ export function ChatPane({
     [onCopyStarter],
   )
 
+  // items.id=416 (decisions.id=766): shows a copy-review outcome, then
+  // auto-clears it back to idle after COPY_REVIEW_DISPLAY_HOLD_MS --
+  // same "own timeout, not on every render" shape as copiedStarterId above.
+  const showCopyReviewOutcome = useCallback((state: CopyReviewState) => {
+    if (copyReviewClearRef.current !== null) {
+      window.clearTimeout(copyReviewClearRef.current)
+    }
+    setCopyReview(state)
+    copyReviewClearRef.current = window.setTimeout(() => {
+      setCopyReview({ phase: 'idle' })
+      copyReviewClearRef.current = null
+    }, COPY_REVIEW_DISPLAY_HOLD_MS)
+  }, [])
+
+  // items.id=416 (decisions.id=766, core mechanism): extends Gate3 review to
+  // EVERY copy of chat content, not just handleCopyStarter's dedicated
+  // button -- previously an already-approved message got zero re-protection
+  // against a plain manual copy, and a withheld message (durable,
+  // permanently persisted, per messages_001.sql) rendered identically to
+  // approved with no protection at all. Cross-message selection
+  // (items.id=416 Gap 1): treated as ONE new composition -- a single
+  // combined gate3 call against the concatenated text, not fragmented
+  // per-message sub-reviews.
+  const runCopyReview = useCallback(
+    (text: string, includesWithheld: boolean) => {
+      let revealed = false
+      let settled = false
+
+      const revealTimer = window.setTimeout(() => {
+        revealed = true
+        setCopyReview({ phase: 'scanning' })
+      }, COPY_REVIEW_REVEAL_THRESHOLD_MS)
+
+      const finish = (state: CopyReviewState) => {
+        if (revealed) {
+          window.setTimeout(() => showCopyReviewOutcome(state), COPY_REVIEW_MIN_HOLD_MS)
+        } else {
+          showCopyReviewOutcome(state)
+        }
+      }
+
+      const capTimer = window.setTimeout(() => {
+        if (settled) return
+        settled = true
+        window.clearTimeout(revealTimer)
+        // Gap 2 floor: never fail silently, even on a proactive give-up
+        // rather than a real writeText() rejection.
+        finish({ phase: 'failed' })
+      }, COPY_REVIEW_TRANSIENT_ACTIVATION_CAP_MS)
+
+      commands
+        .requestChatCopyGate3Review({
+          user_id: userId,
+          persona_id: personaId,
+          content_text: text,
+        })
+        .then((result) => {
+          if (settled) return
+          settled = true
+          window.clearTimeout(revealTimer)
+          window.clearTimeout(capTimer)
+
+          if (result.status !== 'ok') {
+            finish({ phase: 'failed' })
+            return
+          }
+          const data = result.data
+          if (data.pending_consent) {
+            finish({ phase: 'needs-review' })
+            return
+          }
+          if (data.approved) {
+            void navigator.clipboard
+              .writeText(text)
+              .then(() => {
+                // Silent on a fast, unflagged pass -- "no visible
+                // interruption at all" per this item's own UX spec. The
+                // withheld-inclusion flag is informational, not part of the
+                // scan-timing UI it's meant to avoid, so it always surfaces.
+                if (revealed || includesWithheld) {
+                  finish({ phase: 'passed', includesWithheld })
+                }
+              })
+              .catch(() => {
+                // Gap 2 floor: writeText() rejected (transient activation
+                // expired) -- explicit failure, never a silent no-op.
+                finish({ phase: 'failed' })
+              })
+            return
+          }
+          finish({ phase: 'blocked', message: data.plain_language })
+        })
+    },
+    [userId, personaId, showCopyReviewOutcome],
+  )
+
+  // decisions.id=766's standalone-withheld carve-out (distinct from Gap 1's
+  // multi-message flag above): copying JUST one previously-withheld message
+  // -- a decision the user already made once -- needs a harder
+  // re-confirmation, not a fresh pass/fail scan.
+  const requestWithheldReconfirm = useCallback((text: string) => {
+    if (copyReviewClearRef.current !== null) {
+      window.clearTimeout(copyReviewClearRef.current)
+      copyReviewClearRef.current = null
+    }
+    setCopyReview({ phase: 'confirm-withheld', text })
+  }, [])
+
+  const confirmWithheldCopy = useCallback(() => {
+    setCopyReview((current) => {
+      if (current.phase !== 'confirm-withheld') return current
+      void navigator.clipboard.writeText(current.text).catch(() => {
+        showCopyReviewOutcome({ phase: 'failed' })
+      })
+      return { phase: 'idle' }
+    })
+  }, [showCopyReviewOutcome])
+
+  const cancelWithheldCopy = useCallback(() => {
+    setCopyReview({ phase: 'idle' })
+  }, [])
+
+  // items.id=416 (decisions.id=766, core mechanism): the native `copy`
+  // event (Ctrl+C / right-click-copy) on this transcript -- same
+  // click-initiated-only discipline as handleCopyStarter's own comment
+  // above (this event IS the user's copy gesture), extended to cover every
+  // copy path instead of just the dedicated button. Hard scope boundary
+  // (must be preserved): never fires on or inspects clipboard contents from
+  // outside this element, never a background poll, never
+  // navigator.clipboard.readText() -- strictly reactive to a copy gesture
+  // on QR's own rendered content, per the locked
+  // no-passive-clipboard-monitoring rule.
+  const handleTranscriptCopy = useCallback(
+    (e: ClipboardEvent<HTMLUListElement>) => {
+      e.preventDefault() // synchronous, before any async work
+
+      const selection = window.getSelection()
+      const text = selection?.toString() ?? ''
+      if (!text || !selection || selection.rangeCount === 0) return
+
+      const range = selection.getRangeAt(0)
+      const selectedMessages = Array.from(
+        e.currentTarget.querySelectorAll<HTMLLIElement>('li[data-message-id]'),
+      ).filter((li) => range.intersectsNode(li))
+
+      if (selectedMessages.length === 0) {
+        // Selection touched no message content (pure chrome/whitespace) --
+        // nothing Gate3-relevant to review.
+        void navigator.clipboard.writeText(text)
+        return
+      }
+
+      const statuses = selectedMessages.map((li) => li.dataset.gate3Status)
+      const includesWithheld = statuses.includes('withheld')
+
+      if (selectedMessages.length === 1 && statuses[0] === 'withheld') {
+        requestWithheldReconfirm(text)
+        return
+      }
+
+      runCopyReview(text, includesWithheld)
+    },
+    [runCopyReview, requestWithheldReconfirm],
+  )
+
   // items.id=391 (Jason, 2026-09-02): the transcript never auto-scrolled
   // to the newest message at all -- confirmed as the actual blocker
   // behind "click 2nd opinion, forget to copy the QR chat message, quickly
@@ -453,6 +676,14 @@ export function ChatPane({
     if (!el) return
     el.scrollTop = el.scrollHeight
   }, [collapsed, messages])
+
+  useEffect(() => {
+    return () => {
+      if (copyReviewClearRef.current !== null) {
+        window.clearTimeout(copyReviewClearRef.current)
+      }
+    }
+  }, [])
 
   return (
     <div className="chat-pane" data-collapsed={collapsed ? '' : undefined}>
@@ -492,7 +723,7 @@ export function ChatPane({
           {messages.length === 0 && !loadError && (
             <p>{t('navShell.chat.emptyTranscript')}</p>
           )}
-          <ul className="chat-pane__message-list">
+          <ul className="chat-pane__message-list" onCopy={handleTranscriptCopy}>
             {messages.map((m) => {
               // items.id=359 piece 6: an approved gate3 draft is a
               // visually distinct message type, not another plain bubble
@@ -502,7 +733,12 @@ export function ChatPane({
               // copy affordance exists before the gate clears.
               if (m.gate3_review_status === 'approved') {
                 return (
-                  <li key={m.id} className="chat-pane__message chat-pane__message--starter">
+                  <li
+                    key={m.id}
+                    className="chat-pane__message chat-pane__message--starter"
+                    data-message-id={m.id}
+                    data-gate3-status={m.gate3_review_status ?? ''}
+                  >
                     <span className="chat-pane__starter-label">
                       {t('navShell.chat.starterLabel')}
                     </span>
@@ -520,7 +756,12 @@ export function ChatPane({
                 )
               }
               return (
-                <li key={m.id} className={`chat-pane__message chat-pane__message--${m.sender}`}>
+                <li
+                  key={m.id}
+                  className={`chat-pane__message chat-pane__message--${m.sender}`}
+                  data-message-id={m.id}
+                  data-gate3-status={m.gate3_review_status ?? ''}
+                >
                   <span className="chat-pane__message-content">
                     {m.id === liveMessageId && liveContent ? liveContent : m.content}
                   </span>
@@ -533,6 +774,55 @@ export function ChatPane({
               )
             })}
           </ul>
+          {copyReview.phase === 'scanning' && (
+            <p className="chat-pane__copy-review-notice" aria-live="polite">
+              {t('navShell.chat.copyScanning')}
+            </p>
+          )}
+          {copyReview.phase === 'passed' && (
+            <p className="chat-pane__copy-review-notice" aria-live="polite">
+              {t('navShell.chat.copyScanPassed')}
+              {copyReview.includesWithheld && (
+                <span className="chat-pane__copy-review-flag">
+                  {' '}
+                  {t('navShell.chat.copyIncludesWithheldFlag')}
+                </span>
+              )}
+            </p>
+          )}
+          {copyReview.phase === 'blocked' && (
+            <p
+              role="alert"
+              className="chat-pane__copy-review-notice chat-pane__copy-review-notice--blocked"
+            >
+              {copyReview.message ?? t('navShell.chat.copyBlocked')}
+            </p>
+          )}
+          {copyReview.phase === 'needs-review' && (
+            <p role="alert" className="chat-pane__copy-review-notice">
+              {t('navShell.chat.copyNeedsReview')}
+            </p>
+          )}
+          {copyReview.phase === 'failed' && (
+            <p
+              role="alert"
+              className="chat-pane__copy-review-notice chat-pane__copy-review-notice--failed"
+            >
+              {t('navShell.chat.copyFailed')}
+            </p>
+          )}
+          {copyReview.phase === 'confirm-withheld' && (
+            <div className="chat-pane__copy-withheld-confirm" role="alertdialog">
+              <p>{t('navShell.chat.copyWithheldConfirmTitle')}</p>
+              <p>{t('navShell.chat.copyWithheldConfirmBody')}</p>
+              <button type="button" onClick={confirmWithheldCopy}>
+                {t('navShell.chat.copyWithheldConfirmConfirm')}
+              </button>
+              <button type="button" onClick={cancelWithheldCopy}>
+                {t('navShell.chat.copyWithheldConfirmCancel')}
+              </button>
+            </div>
+          )}
           {isGenerating && (
             <p className="chat-pane__generating" aria-live="polite">
               {liveStepDisplayName

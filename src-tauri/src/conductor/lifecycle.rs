@@ -86,6 +86,8 @@ use crate::conductor::failure::{
     ConductorError, FailureAction, FailureHandler, FailureResult, FailureSeverity,
 };
 use crate::conductor::memory_broker::MemoryBroker;
+use crate::conductor::privacy::output_scan::{scan_output, ScanIntensity};
+use crate::conductor::privacy::types::sensitivity_severity;
 use crate::conductor::privacy::{logger::DisclosureLoggerForRun, PrivacyGateway};
 use crate::conductor::tokens::{validate_step, FieldRequirement, StepDefinition, StepType};
 use crate::conductor::types::{
@@ -150,6 +152,8 @@ pub enum LifecycleError {
     PersonalStore(String),
     #[error("Output store: {0}")]
     OutputStore(String),
+    #[error("Privacy scan: {0}")]
+    PrivacyScan(String),
     #[error("Persona store: {0}")]
     PersonaStore(String),
     #[error("Focus settings store: {0}")]
@@ -1819,6 +1823,28 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         let sensitivity = self.output_sensitivity().to_owned();
         let output_id = Uuid::new_v4().to_string();
 
+        // items.id=416 (decisions.id=767): Privacy Guardian classification
+        // established once, at creation, rather than deferred to whenever a
+        // later action (e.g. a Library copy) first triggers it -- outputs
+        // are immutable after this point (output_store.rs's own header:
+        // the only later mutation is delete-time content-zeroing), so a
+        // scan computed here can never go stale. execution_tier uses
+        // _focus_max_permitted_tier (the run's hard ceiling) since no single
+        // per-run "final" execution tier is tracked -- it's computed fresh
+        // per-step (see execute_step's own Axis-1 calculation), not
+        // persisted on FocusRun.
+        let scan_result = scan_output(
+            &self.privacy_gateway.as_ref().unwrap().logger,
+            "output-creation",
+            &focus_run_id,
+            &final_content,
+            self._focus_max_permitted_tier,
+            sensitivity_severity(&sensitivity),
+            ScanIntensity::Full,
+        )
+        .await
+        .map_err(|e| LifecycleError::PrivacyScan(e.to_string()))?;
+
         save_output(
             &self.user_id,
             &self.persona_id,
@@ -1828,6 +1854,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             &final_content,
             &sensitivity,
             Some(&output_id),
+            Some(&scan_result),
         )
         .await
         .map_err(|e| LifecycleError::OutputStore(e.to_string()))?;

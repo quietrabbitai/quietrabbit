@@ -64,6 +64,21 @@ impl Sensitivity {
     }
 }
 
+/// String -> Sensitivity -> severity mapping. Mirrors executor.rs's
+/// to_gate_track() fail-safe: unrecognised/"general" values map to General.
+/// Relocated from commands/library.rs (items.id=416) so lifecycle.rs's
+/// creation-time output_scan call can share it instead of duplicating the
+/// same match arm.
+pub(crate) fn sensitivity_severity(sensitivity: &str) -> u8 {
+    match sensitivity {
+        "personal" => Sensitivity::Personal,
+        "medical" => Sensitivity::Medical,
+        "financial" => Sensitivity::Financial,
+        _ => Sensitivity::General,
+    }
+    .severity()
+}
+
 // -- PersonalField ------------------------------------------------------------
 // Mirrors Python's PersonalField dataclass.
 // field_value is decrypted plaintext -- never logged, never serialised.

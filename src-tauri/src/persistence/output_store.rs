@@ -31,6 +31,7 @@ use sqlx::Row;
 use sqlx::SqliteConnection;
 use thiserror::Error;
 
+use crate::conductor::privacy::output_scan::OutputScanResult;
 use crate::conductor::privacy::types::{ElementDecision, ElementDecisionKind};
 
 // ---------------------------------------------------------------------------
@@ -85,6 +86,22 @@ pub struct OutputRecord {
     pub storage_path: Option<String>,
     pub storage_version: i32,
     pub original_filename: Option<String>,
+    /// items.id=416 (decisions.id=767): the real Privacy Guardian
+    /// (output_scan::scan_output, ScanIntensity::Full) result, cached at
+    /// creation time -- distinct from `sensitivity` above, which is an
+    /// earlier, separate in-run classification, left untouched. NULL/false
+    /// defaults mean "never scanned" (a row created before this cache
+    /// existed, or one that never went through lifecycle.rs::output(), e.g.
+    /// an ingested document) -- see pg_scan_completed_at.
+    pub pg_scan_blocked: bool,
+    pub pg_scan_timed_out: bool,
+    pub pg_scan_plain_language: Option<String>,
+    /// JSON array of OutputScanFinding, or NULL if never scanned.
+    pub pg_scan_findings_json: Option<String>,
+    /// NULL = never scanned (legacy row, or a creation path that doesn't
+    /// call scan_output) -- the signal callers use to decide whether
+    /// pg_scan_blocked is trustworthy cache or just an unset default.
+    pub pg_scan_completed_at: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -221,6 +238,11 @@ fn row_to_output_record(r: &sqlx::sqlite::SqliteRow) -> Result<OutputRecord, sql
         storage_path: r.try_get("storage_path")?,
         storage_version: r.try_get("storage_version")?,
         original_filename: r.try_get("original_filename")?,
+        pg_scan_blocked: r.try_get::<i64, _>("pg_scan_blocked")? != 0,
+        pg_scan_timed_out: r.try_get::<i64, _>("pg_scan_timed_out")? != 0,
+        pg_scan_plain_language: r.try_get("pg_scan_plain_language")?,
+        pg_scan_findings_json: r.try_get("pg_scan_findings_json")?,
+        pg_scan_completed_at: r.try_get("pg_scan_completed_at")?,
     })
 }
 
@@ -234,6 +256,17 @@ fn row_to_output_record(r: &sqlx::sqlite::SqliteRow) -> Result<OutputRecord, sql
 ///
 /// sensitivity_severity is a GENERATED ALWAYS column in the outputs table —
 /// omitted from INSERT; SQLite computes it automatically.
+///
+/// scan_result (items.id=416, decisions.id=767): the real Privacy Guardian
+/// scan (output_scan::scan_output, ScanIntensity::Full) computed by the
+/// caller at creation time, persisted alongside so later reads (e.g.
+/// commands::library::prepare_clipboard_copy) never need to re-scan
+/// immutable content. lifecycle.rs::output() always passes Some(&result) --
+/// None is reserved for callers with no creation-time scan to report (test
+/// seeding not exercising the cache, or a future non-Focus-run creation
+/// path); a None row simply reads back as "never scanned"
+/// (pg_scan_completed_at NULL), which callers must treat as cache-miss, not
+/// as scan_result.blocked == false.
 #[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
 pub async fn save_output(
     user_id: &str,
@@ -244,6 +277,7 @@ pub async fn save_output(
     content: &str,
     sensitivity: &str,
     output_id: Option<&str>,
+    scan_result: Option<&OutputScanResult>,
 ) -> Result<String, OutputStoreError> {
     if !VALID_SENSITIVITY.contains(&sensitivity) {
         return Err(OutputStoreError::Validation(format!(
@@ -259,11 +293,45 @@ pub async fn save_output(
     let timestamp = crate::providers::utils::now();
     let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
 
+    let (
+        pg_scan_blocked,
+        pg_scan_timed_out,
+        pg_scan_plain_language,
+        pg_scan_findings_json,
+        pg_scan_completed_at,
+    ) = match scan_result {
+        Some(r) => (
+            r.blocked,
+            r.timed_out,
+            r.plain_language.clone(),
+            Some(
+                serde_json::to_string(
+                    &r.findings
+                        .iter()
+                        .map(|f| {
+                            serde_json::json!({
+                                "start_byte": f.start_byte,
+                                "end_byte": f.end_byte,
+                                "label": f.label,
+                                "score": f.score,
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap_or_else(|_| "[]".to_string()),
+            ),
+            Some(timestamp.clone()),
+        ),
+        None => (false, false, None, None, None),
+    };
+
     sqlx::query(
         "INSERT INTO outputs
          (id, focus_run_id, output_type, content, sensitivity,
-          status, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 'active', ?, ?)",
+          status, created_at, updated_at,
+          pg_scan_blocked, pg_scan_timed_out, pg_scan_plain_language,
+          pg_scan_findings_json, pg_scan_completed_at)
+         VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&oid)
     .bind(focus_run_id)
@@ -272,10 +340,65 @@ pub async fn save_output(
     .bind(sensitivity)
     .bind(&timestamp)
     .bind(&timestamp)
+    .bind(pg_scan_blocked)
+    .bind(pg_scan_timed_out)
+    .bind(pg_scan_plain_language)
+    .bind(pg_scan_findings_json)
+    .bind(pg_scan_completed_at)
     .execute(&mut conn)
     .await?;
 
     Ok(oid)
+}
+
+/// items.id=416: backfills the pg_scan_* columns for a row that was created
+/// before this cache existed (or via a creation path that doesn't call
+/// scan_output, e.g. ingestion) and just got its first live copy-time scan
+/// in commands::library::prepare_clipboard_copy's fallback branch -- so the
+/// *next* copy of the same immutable output becomes a cache hit too, per
+/// decisions.id=767's "classify once" principle, converging every output
+/// onto the creation-time model over time rather than re-scanning it forever.
+pub async fn backfill_scan_result(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    output_id: &str,
+    scan_result: &OutputScanResult,
+) -> Result<(), OutputStoreError> {
+    let findings_json = serde_json::to_string(
+        &scan_result
+            .findings
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "start_byte": f.start_byte,
+                    "end_byte": f.end_byte,
+                    "label": f.label,
+                    "score": f.score,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_else(|_| "[]".to_string());
+    let timestamp = crate::providers::utils::now();
+    let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
+
+    sqlx::query(
+        "UPDATE outputs
+         SET pg_scan_blocked = ?, pg_scan_timed_out = ?, pg_scan_plain_language = ?,
+             pg_scan_findings_json = ?, pg_scan_completed_at = ?
+         WHERE id = ?",
+    )
+    .bind(scan_result.blocked)
+    .bind(scan_result.timed_out)
+    .bind(&scan_result.plain_language)
+    .bind(&findings_json)
+    .bind(&timestamp)
+    .bind(output_id)
+    .execute(&mut conn)
+    .await?;
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -296,7 +419,9 @@ pub async fn get_output(
         "SELECT o.id, o.focus_run_id, r.focus_id, o.output_type, o.content,
                 o.sensitivity, o.status, o.created_at, o.updated_at,
                 o.source, o.project_entity_id, o.focus_slug, o.storage_path,
-                o.storage_version, o.original_filename
+                o.storage_version, o.original_filename,
+                o.pg_scan_blocked, o.pg_scan_timed_out, o.pg_scan_plain_language,
+                o.pg_scan_findings_json, o.pg_scan_completed_at
          FROM outputs o
          JOIN focus_runs r ON r.id = o.focus_run_id
          WHERE o.id = ? AND o.status = 'active'",
@@ -328,7 +453,9 @@ pub async fn get_output_for_run(
         "SELECT o.id, o.focus_run_id, r.focus_id, o.output_type, o.content,
                 o.sensitivity, o.status, o.created_at, o.updated_at,
                 o.source, o.project_entity_id, o.focus_slug, o.storage_path,
-                o.storage_version, o.original_filename
+                o.storage_version, o.original_filename,
+                o.pg_scan_blocked, o.pg_scan_timed_out, o.pg_scan_plain_language,
+                o.pg_scan_findings_json, o.pg_scan_completed_at
          FROM outputs o
          JOIN focus_runs r ON r.id = o.focus_run_id
          WHERE o.focus_run_id = ? AND o.status = 'active'
@@ -551,7 +678,9 @@ pub async fn list_outputs(
         "SELECT o.id, o.focus_run_id, r.focus_id, o.output_type, o.content,
                 o.sensitivity, o.status, o.created_at, o.updated_at,
                 o.source, o.project_entity_id, o.focus_slug, o.storage_path,
-                o.storage_version, o.original_filename
+                o.storage_version, o.original_filename,
+                o.pg_scan_blocked, o.pg_scan_timed_out, o.pg_scan_plain_language,
+                o.pg_scan_findings_json, o.pg_scan_completed_at
          FROM outputs o
          JOIN focus_runs r ON r.id = o.focus_run_id
          WHERE o.status = 'active'",
@@ -1908,6 +2037,7 @@ mod tests {
                 "note",
                 "a qr-generated note",
                 "general",
+                None,
                 None,
             )
             .await

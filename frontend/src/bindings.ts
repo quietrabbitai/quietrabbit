@@ -239,6 +239,52 @@ export const commands = {
 	 *  risk destination needs no re-check.
 	 */
 	recheckTier3ProviderSelection: (request: RecheckTier3ProviderSelectionRequest) => typedError<Gate3ReviewResult, string>(__TAURI_INVOKE("recheck_tier3_provider_selection", { request })),
+	/**
+	 *  items.id=416 (decisions.id=766): extends Gate3 review to every native
+	 *  copy path on ChatPane's transcript (Ctrl+C / right-click-copy), not just
+	 *  the dedicated "Copy starter" button -- previously an already-`approved`
+	 *  message got zero re-protection against a plain manual copy, and a
+	 *  `withheld` message (durable, permanently persisted) rendered identically
+	 *  to `approved` with no protection at all. See ChatPane.tsx's own copy
+	 *  (`copy` event) handler for the click-initiated-only trigger this
+	 *  responds to -- never fired outside a user's own copy gesture on QR's own
+	 *  rendered content, never a poll, per the same locked
+	 *  no-passive-clipboard-monitoring rule handleCopyStarter documents.
+	 * 
+	 *  Unlike request_tier3_gate3_review, there is no single message row to
+	 *  read from -- a selection may span multiple messages (items.id=416's
+	 *  cross-message-selection resolution: treated as ONE new composition, one
+	 *  combined review, not fragmented per-message sub-reviews) -- so
+	 *  content_text is supplied directly by the frontend (the concatenated
+	 *  selection) rather than looked up by id, and content_key/focus_run_id are
+	 *  synthesized labels for the disclosure_log audit row, not references to
+	 *  any persisted row (confirmed in gate3.rs: neither is used for a DB
+	 *  lookup, only pushed into the audit entry's fields_shared/fields_withheld).
+	 * 
+	 *  Parameter sourcing mostly mirrors request_tier3_gate3_review's own
+	 *  quick-ask constants (content_sensitivity_severity=1, execution_tier=1),
+	 *  but NOT its target_tier=3 -- confirmed live (2026-09-04) that reusing 3
+	 *  unconditionally makes gate3's own zero_spans_safe_to_auto_approve
+	 *  (target_tier/destination_risk >= 3 forces High review regardless of
+	 *  content) fire for every single copy when no Tier 3 provider pane happens
+	 *  to be open, defeating the "silent on a fast, unflagged pass" UX this
+	 *  whole feature is built around: request_tier3_gate3_review's target_tier=3
+	 *  is correct there because that flow's own precondition is "the user is
+	 *  literally about to access Tier 3" (its own doc comment) -- a native copy
+	 *  gesture on this transcript carries no such precondition; the destination
+	 *  could just as easily be a text editor as a Tier 3 pane. target_tier=1
+	 *  here means an unknown/no-Tier-3-destination copy is judged on its own
+	 *  content severity alone (correct, most copies pass silently and fast),
+	 *  while destination_risk_rating below still reflects any ACTUALLY active
+	 *  Tier 3 provider's real risk -- so a copy made while a genuinely risky
+	 *  destination is open still gets the stricter review, preserving
+	 *  decisions.id=755's original intent for that real case.
+	 *  This command intentionally does NOT touch messages.gate3_review_status
+	 *  or messages.reviewed_at_risk_rating -- those track a single drafted
+	 *  message's own lifecycle; a copy-triggered review is a fresh, ephemeral
+	 *  check with no message row of its own to update.
+	 */
+	requestChatCopyGate3Review: (request: RequestChatCopyGate3ReviewRequest) => typedError<Gate3ReviewResult, string>(__TAURI_INVOKE("request_chat_copy_gate3_review", { request })),
 	getOnboardingFocusSuggestions: (personas: string[]) => typedError<NotImplementedPlaceholder, string>(__TAURI_INVOKE("get_onboarding_focus_suggestions", { personas })),
 	submitOnboardingPersonaSelection: (personas: string[]) => typedError<string[], string>(__TAURI_INVOKE("submit_onboarding_persona_selection", { personas })),
 	submitOnboardingFocusSelection: (focusSelections: NotImplementedPlaceholder[]) => typedError<string[], string>(__TAURI_INVOKE("submit_onboarding_focus_selection", { focusSelections })),
@@ -1075,6 +1121,19 @@ export type RecheckTier3ProviderSelectionRequest = {
  */
 export type RecoveryKeyDisplay = {
 	mnemonic: string,
+};
+
+/**
+ *  items.id=416 (decisions.id=766): a native copy gesture on ChatPane's
+ *  message transcript -- content_text is the concatenated text of whatever
+ *  the user selected (one message or a span across several), supplied
+ *  directly by the frontend rather than looked up by message_id, since a
+ *  cross-message selection has no single message row to read from.
+ */
+export type RequestChatCopyGate3ReviewRequest = {
+	user_id: string,
+	persona_id: string,
+	content_text: string,
 };
 
 export type RequestTier3Gate3ReviewRequest = {

@@ -46,22 +46,10 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 
 use crate::auth::registry::{key_hex, KeyRegistry};
 use crate::conductor::privacy::output_scan::{scan_output, ScanIntensity};
-use crate::conductor::privacy::types::Sensitivity;
+use crate::conductor::privacy::types::sensitivity_severity;
 use crate::persistence::disclosure_log_store::SqliteDisclosureLogger;
 use crate::persistence::focus_settings_store;
 use crate::persistence::output_store;
-
-/// String -> Sensitivity -> severity mapping. Mirrors executor.rs's
-/// to_gate_track() fail-safe: unrecognised/"general" values map to General.
-fn sensitivity_severity(sensitivity: &str) -> u8 {
-    match sensitivity {
-        "personal" => Sensitivity::Personal,
-        "medical" => Sensitivity::Medical,
-        "financial" => Sensitivity::Financial,
-        _ => Sensitivity::General,
-    }
-    .severity()
-}
 
 /// Whether the Focus owning `focus_id` is in 'protected' profile, per
 /// focus_settings.focus_profile (D6-294). A missing focus_settings row
@@ -303,32 +291,50 @@ async fn prepare_clipboard_copy(
             .to_string()
     })?;
 
-    let execution_tier = output_store::get_focus_run_routing_tier(
-        user_id,
-        persona_id,
-        key_hex,
-        &record.focus_run_id,
-    )
-    .await
-    .map_err(|e| e.to_string())?
-    .unwrap_or(1) as u8;
+    // items.id=416 (decisions.id=767): outputs are immutable after creation,
+    // so a scan computed once at creation can never go stale -- reuse the
+    // cached creation-time result (lifecycle.rs::output()) instead of
+    // re-scanning identical content on every copy. pg_scan_completed_at is
+    // only ever unset for a row that predates this creation-time scan, or
+    // that never went through it at all (e.g. an ingested document) -- for
+    // those, fall back to the old live-scan-at-copy-time behavior and
+    // backfill the result so the next copy of the same output is a cache hit.
+    let blocked = if record.pg_scan_completed_at.is_some() {
+        record.pg_scan_blocked
+    } else {
+        let execution_tier = output_store::get_focus_run_routing_tier(
+            user_id,
+            persona_id,
+            key_hex,
+            &record.focus_run_id,
+        )
+        .await
+        .map_err(|e| e.to_string())?
+        .unwrap_or(1) as u8;
 
-    let logger = SqliteDisclosureLogger::new(user_id, persona_id, key_hex);
-    let severity = sensitivity_severity(&record.sensitivity);
+        let logger = SqliteDisclosureLogger::new(user_id, persona_id, key_hex);
+        let severity = sensitivity_severity(&record.sensitivity);
 
-    let result = scan_output(
-        &logger,
-        &format!("clipboard-copy-{output_id}"),
-        &record.focus_run_id,
-        content,
-        execution_tier,
-        severity,
-        ScanIntensity::Full,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+        let result = scan_output(
+            &logger,
+            &format!("clipboard-copy-{output_id}"),
+            &record.focus_run_id,
+            content,
+            execution_tier,
+            severity,
+            ScanIntensity::Full,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
 
-    if result.blocked {
+        output_store::backfill_scan_result(user_id, persona_id, key_hex, output_id, &result)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        result.blocked
+    };
+
+    if blocked {
         // Actionable, clipboard-specific -- not scan_output's generic
         // "can't be exported as-is" message, which doesn't say what the
         // user can still do. No [Get help] bracket: checked whether any
@@ -376,6 +382,7 @@ pub async fn copy_output_to_clipboard(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conductor::privacy::output_scan::OutputScanResult;
     use crate::persistence::{output_store, persona_store};
     use crate::test_support::{mock_app_with_registry, populate_registry, ENV_MUTEX};
     use tauri::Manager;
@@ -490,6 +497,7 @@ mod tests {
             "note",
             content,
             "general",
+            None,
             None,
         )
         .await
@@ -692,6 +700,7 @@ mod tests {
             content,
             sensitivity,
             None,
+            None,
         )
         .await
         .expect("save_output must succeed in test setup")
@@ -726,6 +735,69 @@ mod tests {
         assert!(
             err.contains("clipboard") && err.contains("view and use it here"),
             "blocked message must be actionable, not generic: {err}"
+        );
+    }
+
+    /// items.id=416 (decisions.id=767): when a creation-time scan result was
+    /// already persisted (pg_scan_completed_at set), prepare_clipboard_copy
+    /// must use the cached `blocked` value directly rather than re-running
+    /// scan_output. Seeds a "general" (low-severity) output with a cached
+    /// scan result that says `blocked: true` -- if the cache were being
+    /// ignored, the legacy fallback path would recompute blocked=false for
+    /// "general" severity and this test would fail, proving the cache is
+    /// actually being read.
+    #[tokio::test]
+    async fn clipboard_copy_uses_cached_scan_result_instead_of_rescanning() {
+        let _env = setup().await;
+        focus_settings_store::create_focus_settings(
+            PERSONA_ID,
+            "focus-open",
+            "bidirectional",
+            "shared",
+            2,
+            2,
+            "open",
+            None,
+        )
+        .await
+        .expect("create_focus_settings must succeed in test setup");
+        let focus_run_id = "run-cached-scan";
+        output_store::test_seed_focus_run(
+            USER_ID,
+            PERSONA_ID,
+            &key_hex_str(),
+            focus_run_id,
+            "focus-open",
+        )
+        .await
+        .expect("test_seed_focus_run must succeed in test setup");
+
+        let cached_scan = OutputScanResult {
+            blocked: true,
+            timed_out: false,
+            findings: vec![],
+            plain_language: Some("cached block".to_string()),
+        };
+        let output_id = output_store::save_output(
+            USER_ID,
+            PERSONA_ID,
+            &key_hex_str(),
+            focus_run_id,
+            "note",
+            "harmless-looking general content",
+            "general",
+            None,
+            Some(&cached_scan),
+        )
+        .await
+        .expect("save_output must succeed in test setup");
+
+        let result = prepare_clipboard_copy(&output_id, USER_ID, PERSONA_ID, &key_hex_str()).await;
+
+        assert!(
+            result.is_err(),
+            "cached blocked=true must be honored even though live severity-based \
+             scanning of \"general\" content would not have blocked it"
         );
     }
 

@@ -153,6 +153,18 @@ pub struct RequestTier3Gate3ReviewRequest {
     pub message_id: String,
 }
 
+/// items.id=416 (decisions.id=766): a native copy gesture on ChatPane's
+/// message transcript -- content_text is the concatenated text of whatever
+/// the user selected (one message or a span across several), supplied
+/// directly by the frontend rather than looked up by message_id, since a
+/// cross-message selection has no single message row to read from.
+#[derive(Debug, Deserialize, Type)]
+pub struct RequestChatCopyGate3ReviewRequest {
+    pub user_id: String,
+    pub persona_id: String,
+    pub content_text: String,
+}
+
 /// items.id=406 (decisions.id=755): the provider-selection re-check
 /// trigger's request. `newly_active_provider_ids` is whatever the rail
 /// reports as active/laid-out at the moment of this call -- same
@@ -863,6 +875,113 @@ pub async fn request_tier3_gate3_review(
         .await
         .map_err(|e| e.to_string())?;
     }
+
+    Ok(result.into())
+}
+
+/// items.id=416 (decisions.id=766): extends Gate3 review to every native
+/// copy path on ChatPane's transcript (Ctrl+C / right-click-copy), not just
+/// the dedicated "Copy starter" button -- previously an already-`approved`
+/// message got zero re-protection against a plain manual copy, and a
+/// `withheld` message (durable, permanently persisted) rendered identically
+/// to `approved` with no protection at all. See ChatPane.tsx's own copy
+/// (`copy` event) handler for the click-initiated-only trigger this
+/// responds to -- never fired outside a user's own copy gesture on QR's own
+/// rendered content, never a poll, per the same locked
+/// no-passive-clipboard-monitoring rule handleCopyStarter documents.
+///
+/// Unlike request_tier3_gate3_review, there is no single message row to
+/// read from -- a selection may span multiple messages (items.id=416's
+/// cross-message-selection resolution: treated as ONE new composition, one
+/// combined review, not fragmented per-message sub-reviews) -- so
+/// content_text is supplied directly by the frontend (the concatenated
+/// selection) rather than looked up by id, and content_key/focus_run_id are
+/// synthesized labels for the disclosure_log audit row, not references to
+/// any persisted row (confirmed in gate3.rs: neither is used for a DB
+/// lookup, only pushed into the audit entry's fields_shared/fields_withheld).
+///
+/// Parameter sourcing mostly mirrors request_tier3_gate3_review's own
+/// quick-ask constants (content_sensitivity_severity=1, execution_tier=1),
+/// but NOT its target_tier=3 -- confirmed live (2026-09-04) that reusing 3
+/// unconditionally makes gate3's own zero_spans_safe_to_auto_approve
+/// (target_tier/destination_risk >= 3 forces High review regardless of
+/// content) fire for every single copy when no Tier 3 provider pane happens
+/// to be open, defeating the "silent on a fast, unflagged pass" UX this
+/// whole feature is built around: request_tier3_gate3_review's target_tier=3
+/// is correct there because that flow's own precondition is "the user is
+/// literally about to access Tier 3" (its own doc comment) -- a native copy
+/// gesture on this transcript carries no such precondition; the destination
+/// could just as easily be a text editor as a Tier 3 pane. target_tier=1
+/// here means an unknown/no-Tier-3-destination copy is judged on its own
+/// content severity alone (correct, most copies pass silently and fast),
+/// while destination_risk_rating below still reflects any ACTUALLY active
+/// Tier 3 provider's real risk -- so a copy made while a genuinely risky
+/// destination is open still gets the stricter review, preserving
+/// decisions.id=755's original intent for that real case.
+/// This command intentionally does NOT touch messages.gate3_review_status
+/// or messages.reviewed_at_risk_rating -- those track a single drafted
+/// message's own lifecycle; a copy-triggered review is a fresh, ephemeral
+/// check with no message row of its own to update.
+#[tauri::command]
+#[specta::specta]
+pub async fn request_chat_copy_gate3_review(
+    app_handle: tauri::AppHandle,
+    request: RequestChatCopyGate3ReviewRequest,
+    key_registry: State<'_, KeyRegistry>,
+    layout_state: State<'_, crate::commands::tier3_pane::PaneLayoutState>,
+) -> Result<Gate3ReviewResult, String> {
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
+    let settings =
+        focus_settings_store::get_focus_settings(&request.persona_id, TIER3_DRAFT_FOCUS_ID)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| {
+                format!(
+                    "no focus_settings row for persona='{}' focus='{}'",
+                    request.persona_id, TIER3_DRAFT_FOCUS_ID
+                )
+            })?;
+
+    let gateway = PrivacyGateway::new(SqliteDisclosureLogger::new(
+        &request.user_id,
+        &request.persona_id,
+        &key_hex_str,
+    ));
+
+    let active_provider_ids: Vec<String> = {
+        let map = layout_state.0.lock().unwrap();
+        map.keys().cloned().collect()
+    };
+    let destination_risk_rating =
+        crate::persistence::provider_store::max_risk_rating_for_providers(&active_provider_ids)
+            .await
+            .map_err(|e| e.to_string())?;
+
+    let synthetic_key = format!("clipboard-copy-chat-{}-{}", request.persona_id, now());
+
+    let result = gateway
+        .gate3(
+            "chat-copy",
+            &synthetic_key,
+            "Quick Ask",
+            &synthetic_key,
+            &request.content_text,
+            1, // content_sensitivity_severity
+            1, // target_tier -- NOT 3; see doc comment above
+            settings.max_permitted_tier as u8,
+            1, // execution_tier
+            Some(&app_handle),
+            destination_risk_rating,
+            &request.user_id,
+            &request.persona_id,
+            &key_hex_str,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
 
     Ok(result.into())
 }

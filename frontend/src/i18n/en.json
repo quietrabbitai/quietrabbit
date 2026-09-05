@@ -33,7 +33,17 @@
       "collapsedExpandLabel": "Expand",
       "starterLabel": "Drafted starter — cleared, ready to send",
       "starterCopyButton": "Copy starter",
-      "starterCopiedLabel": "Copied"
+      "starterCopiedLabel": "Copied",
+      "copyScanning": "Scanning for privacy violations…",
+      "copyScanPassed": "Privacy screen passed.",
+      "copyIncludesWithheldFlag": "This includes a message you previously chose not to send.",
+      "copyBlocked": "This copy contains information that can't be copied automatically.",
+      "copyNeedsReview": "This needs a closer look -- open the chat to review it.",
+      "copyFailed": "Copy failed. Try again.",
+      "copyWithheldConfirmTitle": "You previously declined to send this.",
+      "copyWithheldConfirmBody": "Are you sure you want to copy it anyway?",
+      "copyWithheldConfirmConfirm": "Copy anyway",
+      "copyWithheldConfirmCancel": "Cancel"
     },
     "libraryPane": {
       "listHeading": "Outputs",
