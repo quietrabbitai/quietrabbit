@@ -30,6 +30,7 @@ use quietrabbit_lib::conductor::privacy::{
     logger::{FailLogger, TestLogger},
     types::{AbstractionPolicy, PersonalField, PersonalTrack, Sensitivity},
 };
+use quietrabbit_lib::conductor::tokens::ExternalAccess;
 
 // ---------------------------------------------------------------------------
 // Fixture loading
@@ -956,7 +957,7 @@ async fn test_gate3() {
             "test content",
             severity,
             target_tier,
-            space_max,
+            ExternalAccess::from_legacy_tier(space_max),
             execution_tier,
             None, // app_handle: None -- every vector here exercises only the
             // tier-ceiling (check 1) / legacy-sensitivity (check 2b) paths,

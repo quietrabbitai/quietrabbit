@@ -10,10 +10,10 @@
     "space_max_permitted_tier": 1
   },
   {
-    "approved": false,
-    "blocked": true,
-    "plain_language": "This content can't be shared with a higher-tier service from this Focus. [Change Focus settings] [Use local only]",
-    "event_type": "gate3_tier_ceiling_block",
+    "approved": true,
+    "blocked": false,
+    "plain_language": null,
+    "event_type": "gate3_promotion_approved",
     "label": "gate3::ceiling_block::t3_max2",
     "content_sensitivity_severity": 1,
     "target_tier": 3,
@@ -112,9 +112,9 @@
   {
     "approved": false,
     "blocked": true,
-    "plain_language": "This content can't be shared with a higher-tier service from this Focus. [Change Focus settings] [Use local only]",
-    "event_type": "gate3_tier_ceiling_block",
-    "label": "gate3::ceiling_beats_sensitivity",
+    "plain_language": "This content contains medical or financial information and can't be shared with external services. [Use local only] [Get help]",
+    "event_type": "gate3_sensitivity_block",
+    "label": "gate3::sensitivity_blocks_when_ceiling_permits",
     "content_sensitivity_severity": 3,
     "target_tier": 3,
     "space_max_permitted_tier": 2
