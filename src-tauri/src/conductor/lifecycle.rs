@@ -1582,8 +1582,9 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         // 'cloud_inference_api' (items.id=430's flag-based replacement for
         // the old hardcoded ["mistral","groq"] array), then resolved via
         // user_provider_preference_store::resolve_preference()'s Focus ->
-        // Persona -> account precedence (items.id=428) instead of the
-        // legacy users.tier2_provider_preference column. DB read failure or
+        // Persona -> account precedence (items.id=428) -- the legacy
+        // users.tier2_provider_preference column this superseded was dropped
+        // outright by items.id=433. DB read failure or
         // an unresolved/ambiguous preference collapses to None, same as "no
         // preference set" -- StepExecutor turns None into the F10
         // MissingTier2Config failure rather than guessing a provider.

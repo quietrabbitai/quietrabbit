@@ -374,18 +374,16 @@ export const commands = {
 	 *  preference -- distinct from set_tier2_provider above, which stores a
 	 *  credential. This is the "which provider should QR actually use" choice.
 	 * 
-	 *  items.id=432: lifecycle.rs no longer reads
-	 *  users.tier2_provider_preference (items.id=253/251's original path) --
-	 *  it now resolves an account-wide user_provider_preference row via
-	 *  find_preferred_provider()/resolve_preference() (items.id=428/432). This
-	 *  command dual-writes: the legacy column (kept populated, not read by
-	 *  anything anymore, until items.id=433 drops it -- out of scope here) AND
-	 *  the new table, which is what actually drives execution now. Selecting a
-	 *  provider marks its account-wide row Preferred and downgrades any OTHER
-	 *  Tier 1.5 candidate's account-wide row that was previously Preferred to
-	 *  Allowed, preserving find_preferred_provider()'s "at most one Preferred"
-	 *  assumption. Clearing (`provider: None`) downgrades any currently-
-	 *  Preferred candidate the same way, without picking a new one.
+	 *  items.id=432: lifecycle.rs resolves an account-wide user_provider_preference
+	 *  row via find_preferred_provider()/resolve_preference() (items.id=428/432)
+	 *  instead of the legacy users.tier2_provider_preference column (dropped by
+	 *  items.id=433 -- this command wrote it as a dual-write in the interim, now
+	 *  removed along with the column). Selecting a provider marks its
+	 *  account-wide row Preferred and downgrades any OTHER Tier 1.5 candidate's
+	 *  account-wide row that was previously Preferred to Allowed, preserving
+	 *  find_preferred_provider()'s "at most one Preferred" assumption. Clearing
+	 *  (`provider: None`) downgrades any currently-Preferred candidate the same
+	 *  way, without picking a new one.
 	 */
 	setTier2ProviderPreference: (provider: string | null) => typedError<null, string>(__TAURI_INVOKE("set_tier2_provider_preference", { provider })),
 	dismissNotification: (notificationId: string) => typedError<null, string>(__TAURI_INVOKE("dismiss_notification", { notificationId })),

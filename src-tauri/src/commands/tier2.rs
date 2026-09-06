@@ -141,18 +141,16 @@ pub async fn set_tier2_provider(
 /// preference -- distinct from set_tier2_provider above, which stores a
 /// credential. This is the "which provider should QR actually use" choice.
 ///
-/// items.id=432: lifecycle.rs no longer reads
-/// users.tier2_provider_preference (items.id=253/251's original path) --
-/// it now resolves an account-wide user_provider_preference row via
-/// find_preferred_provider()/resolve_preference() (items.id=428/432). This
-/// command dual-writes: the legacy column (kept populated, not read by
-/// anything anymore, until items.id=433 drops it -- out of scope here) AND
-/// the new table, which is what actually drives execution now. Selecting a
-/// provider marks its account-wide row Preferred and downgrades any OTHER
-/// Tier 1.5 candidate's account-wide row that was previously Preferred to
-/// Allowed, preserving find_preferred_provider()'s "at most one Preferred"
-/// assumption. Clearing (`provider: None`) downgrades any currently-
-/// Preferred candidate the same way, without picking a new one.
+/// items.id=432: lifecycle.rs resolves an account-wide user_provider_preference
+/// row via find_preferred_provider()/resolve_preference() (items.id=428/432)
+/// instead of the legacy users.tier2_provider_preference column (dropped by
+/// items.id=433 -- this command wrote it as a dual-write in the interim, now
+/// removed along with the column). Selecting a provider marks its
+/// account-wide row Preferred and downgrades any OTHER Tier 1.5 candidate's
+/// account-wide row that was previously Preferred to Allowed, preserving
+/// find_preferred_provider()'s "at most one Preferred" assumption. Clearing
+/// (`provider: None`) downgrades any currently-Preferred candidate the same
+/// way, without picking a new one.
 #[tauri::command]
 #[specta::specta]
 pub async fn set_tier2_provider_preference(
@@ -171,10 +169,6 @@ pub async fn set_tier2_provider_preference(
         .with_key(|k| k.user_id.clone())
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
-
-    crate::auth::user_store::set_tier2_provider_preference(&user_id, provider.as_deref())
-        .await
-        .map_err(|e| e.to_string())?;
 
     let candidates = provider_store::list_providers_by_type("cloud_inference_api")
         .await
@@ -395,33 +389,14 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn set_tier2_provider_preference_round_trips_via_user_store() {
-        let master_key = [0x33u8; crate::auth::kdf::MASTER_KEY_LEN];
-        let _env = setup_shared_db("user-c").await;
-        let app = mock_app_with_registry();
-        let registry = app.state::<KeyRegistry>();
-        populate_registry(&registry, "user-c", master_key).await;
-
-        set_tier2_provider_preference(Some("groq".to_owned()), registry.clone())
-            .await
-            .expect("set_tier2_provider_preference must succeed when logged in");
-
-        let pref = crate::auth::user_store::get_tier2_provider_preference("user-c")
-            .await
-            .unwrap();
-        assert_eq!(pref, Some("groq".to_owned()));
-    }
-
-    /// items.id=432: set_tier2_provider_preference must dual-write -- the
-    /// legacy column (asserted above) AND an account-wide Preferred row in
-    /// the new user_provider_preference table, which is what
-    /// lifecycle.rs::find_preferred_provider() actually reads now. Switching
+    /// items.id=432/433: set_tier2_provider_preference must write an
+    /// account-wide Preferred row in user_provider_preference -- the table
+    /// lifecycle.rs::find_preferred_provider() actually reads. Switching
     /// the choice must downgrade the previously-Preferred candidate to
     /// Allowed rather than leaving two candidates both Preferred (which
     /// would make find_preferred_provider() return an ambiguous None).
     #[tokio::test]
-    async fn set_tier2_provider_preference_dual_writes_and_downgrades_other_candidate() {
+    async fn set_tier2_provider_preference_downgrades_other_candidate() {
         let master_key = [0x66u8; crate::auth::kdf::MASTER_KEY_LEN];
         let _env = setup_shared_db("user-f").await;
         let app = mock_app_with_registry();
