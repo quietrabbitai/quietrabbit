@@ -181,6 +181,13 @@ pub struct StepContext {
     /// re-check and gate3's Check 1, both below. Renamed/retyped from the
     /// former space_max_permitted_tier: u8, which had exactly these two use
     /// sites.
+    ///
+    /// Do NOT reuse this field for abstraction-axis decisions (the
+    /// ADR-012 floor clamp): it is deliberately Focus-level-only and does
+    /// not see a step's own override, which is exactly the input the floor
+    /// clamp needs. See lifecycle.rs::execute_step()'s locally-computed
+    /// effective_access and PROVIDER_REGISTRY_AND_TIER_MODEL_SPEC.md Part 7
+    /// (items.id=444) for the regression this would otherwise cause.
     pub focus_external_access: ExternalAccess,
     pub execution_tier: u8,
     pub abstraction_tier: u8,

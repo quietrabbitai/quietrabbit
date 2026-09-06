@@ -1559,19 +1559,29 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             )
         };
 
+        // Axis 2 input: this step's actual effective access, folding in its own
+        // override — distinct from focus_external_access (Focus-level-only,
+        // items.id=439), which the abstraction floor cannot correctly key off
+        // alone (PROVIDER_REGISTRY_AND_TIER_MODEL_SPEC.md Part 7a).
+        let effective_access = step
+            .external_access_override
+            .map(|o| o.min(self._focus_external_access))
+            .unwrap_or(self._focus_external_access);
+
         // Axis 2: abstraction_tier with floor clamping (ADR-012 Amendment 3)
         let raw_abstraction = self._focus_privacy_tier.min(execution_tier);
-        let abstraction_tier = if execution_tier > 1 {
-            raw_abstraction.max(2) // floor clamp: abstraction_tier >= 2 when Tier 2+
+        let abstraction_tier = if effective_access != ExternalAccess::LocalOnly {
+            raw_abstraction.max(2) // floor clamp: abstraction_tier >= 2 when external access is live (items.id=444, Part 7)
         } else {
             raw_abstraction
         };
 
         log::debug!(
-            "lifecycle: step={} execution_tier={} abstraction_tier={} \
+            "lifecycle: step={} execution_tier={} effective_access={} abstraction_tier={} \
              raw_abstraction={} focus_privacy_tier={}",
             step.step_id,
             execution_tier,
+            effective_access.as_str(),
             abstraction_tier,
             raw_abstraction,
             self._focus_privacy_tier,
@@ -2685,6 +2695,65 @@ mod tests {
         let abstraction = if execution_tier > 1 { raw.max(2) } else { raw };
         assert_eq!(raw, 2);
         assert_eq!(abstraction, 2);
+    }
+
+    // items.id=444 (Part 7): floor-clamp trigger re-keyed from
+    // execution_tier > 1 to effective_access != LocalOnly, where
+    // effective_access folds a step's own external_access_override against
+    // the Focus-level focus_external_access ceiling.
+
+    #[test]
+    fn effective_access_smoke_test_voice_steps_not_floor_clamped() {
+        // writing-assistant.focus: voice_analysis/voice_transform declare
+        // routing_tier: 1 -> external_access_override: Some(LocalOnly).
+        // Focus max_routing_tier: 2 -> max_external_access: AnonymousRequired.
+        // Regardless of the user's focus_settings.max_permitted_tier (2 or
+        // 3), these two steps must NOT have their abstraction floor
+        // clamped -- confirms items.id=444's fix on the exact shipping
+        // Focus that motivated it (spec Part 7d).
+        for focus_max_permitted_tier in [2u8, 3u8] {
+            let focus_external_access = ExternalAccess::from_legacy_tier(focus_max_permitted_tier)
+                .min(ExternalAccess::AnonymousRequired);
+            let step_override = Some(ExternalAccess::LocalOnly);
+            let effective_access = step_override
+                .map(|o| o.min(focus_external_access))
+                .unwrap_or(focus_external_access);
+            assert_eq!(effective_access, ExternalAccess::LocalOnly);
+
+            let focus_privacy_tier: u8 = 1;
+            let raw_abstraction = focus_privacy_tier.min(1u8); // execution_tier == 1 (step.routing_tier folds it down)
+            let abstraction_tier = if effective_access != ExternalAccess::LocalOnly {
+                raw_abstraction.max(2)
+            } else {
+                raw_abstraction
+            };
+            assert_eq!(
+                abstraction_tier, raw_abstraction,
+                "voice step must not be floor-clamped at focus_max_permitted_tier={focus_max_permitted_tier}"
+            );
+        }
+    }
+
+    #[test]
+    fn effective_access_none_override_inherits_focus_level() {
+        // A step with no override (e.g. a handoff step) makes no capability
+        // claim of its own -- it inherits focus_external_access unchanged,
+        // and the ordinary floor clamp still applies.
+        let focus_external_access = ExternalAccess::AnonymousRequired;
+        let step_override: Option<ExternalAccess> = None;
+        let effective_access = step_override
+            .map(|o| o.min(focus_external_access))
+            .unwrap_or(focus_external_access);
+        assert_eq!(effective_access, focus_external_access);
+
+        let focus_privacy_tier: u8 = 1;
+        let raw_abstraction = focus_privacy_tier.min(2u8);
+        let abstraction_tier = if effective_access != ExternalAccess::LocalOnly {
+            raw_abstraction.max(2)
+        } else {
+            raw_abstraction
+        };
+        assert_eq!(abstraction_tier, 2);
     }
 
     // -------------------------------------------------------------------------
