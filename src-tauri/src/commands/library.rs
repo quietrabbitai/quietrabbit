@@ -383,6 +383,7 @@ pub async fn copy_output_to_clipboard(
 mod tests {
     use super::*;
     use crate::conductor::privacy::output_scan::OutputScanResult;
+    use crate::conductor::tokens::ExternalAccess;
     use crate::persistence::{output_store, persona_store};
     use crate::test_support::{mock_app_with_registry, populate_registry, ENV_MUTEX};
     use tauri::Manager;
@@ -471,7 +472,7 @@ mod tests {
             "bidirectional",
             "shared",
             2,
-            2,
+            ExternalAccess::AnonymousRequired,
             focus_profile,
             None,
         )
@@ -673,7 +674,7 @@ mod tests {
             "bidirectional",
             "shared",
             2,
-            2,
+            ExternalAccess::AnonymousRequired,
             focus_profile,
             None,
         )
@@ -755,7 +756,7 @@ mod tests {
             "bidirectional",
             "shared",
             2,
-            2,
+            ExternalAccess::AnonymousRequired,
             "open",
             None,
         )
@@ -851,7 +852,7 @@ mod tests {
             "bidirectional",
             "shared",
             2,
-            2,
+            ExternalAccess::AnonymousRequired,
             focus_profile,
             None,
         )

@@ -125,7 +125,7 @@ export const commands = {
 	context_flow: string,
 	library_visibility: string,
 	privacy_tier: number,
-	max_permitted_tier: number,
+	max_permitted_tier: ExternalAccess,
 	updated_at: string,
 	/**
 	 *  Most recent focus_runs.started_at for this Focus (outputs.db), or
@@ -822,6 +822,23 @@ export type CreatePersonaResponse = {
 };
 
 /**
+ *  Replaces ordinal tier comparisons at the five capability-gate call sites
+ *  named in Part 6e: "may this step's execution leave the device at all,"
+ *  decoupled from the old routing_tier==3 "pause for user handoff" signal
+ *  (see StepDefinition::requires_user_handoff) and from the abstraction axis
+ *  (focus_settings.privacy_tier, items.id=444 — untouched by this enum).
+ * 
+ *  Declaration order IS the ordering derive(Ord) uses — local_only is the
+ *  tightest, unrestricted the loosest. anonymous_preferred is new: it never
+ *  existed as a tier number (Part 6b), so from_legacy_tier() can never
+ *  produce it — only a Focus/step authored directly against this enum can.
+ * 
+ *  Style mirrors NamedPolicy (persistence/focus_provider_criteria_store.rs):
+ *  as_str()/from_str()-shaped helpers, snake_case serde.
+ */
+export type ExternalAccess = "local_only" | "anonymous_required" | "anonymous_preferred" | "unrestricted";
+
+/**
  *  IPC gap: dormancy_state still missing -- split to items.id=256 (see
  *  module header). last_used closed by items.id=237.
  */
@@ -831,7 +848,7 @@ export type FocusInfo = {
 	context_flow: string,
 	library_visibility: string,
 	privacy_tier: number,
-	max_permitted_tier: number,
+	max_permitted_tier: ExternalAccess,
 	updated_at: string,
 	/**
 	 *  Most recent focus_runs.started_at for this Focus (outputs.db), or
@@ -854,7 +871,7 @@ export type Gate3ReviewResult = {
 	timeout: boolean,
 	plain_language: string | null,
 	target_tier: number | null,
-	space_max_permitted_tier: number | null,
+	space_max_permitted_tier: ExternalAccess | null,
 };
 
 export type GetPendingCrossPersonaConfirmationsRequest = {
@@ -1322,7 +1339,7 @@ export type UpdateFocusSettingsRequest = {
 	context_flow: string | null,
 	library_visibility: string | null,
 	privacy_tier: number | null,
-	max_permitted_tier: number | null,
+	max_permitted_tier: ExternalAccess | null,
 	focus_profile: string | null,
 };
 

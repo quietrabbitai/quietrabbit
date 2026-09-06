@@ -80,7 +80,6 @@ use crate::auth::registry::{key_hex, KeyRegistry};
 use crate::conductor::extract;
 use crate::conductor::privacy::types::{ExtractConfirmDecision, Gate3ReviewResult};
 use crate::conductor::privacy::PrivacyGateway;
-use crate::conductor::tokens::ExternalAccess;
 use crate::persistence::disclosure_log_store::SqliteDisclosureLogger;
 use crate::persistence::focus_settings_store;
 use crate::persistence::message_store;
@@ -397,14 +396,13 @@ pub async fn submit_friction_gate_decision(
     }
 
     // decision == "proceed": apply the originally-requested change.
-    for (name, val) in [
-        ("privacy_tier", orig.privacy_tier),
-        ("max_permitted_tier", orig.max_permitted_tier),
-    ] {
-        if let Some(v) = val {
-            if !(1..=3).contains(&v) {
-                return Err(format!("{name} must be between 1 and 3, got {v}"));
-            }
+    // privacy_tier is bounds-checked here (1-3); max_permitted_tier needs no
+    // such check -- items.id=448 retyped it to ExternalAccess, so an invalid
+    // value is unrepresentable (same reasoning already applied to
+    // FailureHandler::new(), conductor/failure.rs).
+    if let Some(v) = orig.privacy_tier {
+        if !(1..=3).contains(&v) {
+            return Err(format!("privacy_tier must be between 1 and 3, got {v}"));
         }
     }
 
@@ -837,7 +835,7 @@ pub async fn request_tier3_gate3_review(
             // pane's own precondition is "the user is literally about to
             // access Tier 3" (see this fn's doc comment above).
             3,
-            ExternalAccess::from_legacy_tier(settings.max_permitted_tier as u8),
+            settings.max_permitted_tier,
             1, // execution_tier
             Some(&app_handle),
             destination_risk_rating,
@@ -983,7 +981,7 @@ pub async fn request_chat_copy_gate3_review(
             // ExternalAccess::LocalOnly-equivalent, i.e. this copy is not
             // treated as requiring external access on its own.
             1,
-            ExternalAccess::from_legacy_tier(settings.max_permitted_tier as u8),
+            settings.max_permitted_tier,
             1, // execution_tier
             Some(&app_handle),
             destination_risk_rating,
@@ -1113,7 +1111,7 @@ pub async fn recheck_tier3_provider_selection(
             // gate3.rs's own doc comment for why this stays legacy-typed).
             // 3 == ExternalAccess::Unrestricted-equivalent.
             3,
-            ExternalAccess::from_legacy_tier(settings.max_permitted_tier as u8),
+            settings.max_permitted_tier,
             1, // execution_tier
             Some(&app_handle),
             Some(new_risk),
@@ -1350,6 +1348,7 @@ async fn write_floor_consent_preference(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conductor::tokens::ExternalAccess;
     use crate::persistence::{focus_settings_store, message_store};
     use crate::test_support::{mock_app_with_registry, populate_registry, ENV_MUTEX};
     use tauri::Manager;
@@ -1553,7 +1552,7 @@ mod tests {
             "bidirectional",
             "shared",
             1,
-            3,
+            ExternalAccess::Unrestricted,
             "open",
             None,
         )
@@ -1564,7 +1563,7 @@ mod tests {
             .await
             .expect("get_focus_settings must succeed")
             .expect("row must exist");
-        assert_eq!(settings.max_permitted_tier, 3);
+        assert_eq!(settings.max_permitted_tier, ExternalAccess::Unrestricted);
     }
 
     /// items.id=321: submit_friction_gate_decision must accept and apply a
@@ -1606,7 +1605,7 @@ mod tests {
             "bidirectional",
             "shared",
             2,
-            2,
+            ExternalAccess::AnonymousRequired,
             "open",
             None,
         )
@@ -1619,7 +1618,7 @@ mod tests {
             context_flow: None,
             library_visibility: None,
             privacy_tier: None,
-            max_permitted_tier: Some(3),
+            max_permitted_tier: Some(ExternalAccess::Unrestricted),
             focus_profile: None,
         };
 
@@ -1631,14 +1630,15 @@ mod tests {
         .expect("submit_friction_gate_decision must succeed for a max_permitted_tier-only trip")
         .expect("decision='proceed' must return Some(FocusInfo)");
 
-        assert_eq!(applied.max_permitted_tier, 3);
+        assert_eq!(applied.max_permitted_tier, ExternalAccess::Unrestricted);
 
         let settings = focus_settings_store::get_focus_settings(PERSONA_ID, TIER3_DRAFT_FOCUS_ID)
             .await
             .expect("get_focus_settings must succeed")
             .expect("row must exist");
         assert_eq!(
-            settings.max_permitted_tier, 3,
+            settings.max_permitted_tier,
+            ExternalAccess::Unrestricted,
             "the applied change must persist, not just be echoed back"
         );
     }

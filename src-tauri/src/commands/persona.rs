@@ -65,6 +65,7 @@ use specta::Type;
 use tauri::State;
 
 use crate::auth::registry::{key_hex, KeyRegistry};
+use crate::conductor::tokens::ExternalAccess;
 use crate::persistence::focus_settings_store;
 use crate::persistence::output_store;
 use crate::persistence::persona_store;
@@ -109,7 +110,7 @@ pub struct FocusInfo {
     pub context_flow: String,
     pub library_visibility: String,
     pub privacy_tier: i32,
-    pub max_permitted_tier: i32,
+    pub max_permitted_tier: ExternalAccess,
     pub updated_at: String,
     /// Most recent focus_runs.started_at for this Focus (outputs.db), or
     /// None if it has never run or outputs.db isn't reachable with the
@@ -124,7 +125,7 @@ pub struct UpdateFocusSettingsRequest {
     pub context_flow: Option<String>,
     pub library_visibility: Option<String>,
     pub privacy_tier: Option<i32>,
-    pub max_permitted_tier: Option<i32>,
+    pub max_permitted_tier: Option<ExternalAccess>,
     pub focus_profile: Option<String>,
 }
 
@@ -143,10 +144,10 @@ pub struct FrictionGateDetail {
     pub focus_id: String,
     pub requested_privacy_tier: Option<i32>,
     pub requested_focus_profile: Option<String>,
-    pub requested_max_permitted_tier: Option<i32>,
+    pub requested_max_permitted_tier: Option<ExternalAccess>,
     pub existing_privacy_tier: i32,
     pub existing_focus_profile: String,
-    pub existing_max_permitted_tier: i32,
+    pub existing_max_permitted_tier: ExternalAccess,
     /// True when privacy_tier would numerically increase (loosen -- see
     /// module header's TIER DIRECTION NOTE). False when only focus_profile
     /// moving to 'protected' tripped the gate.
@@ -319,15 +320,13 @@ pub async fn update_focus_settings(
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
-    // Tier bounds check: valid tiers are 1-3.
-    for (name, val) in [
-        ("privacy_tier", request.privacy_tier),
-        ("max_permitted_tier", request.max_permitted_tier),
-    ] {
-        if let Some(v) = val {
-            if !(1..=3).contains(&v) {
-                return Err(format!("{name} must be between 1 and 3, got {v}"));
-            }
+    // Tier bounds check: privacy_tier is valid 1-3. max_permitted_tier needs
+    // no such check -- items.id=448 retyped it to ExternalAccess, so an
+    // invalid value is unrepresentable (same reasoning already applied to
+    // FailureHandler::new(), conductor/failure.rs).
+    if let Some(v) = request.privacy_tier {
+        if !(1..=3).contains(&v) {
+            return Err(format!("privacy_tier must be between 1 and 3, got {v}"));
         }
     }
 
@@ -555,7 +554,7 @@ mod tests {
                 "bidirectional",
                 "shared",
                 2,
-                2,
+                ExternalAccess::AnonymousRequired,
                 "open",
                 None,
             )
@@ -584,7 +583,7 @@ mod tests {
             "bidirectional",
             "shared",
             2,
-            2,
+            ExternalAccess::AnonymousRequired,
             "open",
             None,
         )
@@ -622,7 +621,7 @@ mod tests {
             "bidirectional",
             "shared",
             2,
-            2,
+            ExternalAccess::AnonymousRequired,
             "open",
             None,
         )
@@ -669,7 +668,7 @@ mod tests {
             "bidirectional",
             "shared",
             2,
-            2,
+            ExternalAccess::AnonymousRequired,
             "open",
             None,
         )
@@ -719,7 +718,7 @@ mod tests {
             "bidirectional",
             "shared",
             2,
-            2,
+            ExternalAccess::AnonymousRequired,
             "open",
             None,
         )
@@ -739,7 +738,7 @@ mod tests {
                 context_flow: None,
                 library_visibility: None,
                 privacy_tier: None,
-                max_permitted_tier: Some(3),
+                max_permitted_tier: Some(ExternalAccess::Unrestricted),
                 focus_profile: None,
             },
         )
@@ -750,8 +749,14 @@ mod tests {
             serde_json::from_str(&err).expect("gate error must be FrictionGateDetail JSON");
 
         assert!(detail.max_permitted_tier_would_loosen);
-        assert_eq!(detail.requested_max_permitted_tier, Some(3));
-        assert_eq!(detail.existing_max_permitted_tier, 2);
+        assert_eq!(
+            detail.requested_max_permitted_tier,
+            Some(ExternalAccess::Unrestricted)
+        );
+        assert_eq!(
+            detail.existing_max_permitted_tier,
+            ExternalAccess::AnonymousRequired
+        );
         assert!(
             !detail.privacy_would_loosen && !detail.moves_to_protected,
             "only max_permitted_tier changed -- the other two flags must stay false"

@@ -3,6 +3,8 @@
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
+use crate::conductor::tokens::ExternalAccess;
+
 // -- AbstractionPolicy --------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq)]
@@ -172,7 +174,10 @@ pub struct Gate3Result {
     pub target_tier: Option<u8>,
     /// items.id=321: the space_max_permitted_tier that failed the ceiling
     /// check, paired with target_tier above. None outside that one path.
-    pub space_max_permitted_tier: Option<u8>,
+    /// items.id=448: retyped from u8 to ExternalAccess -- gate3.rs's Check 1
+    /// already has focus_external_access: ExternalAccess in hand when it
+    /// populates this field, so the field's own type now matches directly.
+    pub space_max_permitted_tier: Option<ExternalAccess>,
 }
 
 /// IPC-safe projection of Gate3Result — Gate3Result itself derives neither
@@ -187,7 +192,7 @@ pub struct Gate3ReviewResult {
     pub timeout: bool,
     pub plain_language: Option<String>,
     pub target_tier: Option<u8>,
-    pub space_max_permitted_tier: Option<u8>,
+    pub space_max_permitted_tier: Option<ExternalAccess>,
 }
 
 impl From<Gate3Result> for Gate3ReviewResult {

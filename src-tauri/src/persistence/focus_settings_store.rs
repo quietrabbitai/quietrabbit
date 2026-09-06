@@ -32,6 +32,8 @@ use sqlx::Row;
 use sqlx::SqliteConnection;
 use thiserror::Error;
 
+use crate::conductor::tokens::ExternalAccess;
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -72,7 +74,7 @@ pub struct FocusSettings {
     pub context_flow: String,
     pub library_visibility: String,
     pub privacy_tier: i32,
-    pub max_permitted_tier: i32,
+    pub max_permitted_tier: ExternalAccess,
     pub focus_profile: String,
     /// None if no voice override is set for this Focus.
     pub voice_override: Option<serde_json::Value>,
@@ -141,7 +143,13 @@ fn row_to_focus_settings(row: &sqlx::sqlite::SqliteRow) -> Result<FocusSettings,
         context_flow: row.try_get("context_flow")?,
         library_visibility: row.try_get("library_visibility")?,
         privacy_tier: row.try_get::<i64, _>("privacy_tier")? as i32,
-        max_permitted_tier: row.try_get::<i64, _>("max_permitted_tier")? as i32,
+        // Schema CHECK (max_permitted_tier BETWEEN 1 AND 3, shared_001.sql)
+        // guarantees this is always 1/2/3 -- from_legacy_tier()'s
+        // unreachable!() is the correct failure mode if that ever stops
+        // being true, not a silent fallback here.
+        max_permitted_tier: ExternalAccess::from_legacy_tier(
+            row.try_get::<i64, _>("max_permitted_tier")? as u8,
+        ),
         focus_profile: row.try_get("focus_profile")?,
         voice_override,
         created_at: row.try_get("created_at")?,
@@ -153,11 +161,13 @@ fn row_to_focus_settings(row: &sqlx::sqlite::SqliteRow) -> Result<FocusSettings,
 // Validation
 // ---------------------------------------------------------------------------
 
+// max_permitted_tier has no range check here -- items.id=448 retyped it to
+// ExternalAccess, so an invalid value is unrepresentable (same reasoning
+// already applied to FailureHandler::new(), conductor/failure.rs).
 fn validate_settings(
     context_flow: &str,
     library_visibility: &str,
     privacy_tier: i32,
-    max_permitted_tier: i32,
     focus_profile: &str,
 ) -> Result<(), FocusSettingsStoreError> {
     if !VALID_CONTEXT_FLOWS.contains(&context_flow) {
@@ -176,12 +186,6 @@ fn validate_settings(
         return Err(FocusSettingsStoreError::Validation(format!(
             "privacy_tier must be between {TIER_MIN} and {TIER_MAX}, \
              got {privacy_tier}."
-        )));
-    }
-    if !(TIER_MIN..=TIER_MAX).contains(&max_permitted_tier) {
-        return Err(FocusSettingsStoreError::Validation(format!(
-            "max_permitted_tier must be between {TIER_MIN} and {TIER_MAX}, \
-             got {max_permitted_tier}."
         )));
     }
     if !VALID_FOCUS_PROFILES.contains(&focus_profile) {
@@ -265,7 +269,7 @@ pub async fn create_focus_settings(
     context_flow: &str,
     library_visibility: &str,
     privacy_tier: i32,
-    max_permitted_tier: i32,
+    max_permitted_tier: ExternalAccess,
     focus_profile: &str,
     voice_override: Option<serde_json::Value>,
 ) -> Result<FocusSettings, FocusSettingsStoreError> {
@@ -273,7 +277,6 @@ pub async fn create_focus_settings(
         context_flow,
         library_visibility,
         privacy_tier,
-        max_permitted_tier,
         focus_profile,
     )?;
 
@@ -296,7 +299,7 @@ pub async fn create_focus_settings(
     .bind(context_flow)
     .bind(library_visibility)
     .bind(privacy_tier)
-    .bind(max_permitted_tier)
+    .bind(max_permitted_tier.as_legacy_tier() as i32)
     .bind(focus_profile)
     .bind(&voice_json)
     .bind(&created_at)
@@ -338,7 +341,7 @@ pub async fn update_focus_settings(
     context_flow: Option<&str>,
     library_visibility: Option<&str>,
     privacy_tier: Option<i32>,
-    max_permitted_tier: Option<i32>,
+    max_permitted_tier: Option<ExternalAccess>,
     focus_profile: Option<&str>,
     voice_override: Option<Option<serde_json::Value>>,
 ) -> Result<FocusSettings, FocusSettingsStoreError> {
@@ -355,7 +358,7 @@ pub async fn update_focus_settings(
     let new_mtier = max_permitted_tier.unwrap_or(existing.max_permitted_tier);
     let new_profile = focus_profile.unwrap_or(&existing.focus_profile);
 
-    validate_settings(new_flow, new_vis, new_ptier, new_mtier, new_profile)?;
+    validate_settings(new_flow, new_vis, new_ptier, new_profile)?;
 
     // voice_override tri-state: None = no change, Some(None) = clear, Some(Some(v)) = set.
     // Some(None) produces new_voice_json = None, which binds as SQL NULL — correct.
@@ -381,7 +384,7 @@ pub async fn update_focus_settings(
     .bind(new_flow)
     .bind(new_vis)
     .bind(new_ptier)
-    .bind(new_mtier)
+    .bind(new_mtier.as_legacy_tier() as i32)
     .bind(new_profile)
     .bind(&new_voice_json)
     .bind(&updated_at)
@@ -436,10 +439,10 @@ pub async fn record_friction_gate_decision(
     decision: &str,
     requested_privacy_tier: Option<i32>,
     requested_focus_profile: Option<&str>,
-    requested_max_permitted_tier: Option<i32>,
+    requested_max_permitted_tier: Option<ExternalAccess>,
     existing_privacy_tier: i32,
     existing_focus_profile: &str,
-    existing_max_permitted_tier: Option<i32>,
+    existing_max_permitted_tier: Option<ExternalAccess>,
 ) -> Result<String, FocusSettingsStoreError> {
     if !matches!(decision, "proceed" | "cancel") {
         return Err(FocusSettingsStoreError::Validation(format!(
@@ -477,10 +480,10 @@ pub async fn record_friction_gate_decision(
     .bind(decision)
     .bind(requested_privacy_tier)
     .bind(requested_focus_profile)
-    .bind(requested_max_permitted_tier)
+    .bind(requested_max_permitted_tier.map(|t| t.as_legacy_tier() as i32))
     .bind(existing_privacy_tier)
     .bind(existing_focus_profile)
-    .bind(existing_max_permitted_tier)
+    .bind(existing_max_permitted_tier.map(|t| t.as_legacy_tier() as i32))
     .bind(&created_at)
     .execute(&mut conn)
     .await?;

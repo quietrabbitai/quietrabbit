@@ -935,7 +935,19 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             })?;
 
         Ok((
-            settings.max_permitted_tier as u8,
+            // items.id=448 retyped FocusSettings.max_permitted_tier from i32
+            // to ExternalAccess. The numeric execution_tier ceiling calc in
+            // this file (u8::min() against focus_def.max_routing_tier /
+            // step.routing_tier) is a deliberately separate axis, out of
+            // that item's scope -- as_legacy_tier() round-trips it back to
+            // the legacy 1/2/3 value this function has always returned.
+            // Safe specifically because shared_001.sql's schema CHECK
+            // (max_permitted_tier BETWEEN 1 AND 3) guarantees the DB value
+            // this was read from can only ever be 1, 2, or 3 -- so
+            // from_legacy_tier() (in row_to_focus_settings) could never have
+            // produced AnonymousPreferred here, the one variant
+            // as_legacy_tier() cannot round-trip losslessly.
+            settings.max_permitted_tier.as_legacy_tier(),
             settings.privacy_tier as u8,
         ))
     }

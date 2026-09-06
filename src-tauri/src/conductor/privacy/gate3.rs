@@ -108,8 +108,9 @@ pub async fn gate3<L: DisclosureLogger>(
     target_tier: u8,
     // items.id=439 (Part 6e): retyped from the former space_max_permitted_tier: u8.
     // Unlike target_tier below, this param has exactly one other use besides
-    // Check 1 -- echoing into Gate3Result.space_max_permitted_tier (items.id=448,
-    // untouched Option<u8> shape) -- so retyping it outright is safe.
+    // Check 1 -- echoing into Gate3Result.space_max_permitted_tier, itself
+    // retyped to Option<ExternalAccess> by items.id=448 -- so this value now
+    // passes straight through with no conversion at either end.
     focus_external_access: ExternalAccess,
     execution_tier: u8,
     app_handle: Option<&tauri::AppHandle<tauri::Wry>>,
@@ -167,9 +168,7 @@ pub async fn gate3<L: DisclosureLogger>(
                     .to_string(),
             ),
             target_tier: Some(target_tier),
-            // items.id=448 owns this field's real redesign; as_legacy_tier()
-            // is a lossy but display-only round-trip until then.
-            space_max_permitted_tier: Some(focus_external_access.as_legacy_tier()),
+            space_max_permitted_tier: Some(focus_external_access),
             ..Gate3Result::default()
         });
     }

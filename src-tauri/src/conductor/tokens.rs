@@ -136,7 +136,9 @@ impl FromStr for FieldRequirement {
 ///
 /// Style mirrors NamedPolicy (persistence/focus_provider_criteria_store.rs):
 /// as_str()/from_str()-shaped helpers, snake_case serde.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, specta::Type,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ExternalAccess {
     LocalOnly,
@@ -180,10 +182,14 @@ impl ExternalAccess {
 
     /// The reverse of from_legacy_tier(), needed only where a caller must
     /// still populate a legacy u8 field it does not own the shape of this
-    /// session (Gate3Result.space_max_permitted_tier, items.id=448).
+    /// session (lifecycle.rs's get_focus_tier_ceiling(), items.id=448 --
+    /// the numeric execution_tier ceiling calc there is a deliberately
+    /// separate axis from ExternalAccess, out of this item's scope).
     /// AnonymousPreferred has no legacy slot of its own -- it maps to 3
     /// (Unrestricted's legacy value), a lossy round-trip acceptable only
-    /// for that display-only field, not for any enforcement decision.
+    /// where the caller can prove the value never actually holds
+    /// AnonymousPreferred (see that call site's own comment), not for any
+    /// enforcement decision in general.
     pub fn as_legacy_tier(self) -> u8 {
         match self {
             Self::LocalOnly => 1,
