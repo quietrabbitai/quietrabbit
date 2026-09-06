@@ -958,7 +958,16 @@ async fn test_gate3() {
             target_tier,
             space_max,
             execution_tier,
+            None, // app_handle: None -- every vector here exercises only the
+            // tier-ceiling (check 1) / legacy-sensitivity (check 2b) paths,
+            // never gate3_with_pf. The four items.id=406 params below are
+            // unreachable in this suite, so their values are inert; None/""
+            // (graceful-degradation defaults) are used rather than fabricated
+            // identities.
             None,
+            "",
+            "",
+            "",
         )
         .await
         .unwrap_or_else(|e| panic!("{label}: gate3 returned Err: {e}"));
