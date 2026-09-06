@@ -308,6 +308,40 @@ pub async fn resolve_preference(
     }
 }
 
+/// items.id=432: picks the Preferred provider across several candidates
+/// (e.g. the Tier 1.5 set -- resolve_preference() itself only answers "what
+/// is the preference for this ONE provider_id," but lifecycle.rs needs to
+/// choose BETWEEN groq and mistral, not resolve one named provider).
+/// Resolves each candidate independently at the given scope and returns the
+/// single one whose resolved preference is Preferred. Zero matches -> None,
+/// matching this codebase's existing "no prescribed default" behavior
+/// (surfaces MissingTier2Config downstream, same as today). More than one
+/// match is a data anomaly the schema doesn't prevent (nothing stops two
+/// different providers both being marked Preferred at the same scope) --
+/// also returns None rather than an arbitrary pick, consistent with this
+/// codebase's existing unreachable!()-guarded "never silently guess"
+/// pattern in executor.rs.
+pub async fn find_preferred_provider(
+    user_id: &str,
+    persona_id: Option<&str>,
+    focus_id: Option<&str>,
+    candidate_provider_ids: &[String],
+) -> Result<Option<String>, UserProviderPreferenceStoreError> {
+    let mut preferred: Vec<String> = Vec::new();
+    for provider_id in candidate_provider_ids {
+        if let Some(pref) = resolve_preference(user_id, persona_id, focus_id, provider_id).await? {
+            if pref.user_preference == UserPreference::Preferred {
+                preferred.push(provider_id.clone());
+            }
+        }
+    }
+
+    match preferred.len() {
+        1 => Ok(Some(preferred.into_iter().next().unwrap())),
+        _ => Ok(None),
+    }
+}
+
 /// Raw lookup at an exact scope (no cascading) -- for callers that need to
 /// know whether a specific-scope override row exists, distinct from
 /// resolve_preference()'s cascading result.
@@ -647,6 +681,72 @@ mod tests {
         }
 
         assert!(result.expect("query must succeed").is_none());
+    }
+
+    /// items.id=432: zero/one/many-candidates cases for
+    /// find_preferred_provider -- this is the function lifecycle.rs uses to
+    /// choose between groq/mistral instead of resolving one named provider.
+    #[tokio::test]
+    async fn find_preferred_provider_zero_one_many_candidates() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let _tempdir = setup_real_db().await;
+
+        let outcome = async {
+            // groq/mistral already exist as providers rows -- seeded by
+            // shared_014.sql (items.id=429/430/432), applied as part of
+            // setup_real_db()'s migrate_shared_db() call above.
+            let candidates = vec!["groq".to_owned(), "mistral".to_owned()];
+
+            // Zero: neither candidate has any row at all.
+            let none = find_preferred_provider("u1", Some("p1"), None, &candidates).await?;
+            assert_eq!(none, None, "no preference set for either candidate -> None");
+
+            // One: groq marked Preferred, mistral untouched.
+            upsert_preference(NewUserProviderPreference {
+                user_id: "u1",
+                persona_id: None,
+                focus_id: None,
+                provider_id: "groq",
+                login_available: true,
+                user_preference: UserPreference::Preferred,
+                local_model_version: None,
+                subscription_status: None,
+            })
+            .await?;
+            let one = find_preferred_provider("u1", Some("p1"), None, &candidates).await?;
+            assert_eq!(one, Some("groq".to_owned()));
+
+            // Many: mistral ALSO marked Preferred (a data anomaly the schema
+            // doesn't prevent) -> ambiguous, must return None rather than
+            // guess, same as this codebase's unreachable!()-guarded pattern.
+            upsert_preference(NewUserProviderPreference {
+                user_id: "u1",
+                persona_id: None,
+                focus_id: None,
+                provider_id: "mistral",
+                login_available: true,
+                user_preference: UserPreference::Preferred,
+                local_model_version: None,
+                subscription_status: None,
+            })
+            .await?;
+            let many = find_preferred_provider("u1", Some("p1"), None, &candidates).await?;
+            assert_eq!(
+                many, None,
+                "two candidates both Preferred is ambiguous -> None"
+            );
+
+            Ok::<(), UserProviderPreferenceStoreError>(())
+        }
+        .await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+        outcome.expect("find_preferred_provider assertions must pass");
     }
 
     /// The three partial unique indexes must actually reject a second

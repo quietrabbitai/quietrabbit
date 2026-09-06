@@ -146,12 +146,17 @@ fn ollama_client() -> &'static OllamaClient {
 ///   None       -> normal Floor Consent Gate evaluation.
 ///   One-run scope: applies for this context only; not persisted.
 ///
-/// tier2_provider_preference: read from users.tier2_provider_preference by
-///   lifecycle (items.id=251), only when execution_tier >= 2.
+/// tier2_provider_preference: resolved by lifecycle (items.id=251, repointed
+///   items.id=432) via user_provider_preference_store::resolve_preference()'s
+///   Focus -> Persona -> account precedence across the Tier 1.5 candidate
+///   set (providers.provider_type='cloud_inference_api', items.id=430) --
+///   not the legacy users.tier2_provider_preference column. Only populated
+///   when execution_tier >= 2.
 ///   Some("mistral") | Some("groq") -> dispatch to that provider.
-///   None -> no provider chosen yet; StepExecutor raises F10
-///   MissingTier2Config rather than guessing (architecture: "no prescribed
-///   default"). Always None at execution_tier == 1.
+///   None -> no provider chosen (or the resolved preference was ambiguous
+///   across candidates); StepExecutor raises F10 MissingTier2Config rather
+///   than guessing (architecture: "no prescribed default"). Always None at
+///   execution_tier == 1.
 pub struct StepContext {
     pub step: StepDefinition,
     pub focus_id: String,

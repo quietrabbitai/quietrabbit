@@ -470,6 +470,36 @@ pub async fn list_active_providers() -> Result<Vec<Provider>, ProviderStoreError
     Ok(providers)
 }
 
+/// items.id=430/432: active providers of a given `provider_type` --
+/// the flag-based replacement for hardcoded provider-name arrays
+/// (commands/system.rs's retired TIER2_PROVIDERS const, conductor/
+/// lifecycle.rs's Tier-1.5 candidate set). `provider_type` is a decided,
+/// open-vocabulary column (Part 2), not a tier label -- filtering on it is
+/// exactly the flag-based eligibility this table exists to provide (core
+/// rule 2), not a reintroduction of the old hardcoding problem.
+pub async fn list_providers_by_type(
+    provider_type: &str,
+) -> Result<Vec<Provider>, ProviderStoreError> {
+    let mut conn = open_shared_db().await?;
+
+    let sql = format!(
+        "SELECT {SELECT_COLUMNS}
+         FROM providers
+         WHERE activation_status = 'active' AND provider_type = ?
+         ORDER BY display_name ASC"
+    );
+    let rows = sqlx::query(&sql)
+        .bind(provider_type)
+        .fetch_all(&mut conn)
+        .await?;
+
+    let mut providers = Vec::new();
+    for r in rows {
+        providers.push(row_to_provider(&r)?);
+    }
+    Ok(providers)
+}
+
 /// All providers regardless of activation_status, for admin/maintenance
 /// views (e.g. a future Chat-PM-facing catalog-review surface) -- NOT the
 /// selector screen's path, which must use list_active_providers().
@@ -793,5 +823,89 @@ mod tests {
 
         result.expect("migrate_shared_db must succeed");
         outcome.expect("public API assertions must pass");
+    }
+
+    /// items.id=430/432: shared_014.sql seeds groq/mistral as
+    /// provider_type='cloud_inference_api' rows -- confirms the migration
+    /// landed the mechanically-known facts correctly and left the
+    /// requires-curation flags (retains_data, trains_on_data_by_default,
+    /// risk_rating, qr_internal_eligible) at the table's own conservative
+    /// defaults rather than fabricated values.
+    #[tokio::test]
+    async fn groq_and_mistral_seeded_as_cloud_inference_api() {
+        let mut conn = make_test_conn().await;
+        crate::persistence::migrations::run_migrations(&mut conn, "shared", None)
+            .await
+            .expect("run shared migrations");
+
+        for id in ["groq", "mistral"] {
+            let p = get_provider_via_conn(&mut conn, id).await;
+            assert_eq!(p.provider_type, "cloud_inference_api");
+            assert_eq!(p.mode, ProviderMode::Api);
+            assert!(!p.is_local, "{id} is not local (Tier 1.5)");
+            assert!(
+                p.login_required,
+                "{id} requires login (Tier 1.5, non-anonymous)"
+            );
+            assert!(!p.is_anonymous, "{id} is not anonymous");
+            // Conservative table defaults, not fabricated research (this
+            // session's judgment call 3) -- pending items.id=440's audit.
+            assert!(
+                p.retains_data,
+                "{id} left at conservative default pending curation"
+            );
+            assert!(
+                p.trains_on_data_by_default,
+                "{id} left at conservative default pending curation"
+            );
+            assert_eq!(
+                p.risk_rating, 3,
+                "{id} left at conservative default pending curation"
+            );
+            assert!(!p.qr_internal_eligible);
+        }
+    }
+
+    /// items.id=430/432: list_providers_by_type is the flag-based
+    /// replacement for a hardcoded ["mistral", "groq"] array -- must return
+    /// exactly the seeded Tier 1.5 set and nothing else (Duck.ai/Claude/
+    /// ChatGPT/Gemini are a different provider_type).
+    #[tokio::test]
+    async fn list_providers_by_type_returns_only_matching_active_providers() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let result = crate::persistence::migrations::migrate_shared_db().await;
+
+        let outcome = async {
+            let cloud_api = list_providers_by_type("cloud_inference_api").await?;
+            let ids: Vec<&str> = cloud_api.iter().map(|p| p.id.as_str()).collect();
+            assert_eq!(
+                ids.len(),
+                2,
+                "only groq and mistral are cloud_inference_api"
+            );
+            assert!(ids.contains(&"groq"));
+            assert!(ids.contains(&"mistral"));
+
+            let external = list_providers_by_type("external_service").await?;
+            let external_ids: Vec<&str> = external.iter().map(|p| p.id.as_str()).collect();
+            assert!(!external_ids.contains(&"groq"));
+            assert!(!external_ids.contains(&"mistral"));
+
+            Ok::<(), ProviderStoreError>(())
+        }
+        .await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+
+        result.expect("migrate_shared_db must succeed");
+        outcome.expect("list_providers_by_type assertions must pass");
     }
 }

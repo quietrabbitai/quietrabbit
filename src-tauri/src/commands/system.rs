@@ -23,17 +23,10 @@ use tokio::sync::RwLock;
 
 use crate::auth::registry::{key_hex, KeyRegistry};
 use crate::ollama_sidecar::OllamaSource;
-use crate::persistence::integration_keys_store;
+use crate::persistence::{integration_keys_store, provider_store};
 use crate::providers::ollama_client::OllamaClient;
 use crate::providers::types::{ProviderHealth, ProviderStatus};
 
-// The two Tier 2 providers named throughout the architecture (CLAUDE.md,
-// Architecture/QUIET_RABBIT_ARCHITECTURE.md:96-97, schema/shared_001.sql's
-// own users.tier2_provider_preference CHECK) -- kept local rather than a
-// shared constant since tier2.rs's own TIER2_KEY_TYPE is private and this
-// is the only other call site that needs the provider set, not just the
-// key_type string.
-const TIER2_PROVIDERS: [&str; 2] = ["mistral", "groq"];
 const TIER2_KEY_TYPE: &str = "tier2";
 
 // ---------------------------------------------------------------------------
@@ -47,16 +40,17 @@ pub struct HealthResponse {
     /// Set during app setup by OllamaSidecar::ensure_available().
     /// "unavailable" is returned during the brief startup detection window.
     pub ollama_source: String,
-    /// True iff an active user-global key exists for ANY Tier 2 provider
-    /// (mistral or groq) -- a capability-status signal ("is Tier 2 usable
-    /// at all," e.g. for an onboarding nudge), not a report of which
-    /// provider is active. Provider *selection* at execution time is a
-    /// separate, currently-unwired concern (executor.rs hardcodes Groq
-    /// today; users.tier2_provider_preference exists in schema but nothing
-    /// reads it yet) -- out of scope for this field, confirmed no-loss
-    /// this session: there is no per-provider consumer downstream to feed.
-    /// False, not an error, when no session is resident -- get_health must
-    /// stay callable pre-login (Ollama status has no such requirement).
+    /// True iff an active user-global key exists for ANY Tier 1.5 provider
+    /// (providers.provider_type='cloud_inference_api' -- items.id=430; was a
+    /// hardcoded ["mistral","groq"] array before this) -- a capability-status
+    /// signal ("is Tier 1.5 usable at all," e.g. for an onboarding nudge),
+    /// not a report of which provider is active. Provider *selection* at
+    /// execution time is a separate concern, wired through
+    /// user_provider_preference_store::resolve_preference() (items.id=432) --
+    /// out of scope for this field, there is no per-provider consumer
+    /// downstream to feed. False, not an error, when no session is resident
+    /// -- get_health must stay callable pre-login (Ollama status has no such
+    /// requirement).
     pub tier2_configured: bool,
 }
 
@@ -93,8 +87,12 @@ pub async fn get_health(
 
 /// False (not an error) with no resident session -- see HealthResponse's
 /// own doc comment on why get_health must stay usable pre-login. True as
-/// soon as ANY Tier 2 provider has an active user-global key; short-circuits
-/// on the first hit rather than checking both providers unconditionally.
+/// soon as ANY Tier 1.5 provider has an active user-global key;
+/// short-circuits on the first hit rather than checking every candidate
+/// unconditionally. items.id=430: the candidate set is read from
+/// providers.provider_type='cloud_inference_api' instead of a hardcoded
+/// ["mistral","groq"] array, so a future Tier 1.5 provider is picked up
+/// automatically once curated into the providers table.
 async fn tier2_is_configured(key_registry: &KeyRegistry) -> Result<bool, String> {
     let session = key_registry
         .with_key(|k| (k.user_id.clone(), key_hex(&k.master_key)))
@@ -103,11 +101,14 @@ async fn tier2_is_configured(key_registry: &KeyRegistry) -> Result<bool, String>
         return Ok(false);
     };
 
-    for provider in TIER2_PROVIDERS {
+    let candidates = provider_store::list_providers_by_type("cloud_inference_api")
+        .await
+        .map_err(|e| e.to_string())?;
+    for provider in candidates {
         let found = integration_keys_store::get_active_key(
             &user_id,
             &key_hex_str,
-            provider,
+            &provider.id,
             TIER2_KEY_TYPE,
             None,
         )
@@ -184,6 +185,13 @@ mod tests {
         crate::persistence::migrations::migrate_keys_db(user_id, &key_hex(master_key))
             .await
             .expect("integration_keys.db migration must succeed in test setup");
+        // items.id=430: tier2_is_configured() now reads the Tier 1.5
+        // candidate set from providers (shared.db) instead of a hardcoded
+        // array -- shared.db must be migrated too so list_providers_by_type
+        // finds the seeded groq/mistral rows.
+        crate::persistence::migrations::migrate_shared_db()
+            .await
+            .expect("shared.db migration must succeed in test setup");
 
         TestEnv {
             _tempdir: tempdir,
@@ -240,7 +248,8 @@ mod tests {
     async fn true_when_only_mistral_is_configured() {
         // Aggregate-across-providers behavior: groq unset, mistral set --
         // must still report true. Guards against a scan that only ever
-        // checked the first provider in TIER2_PROVIDERS.
+        // checked the first provider in the cloud_inference_api candidate
+        // list.
         let master_key = [0x55u8; crate::auth::kdf::MASTER_KEY_LEN];
         let _env = setup("user-e", &master_key).await;
         let app = mock_app_with_registry();

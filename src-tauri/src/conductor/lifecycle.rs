@@ -1576,16 +1576,32 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         }
         .await;
 
-        // Tier 2 provider preference (items.id=251). Only relevant at
-        // tier>=2 -- Tier 1 never dispatches to an external provider. DB
-        // read failure collapses to None, same as "no preference set" --
-        // StepExecutor turns None into the F10 MissingTier2Config failure
-        // rather than guessing a provider.
+        // Tier 1.5 provider preference (items.id=251, repointed items.id=432).
+        // Only relevant at tier>=2 -- Tier 1 never dispatches to an external
+        // provider. Candidate set is read from providers.provider_type=
+        // 'cloud_inference_api' (items.id=430's flag-based replacement for
+        // the old hardcoded ["mistral","groq"] array), then resolved via
+        // user_provider_preference_store::resolve_preference()'s Focus ->
+        // Persona -> account precedence (items.id=428) instead of the
+        // legacy users.tier2_provider_preference column. DB read failure or
+        // an unresolved/ambiguous preference collapses to None, same as "no
+        // preference set" -- StepExecutor turns None into the F10
+        // MissingTier2Config failure rather than guessing a provider.
         let tier2_provider_preference: Option<String> = if execution_tier >= 2 {
-            crate::auth::user_store::get_tier2_provider_preference(&user_id)
-                .await
-                .ok()
-                .flatten()
+            let candidates =
+                crate::persistence::provider_store::list_providers_by_type("cloud_inference_api")
+                    .await
+                    .unwrap_or_default();
+            let candidate_ids: Vec<String> = candidates.into_iter().map(|p| p.id).collect();
+            crate::persistence::user_provider_preference_store::find_preferred_provider(
+                &user_id,
+                Some(&persona_id),
+                Some(&focus_id),
+                &candidate_ids,
+            )
+            .await
+            .ok()
+            .flatten()
         } else {
             None
         };

@@ -44,6 +44,10 @@ use tauri::State;
 
 use crate::auth::registry::{key_hex, KeyRegistry};
 use crate::persistence::integration_keys_store;
+use crate::persistence::provider_store;
+use crate::persistence::user_provider_preference_store::{
+    self, NewUserProviderPreference, UserPreference,
+};
 
 const TIER2_KEY_TYPE: &str = "tier2";
 const VALID_TIER2_PROVIDERS: &[&str] = &["mistral", "groq"];
@@ -135,9 +139,20 @@ pub async fn set_tier2_provider(
 
 /// Set (or clear, with `provider: None`) the current user's Tier 2 provider
 /// preference -- distinct from set_tier2_provider above, which stores a
-/// credential. This is the "which provider should QR actually use" choice
-/// executor.rs reads via user_store::get_tier2_provider_preference
-/// (items.id=253, unblocks items.id=251's read path).
+/// credential. This is the "which provider should QR actually use" choice.
+///
+/// items.id=432: lifecycle.rs no longer reads
+/// users.tier2_provider_preference (items.id=253/251's original path) --
+/// it now resolves an account-wide user_provider_preference row via
+/// find_preferred_provider()/resolve_preference() (items.id=428/432). This
+/// command dual-writes: the legacy column (kept populated, not read by
+/// anything anymore, until items.id=433 drops it -- out of scope here) AND
+/// the new table, which is what actually drives execution now. Selecting a
+/// provider marks its account-wide row Preferred and downgrades any OTHER
+/// Tier 1.5 candidate's account-wide row that was previously Preferred to
+/// Allowed, preserving find_preferred_provider()'s "at most one Preferred"
+/// assumption. Clearing (`provider: None`) downgrades any currently-
+/// Preferred candidate the same way, without picking a new one.
 #[tauri::command]
 #[specta::specta]
 pub async fn set_tier2_provider_preference(
@@ -159,7 +174,63 @@ pub async fn set_tier2_provider_preference(
 
     crate::auth::user_store::set_tier2_provider_preference(&user_id, provider.as_deref())
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+    let candidates = provider_store::list_providers_by_type("cloud_inference_api")
+        .await
+        .map_err(|e| e.to_string())?;
+
+    for candidate in &candidates {
+        let existing = user_provider_preference_store::get_preference_at_scope(
+            &user_id,
+            None,
+            None,
+            &candidate.id,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+        let is_selected = provider.as_deref() == Some(candidate.id.as_str());
+        let was_preferred = existing
+            .as_ref()
+            .map(|e| e.user_preference == UserPreference::Preferred)
+            .unwrap_or(false);
+
+        let new_preference = if is_selected {
+            UserPreference::Preferred
+        } else if was_preferred {
+            UserPreference::Allowed
+        } else {
+            // Not the selected candidate and never Preferred -- nothing to
+            // change (avoids creating a fresh 'allowed' row for every
+            // untouched candidate on every call).
+            continue;
+        };
+
+        let login_available = existing
+            .as_ref()
+            .map(|e| e.login_available)
+            .unwrap_or(false);
+        let local_model_version = existing
+            .as_ref()
+            .and_then(|e| e.local_model_version.clone());
+        let subscription_status = existing.as_ref().and_then(|e| e.subscription_status);
+
+        user_provider_preference_store::upsert_preference(NewUserProviderPreference {
+            user_id: &user_id,
+            persona_id: None,
+            focus_id: None,
+            provider_id: &candidate.id,
+            login_available,
+            user_preference: new_preference,
+            local_model_version: local_model_version.as_deref(),
+            subscription_status,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -340,6 +411,65 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pref, Some("groq".to_owned()));
+    }
+
+    /// items.id=432: set_tier2_provider_preference must dual-write -- the
+    /// legacy column (asserted above) AND an account-wide Preferred row in
+    /// the new user_provider_preference table, which is what
+    /// lifecycle.rs::find_preferred_provider() actually reads now. Switching
+    /// the choice must downgrade the previously-Preferred candidate to
+    /// Allowed rather than leaving two candidates both Preferred (which
+    /// would make find_preferred_provider() return an ambiguous None).
+    #[tokio::test]
+    async fn set_tier2_provider_preference_dual_writes_and_downgrades_other_candidate() {
+        let master_key = [0x66u8; crate::auth::kdf::MASTER_KEY_LEN];
+        let _env = setup_shared_db("user-f").await;
+        let app = mock_app_with_registry();
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(&registry, "user-f", master_key).await;
+
+        set_tier2_provider_preference(Some("groq".to_owned()), registry.clone())
+            .await
+            .expect("set_tier2_provider_preference must succeed when logged in");
+
+        let groq_pref =
+            user_provider_preference_store::get_preference_at_scope("user-f", None, None, "groq")
+                .await
+                .unwrap()
+                .expect("an account-wide groq row must exist after selecting groq");
+        assert_eq!(groq_pref.user_preference, UserPreference::Preferred);
+
+        // Switch to mistral -- groq's row must be downgraded to Allowed, not
+        // left Preferred (which would make find_preferred_provider return
+        // an ambiguous None instead of "mistral").
+        set_tier2_provider_preference(Some("mistral".to_owned()), registry.clone())
+            .await
+            .expect("switching provider must succeed");
+
+        let groq_after =
+            user_provider_preference_store::get_preference_at_scope("user-f", None, None, "groq")
+                .await
+                .unwrap()
+                .expect("groq's row must still exist, just downgraded");
+        assert_eq!(groq_after.user_preference, UserPreference::Allowed);
+
+        let mistral_after = user_provider_preference_store::get_preference_at_scope(
+            "user-f", None, None, "mistral",
+        )
+        .await
+        .unwrap()
+        .expect("an account-wide mistral row must exist after selecting mistral");
+        assert_eq!(mistral_after.user_preference, UserPreference::Preferred);
+
+        let preferred = user_provider_preference_store::find_preferred_provider(
+            "user-f",
+            None,
+            None,
+            &["groq".to_owned(), "mistral".to_owned()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(preferred, Some("mistral".to_owned()));
     }
 
     #[tokio::test]

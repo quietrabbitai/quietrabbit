@@ -372,9 +372,20 @@ export const commands = {
 	/**
 	 *  Set (or clear, with `provider: None`) the current user's Tier 2 provider
 	 *  preference -- distinct from set_tier2_provider above, which stores a
-	 *  credential. This is the "which provider should QR actually use" choice
-	 *  executor.rs reads via user_store::get_tier2_provider_preference
-	 *  (items.id=253, unblocks items.id=251's read path).
+	 *  credential. This is the "which provider should QR actually use" choice.
+	 * 
+	 *  items.id=432: lifecycle.rs no longer reads
+	 *  users.tier2_provider_preference (items.id=253/251's original path) --
+	 *  it now resolves an account-wide user_provider_preference row via
+	 *  find_preferred_provider()/resolve_preference() (items.id=428/432). This
+	 *  command dual-writes: the legacy column (kept populated, not read by
+	 *  anything anymore, until items.id=433 drops it -- out of scope here) AND
+	 *  the new table, which is what actually drives execution now. Selecting a
+	 *  provider marks its account-wide row Preferred and downgrades any OTHER
+	 *  Tier 1.5 candidate's account-wide row that was previously Preferred to
+	 *  Allowed, preserving find_preferred_provider()'s "at most one Preferred"
+	 *  assumption. Clearing (`provider: None`) downgrades any currently-
+	 *  Preferred candidate the same way, without picking a new one.
 	 */
 	setTier2ProviderPreference: (provider: string | null) => typedError<null, string>(__TAURI_INVOKE("set_tier2_provider_preference", { provider })),
 	dismissNotification: (notificationId: string) => typedError<null, string>(__TAURI_INVOKE("dismiss_notification", { notificationId })),
@@ -875,16 +886,17 @@ export type HealthResponse = {
 	 */
 	ollama_source: string,
 	/**
-	 *  True iff an active user-global key exists for ANY Tier 2 provider
-	 *  (mistral or groq) -- a capability-status signal ("is Tier 2 usable
-	 *  at all," e.g. for an onboarding nudge), not a report of which
-	 *  provider is active. Provider *selection* at execution time is a
-	 *  separate, currently-unwired concern (executor.rs hardcodes Groq
-	 *  today; users.tier2_provider_preference exists in schema but nothing
-	 *  reads it yet) -- out of scope for this field, confirmed no-loss
-	 *  this session: there is no per-provider consumer downstream to feed.
-	 *  False, not an error, when no session is resident -- get_health must
-	 *  stay callable pre-login (Ollama status has no such requirement).
+	 *  True iff an active user-global key exists for ANY Tier 1.5 provider
+	 *  (providers.provider_type='cloud_inference_api' -- items.id=430; was a
+	 *  hardcoded ["mistral","groq"] array before this) -- a capability-status
+	 *  signal ("is Tier 1.5 usable at all," e.g. for an onboarding nudge),
+	 *  not a report of which provider is active. Provider *selection* at
+	 *  execution time is a separate concern, wired through
+	 *  user_provider_preference_store::resolve_preference() (items.id=432) --
+	 *  out of scope for this field, there is no per-provider consumer
+	 *  downstream to feed. False, not an error, when no session is resident
+	 *  -- get_health must stay callable pre-login (Ollama status has no such
+	 *  requirement).
 	 */
 	tier2_configured: boolean,
 };
