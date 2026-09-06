@@ -80,6 +80,7 @@ use crate::auth::registry::{key_hex, KeyRegistry};
 use crate::conductor::extract;
 use crate::conductor::privacy::types::{ExtractConfirmDecision, Gate3ReviewResult};
 use crate::conductor::privacy::PrivacyGateway;
+use crate::conductor::tokens::ExternalAccess;
 use crate::persistence::disclosure_log_store::SqliteDisclosureLogger;
 use crate::persistence::focus_settings_store;
 use crate::persistence::message_store;
@@ -830,8 +831,13 @@ pub async fn request_tier3_gate3_review(
             &message.id,
             &message.content,
             1, // content_sensitivity_severity
-            3, // target_tier -- unchanged, still the tier-ceiling check's input
-            settings.max_permitted_tier as u8,
+            // target_tier -- unchanged, still u8 (items.id=439: gate3()'s
+            // target_tier stays legacy-typed, see gate3.rs's own doc
+            // comment). 3 == ExternalAccess::Unrestricted-equivalent; this
+            // pane's own precondition is "the user is literally about to
+            // access Tier 3" (see this fn's doc comment above).
+            3,
+            ExternalAccess::from_legacy_tier(settings.max_permitted_tier as u8),
             1, // execution_tier
             Some(&app_handle),
             destination_risk_rating,
@@ -971,8 +977,13 @@ pub async fn request_chat_copy_gate3_review(
             &synthetic_key,
             &request.content_text,
             1, // content_sensitivity_severity
-            1, // target_tier -- NOT 3; see doc comment above
-            settings.max_permitted_tier as u8,
+            // target_tier -- unchanged, still u8 (items.id=439: see
+            // gate3.rs's own doc comment for why this stays legacy-typed).
+            // NOT 3; see doc comment above -- 1 ==
+            // ExternalAccess::LocalOnly-equivalent, i.e. this copy is not
+            // treated as requiring external access on its own.
+            1,
+            ExternalAccess::from_legacy_tier(settings.max_permitted_tier as u8),
             1, // execution_tier
             Some(&app_handle),
             destination_risk_rating,
@@ -1098,8 +1109,11 @@ pub async fn recheck_tier3_provider_selection(
             &content_key,
             &message.content,
             1, // content_sensitivity_severity
-            3, // target_tier -- unchanged, still the tier-ceiling check's input
-            settings.max_permitted_tier as u8,
+            // target_tier -- unchanged, still u8 (items.id=439: see
+            // gate3.rs's own doc comment for why this stays legacy-typed).
+            // 3 == ExternalAccess::Unrestricted-equivalent.
+            3,
+            ExternalAccess::from_legacy_tier(settings.max_permitted_tier as u8),
             1, // execution_tier
             Some(&app_handle),
             Some(new_risk),

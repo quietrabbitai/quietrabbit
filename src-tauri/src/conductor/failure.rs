@@ -23,6 +23,8 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::conductor::tokens::ExternalAccess;
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -123,7 +125,9 @@ pub enum ConductorError {
     #[error("{plain_language}")]
     UnknownProvider { plain_language: String },
 
-    // F_SYSTEM — Step 3 ceiling violation: routing_tier > space_max_permitted_tier
+    // F_SYSTEM — Step 3 ceiling violation: external_access_override exceeds
+    // the Focus's external_access ceiling (items.id=439, formerly
+    // routing_tier > space_max_permitted_tier)
     #[error("{plain_language}")]
     TierBoundaryViolation { plain_language: String },
 
@@ -245,23 +249,19 @@ pub struct FailureResult {
 /// Stateless — caller (StepExecutor) tracks retry_count per step.
 /// Python oracle: FailureHandler class in conductor/failure.py.
 pub struct FailureHandler {
-    /// The maximum tier permitted for this focus run's persona.
-    /// Controls whether offer_tier2 or local-only fallback is used.
-    /// Valid range: 1-3. Enforced by debug_assert in new().
-    /// Python oracle: space_max_permitted_tier on FailureHandler.__init__
-    pub space_max_permitted_tier: u8,
+    /// items.id=439 (Part 6e): the Focus-level external_access ceiling
+    /// permitted for this focus run's persona — controls whether
+    /// offer_tier2 or local-only fallback is used. Retyped from the former
+    /// space_max_permitted_tier: u8 (Python oracle name); the enum makes an
+    /// invalid value unrepresentable, so the debug_assert! this constructor
+    /// used to carry is gone — same reasoning already applied to StepType
+    /// elsewhere in this codebase.
+    pub external_access: ExternalAccess,
 }
 
 impl FailureHandler {
-    pub fn new(space_max_permitted_tier: u8) -> Self {
-        debug_assert!(
-            (1..=3).contains(&space_max_permitted_tier),
-            "space_max_permitted_tier must be 1, 2, or 3 — got {}",
-            space_max_permitted_tier
-        );
-        Self {
-            space_max_permitted_tier,
-        }
+    pub fn new(external_access: ExternalAccess) -> Self {
+        Self { external_access }
     }
 
     /// Map a ConductorError to a FailureResult.
@@ -582,7 +582,7 @@ impl FailureHandler {
         step_id: Option<String>,
         focus_id: Option<String>,
     ) -> FailureResult {
-        if self.space_max_permitted_tier >= 2 {
+        if self.external_access != ExternalAccess::LocalOnly {
             return FailureResult {
                 action: FailureAction::OfferTier2,
                 failure_mode: Some("F1".to_owned()),
@@ -618,7 +618,7 @@ impl FailureHandler {
         retry_count: u32,
     ) -> FailureResult {
         let exhausted = retry_count >= MAX_RETRIES;
-        if self.space_max_permitted_tier >= 2 {
+        if self.external_access != ExternalAccess::LocalOnly {
             return FailureResult {
                 action: FailureAction::OfferTier2,
                 failure_mode: Some("F2".to_owned()),
@@ -682,7 +682,7 @@ impl FailureHandler {
         step_id: Option<String>,
         focus_id: Option<String>,
     ) -> FailureResult {
-        if self.space_max_permitted_tier >= 2 {
+        if self.external_access != ExternalAccess::LocalOnly {
             return FailureResult {
                 action: FailureAction::OfferTier2,
                 failure_mode: Some(mode.to_owned()),
@@ -724,7 +724,7 @@ mod tests {
     use super::*;
 
     fn handler(tier: u8) -> FailureHandler {
-        FailureHandler::new(tier)
+        FailureHandler::new(ExternalAccess::from_legacy_tier(tier))
     }
 
     fn err(variant: ConductorError) -> ConductorError {

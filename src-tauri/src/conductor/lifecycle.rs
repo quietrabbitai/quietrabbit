@@ -89,7 +89,9 @@ use crate::conductor::memory_broker::MemoryBroker;
 use crate::conductor::privacy::output_scan::{scan_output, ScanIntensity};
 use crate::conductor::privacy::types::sensitivity_severity;
 use crate::conductor::privacy::{logger::DisclosureLoggerForRun, PrivacyGateway};
-use crate::conductor::tokens::{validate_step, FieldRequirement, StepDefinition, StepType};
+use crate::conductor::tokens::{
+    validate_step, ExternalAccess, FieldRequirement, StepDefinition, StepType,
+};
 use crate::conductor::types::{
     PersonalContextManifest, PersonalTrack, SharedStateTrack, TaskTrack,
 };
@@ -379,6 +381,19 @@ fn parse_focus_definition(raw: RawFocusFile) -> Result<FocusDefinition, Lifecycl
                 })
                 .unwrap_or_default();
 
+            // items.id=439 (Part 6c/6d): mechanical derivation, no separate
+            // .focus YAML field for either. requires_user_handoff fully
+            // decouples the old routing_tier==3 pause signal from capability
+            // -- such a step makes no external_access claim of its own
+            // (inherits the Focus's), matching Part 6d exactly.
+            let raw_routing_tier = raw_step.routing_tier.unwrap_or(1);
+            let requires_user_handoff = raw_routing_tier == 3;
+            let external_access_override = if requires_user_handoff {
+                None
+            } else {
+                Some(ExternalAccess::from_legacy_tier(raw_routing_tier))
+            };
+
             steps.push(StepDefinition {
                 step_id: step_id_key.clone(),
                 display_name: raw_step.display_name.unwrap_or_else(|| step_id_key.clone()),
@@ -386,20 +401,31 @@ fn parse_focus_definition(raw: RawFocusFile) -> Result<FocusDefinition, Lifecycl
                     .guide_id
                     .unwrap_or_else(|| default_guide_id.clone()),
                 task_type: raw_step.task_type.unwrap_or_else(|| "general".to_owned()),
-                routing_tier: raw_step.routing_tier.unwrap_or(1),
+                routing_tier: raw_routing_tier,
                 step_type,
                 output_var: raw_step.output_var,
                 prompt_template: raw_step.prompt_template.unwrap_or_default(),
                 field_requirements,
                 options_override,
+                external_access_override,
+                requires_user_handoff,
             });
         }
     }
 
+    let max_routing_tier = raw.max_routing_tier.unwrap_or(1);
+
     Ok(FocusDefinition {
         display_name: raw.display_name.unwrap_or_else(|| focus_id.clone()),
         description: raw.description.unwrap_or_default(),
-        max_routing_tier: raw.max_routing_tier.unwrap_or(1),
+        max_routing_tier,
+        // items.id=439 (Part 6, Jason's three-way-fold resolution): a
+        // second structural ceiling, .focus-authored like
+        // step.external_access_override, folded into FocusRun's
+        // _focus_external_access alongside focus_settings.max_permitted_tier
+        // -- see authorize() below. Derived from the same YAML key as
+        // max_routing_tier; no separate YAML field.
+        max_external_access: ExternalAccess::from_legacy_tier(max_routing_tier),
         multi_source_validation: raw.multi_source_validation.unwrap_or(false),
         focus_id,
         version,
@@ -492,6 +518,11 @@ pub struct FocusDefinition {
     pub description: String,
     pub version: String,
     pub max_routing_tier: u8,
+    /// items.id=439 (Part 6, Jason's three-way-fold resolution): derived
+    /// from max_routing_tier at parse time. See FocusRun's
+    /// _focus_external_access field for how it combines with
+    /// focus_settings.max_permitted_tier.
+    pub max_external_access: ExternalAccess,
     pub steps: Vec<StepDefinition>,
     pub output_type: String,
     pub suggest_in_focuses: Vec<String>,
@@ -683,6 +714,13 @@ pub struct FocusRun<L: DisclosureLoggerForRun = SqliteDisclosureLogger> {
     // Tier configuration (set at AUTHORIZE, used throughout EXECUTE)
     _focus_max_permitted_tier: u8,
     _focus_privacy_tier: u8,
+    /// items.id=439: the Focus-level external_access ceiling, excluding any
+    /// step's own override -- min(from_legacy_tier(_focus_max_permitted_tier),
+    /// focus_def.max_external_access). Set at AUTHORIZE (Jason's
+    /// three-way-fold resolution; see plan doc), used by authorize()'s
+    /// per-step tighten-only check, FailureHandler::new(), and threaded into
+    /// every StepContext as focus_external_access.
+    _focus_external_access: ExternalAccess,
 
     // Run execution state
     _output_id: Option<String>,
@@ -745,6 +783,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             privacy_gateway: None,
             _focus_max_permitted_tier: 1,
             _focus_privacy_tier: 1,
+            _focus_external_access: ExternalAccess::LocalOnly,
             _output_id: None,
             current_step: 0,
             _checkpointing_suspended: false,
@@ -839,16 +878,29 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         self._focus_privacy_tier = privacy_tier;
 
         let focus_def = self.focus_def.as_ref().unwrap();
+
+        // items.id=439 (Part 6, Jason's three-way-fold resolution): the
+        // Focus-level ceiling excluding any step's own override -- folds the
+        // user preference (focus_settings.max_permitted_tier) together with
+        // the Focus-author structural ceiling (focus_def.max_external_access)
+        // without collapsing either into a single legacy number.
+        self._focus_external_access =
+            ExternalAccess::from_legacy_tier(max_permitted).min(focus_def.max_external_access);
+
         for step in &focus_def.steps {
-            if step.routing_tier > self._focus_max_permitted_tier {
-                return Err(LifecycleError::TierViolation(format!(
-                    "Step '{}' requires tier {} but focus ceiling is {}.",
-                    step.step_id, step.routing_tier, self._focus_max_permitted_tier
-                )));
+            if let Some(override_) = step.external_access_override {
+                if override_ > self._focus_external_access {
+                    return Err(LifecycleError::TierViolation(format!(
+                        "Step '{}' requires external access '{}' but focus ceiling is '{}'.",
+                        step.step_id,
+                        override_.as_str(),
+                        self._focus_external_access.as_str()
+                    )));
+                }
             }
         }
 
-        self.failure_handler = Some(FailureHandler::new(self._focus_max_permitted_tier));
+        self.failure_handler = Some(FailureHandler::new(self._focus_external_access));
         self.focus_run_id = Some(Uuid::new_v4().to_string());
         self.write_focus_run_record("initializing").await?;
         Ok(())
@@ -1395,8 +1447,10 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
 
             self.emit_status("running", Some(&step.display_name));
 
-            // Tier 3 boundary: checkpoint (if not suspended), set status, return early.
-            if step.routing_tier == 3 {
+            // Handoff-pause boundary (items.id=439, Part 6d — fully decoupled
+            // from external_access, formerly step.routing_tier == 3):
+            // checkpoint (if not suspended), set status, return early.
+            if step.requires_user_handoff {
                 if !self._checkpointing_suspended {
                     if let Err(e) = self.write_checkpoint(&step.step_id).await {
                         log::warn!("lifecycle: Tier 3 checkpoint write failed: {e}");
@@ -1544,7 +1598,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         let focus_run_id = self.focus_run_id.clone().unwrap_or_default();
         let user_input = self.user_input.clone();
         let persona_context = self._persona_context_rendered.clone();
-        let space_max_permitted_tier = self._focus_max_permitted_tier;
+        let focus_external_access = self._focus_external_access;
         let scheduler = Arc::clone(&self.scheduler);
         let user_id = self.user_id.clone();
 
@@ -1613,7 +1667,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             focus_run_id,
             user_input,
             persona_context,
-            space_max_permitted_tier,
+            focus_external_access,
             execution_tier,
             abstraction_tier,
             raw_abstraction,
@@ -3030,7 +3084,7 @@ mod tests {
         run.personal_track = Some(personal_track);
         run.task_track = Some(TaskTrack::new());
         run.shared_state = Some(SharedStateTrack::new());
-        run.failure_handler = Some(FailureHandler::new(1));
+        run.failure_handler = Some(FailureHandler::new(ExternalAccess::LocalOnly));
         run.privacy_gateway = Some(PrivacyGateway::new(
             crate::conductor::privacy::logger::TestLogger::for_run("u", "p", ""),
         ));

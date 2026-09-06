@@ -68,7 +68,7 @@ use crate::conductor::privacy::types::{
     AbstractionPolicy, PersonalField as GateField, PersonalTrack as GateTrack, Sensitivity,
 };
 use crate::conductor::privacy::PrivacyGateway;
-use crate::conductor::tokens::StepDefinition;
+use crate::conductor::tokens::{ExternalAccess, StepDefinition};
 use crate::conductor::types::{PersonalTrack, SharedStateTrack, TaskStep, TaskTrack};
 use crate::providers::groq::GroqProvider;
 use crate::providers::mistral::MistralProvider;
@@ -175,7 +175,13 @@ pub struct StepContext {
     pub user_id: String,
     pub persona_id: String,
     pub key_hex: String,
-    pub space_max_permitted_tier: u8,
+    /// items.id=439 (Part 6): the Focus-level external_access ceiling,
+    /// excluding this step's own external_access_override (see
+    /// FocusRun::_focus_external_access) — used by the Step 3 tighten-only
+    /// re-check and gate3's Check 1, both below. Renamed/retyped from the
+    /// former space_max_permitted_tier: u8, which had exactly these two use
+    /// sites.
+    pub focus_external_access: ExternalAccess,
     pub execution_tier: u8,
     pub abstraction_tier: u8,
     pub raw_abstraction: u8,
@@ -339,20 +345,26 @@ impl StepExecutor {
             });
         }
 
-        // -- Step 3 — tier ceiling gate --
-        if ctx.step.routing_tier > ctx.space_max_permitted_tier {
-            return Ok(Some(failure_handler.handle(
-                &ConductorError::TierBoundaryViolation {
-                    plain_language: format!(
-                        "Step '{}' requires tier {} but this life only permits \
-                         tier {}. [Get help]",
-                        ctx.step.step_id, ctx.step.routing_tier, ctx.space_max_permitted_tier
-                    ),
-                },
-                Some(&ctx.step.step_id),
-                Some(&ctx.focus_id),
-                retry_count,
-            )));
+        // -- Step 3 — external_access ceiling gate (items.id=439, Part 6e) --
+        // Defense-in-depth re-check of authorize()'s own tighten-only
+        // validation, same shape, corrected vocabulary.
+        if let Some(override_) = ctx.step.external_access_override {
+            if override_ > ctx.focus_external_access {
+                return Ok(Some(failure_handler.handle(
+                    &ConductorError::TierBoundaryViolation {
+                        plain_language: format!(
+                            "Step '{}' requires external access '{}' but this life only \
+                             permits '{}'. [Get help]",
+                            ctx.step.step_id,
+                            override_.as_str(),
+                            ctx.focus_external_access.as_str()
+                        ),
+                    },
+                    Some(&ctx.step.step_id),
+                    Some(&ctx.focus_id),
+                    retry_count,
+                )));
+            }
         }
 
         // -- Step 4 — Tier 3 boundary handled by lifecycle; executor never reached --
@@ -696,7 +708,7 @@ impl StepExecutor {
                         &response.content,
                         step_sensitivity as u8,
                         next_tier,
-                        ctx.space_max_permitted_tier,
+                        ctx.focus_external_access,
                         execution_tier,
                         app_handle,
                         // items.id=406: no specific-provider selection concept
@@ -1680,12 +1692,14 @@ mod tests {
                 prompt_template: "Hello {name}".to_owned(),
                 field_requirements: std::collections::HashMap::new(),
                 options_override: std::collections::HashMap::new(),
+                external_access_override: Some(ExternalAccess::AnonymousRequired),
+                requires_user_handoff: false,
             },
             focus_id: "f".to_owned(),
             focus_run_id: "fr".to_owned(),
             user_input: "".to_owned(),
             persona_context: "".to_owned(),
-            space_max_permitted_tier: 2,
+            focus_external_access: ExternalAccess::AnonymousRequired,
             execution_tier: 2,
             abstraction_tier: 2,
             raw_abstraction: 1,
@@ -1731,12 +1745,14 @@ mod tests {
                 prompt_template: "Hello {name}".to_owned(),
                 field_requirements: std::collections::HashMap::new(),
                 options_override: std::collections::HashMap::new(),
+                external_access_override: Some(ExternalAccess::LocalOnly),
+                requires_user_handoff: false,
             },
             focus_id: "f".to_owned(),
             focus_run_id: "fr".to_owned(),
             user_input: "".to_owned(),
             persona_context: "".to_owned(),
-            space_max_permitted_tier: 1,
+            focus_external_access: ExternalAccess::LocalOnly,
             execution_tier: 1,
             abstraction_tier: 1,
             raw_abstraction: 1,
@@ -1768,12 +1784,14 @@ mod tests {
                 prompt_template: "Hello {user_input}".to_owned(),
                 field_requirements: std::collections::HashMap::new(),
                 options_override: std::collections::HashMap::new(),
+                external_access_override: Some(ExternalAccess::LocalOnly),
+                requires_user_handoff: false,
             },
             focus_id: "f".to_owned(),
             focus_run_id: "fr".to_owned(),
             user_input: "".to_owned(),
             persona_context: "".to_owned(),
-            space_max_permitted_tier: 1,
+            focus_external_access: ExternalAccess::LocalOnly,
             execution_tier: 1,
             abstraction_tier: 1,
             raw_abstraction: 1,

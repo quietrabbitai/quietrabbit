@@ -226,6 +226,7 @@ pub async fn update_topic_state(
 mod tests {
     use super::*;
     use crate::conductor::lifecycle::HighPriorityTrigger;
+    use crate::conductor::tokens::ExternalAccess;
     use chrono::Duration;
     use serde_json::json;
 
@@ -239,6 +240,7 @@ mod tests {
             description: String::new(),
             version: "1.0".to_owned(),
             max_routing_tier: 1,
+            max_external_access: ExternalAccess::LocalOnly,
             steps: vec![],
             output_type: "general".to_owned(),
             suggest_in_focuses: vec![],
@@ -261,6 +263,7 @@ mod tests {
             description: String::new(),
             version: "1.0".to_owned(),
             max_routing_tier: 1,
+            max_external_access: ExternalAccess::LocalOnly,
             steps: vec![],
             output_type: "general".to_owned(),
             suggest_in_focuses: vec![],
@@ -284,6 +287,7 @@ mod tests {
             description: String::new(),
             version: "1.0".to_owned(),
             max_routing_tier: 1,
+            max_external_access: ExternalAccess::LocalOnly,
             steps: vec![],
             output_type: "general".to_owned(),
             suggest_in_focuses: vec![],

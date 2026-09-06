@@ -18,6 +18,7 @@ pub mod types;
 // Use PrivacyGateway<TestLogger>  in golden-vector tests.
 // Use PrivacyGateway<FailLogger>  to exercise disclosure-log failure paths.
 
+use crate::conductor::tokens::ExternalAccess;
 use errors::DisclosureLogWriteError;
 use logger::DisclosureLogger;
 use types::{Gate1Result, Gate2Result, Gate3Result, PersonalTrack};
@@ -89,7 +90,7 @@ impl<L: DisclosureLogger> PrivacyGateway<L> {
         content_text: &str,
         content_sensitivity_severity: u8,
         target_tier: u8,
-        space_max_permitted_tier: u8,
+        focus_external_access: ExternalAccess,
         execution_tier: u8,
         app_handle: Option<&tauri::AppHandle<tauri::Wry>>,
         destination_risk_rating: Option<u8>,
@@ -106,7 +107,7 @@ impl<L: DisclosureLogger> PrivacyGateway<L> {
             content_text,
             content_sensitivity_severity,
             target_tier,
-            space_max_permitted_tier,
+            focus_external_access,
             execution_tier,
             app_handle,
             destination_risk_rating,
