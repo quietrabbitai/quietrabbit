@@ -90,7 +90,8 @@ pub async fn gate3<L: DisclosureLogger>(
     execution_tier: u8,
     app_handle: Option<&tauri::AppHandle<tauri::Wry>>,
     // items.id=406 (decisions.id=753): live per-provider destination risk
-    // (1=Low/2=Medium/3=High, from tier3_providers.risk_rating), MAX across
+    // (1=Low/2=Medium/3=High, from providers.risk_rating -- items.id=427
+    // generalized tier3_providers into providers, column unchanged), MAX across
     // whatever destinations are currently active/selected. None when the
     // caller has no specific-provider context (e.g. executor.rs's generic
     // Focus-step promotion) -- falls back to target_tier itself, exactly

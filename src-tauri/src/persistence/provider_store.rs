@@ -1,15 +1,23 @@
 // src-tauri/src/persistence/provider_store.rs
 //
-// tier3_providers CRUD for shared.db (unencrypted) -- items.id=202.
-// Schema: shared_001.sql's tier3_providers table (added 2026-08-04), per
-// decisions.id=684 (schema required, scoped with items.id=186's curation
-// policy) and decisions.id=710 (items.id=186 scoped -- policy this table
-// expresses). See shared_001.sql's own tier3_providers header for full
-// column-by-column rationale; not re-derived here.
+// providers CRUD for shared.db (unencrypted) -- items.id=427/428
+// (PROVIDER_REGISTRY_AND_TIER_MODEL_SPEC.md Part 2), generalizing
+// tier3_providers (items.id=202) into a flag-based table spanning every
+// tier. shared_013.sql carries tier3_providers' 4 real seeded rows across
+// and drops the old table -- this module is fully repointed at the new
+// shape, not a parallel path. See shared_013.sql's own providers header
+// for full column-by-column rationale; not re-derived here.
+//
+// CORE DESIGN RULE (Part 1): no tier column exists here and none should be
+// added back. Eligibility/routing reads a decided flag column instead
+// (is_local, is_anonymous, retains_data, trains_on_data_by_default,
+// qr_internal_eligible, risk_rating, privacy_guardian_default_level).
+// Tier labels are a display-layer-only concern computed from provider_type
+// by callers that need one (e.g. commands::tier3_pane::lane_str) -- never
+// read back into this module or into any decision logic.
 //
 // Backs TIER3_ACCESS_MODEL.md's selector screen (State 3, decisions.id=681)
-// -- list_active_providers() is that screen's primary read path, split by
-// tier for the two-box layout.
+// -- list_active_providers() is that screen's primary read path.
 //
 // QUERY STYLE: runtime sqlx::query() only -- no query!() macros, matching
 // every other store in this module (persona_store.rs, focus_settings_store.rs).
@@ -25,11 +33,6 @@
 // script/migration) and any future Chat-PM-directed catalog maintenance,
 // not end-user action. Flagged here so a future reader doesn't assume a
 // missing write-path IPC command is an oversight.
-//
-// SEED DATA: NOT included in this module. Populating real, verified rows
-// for Duck.ai/Brave Leo/Claude/ChatGPT/Gemini against decisions.id=710(a)'s
-// documentation-gate criteria is research/content work, out of scope here
-// -- see shared_001.sql's tier3_providers header and this session's handoff.
 
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::ConnectOptions;
@@ -57,42 +60,15 @@ pub enum ProviderStoreError {
 // Data types
 // ---------------------------------------------------------------------------
 
-/// tier: 2 or 3, mirrors TIER3_ACCESS_MODEL.md's two lanes exactly --
-/// enforced by the DB's own CHECK, re-validated here at the Rust boundary
-/// so a bad value is rejected before it reaches sqlx, not just at INSERT.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ProviderTier {
-    Tier2 = 2,
-    Tier3 = 3,
-}
-
-impl ProviderTier {
-    fn as_i64(self) -> i64 {
-        self as i64
-    }
-
-    fn from_i64(v: i64) -> Result<Self, ProviderStoreError> {
-        match v {
-            2 => Ok(ProviderTier::Tier2),
-            3 => Ok(ProviderTier::Tier3),
-            other => Err(ProviderStoreError::Validation(format!(
-                "tier must be 2 or 3, got {other} -- schema CHECK should have \
-                 rejected this at write time; seeing it here means a row was \
-                 written outside this module or the CHECK itself drifted."
-            ))),
-        }
-    }
-}
-
-/// mode: only 'embedded_web' is used for R1. 'api' is reserved per
-/// shared_001.sql's tier3_providers header -- see that header before
-/// adding Api-specific fields to this struct; none exist yet.
+/// mode: 'local' added for items.id=427 -- 'api' remains reserved per
+/// shared_001.sql's original tier3_providers header (see shared_013.sql for
+/// the carry-forward note); no Api-specific fields exist yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderMode {
     EmbeddedWeb,
     Api,
+    Local,
 }
 
 impl ProviderMode {
@@ -100,6 +76,7 @@ impl ProviderMode {
         match self {
             ProviderMode::EmbeddedWeb => "embedded_web",
             ProviderMode::Api => "api",
+            ProviderMode::Local => "local",
         }
     }
 
@@ -107,8 +84,9 @@ impl ProviderMode {
         match s {
             "embedded_web" => Ok(ProviderMode::EmbeddedWeb),
             "api" => Ok(ProviderMode::Api),
+            "local" => Ok(ProviderMode::Local),
             other => Err(ProviderStoreError::Validation(format!(
-                "mode must be 'embedded_web' or 'api', got '{other}' -- schema \
+                "mode must be 'embedded_web', 'api', or 'local', got '{other}' -- schema \
                  CHECK should have rejected this at write time."
             ))),
         }
@@ -116,8 +94,8 @@ impl ProviderMode {
 }
 
 /// activation_status: 'active' | 'deprecated' only -- deliberately no
-/// richer state machine, per shared_001.sql's tier3_providers header
-/// (decisions.id=710(b): release-bundled, not runtime-activated).
+/// richer state machine, per shared_001.sql's original tier3_providers
+/// header (decisions.id=710(b): release-bundled, not runtime-activated).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ActivationStatus {
@@ -145,30 +123,109 @@ impl ActivationStatus {
     }
 }
 
+/// privacy_guardian_default_level: deliberately parallel to ReviewTier's
+/// own three values (conductor/privacy/types.rs), same reasoning
+/// risk_rating already established (shared_012.sql).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrivacyGuardianDefaultLevel {
+    Low,
+    Medium,
+    High,
+}
+
+impl PrivacyGuardianDefaultLevel {
+    fn as_str(self) -> &'static str {
+        match self {
+            PrivacyGuardianDefaultLevel::Low => "low",
+            PrivacyGuardianDefaultLevel::Medium => "medium",
+            PrivacyGuardianDefaultLevel::High => "high",
+        }
+    }
+
+    fn from_str(s: &str) -> Result<Self, ProviderStoreError> {
+        match s {
+            "low" => Ok(PrivacyGuardianDefaultLevel::Low),
+            "medium" => Ok(PrivacyGuardianDefaultLevel::Medium),
+            "high" => Ok(PrivacyGuardianDefaultLevel::High),
+            other => Err(ProviderStoreError::Validation(format!(
+                "privacy_guardian_default_level must be 'low', 'medium', or 'high', got '{other}' \
+                 -- schema CHECK should have rejected this at write time."
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Provider {
     pub id: String,
     pub display_name: String,
-    pub tier: ProviderTier,
+    /// Open vocabulary, no CHECK -- mechanical integration shape
+    /// ('local_model' | 'cloud_inference_api' | 'split_screen_web' |
+    /// 'external_service'), not a classification. Never branched on for
+    /// eligibility -- only display grouping (see commands::tier3_pane).
+    pub provider_type: String,
     pub mode: ProviderMode,
     pub launch_url: Option<String>,
-    pub login_required: bool,
     pub activation_status: ActivationStatus,
     /// Stored as JSON TEXT in DB. Default is empty object {}. Holds
     /// decisions.id=710(a)'s documentation-gate fields (ToS/retention
     /// citation, jurisdiction, contradictory-report notes) -- also this
     /// provider's selector-card retention-posture display source, per
-    /// shared_001.sql's CARD DISPLAY note.
+    /// shared_001.sql's original CARD DISPLAY note.
     pub documentation_gate: serde_json::Value,
     pub last_reviewed_at: Option<String>,
     pub review_trigger_note: Option<String>,
     pub created_at: String,
+    /// Runs on the user's own hardware. Decided at curation time, never
+    /// derived from provider_type.
+    pub is_local: bool,
+    /// No login, no persistent identity.
+    pub is_anonymous: bool,
+    /// Reviewed yes/no -- not a formula over documentation_gate's
+    /// retention-summary prose.
+    pub retains_data: bool,
+    /// The specific, high-stakes fact behind the OpenAI/Gemini
+    /// documentation_gate caveats.
+    pub trains_on_data_by_default: bool,
+    pub login_required: bool,
+    /// Part 3b's floor mechanism. Defaults false -- a provider must be
+    /// explicitly marked eligible for QR-internal operations (Privacy
+    /// Guardian's own evaluation, document ingestion/extraction).
+    pub qr_internal_eligible: bool,
+    pub privacy_guardian_default_level: Option<PrivacyGuardianDefaultLevel>,
     /// items.id=406 (decisions.id=753): live per-provider destination risk
     /// rating driving Privacy Guardian routing -- 1=Low, 2=Medium, 3=High.
-    /// Deliberately its own column (shared_012.sql), not folded into
-    /// documentation_gate's freeform display JSON -- see that migration's
-    /// header for why.
+    /// Deliberately its own column, not folded into documentation_gate's
+    /// freeform display JSON -- see shared_012.sql's header for why.
     pub risk_rating: u8,
+    /// Tier 1/1.5 rows only. Min RAM/VRAM class, expected tokens/sec on a
+    /// reference hardware class -- objectively measurable, so JSON is an
+    /// acceptable escape hatch here unlike the flag columns above.
+    pub hardware_requirement: Option<serde_json::Value>,
+}
+
+/// Input to create_provider(). A plain struct rather than 15+ positional
+/// arguments -- the prior 7-argument signature already carried
+/// #[allow(clippy::too_many_arguments)]; adding Part 2's 8 new decided-flag
+/// columns on top of that would make positional bool/string arguments a
+/// real transposition hazard, not just a style concern.
+pub struct NewProvider<'a> {
+    pub id: &'a str,
+    pub display_name: &'a str,
+    pub provider_type: &'a str,
+    pub mode: ProviderMode,
+    pub launch_url: Option<&'a str>,
+    pub login_required: bool,
+    pub is_local: bool,
+    pub is_anonymous: bool,
+    pub retains_data: bool,
+    pub trains_on_data_by_default: bool,
+    pub qr_internal_eligible: bool,
+    pub privacy_guardian_default_level: Option<PrivacyGuardianDefaultLevel>,
+    pub risk_rating: u8,
+    pub hardware_requirement: Option<serde_json::Value>,
+    pub documentation_gate: &'a serde_json::Value,
 }
 
 // ---------------------------------------------------------------------------
@@ -194,13 +251,19 @@ async fn open_shared_db() -> Result<SqliteConnection, ProviderStoreError> {
     Ok(conn)
 }
 
+const SELECT_COLUMNS: &str = "id, display_name, provider_type, mode, launch_url,
+                activation_status, documentation_gate, last_reviewed_at,
+                review_trigger_note, created_at, is_local, is_anonymous,
+                retains_data, trains_on_data_by_default, login_required,
+                qr_internal_eligible, privacy_guardian_default_level,
+                risk_rating, hardware_requirement";
+
 // ---------------------------------------------------------------------------
 // Row extraction
 // ---------------------------------------------------------------------------
 
 fn row_to_provider(row: &sqlx::sqlite::SqliteRow) -> Result<Provider, ProviderStoreError> {
     let id: String = row.try_get("id").map_err(ProviderStoreError::Database)?;
-    let tier_raw: i64 = row.try_get("tier").map_err(ProviderStoreError::Database)?;
     let mode_raw: String = row.try_get("mode").map_err(ProviderStoreError::Database)?;
     let login_required_raw: i64 = row
         .try_get("login_required")
@@ -210,6 +273,27 @@ fn row_to_provider(row: &sqlx::sqlite::SqliteRow) -> Result<Provider, ProviderSt
         .map_err(ProviderStoreError::Database)?;
     let doc_gate_raw: String = row
         .try_get("documentation_gate")
+        .map_err(ProviderStoreError::Database)?;
+    let is_local_raw: i64 = row
+        .try_get("is_local")
+        .map_err(ProviderStoreError::Database)?;
+    let is_anonymous_raw: i64 = row
+        .try_get("is_anonymous")
+        .map_err(ProviderStoreError::Database)?;
+    let retains_data_raw: i64 = row
+        .try_get("retains_data")
+        .map_err(ProviderStoreError::Database)?;
+    let trains_raw: i64 = row
+        .try_get("trains_on_data_by_default")
+        .map_err(ProviderStoreError::Database)?;
+    let qr_internal_raw: i64 = row
+        .try_get("qr_internal_eligible")
+        .map_err(ProviderStoreError::Database)?;
+    let pg_level_raw: Option<String> = row
+        .try_get("privacy_guardian_default_level")
+        .map_err(ProviderStoreError::Database)?;
+    let hardware_req_raw: Option<String> = row
+        .try_get("hardware_requirement")
         .map_err(ProviderStoreError::Database)?;
 
     let documentation_gate: serde_json::Value =
@@ -221,17 +305,34 @@ fn row_to_provider(row: &sqlx::sqlite::SqliteRow) -> Result<Provider, ProviderSt
             serde_json::Value::Object(serde_json::Map::new())
         });
 
+    let hardware_requirement = hardware_req_raw.and_then(|raw| {
+        serde_json::from_str(&raw)
+            .map_err(|e| {
+                log::warn!(
+                    "provider '{id}' hardware_requirement failed to parse as JSON, \
+                     dropping: {e}"
+                );
+            })
+            .ok()
+    });
+
+    let privacy_guardian_default_level = pg_level_raw
+        .as_deref()
+        .map(PrivacyGuardianDefaultLevel::from_str)
+        .transpose()?;
+
     Ok(Provider {
         id,
         display_name: row
             .try_get("display_name")
             .map_err(ProviderStoreError::Database)?,
-        tier: ProviderTier::from_i64(tier_raw)?,
+        provider_type: row
+            .try_get("provider_type")
+            .map_err(ProviderStoreError::Database)?,
         mode: ProviderMode::from_str(&mode_raw)?,
         launch_url: row
             .try_get("launch_url")
             .map_err(ProviderStoreError::Database)?,
-        login_required: login_required_raw != 0,
         activation_status: ActivationStatus::from_str(&activation_status_raw)?,
         documentation_gate,
         last_reviewed_at: row
@@ -243,12 +344,20 @@ fn row_to_provider(row: &sqlx::sqlite::SqliteRow) -> Result<Provider, ProviderSt
         created_at: row
             .try_get("created_at")
             .map_err(ProviderStoreError::Database)?,
+        is_local: is_local_raw != 0,
+        is_anonymous: is_anonymous_raw != 0,
+        retains_data: retains_data_raw != 0,
+        trains_on_data_by_default: trains_raw != 0,
+        login_required: login_required_raw != 0,
+        qr_internal_eligible: qr_internal_raw != 0,
+        privacy_guardian_default_level,
         risk_rating: {
             let raw: i64 = row
                 .try_get("risk_rating")
                 .map_err(ProviderStoreError::Database)?;
             raw as u8
         },
+        hardware_requirement,
     })
 }
 
@@ -282,15 +391,11 @@ fn classify_constraint_error(provider_id: &str, e: sqlx::Error) -> ProviderStore
 pub async fn get_provider(provider_id: &str) -> Result<Option<Provider>, ProviderStoreError> {
     let mut conn = open_shared_db().await?;
 
-    let row = sqlx::query(
-        "SELECT id, display_name, tier, mode, launch_url, login_required,
-                activation_status, documentation_gate, last_reviewed_at,
-                review_trigger_note, created_at, risk_rating
-         FROM tier3_providers WHERE id = ?",
-    )
-    .bind(provider_id)
-    .fetch_optional(&mut conn)
-    .await?;
+    let sql = format!("SELECT {SELECT_COLUMNS} FROM providers WHERE id = ?");
+    let row = sqlx::query(&sql)
+        .bind(provider_id)
+        .fetch_optional(&mut conn)
+        .await?;
 
     match row {
         None => Ok(None),
@@ -306,6 +411,9 @@ pub async fn get_provider(provider_id: &str) -> Result<Option<Provider>, Provide
 /// `provider_ids` is empty (no known destination yet -- callers should
 /// treat this the same as "no rating available", i.e. fall back to
 /// whatever conservative default they'd otherwise use).
+///
+/// items.id=427: repointed at providers -- signature and behavior
+/// otherwise unchanged, this is a live Privacy Guardian consumer.
 pub async fn max_risk_rating_for_providers(
     provider_ids: &[String],
 ) -> Result<Option<u8>, ProviderStoreError> {
@@ -324,9 +432,8 @@ pub async fn max_risk_rating_for_providers(
         .map(|_| "?")
         .collect::<Vec<_>>()
         .join(", ");
-    let sql = format!(
-        "SELECT MAX(risk_rating) as max_risk FROM tier3_providers WHERE id IN ({placeholders})"
-    );
+    let sql =
+        format!("SELECT MAX(risk_rating) as max_risk FROM providers WHERE id IN ({placeholders})");
 
     let mut query = sqlx::query(&sql);
     for id in provider_ids {
@@ -341,23 +448,20 @@ pub async fn max_risk_rating_for_providers(
 }
 
 /// The selector screen's primary read path (TIER3_ACCESS_MODEL.md State 3):
-/// all 'active' providers, ordered tier then display_name so a caller can
-/// split the result into the two selector boxes without a second query --
-/// tier ASC puts Tier 2 ("no login required") rows first, matching the
-/// spec's top-box/bottom-box ordering.
+/// all 'active' providers, ordered provider_type then display_name so a
+/// caller can group the result for display without a second query. No
+/// stability contract beyond "grouped and deterministic" -- provider_type
+/// replaces the old tier-based ordering (items.id=427: no tier column).
 pub async fn list_active_providers() -> Result<Vec<Provider>, ProviderStoreError> {
     let mut conn = open_shared_db().await?;
 
-    let rows = sqlx::query(
-        "SELECT id, display_name, tier, mode, launch_url, login_required,
-                activation_status, documentation_gate, last_reviewed_at,
-                review_trigger_note, created_at, risk_rating
-         FROM tier3_providers
+    let sql = format!(
+        "SELECT {SELECT_COLUMNS}
+         FROM providers
          WHERE activation_status = 'active'
-         ORDER BY tier ASC, display_name ASC",
-    )
-    .fetch_all(&mut conn)
-    .await?;
+         ORDER BY provider_type ASC, display_name ASC"
+    );
+    let rows = sqlx::query(&sql).fetch_all(&mut conn).await?;
 
     let mut providers = Vec::new();
     for r in rows {
@@ -372,15 +476,12 @@ pub async fn list_active_providers() -> Result<Vec<Provider>, ProviderStoreError
 pub async fn list_all_providers() -> Result<Vec<Provider>, ProviderStoreError> {
     let mut conn = open_shared_db().await?;
 
-    let rows = sqlx::query(
-        "SELECT id, display_name, tier, mode, launch_url, login_required,
-                activation_status, documentation_gate, last_reviewed_at,
-                review_trigger_note, created_at, risk_rating
-         FROM tier3_providers
-         ORDER BY tier ASC, display_name ASC",
-    )
-    .fetch_all(&mut conn)
-    .await?;
+    let sql = format!(
+        "SELECT {SELECT_COLUMNS}
+         FROM providers
+         ORDER BY provider_type ASC, display_name ASC"
+    );
+    let rows = sqlx::query(&sql).fetch_all(&mut conn).await?;
 
     let mut providers = Vec::new();
     for r in rows {
@@ -396,17 +497,8 @@ pub async fn list_all_providers() -> Result<Vec<Provider>, ProviderStoreError> {
 /// Create a new provider catalog row. Release-time/catalog-maintenance use
 /// only (see module header WRITE ACCESS note) -- not exposed via IPC.
 /// Returns Err(AlreadyExists) if provider_id already exists.
-#[allow(clippy::too_many_arguments)] // Explicit boundary matching the row shape; see focus_settings_store.rs's record_friction_gate_decision precedent.
-pub async fn create_provider(
-    provider_id: &str,
-    display_name: &str,
-    tier: ProviderTier,
-    mode: ProviderMode,
-    launch_url: Option<&str>,
-    login_required: bool,
-    documentation_gate: &serde_json::Value,
-) -> Result<Provider, ProviderStoreError> {
-    if mode == ProviderMode::EmbeddedWeb && launch_url.is_none() {
+pub async fn create_provider(new: NewProvider<'_>) -> Result<Provider, ProviderStoreError> {
+    if new.mode == ProviderMode::EmbeddedWeb && new.launch_url.is_none() {
         return Err(ProviderStoreError::Validation(
             "launch_url is required when mode='embedded_web' -- the pane has \
              nothing to point CEF at otherwise."
@@ -415,45 +507,68 @@ pub async fn create_provider(
     }
 
     let created_at = crate::providers::utils::now();
-    let doc_gate_str = serde_json::to_string(documentation_gate).map_err(|e| {
+    let doc_gate_str = serde_json::to_string(new.documentation_gate).map_err(|e| {
         ProviderStoreError::Validation(format!("documentation_gate not valid JSON: {e}"))
     })?;
+    let hardware_req_str = new
+        .hardware_requirement
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| {
+            ProviderStoreError::Validation(format!("hardware_requirement not valid JSON: {e}"))
+        })?;
     let mut conn = open_shared_db().await?;
 
     sqlx::query(
-        "INSERT INTO tier3_providers
-         (id, display_name, tier, mode, launch_url, login_required,
+        "INSERT INTO providers
+         (id, display_name, provider_type, mode, launch_url, login_required,
           activation_status, documentation_gate, last_reviewed_at,
-          review_trigger_note, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'active', ?, NULL, NULL, ?)",
+          review_trigger_note, created_at, is_local, is_anonymous,
+          retains_data, trains_on_data_by_default, qr_internal_eligible,
+          privacy_guardian_default_level, risk_rating, hardware_requirement)
+         VALUES (?, ?, ?, ?, ?, ?, 'active', ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
-    .bind(provider_id)
-    .bind(display_name)
-    .bind(tier.as_i64())
-    .bind(mode.as_str())
-    .bind(launch_url)
-    .bind(login_required as i64)
+    .bind(new.id)
+    .bind(new.display_name)
+    .bind(new.provider_type)
+    .bind(new.mode.as_str())
+    .bind(new.launch_url)
+    .bind(new.login_required as i64)
     .bind(&doc_gate_str)
     .bind(&created_at)
+    .bind(new.is_local as i64)
+    .bind(new.is_anonymous as i64)
+    .bind(new.retains_data as i64)
+    .bind(new.trains_on_data_by_default as i64)
+    .bind(new.qr_internal_eligible as i64)
+    .bind(new.privacy_guardian_default_level.map(|l| l.as_str()))
+    .bind(new.risk_rating as i64)
+    .bind(&hardware_req_str)
     .execute(&mut conn)
     .await
-    .map_err(|e| classify_constraint_error(provider_id, e))?;
+    .map_err(|e| classify_constraint_error(new.id, e))?;
 
     Ok(Provider {
-        id: provider_id.to_owned(),
-        display_name: display_name.to_owned(),
-        tier,
-        mode,
-        launch_url: launch_url.map(|s| s.to_owned()),
-        login_required,
+        id: new.id.to_owned(),
+        display_name: new.display_name.to_owned(),
+        provider_type: new.provider_type.to_owned(),
+        mode: new.mode,
+        launch_url: new.launch_url.map(|s| s.to_owned()),
         activation_status: ActivationStatus::Active,
-        documentation_gate: documentation_gate.clone(),
+        documentation_gate: new.documentation_gate.clone(),
         last_reviewed_at: None,
         review_trigger_note: None,
         created_at,
-        // Not specified in the INSERT above -- picks up shared_012.sql's
-        // column DEFAULT (3/High), the fail-safe for an unrated new row.
-        risk_rating: 3,
+        is_local: new.is_local,
+        is_anonymous: new.is_anonymous,
+        retains_data: new.retains_data,
+        trains_on_data_by_default: new.trains_on_data_by_default,
+        login_required: new.login_required,
+        qr_internal_eligible: new.qr_internal_eligible,
+        privacy_guardian_default_level: new.privacy_guardian_default_level,
+        risk_rating: new.risk_rating,
+        hardware_requirement: new.hardware_requirement,
     })
 }
 
@@ -467,7 +582,7 @@ pub async fn set_activation_status(
 ) -> Result<(), ProviderStoreError> {
     let mut conn = open_shared_db().await?;
 
-    let result = sqlx::query("UPDATE tier3_providers SET activation_status = ? WHERE id = ?")
+    let result = sqlx::query("UPDATE providers SET activation_status = ? WHERE id = ?")
         .bind(status.as_str())
         .bind(provider_id)
         .execute(&mut conn)
@@ -504,7 +619,7 @@ pub async fn record_review(
     let mut conn = open_shared_db().await?;
 
     let result = sqlx::query(
-        "UPDATE tier3_providers
+        "UPDATE providers
          SET last_reviewed_at = ?, review_trigger_note = ?
          WHERE id = ?",
     )
@@ -535,7 +650,7 @@ pub async fn update_documentation_gate(
     })?;
     let mut conn = open_shared_db().await?;
 
-    let result = sqlx::query("UPDATE tier3_providers SET documentation_gate = ? WHERE id = ?")
+    let result = sqlx::query("UPDATE providers SET documentation_gate = ? WHERE id = ?")
         .bind(&doc_gate_str)
         .bind(provider_id)
         .execute(&mut conn)
@@ -545,4 +660,138 @@ pub async fn update_documentation_gate(
         return Err(ProviderStoreError::NotFound(provider_id.to_owned()));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mirrors migrations.rs's own make_test_conn (private to that module's
+    /// test mod, so not reusable directly) -- same in-memory, unencrypted
+    /// connection shape.
+    async fn make_test_conn() -> SqliteConnection {
+        SqliteConnectOptions::new()
+            .filename(":memory:")
+            .connect()
+            .await
+            .expect("in-memory connection failed")
+    }
+
+    /// items.id=427: asserts shared_013.sql's migration of tier3_providers'
+    /// 4 real rows into providers actually preserves the live-consumer-
+    /// critical values (risk_rating, login_required) and the new
+    /// provider_type derivation -- not just eyeballed against the SQL.
+    #[tokio::test]
+    async fn migrated_providers_preserve_risk_rating_and_login_required() {
+        let mut conn = make_test_conn().await;
+        crate::persistence::migrations::run_migrations(&mut conn, "shared", None)
+            .await
+            .expect("run shared migrations");
+
+        let duckai = get_provider_via_conn(&mut conn, "duckai").await;
+        assert_eq!(duckai.risk_rating, 1);
+        assert!(!duckai.login_required);
+        assert_eq!(duckai.provider_type, "split_screen_web");
+        assert!(duckai.is_anonymous);
+        assert!(!duckai.retains_data);
+        assert!(!duckai.trains_on_data_by_default);
+
+        for id in ["claude", "chatgpt", "gemini"] {
+            let p = get_provider_via_conn(&mut conn, id).await;
+            assert_eq!(p.risk_rating, 3, "{id} must keep its High risk rating");
+            assert!(p.login_required, "{id} must keep login_required=1");
+            assert_eq!(p.provider_type, "external_service");
+            assert!(!p.is_anonymous);
+            assert!(
+                p.retains_data,
+                "{id} retains data per its documentation_gate"
+            );
+            assert!(
+                p.trains_on_data_by_default,
+                "{id} trains on data by default per its documentation_gate"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tier3_providers_table_no_longer_exists_after_migration() {
+        let mut conn = make_test_conn().await;
+        crate::persistence::migrations::run_migrations(&mut conn, "shared", None)
+            .await
+            .expect("run shared migrations");
+
+        let exists: Option<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='tier3_providers'",
+        )
+        .fetch_optional(&mut conn)
+        .await
+        .unwrap();
+        assert!(
+            exists.is_none(),
+            "tier3_providers must be dropped once generalized into providers"
+        );
+    }
+
+    async fn get_provider_via_conn(conn: &mut SqliteConnection, id: &str) -> Provider {
+        let sql = format!("SELECT {SELECT_COLUMNS} FROM providers WHERE id = ?");
+        let row = sqlx::query(&sql)
+            .bind(id)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap_or_else(|e| panic!("provider '{id}' must exist after migration: {e}"));
+        row_to_provider(&row).unwrap_or_else(|e| panic!("provider '{id}' row shape: {e}"))
+    }
+
+    /// Exercises the real public API (list_active_providers,
+    /// max_risk_rating_for_providers) against a real on-disk shared.db under
+    /// a tempdir-backed QR_DATA_ROOT -- not just the migration SQL directly
+    /// (the two tests above). This is the live Privacy Guardian consumer's
+    /// actual call path. Pattern matches migrations.rs's own
+    /// QR_DATA_ROOT-mutating tests (ENV_MUTEX serialization, save/restore).
+    #[tokio::test]
+    async fn list_active_providers_and_max_risk_rating_via_public_api() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let result = crate::persistence::migrations::migrate_shared_db().await;
+
+        let outcome = async {
+            let providers = list_active_providers().await?;
+            let ids: Vec<&str> = providers.iter().map(|p| p.id.as_str()).collect();
+            assert!(ids.contains(&"duckai"));
+            assert!(ids.contains(&"claude"));
+            assert!(ids.contains(&"chatgpt"));
+            assert!(ids.contains(&"gemini"));
+
+            let max_risk =
+                max_risk_rating_for_providers(&["duckai".to_string(), "claude".to_string()])
+                    .await?;
+            assert_eq!(
+                max_risk,
+                Some(3),
+                "MAX across a Low(duckai)+High(claude) selection must be High"
+            );
+
+            let max_risk_low_only = max_risk_rating_for_providers(&["duckai".to_string()]).await?;
+            assert_eq!(max_risk_low_only, Some(1));
+
+            Ok::<(), ProviderStoreError>(())
+        }
+        .await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+
+        result.expect("migrate_shared_db must succeed");
+        outcome.expect("public API assertions must pass");
+    }
 }

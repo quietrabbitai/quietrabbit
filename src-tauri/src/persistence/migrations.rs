@@ -245,6 +245,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/shared_012.sql"),
     },
     SchemaFile {
+        prefix: "shared",
+        version: 13,
+        sql: include_str!("../../schema/shared_013.sql"),
+    },
+    SchemaFile {
         prefix: "tier3_cookies",
         version: 1,
         sql: include_str!("../../schema/tier3_cookies_001.sql"),
@@ -1280,15 +1285,15 @@ mod tests {
             .await
             .expect("shared migration chain must apply cleanly on a fresh db");
         assert_eq!(
-            applied, 12,
-            "expected all twelve shared schema versions to apply"
+            applied, 13,
+            "expected all thirteen shared schema versions to apply"
         );
 
         let version: (i64,) = sqlx::query_as("SELECT MAX(version) FROM schema_version")
             .fetch_one(&mut conn)
             .await
             .unwrap();
-        assert_eq!(version.0, 12);
+        assert_eq!(version.0, 13);
     }
 
     #[tokio::test]
@@ -1359,29 +1364,45 @@ mod tests {
             .expect("drift-healing run must succeed");
 
         assert_eq!(
-            applied, 11,
-            "shared v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, and v12 should count as newly applied from a stale v1 database"
+            applied, 12,
+            "shared v2 through v13 should count as newly applied from a stale v1 database"
         );
 
-        let exists: Option<(String,)> = sqlx::query_as(
+        // items.id=427: shared_013.sql drops tier3_providers (generalized
+        // into providers) -- a stale v1 database heals straight through to
+        // the current providers shape, never stopping at the retired table.
+        let old_table: Option<(String,)> = sqlx::query_as(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='tier3_providers'",
         )
         .fetch_optional(&mut conn)
         .await
         .unwrap();
         assert!(
+            old_table.is_none(),
+            "tier3_providers must not survive healing past shared_013.sql -- it's generalized \
+             into providers, not left dangling as a second source of truth"
+        );
+
+        let exists: Option<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='providers'",
+        )
+        .fetch_optional(&mut conn)
+        .await
+        .unwrap();
+        assert!(
             exists.is_some(),
-            "tier3_providers must be healed into a database stale at schema_version=1, \
+            "providers must be healed into a database stale at schema_version=1, \
              without requiring the database to be deleted and recreated"
         );
 
-        let seeded: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM tier3_providers")
+        let seeded: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM providers")
             .fetch_one(&mut conn)
             .await
             .unwrap();
         assert!(
             seeded.0 > 0,
-            "shared_001.sql's seeded provider rows must also be healed in"
+            "shared_001.sql's seeded provider rows, migrated into providers by shared_013.sql, \
+             must also be healed in"
         );
     }
 

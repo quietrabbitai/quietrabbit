@@ -23,4 +23,5 @@ pub mod provider_store;
 pub mod source_registry_store;
 pub mod tier3_cookie_store;
 pub mod topic_store;
+pub mod user_provider_preference_store;
 pub mod view_cache_store;

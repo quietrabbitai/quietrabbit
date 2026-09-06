@@ -72,7 +72,7 @@ use tauri::State;
 use tokio::sync::oneshot;
 
 use crate::auth::registry::{key_hex, KeyRegistry};
-use crate::persistence::provider_store::{self, ProviderTier};
+use crate::persistence::provider_store;
 use crate::persistence::tier3_cookie_store::{self, StoredCookie};
 use crate::tier3_pane::pane_host::{self, PaneCommand};
 use crate::tier3_pane::PaneKey;
@@ -91,10 +91,20 @@ const COOKIE_OP_TIMEOUT: Duration = Duration::from_millis(500);
 // IPC types
 // ---------------------------------------------------------------------------
 
-/// Selector-screen-facing provider summary. `lane` mirrors
-/// `provider_store::ProviderTier`'s own serde rendering ("tier2"/"tier3")
-/// and the frontend's `ProviderLane` string type (tier3AccessConfig.ts)
-/// verbatim -- no further transformation needed on the TypeScript side.
+/// Selector-screen-facing provider summary. `lane` matches the frontend's
+/// `ProviderLane` string type (tier3AccessConfig.ts) verbatim -- no further
+/// transformation needed on the TypeScript side.
+///
+/// items.id=427: providers has no tier column any more (Part 1's core
+/// rule -- tier is a display label only, never stored). `lane` is now
+/// derived here, at the display layer, from `provider_type` instead --
+/// exactly the pattern the spec permits ("tier labels computed only at the
+/// display layer"). Output is byte-identical to the old tier-based
+/// derivation for the 4 known providers; a future provider_type this match
+/// doesn't recognize falls back to the raw provider_type string, which
+/// won't satisfy the frontend's closed `'tier2' | 'tier3'` type -- that's
+/// Part 3c/5a's problem to solve when a new lane is actually needed, not
+/// this one.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, specta::Type)]
 pub struct Tier3ProviderSummary {
     pub id: String,
@@ -102,10 +112,11 @@ pub struct Tier3ProviderSummary {
     pub lane: String,
 }
 
-fn lane_str(tier: ProviderTier) -> &'static str {
-    match tier {
-        ProviderTier::Tier2 => "tier2",
-        ProviderTier::Tier3 => "tier3",
+fn lane_str(provider_type: &str) -> &str {
+    match provider_type {
+        "split_screen_web" => "tier2",
+        "external_service" => "tier3",
+        other => other,
     }
 }
 
@@ -230,11 +241,10 @@ pub struct PopupClosedPayload {
 //
 // same_site/priority: cef_cookie_same_site_t/cef_cookie_priority_t have no
 // From<i32> in the vendored cef crate (confirmed) -- explicit match here,
-// same defensive-conversion shape as provider_store.rs's
-// ProviderTier::from_i64 (unrecognized value falls back to a documented
-// safe default rather than panicking; a stored value should never be
-// out of range, since it can only have come from get_raw() below, but a
-// future schema/crate-version drift should degrade, not crash).
+// falling back to a documented safe default rather than panicking; a
+// stored value should never be out of range, since it can only have come
+// from get_raw() below, but a future schema/crate-version drift should
+// degrade, not crash.
 
 fn same_site_from_i32(v: i32) -> CookieSameSite {
     match v {
@@ -506,7 +516,7 @@ pub async fn list_active_providers() -> Result<Vec<Tier3ProviderSummary>, String
         .map(|p| Tier3ProviderSummary {
             id: p.id,
             display_name: p.display_name,
-            lane: lane_str(p.tier).to_string(),
+            lane: lane_str(&p.provider_type).to_string(),
         })
         .collect())
 }

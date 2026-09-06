@@ -1277,10 +1277,20 @@ export type Tier2Config = {
 };
 
 /**
- *  Selector-screen-facing provider summary. `lane` mirrors
- *  `provider_store::ProviderTier`'s own serde rendering ("tier2"/"tier3")
- *  and the frontend's `ProviderLane` string type (tier3AccessConfig.ts)
- *  verbatim -- no further transformation needed on the TypeScript side.
+ *  Selector-screen-facing provider summary. `lane` matches the frontend's
+ *  `ProviderLane` string type (tier3AccessConfig.ts) verbatim -- no further
+ *  transformation needed on the TypeScript side.
+ * 
+ *  items.id=427: providers has no tier column any more (Part 1's core
+ *  rule -- tier is a display label only, never stored). `lane` is now
+ *  derived here, at the display layer, from `provider_type` instead --
+ *  exactly the pattern the spec permits ("tier labels computed only at the
+ *  display layer"). Output is byte-identical to the old tier-based
+ *  derivation for the 4 known providers; a future provider_type this match
+ *  doesn't recognize falls back to the raw provider_type string, which
+ *  won't satisfy the frontend's closed `'tier2' | 'tier3'` type -- that's
+ *  Part 3c/5a's problem to solve when a new lane is actually needed, not
+ *  this one.
  */
 export type Tier3ProviderSummary = {
 	id: string,
