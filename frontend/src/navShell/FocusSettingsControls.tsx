@@ -14,20 +14,32 @@
 // PrivacyGuardianModal.tsx uses for ConsentRequestPayload (see that file's
 // header comment). Keep in sync by hand with commands/persona.rs's
 // FrictionGateDetail.
+//
+// items.id=448: max_permitted_tier fields (here and throughout this file)
+// retyped from a 1/2/3 ordinal to the 4-value ExternalAccess enum
+// (local_only/anonymous_required/anonymous_preferred/unrestricted),
+// matching commands/persona.rs's live retype. privacy_tier fields are
+// untouched (still i32/number) -- items.id=446's separate, still-deferred
+// territory, confirmed against live source this session.
 
 import { useCallback, useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { commands, type FocusInfo, type UpdateFocusSettingsRequest } from '../bindings'
+import {
+  commands,
+  type ExternalAccess,
+  type FocusInfo,
+  type UpdateFocusSettingsRequest,
+} from '../bindings'
 
 export interface FrictionGateDetail {
   persona_id: string
   focus_id: string
   requested_privacy_tier: number | null
   requested_focus_profile: string | null
-  requested_max_permitted_tier: number | null
+  requested_max_permitted_tier: ExternalAccess | null
   existing_privacy_tier: number
   existing_focus_profile: string
-  existing_max_permitted_tier: number
+  existing_max_permitted_tier: ExternalAccess
   privacy_would_loosen: boolean
   moves_to_protected: boolean
   max_permitted_tier_would_loosen: boolean
@@ -51,7 +63,38 @@ function parseFrictionGateDetail(errorText: string): FrictionGateDetail | null {
   return null
 }
 
-const TIER_VALUES = [1, 2, 3] as const
+// privacy_tier is untouched by items.id=448 -- still a plain 1/2/3 ordinal,
+// feeding only the privacy-tier select below.
+const PRIVACY_TIER_VALUES = [1, 2, 3] as const
+
+// items.id=448: max_permitted_tier's 4 ExternalAccess values, replacing the
+// old shared TIER_VALUES=[1,2,3] this select used to reuse from the
+// privacy-tier list. anonymous_preferred is a genuinely new option with no
+// legacy 1/2/3 slot (PROVIDER_REGISTRY_AND_TIER_MODEL_SPEC.md Part 6b).
+const MAX_PERMITTED_TIER_VALUES: ExternalAccess[] = [
+  'local_only',
+  'anonymous_required',
+  'anonymous_preferred',
+  'unrestricted',
+]
+
+// items.id=448: plain-language labels, not "anonymous"/"external" (backend
+// vocabulary) -- mirrors the plain-language pattern already shipped on
+// tier3Selector's own badges ("No login required" / "Account required,
+// data retained"). Decided live with Jason this session; see this draft's
+// own "Vocabulary decisions" section for the full reasoning trail.
+function maxPermittedTierLabelKey(value: ExternalAccess): string {
+  switch (value) {
+    case 'local_only':
+      return 'navShell.focusSettings.maxPermittedTierLocalOnlyLabel'
+    case 'anonymous_required':
+      return 'navShell.focusSettings.maxPermittedTierAnonymousRequiredLabel'
+    case 'anonymous_preferred':
+      return 'navShell.focusSettings.maxPermittedTierAnonymousPreferredLabel'
+    case 'unrestricted':
+      return 'navShell.focusSettings.maxPermittedTierUnrestrictedLabel'
+  }
+}
 
 export type FocusSettingsControlsMode = 'full' | 'ceilingOnly'
 
@@ -67,8 +110,11 @@ export interface FocusSettingsControlsProps {
    *  privacy_tier. */
   mode: FocusSettingsControlsMode
   /** ceilingOnly only: prefills the select, e.g. from Gate3Result's own
-   *  target_tier on the block that mounted this control. */
-  suggestedMaxPermittedTier?: number
+   *  target_tier on the block that mounted this control, converted to its
+   *  ExternalAccess equivalent by the caller (items.id=448 -- target_tier
+   *  itself stays a plain number; see Tier3AccessPane.tsx's own
+   *  externalAccessFromLegacyTier helper). */
+  suggestedMaxPermittedTier?: ExternalAccess
   /** Fires after a save applies cleanly, whether directly or via the
    *  friction-gate's "proceed" resolution -- callers use this to retry
    *  whatever action the old settings had blocked. */
@@ -86,7 +132,13 @@ export function FocusSettingsControls({
   const { t } = useTranslation()
   const [settings, setSettings] = useState<FocusInfo | null>(null)
   const [draftPrivacyTier, setDraftPrivacyTier] = useState(2)
-  const [draftMaxPermittedTier, setDraftMaxPermittedTier] = useState(2)
+  // items.id=448: default 'anonymous_required' -- the practical equivalent
+  // of the old numeric default (2), via ExternalAccess::from_legacy_tier's
+  // own 2->AnonymousRequired mapping. Overwritten immediately once real
+  // settings load (see the effect below), same as the old numeric default
+  // was.
+  const [draftMaxPermittedTier, setDraftMaxPermittedTier] =
+    useState<ExternalAccess>('anonymous_required')
   const [loadError, setLoadError] = useState<string | null>(null)
   const [saveError, setSaveError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
@@ -199,7 +251,7 @@ export function FocusSettingsControls({
             value={draftPrivacyTier}
             onChange={(event) => setDraftPrivacyTier(Number(event.target.value))}
           >
-            {TIER_VALUES.map((tier) => (
+            {PRIVACY_TIER_VALUES.map((tier) => (
               <option key={tier} value={tier}>
                 {t(`navShell.focusSettings.tier${tier}Label`)}
               </option>
@@ -215,11 +267,11 @@ export function FocusSettingsControls({
         <select
           id={maxPermittedTierId}
           value={draftMaxPermittedTier}
-          onChange={(event) => setDraftMaxPermittedTier(Number(event.target.value))}
+          onChange={(event) => setDraftMaxPermittedTier(event.target.value as ExternalAccess)}
         >
-          {TIER_VALUES.map((tier) => (
+          {MAX_PERMITTED_TIER_VALUES.map((tier) => (
             <option key={tier} value={tier}>
-              {t(`navShell.focusSettings.tier${tier}Label`)}
+              {t(maxPermittedTierLabelKey(tier))}
             </option>
           ))}
         </select>
@@ -251,8 +303,13 @@ export function FocusSettingsControls({
             {pendingGate.max_permitted_tier_would_loosen && (
               <li>
                 {t('navShell.focusSettings.gateConfirmMaxPermittedTier', {
-                  from: pendingGate.existing_max_permitted_tier,
-                  to: pendingGate.requested_max_permitted_tier,
+                  from: t(maxPermittedTierLabelKey(pendingGate.existing_max_permitted_tier)),
+                  to: t(
+                    maxPermittedTierLabelKey(
+                      pendingGate.requested_max_permitted_tier ??
+                        pendingGate.existing_max_permitted_tier,
+                    ),
+                  ),
                 })}
               </li>
             )}

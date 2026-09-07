@@ -51,7 +51,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { commands, type ChatInfo, type PaneRectFraction, type PersonaInfo } from '../bindings'
+import { commands, type ChatInfo, type ExternalAccess, type PaneRectFraction, type PersonaInfo } from '../bindings'
 import { ChatPane } from '../chat/ChatPane'
 import { ChatHistoryList } from '../chat/ChatHistoryList'
 import { NewChatPersonaPicker } from '../chat/NewChatPersonaPicker'
@@ -157,6 +157,29 @@ export interface Tier3AccessPaneProps {
    *  WorkspaceShell clears it and the effect doesn't refire. */
   pendingChatSelection?: ChatInfo | null
   onPendingChatSelectionConsumed?: () => void
+}
+
+// items.id=448: Gate3ReviewResult.target_tier deliberately stays a plain
+// number (genuinely dual-purpose in gate3.rs -- also feeds
+// destination_risk_rating's fallback, an unrelated risk-rating axis; see
+// this draft's own "Flag for Chat-PM" section for the forward-looking
+// concern this raises). This mirrors Rust's own
+// ExternalAccess::from_legacy_tier mapping (conductor/tokens.rs) so the
+// inline "raise it now" affordance can prefill its select with a real
+// ExternalAccess value from that legacy number. Can never produce
+// anonymous_preferred (no legacy slot maps to it) -- acceptable here since
+// this is only a suggested starting value the user can still change.
+function externalAccessFromLegacyTier(tier: number): ExternalAccess {
+  switch (tier) {
+    case 1:
+      return 'local_only'
+    case 2:
+      return 'anonymous_required'
+    case 3:
+      return 'unrestricted'
+    default:
+      return 'unrestricted'
+  }
 }
 
 export function Tier3AccessPane({
@@ -338,7 +361,7 @@ export function Tier3AccessPane({
   // "[Change Focus settings]" bracket text.
   const [reviewCeiling, setReviewCeiling] = useState<{
     targetTier: number
-    current: number
+    current: ExternalAccess
   } | null>(null)
   const [consentPayload, setConsentPayload] = useState<ConsentRequestPayload | null>(null)
   // ConsentRequestPayload carries focus_run_id, not message_id -- gate3()
@@ -1279,7 +1302,7 @@ export function Tier3AccessPane({
           personaId={personaId}
           focusId="quick-ask"
           mode="ceilingOnly"
-          suggestedMaxPermittedTier={reviewCeiling.targetTier}
+          suggestedMaxPermittedTier={externalAccessFromLegacyTier(reviewCeiling.targetTier)}
           onSaved={() => {
             setReviewCeiling(null)
             if (pendingMessageId) handleDraftReady(pendingMessageId)
