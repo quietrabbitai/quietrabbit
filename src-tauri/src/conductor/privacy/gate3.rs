@@ -1097,4 +1097,657 @@ mod tests {
     fn suggestion_unknown_category_is_none() {
         assert_eq!(generalization_suggestion("private_ssn"), None);
     }
+
+    // -- partition_by_prior_decision (items.id=442) ---------------------------
+    // Integration-style tests against a real SQLCipher fixture DB (tempdir +
+    // QR_DATA_ROOT, same pattern output_store.rs/personal_store.rs already
+    // use). partition_by_prior_decision is called directly with a plain
+    // Vec<PfEntityDecoded> -- it bypasses PF/AppHandle entirely, so none of
+    // the PF-in-CI harness (items.id=451, deferred) is needed here.
+
+    use crate::conductor::privacy::logger::TestLogger;
+
+    const TEST_KEY_HEX: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+
+    fn entity_with(label: &str, span_text: &str) -> PfEntityDecoded {
+        PfEntityDecoded {
+            start_byte: 0,
+            end_byte: span_text.len(),
+            score: 0.95,
+            label: label.to_owned(),
+            span_text: span_text.to_owned(),
+        }
+    }
+
+    /// Only valid for Layer-1-hashable categories (private_email,
+    /// private_phone, ...) -- see fact_identity.rs. Every fixture entity in
+    /// this test group uses one of those, so fact_key is fully deterministic
+    /// and never touches Layer 3 (entity_facts).
+    fn expected_fact_key(category: &str, span_text: &str) -> String {
+        let canonical = fact_identity::canonicalize_fact(category, span_text)
+            .expect("test fixtures use Layer-1-hashable categories only");
+        fact_identity::fact_hash(category, &canonical)
+    }
+
+    #[tokio::test]
+    async fn standing_preference_wins_over_conversation_scoped_decision() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "partition-case1-user";
+        let persona_id = "partition-case1-persona";
+        let focus_run_id = "run-partition-case1";
+        let span_text = "case1@example.com";
+        let fact_key = expected_fact_key("private_email", span_text);
+
+        crate::persistence::output_store::test_seed_focus_run(
+            user_id,
+            persona_id,
+            TEST_KEY_HEX,
+            focus_run_id,
+            "quick-ask",
+        )
+        .await
+        .expect("seed focus_run must succeed");
+
+        // Standing preference: generalize. Conversation-scoped: keep_private
+        // -- deliberately opposite decisions, so whichever wins is provable
+        // from early_result (approved vs blocked) alone.
+        crate::persistence::personal_store::write_standing_preference(
+            user_id,
+            persona_id,
+            TEST_KEY_HEX,
+            &fact_key,
+            "private_email",
+            "generalize",
+            Some("[email address]"),
+            None,
+        )
+        .await
+        .expect("write_standing_preference must succeed");
+
+        crate::persistence::output_store::write_auto_reapplied_consent_decision(
+            user_id,
+            persona_id,
+            TEST_KEY_HEX,
+            focus_run_id,
+            "keep_private",
+            None,
+            None,
+            "private_email",
+            &fact_key,
+            span_text,
+        )
+        .await
+        .expect("write_auto_reapplied_consent_decision must succeed");
+
+        let logger = TestLogger::new();
+        let outcome = partition_by_prior_decision(
+            &logger,
+            user_id,
+            persona_id,
+            TEST_KEY_HEX,
+            "step-1",
+            focus_run_id,
+            1,
+            vec![entity_with("private_email", span_text)],
+        )
+        .await
+        .expect("partition_by_prior_decision must succeed");
+
+        assert!(outcome.needs_review.is_empty());
+        let result = outcome
+            .early_result
+            .expect("all entities were auto-resolved");
+        assert!(
+            result.approved,
+            "standing preference's 'generalize' must win over the conversation-scoped 'keep_private'"
+        );
+        assert!(!result.blocked);
+
+        assert_eq!(logger.entry_count(), 1);
+        let entries = logger.entries();
+        assert_eq!(entries[0].event_type, "gate3_fact_reapplied");
+        assert_eq!(entries[0].category.as_deref(), Some("private_email"));
+        assert_eq!(entries[0].fact_key.as_deref(), Some(fact_key.as_str()));
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    #[tokio::test]
+    async fn only_conversation_scoped_decision_is_also_reapplied() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "partition-case2-user";
+        let persona_id = "partition-case2-persona";
+        let focus_run_id = "run-partition-case2";
+        let span_text = "case2@example.com";
+        let fact_key = expected_fact_key("private_email", span_text);
+
+        crate::persistence::output_store::test_seed_focus_run(
+            user_id,
+            persona_id,
+            TEST_KEY_HEX,
+            focus_run_id,
+            "quick-ask",
+        )
+        .await
+        .expect("seed focus_run must succeed");
+
+        // No standing preference -- only a conversation-scoped decision.
+        crate::persistence::output_store::write_auto_reapplied_consent_decision(
+            user_id,
+            persona_id,
+            TEST_KEY_HEX,
+            focus_run_id,
+            "keep_private",
+            None,
+            None,
+            "private_email",
+            &fact_key,
+            span_text,
+        )
+        .await
+        .expect("write_auto_reapplied_consent_decision must succeed");
+
+        let logger = TestLogger::new();
+        let outcome = partition_by_prior_decision(
+            &logger,
+            user_id,
+            persona_id,
+            TEST_KEY_HEX,
+            "step-1",
+            focus_run_id,
+            1,
+            vec![entity_with("private_email", span_text)],
+        )
+        .await
+        .expect("partition_by_prior_decision must succeed");
+
+        assert!(outcome.needs_review.is_empty());
+        let result = outcome
+            .early_result
+            .expect("all entities were auto-resolved");
+        assert!(result.blocked, "keep_private must reapply as blocked");
+        assert!(result.plain_language.is_some());
+        assert!(!result.approved);
+
+        assert_eq!(logger.entry_count(), 1);
+        assert_eq!(logger.entries()[0].event_type, "gate3_fact_reapplied");
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    #[tokio::test]
+    async fn neither_exists_routes_to_needs_review_and_records_fact_mention() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "partition-case3-user";
+        let persona_id = "partition-case3-persona";
+        let focus_run_id = "run-partition-case3";
+        let span_text = "case3@example.com";
+        let fact_key = expected_fact_key("private_email", span_text);
+
+        crate::persistence::output_store::test_seed_focus_run(
+            user_id,
+            persona_id,
+            TEST_KEY_HEX,
+            focus_run_id,
+            "quick-ask",
+        )
+        .await
+        .expect("seed focus_run must succeed");
+
+        let logger = TestLogger::new();
+        let outcome = partition_by_prior_decision(
+            &logger,
+            user_id,
+            persona_id,
+            TEST_KEY_HEX,
+            "step-1",
+            focus_run_id,
+            1,
+            vec![entity_with("private_email", span_text)],
+        )
+        .await
+        .expect("partition_by_prior_decision must succeed");
+
+        assert!(outcome.early_result.is_none());
+        assert_eq!(outcome.needs_review.len(), 1);
+        let (returned_entity, returned_fact_key) = &outcome.needs_review[0];
+        assert_eq!(returned_entity.label, "private_email");
+        assert_eq!(returned_entity.span_text, span_text);
+        assert_eq!(returned_fact_key.as_deref(), Some(fact_key.as_str()));
+        assert_eq!(logger.entry_count(), 0);
+
+        let mut conn =
+            crate::persistence::output_store::open_outputs_db(user_id, persona_id, TEST_KEY_HEX)
+                .await
+                .expect("open_outputs_db must succeed");
+        let row: (String, String) = sqlx::query_as(
+            "SELECT category, original_text FROM pf_fact_mentions \
+             WHERE focus_run_id = ? AND fact_key = ?",
+        )
+        .bind(focus_run_id)
+        .bind(&fact_key)
+        .fetch_one(&mut conn)
+        .await
+        .expect("pf_fact_mentions row must exist");
+        assert_eq!(row.0, "private_email");
+        assert_eq!(row.1, span_text);
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    #[tokio::test]
+    async fn all_auto_resolved_and_all_keep_private_blocks_early() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "partition-case4-user";
+        let persona_id = "partition-case4-persona";
+        let focus_run_id = "run-partition-case4";
+        let email_text = "case4@example.com";
+        let phone_text = "555-100-2000";
+        let email_key = expected_fact_key("private_email", email_text);
+        let phone_key = expected_fact_key("private_phone", phone_text);
+
+        crate::persistence::output_store::test_seed_focus_run(
+            user_id,
+            persona_id,
+            TEST_KEY_HEX,
+            focus_run_id,
+            "quick-ask",
+        )
+        .await
+        .expect("seed focus_run must succeed");
+
+        for (fact_key, category) in [(&email_key, "private_email"), (&phone_key, "private_phone")] {
+            crate::persistence::personal_store::write_standing_preference(
+                user_id,
+                persona_id,
+                TEST_KEY_HEX,
+                fact_key,
+                category,
+                "keep_private",
+                None,
+                None,
+            )
+            .await
+            .expect("write_standing_preference must succeed");
+        }
+
+        let logger = TestLogger::new();
+        let outcome = partition_by_prior_decision(
+            &logger,
+            user_id,
+            persona_id,
+            TEST_KEY_HEX,
+            "step-1",
+            focus_run_id,
+            1,
+            vec![
+                entity_with("private_email", email_text),
+                entity_with("private_phone", phone_text),
+            ],
+        )
+        .await
+        .expect("partition_by_prior_decision must succeed");
+
+        assert!(outcome.needs_review.is_empty());
+        let result = outcome
+            .early_result
+            .expect("all entities were auto-resolved");
+        assert!(result.blocked);
+        assert!(!result.approved);
+        assert_eq!(logger.entry_count(), 2);
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    #[tokio::test]
+    async fn all_auto_resolved_but_not_all_keep_private_approves_early() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "partition-case5-user";
+        let persona_id = "partition-case5-persona";
+        let focus_run_id = "run-partition-case5";
+        let email_text = "case5@example.com";
+        let phone_text = "555-100-3000";
+        let email_key = expected_fact_key("private_email", email_text);
+        let phone_key = expected_fact_key("private_phone", phone_text);
+
+        crate::persistence::output_store::test_seed_focus_run(
+            user_id,
+            persona_id,
+            TEST_KEY_HEX,
+            focus_run_id,
+            "quick-ask",
+        )
+        .await
+        .expect("seed focus_run must succeed");
+
+        crate::persistence::personal_store::write_standing_preference(
+            user_id,
+            persona_id,
+            TEST_KEY_HEX,
+            &email_key,
+            "private_email",
+            "keep_private",
+            None,
+            None,
+        )
+        .await
+        .expect("write_standing_preference must succeed");
+
+        crate::persistence::personal_store::write_standing_preference(
+            user_id,
+            persona_id,
+            TEST_KEY_HEX,
+            &phone_key,
+            "private_phone",
+            "generalize",
+            Some("[phone number]"),
+            None,
+        )
+        .await
+        .expect("write_standing_preference must succeed");
+
+        let logger = TestLogger::new();
+        let outcome = partition_by_prior_decision(
+            &logger,
+            user_id,
+            persona_id,
+            TEST_KEY_HEX,
+            "step-1",
+            focus_run_id,
+            1,
+            vec![
+                entity_with("private_email", email_text),
+                entity_with("private_phone", phone_text),
+            ],
+        )
+        .await
+        .expect("partition_by_prior_decision must succeed");
+
+        assert!(outcome.needs_review.is_empty());
+        let result = outcome
+            .early_result
+            .expect("all entities were auto-resolved");
+        assert!(
+            result.approved,
+            "a mixed auto-resolved batch (not all keep_private) must approve, not block"
+        );
+        assert!(!result.blocked);
+        assert_eq!(logger.entry_count(), 2);
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_resolved_and_unresolved_only_surfaces_the_unresolved_entity() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "partition-case6-user";
+        let persona_id = "partition-case6-persona";
+        let focus_run_id = "run-partition-case6";
+        let resolved_text = "case6-resolved@example.com";
+        let unresolved_text = "case6-unresolved@example.com";
+        let resolved_key = expected_fact_key("private_email", resolved_text);
+        let unresolved_key = expected_fact_key("private_email", unresolved_text);
+
+        crate::persistence::output_store::test_seed_focus_run(
+            user_id,
+            persona_id,
+            TEST_KEY_HEX,
+            focus_run_id,
+            "quick-ask",
+        )
+        .await
+        .expect("seed focus_run must succeed");
+
+        crate::persistence::personal_store::write_standing_preference(
+            user_id,
+            persona_id,
+            TEST_KEY_HEX,
+            &resolved_key,
+            "private_email",
+            "generalize",
+            Some("[email address]"),
+            None,
+        )
+        .await
+        .expect("write_standing_preference must succeed");
+
+        let logger = TestLogger::new();
+        let outcome = partition_by_prior_decision(
+            &logger,
+            user_id,
+            persona_id,
+            TEST_KEY_HEX,
+            "step-1",
+            focus_run_id,
+            1,
+            vec![
+                entity_with("private_email", resolved_text),
+                entity_with("private_email", unresolved_text),
+            ],
+        )
+        .await
+        .expect("partition_by_prior_decision must succeed");
+
+        assert!(outcome.early_result.is_none());
+        assert_eq!(outcome.needs_review.len(), 1);
+        let (returned_entity, returned_fact_key) = &outcome.needs_review[0];
+        assert_eq!(returned_entity.span_text, unresolved_text);
+        assert_eq!(returned_fact_key.as_deref(), Some(unresolved_key.as_str()));
+
+        assert_eq!(logger.entry_count(), 1);
+        assert_eq!(
+            logger.entries()[0].fact_key.as_deref(),
+            Some(resolved_key.as_str())
+        );
+
+        let mut conn =
+            crate::persistence::output_store::open_outputs_db(user_id, persona_id, TEST_KEY_HEX)
+                .await
+                .expect("open_outputs_db must succeed");
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM pf_fact_mentions WHERE focus_run_id = ?")
+                .bind(focus_run_id)
+                .fetch_one(&mut conn)
+                .await
+                .expect("count query must succeed");
+        assert_eq!(
+            count.0, 1,
+            "only the unresolved entity should get a pf_fact_mentions row"
+        );
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    #[tokio::test]
+    async fn partition_by_prior_decision_degrades_gracefully_when_standing_preference_query_fails()
+    {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "partition-case7a-user";
+        let persona_id = "partition-case7a-persona";
+        let focus_run_id = "run-partition-case7a";
+        let span_text = "case7a@example.com";
+
+        crate::persistence::output_store::test_seed_focus_run(
+            user_id,
+            persona_id,
+            TEST_KEY_HEX,
+            focus_run_id,
+            "quick-ask",
+        )
+        .await
+        .expect("seed focus_run must succeed");
+
+        // Force personal.db to exist in valid (migrated) form first, then
+        // corrupt it on disk -- the next open must fail with a genuine
+        // "file is not a database" error, exactly as real disk corruption
+        // would, without touching production code.
+        crate::persistence::personal_store::find_standing_preference(
+            user_id,
+            persona_id,
+            TEST_KEY_HEX,
+            "throwaway",
+        )
+        .await
+        .expect("initial query must self-heal-create personal.db");
+
+        let personal_db_path = crate::persistence::migrations::get_data_root()
+            .join("users")
+            .join(user_id)
+            .join("personas")
+            .join(persona_id)
+            .join("personal.db");
+        std::fs::write(&personal_db_path, b"not a valid sqlite file").expect("corrupt personal.db");
+
+        let logger = TestLogger::new();
+        let outcome = partition_by_prior_decision(
+            &logger,
+            user_id,
+            persona_id,
+            TEST_KEY_HEX,
+            "step-1",
+            focus_run_id,
+            1,
+            vec![entity_with("private_email", span_text)],
+        )
+        .await
+        .expect("a standing-preference query failure must not be fatal");
+
+        assert!(outcome.early_result.is_none());
+        assert_eq!(outcome.needs_review.len(), 1);
+        assert_eq!(logger.entry_count(), 0);
+
+        // outputs.db was never touched -- the personal.db failure must not
+        // cascade into losing the pf_fact_mentions bookkeeping write.
+        let mut conn =
+            crate::persistence::output_store::open_outputs_db(user_id, persona_id, TEST_KEY_HEX)
+                .await
+                .expect("open_outputs_db must succeed");
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM pf_fact_mentions WHERE focus_run_id = ?")
+                .bind(focus_run_id)
+                .fetch_one(&mut conn)
+                .await
+                .expect("count query must succeed");
+        assert_eq!(count.0, 1);
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    #[tokio::test]
+    async fn partition_by_prior_decision_degrades_gracefully_when_consent_decision_query_fails() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "partition-case7b-user";
+        let persona_id = "partition-case7b-persona";
+        let focus_run_id = "run-partition-case7b";
+        let span_text = "case7b@example.com";
+
+        crate::persistence::output_store::test_seed_focus_run(
+            user_id,
+            persona_id,
+            TEST_KEY_HEX,
+            focus_run_id,
+            "quick-ask",
+        )
+        .await
+        .expect("seed focus_run must succeed");
+
+        // Corrupt outputs.db on disk after it was validly created+migrated.
+        // No standing preference is seeded -- personal.db doesn't need to
+        // pre-exist, find_standing_preference self-heals it fresh and
+        // correctly returns Ok(None). This also exercises
+        // load_fact_mentions_for_run's own degradation at the top of the
+        // function and insert_fact_mention's best-effort failure, since both
+        // hit this same corrupted file.
+        let outputs_db_path = crate::persistence::migrations::get_data_root()
+            .join("users")
+            .join(user_id)
+            .join("personas")
+            .join(persona_id)
+            .join("outputs.db");
+        std::fs::write(&outputs_db_path, b"not a valid sqlite file").expect("corrupt outputs.db");
+
+        let logger = TestLogger::new();
+        let outcome = partition_by_prior_decision(
+            &logger,
+            user_id,
+            persona_id,
+            TEST_KEY_HEX,
+            "step-1",
+            focus_run_id,
+            1,
+            vec![entity_with("private_email", span_text)],
+        )
+        .await
+        .expect("a conversation-decision query failure must not be fatal");
+
+        assert!(outcome.early_result.is_none());
+        assert_eq!(outcome.needs_review.len(), 1);
+        assert_eq!(logger.entry_count(), 0);
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
 }
