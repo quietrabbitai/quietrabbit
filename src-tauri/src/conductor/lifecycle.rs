@@ -62,7 +62,7 @@
 // Rename chain (CLAUDE.md):
 //   PathDefinition -> FocusDefinition | PathRun -> FocusRun
 //   space_id -> life_id -> persona_id (D6-298)
-//   life_context -> persona_context (D6-323, token name; DB field name retained)
+//   life_context -> persona_context (D6-298/D6-323, token name and internal field — rename complete)
 //   focus_runs, focus_run_snapshots (SQL table identifiers)
 
 use std::collections::HashMap;

@@ -248,9 +248,9 @@ pub async fn load_personal_track(
         .set_voice_profile(profile)
         .map_err(|e| PersonalStoreError::Validation(e.to_string()))?;
 
-    // life_context is empty at INITIALIZE — legacy name retained per standing rule.
+    // persona_context is empty at INITIALIZE.
     track
-        .set_life_context(indexmap::IndexMap::new())
+        .set_persona_context(indexmap::IndexMap::new())
         .map_err(|e| PersonalStoreError::Validation(e.to_string()))?;
 
     Ok(track)

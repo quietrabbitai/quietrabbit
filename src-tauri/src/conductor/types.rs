@@ -226,7 +226,7 @@ pub struct PersonalTrack {
     /// =296), read-only after seal.
     group_facts: IndexMap<String, GroupFact>,
     voice_profile: IndexMap<String, String>,
-    life_context: IndexMap<String, String>, // legacy name — D6-323, do not rename
+    persona_context: IndexMap<String, String>,
     source_versions: IndexMap<String, String>,
     sealed: bool,
 }
@@ -238,7 +238,7 @@ impl PersonalTrack {
             entity_facts: IndexMap::new(),
             group_facts: IndexMap::new(),
             voice_profile: IndexMap::new(),
-            life_context: IndexMap::new(),
+            persona_context: IndexMap::new(),
             source_versions: IndexMap::new(),
             sealed: false,
         }
@@ -289,15 +289,14 @@ impl PersonalTrack {
         Ok(())
     }
 
-    /// Legacy name retained per D6-323 standing rule — do not rename.
-    pub fn set_life_context(
+    pub fn set_persona_context(
         &mut self,
         context: IndexMap<String, String>,
     ) -> Result<(), TrackError> {
         if self.sealed {
             return Err(TrackError::SealedTrack);
         }
-        self.life_context = context;
+        self.persona_context = context;
         Ok(())
     }
 
@@ -338,8 +337,8 @@ impl PersonalTrack {
         &self.voice_profile
     }
 
-    pub fn life_context(&self) -> &IndexMap<String, String> {
-        &self.life_context
+    pub fn persona_context(&self) -> &IndexMap<String, String> {
+        &self.persona_context
     }
 
     pub fn source_versions(&self) -> &IndexMap<String, String> {
