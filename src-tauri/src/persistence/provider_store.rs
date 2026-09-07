@@ -174,6 +174,11 @@ pub struct Provider {
     /// provider's selector-card retention-posture display source, per
     /// shared_001.sql's original CARD DISPLAY note.
     pub documentation_gate: serde_json::Value,
+    /// Consumer-facing plain-language privacy summary (JSON) -- this
+    /// provider's own "what this means for you" explainer content, distinct
+    /// from documentation_gate's compliance/audit-trail research framing.
+    /// NULL until curated.
+    pub user_privacy_summary: Option<serde_json::Value>,
     pub last_reviewed_at: Option<String>,
     pub review_trigger_note: Option<String>,
     pub created_at: String,
@@ -256,7 +261,7 @@ const SELECT_COLUMNS: &str = "id, display_name, provider_type, mode, launch_url,
                 review_trigger_note, created_at, is_local, is_anonymous,
                 retains_data, trains_on_data_by_default, login_required,
                 qr_internal_eligible, privacy_guardian_default_level,
-                risk_rating, hardware_requirement";
+                risk_rating, hardware_requirement, user_privacy_summary";
 
 // ---------------------------------------------------------------------------
 // Row extraction
@@ -295,6 +300,9 @@ fn row_to_provider(row: &sqlx::sqlite::SqliteRow) -> Result<Provider, ProviderSt
     let hardware_req_raw: Option<String> = row
         .try_get("hardware_requirement")
         .map_err(ProviderStoreError::Database)?;
+    let user_privacy_summary_raw: Option<String> = row
+        .try_get("user_privacy_summary")
+        .map_err(ProviderStoreError::Database)?;
 
     let documentation_gate: serde_json::Value =
         serde_json::from_str(&doc_gate_raw).unwrap_or_else(|e| {
@@ -321,6 +329,17 @@ fn row_to_provider(row: &sqlx::sqlite::SqliteRow) -> Result<Provider, ProviderSt
         .map(PrivacyGuardianDefaultLevel::from_str)
         .transpose()?;
 
+    let user_privacy_summary = user_privacy_summary_raw.and_then(|raw| {
+        serde_json::from_str(&raw)
+            .map_err(|e| {
+                log::warn!(
+                    "provider '{id}' user_privacy_summary failed to parse as JSON, \
+                     dropping: {e}"
+                );
+            })
+            .ok()
+    });
+
     Ok(Provider {
         id,
         display_name: row
@@ -335,6 +354,7 @@ fn row_to_provider(row: &sqlx::sqlite::SqliteRow) -> Result<Provider, ProviderSt
             .map_err(ProviderStoreError::Database)?,
         activation_status: ActivationStatus::from_str(&activation_status_raw)?,
         documentation_gate,
+        user_privacy_summary,
         last_reviewed_at: row
             .try_get("last_reviewed_at")
             .map_err(ProviderStoreError::Database)?,
@@ -587,6 +607,7 @@ pub async fn create_provider(new: NewProvider<'_>) -> Result<Provider, ProviderS
         launch_url: new.launch_url.map(|s| s.to_owned()),
         activation_status: ActivationStatus::Active,
         documentation_gate: new.documentation_gate.clone(),
+        user_privacy_summary: None,
         last_reviewed_at: None,
         review_trigger_note: None,
         created_at,
@@ -827,10 +848,10 @@ mod tests {
 
     /// items.id=430/432: shared_014.sql seeds groq/mistral as
     /// provider_type='cloud_inference_api' rows -- confirms the migration
-    /// landed the mechanically-known facts correctly and left the
-    /// requires-curation flags (retains_data, trains_on_data_by_default,
-    /// risk_rating, qr_internal_eligible) at the table's own conservative
-    /// defaults rather than fabricated values.
+    /// landed the mechanically-known facts correctly. items.id=440 Part A
+    /// (this session) replaced the original placeholder seed with real,
+    /// sourced curation flags -- distinct per provider, no longer the
+    /// shared conservative defaults the placeholder left them at.
     #[tokio::test]
     async fn groq_and_mistral_seeded_as_cloud_inference_api() {
         let mut conn = make_test_conn().await;
@@ -848,22 +869,38 @@ mod tests {
                 "{id} requires login (Tier 1.5, non-anonymous)"
             );
             assert!(!p.is_anonymous, "{id} is not anonymous");
-            // Conservative table defaults, not fabricated research (this
-            // session's judgment call 3) -- pending items.id=440's audit.
-            assert!(
-                p.retains_data,
-                "{id} left at conservative default pending curation"
-            );
-            assert!(
-                p.trains_on_data_by_default,
-                "{id} left at conservative default pending curation"
-            );
-            assert_eq!(
-                p.risk_rating, 3,
-                "{id} left at conservative default pending curation"
-            );
             assert!(!p.qr_internal_eligible);
         }
+
+        let groq = get_provider_via_conn(&mut conn, "groq").await;
+        assert!(
+            !groq.retains_data,
+            "groq: not retained beyond providing the service, per its DPA"
+        );
+        assert!(
+            !groq.trains_on_data_by_default,
+            "groq: not trained on by default, per its Services Agreement"
+        );
+        assert_eq!(groq.risk_rating, 1);
+        assert_eq!(
+            groq.privacy_guardian_default_level,
+            Some(PrivacyGuardianDefaultLevel::Low)
+        );
+
+        let mistral = get_provider_via_conn(&mut conn, "mistral").await;
+        assert!(
+            mistral.retains_data,
+            "mistral: 30-day abuse-monitoring log retained by default"
+        );
+        assert!(
+            mistral.trains_on_data_by_default,
+            "mistral: training is opt-out, not excluded by default, per its DPA"
+        );
+        assert_eq!(mistral.risk_rating, 2);
+        assert_eq!(
+            mistral.privacy_guardian_default_level,
+            Some(PrivacyGuardianDefaultLevel::Medium)
+        );
     }
 
     /// items.id=430/432: list_providers_by_type is the flag-based

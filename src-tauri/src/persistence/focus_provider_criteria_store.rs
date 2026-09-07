@@ -618,9 +618,14 @@ mod tests {
         let _tempdir = setup_real_db().await;
 
         let outcome = async {
-            // require_not_trains_on_data=1 alone would only match duckai.
-            // deny=[duckai] excludes it anyway; allow=[claude] carves claude
-            // in despite it failing the requirement (trains_on_data=1).
+            // require_not_trains_on_data=1 alone matches duckai and groq
+            // (items.id=440 Part A curated groq as not training on data by
+            // default -- no longer just duckai, as it was when this test was
+            // first written against groq's pre-curation placeholder seed).
+            // deny=[duckai] excludes it anyway despite passing the
+            // requirement; allow=[claude] carves claude in despite it
+            // failing the requirement (trains_on_data=1); groq passes the
+            // requirement on its own merits and needs neither list.
             set_criteria(
                 "f1",
                 false,
@@ -635,9 +640,10 @@ mod tests {
             let ids: Vec<&str> = eligible.iter().map(|p| p.id.as_str()).collect();
             assert_eq!(
                 ids,
-                vec!["claude"],
-                "deny must beat a passing require match (duckai), and allow must beat a \
-                 failing require match (claude) -- everything else fails the requirement"
+                vec!["groq", "claude"],
+                "deny must beat a passing require match (duckai), allow must beat a failing \
+                 require match (claude), and groq must pass the requirement on its own \
+                 merits -- everything else fails the requirement"
             );
             Ok::<(), FocusProviderCriteriaStoreError>(())
         }

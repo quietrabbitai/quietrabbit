@@ -68,6 +68,14 @@
 --   risk_rating: carried unchanged from shared_012.sql -- same column,
 --     same CHECK, same DEFAULT 3 fail-safe, same live Privacy Guardian
 --     consumer.
+--   user_privacy_summary: TEXT JSON, nullable, no CHECK -- mirrors
+--     documentation_gate's JSON-in-TEXT convention exactly (same escape-
+--     hatch rationale). Holds the consumer-facing plain-language privacy
+--     summary (this row's own "what this means for you" explainer content)
+--     shown directly to the user -- distinct from documentation_gate's
+--     compliance/audit-trail research framing. NULL until curated; no
+--     DEFAULT '{}' since "not yet summarized" is a meaningfully different
+--     state from "reviewed, no summary" for this display-facing field.
 CREATE TABLE IF NOT EXISTS providers (
     id                              TEXT PRIMARY KEY,
     display_name                    TEXT NOT NULL,
@@ -98,7 +106,8 @@ CREATE TABLE IF NOT EXISTS providers (
                                             OR privacy_guardian_default_level IN ('low', 'medium', 'high')),
     risk_rating                     INTEGER NOT NULL DEFAULT 3
                                         CHECK (risk_rating IN (1, 2, 3)),
-    hardware_requirement            TEXT
+    hardware_requirement            TEXT,
+    user_privacy_summary            TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_providers_selector
@@ -167,6 +176,57 @@ SELECT
 FROM tier3_providers;
 
 DROP TABLE tier3_providers;
+
+-- Post-migration curation pass (this session, 2026-09-07): documentation_gate
+-- content amendments for claude and gemini (one new finding each -- see
+-- per-row comments below) plus initial user_privacy_summary values for all
+-- 4 migrated providers. documentation_gate is carried unchanged from
+-- tier3_providers by the INSERT...SELECT above (plain column reference, no
+-- CASE derivation) -- these UPDATEs are the only way to amend that content
+-- without touching shared_001.sql, consistent with editing this migration
+-- in place rather than adding a new one (both shared_013.sql and
+-- shared_014.sql confirmed unpushed this session). Full JSON literals, not
+-- json_patch/json_set -- no migration in this codebase uses SQL JSON1
+-- functions, and documentation_gate is otherwise always written as a
+-- complete literal blob (shared_001.sql, shared_014.sql); matching that
+-- convention rather than introducing a new one.
+--
+-- chatgpt is NOT amended beyond user_privacy_summary: its existing
+-- contradictory_reporting field (Jan 5 2026 discovery order, July 2026
+-- misrepresentation allegation, specific court citations) is already
+-- accurate and more complete than an earlier-considered replacement would
+-- have been -- verified by reading shared_001.sql's seed directly. duckai
+-- is likewise NOT amended -- its documentation_gate was already accurate.
+
+-- claude: adds the Anthropic Usage Policy retention carveout -- content
+-- flagged for a Usage Policy violation is retained on a separate, longer
+-- schedule than the training opt-out setting otherwise controls. Not
+-- previously captured in the July 2026 review.
+UPDATE providers SET
+    documentation_gate = '{"tos_url":"https://privacy.claude.com/en/articles/9301722-updates-to-our-acceptable-use-policy-now-usage-policy-consumer-terms-of-service-and-privacy-policy","retention_summary":"Default backend retention is 30 days for deleted conversations -- removed from chat history immediately on deletion, purged from Anthropic backend systems within 30 days. Consumer accounts (Free, Pro, Max) are opted IN to model-training use of conversations by default as of the August 2025 policy change -- users must actively opt out. Training-enabled data is retained for up to 5 years. Deleting a conversation excludes it from future training.","jurisdiction":"Anthropic PBC, USA, for US and rest-of-world consumer accounts. Anthropic Ireland, Limited is the data controller and consumer-terms counterparty for EEA, UK, and Swiss users.","contradictory_reporting":"None found this review.","review_caveat":"August 2025 policy change flipped the consumer training default from opt-in to opt-out-required -- a material posture shift from earlier project evaluations of this provider. Re-verify if Anthropic changes the default again.","sources":["https://privacy.claude.com/en/articles/9301722-updates-to-our-acceptable-use-policy-now-usage-policy-consumer-terms-of-service-and-privacy-policy","https://www.anthropic.com/news/updates-to-our-consumer-terms"],"usage_policy_carveout":"Content flagged as violating Anthropic''s Usage Policy may be retained (2 years for inputs/outputs, 7 years for classification scores) regardless of the user''s training opt-out setting, per Anthropic''s July 2026 Privacy Center update."}',
+    user_privacy_summary = '{"summary": "Claude Free, Pro, and Max plans train on your conversations by default since August 2025. Turning this off in Settings restores the original 30-day deletion window instead of 5-year retention.", "account_status_note": "Claude for Work, Enterprise, Education, and API usage are never used for training, regardless of this setting.", "actions": [{"label": "Turn off model training", "description": "Settings -> Privacy -> disable ''Improve Claude for everyone.''"}, {"label": "Use Incognito chats", "description": "One-off conversations that are never used for training, even with the main toggle on."}], "settings_url": "https://claude.ai/settings/data-privacy-controls"}'
+WHERE id = 'claude';
+
+-- gemini: adds a scope note -- this row's assessment is about Gemini AI
+-- Chat specifically, not other Google products with their own, separate
+-- privacy posture changes (e.g. Google Search's June 2026 saved-media
+-- change), which a reader could otherwise conflate with this card.
+UPDATE providers SET
+    documentation_gate = '{"tos_url":"https://support.google.com/gemini/answer/13594961","retention_summary":"Default retention is 18 months for Gemini Apps Activity, user-configurable to 3 or 36 months or indefinite. Keep Activity off reduces retention to 72 hours for most conversations. A subset of conversations selected for human review, for quality and safety purposes, is retained separately for up to 3 years and is NOT deleted when the user deletes their activity -- this human-reviewed subset does not follow the headline retention window.","jurisdiction":"Google Ireland Limited for EEA and Switzerland users. Google LLC, USA, for all other users.","contradictory_reporting":"No third-party contradiction found this review, but flagging an internal-policy caveat worth surfacing on the card: the up-to-3-years human-review carve-out, which survives user deletion, materially changes the retention story beyond the headline 18-month figure -- same spirit as the Groq precedent of not taking the top-line retention number at face value.","sources":["https://support.google.com/gemini/answer/13594961"],"scope_note":"This assessment covers Gemini AI Chat specifically, not other Google products (e.g. a separate June 2026 change affects Google Search''s use of saved media for AI training)."}',
+    user_privacy_summary = '{"summary": "Gemini keeps your conversations for 18 months by default and may use them to improve Google''s AI. A sample may be reviewed by a human, and reviewed conversations are kept for up to 3 years even if you delete your activity.", "account_status_note": "Gemini accessed through a paid Google Workspace business account is not used for training and follows your organization''s data rules instead.", "actions": [{"label": "Turn off Gemini Apps Activity", "description": "myaccount.google.com -> Data & Privacy -> stops future conversations from being saved or used for training."}, {"label": "Use Temporary Chat", "description": "Conversations that disappear after the session and aren''t used for training."}], "settings_url": "https://myactivity.google.com/product/gemini"}'
+WHERE id = 'gemini';
+
+-- chatgpt: user_privacy_summary only -- documentation_gate intentionally
+-- untouched (see comment above this block).
+UPDATE providers SET
+    user_privacy_summary = '{"summary": "ChatGPT trains on your conversations by default on Free and Plus plans unless you turn it off. Temporary Chat mode keeps a conversation out of your history and out of training entirely.", "account_status_note": "ChatGPT Team, Enterprise, and Edu accounts are excluded from training by default.", "actions": [{"label": "Turn off model training", "description": "Settings -> Data Controls -> disable ''Improve the model for everyone.''"}, {"label": "Use Temporary Chat", "description": "Conversations that don''t save to history or train the model."}], "settings_url": "https://help.openai.com/en/articles/7730893-data-controls-faq"}'
+WHERE id = 'chatgpt';
+
+-- duckai: user_privacy_summary only -- documentation_gate intentionally
+-- untouched (already accurate).
+UPDATE providers SET
+    user_privacy_summary = '{"summary": "Duck.ai proxies your request so Anthropic, OpenAI, and other model providers never see your identity, and doesn''t use your chats to train any model. Chats save locally on your device by default, not on DuckDuckGo''s servers.", "account_status_note": "No account needed. An optional ''Sync & Backup'' feature can store encrypted chats on DuckDuckGo''s servers, but only your device holds the decryption key.", "actions": [{"label": "Use the Fire Button", "description": "Instantly clears all local chat history from Duck.ai."}], "settings_url": "https://duckduckgo.com/duckai/privacy-terms"}'
+WHERE id = 'duckai';
 
 -- user_provider_preference (Part 2b): per-user configuration, scoped
 -- User x Persona x Focus. Cannot live on providers (global table would
@@ -249,4 +309,4 @@ CREATE INDEX IF NOT EXISTS idx_user_provider_pref_lookup
 
 INSERT OR IGNORE INTO schema_version (version, applied_at, description)
 VALUES (13, datetime('now'),
-    'items.id=427/428: providers table (generalizes tier3_providers -- flag-based, no tier column, 4 existing rows migrated with derived flags) + user_provider_preference table (Focus>Persona>account-wide cascading provider configuration)');
+    'items.id=427/428: providers table (generalizes tier3_providers -- flag-based, no tier column, 4 existing rows migrated with derived flags) + user_provider_preference table (Focus>Persona>account-wide cascading provider configuration) + user_privacy_summary column (consumer-facing privacy explainer, distinct from documentation_gate) + a curation pass amending claude/gemini documentation_gate and setting user_privacy_summary for all 4 migrated rows');
