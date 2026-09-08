@@ -406,6 +406,12 @@ export const commands = {
 	 *  way, without picking a new one.
 	 */
 	setTier2ProviderPreference: (provider: string | null) => typedError<null, string>(__TAURI_INVOKE("set_tier2_provider_preference", { provider })),
+	/**
+	 *  List every provider preference row for the current user, across every
+	 *  scope (account-wide, Persona-wide, Focus-specific) -- for a future
+	 *  settings-surface listing. items.id=254 Part 1.
+	 */
+	getTier2ProviderPreferences: () => typedError<UserProviderPreference[], string>(__TAURI_INVOKE("get_tier2_provider_preferences")),
 	dismissNotification: (notificationId: string) => typedError<null, string>(__TAURI_INVOKE("dismiss_notification", { notificationId })),
 	login: (displayName: string, password: string) => typedError<null, string>(__TAURI_INVOKE("login", { displayName, password })),
 	logout: () => typedError<null, string>(__TAURI_INVOKE("logout")),
@@ -1319,6 +1325,8 @@ export type SubmitFrictionGateDecisionRequest = {
 	original_request: UpdateFocusSettingsRequest,
 };
 
+export type SubscriptionStatus = "free" | "paid";
+
 /**
  *  Non-secret Tier 2 configuration state -- never carries the credential
  *  itself. `configured` is true iff an active user-global tier2 key exists
@@ -1390,6 +1398,30 @@ export type UpdateTopicStateRequest = {
 	user_id: string,
 	persona_id: string,
 	state: string,
+};
+
+export type UserPreference = "preferred" | "allowed" | "declined";
+
+export type UserProviderPreference = {
+	id: string,
+	user_id: string,
+	/**
+	 *  NULL = account-wide default (Part 2b's NULL-means-account-wide
+	 *  convention, mirroring user_capabilities).
+	 */
+	persona_id: string | null,
+	/**  NULL = Persona-wide default; set = Focus-specific override. */
+	focus_id: string | null,
+	provider_id: string,
+	login_available: boolean,
+	user_preference: UserPreference,
+	enabled_at: string | null,
+	declined_at: string | null,
+	local_model_version: string | null,
+	installed_at: string | null,
+	last_verified_at: string | null,
+	subscription_status: SubscriptionStatus | null,
+	created_at: string,
 };
 
 /**

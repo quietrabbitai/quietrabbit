@@ -46,7 +46,7 @@ use crate::auth::registry::{key_hex, KeyRegistry};
 use crate::persistence::integration_keys_store;
 use crate::persistence::provider_store;
 use crate::persistence::user_provider_preference_store::{
-    self, NewUserProviderPreference, UserPreference,
+    self, NewUserProviderPreference, UserPreference, UserProviderPreference,
 };
 
 const TIER2_KEY_TYPE: &str = "tier2";
@@ -225,6 +225,24 @@ pub async fn set_tier2_provider_preference(
     }
 
     Ok(())
+}
+
+/// List every provider preference row for the current user, across every
+/// scope (account-wide, Persona-wide, Focus-specific) -- for a future
+/// settings-surface listing. items.id=254 Part 1.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_tier2_provider_preferences(
+    key_registry: State<'_, KeyRegistry>,
+) -> Result<Vec<UserProviderPreference>, String> {
+    let user_id = key_registry
+        .with_key(|k| k.user_id.clone())
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
+    user_provider_preference_store::list_preferences_for_user(&user_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------

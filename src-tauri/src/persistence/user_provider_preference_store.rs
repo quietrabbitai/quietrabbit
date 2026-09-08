@@ -54,7 +54,7 @@ pub enum UserProviderPreferenceStoreError {
 // Data types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, specta::Type)]
 #[serde(rename_all = "lowercase")]
 pub enum UserPreference {
     Preferred,
@@ -84,7 +84,7 @@ impl UserPreference {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, specta::Type)]
 #[serde(rename_all = "lowercase")]
 pub enum SubscriptionStatus {
     Free,
@@ -111,7 +111,7 @@ impl SubscriptionStatus {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, specta::Type)]
 pub struct UserProviderPreference {
     pub id: String,
     pub user_id: String,

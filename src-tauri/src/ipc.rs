@@ -111,6 +111,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::tier2::get_tier2_config,
         commands::tier2::set_tier2_provider,
         commands::tier2::set_tier2_provider_preference,
+        commands::tier2::get_tier2_provider_preferences,
         // Group 10 -- Notifications (stub)
         commands::notifications::dismiss_notification,
         // Group 11 -- Auth (items.id=205, 2026-08-01; get_recovery_key_display
@@ -235,6 +236,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::tier2::get_tier2_config,
         commands::tier2::set_tier2_provider,
         commands::tier2::set_tier2_provider_preference,
+        commands::tier2::get_tier2_provider_preferences,
         // Group 10 -- Notifications (stub)
         commands::notifications::dismiss_notification,
         // Group 11 -- Auth (items.id=205, 2026-08-01; get_recovery_key_display
