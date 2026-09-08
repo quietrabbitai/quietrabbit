@@ -124,6 +124,16 @@ pub async fn gate3<L: DisclosureLogger>(
     // always means High" assumption for callers that DO know their actual
     // destination set; the OR-condition structure itself is unchanged.
     destination_risk_rating: Option<u8>,
+    // items.id=458 (corrected scope of the earlier items.id=799): true for
+    // every caller with a real content_sensitivity_severity to consult --
+    // false only for callers with no PersonalTrack (request_tier3_gate3_review,
+    // request_chat_copy_gate3_review in commands/consent.rs) that hardcode
+    // content_sensitivity_severity=1 as a placeholder. When false, a live
+    // destination_risk alone no longer forces the High-tier consent gate on
+    // zero PF spans -- see zero_spans_safe_to_auto_approve's own doc comment.
+    // Only affects the gate3_with_pf path; Check 1 and Check 2b below never
+    // reference destination_risk and are unaffected either way.
+    severity_authoritative: bool,
     // items.id=406 (decisions.id=756/757): identity needed to open
     // outputs.db/personal.db for the fact-identity persistence cascade
     // (prior-decision query, pf_fact_mentions, pf_standing_preferences).
@@ -190,6 +200,7 @@ pub async fn gate3<L: DisclosureLogger>(
                 execution_tier,
                 handle,
                 destination_risk_rating,
+                severity_authoritative,
                 user_id,
                 persona_id,
                 key_hex,
@@ -272,6 +283,7 @@ async fn gate3_with_pf<L: DisclosureLogger>(
     execution_tier: u8,
     handle: &tauri::AppHandle<tauri::Wry>,
     destination_risk_rating: Option<u8>,
+    severity_authoritative: bool,
     user_id: &str,
     persona_id: &str,
     key_hex: &str,
@@ -452,7 +464,11 @@ async fn gate3_with_pf<L: DisclosureLogger>(
     // regardless of PF confidence" rule. The severity/target_tier guard below
     // must stay in sync with assign_review_tier's forced-High condition.
     if entities.is_empty()
-        && zero_spans_safe_to_auto_approve(content_sensitivity_severity, destination_risk)
+        && zero_spans_safe_to_auto_approve(
+            content_sensitivity_severity,
+            destination_risk,
+            severity_authoritative,
+        )
     {
         logger
             .write(DisclosureLogEntry {
@@ -833,8 +849,24 @@ fn build_consent_spans(
 /// sync with that function's `destination_risk >= 3 ||
 /// content_sensitivity_severity >= 3` condition — this is the
 /// entities-independent half of the same rule (items.id=36).
-fn zero_spans_safe_to_auto_approve(content_sensitivity_severity: u8, destination_risk: u8) -> bool {
-    !(content_sensitivity_severity >= 3 || destination_risk >= 3)
+///
+/// `severity_authoritative` is false only for callers with no PersonalTrack
+/// to consult -- content_sensitivity_severity is a fixed placeholder value
+/// for them, not a real assessment (see request_tier3_gate3_review and
+/// request_chat_copy_gate3_review in commands/consent.rs). For those
+/// callers, a live destination_risk alone must not force the High-tier
+/// consent gate on zero PF spans -- that produced an empty, uninformative
+/// interrupt (items.id=458, corrected scope of the earlier items.id=799).
+/// The severity check stays live regardless of this flag, as a defensive
+/// floor. The main Focus-execution path (executor.rs, real per-field
+/// severity from compute_step_sensitivity) always passes true and is
+/// unaffected.
+fn zero_spans_safe_to_auto_approve(
+    content_sensitivity_severity: u8,
+    destination_risk: u8,
+    severity_authoritative: bool,
+) -> bool {
+    !(content_sensitivity_severity >= 3 || (severity_authoritative && destination_risk >= 3))
 }
 
 /// items.id=406 (decisions.id=754): assigns ONE span's own review tier,
@@ -948,25 +980,42 @@ mod tests {
 
     #[test]
     fn zero_spans_auto_approve_allowed_when_low_severity_and_tier() {
-        assert!(zero_spans_safe_to_auto_approve(1, 2));
-        assert!(zero_spans_safe_to_auto_approve(2, 2));
+        assert!(zero_spans_safe_to_auto_approve(1, 2, true));
+        assert!(zero_spans_safe_to_auto_approve(2, 2, true));
     }
 
     #[test]
     fn zero_spans_auto_approve_blocked_by_severity_financial_repro() {
         // Repro: "$85,000 household income" / "$12,000 credit card debt" --
         // severity=3 (financial), zero PF spans. Must NOT be auto-approved.
-        assert!(!zero_spans_safe_to_auto_approve(3, 2));
+        assert!(!zero_spans_safe_to_auto_approve(3, 2, true));
     }
 
     #[test]
     fn zero_spans_auto_approve_blocked_by_medical_severity() {
-        assert!(!zero_spans_safe_to_auto_approve(4, 2));
+        assert!(!zero_spans_safe_to_auto_approve(4, 2, true));
     }
 
     #[test]
     fn zero_spans_auto_approve_blocked_by_target_tier() {
-        assert!(!zero_spans_safe_to_auto_approve(1, 3));
+        assert!(!zero_spans_safe_to_auto_approve(1, 3, true));
+    }
+
+    // items.id=458: callers with no PersonalTrack (request_tier3_gate3_review,
+    // request_chat_copy_gate3_review) hardcode content_sensitivity_severity=1
+    // and pass severity_authoritative=false -- a live destination_risk alone
+    // must no longer force the High-tier gate on zero PF spans for them.
+    #[test]
+    fn zero_spans_auto_approve_ignores_destination_risk_when_severity_not_authoritative() {
+        assert!(zero_spans_safe_to_auto_approve(1, 3, false));
+        assert!(zero_spans_safe_to_auto_approve(1, 4, false));
+    }
+
+    // The severity check is a defensive floor that stays live regardless of
+    // severity_authoritative -- even a placeholder severity of 3+ still blocks.
+    #[test]
+    fn zero_spans_auto_approve_still_blocked_by_severity_when_not_authoritative() {
+        assert!(!zero_spans_safe_to_auto_approve(3, 1, false));
     }
 
     // -- assign_review_tier_for_span ------------------------------------------

@@ -966,6 +966,10 @@ async fn test_gate3() {
             // (graceful-degradation defaults) are used rather than fabricated
             // identities.
             None,
+            // items.id=458: severity_authoritative -- also unreachable in
+            // this suite (only matters inside gate3_with_pf); true matches
+            // this suite's real callers (executor.rs), which never pass false.
+            true,
             "",
             "",
             "",

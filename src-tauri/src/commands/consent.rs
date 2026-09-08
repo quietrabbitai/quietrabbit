@@ -714,16 +714,27 @@ const TIER3_DRAFT_FOCUS_ID: &str = "quick-ask";
 /// call site was conductor/executor.rs's own step-execution loop, with no
 /// StepContext/PersonalTrack available here.
 ///
-/// Parameter sourcing (fixed/derived from quick-ask.focus, not guessed):
+/// This call site reviews arbitrary message content drafted ahead of Tier 3
+/// access, via any entry path (direct chat, escalation, or a Focus-run
+/// handoff) -- it is NOT specific to Quick-Ask-Focus-generated content, and
+/// makes no claim that no personal fields ever flow through it. quick-ask.focus's
+/// step id and display_name are reused below purely as a synthetic label for
+/// disclosure_log/audit purposes, not as a claim about the reviewed
+/// content's structure.
+///
+/// Parameter sourcing:
 ///   - target_tier=3: this flow only exists ahead of Tier 3 access.
-///   - execution_tier=1, content_sensitivity_severity=1: quick-ask.focus
-///     declares max_routing_tier: 1 and field_requirements: [] -- no
-///     personal fields ever flow through it. target_tier=3 alone already
-///     forces ReviewTier::High and defeats gate3's zero-span auto-approve
-///     path (zero_spans_safe_to_auto_approve's target_tier >= 3 arm)
-///     regardless of severity, so this default does not weaken review.
+///   - execution_tier=1, content_sensitivity_severity=1: no PersonalTrack is
+///     available at this call site to compute a real severity, so this is a
+///     fixed placeholder, not a real assessment.
 ///   - step_id="draft", focus_name="Quick Ask": quick-ask.focus's own step
-///     id and display_name.
+///     id and display_name, borrowed as a synthetic label only -- see above.
+///   - severity_authoritative=false (items.id=458, corrected scope of the
+///     earlier items.id=799): content_sensitivity_severity=1 being a
+///     placeholder means a live destination_risk alone must not force
+///     gate3's High-tier consent gate on zero PF spans here -- that produced
+///     an empty, uninformative interrupt. See
+///     zero_spans_safe_to_auto_approve's own doc comment in gate3.rs.
 ///   - space_max_permitted_tier: a real per-Persona focus_settings lookup,
 ///     never a constant -- missing row is a hard Err, mirroring AUTHORIZE's
 ///     own assertion (lifecycle.rs).
@@ -839,6 +850,10 @@ pub async fn request_tier3_gate3_review(
             1, // execution_tier
             Some(&app_handle),
             destination_risk_rating,
+            // items.id=458: no PersonalTrack here, content_sensitivity_severity
+            // above is a placeholder -- destination_risk alone must not force
+            // the High-tier gate on zero PF spans (see doc comment above).
+            false,
             &request.user_id,
             &request.persona_id,
             &key_hex_str,
@@ -905,23 +920,32 @@ pub async fn request_tier3_gate3_review(
 /// lookup, only pushed into the audit entry's fields_shared/fields_withheld).
 ///
 /// Parameter sourcing mostly mirrors request_tier3_gate3_review's own
-/// quick-ask constants (content_sensitivity_severity=1, execution_tier=1),
-/// but NOT its target_tier=3 -- confirmed live (2026-09-04) that reusing 3
-/// unconditionally makes gate3's own zero_spans_safe_to_auto_approve
-/// (target_tier/destination_risk >= 3 forces High review regardless of
-/// content) fire for every single copy when no Tier 3 provider pane happens
-/// to be open, defeating the "silent on a fast, unflagged pass" UX this
-/// whole feature is built around: request_tier3_gate3_review's target_tier=3
-/// is correct there because that flow's own precondition is "the user is
-/// literally about to access Tier 3" (its own doc comment) -- a native copy
-/// gesture on this transcript carries no such precondition; the destination
-/// could just as easily be a text editor as a Tier 3 pane. target_tier=1
-/// here means an unknown/no-Tier-3-destination copy is judged on its own
-/// content severity alone (correct, most copies pass silently and fast),
-/// while destination_risk_rating below still reflects any ACTUALLY active
-/// Tier 3 provider's real risk -- so a copy made while a genuinely risky
-/// destination is open still gets the stricter review, preserving
+/// quick-ask constants (content_sensitivity_severity=1, execution_tier=1) --
+/// both are fixed placeholders reflecting the absence of a PersonalTrack at
+/// this call site, not a claim about the reviewed content's structure. Like
+/// request_tier3_gate3_review, this command reviews arbitrary
+/// message/clipboard content, not Quick-Ask-Focus output specifically;
+/// quick-ask.focus's identifiers are borrowed only as a synthetic label. This
+/// command does NOT mirror request_tier3_gate3_review's target_tier=3 --
+/// confirmed live (2026-09-04) that reusing 3 unconditionally makes gate3's
+/// own zero_spans_safe_to_auto_approve (destination_risk >= 3 forces High
+/// review regardless of content) fire for every single copy when no Tier 3
+/// provider pane happens to be open, defeating the "silent on a fast,
+/// unflagged pass" UX this whole feature is built around: request_tier3_gate3_review's
+/// target_tier=3 is correct there because that flow's own precondition is
+/// "the user is literally about to access Tier 3" (its own doc comment) -- a
+/// native copy gesture on this transcript carries no such precondition; the
+/// destination could just as easily be a text editor as a Tier 3 pane.
+/// target_tier=1 here means an unknown/no-Tier-3-destination copy is judged
+/// on its own content severity alone (correct, most copies pass silently and
+/// fast), while destination_risk_rating below still reflects any ACTUALLY
+/// active Tier 3 provider's real risk -- so a copy made while a genuinely
+/// risky destination is open still gets the stricter review, preserving
 /// decisions.id=755's original intent for that real case.
+/// severity_authoritative=false (items.id=458, corrected scope of the
+/// earlier items.id=799): content_sensitivity_severity=1 being a placeholder
+/// means destination_risk alone must not force the High-tier gate on zero PF
+/// spans -- an empty, uninformative interrupt on an otherwise silent copy.
 /// This command intentionally does NOT touch messages.gate3_review_status
 /// or messages.reviewed_at_risk_rating -- those track a single drafted
 /// message's own lifecycle; a copy-triggered review is a fresh, ephemeral
@@ -985,6 +1009,10 @@ pub async fn request_chat_copy_gate3_review(
             1, // execution_tier
             Some(&app_handle),
             destination_risk_rating,
+            // items.id=458: no PersonalTrack here, content_sensitivity_severity
+            // above is a placeholder -- destination_risk alone must not force
+            // the High-tier gate on zero PF spans (see doc comment above).
+            false,
             &request.user_id,
             &request.persona_id,
             &key_hex_str,
@@ -1115,6 +1143,13 @@ pub async fn recheck_tier3_provider_selection(
             1, // execution_tier
             Some(&app_handle),
             Some(new_risk),
+            // items.id=458 scoped this bypass to request_tier3_gate3_review
+            // and request_chat_copy_gate3_review only -- this call site has
+            // the same hardcoded-severity/no-PersonalTrack shape but is
+            // explicitly out of scope for that fix (flagged separately for
+            // Chat-PM to authorize on its own). true preserves this
+            // function's exact current behavior.
+            true,
             &request.user_id,
             &request.persona_id,
             &key_hex_str,

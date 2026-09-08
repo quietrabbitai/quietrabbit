@@ -722,6 +722,11 @@ impl StepExecutor {
                         // at this generic Focus-step-promotion layer -- falls
                         // back to target_tier itself, unchanged behavior.
                         None,
+                        // items.id=458: step_sensitivity above is a real
+                        // per-field severity from compute_step_sensitivity,
+                        // not a placeholder -- keep the full
+                        // destination_risk-forcing behavior on zero PF spans.
+                        true,
                         &ctx.user_id,
                         &ctx.persona_id,
                         &ctx.key_hex,
