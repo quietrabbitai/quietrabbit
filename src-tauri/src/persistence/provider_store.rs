@@ -126,7 +126,7 @@ impl ActivationStatus {
 /// privacy_guardian_default_level: deliberately parallel to ReviewTier's
 /// own three values (conductor/privacy/types.rs), same reasoning
 /// risk_rating already established (shared_012.sql).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, specta::Type)]
 #[serde(rename_all = "lowercase")]
 pub enum PrivacyGuardianDefaultLevel {
     Low,

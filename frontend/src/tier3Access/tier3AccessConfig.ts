@@ -30,7 +30,24 @@
 // tier-to-lane transformation happens here -- just a field rename
 // (display_name -> name) to match this file's own Provider shape.
 
+// Deep component imports, not the top-level `@lobehub/icons` barrel: each
+// icon's barrel `index.js` unconditionally builds a "compounded" object
+// (Avatar/Color/Combine/Text all attached to the default export), and the
+// Combine feature alone statically imports `react-layout-kit` -- a real,
+// unavoidable runtime dependency once any icon is imported through the
+// barrel, regardless of whether this app ever touches `.Combine`. The leaf
+// component files below have no such dependency (confirmed: only `react`
+// and a local, import-free `style` module) -- same real, MIT-licensed SVGs,
+// none of the barrel's transitive weight.
+import ClaudeColor from '@lobehub/icons/es/Claude/components/Color'
+import GeminiColor from '@lobehub/icons/es/Gemini/components/Color'
+import GroqMono from '@lobehub/icons/es/Groq/components/Mono'
+import MistralColor from '@lobehub/icons/es/Mistral/components/Color'
+import OpenAIMono from '@lobehub/icons/es/OpenAI/components/Mono'
+import type { IconType } from '@lobehub/icons'
 import { commands } from '../bindings'
+import type { PrivacyGuardianDefaultLevel } from '../bindings'
+import duckLogoUrl from './assets/duckduckgo-dax-solo.svg'
 
 /** The two lanes a provider can belong to (decisions.id=680/681).
  *  Tier is a routing designation only, never surfaced to the user by
@@ -42,13 +59,16 @@ export type ProviderLane = 'tier2' | 'tier3'
 /** One selectable destination in the selector screen. Backed by the real
  *  provider catalog (provider_store::tier3_providers, decisions.id=684/710)
  *  via commands.listActiveProviders() -- see fetchActiveProviders() below.
- *  Card-ready fields beyond id/name/lane (retention posture, documentation
- *  gate) are not surfaced here; this screen only needs enough to render
- *  and select. */
+ *  loginRequired/isAnonymous/privacyGuardianDefaultLevel (items.id=418) are
+ *  the provider indicator badges' real, existing data source -- no other
+ *  card-ready fields (documentation gate, etc.) are surfaced here. */
 export interface Provider {
   id: string
   name: string
   lane: ProviderLane
+  loginRequired: boolean
+  isAnonymous: boolean
+  privacyGuardianDefaultLevel: PrivacyGuardianDefaultLevel | null
 }
 
 /** Fetches the selector screen's real provider list. Ordered tier-then-name
@@ -63,6 +83,9 @@ export async function fetchActiveProviders(): Promise<Provider[]> {
     id: p.id,
     name: p.display_name,
     lane: p.lane as ProviderLane,
+    loginRequired: p.login_required,
+    isAnonymous: p.is_anonymous,
+    privacyGuardianDefaultLevel: p.privacy_guardian_default_level,
   }))
 }
 
@@ -101,3 +124,46 @@ export const DEFAULT_PROVIDER_BRAND_COLOR = '#5A6870'
 export function providerBrandColor(providerId: string): string {
   return PROVIDER_BRAND_COLORS[providerId] ?? DEFAULT_PROVIDER_BRAND_COLOR
 }
+
+/** items.id=418 (decisions.id=800): rule 17 carve-out for the identity
+ *  badge's fill color, same precedent and same narrow scope as
+ *  PROVIDER_BRAND_COLORS above -- mapped directly to the real
+ *  privacy_guardian_default_level field, no invented data. */
+export const PRIVACY_LEVEL_COLORS: Record<PrivacyGuardianDefaultLevel, string> = {
+  low: '#4c7a5e',
+  medium: '#c19e42',
+  high: '#a15a4c',
+}
+
+/** Neutral fallback for a provider not yet curated (level is null) --
+ *  not a claim that its actual risk is low, medium, or high. */
+export const DEFAULT_PRIVACY_LEVEL_COLOR = '#5A6870'
+
+export function privacyLevelColor(level: PrivacyGuardianDefaultLevel | null): string {
+  return level ? PRIVACY_LEVEL_COLORS[level] : DEFAULT_PRIVACY_LEVEL_COLOR
+}
+
+/** items.id=418: real provider logos via @lobehub/icons (MIT), replacing
+ *  the letter-square placeholder for the providers it covers. Named
+ *  product-branded marks (Claude, OpenAI), not the parent-company ones
+ *  (Anthropic, Google) -- matches this app's existing id/name conventions.
+ *  Claude/Gemini/Mistral use their multi-color mark; Groq and OpenAI's own
+ *  marks are single-color by design (neither ships a `.Color` variant at
+ *  all), so their Mono component *is* their real logo, not a fallback. No
+ *  lobehub export exists for Duck.ai/DuckDuckGo; see DUCK_LOGO_URL. */
+export const PROVIDER_LOGO_COMPONENTS: Record<string, IconType> = {
+  claude: ClaudeColor,
+  chatgpt: OpenAIMono,
+  gemini: GeminiColor,
+  groq: GroqMono,
+  mistral: MistralColor,
+}
+
+/** items.id=418: DuckDuckGo has no @lobehub/icons entry. Jason's direction
+ *  (2026-09-07): use the actual DuckDuckGo mark, sourced unmodified from
+ *  duckduckgo.com/press's official brand assets, rather than an
+ *  approximation or a differently-styled icon-pack version -- see
+ *  assets/duckduckgo-dax-solo.svg's own header for source/license detail.
+ *  This means the badge won't visually distinguish Duck.ai from the base
+ *  DuckDuckGo brand; accepted tradeoff vs. altering a third party's mark. */
+export const DUCK_LOGO_URL = duckLogoUrl

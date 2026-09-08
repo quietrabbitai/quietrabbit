@@ -110,6 +110,9 @@ pub struct Tier3ProviderSummary {
     pub id: String,
     pub display_name: String,
     pub lane: String,
+    pub login_required: bool,
+    pub is_anonymous: bool,
+    pub privacy_guardian_default_level: Option<provider_store::PrivacyGuardianDefaultLevel>,
 }
 
 fn lane_str(provider_type: &str) -> &str {
@@ -517,6 +520,9 @@ pub async fn list_active_providers() -> Result<Vec<Tier3ProviderSummary>, String
             id: p.id,
             display_name: p.display_name,
             lane: lane_str(&p.provider_type).to_string(),
+            login_required: p.login_required,
+            is_anonymous: p.is_anonymous,
+            privacy_guardian_default_level: p.privacy_guardian_default_level,
         })
         .collect())
 }

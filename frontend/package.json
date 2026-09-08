@@ -11,6 +11,7 @@
     "test": "node --experimental-strip-types src/tier3Access/consentDecisions.test.ts && node --experimental-strip-types src/tier3Access/reviewSections.test.ts"
   },
   "dependencies": {
+    "@lobehub/icons": "1.58.0",
     "@tauri-apps/api": "^2.11.1",
     "i18next": "^26.3.6",
     "react": "^19.2.7",

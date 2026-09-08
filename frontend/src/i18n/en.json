@@ -150,10 +150,11 @@
       "loaded": "Loaded — tap to view",
       "active": "Active"
     },
-    "hopIndicatorTitle": "Internet-facing",
     "tier2BadgeTitle": "No login required",
     "tier3BadgeTitle": "Account required, data retained",
-    "closeRowTitle": "Close {{name}}"
+    "closeRowTitle": "Close {{name}}",
+    "hostingBadgeTitle": "Cloud-hosted",
+    "badgeDefaultPostureNotice": "Shows this provider's default privacy posture, not your account settings there. If you've changed a setting on {{providerName}}'s own site (e.g. turned off training), this badge won't reflect that — QR can't see your account there."
   },
   "privacyGuardianModal": {
     "headerTitle": "PRIVACY GUARDIAN",

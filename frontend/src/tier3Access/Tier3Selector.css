@@ -86,13 +86,29 @@
   opacity: 0.65;
 }
 
-.tier3-rail__hop {
+/* items.id=418: two indicator badges, shown on every row regardless of
+ * idle/loaded/active state (unlike .tier3-rail__icon's idle dimming) --
+ * provider-level info, not pane-lifecycle state. Sized to match
+ * .tier3-rail__close's 20px width. */
+.tier3-rail__badge {
   flex: 0 0 auto;
-  width: 6px;
-  height: 6px;
+  width: 20px;
+  height: 20px;
   border-radius: 50%;
-  background: #50b8d8;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   align-self: center;
+}
+
+.tier3-rail__badge--hosting {
+  background: var(--border);
+  color: var(--text);
+  opacity: 0.65;
+}
+
+.tier3-rail__badge--identity {
+  color: var(--bg);
 }
 
 .tier3-rail__tierbadge {

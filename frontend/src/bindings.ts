@@ -1115,6 +1115,13 @@ export type PersonalFieldInfo = {
 	abstraction_tier3: string,
 };
 
+/**
+ *  privacy_guardian_default_level: deliberately parallel to ReviewTier's
+ *  own three values (conductor/privacy/types.rs), same reasoning
+ *  risk_rating already established (shared_012.sql).
+ */
+export type PrivacyGuardianDefaultLevel = "low" | "medium" | "high";
+
 export type ProviderHealth = {
 	provider: string,
 	status: ProviderStatus,
@@ -1323,6 +1330,9 @@ export type Tier3ProviderSummary = {
 	id: string,
 	display_name: string,
 	lane: string,
+	login_required: boolean,
+	is_anonymous: boolean,
+	privacy_guardian_default_level: PrivacyGuardianDefaultLevel | null,
 };
 
 export type TopicInfo = {

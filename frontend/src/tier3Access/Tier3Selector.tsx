@@ -30,7 +30,54 @@
 
 import { useTranslation } from 'react-i18next'
 import './Tier3Selector.css'
-import { providerBrandColor, type Provider } from './tier3AccessConfig'
+import {
+  DUCK_LOGO_URL,
+  PROVIDER_LOGO_COMPONENTS,
+  privacyLevelColor,
+  providerBrandColor,
+  type Provider,
+} from './tier3AccessConfig'
+
+/** items.id=418: generic, non-branded glyphs for the two new indicator
+ *  badges -- hand-drawn shapes (cloud/person/mask), not reproductions of
+ *  any trademarked or platform-specific icon (e.g. not Chrome's incognito
+ *  glyph). Sized to sit inside a 20px circular badge. */
+function CloudGlyph() {
+  return (
+    <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+      <path
+        d="M4.6 11.5a2.6 2.6 0 0 1-.4-5.17A3.4 3.4 0 0 1 10.7 4.9a2.6 2.6 0 0 1 .7 5.1v.5h-6.8z"
+        fill="currentColor"
+      />
+    </svg>
+  )
+}
+
+function PersonGlyph() {
+  return (
+    <svg viewBox="0 0 16 16" width="10" height="10" aria-hidden="true">
+      <circle cx="8" cy="5.2" r="2.9" fill="currentColor" />
+      <path d="M2.3 14c.4-3.3 3-5.7 5.7-5.7s5.3 2.4 5.7 5.7z" fill="currentColor" />
+    </svg>
+  )
+}
+
+function IncognitoGlyph() {
+  return (
+    <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+      <path
+        d="M2.4 9.3c0-2.9 2.6-5.1 5.6-5.1s5.6 2.2 5.6 5.1"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.3"
+        strokeLinecap="round"
+      />
+      <circle cx="4.7" cy="9.8" r="1.5" fill="currentColor" />
+      <circle cx="11.3" cy="9.8" r="1.5" fill="currentColor" />
+      <path d="M6.2 9.8h3.6" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" />
+    </svg>
+  )
+}
 
 export type RailRowState = 'idle' | 'loaded' | 'active'
 
@@ -84,6 +131,9 @@ export function Tier3Selector({
     <ul className="tier3-rail" aria-label={t('tier3Selector.railLabel')}>
       {rows.map((provider) => {
         const state = rowState(provider.id, openPaneIds, activeProviderId)
+        const LogoComponent = PROVIDER_LOGO_COMPONENTS[provider.id]
+        const isDuck = provider.id === 'duck'
+        const hasRealLogo = Boolean(LogoComponent) || isDuck
         return (
           <li
             key={provider.id}
@@ -105,12 +155,18 @@ export function Tier3Selector({
                 className="tier3-rail__icon"
                 aria-hidden="true"
                 style={
-                  state !== 'idle'
+                  !hasRealLogo && state !== 'idle'
                     ? { backgroundColor: providerBrandColor(provider.id) }
                     : undefined
                 }
               >
-                {provider.name.slice(0, 1)}
+                {LogoComponent ? (
+                  <LogoComponent size={16} />
+                ) : isDuck ? (
+                  <img src={DUCK_LOGO_URL} width={16} height={16} alt="" />
+                ) : (
+                  provider.name.slice(0, 1)
+                )}
               </span>
               <span className="tier3-rail__meta">
                 <span className="tier3-rail__name">{provider.name}</span>
@@ -118,13 +174,21 @@ export function Tier3Selector({
                   {t(`tier3Selector.rowState.${state}`)}
                 </span>
               </span>
-              {state !== 'idle' && (
-                <span
-                  className="tier3-rail__hop"
-                  title={t('tier3Selector.hopIndicatorTitle')}
-                  aria-hidden="true"
-                />
-              )}
+              <span
+                className="tier3-rail__badge tier3-rail__badge--hosting"
+                title={t('tier3Selector.hostingBadgeTitle')}
+                aria-hidden="true"
+              >
+                <CloudGlyph />
+              </span>
+              <span
+                className="tier3-rail__badge tier3-rail__badge--identity"
+                style={{ backgroundColor: privacyLevelColor(provider.privacyGuardianDefaultLevel) }}
+                title={t('tier3Selector.badgeDefaultPostureNotice', { providerName: provider.name })}
+                aria-hidden="true"
+              >
+                {provider.isAnonymous ? <IncognitoGlyph /> : <PersonGlyph />}
+              </span>
               <span
                 className="tier3-rail__tierbadge"
                 title={
