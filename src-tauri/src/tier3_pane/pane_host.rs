@@ -2015,6 +2015,770 @@ pub struct PaneHost {
     open_pane_count: Arc<AtomicUsize>,
 }
 
+/// FIX (items.id=227, 2026-08-08): tauri-runtime-wry installs a
+/// button-press-event AND a touch-event handler directly on this webview
+/// widget during webview creation itself (tauri-runtime-wry-2.11.2/src/
+/// lib.rs:5277, unconditional on Linux -- the only decorated/resizable
+/// check is inside the handler, after the crash below). Both walk
+/// `webview.parent().and_then(|w| w.parent())` expecting stock tao/wry's
+/// fixed two-level webview -> GtkBox -> GtkWindow layout, then
+/// `.downcast::<gtk::Window>().unwrap()` -- their own comment says "Safe
+/// to unwrap unless this is not from tao". `PaneHost::install` calls this
+/// right after reparenting the webview one level deeper into its own
+/// `gtk::Overlay`, which makes exactly that not-from-tao case real: the
+/// "grandparent" becomes the host vbox (a GtkBox, not a GtkWindow), the
+/// downcast returns Err, and the unwrap panics inside a GTK signal
+/// callback -- which can't unwind across the C FFI boundary, so the whole
+/// process aborts. This was never triggered before because the GLArea
+/// pass-through fix (`handle_glarea_realize`) is what first let a real
+/// click reach this widget at all; fixing that bug is what surfaced this
+/// one. This app never uses undecorated/borderless windows
+/// (tauri.conf.json has no `decorations` override), so the resize-drag
+/// feature these handlers exist for is dead weight here even when it
+/// doesn't crash.
+///
+/// Confirmed independently (WebKit's own source,
+/// WebKitWebViewBase.cpp:2454 -- `widgetClass->button_press_event =
+/// webkitWebViewBaseButtonPressEvent`) that WebKitGTK's actual page/DOM
+/// click delivery is wired through the GtkWidgetClass vfunc slot at
+/// class-init time, not a g_signal_connect() closure -- disconnecting
+/// externally-connected handlers below cannot reach or affect it.
+///
+/// Neither gtk-rs nor tauri-runtime-wry ever hands back the
+/// SignalHandlerId for either handler (both connected internally, opaque
+/// to our code), so the only way to remove them is
+/// g_signal_handlers_disconnect_matched() matched by signal alone.
+/// touch-event has no other consumer sharing it, so it comes off clean.
+/// button-press-event does NOT: wry's own (not tauri-runtime-wry's)
+/// synthetic_mouse_events.rs shares that exact signal on this exact
+/// widget for mouse button 8/9 (back/forward) navigation, and a
+/// signal-only match can't distinguish the two internal handlers from
+/// each other (no exported symbol to tell gtk-rs's generic per-closure
+/// trampolines apart, and that module is private to wry's own crate, so
+/// we cannot just call its setup() again afterward). Reimplemented
+/// immediately below instead, as code we own outright: a fresh closure
+/// that shares no code path, and in particular never touches window
+/// ancestry, with undecorated_resizing.rs's crashing handler.
+///
+/// External review caught a real gap here (2026-08-09): a bare
+/// signal-only match is a promise about how many handlers exist *right
+/// now*, on this exact wry/tauri-runtime-wry version -- not a guarantee
+/// that stays true. A future WebKitGTK version, a different Tauri
+/// plugin, or anything else that ever connects to button-press-event/
+/// touch-event on this same widget would be swept up here too, silently,
+/// with no signal anything changed. Each disconnect call's own return
+/// value (the count actually disconnected) is checked against what this
+/// comment claims above -- 2 for button-press-event, 1 for touch-event
+/// -- and logged at error level, loud enough to notice, if that ever
+/// drifts. Not a hard panic/assert: a version bump silently adding a
+/// THIRD legitimate handler here shouldn't crash the whole app on
+/// startup, but it must be impossible to miss in the logs.
+fn fix_webview_click_handlers(webview_widget: &gtk::Widget) {
+    {
+        use gtk::glib::{gobject_ffi, translate::IntoGlib};
+        let obj = webview_widget.upcast_ref::<gtk::glib::Object>();
+        let widget_gtype = obj.type_().into_glib();
+        for (signal_name, expected_count) in
+            [(c"button-press-event", 2u32), (c"touch-event", 1u32)]
+        {
+            // SAFETY:
+            // - obj.as_ptr() is valid and the referenced GObject is
+            //   alive for this entire call: `webview_widget` (and
+            //   `obj`, an upcast reference to it) is an owned,
+            //   reference-counted GTK widget held by the caller for at
+            //   least this whole call -- it cannot be dropped or
+            //   finalized out from under these calls.
+            // - `signal_id` is guaranteed to belong to (or be
+            //   inherited by) `obj`'s own type: it comes from
+            //   g_signal_lookup(name, widget_gtype), and widget_gtype
+            //   is obj.type_() -- this object's own runtime type, not
+            //   a different/unrelated one.
+            // - Both calls happen on the correct thread for GObject/
+            //   GTK signal APIs (never thread-safe to call off the
+            //   thread that owns the main loop): this runs from
+            //   `PaneHost::install`, called from main.rs's app.run(...)
+            //   closure on tauri::RunEvent::Ready -- Tauri/tao's own
+            //   main event-loop callback, which IS the GTK main
+            //   thread on this Linux backend.
+            // - No raw pointer obtained here escapes this block: the
+            //   `*mut GObject` from obj.as_ptr() is used only as an
+            //   argument to these two FFI calls below, never stored,
+            //   returned, or captured into anything longer-lived.
+            unsafe {
+                let signal_id =
+                    gobject_ffi::g_signal_lookup(signal_name.as_ptr(), widget_gtype);
+                if signal_id == 0 {
+                    log::warn!(
+                        "tier3_pane::pane_host: g_signal_lookup found no {signal_name:?} \
+                         signal on the webview widget's type -- nothing disconnected"
+                    );
+                    continue;
+                }
+                let disconnected = gobject_ffi::g_signal_handlers_disconnect_matched(
+                    obj.as_ptr(),
+                    gobject_ffi::G_SIGNAL_MATCH_ID,
+                    signal_id,
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                );
+                if disconnected == expected_count {
+                    log::info!(
+                        "tier3_pane::pane_host: disconnected {disconnected} \
+                         {signal_name:?} handler(s) from the webview widget as \
+                         expected (removing tauri-runtime-wry's undecorated-resize \
+                         crash path -- items.id=227)"
+                    );
+                } else {
+                    log::error!(
+                        "tier3_pane::pane_host: EXPECTED COUNT MISMATCH disconnecting \
+                         {signal_name:?} from the webview widget -- removed \
+                         {disconnected}, expected {expected_count}. items.id=227's \
+                         blanket disconnect assumed exactly the handlers known at the \
+                         time this was written (tauri-runtime-wry 2.11.2 / wry 0.55.1) \
+                         -- a different count means either a version bump changed \
+                         what's connected here, or a new consumer (another plugin?) \
+                         now shares this signal too, and it was just silently \
+                         disconnected along with the rest. Investigate before trusting \
+                         mouse/touch input on this widget."
+                    );
+                }
+            }
+        }
+    }
+    // Reimplementation of wry's synthetic_mouse_events.rs mousedown half
+    // (button 8/9 back/forward -> synthesized JS `mousedown`), ported
+    // from that module's actual source rather than guessed -- the
+    // mouseup half (and the real window.history.back()/forward()
+    // trigger, which lives in ITS js string's mouseup branch) is
+    // untouched, still wry's own original button-release-event handler,
+    // since that signal was never disconnected above. This half's own
+    // held-button state (`press_state`) is intentionally a fresh,
+    // independent Rc from wry's own -- it does not observe what the
+    // surviving release handler's state does or vice versa. The only
+    // place that would matter is the `buttons` bitmask on a MouseEvent
+    // if back AND forward were both already held when this fires, which
+    // is not a real usage pattern for a back/forward side-button click;
+    // accepted as-is rather than reaching into wry's private state to
+    // unify it.
+    if let Ok(webview) = webview_widget.clone().downcast::<webkit2gtk::WebView>() {
+        use webkit2gtk::{ContextMenuExt, HitTestResultExt, WebViewExt};
+
+        // items.id=379 follow-up: custom right-click menu for the main
+        // chat UI -- mirrors the Tier 3 pane behavior (Copy when
+        // selected, Cut/Paste/Select-All when editable) by trimming
+        // WebKit's own already-correctly-positioned/dismissed
+        // `ContextMenu` in place, rather than reimplementing any of
+        // that. Unlike the Tier 3 CEF case (items.id=379's own
+        // `run_context_menu`), this is a real windowed webview
+        // receiving a real triggering `gdk::Event` synchronously, on
+        // this same GTK main thread -- none of that item's async/OSR
+        // workarounds (channel handoff, HiDPI scale-factor math,
+        // deferring until no pointer button is held) apply here. Each
+        // `ContextMenuItem::from_stock_action` is a genuine native
+        // WebKit action -- picking one runs it directly (WebKit's own
+        // Copy/Cut/Paste/Select-All/Inspect-Element implementations),
+        // so no `connect_activate`/`execute_editing_command` wiring is
+        // needed, unlike the hand-built `gtk::Menu` items.id=379 needed
+        // for the CEF case. Returns `false` (not handled) so WebKit
+        // still displays/positions/dismisses its own menu exactly as
+        // it already does today -- only its item list changes. Back/
+        // Forward/Stop/Reload are dropped unconditionally (this is a
+        // single-page app, no page-navigation model applies); Inspect
+        // Element is debug-only, matching this codebase's existing
+        // dev-only-surface convention (ipc.rs's specta_builder,
+        // commands/messages.rs, commands/consent.rs).
+        webview.connect_context_menu(|_webview, menu, _event, hit_test_result| {
+            menu.remove_all();
+            if hit_test_result.context_is_selection() {
+                menu.append(&webkit2gtk::ContextMenuItem::from_stock_action(
+                    webkit2gtk::ContextMenuAction::Copy,
+                ));
+            }
+            if hit_test_result.context_is_editable() {
+                menu.append(&webkit2gtk::ContextMenuItem::from_stock_action(
+                    webkit2gtk::ContextMenuAction::Cut,
+                ));
+                menu.append(&webkit2gtk::ContextMenuItem::from_stock_action(
+                    webkit2gtk::ContextMenuAction::Paste,
+                ));
+                menu.append(&webkit2gtk::ContextMenuItem::from_stock_action(
+                    webkit2gtk::ContextMenuAction::SelectAll,
+                ));
+            }
+            #[cfg(debug_assertions)]
+            menu.append(&webkit2gtk::ContextMenuItem::from_stock_action(
+                webkit2gtk::ContextMenuAction::InspectElement,
+            ));
+            false
+        });
+
+        webview_widget.add_events(
+            gtk::gdk::EventMask::BUTTON1_MOTION_MASK | gtk::gdk::EventMask::BUTTON_PRESS_MASK,
+        );
+        let press_state: Rc<RefCell<u8>> = Rc::new(RefCell::new(0));
+        webview_widget.connect_button_press_event(
+            move |_widget, event: &gtk::gdk::EventButton| match event.button() {
+                8 | 9 => {
+                    let held = {
+                        let mut state = press_state.borrow_mut();
+                        *state |= if event.button() == 8 { 0b01 } else { 0b10 };
+                        *state
+                    };
+                    webview.evaluate_javascript(
+                        &mouse_backforward_mousedown_js(event, held),
+                        None,
+                        None,
+                        None::<&gtk::gio::Cancellable>,
+                        |_| {},
+                    );
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
+            },
+        );
+    } else {
+        log::warn!(
+            "tier3_pane::pane_host: main window's webview widget is not a \
+             webkit2gtk::WebView -- items.id=227's mouse back/forward \
+             reimplementation was not installed"
+        );
+    }
+}
+
+/// Creates the `Overlay`/`GLArea` pair `PaneHost::install` composites: the
+/// reparented webview becomes the overlay's base child, the `GLArea` is
+/// added as a transparent overlay child above it and configured for
+/// on-demand (not every-frame-clock-tick) rendering, matching
+/// items.id=223's on-demand-cost discipline.
+fn build_overlay_and_glarea(webview_widget: gtk::Widget) -> (gtk::Overlay, gtk::GLArea) {
+    let overlay = gtk::Overlay::new();
+    overlay.add(&webview_widget);
+
+    let glarea = gtk::GLArea::new();
+    glarea.set_has_alpha(true);
+    glarea.set_hexpand(true);
+    glarea.set_vexpand(true);
+    // DIAGNOSTIC (items.id=225, 2026-08-07): the GLArea overlay appears
+    // to swallow all pointer input across the whole window even with
+    // overlay pass-through set below -- confirmed via direct click
+    // testing (Tier3Selector checkboxes and the harness's own
+    // "Simulate response generating" button are both completely inert).
+    // set_can_focus(false) rules out one candidate cause (the GLArea
+    // grabbing keyboard/click-to-focus before pass-through routing).
+    glarea.set_can_focus(false);
+    // Redraw only on an explicit queue_draw() call (from the GLib
+    // timeout below, gated on open_pane_count > 0) -- not on every GTK
+    // frame-clock tick regardless of whether any pane is open. Matches
+    // items.id=223's on-demand-cost discipline: a user who never opens
+    // Tier 2/3 should not pay for a continuously re-rendering GLArea.
+    glarea.set_auto_render(false);
+
+    overlay.add_overlay(&glarea);
+    // Input forwarding into CEF does not exist yet at any layer (a real,
+    // pre-existing gap -- see tier3_pane/mod.rs docs) -- until it does,
+    // mouse/keyboard events must keep reaching the webview underneath,
+    // not be swallowed by an overlay child that can't yet do anything
+    // with them.
+    overlay.set_overlay_pass_through(&glarea, true);
+
+    (overlay, glarea)
+}
+
+/// Creates the three mpsc channel pairs and the `PaneManager` that owns
+/// them, for `PaneHost::install`. The pairs are created once, here, for
+/// the app's whole lifetime; each pane clones the relevant sender half
+/// into its own `PaneLifeSpanHandler`/`PaneLoadHandler`/`ClientBuilder` at
+/// `open_pane` time (items.id=234, items.id=379) -- the receiver halves
+/// live on `PaneManager` itself, drained once per GTK render tick.
+fn build_pane_manager(app_handle: tauri::AppHandle) -> Rc<RefCell<PaneManager>> {
+    let (popup_requested_tx, popup_requested_rx) = std::sync::mpsc::channel();
+    let (popup_close_tx, popup_close_rx) = std::sync::mpsc::channel();
+    let (context_menu_requested_tx, context_menu_requested_rx) = std::sync::mpsc::channel();
+    Rc::new(RefCell::new(PaneManager {
+        panes: IndexMap::new(),
+        open_pane_count: Arc::new(AtomicUsize::new(0)),
+        last_focus: None,
+        popups: HashMap::new(),
+        popup_requested_tx,
+        popup_requested_rx,
+        popup_close_tx,
+        popup_close_rx,
+        context_menu_requested_tx,
+        context_menu_requested_rx,
+        active_pane: None,
+        app_handle,
+    }))
+}
+
+/// Body of the GLArea's `realize` signal handler, wired up in
+/// `PaneHost::install`. Runs once per GLArea realization: activates the
+/// GL context, re-applies the private-event-window input-shape fix GTK
+/// forces a realize to redo, and builds the one shared `GlProcLoader`/
+/// `RenderState`/`glow::Context` for the GLArea's whole realized
+/// lifetime.
+fn handle_glarea_realize(
+    area: &gtk::GLArea,
+    render_state: &Rc<RefCell<Option<RenderState>>>,
+    gl_context: &Rc<RefCell<Option<glow::Context>>>,
+    gl_loader: &Rc<RefCell<Option<crate::tier3_pane::gl_loader::GlProcLoader>>>,
+) {
+    area.make_current();
+    if let Some(err) = area.error() {
+        log::error!("tier3_pane::pane_host: GLArea realize error: {err}");
+        return;
+    }
+    // ROOT CAUSE FOUND (items.id=227, 2026-08-08, confirmed against
+    // GTK 3.24's actual C source, not just black-box testing):
+    // items.id=225's reassertion below (window.set_pass_through)
+    // was never wrong, it was just aimed at the wrong window.
+    // GtkGLArea sets has_window=FALSE (gtk_gl_area_init) -- for a
+    // no-window widget, area.window() resolves to its
+    // *parent_window*, which GtkOverlay explicitly points at a
+    // dedicated per-overlay-child GdkWindow it creates for us
+    // (gtk_overlay_create_child_window) and *already* pass-throughs
+    // correctly on our behalf (that's what
+    // overlay.set_overlay_pass_through() actually does under the
+    // hood). Confirmed via live click capture: both pass-through
+    // calls report is_pass_through=true and are telling the
+    // truth -- for that window. But gtk_gl_area_realize() (see
+    // gtk/gtkglarea.c upstream) *unconditionally* creates a
+    // second, private GDK_INPUT_ONLY window of its own
+    // (priv->event_window, sized to the widget's own allocation,
+    // parented one level *inside* the window pass-through was set
+    // on) specifically to catch input for this has_window=FALSE
+    // widget -- gtk_widget_register_window() ties it back to the
+    // GLArea widget for signal dispatch, which is exactly why
+    // GLArea's own button-press-event fired on every real click
+    // during this investigation (confirmed via a now-removed
+    // temporary widget-level trace) while the webview's never
+    // did. This private window has no public accessor
+    // anywhere in GTK3's API (gtk_gl_area_*, gtk_overlay_*, no
+    // getter) and pass-through is a per-window flag, not
+    // inherited by descendants -- so nothing reachable from
+    // application code had ever touched it; it silently keeps
+    // its GTK default of FALSE regardless of what we do to its
+    // parent. Real fix: find it anyway via the one public GDK
+    // API that can see it (gdk_window_get_children() on the
+    // window pass-through already worked on) and set
+    // pass-through on it directly. (items.id=257 Path A,
+    // 2026-08-22, refines this further: instead of a blanket
+    // pass-through -- which would make glarea and its panes
+    // unable to receive input at all -- event_window's GDK
+    // input SHAPE is restricted below to just the open panes'
+    // rects, rebuilt as panes open/close/resize; see the
+    // click/mouse-forwarding section doc above
+    // `build_pane_hit_widget`.) gtk_gl_area_realize()
+    // (upstream) only ever creates the one INPUT_ONLY child,
+    // so today that means exactly one match -- but the code
+    // below verifies that rather than assuming it (external
+    // review, 2026-08-09): collect every INPUT_ONLY child and
+    // match on the count, so a future GTK version creating
+    // more than one can't get silently mis-handled the same
+    // way the original wry ancestry assumption that started
+    // this whole item was -- an unverified "there's only one
+    // of these" is exactly the class of bug items.id=227 has
+    // been chasing all along.
+    //
+    // connect_realize only fires once per realization, so this
+    // fix only re-applies if GTK ever fires realize again.
+    // Confirmed directly (not just asserted) that this app's
+    // lifecycle never does that in practice: install() itself
+    // only ever runs once, gated on tauri::RunEvent::Ready
+    // (fires once per app lifetime -- see main.rs's app.run()
+    // closure, the only call site), and nothing else in this
+    // codebase hides, removes, or reparents the GLArea
+    // afterward. GTK3 doesn't unrealize child widgets on
+    // iconify/minimize either -- only on actual removal from a
+    // realized parent, which never happens here post-install.
+    //
+    // Walked through what WOULD happen if a second realize
+    // ever did occur, rather than just trusting "it's inside
+    // connect_realize so it must be fine": gtk_gl_area_realize
+    // (the class handler, runs before this closure on every
+    // firing -- see GTK_WIDGET_CLASS(...)->realize(widget) at
+    // the top of gtk_gl_area_realize upstream) unconditionally
+    // creates a brand new priv->event_window every time it
+    // runs, unrealize destroys the old one first. Nothing in
+    // this closure caches the old event_window across calls --
+    // `window.children()` below is a live GDK query issued
+    // fresh every time this closure fires, so on a
+    // hypothetical second realize it would enumerate whatever
+    // INPUT_ONLY children exist at that moment (the new
+    // event_window, not a stale reference to the destroyed
+    // one) and correctly pass-through it again. area.window()
+    // itself (the Overlay's own per-child window, not GLArea's
+    // private one) is also queried fresh each call, not read
+    // from a captured variable -- so even in the unlikely case
+    // the Overlay recreated that window too, this would still
+    // resolve correctly. This fix is structurally correct for
+    // a second realize even though one never actually happens.
+    if let Some(window) = area.window() {
+        window.set_pass_through(true);
+        let input_only_children: Vec<gtk::gdk::Window> = window
+            .children()
+            .into_iter()
+            .filter(|child| child.is_input_only())
+            .collect();
+        match input_only_children.as_slice() {
+            [event_window] => {
+                // pass_through(false) (GTK's own default -- set
+                // explicitly rather than left implicit, matching
+                // this codebase's defensive style elsewhere) is
+                // moot in practice now: this input shape is set
+                // empty here once and never rebuilt afterward
+                // (items.id=257 Path B -- pane click routing no
+                // longer goes through GDK at all, see the "Pane
+                // content click/mouse forwarding" section doc
+                // above), so there is no non-empty shape for
+                // pass-through to ever apply to. Kept explicit,
+                // and kept as exactly this one confirmed-safe
+                // `input_shape_combine_region` call (this
+                // session's own `gdb` work confirmed an EMPTY
+                // region here does not freeze Wayland pointer
+                // input; only a non-empty one did) rather than
+                // removed, since a permanently-empty shape is the
+                // smallest change that provably avoids the freeze.
+                event_window.set_pass_through(false);
+                event_window
+                    .input_shape_combine_region(&gtk::cairo::Region::create(), 0, 0);
+                log::info!(
+                    "tier3_pane::pane_host: GLArea private event_window \
+                     found, input shape set permanently empty (items.id=257 \
+                     Path B -- glarea is a pure compositor now, pane click \
+                     routing goes through the frontend's DOM hit-layer \
+                     instead), is_pass_through={} \
+                     (parent GdkWindow is_pass_through={})",
+                    event_window.is_pass_through(),
+                    window.is_pass_through(),
+                );
+            }
+            [] => log::warn!(
+                "tier3_pane::pane_host: GLArea's parent_window has no \
+                 INPUT_ONLY child at realize -- expected \
+                 priv->event_window (see gtk_gl_area_realize upstream) \
+                 was not found. Harmless to pane click/mouse forwarding \
+                 (items.id=257 Path B routes that through the frontend's \
+                 DOM hit-layer, not this window) -- logged in case a \
+                 future GTK version's changed behavior here matters for \
+                 some other reason."
+            ),
+            multiple => log::error!(
+                "tier3_pane::pane_host: GLArea's parent_window has \
+                 {} INPUT_ONLY children at realize -- expected exactly \
+                 one (priv->event_window). Refusing to guess which one \
+                 is the real one; none had their input shape reset to \
+                 empty. This means GTK's own gtk_gl_area_realize() \
+                 behavior has changed from what items.id=227 verified \
+                 against (GTK 3.24) -- investigate. Does not affect pane \
+                 click/mouse forwarding (items.id=257 Path B routes that \
+                 through the frontend's DOM hit-layer, not this window).",
+                multiple.len()
+            ),
+        }
+    } else {
+        log::warn!(
+            "tier3_pane::pane_host: GLArea has no GdkWindow at realize -- \
+             cannot reassert pass_through"
+        );
+    }
+    let width = area.allocated_width().max(1) as u32;
+    let height = area.allocated_height().max(1) as u32;
+    // One `GlProcLoader`, stored in `gl_loader` for the GLArea's
+    // whole realized lifetime (see the ROOT CAUSE FOUND comment
+    // near this closure's construction) -- both `RenderState`
+    // and the standalone `glow::Context` below resolve their
+    // function pointers from this same still-alive instance
+    // instead of two that would otherwise be dropped (and
+    // `dlclose`d) the moment this closure returns.
+    *gl_loader.borrow_mut() = Some(crate::tier3_pane::gl_loader::GlProcLoader::open());
+    let loader_ref = gl_loader.borrow();
+    let loader = loader_ref.as_ref().expect("just set above");
+    let state = pollster::block_on(RenderState::new(loader.loader_fn(), (width, height)));
+    *render_state.borrow_mut() = Some(state);
+    let gl = unsafe { glow::Context::from_loader_function(loader.loader_fn()) };
+    *gl_context.borrow_mut() = Some(gl);
+    drop(loader_ref);
+    log::info!("tier3_pane::pane_host: shared RenderState constructed from GTK's external GL context ({width}x{height})");
+}
+
+/// Body of the GLArea's `resize` signal handler, wired up in
+/// `PaneHost::install`: resizes the shared `RenderState`'s target and
+/// re-syncs every open pane/popup's CEF-side size to match (items.id=234).
+fn handle_glarea_resize(
+    area: &gtk::GLArea,
+    width: i32,
+    height: i32,
+    render_state: &Rc<RefCell<Option<RenderState>>>,
+    manager: &Rc<RefCell<PaneManager>>,
+    app_handle: &tauri::AppHandle,
+) {
+    log::debug!("DIAG items.id=227: connect_resize fired width={width} height={height}");
+    let (seq, elapsed_ms) = diag_312_tick();
+    log::debug!(
+        "DIAG items.id=312: seq={seq} t={elapsed_ms}ms connect_resize \
+         width={width} height={height} allocated=({},{})",
+        area.allocated_width(),
+        area.allocated_height(),
+    );
+    let (width, height) = (width.max(1) as u32, height.max(1) as u32);
+    if let Some(rs) = render_state.borrow_mut().as_mut() {
+        rs.resize((width, height));
+    }
+    let layout = app_handle
+        .state::<PaneLayoutState>()
+        .0
+        .lock()
+        .unwrap()
+        .clone();
+    let mut mgr = manager.borrow_mut();
+    mgr.sync_pane_sizes((width, height), &layout);
+    // items.id=234: popup rects rescale proportionally on
+    // ordinary window resize too, same mechanism as panes.
+    mgr.sync_popup_sizes((width, height));
+}
+
+/// Sizing + diagnostic-correlation data computed once at the top of the
+/// GLArea's `render` handler (`PaneHost::install`) and threaded through to
+/// `render_and_present`, so its own DIAG items.id=312 log lines share one
+/// `seq`/`elapsed_ms` pair with the handler's "fired" log line.
+struct RenderTickContext {
+    /// GTK logical pixels (`allocated_width`/`allocated_height`).
+    glarea_size: (u32, u32),
+    /// `glarea_size` scaled by `scale_u32` -- what CEF/`sync_pane_sizes`/
+    /// `RenderState` all expect.
+    glarea_size_physical: (u32, u32),
+    scale_u32: u32,
+    seq: u64,
+    elapsed_ms: u128,
+}
+
+/// CRITICAL (confirmed this session): must be called before any wgpu
+/// device/queue call this render tick. wgpu-hal's own internal calls
+/// silently rebind `GL_DRAW_FRAMEBUFFER` to their own scratch target --
+/// GTK's own compositing would read from the wrong framebuffer once the
+/// `render` signal handler returns otherwise. `render_and_present`
+/// explicitly rebinds what this captures, after every wgpu call it makes.
+fn capture_draw_framebuffer(gl_context: &Rc<RefCell<Option<glow::Context>>>) -> Option<i32> {
+    use glow::HasContext as _;
+    gl_context
+        .borrow()
+        .as_ref()
+        .map(|gl| unsafe { gl.get_parameter_i32(glow::DRAW_FRAMEBUFFER_BINDING) })
+}
+
+/// FIX (items.id=329, click-sync-on-open): re-syncs every open pane/
+/// popup's CEF-side size on every render tick, not just on
+/// `connect_resize` -- a pane opened between two window resizes painted
+/// at the right spot but CEF's own notion of its rect stayed stale until
+/// an incidental resize finally synced it, so clicks landed off-target
+/// until then. `connect_render` already recomputes `layout`/`glarea_size`
+/// every tick and fires on `queue_render()` (see `PaneHost::queue_draw`'s
+/// doc), which `set_pane_layout` (commands/tier3_pane.rs) already calls
+/// right after a pane's first layout fractions land -- so syncing here
+/// closes the gap on the very next render tick after open, no new call
+/// site needed. Cheap on every other frame: both syncs no-op via
+/// `last_applied_size` once a pane/popup's CEF-side size already matches.
+///
+/// `glarea_size_physical`, not logical pixels: this block's first version
+/// passed the logical size here instead -- confirmed live, that made
+/// every pane render zoomed in (browser_size came out smaller than the
+/// real canvas by the scale factor) and froze scrolling near the page's
+/// true bottom (CEF's own scroll-clamp math was working off that wrong,
+/// too-small viewport height).
+fn sync_frame_sizes(
+    manager: &Rc<RefCell<PaneManager>>,
+    glarea_size_physical: (u32, u32),
+    layout: &HashMap<PaneKey, PaneRectFraction>,
+) {
+    manager.borrow_mut().drain_ready_browsers();
+    let mut mgr = manager.borrow_mut();
+    mgr.sync_pane_sizes(glarea_size_physical, layout);
+    mgr.sync_popup_sizes(glarea_size_physical);
+}
+
+/// items.id=234: resolves any new popup requests, reacts to popup
+/// lifecycle events (self-close/first-paint-ready), and acts on any
+/// parent-navigate-away close requests -- then forwards whatever happened
+/// this tick to the frontend as tier3-popup-opened/-closed events.
+fn drain_and_emit_popup_notifications(
+    manager: &Rc<RefCell<PaneManager>>,
+    app_handle: &tauri::AppHandle,
+    glarea_size: (u32, u32),
+    layout: &HashMap<PaneKey, PaneRectFraction>,
+) {
+    let popup_notifications = {
+        let mut mgr = manager.borrow_mut();
+        let mut n = mgr.drain_popup_requests(glarea_size, layout);
+        n.extend(mgr.drain_popup_events());
+        n.extend(mgr.drain_popup_close_requests());
+        n
+    };
+    if !popup_notifications.is_empty() {
+        use tauri::Emitter;
+        for notification in popup_notifications {
+            match notification {
+                PopupNotification::Opened { key, rect } => {
+                    let payload = PopupOpenedPayload {
+                        provider_id: key,
+                        rect,
+                    };
+                    if let Err(e) = app_handle.emit("tier3-popup-opened", &payload) {
+                        log::warn!(
+                            "tier3_pane::pane_host: failed to emit \
+                             tier3-popup-opened: {e}"
+                        );
+                    }
+                }
+                PopupNotification::Closed { key } => {
+                    let payload = PopupClosedPayload { provider_id: key };
+                    if let Err(e) = app_handle.emit("tier3-popup-closed", &payload) {
+                        log::warn!(
+                            "tier3_pane::pane_host: failed to emit \
+                             tier3-popup-closed: {e}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// items.id=379: resolves any pending right-click requests and pops a
+/// native `gtk::Menu` for each. `glarea_size_physical`, not logical
+/// pixels -- `show_context_menu` adds this offset directly to
+/// `ContextMenuParams::xcoord()`/`ycoord()`, which are real physical
+/// pixels per items.id=328's established convention, so the units must
+/// match.
+fn drain_and_show_context_menus(
+    manager: &Rc<RefCell<PaneManager>>,
+    app_handle: &tauri::AppHandle,
+    area: &gtk::GLArea,
+    glarea_size_physical: (u32, u32),
+    layout: &HashMap<PaneKey, PaneRectFraction>,
+) {
+    let context_menu_requests = {
+        let mut mgr = manager.borrow_mut();
+        mgr.drain_context_menu_requests(glarea_size_physical, layout)
+    };
+    for resolved in context_menu_requests {
+        show_context_menu(area, app_handle, resolved);
+    }
+}
+
+/// Pumps `send_external_begin_frame()` for every open pane and popup
+/// browser, once per render tick.
+fn pump_begin_frames(manager: &Rc<RefCell<PaneManager>>) {
+    for pane in manager.borrow().panes.values() {
+        if let Some(host) = pane.browser_lifecycle.browser().and_then(|b| b.host()) {
+            host.send_external_begin_frame();
+        }
+    }
+    for popup in manager.borrow().popups.values() {
+        if let Some(host) = popup.lifecycle.browser().and_then(|b| b.host()) {
+            host.send_external_begin_frame();
+        }
+    }
+}
+
+/// Builds the active pane's popup-layout map, runs the items.id=312
+/// size-mismatch diagnostic, calls `RenderState::render`, then rebinds
+/// `GL_DRAW_FRAMEBUFFER` to what `capture_draw_framebuffer` captured and
+/// resets scissor/viewport. Kept as one function, not split further, so
+/// "capture before any wgpu call, rebind immediately after render" can't
+/// be separated across a function boundary by a future edit inserting
+/// something in between.
+fn render_and_present(
+    render_state: &Rc<RefCell<Option<RenderState>>>,
+    gl_context: &Rc<RefCell<Option<glow::Context>>>,
+    manager: &Rc<RefCell<PaneManager>>,
+    layout: &HashMap<PaneKey, PaneRectFraction>,
+    tick: &RenderTickContext,
+    captured_fbo: Option<i32>,
+) {
+    use glow::HasContext as _;
+
+    if let Some(rs) = render_state.borrow_mut().as_mut() {
+        // DIAG items.id=312 (temporary): `tick.glarea_size` is GTK
+        // *logical* pixels (`allocated_width/height`); `rs.size()` is
+        // whatever the last `connect_resize` call stored, which GTK
+        // documents as *physical* GL framebuffer pixels -- i.e. already
+        // multiplied by the device scale factor. Compare against
+        // `tick.glarea_size_physical` so this only fires on a genuine
+        // staleness mismatch (RenderState about to wrap a texture at a
+        // size GTK's own allocation has already moved past), not on the
+        // expected HiDPI unit difference.
+        let rs_size = rs.size();
+        if rs_size != tick.glarea_size_physical {
+            log::warn!(
+                "DIAG items.id=312: seq={} t={}ms SIZE MISMATCH \
+                 glarea_size_physical={:?} (logical={:?} scale={}) \
+                 render_state.size={rs_size:?}",
+                tick.seq,
+                tick.elapsed_ms,
+                tick.glarea_size_physical,
+                tick.glarea_size,
+                tick.scale_u32,
+            );
+        } else {
+            log::debug!(
+                "DIAG items.id=312: seq={} t={}ms pre-render size={rs_size:?} \
+                 (matches glarea_size_physical, scale={})",
+                tick.seq,
+                tick.elapsed_ms,
+                tick.scale_u32,
+            );
+        }
+        // items.id=366: unlike the pane loop above (which only ever
+        // draws a pane whose key has a `layout` entry -- the frontend
+        // only reports one for the currently-visible pane, which is
+        // what actually enforces the single-active-pane model at paint
+        // time, not `was_hidden` itself), this map used to be built
+        // from *every* open popup unconditionally. `was_hidden(true)`
+        // (items.id=361) stops a deactivated pane's popup from
+        // producing new frames, but does nothing about the frame it
+        // already produced -- `POPUP_TEXTURES` keeps that
+        // last-painted texture until `force_close_popup` explicitly
+        // removes it, so with no filter here the stale texture kept
+        // compositing every frame regardless of which pane was
+        // actually active (confirmed live, 2026-08-30: a Claude login
+        // popup stayed on screen after switching to ChatGPT's pane).
+        // Filtering to only the active pane's own popup matches the
+        // pane loop's own filtering, just done here instead of on the
+        // frontend side since popups have no frontend-owned layout
+        // state to omit an entry from.
+        let popup_layout: HashMap<PaneKey, PaneRectFraction> = {
+            let mgr = manager.borrow();
+            let active = mgr.active_pane.clone();
+            mgr.popups
+                .iter()
+                .filter(|(k, _)| Some(*k) == active.as_ref())
+                .map(|(k, p)| (k.clone(), p.rect))
+                .collect()
+        };
+        rs.render(layout, &popup_layout, captured_fbo.map(|fbo| fbo as u32));
+    }
+
+    if let (Some(gl), Some(fbo)) = (gl_context.borrow().as_ref(), captured_fbo) {
+        let framebuffer = std::num::NonZeroU32::new(fbo as u32).map(glow::NativeFramebuffer);
+        unsafe {
+            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, framebuffer);
+            // items.id=257: wgpu's render pass leaves SCISSOR_TEST
+            // enabled and the viewport clamped to whichever pane was
+            // drawn last -- reset both so nothing else sharing this GL
+            // context (GTK's own subsequent presentation, any other
+            // widget drawing through it) inherits a stale scissor/
+            // viewport rect.
+            gl.disable(glow::SCISSOR_TEST);
+            if let Some(rs) = render_state.borrow().as_ref() {
+                let (w, h) = rs.size();
+                gl.viewport(0, 0, w as i32, h as i32);
+            }
+        }
+    }
+}
+
 impl PaneHost {
     /// Reparents Tauri's own webview widget into a `gtk::Overlay` and adds
     /// the shared `GLArea` as a transparent overlay child above it, then
@@ -2043,269 +2807,9 @@ impl PaneHost {
             );
         vbox.remove(&webview_widget);
 
-        // FIX (items.id=227, 2026-08-08): tauri-runtime-wry installs a
-        // button-press-event AND a touch-event handler directly on this
-        // webview widget during webview creation itself (tauri-runtime-
-        // wry-2.11.2/src/lib.rs:5277, unconditional on Linux -- the only
-        // decorated/resizable check is inside the handler, after the
-        // crash below). Both walk `webview.parent().and_then(|w|
-        // w.parent())` expecting stock tao/wry's fixed two-level webview
-        // -> GtkBox -> GtkWindow layout, then
-        // `.downcast::<gtk::Window>().unwrap()` -- their own comment says
-        // "Safe to unwrap unless this is not from tao". Reparenting the
-        // webview one level deeper into our own gtk::Overlay below makes
-        // exactly that not-from-tao case real: the "grandparent" becomes
-        // our vbox (a GtkBox, not a GtkWindow), the downcast returns Err,
-        // and the unwrap panics inside a GTK signal callback -- which
-        // can't unwind across the C FFI boundary, so the whole process
-        // aborts. This was never triggered before because the GLArea
-        // pass-through fix above is what first let a real click reach
-        // this widget at all; fixing that bug is what surfaced this one.
-        // This app never uses undecorated/borderless windows
-        // (tauri.conf.json has no `decorations` override), so the
-        // resize-drag feature these handlers exist for is dead weight
-        // here even when it doesn't crash.
-        //
-        // Confirmed independently (WebKit's own source,
-        // WebKitWebViewBase.cpp:2454 -- `widgetClass->button_press_event
-        // = webkitWebViewBaseButtonPressEvent`) that WebKitGTK's actual
-        // page/DOM click delivery is wired through the GtkWidgetClass
-        // vfunc slot at class-init time, not a g_signal_connect() closure
-        // -- disconnecting externally-connected handlers below cannot
-        // reach or affect it.
-        //
-        // Neither gtk-rs nor tauri-runtime-wry ever hands back the
-        // SignalHandlerId for either handler (both connected internally,
-        // opaque to our code), so the only way to remove them is
-        // g_signal_handlers_disconnect_matched() matched by signal alone.
-        // touch-event has no other consumer sharing it, so it comes off
-        // clean. button-press-event does NOT: wry's own (not tauri-
-        // runtime-wry's) synthetic_mouse_events.rs shares that exact
-        // signal on this exact widget for mouse button 8/9 (back/forward)
-        // navigation, and a signal-only match can't distinguish the two
-        // internal handlers from each other (no exported symbol to tell
-        // gtk-rs's generic per-closure trampolines apart, and that module
-        // is private to wry's own crate, so we cannot just call its
-        // setup() again afterward). Reimplemented immediately below
-        // instead, as code we own outright: a fresh closure that shares
-        // no code path, and in particular never touches window ancestry,
-        // with undecorated_resizing.rs's crashing handler.
-        //
-        // External review caught a real gap here (2026-08-09): a bare
-        // signal-only match is a promise about how many handlers exist
-        // *right now*, on this exact wry/tauri-runtime-wry version -- not
-        // a guarantee that stays true. A future WebKitGTK version, a
-        // different Tauri plugin, or anything else that ever connects to
-        // button-press-event/touch-event on this same widget would be
-        // swept up here too, silently, with no signal anything changed.
-        // Each disconnect call's own return value (the count actually
-        // disconnected) is checked against what this comment claims above
-        // -- 2 for button-press-event, 1 for touch-event -- and logged at
-        // error level, loud enough to notice, if that ever drifts. Not a
-        // hard panic/assert: a version bump silently adding a THIRD
-        // legitimate handler here shouldn't crash the whole app on
-        // startup, but it must be impossible to miss in the logs.
-        {
-            use gtk::glib::{gobject_ffi, translate::IntoGlib};
-            let obj = webview_widget.upcast_ref::<gtk::glib::Object>();
-            let widget_gtype = obj.type_().into_glib();
-            for (signal_name, expected_count) in
-                [(c"button-press-event", 2u32), (c"touch-event", 1u32)]
-            {
-                // SAFETY:
-                // - obj.as_ptr() is valid and the referenced GObject is
-                //   alive for this entire call: `webview_widget` (and
-                //   `obj`, an upcast reference to it) is an owned,
-                //   reference-counted GTK widget held on this stack frame
-                //   for the whole unsafe block -- it cannot be dropped or
-                //   finalized out from under these calls.
-                // - `signal_id` is guaranteed to belong to (or be
-                //   inherited by) `obj`'s own type: it comes from
-                //   g_signal_lookup(name, widget_gtype), and widget_gtype
-                //   is obj.type_() -- this object's own runtime type, not
-                //   a different/unrelated one.
-                // - Both calls happen on the correct thread for GObject/
-                //   GTK signal APIs (never thread-safe to call off the
-                //   thread that owns the main loop): this code runs
-                //   inside PaneHost::install, called from main.rs's
-                //   app.run(...) closure on tauri::RunEvent::Ready --
-                //   Tauri/tao's own main event-loop callback, which IS
-                //   the GTK main thread on this Linux backend.
-                // - No raw pointer obtained here escapes this block: the
-                //   `*mut GObject` from obj.as_ptr() is used only as an
-                //   argument to these two FFI calls below, never stored,
-                //   returned, or captured into anything longer-lived.
-                unsafe {
-                    let signal_id =
-                        gobject_ffi::g_signal_lookup(signal_name.as_ptr(), widget_gtype);
-                    if signal_id == 0 {
-                        log::warn!(
-                            "tier3_pane::pane_host: g_signal_lookup found no {signal_name:?} \
-                             signal on the webview widget's type -- nothing disconnected"
-                        );
-                        continue;
-                    }
-                    let disconnected = gobject_ffi::g_signal_handlers_disconnect_matched(
-                        obj.as_ptr(),
-                        gobject_ffi::G_SIGNAL_MATCH_ID,
-                        signal_id,
-                        0,
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                    );
-                    if disconnected == expected_count {
-                        log::info!(
-                            "tier3_pane::pane_host: disconnected {disconnected} \
-                             {signal_name:?} handler(s) from the webview widget as \
-                             expected (removing tauri-runtime-wry's undecorated-resize \
-                             crash path -- items.id=227)"
-                        );
-                    } else {
-                        log::error!(
-                            "tier3_pane::pane_host: EXPECTED COUNT MISMATCH disconnecting \
-                             {signal_name:?} from the webview widget -- removed \
-                             {disconnected}, expected {expected_count}. items.id=227's \
-                             blanket disconnect assumed exactly the handlers known at the \
-                             time this was written (tauri-runtime-wry 2.11.2 / wry 0.55.1) \
-                             -- a different count means either a version bump changed \
-                             what's connected here, or a new consumer (another plugin?) \
-                             now shares this signal too, and it was just silently \
-                             disconnected along with the rest. Investigate before trusting \
-                             mouse/touch input on this widget."
-                        );
-                    }
-                }
-            }
-        }
-        // Reimplementation of wry's synthetic_mouse_events.rs mousedown
-        // half (button 8/9 back/forward -> synthesized JS `mousedown`),
-        // ported from that module's actual source rather than guessed --
-        // the mouseup half (and the real window.history.back()/forward()
-        // trigger, which lives in ITS js string's mouseup branch) is
-        // untouched, still wry's own original button-release-event
-        // handler, since that signal was never disconnected above. This
-        // half's own held-button state (`press_state`) is intentionally a
-        // fresh, independent Rc from wry's own -- it does not observe
-        // what the surviving release handler's state does or vice versa.
-        // The only place that would matter is the `buttons` bitmask on a
-        // MouseEvent if back AND forward were both already held when this
-        // fires, which is not a real usage pattern for a back/forward
-        // side-button click; accepted as-is rather than reaching into
-        // wry's private state to unify it.
-        if let Ok(webview) = webview_widget.clone().downcast::<webkit2gtk::WebView>() {
-            use webkit2gtk::{ContextMenuExt, HitTestResultExt, WebViewExt};
+        fix_webview_click_handlers(&webview_widget);
 
-            // items.id=379 follow-up: custom right-click menu for the main
-            // chat UI -- mirrors the Tier 3 pane behavior (Copy when
-            // selected, Cut/Paste/Select-All when editable) by trimming
-            // WebKit's own already-correctly-positioned/dismissed
-            // `ContextMenu` in place, rather than reimplementing any of
-            // that. Unlike the Tier 3 CEF case (items.id=379's own
-            // `run_context_menu`), this is a real windowed webview
-            // receiving a real triggering `gdk::Event` synchronously, on
-            // this same GTK main thread -- none of that item's async/OSR
-            // workarounds (channel handoff, HiDPI scale-factor math,
-            // deferring until no pointer button is held) apply here. Each
-            // `ContextMenuItem::from_stock_action` is a genuine native
-            // WebKit action -- picking one runs it directly (WebKit's own
-            // Copy/Cut/Paste/Select-All/Inspect-Element implementations),
-            // so no `connect_activate`/`execute_editing_command` wiring is
-            // needed, unlike the hand-built `gtk::Menu` items.id=379 needed
-            // for the CEF case. Returns `false` (not handled) so WebKit
-            // still displays/positions/dismisses its own menu exactly as
-            // it already does today -- only its item list changes. Back/
-            // Forward/Stop/Reload are dropped unconditionally (this is a
-            // single-page app, no page-navigation model applies); Inspect
-            // Element is debug-only, matching this codebase's existing
-            // dev-only-surface convention (ipc.rs's specta_builder,
-            // commands/messages.rs, commands/consent.rs).
-            webview.connect_context_menu(|_webview, menu, _event, hit_test_result| {
-                menu.remove_all();
-                if hit_test_result.context_is_selection() {
-                    menu.append(&webkit2gtk::ContextMenuItem::from_stock_action(
-                        webkit2gtk::ContextMenuAction::Copy,
-                    ));
-                }
-                if hit_test_result.context_is_editable() {
-                    menu.append(&webkit2gtk::ContextMenuItem::from_stock_action(
-                        webkit2gtk::ContextMenuAction::Cut,
-                    ));
-                    menu.append(&webkit2gtk::ContextMenuItem::from_stock_action(
-                        webkit2gtk::ContextMenuAction::Paste,
-                    ));
-                    menu.append(&webkit2gtk::ContextMenuItem::from_stock_action(
-                        webkit2gtk::ContextMenuAction::SelectAll,
-                    ));
-                }
-                #[cfg(debug_assertions)]
-                menu.append(&webkit2gtk::ContextMenuItem::from_stock_action(
-                    webkit2gtk::ContextMenuAction::InspectElement,
-                ));
-                false
-            });
-
-            webview_widget.add_events(
-                gtk::gdk::EventMask::BUTTON1_MOTION_MASK | gtk::gdk::EventMask::BUTTON_PRESS_MASK,
-            );
-            let press_state: Rc<RefCell<u8>> = Rc::new(RefCell::new(0));
-            webview_widget.connect_button_press_event(
-                move |_widget, event: &gtk::gdk::EventButton| match event.button() {
-                    8 | 9 => {
-                        let held = {
-                            let mut state = press_state.borrow_mut();
-                            *state |= if event.button() == 8 { 0b01 } else { 0b10 };
-                            *state
-                        };
-                        webview.evaluate_javascript(
-                            &mouse_backforward_mousedown_js(event, held),
-                            None,
-                            None,
-                            None::<&gtk::gio::Cancellable>,
-                            |_| {},
-                        );
-                        glib::Propagation::Stop
-                    }
-                    _ => glib::Propagation::Proceed,
-                },
-            );
-        } else {
-            log::warn!(
-                "tier3_pane::pane_host: main window's webview widget is not a \
-                 webkit2gtk::WebView -- items.id=227's mouse back/forward \
-                 reimplementation was not installed"
-            );
-        }
-
-        let overlay = gtk::Overlay::new();
-        overlay.add(&webview_widget);
-
-        let glarea = gtk::GLArea::new();
-        glarea.set_has_alpha(true);
-        glarea.set_hexpand(true);
-        glarea.set_vexpand(true);
-        // DIAGNOSTIC (items.id=225, 2026-08-07): the GLArea overlay appears
-        // to swallow all pointer input across the whole window even with
-        // overlay pass-through set below -- confirmed via direct click
-        // testing (Tier3Selector checkboxes and the harness's own
-        // "Simulate response generating" button are both completely inert).
-        // set_can_focus(false) rules out one candidate cause (the GLArea
-        // grabbing keyboard/click-to-focus before pass-through routing).
-        glarea.set_can_focus(false);
-        // Redraw only on an explicit queue_draw() call (from the GLib
-        // timeout below, gated on open_pane_count > 0) -- not on every GTK
-        // frame-clock tick regardless of whether any pane is open. Matches
-        // items.id=223's on-demand-cost discipline: a user who never opens
-        // Tier 2/3 should not pay for a continuously re-rendering GLArea.
-        glarea.set_auto_render(false);
-
-        overlay.add_overlay(&glarea);
-        // Input forwarding into CEF does not exist yet at any layer (a
-        // real, pre-existing gap -- see tier3_pane/mod.rs docs) -- until it
-        // does, mouse/keyboard events must keep reaching the webview
-        // underneath, not be swallowed by an overlay child that can't yet
-        // do anything with them.
-        overlay.set_overlay_pass_through(&glarea, true);
+        let (overlay, glarea) = build_overlay_and_glarea(webview_widget.clone());
 
         // ROOT CAUSE FOUND (items.id=225, 2026-08-07): every signal handler
         // below (`connect_realize`/`connect_resize`/`connect_render`) was
@@ -2359,215 +2863,14 @@ impl PaneHost {
         // below) -- it cannot be constructed before the GLArea is realized.
         let gl_loader: Rc<RefCell<Option<crate::tier3_pane::gl_loader::GlProcLoader>>> =
             Rc::new(RefCell::new(None));
-        // items.id=234: both channel pairs are created once, here, and
-        // their sender halves cloned into each pane's PaneLifeSpanHandler/
-        // PaneLoadHandler at open_pane time -- the receiver halves live on
-        // PaneManager itself, drained once per GTK render tick.
-        let (popup_requested_tx, popup_requested_rx) = std::sync::mpsc::channel();
-        let (popup_close_tx, popup_close_rx) = std::sync::mpsc::channel();
-        // items.id=379: same one-pair-for-the-whole-app-lifetime shape as
-        // the two channels above.
-        let (context_menu_requested_tx, context_menu_requested_rx) = std::sync::mpsc::channel();
-        let manager = Rc::new(RefCell::new(PaneManager {
-            panes: IndexMap::new(),
-            open_pane_count: Arc::new(AtomicUsize::new(0)),
-            last_focus: None,
-            popups: HashMap::new(),
-            popup_requested_tx,
-            popup_requested_rx,
-            popup_close_tx,
-            popup_close_rx,
-            context_menu_requested_tx,
-            context_menu_requested_rx,
-            active_pane: None,
-            app_handle: app_handle.clone(),
-        }));
+        let manager = build_pane_manager(app_handle.clone());
         let open_pane_count = manager.borrow().open_pane_count.clone();
         {
             let render_state = render_state.clone();
             let gl_context = gl_context.clone();
             let gl_loader = gl_loader.clone();
-            let glarea_for_realize = glarea.clone();
             glarea.connect_realize(move |area| {
-                area.make_current();
-                if let Some(err) = area.error() {
-                    log::error!("tier3_pane::pane_host: GLArea realize error: {err}");
-                    return;
-                }
-                // ROOT CAUSE FOUND (items.id=227, 2026-08-08, confirmed against
-                // GTK 3.24's actual C source, not just black-box testing):
-                // items.id=225's reassertion below (window.set_pass_through)
-                // was never wrong, it was just aimed at the wrong window.
-                // GtkGLArea sets has_window=FALSE (gtk_gl_area_init) -- for a
-                // no-window widget, area.window() resolves to its
-                // *parent_window*, which GtkOverlay explicitly points at a
-                // dedicated per-overlay-child GdkWindow it creates for us
-                // (gtk_overlay_create_child_window) and *already* pass-throughs
-                // correctly on our behalf (that's what
-                // overlay.set_overlay_pass_through() actually does under the
-                // hood). Confirmed via live click capture: both pass-through
-                // calls report is_pass_through=true and are telling the
-                // truth -- for that window. But gtk_gl_area_realize() (see
-                // gtk/gtkglarea.c upstream) *unconditionally* creates a
-                // second, private GDK_INPUT_ONLY window of its own
-                // (priv->event_window, sized to the widget's own allocation,
-                // parented one level *inside* the window pass-through was set
-                // on) specifically to catch input for this has_window=FALSE
-                // widget -- gtk_widget_register_window() ties it back to the
-                // GLArea widget for signal dispatch, which is exactly why
-                // GLArea's own button-press-event fired on every real click
-                // during this investigation (confirmed via a now-removed
-                // temporary widget-level trace) while the webview's never
-                // did. This private window has no public accessor
-                // anywhere in GTK3's API (gtk_gl_area_*, gtk_overlay_*, no
-                // getter) and pass-through is a per-window flag, not
-                // inherited by descendants -- so nothing reachable from
-                // application code had ever touched it; it silently keeps
-                // its GTK default of FALSE regardless of what we do to its
-                // parent. Real fix: find it anyway via the one public GDK
-                // API that can see it (gdk_window_get_children() on the
-                // window pass-through already worked on) and set
-                // pass-through on it directly. (items.id=257 Path A,
-                // 2026-08-22, refines this further: instead of a blanket
-                // pass-through -- which would make glarea and its panes
-                // unable to receive input at all -- event_window's GDK
-                // input SHAPE is restricted below to just the open panes'
-                // rects, rebuilt as panes open/close/resize; see the
-                // click/mouse-forwarding section doc above
-                // `build_pane_hit_widget`.) gtk_gl_area_realize()
-                // (upstream) only ever creates the one INPUT_ONLY child,
-                // so today that means exactly one match -- but the code
-                // below verifies that rather than assuming it (external
-                // review, 2026-08-09): collect every INPUT_ONLY child and
-                // match on the count, so a future GTK version creating
-                // more than one can't get silently mis-handled the same
-                // way the original wry ancestry assumption that started
-                // this whole item was -- an unverified "there's only one
-                // of these" is exactly the class of bug items.id=227 has
-                // been chasing all along.
-                //
-                // connect_realize only fires once per realization, so this
-                // fix only re-applies if GTK ever fires realize again.
-                // Confirmed directly (not just asserted) that this app's
-                // lifecycle never does that in practice: install() itself
-                // only ever runs once, gated on tauri::RunEvent::Ready
-                // (fires once per app lifetime -- see main.rs's app.run()
-                // closure, the only call site), and nothing else in this
-                // codebase hides, removes, or reparents the GLArea
-                // afterward. GTK3 doesn't unrealize child widgets on
-                // iconify/minimize either -- only on actual removal from a
-                // realized parent, which never happens here post-install.
-                //
-                // Walked through what WOULD happen if a second realize
-                // ever did occur, rather than just trusting "it's inside
-                // connect_realize so it must be fine": gtk_gl_area_realize
-                // (the class handler, runs before this closure on every
-                // firing -- see GTK_WIDGET_CLASS(...)->realize(widget) at
-                // the top of gtk_gl_area_realize upstream) unconditionally
-                // creates a brand new priv->event_window every time it
-                // runs, unrealize destroys the old one first. Nothing in
-                // this closure caches the old event_window across calls --
-                // `window.children()` below is a live GDK query issued
-                // fresh every time this closure fires, so on a
-                // hypothetical second realize it would enumerate whatever
-                // INPUT_ONLY children exist at that moment (the new
-                // event_window, not a stale reference to the destroyed
-                // one) and correctly pass-through it again. area.window()
-                // itself (the Overlay's own per-child window, not GLArea's
-                // private one) is also queried fresh each call, not read
-                // from a captured variable -- so even in the unlikely case
-                // the Overlay recreated that window too, this would still
-                // resolve correctly. This fix is structurally correct for
-                // a second realize even though one never actually happens.
-                if let Some(window) = area.window() {
-                    window.set_pass_through(true);
-                    let input_only_children: Vec<gtk::gdk::Window> = window
-                        .children()
-                        .into_iter()
-                        .filter(|child| child.is_input_only())
-                        .collect();
-                    match input_only_children.as_slice() {
-                        [event_window] => {
-                            // pass_through(false) (GTK's own default -- set
-                            // explicitly rather than left implicit, matching
-                            // this codebase's defensive style elsewhere) is
-                            // moot in practice now: this input shape is set
-                            // empty here once and never rebuilt afterward
-                            // (items.id=257 Path B -- pane click routing no
-                            // longer goes through GDK at all, see the "Pane
-                            // content click/mouse forwarding" section doc
-                            // above), so there is no non-empty shape for
-                            // pass-through to ever apply to. Kept explicit,
-                            // and kept as exactly this one confirmed-safe
-                            // `input_shape_combine_region` call (this
-                            // session's own `gdb` work confirmed an EMPTY
-                            // region here does not freeze Wayland pointer
-                            // input; only a non-empty one did) rather than
-                            // removed, since a permanently-empty shape is the
-                            // smallest change that provably avoids the freeze.
-                            event_window.set_pass_through(false);
-                            event_window
-                                .input_shape_combine_region(&gtk::cairo::Region::create(), 0, 0);
-                            log::info!(
-                                "tier3_pane::pane_host: GLArea private event_window \
-                                 found, input shape set permanently empty (items.id=257 \
-                                 Path B -- glarea is a pure compositor now, pane click \
-                                 routing goes through the frontend's DOM hit-layer \
-                                 instead), is_pass_through={} \
-                                 (parent GdkWindow is_pass_through={})",
-                                event_window.is_pass_through(),
-                                window.is_pass_through(),
-                            );
-                        }
-                        [] => log::warn!(
-                            "tier3_pane::pane_host: GLArea's parent_window has no \
-                             INPUT_ONLY child at realize -- expected \
-                             priv->event_window (see gtk_gl_area_realize upstream) \
-                             was not found. Harmless to pane click/mouse forwarding \
-                             (items.id=257 Path B routes that through the frontend's \
-                             DOM hit-layer, not this window) -- logged in case a \
-                             future GTK version's changed behavior here matters for \
-                             some other reason."
-                        ),
-                        multiple => log::error!(
-                            "tier3_pane::pane_host: GLArea's parent_window has \
-                             {} INPUT_ONLY children at realize -- expected exactly \
-                             one (priv->event_window). Refusing to guess which one \
-                             is the real one; none had their input shape reset to \
-                             empty. This means GTK's own gtk_gl_area_realize() \
-                             behavior has changed from what items.id=227 verified \
-                             against (GTK 3.24) -- investigate. Does not affect pane \
-                             click/mouse forwarding (items.id=257 Path B routes that \
-                             through the frontend's DOM hit-layer, not this window).",
-                            multiple.len()
-                        ),
-                    }
-                } else {
-                    log::warn!(
-                        "tier3_pane::pane_host: GLArea has no GdkWindow at realize -- \
-                         cannot reassert pass_through"
-                    );
-                }
-                let width = glarea_for_realize.allocated_width().max(1) as u32;
-                let height = glarea_for_realize.allocated_height().max(1) as u32;
-                // One `GlProcLoader`, stored in `gl_loader` for the GLArea's
-                // whole realized lifetime (see the ROOT CAUSE FOUND comment
-                // near this closure's construction) -- both `RenderState`
-                // and the standalone `glow::Context` below resolve their
-                // function pointers from this same still-alive instance
-                // instead of two that would otherwise be dropped (and
-                // `dlclose`d) the moment this closure returns.
-                *gl_loader.borrow_mut() = Some(crate::tier3_pane::gl_loader::GlProcLoader::open());
-                let loader_ref = gl_loader.borrow();
-                let loader = loader_ref.as_ref().expect("just set above");
-                let state =
-                    pollster::block_on(RenderState::new(loader.loader_fn(), (width, height)));
-                *render_state.borrow_mut() = Some(state);
-                let gl =
-                    unsafe { glow::Context::from_loader_function(loader.loader_fn()) };
-                *gl_context.borrow_mut() = Some(gl);
-                drop(loader_ref);
-                log::info!("tier3_pane::pane_host: shared RenderState constructed from GTK's external GL context ({width}x{height})");
+                handle_glarea_realize(area, &render_state, &gl_context, &gl_loader);
             });
         }
 
@@ -2576,31 +2879,7 @@ impl PaneHost {
             let manager = manager.clone();
             let app_handle = app_handle.clone();
             glarea.connect_resize(move |area, width, height| {
-                log::debug!(
-                    "DIAG items.id=227: connect_resize fired width={width} height={height}"
-                );
-                let (seq, elapsed_ms) = diag_312_tick();
-                log::debug!(
-                    "DIAG items.id=312: seq={seq} t={elapsed_ms}ms connect_resize \
-                     width={width} height={height} allocated=({},{})",
-                    area.allocated_width(),
-                    area.allocated_height(),
-                );
-                let (width, height) = (width.max(1) as u32, height.max(1) as u32);
-                if let Some(rs) = render_state.borrow_mut().as_mut() {
-                    rs.resize((width, height));
-                }
-                let layout = app_handle
-                    .state::<PaneLayoutState>()
-                    .0
-                    .lock()
-                    .unwrap()
-                    .clone();
-                let mut mgr = manager.borrow_mut();
-                mgr.sync_pane_sizes((width, height), &layout);
-                // items.id=234: popup rects rescale proportionally on
-                // ordinary window resize too, same mechanism as panes.
-                mgr.sync_popup_sizes((width, height));
+                handle_glarea_resize(area, width, height, &render_state, &manager, &app_handle);
             });
         }
 
@@ -2610,7 +2889,6 @@ impl PaneHost {
             let manager = manager.clone();
             let app_handle = app_handle.clone();
             glarea.connect_render(move |area, _gtk_gl_context| {
-                use glow::HasContext as _;
                 log::debug!(
                     "DIAG items.id=227: connect_render fired, open_panes={}",
                     manager.borrow().panes.len()
@@ -2624,16 +2902,11 @@ impl PaneHost {
                 );
 
                 // CRITICAL (confirmed this session): capture GTK's real
-                // bound draw framebuffer BEFORE any wgpu device/queue call.
-                // wgpu-hal's own internal calls silently rebind
-                // GL_DRAW_FRAMEBUFFER to their own scratch target -- GTK's
-                // own compositing would read from the wrong framebuffer
-                // once this callback returns otherwise. Explicitly rebound
-                // below, after every wgpu call this frame.
-                let captured_fbo = gl_context
-                    .borrow()
-                    .as_ref()
-                    .map(|gl| unsafe { gl.get_parameter_i32(glow::DRAW_FRAMEBUFFER_BINDING) });
+                // bound draw framebuffer BEFORE any wgpu device/queue call
+                // -- see `capture_draw_framebuffer`'s own doc. Explicitly
+                // rebound in `render_and_present` below, after every wgpu
+                // call this frame.
+                let captured_fbo = capture_draw_framebuffer(&gl_context);
 
                 let layout = app_handle
                     .state::<PaneLayoutState>()
@@ -2649,195 +2922,30 @@ impl PaneHost {
                 // pixels; `sync_pane_sizes`/`sync_popup_sizes` (and CEF's
                 // `was_resized()`/browser_size contract generally) expect
                 // *physical* GL framebuffer pixels, same as `connect_resize`
-                // passes them (see the DIAG items.id=312 comment below,
-                // which already draws this same distinction for `rs.size()`
-                // comparison) -- scale up before using for anything CEF-
-                // facing, not just the diagnostic.
+                // passes them -- scale up before using for anything
+                // CEF-facing, not just the diagnostic.
                 let scale_u32 = area.scale_factor().max(1) as u32;
                 let glarea_size_physical = (glarea_size.0 * scale_u32, glarea_size.1 * scale_u32);
-
-                manager.borrow_mut().drain_ready_browsers();
-
-                // FIX (items.id=329, click-sync-on-open): `connect_resize`
-                // was the only call site for `sync_pane_sizes`/
-                // `sync_popup_sizes`, so a pane opened between two window
-                // resizes painted at the right spot (Y-flip fix, items.id=257
-                // round 1) but CEF's own notion of that pane's rect stayed
-                // whatever it was initialized to until an incidental resize
-                // finally synced it -- clicks landed up-and-to-the-right of
-                // the visible target until then. `connect_render` already
-                // recomputes `layout`/`glarea_size` every tick and fires on
-                // `queue_render()` (see `PaneHost::queue_draw`'s doc), which
-                // `set_pane_layout` (commands/tier3_pane.rs) already calls
-                // right after a pane's first layout fractions land -- so
-                // syncing here closes the gap on the very next render tick
-                // after open, no new call site needed. Cheap on every other
-                // frame: both syncs no-op via `last_applied_size` once a
-                // pane/popup's CEF-side size already matches.
-                //
-                // Round-2 fix-of-a-fix (items.id=329, same session): this
-                // block's first version passed the *logical* `glarea_size`
-                // here instead of `glarea_size_physical` -- confirmed live,
-                // that made every pane render zoomed in (browser_size came
-                // out smaller than the real canvas by the scale factor, so
-                // CEF laid out a smaller viewport stretched over the actual
-                // larger one) and froze scrolling near the page's true
-                // bottom (CEF's own scroll-clamp math was working off that
-                // wrong, too-small viewport height).
-                {
-                    let mut mgr = manager.borrow_mut();
-                    mgr.sync_pane_sizes(glarea_size_physical, &layout);
-                    mgr.sync_popup_sizes(glarea_size_physical);
-                }
-
-                // items.id=234: resolve any new popup requests, react to
-                // popup lifecycle events (self-close/first-paint-ready),
-                // and act on any parent-navigate-away close requests --
-                // then forward whatever happened this tick to the
-                // frontend as tier3-popup-opened/-closed events.
-                let popup_notifications = {
-                    let mut mgr = manager.borrow_mut();
-                    let mut n = mgr.drain_popup_requests(glarea_size, &layout);
-                    n.extend(mgr.drain_popup_events());
-                    n.extend(mgr.drain_popup_close_requests());
-                    n
+                let tick = RenderTickContext {
+                    glarea_size,
+                    glarea_size_physical,
+                    scale_u32,
+                    seq,
+                    elapsed_ms,
                 };
-                if !popup_notifications.is_empty() {
-                    use tauri::Emitter;
-                    for notification in popup_notifications {
-                        match notification {
-                            PopupNotification::Opened { key, rect } => {
-                                let payload = PopupOpenedPayload {
-                                    provider_id: key,
-                                    rect,
-                                };
-                                if let Err(e) = app_handle.emit("tier3-popup-opened", &payload) {
-                                    log::warn!(
-                                        "tier3_pane::pane_host: failed to emit \
-                                         tier3-popup-opened: {e}"
-                                    );
-                                }
-                            }
-                            PopupNotification::Closed { key } => {
-                                let payload = PopupClosedPayload { provider_id: key };
-                                if let Err(e) = app_handle.emit("tier3-popup-closed", &payload) {
-                                    log::warn!(
-                                        "tier3_pane::pane_host: failed to emit \
-                                         tier3-popup-closed: {e}"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
 
-                // items.id=379: resolve any pending right-click requests and
-                // pop a native gtk::Menu for each -- see
-                // `drain_context_menu_requests`'s own doc for why this
-                // doesn't reuse the popup_notifications emit pattern above
-                // (nothing here is frontend-visible state, just a GTK
-                // widget this function pops directly). `glarea_size_physical`,
-                // not the logical `glarea_size` `drain_popup_requests` above
-                // uses (that call's own fractional result cancels the unit
-                // out either way, this one doesn't) -- `show_context_menu`
-                // adds this offset directly to `ContextMenuParams::xcoord()`/
-                // `ycoord()`, which are real physical pixels per items.id=328's
-                // established convention, so the units must match.
-                let context_menu_requests = {
-                    let mut mgr = manager.borrow_mut();
-                    mgr.drain_context_menu_requests(glarea_size_physical, &layout)
-                };
-                for resolved in context_menu_requests {
-                    show_context_menu(area, &app_handle, resolved);
-                }
+                sync_frame_sizes(&manager, glarea_size_physical, &layout);
+                drain_and_emit_popup_notifications(&manager, &app_handle, glarea_size, &layout);
+                drain_and_show_context_menus(
+                    &manager,
+                    &app_handle,
+                    area,
+                    glarea_size_physical,
+                    &layout,
+                );
+                pump_begin_frames(&manager);
+                render_and_present(&render_state, &gl_context, &manager, &layout, &tick, captured_fbo);
 
-                for pane in manager.borrow().panes.values() {
-                    if let Some(host) = pane.browser_lifecycle.browser().and_then(|b| b.host()) {
-                        host.send_external_begin_frame();
-                    }
-                }
-                for popup in manager.borrow().popups.values() {
-                    if let Some(host) = popup.lifecycle.browser().and_then(|b| b.host()) {
-                        host.send_external_begin_frame();
-                    }
-                }
-
-                if let Some(rs) = render_state.borrow_mut().as_mut() {
-                    // DIAG items.id=312 (temporary): `glarea_size` above is
-                    // GTK *logical* pixels (`allocated_width/height`);
-                    // `rs.size()` is whatever the last `connect_resize`
-                    // call stored, which GTK documents as *physical* GL
-                    // framebuffer pixels -- i.e. already multiplied by the
-                    // device scale factor. Compare against
-                    // `glarea_size_physical` (computed above, now shared
-                    // with the items.id=329 pane/popup size sync) so this
-                    // only fires on a genuine staleness mismatch (RenderState
-                    // about to wrap a texture at a size GTK's own allocation
-                    // has already moved past), not on the expected HiDPI
-                    // unit difference.
-                    let rs_size = rs.size();
-                    if rs_size != glarea_size_physical {
-                        log::warn!(
-                            "DIAG items.id=312: seq={seq} t={elapsed_ms}ms SIZE MISMATCH \
-                             glarea_size_physical={glarea_size_physical:?} (logical={glarea_size:?} \
-                             scale={scale_u32}) render_state.size={rs_size:?}"
-                        );
-                    } else {
-                        log::debug!(
-                            "DIAG items.id=312: seq={seq} t={elapsed_ms}ms pre-render \
-                             size={rs_size:?} (matches glarea_size_physical, scale={scale_u32})"
-                        );
-                    }
-                    // items.id=366: unlike the pane loop above (which only
-                    // ever draws a pane whose key has a `layout` entry --
-                    // the frontend only reports one for the currently-
-                    // visible pane, which is what actually enforces the
-                    // single-active-pane model at paint time, not
-                    // `was_hidden` itself), this map used to be built from
-                    // *every* open popup unconditionally. `was_hidden(true)`
-                    // (items.id=361) stops a deactivated pane's popup from
-                    // producing new frames, but does nothing about the
-                    // frame it already produced -- `POPUP_TEXTURES` keeps
-                    // that last-painted texture until `force_close_popup`
-                    // explicitly removes it, so with no filter here the
-                    // stale texture kept compositing every frame regardless
-                    // of which pane was actually active (confirmed live,
-                    // 2026-08-30: a Claude login popup stayed on screen
-                    // after switching to ChatGPT's pane). Filtering to only
-                    // the active pane's own popup matches the pane loop's
-                    // own filtering, just done here instead of on the
-                    // frontend side since popups have no frontend-owned
-                    // layout state to omit an entry from.
-                    let popup_layout: HashMap<PaneKey, PaneRectFraction> = {
-                        let mgr = manager.borrow();
-                        let active = mgr.active_pane.clone();
-                        mgr.popups
-                            .iter()
-                            .filter(|(k, _)| Some(*k) == active.as_ref())
-                            .map(|(k, p)| (k.clone(), p.rect))
-                            .collect()
-                    };
-                    rs.render(&layout, &popup_layout, captured_fbo.map(|fbo| fbo as u32));
-                }
-
-                if let (Some(gl), Some(fbo)) = (gl_context.borrow().as_ref(), captured_fbo) {
-                    let framebuffer =
-                        std::num::NonZeroU32::new(fbo as u32).map(glow::NativeFramebuffer);
-                    unsafe {
-                        gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, framebuffer);
-                        // items.id=257: wgpu's render pass leaves
-                        // SCISSOR_TEST enabled and the viewport clamped to
-                        // whichever pane was drawn last -- reset both so
-                        // nothing else sharing this GL context (GTK's own
-                        // subsequent presentation, any other widget drawing
-                        // through it) inherits a stale scissor/viewport rect.
-                        gl.disable(glow::SCISSOR_TEST);
-                        if let Some(rs) = render_state.borrow().as_ref() {
-                            let (w, h) = rs.size();
-                            gl.viewport(0, 0, w as i32, h as i32);
-                        }
-                    }
-                }
                 glib::Propagation::Stop
             });
         }
