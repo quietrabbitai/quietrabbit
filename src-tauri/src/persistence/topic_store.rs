@@ -19,10 +19,14 @@
 // of truth for filesystem state. Boot Check uses it as primary lookup.
 // Filesystem existence takes precedence on backup restore or manual recovery.
 //
-// Path helpers (ensure_focus_dirs, get_domain_context_path, get_plan_state_path)
-// are exported as pub from this module as the canonical source.
-// plan_state_store.rs and migrations.rs contain private duplicates pending
-// the Layer 8+ path unification TODO.
+// Path helpers ensure_focus_dirs and get_plan_state_path are exported as pub
+// from this module as the canonical source; their former private duplicates
+// in plan_state_store.rs and migrations.rs were unified onto these exports
+// (items.id=222). get_domain_context_path is NOT one of this module's
+// exports -- items.id=94 found it dead here (zero callers) and removed it;
+// the canonical (still-private) copy lives in domain_context_store.rs, which
+// owns the concept. migrations.rs's own domain_context.db path construction
+// remains a separate, not-yet-unified duplicate of that private copy.
 //
 // QUERY STYLE: runtime sqlx::query() only -- no query!() macros.
 // PRAGMA key applied via SqliteConnectOptions (D6-346).
@@ -31,7 +35,6 @@
 use std::path::PathBuf;
 
 use chrono::{Duration, Utc};
-use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::ConnectOptions;
 use sqlx::Row;
 use sqlx::SqliteConnection;
@@ -254,29 +257,6 @@ async fn open_outputs_db(
     Ok(conn)
 }
 
-/// Open shared.db (unencrypted, instance-level, topic_index mirror).
-/// Non-fatal context: callers discard errors from mirror operations.
-async fn open_shared_db() -> Result<SqliteConnection, TopicStoreError> {
-    let db_path = crate::persistence::migrations::get_data_root()
-        .join("instance")
-        .join("shared.db");
-
-    let network_storage = std::env::var("QR_NETWORK_STORAGE")
-        .map(|v| v.to_lowercase() == "true")
-        .unwrap_or(false);
-    let journal_mode = if network_storage { "DELETE" } else { "WAL" };
-
-    let conn = SqliteConnectOptions::new()
-        .filename(&db_path)
-        .create_if_missing(false)
-        .pragma("journal_mode", journal_mode)
-        .pragma("busy_timeout", "5000")
-        .connect()
-        .await?;
-
-    Ok(conn)
-}
-
 // ---------------------------------------------------------------------------
 // Topic CRUD
 // ---------------------------------------------------------------------------
@@ -286,6 +266,7 @@ async fn open_shared_db() -> Result<SqliteConnection, TopicStoreError> {
 /// placeholder_name generated from focus_id + timestamp if not provided.
 /// name: user-assigned. None = unnamed (naming offered on resume).
 pub async fn create_topic(
+    pool: &sqlx::SqlitePool,
     user_id: &str,
     persona_id: &str,
     key_hex: &str,
@@ -361,6 +342,7 @@ pub async fn create_topic(
 
     // Mirror to shared.db topic_index -- non-fatal.
     let _ = mirror_topic_index(
+        pool,
         &topic_id,
         persona_id,
         focus_id,
@@ -461,6 +443,7 @@ pub async fn list_topics(
 /// This function does not enforce that -- callers must not pass 'complete'
 /// from system code. Only user-initiated calls may pass 'complete'.
 pub async fn update_topic_state(
+    pool: &sqlx::SqlitePool,
     user_id: &str,
     persona_id: &str,
     key_hex: &str,
@@ -491,7 +474,7 @@ pub async fn update_topic_state(
 
     let updated = result.rows_affected() > 0;
     if updated {
-        let _ = update_topic_index_state(topic_id, lifecycle_state, &timestamp).await;
+        let _ = update_topic_index_state(pool, topic_id, lifecycle_state, &timestamp).await;
     }
     Ok(updated)
 }
@@ -499,6 +482,7 @@ pub async fn update_topic_state(
 /// Set or update the user-assigned name for a topic.
 /// Also updates the topic_index display_name mirror. Returns true if found and updated.
 pub async fn name_topic(
+    pool: &sqlx::SqlitePool,
     user_id: &str,
     persona_id: &str,
     key_hex: &str,
@@ -517,7 +501,7 @@ pub async fn name_topic(
 
     let updated = result.rows_affected() > 0;
     if updated {
-        let _ = update_topic_index_display_name(topic_id, name, &timestamp).await;
+        let _ = update_topic_index_display_name(pool, topic_id, name, &timestamp).await;
     }
     Ok(updated)
 }
@@ -525,9 +509,12 @@ pub async fn name_topic(
 /// Increment session_count on topic_index in shared.db.
 /// Called at Phase 3 INITIALIZE. Returns new session_count, 0 if not found.
 /// Note: touches shared.db only -- user_id/persona_id/key_hex are not needed.
-pub async fn increment_topic_session_count(topic_id: &str) -> Result<i32, TopicStoreError> {
+pub async fn increment_topic_session_count(
+    pool: &sqlx::SqlitePool,
+    topic_id: &str,
+) -> Result<i32, TopicStoreError> {
     let timestamp = crate::providers::utils::now();
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
 
     sqlx::query(
         "UPDATE topic_index SET session_count = session_count + 1,
@@ -536,12 +523,12 @@ pub async fn increment_topic_session_count(topic_id: &str) -> Result<i32, TopicS
     .bind(&timestamp)
     .bind(&timestamp)
     .bind(topic_id)
-    .execute(&mut conn)
+    .execute(&mut *conn)
     .await?;
 
     let row = sqlx::query("SELECT session_count FROM topic_index WHERE topic_id = ?")
         .bind(topic_id)
-        .fetch_optional(&mut conn)
+        .fetch_optional(&mut *conn)
         .await?;
 
     match row {
@@ -881,6 +868,7 @@ pub async fn record_preference_applied(
 /// Non-fatal if shared.db write fails -- outputs.db is authoritative.
 #[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
 async fn mirror_topic_index(
+    pool: &sqlx::SqlitePool,
     topic_id: &str,
     persona_id: &str,
     focus_id: &str,
@@ -890,7 +878,7 @@ async fn mirror_topic_index(
     session_count: i64,
     created_at: &str,
 ) -> Result<(), TopicStoreError> {
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
     sqlx::query(
         "INSERT OR REPLACE INTO topic_index
          (topic_id, persona_id, focus_id, display_name, lifecycle_state,
@@ -906,18 +894,19 @@ async fn mirror_topic_index(
     .bind(session_count)
     .bind(created_at)
     .bind(created_at)
-    .execute(&mut conn)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }
 
 /// Update lifecycle_state and last_active_at in topic_index. Non-fatal.
 async fn update_topic_index_state(
+    pool: &sqlx::SqlitePool,
     topic_id: &str,
     lifecycle_state: &str,
     timestamp: &str,
 ) -> Result<(), TopicStoreError> {
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
     sqlx::query(
         "UPDATE topic_index SET lifecycle_state = ?,
          last_active_at = ?, updated_at = ? WHERE topic_id = ?",
@@ -926,23 +915,24 @@ async fn update_topic_index_state(
     .bind(timestamp)
     .bind(timestamp)
     .bind(topic_id)
-    .execute(&mut conn)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }
 
 /// Update display_name in topic_index when user names a topic. Non-fatal.
 async fn update_topic_index_display_name(
+    pool: &sqlx::SqlitePool,
     topic_id: &str,
     display_name: &str,
     timestamp: &str,
 ) -> Result<(), TopicStoreError> {
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
     sqlx::query("UPDATE topic_index SET display_name = ?, updated_at = ? WHERE topic_id = ?")
         .bind(display_name)
         .bind(timestamp)
         .bind(topic_id)
-        .execute(&mut conn)
+        .execute(&mut *conn)
         .await?;
     Ok(())
 }

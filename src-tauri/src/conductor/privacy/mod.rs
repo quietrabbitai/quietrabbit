@@ -23,6 +23,12 @@ use errors::DisclosureLogWriteError;
 use logger::DisclosureLogger;
 use types::{Gate1Result, Gate2Result, Gate3Result, PersonalTrack};
 
+/// Maximum time allowed for the Privacy Filter FFI call inside spawn_blocking.
+/// Shared by gate3.rs and output_scan.rs -- same FFI call, same timeout
+/// budget, in both callers. IPC flag: timeout → gate_timeout event written
+/// to disclosure_log (D6-362).
+pub const PF_TIMEOUT_SECS: u64 = 10;
+
 pub struct PrivacyGateway<L: DisclosureLogger> {
     pub logger: L,
 }

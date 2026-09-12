@@ -49,6 +49,10 @@ use sqlx::Row;
 use sqlx::SqliteConnection;
 use thiserror::Error;
 
+// items.id=222: get_plan_state_path is canonical in topic_store.rs (items.id=94).
+// Aliased locally so the many call sites below stay unchanged.
+use crate::persistence::topic_store::get_plan_state_path as get_plan_state_db_path;
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -162,28 +166,6 @@ pub enum PlanStateStoreError {
     Io(#[from] std::io::Error),
     #[error("Migration error: {0}")]
     Migration(String),
-}
-
-// ---------------------------------------------------------------------------
-// Path helper
-// ---------------------------------------------------------------------------
-
-fn get_plan_state_db_path(
-    user_id: &str,
-    persona_id: &str,
-    focus_id: &str,
-    topic_id: &str,
-) -> PathBuf {
-    crate::persistence::migrations::get_data_root()
-        .join("users")
-        .join(user_id)
-        .join("personas")
-        .join(persona_id)
-        .join("focuses")
-        .join(focus_id)
-        .join("topics")
-        .join(topic_id)
-        .join("plan_state.db")
 }
 
 // ---------------------------------------------------------------------------

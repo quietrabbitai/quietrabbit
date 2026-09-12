@@ -182,6 +182,7 @@ pub async fn get_ingested_document_bytes(
     user_id: String,
     persona_id: String,
     key_registry: State<'_, KeyRegistry>,
+    pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<Vec<u8>, String> {
     let (master_key, key_hex_str) = key_registry
         .with_key(|k| (k.master_key, key_hex(&k.master_key)))
@@ -193,8 +194,12 @@ pub async fn get_ingested_document_bytes(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "not_found".to_string())?;
 
-    if super::library::is_protected(&persona_id, super::library::visibility_focus_id(&record))
-        .await?
+    if super::library::is_protected(
+        &pool,
+        &persona_id,
+        super::library::visibility_focus_id(&record),
+    )
+    .await?
     {
         return Err("not_found".to_string());
     }

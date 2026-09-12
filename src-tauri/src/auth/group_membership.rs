@@ -91,14 +91,9 @@
 // remote-wipe mechanism exists anywhere in this system to build against.
 //
 // QUERY STYLE: runtime sqlx::query()/query_as() only -- no query!() macros
-// (many-small-encrypted-DB topology, no static DATABASE_URL). open_shared_db
-// is duplicated here rather than reused from group_invitations.rs -- same
-// reasoning that module's own header gives for duplicating it from
-// user_store.rs: different error type per module, ~12-line
-// zero-divergence-risk helper.
+// (many-small-encrypted-DB topology, no static DATABASE_URL). shared.db
+// access is pooled (items.id=483) -- callers pass a &sqlx::SqlitePool in.
 
-use sqlx::sqlite::SqliteConnectOptions;
-use sqlx::ConnectOptions;
 use sqlx::SqliteConnection;
 use thiserror::Error;
 use x25519_dalek::StaticSecret;
@@ -172,23 +167,6 @@ impl std::str::FromStr for DepartureReason {
 // ---------------------------------------------------------------------------
 // DB opener (shared.db -- unencrypted)
 // ---------------------------------------------------------------------------
-
-async fn open_shared_db() -> Result<SqliteConnection, GroupMembershipError> {
-    let db_path = crate::persistence::migrations::get_data_root()
-        .join("instance")
-        .join("shared.db");
-    let network_storage = std::env::var("QR_NETWORK_STORAGE")
-        .map(|v| v.to_lowercase() == "true")
-        .unwrap_or(false);
-    let journal_mode = if network_storage { "DELETE" } else { "WAL" };
-    let conn = SqliteConnectOptions::new()
-        .filename(&db_path)
-        .create_if_missing(false)
-        .pragma("journal_mode", journal_mode)
-        .connect()
-        .await?;
-    Ok(conn)
-}
 
 fn hex_decode(context: &str, s: &str) -> Result<Vec<u8>, GroupMembershipError> {
     if !s.len().is_multiple_of(2) {
@@ -277,6 +255,7 @@ pub(crate) async fn remaining_members(
 /// by failure -- see this module's own header ("a household's members each
 /// run their own QR install").
 pub async fn remove_member(
+    pool: &sqlx::SqlitePool,
     group_id: &str,
     departing_persona_id: &str,
     reason: DepartureReason,
@@ -284,13 +263,14 @@ pub async fn remove_member(
     group_key_registry: &GroupKeyRegistry,
     key_registry: &KeyRegistry,
 ) -> Result<(), GroupMembershipError> {
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
 
     sqlx::query("SAVEPOINT remove_member")
-        .execute(&mut conn)
+        .execute(&mut *conn)
         .await?;
 
     let result = remove_member_inner(
+        pool,
         &mut conn,
         group_id,
         departing_persona_id,
@@ -302,12 +282,12 @@ pub async fn remove_member(
     match &result {
         Ok(()) => {
             sqlx::query("RELEASE remove_member")
-                .execute(&mut conn)
+                .execute(&mut *conn)
                 .await?;
         }
         Err(_) => {
             let _ = sqlx::query("ROLLBACK TO remove_member")
-                .execute(&mut conn)
+                .execute(&mut *conn)
                 .await;
         }
     }
@@ -357,6 +337,7 @@ pub async fn remove_member(
 }
 
 async fn remove_member_inner(
+    pool: &sqlx::SqlitePool,
     conn: &mut SqliteConnection,
     group_id: &str,
     departing_persona_id: &str,
@@ -397,7 +378,7 @@ async fn remove_member_inner(
     for member_persona_id in remaining {
         let owner_user_id =
             group_invitations::resolve_persona_owner(&member_persona_id, conn).await?;
-        let recipient_public_key = sharing_keypair::get_public_key(&owner_user_id)
+        let recipient_public_key = sharing_keypair::get_public_key(pool, &owner_user_id)
             .await?
             .ok_or_else(|| GroupMembershipError::RecipientHasNoSharingKey(owner_user_id.clone()))?;
         let envelope =
@@ -461,19 +442,20 @@ async fn remove_member_inner(
 /// from a `write failed` state reproduces the identical key and simply
 /// tries the write again.
 pub async fn apply_pending_rotations(
+    pool: &sqlx::SqlitePool,
     persona_id: &str,
     group_key_registry: &GroupKeyRegistry,
     sharing_private_key: &StaticSecret,
     personal_key_hex: &str,
 ) -> Result<(), GroupMembershipError> {
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
 
     let rows: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT id, group_id, encrypted_group_key FROM pending_group_key_rotations
          WHERE recipient_persona_id = ? AND status = 'pending'",
     )
     .bind(persona_id)
-    .fetch_all(&mut conn)
+    .fetch_all(&mut *conn)
     .await?;
 
     let owner_user_id = group_invitations::resolve_persona_owner(persona_id, &mut conn).await?;
@@ -522,14 +504,15 @@ pub async fn apply_pending_rotations(
         )
         .bind(crate::providers::utils::now())
         .bind(&rotation_id)
-        .execute(&mut conn)
+        .execute(&mut *conn)
         .await?;
 
         // Best-effort, same failure-handling contract as every other
         // group_sync call site -- a re-push failure must not turn an
         // otherwise-successful rotation apply into an Err.
         if let Err(e) =
-            group_sync_engine::republish_owned_documents(persona_id, &group_id, &new_key_hex).await
+            group_sync_engine::republish_owned_documents(pool, persona_id, &group_id, &new_key_hex)
+                .await
         {
             log::warn!(
                 "apply_pending_rotations: republish_owned_documents failed for \
@@ -557,6 +540,7 @@ mod tests {
         _tempdir: tempfile::TempDir,
         _lock: std::sync::MutexGuard<'static, ()>,
         saved_root: Option<String>,
+        pool: sqlx::SqlitePool,
     }
 
     impl Drop for TestEnv {
@@ -579,16 +563,25 @@ mod tests {
             .await
             .expect("shared.db migration must succeed in test setup");
 
+        let pool =
+            sqlx::SqlitePool::connect_with(crate::providers::utils::connect_options_unencrypted(
+                &crate::providers::utils::db_path_shared(),
+            ))
+            .await
+            .expect("shared.db pool must connect");
+
         TestEnv {
             _tempdir: tempdir,
             _lock: lock,
             saved_root,
+            pool,
         }
     }
 
     /// Same fixture shape as group_invitations.rs's own test module --
     /// duplicated deliberately (test-only, zero-divergence-risk).
     async fn make_user_with_persona(
+        pool: &sqlx::SqlitePool,
         display_name: &str,
         master_key_fill: u8,
     ) -> (String, String, StaticSecret) {
@@ -598,6 +591,7 @@ mod tests {
             sharing_keypair::derive_sharing_keypair(&master_key, &user_id);
 
         crate::auth::user_store::create_user(
+            pool,
             &user_id,
             display_name,
             "user",
@@ -612,9 +606,16 @@ mod tests {
         .expect("create_user must succeed");
 
         let persona_id = uuid::Uuid::new_v4().to_string();
-        persona_store::create_persona(&persona_id, "Test Persona", "personal", &user_id, None)
-            .await
-            .expect("create_persona must succeed");
+        persona_store::create_persona(
+            pool,
+            &persona_id,
+            "Test Persona",
+            "personal",
+            &user_id,
+            None,
+        )
+        .await
+        .expect("create_persona must succeed");
 
         (user_id, persona_id, sharing_private_key)
     }
@@ -624,17 +625,19 @@ mod tests {
     #[tokio::test]
     async fn remaining_members_excludes_departed_and_self() {
         let _env = setup().await;
-        let (_sender_user, sender_persona, _) = make_user_with_persona("Sender", 0x11).await;
-        let (_b_user, b_persona, _) = make_user_with_persona("Bob", 0x22).await;
-        let (_c_user, c_persona, _) = make_user_with_persona("Carol", 0x33).await;
+        let pool = &_env.pool;
+        let (_sender_user, sender_persona, _) = make_user_with_persona(pool, "Sender", 0x11).await;
+        let (_b_user, b_persona, _) = make_user_with_persona(pool, "Bob", 0x22).await;
+        let (_c_user, c_persona, _) = make_user_with_persona(pool, "Carol", 0x33).await;
 
         let group_id = "group-roster-1";
         let group_key = [0x55u8; kdf::MASTER_KEY_LEN];
 
-        let mut conn = open_shared_db().await.unwrap();
+        let mut conn = pool.acquire().await.unwrap();
 
         for persona in [&b_persona, &c_persona] {
             let invitation_id = group_invitations::send_invitation(
+                pool,
                 persona,
                 group_id,
                 "Test Group",
@@ -645,7 +648,7 @@ mod tests {
             .unwrap();
             sqlx::query("UPDATE pending_group_invitations SET status = 'accepted' WHERE id = ?")
                 .bind(&invitation_id)
-                .execute(&mut conn)
+                .execute(&mut *conn)
                 .await
                 .unwrap();
         }
@@ -658,7 +661,7 @@ mod tests {
         .bind(&b_persona)
         .bind(crate::providers::utils::now())
         .bind("left")
-        .execute(&mut conn)
+        .execute(&mut *conn)
         .await
         .unwrap();
 
@@ -685,13 +688,15 @@ mod tests {
     #[tokio::test]
     async fn remove_member_is_idempotent_for_already_departed_persona() {
         let _env = setup().await;
-        let (_sender_user, sender_persona, _) = make_user_with_persona("Sender", 0x44).await;
-        let (_b_user, b_persona, _) = make_user_with_persona("Bob", 0x55).await;
+        let pool = &_env.pool;
+        let (_sender_user, sender_persona, _) = make_user_with_persona(pool, "Sender", 0x44).await;
+        let (_b_user, b_persona, _) = make_user_with_persona(pool, "Bob", 0x55).await;
 
         let group_id = "group-idempotent-1";
         let registry = GroupKeyRegistry::default();
 
         remove_member(
+            pool,
             group_id,
             &b_persona,
             DepartureReason::Left,
@@ -703,6 +708,7 @@ mod tests {
         .expect("first remove_member must succeed");
 
         let second = remove_member(
+            pool,
             group_id,
             &b_persona,
             DepartureReason::Left,
@@ -720,15 +726,17 @@ mod tests {
     #[tokio::test]
     async fn remove_member_queues_rotation_for_remaining_members_and_evicts_registry() {
         let _env = setup().await;
-        let (_sender_user, sender_persona, _) = make_user_with_persona("Sender", 0x66).await;
-        let (_b_user, b_persona, b_private_key) = make_user_with_persona("Bob", 0x77).await;
-        let (_c_user, c_persona, c_private_key) = make_user_with_persona("Carol", 0x88).await;
+        let pool = &_env.pool;
+        let (_sender_user, sender_persona, _) = make_user_with_persona(pool, "Sender", 0x66).await;
+        let (_b_user, b_persona, b_private_key) = make_user_with_persona(pool, "Bob", 0x77).await;
+        let (_c_user, c_persona, c_private_key) = make_user_with_persona(pool, "Carol", 0x88).await;
 
         let group_id = "group-remove-1";
         let group_key = [0x99u8; kdf::MASTER_KEY_LEN];
         let registry = GroupKeyRegistry::default();
 
         let b_invitation = group_invitations::send_invitation(
+            pool,
             &b_persona,
             group_id,
             "Test Group",
@@ -738,6 +746,7 @@ mod tests {
         .await
         .unwrap();
         group_invitations::accept_invitation(
+            pool,
             &b_invitation,
             &b_persona,
             &b_private_key,
@@ -748,6 +757,7 @@ mod tests {
         .unwrap();
 
         let c_invitation = group_invitations::send_invitation(
+            pool,
             &c_persona,
             group_id,
             "Test Group",
@@ -757,6 +767,7 @@ mod tests {
         .await
         .unwrap();
         group_invitations::accept_invitation(
+            pool,
             &c_invitation,
             &c_persona,
             &c_private_key,
@@ -770,6 +781,7 @@ mod tests {
         assert!(registry.is_occupied(&c_persona, group_id).await);
 
         remove_member(
+            pool,
             group_id,
             &b_persona,
             DepartureReason::Removed,
@@ -790,13 +802,13 @@ mod tests {
              remove_member only queues redistribution"
         );
 
-        let mut conn = open_shared_db().await.unwrap();
+        let mut conn = pool.acquire().await.unwrap();
         let rows: Vec<(String, String)> = sqlx::query_as(
             "SELECT recipient_persona_id, encrypted_group_key \
              FROM pending_group_key_rotations WHERE group_id = ?",
         )
         .bind(group_id)
-        .fetch_all(&mut conn)
+        .fetch_all(&mut *conn)
         .await
         .unwrap();
         assert_eq!(
@@ -823,11 +835,12 @@ mod tests {
         // eviction -- see remove_member's own doc comment (PERSONAL.DB
         // SYNC ON EVICT).
         let _env = setup().await;
-        let (_sender_user, sender_persona, _) = make_user_with_persona("Sender", 0xE0).await;
+        let pool = &_env.pool;
+        let (_sender_user, sender_persona, _) = make_user_with_persona(pool, "Sender", 0xE0).await;
 
         let departing_master_key = [0xE1u8; kdf::MASTER_KEY_LEN];
         let (departing_user, departing_persona, departing_private_key) =
-            make_user_with_persona("Departing", 0xE1).await;
+            make_user_with_persona(pool, "Departing", 0xE1).await;
         let departing_key_hex = crate::auth::registry::key_hex(&departing_master_key);
 
         let group_id = "group-self-departure-1";
@@ -835,6 +848,7 @@ mod tests {
         let registry = GroupKeyRegistry::default();
 
         let invitation = group_invitations::send_invitation(
+            pool,
             &departing_persona,
             group_id,
             "Test Group",
@@ -844,6 +858,7 @@ mod tests {
         .await
         .unwrap();
         group_invitations::accept_invitation(
+            pool,
             &invitation,
             &departing_persona,
             &departing_private_key,
@@ -877,6 +892,7 @@ mod tests {
             .await;
 
         remove_member(
+            pool,
             group_id,
             &departing_persona,
             DepartureReason::Left,
@@ -908,11 +924,12 @@ mod tests {
         // be silently skipped, not error, when key_registry holds a
         // DIFFERENT account than departing_persona_id's owner.
         let _env = setup().await;
-        let (_sender_user, sender_persona, _) = make_user_with_persona("Sender", 0xE3).await;
+        let pool = &_env.pool;
+        let (_sender_user, sender_persona, _) = make_user_with_persona(pool, "Sender", 0xE3).await;
 
         let departing_master_key = [0xE4u8; kdf::MASTER_KEY_LEN];
         let (departing_user, departing_persona, departing_private_key) =
-            make_user_with_persona("Departing", 0xE4).await;
+            make_user_with_persona(pool, "Departing", 0xE4).await;
         let departing_key_hex = crate::auth::registry::key_hex(&departing_master_key);
 
         let group_id = "group-remote-departure-1";
@@ -920,6 +937,7 @@ mod tests {
         let registry = GroupKeyRegistry::default();
 
         let invitation = group_invitations::send_invitation(
+            pool,
             &departing_persona,
             group_id,
             "Test Group",
@@ -929,6 +947,7 @@ mod tests {
         .await
         .unwrap();
         group_invitations::accept_invitation(
+            pool,
             &invitation,
             &departing_persona,
             &departing_private_key,
@@ -941,7 +960,7 @@ mod tests {
         // The initiator's own resident session -- a DIFFERENT account from
         // the departing persona's owner.
         let (initiator_user, _initiator_persona, initiator_private_key) =
-            make_user_with_persona("Initiator", 0xE6).await;
+            make_user_with_persona(pool, "Initiator", 0xE6).await;
         let initiator_master_key = [0xE6u8; kdf::MASTER_KEY_LEN];
         let key_registry = KeyRegistry::default();
         key_registry
@@ -953,7 +972,7 @@ mod tests {
             })
             .await;
 
-        remove_member(
+        remove_member(pool,
             group_id,
             &departing_persona,
             DepartureReason::Removed,
@@ -983,17 +1002,19 @@ mod tests {
     #[tokio::test]
     async fn apply_pending_rotations_rekeys_group_db_and_swaps_registry_key() {
         let _env = setup().await;
-        let (_sender_user, sender_persona, _) = make_user_with_persona("Sender", 0xAA).await;
+        let pool = &_env.pool;
+        let (_sender_user, sender_persona, _) = make_user_with_persona(pool, "Sender", 0xAA).await;
         let (_recipient_user, recipient_persona, recipient_private_key) =
-            make_user_with_persona("Recipient", 0xBB).await;
+            make_user_with_persona(pool, "Recipient", 0xBB).await;
         let (_departing_user, departing_persona, departing_private_key) =
-            make_user_with_persona("Departing", 0xCC).await;
+            make_user_with_persona(pool, "Departing", 0xCC).await;
 
         let group_id = "group-apply-1";
         let old_group_key = [0x11u8; kdf::MASTER_KEY_LEN];
         let registry = GroupKeyRegistry::default();
 
         let recipient_invitation = group_invitations::send_invitation(
+            pool,
             &recipient_persona,
             group_id,
             "Test Group",
@@ -1003,6 +1024,7 @@ mod tests {
         .await
         .unwrap();
         group_invitations::accept_invitation(
+            pool,
             &recipient_invitation,
             &recipient_persona,
             &recipient_private_key,
@@ -1027,6 +1049,7 @@ mod tests {
         .unwrap();
 
         let departing_invitation = group_invitations::send_invitation(
+            pool,
             &departing_persona,
             group_id,
             "Test Group",
@@ -1036,6 +1059,7 @@ mod tests {
         .await
         .unwrap();
         group_invitations::accept_invitation(
+            pool,
             &departing_invitation,
             &departing_persona,
             &departing_private_key,
@@ -1046,6 +1070,7 @@ mod tests {
         .unwrap();
 
         remove_member(
+            pool,
             group_id,
             &departing_persona,
             DepartureReason::Left,
@@ -1057,6 +1082,7 @@ mod tests {
         .unwrap();
 
         apply_pending_rotations(
+            pool,
             &recipient_persona,
             &registry,
             &recipient_private_key,
@@ -1083,14 +1109,14 @@ mod tests {
             "the document written under the old key must survive the rekey"
         );
 
-        let mut conn = open_shared_db().await.unwrap();
+        let mut conn = pool.acquire().await.unwrap();
         let status: (String,) = sqlx::query_as(
             "SELECT status FROM pending_group_key_rotations \
              WHERE recipient_persona_id = ? AND group_id = ?",
         )
         .bind(&recipient_persona)
         .bind(group_id)
-        .fetch_one(&mut conn)
+        .fetch_one(&mut *conn)
         .await
         .unwrap();
         assert_eq!(status.0, "applied");
@@ -1099,17 +1125,19 @@ mod tests {
     #[tokio::test]
     async fn apply_pending_rotations_skips_when_old_key_not_resident() {
         let _env = setup().await;
-        let (_sender_user, sender_persona, _) = make_user_with_persona("Sender", 0xDD).await;
+        let pool = &_env.pool;
+        let (_sender_user, sender_persona, _) = make_user_with_persona(pool, "Sender", 0xDD).await;
         let (_recipient_user, recipient_persona, recipient_private_key) =
-            make_user_with_persona("Recipient", 0xEE).await;
+            make_user_with_persona(pool, "Recipient", 0xEE).await;
         let (_departing_user, departing_persona, departing_private_key) =
-            make_user_with_persona("Departing", 0xFF).await;
+            make_user_with_persona(pool, "Departing", 0xFF).await;
 
         let group_id = "group-apply-2";
         let old_group_key = [0x22u8; kdf::MASTER_KEY_LEN];
         let registry = GroupKeyRegistry::default();
 
         let recipient_invitation = group_invitations::send_invitation(
+            pool,
             &recipient_persona,
             group_id,
             "Test Group",
@@ -1119,6 +1147,7 @@ mod tests {
         .await
         .unwrap();
         group_invitations::accept_invitation(
+            pool,
             &recipient_invitation,
             &recipient_persona,
             &recipient_private_key,
@@ -1129,6 +1158,7 @@ mod tests {
         .unwrap();
 
         let departing_invitation = group_invitations::send_invitation(
+            pool,
             &departing_persona,
             group_id,
             "Test Group",
@@ -1138,6 +1168,7 @@ mod tests {
         .await
         .unwrap();
         group_invitations::accept_invitation(
+            pool,
             &departing_invitation,
             &departing_persona,
             &departing_private_key,
@@ -1148,6 +1179,7 @@ mod tests {
         .unwrap();
 
         remove_member(
+            pool,
             group_id,
             &departing_persona,
             DepartureReason::Left,
@@ -1163,6 +1195,7 @@ mod tests {
         registry.clear(&recipient_persona, group_id).await;
 
         apply_pending_rotations(
+            pool,
             &recipient_persona,
             &registry,
             &recipient_private_key,
@@ -1171,14 +1204,14 @@ mod tests {
         .await
         .expect("apply_pending_rotations must not error when the old key isn't resident");
 
-        let mut conn = open_shared_db().await.unwrap();
+        let mut conn = pool.acquire().await.unwrap();
         let status: (String,) = sqlx::query_as(
             "SELECT status FROM pending_group_key_rotations \
              WHERE recipient_persona_id = ? AND group_id = ?",
         )
         .bind(&recipient_persona)
         .bind(group_id)
-        .fetch_one(&mut conn)
+        .fetch_one(&mut *conn)
         .await
         .unwrap();
         assert_eq!(

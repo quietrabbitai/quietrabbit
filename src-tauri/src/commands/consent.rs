@@ -332,6 +332,7 @@ pub async fn submit_element_consent_decision(
 #[specta::specta]
 pub async fn submit_friction_gate_decision(
     request: SubmitFrictionGateDecisionRequest,
+    pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<Option<crate::commands::persona::FocusInfo>, String> {
     if !matches!(request.decision.as_str(), "proceed" | "cancel") {
         return Err(format!(
@@ -346,10 +347,11 @@ pub async fn submit_friction_gate_decision(
     // to recompute which dimension(s) actually trip the gate -- do not trust
     // a frontend-supplied FrictionGateDetail, since settings could have
     // changed between the original blocked call and this decision.
-    let existing = focus_settings_store::get_focus_settings(&orig.persona_id, &orig.focus_id)
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "not_found".to_string())?;
+    let existing =
+        focus_settings_store::get_focus_settings(&pool, &orig.persona_id, &orig.focus_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "not_found".to_string())?;
 
     let privacy_would_loosen = orig
         .privacy_tier
@@ -366,6 +368,7 @@ pub async fn submit_friction_gate_decision(
         .unwrap_or(false);
 
     focus_settings_store::record_friction_gate_decision(
+        &pool,
         &orig.persona_id,
         &orig.focus_id,
         &request.decision,
@@ -407,6 +410,7 @@ pub async fn submit_friction_gate_decision(
     }
 
     let s = focus_settings_store::update_focus_settings(
+        &pool,
         &orig.persona_id,
         &orig.focus_id,
         orig.context_flow.as_deref(),
@@ -756,6 +760,7 @@ pub async fn request_tier3_gate3_review(
     request: RequestTier3Gate3ReviewRequest,
     key_registry: State<'_, KeyRegistry>,
     layout_state: State<'_, crate::commands::tier3_pane::PaneLayoutState>,
+    pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<Gate3ReviewResult, String> {
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.master_key))
@@ -794,7 +799,7 @@ pub async fn request_tier3_gate3_review(
     })?;
 
     let settings =
-        focus_settings_store::get_focus_settings(&request.persona_id, TIER3_DRAFT_FOCUS_ID)
+        focus_settings_store::get_focus_settings(&pool, &request.persona_id, TIER3_DRAFT_FOCUS_ID)
             .await
             .map_err(|e| e.to_string())?
             .ok_or_else(|| {
@@ -828,9 +833,12 @@ pub async fn request_tier3_gate3_review(
         map.keys().cloned().collect()
     };
     let destination_risk_rating =
-        crate::persistence::provider_store::max_risk_rating_for_providers(&active_provider_ids)
-            .await
-            .map_err(|e| e.to_string())?;
+        crate::persistence::provider_store::max_risk_rating_for_providers(
+            &pool,
+            &active_provider_ids,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
 
     let result = gateway
         .gate3(
@@ -957,6 +965,7 @@ pub async fn request_chat_copy_gate3_review(
     request: RequestChatCopyGate3ReviewRequest,
     key_registry: State<'_, KeyRegistry>,
     layout_state: State<'_, crate::commands::tier3_pane::PaneLayoutState>,
+    pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<Gate3ReviewResult, String> {
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.master_key))
@@ -964,7 +973,7 @@ pub async fn request_chat_copy_gate3_review(
         .ok_or_else(|| "not logged in".to_owned())?;
 
     let settings =
-        focus_settings_store::get_focus_settings(&request.persona_id, TIER3_DRAFT_FOCUS_ID)
+        focus_settings_store::get_focus_settings(&pool, &request.persona_id, TIER3_DRAFT_FOCUS_ID)
             .await
             .map_err(|e| e.to_string())?
             .ok_or_else(|| {
@@ -985,9 +994,12 @@ pub async fn request_chat_copy_gate3_review(
         map.keys().cloned().collect()
     };
     let destination_risk_rating =
-        crate::persistence::provider_store::max_risk_rating_for_providers(&active_provider_ids)
-            .await
-            .map_err(|e| e.to_string())?;
+        crate::persistence::provider_store::max_risk_rating_for_providers(
+            &pool,
+            &active_provider_ids,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
 
     let synthetic_key = format!("clipboard-copy-chat-{}-{}", request.persona_id, now());
 
@@ -1043,6 +1055,7 @@ pub async fn recheck_tier3_provider_selection(
     app_handle: tauri::AppHandle,
     request: RecheckTier3ProviderSelectionRequest,
     key_registry: State<'_, KeyRegistry>,
+    pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<Gate3ReviewResult, String> {
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.master_key))
@@ -1085,6 +1098,7 @@ pub async fn recheck_tier3_provider_selection(
     };
 
     let new_max_risk = crate::persistence::provider_store::max_risk_rating_for_providers(
+        &pool,
         &request.newly_active_provider_ids,
     )
     .await
@@ -1103,7 +1117,7 @@ pub async fn recheck_tier3_provider_selection(
     }
 
     let settings =
-        focus_settings_store::get_focus_settings(&request.persona_id, TIER3_DRAFT_FOCUS_ID)
+        focus_settings_store::get_focus_settings(&pool, &request.persona_id, TIER3_DRAFT_FOCUS_ID)
             .await
             .map_err(|e| e.to_string())?
             .ok_or_else(|| {
@@ -1434,7 +1448,9 @@ mod tests {
     async fn resolve_tier3_gate3_review_rejects_invalid_status() {
         let _env = setup().await;
 
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(sqlx::SqlitePool::connect_lazy_with(
+            sqlx::sqlite::SqliteConnectOptions::new().filename(":memory:"),
+        ));
         let registry = app.state::<KeyRegistry>();
         populate_registry(&registry, USER_ID, MASTER_KEY).await;
 
@@ -1472,7 +1488,9 @@ mod tests {
         .await
         .expect("save_message must succeed");
 
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(sqlx::SqlitePool::connect_lazy_with(
+            sqlx::sqlite::SqliteConnectOptions::new().filename(":memory:"),
+        ));
         let registry = app.state::<KeyRegistry>();
         populate_registry(&registry, USER_ID, MASTER_KEY).await;
 
@@ -1512,7 +1530,9 @@ mod tests {
         .await
         .expect("save_message must succeed");
 
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(sqlx::SqlitePool::connect_lazy_with(
+            sqlx::sqlite::SqliteConnectOptions::new().filename(":memory:"),
+        ));
         let registry = app.state::<KeyRegistry>();
         populate_registry(&registry, USER_ID, MASTER_KEY).await;
 
@@ -1555,10 +1575,17 @@ mod tests {
         crate::persistence::migrations::migrate_shared_db()
             .await
             .expect("shared.db migration must succeed in test setup");
+        let pool =
+            sqlx::SqlitePool::connect_with(crate::providers::utils::connect_options_unencrypted(
+                &crate::providers::utils::db_path_shared(),
+            ))
+            .await
+            .expect("shared.db pool must connect");
         // focus_settings.persona_id has a FOREIGN KEY into personas(id) --
         // create_persona's own FK requires a real users row first, mirroring
         // commands/library.rs's setup() precedent exactly.
         crate::auth::user_store::create_user(
+            &pool,
             USER_ID,
             "Consent Test User",
             "user",
@@ -1572,6 +1599,7 @@ mod tests {
         .await
         .expect("create_user must succeed in test setup");
         crate::persistence::persona_store::create_persona(
+            &pool,
             PERSONA_ID,
             "Consent Test Persona",
             "personal",
@@ -1582,6 +1610,7 @@ mod tests {
         .expect("create_persona must succeed in test setup");
 
         focus_settings_store::create_focus_settings(
+            &pool,
             PERSONA_ID,
             TIER3_DRAFT_FOCUS_ID,
             "bidirectional",
@@ -1594,10 +1623,11 @@ mod tests {
         .await
         .expect("create_focus_settings must succeed");
 
-        let settings = focus_settings_store::get_focus_settings(PERSONA_ID, TIER3_DRAFT_FOCUS_ID)
-            .await
-            .expect("get_focus_settings must succeed")
-            .expect("row must exist");
+        let settings =
+            focus_settings_store::get_focus_settings(&pool, PERSONA_ID, TIER3_DRAFT_FOCUS_ID)
+                .await
+                .expect("get_focus_settings must succeed")
+                .expect("row must exist");
         assert_eq!(settings.max_permitted_tier, ExternalAccess::Unrestricted);
     }
 
@@ -1612,7 +1642,14 @@ mod tests {
         crate::persistence::migrations::migrate_shared_db()
             .await
             .expect("shared.db migration must succeed in test setup");
+        let pool =
+            sqlx::SqlitePool::connect_with(crate::providers::utils::connect_options_unencrypted(
+                &crate::providers::utils::db_path_shared(),
+            ))
+            .await
+            .expect("shared.db pool must connect");
         crate::auth::user_store::create_user(
+            &pool,
             USER_ID,
             "Consent Test User",
             "user",
@@ -1626,6 +1663,7 @@ mod tests {
         .await
         .expect("create_user must succeed in test setup");
         crate::persistence::persona_store::create_persona(
+            &pool,
             PERSONA_ID,
             "Consent Test Persona",
             "personal",
@@ -1635,6 +1673,7 @@ mod tests {
         .await
         .expect("create_persona must succeed in test setup");
         focus_settings_store::create_focus_settings(
+            &pool,
             PERSONA_ID,
             TIER3_DRAFT_FOCUS_ID,
             "bidirectional",
@@ -1657,20 +1696,26 @@ mod tests {
             focus_profile: None,
         };
 
-        let applied = submit_friction_gate_decision(SubmitFrictionGateDecisionRequest {
-            decision: "proceed".to_owned(),
-            original_request,
-        })
+        let app = mock_app_with_registry(pool.clone());
+        let pool_state = app.state::<sqlx::SqlitePool>();
+        let applied = submit_friction_gate_decision(
+            SubmitFrictionGateDecisionRequest {
+                decision: "proceed".to_owned(),
+                original_request,
+            },
+            pool_state,
+        )
         .await
         .expect("submit_friction_gate_decision must succeed for a max_permitted_tier-only trip")
         .expect("decision='proceed' must return Some(FocusInfo)");
 
         assert_eq!(applied.max_permitted_tier, ExternalAccess::Unrestricted);
 
-        let settings = focus_settings_store::get_focus_settings(PERSONA_ID, TIER3_DRAFT_FOCUS_ID)
-            .await
-            .expect("get_focus_settings must succeed")
-            .expect("row must exist");
+        let settings =
+            focus_settings_store::get_focus_settings(&pool, PERSONA_ID, TIER3_DRAFT_FOCUS_ID)
+                .await
+                .expect("get_focus_settings must succeed")
+                .expect("row must exist");
         assert_eq!(
             settings.max_permitted_tier,
             ExternalAccess::Unrestricted,

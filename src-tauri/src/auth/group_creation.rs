@@ -52,9 +52,6 @@
 // is unencrypted -- no PRAGMA key required (same as every sibling module in
 // this feature).
 
-use sqlx::sqlite::SqliteConnectOptions;
-use sqlx::ConnectOptions;
-use sqlx::SqliteConnection;
 use thiserror::Error;
 
 use crate::auth::group_invitations::{self, GroupInvitationError};
@@ -87,30 +84,6 @@ pub enum GroupCreationError {
     CreatorHasNoSharingKey(String),
 }
 
-// ---------------------------------------------------------------------------
-// DB opener (shared.db -- unencrypted)
-// ---------------------------------------------------------------------------
-// Duplicated rather than reused -- same reasoning every sibling module in
-// this feature already gives: different error type per module, ~12-line
-// zero-divergence-risk helper, not worth coupling.
-
-async fn open_shared_db() -> Result<SqliteConnection, GroupCreationError> {
-    let db_path = crate::persistence::migrations::get_data_root()
-        .join("instance")
-        .join("shared.db");
-    let network_storage = std::env::var("QR_NETWORK_STORAGE")
-        .map(|v| v.to_lowercase() == "true")
-        .unwrap_or(false);
-    let journal_mode = if network_storage { "DELETE" } else { "WAL" };
-    let conn = SqliteConnectOptions::new()
-        .filename(&db_path)
-        .create_if_missing(false)
-        .pragma("journal_mode", journal_mode)
-        .connect()
-        .await?;
-    Ok(conn)
-}
-
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -124,6 +97,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// give the creator a self-accepted pending_group_invitations row (see this
 /// module's own header, ROSTER RECONCILIATION). Returns the new group_id.
 pub async fn create_group(
+    pool: &sqlx::SqlitePool,
     creator_persona_id: &str,
     group_display_name: &str,
     creator_label: &str,
@@ -139,7 +113,7 @@ pub async fn create_group(
     // 2. Verify the creator persona actually belongs to the resident
     // account -- structural precondition for steps 5/6 below, not a new
     // authorization layer (see module header).
-    let mut shared_conn = open_shared_db().await?;
+    let mut shared_conn = pool.acquire().await?;
     let owner_user_id =
         group_invitations::resolve_persona_owner(creator_persona_id, &mut shared_conn).await?;
     if owner_user_id != current_user_id {
@@ -191,7 +165,7 @@ pub async fn create_group(
     // 6. Self-accepted invitation row -- written last, as the "this
     // membership is now real" signal (see module header, ROSTER
     // RECONCILIATION and ORDERING).
-    let creator_public_key = sharing_keypair::get_public_key(&current_user_id)
+    let creator_public_key = sharing_keypair::get_public_key(pool, &current_user_id)
         .await?
         .ok_or_else(|| GroupCreationError::CreatorHasNoSharingKey(current_user_id.clone()))?;
     let envelope = sharing_keypair::encrypt_to_public_key(&creator_public_key, &group_key)?;
@@ -212,7 +186,7 @@ pub async fn create_group(
     .bind(creator_label)
     .bind(&now)
     .bind(&now)
-    .execute(&mut shared_conn)
+    .execute(&mut *shared_conn)
     .await?;
 
     Ok(group_id)
@@ -234,6 +208,7 @@ mod tests {
         _tempdir: tempfile::TempDir,
         _lock: std::sync::MutexGuard<'static, ()>,
         saved_root: Option<String>,
+        pool: sqlx::SqlitePool,
     }
 
     impl Drop for TestEnv {
@@ -256,10 +231,18 @@ mod tests {
             .await
             .expect("shared.db migration must succeed in test setup");
 
+        let pool =
+            sqlx::SqlitePool::connect_with(crate::providers::utils::connect_options_unencrypted(
+                &crate::providers::utils::db_path_shared(),
+            ))
+            .await
+            .expect("shared.db pool must connect");
+
         TestEnv {
             _tempdir: tempdir,
             _lock: lock,
             saved_root,
+            pool,
         }
     }
 
@@ -268,6 +251,7 @@ mod tests {
     /// Mirrors group_invitations.rs's own make_user_with_persona fixture,
     /// plus the login step create_group requires.
     async fn make_logged_in_user_with_persona(
+        pool: &sqlx::SqlitePool,
         display_name: &str,
         master_key_fill: u8,
         key_registry: &KeyRegistry,
@@ -278,6 +262,7 @@ mod tests {
             sharing_keypair::derive_sharing_keypair(&master_key, &user_id);
 
         crate::auth::user_store::create_user(
+            pool,
             &user_id,
             display_name,
             "user",
@@ -292,9 +277,16 @@ mod tests {
         .expect("create_user must succeed");
 
         let persona_id = uuid::Uuid::new_v4().to_string();
-        persona_store::create_persona(&persona_id, "Test Persona", "personal", &user_id, None)
-            .await
-            .expect("create_persona must succeed");
+        persona_store::create_persona(
+            pool,
+            &persona_id,
+            "Test Persona",
+            "personal",
+            &user_id,
+            None,
+        )
+        .await
+        .expect("create_persona must succeed");
 
         key_registry
             .replace(UnlockedKey {
@@ -311,12 +303,14 @@ mod tests {
     #[tokio::test]
     async fn create_group_materializes_the_creators_local_group_db() {
         let _env = setup().await;
+        let pool = &_env.pool;
         let key_registry = KeyRegistry::default();
         let group_key_registry = GroupKeyRegistry::default();
         let (_user_id, persona_id) =
-            make_logged_in_user_with_persona("Alice", 0x11, &key_registry).await;
+            make_logged_in_user_with_persona(pool, "Alice", 0x11, &key_registry).await;
 
         let group_id = create_group(
+            pool,
             &persona_id,
             "The Household",
             "Alice",
@@ -339,10 +333,11 @@ mod tests {
     #[tokio::test]
     async fn create_group_durably_persists_the_group_key() {
         let _env = setup().await;
+        let pool = &_env.pool;
         let key_registry = KeyRegistry::default();
         let group_key_registry = GroupKeyRegistry::default();
         let (user_id, persona_id) =
-            make_logged_in_user_with_persona("Bob", 0x22, &key_registry).await;
+            make_logged_in_user_with_persona(pool, "Bob", 0x22, &key_registry).await;
 
         let personal_key_hex = key_registry
             .personal_key_hex()
@@ -350,6 +345,7 @@ mod tests {
             .expect("key must be resident");
 
         let group_id = create_group(
+            pool,
             &persona_id,
             "The Household",
             "Bob",
@@ -369,12 +365,14 @@ mod tests {
     #[tokio::test]
     async fn create_group_makes_the_creator_visible_to_remaining_members() {
         let _env = setup().await;
+        let pool = &_env.pool;
         let key_registry = KeyRegistry::default();
         let group_key_registry = GroupKeyRegistry::default();
         let (_user_id, persona_id) =
-            make_logged_in_user_with_persona("Carol", 0x33, &key_registry).await;
+            make_logged_in_user_with_persona(pool, "Carol", 0x33, &key_registry).await;
 
         let group_id = create_group(
+            pool,
             &persona_id,
             "The Household",
             "Carol",
@@ -384,7 +382,7 @@ mod tests {
         .await
         .expect("create_group must succeed");
 
-        let mut conn = open_shared_db().await.expect("open shared.db");
+        let mut conn = pool.acquire().await.expect("open shared.db");
         let remaining = crate::auth::group_membership::remaining_members(
             &group_id,
             "not-anyones-persona-id",
@@ -403,10 +401,12 @@ mod tests {
     #[tokio::test]
     async fn create_group_fails_when_not_logged_in() {
         let _env = setup().await;
+        let pool = &_env.pool;
         let key_registry = KeyRegistry::default();
         let group_key_registry = GroupKeyRegistry::default();
 
         let result = create_group(
+            pool,
             "some-persona-id",
             "The Household",
             "Nobody",
@@ -421,18 +421,20 @@ mod tests {
     #[tokio::test]
     async fn create_group_fails_for_a_persona_not_owned_by_the_resident_account() {
         let _env = setup().await;
+        let pool = &_env.pool;
         let key_registry = KeyRegistry::default();
         let group_key_registry = GroupKeyRegistry::default();
 
         // Logged in as Dave...
         let (_dave_user_id, _dave_persona_id) =
-            make_logged_in_user_with_persona("Dave", 0x44, &key_registry).await;
+            make_logged_in_user_with_persona(pool, "Dave", 0x44, &key_registry).await;
         // ...but Erin's persona belongs to a different, not-currently-resident account.
         let erin_key_registry = KeyRegistry::default();
         let (_erin_user_id, erin_persona_id) =
-            make_logged_in_user_with_persona("Erin", 0x55, &erin_key_registry).await;
+            make_logged_in_user_with_persona(pool, "Erin", 0x55, &erin_key_registry).await;
 
         let result = create_group(
+            pool,
             &erin_persona_id,
             "The Household",
             "Dave",
@@ -456,12 +458,14 @@ mod tests {
     #[tokio::test]
     async fn a_second_members_departure_queues_the_creator_a_rotation_envelope() {
         let _env = setup().await;
+        let pool = &_env.pool;
         let creator_key_registry = KeyRegistry::default();
         let group_key_registry = GroupKeyRegistry::default();
         let (_creator_user_id, creator_persona_id) =
-            make_logged_in_user_with_persona("Frank", 0x66, &creator_key_registry).await;
+            make_logged_in_user_with_persona(pool, "Frank", 0x66, &creator_key_registry).await;
 
         let group_id = create_group(
+            pool,
             &creator_persona_id,
             "The Household",
             "Frank",
@@ -480,12 +484,13 @@ mod tests {
 
         let grace_key_registry = KeyRegistry::default();
         let (_grace_user_id, grace_persona_id) =
-            make_logged_in_user_with_persona("Grace", 0x77, &grace_key_registry).await;
+            make_logged_in_user_with_persona(pool, "Grace", 0x77, &grace_key_registry).await;
         let grace_master_key = [0x77u8; kdf::MASTER_KEY_LEN];
         let (grace_sharing_private_key, _) =
             sharing_keypair::derive_sharing_keypair(&grace_master_key, &_grace_user_id);
 
         let invitation_id = group_invitations::send_invitation(
+            pool,
             &grace_persona_id,
             &group_id,
             "The Household",
@@ -495,6 +500,7 @@ mod tests {
         .await
         .expect("send_invitation must succeed");
         group_invitations::accept_invitation(
+            pool,
             &invitation_id,
             &grace_persona_id,
             &grace_sharing_private_key,
@@ -507,6 +513,7 @@ mod tests {
         // Grace departs -- remove_member should now queue a rotation
         // envelope for the creator too, not just any other invited member.
         crate::auth::group_membership::remove_member(
+            pool,
             &group_id,
             &grace_persona_id,
             crate::auth::group_membership::DepartureReason::Left,
@@ -517,12 +524,12 @@ mod tests {
         .await
         .expect("remove_member must succeed");
 
-        let mut conn = open_shared_db().await.unwrap();
+        let mut conn = pool.acquire().await.unwrap();
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT recipient_persona_id FROM pending_group_key_rotations WHERE group_id = ?",
         )
         .bind(&group_id)
-        .fetch_all(&mut conn)
+        .fetch_all(&mut *conn)
         .await
         .unwrap();
 

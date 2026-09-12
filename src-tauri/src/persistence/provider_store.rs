@@ -23,8 +23,8 @@
 // every other store in this module (persona_store.rs, focus_settings_store.rs).
 // shared.db is unencrypted -- no PRAGMA key required.
 //
-// CONNECTION MODEL: one connection per call, matching persona_store.rs
-// (Phase 1 correctness implementation, not yet pooled).
+// CONNECTION MODEL: pooled (items.id=483), matching persona_store.rs --
+// callers pass a &sqlx::SqlitePool in; every fn here does pool.acquire().
 //
 // WRITE ACCESS: this module provides full CRUD (create/update/deactivate),
 // but per decisions.id=710(b) the curated list is release-bundled, not
@@ -34,10 +34,7 @@
 // not end-user action. Flagged here so a future reader doesn't assume a
 // missing write-path IPC command is an oversight.
 
-use sqlx::sqlite::SqliteConnectOptions;
-use sqlx::ConnectOptions;
 use sqlx::Row;
-use sqlx::SqliteConnection;
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
@@ -156,6 +153,38 @@ impl PrivacyGuardianDefaultLevel {
     }
 }
 
+/// items.id=465 (shared_016.sql): whether a provider's privacy posture is
+/// backed by contractual language (DPA/Services Agreement) or is merely
+/// descriptive policy prose with no contractual commitment. Human-curated
+/// only, same as privacy_guardian_default_level -- never derived from
+/// documentation_gate's freeform research text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, specta::Type)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivacyCommitmentBasis {
+    Contractual,
+    PolicyOnly,
+}
+
+impl PrivacyCommitmentBasis {
+    fn as_str(self) -> &'static str {
+        match self {
+            PrivacyCommitmentBasis::Contractual => "contractual",
+            PrivacyCommitmentBasis::PolicyOnly => "policy_only",
+        }
+    }
+
+    fn from_str(s: &str) -> Result<Self, ProviderStoreError> {
+        match s {
+            "contractual" => Ok(PrivacyCommitmentBasis::Contractual),
+            "policy_only" => Ok(PrivacyCommitmentBasis::PolicyOnly),
+            other => Err(ProviderStoreError::Validation(format!(
+                "privacy_commitment_basis must be 'contractual' or 'policy_only', got '{other}' \
+                 -- schema CHECK should have rejected this at write time."
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Provider {
     pub id: String,
@@ -208,6 +237,20 @@ pub struct Provider {
     /// reference hardware class -- objectively measurable, so JSON is an
     /// acceptable escape hatch here unlike the flag columns above.
     pub hardware_requirement: Option<serde_json::Value>,
+    /// items.id=465 (shared_016.sql): whether QR itself recommends this
+    /// provider, interpreted jointly with provider_type -- one
+    /// recommendation slot per provider_type (cloud_inference_api /
+    /// split_screen_web / external_service), NOT a cross-slot rankable
+    /// field. DEFAULT false -- same unmarked-is-excluded convention as
+    /// qr_internal_eligible.
+    pub qr_recommended: bool,
+    /// items.id=465 (shared_016.sql): human-curated only, NULL until
+    /// assessed -- never derived from documentation_gate's freeform prose.
+    pub privacy_commitment_basis: Option<PrivacyCommitmentBasis>,
+    /// items.id=465 (shared_016.sql): throughput/latency class (JSON,
+    /// nullable), decoupled from hardware_requirement -- any provider row
+    /// can carry a performance_profile regardless of install footprint.
+    pub performance_profile: Option<serde_json::Value>,
 }
 
 /// Input to create_provider(). A plain struct rather than 15+ positional
@@ -231,37 +274,26 @@ pub struct NewProvider<'a> {
     pub risk_rating: u8,
     pub hardware_requirement: Option<serde_json::Value>,
     pub documentation_gate: &'a serde_json::Value,
+    /// items.id=465: defaults false/None at every existing call site
+    /// (release-time seeding still curates these via a migration's own
+    /// UPDATE, not through create_provider -- same precedent shared_014.sql
+    /// already set for qr_internal_eligible).
+    pub qr_recommended: bool,
+    pub privacy_commitment_basis: Option<PrivacyCommitmentBasis>,
+    pub performance_profile: Option<serde_json::Value>,
 }
 
 // ---------------------------------------------------------------------------
 // DB opener (shared.db — unencrypted)
 // ---------------------------------------------------------------------------
 
-async fn open_shared_db() -> Result<SqliteConnection, ProviderStoreError> {
-    let db_path = crate::persistence::migrations::get_data_root()
-        .join("instance")
-        .join("shared.db");
-    let network_storage = std::env::var("QR_NETWORK_STORAGE")
-        .map(|v| v.to_lowercase() == "true")
-        .unwrap_or(false);
-    let journal_mode = if network_storage { "DELETE" } else { "WAL" };
-
-    let conn = SqliteConnectOptions::new()
-        .filename(&db_path)
-        .create_if_missing(false)
-        .pragma("journal_mode", journal_mode)
-        .connect()
-        .await?;
-
-    Ok(conn)
-}
-
 const SELECT_COLUMNS: &str = "id, display_name, provider_type, mode, launch_url,
                 activation_status, documentation_gate, last_reviewed_at,
                 review_trigger_note, created_at, is_local, is_anonymous,
                 retains_data, trains_on_data_by_default, login_required,
                 qr_internal_eligible, privacy_guardian_default_level,
-                risk_rating, hardware_requirement, user_privacy_summary";
+                risk_rating, hardware_requirement, user_privacy_summary,
+                qr_recommended, privacy_commitment_basis, performance_profile";
 
 // ---------------------------------------------------------------------------
 // Row extraction
@@ -303,6 +335,15 @@ fn row_to_provider(row: &sqlx::sqlite::SqliteRow) -> Result<Provider, ProviderSt
     let user_privacy_summary_raw: Option<String> = row
         .try_get("user_privacy_summary")
         .map_err(ProviderStoreError::Database)?;
+    let qr_recommended_raw: i64 = row
+        .try_get("qr_recommended")
+        .map_err(ProviderStoreError::Database)?;
+    let privacy_commitment_basis_raw: Option<String> = row
+        .try_get("privacy_commitment_basis")
+        .map_err(ProviderStoreError::Database)?;
+    let performance_profile_raw: Option<String> = row
+        .try_get("performance_profile")
+        .map_err(ProviderStoreError::Database)?;
 
     let documentation_gate: serde_json::Value =
         serde_json::from_str(&doc_gate_raw).unwrap_or_else(|e| {
@@ -334,6 +375,22 @@ fn row_to_provider(row: &sqlx::sqlite::SqliteRow) -> Result<Provider, ProviderSt
             .map_err(|e| {
                 log::warn!(
                     "provider '{id}' user_privacy_summary failed to parse as JSON, \
+                     dropping: {e}"
+                );
+            })
+            .ok()
+    });
+
+    let privacy_commitment_basis = privacy_commitment_basis_raw
+        .as_deref()
+        .map(PrivacyCommitmentBasis::from_str)
+        .transpose()?;
+
+    let performance_profile = performance_profile_raw.and_then(|raw| {
+        serde_json::from_str(&raw)
+            .map_err(|e| {
+                log::warn!(
+                    "provider '{id}' performance_profile failed to parse as JSON, \
                      dropping: {e}"
                 );
             })
@@ -378,6 +435,9 @@ fn row_to_provider(row: &sqlx::sqlite::SqliteRow) -> Result<Provider, ProviderSt
             raw as u8
         },
         hardware_requirement,
+        qr_recommended: qr_recommended_raw != 0,
+        privacy_commitment_basis,
+        performance_profile,
     })
 }
 
@@ -408,13 +468,16 @@ fn classify_constraint_error(provider_id: &str, e: sqlx::Error) -> ProviderStore
 /// Fetch a provider by ID. Returns None if not found. No activation_status
 /// filter -- callers wanting only 'active' rows should use
 /// list_active_providers() or filter explicitly; this is the raw lookup.
-pub async fn get_provider(provider_id: &str) -> Result<Option<Provider>, ProviderStoreError> {
-    let mut conn = open_shared_db().await?;
+pub async fn get_provider(
+    pool: &sqlx::SqlitePool,
+    provider_id: &str,
+) -> Result<Option<Provider>, ProviderStoreError> {
+    let mut conn = pool.acquire().await?;
 
     let sql = format!("SELECT {SELECT_COLUMNS} FROM providers WHERE id = ?");
     let row = sqlx::query(&sql)
         .bind(provider_id)
-        .fetch_optional(&mut conn)
+        .fetch_optional(&mut *conn)
         .await?;
 
     match row {
@@ -435,13 +498,14 @@ pub async fn get_provider(provider_id: &str) -> Result<Option<Provider>, Provide
 /// items.id=427: repointed at providers -- signature and behavior
 /// otherwise unchanged, this is a live Privacy Guardian consumer.
 pub async fn max_risk_rating_for_providers(
+    pool: &sqlx::SqlitePool,
     provider_ids: &[String],
 ) -> Result<Option<u8>, ProviderStoreError> {
     if provider_ids.is_empty() {
         return Ok(None);
     }
 
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
 
     // Bound to (small) actual provider IDs, not user-supplied text -- an
     // IN(...) list built from a fixed, checked-length local set is standard
@@ -460,7 +524,7 @@ pub async fn max_risk_rating_for_providers(
         query = query.bind(id);
     }
 
-    let row = query.fetch_one(&mut conn).await?;
+    let row = query.fetch_one(&mut *conn).await?;
     let max_risk: Option<i64> = row
         .try_get("max_risk")
         .map_err(ProviderStoreError::Database)?;
@@ -472,8 +536,10 @@ pub async fn max_risk_rating_for_providers(
 /// caller can group the result for display without a second query. No
 /// stability contract beyond "grouped and deterministic" -- provider_type
 /// replaces the old tier-based ordering (items.id=427: no tier column).
-pub async fn list_active_providers() -> Result<Vec<Provider>, ProviderStoreError> {
-    let mut conn = open_shared_db().await?;
+pub async fn list_active_providers(
+    pool: &sqlx::SqlitePool,
+) -> Result<Vec<Provider>, ProviderStoreError> {
+    let mut conn = pool.acquire().await?;
 
     let sql = format!(
         "SELECT {SELECT_COLUMNS}
@@ -481,7 +547,7 @@ pub async fn list_active_providers() -> Result<Vec<Provider>, ProviderStoreError
          WHERE activation_status = 'active'
          ORDER BY provider_type ASC, display_name ASC"
     );
-    let rows = sqlx::query(&sql).fetch_all(&mut conn).await?;
+    let rows = sqlx::query(&sql).fetch_all(&mut *conn).await?;
 
     let mut providers = Vec::new();
     for r in rows {
@@ -498,9 +564,10 @@ pub async fn list_active_providers() -> Result<Vec<Provider>, ProviderStoreError
 /// exactly the flag-based eligibility this table exists to provide (core
 /// rule 2), not a reintroduction of the old hardcoding problem.
 pub async fn list_providers_by_type(
+    pool: &sqlx::SqlitePool,
     provider_type: &str,
 ) -> Result<Vec<Provider>, ProviderStoreError> {
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
 
     let sql = format!(
         "SELECT {SELECT_COLUMNS}
@@ -510,7 +577,7 @@ pub async fn list_providers_by_type(
     );
     let rows = sqlx::query(&sql)
         .bind(provider_type)
-        .fetch_all(&mut conn)
+        .fetch_all(&mut *conn)
         .await?;
 
     let mut providers = Vec::new();
@@ -523,15 +590,17 @@ pub async fn list_providers_by_type(
 /// All providers regardless of activation_status, for admin/maintenance
 /// views (e.g. a future Chat-PM-facing catalog-review surface) -- NOT the
 /// selector screen's path, which must use list_active_providers().
-pub async fn list_all_providers() -> Result<Vec<Provider>, ProviderStoreError> {
-    let mut conn = open_shared_db().await?;
+pub async fn list_all_providers(
+    pool: &sqlx::SqlitePool,
+) -> Result<Vec<Provider>, ProviderStoreError> {
+    let mut conn = pool.acquire().await?;
 
     let sql = format!(
         "SELECT {SELECT_COLUMNS}
          FROM providers
          ORDER BY provider_type ASC, display_name ASC"
     );
-    let rows = sqlx::query(&sql).fetch_all(&mut conn).await?;
+    let rows = sqlx::query(&sql).fetch_all(&mut *conn).await?;
 
     let mut providers = Vec::new();
     for r in rows {
@@ -541,13 +610,114 @@ pub async fn list_all_providers() -> Result<Vec<Provider>, ProviderStoreError> {
 }
 
 // ---------------------------------------------------------------------------
+// provider_models (items.id=465, shared_016.sql)
+// ---------------------------------------------------------------------------
+
+/// One catalog model entry for a provider. `id` is literally
+/// "provider_id:model_id" -- the same opaque string
+/// conductor/executor.rs's select_model()/get_context_window() already
+/// pass around (e.g. "groq:llama-3.1-8b-instant"), so callers never split
+/// or reassemble it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ProviderModel {
+    pub id: String,
+    pub provider_id: String,
+    pub model_id: String,
+    pub context_window_tokens: u32,
+    pub is_default: bool,
+    pub created_at: String,
+}
+
+fn row_to_provider_model(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<ProviderModel, ProviderStoreError> {
+    let context_window_tokens: i64 = row
+        .try_get("context_window_tokens")
+        .map_err(ProviderStoreError::Database)?;
+    let is_default: i64 = row
+        .try_get("is_default")
+        .map_err(ProviderStoreError::Database)?;
+
+    Ok(ProviderModel {
+        id: row.try_get("id").map_err(ProviderStoreError::Database)?,
+        provider_id: row
+            .try_get("provider_id")
+            .map_err(ProviderStoreError::Database)?,
+        model_id: row
+            .try_get("model_id")
+            .map_err(ProviderStoreError::Database)?,
+        context_window_tokens: context_window_tokens as u32,
+        is_default: is_default != 0,
+        created_at: row
+            .try_get("created_at")
+            .map_err(ProviderStoreError::Database)?,
+    })
+}
+
+/// The model conductor/executor.rs's select_model() resolves for a Tier 2
+/// provider -- replaces the hardcoded `match tier2_provider { Some("mistral")
+/// => ..., Some("groq") => ... }` literal-string dispatch. `None` when
+/// `provider_id` has no default row in provider_models (an unknown provider,
+/// or a known one not yet curated with a model) -- callers must treat that
+/// as a real failure (ConductorError::UnknownProvider in executor.rs), not
+/// silently fall back to any other provider.
+pub async fn get_default_model(
+    pool: &sqlx::SqlitePool,
+    provider_id: &str,
+) -> Result<Option<ProviderModel>, ProviderStoreError> {
+    let mut conn = pool.acquire().await?;
+
+    let row = sqlx::query(
+        "SELECT id, provider_id, model_id, context_window_tokens, is_default, created_at
+         FROM provider_models
+         WHERE provider_id = ? AND is_default = 1",
+    )
+    .bind(provider_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+
+    match row {
+        None => Ok(None),
+        Some(r) => Ok(Some(row_to_provider_model(&r)?)),
+    }
+}
+
+/// Look up a catalog model by its full "provider_id:model_id" id --
+/// conductor/executor.rs's get_context_window() reads this first, before
+/// falling back to its own small hardcoded map for the local Ollama ids
+/// that have no providers row to hang a catalog entry off yet.
+pub async fn get_model(
+    pool: &sqlx::SqlitePool,
+    id: &str,
+) -> Result<Option<ProviderModel>, ProviderStoreError> {
+    let mut conn = pool.acquire().await?;
+
+    let row = sqlx::query(
+        "SELECT id, provider_id, model_id, context_window_tokens, is_default, created_at
+         FROM provider_models
+         WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(&mut *conn)
+    .await?;
+
+    match row {
+        None => Ok(None),
+        Some(r) => Ok(Some(row_to_provider_model(&r)?)),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Write operations
 // ---------------------------------------------------------------------------
 
 /// Create a new provider catalog row. Release-time/catalog-maintenance use
 /// only (see module header WRITE ACCESS note) -- not exposed via IPC.
 /// Returns Err(AlreadyExists) if provider_id already exists.
-pub async fn create_provider(new: NewProvider<'_>) -> Result<Provider, ProviderStoreError> {
+pub async fn create_provider(
+    pool: &sqlx::SqlitePool,
+    new: NewProvider<'_>,
+) -> Result<Provider, ProviderStoreError> {
     if new.mode == ProviderMode::EmbeddedWeb && new.launch_url.is_none() {
         return Err(ProviderStoreError::Validation(
             "launch_url is required when mode='embedded_web' -- the pane has \
@@ -568,7 +738,15 @@ pub async fn create_provider(new: NewProvider<'_>) -> Result<Provider, ProviderS
         .map_err(|e| {
             ProviderStoreError::Validation(format!("hardware_requirement not valid JSON: {e}"))
         })?;
-    let mut conn = open_shared_db().await?;
+    let performance_profile_str = new
+        .performance_profile
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| {
+            ProviderStoreError::Validation(format!("performance_profile not valid JSON: {e}"))
+        })?;
+    let mut conn = pool.acquire().await?;
 
     sqlx::query(
         "INSERT INTO providers
@@ -576,8 +754,9 @@ pub async fn create_provider(new: NewProvider<'_>) -> Result<Provider, ProviderS
           activation_status, documentation_gate, last_reviewed_at,
           review_trigger_note, created_at, is_local, is_anonymous,
           retains_data, trains_on_data_by_default, qr_internal_eligible,
-          privacy_guardian_default_level, risk_rating, hardware_requirement)
-         VALUES (?, ?, ?, ?, ?, ?, 'active', ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          privacy_guardian_default_level, risk_rating, hardware_requirement,
+          qr_recommended, privacy_commitment_basis, performance_profile)
+         VALUES (?, ?, ?, ?, ?, ?, 'active', ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(new.id)
     .bind(new.display_name)
@@ -595,7 +774,10 @@ pub async fn create_provider(new: NewProvider<'_>) -> Result<Provider, ProviderS
     .bind(new.privacy_guardian_default_level.map(|l| l.as_str()))
     .bind(new.risk_rating as i64)
     .bind(&hardware_req_str)
-    .execute(&mut conn)
+    .bind(new.qr_recommended as i64)
+    .bind(new.privacy_commitment_basis.map(|b| b.as_str()))
+    .bind(&performance_profile_str)
+    .execute(&mut *conn)
     .await
     .map_err(|e| classify_constraint_error(new.id, e))?;
 
@@ -620,6 +802,9 @@ pub async fn create_provider(new: NewProvider<'_>) -> Result<Provider, ProviderS
         privacy_guardian_default_level: new.privacy_guardian_default_level,
         risk_rating: new.risk_rating,
         hardware_requirement: new.hardware_requirement,
+        qr_recommended: new.qr_recommended,
+        privacy_commitment_basis: new.privacy_commitment_basis,
+        performance_profile: new.performance_profile,
     })
 }
 
@@ -628,15 +813,16 @@ pub async fn create_provider(new: NewProvider<'_>) -> Result<Provider, ProviderS
 /// machine) -- 'deprecated' rows stay in the table for audit/history
 /// rather than being deleted.
 pub async fn set_activation_status(
+    pool: &sqlx::SqlitePool,
     provider_id: &str,
     status: ActivationStatus,
 ) -> Result<(), ProviderStoreError> {
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
 
     let result = sqlx::query("UPDATE providers SET activation_status = ? WHERE id = ?")
         .bind(status.as_str())
         .bind(provider_id)
-        .execute(&mut conn)
+        .execute(&mut *conn)
         .await?;
 
     if result.rows_affected() == 0 {
@@ -655,6 +841,7 @@ pub async fn set_activation_status(
 /// record_friction_gate_decision validation shape: at least one
 /// meaningful field required, not silently accepted empty).
 pub async fn record_review(
+    pool: &sqlx::SqlitePool,
     provider_id: &str,
     trigger_note: &str,
 ) -> Result<(), ProviderStoreError> {
@@ -667,7 +854,7 @@ pub async fn record_review(
     }
 
     let reviewed_at = crate::providers::utils::now();
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
 
     let result = sqlx::query(
         "UPDATE providers
@@ -677,7 +864,7 @@ pub async fn record_review(
     .bind(&reviewed_at)
     .bind(trigger_note)
     .bind(provider_id)
-    .execute(&mut conn)
+    .execute(&mut *conn)
     .await?;
 
     if result.rows_affected() == 0 {
@@ -693,18 +880,19 @@ pub async fn record_review(
 /// explicit calls rather than one that could silently update content
 /// without a recorded trigger.
 pub async fn update_documentation_gate(
+    pool: &sqlx::SqlitePool,
     provider_id: &str,
     documentation_gate: &serde_json::Value,
 ) -> Result<(), ProviderStoreError> {
     let doc_gate_str = serde_json::to_string(documentation_gate).map_err(|e| {
         ProviderStoreError::Validation(format!("documentation_gate not valid JSON: {e}"))
     })?;
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
 
     let result = sqlx::query("UPDATE providers SET documentation_gate = ? WHERE id = ?")
         .bind(&doc_gate_str)
         .bind(provider_id)
-        .execute(&mut conn)
+        .execute(&mut *conn)
         .await?;
 
     if result.rows_affected() == 0 {
@@ -720,6 +908,8 @@ pub async fn update_documentation_gate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::sqlite::SqliteConnectOptions;
+    use sqlx::{ConnectOptions, SqliteConnection};
 
     /// Mirrors migrations.rs's own make_test_conn (private to that module's
     /// test mod, so not reusable directly) -- same in-memory, unencrypted
@@ -813,7 +1003,13 @@ mod tests {
         let result = crate::persistence::migrations::migrate_shared_db().await;
 
         let outcome = async {
-            let providers = list_active_providers().await?;
+            let pool = sqlx::SqlitePool::connect_with(
+                crate::providers::utils::connect_options_unencrypted(
+                    &crate::providers::utils::db_path_shared(),
+                ),
+            )
+            .await?;
+            let providers = list_active_providers(&pool).await?;
             let ids: Vec<&str> = providers.iter().map(|p| p.id.as_str()).collect();
             assert!(ids.contains(&"duckai"));
             assert!(ids.contains(&"claude"));
@@ -821,7 +1017,7 @@ mod tests {
             assert!(ids.contains(&"gemini"));
 
             let max_risk =
-                max_risk_rating_for_providers(&["duckai".to_string(), "claude".to_string()])
+                max_risk_rating_for_providers(&pool, &["duckai".to_string(), "claude".to_string()])
                     .await?;
             assert_eq!(
                 max_risk,
@@ -829,7 +1025,8 @@ mod tests {
                 "MAX across a Low(duckai)+High(claude) selection must be High"
             );
 
-            let max_risk_low_only = max_risk_rating_for_providers(&["duckai".to_string()]).await?;
+            let max_risk_low_only =
+                max_risk_rating_for_providers(&pool, &["duckai".to_string()]).await?;
             assert_eq!(max_risk_low_only, Some(1));
 
             Ok::<(), ProviderStoreError>(())
@@ -917,7 +1114,13 @@ mod tests {
         let result = crate::persistence::migrations::migrate_shared_db().await;
 
         let outcome = async {
-            let cloud_api = list_providers_by_type("cloud_inference_api").await?;
+            let pool = sqlx::SqlitePool::connect_with(
+                crate::providers::utils::connect_options_unencrypted(
+                    &crate::providers::utils::db_path_shared(),
+                ),
+            )
+            .await?;
+            let cloud_api = list_providers_by_type(&pool, "cloud_inference_api").await?;
             let ids: Vec<&str> = cloud_api.iter().map(|p| p.id.as_str()).collect();
             assert_eq!(
                 ids.len(),
@@ -927,7 +1130,7 @@ mod tests {
             assert!(ids.contains(&"groq"));
             assert!(ids.contains(&"mistral"));
 
-            let external = list_providers_by_type("external_service").await?;
+            let external = list_providers_by_type(&pool, "external_service").await?;
             let external_ids: Vec<&str> = external.iter().map(|p| p.id.as_str()).collect();
             assert!(!external_ids.contains(&"groq"));
             assert!(!external_ids.contains(&"mistral"));

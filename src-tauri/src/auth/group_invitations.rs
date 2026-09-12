@@ -57,8 +57,6 @@
 // QUERY STYLE: runtime sqlx::query() only -- no query!() macros. shared.db
 // is unencrypted -- no PRAGMA key required (same as persona_store.rs).
 
-use sqlx::sqlite::SqliteConnectOptions;
-use sqlx::ConnectOptions;
 use sqlx::Row;
 use sqlx::SqliteConnection;
 use thiserror::Error;
@@ -92,30 +90,6 @@ pub enum GroupInvitationError {
     NotPending(String, String),
     #[error("Failed to durably persist group key: {0}")]
     PersonalStore(#[from] PersonalStoreError),
-}
-
-// ---------------------------------------------------------------------------
-// DB opener (shared.db -- unencrypted)
-// ---------------------------------------------------------------------------
-// Duplicated rather than reused -- same reasoning user_store.rs's own header
-// gives: different error type per module, ~12-line zero-divergence-risk
-// helper, not worth coupling.
-
-async fn open_shared_db() -> Result<SqliteConnection, GroupInvitationError> {
-    let db_path = crate::persistence::migrations::get_data_root()
-        .join("instance")
-        .join("shared.db");
-    let network_storage = std::env::var("QR_NETWORK_STORAGE")
-        .map(|v| v.to_lowercase() == "true")
-        .unwrap_or(false);
-    let journal_mode = if network_storage { "DELETE" } else { "WAL" };
-    let conn = SqliteConnectOptions::new()
-        .filename(&db_path)
-        .create_if_missing(false)
-        .pragma("journal_mode", journal_mode)
-        .connect()
-        .await?;
-    Ok(conn)
 }
 
 fn hex_decode(context: &str, s: &str) -> Result<Vec<u8>, GroupInvitationError> {
@@ -196,19 +170,20 @@ pub struct PendingInvitation {
 /// prerequisite for this item).
 #[allow(dead_code)] // items.id=284: ahead of its first real caller (invite-UI item, not yet scoped)
 pub async fn send_invitation(
+    pool: &sqlx::SqlitePool,
     recipient_persona_id: &str,
     group_id: &str,
     group_display_name: &str,
     sender_label: &str,
     group_symmetric_key: &[u8; kdf::MASTER_KEY_LEN],
 ) -> Result<String, GroupInvitationError> {
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
     let owner_user_id = resolve_persona_owner(recipient_persona_id, &mut conn).await?;
 
     // Own connection, matching login()'s independently-opening-calls style
     // -- no shared transaction with the INSERT below, none needed (a public
     // key lookup and an invitation write are not one logical operation).
-    let recipient_public_key = sharing_keypair::get_public_key(&owner_user_id)
+    let recipient_public_key = sharing_keypair::get_public_key(pool, &owner_user_id)
         .await?
         .ok_or_else(|| GroupInvitationError::RecipientHasNoSharingKey(owner_user_id.clone()))?;
 
@@ -231,7 +206,7 @@ pub async fn send_invitation(
     .bind(hex_encode(&envelope))
     .bind(sender_label)
     .bind(&created_at)
-    .execute(&mut conn)
+    .execute(&mut *conn)
     .await?;
 
     Ok(id)
@@ -243,9 +218,10 @@ pub async fn send_invitation(
 
 #[allow(dead_code)] // items.id=284: ahead of its first real caller (invite-UI item, not yet scoped)
 pub async fn list_pending_invitations(
+    pool: &sqlx::SqlitePool,
     recipient_persona_id: &str,
 ) -> Result<Vec<PendingInvitation>, GroupInvitationError> {
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
 
     let rows = sqlx::query(
         "SELECT id, group_id, group_display_name, sender_label, created_at
@@ -254,7 +230,7 @@ pub async fn list_pending_invitations(
          ORDER BY created_at",
     )
     .bind(recipient_persona_id)
-    .fetch_all(&mut conn)
+    .fetch_all(&mut *conn)
     .await?;
 
     Ok(rows
@@ -336,13 +312,14 @@ async fn fetch_pending_invitation(
 /// row, rather than producing a different or corrupted result.
 #[allow(dead_code)] // items.id=284: ahead of its first real caller (invite-UI item, not yet scoped)
 pub async fn accept_invitation(
+    pool: &sqlx::SqlitePool,
     invitation_id: &str,
     recipient_persona_id: &str,
     sharing_private_key: &StaticSecret,
     group_key_registry: &GroupKeyRegistry,
     personal_key_hex: &str,
 ) -> Result<(), GroupInvitationError> {
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
     let invitation =
         fetch_pending_invitation(invitation_id, recipient_persona_id, &mut conn).await?;
 
@@ -390,7 +367,7 @@ pub async fn accept_invitation(
     )
     .bind(crate::providers::utils::now())
     .bind(invitation_id)
-    .execute(&mut conn)
+    .execute(&mut *conn)
     .await?;
 
     // items.id=287 "app-start" pull cadence, per-group: the registry starts
@@ -403,6 +380,7 @@ pub async fn accept_invitation(
     // an otherwise-successful accept_invitation into an Err.
     let group_key_hex = crate::auth::registry::key_hex(&group_key);
     if let Err(e) = crate::group_sync::engine::pull_if_newer(
+        pool,
         recipient_persona_id,
         &invitation.group_id,
         &group_key_hex,
@@ -416,6 +394,7 @@ pub async fn accept_invitation(
         );
     }
     if let Err(e) = crate::group_sync::engine::pull_permissions_if_newer(
+        pool,
         recipient_persona_id,
         &invitation.group_id,
         &group_key_hex,
@@ -435,10 +414,11 @@ pub async fn accept_invitation(
 /// Decline a pending invitation. No decryption -- just a status update.
 #[allow(dead_code)] // items.id=284: ahead of its first real caller (invite-UI item, not yet scoped)
 pub async fn decline_invitation(
+    pool: &sqlx::SqlitePool,
     invitation_id: &str,
     recipient_persona_id: &str,
 ) -> Result<(), GroupInvitationError> {
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
     // fetch_pending_invitation's NotFound/NotPending distinction applies
     // identically here -- reused rather than duplicating the same
     // SELECT-and-classify logic for a second time.
@@ -451,7 +431,7 @@ pub async fn decline_invitation(
     )
     .bind(crate::providers::utils::now())
     .bind(invitation_id)
-    .execute(&mut conn)
+    .execute(&mut *conn)
     .await?;
 
     Ok(())
@@ -473,6 +453,7 @@ mod tests {
         _tempdir: tempfile::TempDir,
         _lock: std::sync::MutexGuard<'static, ()>,
         saved_root: Option<String>,
+        pool: sqlx::SqlitePool,
     }
 
     impl Drop for TestEnv {
@@ -495,10 +476,18 @@ mod tests {
             .await
             .expect("shared.db migration must succeed in test setup");
 
+        let pool =
+            sqlx::SqlitePool::connect_with(crate::providers::utils::connect_options_unencrypted(
+                &crate::providers::utils::db_path_shared(),
+            ))
+            .await
+            .expect("shared.db pool must connect");
+
         TestEnv {
             _tempdir: tempdir,
             _lock: lock,
             saved_root,
+            pool,
         }
     }
 
@@ -506,6 +495,7 @@ mod tests {
     /// (user_id, persona_id, sharing_private_key). Mirrors user_store.rs /
     /// persona_store.rs test fixture conventions.
     async fn make_user_with_persona(
+        pool: &sqlx::SqlitePool,
         display_name: &str,
         master_key_fill: u8,
     ) -> (String, String, StaticSecret) {
@@ -515,6 +505,7 @@ mod tests {
             sharing_keypair::derive_sharing_keypair(&master_key, &user_id);
 
         crate::auth::user_store::create_user(
+            pool,
             &user_id,
             display_name,
             "user",
@@ -529,9 +520,16 @@ mod tests {
         .expect("create_user must succeed");
 
         let persona_id = uuid::Uuid::new_v4().to_string();
-        persona_store::create_persona(&persona_id, "Test Persona", "personal", &user_id, None)
-            .await
-            .expect("create_persona must succeed");
+        persona_store::create_persona(
+            pool,
+            &persona_id,
+            "Test Persona",
+            "personal",
+            &user_id,
+            None,
+        )
+        .await
+        .expect("create_persona must succeed");
 
         (user_id, persona_id, sharing_private_key)
     }
@@ -539,14 +537,16 @@ mod tests {
     #[tokio::test]
     async fn round_trip_accept_populates_group_key_registry() {
         let _env = setup().await;
-        let (_sender_user, sender_persona, _) = make_user_with_persona("Alice", 0x11).await;
+        let pool = &_env.pool;
+        let (_sender_user, sender_persona, _) = make_user_with_persona(pool, "Alice", 0x11).await;
         let (_recipient_user, recipient_persona, recipient_private_key) =
-            make_user_with_persona("Bob", 0x22).await;
+            make_user_with_persona(pool, "Bob", 0x22).await;
 
         let group_id = "group-1";
         let group_key = [0x99u8; kdf::MASTER_KEY_LEN];
 
         let invitation_id = send_invitation(
+            pool,
             &recipient_persona,
             group_id,
             "Family Documents",
@@ -556,7 +556,7 @@ mod tests {
         .await
         .expect("send_invitation must succeed");
 
-        let pending = list_pending_invitations(&recipient_persona)
+        let pending = list_pending_invitations(pool, &recipient_persona)
             .await
             .expect("list_pending_invitations must succeed");
         assert_eq!(pending.len(), 1);
@@ -565,6 +565,7 @@ mod tests {
 
         let registry = GroupKeyRegistry::default();
         accept_invitation(
+            pool,
             &invitation_id,
             &recipient_persona,
             &recipient_private_key,
@@ -580,7 +581,7 @@ mod tests {
         assert_eq!(stored_key, Some(group_key));
 
         // Accepted invitation must no longer show up as pending.
-        let pending_after = list_pending_invitations(&recipient_persona)
+        let pending_after = list_pending_invitations(pool, &recipient_persona)
             .await
             .expect("list_pending_invitations must succeed");
         assert!(pending_after.is_empty());
@@ -592,14 +593,16 @@ mod tests {
         // write -- prove it actually lands in personal.db's group_keys
         // table, not just the in-memory registry.
         let _env = setup().await;
-        let (_sender_user, sender_persona, _) = make_user_with_persona("Alice", 0xA1).await;
+        let pool = &_env.pool;
+        let (_sender_user, sender_persona, _) = make_user_with_persona(pool, "Alice", 0xA1).await;
         let (recipient_user, recipient_persona, recipient_private_key) =
-            make_user_with_persona("Bob", 0xA2).await;
+            make_user_with_persona(pool, "Bob", 0xA2).await;
 
         let group_id = "group-durable-1";
         let group_key = [0xE1u8; kdf::MASTER_KEY_LEN];
 
         let invitation_id = send_invitation(
+            pool,
             &recipient_persona,
             group_id,
             "Durable Test Group",
@@ -611,6 +614,7 @@ mod tests {
 
         let registry = GroupKeyRegistry::default();
         accept_invitation(
+            pool,
             &invitation_id,
             &recipient_persona,
             &recipient_private_key,
@@ -639,12 +643,14 @@ mod tests {
     #[tokio::test]
     async fn decline_updates_status_without_touching_registry() {
         let _env = setup().await;
-        let (_sender_user, sender_persona, _) = make_user_with_persona("Alice", 0x33).await;
+        let pool = &_env.pool;
+        let (_sender_user, sender_persona, _) = make_user_with_persona(pool, "Alice", 0x33).await;
         let (_recipient_user, recipient_persona, _recipient_private_key) =
-            make_user_with_persona("Bob", 0x44).await;
+            make_user_with_persona(pool, "Bob", 0x44).await;
 
         let group_key = [0x77u8; kdf::MASTER_KEY_LEN];
         let invitation_id = send_invitation(
+            pool,
             &recipient_persona,
             "group-2",
             "Business Docs",
@@ -654,14 +660,14 @@ mod tests {
         .await
         .expect("send_invitation must succeed");
 
-        decline_invitation(&invitation_id, &recipient_persona)
+        decline_invitation(pool, &invitation_id, &recipient_persona)
             .await
             .expect("decline_invitation must succeed");
 
         let registry = GroupKeyRegistry::default();
         assert!(!registry.is_occupied(&recipient_persona, "group-2").await);
 
-        let pending = list_pending_invitations(&recipient_persona)
+        let pending = list_pending_invitations(pool, &recipient_persona)
             .await
             .expect("list_pending_invitations must succeed");
         assert!(
@@ -673,12 +679,14 @@ mod tests {
     #[tokio::test]
     async fn tampered_envelope_fails_with_decryption_failed_and_leaves_row_pending() {
         let _env = setup().await;
-        let (_sender_user, sender_persona, _) = make_user_with_persona("Alice", 0x55).await;
+        let pool = &_env.pool;
+        let (_sender_user, sender_persona, _) = make_user_with_persona(pool, "Alice", 0x55).await;
         let (_recipient_user, recipient_persona, recipient_private_key) =
-            make_user_with_persona("Bob", 0x66).await;
+            make_user_with_persona(pool, "Bob", 0x66).await;
 
         let group_key = [0x88u8; kdf::MASTER_KEY_LEN];
         let invitation_id = send_invitation(
+            pool,
             &recipient_persona,
             "group-3",
             "Tampered Group",
@@ -689,12 +697,12 @@ mod tests {
         .expect("send_invitation must succeed");
 
         // Flip a bit inside the stored hex-encoded envelope.
-        let mut conn = open_shared_db().await.unwrap();
+        let mut conn = pool.acquire().await.unwrap();
         let (encrypted_hex,): (String,) = sqlx::query_as(
             "SELECT encrypted_group_key FROM pending_group_invitations WHERE id = ?",
         )
         .bind(&invitation_id)
-        .fetch_one(&mut conn)
+        .fetch_one(&mut *conn)
         .await
         .unwrap();
         let mut bytes = hex_decode("test", &encrypted_hex).unwrap();
@@ -703,12 +711,13 @@ mod tests {
         sqlx::query("UPDATE pending_group_invitations SET encrypted_group_key = ? WHERE id = ?")
             .bind(hex_encode(&bytes))
             .bind(&invitation_id)
-            .execute(&mut conn)
+            .execute(&mut *conn)
             .await
             .unwrap();
 
         let registry = GroupKeyRegistry::default();
         let result = accept_invitation(
+            pool,
             &invitation_id,
             &recipient_persona,
             &recipient_private_key,
@@ -728,7 +737,7 @@ mod tests {
         );
 
         // Row must still be pending -- accept must not have mutated it.
-        let pending = list_pending_invitations(&recipient_persona)
+        let pending = list_pending_invitations(pool, &recipient_persona)
             .await
             .expect("list_pending_invitations must succeed");
         assert_eq!(pending.len(), 1, "tampered accept must leave row pending");
@@ -738,8 +747,10 @@ mod tests {
     #[tokio::test]
     async fn ambiguous_persona_ownership_is_rejected_not_silently_resolved() {
         let _env = setup().await;
-        let (_sender_user, sender_persona, _) = make_user_with_persona("Alice", 0x77).await;
-        let (_recipient_user, recipient_persona, _) = make_user_with_persona("Bob", 0x88).await;
+        let pool = &_env.pool;
+        let (_sender_user, sender_persona, _) = make_user_with_persona(pool, "Alice", 0x77).await;
+        let (_recipient_user, recipient_persona, _) =
+            make_user_with_persona(pool, "Bob", 0x88).await;
 
         // Prove the schema-reachable multi-owner case is actually exercised,
         // not just asserted in a comment: add a second user to the
@@ -750,6 +761,7 @@ mod tests {
         let (_priv, pub_key) =
             sharing_keypair::derive_sharing_keypair(&master_key, &second_user_id);
         crate::auth::user_store::create_user(
+            pool,
             &second_user_id,
             "Carol",
             "user",
@@ -762,12 +774,13 @@ mod tests {
         )
         .await
         .expect("create_user must succeed");
-        persona_store::add_user_to_persona(&second_user_id, &recipient_persona)
+        persona_store::add_user_to_persona(pool, &second_user_id, &recipient_persona)
             .await
             .expect("add_user_to_persona must succeed");
 
         let group_key = [0xAAu8; kdf::MASTER_KEY_LEN];
         let result = send_invitation(
+            pool,
             &recipient_persona,
             "group-4",
             "Ambiguous Group",
@@ -788,10 +801,12 @@ mod tests {
     #[tokio::test]
     async fn accept_unknown_invitation_id_is_not_found() {
         let _env = setup().await;
-        let (_user, persona_id, private_key) = make_user_with_persona("Solo", 0xBB).await;
+        let pool = &_env.pool;
+        let (_user, persona_id, private_key) = make_user_with_persona(pool, "Solo", 0xBB).await;
         let registry = GroupKeyRegistry::default();
 
         let result = accept_invitation(
+            pool,
             "nonexistent-id",
             &persona_id,
             &private_key,
@@ -805,12 +820,14 @@ mod tests {
     #[tokio::test]
     async fn accept_already_accepted_invitation_is_not_pending() {
         let _env = setup().await;
-        let (_sender_user, sender_persona, _) = make_user_with_persona("Alice", 0xCC).await;
+        let pool = &_env.pool;
+        let (_sender_user, sender_persona, _) = make_user_with_persona(pool, "Alice", 0xCC).await;
         let (_recipient_user, recipient_persona, recipient_private_key) =
-            make_user_with_persona("Bob", 0xDD).await;
+            make_user_with_persona(pool, "Bob", 0xDD).await;
 
         let group_key = [0x11u8; kdf::MASTER_KEY_LEN];
         let invitation_id = send_invitation(
+            pool,
             &recipient_persona,
             "group-5",
             "Twice",
@@ -822,6 +839,7 @@ mod tests {
 
         let registry = GroupKeyRegistry::default();
         accept_invitation(
+            pool,
             &invitation_id,
             &recipient_persona,
             &recipient_private_key,
@@ -832,6 +850,7 @@ mod tests {
         .expect("first accept must succeed");
 
         let second = accept_invitation(
+            pool,
             &invitation_id,
             &recipient_persona,
             &recipient_private_key,

@@ -59,10 +59,7 @@
 // limitation, mirroring group.db's trust-based framing, items.id=210).
 
 use serde::{Deserialize, Serialize};
-use sqlx::sqlite::SqliteConnectOptions;
-use sqlx::ConnectOptions;
 use sqlx::Row;
-use sqlx::SqliteConnection;
 use thiserror::Error;
 use x25519_dalek::StaticSecret;
 
@@ -175,27 +172,6 @@ fn sync_file_path(folder_path: &str, share_id: &str) -> std::path::PathBuf {
     sync_dir(folder_path, share_id).join("update.qrshare")
 }
 
-// ---------------------------------------------------------------------------
-// DB opener (shared.db -- unencrypted)
-// ---------------------------------------------------------------------------
-
-async fn open_shared_db() -> Result<SqliteConnection, PersonaViewSyncError> {
-    let db_path = crate::persistence::migrations::get_data_root()
-        .join("instance")
-        .join("shared.db");
-    let network_storage = std::env::var("QR_NETWORK_STORAGE")
-        .map(|v| v.to_lowercase() == "true")
-        .unwrap_or(false);
-    let journal_mode = if network_storage { "DELETE" } else { "WAL" };
-    let conn = SqliteConnectOptions::new()
-        .filename(&db_path)
-        .create_if_missing(false)
-        .pragma("journal_mode", journal_mode)
-        .connect()
-        .await?;
-    Ok(conn)
-}
-
 fn hex_decode(context: &str, s: &str) -> Result<Vec<u8>, PersonaViewSyncError> {
     if !s.len().is_multiple_of(2) {
         return Err(PersonaViewSyncError::Validation(format!(
@@ -265,12 +241,13 @@ fn content_hash(
 /// real single-file atomicity -- unlike SYNCED's cross-file split); only
 /// once that succeeds does shared.db get touched (status -> 'accepted').
 pub async fn accept_persona_view_share(
+    pool: &sqlx::SqlitePool,
     share_id: &str,
     recipient_user_id: &str,
     recipient_personal_key_hex: &str,
     sharing_private_key: &StaticSecret,
 ) -> Result<(), PersonaViewSyncError> {
-    let mut shared_conn = open_shared_db().await?;
+    let mut shared_conn = pool.acquire().await?;
     let share =
         persona_sharing::fetch_pending_persona_share(share_id, recipient_user_id, &mut shared_conn)
             .await?;
@@ -354,7 +331,7 @@ pub async fn accept_persona_view_share(
     .bind(&responded_at)
     .bind(share_id)
     .bind(recipient_user_id)
-    .execute(&mut shared_conn)
+    .execute(&mut *shared_conn)
     .await?;
 
     Ok(())
@@ -373,10 +350,11 @@ pub async fn accept_persona_view_share(
 /// unknown share_id) is a Validation error, not a silent no-op, so a caller
 /// can't mistake "nothing happened" for "revoked".
 pub async fn revoke_persona_view_share(
+    pool: &sqlx::SqlitePool,
     owner_user_id: &str,
     share_id: &str,
 ) -> Result<(), PersonaViewSyncError> {
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
     let now = crate::providers::utils::now();
 
     let result = sqlx::query(
@@ -387,7 +365,7 @@ pub async fn revoke_persona_view_share(
     .bind(&now)
     .bind(share_id)
     .bind(owner_user_id)
-    .execute(&mut conn)
+    .execute(&mut *conn)
     .await?;
 
     if result.rows_affected() == 0 {
@@ -406,9 +384,10 @@ pub async fn revoke_persona_view_share(
 /// (share_id, source_persona_id, recipient_user_id, revoked_at) for every
 /// accepted VIEW-ONLY share owned by a persona `user_id` owns.
 async fn list_outbound_view_shares(
+    pool: &sqlx::SqlitePool,
     user_id: &str,
 ) -> Result<Vec<(String, String, String, Option<String>)>, PersonaViewSyncError> {
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
     let rows = sqlx::query(
         "SELECT pps.id, pps.source_persona_id, pps.recipient_user_id, pps.revoked_at
          FROM pending_persona_shares pps
@@ -416,7 +395,7 @@ async fn list_outbound_view_shares(
          WHERE up.user_id = ? AND pps.status = 'accepted' AND pps.share_type = 'view_only'",
     )
     .bind(user_id)
-    .fetch_all(&mut conn)
+    .fetch_all(&mut *conn)
     .await?;
 
     let mut out = Vec::with_capacity(rows.len());
@@ -435,15 +414,16 @@ async fn list_outbound_view_shares(
 /// accepted. No materialized_persona_id equivalent -- there is nothing
 /// analogous to look up (decisions.id=723).
 async fn list_inbound_view_shares(
+    pool: &sqlx::SqlitePool,
     recipient_user_id: &str,
 ) -> Result<Vec<String>, PersonaViewSyncError> {
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
     let rows = sqlx::query(
         "SELECT id FROM pending_persona_shares
          WHERE recipient_user_id = ? AND status = 'accepted' AND share_type = 'view_only'",
     )
     .bind(recipient_user_id)
-    .fetch_all(&mut conn)
+    .fetch_all(&mut *conn)
     .await?;
 
     let mut out = Vec::with_capacity(rows.len());
@@ -457,8 +437,12 @@ async fn list_inbound_view_shares(
 // Push
 // ---------------------------------------------------------------------------
 
-async fn push_all_owned_view_shares(user_id: &str, personal_key_hex: &str) {
-    let shares = match list_outbound_view_shares(user_id).await {
+async fn push_all_owned_view_shares(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    personal_key_hex: &str,
+) {
+    let shares = match list_outbound_view_shares(pool, user_id).await {
         Ok(s) => s,
         Err(e) => {
             log::warn!("persona_view_sync: could not list outbound shares for user={user_id}: {e}");
@@ -468,6 +452,7 @@ async fn push_all_owned_view_shares(user_id: &str, personal_key_hex: &str) {
 
     for (share_id, owner_persona_id, recipient_user_id, revoked_at) in shares {
         push_one_view_share(
+            pool,
             user_id,
             &owner_persona_id,
             personal_key_hex,
@@ -480,6 +465,7 @@ async fn push_all_owned_view_shares(user_id: &str, personal_key_hex: &str) {
 }
 
 async fn push_one_view_share(
+    pool: &sqlx::SqlitePool,
     owner_user_id: &str,
     owner_persona_id: &str,
     owner_personal_key_hex: &str,
@@ -488,6 +474,7 @@ async fn push_one_view_share(
     revoked: bool,
 ) {
     let result = push_if_changed_view(
+        pool,
         owner_user_id,
         owner_persona_id,
         owner_personal_key_hex,
@@ -505,6 +492,7 @@ async fn push_one_view_share(
                  owner_persona={owner_persona_id}: {e}"
             );
             if let Err(e2) = owner_settings_store::record_push_result(
+                pool,
                 owner_persona_id,
                 share_id,
                 Err(&e.to_string()),
@@ -521,6 +509,7 @@ async fn push_one_view_share(
 /// differs from the last push. Reuses persona_sync's own owner-side settings
 /// row (role='owner') unchanged -- see this module's own header.
 async fn push_if_changed_view(
+    pool: &sqlx::SqlitePool,
     owner_user_id: &str,
     owner_persona_id: &str,
     owner_personal_key_hex: &str,
@@ -529,7 +518,8 @@ async fn push_if_changed_view(
     revoked: bool,
 ) -> Result<bool, PersonaViewSyncError> {
     let Some(settings) =
-        owner_settings_store::get_persona_share_sync_settings(owner_persona_id, share_id).await?
+        owner_settings_store::get_persona_share_sync_settings(pool, owner_persona_id, share_id)
+            .await?
     else {
         return Ok(false);
     };
@@ -578,11 +568,12 @@ async fn push_if_changed_view(
     };
 
     if settings.last_content_hash.as_deref() == Some(hash.as_str()) {
-        owner_settings_store::record_push_result(owner_persona_id, share_id, Ok(None)).await?;
+        owner_settings_store::record_push_result(pool, owner_persona_id, share_id, Ok(None))
+            .await?;
         return Ok(false);
     }
 
-    let recipient_public_key = sharing_keypair::get_public_key(recipient_user_id)
+    let recipient_public_key = sharing_keypair::get_public_key(pool, recipient_user_id)
         .await?
         .ok_or_else(|| {
             PersonaViewSyncError::Validation(format!(
@@ -596,7 +587,8 @@ async fn push_if_changed_view(
     let path = sync_file_path(&settings.folder_path, share_id);
     write_envelope_atomic(&path, &envelope).await?;
 
-    owner_settings_store::record_push_result(owner_persona_id, share_id, Ok(Some(&hash))).await?;
+    owner_settings_store::record_push_result(pool, owner_persona_id, share_id, Ok(Some(&hash)))
+        .await?;
 
     Ok(true)
 }
@@ -606,11 +598,12 @@ async fn push_if_changed_view(
 // ---------------------------------------------------------------------------
 
 async fn pull_all_accepted_view_shares(
+    pool: &sqlx::SqlitePool,
     recipient_user_id: &str,
     recipient_personal_key_hex: &str,
     sharing_private_key: &StaticSecret,
 ) {
-    let shares = match list_inbound_view_shares(recipient_user_id).await {
+    let shares = match list_inbound_view_shares(pool, recipient_user_id).await {
         Ok(s) => s,
         Err(e) => {
             log::warn!(
@@ -622,6 +615,7 @@ async fn pull_all_accepted_view_shares(
 
     for share_id in shares {
         let result = pull_if_newer_view(
+            pool,
             recipient_user_id,
             recipient_personal_key_hex,
             &share_id,
@@ -632,6 +626,7 @@ async fn pull_all_accepted_view_shares(
         if let Err(e) = result {
             log::warn!("persona_view_sync: pull failed for share={share_id}: {e}");
             if let Err(e2) = settings_store::record_pull_result(
+                pool,
                 recipient_user_id,
                 &share_id,
                 Err(&e.to_string()),
@@ -650,13 +645,15 @@ async fn pull_all_accepted_view_shares(
 /// that will never change again), no envelope is waiting yet, or it isn't
 /// newer than the last one applied.
 async fn pull_if_newer_view(
+    pool: &sqlx::SqlitePool,
     recipient_user_id: &str,
     recipient_personal_key_hex: &str,
     share_id: &str,
     sharing_private_key: &StaticSecret,
 ) -> Result<bool, PersonaViewSyncError> {
     let Some(settings) =
-        settings_store::get_persona_view_share_sync_settings(recipient_user_id, share_id).await?
+        settings_store::get_persona_view_share_sync_settings(pool, recipient_user_id, share_id)
+            .await?
     else {
         return Ok(false);
     };
@@ -749,7 +746,7 @@ async fn pull_if_newer_view(
         }
     }
 
-    settings_store::record_pull_result(recipient_user_id, share_id, Ok(())).await?;
+    settings_store::record_pull_result(pool, recipient_user_id, share_id, Ok(())).await?;
 
     Ok(true)
 }
@@ -762,7 +759,7 @@ async fn pull_if_newer_view(
 /// whichever account is currently resident in `key_registry`. A no-op if
 /// nobody is logged in. Called from main.rs's existing periodic timer,
 /// alongside persona_sync's own sweep -- same timer, no second interval.
-pub async fn run_periodic_sweep(key_registry: &KeyRegistry) {
+pub async fn run_periodic_sweep(pool: &sqlx::SqlitePool, key_registry: &KeyRegistry) {
     let Some((user_id, personal_key_hex, sharing_private_key_bytes)) = key_registry
         .with_key(|k| {
             (
@@ -777,8 +774,8 @@ pub async fn run_periodic_sweep(key_registry: &KeyRegistry) {
     };
     let sharing_private_key = StaticSecret::from(sharing_private_key_bytes);
 
-    push_all_owned_view_shares(&user_id, &personal_key_hex).await;
-    pull_all_accepted_view_shares(&user_id, &personal_key_hex, &sharing_private_key).await;
+    push_all_owned_view_shares(pool, &user_id, &personal_key_hex).await;
+    pull_all_accepted_view_shares(pool, &user_id, &personal_key_hex, &sharing_private_key).await;
 }
 
 /// Pull every accepted inbound VIEW-ONLY share once, immediately. Called
@@ -786,11 +783,12 @@ pub async fn run_periodic_sweep(key_registry: &KeyRegistry) {
 /// finish_login) -- same reasoning persona_sync::engine::
 /// pull_all_accepted_shares_on_login's own doc comment gives.
 pub async fn pull_all_accepted_view_shares_on_login(
+    pool: &sqlx::SqlitePool,
     user_id: &str,
     personal_key_hex: &str,
     sharing_private_key: &StaticSecret,
 ) {
-    pull_all_accepted_view_shares(user_id, personal_key_hex, sharing_private_key).await;
+    pull_all_accepted_view_shares(pool, user_id, personal_key_hex, sharing_private_key).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -810,6 +808,7 @@ mod tests {
         _tempdir: tempfile::TempDir,
         _lock: std::sync::MutexGuard<'static, ()>,
         saved_root: Option<String>,
+        pool: sqlx::SqlitePool,
     }
 
     impl Drop for TestEnv {
@@ -831,15 +830,24 @@ mod tests {
             .await
             .expect("shared.db migration must succeed in test setup");
 
+        let pool =
+            sqlx::SqlitePool::connect_with(crate::providers::utils::connect_options_unencrypted(
+                &crate::providers::utils::db_path_shared(),
+            ))
+            .await
+            .expect("shared.db pool must connect");
+
         TestEnv {
             _tempdir: tempdir,
             _lock: lock,
             saved_root,
+            pool,
         }
     }
 
     /// Mirrors persona_sync::engine's own test fixture convention.
     async fn make_user_with_persona(
+        pool: &sqlx::SqlitePool,
         display_name: &str,
         master_key_fill: u8,
     ) -> (String, String, String, StaticSecret) {
@@ -850,6 +858,7 @@ mod tests {
         let key_hex: String = master_key.iter().map(|b| format!("{b:02x}")).collect();
 
         crate::auth::user_store::create_user(
+            pool,
             &user_id,
             display_name,
             "user",
@@ -864,9 +873,16 @@ mod tests {
         .expect("create_user must succeed");
 
         let persona_id = uuid::Uuid::new_v4().to_string();
-        persona_store::create_persona(&persona_id, "Shared Persona", "personal", &user_id, None)
-            .await
-            .expect("create_persona must succeed");
+        persona_store::create_persona(
+            pool,
+            &persona_id,
+            "Shared Persona",
+            "personal",
+            &user_id,
+            None,
+        )
+        .await
+        .expect("create_persona must succeed");
 
         (user_id, persona_id, key_hex, sharing_private_key)
     }
@@ -874,6 +890,7 @@ mod tests {
     /// Recipient side of VIEW-ONLY needs only an account -- no Persona
     /// (decisions.id=723).
     async fn make_recipient_user(
+        pool: &sqlx::SqlitePool,
         display_name: &str,
         master_key_fill: u8,
     ) -> (String, String, StaticSecret) {
@@ -884,6 +901,7 @@ mod tests {
         let key_hex: String = master_key.iter().map(|b| format!("{b:02x}")).collect();
 
         crate::auth::user_store::create_user(
+            pool,
             &user_id,
             display_name,
             "user",
@@ -903,8 +921,11 @@ mod tests {
     #[tokio::test]
     async fn accept_populates_cache_and_flips_status_without_creating_a_persona() {
         let _env = setup().await;
-        let (owner_id, owner_persona, owner_key, _) = make_user_with_persona("Alice", 0x30).await;
-        let (recipient_id, recipient_key, recipient_priv) = make_recipient_user("Bob", 0x40).await;
+        let pool = &_env.pool;
+        let (owner_id, owner_persona, owner_key, _) =
+            make_user_with_persona(pool, "Alice", 0x30).await;
+        let (recipient_id, recipient_key, recipient_priv) =
+            make_recipient_user(pool, "Bob", 0x40).await;
 
         entity_store::create_entity(
             &owner_id,
@@ -920,6 +941,7 @@ mod tests {
         .unwrap();
 
         let share_id = send_persona_share(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -929,9 +951,15 @@ mod tests {
         .await
         .unwrap();
 
-        accept_persona_view_share(&share_id, &recipient_id, &recipient_key, &recipient_priv)
-            .await
-            .expect("accept_persona_view_share must succeed");
+        accept_persona_view_share(
+            pool,
+            &share_id,
+            &recipient_id,
+            &recipient_key,
+            &recipient_priv,
+        )
+        .await
+        .expect("accept_persona_view_share must succeed");
 
         let mut cache_conn =
             view_cache_store::open_view_cache_db(&recipient_id, &share_id, &recipient_key)
@@ -944,11 +972,11 @@ mod tests {
         assert_eq!(meta.status, ViewCacheStatus::Active);
         assert_eq!(meta.source_persona_display_name, "Shared Persona");
 
-        let mut shared_conn = open_shared_db().await.unwrap();
+        let mut shared_conn = pool.acquire().await.unwrap();
         let status: String =
             sqlx::query_scalar("SELECT status FROM pending_persona_shares WHERE id = ?")
                 .bind(&share_id)
-                .fetch_one(&mut shared_conn)
+                .fetch_one(&mut *shared_conn)
                 .await
                 .unwrap();
         assert_eq!(status, "accepted");
@@ -957,7 +985,7 @@ mod tests {
         let persona_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM user_personas WHERE user_id = ?")
                 .bind(&recipient_id)
-                .fetch_one(&mut shared_conn)
+                .fetch_one(&mut *shared_conn)
                 .await
                 .unwrap();
         assert_eq!(persona_count, 0);
@@ -966,10 +994,14 @@ mod tests {
     #[tokio::test]
     async fn accept_rejects_a_synced_share() {
         let _env = setup().await;
-        let (owner_id, owner_persona, owner_key, _) = make_user_with_persona("Alice", 0x31).await;
-        let (recipient_id, recipient_key, recipient_priv) = make_recipient_user("Bob", 0x41).await;
+        let pool = &_env.pool;
+        let (owner_id, owner_persona, owner_key, _) =
+            make_user_with_persona(pool, "Alice", 0x31).await;
+        let (recipient_id, recipient_key, recipient_priv) =
+            make_recipient_user(pool, "Bob", 0x41).await;
 
         let share_id = send_persona_share(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -979,17 +1011,25 @@ mod tests {
         .await
         .unwrap();
 
-        let result =
-            accept_persona_view_share(&share_id, &recipient_id, &recipient_key, &recipient_priv)
-                .await;
+        let result = accept_persona_view_share(
+            pool,
+            &share_id,
+            &recipient_id,
+            &recipient_key,
+            &recipient_priv,
+        )
+        .await;
         assert!(matches!(result, Err(PersonaViewSyncError::Validation(_))));
     }
 
     #[tokio::test]
     async fn push_then_pull_round_trips_content_into_the_read_only_cache() {
         let _env = setup().await;
-        let (owner_id, owner_persona, owner_key, _) = make_user_with_persona("Alice", 0x32).await;
-        let (recipient_id, recipient_key, recipient_priv) = make_recipient_user("Bob", 0x42).await;
+        let pool = &_env.pool;
+        let (owner_id, owner_persona, owner_key, _) =
+            make_user_with_persona(pool, "Alice", 0x32).await;
+        let (recipient_id, recipient_key, recipient_priv) =
+            make_recipient_user(pool, "Bob", 0x42).await;
 
         let entity_id = entity_store::create_entity(
             &owner_id,
@@ -1021,6 +1061,7 @@ mod tests {
         .unwrap();
 
         let share_id = send_persona_share(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -1030,13 +1071,20 @@ mod tests {
         .await
         .unwrap();
 
-        accept_persona_view_share(&share_id, &recipient_id, &recipient_key, &recipient_priv)
-            .await
-            .unwrap();
+        accept_persona_view_share(
+            pool,
+            &share_id,
+            &recipient_id,
+            &recipient_key,
+            &recipient_priv,
+        )
+        .await
+        .unwrap();
 
         let shared_folder = tempfile::tempdir().unwrap();
         let folder_path = shared_folder.path().to_str().unwrap();
         owner_settings_store::set_persona_share_sync_folder(
+            pool,
             &owner_persona,
             &share_id,
             owner_settings_store::SyncRole::Owner,
@@ -1044,9 +1092,14 @@ mod tests {
         )
         .await
         .unwrap();
-        settings_store::set_persona_view_share_sync_folder(&recipient_id, &share_id, folder_path)
-            .await
-            .unwrap();
+        settings_store::set_persona_view_share_sync_folder(
+            pool,
+            &recipient_id,
+            &share_id,
+            folder_path,
+        )
+        .await
+        .unwrap();
 
         // Change the fact after the grant was sent -- exercises the ongoing
         // channel, not a replay of the original grant payload.
@@ -1068,6 +1121,7 @@ mod tests {
         .unwrap();
 
         let pushed = push_if_changed_view(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -1079,9 +1133,15 @@ mod tests {
         .expect("push_if_changed_view must succeed");
         assert!(pushed);
 
-        let applied = pull_if_newer_view(&recipient_id, &recipient_key, &share_id, &recipient_priv)
-            .await
-            .expect("pull_if_newer_view must succeed");
+        let applied = pull_if_newer_view(
+            pool,
+            &recipient_id,
+            &recipient_key,
+            &share_id,
+            &recipient_priv,
+        )
+        .await
+        .expect("pull_if_newer_view must succeed");
         assert!(applied);
 
         let mut cache_conn =
@@ -1103,10 +1163,13 @@ mod tests {
     #[tokio::test]
     async fn a_repeat_push_with_unchanged_content_is_skipped() {
         let _env = setup().await;
-        let (owner_id, owner_persona, owner_key, _) = make_user_with_persona("Alice", 0x33).await;
-        let (recipient_id, _, _) = make_recipient_user("Bob", 0x43).await;
+        let pool = &_env.pool;
+        let (owner_id, owner_persona, owner_key, _) =
+            make_user_with_persona(pool, "Alice", 0x33).await;
+        let (recipient_id, _, _) = make_recipient_user(pool, "Bob", 0x43).await;
 
         let share_id = send_persona_share(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -1119,6 +1182,7 @@ mod tests {
         let shared_folder = tempfile::tempdir().unwrap();
         let folder_path = shared_folder.path().to_str().unwrap();
         owner_settings_store::set_persona_share_sync_folder(
+            pool,
             &owner_persona,
             &share_id,
             owner_settings_store::SyncRole::Owner,
@@ -1128,6 +1192,7 @@ mod tests {
         .unwrap();
 
         let first = push_if_changed_view(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -1140,6 +1205,7 @@ mod tests {
         assert!(first);
 
         let second = push_if_changed_view(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -1155,8 +1221,11 @@ mod tests {
     #[tokio::test]
     async fn revoke_then_push_then_pull_ends_the_share_and_clears_the_cache() {
         let _env = setup().await;
-        let (owner_id, owner_persona, owner_key, _) = make_user_with_persona("Alice", 0x34).await;
-        let (recipient_id, recipient_key, recipient_priv) = make_recipient_user("Bob", 0x44).await;
+        let pool = &_env.pool;
+        let (owner_id, owner_persona, owner_key, _) =
+            make_user_with_persona(pool, "Alice", 0x34).await;
+        let (recipient_id, recipient_key, recipient_priv) =
+            make_recipient_user(pool, "Bob", 0x44).await;
 
         entity_store::create_entity(
             &owner_id,
@@ -1172,6 +1241,7 @@ mod tests {
         .unwrap();
 
         let share_id = send_persona_share(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -1180,13 +1250,20 @@ mod tests {
         )
         .await
         .unwrap();
-        accept_persona_view_share(&share_id, &recipient_id, &recipient_key, &recipient_priv)
-            .await
-            .unwrap();
+        accept_persona_view_share(
+            pool,
+            &share_id,
+            &recipient_id,
+            &recipient_key,
+            &recipient_priv,
+        )
+        .await
+        .unwrap();
 
         let shared_folder = tempfile::tempdir().unwrap();
         let folder_path = shared_folder.path().to_str().unwrap();
         owner_settings_store::set_persona_share_sync_folder(
+            pool,
             &owner_persona,
             &share_id,
             owner_settings_store::SyncRole::Owner,
@@ -1194,12 +1271,18 @@ mod tests {
         )
         .await
         .unwrap();
-        settings_store::set_persona_view_share_sync_folder(&recipient_id, &share_id, folder_path)
-            .await
-            .unwrap();
+        settings_store::set_persona_view_share_sync_folder(
+            pool,
+            &recipient_id,
+            &share_id,
+            folder_path,
+        )
+        .await
+        .unwrap();
 
         // A real content push+pull first, so there's something to clear.
         push_if_changed_view(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -1209,15 +1292,22 @@ mod tests {
         )
         .await
         .unwrap();
-        pull_if_newer_view(&recipient_id, &recipient_key, &share_id, &recipient_priv)
-            .await
-            .unwrap();
+        pull_if_newer_view(
+            pool,
+            &recipient_id,
+            &recipient_key,
+            &share_id,
+            &recipient_priv,
+        )
+        .await
+        .unwrap();
 
-        revoke_persona_view_share(&owner_id, &share_id)
+        revoke_persona_view_share(pool, &owner_id, &share_id)
             .await
             .expect("revoke_persona_view_share must succeed");
 
         let tombstone_pushed = push_if_changed_view(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -1229,9 +1319,15 @@ mod tests {
         .expect("tombstone push must succeed");
         assert!(tombstone_pushed);
 
-        let applied = pull_if_newer_view(&recipient_id, &recipient_key, &share_id, &recipient_priv)
-            .await
-            .expect("tombstone pull must succeed");
+        let applied = pull_if_newer_view(
+            pool,
+            &recipient_id,
+            &recipient_key,
+            &share_id,
+            &recipient_priv,
+        )
+        .await
+        .expect("tombstone pull must succeed");
         assert!(applied);
 
         let mut cache_conn =
@@ -1253,20 +1349,29 @@ mod tests {
 
         // A terminal share must not be re-pulled even if somehow the folder
         // still holds a file -- pull_if_newer_view short-circuits on status.
-        let repeat = pull_if_newer_view(&recipient_id, &recipient_key, &share_id, &recipient_priv)
-            .await
-            .unwrap();
+        let repeat = pull_if_newer_view(
+            pool,
+            &recipient_id,
+            &recipient_key,
+            &share_id,
+            &recipient_priv,
+        )
+        .await
+        .unwrap();
         assert!(!repeat, "an already-ended share must not be pulled again");
     }
 
     #[tokio::test]
     async fn revoke_rejects_a_share_not_owned_by_the_caller() {
         let _env = setup().await;
-        let (owner_id, owner_persona, owner_key, _) = make_user_with_persona("Alice", 0x35).await;
-        let (recipient_id, _, _) = make_recipient_user("Bob", 0x45).await;
-        let (other_id, _, _, _) = make_user_with_persona("Eve", 0x36).await;
+        let pool = &_env.pool;
+        let (owner_id, owner_persona, owner_key, _) =
+            make_user_with_persona(pool, "Alice", 0x35).await;
+        let (recipient_id, _, _) = make_recipient_user(pool, "Bob", 0x45).await;
+        let (other_id, _, _, _) = make_user_with_persona(pool, "Eve", 0x36).await;
 
         let share_id = send_persona_share(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -1276,17 +1381,20 @@ mod tests {
         .await
         .unwrap();
 
-        let result = revoke_persona_view_share(&other_id, &share_id).await;
+        let result = revoke_persona_view_share(pool, &other_id, &share_id).await;
         assert!(matches!(result, Err(PersonaViewSyncError::Validation(_))));
     }
 
     #[tokio::test]
     async fn push_is_a_silent_noop_when_folder_is_unset() {
         let _env = setup().await;
-        let (owner_id, owner_persona, owner_key, _) = make_user_with_persona("Alice", 0x37).await;
-        let (recipient_id, _, _) = make_recipient_user("Bob", 0x47).await;
+        let pool = &_env.pool;
+        let (owner_id, owner_persona, owner_key, _) =
+            make_user_with_persona(pool, "Alice", 0x37).await;
+        let (recipient_id, _, _) = make_recipient_user(pool, "Bob", 0x47).await;
 
         let share_id = send_persona_share(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -1297,6 +1405,7 @@ mod tests {
         .unwrap();
 
         let pushed = push_if_changed_view(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,

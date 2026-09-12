@@ -40,10 +40,7 @@
 // user_provider_preference_store.rs exactly -- runtime sqlx::query() only,
 // one connection per call, shared.db (unencrypted, no PRAGMA key required).
 
-use sqlx::sqlite::SqliteConnectOptions;
-use sqlx::ConnectOptions;
 use sqlx::Row;
-use sqlx::SqliteConnection;
 use thiserror::Error;
 
 use crate::persistence::provider_store::{self, Provider, ProviderStoreError};
@@ -136,25 +133,6 @@ pub struct FocusProviderCriteria {
 // DB opener (shared.db — unencrypted)
 // ---------------------------------------------------------------------------
 
-async fn open_shared_db() -> Result<SqliteConnection, FocusProviderCriteriaStoreError> {
-    let db_path = crate::persistence::migrations::get_data_root()
-        .join("instance")
-        .join("shared.db");
-    let network_storage = std::env::var("QR_NETWORK_STORAGE")
-        .map(|v| v.to_lowercase() == "true")
-        .unwrap_or(false);
-    let journal_mode = if network_storage { "DELETE" } else { "WAL" };
-
-    let conn = SqliteConnectOptions::new()
-        .filename(&db_path)
-        .create_if_missing(false)
-        .pragma("journal_mode", journal_mode)
-        .connect()
-        .await?;
-
-    Ok(conn)
-}
-
 const SELECT_COLUMNS: &str = "focus_id, require_is_local, require_is_anonymous,
                 require_not_trains_on_data, allow_provider_ids, deny_provider_ids,
                 seeded_from_policy, created_at, updated_at";
@@ -200,13 +178,14 @@ fn row_to_criteria(
 // ---------------------------------------------------------------------------
 
 pub async fn get_criteria(
+    pool: &sqlx::SqlitePool,
     focus_id: &str,
 ) -> Result<Option<FocusProviderCriteria>, FocusProviderCriteriaStoreError> {
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
     let sql = format!("SELECT {SELECT_COLUMNS} FROM focus_provider_criteria WHERE focus_id = ?");
     let row = sqlx::query(&sql)
         .bind(focus_id)
-        .fetch_optional(&mut conn)
+        .fetch_optional(&mut *conn)
         .await?;
     match row {
         None => Ok(None),
@@ -224,12 +203,14 @@ pub async fn get_criteria(
 /// policy to a Focus that already has a row overwrites it outright (this is
 /// "start over from this policy," not a merge).
 pub async fn populate_from_policy(
+    pool: &sqlx::SqlitePool,
     focus_id: &str,
     policy: NamedPolicy,
 ) -> Result<FocusProviderCriteria, FocusProviderCriteriaStoreError> {
     let (require_is_local, require_is_anonymous, require_not_trains_on_data) =
         policy.require_flags();
     write_criteria(
+        pool,
         focus_id,
         require_is_local,
         require_is_anonymous,
@@ -246,9 +227,10 @@ pub async fn populate_from_policy(
 /// was never seeded from a policy (nothing to reset to -- e.g. it was built
 /// via set_criteria() directly).
 pub async fn reset_to_policy(
+    pool: &sqlx::SqlitePool,
     focus_id: &str,
 ) -> Result<FocusProviderCriteria, FocusProviderCriteriaStoreError> {
-    let existing = get_criteria(focus_id)
+    let existing = get_criteria(pool, focus_id)
         .await?
         .ok_or_else(|| FocusProviderCriteriaStoreError::NotFound(focus_id.to_owned()))?;
     let policy = existing.seeded_from_policy.ok_or_else(|| {
@@ -257,13 +239,14 @@ pub async fn reset_to_policy(
              edited directly via set_criteria(), not from a named policy"
         ))
     })?;
-    populate_from_policy(focus_id, policy).await
+    populate_from_policy(pool, focus_id, policy).await
 }
 
 /// Direct edit (Focus Builder's per-Focus override, spec Part 3c) -- clears
 /// seeded_from_policy, since an edited record is no longer purely that
 /// policy (still resettable if the caller re-applies a policy afterward).
 pub async fn set_criteria(
+    pool: &sqlx::SqlitePool,
     focus_id: &str,
     require_is_local: bool,
     require_is_anonymous: bool,
@@ -272,6 +255,7 @@ pub async fn set_criteria(
     deny_provider_ids: &[String],
 ) -> Result<FocusProviderCriteria, FocusProviderCriteriaStoreError> {
     write_criteria(
+        pool,
         focus_id,
         require_is_local,
         require_is_anonymous,
@@ -285,6 +269,7 @@ pub async fn set_criteria(
 
 #[allow(clippy::too_many_arguments)]
 async fn write_criteria(
+    pool: &sqlx::SqlitePool,
     focus_id: &str,
     require_is_local: bool,
     require_is_anonymous: bool,
@@ -304,9 +289,9 @@ async fn write_criteria(
         ))
     })?;
     let now = crate::providers::utils::now();
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
 
-    let existing = get_criteria(focus_id).await?;
+    let existing = get_criteria(pool, focus_id).await?;
     if existing.is_some() {
         sqlx::query(
             "UPDATE focus_provider_criteria
@@ -323,7 +308,7 @@ async fn write_criteria(
         .bind(seeded_from_policy.map(NamedPolicy::as_str))
         .bind(&now)
         .bind(focus_id)
-        .execute(&mut conn)
+        .execute(&mut *conn)
         .await?;
     } else {
         sqlx::query(
@@ -341,11 +326,11 @@ async fn write_criteria(
         .bind(seeded_from_policy.map(NamedPolicy::as_str))
         .bind(&now)
         .bind(&now)
-        .execute(&mut conn)
+        .execute(&mut *conn)
         .await?;
     }
 
-    get_criteria(focus_id)
+    get_criteria(pool, focus_id)
         .await?
         .ok_or_else(|| FocusProviderCriteriaStoreError::NotFound(focus_id.to_owned()))
 }
@@ -361,11 +346,12 @@ async fn write_criteria(
 /// every active provider unfiltered (this table isn't wired into any
 /// enforcement path this session -- there is no live default to get wrong).
 pub async fn eligible_providers_for_focus(
+    pool: &sqlx::SqlitePool,
     focus_id: &str,
 ) -> Result<Vec<Provider>, FocusProviderCriteriaStoreError> {
-    let all_active = provider_store::list_active_providers().await?;
+    let all_active = provider_store::list_active_providers(pool).await?;
 
-    let criteria = match get_criteria(focus_id).await? {
+    let criteria = match get_criteria(pool, focus_id).await? {
         None => return Ok(all_active),
         Some(c) => c,
     };
@@ -400,23 +386,29 @@ mod tests {
     /// chatgpt/gemini providers rows shared_014.sql/shared_013.sql seed.
     /// Matches user_provider_preference_store.rs's own setup_real_db
     /// pattern (ENV_MUTEX serialization).
-    async fn setup_real_db() -> tempfile::TempDir {
+    async fn setup_real_db() -> (tempfile::TempDir, sqlx::SqlitePool) {
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
         crate::persistence::migrations::migrate_shared_db()
             .await
             .expect("migrate_shared_db must succeed");
-        tempdir
+        let pool =
+            sqlx::SqlitePool::connect_with(crate::providers::utils::connect_options_unencrypted(
+                &crate::providers::utils::db_path_shared(),
+            ))
+            .await
+            .expect("shared.db pool must connect");
+        (tempdir, pool)
     }
 
     #[tokio::test]
     async fn populate_from_policy_local_only_sets_single_flag() {
         let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
-        let _tempdir = setup_real_db().await;
+        let (_tempdir, pool) = setup_real_db().await;
 
         let outcome = async {
-            let c = populate_from_policy("f1", NamedPolicy::LocalOnly).await?;
+            let c = populate_from_policy(&pool, "f1", NamedPolicy::LocalOnly).await?;
             assert!(c.require_is_local);
             assert!(!c.require_is_anonymous);
             assert!(!c.require_not_trains_on_data);
@@ -440,10 +432,10 @@ mod tests {
     async fn local_and_anonymous_requires_both_flags() {
         let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
-        let _tempdir = setup_real_db().await;
+        let (_tempdir, pool) = setup_real_db().await;
 
         let outcome = async {
-            let c = populate_from_policy("f1", NamedPolicy::LocalAndAnonymous).await?;
+            let c = populate_from_policy(&pool, "f1", NamedPolicy::LocalAndAnonymous).await?;
             assert!(
                 c.require_is_local,
                 "local_and_anonymous must require is_local"
@@ -469,10 +461,10 @@ mod tests {
     async fn reset_to_policy_reapplies_and_errors_without_one() {
         let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
-        let _tempdir = setup_real_db().await;
+        let (_tempdir, pool) = setup_real_db().await;
 
         let outcome = async {
-            populate_from_policy("f1", NamedPolicy::LocalOnly).await?;
+            populate_from_policy(&pool, "f1", NamedPolicy::LocalOnly).await?;
 
             // Simulate a tampered/edited flag set that still claims
             // seeded_from_policy='local_only' (bypassing set_criteria, which
@@ -483,15 +475,15 @@ mod tests {
             sqlx::query(
                 "UPDATE focus_provider_criteria SET require_is_local = 0 WHERE focus_id = 'f1'",
             )
-            .execute(&mut open_shared_db().await?)
+            .execute(&mut *pool.acquire().await?)
             .await?;
-            let tampered = get_criteria("f1").await?.unwrap();
+            let tampered = get_criteria(&pool, "f1").await?.unwrap();
             assert!(
                 !tampered.require_is_local,
                 "tampering must have taken effect"
             );
 
-            let reset = reset_to_policy("f1").await?;
+            let reset = reset_to_policy(&pool, "f1").await?;
             assert!(
                 reset.require_is_local,
                 "reset_to_policy must re-apply local_only's require_is_local"
@@ -499,8 +491,8 @@ mod tests {
             assert!(!reset.require_not_trains_on_data);
             assert_eq!(reset.seeded_from_policy, Some(NamedPolicy::LocalOnly));
 
-            set_criteria("f2", true, false, false, &[], &[]).await?;
-            let err = reset_to_policy("f2")
+            set_criteria(&pool, "f2", true, false, false, &[], &[]).await?;
+            let err = reset_to_policy(&pool, "f2")
                 .await
                 .expect_err("a row never seeded from a policy has nothing to reset to");
             assert!(matches!(
@@ -524,11 +516,12 @@ mod tests {
     async fn set_criteria_clears_seeded_from_policy() {
         let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
-        let _tempdir = setup_real_db().await;
+        let (_tempdir, pool) = setup_real_db().await;
 
         let outcome = async {
-            populate_from_policy("f1", NamedPolicy::Unrestricted).await?;
+            populate_from_policy(&pool, "f1", NamedPolicy::Unrestricted).await?;
             let edited = set_criteria(
+                &pool,
                 "f1",
                 true,
                 false,
@@ -559,10 +552,10 @@ mod tests {
     async fn eligible_providers_for_focus_no_row_returns_all_active() {
         let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
-        let _tempdir = setup_real_db().await;
+        let (_tempdir, pool) = setup_real_db().await;
 
         let outcome = async {
-            let eligible = eligible_providers_for_focus("no-such-focus").await?;
+            let eligible = eligible_providers_for_focus(&pool, "no-such-focus").await?;
             let ids: Vec<&str> = eligible.iter().map(|p| p.id.as_str()).collect();
             assert!(ids.contains(&"duckai"));
             assert!(ids.contains(&"claude"));
@@ -588,11 +581,11 @@ mod tests {
     async fn eligible_providers_for_focus_local_only_currently_empty() {
         let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
-        let _tempdir = setup_real_db().await;
+        let (_tempdir, pool) = setup_real_db().await;
 
         let outcome = async {
-            populate_from_policy("f1", NamedPolicy::LocalOnly).await?;
-            let eligible = eligible_providers_for_focus("f1").await?;
+            populate_from_policy(&pool, "f1", NamedPolicy::LocalOnly).await?;
+            let eligible = eligible_providers_for_focus(&pool, "f1").await?;
             assert!(
                 eligible.is_empty(),
                 "no is_local=1 provider rows exist yet -- local_only correctly matches none"
@@ -615,7 +608,7 @@ mod tests {
     async fn eligible_providers_for_focus_deny_beats_allow_beats_require() {
         let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
-        let _tempdir = setup_real_db().await;
+        let (_tempdir, pool) = setup_real_db().await;
 
         let outcome = async {
             // require_not_trains_on_data=1 alone matches duckai and groq
@@ -627,6 +620,7 @@ mod tests {
             // failing the requirement (trains_on_data=1); groq passes the
             // requirement on its own merits and needs neither list.
             set_criteria(
+                &pool,
                 "f1",
                 false,
                 false,
@@ -636,7 +630,7 @@ mod tests {
             )
             .await?;
 
-            let eligible = eligible_providers_for_focus("f1").await?;
+            let eligible = eligible_providers_for_focus(&pool, "f1").await?;
             let ids: Vec<&str> = eligible.iter().map(|p| p.id.as_str()).collect();
             assert_eq!(
                 ids,

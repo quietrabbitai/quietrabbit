@@ -50,7 +50,6 @@ use crate::persistence::user_provider_preference_store::{
 };
 
 const TIER2_KEY_TYPE: &str = "tier2";
-const VALID_TIER2_PROVIDERS: &[&str] = &["mistral", "groq"];
 
 // ---------------------------------------------------------------------------
 // IPC types
@@ -156,26 +155,33 @@ pub async fn set_tier2_provider(
 pub async fn set_tier2_provider_preference(
     provider: Option<String>,
     key_registry: State<'_, KeyRegistry>,
+    pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<(), String> {
-    if let Some(p) = &provider {
-        if !VALID_TIER2_PROVIDERS.contains(&p.as_str()) {
-            return Err(format!(
-                "invalid Tier 2 provider: {p}. Valid: mistral, groq, or null to clear"
-            ));
-        }
-    }
-
     let user_id = key_registry
         .with_key(|k| k.user_id.clone())
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
-    let candidates = provider_store::list_providers_by_type("cloud_inference_api")
+    let candidates = provider_store::list_providers_by_type(&pool, "cloud_inference_api")
         .await
         .map_err(|e| e.to_string())?;
 
+    if let Some(p) = &provider {
+        if !candidates.iter().any(|c| c.id == *p) {
+            let valid = candidates
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "invalid Tier 2 provider: {p}. Valid: {valid}, or null to clear"
+            ));
+        }
+    }
+
     for candidate in &candidates {
         let existing = user_provider_preference_store::get_preference_at_scope(
+            &pool,
             &user_id,
             None,
             None,
@@ -210,16 +216,19 @@ pub async fn set_tier2_provider_preference(
             .and_then(|e| e.local_model_version.clone());
         let subscription_status = existing.as_ref().and_then(|e| e.subscription_status);
 
-        user_provider_preference_store::upsert_preference(NewUserProviderPreference {
-            user_id: &user_id,
-            persona_id: None,
-            focus_id: None,
-            provider_id: &candidate.id,
-            login_available,
-            user_preference: new_preference,
-            local_model_version: local_model_version.as_deref(),
-            subscription_status,
-        })
+        user_provider_preference_store::upsert_preference(
+            &pool,
+            NewUserProviderPreference {
+                user_id: &user_id,
+                persona_id: None,
+                focus_id: None,
+                provider_id: &candidate.id,
+                login_available,
+                user_preference: new_preference,
+                local_model_version: local_model_version.as_deref(),
+                subscription_status,
+            },
+        )
         .await
         .map_err(|e| e.to_string())?;
     }
@@ -234,13 +243,14 @@ pub async fn set_tier2_provider_preference(
 #[specta::specta]
 pub async fn get_tier2_provider_preferences(
     key_registry: State<'_, KeyRegistry>,
+    pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<Vec<UserProviderPreference>, String> {
     let user_id = key_registry
         .with_key(|k| k.user_id.clone())
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
-    user_provider_preference_store::list_preferences_for_user(&user_id)
+    user_provider_preference_store::list_preferences_for_user(&pool, &user_id)
         .await
         .map_err(|e| e.to_string())
 }
@@ -276,6 +286,12 @@ mod tests {
     /// real migration path, not a hand-built schema), so this test
     /// exercises the actual production code path end to end: real
     /// SQLCipher file, real KeyRegistry, real store queries.
+    fn dummy_pool() -> sqlx::SqlitePool {
+        sqlx::SqlitePool::connect_lazy_with(
+            sqlx::sqlite::SqliteConnectOptions::new().filename(":memory:"),
+        )
+    }
+
     async fn setup(user_id: &str, master_key: &[u8; crate::auth::kdf::MASTER_KEY_LEN]) -> TestEnv {
         let lock = ENV_MUTEX.lock().unwrap();
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
@@ -298,7 +314,7 @@ mod tests {
     async fn get_tier2_config_reports_unconfigured_when_no_key_set() {
         let master_key = [0x11u8; crate::auth::kdf::MASTER_KEY_LEN];
         let _env = setup("user-a", &master_key).await;
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(dummy_pool());
         let registry = app.state::<KeyRegistry>();
         populate_registry(&registry, "user-a", master_key).await;
 
@@ -315,7 +331,7 @@ mod tests {
     async fn set_then_get_round_trips_and_never_exposes_the_key() {
         let master_key = [0x22u8; crate::auth::kdf::MASTER_KEY_LEN];
         let _env = setup("user-b", &master_key).await;
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(dummy_pool());
         let registry = app.state::<KeyRegistry>();
         populate_registry(&registry, "user-b", master_key).await;
 
@@ -364,6 +380,7 @@ mod tests {
         _tempdir: tempfile::TempDir,
         _lock: std::sync::MutexGuard<'static, ()>,
         saved_root: Option<String>,
+        pool: sqlx::SqlitePool,
     }
 
     impl Drop for SharedDbTestEnv {
@@ -386,7 +403,15 @@ mod tests {
             .await
             .expect("shared.db migration must succeed in test setup");
 
+        let pool =
+            sqlx::SqlitePool::connect_with(crate::providers::utils::connect_options_unencrypted(
+                &crate::providers::utils::db_path_shared(),
+            ))
+            .await
+            .expect("shared.db pool must connect");
+
         crate::auth::user_store::create_user(
+            &pool,
             user_id,
             "Alice",
             "admin",
@@ -404,6 +429,7 @@ mod tests {
             _tempdir: tempdir,
             _lock: lock,
             saved_root,
+            pool,
         }
     }
 
@@ -417,37 +443,40 @@ mod tests {
     async fn set_tier2_provider_preference_downgrades_other_candidate() {
         let master_key = [0x66u8; crate::auth::kdf::MASTER_KEY_LEN];
         let _env = setup_shared_db("user-f").await;
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         populate_registry(&registry, "user-f", master_key).await;
+        let pool = app.state::<sqlx::SqlitePool>();
 
-        set_tier2_provider_preference(Some("groq".to_owned()), registry.clone())
+        set_tier2_provider_preference(Some("groq".to_owned()), registry.clone(), pool.clone())
             .await
             .expect("set_tier2_provider_preference must succeed when logged in");
 
-        let groq_pref =
-            user_provider_preference_store::get_preference_at_scope("user-f", None, None, "groq")
-                .await
-                .unwrap()
-                .expect("an account-wide groq row must exist after selecting groq");
+        let groq_pref = user_provider_preference_store::get_preference_at_scope(
+            &pool, "user-f", None, None, "groq",
+        )
+        .await
+        .unwrap()
+        .expect("an account-wide groq row must exist after selecting groq");
         assert_eq!(groq_pref.user_preference, UserPreference::Preferred);
 
         // Switch to mistral -- groq's row must be downgraded to Allowed, not
         // left Preferred (which would make find_preferred_provider return
         // an ambiguous None instead of "mistral").
-        set_tier2_provider_preference(Some("mistral".to_owned()), registry.clone())
+        set_tier2_provider_preference(Some("mistral".to_owned()), registry.clone(), pool.clone())
             .await
             .expect("switching provider must succeed");
 
-        let groq_after =
-            user_provider_preference_store::get_preference_at_scope("user-f", None, None, "groq")
-                .await
-                .unwrap()
-                .expect("groq's row must still exist, just downgraded");
+        let groq_after = user_provider_preference_store::get_preference_at_scope(
+            &pool, "user-f", None, None, "groq",
+        )
+        .await
+        .unwrap()
+        .expect("groq's row must still exist, just downgraded");
         assert_eq!(groq_after.user_preference, UserPreference::Allowed);
 
         let mistral_after = user_provider_preference_store::get_preference_at_scope(
-            "user-f", None, None, "mistral",
+            &pool, "user-f", None, None, "mistral",
         )
         .await
         .unwrap()
@@ -455,6 +484,7 @@ mod tests {
         assert_eq!(mistral_after.user_preference, UserPreference::Preferred);
 
         let preferred = user_provider_preference_store::find_preferred_provider(
+            &pool,
             "user-f",
             None,
             None,
@@ -469,11 +499,12 @@ mod tests {
     async fn set_tier2_provider_preference_rejects_unknown_provider() {
         let master_key = [0x44u8; crate::auth::kdf::MASTER_KEY_LEN];
         let _env = setup_shared_db("user-d").await;
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         populate_registry(&registry, "user-d", master_key).await;
+        let pool = app.state::<sqlx::SqlitePool>();
 
-        let result = set_tier2_provider_preference(Some("openai".to_owned()), registry).await;
+        let result = set_tier2_provider_preference(Some("openai".to_owned()), registry, pool).await;
         let err = result.expect_err("openai is not a valid Tier 2 provider");
         assert!(err.contains("invalid Tier 2 provider"), "got: {err}");
     }
@@ -482,9 +513,11 @@ mod tests {
     async fn set_tier2_provider_preference_fails_cleanly_when_not_logged_in() {
         let app = tauri::test::mock_app();
         app.manage(KeyRegistry::default());
+        app.manage(dummy_pool());
         let registry = app.state::<KeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
 
-        let result = set_tier2_provider_preference(Some("groq".to_owned()), registry).await;
+        let result = set_tier2_provider_preference(Some("groq".to_owned()), registry, pool).await;
         assert!(result.is_err());
     }
 }

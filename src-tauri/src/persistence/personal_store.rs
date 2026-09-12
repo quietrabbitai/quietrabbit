@@ -1424,68 +1424,6 @@ pub async fn delete_voice_profile_entry(
 // Disclosure log (write-only — D6-198)
 // ---------------------------------------------------------------------------
 
-/// Write a disclosure log entry. NEVER deleted — permanent audit trail (D6-198).
-/// Returns the new entry id.
-#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
-pub async fn write_disclosure_log(
-    user_id: &str,
-    persona_id: &str,
-    key_hex: &str,
-    focus_run_id: &str,
-    step_id: &str,
-    routing_tier: i32,
-    provider: Option<&str>,
-    fields_shared: &[String],
-    fields_abstracted: &serde_json::Value,
-    fields_withheld: &[String],
-    override_declined: bool,
-    declined_at: Option<&str>,
-    execution_tier: Option<i32>,
-    abstraction_tier: Option<i32>,
-    extra_metadata: Option<serde_json::Value>,
-) -> Result<String, PersonalStoreError> {
-    let entry_id = uuid::Uuid::new_v4().to_string();
-    let timestamp = crate::providers::utils::now();
-    let shared_json = serde_json::to_string(fields_shared).unwrap_or_else(|_| "[]".to_owned());
-    let abstracted_json =
-        serde_json::to_string(fields_abstracted).unwrap_or_else(|_| "{}".to_owned());
-    let withheld_json = serde_json::to_string(fields_withheld).unwrap_or_else(|_| "[]".to_owned());
-    let metadata_json = serde_json::to_string(&extra_metadata.unwrap_or_default())
-        .unwrap_or_else(|_| "{}".to_owned());
-    let override_flag: i32 = if override_declined { 1 } else { 0 };
-
-    let mut conn = open_personal_db(user_id, persona_id, key_hex).await?;
-
-    sqlx::query(
-        "INSERT INTO disclosure_log
-         (id, user_id, persona_id, focus_run_id, step_id, routing_tier,
-          provider, fields_shared, fields_abstracted, fields_withheld,
-          override_declined, declined_at, created_at, extra_metadata,
-          execution_tier, abstraction_tier)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&entry_id)
-    .bind(user_id)
-    .bind(persona_id)
-    .bind(focus_run_id)
-    .bind(step_id)
-    .bind(routing_tier)
-    .bind(provider)
-    .bind(&shared_json)
-    .bind(&abstracted_json)
-    .bind(&withheld_json)
-    .bind(override_flag)
-    .bind(declined_at)
-    .bind(&timestamp)
-    .bind(&metadata_json)
-    .bind(execution_tier)
-    .bind(abstraction_tier)
-    .execute(&mut conn)
-    .await?;
-
-    Ok(entry_id)
-}
-
 /// Read disclosure log entries for a focus run. Read-only — no delete (D6-198).
 /// JSON TEXT columns deserialized to serde_json::Value on read.
 pub async fn get_disclosure_log_for_run(

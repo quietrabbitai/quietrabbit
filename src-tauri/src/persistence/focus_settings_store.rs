@@ -20,16 +20,10 @@
 // QUERY STYLE: runtime sqlx::query() only — no query!() macros.
 // shared.db is unencrypted — no PRAGMA key required.
 //
-// CONNECTION MODEL: one connection per call (Phase 1 correctness implementation).
-// Not the final architecture — shared.db will move to a connection pool
-// under the actor model when the full providers layer is ported.
+// CONNECTION MODEL: pooled (items.id=483) -- callers pass a &sqlx::SqlitePool
+// in; every fn here does pool.acquire().
 
-use std::path::PathBuf;
-
-use sqlx::sqlite::SqliteConnectOptions;
-use sqlx::ConnectOptions;
 use sqlx::Row;
-use sqlx::SqliteConnection;
 use thiserror::Error;
 
 use crate::conductor::tokens::ExternalAccess;
@@ -80,39 +74,6 @@ pub struct FocusSettings {
     pub voice_override: Option<serde_json::Value>,
     pub created_at: String,
     pub updated_at: String,
-}
-
-// ---------------------------------------------------------------------------
-// Path helper
-// ---------------------------------------------------------------------------
-
-fn get_shared_db_path() -> PathBuf {
-    crate::persistence::migrations::get_data_root()
-        .join("instance")
-        .join("shared.db")
-}
-
-// ---------------------------------------------------------------------------
-// DB opener
-// ---------------------------------------------------------------------------
-
-/// Open shared.db (unencrypted). No PRAGMA key required.
-/// Journal mode set per QR_NETWORK_STORAGE.
-async fn open_shared_db() -> Result<SqliteConnection, FocusSettingsStoreError> {
-    let db_path = get_shared_db_path();
-    let network_storage = std::env::var("QR_NETWORK_STORAGE")
-        .map(|v| v.to_lowercase() == "true")
-        .unwrap_or(false);
-    let journal_mode = if network_storage { "DELETE" } else { "WAL" };
-
-    let conn = SqliteConnectOptions::new()
-        .filename(&db_path)
-        .create_if_missing(false)
-        .pragma("journal_mode", journal_mode)
-        .connect()
-        .await?;
-
-    Ok(conn)
 }
 
 // ---------------------------------------------------------------------------
@@ -206,10 +167,11 @@ fn validate_settings(
 /// Primary read path — called by lifecycle AUTHORIZE and tier ceiling check.
 /// Conductor asserts non-None at AUTHORIZE — missing row is a hard error.
 pub async fn get_focus_settings(
+    pool: &sqlx::SqlitePool,
     persona_id: &str,
     focus_id: &str,
 ) -> Result<Option<FocusSettings>, FocusSettingsStoreError> {
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
 
     let row = sqlx::query(
         "SELECT persona_id, focus_id, context_flow, library_visibility,
@@ -219,7 +181,7 @@ pub async fn get_focus_settings(
     )
     .bind(persona_id)
     .bind(focus_id)
-    .fetch_optional(&mut conn)
+    .fetch_optional(&mut *conn)
     .await?;
 
     match row {
@@ -232,9 +194,10 @@ pub async fn get_focus_settings(
 
 /// Return all focus settings rows for a persona, ordered by focus_id.
 pub async fn list_focus_settings_for_persona(
+    pool: &sqlx::SqlitePool,
     persona_id: &str,
 ) -> Result<Vec<FocusSettings>, FocusSettingsStoreError> {
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
 
     let rows = sqlx::query(
         "SELECT persona_id, focus_id, context_flow, library_visibility,
@@ -244,7 +207,7 @@ pub async fn list_focus_settings_for_persona(
          ORDER BY focus_id",
     )
     .bind(persona_id)
-    .fetch_all(&mut conn)
+    .fetch_all(&mut *conn)
     .await?;
 
     let mut result = Vec::new();
@@ -264,6 +227,7 @@ pub async fn list_focus_settings_for_persona(
 /// logic error (AUTHORIZE assertion catches missing rows first).
 #[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
 pub async fn create_focus_settings(
+    pool: &sqlx::SqlitePool,
     persona_id: &str,
     focus_id: &str,
     context_flow: &str,
@@ -285,7 +249,7 @@ pub async fn create_focus_settings(
         .as_ref()
         .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "null".to_owned()));
 
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
 
     sqlx::query(
         "INSERT INTO focus_settings
@@ -304,7 +268,7 @@ pub async fn create_focus_settings(
     .bind(&voice_json)
     .bind(&created_at)
     .bind(&created_at)
-    .execute(&mut conn)
+    .execute(&mut *conn)
     .await?;
 
     Ok(FocusSettings {
@@ -336,6 +300,7 @@ pub async fn create_focus_settings(
 /// Returns Err(Validation) on invalid field values.
 #[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
 pub async fn update_focus_settings(
+    pool: &sqlx::SqlitePool,
     persona_id: &str,
     focus_id: &str,
     context_flow: Option<&str>,
@@ -345,7 +310,7 @@ pub async fn update_focus_settings(
     focus_profile: Option<&str>,
     voice_override: Option<Option<serde_json::Value>>,
 ) -> Result<FocusSettings, FocusSettingsStoreError> {
-    let existing = get_focus_settings(persona_id, focus_id)
+    let existing = get_focus_settings(pool, persona_id, focus_id)
         .await?
         .ok_or_else(|| FocusSettingsStoreError::NotFound {
             persona_id: persona_id.to_owned(),
@@ -372,7 +337,7 @@ pub async fn update_focus_settings(
 
     let updated_at = crate::providers::utils::now();
 
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
 
     sqlx::query(
         "UPDATE focus_settings SET
@@ -390,7 +355,7 @@ pub async fn update_focus_settings(
     .bind(&updated_at)
     .bind(persona_id)
     .bind(focus_id)
-    .execute(&mut conn)
+    .execute(&mut *conn)
     .await?;
 
     Ok(FocusSettings {
@@ -434,6 +399,7 @@ pub async fn update_focus_settings(
 /// against a concurrent write.
 #[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
 pub async fn record_friction_gate_decision(
+    pool: &sqlx::SqlitePool,
     persona_id: &str,
     focus_id: &str,
     decision: &str,
@@ -464,7 +430,7 @@ pub async fn record_friction_gate_decision(
 
     let id = uuid::Uuid::new_v4().to_string();
     let created_at = crate::providers::utils::now();
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
 
     sqlx::query(
         "INSERT INTO focus_settings_friction_decisions
@@ -485,7 +451,7 @@ pub async fn record_friction_gate_decision(
     .bind(existing_focus_profile)
     .bind(existing_max_permitted_tier.map(|t| t.as_legacy_tier() as i32))
     .bind(&created_at)
-    .execute(&mut conn)
+    .execute(&mut *conn)
     .await?;
 
     Ok(id)

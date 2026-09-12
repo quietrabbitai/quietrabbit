@@ -2,20 +2,8 @@
 //
 // User account CRUD against shared.db's users/user_salts tables (items.id=
 // 205). Mirrors persistence/persona_store.rs's connection pattern
-// (open_shared_db, SAVEPOINT-atomic multi-table writes, sqlx::query()
-// runtime style).
-//
-// open_shared_db() IS DUPLICATED here rather than reused from
-// persona_store.rs -- considered reuse first (raised in external review
-// this session) and rejected on a concrete basis, not convenience:
-// persona_store::open_shared_db() returns Result<_, PersonaStoreError>,
-// coupling its signature to that module's own error type. Reusing it here
-// would mean either (a) this module's functions awkwardly convert through
-// PersonaStoreError, or (b) changing persona_store's existing, working
-// signature to something more generic -- a real change to already-shipped
-// code for a ~12-line, zero-divergence-risk helper (path+pragma+connect,
-// no per-caller variation). Judged not worth it; duplication accepted here
-// deliberately, not by default.
+// (pooled per items.id=483, SAVEPOINT-atomic multi-table writes,
+// sqlx::query() runtime style) -- callers pass a &sqlx::SqlitePool in.
 //
 // SCOPE BOUNDARY, deliberate: this module creates a user + salt row ONLY.
 // It does not create a persona, does not run any per-persona DB migration,
@@ -45,10 +33,7 @@
 // candidate today. If onboarding design later introduces a separate
 // login-identifier concept, this is the function to revisit.
 
-use sqlx::sqlite::SqliteConnectOptions;
-use sqlx::ConnectOptions;
 use sqlx::Row;
-use sqlx::SqliteConnection;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -74,30 +59,13 @@ pub struct UserRecord {
     pub idle_timeout_minutes: i64,
 }
 
-async fn open_shared_db() -> Result<SqliteConnection, UserStoreError> {
-    let db_path = crate::persistence::migrations::get_data_root()
-        .join("instance")
-        .join("shared.db");
-    let network_storage = std::env::var("QR_NETWORK_STORAGE")
-        .map(|v| v.to_lowercase() == "true")
-        .unwrap_or(false);
-    let journal_mode = if network_storage { "DELETE" } else { "WAL" };
-    let conn = SqliteConnectOptions::new()
-        .filename(&db_path)
-        .create_if_missing(false)
-        .pragma("journal_mode", journal_mode)
-        .connect()
-        .await?;
-    Ok(conn)
-}
-
 /// True if any user row exists at all -- the "fresh install" check
 /// login()'s bootstrap branch uses to decide whether to create the primary
 /// admin (Section 2.3: "First run: create the primary admin user...").
-pub async fn has_any_users() -> Result<bool, UserStoreError> {
-    let mut conn = open_shared_db().await?;
+pub async fn has_any_users(pool: &sqlx::SqlitePool) -> Result<bool, UserStoreError> {
+    let mut conn = pool.acquire().await?;
     let row: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM users LIMIT 1")
-        .fetch_optional(&mut conn)
+        .fetch_optional(&mut *conn)
         .await?;
     Ok(row.is_some())
 }
@@ -105,15 +73,16 @@ pub async fn has_any_users() -> Result<bool, UserStoreError> {
 /// Fetch a user by display_name. See module header on why display_name is
 /// the login identifier.
 pub async fn find_user_by_display_name(
+    pool: &sqlx::SqlitePool,
     display_name: &str,
 ) -> Result<Option<UserRecord>, UserStoreError> {
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
     let row = sqlx::query(
         "SELECT id, display_name, role, is_primary, idle_timeout_minutes
          FROM users WHERE display_name = ?",
     )
     .bind(display_name)
-    .fetch_optional(&mut conn)
+    .fetch_optional(&mut *conn)
     .await?;
     Ok(row.map(|r| UserRecord {
         id: r.get("id"),
@@ -128,14 +97,17 @@ pub async fn find_user_by_display_name(
 /// used by commands::auth::get_session to resolve the resident
 /// KeyRegistry.user_id (a raw id, not a display_name) into the fields the
 /// frontend session response needs.
-pub async fn find_user_by_id(user_id: &str) -> Result<Option<UserRecord>, UserStoreError> {
-    let mut conn = open_shared_db().await?;
+pub async fn find_user_by_id(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+) -> Result<Option<UserRecord>, UserStoreError> {
+    let mut conn = pool.acquire().await?;
     let row = sqlx::query(
         "SELECT id, display_name, role, is_primary, idle_timeout_minutes
          FROM users WHERE id = ?",
     )
     .bind(user_id)
-    .fetch_optional(&mut conn)
+    .fetch_optional(&mut *conn)
     .await?;
     Ok(row.map(|r| UserRecord {
         id: r.get("id"),
@@ -173,15 +145,16 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// not happen for any user created via create_user(), but checked
 /// explicitly rather than assumed).
 pub async fn get_salt_params(
+    pool: &sqlx::SqlitePool,
     user_id: &str,
 ) -> Result<Option<(Vec<u8>, u32, u32, u32)>, UserStoreError> {
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
     let row = sqlx::query(
         "SELECT salt_hex, kdf_memory_kib, kdf_iterations, kdf_parallelism
          FROM user_salts WHERE user_id = ?",
     )
     .bind(user_id)
-    .fetch_optional(&mut conn)
+    .fetch_optional(&mut *conn)
     .await?;
 
     let Some(row) = row else { return Ok(None) };
@@ -227,6 +200,7 @@ pub async fn get_salt_params(
 /// auth::sharing_keypair's module header.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_user(
+    pool: &sqlx::SqlitePool,
     user_id: &str,
     display_name: &str,
     role: &str,
@@ -238,10 +212,10 @@ pub async fn create_user(
     sharing_public_key: &[u8; 32],
 ) -> Result<(), UserStoreError> {
     let created_at = crate::providers::utils::now();
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
 
     sqlx::query("SAVEPOINT create_user")
-        .execute(&mut conn)
+        .execute(&mut *conn)
         .await?;
 
     let step: Result<(), sqlx::Error> = async {
@@ -255,7 +229,7 @@ pub async fn create_user(
         .bind(role)
         .bind(is_primary as i64)
         .bind(&created_at)
-        .execute(&mut conn)
+        .execute(&mut *conn)
         .await?;
 
         sqlx::query(
@@ -270,7 +244,7 @@ pub async fn create_user(
         .bind(kdf_iterations)
         .bind(kdf_parallelism)
         .bind(&created_at)
-        .execute(&mut conn)
+        .execute(&mut *conn)
         .await?;
 
         sqlx::query(
@@ -281,7 +255,7 @@ pub async fn create_user(
         .bind(user_id)
         .bind(hex_encode(sharing_public_key))
         .bind(&created_at)
-        .execute(&mut conn)
+        .execute(&mut *conn)
         .await?;
 
         Ok(())
@@ -291,13 +265,13 @@ pub async fn create_user(
     match step {
         Ok(()) => {
             sqlx::query("RELEASE create_user")
-                .execute(&mut conn)
+                .execute(&mut *conn)
                 .await?;
             Ok(())
         }
         Err(e) => {
             let _ = sqlx::query("ROLLBACK TO create_user")
-                .execute(&mut conn)
+                .execute(&mut *conn)
                 .await;
             // Structured constraint detection (DatabaseError::is_unique_violation),
             // not string-matching -- corrected this session per external
@@ -336,6 +310,7 @@ mod tests {
         _tempdir: tempfile::TempDir,
         _lock: std::sync::MutexGuard<'static, ()>,
         saved_root: Option<String>,
+        pool: sqlx::SqlitePool,
     }
 
     impl Drop for TestEnv {
@@ -358,23 +333,34 @@ mod tests {
             .await
             .expect("shared.db migration must succeed in test setup");
 
+        let pool =
+            sqlx::SqlitePool::connect_with(crate::providers::utils::connect_options_unencrypted(
+                &crate::providers::utils::db_path_shared(),
+            ))
+            .await
+            .expect("shared.db pool must connect");
+
         TestEnv {
             _tempdir: tempdir,
             _lock: lock,
             saved_root,
+            pool,
         }
     }
 
     #[tokio::test]
     async fn fresh_db_has_no_users() {
         let _env = setup().await;
-        assert!(!has_any_users().await.unwrap());
+        let pool = &_env.pool;
+        assert!(!has_any_users(pool,).await.unwrap());
     }
 
     #[tokio::test]
     async fn create_user_then_has_any_users_is_true() {
         let _env = setup().await;
+        let pool = &_env.pool;
         create_user(
+            pool,
             "u1",
             "Alice",
             "admin",
@@ -387,13 +373,15 @@ mod tests {
         )
         .await
         .expect("create_user should succeed");
-        assert!(has_any_users().await.unwrap());
+        assert!(has_any_users(pool,).await.unwrap());
     }
 
     #[tokio::test]
     async fn find_user_by_display_name_round_trips() {
         let _env = setup().await;
+        let pool = &_env.pool;
         create_user(
+            pool,
             "u1",
             "Alice",
             "admin",
@@ -407,7 +395,7 @@ mod tests {
         .await
         .unwrap();
 
-        let found = find_user_by_display_name("Alice").await.unwrap();
+        let found = find_user_by_display_name(pool, "Alice").await.unwrap();
         assert!(found.is_some());
         let record = found.unwrap();
         assert_eq!(record.id, "u1");
@@ -419,14 +407,17 @@ mod tests {
     #[tokio::test]
     async fn find_user_by_display_name_returns_none_when_absent() {
         let _env = setup().await;
-        let found = find_user_by_display_name("Nobody").await.unwrap();
+        let pool = &_env.pool;
+        let found = find_user_by_display_name(pool, "Nobody").await.unwrap();
         assert!(found.is_none());
     }
 
     #[tokio::test]
     async fn find_user_by_id_round_trips() {
         let _env = setup().await;
+        let pool = &_env.pool;
         create_user(
+            pool,
             "u1",
             "Alice",
             "admin",
@@ -440,7 +431,7 @@ mod tests {
         .await
         .unwrap();
 
-        let found = find_user_by_id("u1").await.unwrap();
+        let found = find_user_by_id(pool, "u1").await.unwrap();
         assert!(found.is_some());
         let record = found.unwrap();
         assert_eq!(record.display_name, "Alice");
@@ -451,14 +442,17 @@ mod tests {
     #[tokio::test]
     async fn find_user_by_id_returns_none_when_absent() {
         let _env = setup().await;
-        let found = find_user_by_id("nonexistent").await.unwrap();
+        let pool = &_env.pool;
+        let found = find_user_by_id(pool, "nonexistent").await.unwrap();
         assert!(found.is_none());
     }
 
     #[tokio::test]
     async fn create_user_duplicate_display_name_is_already_exists() {
         let _env = setup().await;
+        let pool = &_env.pool;
         create_user(
+            pool,
             "u1",
             "Alice",
             "admin",
@@ -473,6 +467,7 @@ mod tests {
         .unwrap();
 
         let result = create_user(
+            pool,
             "u2",
             "Alice",
             "user",
@@ -493,7 +488,9 @@ mod tests {
         // must reject a second is_primary=true row -- confirms create_user
         // doesn't accidentally bypass that constraint.
         let _env = setup().await;
+        let pool = &_env.pool;
         create_user(
+            pool,
             "u1",
             "Alice",
             "admin",
@@ -508,6 +505,7 @@ mod tests {
         .unwrap();
 
         let result = create_user(
+            pool,
             "u2",
             "Bob",
             "admin",
@@ -528,7 +526,9 @@ mod tests {
     #[tokio::test]
     async fn get_salt_params_round_trips() {
         let _env = setup().await;
+        let pool = &_env.pool;
         create_user(
+            pool,
             "u1",
             "Alice",
             "admin",
@@ -542,7 +542,7 @@ mod tests {
         .await
         .unwrap();
 
-        let params = get_salt_params("u1").await.unwrap();
+        let params = get_salt_params(pool, "u1").await.unwrap();
         assert!(params.is_some());
         let (salt, mem, iter, par) = params.unwrap();
         assert_eq!(salt, vec![0xDE, 0xAD, 0xBE, 0xEF]);
@@ -554,7 +554,8 @@ mod tests {
     #[tokio::test]
     async fn get_salt_params_returns_none_for_unknown_user() {
         let _env = setup().await;
-        let params = get_salt_params("nonexistent").await.unwrap();
+        let pool = &_env.pool;
+        let params = get_salt_params(pool, "nonexistent").await.unwrap();
         assert!(params.is_none());
     }
 

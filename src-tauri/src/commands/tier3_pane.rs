@@ -113,6 +113,20 @@ pub struct Tier3ProviderSummary {
     pub login_required: bool,
     pub is_anonymous: bool,
     pub privacy_guardian_default_level: Option<provider_store::PrivacyGuardianDefaultLevel>,
+    /// items.id=465: whether QR itself recommends this provider, within its
+    /// own provider_type slot -- not a cross-slot ranking (see
+    /// provider_store::Provider::qr_recommended's own doc).
+    pub qr_recommended: bool,
+    /// items.id=465: throughput/latency class, nullable. Serialized to a
+    /// JSON string rather than carried as serde_json::Value -- that type is
+    /// self-referential and specta's TypeScript exporter recurses through
+    /// it without terminating (see commands/mod.rs's PlaceholderPayload doc
+    /// for the same constraint hitting this codebase before). The frontend
+    /// JSON.parse()s this field if it needs the structured shape.
+    pub performance_profile: Option<String>,
+    /// items.id=465: contractual vs. policy-only privacy commitment,
+    /// human-curated, NULL until assessed.
+    pub privacy_commitment_basis: Option<provider_store::PrivacyCommitmentBasis>,
 }
 
 fn lane_str(provider_type: &str) -> &str {
@@ -509,8 +523,10 @@ async fn persist_cookies_from_jar(
 /// tier3AccessConfig.ts's PLACEHOLDER_PROVIDERS stand-in array.
 #[tauri::command]
 #[specta::specta]
-pub async fn list_active_providers() -> Result<Vec<Tier3ProviderSummary>, String> {
-    let providers = provider_store::list_active_providers()
+pub async fn list_active_providers(
+    pool: State<'_, sqlx::SqlitePool>,
+) -> Result<Vec<Tier3ProviderSummary>, String> {
+    let providers = provider_store::list_active_providers(&pool)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -523,6 +539,9 @@ pub async fn list_active_providers() -> Result<Vec<Tier3ProviderSummary>, String
             login_required: p.login_required,
             is_anonymous: p.is_anonymous,
             privacy_guardian_default_level: p.privacy_guardian_default_level,
+            qr_recommended: p.qr_recommended,
+            performance_profile: p.performance_profile.map(|v| v.to_string()),
+            privacy_commitment_basis: p.privacy_commitment_basis,
         })
         .collect())
 }
@@ -552,6 +571,7 @@ pub async fn open_tier3_panes(
     provider_ids: Vec<String>,
     key_registry: State<'_, KeyRegistry>,
     app_handle: tauri::AppHandle,
+    pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<(), String> {
     // Not logged in => no per-provider cookie store to restore from at all
     // -- treated the same as "no stored cookies" (log + proceed), not a
@@ -562,7 +582,7 @@ pub async fn open_tier3_panes(
         .await;
 
     for provider_id in provider_ids {
-        let provider = provider_store::get_provider(&provider_id)
+        let provider = provider_store::get_provider(&pool, &provider_id)
             .await
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("provider '{provider_id}' not found"))?;
@@ -617,6 +637,7 @@ pub async fn close_tier3_pane(
     provider_id: String,
     key_registry: State<'_, KeyRegistry>,
     app_handle: tauri::AppHandle,
+    pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<(), String> {
     {
         let provider_id = provider_id.clone();
@@ -631,7 +652,10 @@ pub async fn close_tier3_pane(
         .with_key(|k| (k.user_id.clone(), key_hex(&k.master_key)))
         .await;
 
-    match (session, provider_store::get_provider(&provider_id).await) {
+    match (
+        session,
+        provider_store::get_provider(&pool, &provider_id).await,
+    ) {
         (Some((user_id, key_hex_str)), Ok(Some(provider))) => {
             if let Some(launch_url) = provider.launch_url {
                 persist_cookies_from_jar(&user_id, &key_hex_str, &provider_id, &launch_url).await;

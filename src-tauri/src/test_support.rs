@@ -36,12 +36,22 @@ pub static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 // precedent above.
 // ---------------------------------------------------------------------------
 
+/// `pool` (items.id=483): every command module using this harness now runs
+/// against a real shared.db SqlitePool, same as the production Tauri
+/// builder's own `.manage(pool)` in main.rs -- a command that touches
+/// shared.db via `State<sqlx::SqlitePool>` needs one managed here too, or
+/// `app.state::<sqlx::SqlitePool>()` panics. Callers whose commands never
+/// touch shared.db still pass one (their own setup()'s pool, even against a
+/// tempdir that never ran migrate_shared_db) -- unused by those commands,
+/// harmless, and keeps this harness single-shaped rather than forking a
+/// second pool-less variant.
 #[cfg(test)]
-pub fn mock_app_with_registry() -> tauri::App<tauri::test::MockRuntime> {
+pub fn mock_app_with_registry(pool: sqlx::SqlitePool) -> tauri::App<tauri::test::MockRuntime> {
     use tauri::Manager;
 
     let app = tauri::test::mock_app();
     app.manage(crate::auth::registry::KeyRegistry::default());
+    app.manage(pool);
     app
 }
 

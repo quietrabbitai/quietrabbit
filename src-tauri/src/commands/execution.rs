@@ -118,6 +118,7 @@ pub struct ResumeRunRequest {
 pub(crate) async fn load_and_authorize_run(
     app_handle: tauri::AppHandle,
     scheduler: tauri::State<'_, Arc<ConductorScheduler>>,
+    pool: tauri::State<'_, sqlx::SqlitePool>,
     key_hex: String,
     crisis_detected: bool,
     request: SubmitFocusRunRequest,
@@ -139,6 +140,7 @@ pub(crate) async fn load_and_authorize_run(
         request.user_id,
         request.persona_id,
         request.focus_id,
+        pool.inner().clone(),
         scheduler,
         request.user_input,
         false, // is_fast_lane: always false at IPC boundary
@@ -163,6 +165,7 @@ pub(crate) async fn load_and_authorize_run(
 pub async fn submit_focus_run(
     app_handle: tauri::AppHandle,
     scheduler: tauri::State<'_, Arc<ConductorScheduler>>,
+    pool: tauri::State<'_, sqlx::SqlitePool>,
     key_registry: State<'_, KeyRegistry>,
     request: SubmitFocusRunRequest,
 ) -> Result<SubmitFocusRunResponse, String> {
@@ -176,9 +179,15 @@ pub async fn submit_focus_run(
     // blended with any history here, so this is already the "fresh turn".
     let crisis_detected = crate::conductor::crisis::detect(&request.user_input);
 
-    let mut run =
-        load_and_authorize_run(app_handle, scheduler, key_hex_str, crisis_detected, request)
-            .await?;
+    let mut run = load_and_authorize_run(
+        app_handle,
+        scheduler,
+        pool,
+        key_hex_str,
+        crisis_detected,
+        request,
+    )
+    .await?;
 
     let run_id = run
         .focus_run_id
@@ -421,6 +430,7 @@ pub async fn resume_run(
                 reason: c.reason,
                 confidence: c.confidence,
                 warn_flag: c.warn_flag,
+                source: c.source,
             })
             .collect();
 

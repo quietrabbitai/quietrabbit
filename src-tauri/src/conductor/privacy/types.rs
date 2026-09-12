@@ -379,6 +379,9 @@ pub struct ExtractedCandidate {
     /// True when confidence is in the 0.6-0.8 warn band.
     /// Frontend should surface a lower-confidence indicator for these candidates.
     pub warn_flag: bool,
+    /// Provenance (decisions.id=623): "conductor_batch" | "ingest_pathway_a" | "quick_close".
+    /// None only for rows persisted before outputs_002.sql added this column.
+    pub source: Option<String>,
 }
 
 /// The user's decision for a single extraction candidate.

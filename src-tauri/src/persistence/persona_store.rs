@@ -14,12 +14,13 @@
 // QUERY STYLE: runtime sqlx::query() only — no query!() macros.
 // shared.db is unencrypted — no PRAGMA key required.
 //
-// CONNECTION MODEL: one connection per call (Phase 1 correctness implementation).
+// CONNECTION MODEL: pooled (items.id=483) -- shared.db is the one genuinely
+// unencrypted DB in this topology, so it's the one exception to the
+// per-call-connection rule the rest of persistence/ follows. Callers pass
+// a &sqlx::SqlitePool in; every fn here does pool.acquire() rather than
+// opening its own connection.
 
-use sqlx::sqlite::SqliteConnectOptions;
-use sqlx::ConnectOptions;
 use sqlx::Row;
-use sqlx::SqliteConnection;
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
@@ -61,25 +62,6 @@ pub struct Persona {
 // ---------------------------------------------------------------------------
 // DB opener (shared.db — unencrypted)
 // ---------------------------------------------------------------------------
-
-async fn open_shared_db() -> Result<SqliteConnection, PersonaStoreError> {
-    let db_path = crate::persistence::migrations::get_data_root()
-        .join("instance")
-        .join("shared.db");
-    let network_storage = std::env::var("QR_NETWORK_STORAGE")
-        .map(|v| v.to_lowercase() == "true")
-        .unwrap_or(false);
-    let journal_mode = if network_storage { "DELETE" } else { "WAL" };
-
-    let conn = SqliteConnectOptions::new()
-        .filename(&db_path)
-        .create_if_missing(false)
-        .pragma("journal_mode", journal_mode)
-        .connect()
-        .await?;
-
-    Ok(conn)
-}
 
 // ---------------------------------------------------------------------------
 // Row extraction
@@ -138,8 +120,11 @@ fn classify_constraint_error(persona_id: &str, e: sqlx::Error) -> PersonaStoreEr
 // ---------------------------------------------------------------------------
 
 /// Fetch a persona by ID. Returns None if not found.
-pub async fn get_persona(persona_id: &str) -> Result<Option<Persona>, PersonaStoreError> {
-    let mut conn = open_shared_db().await?;
+pub async fn get_persona(
+    pool: &sqlx::SqlitePool,
+    persona_id: &str,
+) -> Result<Option<Persona>, PersonaStoreError> {
+    let mut conn = pool.acquire().await?;
 
     let row = sqlx::query(
         "SELECT p.id, p.display_name, p.persona_type, p.created_at, p.extra_metadata,
@@ -150,7 +135,7 @@ pub async fn get_persona(persona_id: &str) -> Result<Option<Persona>, PersonaSto
          GROUP BY p.id",
     )
     .bind(persona_id)
-    .fetch_optional(&mut conn)
+    .fetch_optional(&mut *conn)
     .await?;
 
     match row {
@@ -166,10 +151,11 @@ pub async fn get_persona(persona_id: &str) -> Result<Option<Persona>, PersonaSto
 /// Membership validation only — no tier data (D6-297).
 /// Used by lifecycle AUTHORIZE to enforce access control.
 pub async fn get_persona_for_user(
+    pool: &sqlx::SqlitePool,
     user_id: &str,
     persona_id: &str,
 ) -> Result<Option<Persona>, PersonaStoreError> {
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
 
     let row = sqlx::query(
         "SELECT p.id, p.display_name, p.persona_type,
@@ -183,7 +169,7 @@ pub async fn get_persona_for_user(
     )
     .bind(user_id)
     .bind(persona_id)
-    .fetch_optional(&mut conn)
+    .fetch_optional(&mut *conn)
     .await?;
 
     match row {
@@ -195,8 +181,11 @@ pub async fn get_persona_for_user(
 }
 
 /// Return all personas accessible to a user, ordered by display_name.
-pub async fn list_personas_for_user(user_id: &str) -> Result<Vec<Persona>, PersonaStoreError> {
-    let mut conn = open_shared_db().await?;
+pub async fn list_personas_for_user(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+) -> Result<Vec<Persona>, PersonaStoreError> {
+    let mut conn = pool.acquire().await?;
 
     let rows = sqlx::query(
         "SELECT p.id, p.display_name, p.persona_type,
@@ -210,7 +199,7 @@ pub async fn list_personas_for_user(user_id: &str) -> Result<Vec<Persona>, Perso
          ORDER BY p.display_name",
     )
     .bind(user_id)
-    .fetch_all(&mut conn)
+    .fetch_all(&mut *conn)
     .await?;
 
     let mut personas = Vec::new();
@@ -234,6 +223,7 @@ pub async fn list_personas_for_user(user_id: &str) -> Result<Vec<Persona>, Perso
 /// needed here (unlike write_floor_consent_preference's read-merge-write in
 /// commands/consent.rs) since this is the row's very first write.
 pub async fn create_persona(
+    pool: &sqlx::SqlitePool,
     persona_id: &str,
     display_name: &str,
     persona_type: &str,
@@ -245,10 +235,10 @@ pub async fn create_persona(
         Some(c) => serde_json::json!({ "color": c }).to_string(),
         None => "{}".to_owned(),
     };
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
 
     sqlx::query("SAVEPOINT create_persona")
-        .execute(&mut conn)
+        .execute(&mut *conn)
         .await?;
 
     let step: Result<(), sqlx::Error> = async {
@@ -262,7 +252,7 @@ pub async fn create_persona(
         .bind(persona_type)
         .bind(&created_at)
         .bind(&extra_metadata_json)
-        .execute(&mut conn)
+        .execute(&mut *conn)
         .await?;
 
         sqlx::query(
@@ -272,7 +262,7 @@ pub async fn create_persona(
         .bind(creator_user_id)
         .bind(persona_id)
         .bind(&created_at)
-        .execute(&mut conn)
+        .execute(&mut *conn)
         .await?;
 
         Ok(())
@@ -282,12 +272,12 @@ pub async fn create_persona(
     match step {
         Ok(()) => {
             sqlx::query("RELEASE create_persona")
-                .execute(&mut conn)
+                .execute(&mut *conn)
                 .await?;
         }
         Err(e) => {
             if let Err(rollback_err) = sqlx::query("ROLLBACK TO create_persona")
-                .execute(&mut conn)
+                .execute(&mut *conn)
                 .await
             {
                 log::error!(
@@ -314,12 +304,15 @@ pub async fn create_persona(
 /// Returns true if deleted, false if not found.
 /// Does NOT delete per-persona databases (personal.db, outputs.db) —
 /// those require explicit user confirmation and a separate cleanup operation.
-pub async fn delete_persona(persona_id: &str) -> Result<bool, PersonaStoreError> {
-    let mut conn = open_shared_db().await?;
+pub async fn delete_persona(
+    pool: &sqlx::SqlitePool,
+    persona_id: &str,
+) -> Result<bool, PersonaStoreError> {
+    let mut conn = pool.acquire().await?;
 
     let result = sqlx::query("DELETE FROM personas WHERE id = ?")
         .bind(persona_id)
-        .execute(&mut conn)
+        .execute(&mut *conn)
         .await?;
 
     Ok(result.rows_affected() > 0)
@@ -333,15 +326,16 @@ pub async fn delete_persona(persona_id: &str) -> Result<bool, PersonaStoreError>
 /// Returns true if added, false if already a member.
 /// Returns Err(NotFound) if persona does not exist.
 pub async fn add_user_to_persona(
+    pool: &sqlx::SqlitePool,
     user_id: &str,
     persona_id: &str,
 ) -> Result<bool, PersonaStoreError> {
     // Verify persona exists first — mirrors Python LookupError behavior.
-    if get_persona(persona_id).await?.is_none() {
+    if get_persona(pool, persona_id).await?.is_none() {
         return Err(PersonaStoreError::NotFound(persona_id.to_owned()));
     }
 
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
     let timestamp = crate::providers::utils::now();
 
     let result = sqlx::query(
@@ -351,7 +345,7 @@ pub async fn add_user_to_persona(
     .bind(user_id)
     .bind(persona_id)
     .bind(&timestamp)
-    .execute(&mut conn)
+    .execute(&mut *conn)
     .await?;
 
     // rows_affected == 0 means OR IGNORE fired — already a member.
@@ -361,15 +355,16 @@ pub async fn add_user_to_persona(
 /// Remove a user from a persona.
 /// Returns true if removed, false if not a member.
 pub async fn remove_user_from_persona(
+    pool: &sqlx::SqlitePool,
     user_id: &str,
     persona_id: &str,
 ) -> Result<bool, PersonaStoreError> {
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
 
     let result = sqlx::query("DELETE FROM user_personas WHERE user_id = ? AND persona_id = ?")
         .bind(user_id)
         .bind(persona_id)
-        .execute(&mut conn)
+        .execute(&mut *conn)
         .await?;
 
     Ok(result.rows_affected() > 0)
@@ -377,15 +372,16 @@ pub async fn remove_user_from_persona(
 
 /// Check if a user is a member of a persona.
 pub async fn is_user_in_persona(
+    pool: &sqlx::SqlitePool,
     user_id: &str,
     persona_id: &str,
 ) -> Result<bool, PersonaStoreError> {
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
 
     let row = sqlx::query("SELECT 1 FROM user_personas WHERE user_id = ? AND persona_id = ?")
         .bind(user_id)
         .bind(persona_id)
-        .fetch_optional(&mut conn)
+        .fetch_optional(&mut *conn)
         .await?;
 
     Ok(row.is_some())

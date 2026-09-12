@@ -182,6 +182,39 @@ async fn async_main() {
                                  until this is resolved"
                             ),
                         }
+
+                        // items.id=483: pooled connection for shared.db only
+                        // (genuinely unencrypted -- every other DB in this
+                        // topology is SQLCipher-keyed and stays one-
+                        // connection-per-call, see providers/utils.rs's own
+                        // module header and CLAUDE.md's SQLCipher section for
+                        // why pooling those would extend decrypted access
+                        // past KeyRegistry's clear() boundary). Built here,
+                        // same block_in_place + Handle::current().block_on()
+                        // pattern as migrate_shared_db() just above, for the
+                        // same reason: this setup() closure is sync.
+                        let shared_db_path = quietrabbit_lib::providers::utils::db_path_shared();
+                        let pool_result = tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(
+                                sqlx::sqlite::SqlitePoolOptions::new()
+                                    .max_connections(5)
+                                    .connect_with(
+                                    quietrabbit_lib::providers::utils::connect_options_unencrypted(
+                                        &shared_db_path,
+                                    ),
+                                ),
+                            )
+                        });
+                        match pool_result {
+                            Ok(pool) => {
+                                app.manage(pool);
+                            }
+                            Err(e) => log::error!(
+                                "main: shared.db pool could not be created: {e} — \
+                                 commands touching shared.db will panic until this \
+                                 is resolved"
+                            ),
+                        }
                     }
                 }
                 Err(e) => log::error!(
@@ -314,6 +347,7 @@ async fn async_main() {
                     ticker.tick().await;
                     let registry =
                         pull_handle.state::<quietrabbit_lib::auth::registry::GroupKeyRegistry>();
+                    let pool = pull_handle.state::<sqlx::SqlitePool>();
 
                     // items.id=288 (group.db 266f): apply any pending key
                     // rotations before this tick's pull sweep below -- a
@@ -351,6 +385,7 @@ async fn async_main() {
                         for persona_id in resident_personas {
                             if let Err(e) =
                                 quietrabbit_lib::auth::group_membership::apply_pending_rotations(
+                                    &pool,
                                     &persona_id,
                                     &registry,
                                     &sharing_private_key,
@@ -374,6 +409,7 @@ async fn async_main() {
                             continue;
                         };
                         if let Err(e) = quietrabbit_lib::group_sync::engine::pull_if_newer(
+                            &pool,
                             &persona_id,
                             &group_id,
                             &key_hex_str,
@@ -387,6 +423,7 @@ async fn async_main() {
                         }
                         if let Err(e) =
                             quietrabbit_lib::group_sync::engine::pull_permissions_if_newer(
+                                &pool,
                                 &persona_id,
                                 &group_id,
                                 &key_hex_str,
@@ -410,7 +447,8 @@ async fn async_main() {
                     // scoped, not per-resident-group-key like the loop above
                     // -- run once per tick for whichever account is
                     // currently logged in (a no-op if nobody is).
-                    quietrabbit_lib::persona_sync::engine::run_periodic_sweep(&key_registry).await;
+                    quietrabbit_lib::persona_sync::engine::run_periodic_sweep(&pool, &key_registry)
+                        .await;
 
                     // items.id=304 (decisions.id=723): VIEW-ONLY persona-share
                     // sync periodic push + pull, same timer tick, same
@@ -420,8 +458,11 @@ async fn async_main() {
                     // parallel module with no provisioning/reconciliation
                     // concerns of their own (see persona_view_sync::engine's
                     // own module header).
-                    quietrabbit_lib::persona_view_sync::engine::run_periodic_sweep(&key_registry)
-                        .await;
+                    quietrabbit_lib::persona_view_sync::engine::run_periodic_sweep(
+                        &pool,
+                        &key_registry,
+                    )
+                    .await;
                 }
             });
 
@@ -441,7 +482,15 @@ async fn async_main() {
                     ticker.tick().await;
                     let key_registry =
                         idle_handle.state::<quietrabbit_lib::auth::registry::KeyRegistry>();
-                    quietrabbit_lib::auth::idle_timeout::run_periodic_check(&key_registry).await;
+                    let group_key_registry =
+                        idle_handle.state::<quietrabbit_lib::auth::registry::GroupKeyRegistry>();
+                    let pool = idle_handle.state::<sqlx::SqlitePool>();
+                    quietrabbit_lib::auth::idle_timeout::run_periodic_check(
+                        &pool,
+                        &key_registry,
+                        &group_key_registry,
+                    )
+                    .await;
                 }
             });
 

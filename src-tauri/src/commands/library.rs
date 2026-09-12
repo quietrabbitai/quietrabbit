@@ -56,9 +56,13 @@ use crate::persistence::output_store;
 /// is treated as not-protected -- the confirmed rule only suppresses a
 /// *confirmed* 'protected', it does not invent behavior for the unknown
 /// case (items.id=230).
-pub(crate) async fn is_protected(persona_id: &str, focus_id: &str) -> Result<bool, String> {
+pub(crate) async fn is_protected(
+    pool: &sqlx::SqlitePool,
+    persona_id: &str,
+    focus_id: &str,
+) -> Result<bool, String> {
     Ok(
-        focus_settings_store::get_focus_settings(persona_id, focus_id)
+        focus_settings_store::get_focus_settings(pool, persona_id, focus_id)
             .await
             .map_err(|e| e.to_string())?
             .map(|s| s.focus_profile == "protected")
@@ -149,6 +153,7 @@ pub(crate) fn visibility_focus_id(record: &output_store::OutputRecord) -> &str {
 /// See module header.
 #[tauri::command]
 #[specta::specta]
+#[allow(clippy::too_many_arguments)]
 pub async fn list_outputs(
     user_id: String,
     persona_id: String,
@@ -157,6 +162,7 @@ pub async fn list_outputs(
     topic_id: Option<String>,
     output_type: Option<String>,
     source: Option<String>,
+    pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<Vec<OutputInfo>, String> {
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.master_key))
@@ -187,7 +193,7 @@ pub async fn list_outputs(
         let protected = match protected_cache.get(&vis_focus_id) {
             Some(v) => *v,
             None => {
-                let v = is_protected(&persona_id, &vis_focus_id).await?;
+                let v = is_protected(&pool, &persona_id, &vis_focus_id).await?;
                 protected_cache.insert(vis_focus_id.clone(), v);
                 v
             }
@@ -211,6 +217,7 @@ pub async fn get_output(
     user_id: String,
     persona_id: String,
     key_registry: State<'_, KeyRegistry>,
+    pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<OutputInfo, String> {
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.master_key))
@@ -222,7 +229,7 @@ pub async fn get_output(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "not_found".to_string())?;
 
-    if is_protected(&persona_id, visibility_focus_id(&record)).await? {
+    if is_protected(&pool, &persona_id, visibility_focus_id(&record)).await? {
         return Err("not_found".to_string());
     }
 
@@ -269,6 +276,7 @@ pub async fn delete_output(
 /// Returns the content to copy on success, or the user-facing blocked
 /// message on failure.
 async fn prepare_clipboard_copy(
+    pool: &sqlx::SqlitePool,
     output_id: &str,
     user_id: &str,
     persona_id: &str,
@@ -279,7 +287,7 @@ async fn prepare_clipboard_copy(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "not_found".to_string())?;
 
-    if is_protected(persona_id, visibility_focus_id(&record)).await? {
+    if is_protected(pool, persona_id, visibility_focus_id(&record)).await? {
         return Err("not_found".to_string());
     }
 
@@ -362,13 +370,15 @@ pub async fn copy_output_to_clipboard(
     user_id: String,
     persona_id: String,
     key_registry: State<'_, KeyRegistry>,
+    pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<(), String> {
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.master_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
-    let content = prepare_clipboard_copy(&output_id, &user_id, &persona_id, &key_hex_str).await?;
+    let content =
+        prepare_clipboard_copy(&pool, &output_id, &user_id, &persona_id, &key_hex_str).await?;
 
     app.clipboard()
         .write_text(content)
@@ -401,6 +411,7 @@ mod tests {
         _tempdir: tempfile::TempDir,
         _lock: std::sync::MutexGuard<'static, ()>,
         saved_root: Option<String>,
+        pool: sqlx::SqlitePool,
     }
 
     impl Drop for TestEnv {
@@ -436,9 +447,18 @@ mod tests {
         crate::persistence::migrations::migrate_personal_db(USER_ID, PERSONA_ID, &key_hex_str())
             .await
             .expect("personal.db migration must succeed in test setup");
+
+        let pool =
+            sqlx::SqlitePool::connect_with(crate::providers::utils::connect_options_unencrypted(
+                &crate::providers::utils::db_path_shared(),
+            ))
+            .await
+            .expect("shared.db pool must connect");
+
         // user_personas.user_id REFERENCES users(id) -- create_persona's
         // FK requires a real users row first.
         crate::auth::user_store::create_user(
+            &pool,
             USER_ID,
             "Lib Test User",
             "user",
@@ -451,22 +471,36 @@ mod tests {
         )
         .await
         .expect("create_user must succeed in test setup");
-        persona_store::create_persona(PERSONA_ID, "Lib Test Persona", "personal", USER_ID, None)
-            .await
-            .expect("create_persona must succeed in test setup");
+        persona_store::create_persona(
+            &pool,
+            PERSONA_ID,
+            "Lib Test Persona",
+            "personal",
+            USER_ID,
+            None,
+        )
+        .await
+        .expect("create_persona must succeed in test setup");
 
         TestEnv {
             _tempdir: tempdir,
             _lock: lock,
             saved_root,
+            pool,
         }
     }
 
     /// Seeds a focus_settings row for `focus_id` with the given focus_profile
     /// (open/organized/protected), plus a matching focus_run and one active
     /// output. Returns the output id.
-    async fn seed_output_for_focus(focus_id: &str, focus_profile: &str, content: &str) -> String {
+    async fn seed_output_for_focus(
+        pool: &sqlx::SqlitePool,
+        focus_id: &str,
+        focus_profile: &str,
+        content: &str,
+    ) -> String {
         focus_settings_store::create_focus_settings(
+            pool,
             PERSONA_ID,
             focus_id,
             "bidirectional",
@@ -508,11 +542,12 @@ mod tests {
     #[tokio::test]
     async fn list_outputs_includes_open_focus_output() {
         let _env = setup().await;
-        seed_output_for_focus("focus-open", "open", "visible content").await;
+        seed_output_for_focus(&_env.pool, "focus-open", "open", "visible content").await;
 
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         populate_registry(&registry, USER_ID, MASTER_KEY).await;
+        let pool = app.state::<sqlx::SqlitePool>();
 
         let results = list_outputs(
             USER_ID.to_owned(),
@@ -522,6 +557,7 @@ mod tests {
             None,
             None,
             None,
+            pool,
         )
         .await
         .expect("list_outputs must succeed");
@@ -533,12 +569,19 @@ mod tests {
     #[tokio::test]
     async fn list_outputs_excludes_protected_focus_output() {
         let _env = setup().await;
-        seed_output_for_focus("focus-open", "open", "open content").await;
-        seed_output_for_focus("focus-protected", "protected", "protected content").await;
+        seed_output_for_focus(&_env.pool, "focus-open", "open", "open content").await;
+        seed_output_for_focus(
+            &_env.pool,
+            "focus-protected",
+            "protected",
+            "protected content",
+        )
+        .await;
 
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         populate_registry(&registry, USER_ID, MASTER_KEY).await;
+        let pool = app.state::<sqlx::SqlitePool>();
 
         let results = list_outputs(
             USER_ID.to_owned(),
@@ -548,6 +591,7 @@ mod tests {
             None,
             None,
             None,
+            pool,
         )
         .await
         .expect("list_outputs must succeed");
@@ -559,17 +603,20 @@ mod tests {
     #[tokio::test]
     async fn get_output_returns_open_focus_output() {
         let _env = setup().await;
-        let output_id = seed_output_for_focus("focus-open", "open", "visible content").await;
+        let output_id =
+            seed_output_for_focus(&_env.pool, "focus-open", "open", "visible content").await;
 
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         populate_registry(&registry, USER_ID, MASTER_KEY).await;
+        let pool = app.state::<sqlx::SqlitePool>();
 
         let result = get_output(
             output_id,
             USER_ID.to_owned(),
             PERSONA_ID.to_owned(),
             registry,
+            pool,
         )
         .await
         .expect("get_output must succeed for an open-profile output");
@@ -580,18 +627,25 @@ mod tests {
     #[tokio::test]
     async fn get_output_blocks_protected_focus_output_as_not_found() {
         let _env = setup().await;
-        let output_id =
-            seed_output_for_focus("focus-protected", "protected", "protected content").await;
+        let output_id = seed_output_for_focus(
+            &_env.pool,
+            "focus-protected",
+            "protected",
+            "protected content",
+        )
+        .await;
 
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         populate_registry(&registry, USER_ID, MASTER_KEY).await;
+        let pool = app.state::<sqlx::SqlitePool>();
 
         let result = get_output(
             output_id,
             USER_ID.to_owned(),
             PERSONA_ID.to_owned(),
             registry,
+            pool,
         )
         .await;
 
@@ -606,15 +660,17 @@ mod tests {
     async fn get_output_still_returns_not_found_for_a_genuinely_missing_id() {
         let _env = setup().await;
 
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         populate_registry(&registry, USER_ID, MASTER_KEY).await;
+        let pool = app.state::<sqlx::SqlitePool>();
 
         let result = get_output(
             "does-not-exist".to_owned(),
             USER_ID.to_owned(),
             PERSONA_ID.to_owned(),
             registry,
+            pool,
         )
         .await;
 
@@ -624,12 +680,13 @@ mod tests {
     #[tokio::test]
     async fn list_outputs_still_honors_focus_id_filter_alongside_visibility() {
         let _env = setup().await;
-        seed_output_for_focus("focus-a", "open", "a content").await;
-        seed_output_for_focus("focus-b", "open", "b content").await;
+        seed_output_for_focus(&_env.pool, "focus-a", "open", "a content").await;
+        seed_output_for_focus(&_env.pool, "focus-b", "open", "b content").await;
 
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         populate_registry(&registry, USER_ID, MASTER_KEY).await;
+        let pool = app.state::<sqlx::SqlitePool>();
 
         let results = list_outputs(
             USER_ID.to_owned(),
@@ -639,6 +696,7 @@ mod tests {
             None,
             None,
             None,
+            pool,
         )
         .await
         .expect("list_outputs must succeed");
@@ -663,12 +721,14 @@ mod tests {
     /// Like seed_output_for_focus, but lets the caller pick sensitivity
     /// instead of hardcoding "general" -- needed to exercise the blocked path.
     async fn seed_output_with_sensitivity(
+        pool: &sqlx::SqlitePool,
         focus_id: &str,
         focus_profile: &str,
         content: &str,
         sensitivity: &str,
     ) -> String {
         focus_settings_store::create_focus_settings(
+            pool,
             PERSONA_ID,
             focus_id,
             "bidirectional",
@@ -710,11 +770,18 @@ mod tests {
     #[tokio::test]
     async fn clipboard_copy_succeeds_for_low_severity_output() {
         let _env = setup().await;
-        let output_id =
-            seed_output_with_sensitivity("focus-open", "open", "shareable content", "general")
-                .await;
+        let output_id = seed_output_with_sensitivity(
+            &_env.pool,
+            "focus-open",
+            "open",
+            "shareable content",
+            "general",
+        )
+        .await;
 
-        let result = prepare_clipboard_copy(&output_id, USER_ID, PERSONA_ID, &key_hex_str()).await;
+        let result =
+            prepare_clipboard_copy(&_env.pool, &output_id, USER_ID, PERSONA_ID, &key_hex_str())
+                .await;
 
         assert_eq!(result, Ok("shareable content".to_string()));
     }
@@ -723,6 +790,7 @@ mod tests {
     async fn clipboard_copy_blocks_financial_severity_output() {
         let _env = setup().await;
         let output_id = seed_output_with_sensitivity(
+            &_env.pool,
             "focus-open",
             "open",
             "account number 123456789",
@@ -730,7 +798,9 @@ mod tests {
         )
         .await;
 
-        let result = prepare_clipboard_copy(&output_id, USER_ID, PERSONA_ID, &key_hex_str()).await;
+        let result =
+            prepare_clipboard_copy(&_env.pool, &output_id, USER_ID, PERSONA_ID, &key_hex_str())
+                .await;
 
         let err = result.expect_err("financial-severity output must be blocked");
         assert!(
@@ -751,6 +821,7 @@ mod tests {
     async fn clipboard_copy_uses_cached_scan_result_instead_of_rescanning() {
         let _env = setup().await;
         focus_settings_store::create_focus_settings(
+            &_env.pool,
             PERSONA_ID,
             "focus-open",
             "bidirectional",
@@ -793,7 +864,9 @@ mod tests {
         .await
         .expect("save_output must succeed in test setup");
 
-        let result = prepare_clipboard_copy(&output_id, USER_ID, PERSONA_ID, &key_hex_str()).await;
+        let result =
+            prepare_clipboard_copy(&_env.pool, &output_id, USER_ID, PERSONA_ID, &key_hex_str())
+                .await;
 
         assert!(
             result.is_err(),
@@ -806,6 +879,7 @@ mod tests {
     async fn clipboard_copy_blocks_protected_focus_output_as_not_found() {
         let _env = setup().await;
         let output_id = seed_output_with_sensitivity(
+            &_env.pool,
             "focus-protected",
             "protected",
             "protected content",
@@ -813,7 +887,9 @@ mod tests {
         )
         .await;
 
-        let result = prepare_clipboard_copy(&output_id, USER_ID, PERSONA_ID, &key_hex_str()).await;
+        let result =
+            prepare_clipboard_copy(&_env.pool, &output_id, USER_ID, PERSONA_ID, &key_hex_str())
+                .await;
 
         assert_eq!(
             result.unwrap_err(),
@@ -827,8 +903,14 @@ mod tests {
     async fn clipboard_copy_still_returns_not_found_for_a_genuinely_missing_id() {
         let _env = setup().await;
 
-        let result =
-            prepare_clipboard_copy("does-not-exist", USER_ID, PERSONA_ID, &key_hex_str()).await;
+        let result = prepare_clipboard_copy(
+            &_env.pool,
+            "does-not-exist",
+            USER_ID,
+            PERSONA_ID,
+            &key_hex_str(),
+        )
+        .await;
 
         assert_eq!(result.unwrap_err(), "not_found");
     }
@@ -845,8 +927,13 @@ mod tests {
     /// focus_settings row for `focus_slug` (not for the pseudo-Focus) with
     /// the given focus_profile, so is_protected has something real to find.
     /// Returns the output id.
-    async fn seed_ingested_output_for_focus_slug(focus_slug: &str, focus_profile: &str) -> String {
+    async fn seed_ingested_output_for_focus_slug(
+        pool: &sqlx::SqlitePool,
+        focus_slug: &str,
+        focus_profile: &str,
+    ) -> String {
         focus_settings_store::create_focus_settings(
+            pool,
             PERSONA_ID,
             focus_slug,
             "bidirectional",
@@ -886,17 +973,20 @@ mod tests {
     async fn get_output_blocks_ingested_document_filed_under_a_protected_focus() {
         let _env = setup().await;
         let output_id =
-            seed_ingested_output_for_focus_slug("focus-protected-slug", "protected").await;
+            seed_ingested_output_for_focus_slug(&_env.pool, "focus-protected-slug", "protected")
+                .await;
 
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         populate_registry(&registry, USER_ID, MASTER_KEY).await;
+        let pool = app.state::<sqlx::SqlitePool>();
 
         let result = get_output(
             output_id,
             USER_ID.to_owned(),
             PERSONA_ID.to_owned(),
             registry,
+            pool,
         )
         .await;
 
@@ -912,17 +1002,20 @@ mod tests {
     #[tokio::test]
     async fn get_output_allows_ingested_document_filed_under_an_open_focus() {
         let _env = setup().await;
-        let output_id = seed_ingested_output_for_focus_slug("focus-open-slug", "open").await;
+        let output_id =
+            seed_ingested_output_for_focus_slug(&_env.pool, "focus-open-slug", "open").await;
 
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         populate_registry(&registry, USER_ID, MASTER_KEY).await;
+        let pool = app.state::<sqlx::SqlitePool>();
 
         let result = get_output(
             output_id,
             USER_ID.to_owned(),
             PERSONA_ID.to_owned(),
             registry,
+            pool,
         )
         .await
         .expect("an ingested document under an open Focus must be reachable");
@@ -934,12 +1027,13 @@ mod tests {
     #[tokio::test]
     async fn list_outputs_defaults_to_excluding_ingested_documents() {
         let _env = setup().await;
-        seed_output_for_focus("focus-open", "open", "a qr-generated note").await;
-        seed_ingested_output_for_focus_slug("focus-open-slug", "open").await;
+        seed_output_for_focus(&_env.pool, "focus-open", "open", "a qr-generated note").await;
+        seed_ingested_output_for_focus_slug(&_env.pool, "focus-open-slug", "open").await;
 
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         populate_registry(&registry, USER_ID, MASTER_KEY).await;
+        let pool = app.state::<sqlx::SqlitePool>();
 
         let default_view = list_outputs(
             USER_ID.to_owned(),
@@ -949,6 +1043,7 @@ mod tests {
             None,
             None,
             None,
+            pool,
         )
         .await
         .expect("list_outputs must succeed");
@@ -961,9 +1056,10 @@ mod tests {
         );
         assert_eq!(default_view[0].source, "qr_generated");
 
-        let app2 = mock_app_with_registry();
+        let app2 = mock_app_with_registry(_env.pool.clone());
         let registry2 = app2.state::<KeyRegistry>();
         populate_registry(&registry2, USER_ID, MASTER_KEY).await;
+        let pool2 = app2.state::<sqlx::SqlitePool>();
 
         let imported_view = list_outputs(
             USER_ID.to_owned(),
@@ -973,6 +1069,7 @@ mod tests {
             None,
             None,
             Some("external_ingested".to_owned()),
+            pool2,
         )
         .await
         .expect("list_outputs must succeed");

@@ -60,11 +60,6 @@
 //   [45..]     [u8]    ChaCha20-Poly1305 ciphertext, INCLUDING the 16-byte
 //                      Poly1305 tag chacha20poly1305's own encrypt() appends
 //
-// open_shared_db() IS DUPLICATED here rather than reused from user_store.rs
-// -- same reasoning user_store.rs's own module header gives for not reusing
-// persona_store.rs's copy: each module's error type differs, and this is a
-// ~12-line, zero-divergence-risk helper.
-//
 // SCOPE NOTE for items.id=284, not solved here: user_sharing_keys (below) is
 // keyed by user_id (account-level, matching decisions.id=677's own "every
 // account" framing), but pending_group_invitations.recipient_persona_id
@@ -75,10 +70,7 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use hkdf::Hkdf;
 use sha2::Sha256;
-use sqlx::sqlite::SqliteConnectOptions;
-use sqlx::ConnectOptions;
 use sqlx::Row;
-use sqlx::SqliteConnection;
 use thiserror::Error;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
@@ -107,23 +99,6 @@ pub enum SharingKeypairError {
     EncryptionFailed(String),
     #[error("Could not generate random bytes: {0}")]
     RandomSource(String),
-}
-
-async fn open_shared_db() -> Result<SqliteConnection, SharingKeypairError> {
-    let db_path = crate::persistence::migrations::get_data_root()
-        .join("instance")
-        .join("shared.db");
-    let network_storage = std::env::var("QR_NETWORK_STORAGE")
-        .map(|v| v.to_lowercase() == "true")
-        .unwrap_or(false);
-    let journal_mode = if network_storage { "DELETE" } else { "WAL" };
-    let conn = SqliteConnectOptions::new()
-        .filename(&db_path)
-        .create_if_missing(false)
-        .pragma("journal_mode", journal_mode)
-        .connect()
-        .await?;
-    Ok(conn)
 }
 
 fn hex_decode(user_id: &str, s: &str) -> Result<Vec<u8>, SharingKeypairError> {
@@ -272,12 +247,13 @@ pub fn decrypt_own_envelope(
 /// in user_store::create_user()'s SAVEPOINT (same-transaction atomicity with
 /// the users/user_salts insert), not here.
 pub async fn get_public_key(
+    pool: &sqlx::SqlitePool,
     user_id: &str,
 ) -> Result<Option<[u8; PUBLIC_KEY_LEN]>, SharingKeypairError> {
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
     let row = sqlx::query("SELECT public_key_hex FROM user_sharing_keys WHERE user_id = ?")
         .bind(user_id)
-        .fetch_optional(&mut conn)
+        .fetch_optional(&mut *conn)
         .await?;
     let Some(row) = row else {
         return Ok(None);

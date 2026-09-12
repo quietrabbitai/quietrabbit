@@ -224,8 +224,11 @@ impl KeyRegistry {
 //     resident after the owning account has logged out (design doc Section
 //     4 item 3 flags exactly this as something the implementation must not
 //     assume away).
-// Neither is wired into any real call site here (no logout code is
-// touched in this item) -- these are the primitives only.
+// clear_persona() is wired into commands::auth::logout() and
+// auth::idle_timeout::run_periodic_check() via the shared
+// auth::clear_group_keys_for_user() helper (items.id=469) -- clear(persona_id,
+// group_id) has no caller yet, that granularity remains a primitive for a
+// future single-group removal (e.g. leaving one group).
 
 /// One Persona's resident, unlocked symmetric key for one group. Never
 /// persisted -- exists only as Tauri managed state for this process's

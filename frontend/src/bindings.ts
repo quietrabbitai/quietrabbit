@@ -1142,6 +1142,15 @@ export type PersonalFieldInfo = {
 };
 
 /**
+ *  items.id=465 (shared_016.sql): whether a provider's privacy posture is
+ *  backed by contractual language (DPA/Services Agreement) or is merely
+ *  descriptive policy prose with no contractual commitment. Human-curated
+ *  only, same as privacy_guardian_default_level -- never derived from
+ *  documentation_gate's freeform research text.
+ */
+export type PrivacyCommitmentBasis = "contractual" | "policy_only";
+
+/**
  *  privacy_guardian_default_level: deliberately parallel to ReviewTier's
  *  own three values (conductor/privacy/types.rs), same reasoning
  *  risk_rating already established (shared_012.sql).
@@ -1361,6 +1370,26 @@ export type Tier3ProviderSummary = {
 	login_required: boolean,
 	is_anonymous: boolean,
 	privacy_guardian_default_level: PrivacyGuardianDefaultLevel | null,
+	/**
+	 *  items.id=465: whether QR itself recommends this provider, within its
+	 *  own provider_type slot -- not a cross-slot ranking (see
+	 *  provider_store::Provider::qr_recommended's own doc).
+	 */
+	qr_recommended: boolean,
+	/**
+	 *  items.id=465: throughput/latency class, nullable. Serialized to a
+	 *  JSON string rather than carried as serde_json::Value -- that type is
+	 *  self-referential and specta's TypeScript exporter recurses through
+	 *  it without terminating (see commands/mod.rs's PlaceholderPayload doc
+	 *  for the same constraint hitting this codebase before). The frontend
+	 *  JSON.parse()s this field if it needs the structured shape.
+	 */
+	performance_profile: string | null,
+	/**
+	 *  items.id=465: contractual vs. policy-only privacy commitment,
+	 *  human-curated, NULL until assessed.
+	 */
+	privacy_commitment_basis: PrivacyCommitmentBasis | null,
 };
 
 export type TopicInfo = {

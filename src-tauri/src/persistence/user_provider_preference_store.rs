@@ -30,10 +30,7 @@
 // runtime sqlx::query() only, one connection per call, shared.db
 // (unencrypted, no PRAGMA key required).
 
-use sqlx::sqlite::SqliteConnectOptions;
-use sqlx::ConnectOptions;
 use sqlx::Row;
-use sqlx::SqliteConnection;
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
@@ -150,25 +147,6 @@ pub struct NewUserProviderPreference<'a> {
 // DB opener (shared.db — unencrypted)
 // ---------------------------------------------------------------------------
 
-async fn open_shared_db() -> Result<SqliteConnection, UserProviderPreferenceStoreError> {
-    let db_path = crate::persistence::migrations::get_data_root()
-        .join("instance")
-        .join("shared.db");
-    let network_storage = std::env::var("QR_NETWORK_STORAGE")
-        .map(|v| v.to_lowercase() == "true")
-        .unwrap_or(false);
-    let journal_mode = if network_storage { "DELETE" } else { "WAL" };
-
-    let conn = SqliteConnectOptions::new()
-        .filename(&db_path)
-        .create_if_missing(false)
-        .pragma("journal_mode", journal_mode)
-        .connect()
-        .await?;
-
-    Ok(conn)
-}
-
 const SELECT_COLUMNS: &str = "id, user_id, persona_id, focus_id, provider_id,
                 login_available, user_preference, enabled_at, declined_at,
                 local_model_version, installed_at, last_verified_at,
@@ -253,12 +231,13 @@ fn row_to_preference(
 /// (persona_store.rs style) at this data volume (at most 3 rows could ever
 /// match for a given user+provider).
 pub async fn resolve_preference(
+    pool: &sqlx::SqlitePool,
     user_id: &str,
     persona_id: Option<&str>,
     focus_id: Option<&str>,
     provider_id: &str,
 ) -> Result<Option<UserProviderPreference>, UserProviderPreferenceStoreError> {
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
 
     if let Some(focus_id) = focus_id {
         let sql = format!(
@@ -269,7 +248,7 @@ pub async fn resolve_preference(
             .bind(user_id)
             .bind(focus_id)
             .bind(provider_id)
-            .fetch_optional(&mut conn)
+            .fetch_optional(&mut *conn)
             .await?
         {
             return Ok(Some(row_to_preference(&row)?));
@@ -285,7 +264,7 @@ pub async fn resolve_preference(
             .bind(user_id)
             .bind(persona_id)
             .bind(provider_id)
-            .fetch_optional(&mut conn)
+            .fetch_optional(&mut *conn)
             .await?
         {
             return Ok(Some(row_to_preference(&row)?));
@@ -299,7 +278,7 @@ pub async fn resolve_preference(
     let row = sqlx::query(&sql)
         .bind(user_id)
         .bind(provider_id)
-        .fetch_optional(&mut conn)
+        .fetch_optional(&mut *conn)
         .await?;
 
     match row {
@@ -322,6 +301,7 @@ pub async fn resolve_preference(
 /// codebase's existing unreachable!()-guarded "never silently guess"
 /// pattern in executor.rs.
 pub async fn find_preferred_provider(
+    pool: &sqlx::SqlitePool,
     user_id: &str,
     persona_id: Option<&str>,
     focus_id: Option<&str>,
@@ -329,7 +309,9 @@ pub async fn find_preferred_provider(
 ) -> Result<Option<String>, UserProviderPreferenceStoreError> {
     let mut preferred: Vec<String> = Vec::new();
     for provider_id in candidate_provider_ids {
-        if let Some(pref) = resolve_preference(user_id, persona_id, focus_id, provider_id).await? {
+        if let Some(pref) =
+            resolve_preference(pool, user_id, persona_id, focus_id, provider_id).await?
+        {
             if pref.user_preference == UserPreference::Preferred {
                 preferred.push(provider_id.clone());
             }
@@ -346,12 +328,13 @@ pub async fn find_preferred_provider(
 /// know whether a specific-scope override row exists, distinct from
 /// resolve_preference()'s cascading result.
 pub async fn get_preference_at_scope(
+    pool: &sqlx::SqlitePool,
     user_id: &str,
     persona_id: Option<&str>,
     focus_id: Option<&str>,
     provider_id: &str,
 ) -> Result<Option<UserProviderPreference>, UserProviderPreferenceStoreError> {
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
 
     let sql = format!(
         "SELECT {SELECT_COLUMNS} FROM user_provider_preference
@@ -367,7 +350,7 @@ pub async fn get_preference_at_scope(
         .bind(focus_id)
         .bind(focus_id)
         .bind(provider_id)
-        .fetch_optional(&mut conn)
+        .fetch_optional(&mut *conn)
         .await?;
 
     match row {
@@ -379,16 +362,20 @@ pub async fn get_preference_at_scope(
 /// All preference rows for a user, across every scope -- for a future
 /// settings-surface listing, not a hot read path.
 pub async fn list_preferences_for_user(
+    pool: &sqlx::SqlitePool,
     user_id: &str,
 ) -> Result<Vec<UserProviderPreference>, UserProviderPreferenceStoreError> {
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
 
     let sql = format!(
         "SELECT {SELECT_COLUMNS} FROM user_provider_preference
          WHERE user_id = ?
          ORDER BY provider_id ASC, persona_id ASC, focus_id ASC"
     );
-    let rows = sqlx::query(&sql).bind(user_id).fetch_all(&mut conn).await?;
+    let rows = sqlx::query(&sql)
+        .bind(user_id)
+        .fetch_all(&mut *conn)
+        .await?;
 
     let mut prefs = Vec::new();
     for r in rows {
@@ -409,13 +396,20 @@ pub async fn list_preferences_for_user(
 /// get_preference_at_scope()'s own scope-matching WHERE shape so "does a
 /// row exist here" and "write to that exact row" never drift apart.
 pub async fn upsert_preference(
+    pool: &sqlx::SqlitePool,
     new: NewUserProviderPreference<'_>,
 ) -> Result<UserProviderPreference, UserProviderPreferenceStoreError> {
-    let existing =
-        get_preference_at_scope(new.user_id, new.persona_id, new.focus_id, new.provider_id).await?;
+    let existing = get_preference_at_scope(
+        pool,
+        new.user_id,
+        new.persona_id,
+        new.focus_id,
+        new.provider_id,
+    )
+    .await?;
 
     let now = crate::providers::utils::now();
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
 
     if let Some(existing) = existing {
         sqlx::query(
@@ -435,12 +429,18 @@ pub async fn upsert_preference(
         .bind(new.user_preference.as_str())
         .bind(&now)
         .bind(&existing.id)
-        .execute(&mut conn)
+        .execute(&mut *conn)
         .await?;
 
-        return get_preference_at_scope(new.user_id, new.persona_id, new.focus_id, new.provider_id)
-            .await?
-            .ok_or_else(|| UserProviderPreferenceStoreError::NotFound(existing.id.clone()));
+        return get_preference_at_scope(
+            pool,
+            new.user_id,
+            new.persona_id,
+            new.focus_id,
+            new.provider_id,
+        )
+        .await?
+        .ok_or_else(|| UserProviderPreferenceStoreError::NotFound(existing.id.clone()));
     }
 
     let id = uuid::Uuid::new_v4().to_string();
@@ -469,7 +469,7 @@ pub async fn upsert_preference(
     .bind(new.local_model_version)
     .bind(new.subscription_status.map(|s| s.as_str()))
     .bind(&now)
-    .execute(&mut conn)
+    .execute(&mut *conn)
     .await?;
 
     Ok(UserProviderPreference {
@@ -495,12 +495,13 @@ pub async fn upsert_preference(
 /// only right after an actual live check, matching
 /// get_capability_profile's own live-check-never-cached convention.
 pub async fn record_local_install(
+    pool: &sqlx::SqlitePool,
     user_id: &str,
     provider_id: &str,
     local_model_version: &str,
 ) -> Result<(), UserProviderPreferenceStoreError> {
     let now = crate::providers::utils::now();
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
 
     let result = sqlx::query(
         "UPDATE user_provider_preference
@@ -513,7 +514,7 @@ pub async fn record_local_install(
     .bind(&now)
     .bind(user_id)
     .bind(provider_id)
-    .execute(&mut conn)
+    .execute(&mut *conn)
     .await?;
 
     if result.rows_affected() == 0 {
@@ -531,15 +532,17 @@ pub async fn record_local_install(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::sqlite::SqliteConnectOptions;
+    use sqlx::ConnectOptions;
 
     /// Sets QR_DATA_ROOT to a fresh tempdir, migrates shared.db for real,
     /// and seeds a user + persona -- so tests below can call the actual
     /// public API (resolve_preference, upsert_preference), which opens its
-    /// own connection via open_shared_db()/get_data_root(), not an
+    /// own connection via pool.acquire()/get_data_root(), not an
     /// in-memory fixture. Matches migrations.rs's own QR_DATA_ROOT-mutating
     /// test pattern (ENV_MUTEX serialization). Returns the tempdir so it
     /// isn't dropped (and deleted) before the calling test finishes.
-    async fn setup_real_db() -> tempfile::TempDir {
+    async fn setup_real_db() -> (tempfile::TempDir, sqlx::SqlitePool) {
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
 
@@ -569,7 +572,14 @@ mod tests {
         .await
         .unwrap();
 
-        tempdir
+        let pool =
+            sqlx::SqlitePool::connect_with(crate::providers::utils::connect_options_unencrypted(
+                &crate::providers::utils::db_path_shared(),
+            ))
+            .await
+            .expect("shared.db pool must connect");
+
+        (tempdir, pool)
     }
 
     /// items.id=428: most-specific-match-wins -- a Focus row must win over
@@ -579,58 +589,69 @@ mod tests {
     async fn resolve_preference_focus_beats_persona_beats_account() {
         let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
-        let _tempdir = setup_real_db().await;
+        let (_tempdir, pool) = setup_real_db().await;
 
         let outcome = async {
-            upsert_preference(NewUserProviderPreference {
-                user_id: "u1",
-                persona_id: None,
-                focus_id: None,
-                provider_id: "duckai",
-                login_available: false,
-                user_preference: UserPreference::Allowed,
-                local_model_version: None,
-                subscription_status: None,
-            })
+            upsert_preference(
+                &pool,
+                NewUserProviderPreference {
+                    user_id: "u1",
+                    persona_id: None,
+                    focus_id: None,
+                    provider_id: "duckai",
+                    login_available: false,
+                    user_preference: UserPreference::Allowed,
+                    local_model_version: None,
+                    subscription_status: None,
+                },
+            )
             .await?;
-            upsert_preference(NewUserProviderPreference {
-                user_id: "u1",
-                persona_id: Some("p1"),
-                focus_id: None,
-                provider_id: "duckai",
-                login_available: false,
-                user_preference: UserPreference::Preferred,
-                local_model_version: None,
-                subscription_status: None,
-            })
+            upsert_preference(
+                &pool,
+                NewUserProviderPreference {
+                    user_id: "u1",
+                    persona_id: Some("p1"),
+                    focus_id: None,
+                    provider_id: "duckai",
+                    login_available: false,
+                    user_preference: UserPreference::Preferred,
+                    local_model_version: None,
+                    subscription_status: None,
+                },
+            )
             .await?;
-            upsert_preference(NewUserProviderPreference {
-                user_id: "u1",
-                persona_id: Some("p1"),
-                focus_id: Some("f1"),
-                provider_id: "duckai",
-                login_available: false,
-                user_preference: UserPreference::Declined,
-                local_model_version: None,
-                subscription_status: None,
-            })
+            upsert_preference(
+                &pool,
+                NewUserProviderPreference {
+                    user_id: "u1",
+                    persona_id: Some("p1"),
+                    focus_id: Some("f1"),
+                    provider_id: "duckai",
+                    login_available: false,
+                    user_preference: UserPreference::Declined,
+                    local_model_version: None,
+                    subscription_status: None,
+                },
+            )
             .await?;
 
-            let focus_scoped = resolve_preference("u1", Some("p1"), Some("f1"), "duckai").await?;
+            let focus_scoped =
+                resolve_preference(&pool, "u1", Some("p1"), Some("f1"), "duckai").await?;
             assert_eq!(
                 focus_scoped.unwrap().user_preference,
                 UserPreference::Declined,
                 "the Focus-scoped row must win when a focus_id is given"
             );
 
-            let persona_scoped = resolve_preference("u1", Some("p1"), None, "duckai").await?;
+            let persona_scoped =
+                resolve_preference(&pool, "u1", Some("p1"), None, "duckai").await?;
             assert_eq!(
                 persona_scoped.unwrap().user_preference,
                 UserPreference::Preferred,
                 "the Persona-scoped row must win when no focus_id is given"
             );
 
-            let account_scoped = resolve_preference("u1", None, None, "duckai").await?;
+            let account_scoped = resolve_preference(&pool, "u1", None, None, "duckai").await?;
             assert_eq!(
                 account_scoped.unwrap().user_preference,
                 UserPreference::Allowed,
@@ -642,7 +663,7 @@ mod tests {
             // (no match under a different persona_id combination isn't
             // queried here) to persona p1's own row.
             let persona_p1_no_focus_override =
-                resolve_preference("u1", Some("p1"), Some("f-unrelated"), "duckai").await?;
+                resolve_preference(&pool, "u1", Some("p1"), Some("f-unrelated"), "duckai").await?;
             assert_eq!(
                 persona_p1_no_focus_override.unwrap().user_preference,
                 UserPreference::Preferred,
@@ -670,9 +691,9 @@ mod tests {
     async fn no_row_at_any_scope_means_no_match() {
         let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
-        let _tempdir = setup_real_db().await;
+        let (_tempdir, pool) = setup_real_db().await;
 
-        let result = resolve_preference("u1", Some("p1"), Some("f1"), "duckai").await;
+        let result = resolve_preference(&pool, "u1", Some("p1"), Some("f1"), "duckai").await;
 
         if let Some(v) = saved_root {
             std::env::set_var("QR_DATA_ROOT", v);
@@ -690,7 +711,7 @@ mod tests {
     async fn find_preferred_provider_zero_one_many_candidates() {
         let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
-        let _tempdir = setup_real_db().await;
+        let (_tempdir, pool) = setup_real_db().await;
 
         let outcome = async {
             // groq/mistral already exist as providers rows -- seeded by
@@ -699,39 +720,45 @@ mod tests {
             let candidates = vec!["groq".to_owned(), "mistral".to_owned()];
 
             // Zero: neither candidate has any row at all.
-            let none = find_preferred_provider("u1", Some("p1"), None, &candidates).await?;
+            let none = find_preferred_provider(&pool, "u1", Some("p1"), None, &candidates).await?;
             assert_eq!(none, None, "no preference set for either candidate -> None");
 
             // One: groq marked Preferred, mistral untouched.
-            upsert_preference(NewUserProviderPreference {
-                user_id: "u1",
-                persona_id: None,
-                focus_id: None,
-                provider_id: "groq",
-                login_available: true,
-                user_preference: UserPreference::Preferred,
-                local_model_version: None,
-                subscription_status: None,
-            })
+            upsert_preference(
+                &pool,
+                NewUserProviderPreference {
+                    user_id: "u1",
+                    persona_id: None,
+                    focus_id: None,
+                    provider_id: "groq",
+                    login_available: true,
+                    user_preference: UserPreference::Preferred,
+                    local_model_version: None,
+                    subscription_status: None,
+                },
+            )
             .await?;
-            let one = find_preferred_provider("u1", Some("p1"), None, &candidates).await?;
+            let one = find_preferred_provider(&pool, "u1", Some("p1"), None, &candidates).await?;
             assert_eq!(one, Some("groq".to_owned()));
 
             // Many: mistral ALSO marked Preferred (a data anomaly the schema
             // doesn't prevent) -> ambiguous, must return None rather than
             // guess, same as this codebase's unreachable!()-guarded pattern.
-            upsert_preference(NewUserProviderPreference {
-                user_id: "u1",
-                persona_id: None,
-                focus_id: None,
-                provider_id: "mistral",
-                login_available: true,
-                user_preference: UserPreference::Preferred,
-                local_model_version: None,
-                subscription_status: None,
-            })
+            upsert_preference(
+                &pool,
+                NewUserProviderPreference {
+                    user_id: "u1",
+                    persona_id: None,
+                    focus_id: None,
+                    provider_id: "mistral",
+                    login_available: true,
+                    user_preference: UserPreference::Preferred,
+                    local_model_version: None,
+                    subscription_status: None,
+                },
+            )
             .await?;
-            let many = find_preferred_provider("u1", Some("p1"), None, &candidates).await?;
+            let many = find_preferred_provider(&pool, "u1", Some("p1"), None, &candidates).await?;
             assert_eq!(
                 many, None,
                 "two candidates both Preferred is ambiguous -> None"
@@ -756,7 +783,7 @@ mod tests {
     async fn duplicate_account_wide_row_is_rejected() {
         let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
-        let tempdir = setup_real_db().await;
+        let (tempdir, _pool) = setup_real_db().await;
 
         let db_path = tempdir.path().join("instance").join("shared.db");
         let outcome = async {

@@ -126,6 +126,27 @@ fn ollama_client() -> &'static OllamaClient {
     OLLAMA_CLIENT.get_or_init(OllamaClient::new)
 }
 
+/// items.id=465 (closes B2): a small registry keyed by each Tier 2
+/// provider's own `Tier2Provider::provider_id()`, replacing the old
+/// hardcoded `match tier2_provider_preference.as_deref() { Some("mistral")
+/// => ..., Some("groq") => ..., Some(other) => unreachable!(...) }`
+/// dispatch. Adding a third Tier 2 provider now means adding one entry
+/// here, not a new match arm at every dispatch site that switches on a
+/// provider string.
+static TIER2_PROVIDER_REGISTRY: OnceLock<HashMap<&'static str, &'static dyn Tier2Provider>> =
+    OnceLock::new();
+
+fn tier2_provider_registry() -> &'static HashMap<&'static str, &'static dyn Tier2Provider> {
+    TIER2_PROVIDER_REGISTRY.get_or_init(|| {
+        let mut m: HashMap<&'static str, &'static dyn Tier2Provider> = HashMap::new();
+        let groq: &'static dyn Tier2Provider = groq_provider();
+        let mistral: &'static dyn Tier2Provider = mistral_provider();
+        m.insert(groq.provider_id(), groq);
+        m.insert(mistral.provider_id(), mistral);
+        m
+    })
+}
+
 // ---------------------------------------------------------------------------
 // StepContext
 // ---------------------------------------------------------------------------
@@ -244,6 +265,7 @@ impl StepExecutor {
         privacy_gateway: &PrivacyGateway<L>,
         scheduler: &Arc<ConductorScheduler>,
         app_handle: Option<&tauri::AppHandle<tauri::Wry>>,
+        pool: &sqlx::SqlitePool,
     ) -> Option<FailureResult> {
         let mut retry_count = 0u32;
 
@@ -259,6 +281,7 @@ impl StepExecutor {
                     privacy_gateway,
                     scheduler,
                     app_handle,
+                    pool,
                 )
                 .await
             {
@@ -315,6 +338,7 @@ impl StepExecutor {
         privacy_gateway: &PrivacyGateway<L>,
         scheduler: &Arc<ConductorScheduler>,
         app_handle: Option<&tauri::AppHandle<tauri::Wry>>,
+        pool: &sqlx::SqlitePool,
     ) -> Result<Option<FailureResult>, ConductorError> {
         let execution_tier = ctx.execution_tier;
         let abstraction_tier = ctx.abstraction_tier;
@@ -399,10 +423,12 @@ impl StepExecutor {
         }
 
         let model_id = select_model(
+            pool,
             &ctx.step.task_type,
             execution_tier,
             ctx.tier2_provider_preference.as_deref(),
-        );
+        )
+        .await?;
 
         // Build gate track for Gate1/Gate2 calls.
         // privacy::types::PersonalTrack (typed enum fields) differs from
@@ -552,11 +578,10 @@ impl StepExecutor {
             m
         };
 
-        let effective_ctx = options_raw
-            .get("num_ctx")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32)
-            .unwrap_or_else(|| get_context_window(&model_id));
+        let effective_ctx = match options_raw.get("num_ctx").and_then(|v| v.as_u64()) {
+            Some(v) => v as u32,
+            None => get_context_window(pool, &model_id).await,
+        };
 
         let ctx_status = check_context_window(&prompt, &ctx.step.task_type, effective_ctx);
         if ctx_status.status == ContextWindowStatusKind::Exceeded {
@@ -606,19 +631,23 @@ impl StepExecutor {
 
         let generate_result: Result<_, ConductorError> = if execution_tier >= 2 {
             // Step 4.5 above already guarantees tier2_provider_preference is
-            // Some("mistral" | "groq") at this point -- no silent fallback
-            // to Groq for anything else (matches select_model()'s policy;
-            // a third schema-permitted provider value must fail loudly
-            // here, not misroute).
+            // Some(...) at this point -- no silent fallback to any default
+            // provider for a None preference (matches select_model()'s
+            // policy). A provider id that IS present but isn't registered
+            // in tier2_provider_registry() (items.id=465: closes B2) is a
+            // real ConductorError, not a panic -- unlike the old hardcoded
+            // match, this dispatch no longer assumes the schema-permitted
+            // value set is exactly {"mistral", "groq"}.
             match ctx.tier2_provider_preference.as_deref() {
-                Some("mistral") => mistral_provider().generate(&request).await,
-                Some("groq") => groq_provider().generate(&request).await,
-                Some(other) => unreachable!(
-                    "tier2_provider_preference '{other}' is not one of the \
-                     schema-permitted values ('mistral', 'groq') -- \
-                     schema/shared_001.sql's CHECK constraint should have \
-                     prevented this from ever being stored"
-                ),
+                Some(provider_id) => match tier2_provider_registry().get(provider_id) {
+                    Some(provider) => provider.generate(&request).await,
+                    None => Err(ConductorError::UnknownProvider {
+                        plain_language: format!(
+                            "Tier 2 provider '{provider_id}' is not registered with this \
+                             build of Quiet Rabbit."
+                        ),
+                    }),
+                },
                 None => unreachable!(
                     "execution_tier >= 2 with no tier2_provider_preference -- \
                      the Step 4.5 guard above must already have \
@@ -976,50 +1005,83 @@ async fn scan_voice_profile<L: DisclosureLogger>(
 /// the user's Tier 2 provider preference.
 /// Python oracle: StepExecutor._select_model()
 ///
-/// tier2_provider must be Some("mistral") or Some("groq") whenever
-/// tier >= 2 — the caller (execute_once's Step 4.5 guard) short-circuits
-/// to the F10 MissingTier2Config failure before ever reaching this
-/// function with tier >= 2 and None. No catch-all fallback to Groq: an
-/// unexpected value here means schema/shared_001.sql's CHECK constraint
-/// on tier2_provider_preference was bypassed, or this function was called
-/// without going through the Step 4.5 guard — both are bugs that must
-/// fail loudly, not silently misroute to a provider the user didn't pick.
-fn select_model(task_type: &str, tier: u8, tier2_provider: Option<&str>) -> String {
+/// items.id=465 (closes B3): the Tier 2 branch now queries
+/// provider_store::get_default_model() (provider_models WHERE
+/// provider_id = ? AND is_default = 1) instead of matching on the literal
+/// provider string -- adding a third Tier 2 provider is now a catalog row,
+/// not a new match arm here.
+///
+/// tier2_provider must be Some(...) whenever tier >= 2 — the caller
+/// (execute_once's Step 4.5 guard) short-circuits to the F10
+/// MissingTier2Config failure before ever reaching this function with
+/// tier >= 2 and None; that invariant is untouched by this fix, so the
+/// None arm below still panics rather than silently misrouting. A
+/// provider id that IS present but has no default model curated in the
+/// catalog (unknown provider, or a known one not yet given a
+/// provider_models row) is a real ConductorError, not a panic.
+async fn select_model(
+    pool: &sqlx::SqlitePool,
+    task_type: &str,
+    tier: u8,
+    tier2_provider: Option<&str>,
+) -> Result<String, ConductorError> {
     if tier == 1 {
-        match task_type {
+        return Ok(match task_type {
             "code" => "qwen2.5:7b".to_owned(),
             "quick_response" | "summarization" => "llama3.2:3b".to_owned(),
             _ => "llama3.1:8b".to_owned(),
-        }
-    } else {
-        match tier2_provider {
-            Some("mistral") => "mistral:mistral-small-latest".to_owned(),
-            Some("groq") => "groq:llama-3.1-8b-instant".to_owned(),
-            Some(other) => unreachable!(
-                "tier2_provider_preference '{other}' is not one of the \
-                 schema-permitted values ('mistral', 'groq') -- \
-                 schema/shared_001.sql's CHECK constraint should have \
-                 prevented this from ever being stored"
+        });
+    }
+
+    let provider_id = match tier2_provider {
+        Some(id) => id,
+        None => unreachable!(
+            "select_model called with tier>=2 and no tier2_provider -- \
+             caller must guard on ctx.tier2_provider_preference.is_none() \
+             before calling select_model (see the Step 4.5 \
+             MissingTier2Config check in execute_once)"
+        ),
+    };
+
+    match crate::persistence::provider_store::get_default_model(pool, provider_id).await {
+        Ok(Some(model)) => Ok(model.id),
+        Ok(None) => Err(ConductorError::UnknownProvider {
+            plain_language: format!(
+                "Tier 2 provider '{provider_id}' has no default model configured \
+                 in the provider catalog."
             ),
-            None => unreachable!(
-                "select_model called with tier>=2 and no tier2_provider -- \
-                 caller must guard on ctx.tier2_provider_preference.is_none() \
-                 before calling select_model (see the Step 4.5 \
-                 MissingTier2Config check in execute_once)"
+        }),
+        Err(e) => Err(ConductorError::UnknownProvider {
+            plain_language: format!(
+                "could not look up the default model for Tier 2 provider \
+                 '{provider_id}': {e}"
             ),
-        }
+        }),
     }
 }
 
 /// Context window size for a given model ID.
 /// Python oracle: StepExecutor._get_context_window()
-fn get_context_window(model_id: &str) -> u32 {
+///
+/// items.id=465 (PARTIAL close of B4 -- confirmed acceptable scope,
+/// chat_session_handoffs.id=316): checks provider_models first, by the
+/// full "provider:model" id, falling back to this 3-entry hardcoded map
+/// ONLY for the local Ollama ids -- those have no providers row to hang a
+/// catalog entry off yet (Ollama-as-Tier1 wiring is a separate, larger,
+/// out-of-scope initiative). Not a full close of B4.
+async fn get_context_window(pool: &sqlx::SqlitePool, model_id: &str) -> u32 {
+    let from_catalog = crate::persistence::provider_store::get_model(pool, model_id)
+        .await
+        .ok()
+        .flatten();
+    if let Some(model) = from_catalog {
+        return model.context_window_tokens;
+    }
+
     match model_id {
         "llama3.2:3b" => 4096,
         "llama3.1:8b" => 8192,
         "qwen2.5:7b" => 8192,
-        "groq:llama-3.1-8b-instant" => 8192,
-        "mistral:mistral-small-latest" => 32768,
         _ => 2048,
     }
 }
@@ -1491,87 +1553,196 @@ mod tests {
         assert_eq!(format_voice_profile(&vp), "");
     }
 
-    #[test]
-    fn select_model_tier1_code() {
-        assert_eq!(select_model("code", 1, None), "qwen2.5:7b");
+    /// items.id=465: select_model()'s Tier 2 branch and get_context_window()
+    /// now read provider_models (shared.db) instead of matching on literal
+    /// provider/model strings -- these tests need a real, migrated shared.db
+    /// (shared_016.sql's own curation pass seeds groq/mistral's default
+    /// models), not just in-process logic. Mirrors provider_store.rs's own
+    /// list_active_providers_and_max_risk_rating_via_public_api pattern:
+    /// ENV_MUTEX-serialized, tempdir-backed QR_DATA_ROOT.
+    async fn with_temp_shared_db<F, Fut>(f: F) -> Fut::Output
+    where
+        F: FnOnce(sqlx::SqlitePool) -> Fut,
+        Fut: std::future::Future,
+    {
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        crate::persistence::migrations::migrate_shared_db()
+            .await
+            .expect("shared.db migration must succeed in test setup");
+
+        let pool =
+            sqlx::SqlitePool::connect_with(crate::providers::utils::connect_options_unencrypted(
+                &crate::providers::utils::db_path_shared(),
+            ))
+            .await
+            .expect("shared.db pool must connect");
+
+        let result = f(pool).await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+        result
     }
 
-    #[test]
-    fn select_model_tier1_quick_response() {
-        assert_eq!(select_model("quick_response", 1, None), "llama3.2:3b");
+    /// Tier 1 never touches provider_store -- an in-memory, unmigrated pool
+    /// is fine here (never acquired against).
+    fn dummy_pool() -> sqlx::SqlitePool {
+        sqlx::SqlitePool::connect_lazy_with(
+            sqlx::sqlite::SqliteConnectOptions::new().filename(":memory:"),
+        )
     }
 
-    #[test]
-    fn select_model_tier1_summarization() {
-        assert_eq!(select_model("summarization", 1, None), "llama3.2:3b");
-    }
-
-    #[test]
-    fn select_model_tier1_general() {
-        assert_eq!(select_model("general", 1, None), "llama3.1:8b");
-    }
-
-    #[test]
-    fn select_model_tier2_groq_any_type() {
+    #[tokio::test]
+    async fn select_model_tier1_code() {
+        // Tier 1 never touches provider_store -- no DB setup needed.
         assert_eq!(
-            select_model("code", 2, Some("groq")),
-            "groq:llama-3.1-8b-instant"
-        );
-        assert_eq!(
-            select_model("general", 2, Some("groq")),
-            "groq:llama-3.1-8b-instant"
+            select_model(&dummy_pool(), "code", 1, None).await.unwrap(),
+            "qwen2.5:7b"
         );
     }
 
-    #[test]
-    fn select_model_tier2_mistral_any_type() {
+    #[tokio::test]
+    async fn select_model_tier1_quick_response() {
         assert_eq!(
-            select_model("code", 2, Some("mistral")),
-            "mistral:mistral-small-latest"
+            select_model(&dummy_pool(), "quick_response", 1, None)
+                .await
+                .unwrap(),
+            "llama3.2:3b"
         );
+    }
+
+    #[tokio::test]
+    async fn select_model_tier1_summarization() {
         assert_eq!(
-            select_model("general", 2, Some("mistral")),
-            "mistral:mistral-small-latest"
+            select_model(&dummy_pool(), "summarization", 1, None)
+                .await
+                .unwrap(),
+            "llama3.2:3b"
         );
+    }
+
+    #[tokio::test]
+    async fn select_model_tier1_general() {
+        assert_eq!(
+            select_model(&dummy_pool(), "general", 1, None)
+                .await
+                .unwrap(),
+            "llama3.1:8b"
+        );
+    }
+
+    #[tokio::test]
+    async fn select_model_tier2_groq_any_type() {
+        with_temp_shared_db(|pool| async move {
+            assert_eq!(
+                select_model(&pool, "code", 2, Some("groq")).await.unwrap(),
+                "groq:llama-3.1-8b-instant"
+            );
+            assert_eq!(
+                select_model(&pool, "general", 2, Some("groq"))
+                    .await
+                    .unwrap(),
+                "groq:llama-3.1-8b-instant"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn select_model_tier2_mistral_any_type() {
+        with_temp_shared_db(|pool| async move {
+            assert_eq!(
+                select_model(&pool, "code", 2, Some("mistral"))
+                    .await
+                    .unwrap(),
+                "mistral:mistral-small-latest"
+            );
+            assert_eq!(
+                select_model(&pool, "general", 2, Some("mistral"))
+                    .await
+                    .unwrap(),
+                "mistral:mistral-small-latest"
+            );
+        })
+        .await;
     }
 
     /// items.id=251 — the test proving provider selection actually
     /// switches behavior, not just that a preference can be stored.
     /// Same task_type and tier; the only thing that differs is
     /// tier2_provider, and the two calls must produce different models.
-    #[test]
-    fn select_model_switches_on_tier2_provider_preference() {
-        let groq_model = select_model("general", 2, Some("groq"));
-        let mistral_model = select_model("general", 2, Some("mistral"));
-        assert_ne!(groq_model, mistral_model);
-        assert_eq!(groq_model, "groq:llama-3.1-8b-instant");
-        assert_eq!(mistral_model, "mistral:mistral-small-latest");
+    #[tokio::test]
+    async fn select_model_switches_on_tier2_provider_preference() {
+        with_temp_shared_db(|pool| async move {
+            let groq_model = select_model(&pool, "general", 2, Some("groq"))
+                .await
+                .unwrap();
+            let mistral_model = select_model(&pool, "general", 2, Some("mistral"))
+                .await
+                .unwrap();
+            assert_ne!(groq_model, mistral_model);
+            assert_eq!(groq_model, "groq:llama-3.1-8b-instant");
+            assert_eq!(mistral_model, "mistral:mistral-small-latest");
+        })
+        .await;
     }
 
-    #[test]
+    #[tokio::test]
     #[should_panic(expected = "select_model called with tier>=2 and no tier2_provider")]
-    fn select_model_tier2_none_preference_panics() {
-        select_model("general", 2, None);
+    async fn select_model_tier2_none_preference_panics() {
+        // Panics before ever touching provider_store -- no DB setup needed.
+        let _ = select_model(&dummy_pool(), "general", 2, None).await;
     }
 
-    #[test]
-    #[should_panic(expected = "is not one of the schema-permitted values")]
-    fn select_model_tier2_unknown_provider_panics() {
-        select_model("general", 2, Some("openai"));
+    /// items.id=465: an unrecognized-but-present provider id is now a real
+    /// ConductorError (no provider_models row to resolve), not a panic --
+    /// see select_model()'s own doc on why the old hardcoded-match panic
+    /// for this case no longer applies.
+    #[tokio::test]
+    async fn select_model_tier2_unknown_provider_returns_unknown_provider_error() {
+        with_temp_shared_db(|pool| async move {
+            let err = select_model(&pool, "general", 2, Some("openai"))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ConductorError::UnknownProvider { .. }),
+                "got: {err:?}"
+            );
+        })
+        .await;
     }
 
-    #[test]
-    fn context_window_known_models() {
-        assert_eq!(get_context_window("llama3.2:3b"), 4096);
-        assert_eq!(get_context_window("llama3.1:8b"), 8192);
-        assert_eq!(get_context_window("qwen2.5:7b"), 8192);
-        assert_eq!(get_context_window("groq:llama-3.1-8b-instant"), 8192);
-        assert_eq!(get_context_window("mistral:mistral-small-latest"), 32768);
+    #[tokio::test]
+    async fn context_window_known_models() {
+        with_temp_shared_db(|pool| async move {
+            assert_eq!(get_context_window(&pool, "llama3.2:3b").await, 4096);
+            assert_eq!(get_context_window(&pool, "llama3.1:8b").await, 8192);
+            assert_eq!(get_context_window(&pool, "qwen2.5:7b").await, 8192);
+            assert_eq!(
+                get_context_window(&pool, "groq:llama-3.1-8b-instant").await,
+                8192
+            );
+            assert_eq!(
+                get_context_window(&pool, "mistral:mistral-small-latest").await,
+                32768
+            );
+        })
+        .await;
     }
 
-    #[test]
-    fn context_window_unknown_model_defaults() {
-        assert_eq!(get_context_window("unknown:model"), 2048);
+    #[tokio::test]
+    async fn context_window_unknown_model_defaults() {
+        with_temp_shared_db(|pool| async move {
+            assert_eq!(get_context_window(&pool, "unknown:model").await, 2048);
+        })
+        .await;
     }
 
     #[test]

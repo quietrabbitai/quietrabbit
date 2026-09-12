@@ -96,9 +96,7 @@ use crate::conductor::types::{
     PersonalContextManifest, PersonalTrack, SharedStateTrack, TaskTrack,
 };
 use crate::persistence::disclosure_log_store::SqliteDisclosureLogger;
-use crate::providers::utils::{
-    connect_options_encrypted, connect_options_unencrypted, db_path_outputs, db_path_shared, now,
-};
+use crate::providers::utils::{connect_options_encrypted, db_path_outputs, now};
 
 // ---------------------------------------------------------------------------
 // LifecycleError
@@ -647,14 +645,6 @@ async fn open_outputs_db(
     Ok(conn)
 }
 
-/// Open shared.db (unencrypted) for artifact version queries and floor consent reads.
-/// Python oracle: open_instance_db() context manager.
-async fn open_instance_db() -> Result<SqliteConnection, LifecycleError> {
-    let path = db_path_shared();
-    let conn = connect_options_unencrypted(&path).connect().await?;
-    Ok(conn)
-}
-
 // ---------------------------------------------------------------------------
 // FocusRun
 // ---------------------------------------------------------------------------
@@ -681,6 +671,11 @@ pub struct FocusRun<L: DisclosureLoggerForRun = SqliteDisclosureLogger> {
     pub user_id: String,
     pub persona_id: String,
     pub focus_id: String,
+    /// shared.db pool (items.id=483) -- every shared.db read this struct's
+    /// methods make (focus_settings/personas tier ceiling, provider/
+    /// preference lookups, artifact_versions) goes through this, replacing
+    /// what used to be per-call open_instance_db() connections.
+    pub pool: sqlx::SqlitePool,
     pub scheduler: Arc<ConductorScheduler>,
     pub user_input: String,
     pub is_fast_lane: bool,
@@ -753,6 +748,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         user_id: String,
         persona_id: String,
         focus_id: String,
+        pool: sqlx::SqlitePool,
         scheduler: Arc<ConductorScheduler>,
         user_input: String,
         is_fast_lane: bool,
@@ -766,6 +762,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             user_id,
             persona_id,
             focus_id,
+            pool,
             scheduler,
             user_input,
             is_fast_lane,
@@ -913,7 +910,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         use crate::persistence::focus_settings_store::get_focus_settings;
         use crate::persistence::persona_store::get_persona_for_user;
 
-        let _persona = get_persona_for_user(&self.user_id, &self.persona_id)
+        let _persona = get_persona_for_user(&self.pool, &self.user_id, &self.persona_id)
             .await
             .map_err(|e| LifecycleError::PersonaStore(e.to_string()))?
             .ok_or_else(|| {
@@ -923,7 +920,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                 ))
             })?;
 
-        let settings = get_focus_settings(&self.persona_id, &self.focus_id)
+        let settings = get_focus_settings(&self.pool, &self.persona_id, &self.focus_id)
             .await
             .map_err(|e| LifecycleError::FocusSettingsStore(e.to_string()))?
             .ok_or_else(|| {
@@ -1349,7 +1346,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         if guide_ids.is_empty() {
             return IndexMap::new();
         }
-        let Ok(mut conn) = open_instance_db().await else {
+        let Ok(mut conn) = self.pool.acquire().await else {
             return IndexMap::new();
         };
         let placeholders = guide_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
@@ -1361,7 +1358,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         for id in guide_ids {
             q = q.bind(id);
         }
-        match q.fetch_all(&mut conn).await {
+        match q.fetch_all(&mut *conn).await {
             Ok(rows) => rows
                 .into_iter()
                 .filter_map(|r| {
@@ -1381,14 +1378,14 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
     /// Non-fatal: returns empty IndexMap on DB error.
     /// Python oracle: FocusRun._load_operator_versions()
     async fn load_operator_versions(&self) -> IndexMap<String, String> {
-        let Ok(mut conn) = open_instance_db().await else {
+        let Ok(mut conn) = self.pool.acquire().await else {
             return IndexMap::new();
         };
         match sqlx::query(
             "SELECT artifact_id, version FROM artifact_versions \
              WHERE artifact_type = 'operator' AND revoked = 0",
         )
-        .fetch_all(&mut conn)
+        .fetch_all(&mut *conn)
         .await
         {
             Ok(rows) => rows
@@ -1627,10 +1624,10 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         // Floor consent preference (D5-152). Read from personas.extra_metadata in shared.db.
         // Non-fatal — consent gate fires normally if read fails.
         let floor_consent_preference: Option<String> = async {
-            let mut conn = open_instance_db().await.ok()?;
+            let mut conn = self.pool.acquire().await.ok()?;
             let row = sqlx::query("SELECT extra_metadata FROM personas WHERE id = ?")
                 .bind(&persona_id)
-                .fetch_optional(&mut conn)
+                .fetch_optional(&mut *conn)
                 .await
                 .ok()??;
             let extra_str: String = row.try_get("extra_metadata").ok()?;
@@ -1665,12 +1662,15 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         // preference set" -- StepExecutor turns None into the F10
         // MissingTier2Config failure rather than guessing a provider.
         let tier2_provider_preference: Option<String> = if execution_tier >= 2 {
-            let candidates =
-                crate::persistence::provider_store::list_providers_by_type("cloud_inference_api")
-                    .await
-                    .unwrap_or_default();
+            let candidates = crate::persistence::provider_store::list_providers_by_type(
+                &self.pool,
+                "cloud_inference_api",
+            )
+            .await
+            .unwrap_or_default();
             let candidate_ids: Vec<String> = candidates.into_iter().map(|p| p.id).collect();
             crate::persistence::user_provider_preference_store::find_preferred_provider(
+                &self.pool,
                 &user_id,
                 Some(&persona_id),
                 Some(&focus_id),
@@ -1725,6 +1725,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                 privacy_gateway,
                 &scheduler,
                 self.app_handle.as_ref(),
+                &self.pool,
             )
             .await)
     }
@@ -2218,9 +2219,13 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         };
 
         let ollama = crate::providers::ollama_client::OllamaClient::new();
-        let candidates =
-            crate::conductor::extract::extract_candidates(&step_outputs, &excluded_fields, &ollama)
-                .await;
+        let candidates = crate::conductor::extract::extract_candidates(
+            &step_outputs,
+            &excluded_fields,
+            &ollama,
+            crate::conductor::extract::SOURCE_CONDUCTOR_BATCH,
+        )
+        .await;
 
         if !candidates.is_empty() {
             // Invariant: focus_run_id must be set by AUTHORIZE before we reach here.
@@ -2259,6 +2264,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                     reason: c.reason.clone(),
                     confidence: c.confidence,
                     warn_flag: c.warn_flag,
+                    source: Some(c.source.clone()),
                 })
                 .collect();
 
@@ -2343,6 +2349,31 @@ pub async fn demote_interrupted_runs(
 mod tests {
     use super::*;
     use crate::conductor::types::TaskStep;
+
+    /// A lazy, never-connected shared.db pool (items.id=483) for FocusRun
+    /// test fixtures that never exercise a DB-touching method
+    /// (get_focus_tier_ceiling/authorize, or execute()'s tier>=1 model
+    /// selection) -- every fixture below stops well short of those paths
+    /// (pure in-memory methods, or execute() on a pre-sealed Tier 3 run,
+    /// which is a terminal boundary that returns before StepExecutor is
+    /// ever reached). connect_lazy_with never opens a real connection until
+    /// something is actually acquired against it, so this is safe to
+    /// construct freely without a tempdir/QR_DATA_ROOT.
+    fn dummy_pool() -> sqlx::SqlitePool {
+        // idle_timeout/max_lifetime/min_connections are disabled here: sqlx's
+        // default PoolOptions spawn a background reaper task unconditionally
+        // on pool creation (even for a lazy pool), which requires a Tokio
+        // runtime to be current. Several of this module's fixtures
+        // (output_sensitivity_* below) are plain #[test] functions with no
+        // Tokio runtime -- without disabling these options, constructing the
+        // pool itself panics with "this functionality requires a Tokio
+        // context" before any query is ever run.
+        sqlx::sqlite::SqlitePoolOptions::new()
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .min_connections(0)
+            .connect_lazy_with(sqlx::sqlite::SqliteConnectOptions::new().filename(":memory:"))
+    }
 
     // -------------------------------------------------------------------------
     // parse_focus_definition
@@ -2615,6 +2646,7 @@ mod tests {
             "u".to_owned(),
             "p".to_owned(),
             "f".to_owned(),
+            dummy_pool(),
             scheduler,
             "".to_owned(),
             false,
@@ -2663,6 +2695,7 @@ mod tests {
             "u".to_owned(),
             "p".to_owned(),
             "f".to_owned(),
+            dummy_pool(),
             scheduler,
             "".to_owned(),
             false,
@@ -2786,6 +2819,7 @@ mod tests {
             "u".to_owned(),
             persona_id.to_owned(),
             "f".to_owned(),
+            dummy_pool(),
             scheduler,
             "".to_owned(),
             false,
@@ -2981,6 +3015,7 @@ mod tests {
             "u".to_owned(),
             persona_id.to_owned(),
             "f".to_owned(),
+            dummy_pool(),
             scheduler,
             "".to_owned(),
             false,
@@ -3045,6 +3080,7 @@ mod tests {
             "u".to_owned(),
             "persona-work".to_owned(),
             "f".to_owned(),
+            dummy_pool(),
             scheduler,
             "".to_owned(),
             false,
@@ -3149,6 +3185,7 @@ mod tests {
             "u".to_owned(),
             "p".to_owned(),
             "f".to_owned(),
+            dummy_pool(),
             scheduler,
             "".to_owned(),
             false,
@@ -3277,6 +3314,7 @@ mod tests {
             "u".to_owned(),
             "p".to_owned(),
             "f".to_owned(),
+            dummy_pool(),
             scheduler,
             "".to_owned(),
             false,

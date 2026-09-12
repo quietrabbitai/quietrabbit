@@ -61,15 +61,12 @@ use super::{
     logger::{DisclosureLogEntry, DisclosureLogger},
     privacy_filter::{self, PfEntityDecoded},
     types::{ConsentRequestPayload, ConsentSpanItem, Gate3Result, ReviewTier},
+    PF_TIMEOUT_SECS,
 };
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-/// Maximum time allowed for the Privacy Filter FFI call inside spawn_blocking.
-/// IPC flag: timeout → gate_timeout event written to disclosure_log (D6-362).
-const PF_TIMEOUT_SECS: u64 = 10;
 
 /// Minimum confidence score for Low tier. The span must meet this threshold
 /// AND be in LOW_TIER_CATEGORIES. items.id=406: renamed from

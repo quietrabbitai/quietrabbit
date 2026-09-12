@@ -67,6 +67,19 @@ const CONFIDENCE_SUPPRESS: f64 = 0.6;
 /// Confidence at or above this threshold -> normal (no warn flag).
 const CONFIDENCE_WARN_CEILING: f64 = 0.8;
 
+/// Provenance values for extract_confirm_candidates.source (decisions.id=623).
+/// CHECK-constrained in schema to exactly these three (outputs_002.sql).
+/// Historian's batch pass over Conductor-flagged turns at FocusRun-completion --
+/// the only one of the three with a live caller today (this module's own
+/// post-execute extraction pass, called from lifecycle.rs execute_full_inner()).
+pub const SOURCE_CONDUCTOR_BATCH: &str = "conductor_batch";
+/// Document ingestion's Pathway A flow (decisions.id=487/488). No live caller
+/// yet -- ingest.rs's extraction intent is explicitly unbuilt (items.id=383).
+pub const SOURCE_INGEST_PATHWAY_A: &str = "ingest_pathway_a";
+/// Quick Close's disclosure-history branch (decisions.id=614). No live caller
+/// yet -- Historian/Quick Close have zero implementation (items.id=139, 263).
+pub const SOURCE_QUICK_CLOSE: &str = "quick_close";
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -81,6 +94,8 @@ pub struct ExtractCandidate {
     pub confidence: f64,
     /// True when confidence is in the 0.6-0.8 warn band.
     pub warn_flag: bool,
+    /// Provenance: one of SOURCE_CONDUCTOR_BATCH/SOURCE_INGEST_PATHWAY_A/SOURCE_QUICK_CLOSE.
+    pub source: String,
 }
 
 /// A persisted candidate row loaded from extract_confirm_candidates.
@@ -94,6 +109,8 @@ pub struct PersistedCandidate {
     pub confidence: f64,
     pub warn_flag: bool,
     pub status: String,
+    /// Nullable: rows persisted before outputs_002.sql added this column have no source.
+    pub source: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -226,10 +243,13 @@ fn validate_field_name(field_name: &str) -> bool {
 ///
 /// `excluded_fields`: focus field_requirements + existing personal.db field names.
 /// `step_outputs`:    Vec of (step_id, output_text) in execution order.
+/// `source`:          provenance tag for the resulting candidates -- one of
+///                     SOURCE_CONDUCTOR_BATCH/SOURCE_INGEST_PATHWAY_A/SOURCE_QUICK_CLOSE.
 pub async fn extract_candidates(
     step_outputs: &[(String, String)],
     excluded_fields: &[String],
     client: &OllamaClient,
+    source: &str,
 ) -> Vec<ExtractCandidate> {
     if step_outputs.is_empty() {
         return vec![];
@@ -294,14 +314,18 @@ Conversation:
     };
 
     // Step 5: parse and filter
-    parse_and_filter(&response_text, excluded_fields)
+    parse_and_filter(&response_text, excluded_fields, source)
 }
 
 // ---------------------------------------------------------------------------
 // parse_and_filter (module-local)
 // ---------------------------------------------------------------------------
 
-fn parse_and_filter(response_text: &str, excluded_fields: &[String]) -> Vec<ExtractCandidate> {
+fn parse_and_filter(
+    response_text: &str,
+    excluded_fields: &[String],
+    source: &str,
+) -> Vec<ExtractCandidate> {
     // Strip markdown fences if model wrapped the JSON
     let trimmed = response_text.trim();
     let json_str = if trimmed.starts_with("```") {
@@ -417,6 +441,7 @@ fn parse_and_filter(response_text: &str, excluded_fields: &[String]) -> Vec<Extr
             reason,
             confidence,
             warn_flag,
+            source: source.to_owned(),
         });
     }
 
@@ -449,8 +474,8 @@ pub async fn persist_candidates(
         let row = sqlx::query(
             "INSERT INTO extract_confirm_candidates
              (focus_run_id, field_name, extracted_value, sensitivity,
-              reason, confidence, status, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+              reason, confidence, source, status, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
              RETURNING id",
         )
         .bind(focus_run_id)
@@ -459,6 +484,7 @@ pub async fn persist_candidates(
         .bind(&c.sensitivity)
         .bind(&c.reason)
         .bind(c.confidence)
+        .bind(&c.source)
         .bind(&now)
         .bind(&now)
         .fetch_one(&mut conn)
@@ -485,7 +511,7 @@ pub async fn load_pending_candidates(
     let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
 
     let rows = sqlx::query(
-        "SELECT id, field_name, extracted_value, sensitivity, reason, confidence, status
+        "SELECT id, field_name, extracted_value, sensitivity, reason, confidence, source, status
          FROM extract_confirm_candidates
          WHERE focus_run_id = ? AND status = 'pending'
          ORDER BY id",
@@ -506,6 +532,7 @@ pub async fn load_pending_candidates(
                 confidence,
                 warn_flag: confidence < CONFIDENCE_WARN_CEILING,
                 status: r.try_get("status")?,
+                source: r.try_get("source")?,
             })
         })
         .collect()
@@ -800,7 +827,7 @@ mod tests {
             {"field_name": "home_city", "value": "Austin", "reason": "useful", "confidence": 0.5},
             {"field_name": "occupation", "value": "engineer", "reason": "useful", "confidence": 0.9}
         ]"#;
-        let result = parse_and_filter(json, &[]);
+        let result = parse_and_filter(json, &[], "conductor_batch");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].field_name, "occupation");
     }
@@ -811,7 +838,7 @@ mod tests {
             {"field_name": "home_city", "value": "Austin", "reason": "r", "confidence": 1.7},
             {"field_name": "occupation", "value": "engineer", "reason": "r", "confidence": -0.5}
         ]"#;
-        let result = parse_and_filter(json, &[]);
+        let result = parse_and_filter(json, &[], "conductor_batch");
         assert!(result.is_empty());
     }
 
@@ -821,7 +848,7 @@ mod tests {
             {"field_name": "home_city", "value": "Austin", "reason": "useful", "confidence": 0.9}
         ]"#;
         let excluded = vec!["home_city".to_owned()];
-        let result = parse_and_filter(json, &excluded);
+        let result = parse_and_filter(json, &excluded, "conductor_batch");
         assert!(result.is_empty());
     }
 
@@ -831,7 +858,7 @@ mod tests {
             {"field_name": "home_city", "value": "Austin", "reason": "r", "confidence": 0.9},
             {"field_name": "home_city", "value": "Dallas", "reason": "r", "confidence": 0.85}
         ]"#;
-        let result = parse_and_filter(json, &[]);
+        let result = parse_and_filter(json, &[], "conductor_batch");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].extracted_value, "Austin");
     }
@@ -842,19 +869,19 @@ mod tests {
             {"field_name": "bad field", "value": "x", "reason": "r", "confidence": 0.9},
             {"field_name": "Home_City", "value": "x", "reason": "r", "confidence": 0.9}
         ]"#;
-        let result = parse_and_filter(json, &[]);
+        let result = parse_and_filter(json, &[], "conductor_batch");
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_parse_and_filter_empty_array() {
-        let result = parse_and_filter("[]", &[]);
+        let result = parse_and_filter("[]", &[], "conductor_batch");
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_parse_and_filter_bad_json() {
-        let result = parse_and_filter("not json at all", &[]);
+        let result = parse_and_filter("not json at all", &[], "conductor_batch");
         assert!(result.is_empty());
     }
 
@@ -863,7 +890,7 @@ mod tests {
         let json = r#"[
             {"field_name": "preferred_name", "value": "Alex", "reason": "r", "confidence": 0.7}
         ]"#;
-        let result = parse_and_filter(json, &[]);
+        let result = parse_and_filter(json, &[], "conductor_batch");
         assert_eq!(result.len(), 1);
         assert!(result[0].warn_flag);
     }
@@ -873,7 +900,7 @@ mod tests {
         let json = r#"[
             {"field_name": "home_city", "value": "Austin", "reason": "r", "confidence": 0.85}
         ]"#;
-        let result = parse_and_filter(json, &[]);
+        let result = parse_and_filter(json, &[], "conductor_batch");
         assert_eq!(result.len(), 1);
         assert!(!result[0].warn_flag);
     }
@@ -881,7 +908,7 @@ mod tests {
     #[test]
     fn test_parse_and_filter_strips_markdown_fences() {
         let json = "```json\n[{\"field_name\":\"home_city\",\"value\":\"Austin\",\"reason\":\"r\",\"confidence\":0.9}]\n```";
-        let result = parse_and_filter(json, &[]);
+        let result = parse_and_filter(json, &[], "conductor_batch");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].field_name, "home_city");
     }

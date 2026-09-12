@@ -214,6 +214,7 @@ pub async fn list_messages(
 pub async fn send_message(
     app_handle: tauri::AppHandle,
     scheduler: tauri::State<'_, Arc<ConductorScheduler>>,
+    pool: tauri::State<'_, sqlx::SqlitePool>,
     key_registry: State<'_, KeyRegistry>,
     user_id: String,
     persona_id: String,
@@ -271,6 +272,7 @@ pub async fn send_message(
     let mut run = execution::load_and_authorize_run(
         app_handle,
         scheduler,
+        pool,
         key_hex_str.clone(),
         crisis_detected,
         request,
@@ -672,7 +674,9 @@ mod tests {
         .await
         .expect("save_message must succeed");
 
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(sqlx::SqlitePool::connect_lazy_with(
+            sqlx::sqlite::SqliteConnectOptions::new().filename(":memory:"),
+        ));
         let registry = app.state::<KeyRegistry>();
         populate_registry(&registry, USER_ID, MASTER_KEY).await;
 
@@ -694,7 +698,9 @@ mod tests {
     async fn list_messages_command_returns_empty_vec_for_unknown_context_key() {
         let _env = setup().await;
 
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(sqlx::SqlitePool::connect_lazy_with(
+            sqlx::sqlite::SqliteConnectOptions::new().filename(":memory:"),
+        ));
         let registry = app.state::<KeyRegistry>();
         populate_registry(&registry, USER_ID, MASTER_KEY).await;
 

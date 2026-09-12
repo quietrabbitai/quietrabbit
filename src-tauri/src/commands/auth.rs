@@ -97,33 +97,6 @@ pub struct SessionInfo {
 }
 
 // ---------------------------------------------------------------------------
-// shared.db opener (for auth_sessions/auth_failures/auth_lockouts)
-// ---------------------------------------------------------------------------
-// Duplicated from persona_store.rs/user_store.rs rather than reused, same
-// reasoning as user_store.rs's own header: coupling to a foreign error
-// type isn't worth it for ~12 lines with no per-caller variation.
-
-async fn open_shared_db() -> Result<sqlx::SqliteConnection, String> {
-    use sqlx::sqlite::SqliteConnectOptions;
-    use sqlx::ConnectOptions;
-
-    let db_path = crate::persistence::migrations::get_data_root()
-        .join("instance")
-        .join("shared.db");
-    let network_storage = std::env::var("QR_NETWORK_STORAGE")
-        .map(|v| v.to_lowercase() == "true")
-        .unwrap_or(false);
-    let journal_mode = if network_storage { "DELETE" } else { "WAL" };
-    SqliteConnectOptions::new()
-        .filename(&db_path)
-        .create_if_missing(false)
-        .pragma("journal_mode", journal_mode)
-        .connect()
-        .await
-        .map_err(|e| format!("couldn't open shared.db: {e}"))
-}
-
-// ---------------------------------------------------------------------------
 // Key verification against integration_keys.db
 // ---------------------------------------------------------------------------
 
@@ -200,11 +173,11 @@ async fn verify_integration_keys_db(user_id: &str, key_hex: &str) -> Result<(), 
 /// (its current, unchanged default -- this session builds bookkeeping,
 /// not enforcement). Queries the flag rather than hardcoding false, so
 /// flipping enforcement on later is a data change, not a code change.
-async fn is_locked_out(display_name: &str) -> Result<bool, String> {
-    let mut conn = open_shared_db().await?;
+async fn is_locked_out(pool: &sqlx::SqlitePool, display_name: &str) -> Result<bool, String> {
+    let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
     let enabled: Option<(String,)> =
         sqlx::query_as("SELECT value FROM instance_config WHERE key = 'auth_lockout_enabled'")
-            .fetch_optional(&mut conn)
+            .fetch_optional(&mut *conn)
             .await
             .map_err(|e| e.to_string())?;
 
@@ -215,7 +188,7 @@ async fn is_locked_out(display_name: &str) -> Result<bool, String> {
     let row: Option<(String,)> =
         sqlx::query_as("SELECT locked_until FROM auth_lockouts WHERE display_name = ?")
             .bind(display_name)
-            .fetch_optional(&mut conn)
+            .fetch_optional(&mut *conn)
             .await
             .map_err(|e| e.to_string())?;
 
@@ -230,8 +203,8 @@ async fn is_locked_out(display_name: &str) -> Result<bool, String> {
 /// Record a failed attempt in auth_failures. Lockout THRESHOLD/DURATION
 /// logic is deliberately not built here (policy, not mechanism -- see
 /// module header) -- this only appends the bookkeeping row.
-async fn record_failed_attempt(display_name: &str) -> Result<(), String> {
-    let mut conn = open_shared_db().await?;
+async fn record_failed_attempt(pool: &sqlx::SqlitePool, display_name: &str) -> Result<(), String> {
+    let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
     sqlx::query(
         "INSERT INTO auth_failures (id, display_name, attempted_at)
          VALUES (?, ?, ?)",
@@ -239,7 +212,7 @@ async fn record_failed_attempt(display_name: &str) -> Result<(), String> {
     .bind(uuid::Uuid::new_v4().to_string())
     .bind(display_name)
     .bind(crate::providers::utils::now())
-    .execute(&mut conn)
+    .execute(&mut *conn)
     .await
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -256,8 +229,9 @@ pub async fn login(
     password: String,
     key_registry: State<'_, KeyRegistry>,
     group_key_registry: State<'_, GroupKeyRegistry>,
+    pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<(), String> {
-    let has_users = user_store::has_any_users()
+    let has_users = user_store::has_any_users(&pool)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -290,6 +264,7 @@ pub async fn login(
             sharing_keypair::derive_sharing_keypair(&master_key, &user_id);
 
         user_store::create_user(
+            &pool,
             &user_id,
             &display_name,
             "admin",
@@ -334,20 +309,27 @@ pub async fn login(
         // onboarding runs -- a real, named, deliberate intermediate
         // state, not an oversight. >>>
 
-        finish_login(&user_id, master_key, &key_registry, &group_key_registry).await
+        finish_login(
+            &user_id,
+            master_key,
+            &key_registry,
+            &group_key_registry,
+            &pool,
+        )
+        .await
     } else {
-        let user = user_store::find_user_by_display_name(&display_name)
+        let user = user_store::find_user_by_display_name(&pool, &display_name)
             .await
             .map_err(|e| e.to_string())?
             // Same error message as a wrong password below -- do not
             // reveal whether the display_name itself exists.
             .ok_or_else(|| "invalid credentials".to_owned())?;
 
-        if is_locked_out(&display_name).await? {
+        if is_locked_out(&pool, &display_name).await? {
             return Err("account locked, try again later".to_owned());
         }
 
-        let (salt, mem, iter, par) = user_store::get_salt_params(&user.id)
+        let (salt, mem, iter, par) = user_store::get_salt_params(&pool, &user.id)
             .await
             .map_err(|e| e.to_string())?
             .ok_or_else(|| {
@@ -364,7 +346,7 @@ pub async fn login(
 
         match verify_integration_keys_db(&user.id, &key_hex(&candidate_key)).await {
             Err(KeyVerification::WrongKey) => {
-                record_failed_attempt(&display_name).await?;
+                record_failed_attempt(&pool, &display_name).await?;
                 Err("invalid credentials".to_owned())
             }
             Err(KeyVerification::Other(msg)) => {
@@ -374,7 +356,14 @@ pub async fn login(
                 Err(format!("couldn't verify credentials: {msg}"))
             }
             Ok(()) => {
-                finish_login(&user.id, candidate_key, &key_registry, &group_key_registry).await
+                finish_login(
+                    &user.id,
+                    candidate_key,
+                    &key_registry,
+                    &group_key_registry,
+                    &pool,
+                )
+                .await
             }
         }
     }
@@ -402,6 +391,7 @@ async fn finish_login(
     master_key: [u8; kdf::MASTER_KEY_LEN],
     key_registry: &State<'_, KeyRegistry>,
     group_key_registry: &State<'_, GroupKeyRegistry>,
+    pool: &sqlx::SqlitePool,
 ) -> Result<(), String> {
     let now = crate::providers::utils::now();
 
@@ -430,6 +420,7 @@ async fn finish_login(
     // login into an Err.
     let personal_key_hex_for_sync = key_hex(&master_key);
     crate::persona_sync::engine::pull_all_accepted_shares_on_login(
+        pool,
         user_id,
         &personal_key_hex_for_sync,
         &sharing_private_key,
@@ -441,6 +432,7 @@ async fn finish_login(
     // separate sibling call for the same module-separation reasoning
     // persona_view_sync::engine's own header gives.
     crate::persona_view_sync::engine::pull_all_accepted_view_shares_on_login(
+        pool,
         user_id,
         &personal_key_hex_for_sync,
         &sharing_private_key,
@@ -459,7 +451,7 @@ async fn finish_login(
     // improvement (there would be no way to fix the row without being able
     // to log in in the first place).
     let personal_key_hex = key_hex(&master_key);
-    match persona_store::list_personas_for_user(user_id).await {
+    match persona_store::list_personas_for_user(pool, user_id).await {
         Ok(personas) => {
             for persona in personas {
                 match group_key_store::list_group_keys(user_id, &persona.id, &personal_key_hex)
@@ -503,7 +495,7 @@ async fn finish_login(
         ),
     }
 
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
     // Section 3.1: absolute session lifetime, "hard ceiling... currently
     // 30 days... stays out of the settings surface entirely" -- a
     // constant, not a per-row/per-user configurable field (unlike
@@ -519,7 +511,7 @@ async fn finish_login(
     .bind(&now)
     .bind(&now)
     .bind(&expires_at)
-    .execute(&mut conn)
+    .execute(&mut *conn)
     .await
     .map_err(|e| e.to_string())?;
 
@@ -528,12 +520,22 @@ async fn finish_login(
 
 #[tauri::command]
 #[specta::specta]
-pub async fn logout(key_registry: State<'_, KeyRegistry>) -> Result<(), String> {
+pub async fn logout(
+    key_registry: State<'_, KeyRegistry>,
+    group_key_registry: State<'_, GroupKeyRegistry>,
+    pool: State<'_, sqlx::SqlitePool>,
+) -> Result<(), String> {
     let user_id = key_registry.with_key(|k| k.user_id.clone()).await;
     key_registry.clear().await;
 
     if let Some(user_id) = user_id {
-        let mut conn = open_shared_db().await?;
+        // items.id=469: group keys are per-Persona, not per-account, so
+        // clearing KeyRegistry alone left every Persona's group key
+        // resident until process exit. See auth::clear_group_keys_for_user
+        // for the enumerate-and-clear logic shared with idle-timeout.
+        crate::auth::clear_group_keys_for_user(&pool, &group_key_registry, &user_id).await;
+
+        let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
         let now = crate::providers::utils::now();
         // Soft-expire (Jason's direction, 2026-08-01): update expires_at
         // rather than DELETE, to preserve an audit trail of when sessions
@@ -545,7 +547,7 @@ pub async fn logout(key_registry: State<'_, KeyRegistry>) -> Result<(), String> 
         .bind(&now)
         .bind(&user_id)
         .bind(&now)
-        .execute(&mut conn)
+        .execute(&mut *conn)
         .await
         .map_err(|e| e.to_string())?;
     }
@@ -561,10 +563,13 @@ pub async fn logout(key_registry: State<'_, KeyRegistry>) -> Result<(), String> 
 /// a stray ping racing a logout is expected, not exceptional.
 #[tauri::command]
 #[specta::specta]
-pub async fn record_activity(key_registry: State<'_, KeyRegistry>) -> Result<(), String> {
+pub async fn record_activity(
+    key_registry: State<'_, KeyRegistry>,
+    pool: State<'_, sqlx::SqlitePool>,
+) -> Result<(), String> {
     let user_id = key_registry.with_key(|k| k.user_id.clone()).await;
     if let Some(user_id) = user_id {
-        let mut conn = open_shared_db().await?;
+        let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
         let now = crate::providers::utils::now();
         sqlx::query(
             "UPDATE auth_sessions SET last_active_at = ?
@@ -573,7 +578,7 @@ pub async fn record_activity(key_registry: State<'_, KeyRegistry>) -> Result<(),
         .bind(&now)
         .bind(&user_id)
         .bind(&now)
-        .execute(&mut conn)
+        .execute(&mut *conn)
         .await
         .map_err(|e| e.to_string())?;
     }
@@ -617,12 +622,13 @@ pub async fn get_recovery_key_display(
 #[specta::specta]
 pub async fn get_session(
     key_registry: State<'_, KeyRegistry>,
+    pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<Option<SessionInfo>, String> {
     let Some(user_id) = key_registry.with_key(|k| k.user_id.clone()).await else {
         return Ok(None);
     };
 
-    let user = user_store::find_user_by_id(&user_id)
+    let user = user_store::find_user_by_id(&pool, &user_id)
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "internal error: session references a nonexistent user".to_owned())?;
@@ -657,6 +663,7 @@ mod tests {
         _tempdir: tempfile::TempDir,
         _lock: std::sync::MutexGuard<'static, ()>,
         saved_root: Option<String>,
+        pool: sqlx::SqlitePool,
     }
 
     impl Drop for TestEnv {
@@ -679,10 +686,18 @@ mod tests {
             .await
             .expect("shared.db migration must succeed in test setup");
 
+        let pool =
+            sqlx::SqlitePool::connect_with(crate::providers::utils::connect_options_unencrypted(
+                &crate::providers::utils::db_path_shared(),
+            ))
+            .await
+            .expect("shared.db pool must connect");
+
         TestEnv {
             _tempdir: tempdir,
             _lock: lock,
             saved_root,
+            pool,
         }
     }
 
@@ -692,25 +707,28 @@ mod tests {
     /// file (verified against tauri 2.11.x docs this session). Commands
     /// are called directly as functions, not through the IPC layer -- this
     /// tests login()/logout()'s own logic, not Tauri's invoke plumbing.
-    fn mock_app_with_registry() -> tauri::App<tauri::test::MockRuntime> {
+    fn mock_app_with_registry(pool: sqlx::SqlitePool) -> tauri::App<tauri::test::MockRuntime> {
         let app = tauri::test::mock_app();
         app.manage(KeyRegistry::default());
         app.manage(GroupKeyRegistry::default());
+        app.manage(pool);
         app
     }
 
     #[tokio::test]
     async fn bootstrap_login_creates_primary_admin_and_populates_registry() {
         let _env = setup().await;
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         let group_key_registry = app.state::<GroupKeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
 
         let result = login(
             "Alice".to_owned(),
             "correct horse battery staple".to_owned(),
             registry.clone(),
             group_key_registry.clone(),
+            pool.clone(),
         )
         .await;
         assert!(result.is_ok(), "bootstrap login should succeed: {result:?}");
@@ -719,7 +737,7 @@ mod tests {
             "registry should hold a key after bootstrap login"
         );
 
-        let user = user_store::find_user_by_display_name("Alice")
+        let user = user_store::find_user_by_display_name(&pool, "Alice")
             .await
             .unwrap();
         assert!(user.is_some());
@@ -731,22 +749,24 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_login_writes_a_session_row() {
         let _env = setup().await;
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         let group_key_registry = app.state::<GroupKeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
 
         login(
             "Alice".to_owned(),
             "password123".to_owned(),
             registry.clone(),
             group_key_registry.clone(),
+            pool.clone(),
         )
         .await
         .unwrap();
 
-        let mut conn = open_shared_db().await.unwrap();
+        let mut conn = pool.acquire().await.unwrap();
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM auth_sessions")
-            .fetch_one(&mut conn)
+            .fetch_one(&mut *conn)
             .await
             .unwrap();
         assert_eq!(
@@ -758,22 +778,24 @@ mod tests {
     #[tokio::test]
     async fn record_activity_updates_last_active_at_for_the_logged_in_user() {
         let _env = setup().await;
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         let group_key_registry = app.state::<GroupKeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
 
         login(
             "Alice".to_owned(),
             "correct horse battery staple".to_owned(),
             registry.clone(),
             group_key_registry.clone(),
+            pool.clone(),
         )
         .await
         .unwrap();
 
-        let mut conn = open_shared_db().await.unwrap();
+        let mut conn = pool.acquire().await.unwrap();
         let original: String = sqlx::query_scalar("SELECT last_active_at FROM auth_sessions")
-            .fetch_one(&mut conn)
+            .fetch_one(&mut *conn)
             .await
             .unwrap();
 
@@ -783,10 +805,12 @@ mod tests {
         // granularity between two calls a few microseconds apart.
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
 
-        record_activity(registry.clone()).await.unwrap();
+        record_activity(registry.clone(), pool.clone())
+            .await
+            .unwrap();
 
         let updated: String = sqlx::query_scalar("SELECT last_active_at FROM auth_sessions")
-            .fetch_one(&mut conn)
+            .fetch_one(&mut *conn)
             .await
             .unwrap();
         assert!(
@@ -802,15 +826,17 @@ mod tests {
         // primary admin (which the DB would reject anyway via the partial
         // unique index -- but login() should never attempt it).
         let _env = setup().await;
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         let group_key_registry = app.state::<GroupKeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
 
         login(
             "Alice".to_owned(),
             "password123".to_owned(),
             registry.clone(),
             group_key_registry.clone(),
+            pool.clone(),
         )
         .await
         .unwrap();
@@ -821,6 +847,7 @@ mod tests {
             "password123".to_owned(),
             registry.clone(),
             group_key_registry.clone(),
+            pool.clone(),
         )
         .await;
         assert!(
@@ -832,15 +859,17 @@ mod tests {
     #[tokio::test]
     async fn wrong_password_on_existing_account_fails_and_does_not_populate_registry() {
         let _env = setup().await;
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         let group_key_registry = app.state::<GroupKeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
 
         login(
             "Alice".to_owned(),
             "correct-password".to_owned(),
             registry.clone(),
             group_key_registry.clone(),
+            pool.clone(),
         )
         .await
         .unwrap();
@@ -851,6 +880,7 @@ mod tests {
             "wrong-password".to_owned(),
             registry.clone(),
             group_key_registry.clone(),
+            pool.clone(),
         )
         .await;
         assert!(result.is_err(), "wrong password must fail");
@@ -863,15 +893,17 @@ mod tests {
     #[tokio::test]
     async fn wrong_password_records_a_failed_attempt() {
         let _env = setup().await;
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         let group_key_registry = app.state::<GroupKeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
 
         login(
             "Alice".to_owned(),
             "correct-password".to_owned(),
             registry.clone(),
             group_key_registry.clone(),
+            pool.clone(),
         )
         .await
         .unwrap();
@@ -882,13 +914,14 @@ mod tests {
             "wrong-password".to_owned(),
             registry.clone(),
             group_key_registry.clone(),
+            pool.clone(),
         )
         .await;
 
-        let mut conn = open_shared_db().await.unwrap();
+        let mut conn = pool.acquire().await.unwrap();
         let count: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM auth_failures WHERE display_name = 'Alice'")
-                .fetch_one(&mut conn)
+                .fetch_one(&mut *conn)
                 .await
                 .unwrap();
         assert_eq!(
@@ -900,9 +933,10 @@ mod tests {
     #[tokio::test]
     async fn unknown_display_name_fails_without_revealing_nonexistence() {
         let _env = setup().await;
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         let group_key_registry = app.state::<GroupKeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
 
         // Bootstrap someone first so has_any_users() is true and this
         // exercises the existing-account branch, not bootstrap.
@@ -911,6 +945,7 @@ mod tests {
             "password123".to_owned(),
             registry.clone(),
             group_key_registry.clone(),
+            pool.clone(),
         )
         .await
         .unwrap();
@@ -921,6 +956,7 @@ mod tests {
             "whatever".to_owned(),
             registry.clone(),
             group_key_registry.clone(),
+            pool.clone(),
         )
         .await;
         assert_eq!(result, Err("invalid credentials".to_owned()));
@@ -929,21 +965,25 @@ mod tests {
     #[tokio::test]
     async fn logout_clears_the_registry() {
         let _env = setup().await;
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         let group_key_registry = app.state::<GroupKeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
 
         login(
             "Alice".to_owned(),
             "password123".to_owned(),
             registry.clone(),
             group_key_registry.clone(),
+            pool.clone(),
         )
         .await
         .unwrap();
         assert!(registry.is_occupied().await);
 
-        logout(registry.clone()).await.unwrap();
+        logout(registry.clone(), group_key_registry.clone(), pool.clone())
+            .await
+            .unwrap();
         assert!(
             !registry.is_occupied().await,
             "registry must be empty after logout"
@@ -951,27 +991,171 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logout_soft_expires_the_session_row_rather_than_deleting_it() {
+    async fn logout_clears_group_keys_for_every_persona_under_the_account_but_not_others() {
+        // items.id=469: logout() previously called only key_registry.clear()
+        // -- group keys resident for the logged-out account's Personas
+        // outlived the session. This exercises the multi-Persona case
+        // (one account can have more than one Persona) and confirms the
+        // eviction is scoped correctly: a different account's Persona group
+        // key must survive this account's logout.
         let _env = setup().await;
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         let group_key_registry = app.state::<GroupKeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
 
         login(
             "Alice".to_owned(),
             "password123".to_owned(),
             registry.clone(),
             group_key_registry.clone(),
+            pool.clone(),
         )
         .await
         .unwrap();
-        logout(registry.clone()).await.unwrap();
+        let alice = user_store::find_user_by_display_name(&pool, "Alice")
+            .await
+            .unwrap()
+            .unwrap();
 
-        let mut conn = open_shared_db().await.unwrap();
+        let alice_persona_1 = uuid::Uuid::new_v4().to_string();
+        let alice_persona_2 = uuid::Uuid::new_v4().to_string();
+        persona_store::create_persona(
+            &pool,
+            &alice_persona_1,
+            "Alice Persona 1",
+            "personal",
+            &alice.id,
+            None,
+        )
+        .await
+        .expect("create_persona must succeed");
+        persona_store::create_persona(
+            &pool,
+            &alice_persona_2,
+            "Alice Persona 2",
+            "personal",
+            &alice.id,
+            None,
+        )
+        .await
+        .expect("create_persona must succeed");
+
+        // A different account's Persona -- registry.clear_persona() must
+        // never touch this, since it belongs to an account other than the
+        // one logging out (even though KeyRegistry's single-slot model
+        // means only one account's master key can ever be resident at a
+        // time, GroupKeyRegistry itself has no such constraint).
+        let bob_id = uuid::Uuid::new_v4().to_string();
+        user_store::create_user(
+            &pool,
+            &bob_id,
+            "Bob",
+            "user",
+            false,
+            &[0u8; 16],
+            kdf::DEFAULT_ARGON2_MEMORY_KIB,
+            kdf::DEFAULT_ARGON2_ITERATIONS,
+            kdf::DEFAULT_ARGON2_PARALLELISM,
+            &[0u8; 32],
+        )
+        .await
+        .expect("create_user must succeed");
+        let bob_persona = uuid::Uuid::new_v4().to_string();
+        persona_store::create_persona(
+            &pool,
+            &bob_persona,
+            "Bob Persona",
+            "personal",
+            &bob_id,
+            None,
+        )
+        .await
+        .expect("create_persona must succeed");
+
+        for (persona_id, group_id) in [
+            (&alice_persona_1, "group-a1"),
+            (&alice_persona_2, "group-a2"),
+            (&bob_persona, "group-b1"),
+        ] {
+            group_key_registry
+                .replace(
+                    persona_id,
+                    group_id,
+                    UnlockedGroupKey {
+                        group_id: group_id.to_owned(),
+                        group_key: [0xAAu8; kdf::MASTER_KEY_LEN],
+                        unlocked_at: crate::providers::utils::now(),
+                    },
+                )
+                .await;
+        }
+        assert!(
+            group_key_registry
+                .is_occupied(&alice_persona_1, "group-a1")
+                .await
+        );
+        assert!(
+            group_key_registry
+                .is_occupied(&alice_persona_2, "group-a2")
+                .await
+        );
+        assert!(
+            group_key_registry
+                .is_occupied(&bob_persona, "group-b1")
+                .await
+        );
+
+        logout(registry.clone(), group_key_registry.clone(), pool.clone())
+            .await
+            .unwrap();
+
+        assert!(
+            !group_key_registry
+                .is_occupied(&alice_persona_1, "group-a1")
+                .await,
+            "logout must evict this account's first Persona's group keys"
+        );
+        assert!(
+            !group_key_registry
+                .is_occupied(&alice_persona_2, "group-a2")
+                .await,
+            "logout must evict this account's second Persona's group keys too"
+        );
+        assert!(
+            group_key_registry
+                .is_occupied(&bob_persona, "group-b1")
+                .await,
+            "logout must not clear a different account's Persona group keys"
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_soft_expires_the_session_row_rather_than_deleting_it() {
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let registry = app.state::<KeyRegistry>();
+        let group_key_registry = app.state::<GroupKeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
+
+        login(
+            "Alice".to_owned(),
+            "password123".to_owned(),
+            registry.clone(),
+            group_key_registry.clone(),
+            pool.clone(),
+        )
+        .await
+        .unwrap();
+        logout(registry.clone(), group_key_registry.clone(), pool.clone())
+            .await
+            .unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
         // Row must still exist (not deleted) -- audit trail, Jason's
         // direction, 2026-08-01.
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM auth_sessions")
-            .fetch_one(&mut conn)
+            .fetch_one(&mut *conn)
             .await
             .unwrap();
         assert_eq!(
@@ -980,7 +1164,7 @@ mod tests {
         );
 
         let row: (String,) = sqlx::query_as("SELECT expires_at FROM auth_sessions LIMIT 1")
-            .fetch_one(&mut conn)
+            .fetch_one(&mut *conn)
             .await
             .unwrap();
         let now = crate::providers::utils::now();
@@ -993,20 +1177,22 @@ mod tests {
     #[tokio::test]
     async fn logout_on_empty_registry_is_a_no_op_not_an_error() {
         let _env = setup().await;
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         let group_key_registry = app.state::<GroupKeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
 
-        let result = logout(registry.clone()).await;
+        let result = logout(registry.clone(), group_key_registry.clone(), pool.clone()).await;
         assert!(result.is_ok(), "logout with no resident key must not error");
     }
 
     #[tokio::test]
     async fn get_recovery_key_display_fails_without_a_resident_session() {
         let _env = setup().await;
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
-        let group_key_registry = app.state::<GroupKeyRegistry>();
+        let _group_key_registry = app.state::<GroupKeyRegistry>();
+        let _pool = app.state::<sqlx::SqlitePool>();
 
         let result = get_recovery_key_display(registry.clone()).await;
         assert_eq!(result.err(), Some("not logged in".to_owned()));
@@ -1018,15 +1204,17 @@ mod tests {
         // on the displayed phrase must reconstruct the original 32 bytes
         // bit-for-bit, no wrapping.
         let _env = setup().await;
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         let group_key_registry = app.state::<GroupKeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
 
         login(
             "Alice".to_owned(),
             "correct horse battery staple".to_owned(),
             registry.clone(),
             group_key_registry.clone(),
+            pool.clone(),
         )
         .await
         .unwrap();
@@ -1054,38 +1242,41 @@ mod tests {
     #[tokio::test]
     async fn get_session_with_no_resident_key_returns_ok_none() {
         let _env = setup().await;
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
-        let group_key_registry = app.state::<GroupKeyRegistry>();
+        let _group_key_registry = app.state::<GroupKeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
 
-        let result = get_session(registry.clone()).await;
+        let result = get_session(registry.clone(), pool.clone()).await;
         assert_eq!(result, Ok(None));
     }
 
     #[tokio::test]
     async fn get_session_after_login_returns_session_info() {
         let _env = setup().await;
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         let group_key_registry = app.state::<GroupKeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
 
         login(
             "Alice".to_owned(),
             "correct horse battery staple".to_owned(),
             registry.clone(),
             group_key_registry.clone(),
+            pool.clone(),
         )
         .await
         .unwrap();
 
-        let session = get_session(registry.clone()).await.unwrap();
+        let session = get_session(registry.clone(), pool.clone()).await.unwrap();
         assert!(session.is_some());
         let session = session.unwrap();
         assert_eq!(session.display_name, "Alice");
         assert_eq!(session.role, "admin");
         assert!(session.is_primary);
 
-        let user = user_store::find_user_by_display_name("Alice")
+        let user = user_store::find_user_by_display_name(&pool, "Alice")
             .await
             .unwrap()
             .unwrap();
@@ -1095,23 +1286,30 @@ mod tests {
     #[tokio::test]
     async fn get_session_after_logout_reverts_to_none() {
         let _env = setup().await;
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         let group_key_registry = app.state::<GroupKeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
 
         login(
             "Alice".to_owned(),
             "password123".to_owned(),
             registry.clone(),
             group_key_registry.clone(),
+            pool.clone(),
         )
         .await
         .unwrap();
-        assert!(get_session(registry.clone()).await.unwrap().is_some());
+        assert!(get_session(registry.clone(), pool.clone())
+            .await
+            .unwrap()
+            .is_some());
 
-        logout(registry.clone()).await.unwrap();
+        logout(registry.clone(), group_key_registry.clone(), pool.clone())
+            .await
+            .unwrap();
 
-        let result = get_session(registry.clone()).await;
+        let result = get_session(registry.clone(), pool.clone()).await;
         assert_eq!(result, Ok(None));
     }
 
@@ -1120,29 +1318,38 @@ mod tests {
     #[tokio::test]
     async fn login_rehydrates_group_key_registry_from_personal_db() {
         let _env = setup().await;
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         let group_key_registry = app.state::<GroupKeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
 
         login(
             "Alice".to_owned(),
             "password123".to_owned(),
             registry.clone(),
             group_key_registry.clone(),
+            pool.clone(),
         )
         .await
         .unwrap();
 
-        let user = user_store::find_user_by_display_name("Alice")
+        let user = user_store::find_user_by_display_name(&pool, "Alice")
             .await
             .unwrap()
             .unwrap();
         let personal_key_hex = registry.personal_key_hex().await.unwrap();
 
         let persona_id = uuid::Uuid::new_v4().to_string();
-        persona_store::create_persona(&persona_id, "Test Persona", "personal", &user.id, None)
-            .await
-            .expect("create_persona must succeed");
+        persona_store::create_persona(
+            &pool,
+            &persona_id,
+            "Test Persona",
+            "personal",
+            &user.id,
+            None,
+        )
+        .await
+        .expect("create_persona must succeed");
 
         let group_id = "group-rehydrate-1";
         let group_key_hex = "11".repeat(kdf::MASTER_KEY_LEN);
@@ -1172,6 +1379,7 @@ mod tests {
             "password123".to_owned(),
             registry.clone(),
             group_key_registry.clone(),
+            pool.clone(),
         )
         .await
         .expect("second login must succeed");
@@ -1194,29 +1402,38 @@ mod tests {
         // over one ancillary row would be a support-ticket bug, not a
         // safety improvement.
         let _env = setup().await;
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         let group_key_registry = app.state::<GroupKeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
 
         login(
             "Alice".to_owned(),
             "password123".to_owned(),
             registry.clone(),
             group_key_registry.clone(),
+            pool.clone(),
         )
         .await
         .unwrap();
 
-        let user = user_store::find_user_by_display_name("Alice")
+        let user = user_store::find_user_by_display_name(&pool, "Alice")
             .await
             .unwrap()
             .unwrap();
         let personal_key_hex = registry.personal_key_hex().await.unwrap();
 
         let persona_id = uuid::Uuid::new_v4().to_string();
-        persona_store::create_persona(&persona_id, "Test Persona", "personal", &user.id, None)
-            .await
-            .expect("create_persona must succeed");
+        persona_store::create_persona(
+            &pool,
+            &persona_id,
+            "Test Persona",
+            "personal",
+            &user.id,
+            None,
+        )
+        .await
+        .expect("create_persona must succeed");
 
         let group_id = "group-malformed-1";
         group_key_store::save_group_key(
@@ -1240,6 +1457,7 @@ mod tests {
             "password123".to_owned(),
             registry.clone(),
             group_key_registry.clone(),
+            pool.clone(),
         )
         .await;
 

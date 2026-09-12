@@ -37,37 +37,10 @@
 // it down with it -- confirmed against tauri::async_runtime::spawn's
 // vendored source, a discarded JoinHandle with no supervisor).
 
-use sqlx::{Row, SqliteConnection};
+use sqlx::Row;
 
-use crate::auth::registry::KeyRegistry;
+use crate::auth::registry::{GroupKeyRegistry, KeyRegistry};
 use crate::auth::user_store;
-
-// ---------------------------------------------------------------------------
-// shared.db opener
-// ---------------------------------------------------------------------------
-// Duplicated from commands/auth.rs/user_store.rs rather than reused, same
-// reasoning as those modules' own headers: coupling to a foreign error type
-// isn't worth it for ~12 lines with no per-caller variation.
-
-async fn open_shared_db() -> Result<SqliteConnection, String> {
-    use sqlx::sqlite::SqliteConnectOptions;
-    use sqlx::ConnectOptions;
-
-    let db_path = crate::persistence::migrations::get_data_root()
-        .join("instance")
-        .join("shared.db");
-    let network_storage = std::env::var("QR_NETWORK_STORAGE")
-        .map(|v| v.to_lowercase() == "true")
-        .unwrap_or(false);
-    let journal_mode = if network_storage { "DELETE" } else { "WAL" };
-    SqliteConnectOptions::new()
-        .filename(&db_path)
-        .create_if_missing(false)
-        .pragma("journal_mode", journal_mode)
-        .connect()
-        .await
-        .map_err(|e| format!("couldn't open shared.db: {e}"))
-}
 
 /// Pure boundary check, no DB access -- unit-testable in isolation. Fails
 /// closed (treats an unparsable timestamp as expired) since this guards a
@@ -96,12 +69,16 @@ fn is_idle_expired(idle_timeout_minutes: i64, last_active_at: &str, now: &str) -
 /// periodic-sweep function's posture (persona_sync::engine::
 /// run_periodic_sweep and persona_view_sync's own). Must never panic: this
 /// drives its own always-on timer in main.rs.
-pub async fn run_periodic_check(key_registry: &KeyRegistry) {
+pub async fn run_periodic_check(
+    pool: &sqlx::SqlitePool,
+    key_registry: &KeyRegistry,
+    group_key_registry: &GroupKeyRegistry,
+) {
     let Some(user_id) = key_registry.with_key(|k| k.user_id.clone()).await else {
         return;
     };
 
-    let user = match user_store::find_user_by_id(&user_id).await {
+    let user = match user_store::find_user_by_id(pool, &user_id).await {
         Ok(Some(u)) => u,
         Ok(None) => {
             log::warn!("idle_timeout: resident user_id={user_id} has no matching users row");
@@ -113,10 +90,10 @@ pub async fn run_periodic_check(key_registry: &KeyRegistry) {
         }
     };
 
-    let mut conn = match open_shared_db().await {
+    let mut conn = match pool.acquire().await {
         Ok(c) => c,
         Err(e) => {
-            log::warn!("idle_timeout: {e}");
+            log::warn!("idle_timeout: couldn't acquire shared.db connection: {e}");
             return;
         }
     };
@@ -129,7 +106,7 @@ pub async fn run_periodic_check(key_registry: &KeyRegistry) {
     )
     .bind(&user_id)
     .bind(&now)
-    .fetch_one(&mut conn)
+    .fetch_one(&mut *conn)
     .await
     {
         Ok(row) => row.get("last_active_at"),
@@ -151,6 +128,10 @@ pub async fn run_periodic_check(key_registry: &KeyRegistry) {
     }
 
     key_registry.clear().await;
+    // items.id=469: same gap as commands::auth::logout -- see
+    // auth::clear_group_keys_for_user for why this is needed alongside
+    // key_registry.clear() and not subsumed by it.
+    crate::auth::clear_group_keys_for_user(pool, group_key_registry, &user_id).await;
 
     // Soft-expire, same pattern commands::auth::logout already uses --
     // update expires_at rather than DELETE, to preserve an audit trail of
@@ -162,7 +143,7 @@ pub async fn run_periodic_check(key_registry: &KeyRegistry) {
     .bind(&now)
     .bind(&user_id)
     .bind(&now)
-    .execute(&mut conn)
+    .execute(&mut *conn)
     .await
     {
         log::warn!("idle_timeout: couldn't soft-expire sessions for user={user_id}: {e}");
@@ -182,6 +163,7 @@ mod tests {
         _tempdir: tempfile::TempDir,
         _lock: std::sync::MutexGuard<'static, ()>,
         saved_root: Option<String>,
+        pool: sqlx::SqlitePool,
     }
 
     impl Drop for TestEnv {
@@ -204,17 +186,26 @@ mod tests {
             .await
             .expect("shared.db migration must succeed in test setup");
 
+        let pool =
+            sqlx::SqlitePool::connect_with(crate::providers::utils::connect_options_unencrypted(
+                &crate::providers::utils::db_path_shared(),
+            ))
+            .await
+            .expect("shared.db pool must connect");
+
         TestEnv {
             _tempdir: tempdir,
             _lock: lock,
             saved_root,
+            pool,
         }
     }
 
-    fn mock_app_with_registry() -> tauri::App<tauri::test::MockRuntime> {
+    fn mock_app_with_registry(pool: sqlx::SqlitePool) -> tauri::App<tauri::test::MockRuntime> {
         let app = tauri::test::mock_app();
         app.manage(KeyRegistry::default());
         app.manage(GroupKeyRegistry::default());
+        app.manage(pool);
         app
     }
 
@@ -262,15 +253,17 @@ mod tests {
     async fn run_periodic_check_clears_registry_and_soft_expires_session_when_idle_timeout_exceeded(
     ) {
         let _env = setup().await;
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         let group_key_registry = app.state::<GroupKeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
 
         login(
             "Alice".to_owned(),
             "correct horse battery staple".to_owned(),
             registry.clone(),
             group_key_registry.clone(),
+            pool.clone(),
         )
         .await
         .unwrap();
@@ -281,15 +274,15 @@ mod tests {
         // exists, so this simulates elapsed idle time the same way
         // persona_sync's own absence tests simulate a cleared field:
         // direct SQL against the row a real command call already produced.
-        let mut conn = open_shared_db().await.unwrap();
+        let mut conn = pool.acquire().await.unwrap();
         let stale = (chrono::Utc::now() - chrono::Duration::minutes(30)).to_rfc3339();
         sqlx::query("UPDATE auth_sessions SET last_active_at = ?")
             .bind(&stale)
-            .execute(&mut conn)
+            .execute(&mut *conn)
             .await
             .unwrap();
 
-        run_periodic_check(&registry).await;
+        run_periodic_check(&pool, &registry, &group_key_registry).await;
 
         assert!(
             !registry.is_occupied().await,
@@ -300,7 +293,7 @@ mod tests {
         let still_live: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM auth_sessions WHERE expires_at > ?")
                 .bind(&now)
-                .fetch_one(&mut conn)
+                .fetch_one(&mut *conn)
                 .await
                 .unwrap();
         assert_eq!(
@@ -312,29 +305,31 @@ mod tests {
     #[tokio::test]
     async fn run_periodic_check_does_not_clear_registry_when_idle_timeout_not_yet_exceeded() {
         let _env = setup().await;
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         let group_key_registry = app.state::<GroupKeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
 
         login(
             "Alice".to_owned(),
             "correct horse battery staple".to_owned(),
             registry.clone(),
             group_key_registry.clone(),
+            pool.clone(),
         )
         .await
         .unwrap();
 
         // One minute short of the default 15-minute threshold.
-        let mut conn = open_shared_db().await.unwrap();
+        let mut conn = pool.acquire().await.unwrap();
         let almost_stale = (chrono::Utc::now() - chrono::Duration::minutes(14)).to_rfc3339();
         sqlx::query("UPDATE auth_sessions SET last_active_at = ?")
             .bind(&almost_stale)
-            .execute(&mut conn)
+            .execute(&mut *conn)
             .await
             .unwrap();
 
-        run_periodic_check(&registry).await;
+        run_periodic_check(&pool, &registry, &group_key_registry).await;
 
         assert!(
             registry.is_occupied().await,
@@ -345,21 +340,152 @@ mod tests {
         let still_live: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM auth_sessions WHERE expires_at > ?")
                 .bind(&now)
-                .fetch_one(&mut conn)
+                .fetch_one(&mut *conn)
                 .await
                 .unwrap();
         assert_eq!(still_live.0, 1, "the session must remain live too");
     }
 
+    /// items.id=483: shared.db access is pooled (max_connections=5) instead
+    /// of one-connection-per-call. Before pooling, every tick of this
+    /// function opened a brand-new connection via open_shared_db() that was
+    /// never explicitly closed -- connection count grew without bound as
+    /// main.rs's periodic timer kept firing. Simulates many ticks against a
+    /// non-idle-expired session (so run_periodic_check runs its full acquire
+    /// + query body every time, not the "nobody logged in" early return) and
+    /// asserts the pool's total connection count never exceeds max_connections,
+    /// proving connections are being returned to the pool and reused rather
+    /// than accumulating.
+    #[tokio::test]
+    async fn run_periodic_check_does_not_grow_shared_db_connection_count_across_many_ticks() {
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let registry = app.state::<KeyRegistry>();
+        let group_key_registry = app.state::<GroupKeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
+
+        login(
+            "Alice".to_owned(),
+            "correct horse battery staple".to_owned(),
+            registry.clone(),
+            group_key_registry.clone(),
+            pool.clone(),
+        )
+        .await
+        .unwrap();
+
+        // Comfortably inside the default 15-minute idle window, so every
+        // tick below runs the full acquire-a-connection-and-query body
+        // instead of short-circuiting on an already-expired session.
+        let mut conn = pool.acquire().await.unwrap();
+        let fresh = (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        sqlx::query("UPDATE auth_sessions SET last_active_at = ?")
+            .bind(&fresh)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+
+        for _ in 0..25 {
+            run_periodic_check(&pool, &registry, &group_key_registry).await;
+        }
+
+        assert!(
+            registry.is_occupied().await,
+            "session is still inside the idle window and must not have been cleared"
+        );
+        assert!(
+            pool.size() <= 5,
+            "shared.db pool must stay within max_connections=5 across repeated ticks, \
+             got {} -- connections are leaking instead of being returned to the pool",
+            pool.size()
+        );
+    }
+
     #[tokio::test]
     async fn run_periodic_check_is_a_noop_when_nobody_is_logged_in() {
         let _env = setup().await;
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
+        let group_key_registry = app.state::<GroupKeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
 
         // No login() call at all -- KeyRegistry starts empty.
-        run_periodic_check(&registry).await;
+        run_periodic_check(&pool, &registry, &group_key_registry).await;
 
         assert!(!registry.is_occupied().await);
+    }
+
+    // -- group-key eviction (items.id=469) ------------------------------
+
+    #[tokio::test]
+    async fn run_periodic_check_clears_group_key_registry_for_the_accounts_personas_when_idle_timeout_exceeded(
+    ) {
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let registry = app.state::<KeyRegistry>();
+        let group_key_registry = app.state::<GroupKeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
+
+        login(
+            "Alice".to_owned(),
+            "correct horse battery staple".to_owned(),
+            registry.clone(),
+            group_key_registry.clone(),
+            pool.clone(),
+        )
+        .await
+        .unwrap();
+
+        let user = crate::auth::user_store::find_user_by_display_name(&pool, "Alice")
+            .await
+            .unwrap()
+            .unwrap();
+        let persona_id = uuid::Uuid::new_v4().to_string();
+        crate::persistence::persona_store::create_persona(
+            &pool,
+            &persona_id,
+            "Test Persona",
+            "personal",
+            &user.id,
+            None,
+        )
+        .await
+        .expect("create_persona must succeed");
+
+        group_key_registry
+            .replace(
+                &persona_id,
+                "group-1",
+                crate::auth::registry::UnlockedGroupKey {
+                    group_id: "group-1".to_owned(),
+                    group_key: [0xAAu8; crate::auth::kdf::MASTER_KEY_LEN],
+                    unlocked_at: crate::providers::utils::now(),
+                },
+            )
+            .await;
+        assert!(group_key_registry.is_occupied(&persona_id, "group-1").await);
+
+        // Back-date last_active_at past the default 15-minute idle_timeout_minutes,
+        // same technique the pre-existing KeyRegistry-only test above uses.
+        let mut conn = pool.acquire().await.unwrap();
+        let stale = (chrono::Utc::now() - chrono::Duration::minutes(30)).to_rfc3339();
+        sqlx::query("UPDATE auth_sessions SET last_active_at = ?")
+            .bind(&stale)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+
+        run_periodic_check(&pool, &registry, &group_key_registry).await;
+
+        assert!(
+            !registry.is_occupied().await,
+            "sanity check: the master key must also be cleared"
+        );
+        assert!(
+            !group_key_registry.is_occupied(&persona_id, "group-1").await,
+            "an idle-timeout fire must evict this persona's group keys too, not just the \
+             account master key"
+        );
     }
 }

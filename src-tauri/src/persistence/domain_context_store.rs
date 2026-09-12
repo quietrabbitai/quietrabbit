@@ -134,7 +134,7 @@ fn get_eligible_scopes(execution_tier: i32) -> &'static [&'static str] {
 // Path helper
 // ---------------------------------------------------------------------------
 
-fn get_domain_context_path(user_id: &str, persona_id: &str, focus_id: &str) -> PathBuf {
+pub(crate) fn get_domain_context_path(user_id: &str, persona_id: &str, focus_id: &str) -> PathBuf {
     crate::persistence::migrations::get_data_root()
         .join("users")
         .join(user_id)

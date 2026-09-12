@@ -91,8 +91,6 @@
 //   - application-layer share-stopping (items.id=299 point 4) is untouched.
 
 use serde::{Deserialize, Serialize};
-use sqlx::sqlite::SqliteConnectOptions;
-use sqlx::ConnectOptions;
 use sqlx::Row;
 use sqlx::SqliteConnection;
 use thiserror::Error;
@@ -193,30 +191,6 @@ fn sync_dir(folder_path: &str, share_id: &str) -> std::path::PathBuf {
 
 fn sync_file_path(folder_path: &str, share_id: &str) -> std::path::PathBuf {
     sync_dir(folder_path, share_id).join("update.qrshare")
-}
-
-// ---------------------------------------------------------------------------
-// DB opener (shared.db -- unencrypted)
-// ---------------------------------------------------------------------------
-// Duplicated rather than reused -- same reasoning every other module in this
-// codebase gives for this exact ~12-line helper: different error type per
-// module, zero divergence risk, not worth coupling.
-
-async fn open_shared_db() -> Result<SqliteConnection, PersonaSyncError> {
-    let db_path = crate::persistence::migrations::get_data_root()
-        .join("instance")
-        .join("shared.db");
-    let network_storage = std::env::var("QR_NETWORK_STORAGE")
-        .map(|v| v.to_lowercase() == "true")
-        .unwrap_or(false);
-    let journal_mode = if network_storage { "DELETE" } else { "WAL" };
-    let conn = SqliteConnectOptions::new()
-        .filename(&db_path)
-        .create_if_missing(false)
-        .pragma("journal_mode", journal_mode)
-        .connect()
-        .await?;
-    Ok(conn)
 }
 
 // ---------------------------------------------------------------------------
@@ -399,12 +373,14 @@ pub async fn provision_sync_relationship(
 /// retried directly against the now-known persona_id, not user-visible,
 /// acceptable at this pre-release stage.
 pub async fn accept_and_provision_sync(
+    pool: &sqlx::SqlitePool,
     share_id: &str,
     recipient_user_id: &str,
     recipient_personal_key_hex: &str,
     sharing_private_key: &StaticSecret,
 ) -> Result<String, PersonaSyncError> {
     let persona_id = crate::auth::persona_sharing::accept_persona_share(
+        pool,
         share_id,
         recipient_user_id,
         recipient_personal_key_hex,
@@ -445,9 +421,10 @@ async fn find_source_registry_id(
 /// (share_id, source_persona_id, recipient_user_id) for every accepted
 /// SYNCED share owned by a persona `user_id` owns.
 async fn list_outbound_shares(
+    pool: &sqlx::SqlitePool,
     user_id: &str,
 ) -> Result<Vec<(String, String, String)>, PersonaSyncError> {
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
     let rows = sqlx::query(
         "SELECT pps.id, pps.source_persona_id, pps.recipient_user_id
          FROM pending_persona_shares pps
@@ -455,7 +432,7 @@ async fn list_outbound_shares(
          WHERE up.user_id = ? AND pps.status = 'accepted'",
     )
     .bind(user_id)
-    .fetch_all(&mut conn)
+    .fetch_all(&mut *conn)
     .await?;
 
     let mut out = Vec::with_capacity(rows.len());
@@ -476,16 +453,17 @@ async fn list_outbound_shares(
 /// both together), but a row in that transient state has nothing this sweep
 /// could act on yet.
 async fn list_inbound_shares(
+    pool: &sqlx::SqlitePool,
     recipient_user_id: &str,
 ) -> Result<Vec<(String, String)>, PersonaSyncError> {
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
     let rows = sqlx::query(
         "SELECT id, materialized_persona_id FROM pending_persona_shares
          WHERE recipient_user_id = ? AND status = 'accepted'
          AND materialized_persona_id IS NOT NULL",
     )
     .bind(recipient_user_id)
-    .fetch_all(&mut conn)
+    .fetch_all(&mut *conn)
     .await?;
 
     let mut out = Vec::with_capacity(rows.len());
@@ -506,8 +484,8 @@ async fn list_inbound_shares(
 /// content has changed since the last push. Never propagates a per-share
 /// failure -- logged, matching group_sync::engine's own fail-silent-retry-
 /// next-cycle posture throughout.
-async fn push_all_owned_shares(user_id: &str, personal_key_hex: &str) {
-    let shares = match list_outbound_shares(user_id).await {
+async fn push_all_owned_shares(pool: &sqlx::SqlitePool, user_id: &str, personal_key_hex: &str) {
+    let shares = match list_outbound_shares(pool, user_id).await {
         Ok(s) => s,
         Err(e) => {
             log::warn!("persona_sync: could not list outbound shares for user={user_id}: {e}");
@@ -517,6 +495,7 @@ async fn push_all_owned_shares(user_id: &str, personal_key_hex: &str) {
 
     for (share_id, owner_persona_id, recipient_user_id) in shares {
         push_one_share(
+            pool,
             user_id,
             &owner_persona_id,
             personal_key_hex,
@@ -530,6 +509,7 @@ async fn push_all_owned_shares(user_id: &str, personal_key_hex: &str) {
 /// Push one share if its content has changed, recording the outcome either
 /// way. Never returns Err to its caller -- see push_all_owned_shares.
 async fn push_one_share(
+    pool: &sqlx::SqlitePool,
     owner_user_id: &str,
     owner_persona_id: &str,
     owner_personal_key_hex: &str,
@@ -537,6 +517,7 @@ async fn push_one_share(
     recipient_user_id: &str,
 ) {
     let result = push_if_changed(
+        pool,
         owner_user_id,
         owner_persona_id,
         owner_personal_key_hex,
@@ -552,9 +533,13 @@ async fn push_one_share(
                 "persona_sync: push failed for share={share_id} \
                  owner_persona={owner_persona_id}: {e}"
             );
-            if let Err(e2) =
-                settings_store::record_push_result(owner_persona_id, share_id, Err(&e.to_string()))
-                    .await
+            if let Err(e2) = settings_store::record_push_result(
+                pool,
+                owner_persona_id,
+                share_id,
+                Err(&e.to_string()),
+            )
+            .await
             {
                 log::warn!("persona_sync: could not record push failure: {e2}");
             }
@@ -569,6 +554,7 @@ async fn push_one_share(
 /// record against, matching group_sync's own "no row = nothing to record"
 /// contract).
 async fn push_if_changed(
+    pool: &sqlx::SqlitePool,
     owner_user_id: &str,
     owner_persona_id: &str,
     owner_personal_key_hex: &str,
@@ -576,7 +562,7 @@ async fn push_if_changed(
     recipient_user_id: &str,
 ) -> Result<bool, PersonaSyncError> {
     let Some(settings) =
-        settings_store::get_persona_share_sync_settings(owner_persona_id, share_id).await?
+        settings_store::get_persona_share_sync_settings(pool, owner_persona_id, share_id).await?
     else {
         // Sync not configured for this share on this install yet -- silent
         // no-op, matching group_sync::engine's own contract.
@@ -612,11 +598,11 @@ async fn push_if_changed(
     let hash = content_hash(&active_entities, &entity_facts, &voice_profile_entries)?;
 
     if settings.last_content_hash.as_deref() == Some(hash.as_str()) {
-        settings_store::record_push_result(owner_persona_id, share_id, Ok(None)).await?;
+        settings_store::record_push_result(pool, owner_persona_id, share_id, Ok(None)).await?;
         return Ok(false);
     }
 
-    let recipient_public_key = sharing_keypair::get_public_key(recipient_user_id)
+    let recipient_public_key = sharing_keypair::get_public_key(pool, recipient_user_id)
         .await?
         .ok_or_else(|| {
             PersonaSyncError::Validation(format!(
@@ -637,7 +623,7 @@ async fn push_if_changed(
     let path = sync_file_path(&settings.folder_path, share_id);
     write_envelope_atomic(&path, &envelope).await?;
 
-    settings_store::record_push_result(owner_persona_id, share_id, Ok(Some(&hash))).await?;
+    settings_store::record_push_result(pool, owner_persona_id, share_id, Ok(Some(&hash))).await?;
 
     Ok(true)
 }
@@ -650,11 +636,12 @@ async fn push_if_changed(
 /// pulling and applying any update newer than what's already been synced.
 /// Never propagates a per-share failure -- see push_all_owned_shares.
 async fn pull_all_accepted_shares(
+    pool: &sqlx::SqlitePool,
     recipient_user_id: &str,
     recipient_personal_key_hex: &str,
     sharing_private_key: &StaticSecret,
 ) {
-    let shares = match list_inbound_shares(recipient_user_id).await {
+    let shares = match list_inbound_shares(pool, recipient_user_id).await {
         Ok(s) => s,
         Err(e) => {
             log::warn!(
@@ -666,6 +653,7 @@ async fn pull_all_accepted_shares(
 
     for (share_id, persona_id) in shares {
         let result = pull_if_newer(
+            pool,
             recipient_user_id,
             &persona_id,
             recipient_personal_key_hex,
@@ -676,9 +664,13 @@ async fn pull_all_accepted_shares(
 
         if let Err(e) = result {
             log::warn!("persona_sync: pull failed for share={share_id} persona={persona_id}: {e}");
-            if let Err(e2) =
-                settings_store::record_pull_result(&persona_id, &share_id, Err(&e.to_string()))
-                    .await
+            if let Err(e2) = settings_store::record_pull_result(
+                pool,
+                &persona_id,
+                &share_id,
+                Err(&e.to_string()),
+            )
+            .await
             {
                 log::warn!("persona_sync: could not record pull failure: {e2}");
             }
@@ -690,6 +682,7 @@ async fn pull_all_accepted_shares(
 /// Returns Ok(true) if applied, Ok(false) if sync isn't configured, no
 /// envelope is waiting yet, or it isn't newer than the last one applied.
 async fn pull_if_newer(
+    pool: &sqlx::SqlitePool,
     recipient_user_id: &str,
     persona_id: &str,
     recipient_personal_key_hex: &str,
@@ -697,7 +690,7 @@ async fn pull_if_newer(
     sharing_private_key: &StaticSecret,
 ) -> Result<bool, PersonaSyncError> {
     let Some(settings) =
-        settings_store::get_persona_share_sync_settings(persona_id, share_id).await?
+        settings_store::get_persona_share_sync_settings(pool, persona_id, share_id).await?
     else {
         return Ok(false);
     };
@@ -731,7 +724,7 @@ async fn pull_if_newer(
     )
     .await?;
 
-    settings_store::record_pull_result(persona_id, share_id, Ok(&payload.emitted_at)).await?;
+    settings_store::record_pull_result(pool, persona_id, share_id, Ok(&payload.emitted_at)).await?;
 
     Ok(true)
 }
@@ -1288,7 +1281,7 @@ async fn apply_synced_fact(
 /// account is currently resident in `key_registry`. A no-op if nobody is
 /// logged in. Called from main.rs's existing periodic timer, alongside
 /// group_sync's own pull sweep -- same interval, no second timer.
-pub async fn run_periodic_sweep(key_registry: &KeyRegistry) {
+pub async fn run_periodic_sweep(pool: &sqlx::SqlitePool, key_registry: &KeyRegistry) {
     let Some((user_id, personal_key_hex, sharing_private_key_bytes)) = key_registry
         .with_key(|k| {
             (
@@ -1303,8 +1296,8 @@ pub async fn run_periodic_sweep(key_registry: &KeyRegistry) {
     };
     let sharing_private_key = StaticSecret::from(sharing_private_key_bytes);
 
-    push_all_owned_shares(&user_id, &personal_key_hex).await;
-    pull_all_accepted_shares(&user_id, &personal_key_hex, &sharing_private_key).await;
+    push_all_owned_shares(pool, &user_id, &personal_key_hex).await;
+    pull_all_accepted_shares(pool, &user_id, &personal_key_hex, &sharing_private_key).await;
 }
 
 /// Pull every accepted inbound share once, immediately. Called right after
@@ -1314,11 +1307,12 @@ pub async fn run_periodic_sweep(key_registry: &KeyRegistry) {
 /// gives: the registry starts empty at process boot, so this is the moment
 /// that actually matters; main.rs's periodic timer covers the steady state.
 pub async fn pull_all_accepted_shares_on_login(
+    pool: &sqlx::SqlitePool,
     user_id: &str,
     personal_key_hex: &str,
     sharing_private_key: &StaticSecret,
 ) {
-    pull_all_accepted_shares(user_id, personal_key_hex, sharing_private_key).await;
+    pull_all_accepted_shares(pool, user_id, personal_key_hex, sharing_private_key).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1338,6 +1332,7 @@ mod tests {
         _tempdir: tempfile::TempDir,
         _lock: std::sync::MutexGuard<'static, ()>,
         saved_root: Option<String>,
+        pool: sqlx::SqlitePool,
     }
 
     impl Drop for TestEnv {
@@ -1359,15 +1354,24 @@ mod tests {
             .await
             .expect("shared.db migration must succeed in test setup");
 
+        let pool =
+            sqlx::SqlitePool::connect_with(crate::providers::utils::connect_options_unencrypted(
+                &crate::providers::utils::db_path_shared(),
+            ))
+            .await
+            .expect("shared.db pool must connect");
+
         TestEnv {
             _tempdir: tempdir,
             _lock: lock,
             saved_root,
+            pool,
         }
     }
 
     /// Mirrors persona_sharing.rs's own test fixture convention.
     async fn make_user_with_persona(
+        pool: &sqlx::SqlitePool,
         display_name: &str,
         master_key_fill: u8,
     ) -> (String, String, String, StaticSecret) {
@@ -1378,6 +1382,7 @@ mod tests {
         let key_hex: String = master_key.iter().map(|b| format!("{b:02x}")).collect();
 
         crate::auth::user_store::create_user(
+            pool,
             &user_id,
             display_name,
             "user",
@@ -1392,9 +1397,16 @@ mod tests {
         .expect("create_user must succeed");
 
         let persona_id = uuid::Uuid::new_v4().to_string();
-        persona_store::create_persona(&persona_id, "Shared Persona", "personal", &user_id, None)
-            .await
-            .expect("create_persona must succeed");
+        persona_store::create_persona(
+            pool,
+            &persona_id,
+            "Shared Persona",
+            "personal",
+            &user_id,
+            None,
+        )
+        .await
+        .expect("create_persona must succeed");
 
         (user_id, persona_id, key_hex, sharing_private_key)
     }
@@ -1409,9 +1421,11 @@ mod tests {
     #[tokio::test]
     async fn provisioning_flips_materialized_entities_to_pristine_and_links_source() {
         let _env = setup().await;
-        let (owner_id, owner_persona, owner_key, _) = make_user_with_persona("Alice", 0x10).await;
+        let pool = &_env.pool;
+        let (owner_id, owner_persona, owner_key, _) =
+            make_user_with_persona(pool, "Alice", 0x10).await;
         let (recipient_id, _, recipient_key, recipient_priv) =
-            make_user_with_persona("Bob", 0x20).await;
+            make_user_with_persona(pool, "Bob", 0x20).await;
 
         entity_store::create_entity(
             &owner_id,
@@ -1427,6 +1441,7 @@ mod tests {
         .unwrap();
 
         let share_id = send_persona_share(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -1435,10 +1450,15 @@ mod tests {
         )
         .await
         .unwrap();
-        let persona_id =
-            accept_and_provision_sync(&share_id, &recipient_id, &recipient_key, &recipient_priv)
-                .await
-                .expect("accept_and_provision_sync must succeed");
+        let persona_id = accept_and_provision_sync(
+            pool,
+            &share_id,
+            &recipient_id,
+            &recipient_key,
+            &recipient_priv,
+        )
+        .await
+        .expect("accept_and_provision_sync must succeed");
 
         let mut conn = personal_store::open_personal_db(&recipient_id, &persona_id, &recipient_key)
             .await
@@ -1469,9 +1489,11 @@ mod tests {
     #[tokio::test]
     async fn provisioning_is_safe_to_call_twice_without_corrupting_entity_state() {
         let _env = setup().await;
-        let (owner_id, owner_persona, owner_key, _) = make_user_with_persona("Alice", 0x16).await;
+        let pool = &_env.pool;
+        let (owner_id, owner_persona, owner_key, _) =
+            make_user_with_persona(pool, "Alice", 0x16).await;
         let (recipient_id, _, recipient_key, recipient_priv) =
-            make_user_with_persona("Bob", 0x26).await;
+            make_user_with_persona(pool, "Bob", 0x26).await;
 
         entity_store::create_entity(
             &owner_id,
@@ -1487,6 +1509,7 @@ mod tests {
         .unwrap();
 
         let share_id = send_persona_share(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -1495,10 +1518,15 @@ mod tests {
         )
         .await
         .unwrap();
-        let persona_id =
-            accept_and_provision_sync(&share_id, &recipient_id, &recipient_key, &recipient_priv)
-                .await
-                .unwrap();
+        let persona_id = accept_and_provision_sync(
+            pool,
+            &share_id,
+            &recipient_id,
+            &recipient_key,
+            &recipient_priv,
+        )
+        .await
+        .unwrap();
 
         let mut conn = personal_store::open_personal_db(&recipient_id, &persona_id, &recipient_key)
             .await
@@ -1535,8 +1563,10 @@ mod tests {
     #[tokio::test]
     async fn a_push_that_writes_leaves_the_final_file_with_no_tmp_residue() {
         let _env = setup().await;
-        let (owner_id, owner_persona, owner_key, _) = make_user_with_persona("Alice", 0x17).await;
-        let (recipient_id, _, _, recipient_priv) = make_user_with_persona("Bob", 0x27).await;
+        let pool = &_env.pool;
+        let (owner_id, owner_persona, owner_key, _) =
+            make_user_with_persona(pool, "Alice", 0x17).await;
+        let (recipient_id, _, _, recipient_priv) = make_user_with_persona(pool, "Bob", 0x27).await;
 
         entity_store::create_entity(
             &owner_id,
@@ -1552,6 +1582,7 @@ mod tests {
         .unwrap();
 
         let share_id = send_persona_share(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -1564,6 +1595,7 @@ mod tests {
         let shared_folder = tempfile::tempdir().unwrap();
         let folder_path = shared_folder.path().to_str().unwrap();
         settings_store::set_persona_share_sync_folder(
+            pool,
             &owner_persona,
             &share_id,
             settings_store::SyncRole::Owner,
@@ -1573,6 +1605,7 @@ mod tests {
         .unwrap();
 
         let pushed = push_if_changed(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -1609,10 +1642,11 @@ mod tests {
         assert_eq!(payload.entities[0].display_name, "Contact");
 
         // Settings must reflect the write actually happened, not a skip.
-        let settings = settings_store::get_persona_share_sync_settings(&owner_persona, &share_id)
-            .await
-            .unwrap()
-            .unwrap();
+        let settings =
+            settings_store::get_persona_share_sync_settings(pool, &owner_persona, &share_id)
+                .await
+                .unwrap()
+                .unwrap();
         assert!(settings.last_pushed_at.is_some());
         assert!(settings.last_content_hash.is_some());
     }
@@ -1620,10 +1654,13 @@ mod tests {
     #[tokio::test]
     async fn push_is_a_silent_noop_when_folder_is_unset() {
         let _env = setup().await;
-        let (owner_id, owner_persona, owner_key, _) = make_user_with_persona("Alice", 0x11).await;
-        let (recipient_id, _, _, _) = make_user_with_persona("Bob", 0x21).await;
+        let pool = &_env.pool;
+        let (owner_id, owner_persona, owner_key, _) =
+            make_user_with_persona(pool, "Alice", 0x11).await;
+        let (recipient_id, _, _, _) = make_user_with_persona(pool, "Bob", 0x21).await;
 
         let applied = push_if_changed(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -1638,9 +1675,11 @@ mod tests {
     #[tokio::test]
     async fn push_then_pull_round_trips_a_new_entity_and_fact() {
         let _env = setup().await;
-        let (owner_id, owner_persona, owner_key, _) = make_user_with_persona("Alice", 0x12).await;
+        let pool = &_env.pool;
+        let (owner_id, owner_persona, owner_key, _) =
+            make_user_with_persona(pool, "Alice", 0x12).await;
         let (recipient_id, _, recipient_key, recipient_priv) =
-            make_user_with_persona("Bob", 0x22).await;
+            make_user_with_persona(pool, "Bob", 0x22).await;
 
         let entity_id = entity_store::create_entity(
             &owner_id,
@@ -1672,6 +1711,7 @@ mod tests {
         .unwrap();
 
         let share_id = send_persona_share(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -1680,14 +1720,20 @@ mod tests {
         )
         .await
         .unwrap();
-        let persona_id =
-            accept_and_provision_sync(&share_id, &recipient_id, &recipient_key, &recipient_priv)
-                .await
-                .unwrap();
+        let persona_id = accept_and_provision_sync(
+            pool,
+            &share_id,
+            &recipient_id,
+            &recipient_key,
+            &recipient_priv,
+        )
+        .await
+        .unwrap();
 
         let shared_folder = tempfile::tempdir().unwrap();
         let folder_path = shared_folder.path().to_str().unwrap();
         settings_store::set_persona_share_sync_folder(
+            pool,
             &owner_persona,
             &share_id,
             settings_store::SyncRole::Owner,
@@ -1696,6 +1742,7 @@ mod tests {
         .await
         .unwrap();
         settings_store::set_persona_share_sync_folder(
+            pool,
             &persona_id,
             &share_id,
             settings_store::SyncRole::Recipient,
@@ -1725,6 +1772,7 @@ mod tests {
         .unwrap();
 
         let pushed = push_if_changed(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -1736,6 +1784,7 @@ mod tests {
         assert!(pushed);
 
         let applied = pull_if_newer(
+            pool,
             &recipient_id,
             &persona_id,
             &recipient_key,
@@ -1774,9 +1823,11 @@ mod tests {
         // single-pass insert would violate entities.parent_entity_id's FK
         // on.
         let _env = setup().await;
-        let (owner_id, owner_persona, owner_key, _) = make_user_with_persona("Alice", 0x14).await;
+        let pool = &_env.pool;
+        let (owner_id, owner_persona, owner_key, _) =
+            make_user_with_persona(pool, "Alice", 0x14).await;
         let (recipient_id, _, recipient_key, recipient_priv) =
-            make_user_with_persona("Bob", 0x24).await;
+            make_user_with_persona(pool, "Bob", 0x24).await;
 
         entity_store::create_entity(
             &owner_id,
@@ -1792,6 +1843,7 @@ mod tests {
         .unwrap();
 
         let share_id = send_persona_share(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -1800,14 +1852,20 @@ mod tests {
         )
         .await
         .unwrap();
-        let persona_id =
-            accept_and_provision_sync(&share_id, &recipient_id, &recipient_key, &recipient_priv)
-                .await
-                .unwrap();
+        let persona_id = accept_and_provision_sync(
+            pool,
+            &share_id,
+            &recipient_id,
+            &recipient_key,
+            &recipient_priv,
+        )
+        .await
+        .unwrap();
 
         let shared_folder = tempfile::tempdir().unwrap();
         let folder_path = shared_folder.path().to_str().unwrap();
         settings_store::set_persona_share_sync_folder(
+            pool,
             &owner_persona,
             &share_id,
             settings_store::SyncRole::Owner,
@@ -1816,6 +1874,7 @@ mod tests {
         .await
         .unwrap();
         settings_store::set_persona_share_sync_folder(
+            pool,
             &persona_id,
             &share_id,
             settings_store::SyncRole::Recipient,
@@ -1852,6 +1911,7 @@ mod tests {
         .unwrap();
 
         let pushed = push_if_changed(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -1863,6 +1923,7 @@ mod tests {
         assert!(pushed);
 
         let applied = pull_if_newer(
+            pool,
             &recipient_id,
             &persona_id,
             &recipient_key,
@@ -1894,8 +1955,10 @@ mod tests {
     #[tokio::test]
     async fn a_repeat_push_with_unchanged_content_is_skipped() {
         let _env = setup().await;
-        let (owner_id, owner_persona, owner_key, _) = make_user_with_persona("Alice", 0x13).await;
-        let (recipient_id, _, _, _) = make_user_with_persona("Bob", 0x23).await;
+        let pool = &_env.pool;
+        let (owner_id, owner_persona, owner_key, _) =
+            make_user_with_persona(pool, "Alice", 0x13).await;
+        let (recipient_id, _, _, _) = make_user_with_persona(pool, "Bob", 0x23).await;
 
         entity_store::create_entity(
             &owner_id,
@@ -1910,6 +1973,7 @@ mod tests {
         .await
         .unwrap();
         let share_id = send_persona_share(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -1921,6 +1985,7 @@ mod tests {
 
         let shared_folder = tempfile::tempdir().unwrap();
         settings_store::set_persona_share_sync_folder(
+            pool,
             &owner_persona,
             &share_id,
             settings_store::SyncRole::Owner,
@@ -1930,6 +1995,7 @@ mod tests {
         .unwrap();
 
         let first = push_if_changed(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -1941,6 +2007,7 @@ mod tests {
         assert!(first, "the first push must write, nothing pushed yet");
 
         let second = push_if_changed(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -1958,9 +2025,11 @@ mod tests {
     #[tokio::test]
     async fn a_local_edit_after_pull_blocks_a_later_conflicting_update() {
         let _env = setup().await;
-        let (owner_id, owner_persona, owner_key, _) = make_user_with_persona("Alice", 0x14).await;
+        let pool = &_env.pool;
+        let (owner_id, owner_persona, owner_key, _) =
+            make_user_with_persona(pool, "Alice", 0x14).await;
         let (recipient_id, _, recipient_key, recipient_priv) =
-            make_user_with_persona("Bob", 0x24).await;
+            make_user_with_persona(pool, "Bob", 0x24).await;
 
         let entity_id = entity_store::create_entity(
             &owner_id,
@@ -1976,6 +2045,7 @@ mod tests {
         .unwrap();
 
         let share_id = send_persona_share(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -1984,14 +2054,20 @@ mod tests {
         )
         .await
         .unwrap();
-        let persona_id =
-            accept_and_provision_sync(&share_id, &recipient_id, &recipient_key, &recipient_priv)
-                .await
-                .unwrap();
+        let persona_id = accept_and_provision_sync(
+            pool,
+            &share_id,
+            &recipient_id,
+            &recipient_key,
+            &recipient_priv,
+        )
+        .await
+        .unwrap();
 
         let shared_folder = tempfile::tempdir().unwrap();
         let folder_path = shared_folder.path().to_str().unwrap();
         settings_store::set_persona_share_sync_folder(
+            pool,
             &owner_persona,
             &share_id,
             settings_store::SyncRole::Owner,
@@ -2000,6 +2076,7 @@ mod tests {
         .await
         .unwrap();
         settings_store::set_persona_share_sync_folder(
+            pool,
             &persona_id,
             &share_id,
             settings_store::SyncRole::Recipient,
@@ -2038,6 +2115,7 @@ mod tests {
         .await
         .unwrap();
         push_if_changed(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -2048,6 +2126,7 @@ mod tests {
         .unwrap();
 
         let applied = pull_if_newer(
+            pool,
             &recipient_id,
             &persona_id,
             &recipient_key,
@@ -2085,9 +2164,11 @@ mod tests {
     #[tokio::test]
     async fn a_local_voice_profile_edit_after_pull_blocks_a_later_conflicting_update() {
         let _env = setup().await;
-        let (owner_id, owner_persona, owner_key, _) = make_user_with_persona("Alice", 0x16).await;
+        let pool = &_env.pool;
+        let (owner_id, owner_persona, owner_key, _) =
+            make_user_with_persona(pool, "Alice", 0x16).await;
         let (recipient_id, _, recipient_key, recipient_priv) =
-            make_user_with_persona("Bob", 0x26).await;
+            make_user_with_persona(pool, "Bob", 0x26).await;
 
         // precedence=4 (persona-scoped) matches load_shared_voice_profile_
         // entries' own filter (persona_id = source_persona_id) -- a global
@@ -2106,6 +2187,7 @@ mod tests {
         .unwrap();
 
         let share_id = send_persona_share(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -2114,14 +2196,20 @@ mod tests {
         )
         .await
         .unwrap();
-        let persona_id =
-            accept_and_provision_sync(&share_id, &recipient_id, &recipient_key, &recipient_priv)
-                .await
-                .unwrap();
+        let persona_id = accept_and_provision_sync(
+            pool,
+            &share_id,
+            &recipient_id,
+            &recipient_key,
+            &recipient_priv,
+        )
+        .await
+        .unwrap();
 
         let shared_folder = tempfile::tempdir().unwrap();
         let folder_path = shared_folder.path().to_str().unwrap();
         settings_store::set_persona_share_sync_folder(
+            pool,
             &owner_persona,
             &share_id,
             settings_store::SyncRole::Owner,
@@ -2130,6 +2218,7 @@ mod tests {
         .await
         .unwrap();
         settings_store::set_persona_share_sync_folder(
+            pool,
             &persona_id,
             &share_id,
             settings_store::SyncRole::Recipient,
@@ -2167,6 +2256,7 @@ mod tests {
         .await
         .unwrap();
         push_if_changed(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -2177,6 +2267,7 @@ mod tests {
         .unwrap();
 
         let applied = pull_if_newer(
+            pool,
             &recipient_id,
             &persona_id,
             &recipient_key,
@@ -2224,9 +2315,11 @@ mod tests {
     #[tokio::test]
     async fn an_entity_missing_from_a_later_push_is_marked_deleted_in_source() {
         let _env = setup().await;
-        let (owner_id, owner_persona, owner_key, _) = make_user_with_persona("Alice", 0x15).await;
+        let pool = &_env.pool;
+        let (owner_id, owner_persona, owner_key, _) =
+            make_user_with_persona(pool, "Alice", 0x15).await;
         let (recipient_id, _, recipient_key, recipient_priv) =
-            make_user_with_persona("Bob", 0x25).await;
+            make_user_with_persona(pool, "Bob", 0x25).await;
 
         let entity_id = entity_store::create_entity(
             &owner_id,
@@ -2242,6 +2335,7 @@ mod tests {
         .unwrap();
 
         let share_id = send_persona_share(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -2250,14 +2344,20 @@ mod tests {
         )
         .await
         .unwrap();
-        let persona_id =
-            accept_and_provision_sync(&share_id, &recipient_id, &recipient_key, &recipient_priv)
-                .await
-                .unwrap();
+        let persona_id = accept_and_provision_sync(
+            pool,
+            &share_id,
+            &recipient_id,
+            &recipient_key,
+            &recipient_priv,
+        )
+        .await
+        .unwrap();
 
         let shared_folder = tempfile::tempdir().unwrap();
         let folder_path = shared_folder.path().to_str().unwrap();
         settings_store::set_persona_share_sync_folder(
+            pool,
             &owner_persona,
             &share_id,
             settings_store::SyncRole::Owner,
@@ -2266,6 +2366,7 @@ mod tests {
         .await
         .unwrap();
         settings_store::set_persona_share_sync_folder(
+            pool,
             &persona_id,
             &share_id,
             settings_store::SyncRole::Recipient,
@@ -2289,6 +2390,7 @@ mod tests {
         .await
         .unwrap();
         push_if_changed(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -2298,6 +2400,7 @@ mod tests {
         .await
         .unwrap();
         pull_if_newer(
+            pool,
             &recipient_id,
             &persona_id,
             &recipient_key,
@@ -2314,9 +2417,11 @@ mod tests {
     #[tokio::test]
     async fn a_field_missing_from_a_later_push_is_retired_on_the_recipient() {
         let _env = setup().await;
-        let (owner_id, owner_persona, owner_key, _) = make_user_with_persona("Alice", 0x16).await;
+        let pool = &_env.pool;
+        let (owner_id, owner_persona, owner_key, _) =
+            make_user_with_persona(pool, "Alice", 0x16).await;
         let (recipient_id, _, recipient_key, recipient_priv) =
-            make_user_with_persona("Bob", 0x26).await;
+            make_user_with_persona(pool, "Bob", 0x26).await;
 
         let entity_id = entity_store::create_entity(
             &owner_id,
@@ -2348,6 +2453,7 @@ mod tests {
         .unwrap();
 
         let share_id = send_persona_share(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -2356,14 +2462,20 @@ mod tests {
         )
         .await
         .unwrap();
-        let persona_id =
-            accept_and_provision_sync(&share_id, &recipient_id, &recipient_key, &recipient_priv)
-                .await
-                .unwrap();
+        let persona_id = accept_and_provision_sync(
+            pool,
+            &share_id,
+            &recipient_id,
+            &recipient_key,
+            &recipient_priv,
+        )
+        .await
+        .unwrap();
 
         let shared_folder = tempfile::tempdir().unwrap();
         let folder_path = shared_folder.path().to_str().unwrap();
         settings_store::set_persona_share_sync_folder(
+            pool,
             &owner_persona,
             &share_id,
             settings_store::SyncRole::Owner,
@@ -2372,6 +2484,7 @@ mod tests {
         .await
         .unwrap();
         settings_store::set_persona_share_sync_folder(
+            pool,
             &persona_id,
             &share_id,
             settings_store::SyncRole::Recipient,
@@ -2401,6 +2514,7 @@ mod tests {
         }
 
         let pushed = push_if_changed(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -2412,6 +2526,7 @@ mod tests {
         assert!(pushed);
 
         let applied = pull_if_newer(
+            pool,
             &recipient_id,
             &persona_id,
             &recipient_key,
@@ -2447,9 +2562,11 @@ mod tests {
     #[tokio::test]
     async fn a_missing_singleton_field_is_retired_when_source_matches_synced_share() {
         let _env = setup().await;
-        let (owner_id, owner_persona, owner_key, _) = make_user_with_persona("Alice", 0x17).await;
+        let pool = &_env.pool;
+        let (owner_id, owner_persona, owner_key, _) =
+            make_user_with_persona(pool, "Alice", 0x17).await;
         let (recipient_id, _, recipient_key, recipient_priv) =
-            make_user_with_persona("Bob", 0x27).await;
+            make_user_with_persona(pool, "Bob", 0x27).await;
 
         personal_store::save_personal_field(
             &owner_id,
@@ -2469,6 +2586,7 @@ mod tests {
         .unwrap();
 
         let share_id = send_persona_share(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -2477,14 +2595,20 @@ mod tests {
         )
         .await
         .unwrap();
-        let persona_id =
-            accept_and_provision_sync(&share_id, &recipient_id, &recipient_key, &recipient_priv)
-                .await
-                .unwrap();
+        let persona_id = accept_and_provision_sync(
+            pool,
+            &share_id,
+            &recipient_id,
+            &recipient_key,
+            &recipient_priv,
+        )
+        .await
+        .unwrap();
 
         let shared_folder = tempfile::tempdir().unwrap();
         let folder_path = shared_folder.path().to_str().unwrap();
         settings_store::set_persona_share_sync_folder(
+            pool,
             &owner_persona,
             &share_id,
             settings_store::SyncRole::Owner,
@@ -2493,6 +2617,7 @@ mod tests {
         .await
         .unwrap();
         settings_store::set_persona_share_sync_folder(
+            pool,
             &persona_id,
             &share_id,
             settings_store::SyncRole::Recipient,
@@ -2525,6 +2650,7 @@ mod tests {
         // First pull: materializes the owner's "email" singleton on the
         // recipient's side as source = 'synced_share'.
         push_if_changed(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -2534,6 +2660,7 @@ mod tests {
         .await
         .unwrap();
         pull_if_newer(
+            pool,
             &recipient_id,
             &persona_id,
             &recipient_key,
@@ -2575,6 +2702,7 @@ mod tests {
         }
 
         let pushed = push_if_changed(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -2586,6 +2714,7 @@ mod tests {
         assert!(pushed);
 
         let applied = pull_if_newer(
+            pool,
             &recipient_id,
             &persona_id,
             &recipient_key,
@@ -2628,9 +2757,11 @@ mod tests {
     #[tokio::test]
     async fn a_local_edit_blocks_field_absence_retirement_too() {
         let _env = setup().await;
-        let (owner_id, owner_persona, owner_key, _) = make_user_with_persona("Alice", 0x18).await;
+        let pool = &_env.pool;
+        let (owner_id, owner_persona, owner_key, _) =
+            make_user_with_persona(pool, "Alice", 0x18).await;
         let (recipient_id, _, recipient_key, recipient_priv) =
-            make_user_with_persona("Bob", 0x28).await;
+            make_user_with_persona(pool, "Bob", 0x28).await;
 
         let entity_id = entity_store::create_entity(
             &owner_id,
@@ -2662,6 +2793,7 @@ mod tests {
         .unwrap();
 
         let share_id = send_persona_share(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -2670,14 +2802,20 @@ mod tests {
         )
         .await
         .unwrap();
-        let persona_id =
-            accept_and_provision_sync(&share_id, &recipient_id, &recipient_key, &recipient_priv)
-                .await
-                .unwrap();
+        let persona_id = accept_and_provision_sync(
+            pool,
+            &share_id,
+            &recipient_id,
+            &recipient_key,
+            &recipient_priv,
+        )
+        .await
+        .unwrap();
 
         let shared_folder = tempfile::tempdir().unwrap();
         let folder_path = shared_folder.path().to_str().unwrap();
         settings_store::set_persona_share_sync_folder(
+            pool,
             &owner_persona,
             &share_id,
             settings_store::SyncRole::Owner,
@@ -2686,6 +2824,7 @@ mod tests {
         .await
         .unwrap();
         settings_store::set_persona_share_sync_folder(
+            pool,
             &persona_id,
             &share_id,
             settings_store::SyncRole::Recipient,
@@ -2730,6 +2869,7 @@ mod tests {
             .unwrap();
         }
         push_if_changed(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -2740,6 +2880,7 @@ mod tests {
         .unwrap();
 
         let applied = pull_if_newer(
+            pool,
             &recipient_id,
             &persona_id,
             &recipient_key,
@@ -2781,9 +2922,11 @@ mod tests {
     #[tokio::test]
     async fn a_voice_profile_entry_missing_from_a_later_push_is_deleted_on_the_recipient() {
         let _env = setup().await;
-        let (owner_id, owner_persona, owner_key, _) = make_user_with_persona("Alice", 0x19).await;
+        let pool = &_env.pool;
+        let (owner_id, owner_persona, owner_key, _) =
+            make_user_with_persona(pool, "Alice", 0x19).await;
         let (recipient_id, _, recipient_key, recipient_priv) =
-            make_user_with_persona("Bob", 0x29).await;
+            make_user_with_persona(pool, "Bob", 0x29).await;
 
         let vp_id = personal_store::save_voice_profile_entry(
             &owner_id,
@@ -2799,6 +2942,7 @@ mod tests {
         .unwrap();
 
         let share_id = send_persona_share(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -2807,14 +2951,20 @@ mod tests {
         )
         .await
         .unwrap();
-        let persona_id =
-            accept_and_provision_sync(&share_id, &recipient_id, &recipient_key, &recipient_priv)
-                .await
-                .unwrap();
+        let persona_id = accept_and_provision_sync(
+            pool,
+            &share_id,
+            &recipient_id,
+            &recipient_key,
+            &recipient_priv,
+        )
+        .await
+        .unwrap();
 
         let shared_folder = tempfile::tempdir().unwrap();
         let folder_path = shared_folder.path().to_str().unwrap();
         settings_store::set_persona_share_sync_folder(
+            pool,
             &owner_persona,
             &share_id,
             settings_store::SyncRole::Owner,
@@ -2823,6 +2973,7 @@ mod tests {
         .await
         .unwrap();
         settings_store::set_persona_share_sync_folder(
+            pool,
             &persona_id,
             &share_id,
             settings_store::SyncRole::Recipient,
@@ -2832,6 +2983,7 @@ mod tests {
         .unwrap();
 
         push_if_changed(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -2841,6 +2993,7 @@ mod tests {
         .await
         .unwrap();
         pull_if_newer(
+            pool,
             &recipient_id,
             &persona_id,
             &recipient_key,
@@ -2865,6 +3018,7 @@ mod tests {
         .unwrap();
 
         let pushed = push_if_changed(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -2876,6 +3030,7 @@ mod tests {
         assert!(pushed);
 
         let applied = pull_if_newer(
+            pool,
             &recipient_id,
             &persona_id,
             &recipient_key,
@@ -2904,9 +3059,11 @@ mod tests {
     #[tokio::test]
     async fn a_local_voice_profile_edit_blocks_absence_retirement_too() {
         let _env = setup().await;
-        let (owner_id, owner_persona, owner_key, _) = make_user_with_persona("Alice", 0x1a).await;
+        let pool = &_env.pool;
+        let (owner_id, owner_persona, owner_key, _) =
+            make_user_with_persona(pool, "Alice", 0x1a).await;
         let (recipient_id, _, recipient_key, recipient_priv) =
-            make_user_with_persona("Bob", 0x2a).await;
+            make_user_with_persona(pool, "Bob", 0x2a).await;
 
         let vp_id = personal_store::save_voice_profile_entry(
             &owner_id,
@@ -2922,6 +3079,7 @@ mod tests {
         .unwrap();
 
         let share_id = send_persona_share(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -2930,14 +3088,20 @@ mod tests {
         )
         .await
         .unwrap();
-        let persona_id =
-            accept_and_provision_sync(&share_id, &recipient_id, &recipient_key, &recipient_priv)
-                .await
-                .unwrap();
+        let persona_id = accept_and_provision_sync(
+            pool,
+            &share_id,
+            &recipient_id,
+            &recipient_key,
+            &recipient_priv,
+        )
+        .await
+        .unwrap();
 
         let shared_folder = tempfile::tempdir().unwrap();
         let folder_path = shared_folder.path().to_str().unwrap();
         settings_store::set_persona_share_sync_folder(
+            pool,
             &owner_persona,
             &share_id,
             settings_store::SyncRole::Owner,
@@ -2946,6 +3110,7 @@ mod tests {
         .await
         .unwrap();
         settings_store::set_persona_share_sync_folder(
+            pool,
             &persona_id,
             &share_id,
             settings_store::SyncRole::Recipient,
@@ -2955,6 +3120,7 @@ mod tests {
         .unwrap();
 
         push_if_changed(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -2964,6 +3130,7 @@ mod tests {
         .await
         .unwrap();
         pull_if_newer(
+            pool,
             &recipient_id,
             &persona_id,
             &recipient_key,
@@ -3002,6 +3169,7 @@ mod tests {
         .await
         .unwrap();
         push_if_changed(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -3012,6 +3180,7 @@ mod tests {
         .unwrap();
 
         let applied = pull_if_newer(
+            pool,
             &recipient_id,
             &persona_id,
             &recipient_key,
@@ -3051,11 +3220,14 @@ mod tests {
     #[tokio::test]
     async fn a_user_created_voice_profile_entry_survives_an_absence_push() {
         let _env = setup().await;
-        let (owner_id, owner_persona, owner_key, _) = make_user_with_persona("Alice", 0x1b).await;
+        let pool = &_env.pool;
+        let (owner_id, owner_persona, owner_key, _) =
+            make_user_with_persona(pool, "Alice", 0x1b).await;
         let (recipient_id, _, recipient_key, recipient_priv) =
-            make_user_with_persona("Bob", 0x2b).await;
+            make_user_with_persona(pool, "Bob", 0x2b).await;
 
         let share_id = send_persona_share(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -3064,14 +3236,20 @@ mod tests {
         )
         .await
         .unwrap();
-        let persona_id =
-            accept_and_provision_sync(&share_id, &recipient_id, &recipient_key, &recipient_priv)
-                .await
-                .unwrap();
+        let persona_id = accept_and_provision_sync(
+            pool,
+            &share_id,
+            &recipient_id,
+            &recipient_key,
+            &recipient_priv,
+        )
+        .await
+        .unwrap();
 
         let shared_folder = tempfile::tempdir().unwrap();
         let folder_path = shared_folder.path().to_str().unwrap();
         settings_store::set_persona_share_sync_folder(
+            pool,
             &owner_persona,
             &share_id,
             settings_store::SyncRole::Owner,
@@ -3080,6 +3258,7 @@ mod tests {
         .await
         .unwrap();
         settings_store::set_persona_share_sync_folder(
+            pool,
             &persona_id,
             &share_id,
             settings_store::SyncRole::Recipient,
@@ -3108,6 +3287,7 @@ mod tests {
         .unwrap();
 
         push_if_changed(
+            pool,
             &owner_id,
             &owner_persona,
             &owner_key,
@@ -3117,6 +3297,7 @@ mod tests {
         .await
         .unwrap();
         let applied = pull_if_newer(
+            pool,
             &recipient_id,
             &persona_id,
             &recipient_key,

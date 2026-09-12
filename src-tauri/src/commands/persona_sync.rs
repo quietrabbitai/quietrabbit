@@ -14,6 +14,7 @@
 
 use serde::Serialize;
 use specta::Type;
+use tauri::State;
 
 use crate::persona_sync::settings_store::{self, SyncRole};
 
@@ -39,9 +40,10 @@ pub async fn set_persona_share_sync_folder(
     share_id: String,
     role: String,
     folder_path: String,
+    pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<(), String> {
     let role = SyncRole::parse(&role).map_err(|e| e.to_string())?;
-    settings_store::set_persona_share_sync_folder(&persona_id, &share_id, role, &folder_path)
+    settings_store::set_persona_share_sync_folder(&pool, &persona_id, &share_id, role, &folder_path)
         .await
         .map_err(|e| e.to_string())
 }
@@ -55,8 +57,9 @@ pub async fn set_persona_share_sync_folder(
 pub async fn get_persona_share_sync_folder(
     persona_id: String,
     share_id: String,
+    pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<Option<PersonaShareSyncSettingsInfo>, String> {
-    let settings = settings_store::get_persona_share_sync_settings(&persona_id, &share_id)
+    let settings = settings_store::get_persona_share_sync_settings(&pool, &persona_id, &share_id)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -79,11 +82,13 @@ pub async fn get_persona_share_sync_folder(
 mod tests {
     use super::*;
     use crate::test_support::ENV_MUTEX;
+    use tauri::Manager;
 
     struct TestEnv {
         _tempdir: tempfile::TempDir,
         _lock: std::sync::MutexGuard<'static, ()>,
         saved_root: Option<String>,
+        pool: sqlx::SqlitePool,
     }
 
     impl Drop for TestEnv {
@@ -105,38 +110,59 @@ mod tests {
             .await
             .expect("shared.db migration must succeed in test setup");
 
+        let pool =
+            sqlx::SqlitePool::connect_with(crate::providers::utils::connect_options_unencrypted(
+                &crate::providers::utils::db_path_shared(),
+            ))
+            .await
+            .expect("shared.db pool must connect");
+
         TestEnv {
             _tempdir: tempdir,
             _lock: lock,
             saved_root,
+            pool,
         }
+    }
+
+    fn mock_app_with_pool(pool: sqlx::SqlitePool) -> tauri::App<tauri::test::MockRuntime> {
+        let app = tauri::test::mock_app();
+        app.manage(pool);
+        app
     }
 
     #[tokio::test]
     async fn get_persona_share_sync_folder_is_none_before_any_configuration() {
         let _env = setup().await;
-        let result = get_persona_share_sync_folder("persona-1".to_owned(), "share-1".to_owned())
-            .await
-            .expect("get_persona_share_sync_folder must succeed");
+        let app = mock_app_with_pool(_env.pool.clone());
+        let pool = app.state::<sqlx::SqlitePool>();
+        let result =
+            get_persona_share_sync_folder("persona-1".to_owned(), "share-1".to_owned(), pool)
+                .await
+                .expect("get_persona_share_sync_folder must succeed");
         assert!(result.is_none());
     }
 
     #[tokio::test]
     async fn set_then_get_round_trips_through_the_command_layer() {
         let _env = setup().await;
+        let app = mock_app_with_pool(_env.pool.clone());
+        let pool = app.state::<sqlx::SqlitePool>();
         set_persona_share_sync_folder(
             "persona-1".to_owned(),
             "share-1".to_owned(),
             "owner".to_owned(),
             "/mnt/nas/family".to_owned(),
+            pool.clone(),
         )
         .await
         .expect("set_persona_share_sync_folder must succeed");
 
-        let info = get_persona_share_sync_folder("persona-1".to_owned(), "share-1".to_owned())
-            .await
-            .expect("get_persona_share_sync_folder must succeed")
-            .expect("settings must exist after set_persona_share_sync_folder");
+        let info =
+            get_persona_share_sync_folder("persona-1".to_owned(), "share-1".to_owned(), pool)
+                .await
+                .expect("get_persona_share_sync_folder must succeed")
+                .expect("settings must exist after set_persona_share_sync_folder");
         assert_eq!(info.role, "owner");
         assert_eq!(info.folder_path, "/mnt/nas/family");
         assert!(info.last_synced_at.is_none());
@@ -145,11 +171,14 @@ mod tests {
     #[tokio::test]
     async fn set_rejects_an_unknown_role_with_a_string_error() {
         let _env = setup().await;
+        let app = mock_app_with_pool(_env.pool.clone());
+        let pool = app.state::<sqlx::SqlitePool>();
         let result = set_persona_share_sync_folder(
             "persona-1".to_owned(),
             "share-1".to_owned(),
             "bystander".to_owned(),
             "/mnt/nas/family".to_owned(),
+            pool,
         )
         .await;
         assert!(result.is_err());
@@ -158,11 +187,14 @@ mod tests {
     #[tokio::test]
     async fn set_rejects_empty_path_with_a_string_error() {
         let _env = setup().await;
+        let app = mock_app_with_pool(_env.pool.clone());
+        let pool = app.state::<sqlx::SqlitePool>();
         let result = set_persona_share_sync_folder(
             "persona-1".to_owned(),
             "share-1".to_owned(),
             "recipient".to_owned(),
             "   ".to_owned(),
+            pool,
         )
         .await;
         assert!(result.is_err());

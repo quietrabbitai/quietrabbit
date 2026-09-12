@@ -165,8 +165,11 @@ pub struct FrictionGateDetail {
 
 #[tauri::command]
 #[specta::specta]
-pub async fn list_personas(user_id: String) -> Result<Vec<PersonaInfo>, String> {
-    let personas = persona_store::list_personas_for_user(&user_id)
+pub async fn list_personas(
+    user_id: String,
+    pool: State<'_, sqlx::SqlitePool>,
+) -> Result<Vec<PersonaInfo>, String> {
+    let personas = persona_store::list_personas_for_user(&pool, &user_id)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -194,6 +197,7 @@ pub async fn list_personas(user_id: String) -> Result<Vec<PersonaInfo>, String> 
 #[specta::specta]
 pub async fn create_persona(
     request: CreatePersonaRequest,
+    pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<CreatePersonaResponse, String> {
     if request.name.trim().is_empty() {
         return Err("persona name cannot be empty".to_string());
@@ -209,6 +213,7 @@ pub async fn create_persona(
     let persona_id = uuid::Uuid::new_v4().to_string();
 
     let persona = persona_store::create_persona(
+        &pool,
         &persona_id,
         &request.name,
         persona_type,
@@ -229,13 +234,14 @@ pub async fn list_focuses(
     user_id: String,
     persona_id: String,
     key_registry: State<'_, KeyRegistry>,
+    pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<Vec<FocusInfo>, String> {
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.master_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
-    let settings = focus_settings_store::list_focus_settings_for_persona(&persona_id)
+    let settings = focus_settings_store::list_focus_settings_for_persona(&pool, &persona_id)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -268,13 +274,14 @@ pub async fn get_focus_settings(
     persona_id: String,
     key_registry: State<'_, KeyRegistry>,
     focus_id: String,
+    pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<FocusInfo, String> {
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.master_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
-    let s = focus_settings_store::get_focus_settings(&persona_id, &focus_id)
+    let s = focus_settings_store::get_focus_settings(&pool, &persona_id, &focus_id)
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "not_found".to_string())?;
@@ -314,6 +321,7 @@ pub async fn update_focus_settings(
     user_id: String,
     key_registry: State<'_, KeyRegistry>,
     request: UpdateFocusSettingsRequest,
+    pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<FocusInfo, String> {
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.master_key))
@@ -333,10 +341,11 @@ pub async fn update_focus_settings(
     // Friction gate check (items.id=92). privacy_tier is 1=red (most
     // restrictive) .. 3=green (least restrictive) -- see module header's
     // TIER DIRECTION NOTE. A numeric increase LOOSENS privacy.
-    let existing = focus_settings_store::get_focus_settings(&request.persona_id, &request.focus_id)
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "not_found".to_string())?;
+    let existing =
+        focus_settings_store::get_focus_settings(&pool, &request.persona_id, &request.focus_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "not_found".to_string())?;
 
     let privacy_would_loosen = request
         .privacy_tier
@@ -384,6 +393,7 @@ pub async fn update_focus_settings(
     }
 
     let s = focus_settings_store::update_focus_settings(
+        &pool,
         &request.persona_id,
         &request.focus_id,
         request.context_flow.as_deref(),
@@ -436,6 +446,7 @@ mod tests {
         _tempdir: tempfile::TempDir,
         _lock: std::sync::MutexGuard<'static, ()>,
         saved_root: Option<String>,
+        pool: sqlx::SqlitePool,
     }
 
     impl Drop for TestEnv {
@@ -469,7 +480,15 @@ mod tests {
         .await
         .expect("outputs.db migration must succeed in test setup");
 
+        let pool =
+            sqlx::SqlitePool::connect_with(crate::providers::utils::connect_options_unencrypted(
+                &crate::providers::utils::db_path_shared(),
+            ))
+            .await
+            .expect("shared.db pool must connect");
+
         crate::auth::user_store::create_user(
+            &pool,
             USER_ID,
             "Persona Test User",
             "user",
@@ -487,6 +506,7 @@ mod tests {
             _tempdir: tempdir,
             _lock: lock,
             saved_root,
+            pool,
         }
     }
 
@@ -494,6 +514,7 @@ mod tests {
     async fn list_personas_returns_real_color() {
         let _env = setup().await;
         persona_store::create_persona(
+            &_env.pool,
             PERSONA_ID,
             "Color Test Persona",
             "personal",
@@ -503,7 +524,9 @@ mod tests {
         .await
         .expect("create_persona must succeed");
 
-        let personas = list_personas(USER_ID.to_owned())
+        let app = mock_app_with_registry(_env.pool.clone());
+        let pool = app.state::<sqlx::SqlitePool>();
+        let personas = list_personas(USER_ID.to_owned(), pool)
             .await
             .expect("list_personas must succeed");
 
@@ -518,11 +541,20 @@ mod tests {
     #[tokio::test]
     async fn list_personas_color_is_none_when_unset() {
         let _env = setup().await;
-        persona_store::create_persona(PERSONA_ID, "No Color Persona", "personal", USER_ID, None)
-            .await
-            .expect("create_persona must succeed");
+        persona_store::create_persona(
+            &_env.pool,
+            PERSONA_ID,
+            "No Color Persona",
+            "personal",
+            USER_ID,
+            None,
+        )
+        .await
+        .expect("create_persona must succeed");
 
-        let personas = list_personas(USER_ID.to_owned())
+        let app = mock_app_with_registry(_env.pool.clone());
+        let pool = app.state::<sqlx::SqlitePool>();
+        let personas = list_personas(USER_ID.to_owned(), pool)
             .await
             .expect("list_personas must succeed");
 
@@ -535,11 +567,20 @@ mod tests {
     #[tokio::test]
     async fn list_personas_focus_count_reflects_real_focus_settings_rows() {
         let _env = setup().await;
-        persona_store::create_persona(PERSONA_ID, "Focus Count Persona", "personal", USER_ID, None)
-            .await
-            .expect("create_persona must succeed");
+        persona_store::create_persona(
+            &_env.pool,
+            PERSONA_ID,
+            "Focus Count Persona",
+            "personal",
+            USER_ID,
+            None,
+        )
+        .await
+        .expect("create_persona must succeed");
 
-        let before = list_personas(USER_ID.to_owned())
+        let app = mock_app_with_registry(_env.pool.clone());
+        let pool = app.state::<sqlx::SqlitePool>();
+        let before = list_personas(USER_ID.to_owned(), pool.clone())
             .await
             .expect("list_personas must succeed");
         assert_eq!(
@@ -549,6 +590,7 @@ mod tests {
 
         for focus_id in ["quick-ask", "writing-assistant"] {
             focus_settings_store::create_focus_settings(
+                &_env.pool,
                 PERSONA_ID,
                 focus_id,
                 "bidirectional",
@@ -562,7 +604,7 @@ mod tests {
             .expect("create_focus_settings must succeed");
         }
 
-        let after = list_personas(USER_ID.to_owned())
+        let after = list_personas(USER_ID.to_owned(), pool)
             .await
             .expect("list_personas must succeed");
         assert_eq!(
@@ -574,10 +616,18 @@ mod tests {
     #[tokio::test]
     async fn get_focus_settings_last_used_is_none_before_any_run() {
         let _env = setup().await;
-        persona_store::create_persona(PERSONA_ID, "Last Used Persona", "personal", USER_ID, None)
-            .await
-            .expect("create_persona must succeed");
+        persona_store::create_persona(
+            &_env.pool,
+            PERSONA_ID,
+            "Last Used Persona",
+            "personal",
+            USER_ID,
+            None,
+        )
+        .await
+        .expect("create_persona must succeed");
         focus_settings_store::create_focus_settings(
+            &_env.pool,
             PERSONA_ID,
             "quick-ask",
             "bidirectional",
@@ -590,15 +640,17 @@ mod tests {
         .await
         .expect("create_focus_settings must succeed");
 
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         populate_registry(&registry, USER_ID, MASTER_KEY).await;
+        let pool = app.state::<sqlx::SqlitePool>();
 
         let info = get_focus_settings(
             USER_ID.to_owned(),
             PERSONA_ID.to_owned(),
             registry,
             "quick-ask".to_owned(),
+            pool,
         )
         .await
         .expect("get_focus_settings must succeed");
@@ -612,10 +664,18 @@ mod tests {
     #[tokio::test]
     async fn get_focus_settings_last_used_is_real_after_a_run() {
         let _env = setup().await;
-        persona_store::create_persona(PERSONA_ID, "Last Used Persona 2", "personal", USER_ID, None)
-            .await
-            .expect("create_persona must succeed");
+        persona_store::create_persona(
+            &_env.pool,
+            PERSONA_ID,
+            "Last Used Persona 2",
+            "personal",
+            USER_ID,
+            None,
+        )
+        .await
+        .expect("create_persona must succeed");
         focus_settings_store::create_focus_settings(
+            &_env.pool,
             PERSONA_ID,
             "quick-ask",
             "bidirectional",
@@ -637,15 +697,17 @@ mod tests {
         .await
         .expect("test_seed_focus_run must succeed");
 
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         populate_registry(&registry, USER_ID, MASTER_KEY).await;
+        let pool = app.state::<sqlx::SqlitePool>();
 
         let info = get_focus_settings(
             USER_ID.to_owned(),
             PERSONA_ID.to_owned(),
             registry,
             "quick-ask".to_owned(),
+            pool,
         )
         .await
         .expect("get_focus_settings must succeed");
@@ -659,10 +721,18 @@ mod tests {
     #[tokio::test]
     async fn list_focuses_last_used_matches_get_focus_settings_via_batch_map() {
         let _env = setup().await;
-        persona_store::create_persona(PERSONA_ID, "Batch Persona", "personal", USER_ID, None)
-            .await
-            .expect("create_persona must succeed");
+        persona_store::create_persona(
+            &_env.pool,
+            PERSONA_ID,
+            "Batch Persona",
+            "personal",
+            USER_ID,
+            None,
+        )
+        .await
+        .expect("create_persona must succeed");
         focus_settings_store::create_focus_settings(
+            &_env.pool,
             PERSONA_ID,
             "quick-ask",
             "bidirectional",
@@ -684,11 +754,12 @@ mod tests {
         .await
         .expect("test_seed_focus_run must succeed");
 
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         populate_registry(&registry, USER_ID, MASTER_KEY).await;
+        let pool = app.state::<sqlx::SqlitePool>();
 
-        let focuses = list_focuses(USER_ID.to_owned(), PERSONA_ID.to_owned(), registry)
+        let focuses = list_focuses(USER_ID.to_owned(), PERSONA_ID.to_owned(), registry, pool)
             .await
             .expect("list_focuses must succeed");
 
@@ -704,6 +775,7 @@ mod tests {
     async fn update_focus_settings_max_permitted_tier_loosen_trips_gate() {
         let _env = setup().await;
         persona_store::create_persona(
+            &_env.pool,
             PERSONA_ID,
             "Ceiling Gate Persona",
             "personal",
@@ -713,6 +785,7 @@ mod tests {
         .await
         .expect("create_persona must succeed");
         focus_settings_store::create_focus_settings(
+            &_env.pool,
             PERSONA_ID,
             "quick-ask",
             "bidirectional",
@@ -725,9 +798,10 @@ mod tests {
         .await
         .expect("create_focus_settings must succeed");
 
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         populate_registry(&registry, USER_ID, MASTER_KEY).await;
+        let pool = app.state::<sqlx::SqlitePool>();
 
         let err = update_focus_settings(
             USER_ID.to_owned(),
@@ -741,6 +815,7 @@ mod tests {
                 max_permitted_tier: Some(ExternalAccess::Unrestricted),
                 focus_profile: None,
             },
+            pool,
         )
         .await
         .expect_err("raising max_permitted_tier alone must trip the friction gate");

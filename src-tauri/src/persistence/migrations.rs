@@ -22,9 +22,9 @@
 // LOCK IDENTITY: hostname:pid:uuid (uuid generated once per process startup
 // via OnceLock). The UUID component eliminates PID-reuse false ownership.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::ConnectOptions;
@@ -260,6 +260,16 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/shared_015.sql"),
     },
     SchemaFile {
+        prefix: "shared",
+        version: 16,
+        sql: include_str!("../../schema/shared_016.sql"),
+    },
+    SchemaFile {
+        prefix: "shared",
+        version: 17,
+        sql: include_str!("../../schema/shared_017.sql"),
+    },
+    SchemaFile {
         prefix: "tier3_cookies",
         version: 1,
         sql: include_str!("../../schema/tier3_cookies_001.sql"),
@@ -301,16 +311,80 @@ fn validate_manifest() {
 /// quotes them.
 fn validate_v1_rerun_safety() {
     for f in SCHEMA_FILES.iter().filter(|f| f.version == 1) {
-        for stmt in parse_statements(f.sql) {
-            let upper = stmt.trim_start().to_uppercase();
-            assert!(
-                !upper.starts_with("ALTER TABLE") && !upper.starts_with("DROP "),
-                "{}_001.sql (v1, always re-run every startup) contains a non-\
-                 idempotent statement: {stmt:?} — use a new versioned migration \
-                 file (v2+) instead of amending a v1 file in place for this change",
-                f.prefix,
-            );
+        validate_v1_file_rerun_safety(f.prefix, f.sql);
+    }
+}
+
+/// Returns true if `upper` is a CREATE TABLE/VIRTUAL TABLE/INDEX/UNIQUE
+/// INDEX/TRIGGER statement missing its required IF NOT EXISTS guard.
+/// `upper` must already be the uppercased, trimmed-start statement text.
+fn create_stmt_missing_if_not_exists(upper: &str) -> bool {
+    const GUARDED: &[&str] = &[
+        "CREATE TABLE IF NOT EXISTS",
+        "CREATE VIRTUAL TABLE IF NOT EXISTS",
+        "CREATE INDEX IF NOT EXISTS",
+        "CREATE UNIQUE INDEX IF NOT EXISTS",
+        "CREATE TRIGGER IF NOT EXISTS",
+    ];
+    if GUARDED.iter().any(|g| upper.starts_with(g)) {
+        return false;
+    }
+    const UNGUARDED_KINDS: &[&str] = &[
+        "CREATE TABLE ",
+        "CREATE VIRTUAL TABLE ",
+        "CREATE INDEX ",
+        "CREATE UNIQUE INDEX ",
+        "CREATE TRIGGER ",
+    ];
+    UNGUARDED_KINDS.iter().any(|k| upper.starts_with(k))
+}
+
+/// Statement-level checks behind validate_v1_rerun_safety(), factored out so
+/// tests can feed it arbitrary SQL without adding fake entries to the real
+/// SCHEMA_FILES manifest.
+fn validate_v1_file_rerun_safety(prefix: &str, sql: &str) {
+    for stmt in parse_statements(sql) {
+        let upper = stmt.trim_start().to_uppercase();
+
+        assert!(
+            !upper.starts_with("ALTER TABLE") && !upper.starts_with("DROP "),
+            "{prefix}_001.sql (v1, always re-run every startup) contains a non-\
+             idempotent statement: {stmt:?} — use a new versioned migration \
+             file (v2+) instead of amending a v1 file in place for this change",
+        );
+
+        assert!(
+            !create_stmt_missing_if_not_exists(&upper),
+            "{prefix}_001.sql (v1, always re-run every startup) contains a \
+             CREATE TABLE/INDEX/TRIGGER statement missing its IF NOT EXISTS \
+             guard: {stmt:?} — every v1 CREATE must be idempotent on rerun",
+        );
+
+        // parse_statements folds an entire CREATE TRIGGER...END block into
+        // one statement, so a trigger's upper here is the whole body, not
+        // just its header. Statements inside that body only execute when a
+        // real row change fires the trigger, never on migration replay
+        // itself, so they're exempt from the bare-DML check below --
+        // skip past this statement without inspecting its body's INSERTs.
+        let is_trigger_def =
+            upper.starts_with("CREATE TRIGGER") || upper.starts_with("CREATE OR REPLACE TRIGGER");
+        if is_trigger_def {
+            continue;
         }
+
+        let is_safe_insert =
+            upper.starts_with("INSERT OR IGNORE") || upper.starts_with("INSERT OR REPLACE");
+        let is_bare_dml = (upper.starts_with("INSERT ") && !is_safe_insert)
+            || upper.starts_with("UPDATE ")
+            || upper.starts_with("DELETE ");
+        assert!(
+            !is_bare_dml,
+            "{prefix}_001.sql (v1, always re-run every startup) contains a \
+             bare top-level INSERT/UPDATE/DELETE outside a trigger body: \
+             {stmt:?} — use INSERT OR IGNORE / INSERT OR REPLACE for \
+             idempotent seeding, or move non-idempotent DML into a new \
+             versioned migration file (v2+)",
+        );
     }
 }
 
@@ -405,11 +479,28 @@ fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+/// Lock rows older than this are treated as abandoned (holder crashed before
+/// reaching release_lock()) and become reclaimable by a new acquisition
+/// attempt. items.id=473.
+///
+/// Sized from a real measurement, not a guess: test_shared_migration_
+/// applies_cleanly (below) runs the entire "shared" chain — 17 migration
+/// versions, including this app's largest single schema file (shared_001.sql,
+/// ~35KB) — end to end against an in-memory connection in ~20ms. Real
+/// deployments add SQLCipher's PRAGMA key KDF cost and disk I/O, and
+/// QR_NETWORK_STORAGE=true forces single-writer journal_mode=DELETE, but
+/// none of that plausibly closes a 4-5 order-of-magnitude gap to this
+/// threshold. 300s (5 minutes) is therefore chosen to be effectively
+/// unreachable by any genuinely still-running migration against this app's
+/// current or near-future schemas -- so it should never fire concurrently
+/// with a real one -- while still bounding a crash-recovery wait to
+/// something a person can sit through on a retry, instead of a permanent
+/// lockout that needs manual DB surgery to clear.
+const STALE_LOCK_THRESHOLD_SECS: i64 = 300;
+
 /// "hostname:pid:uuid" lock identity string.
 /// UUID is generated once per process startup via OnceLock — eliminates
-/// PID-reuse false ownership. Stale locks (process died holding lock) are
-/// not automatically recovered; they require manual intervention or a
-/// future lock-expiry mechanism.
+/// PID-reuse false ownership.
 fn process_id() -> String {
     static UUID: OnceLock<String> = OnceLock::new();
     let uuid = UUID.get_or_init(|| uuid::Uuid::new_v4().to_string());
@@ -482,6 +573,9 @@ async fn bootstrap_lock_table(conn: &mut SqliteConnection) -> Result<(), Migrati
 /// Predicate guards both columns: protects against a future bug that might
 /// leave locked_at=NULL with stale locked_by metadata.
 /// No COMMIT needed — autocommit fires immediately after each statement.
+///
+/// If the row is already held, falls through to try_reclaim_stale_lock() to
+/// recover from a holder that crashed before ever calling release_lock().
 async fn acquire_lock(conn: &mut SqliteConnection) -> Result<bool, MigrationError> {
     let pid = process_id();
     let result = sqlx::query(
@@ -493,7 +587,74 @@ async fn acquire_lock(conn: &mut SqliteConnection) -> Result<bool, MigrationErro
     .execute(&mut *conn)
     .await?;
 
-    Ok(result.rows_affected() == 1)
+    if result.rows_affected() == 1 {
+        return Ok(true);
+    }
+
+    try_reclaim_stale_lock(conn, &pid).await
+}
+
+/// If migration_lock is held but locked_at is older than
+/// STALE_LOCK_THRESHOLD_SECS, reclaim it -- the holder almost certainly
+/// crashed mid-migration without reaching release_lock(). Returns true if
+/// this call reclaimed the lock.
+///
+/// The reclaim UPDATE's WHERE clause pins locked_at to the exact value just
+/// read (a compare-and-swap), not to an inequality against a cutoff
+/// timestamp string: two lock rows' RFC3339 strings are only safe to compare
+/// with `<` when both have the same fractional-second digit count, which
+/// chrono's to_rfc3339() (SecondsFormat::AutoSi) does not guarantee. Pinning
+/// to the exact previously-read string sidesteps that entirely and still
+/// gives the same atomicity guarantee as acquire_lock's own UPDATE: if a
+/// second process races this one to reclaim the same stale row, only the
+/// first UPDATE to land will affect a row -- the loser's locked_at no longer
+/// matches and it simply gets rows_affected() == 0.
+async fn try_reclaim_stale_lock(
+    conn: &mut SqliteConnection,
+    pid: &str,
+) -> Result<bool, MigrationError> {
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT locked_at FROM migration_lock WHERE id = 1")
+            .fetch_optional(&mut *conn)
+            .await?;
+
+    let Some((Some(locked_at),)) = row else {
+        return Ok(false);
+    };
+
+    let held_since = match chrono::DateTime::parse_from_rfc3339(&locked_at) {
+        Ok(ts) => ts.with_timezone(&chrono::Utc),
+        Err(_) => return Ok(false),
+    };
+
+    let stale =
+        chrono::Utc::now() - held_since > chrono::Duration::seconds(STALE_LOCK_THRESHOLD_SECS);
+    if !stale {
+        return Ok(false);
+    }
+
+    let result = sqlx::query(
+        "UPDATE migration_lock SET locked_at = ?, locked_by = ? \
+         WHERE id = 1 AND locked_at = ?",
+    )
+    .bind(now())
+    .bind(pid)
+    .bind(&locked_at)
+    .execute(&mut *conn)
+    .await?;
+
+    let reclaimed = result.rows_affected() == 1;
+    if reclaimed {
+        log::warn!(
+            "migration_lock reclaimed: prior holder's lock was acquired at {} \
+             (more than {}s ago) and never released -- it likely crashed \
+             mid-migration. Proceeding as {}.",
+            locked_at,
+            STALE_LOCK_THRESHOLD_SECS,
+            pid
+        );
+    }
+    Ok(reclaimed)
 }
 
 /// Acquire migration_lock, retrying with a short bounded backoff if it's
@@ -592,6 +753,76 @@ pub async fn schema_version_exists(db_path: &Path, key_hex: Option<&str>) -> boo
     matches!(result, Ok(Some(_)))
 }
 
+/// Per-process, in-memory-only "already checked this run" gate for the
+/// trailing PRAGMA integrity_check/quick_check in run_pending (items.id=484,
+/// Option D approved via items.id=475's Plan Mode investigation,
+/// chat_session_handoffs.id=333). Never persisted — resets on every process
+/// launch — so a fresh app start (including recovery from a crash or
+/// unclean shutdown, exactly when real corruption is most likely) still
+/// always checks every file at least once. What this gate removes is the
+/// redundant re-scan on every subsequent open of a file THIS process has
+/// already opened and verified, which is what made integrity_check fire
+/// hundreds of times per session before this change.
+static CHECKED_FILES: OnceLock<std::sync::Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+fn checked_files_set() -> &'static std::sync::Mutex<HashSet<PathBuf>> {
+    CHECKED_FILES.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+}
+
+/// Returns true if `path` was already recorded as checked by an earlier
+/// call in this process run, marking it checked as a side effect if not.
+/// Deliberately check-and-set in one lock acquisition (like path_lock's own
+/// get-or-create above) so two racing callers can't both observe "not yet
+/// checked" for the same path.
+fn already_checked_this_run(path: &Path) -> bool {
+    let mut guard = checked_files_set()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    !guard.insert(path.to_path_buf())
+}
+
+#[cfg(test)]
+fn is_marked_checked_for_test(path: &Path) -> bool {
+    checked_files_set()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(path)
+}
+
+/// Pure decision for run_pending's trailing consistency check — factored
+/// out of the actual PRAGMA execution so the branching itself is directly
+/// unit-testable without spinning up a real connection. `Some(true)` means
+/// run the full PRAGMA integrity_check; `Some(false)` means run the cheaper
+/// PRAGMA quick_check; `None` means skip the check entirely.
+///
+/// db_path is None for every caller with no real file identity to gate
+/// against (this module's and provider_store.rs's :memory:-backed tests,
+/// which call the public run_migrations() directly) — those keep the
+/// unconditional full check this module always ran before items.id=484.
+///
+/// DELIBERATELY does not gate on version-parity alone (migrations_applied
+/// == 0): that was explicitly rejected during items.id=475's investigation
+/// as a real corruption-detection regression, since it would stop catching
+/// disk errors, unclean shutdowns, or hardware faults unrelated to schema
+/// version — self-hosted software with no ops team watching for silent
+/// corruption can't afford that gap. The first-touch-no-migration case
+/// still gets quick_check, never a silent skip.
+fn integrity_check_decision(
+    db_path: Option<&Path>,
+    migrations_applied_this_call: u32,
+) -> Option<bool> {
+    match db_path {
+        None => Some(true),
+        Some(path) => {
+            if already_checked_this_run(path) {
+                None
+            } else {
+                Some(migrations_applied_this_call > 0)
+            }
+        }
+    }
+}
+
 /// Apply all pending migrations for the given prefix to conn.
 /// PRAGMA key (if provided) is applied before any other operation.
 /// Returns number of migrations applied.
@@ -601,6 +832,22 @@ pub async fn run_migrations(
     conn: &mut SqliteConnection,
     prefix: &str,
     key_hex: Option<&str>,
+) -> Result<u32, MigrationError> {
+    run_migrations_at(conn, prefix, key_hex, None).await
+}
+
+/// Same as run_migrations, but threads a real db file path through to
+/// run_pending's trailing consistency check for the items.id=484 per-
+/// process-per-file integrity_check gate (Option D). Only migrate_db_file
+/// (below) has genuine file identity to gate against — every other caller
+/// goes through the public run_migrations() above with db_path=None, which
+/// always runs the full check exactly as this module did before
+/// items.id=484.
+async fn run_migrations_at(
+    conn: &mut SqliteConnection,
+    prefix: &str,
+    key_hex: Option<&str>,
+    db_path: Option<&Path>,
 ) -> Result<u32, MigrationError> {
     // Always validate manifest — O(19), negligible cost, catches hand-edit errors.
     validate_manifest();
@@ -640,13 +887,17 @@ pub async fn run_migrations(
         return Err(MigrationError::Locked);
     }
 
-    let result = run_pending(conn, prefix).await;
+    let result = run_pending(conn, prefix, db_path).await;
     release_lock(conn).await;
     result
 }
 
 /// Inner migration loop — runs after lock is acquired.
-async fn run_pending(conn: &mut SqliteConnection, prefix: &str) -> Result<u32, MigrationError> {
+async fn run_pending(
+    conn: &mut SqliteConnection,
+    prefix: &str,
+    db_path: Option<&Path>,
+) -> Result<u32, MigrationError> {
     let current_version = get_applied_version(conn).await;
     let migrations = get_migration_files(prefix);
     let mut applied: u32 = 0;
@@ -734,18 +985,27 @@ async fn run_pending(conn: &mut SqliteConnection, prefix: &str) -> Result<u32, M
         }
     }
 
-    let check: Option<(String,)> = sqlx::query_as("PRAGMA integrity_check")
-        .fetch_optional(&mut *conn)
-        .await?;
+    // items.id=484 (Option D): gate the trailing consistency check so a
+    // file this process already opened and verified isn't rescanned on
+    // every subsequent open — see integrity_check_decision's own doc
+    // comment for why this doesn't weaken corruption detection.
+    if let Some(full_check) = integrity_check_decision(db_path, applied) {
+        let pragma = if full_check {
+            "PRAGMA integrity_check"
+        } else {
+            "PRAGMA quick_check"
+        };
+        let check: Option<(String,)> = sqlx::query_as(pragma).fetch_optional(&mut *conn).await?;
 
-    if !matches!(check, Some((ref s,)) if s == "ok") {
-        return Err(MigrationError::Failed {
-            db_path: prefix.to_owned(),
-            plain_language: "Quiet Rabbit found a problem with its database. \
-                Your data may need attention. [Get help]"
-                .to_owned(),
-            diagnostic: None,
-        });
+        if !matches!(check, Some((ref s,)) if s == "ok") {
+            return Err(MigrationError::Failed {
+                db_path: prefix.to_owned(),
+                plain_language: "Quiet Rabbit found a problem with its database. \
+                    Your data may need attention. [Get help]"
+                    .to_owned(),
+                diagnostic: None,
+            });
+        }
     }
 
     Ok(applied)
@@ -803,15 +1063,37 @@ pub fn get_data_root() -> PathBuf {
 /// entry lookup/insert, never across an await); each entry is a
 /// tokio::sync::Mutex so a waiting caller yields instead of blocking a
 /// worker thread.
+///
+/// items.id=470: the map stores Weak, not Arc, so it never keeps a path's
+/// mutex alive on its own. The only strong reference is the local `lock`
+/// binding in migrate_db_file, held for exactly the duration of that one
+/// migration (it outlives the `.lock().await` guard, which borrows from
+/// it). Once migrate_db_file returns, that Arc drops; if it was the last
+/// strong reference, the Mutex<()> is freed immediately -- no sweep, no
+/// size threshold, nothing to schedule. The next call for that path finds
+/// a dead Weak (upgrade() -> None) and allocates a fresh entry.
+///
+/// This is race-free for the exact hazard path_lock exists to prevent:
+/// the get-or-create-or-replace decision (upgrade attempt, and the insert
+/// if it fails) all happens while holding `guard`, a single std::sync::
+/// Mutex over the whole map, synchronously with no await in between. A
+/// second caller can't observe or act on the map mid-decision -- it either
+/// sees the old live entry (and upgrades it, extending the same Arc a
+/// migration is currently holding) or sees the just-inserted fresh one.
+/// Nothing removes an entry out from under a strong holder: a Weak can
+/// only fail to upgrade once every Arc referencing it (including any
+/// migration's `lock` local) has already been dropped.
 fn path_lock(path: &Path) -> Arc<tokio::sync::Mutex<()>> {
-    static PATH_LOCKS: OnceLock<std::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> =
+    static PATH_LOCKS: OnceLock<std::sync::Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>> =
         OnceLock::new();
     let map = PATH_LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     let mut guard = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    guard
-        .entry(path.to_path_buf())
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone()
+    if let Some(existing) = guard.get(path).and_then(Weak::upgrade) {
+        return existing;
+    }
+    let fresh = Arc::new(tokio::sync::Mutex::new(()));
+    guard.insert(path.to_path_buf(), Arc::downgrade(&fresh));
+    fresh
 }
 
 /// Shared body for every typed migrate_*_db helper below: ensures the
@@ -829,7 +1111,7 @@ async fn migrate_db_file(
     let lock = path_lock(db_path);
     let _guard = lock.lock().await;
     let mut conn = open_raw(db_path).await?;
-    run_migrations(&mut conn, prefix, key_hex).await
+    run_migrations_at(&mut conn, prefix, key_hex, Some(db_path)).await
 }
 
 // ---------------------------------------------------------------------------
@@ -966,26 +1248,22 @@ pub async fn migrate_scores_db() -> Result<u32, MigrationError> {
 }
 
 /// Migrate a focus's domain_context.db (encrypted). key_hex: bare hex bytes only.
-/// TODO: Unify with topic_store canonical paths once topic_store is ported.
+/// Path is the canonical domain_context_store::get_domain_context_path
+/// (items.id=222, items.id=466).
 pub async fn migrate_domain_context_db(
     user_id: &str,
     persona_id: &str,
     focus_id: &str,
     key_hex: &str,
 ) -> Result<u32, MigrationError> {
-    let db_path = get_data_root()
-        .join("users")
-        .join(user_id)
-        .join("personas")
-        .join(persona_id)
-        .join("focuses")
-        .join(focus_id)
-        .join("domain_context.db");
+    let db_path = crate::persistence::domain_context_store::get_domain_context_path(
+        user_id, persona_id, focus_id,
+    );
     migrate_db_file(&db_path, "domain_context", Some(key_hex)).await
 }
 
 /// Migrate a topic's plan_state.db (encrypted). key_hex: bare hex bytes only.
-/// TODO: Unify with topic_store canonical paths once topic_store is ported.
+/// Path is the canonical topic_store::get_plan_state_path (items.id=94, items.id=222).
 pub async fn migrate_plan_state_db(
     user_id: &str,
     persona_id: &str,
@@ -993,16 +1271,9 @@ pub async fn migrate_plan_state_db(
     topic_id: &str,
     key_hex: &str,
 ) -> Result<u32, MigrationError> {
-    let db_path = get_data_root()
-        .join("users")
-        .join(user_id)
-        .join("personas")
-        .join(persona_id)
-        .join("focuses")
-        .join(focus_id)
-        .join("topics")
-        .join(topic_id)
-        .join("plan_state.db");
+    let db_path = crate::persistence::topic_store::get_plan_state_path(
+        user_id, persona_id, focus_id, topic_id,
+    );
     migrate_db_file(&db_path, "plan_state", Some(key_hex)).await
 }
 
@@ -1121,6 +1392,77 @@ mod tests {
         validate_v1_rerun_safety();
     }
 
+    #[test]
+    #[should_panic(expected = "missing its IF NOT EXISTS guard")]
+    fn test_v1_rejects_create_table_missing_if_not_exists() {
+        validate_v1_file_rerun_safety("fake", "CREATE TABLE foo (id INTEGER);");
+    }
+
+    #[test]
+    #[should_panic(expected = "missing its IF NOT EXISTS guard")]
+    fn test_v1_rejects_create_index_missing_if_not_exists() {
+        validate_v1_file_rerun_safety(
+            "fake",
+            "CREATE TABLE IF NOT EXISTS foo (id INTEGER);\n\
+             CREATE INDEX idx_foo ON foo(id);",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "missing its IF NOT EXISTS guard")]
+    fn test_v1_rejects_create_trigger_missing_if_not_exists() {
+        validate_v1_file_rerun_safety(
+            "fake",
+            "CREATE TABLE IF NOT EXISTS foo (id INTEGER);\n\
+             CREATE TRIGGER trg AFTER INSERT ON foo\nBEGIN\n  \
+             INSERT INTO bar(id) VALUES (1);\nEND;",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "bare top-level INSERT/UPDATE/DELETE")]
+    fn test_v1_rejects_bare_top_level_insert() {
+        validate_v1_file_rerun_safety(
+            "fake",
+            "CREATE TABLE IF NOT EXISTS foo (id INTEGER);\n\
+             INSERT INTO foo (id) VALUES (1);",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "bare top-level INSERT/UPDATE/DELETE")]
+    fn test_v1_rejects_bare_top_level_update() {
+        validate_v1_file_rerun_safety(
+            "fake",
+            "CREATE TABLE IF NOT EXISTS foo (id INTEGER);\n\
+             UPDATE foo SET id = 1;",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "bare top-level INSERT/UPDATE/DELETE")]
+    fn test_v1_rejects_bare_top_level_delete() {
+        validate_v1_file_rerun_safety(
+            "fake",
+            "CREATE TABLE IF NOT EXISTS foo (id INTEGER);\n\
+             DELETE FROM foo;",
+        );
+    }
+
+    #[test]
+    fn test_v1_allows_insert_or_ignore_and_trigger_body_dml() {
+        // Both real-world patterns already present in the current v1 files
+        // (schema_version/instance_config seed rows, and outputs_001.sql's
+        // outputs_fts triggers) must keep passing.
+        validate_v1_file_rerun_safety(
+            "fake",
+            "CREATE TABLE IF NOT EXISTS foo (id INTEGER);\n\
+             INSERT OR IGNORE INTO foo (id) VALUES (1);\n\
+             CREATE TRIGGER IF NOT EXISTS trg AFTER INSERT ON foo\nBEGIN\n  \
+             UPDATE foo SET id = 1;\n  DELETE FROM foo WHERE id = 0;\nEND;",
+        );
+    }
+
     // -- migration runner integration tests ---------------------------------
 
     async fn make_test_conn() -> SqliteConnection {
@@ -1182,6 +1524,83 @@ mod tests {
         assert!(
             acquire_lock(&mut conn).await.unwrap(),
             "should acquire after release"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_acquire_lock_reclaims_abandoned_lock_past_staleness_threshold() {
+        // items.id=473: simulates a process that acquired the lock and then
+        // crashed before ever reaching release_lock() -- the row is left
+        // permanently held (locked_at/locked_by both set, no live process
+        // behind them). Hand-writes that row shape directly rather than
+        // going through acquire_lock(), since the whole point is that no
+        // release ever happened.
+        let mut conn = make_test_conn().await;
+        bootstrap_lock_table(&mut conn).await.unwrap();
+
+        let abandoned_at = (chrono::Utc::now()
+            - chrono::Duration::seconds(STALE_LOCK_THRESHOLD_SECS + 60))
+        .to_rfc3339();
+        sqlx::query("UPDATE migration_lock SET locked_at = ?, locked_by = ? WHERE id = 1")
+            .bind(&abandoned_at)
+            .bind("dead-host:12345:stale-uuid")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+
+        assert!(
+            acquire_lock(&mut conn).await.unwrap(),
+            "acquire_lock must reclaim a lock whose locked_at is past the \
+             staleness threshold, since no release_lock() call is ever \
+             coming for an abandoned row"
+        );
+
+        let row: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT locked_at, locked_by FROM migration_lock WHERE id = 1")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        let (locked_at, locked_by) = row;
+        assert_ne!(
+            locked_at.as_deref(),
+            Some(abandoned_at.as_str()),
+            "reclaim must stamp a fresh locked_at, not keep the abandoned one"
+        );
+        assert_eq!(
+            locked_by.as_deref(),
+            Some(process_id().as_str()),
+            "reclaim must record this process as the new holder"
+        );
+
+        // Second acquire attempt must now fail -- this process holds the
+        // lock it just reclaimed, same as any other successful acquire.
+        assert!(
+            !acquire_lock(&mut conn).await.unwrap(),
+            "lock must be held by this process after reclaiming it"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_acquire_lock_does_not_reclaim_lock_under_staleness_threshold() {
+        // Companion regression test for the hazard this feature must not
+        // introduce: a lock held by a genuinely still-running migration
+        // (locked_at recent, well under the threshold) must NOT be
+        // reclaimable, or two processes could migrate the same database
+        // concurrently -- exactly what migration_lock exists to prevent.
+        let mut conn = make_test_conn().await;
+        bootstrap_lock_table(&mut conn).await.unwrap();
+
+        let recently_locked_at = (chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339();
+        sqlx::query("UPDATE migration_lock SET locked_at = ?, locked_by = ? WHERE id = 1")
+            .bind(&recently_locked_at)
+            .bind("live-host:99999:live-uuid")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+
+        assert!(
+            !acquire_lock(&mut conn).await.unwrap(),
+            "a lock held well under the staleness threshold must not be reclaimed"
         );
     }
 
@@ -1279,6 +1698,73 @@ mod tests {
         r2.expect("second concurrent call must not hit a database-locked race");
     }
 
+    #[test]
+    fn test_path_lock_entry_is_reclaimed_once_unused() {
+        // items.id=470: path_lock stores Weak, not Arc, specifically so an
+        // entry with no active migration doesn't pin its Mutex<()> forever.
+        // Drop the only strong reference and confirm the next lookup can't
+        // upgrade it -- i.e. the memory is actually freed, not just eligible
+        // for some future sweep to find.
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        let db_path = tempdir.path().join("reclaim_test.db");
+
+        let first = path_lock(&db_path);
+        let weak = Arc::downgrade(&first);
+        drop(first);
+
+        assert!(
+            weak.upgrade().is_none(),
+            "dropping the only strong ref must free the Mutex<()> immediately, \
+             not leave it pinned by the map"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_path_lock_still_serializes_after_a_reclaim_cycle() {
+        // items.id=470: the fix must not reopen items.id=391's race. Run one
+        // migration to completion (so its Arc drops and the map's Weak goes
+        // dead -- a reclaim cycle), THEN start two concurrent migrations
+        // against that same path. If the post-cleanup path_lock() ever
+        // handed out two different mutexes for the same file, these two
+        // calls would race exactly like the pre-items.id=391 bug.
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let saved_network = std::env::var("QR_NETWORK_STORAGE").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+        std::env::set_var("QR_NETWORK_STORAGE", "true");
+
+        let user_id = "reclaim-cycle-test-user";
+        let persona_id = "reclaim-cycle-test-persona";
+
+        // First migration runs and completes, dropping its Arc and leaving
+        // a dead Weak behind in PATH_LOCKS for this path.
+        let primed = migrate_personal_db(user_id, persona_id, TEST_KEY_HEX).await;
+
+        // Now race two more against the same (already-migrated) file. Each
+        // must observe the dead Weak, allocate a fresh Arc, and still
+        // serialize against each other via that fresh mutex.
+        let (r1, r2) = tokio::join!(
+            migrate_personal_db(user_id, persona_id, TEST_KEY_HEX),
+            migrate_personal_db(user_id, persona_id, TEST_KEY_HEX),
+        );
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+        if let Some(v) = saved_network {
+            std::env::set_var("QR_NETWORK_STORAGE", v);
+        } else {
+            std::env::remove_var("QR_NETWORK_STORAGE");
+        }
+
+        primed.expect("priming migration must succeed");
+        r1.expect("first post-reclaim call must not hit a database-locked race");
+        r2.expect("second post-reclaim call must not hit a database-locked race");
+    }
+
     // -- items.id=205: auth foundation migration tests ---------------------
     //
     // shared_001.sql was edited directly to its final auth-foundation shape
@@ -1295,15 +1781,15 @@ mod tests {
             .await
             .expect("shared migration chain must apply cleanly on a fresh db");
         assert_eq!(
-            applied, 15,
-            "expected all fifteen shared schema versions to apply"
+            applied, 17,
+            "expected all seventeen shared schema versions to apply"
         );
 
         let version: (i64,) = sqlx::query_as("SELECT MAX(version) FROM schema_version")
             .fetch_one(&mut conn)
             .await
             .unwrap();
-        assert_eq!(version.0, 15);
+        assert_eq!(version.0, 17);
     }
 
     #[tokio::test]
@@ -1374,8 +1860,8 @@ mod tests {
             .expect("drift-healing run must succeed");
 
         assert_eq!(
-            applied, 14,
-            "shared v2 through v15 should count as newly applied from a stale v1 database"
+            applied, 16,
+            "shared v2 through v17 should count as newly applied from a stale v1 database"
         );
 
         // items.id=427: shared_013.sql drops tier3_providers (generalized
@@ -2119,5 +2605,119 @@ mod tests {
         let mut ps_conn = open_verify_conn(&ps_path, Some(TEST_KEY_HEX)).await;
         assert!(table_exists(&mut ps_conn, "topic_header").await);
         assert!(table_exists(&mut ps_conn, "handoff_tokens").await);
+    }
+
+    // -- items.id=484: integrity_check gate (Option D) tests ---------------
+    //
+    // integrity_check_decision is tested directly as pure branching logic
+    // first (fast, deterministic, no real connection needed), then the real
+    // migrate_personal_db path is exercised end-to-end to confirm the gate
+    // is actually wired up. Each pure-logic test uses its own UUID-suffixed
+    // fake path -- CHECKED_FILES is one process-wide static shared by every
+    // test in this binary, so a fixed literal path would let unrelated
+    // tests interfere with each other depending on run order.
+
+    #[test]
+    fn integrity_check_decision_without_a_path_always_runs_full_check() {
+        // Direct run_migrations() callers with no file-path identity (every
+        // :memory:-backed test in this module, plus provider_store.rs's own
+        // direct run_migrations() calls) have nothing to gate against --
+        // they must keep getting the unconditional full check this module
+        // always ran before items.id=484, on every single call.
+        assert_eq!(integrity_check_decision(None, 0), Some(true));
+        assert_eq!(integrity_check_decision(None, 5), Some(true));
+    }
+
+    #[test]
+    fn integrity_check_decision_runs_full_check_on_first_open_with_a_migration_applied() {
+        let fake_path = PathBuf::from(format!("/fake/gate-test-{}.db", uuid::Uuid::new_v4()));
+        assert_eq!(
+            integrity_check_decision(Some(&fake_path), 8),
+            Some(true),
+            "first open of a file that applied a real migration must run the full \
+             integrity_check -- this is exactly the crash/unclean-shutdown detection \
+             Option D must not weaken"
+        );
+    }
+
+    #[test]
+    fn integrity_check_decision_runs_quick_check_on_first_open_with_nothing_pending() {
+        let fake_path = PathBuf::from(format!("/fake/gate-test-{}.db", uuid::Uuid::new_v4()));
+        assert_eq!(
+            integrity_check_decision(Some(&fake_path), 0),
+            Some(false),
+            "first-touch-no-migration must still run the cheaper quick_check, not skip \
+             entirely -- every file must be checked at least once per process launch, \
+             not gated on version-parity alone"
+        );
+    }
+
+    #[test]
+    fn integrity_check_decision_skips_a_same_run_reopen_of_an_already_checked_file() {
+        let fake_path = PathBuf::from(format!("/fake/gate-test-{}.db", uuid::Uuid::new_v4()));
+        // First open records this path as checked, regardless of outcome.
+        assert_eq!(integrity_check_decision(Some(&fake_path), 3), Some(true));
+        // Any subsequent open of the SAME path in this process run must
+        // skip entirely -- even one that itself has further migrations to
+        // apply, per items.id=484's own "on every subsequent open... skip
+        // the check entirely" spec (no carve-out for a later migration).
+        assert_eq!(integrity_check_decision(Some(&fake_path), 0), None);
+        assert_eq!(integrity_check_decision(Some(&fake_path), 2), None);
+    }
+
+    #[tokio::test]
+    async fn migrate_personal_db_forces_full_check_on_first_open_then_skips_same_run_reopen() {
+        // End-to-end proof that migrate_personal_db's real call path
+        // actually reaches the Option D gate. A brand-new file's first
+        // migration always applies all 8 real personal_*.sql versions --
+        // nothing needs to be hand-seeded to force that -- which is exactly
+        // the "applied a real migration" case the gate must run the full
+        // integrity_check for on this, its first open.
+        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "gate-test-user";
+        let persona_id = "gate-test-persona";
+        let db_path = tempdir
+            .path()
+            .join("users")
+            .join(user_id)
+            .join("personas")
+            .join(persona_id)
+            .join("personal.db");
+
+        assert!(
+            !is_marked_checked_for_test(&db_path),
+            "a path never opened by this process must not already be in the gate"
+        );
+
+        let first = migrate_personal_db(user_id, persona_id, TEST_KEY_HEX).await;
+        let marked_after_first = is_marked_checked_for_test(&db_path);
+        let second = migrate_personal_db(user_id, persona_id, TEST_KEY_HEX).await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+
+        assert_eq!(
+            first.expect("first migration, which applies all 8 real versions, must succeed"),
+            8,
+            "a brand-new personal.db must apply every real migration version on first open"
+        );
+        assert!(
+            marked_after_first,
+            "the first open, having applied a real migration and run the full \
+             integrity_check, must record this path as checked so a same-run reopen \
+             can skip it"
+        );
+        assert_eq!(
+            second.expect("a same-run reopen of an already-checked file must not error"),
+            0,
+            "no migrations are pending on the second open of an already-migrated file"
+        );
     }
 }

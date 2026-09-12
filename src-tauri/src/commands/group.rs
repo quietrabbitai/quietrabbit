@@ -62,8 +62,9 @@ pub async fn set_group_sync_folder(
     persona_id: String,
     group_id: String,
     folder_path: String,
+    pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<(), String> {
-    settings_store::set_group_sync_folder(&persona_id, &group_id, &folder_path)
+    settings_store::set_group_sync_folder(&pool, &persona_id, &group_id, &folder_path)
         .await
         .map_err(|e| e.to_string())
 }
@@ -77,8 +78,9 @@ pub async fn set_group_sync_folder(
 pub async fn get_group_sync_folder(
     persona_id: String,
     group_id: String,
+    pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<Option<GroupSyncSettingsInfo>, String> {
-    let settings = settings_store::get_group_sync_settings(&persona_id, &group_id)
+    let settings = settings_store::get_group_sync_settings(&pool, &persona_id, &group_id)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -114,11 +116,13 @@ pub async fn remove_group_member(
     sender_label: String,
     group_key_registry: State<'_, GroupKeyRegistry>,
     key_registry: State<'_, KeyRegistry>,
+    pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<(), String> {
     let reason: DepartureReason = reason
         .parse()
         .map_err(|e: group_membership::GroupMembershipError| e.to_string())?;
     group_membership::remove_member(
+        &pool,
         &group_id,
         &departing_persona_id,
         reason,
@@ -147,8 +151,10 @@ pub async fn create_group(
     creator_label: String,
     group_key_registry: State<'_, GroupKeyRegistry>,
     key_registry: State<'_, KeyRegistry>,
+    pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<String, String> {
     group_creation::create_group(
+        &pool,
         &creator_persona_id,
         &group_display_name,
         &creator_label,
@@ -270,6 +276,7 @@ mod tests {
         _tempdir: tempfile::TempDir,
         _lock: std::sync::MutexGuard<'static, ()>,
         saved_root: Option<String>,
+        pool: sqlx::SqlitePool,
     }
 
     impl Drop for TestEnv {
@@ -291,17 +298,31 @@ mod tests {
             .await
             .expect("shared.db migration must succeed in test setup");
 
+        let pool =
+            sqlx::SqlitePool::connect_with(crate::providers::utils::connect_options_unencrypted(
+                &crate::providers::utils::db_path_shared(),
+            ))
+            .await
+            .expect("shared.db pool must connect");
+
         TestEnv {
             _tempdir: tempdir,
             _lock: lock,
             saved_root,
+            pool,
         }
+    }
+
+    fn mock_app(pool: sqlx::SqlitePool) -> tauri::App<tauri::test::MockRuntime> {
+        mock_app_with_registry(pool)
     }
 
     #[tokio::test]
     async fn get_group_sync_folder_is_none_before_any_configuration() {
         let _env = setup().await;
-        let result = get_group_sync_folder("persona-1".to_owned(), "group-1".to_owned())
+        let app = mock_app(_env.pool.clone());
+        let pool = app.state::<sqlx::SqlitePool>();
+        let result = get_group_sync_folder("persona-1".to_owned(), "group-1".to_owned(), pool)
             .await
             .expect("get_group_sync_folder must succeed");
         assert!(result.is_none());
@@ -310,15 +331,18 @@ mod tests {
     #[tokio::test]
     async fn set_then_get_round_trips_through_the_command_layer() {
         let _env = setup().await;
+        let app = mock_app(_env.pool.clone());
+        let pool = app.state::<sqlx::SqlitePool>();
         set_group_sync_folder(
             "persona-1".to_owned(),
             "group-1".to_owned(),
             "/mnt/nas/family".to_owned(),
+            pool.clone(),
         )
         .await
         .expect("set_group_sync_folder must succeed");
 
-        let info = get_group_sync_folder("persona-1".to_owned(), "group-1".to_owned())
+        let info = get_group_sync_folder("persona-1".to_owned(), "group-1".to_owned(), pool)
             .await
             .expect("get_group_sync_folder must succeed")
             .expect("settings must exist after set_group_sync_folder");
@@ -330,10 +354,13 @@ mod tests {
     #[tokio::test]
     async fn set_group_sync_folder_rejects_empty_path_with_a_string_error() {
         let _env = setup().await;
+        let app = mock_app(_env.pool.clone());
+        let pool = app.state::<sqlx::SqlitePool>();
         let result = set_group_sync_folder(
             "persona-1".to_owned(),
             "group-1".to_owned(),
             "   ".to_owned(),
+            pool,
         )
         .await;
         assert!(result.is_err());
@@ -344,7 +371,7 @@ mod tests {
     #[tokio::test]
     async fn get_group_fact_sources_is_empty_before_any_opt_in() {
         let _env = setup().await;
-        let app = mock_app_with_registry();
+        let app = mock_app(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         populate_registry(
             &registry,
@@ -362,7 +389,7 @@ mod tests {
     #[tokio::test]
     async fn set_then_get_group_fact_source_opt_in_round_trips() {
         let _env = setup().await;
-        let app = mock_app_with_registry();
+        let app = mock_app(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         populate_registry(
             &registry,
@@ -389,7 +416,7 @@ mod tests {
     #[tokio::test]
     async fn set_group_fact_source_opt_in_false_removes_a_prior_opt_in() {
         let _env = setup().await;
-        let app = mock_app_with_registry();
+        let app = mock_app(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         populate_registry(
             &registry,
@@ -426,7 +453,7 @@ mod tests {
     #[tokio::test]
     async fn list_persona_group_ids_is_empty_on_a_fresh_persona() {
         let _env = setup().await;
-        let app = mock_app_with_registry();
+        let app = mock_app(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         populate_registry(
             &registry,
@@ -444,7 +471,7 @@ mod tests {
     #[tokio::test]
     async fn list_persona_group_ids_reflects_saved_group_keys_without_leaking_key_material() {
         let _env = setup().await;
-        let app = mock_app_with_registry();
+        let app = mock_app(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         let master_key = [0x55u8; crate::auth::kdf::MASTER_KEY_LEN];
         populate_registry(&registry, "user-1", master_key).await;

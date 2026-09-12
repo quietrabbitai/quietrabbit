@@ -22,12 +22,7 @@
 // CONNECTION MODEL: one connection per call, same as every other shared.db
 // store in this codebase.
 
-use std::path::PathBuf;
-
-use sqlx::sqlite::SqliteConnectOptions;
-use sqlx::ConnectOptions;
 use sqlx::Row;
-use sqlx::SqliteConnection;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -60,36 +55,6 @@ fn row_to_settings(
 }
 
 // ---------------------------------------------------------------------------
-// DB opener
-// ---------------------------------------------------------------------------
-// Duplicated rather than reused -- same reasoning every other module in this
-// codebase gives for this exact ~12-line helper: different error type per
-// module, zero divergence risk, not worth coupling.
-
-fn get_shared_db_path() -> PathBuf {
-    crate::persistence::migrations::get_data_root()
-        .join("instance")
-        .join("shared.db")
-}
-
-async fn open_shared_db() -> Result<SqliteConnection, PersonaViewShareSyncSettingsError> {
-    let db_path = get_shared_db_path();
-    let network_storage = std::env::var("QR_NETWORK_STORAGE")
-        .map(|v| v.to_lowercase() == "true")
-        .unwrap_or(false);
-    let journal_mode = if network_storage { "DELETE" } else { "WAL" };
-
-    let conn = SqliteConnectOptions::new()
-        .filename(&db_path)
-        .create_if_missing(false)
-        .pragma("journal_mode", journal_mode)
-        .connect()
-        .await?;
-
-    Ok(conn)
-}
-
-// ---------------------------------------------------------------------------
 // Read
 // ---------------------------------------------------------------------------
 
@@ -97,10 +62,11 @@ async fn open_shared_db() -> Result<SqliteConnection, PersonaViewShareSyncSettin
 /// (engine.rs's pull sweep) treat that as "sync not set up yet", a silent
 /// no-op, matching persona_sync::settings_store's own contract.
 pub async fn get_persona_view_share_sync_settings(
+    pool: &sqlx::SqlitePool,
     recipient_user_id: &str,
     share_id: &str,
 ) -> Result<Option<PersonaViewShareSyncSettings>, PersonaViewShareSyncSettingsError> {
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
 
     let row = sqlx::query(
         "SELECT recipient_user_id, share_id, folder_path, last_error, updated_at
@@ -108,7 +74,7 @@ pub async fn get_persona_view_share_sync_settings(
     )
     .bind(recipient_user_id)
     .bind(share_id)
-    .fetch_optional(&mut conn)
+    .fetch_optional(&mut *conn)
     .await?;
 
     match row {
@@ -127,6 +93,7 @@ pub async fn get_persona_view_share_sync_settings(
 /// establishes. Does not touch last_error: pointing at a new folder doesn't
 /// retroactively change the outcome of the last attempt against the old one.
 pub async fn set_persona_view_share_sync_folder(
+    pool: &sqlx::SqlitePool,
     recipient_user_id: &str,
     share_id: &str,
     folder_path: &str,
@@ -138,7 +105,7 @@ pub async fn set_persona_view_share_sync_folder(
     }
 
     let now = crate::providers::utils::now();
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
 
     sqlx::query(
         "INSERT INTO persona_view_share_settings
@@ -151,7 +118,7 @@ pub async fn set_persona_view_share_sync_folder(
     .bind(share_id)
     .bind(folder_path)
     .bind(&now)
-    .execute(&mut conn)
+    .execute(&mut *conn)
     .await?;
 
     Ok(())
@@ -161,11 +128,12 @@ pub async fn set_persona_view_share_sync_folder(
 /// sets it. No-op if no settings row exists yet for this pair -- matching
 /// persona_sync::settings_store's own "no row = nothing to record" contract.
 pub async fn record_pull_result(
+    pool: &sqlx::SqlitePool,
     recipient_user_id: &str,
     share_id: &str,
     result: Result<(), &str>,
 ) -> Result<(), PersonaViewShareSyncSettingsError> {
-    let mut conn = open_shared_db().await?;
+    let mut conn = pool.acquire().await?;
 
     match result {
         Ok(()) => {
@@ -175,7 +143,7 @@ pub async fn record_pull_result(
             )
             .bind(recipient_user_id)
             .bind(share_id)
-            .execute(&mut conn)
+            .execute(&mut *conn)
             .await?;
         }
         Err(msg) => {
@@ -186,7 +154,7 @@ pub async fn record_pull_result(
             .bind(msg)
             .bind(recipient_user_id)
             .bind(share_id)
-            .execute(&mut conn)
+            .execute(&mut *conn)
             .await?;
         }
     }
@@ -207,6 +175,7 @@ mod tests {
         _tempdir: tempfile::TempDir,
         _lock: std::sync::MutexGuard<'static, ()>,
         saved_root: Option<String>,
+        pool: sqlx::SqlitePool,
     }
 
     impl Drop for TestEnv {
@@ -228,17 +197,26 @@ mod tests {
             .await
             .expect("shared.db migration must succeed in test setup");
 
+        let pool =
+            sqlx::SqlitePool::connect_with(crate::providers::utils::connect_options_unencrypted(
+                &crate::providers::utils::db_path_shared(),
+            ))
+            .await
+            .expect("shared.db pool must connect");
+
         TestEnv {
             _tempdir: tempdir,
             _lock: lock,
             saved_root,
+            pool,
         }
     }
 
     #[tokio::test]
     async fn get_settings_returns_none_when_unconfigured() {
         let _env = setup().await;
-        let result = get_persona_view_share_sync_settings("user-1", "share-1")
+        let pool = &_env.pool;
+        let result = get_persona_view_share_sync_settings(pool, "user-1", "share-1")
             .await
             .expect("get must succeed");
         assert!(result.is_none());
@@ -247,11 +225,12 @@ mod tests {
     #[tokio::test]
     async fn set_then_get_round_trips() {
         let _env = setup().await;
-        set_persona_view_share_sync_folder("user-1", "share-1", "/mnt/nas/family")
+        let pool = &_env.pool;
+        set_persona_view_share_sync_folder(pool, "user-1", "share-1", "/mnt/nas/family")
             .await
             .expect("set must succeed");
 
-        let settings = get_persona_view_share_sync_settings("user-1", "share-1")
+        let settings = get_persona_view_share_sync_settings(pool, "user-1", "share-1")
             .await
             .expect("get must succeed")
             .expect("settings must exist after set");
@@ -262,7 +241,8 @@ mod tests {
     #[tokio::test]
     async fn set_rejects_empty_path() {
         let _env = setup().await;
-        let result = set_persona_view_share_sync_folder("user-1", "share-1", "   ").await;
+        let pool = &_env.pool;
+        let result = set_persona_view_share_sync_folder(pool, "user-1", "share-1", "   ").await;
         assert!(matches!(
             result,
             Err(PersonaViewShareSyncSettingsError::Validation(_))
@@ -272,14 +252,15 @@ mod tests {
     #[tokio::test]
     async fn set_reconfigures_folder_path_rather_than_erroring() {
         let _env = setup().await;
-        set_persona_view_share_sync_folder("user-1", "share-1", "/mnt/old")
+        let pool = &_env.pool;
+        set_persona_view_share_sync_folder(pool, "user-1", "share-1", "/mnt/old")
             .await
             .unwrap();
-        set_persona_view_share_sync_folder("user-1", "share-1", "/mnt/new")
+        set_persona_view_share_sync_folder(pool, "user-1", "share-1", "/mnt/new")
             .await
             .expect("reconfiguring an already-set pair must not error");
 
-        let settings = get_persona_view_share_sync_settings("user-1", "share-1")
+        let settings = get_persona_view_share_sync_settings(pool, "user-1", "share-1")
             .await
             .unwrap()
             .unwrap();
@@ -289,17 +270,18 @@ mod tests {
     #[tokio::test]
     async fn record_pull_result_ok_clears_a_prior_error() {
         let _env = setup().await;
-        set_persona_view_share_sync_folder("user-1", "share-1", "/mnt/nas")
+        let pool = &_env.pool;
+        set_persona_view_share_sync_folder(pool, "user-1", "share-1", "/mnt/nas")
             .await
             .unwrap();
-        record_pull_result("user-1", "share-1", Err("unreachable"))
+        record_pull_result(pool, "user-1", "share-1", Err("unreachable"))
             .await
             .unwrap();
-        record_pull_result("user-1", "share-1", Ok(()))
+        record_pull_result(pool, "user-1", "share-1", Ok(()))
             .await
             .expect("record_pull_result must succeed");
 
-        let settings = get_persona_view_share_sync_settings("user-1", "share-1")
+        let settings = get_persona_view_share_sync_settings(pool, "user-1", "share-1")
             .await
             .unwrap()
             .unwrap();
@@ -309,12 +291,15 @@ mod tests {
     #[tokio::test]
     async fn record_result_on_unconfigured_pair_is_a_noop_not_an_error() {
         let _env = setup().await;
-        assert!(record_pull_result("user-1", "share-1", Ok(()))
+        let pool = &_env.pool;
+        assert!(record_pull_result(pool, "user-1", "share-1", Ok(()))
             .await
             .is_ok());
-        assert!(get_persona_view_share_sync_settings("user-1", "share-1")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            get_persona_view_share_sync_settings(pool, "user-1", "share-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

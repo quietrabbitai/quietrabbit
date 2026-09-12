@@ -58,11 +58,8 @@ use super::{
     errors::DisclosureLogWriteError,
     logger::{DisclosureLogEntry, DisclosureLogger},
     privacy_filter::{self, PfEntityDecoded},
+    PF_TIMEOUT_SECS,
 };
-
-/// Matches gate3.rs's PF_TIMEOUT_SECS discipline -- same FFI call, same
-/// timeout budget, so a scan does not hang the write/export path.
-const PF_TIMEOUT_SECS: u64 = 10;
 
 /// Legacy fallback threshold when PF is not available. Mirrors gate3.rs's
 /// content_sensitivity_severity >= 3 sensitivity-block constant exactly --

@@ -73,10 +73,11 @@ pub async fn get_health(
     client: tauri::State<'_, OllamaClient>,
     ollama_source: tauri::State<'_, RwLock<OllamaSource>>,
     key_registry: tauri::State<'_, KeyRegistry>,
+    pool: tauri::State<'_, sqlx::SqlitePool>,
 ) -> Result<HealthResponse, String> {
     let ollama = client.check_health().await;
     let source = ollama_source.read().await.as_str().to_owned();
-    let tier2_configured = tier2_is_configured(&key_registry).await?;
+    let tier2_configured = tier2_is_configured(&pool, &key_registry).await?;
 
     Ok(HealthResponse {
         ollama,
@@ -93,7 +94,10 @@ pub async fn get_health(
 /// providers.provider_type='cloud_inference_api' instead of a hardcoded
 /// ["mistral","groq"] array, so a future Tier 1.5 provider is picked up
 /// automatically once curated into the providers table.
-async fn tier2_is_configured(key_registry: &KeyRegistry) -> Result<bool, String> {
+async fn tier2_is_configured(
+    pool: &sqlx::SqlitePool,
+    key_registry: &KeyRegistry,
+) -> Result<bool, String> {
     let session = key_registry
         .with_key(|k| (k.user_id.clone(), key_hex(&k.master_key)))
         .await;
@@ -101,7 +105,7 @@ async fn tier2_is_configured(key_registry: &KeyRegistry) -> Result<bool, String>
         return Ok(false);
     };
 
-    let candidates = provider_store::list_providers_by_type("cloud_inference_api")
+    let candidates = provider_store::list_providers_by_type(pool, "cloud_inference_api")
         .await
         .map_err(|e| e.to_string())?;
     for provider in candidates {
@@ -164,6 +168,7 @@ mod tests {
         _tempdir: tempfile::TempDir,
         _lock: std::sync::MutexGuard<'static, ()>,
         saved_root: Option<String>,
+        pool: sqlx::SqlitePool,
     }
 
     impl Drop for TestEnv {
@@ -193,17 +198,28 @@ mod tests {
             .await
             .expect("shared.db migration must succeed in test setup");
 
+        let pool =
+            sqlx::SqlitePool::connect_with(crate::providers::utils::connect_options_unencrypted(
+                &crate::providers::utils::db_path_shared(),
+            ))
+            .await
+            .expect("shared.db pool must connect");
+
         TestEnv {
             _tempdir: tempdir,
             _lock: lock,
             saved_root,
+            pool,
         }
     }
 
     #[tokio::test]
     async fn false_with_no_resident_session_not_an_error() {
+        let pool = sqlx::SqlitePool::connect_lazy_with(
+            sqlx::sqlite::SqliteConnectOptions::new().filename(":memory:"),
+        );
         let registry = KeyRegistry::default();
-        let result = tier2_is_configured(&registry).await;
+        let result = tier2_is_configured(&pool, &registry).await;
         assert_eq!(result, Ok(false));
     }
 
@@ -211,11 +227,12 @@ mod tests {
     async fn false_when_logged_in_but_no_provider_configured() {
         let master_key = [0x33u8; crate::auth::kdf::MASTER_KEY_LEN];
         let _env = setup("user-c", &master_key).await;
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         populate_registry(&registry, "user-c", master_key).await;
+        let pool = app.state::<sqlx::SqlitePool>();
 
-        let result = tier2_is_configured(&registry).await;
+        let result = tier2_is_configured(&pool, &registry).await;
         assert_eq!(result, Ok(false));
     }
 
@@ -223,9 +240,10 @@ mod tests {
     async fn true_when_groq_is_configured() {
         let master_key = [0x44u8; crate::auth::kdf::MASTER_KEY_LEN];
         let _env = setup("user-d", &master_key).await;
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         populate_registry(&registry, "user-d", master_key).await;
+        let pool = app.state::<sqlx::SqlitePool>();
 
         integration_keys_store::upsert_key(
             "user-d",
@@ -240,7 +258,7 @@ mod tests {
         .await
         .expect("upsert_key must succeed in test setup");
 
-        let result = tier2_is_configured(&registry).await;
+        let result = tier2_is_configured(&pool, &registry).await;
         assert_eq!(result, Ok(true));
     }
 
@@ -252,9 +270,10 @@ mod tests {
         // list.
         let master_key = [0x55u8; crate::auth::kdf::MASTER_KEY_LEN];
         let _env = setup("user-e", &master_key).await;
-        let app = mock_app_with_registry();
+        let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         populate_registry(&registry, "user-e", master_key).await;
+        let pool = app.state::<sqlx::SqlitePool>();
 
         integration_keys_store::upsert_key(
             "user-e",
@@ -269,7 +288,7 @@ mod tests {
         .await
         .expect("upsert_key must succeed in test setup");
 
-        let result = tier2_is_configured(&registry).await;
+        let result = tier2_is_configured(&pool, &registry).await;
         assert_eq!(result, Ok(true));
     }
 }
