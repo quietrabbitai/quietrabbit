@@ -1,0 +1,863 @@
+=== domain_context ===
+TABLE domain_context_blocks
+  id TEXT notnull=0 pk=1 default=None
+  content TEXT notnull=1 pk=0 default=None
+  visibility_scope TEXT notnull=1 pk=0 default=Some("'tier2_permitted'")
+  transformation TEXT notnull=1 pk=0 default=Some("'generalize_ok'")
+  sensitivity_preset TEXT notnull=1 pk=0 default=Some("'standard'")
+  relevance_tags TEXT notnull=1 pk=0 default=Some("'[]'")
+  token_estimate INTEGER notnull=1 pk=0 default=Some("0")
+  dependency_refs TEXT notnull=1 pk=0 default=Some("'[]'")
+  source_topic_id TEXT notnull=1 pk=0 default=None
+  extraction_event_id TEXT notnull=1 pk=0 default=None
+  inferred_by_system INTEGER notnull=1 pk=0 default=Some("1")
+  standing_summary_eligible INTEGER notnull=1 pk=0 default=Some("1")
+  revoked_at TEXT notnull=0 pk=0 default=None
+  revocation_reason TEXT notnull=0 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+  updated_at TEXT notnull=1 pk=0 default=None
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+TABLE migration_lock
+  id INTEGER notnull=0 pk=1 default=None
+  locked_at TEXT notnull=0 pk=0 default=None
+  locked_by TEXT notnull=0 pk=0 default=None
+TABLE pending_extractions
+  id TEXT notnull=0 pk=1 default=None
+  source_topic_id TEXT notnull=1 pk=0 default=None
+  source_focus_run_id TEXT notnull=1 pk=0 default=None
+  proposed_content TEXT notnull=1 pk=0 default=None
+  proposed_preset TEXT notnull=1 pk=0 default=Some("'standard'")
+  status TEXT notnull=1 pk=0 default=Some("'pending_review'")
+  created_at TEXT notnull=1 pk=0 default=None
+  reviewed_at TEXT notnull=0 pk=0 default=None
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+TABLE provenance_log
+  id TEXT notnull=0 pk=1 default=None
+  source_topic_id TEXT notnull=1 pk=0 default=None
+  source_focus_run_id TEXT notnull=1 pk=0 default=None
+  proposed_content TEXT notnull=1 pk=0 default=None
+  approval_action TEXT notnull=1 pk=0 default=None
+  edited_content TEXT notnull=0 pk=0 default=None
+  approved_block_id TEXT notnull=0 pk=0 default=None
+  approved_at TEXT notnull=1 pk=0 default=None
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+TABLE schema_version
+  version INTEGER notnull=0 pk=1 default=None
+  applied_at TEXT notnull=1 pk=0 default=None
+  description TEXT notnull=1 pk=0 default=None
+TABLE standing_summary
+  id INTEGER notnull=0 pk=1 default=None
+  content TEXT notnull=1 pk=0 default=Some("''")
+  token_count INTEGER notnull=1 pk=0 default=Some("0")
+  source_block_ids TEXT notnull=1 pk=0 default=Some("'[]'")
+  generated_at TEXT notnull=1 pk=0 default=None
+  invalidated_at TEXT notnull=0 pk=0 default=None
+=== group ===
+TABLE document_permissions
+  document_id TEXT notnull=1 pk=1 default=None
+  persona_id TEXT notnull=1 pk=2 default=None
+  tier TEXT notnull=1 pk=0 default=None
+  granted_at TEXT notnull=1 pk=0 default=None
+TABLE documents
+  id TEXT notnull=1 pk=1 default=None
+  title TEXT notnull=1 pk=0 default=None
+  content_ref TEXT notnull=0 pk=0 default=None
+  owner_persona_id TEXT notnull=1 pk=0 default=None
+  checked_out_by_persona_id TEXT notnull=0 pk=0 default=None
+  checked_out_at TEXT notnull=0 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+  updated_at TEXT notnull=1 pk=0 default=None
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+TABLE group_facts
+  id TEXT notnull=1 pk=1 default=None
+  owner_persona_id TEXT notnull=1 pk=0 default=None
+  field_name TEXT notnull=1 pk=0 default=None
+  field_value BLOB notnull=1 pk=0 default=None
+  sensitivity TEXT notnull=1 pk=0 default=None
+  abstraction_tier2 TEXT notnull=1 pk=0 default=Some("'pass'")
+  abstraction_tier3 TEXT notnull=1 pk=0 default=Some("'pass'")
+  created_at TEXT notnull=1 pk=0 default=None
+  updated_at TEXT notnull=1 pk=0 default=None
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+TABLE migration_lock
+  id INTEGER notnull=0 pk=1 default=None
+  locked_at TEXT notnull=0 pk=0 default=None
+  locked_by TEXT notnull=0 pk=0 default=None
+TABLE schema_version
+  version INTEGER notnull=0 pk=1 default=None
+  applied_at TEXT notnull=1 pk=0 default=None
+  description TEXT notnull=1 pk=0 default=None
+=== keys ===
+TABLE integration_keys
+  id TEXT notnull=0 pk=1 default=None
+  provider TEXT notnull=1 pk=0 default=None
+  key_type TEXT notnull=1 pk=0 default=None
+  integration_id TEXT notnull=1 pk=0 default=Some("'_default'")
+  credential_label TEXT notnull=1 pk=0 default=None
+  credential TEXT notnull=1 pk=0 default=None
+  persona_id TEXT notnull=0 pk=0 default=None
+  auth_type TEXT notnull=0 pk=0 default=None
+  expires_at TEXT notnull=0 pk=0 default=None
+  is_active INTEGER notnull=1 pk=0 default=Some("1")
+  created_at TEXT notnull=1 pk=0 default=None
+  last_verified_at TEXT notnull=0 pk=0 default=None
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+TABLE migration_lock
+  id INTEGER notnull=0 pk=1 default=None
+  locked_at TEXT notnull=0 pk=0 default=None
+  locked_by TEXT notnull=0 pk=0 default=None
+TABLE schema_version
+  version INTEGER notnull=0 pk=1 default=None
+  applied_at TEXT notnull=1 pk=0 default=None
+  description TEXT notnull=1 pk=0 default=None
+=== messages ===
+TABLE chats
+  id TEXT notnull=0 pk=1 default=None
+  persona_id TEXT notnull=1 pk=0 default=None
+  context_key TEXT notnull=1 pk=0 default=None
+  title TEXT notnull=0 pk=0 default=None
+  archived_at TEXT notnull=0 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+  last_message_at TEXT notnull=1 pk=0 default=None
+TABLE messages
+  id TEXT notnull=0 pk=1 default=None
+  context_key TEXT notnull=1 pk=0 default=None
+  sender TEXT notnull=1 pk=0 default=None
+  content TEXT notnull=1 pk=0 default=None
+  focus_run_id TEXT notnull=0 pk=0 default=None
+  gate3_review_status TEXT notnull=0 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+  chat_id TEXT notnull=0 pk=0 default=None
+  reviewed_at_risk_rating INTEGER notnull=0 pk=0 default=None
+TABLE migration_lock
+  id INTEGER notnull=0 pk=1 default=None
+  locked_at TEXT notnull=0 pk=0 default=None
+  locked_by TEXT notnull=0 pk=0 default=None
+TABLE schema_version
+  version INTEGER notnull=0 pk=1 default=None
+  applied_at TEXT notnull=1 pk=0 default=None
+  description TEXT notnull=1 pk=0 default=None
+=== outputs ===
+TABLE classification_preferences
+  id TEXT notnull=0 pk=1 default=None
+  focus_id TEXT notnull=1 pk=0 default=None
+  persona_id TEXT notnull=1 pk=0 default=None
+  content_type TEXT notnull=1 pk=0 default=None
+  visibility_scope TEXT notnull=1 pk=0 default=None
+  transformation TEXT notnull=1 pk=0 default=None
+  sensitivity_preset TEXT notnull=0 pk=0 default=None
+  user_calibrated INTEGER notnull=1 pk=0 default=Some("0")
+  confidence REAL notnull=1 pk=0 default=Some("1.0")
+  last_applied_at TEXT notnull=0 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+  updated_at TEXT notnull=1 pk=0 default=None
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+TABLE consent_decisions
+  id TEXT notnull=0 pk=1 default=None
+  focus_run_id TEXT notnull=1 pk=0 default=None
+  decision_type TEXT notnull=1 pk=0 default=None
+  decision TEXT notnull=1 pk=0 default=None
+  abstraction_tier INTEGER notnull=0 pk=0 default=None
+  save_preference INTEGER notnull=0 pk=0 default=None
+  span_id TEXT notnull=0 pk=0 default=None
+  suggestion_text TEXT notnull=0 pk=0 default=None
+  user_modified_text TEXT notnull=0 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+  category TEXT notnull=0 pk=0 default=None
+  fact_key TEXT notnull=0 pk=0 default=None
+  original_text TEXT notnull=0 pk=0 default=None
+TABLE drift_observations
+  id TEXT notnull=0 pk=1 default=None
+  model_id TEXT notnull=1 pk=0 default=None
+  task_type TEXT notnull=1 pk=0 default=None
+  focus_run_id TEXT notnull=1 pk=0 default=None
+  drift_detected INTEGER notnull=1 pk=0 default=Some("0")
+  drift_magnitude REAL notnull=0 pk=0 default=None
+  observed_at TEXT notnull=1 pk=0 default=None
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+TABLE extract_confirm_candidates
+  id INTEGER notnull=0 pk=1 default=None
+  focus_run_id TEXT notnull=1 pk=0 default=None
+  field_name TEXT notnull=1 pk=0 default=None
+  extracted_value TEXT notnull=1 pk=0 default=None
+  sensitivity TEXT notnull=1 pk=0 default=None
+  reason TEXT notnull=0 pk=0 default=None
+  confidence REAL notnull=1 pk=0 default=None
+  status TEXT notnull=1 pk=0 default=Some("'pending'")
+  confirmed_value TEXT notnull=0 pk=0 default=None
+  confirmed_at TEXT notnull=0 pk=0 default=None
+  declined_at TEXT notnull=0 pk=0 default=None
+  persisted_at TEXT notnull=0 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=Some("strftime('%Y-%m-%dT%H:%M:%fZ','now')")
+  updated_at TEXT notnull=1 pk=0 default=Some("strftime('%Y-%m-%dT%H:%M:%fZ','now')")
+  source TEXT notnull=0 pk=0 default=None
+TABLE focus_run_snapshots
+  id TEXT notnull=0 pk=1 default=None
+  focus_run_id TEXT notnull=1 pk=0 default=None
+  step_id TEXT notnull=1 pk=0 default=None
+  phase INTEGER notnull=1 pk=0 default=None
+  task_track_json TEXT notnull=1 pk=0 default=Some("'{}'")
+  shared_state_json TEXT notnull=1 pk=0 default=Some("'{}'")
+  personal_context_manifest TEXT notnull=1 pk=0 default=Some("'{}'")
+  checkpoint_hash TEXT notnull=1 pk=0 default=None
+  purge_after TEXT notnull=0 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+TABLE focus_runs
+  id TEXT notnull=0 pk=1 default=None
+  focus_id TEXT notnull=1 pk=0 default=None
+  status TEXT notnull=1 pk=0 default=Some("'initializing'")
+  is_fast_lane INTEGER notnull=1 pk=0 default=Some("0")
+  routing_tier_used INTEGER notnull=0 pk=0 default=None
+  started_at TEXT notnull=1 pk=0 default=None
+  completed_at TEXT notnull=0 pk=0 default=None
+  feedback_window_expires_at TEXT notnull=0 pk=0 default=None
+  signal_validity TEXT notnull=0 pk=0 default=None
+  notes TEXT notnull=1 pk=0 default=Some("'{}'")
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+  topic_id TEXT notnull=0 pk=0 default=None
+  is_quick_ask INTEGER notnull=1 pk=0 default=Some("0")
+TABLE migration_lock
+  id INTEGER notnull=0 pk=1 default=None
+  locked_at TEXT notnull=0 pk=0 default=None
+  locked_by TEXT notnull=0 pk=0 default=None
+TABLE model_quality_scores
+  id TEXT notnull=0 pk=1 default=None
+  model_id TEXT notnull=1 pk=0 default=None
+  task_type TEXT notnull=1 pk=0 default=None
+  quality_score REAL notnull=1 pk=0 default=None
+  signal_validity TEXT notnull=1 pk=0 default=None
+  focus_run_id TEXT notnull=1 pk=0 default=None
+  recorded_at TEXT notnull=1 pk=0 default=None
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+TABLE outputs
+  id TEXT notnull=0 pk=1 default=None
+  focus_run_id TEXT notnull=1 pk=0 default=None
+  output_type TEXT notnull=1 pk=0 default=None
+  content TEXT notnull=0 pk=0 default=None
+  content_pre_validation TEXT notnull=0 pk=0 default=None
+  content_post_validation TEXT notnull=0 pk=0 default=None
+  sensitivity TEXT notnull=1 pk=0 default=Some("'general'")
+  validation_provider TEXT notnull=0 pk=0 default=None
+  validation_delta TEXT notnull=0 pk=0 default=None
+  quality_rating INTEGER notnull=0 pk=0 default=None
+  status TEXT notnull=1 pk=0 default=Some("'active'")
+  created_at TEXT notnull=1 pk=0 default=None
+  updated_at TEXT notnull=1 pk=0 default=None
+  purge_scheduled_at TEXT notnull=0 pk=0 default=None
+  purge_attempted_at TEXT notnull=0 pk=0 default=None
+  purge_attempts INTEGER notnull=1 pk=0 default=Some("0")
+  purged_at TEXT notnull=0 pk=0 default=None
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+  source TEXT notnull=1 pk=0 default=Some("'qr_generated'")
+  project_entity_id TEXT notnull=0 pk=0 default=None
+  focus_slug TEXT notnull=0 pk=0 default=None
+  storage_path TEXT notnull=0 pk=0 default=None
+  storage_version INTEGER notnull=1 pk=0 default=Some("1")
+  original_filename TEXT notnull=0 pk=0 default=None
+  pg_scan_blocked INTEGER notnull=1 pk=0 default=Some("0")
+  pg_scan_timed_out INTEGER notnull=1 pk=0 default=Some("0")
+  pg_scan_plain_language TEXT notnull=0 pk=0 default=None
+  pg_scan_findings_json TEXT notnull=0 pk=0 default=None
+  pg_scan_completed_at TEXT notnull=0 pk=0 default=None
+TABLE outputs_fts
+  content  notnull=0 pk=0 default=None
+  output_type  notnull=0 pk=0 default=None
+TABLE outputs_fts_config
+  k  notnull=1 pk=1 default=None
+  v  notnull=0 pk=0 default=None
+TABLE outputs_fts_data
+  id INTEGER notnull=0 pk=1 default=None
+  block BLOB notnull=0 pk=0 default=None
+TABLE outputs_fts_docsize
+  id INTEGER notnull=0 pk=1 default=None
+  sz BLOB notnull=0 pk=0 default=None
+TABLE outputs_fts_idx
+  segid  notnull=1 pk=1 default=None
+  term  notnull=1 pk=2 default=None
+  pgno  notnull=0 pk=0 default=None
+TABLE pf_fact_mentions
+  id TEXT notnull=1 pk=1 default=None
+  focus_run_id TEXT notnull=1 pk=0 default=None
+  category TEXT notnull=1 pk=0 default=None
+  fact_key TEXT notnull=1 pk=0 default=None
+  original_text TEXT notnull=1 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+TABLE run_history
+  id TEXT notnull=0 pk=1 default=None
+  focus_run_id TEXT notnull=1 pk=0 default=None
+  focus_id TEXT notnull=1 pk=0 default=None
+  persona_id TEXT notnull=1 pk=0 default=None
+  topic_id TEXT notnull=0 pk=0 default=None
+  output_id TEXT notnull=0 pk=0 default=None
+  output_type TEXT notnull=0 pk=0 default=None
+  is_quick_ask INTEGER notnull=1 pk=0 default=Some("0")
+  promote_window_expires_at TEXT notnull=0 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+TABLE schema_version
+  version INTEGER notnull=0 pk=1 default=None
+  applied_at TEXT notnull=1 pk=0 default=None
+  description TEXT notnull=1 pk=0 default=None
+TABLE topic_storage_locations
+  topic_id TEXT notnull=0 pk=1 default=None
+  db_path TEXT notnull=1 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+  verified_at TEXT notnull=0 pk=0 default=None
+  orphaned INTEGER notnull=1 pk=0 default=Some("0")
+TABLE topics
+  id TEXT notnull=0 pk=1 default=None
+  focus_id TEXT notnull=1 pk=0 default=None
+  user_id TEXT notnull=1 pk=0 default=None
+  persona_id TEXT notnull=1 pk=0 default=None
+  name TEXT notnull=0 pk=0 default=None
+  placeholder_name TEXT notnull=1 pk=0 default=None
+  lifecycle_state TEXT notnull=1 pk=0 default=Some("'active'")
+  dormant_since TEXT notnull=0 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+  updated_at TEXT notnull=1 pk=0 default=None
+  closed_at TEXT notnull=0 pk=0 default=None
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+=== personal ===
+TABLE dedup_candidates
+  id TEXT notnull=0 pk=1 default=None
+  focus_slug TEXT notnull=1 pk=0 default=None
+  record_id_a TEXT notnull=1 pk=0 default=None
+  record_id_b TEXT notnull=1 pk=0 default=None
+  match_confidence REAL notnull=1 pk=0 default=None
+  match_basis TEXT notnull=1 pk=0 default=None
+  differing_fields TEXT notnull=0 pk=0 default=None
+  status TEXT notnull=1 pk=0 default=Some("'pending'")
+  created_at TEXT notnull=1 pk=0 default=None
+  resolved_at TEXT notnull=0 pk=0 default=None
+TABLE disclosure_log
+  id TEXT notnull=0 pk=1 default=None
+  user_id TEXT notnull=1 pk=0 default=None
+  persona_id TEXT notnull=1 pk=0 default=None
+  focus_run_id TEXT notnull=1 pk=0 default=None
+  step_id TEXT notnull=1 pk=0 default=None
+  routing_tier INTEGER notnull=1 pk=0 default=None
+  provider TEXT notnull=0 pk=0 default=None
+  fields_shared TEXT notnull=1 pk=0 default=Some("'[]'")
+  fields_abstracted TEXT notnull=1 pk=0 default=Some("'{}'")
+  fields_withheld TEXT notnull=1 pk=0 default=Some("'[]'")
+  override_declined INTEGER notnull=1 pk=0 default=Some("0")
+  declined_at TEXT notnull=0 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+  execution_tier INTEGER notnull=0 pk=0 default=None
+  abstraction_tier INTEGER notnull=0 pk=0 default=None
+  category TEXT notnull=0 pk=0 default=None
+  fact_key TEXT notnull=0 pk=0 default=None
+TABLE document_forks
+  id TEXT notnull=1 pk=1 default=None
+  title TEXT notnull=1 pk=0 default=None
+  content TEXT notnull=1 pk=0 default=None
+  source_group_id TEXT notnull=1 pk=0 default=None
+  source_document_id TEXT notnull=1 pk=0 default=None
+  source_canon_updated_at TEXT notnull=1 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+  updated_at TEXT notnull=1 pk=0 default=None
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+TABLE entities
+  id TEXT notnull=0 pk=1 default=None
+  entity_type TEXT notnull=1 pk=0 default=None
+  display_name TEXT notnull=1 pk=0 default=None
+  aliases TEXT notnull=1 pk=0 default=Some("'[]'")
+  parent_entity_id TEXT notnull=0 pk=0 default=None
+  status TEXT notnull=1 pk=0 default=Some("'active'")
+  modification_state TEXT notnull=1 pk=0 default=Some("'user_created'")
+  source_registry_id TEXT notnull=0 pk=0 default=None
+  source_url TEXT notnull=0 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=Some("strftime('%Y-%m-%dT%H:%M:%fZ', 'now')")
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+  redact_identification INTEGER notnull=1 pk=0 default=Some("0")
+  hide_from_shared_surfaces INTEGER notnull=1 pk=0 default=Some("0")
+TABLE entity_facts
+  id TEXT notnull=0 pk=1 default=None
+  entity_id TEXT notnull=0 pk=0 default=None
+  field_name TEXT notnull=1 pk=0 default=None
+  field_value BLOB notnull=1 pk=0 default=None
+  sensitivity TEXT notnull=1 pk=0 default=None
+  abstraction_tier2 TEXT notnull=1 pk=0 default=Some("'pass'")
+  abstraction_tier3 TEXT notnull=1 pk=0 default=Some("'pass'")
+  source TEXT notnull=1 pk=0 default=Some("'interview'")
+  valid_from TEXT notnull=0 pk=0 default=None
+  valid_until TEXT notnull=0 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=Some("strftime('%Y-%m-%dT%H:%M:%fZ', 'now')")
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+  source_persona_id TEXT notnull=0 pk=0 default=None
+  cross_persona_export INTEGER notnull=1 pk=0 default=Some("0")
+  origin_persona_id TEXT notnull=0 pk=0 default=None
+  forked_from_instance_id TEXT notnull=0 pk=0 default=None
+  forked_at TEXT notnull=0 pk=0 default=None
+TABLE entity_relationships
+  id TEXT notnull=0 pk=1 default=None
+  from_entity_id TEXT notnull=1 pk=0 default=None
+  to_entity_id TEXT notnull=1 pk=0 default=None
+  relationship_type TEXT notnull=1 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=Some("strftime('%Y-%m-%dT%H:%M:%fZ', 'now')")
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+TABLE group_fact_sources
+  group_id TEXT notnull=1 pk=1 default=None
+  opted_in_at TEXT notnull=1 pk=0 default=None
+TABLE group_keys
+  group_id TEXT notnull=1 pk=1 default=None
+  group_key_hex TEXT notnull=1 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+TABLE migration_lock
+  id INTEGER notnull=0 pk=1 default=None
+  locked_at TEXT notnull=0 pk=0 default=None
+  locked_by TEXT notnull=0 pk=0 default=None
+TABLE notifications
+  id TEXT notnull=0 pk=1 default=None
+  severity TEXT notnull=1 pk=0 default=None
+  title TEXT notnull=1 pk=0 default=None
+  body TEXT notnull=1 pk=0 default=None
+  action_url TEXT notnull=0 pk=0 default=None
+  read_at TEXT notnull=0 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+TABLE pf_standing_preferences
+  id TEXT notnull=1 pk=1 default=None
+  persona_id TEXT notnull=1 pk=0 default=None
+  fact_key TEXT notnull=1 pk=0 default=None
+  category TEXT notnull=1 pk=0 default=None
+  decision TEXT notnull=1 pk=0 default=None
+  suggestion_text TEXT notnull=0 pk=0 default=None
+  user_modified_text TEXT notnull=0 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+TABLE schema_version
+  version INTEGER notnull=0 pk=1 default=None
+  applied_at TEXT notnull=1 pk=0 default=None
+  description TEXT notnull=1 pk=0 default=None
+TABLE source_registry
+  id TEXT notnull=0 pk=1 default=None
+  persona_id TEXT notnull=1 pk=0 default=None
+  focus_slug TEXT notnull=1 pk=0 default=None
+  source_type TEXT notnull=1 pk=0 default=None
+  connection_config TEXT notnull=0 pk=0 default=None
+  last_imported_at TEXT notnull=0 pk=0 default=None
+  last_synced_at TEXT notnull=0 pk=0 default=None
+  status TEXT notnull=1 pk=0 default=Some("'active'")
+  created_at TEXT notnull=1 pk=0 default=None
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+TABLE staleness_check_state
+  id INTEGER notnull=0 pk=1 default=None
+  last_checked_at TEXT notnull=1 pk=0 default=None
+  fields_stale TEXT notnull=1 pk=0 default=Some("'[]'")
+  check_result TEXT notnull=1 pk=0 default=Some("'ok'")
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+TABLE voice_profiles
+  id TEXT notnull=0 pk=1 default=None
+  persona_id TEXT notnull=0 pk=0 default=None
+  source_id TEXT notnull=0 pk=0 default=None
+  precedence INTEGER notnull=1 pk=0 default=None
+  attribute TEXT notnull=1 pk=0 default=None
+  value TEXT notnull=1 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+  updated_at TEXT notnull=1 pk=0 default=None
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+  modification_state TEXT notnull=1 pk=0 default=Some("'user_created'")
+=== plan_state ===
+TABLE handoff_tokens
+  id TEXT notnull=0 pk=1 default=None
+  topic_id TEXT notnull=1 pk=0 default=None
+  focus_run_id TEXT notnull=1 pk=0 default=None
+  action_id TEXT notnull=1 pk=0 default=None
+  expected_return_schema TEXT notnull=1 pk=0 default=Some("'{}'")
+  created_at TEXT notnull=1 pk=0 default=None
+  expiry_at TEXT notnull=1 pk=0 default=None
+  consumed_at TEXT notnull=0 pk=0 default=None
+  expired_at TEXT notnull=0 pk=0 default=None
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+TABLE migration_lock
+  id INTEGER notnull=0 pk=1 default=None
+  locked_at TEXT notnull=0 pk=0 default=None
+  locked_by TEXT notnull=0 pk=0 default=None
+TABLE plan_state_blocks
+  id TEXT notnull=0 pk=1 default=None
+  block_type TEXT notnull=1 pk=0 default=None
+  content TEXT notnull=1 pk=0 default=None
+  visibility_scope TEXT notnull=1 pk=0 default=Some("'tier2_permitted'")
+  transformation TEXT notnull=1 pk=0 default=Some("'generalize_ok'")
+  sensitivity_preset TEXT notnull=0 pk=0 default=None
+  relevance_tags TEXT notnull=1 pk=0 default=Some("'[]'")
+  token_estimate INTEGER notnull=1 pk=0 default=Some("0")
+  dependency_refs TEXT notnull=1 pk=0 default=Some("'[]'")
+  inferred_by_system INTEGER notnull=1 pk=0 default=Some("1")
+  focus_run_id TEXT notnull=1 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+  updated_at TEXT notnull=1 pk=0 default=None
+  archived_at TEXT notnull=0 pk=0 default=None
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+TABLE schema_version
+  version INTEGER notnull=0 pk=1 default=None
+  applied_at TEXT notnull=1 pk=0 default=None
+  description TEXT notnull=1 pk=0 default=None
+TABLE state_ceiling_status
+  id INTEGER notnull=0 pk=1 default=None
+  current_token_estimate INTEGER notnull=1 pk=0 default=Some("0")
+  ceiling_threshold INTEGER notnull=1 pk=0 default=Some("32000")
+  notification_sent_at TEXT notnull=0 pk=0 default=None
+  user_response TEXT notnull=0 pk=0 default=None
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+TABLE topic_header
+  id INTEGER notnull=0 pk=1 default=None
+  topic_id TEXT notnull=1 pk=0 default=None
+  focus_id TEXT notnull=1 pk=0 default=None
+  persona_id TEXT notnull=1 pk=0 default=None
+  name TEXT notnull=0 pk=0 default=None
+  placeholder_name TEXT notnull=1 pk=0 default=None
+  lifecycle_state TEXT notnull=1 pk=0 default=Some("'active'")
+  current_phase TEXT notnull=0 pk=0 default=None
+  session_count INTEGER notnull=1 pk=0 default=Some("0")
+  created_at TEXT notnull=1 pk=0 default=None
+  updated_at TEXT notnull=1 pk=0 default=None
+=== scores ===
+TABLE migration_lock
+  id INTEGER notnull=0 pk=1 default=None
+  locked_at TEXT notnull=0 pk=0 default=None
+  locked_by TEXT notnull=0 pk=0 default=None
+TABLE model_hardware_scores
+  id TEXT notnull=0 pk=1 default=None
+  model_id TEXT notnull=1 pk=0 default=None
+  task_type TEXT notnull=1 pk=0 default=None
+  latency_ms REAL notnull=1 pk=0 default=Some("0.0")
+  format_compliance REAL notnull=1 pk=0 default=Some("1.0")
+  hardware_factor REAL notnull=1 pk=0 default=Some("1.0")
+  seeded_score REAL notnull=1 pk=0 default=Some("0.0")
+  sample_count INTEGER notnull=1 pk=0 default=Some("0")
+  recorded_at TEXT notnull=1 pk=0 default=None
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+TABLE schema_version
+  version INTEGER notnull=0 pk=1 default=None
+  applied_at TEXT notnull=1 pk=0 default=None
+  description TEXT notnull=1 pk=0 default=None
+=== shared ===
+TABLE artifact_versions
+  artifact_type TEXT notnull=1 pk=1 default=None
+  artifact_id TEXT notnull=1 pk=2 default=None
+  scope TEXT notnull=1 pk=3 default=Some("'_global'")
+  persona_id TEXT notnull=1 pk=4 default=Some("'_global'")
+  version TEXT notnull=1 pk=0 default=None
+  trust_level TEXT notnull=1 pk=0 default=None
+  revoked INTEGER notnull=1 pk=0 default=Some("0")
+  installed_at TEXT notnull=1 pk=0 default=None
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+TABLE asset_index
+  asset_id TEXT notnull=0 pk=1 default=None
+  persona_id TEXT notnull=1 pk=0 default=None
+  focus_id TEXT notnull=0 pk=0 default=None
+  asset_type TEXT notnull=1 pk=0 default=None
+  backing_type TEXT notnull=1 pk=0 default=Some("'local'")
+  name TEXT notnull=1 pk=0 default=None
+  name_sensitivity TEXT notnull=1 pk=0 default=Some("'standard'")
+  content_ref TEXT notnull=0 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+  last_modified_at TEXT notnull=1 pk=0 default=None
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+TABLE auth_failures
+  id TEXT notnull=0 pk=1 default=None
+  display_name TEXT notnull=1 pk=0 default=None
+  attempted_at TEXT notnull=1 pk=0 default=None
+  ip_address TEXT notnull=0 pk=0 default=None
+TABLE auth_lockouts
+  display_name TEXT notnull=0 pk=1 default=None
+  locked_until TEXT notnull=1 pk=0 default=None
+  failure_count INTEGER notnull=1 pk=0 default=Some("0")
+  locked_at TEXT notnull=1 pk=0 default=None
+TABLE auth_sessions
+  session_id TEXT notnull=0 pk=1 default=None
+  user_id TEXT notnull=1 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+  last_active_at TEXT notnull=1 pk=0 default=None
+  expires_at TEXT notnull=1 pk=0 default=None
+  ip_address TEXT notnull=0 pk=0 default=None
+  user_agent TEXT notnull=0 pk=0 default=None
+  is_remember_me INTEGER notnull=1 pk=0 default=Some("0")
+TABLE focus_provider_criteria
+  focus_id TEXT notnull=0 pk=1 default=None
+  require_is_local INTEGER notnull=1 pk=0 default=Some("0")
+  require_is_anonymous INTEGER notnull=1 pk=0 default=Some("0")
+  require_not_trains_on_data INTEGER notnull=1 pk=0 default=Some("0")
+  allow_provider_ids TEXT notnull=1 pk=0 default=Some("'[]'")
+  deny_provider_ids TEXT notnull=1 pk=0 default=Some("'[]'")
+  seeded_from_policy TEXT notnull=0 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+  updated_at TEXT notnull=1 pk=0 default=None
+TABLE focus_settings
+  persona_id TEXT notnull=1 pk=1 default=None
+  focus_id TEXT notnull=1 pk=2 default=None
+  context_flow TEXT notnull=1 pk=0 default=Some("'bidirectional'")
+  library_visibility TEXT notnull=1 pk=0 default=Some("'shared'")
+  privacy_tier INTEGER notnull=1 pk=0 default=Some("2")
+  max_permitted_tier INTEGER notnull=1 pk=0 default=Some("2")
+  focus_profile TEXT notnull=1 pk=0 default=Some("'open'")
+  voice_override TEXT notnull=0 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+  updated_at TEXT notnull=1 pk=0 default=None
+TABLE focus_settings_friction_decisions
+  id TEXT notnull=0 pk=1 default=None
+  persona_id TEXT notnull=1 pk=0 default=None
+  focus_id TEXT notnull=1 pk=0 default=None
+  decision TEXT notnull=1 pk=0 default=None
+  requested_privacy_tier INTEGER notnull=0 pk=0 default=None
+  requested_focus_profile TEXT notnull=0 pk=0 default=None
+  requested_max_permitted_tier INTEGER notnull=0 pk=0 default=None
+  existing_privacy_tier INTEGER notnull=1 pk=0 default=None
+  existing_focus_profile TEXT notnull=1 pk=0 default=None
+  existing_max_permitted_tier INTEGER notnull=0 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+TABLE group_departures
+  group_id TEXT notnull=1 pk=1 default=None
+  persona_id TEXT notnull=1 pk=2 default=None
+  departed_at TEXT notnull=1 pk=0 default=None
+  reason TEXT notnull=1 pk=0 default=None
+TABLE group_sync_settings
+  persona_id TEXT notnull=1 pk=1 default=None
+  group_id TEXT notnull=1 pk=2 default=None
+  folder_path TEXT notnull=1 pk=0 default=None
+  last_synced_at TEXT notnull=0 pk=0 default=None
+  last_error TEXT notnull=0 pk=0 default=None
+  updated_at TEXT notnull=1 pk=0 default=None
+TABLE instance_config
+  key TEXT notnull=0 pk=1 default=None
+  value TEXT notnull=1 pk=0 default=None
+TABLE instance_context
+  id TEXT notnull=0 pk=1 default=None
+  field_name TEXT notnull=1 pk=0 default=None
+  field_value TEXT notnull=1 pk=0 default=None
+  sensitivity TEXT notnull=1 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+TABLE migration_lock
+  id INTEGER notnull=0 pk=1 default=None
+  locked_at TEXT notnull=0 pk=0 default=None
+  locked_by TEXT notnull=0 pk=0 default=None
+TABLE pending_group_invitations
+  id TEXT notnull=0 pk=1 default=None
+  recipient_persona_id TEXT notnull=1 pk=0 default=None
+  group_id TEXT notnull=1 pk=0 default=None
+  group_display_name TEXT notnull=1 pk=0 default=None
+  encrypted_group_key TEXT notnull=1 pk=0 default=None
+  sender_label TEXT notnull=1 pk=0 default=None
+  status TEXT notnull=1 pk=0 default=Some("'pending'")
+  created_at TEXT notnull=1 pk=0 default=None
+  responded_at TEXT notnull=0 pk=0 default=None
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+TABLE pending_group_key_rotations
+  id TEXT notnull=0 pk=1 default=None
+  recipient_persona_id TEXT notnull=1 pk=0 default=None
+  group_id TEXT notnull=1 pk=0 default=None
+  encrypted_group_key TEXT notnull=1 pk=0 default=None
+  sender_label TEXT notnull=1 pk=0 default=None
+  status TEXT notnull=1 pk=0 default=Some("'pending'")
+  created_at TEXT notnull=1 pk=0 default=None
+  applied_at TEXT notnull=0 pk=0 default=None
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+TABLE pending_persona_shares
+  id TEXT notnull=0 pk=1 default=None
+  recipient_user_id TEXT notnull=1 pk=0 default=None
+  source_persona_id TEXT notnull=1 pk=0 default=None
+  source_persona_display_name TEXT notnull=1 pk=0 default=None
+  payload_schema_version TEXT notnull=1 pk=0 default=None
+  encrypted_payload TEXT notnull=1 pk=0 default=None
+  status TEXT notnull=1 pk=0 default=Some("'pending'")
+  created_at TEXT notnull=1 pk=0 default=None
+  responded_at TEXT notnull=0 pk=0 default=None
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+  source_persona_type TEXT notnull=1 pk=0 default=Some("'personal'")
+  materialized_persona_id TEXT notnull=0 pk=0 default=None
+  share_type TEXT notnull=1 pk=0 default=Some("'synced'")
+  revoked_at TEXT notnull=0 pk=0 default=None
+TABLE persona_share_sync_settings
+  persona_id TEXT notnull=1 pk=1 default=None
+  share_id TEXT notnull=1 pk=2 default=None
+  role TEXT notnull=1 pk=0 default=None
+  folder_path TEXT notnull=1 pk=0 default=None
+  last_synced_at TEXT notnull=0 pk=0 default=None
+  last_pushed_at TEXT notnull=0 pk=0 default=None
+  last_content_hash TEXT notnull=0 pk=0 default=None
+  last_error TEXT notnull=0 pk=0 default=None
+  updated_at TEXT notnull=1 pk=0 default=None
+TABLE persona_view_share_settings
+  recipient_user_id TEXT notnull=1 pk=1 default=None
+  share_id TEXT notnull=1 pk=2 default=None
+  folder_path TEXT notnull=1 pk=0 default=None
+  last_error TEXT notnull=0 pk=0 default=None
+  updated_at TEXT notnull=1 pk=0 default=None
+TABLE personas
+  id TEXT notnull=0 pk=1 default=None
+  display_name TEXT notnull=1 pk=0 default=None
+  persona_type TEXT notnull=1 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+TABLE provider_models
+  id TEXT notnull=0 pk=1 default=None
+  provider_id TEXT notnull=1 pk=0 default=None
+  model_id TEXT notnull=1 pk=0 default=None
+  context_window_tokens INTEGER notnull=1 pk=0 default=None
+  is_default INTEGER notnull=1 pk=0 default=Some("0")
+  created_at TEXT notnull=1 pk=0 default=None
+TABLE providers
+  id TEXT notnull=0 pk=1 default=None
+  display_name TEXT notnull=1 pk=0 default=None
+  provider_type TEXT notnull=1 pk=0 default=None
+  mode TEXT notnull=1 pk=0 default=None
+  launch_url TEXT notnull=0 pk=0 default=None
+  activation_status TEXT notnull=1 pk=0 default=Some("'active'")
+  documentation_gate TEXT notnull=1 pk=0 default=Some("'{}'")
+  last_reviewed_at TEXT notnull=0 pk=0 default=None
+  review_trigger_note TEXT notnull=0 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+  is_local INTEGER notnull=1 pk=0 default=Some("0")
+  is_anonymous INTEGER notnull=1 pk=0 default=Some("0")
+  retains_data INTEGER notnull=1 pk=0 default=Some("1")
+  trains_on_data_by_default INTEGER notnull=1 pk=0 default=Some("1")
+  login_required INTEGER notnull=1 pk=0 default=None
+  qr_internal_eligible INTEGER notnull=1 pk=0 default=Some("0")
+  privacy_guardian_default_level TEXT notnull=0 pk=0 default=None
+  risk_rating INTEGER notnull=1 pk=0 default=Some("3")
+  hardware_requirement TEXT notnull=0 pk=0 default=None
+  user_privacy_summary TEXT notnull=0 pk=0 default=None
+  qr_recommended INTEGER notnull=1 pk=0 default=Some("0")
+  privacy_commitment_basis TEXT notnull=0 pk=0 default=None
+  performance_profile TEXT notnull=0 pk=0 default=None
+TABLE schema_version
+  version INTEGER notnull=0 pk=1 default=None
+  applied_at TEXT notnull=1 pk=0 default=None
+  description TEXT notnull=1 pk=0 default=None
+TABLE topic_index
+  topic_id TEXT notnull=0 pk=1 default=None
+  persona_id TEXT notnull=1 pk=0 default=None
+  focus_id TEXT notnull=1 pk=0 default=None
+  display_name TEXT notnull=1 pk=0 default=None
+  lifecycle_state TEXT notnull=1 pk=0 default=None
+  last_active_at TEXT notnull=1 pk=0 default=None
+  session_count INTEGER notnull=1 pk=0 default=Some("0")
+  content_summary TEXT notnull=0 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+  updated_at TEXT notnull=1 pk=0 default=None
+TABLE user_capabilities
+  user_id TEXT notnull=1 pk=1 default=None
+  persona_id TEXT notnull=0 pk=2 default=None
+  capability TEXT notnull=1 pk=3 default=None
+  allowed INTEGER notnull=1 pk=0 default=Some("1")
+  created_at TEXT notnull=1 pk=0 default=None
+TABLE user_personas
+  user_id TEXT notnull=1 pk=1 default=None
+  persona_id TEXT notnull=1 pk=2 default=None
+  joined_at TEXT notnull=1 pk=0 default=None
+TABLE user_provider_preference
+  id TEXT notnull=0 pk=1 default=None
+  user_id TEXT notnull=1 pk=0 default=None
+  persona_id TEXT notnull=0 pk=0 default=None
+  focus_id TEXT notnull=0 pk=0 default=None
+  provider_id TEXT notnull=1 pk=0 default=None
+  login_available INTEGER notnull=1 pk=0 default=Some("0")
+  user_preference TEXT notnull=1 pk=0 default=None
+  enabled_at TEXT notnull=0 pk=0 default=None
+  declined_at TEXT notnull=0 pk=0 default=None
+  local_model_version TEXT notnull=0 pk=0 default=None
+  installed_at TEXT notnull=0 pk=0 default=None
+  last_verified_at TEXT notnull=0 pk=0 default=None
+  subscription_status TEXT notnull=0 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+TABLE user_salts
+  user_id TEXT notnull=0 pk=1 default=None
+  salt_hex TEXT notnull=1 pk=0 default=None
+  kdf_algorithm TEXT notnull=1 pk=0 default=Some("'argon2id'")
+  kdf_memory_kib INTEGER notnull=1 pk=0 default=Some("65536")
+  kdf_iterations INTEGER notnull=1 pk=0 default=Some("3")
+  kdf_parallelism INTEGER notnull=1 pk=0 default=Some("4")
+  created_at TEXT notnull=1 pk=0 default=None
+TABLE user_sharing_keys
+  user_id TEXT notnull=0 pk=1 default=None
+  public_key_hex TEXT notnull=1 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+TABLE users
+  id TEXT notnull=0 pk=1 default=None
+  display_name TEXT notnull=1 pk=0 default=None
+  role TEXT notnull=1 pk=0 default=Some("'user'")
+  is_primary INTEGER notnull=1 pk=0 default=Some("0")
+  auth_enabled INTEGER notnull=1 pk=0 default=Some("0")
+  password_hash TEXT notnull=0 pk=0 default=None
+  idle_timeout_minutes INTEGER notnull=1 pk=0 default=Some("15")
+  created_at TEXT notnull=1 pk=0 default=None
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+=== tier3_cookies ===
+TABLE migration_lock
+  id INTEGER notnull=0 pk=1 default=None
+  locked_at TEXT notnull=0 pk=0 default=None
+  locked_by TEXT notnull=0 pk=0 default=None
+TABLE schema_version
+  version INTEGER notnull=0 pk=1 default=None
+  applied_at TEXT notnull=1 pk=0 default=None
+  description TEXT notnull=1 pk=0 default=None
+TABLE tier3_provider_cookies
+  id TEXT notnull=0 pk=1 default=None
+  provider_id TEXT notnull=1 pk=0 default=None
+  name TEXT notnull=1 pk=0 default=None
+  value TEXT notnull=1 pk=0 default=None
+  domain TEXT notnull=1 pk=0 default=None
+  path TEXT notnull=1 pk=0 default=None
+  secure INTEGER notnull=1 pk=0 default=Some("0")
+  httponly INTEGER notnull=1 pk=0 default=Some("0")
+  same_site INTEGER notnull=1 pk=0 default=Some("0")
+  priority INTEGER notnull=1 pk=0 default=Some("0")
+  has_expires INTEGER notnull=1 pk=0 default=Some("0")
+  expires INTEGER notnull=0 pk=0 default=None
+  creation INTEGER notnull=1 pk=0 default=None
+  last_access INTEGER notnull=1 pk=0 default=None
+  updated_at TEXT notnull=1 pk=0 default=None
+=== view_cache ===
+TABLE migration_lock
+  id INTEGER notnull=0 pk=1 default=None
+  locked_at TEXT notnull=0 pk=0 default=None
+  locked_by TEXT notnull=0 pk=0 default=None
+TABLE schema_version
+  version INTEGER notnull=0 pk=1 default=None
+  applied_at TEXT notnull=1 pk=0 default=None
+  description TEXT notnull=1 pk=0 default=None
+TABLE view_cache_entities
+  id TEXT notnull=0 pk=1 default=None
+  entity_type TEXT notnull=1 pk=0 default=None
+  display_name TEXT notnull=1 pk=0 default=None
+  aliases TEXT notnull=1 pk=0 default=Some("'[]'")
+  parent_entity_id TEXT notnull=0 pk=0 default=None
+  status TEXT notnull=1 pk=0 default=None
+  source_url TEXT notnull=0 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+  redact_identification INTEGER notnull=1 pk=0 default=Some("0")
+  hide_from_shared_surfaces INTEGER notnull=1 pk=0 default=Some("0")
+TABLE view_cache_entity_facts
+  id TEXT notnull=0 pk=1 default=None
+  entity_id TEXT notnull=0 pk=0 default=None
+  field_name TEXT notnull=1 pk=0 default=None
+  field_value TEXT notnull=1 pk=0 default=None
+  sensitivity TEXT notnull=1 pk=0 default=None
+  abstraction_tier2 TEXT notnull=1 pk=0 default=None
+  abstraction_tier3 TEXT notnull=1 pk=0 default=None
+  source TEXT notnull=1 pk=0 default=None
+  valid_from TEXT notnull=0 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+TABLE view_cache_meta
+  id INTEGER notnull=0 pk=1 default=None
+  share_id TEXT notnull=1 pk=0 default=None
+  source_persona_display_name TEXT notnull=1 pk=0 default=None
+  source_persona_type TEXT notnull=1 pk=0 default=None
+  status TEXT notnull=1 pk=0 default=Some("'active'")
+  last_synced_at TEXT notnull=0 pk=0 default=None
+  ended_at TEXT notnull=0 pk=0 default=None
+TABLE view_cache_voice_profile_entries
+  id TEXT notnull=0 pk=1 default=None
+  source_id TEXT notnull=0 pk=0 default=None
+  precedence INTEGER notnull=1 pk=0 default=None
+  attribute TEXT notnull=1 pk=0 default=None
+  value TEXT notnull=1 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+  updated_at TEXT notnull=1 pk=0 default=None
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")

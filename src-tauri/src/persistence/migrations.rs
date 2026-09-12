@@ -2720,4 +2720,112 @@ mod tests {
             "no migrations are pending on the second open of an already-migrated file"
         );
     }
+
+    // -- schema shape drift detection (items.id=477) -------------------------
+    //
+    // validate_manifest()/validate_v1_rerun_safety() above only look at
+    // statement *kind* and ordering -- neither catches a plain typo or
+    // accidental column rename inside a CREATE TABLE/ALTER TABLE statement,
+    // which would otherwise only surface as a runtime "no such column" error
+    // against a real user's encrypted DB, long after the schema file was
+    // written. This test runs every prefix's full migration chain against a
+    // fresh in-memory connection, introspects the resulting schema via
+    // sqlite_master/PRAGMA table_info, and diffs the result against a
+    // checked-in golden snapshot (tests/golden/schema_shape.txt) -- any
+    // accidental drift in table/column shape fails cargo test immediately.
+    //
+    // Prefixes are read directly from SCHEMA_FILES rather than a separate
+    // hand-maintained list, so a newly added prefix is picked up
+    // automatically instead of silently going unchecked.
+    //
+    // An intentional schema change updates the snapshot the same way an
+    // intentional Gate1-4 golden-vector fixture update does (see
+    // tests/golden_vectors.rs's own header): re-run with
+    // UPDATE_SCHEMA_SNAPSHOT=1 set, then review and commit the diff.
+
+    fn all_schema_prefixes() -> Vec<&'static str> {
+        let mut prefixes: Vec<&'static str> = SCHEMA_FILES.iter().map(|f| f.prefix).collect();
+        prefixes.sort_unstable();
+        prefixes.dedup();
+        prefixes
+    }
+
+    /// Deterministic textual description of every user table's columns in
+    /// the connection's current schema. Table order is sorted; column order
+    /// is left as PRAGMA table_info returns it (declaration order) -- a
+    /// genuine column reorder is exactly the kind of drift this should catch.
+    async fn describe_schema_shape(conn: &mut SqliteConnection) -> String {
+        let tables: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master \
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
+             ORDER BY name",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .expect("sqlite_master query must succeed against a freshly migrated in-memory db");
+
+        let mut out = String::new();
+        for (table,) in tables {
+            out.push_str(&format!("TABLE {table}\n"));
+            // PRAGMA table_info's table-name argument isn't a normal bindable
+            // query parameter in SQLite -- safe to interpolate directly since
+            // `table` came from sqlite_master itself, never external input.
+            let columns: Vec<(i64, String, String, i64, Option<String>, i64)> =
+                sqlx::query_as(&format!("PRAGMA table_info({table})"))
+                    .fetch_all(&mut *conn)
+                    .await
+                    .unwrap_or_else(|e| panic!("PRAGMA table_info({table}) failed: {e}"));
+            for (_cid, name, col_type, notnull, dflt, pk) in columns {
+                out.push_str(&format!(
+                    "  {name} {col_type} notnull={notnull} pk={pk} default={dflt:?}\n"
+                ));
+            }
+        }
+        out
+    }
+
+    fn schema_shape_golden_path() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("golden")
+            .join("schema_shape.txt")
+    }
+
+    #[tokio::test]
+    async fn test_schema_shape_matches_golden_snapshot() {
+        let mut actual = String::new();
+        for prefix in all_schema_prefixes() {
+            let mut conn = make_test_conn().await;
+            run_migrations(&mut conn, prefix, None)
+                .await
+                .unwrap_or_else(|e| panic!("migrating prefix '{prefix}' failed: {e}"));
+            actual.push_str(&format!("=== {prefix} ===\n"));
+            actual.push_str(&describe_schema_shape(&mut conn).await);
+        }
+
+        let golden_path = schema_shape_golden_path();
+
+        if std::env::var("UPDATE_SCHEMA_SNAPSHOT").is_ok() {
+            std::fs::write(&golden_path, &actual)
+                .unwrap_or_else(|e| panic!("failed to write {golden_path:?}: {e}"));
+            return;
+        }
+
+        let expected = std::fs::read_to_string(&golden_path).unwrap_or_else(|e| {
+            panic!(
+                "could not read {golden_path:?}: {e} -- if this is a brand-new schema \
+                 file/prefix, generate the snapshot by re-running this test with \
+                 UPDATE_SCHEMA_SNAPSHOT=1 set, then review and commit the diff"
+            )
+        });
+
+        assert_eq!(
+            actual,
+            expected,
+            "schema shape drift detected against {}: if this change is intentional, \
+             regenerate the snapshot by re-running this test with \
+             UPDATE_SCHEMA_SNAPSHOT=1 set, then review and commit the diff",
+            golden_path.display()
+        );
+    }
 }
