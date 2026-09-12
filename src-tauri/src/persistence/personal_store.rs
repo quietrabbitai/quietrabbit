@@ -1506,7 +1506,7 @@ mod tests {
     /// a real encrypted file.
     #[tokio::test]
     async fn open_personal_db_opens_a_real_encrypted_file() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -1564,7 +1564,7 @@ mod tests {
     /// schema (not just an empty file) by querying a real table.
     #[tokio::test]
     async fn open_personal_db_self_heals_a_never_created_file() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -1622,7 +1622,7 @@ mod tests {
     async fn open_personal_db_heals_a_pre_existing_v1_only_database() {
         const PERSONAL_001_SCHEMA: &str = include_str!("../../schema/personal_001.sql");
 
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -1765,7 +1765,7 @@ mod tests {
 
     #[tokio::test]
     async fn save_voice_profile_entry_new_row_is_user_created() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -1803,7 +1803,7 @@ mod tests {
 
     #[tokio::test]
     async fn save_voice_profile_entry_edit_flips_pristine_to_user_modified() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -1869,7 +1869,7 @@ mod tests {
 
     #[tokio::test]
     async fn save_voice_profile_entry_edit_leaves_user_created_row_at_user_created() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -1926,7 +1926,7 @@ mod tests {
 
     #[tokio::test]
     async fn standing_preference_round_trips_against_a_real_encrypted_file() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -1974,7 +1974,7 @@ mod tests {
         // D5-152's own "reconfigure rather than error" precedent
         // (write_floor_consent_preference's own personas.extra_metadata
         // merge-not-append behavior).
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());

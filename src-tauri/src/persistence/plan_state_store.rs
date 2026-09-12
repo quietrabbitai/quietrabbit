@@ -913,7 +913,7 @@ mod tests {
     /// the past, and confirms consume_handoff_token now rejects it.
     #[tokio::test]
     async fn consume_handoff_token_rejects_expired_unswept_token() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -968,7 +968,7 @@ mod tests {
     /// fix being too strict.
     #[tokio::test]
     async fn consume_handoff_token_accepts_unexpired_token() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());

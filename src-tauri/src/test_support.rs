@@ -19,8 +19,14 @@
 // serialize QR_DATA_ROOT-mutating tests, rather than three independent
 // copies of the same pattern.
 
+// tokio::sync::Mutex, not std::sync::Mutex: every setup() helper that uses
+// this holds the guard across .await (often for the whole test, via a
+// TestEnv field) by design -- that's what serializes the race described
+// above -- and a std::sync::MutexGuard held across .await is exactly what
+// clippy's await_holding_lock lint (correctly) flags. Same reasoning as
+// auth::registry::UnlockedKey's registry Mutex.
 #[cfg(test)]
-pub static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub static ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 // ---------------------------------------------------------------------------
 // KeyRegistry test harness (items.id=268)

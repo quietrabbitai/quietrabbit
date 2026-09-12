@@ -476,7 +476,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_active_key_and_upsert_key_round_trip_against_real_migrated_db() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -518,7 +518,7 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_key_replaces_not_duplicates_against_real_migrated_db() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -584,7 +584,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_active_key_returns_err_not_none_for_wrong_key_against_real_db() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -624,7 +624,7 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_key_rejects_empty_credential_before_touching_real_db() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());

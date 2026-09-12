@@ -166,7 +166,7 @@ mod tests {
 
     #[tokio::test]
     async fn fork_document_creates_an_independent_row_with_correct_provenance() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -223,7 +223,7 @@ mod tests {
 
     #[tokio::test]
     async fn fork_document_is_a_clean_break_not_a_live_link() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -279,7 +279,7 @@ mod tests {
 
     #[tokio::test]
     async fn fork_document_rejects_a_persona_with_no_read_access_and_writes_nothing() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());

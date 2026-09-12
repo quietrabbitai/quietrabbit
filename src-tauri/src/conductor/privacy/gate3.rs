@@ -1177,7 +1177,7 @@ mod tests {
 
     #[tokio::test]
     async fn standing_preference_wins_over_conversation_scoped_decision() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -1268,7 +1268,7 @@ mod tests {
 
     #[tokio::test]
     async fn only_conversation_scoped_decision_is_also_reapplied() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -1339,7 +1339,7 @@ mod tests {
 
     #[tokio::test]
     async fn neither_exists_routes_to_needs_review_and_records_fact_mention() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -1407,7 +1407,7 @@ mod tests {
 
     #[tokio::test]
     async fn all_auto_resolved_and_all_keep_private_blocks_early() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -1479,7 +1479,7 @@ mod tests {
 
     #[tokio::test]
     async fn all_auto_resolved_but_not_all_keep_private_approves_early() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -1565,7 +1565,7 @@ mod tests {
 
     #[tokio::test]
     async fn mixed_resolved_and_unresolved_only_surfaces_the_unresolved_entity() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -1655,7 +1655,7 @@ mod tests {
     #[tokio::test]
     async fn partition_by_prior_decision_degrades_gracefully_when_standing_preference_query_fails()
     {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -1737,7 +1737,7 @@ mod tests {
 
     #[tokio::test]
     async fn partition_by_prior_decision_degrades_gracefully_when_consent_decision_query_fails() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());

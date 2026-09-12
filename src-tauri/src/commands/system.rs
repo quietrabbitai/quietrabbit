@@ -166,7 +166,7 @@ mod tests {
 
     struct TestEnv {
         _tempdir: tempfile::TempDir,
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _lock: tokio::sync::MutexGuard<'static, ()>,
         saved_root: Option<String>,
         pool: sqlx::SqlitePool,
     }
@@ -181,7 +181,7 @@ mod tests {
     }
 
     async fn setup(user_id: &str, master_key: &[u8; crate::auth::kdf::MASTER_KEY_LEN]) -> TestEnv {
-        let lock = ENV_MUTEX.lock().unwrap();
+        let lock = ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
 
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");

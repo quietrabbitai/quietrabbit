@@ -87,7 +87,7 @@ mod tests {
 
     struct TestEnv {
         _tempdir: tempfile::TempDir,
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _lock: tokio::sync::MutexGuard<'static, ()>,
         saved_root: Option<String>,
     }
 
@@ -100,8 +100,8 @@ mod tests {
         }
     }
 
-    fn setup() -> TestEnv {
-        let lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+    async fn setup() -> TestEnv {
+        let lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -145,7 +145,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_group_facts_for_context_returns_empty_for_a_fresh_group_db() {
-        let _env = setup();
+        let _env = setup().await;
         let facts = load_group_facts_for_context("persona-1", "group-1", TEST_KEY_HEX)
             .await
             .expect("load_group_facts_for_context must succeed on a never-written group.db");
@@ -154,7 +154,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_group_facts_for_context_returns_inserted_rows_with_group_id_stamped() {
-        let _env = setup();
+        let _env = setup().await;
         insert_group_fact(
             "persona-1",
             "group-1",
@@ -189,7 +189,7 @@ mod tests {
         // check here the way get_document's require_read_access_conn has.
         // Any persona able to open the group.db (i.e. holding the key)
         // sees every row, regardless of who is asking.
-        let _env = setup();
+        let _env = setup().await;
         insert_group_fact(
             "owner-persona",
             "group-1",
@@ -209,7 +209,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_group_facts_for_context_orders_by_field_name() {
-        let _env = setup();
+        let _env = setup().await;
         insert_group_fact("persona-1", "group-1", "fact-b", "zebra", "v", "general").await;
         insert_group_fact("persona-1", "group-1", "fact-a", "apple", "v", "general").await;
 

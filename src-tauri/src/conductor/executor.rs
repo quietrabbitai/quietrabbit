@@ -1565,7 +1565,7 @@ mod tests {
         F: FnOnce(sqlx::SqlitePool) -> Fut,
         Fut: std::future::Future,
     {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());

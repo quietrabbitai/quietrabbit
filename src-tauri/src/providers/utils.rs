@@ -195,7 +195,7 @@ mod tests {
 
     #[test]
     fn get_data_root_default() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = ENV_MUTEX.blocking_lock();
         let saved = std::env::var("QR_DATA_ROOT").ok();
         std::env::remove_var("QR_DATA_ROOT");
 
@@ -209,7 +209,7 @@ mod tests {
 
     #[test]
     fn get_data_root_env_override() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = ENV_MUTEX.blocking_lock();
         let saved = std::env::var("QR_DATA_ROOT").ok();
 
         std::env::set_var("QR_DATA_ROOT", "/tmp/qr-test-root");
@@ -232,7 +232,7 @@ mod tests {
 
     #[test]
     fn db_path_personal_correct_structure() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = ENV_MUTEX.blocking_lock();
         let saved = std::env::var("QR_DATA_ROOT").ok();
 
         std::env::set_var("QR_DATA_ROOT", "/data");
@@ -250,7 +250,7 @@ mod tests {
 
     #[test]
     fn db_path_outputs_correct_structure() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = ENV_MUTEX.blocking_lock();
         let saved = std::env::var("QR_DATA_ROOT").ok();
 
         std::env::set_var("QR_DATA_ROOT", "/data");
@@ -268,7 +268,7 @@ mod tests {
 
     #[test]
     fn db_path_integration_keys_correct_structure() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = ENV_MUTEX.blocking_lock();
         let saved = std::env::var("QR_DATA_ROOT").ok();
 
         std::env::set_var("QR_DATA_ROOT", "/data");
@@ -346,7 +346,7 @@ mod tests {
 
     #[test]
     fn journal_mode_value_default_is_wal() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = ENV_MUTEX.blocking_lock();
         let saved = std::env::var("QR_NETWORK_STORAGE").ok();
         std::env::remove_var("QR_NETWORK_STORAGE");
 
@@ -359,7 +359,7 @@ mod tests {
 
     #[test]
     fn journal_mode_value_network_storage_true_is_delete() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = ENV_MUTEX.blocking_lock();
         let saved = std::env::var("QR_NETWORK_STORAGE").ok();
 
         std::env::set_var("QR_NETWORK_STORAGE", "true");

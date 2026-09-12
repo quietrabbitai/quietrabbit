@@ -1696,7 +1696,7 @@ mod tests {
     /// schema (not just an empty file) by querying a real table.
     #[tokio::test]
     async fn open_outputs_db_self_heals_a_never_created_file() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -1750,7 +1750,7 @@ mod tests {
     async fn open_outputs_db_heals_a_pre_existing_database_missing_the_source_column() {
         const OUTPUTS_001_SCHEMA: &str = include_str!("../../schema/outputs_001.sql");
 
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -1823,7 +1823,7 @@ mod tests {
     /// this file, so no separate schema bootstrap is needed here.
     #[tokio::test]
     async fn create_ingest_focus_run_then_save_ingested_output_round_trips() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -1897,7 +1897,7 @@ mod tests {
 
     #[tokio::test]
     async fn each_ingest_upload_gets_its_own_focus_run_not_a_shared_singleton() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -1928,7 +1928,7 @@ mod tests {
 
     #[tokio::test]
     async fn bump_ingested_document_version_increments_and_repoints_storage_path() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -1986,7 +1986,7 @@ mod tests {
 
     #[tokio::test]
     async fn bump_ingested_document_version_rejects_a_nonexistent_id() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -2016,7 +2016,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_outputs_source_filter_isolates_ingested_from_qr_generated() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -2113,7 +2113,7 @@ mod tests {
 
     #[tokio::test]
     async fn fact_mentions_and_prior_decision_round_trip_against_a_real_encrypted_file() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -2208,7 +2208,7 @@ mod tests {
 
     #[tokio::test]
     async fn find_consent_decision_for_fact_is_scoped_to_focus_run_id() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());

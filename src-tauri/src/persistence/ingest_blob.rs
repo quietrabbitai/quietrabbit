@@ -281,7 +281,7 @@ mod tests {
         // pattern every other QR_DATA_ROOT-touching test in this codebase
         // uses, so this doesn't race a concurrently-running test that also
         // mutates the env var.
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.blocking_lock();
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());

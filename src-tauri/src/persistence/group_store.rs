@@ -1479,7 +1479,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_document_unchecked_returns_none_for_a_never_created_document() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -1505,7 +1505,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_document_unchecked_bypasses_permission_denied() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -1724,7 +1724,7 @@ mod tests {
     /// as open_group_db_self_heals_a_never_created_file above.
     #[tokio::test]
     async fn create_and_get_document_round_trip_through_real_encrypted_group_db() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -1766,7 +1766,7 @@ mod tests {
     /// the file level here).
     #[tokio::test]
     async fn rekey_group_db_round_trip_opens_under_new_key_not_old() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -1820,7 +1820,7 @@ mod tests {
     /// the fresh-(persona,group)-pair, first-access case under test.
     #[tokio::test]
     async fn open_group_db_self_heals_a_never_created_file() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());

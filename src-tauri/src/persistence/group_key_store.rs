@@ -137,7 +137,7 @@ mod tests {
 
     struct TestEnv {
         _tempdir: tempfile::TempDir,
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _lock: tokio::sync::MutexGuard<'static, ()>,
         saved_root: Option<String>,
     }
 
@@ -150,8 +150,8 @@ mod tests {
         }
     }
 
-    fn setup() -> TestEnv {
-        let lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+    async fn setup() -> TestEnv {
+        let lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -164,7 +164,7 @@ mod tests {
 
     #[tokio::test]
     async fn save_then_list_round_trips() {
-        let _env = setup();
+        let _env = setup().await;
         let user_id = "gk-user";
         let persona_id = "gk-persona";
 
@@ -190,7 +190,7 @@ mod tests {
 
     #[tokio::test]
     async fn save_upserts_rather_than_duplicating() {
-        let _env = setup();
+        let _env = setup().await;
         let user_id = "gk-user";
         let persona_id = "gk-persona";
 
@@ -225,7 +225,7 @@ mod tests {
 
     #[tokio::test]
     async fn save_keeps_different_groups_independent() {
-        let _env = setup();
+        let _env = setup().await;
         let user_id = "gk-user";
         let persona_id = "gk-persona";
 
@@ -261,7 +261,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_removes_only_the_targeted_group() {
-        let _env = setup();
+        let _env = setup().await;
         let user_id = "gk-user";
         let persona_id = "gk-persona";
 
@@ -299,7 +299,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_on_missing_row_is_a_no_op() {
-        let _env = setup();
+        let _env = setup().await;
         let user_id = "gk-user";
         let persona_id = "gk-persona";
 
@@ -310,7 +310,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_on_fresh_persona_is_empty() {
-        let _env = setup();
+        let _env = setup().await;
         let rows = list_group_keys("gk-user", "gk-fresh-persona", PERSONAL_KEY_HEX)
             .await
             .expect("list_group_keys must succeed on a never-written persona");

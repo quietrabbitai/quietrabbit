@@ -587,7 +587,7 @@ mod tests {
     /// via the real resolve_preference() public API.
     #[tokio::test]
     async fn resolve_preference_focus_beats_persona_beats_account() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let (_tempdir, pool) = setup_real_db().await;
 
@@ -689,7 +689,7 @@ mod tests {
     /// convention).
     #[tokio::test]
     async fn no_row_at_any_scope_means_no_match() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let (_tempdir, pool) = setup_real_db().await;
 
@@ -709,7 +709,7 @@ mod tests {
     /// choose between groq/mistral instead of resolving one named provider.
     #[tokio::test]
     async fn find_preferred_provider_zero_one_many_candidates() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let (_tempdir, pool) = setup_real_db().await;
 
@@ -781,7 +781,7 @@ mod tests {
     /// concrete enforcement judgment call 2 in this session's plan rests on.
     #[tokio::test]
     async fn duplicate_account_wide_row_is_rejected() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let (tempdir, _pool) = setup_real_db().await;
 

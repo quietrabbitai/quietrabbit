@@ -1661,7 +1661,7 @@ mod tests {
         // matching this dev environment's real config -- WAL's
         // readers-don't-block-writers behavior would mask the bug this
         // test exists to catch.
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let saved_network = std::env::var("QR_NETWORK_STORAGE").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
@@ -1727,7 +1727,7 @@ mod tests {
         // against that same path. If the post-cleanup path_lock() ever
         // handed out two different mutexes for the same file, these two
         // calls would race exactly like the pre-items.id=391 bug.
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let saved_network = std::env::var("QR_NETWORK_STORAGE").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
@@ -2073,7 +2073,7 @@ mod tests {
 
     #[tokio::test]
     async fn migrate_personal_db_applies_all_three_versions_to_real_encrypted_file() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -2150,7 +2150,7 @@ mod tests {
 
     #[tokio::test]
     async fn migrate_personal_db_is_idempotent_on_real_file() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -2177,7 +2177,7 @@ mod tests {
 
     #[tokio::test]
     async fn migrate_personal_db_rejects_wrong_key_on_real_file() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -2211,7 +2211,7 @@ mod tests {
 
     #[tokio::test]
     async fn migrate_group_db_applies_to_real_encrypted_file() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -2250,7 +2250,7 @@ mod tests {
 
     #[tokio::test]
     async fn migrate_group_db_is_idempotent_on_real_file() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -2277,7 +2277,7 @@ mod tests {
 
     #[tokio::test]
     async fn schema_version_exists_true_for_real_encrypted_file_with_correct_key() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -2307,7 +2307,7 @@ mod tests {
 
     #[tokio::test]
     async fn schema_version_exists_false_for_real_encrypted_file_with_wrong_key() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -2340,7 +2340,7 @@ mod tests {
 
     #[tokio::test]
     async fn migrate_outputs_db_applies_to_real_encrypted_file() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -2424,7 +2424,7 @@ mod tests {
 
     #[tokio::test]
     async fn migrate_keys_db_applies_to_real_encrypted_file() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -2477,7 +2477,7 @@ mod tests {
         // SQLCipher key is involved here by design. This test still uses a
         // real tempdir-backed file (not :memory:) to exercise the real
         // path-construction/file-creation code, which no existing test does.
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -2504,7 +2504,7 @@ mod tests {
 
     #[tokio::test]
     async fn migrate_domain_context_db_applies_to_real_encrypted_file() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -2557,7 +2557,7 @@ mod tests {
 
     #[tokio::test]
     async fn migrate_focus_storage_migrates_both_real_encrypted_files() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -2673,7 +2673,7 @@ mod tests {
         // nothing needs to be hand-seeded to force that -- which is exactly
         // the "applied a real migration" case the gate must run the full
         // integrity_check for on this, its first open.
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());

@@ -403,7 +403,7 @@ mod tests {
 
     #[tokio::test]
     async fn populate_from_policy_local_only_sets_single_flag() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let (_tempdir, pool) = setup_real_db().await;
 
@@ -430,7 +430,7 @@ mod tests {
     /// provider correctly fails this policy while still passing local_only.
     #[tokio::test]
     async fn local_and_anonymous_requires_both_flags() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let (_tempdir, pool) = setup_real_db().await;
 
@@ -459,7 +459,7 @@ mod tests {
 
     #[tokio::test]
     async fn reset_to_policy_reapplies_and_errors_without_one() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let (_tempdir, pool) = setup_real_db().await;
 
@@ -514,7 +514,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_criteria_clears_seeded_from_policy() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let (_tempdir, pool) = setup_real_db().await;
 
@@ -550,7 +550,7 @@ mod tests {
 
     #[tokio::test]
     async fn eligible_providers_for_focus_no_row_returns_all_active() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let (_tempdir, pool) = setup_real_db().await;
 
@@ -579,7 +579,7 @@ mod tests {
     /// "genuinely greenfield."
     #[tokio::test]
     async fn eligible_providers_for_focus_local_only_currently_empty() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let (_tempdir, pool) = setup_real_db().await;
 
@@ -606,7 +606,7 @@ mod tests {
     /// includes unconditionally -> remainder filtered by require_* flags.
     #[tokio::test]
     async fn eligible_providers_for_focus_deny_beats_allow_beats_require() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let (_tempdir, pool) = setup_real_db().await;
 

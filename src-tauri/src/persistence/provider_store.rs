@@ -995,7 +995,7 @@ mod tests {
     /// QR_DATA_ROOT-mutating tests (ENV_MUTEX serialization, save/restore).
     #[tokio::test]
     async fn list_active_providers_and_max_risk_rating_via_public_api() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -1106,7 +1106,7 @@ mod tests {
     /// ChatGPT/Gemini are a different provider_type).
     #[tokio::test]
     async fn list_providers_by_type_returns_only_matching_active_providers() {
-        let _lock = crate::test_support::ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
