@@ -958,7 +958,28 @@ impl PaneManager {
             };
             let size_px = (width, height);
             if pane.last_applied_size == Some(size_px) {
+                // DIAG items.id=486 (temporary -- remove after root-cause diagnosis):
+                // cache-hit skip. Shares diag_312_tick()'s seq/elapsed_ms so this
+                // interleaves with the existing connect_resize/connect_render DIAG
+                // items.id=312 lines.
+                let (seq, elapsed_ms) = diag_312_tick();
+                let open_count = self.open_pane_count.load(Ordering::Relaxed);
+                log::debug!(
+                    "DIAG items.id=486: seq={seq} t={elapsed_ms}ms sync_pane_sizes \
+                     CACHE-HIT key={key:?} size_px={size_px:?} (== last_applied_size) \
+                     open_pane_count={open_count}"
+                );
                 continue;
+            }
+            {
+                // DIAG items.id=486 (temporary -- remove after root-cause diagnosis):
+                // cache-miss / apply. Logged before the write so old vs. new is visible.
+                let (seq, elapsed_ms) = diag_312_tick();
+                log::debug!(
+                    "DIAG items.id=486: seq={seq} t={elapsed_ms}ms sync_pane_sizes \
+                     APPLY key={key:?} old={:?} new={size_px:?}",
+                    pane.last_applied_size
+                );
             }
             // items.id=328: `LogicalSize` here feeds CEF's `GetViewRect`
             // directly (render.rs's `view_rect`) -- confirmed live, via
