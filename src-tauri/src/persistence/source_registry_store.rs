@@ -1349,9 +1349,10 @@ mod tests {
             .await
             .unwrap();
 
-        let changed = mark_records_deleted_in_source_conn(&mut conn, &source, &[id.clone()])
-            .await
-            .unwrap();
+        let changed =
+            mark_records_deleted_in_source_conn(&mut conn, &source, std::slice::from_ref(&id))
+                .await
+                .unwrap();
         assert_eq!(changed, 0, "a deliberate tombstone must survive a refresh");
         assert_eq!(
             get_entity_conn(&mut conn, &id)

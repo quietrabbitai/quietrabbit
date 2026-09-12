@@ -393,7 +393,7 @@ fn gate2_inputs(label: &str) -> G2Inputs {
 
         // Unicode vectors
         "gate2::unicode_turkish_upper_I_exact" => (
-            format!("Visit \u{0130}stanbul today."),
+            "Visit \u{0130}stanbul today.".to_string(),
             track(vec![field(
                 "city",
                 "\u{0130}stanbul",
@@ -820,7 +820,7 @@ async fn test_gate2() {
         let execution_tier: u8 = if label.contains("tier2") { 2 } else { 1 };
 
         let (response, trk, fields_shared) = gate2_inputs(label);
-        let fields_shared_ref: Option<&[String]> = fields_shared.as_ref().map(|v| v.as_slice());
+        let fields_shared_ref: Option<&[String]> = fields_shared.as_deref();
 
         let logger = TestLogger::new();
         let result = gate2(
