@@ -85,16 +85,25 @@ ignore = [
     # --- gtk-rs 0.18 stack (tauri's Linux webview backend: wry -> tao/webkit2gtk-rs -> gtk -> glib) ---
     # RUSTSEC-2024-0429 is the one entry here that is NOT a routine
     # "unmaintained" notice -- it's UB (unsound iterator impl) in glib
-    # 0.18.5's GVariant string-array iteration. quietrabbit's own code does
-    # not call glib::Variant / VariantStrIter directly (checked via grep,
-    # 2026-09-11), but GTK/webkit2gtk may exercise it internally (clipboard
-    # mime data, D-Bus, accessibility) and that has not been fully ruled
-    # out. No fix exists short of a major bump of the entire gtk-rs stack,
-    # which is upstream of tauri's own Cargo.toml, not something this repo
-    # controls directly. FLAGGED for Chat-PM in the items.id=474 handoff --
-    # this is the one ignore entry in this file that is a real open
-    # question, not an accepted tradeoff.
-    { id = "RUSTSEC-2024-0429", reason = "unsound: glib 0.18.5 VariantStrIter UB, pinned by tauri's gtk-rs 0.18 Linux webview stack (wry->tao->webkit2gtk-rs->gtk->glib); no upgrade path without a major tauri/wry bump. Flagged for Chat-PM, not silently accepted -- see items.id=474 handoff." },
+    # 0.18.5's GVariant string-array iteration. RESOLVED 2026-09-12
+    # (items.id=480): reachability investigated and confirmed NOT
+    # REACHABLE. The unsound code is confined to a single pub(crate)
+    # constructor (VariantStrIter::new()) reachable only via
+    # glib::Variant::array_iter_str() -- a direct source grep across all
+    # 717 locked packages' vendored source found that method called
+    # nowhere outside glib's own crate (no hits in gio, gdk, gtk, atk,
+    # webkit2gtk, soup3, wry, tao, tauri, or any other transitive
+    # dependency). GTK/webkit2gtk's own GVariant handling is pure C
+    # (g_variant_iter_next()), a separate, unaffected code path. Verified
+    # independently by Chat-PM via direct registry-source grep, not just
+    # the investigating session's self-report. Caveat: static source
+    # analysis, not runtime instrumentation -- treated as sufficient since
+    # array_iter_str is a plain inherent method with no dynamic dispatch
+    # or macro-generated call sites. Still listed below because the
+    # advisory remains technically present in the dependency tree (no fix
+    # without a major tauri/wry bump) -- now an accepted, resolved
+    # tradeoff, not an open question.
+    { id = "RUSTSEC-2024-0429", reason = "unsound: glib 0.18.5 VariantStrIter UB, pinned by tauri's gtk-rs 0.18 Linux webview stack. Investigated 2026-09-12 (items.id=480) -- confirmed NOT REACHABLE (vulnerable method never called outside glib's own crate, across all 717 locked packages). Accepted: no upgrade path without a major tauri/wry bump." },
     { id = "RUSTSEC-2024-0370", reason = "unmaintained: proc-macro-error, pulled by glib-macros 0.18.5 (same gtk-rs 0.18 stack as RUSTSEC-2024-0429 above). No CVE, build-time proc-macro only, no upgrade path without the same major gtk-rs bump." },
 
     # --- urlpattern (tauri-utils's own URL-pattern-matching dependency) ---
