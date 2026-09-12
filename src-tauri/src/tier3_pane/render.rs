@@ -172,7 +172,26 @@ impl RenderState {
         }
         .expect("tier3_pane::render: failed to open wgpu-hal GLES device");
 
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        // `flags` deliberately overridden to `empty()` instead of taking
+        // `new_without_display_handle()`'s own default --
+        // that default is `InstanceFlags::from_build_config()`, which includes
+        // `VALIDATION` in every debug build. `VALIDATION` is what makes wgpu-hal's
+        // GLES backend call `eglDebugMessageControlKHR`, registering a *process-wide*
+        // EGL debug callback (see wgpu-hal's `gles/egl.rs`) that logs every EGL
+        // diagnostic on the default display -- not just this instance's own, but
+        // GTK/glycin's unrelated EGL calls too, which is the confirmed source of the
+        // constant `[ERROR wgpu_hal::gles::egl] EGL 'eglSwapInterval' ...
+        // EGL_BAD_SURFACE` log spam (verified live: bursts occurred during glycin
+        // icon loading with zero Tier 3 panes open, so unrelated to this instance's
+        // own render path). This `instance` is only ever used for
+        // `create_adapter_from_hal` below -- the real adapter/device are hand-wired
+        // from GTK's external GL context via `Adapter::new_external`/`open_device`
+        // above, entirely bypassing this instance's own validation layer -- so
+        // dropping `VALIDATION` here loses nothing this codepath ever used.
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            flags: wgpu::InstanceFlags::empty(),
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
         let adapter = unsafe { instance.create_adapter_from_hal::<wgpu_hal::api::Gles>(exposed) };
         let (device, queue) = unsafe {
             adapter.create_device_from_hal::<wgpu_hal::api::Gles>(
