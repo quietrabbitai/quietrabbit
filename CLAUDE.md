@@ -155,10 +155,15 @@ Design sessions must all complete before shared infrastructure build begins.
 personal_fields flat key-value model replaced by entities + entity_facts.
 Migration: personal_002.sql (complete, entities + entity_facts). D6-459 additions
 (source_registry, deduplication, modification_state, soft-delete tombstone) also
-complete -- see personal_002.sql. The personal_*.sql migration sequence was
-consolidated from 7 planned files to 2 before any of the later ones shipped
-(2026-08-01) -- prior references here to personal_005/006/007.sql described a
-planning-stage numbering that was never built; do not search for those files.
+complete -- see personal_002.sql. CORRECTED 2026-09-12 (items.id=477's
+schema-shape golden-snapshot test build surfaced this while iterating
+SCHEMA_FILES): the personal_*.sql sequence was NOT consolidated to 2 files --
+personal_005.sql through personal_008.sql are real, embedded in SCHEMA_FILES,
+and exercised (an existing migrations.rs test asserts personal.db applies all
+8 real versions on first open). The prior "consolidated from 7 planned files
+to 2, do not search for those files" note here was accurate as of 2026-08-01
+but has since gone stale as personal_005-008.sql were actually built. Current
+count: 8 files, personal_001.sql through personal_008.sql, all live.
 
 Key facts:
 - entities: self-referential (parent_entity_id — PENDING DROP, not yet scheduled),
