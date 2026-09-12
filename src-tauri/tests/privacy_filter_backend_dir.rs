@@ -16,8 +16,8 @@
 
 use quietrabbit_lib::conductor::privacy::privacy_filter;
 
-#[test]
-fn classify_succeeds_from_arbitrary_cwd() {
+#[tokio::test]
+async fn classify_succeeds_from_arbitrary_cwd() {
     // cargo test's cwd is always CARGO_MANIFEST_DIR (src-tauri/), never the
     // privacy-filter.cpp bin/ directory that ggml's default cwd-search
     // fallback would need -- this is the "arbitrary cwd" the bug depended on.
@@ -37,12 +37,14 @@ fn classify_succeeds_from_arbitrary_cwd() {
         return;
     }
 
-    if let Err(e) = privacy_filter::run_classify_blocking("My name is Alice Smith.", 0.0) {
-        panic!(
+    match privacy_filter::run_classify_blocking("My name is Alice Smith.".to_owned(), 0.0).await {
+        Ok(Err(e)) => panic!(
             "pf_classify failed: {e} -- if this says 'CPU backend init failed', \
              the libggml-cpu-*.so variants were not found under the resolved \
              backend dir (see build.rs PRIVACY_FILTER_BACKEND_DIR_DEV and \
              privacy_filter.rs BACKEND_DIR_DEV_FALLBACK)"
-        );
+        ),
+        Err(join_err) => panic!("run_classify_blocking task panicked: {join_err}"),
+        Ok(Ok(_)) => {}
     }
 }

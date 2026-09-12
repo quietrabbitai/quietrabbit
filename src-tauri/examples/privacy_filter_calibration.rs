@@ -279,7 +279,8 @@ fn corpus() -> Vec<Case> {
     ]
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     println!("# Privacy Filter Confidence Threshold Calibration\n");
     println!("Run against live privacy-filter.cpp model. items.id=36 / decisions.id=405.\n");
 
@@ -304,11 +305,15 @@ fn main() {
     println!("|---|---|---|---|---|");
 
     for c in &cases {
-        let result = privacy_filter::run_classify_blocking(c.text, 0.0);
+        let result = privacy_filter::run_classify_blocking(c.text.to_owned(), 0.0).await;
         let entities: Vec<PfEntityDecoded> = match result {
-            Ok(e) => e,
-            Err(e) => {
+            Ok(Ok(e)) => e,
+            Ok(Err(e)) => {
                 eprintln!("[{}] PF call failed: {e}", c.id);
+                continue;
+            }
+            Err(join_err) => {
+                eprintln!("[{}] PF task panicked: {join_err}", c.id);
                 continue;
             }
         };

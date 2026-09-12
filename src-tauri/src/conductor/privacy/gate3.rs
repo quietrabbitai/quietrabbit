@@ -292,9 +292,9 @@ async fn gate3_with_pf<L: DisclosureLogger>(
     let destination_risk = destination_risk_rating.unwrap_or(target_tier);
     let text = content_text.to_owned();
 
-    // spawn_blocking: FFI call is synchronous C library — must not block async executor.
-    let pf_task =
-        tokio::task::spawn_blocking(move || privacy_filter::run_classify_blocking(&text, 0.0));
+    // run_classify_blocking spawn_blocking's internally (items.id=479) —
+    // FFI call is a synchronous C library and must not block the async executor.
+    let pf_task = privacy_filter::run_classify_blocking(text, 0.0);
 
     let pf_outcome = tokio::time::timeout(Duration::from_secs(PF_TIMEOUT_SECS), pf_task).await;
 

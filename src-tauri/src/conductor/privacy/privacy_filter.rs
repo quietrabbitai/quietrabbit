@@ -297,7 +297,9 @@ mod inner {
 
     /// Run the Privacy Filter classifier on text. Returns decoded entity spans.
     ///
-    /// Synchronous — MUST be called inside tokio::task::spawn_blocking.
+    /// Synchronous — never call this directly; it's only reachable through
+    /// the crate-level async `run_classify_blocking` wrapper below, which
+    /// runs it inside tokio::task::spawn_blocking (items.id=479).
     /// Holds the PrivacyFilter Mutex for the duration of the C call.
     ///
     /// Pass threshold=0.0 to receive all spans regardless of confidence.
@@ -305,7 +307,7 @@ mod inner {
     ///
     /// Returns Ok(vec) on success; vec may be empty if no spans found.
     /// Returns Err(reason) if the filter is unavailable or the call fails.
-    pub fn run_classify_blocking(
+    pub(super) fn run_classify_blocking_sync(
         text: &str,
         threshold: f32,
     ) -> Result<Vec<PfEntityDecoded>, String> {
@@ -404,7 +406,9 @@ mod inner {
 
 // Re-export live implementations when compiled in.
 #[cfg(privacy_filter_available)]
-pub use inner::{is_available, run_classify_blocking, set_backend_dir};
+use inner::run_classify_blocking_sync;
+#[cfg(privacy_filter_available)]
+pub use inner::{is_available, set_backend_dir};
 
 // ---------------------------------------------------------------------------
 // Stub path — when PRIVACY_FILTER_LIB_DIR was not set at build time
@@ -417,9 +421,13 @@ pub fn is_available() -> bool {
 }
 
 /// Returns Err when the Privacy Filter library was not compiled in.
-/// Gate3 calls this and falls back to pre-filter sensitivity block.
+/// Gate3 calls this (via the async run_classify_blocking wrapper below) and
+/// falls back to pre-filter sensitivity block.
 #[cfg(not(privacy_filter_available))]
-pub fn run_classify_blocking(_text: &str, _threshold: f32) -> Result<Vec<PfEntityDecoded>, String> {
+fn run_classify_blocking_sync(
+    _text: &str,
+    _threshold: f32,
+) -> Result<Vec<PfEntityDecoded>, String> {
     Err("Privacy Filter not compiled in \
          (set PRIVACY_FILTER_LIB_DIR at build time)"
         .to_owned())
@@ -429,6 +437,33 @@ pub fn run_classify_blocking(_text: &str, _threshold: f32) -> Result<Vec<PfEntit
 /// (main.rs's setup hook) call this unconditionally without cfg-gating.
 #[cfg(not(privacy_filter_available))]
 pub fn set_backend_dir(_dir: std::path::PathBuf) {}
+
+// ---------------------------------------------------------------------------
+// Public entry point — always compiled, live or stub (items.id=479)
+// ---------------------------------------------------------------------------
+
+/// Run the Privacy Filter classifier on `text`, off the async executor.
+///
+/// spawn_blocking is baked in here rather than left as a doc-comment
+/// convention a caller has to remember: previously `run_classify_blocking`
+/// was itself the synchronous FFI call, and both existing call sites
+/// (gate3.rs, output_scan.rs) happened to wrap it in
+/// `tokio::task::spawn_blocking` correctly by hand — this was never
+/// type-enforced, so a future caller could invoke it directly from an async
+/// context and block the executor with no compiler warning. Now the
+/// blocking call is unreachable except through this wrapper.
+///
+/// The `Result<Result<_, String>, JoinError>` nesting is deliberate, not
+/// left over: it mirrors exactly what `spawn_blocking(...).await` produced
+/// at the two call sites before this change, so their existing
+/// panic-vs-classifier-error handling (a panic is treated as a harder
+/// failure than an ordinary classifier error) needed no changes.
+pub async fn run_classify_blocking(
+    text: String,
+    threshold: f32,
+) -> Result<Result<Vec<PfEntityDecoded>, String>, tokio::task::JoinError> {
+    tokio::task::spawn_blocking(move || run_classify_blocking_sync(&text, threshold)).await
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -445,11 +480,12 @@ mod tests {
     }
 
     #[cfg(not(privacy_filter_available))]
-    #[test]
-    fn stub_run_classify_returns_err() {
-        let result = run_classify_blocking("Hello, my name is Alice.", 0.5);
-        assert!(result.is_err());
-        let msg = result.unwrap_err();
+    #[tokio::test]
+    async fn stub_run_classify_returns_err() {
+        let result = run_classify_blocking("Hello, my name is Alice.".to_owned(), 0.5).await;
+        let classify_result = result.expect("spawn_blocking should not panic");
+        assert!(classify_result.is_err());
+        let msg = classify_result.unwrap_err();
         assert!(msg.contains("not compiled in"), "unexpected error: {msg}");
     }
 
