@@ -303,25 +303,35 @@ async fn async_main() {
             // Detection runs in a spawned task — setup() is synchronous.
             // OllamaSource stays Unavailable until detection completes
             // (typically < 2 s on Garuda where system Ollama is running).
+            // Supervised (items.id=476): one-shot, so no restart on panic --
+            // just a loud log instead of OllamaSource silently staying
+            // Unavailable forever with no trace of why.
             let handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                let resource_dir = match handle.path().resource_dir() {
-                    Ok(p) => p,
-                    Err(e) => {
-                        log::warn!("main: could not resolve resource_dir: {e}");
-                        return;
+            quietrabbit_lib::task_supervision::spawn_supervised(
+                "ollama_detection",
+                false,
+                move || {
+                    let handle = handle.clone();
+                    async move {
+                        let resource_dir = match handle.path().resource_dir() {
+                            Ok(p) => p,
+                            Err(e) => {
+                                log::warn!("main: could not resolve resource_dir: {e}");
+                                return;
+                            }
+                        };
+
+                        let source = {
+                            let sidecar_state = handle.state::<Mutex<OllamaSidecar>>();
+                            let mut sidecar = sidecar_state.lock().await;
+                            sidecar.ensure_available(&resource_dir).await
+                        };
+
+                        let source_state = handle.state::<RwLock<OllamaSource>>();
+                        *source_state.write().await = source;
                     }
-                };
-
-                let source = {
-                    let sidecar_state = handle.state::<Mutex<OllamaSidecar>>();
-                    let mut sidecar = sidecar_state.lock().await;
-                    sidecar.ensure_available(&resource_dir).await
-                };
-
-                let source_state = handle.state::<RwLock<OllamaSource>>();
-                *source_state.write().await = source;
-            });
+                },
+            );
 
             // items.id=287 (group.db 266e): folder-sync periodic pull.
             // Pattern-matched off the Ollama detection spawn immediately
@@ -340,50 +350,61 @@ async fn async_main() {
             // this can only ever poll groups whose key is currently
             // resident in GroupKeyRegistry this session, never "all groups
             // this persona belongs to". Known, accepted scope limit.
+            // Supervised (items.id=476): restart=true -- if a panic ever
+            // takes this sweep down (e.g. a bug in apply_pending_rotations
+            // or a sync engine), it's logged loudly AND respawned, rather
+            // than group/persona sync silently going dark with no visible
+            // symptom until someone notices stale shared state.
             let pull_handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
-                loop {
-                    ticker.tick().await;
-                    let registry =
-                        pull_handle.state::<quietrabbit_lib::auth::registry::GroupKeyRegistry>();
-                    let pool = pull_handle.state::<sqlx::SqlitePool>();
+            quietrabbit_lib::task_supervision::spawn_supervised(
+                "group_persona_sync_sweep",
+                true,
+                move || {
+                    let pull_handle = pull_handle.clone();
+                    async move {
+                        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
+                        loop {
+                            ticker.tick().await;
+                            let registry = pull_handle
+                                .state::<quietrabbit_lib::auth::registry::GroupKeyRegistry>(
+                            );
+                            let pool = pull_handle.state::<sqlx::SqlitePool>();
 
-                    // items.id=288 (group.db 266f): apply any pending key
-                    // rotations before this tick's pull sweep below -- a
-                    // rotation must land before a pull can usefully decrypt
-                    // anything pushed under the new key. Same
-                    // resident-keys-only limitation as the pull sweep: a
-                    // rotation for a persona whose OLD key isn't currently
-                    // resident is skipped by apply_pending_rotations itself
-                    // and retried next tick -- items.id=290/decisions.id=718
-                    // closes the common restart case of this (rehydrated at
-                    // login), see group_membership.rs's own header for
-                    // remaining caveats. sharing_private_key AND
-                    // personal_key_hex are both per-ACCOUNT (KeyRegistry's
-                    // single slot), not per-persona -- fetched once per tick
-                    // and reused for every resident persona, since at most
-                    // one account is ever unlocked in this process (Section
-                    // 4.2's single-slot model). personal_key_hex feeds
-                    // apply_pending_rotations' own items.id=290 durable-write
-                    // step (group_key_store::save_group_key).
-                    let key_registry =
-                        pull_handle.state::<quietrabbit_lib::auth::registry::KeyRegistry>();
-                    let sharing_private_key_opt = key_registry.sharing_private_key().await;
-                    let personal_key_hex_opt = key_registry.personal_key_hex().await;
-                    if let (Some(sharing_private_key_bytes), Some(personal_key_hex)) =
-                        (sharing_private_key_opt, personal_key_hex_opt)
-                    {
-                        let sharing_private_key =
-                            x25519_dalek::StaticSecret::from(sharing_private_key_bytes);
-                        let resident_personas: std::collections::HashSet<String> = registry
-                            .resident_keys()
-                            .await
-                            .into_iter()
-                            .map(|(persona_id, _group_id)| persona_id)
-                            .collect();
-                        for persona_id in resident_personas {
-                            if let Err(e) =
+                            // items.id=288 (group.db 266f): apply any pending key
+                            // rotations before this tick's pull sweep below -- a
+                            // rotation must land before a pull can usefully decrypt
+                            // anything pushed under the new key. Same
+                            // resident-keys-only limitation as the pull sweep: a
+                            // rotation for a persona whose OLD key isn't currently
+                            // resident is skipped by apply_pending_rotations itself
+                            // and retried next tick -- items.id=290/decisions.id=718
+                            // closes the common restart case of this (rehydrated at
+                            // login), see group_membership.rs's own header for
+                            // remaining caveats. sharing_private_key AND
+                            // personal_key_hex are both per-ACCOUNT (KeyRegistry's
+                            // single slot), not per-persona -- fetched once per tick
+                            // and reused for every resident persona, since at most
+                            // one account is ever unlocked in this process (Section
+                            // 4.2's single-slot model). personal_key_hex feeds
+                            // apply_pending_rotations' own items.id=290 durable-write
+                            // step (group_key_store::save_group_key).
+                            let key_registry =
+                                pull_handle.state::<quietrabbit_lib::auth::registry::KeyRegistry>();
+                            let sharing_private_key_opt = key_registry.sharing_private_key().await;
+                            let personal_key_hex_opt = key_registry.personal_key_hex().await;
+                            if let (Some(sharing_private_key_bytes), Some(personal_key_hex)) =
+                                (sharing_private_key_opt, personal_key_hex_opt)
+                            {
+                                let sharing_private_key =
+                                    x25519_dalek::StaticSecret::from(sharing_private_key_bytes);
+                                let resident_personas: std::collections::HashSet<String> = registry
+                                    .resident_keys()
+                                    .await
+                                    .into_iter()
+                                    .map(|(persona_id, _group_id)| persona_id)
+                                    .collect();
+                                for persona_id in resident_personas {
+                                    if let Err(e) =
                                 quietrabbit_lib::auth::group_membership::apply_pending_rotations(
                                     &pool,
                                     &persona_id,
@@ -398,73 +419,79 @@ async fn async_main() {
                                      persona={persona_id}: {e}"
                                 );
                             }
-                        }
-                    }
+                                }
+                            }
 
-                    for (persona_id, group_id) in registry.resident_keys().await {
-                        let key_hex_opt = registry.key_hex_for(&persona_id, &group_id).await;
-                        let Some(key_hex_str) = key_hex_opt else {
-                            // Evicted between resident_keys() and with_key()
-                            // -- nothing to poll for this pair this tick.
-                            continue;
-                        };
-                        if let Err(e) = quietrabbit_lib::group_sync::engine::pull_if_newer(
-                            &pool,
-                            &persona_id,
-                            &group_id,
-                            &key_hex_str,
-                        )
-                        .await
-                        {
-                            log::warn!(
-                                "main: periodic group_sync pull failed for \
+                            for (persona_id, group_id) in registry.resident_keys().await {
+                                let key_hex_opt =
+                                    registry.key_hex_for(&persona_id, &group_id).await;
+                                let Some(key_hex_str) = key_hex_opt else {
+                                    // Evicted between resident_keys() and with_key()
+                                    // -- nothing to poll for this pair this tick.
+                                    continue;
+                                };
+                                if let Err(e) = quietrabbit_lib::group_sync::engine::pull_if_newer(
+                                    &pool,
+                                    &persona_id,
+                                    &group_id,
+                                    &key_hex_str,
+                                )
+                                .await
+                                {
+                                    log::warn!(
+                                        "main: periodic group_sync pull failed for \
                                  persona={persona_id} group={group_id}: {e}"
-                            );
-                        }
-                        if let Err(e) =
-                            quietrabbit_lib::group_sync::engine::pull_permissions_if_newer(
+                                    );
+                                }
+                                if let Err(e) =
+                                    quietrabbit_lib::group_sync::engine::pull_permissions_if_newer(
+                                        &pool,
+                                        &persona_id,
+                                        &group_id,
+                                        &key_hex_str,
+                                    )
+                                    .await
+                                {
+                                    log::warn!(
+                                        "main: periodic group_sync permissions pull failed for \
+                                 persona={persona_id} group={group_id}: {e}"
+                                    );
+                                }
+                            }
+
+                            // items.id=303 (decisions.id=722): persona-share sync
+                            // periodic push + pull, same timer as group.db's pull
+                            // above -- Jason's direction, narrowing decisions.id=722's
+                            // "push-on-save" to a periodic sweep (persona content has
+                            // no single save-hook choke point the way group.db's
+                            // one-document-one-save-function shape does; see
+                            // persona_sync::engine's own module header). Account-
+                            // scoped, not per-resident-group-key like the loop above
+                            // -- run once per tick for whichever account is
+                            // currently logged in (a no-op if nobody is).
+                            quietrabbit_lib::persona_sync::engine::run_periodic_sweep(
                                 &pool,
-                                &persona_id,
-                                &group_id,
-                                &key_hex_str,
+                                &key_registry,
                             )
-                            .await
-                        {
-                            log::warn!(
-                                "main: periodic group_sync permissions pull failed for \
-                                 persona={persona_id} group={group_id}: {e}"
-                            );
+                            .await;
+
+                            // items.id=304 (decisions.id=723): VIEW-ONLY persona-share
+                            // sync periodic push + pull, same timer tick, same
+                            // content-hash-gating mechanism as the SYNCED sweep above
+                            // -- a separate sibling call, not folded into that
+                            // function's body, since VIEW-ONLY's push/pull are a
+                            // parallel module with no provisioning/reconciliation
+                            // concerns of their own (see persona_view_sync::engine's
+                            // own module header).
+                            quietrabbit_lib::persona_view_sync::engine::run_periodic_sweep(
+                                &pool,
+                                &key_registry,
+                            )
+                            .await;
                         }
                     }
-
-                    // items.id=303 (decisions.id=722): persona-share sync
-                    // periodic push + pull, same timer as group.db's pull
-                    // above -- Jason's direction, narrowing decisions.id=722's
-                    // "push-on-save" to a periodic sweep (persona content has
-                    // no single save-hook choke point the way group.db's
-                    // one-document-one-save-function shape does; see
-                    // persona_sync::engine's own module header). Account-
-                    // scoped, not per-resident-group-key like the loop above
-                    // -- run once per tick for whichever account is
-                    // currently logged in (a no-op if nobody is).
-                    quietrabbit_lib::persona_sync::engine::run_periodic_sweep(&pool, &key_registry)
-                        .await;
-
-                    // items.id=304 (decisions.id=723): VIEW-ONLY persona-share
-                    // sync periodic push + pull, same timer tick, same
-                    // content-hash-gating mechanism as the SYNCED sweep above
-                    // -- a separate sibling call, not folded into that
-                    // function's body, since VIEW-ONLY's push/pull are a
-                    // parallel module with no provisioning/reconciliation
-                    // concerns of their own (see persona_view_sync::engine's
-                    // own module header).
-                    quietrabbit_lib::persona_view_sync::engine::run_periodic_sweep(
-                        &pool,
-                        &key_registry,
-                    )
-                    .await;
-                }
-            });
+                },
+            );
 
             // items.id=311: idle-timeout enforcement. A separate spawn +
             // interval from the 300s sweep loop just above, deliberately --
@@ -475,24 +502,37 @@ async fn async_main() {
             // sweeps above down with it (tauri::async_runtime::spawn is
             // fire-and-forget with no supervisor -- see
             // auth::idle_timeout's own module header).
+            //
+            // Also supervised (items.id=476), same restart=true rationale
+            // as the sweep above -- idle-timeout enforcement silently dying
+            // would mean sessions never auto-lock, a security-relevant
+            // regression with no visible symptom until someone notices.
             let idle_handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
-                loop {
-                    ticker.tick().await;
-                    let key_registry =
-                        idle_handle.state::<quietrabbit_lib::auth::registry::KeyRegistry>();
-                    let group_key_registry =
-                        idle_handle.state::<quietrabbit_lib::auth::registry::GroupKeyRegistry>();
-                    let pool = idle_handle.state::<sqlx::SqlitePool>();
-                    quietrabbit_lib::auth::idle_timeout::run_periodic_check(
-                        &pool,
-                        &key_registry,
-                        &group_key_registry,
-                    )
-                    .await;
-                }
-            });
+            quietrabbit_lib::task_supervision::spawn_supervised(
+                "idle_timeout_check",
+                true,
+                move || {
+                    let idle_handle = idle_handle.clone();
+                    async move {
+                        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+                        loop {
+                            ticker.tick().await;
+                            let key_registry =
+                                idle_handle.state::<quietrabbit_lib::auth::registry::KeyRegistry>();
+                            let group_key_registry =
+                                idle_handle
+                                    .state::<quietrabbit_lib::auth::registry::GroupKeyRegistry>();
+                            let pool = idle_handle.state::<sqlx::SqlitePool>();
+                            quietrabbit_lib::auth::idle_timeout::run_periodic_check(
+                                &pool,
+                                &key_registry,
+                                &group_key_registry,
+                            )
+                            .await;
+                        }
+                    }
+                },
+            );
 
             Ok(())
         })

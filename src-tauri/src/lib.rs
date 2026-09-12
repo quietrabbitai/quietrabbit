@@ -11,6 +11,7 @@ pub mod persistence;
 pub mod persona_sync;
 pub mod persona_view_sync;
 pub mod providers;
+pub mod task_supervision;
 #[cfg(test)]
 pub mod test_support;
 pub mod tier3_pane;
