@@ -597,10 +597,11 @@ pub async fn open_tier3_panes(
         let provider = provider_store::get_provider(&pool, &provider_id)
             .await
             .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("provider '{provider_id}' not found"))?;
+            .ok_or_else(|| "a requested provider is not in the catalog".to_string())?;
+        let display_name = provider.display_name.clone();
         let Some(launch_url) = provider.launch_url else {
             return Err(format!(
-                "provider '{provider_id}' has no launch_url -- cannot open a pane for it"
+                "provider '{display_name}' has no launch_url -- cannot open a pane for it"
             ));
         };
 

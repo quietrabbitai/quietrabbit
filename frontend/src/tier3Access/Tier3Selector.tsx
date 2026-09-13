@@ -132,7 +132,7 @@ export function Tier3Selector({
       {rows.map((provider) => {
         const state = rowState(provider.id, openPaneIds, activeProviderId)
         const LogoComponent = PROVIDER_LOGO_COMPONENTS[provider.id]
-        const isDuck = provider.id === 'duck'
+        const isDuck = provider.id === 'duckai'
         const hasRealLogo = Boolean(LogoComponent) || isDuck
         return (
           <li

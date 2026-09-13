@@ -112,8 +112,7 @@ export async function fetchActiveProviders(): Promise<Provider[]> {
  *  in the map (a muted neutral, not an unstyled/invisible tint) so a
  *  newly-added provider in `provider_store` never renders unstyled. */
 export const PROVIDER_BRAND_COLORS: Record<string, string> = {
-  duck: '#DE8D3A',
-  brave: '#FB542B',
+  duckai: '#DE8D3A',
   claude: '#CC785C',
   chatgpt: '#10A37F',
   gemini: '#4285F4',

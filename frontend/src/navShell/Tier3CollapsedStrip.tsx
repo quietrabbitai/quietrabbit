@@ -132,7 +132,7 @@ export function Tier3CollapsedStrip({
       onClick={() => onExpand(featuredId)}
     >
       <span className="tier3-collapsed-strip__name">
-        {featured?.name ?? featuredId}
+        {featured?.name ?? null}
       </span>
       <span className="tier3-collapsed-strip__expand">
         {t('navShell.tier3CollapsedStrip.expandLabel')}
