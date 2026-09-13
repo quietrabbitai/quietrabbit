@@ -521,6 +521,17 @@ async fn persist_cookies_from_jar(
 /// The selector screen's primary read path (TIER3_ACCESS_MODEL.md State 3,
 /// items.id=202 piece 1's remaining wiring) -- replaces
 /// tier3AccessConfig.ts's PLACEHOLDER_PROVIDERS stand-in array.
+///
+/// items.id=488: provider_store::list_active_providers() returns every
+/// activation_status='active' row regardless of provider_type -- correct
+/// for that function's other caller (focus_provider_criteria_store's
+/// eligible_providers_for_focus, which deliberately wants the full active
+/// pool including cloud_inference_api rows), but wrong here. This screen is
+/// the Tier 2/Tier 3 pane selector specifically, so it must only surface
+/// the two provider_type shapes lane_str() knows how to label
+/// ('split_screen_web' -> tier2, 'external_service' -> tier3) -- filtered
+/// out here rather than in the shared store function, so cloud_inference_api
+/// (Tier 1.5: groq/mistral) and local_model rows never reach this list.
 #[tauri::command]
 #[specta::specta]
 pub async fn list_active_providers(
@@ -532,6 +543,7 @@ pub async fn list_active_providers(
 
     Ok(providers
         .into_iter()
+        .filter(|p| matches!(p.provider_type.as_str(), "split_screen_web" | "external_service"))
         .map(|p| Tier3ProviderSummary {
             id: p.id,
             display_name: p.display_name,
