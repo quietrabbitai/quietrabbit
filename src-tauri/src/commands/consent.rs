@@ -1609,19 +1609,22 @@ mod tests {
         .await
         .expect("create_persona must succeed in test setup");
 
-        focus_settings_store::create_focus_settings(
+        // create_persona already seeds a "quick-ask" focus_settings row
+        // (persona_store::SEEDED_FOCUS_IDS) -- update it rather than
+        // create_focus_settings, which would collide with that seeded PK.
+        focus_settings_store::update_focus_settings(
             &pool,
             PERSONA_ID,
             TIER3_DRAFT_FOCUS_ID,
-            "bidirectional",
-            "shared",
-            1,
-            ExternalAccess::Unrestricted,
-            "open",
+            None,
+            None,
+            Some(1),
+            Some(ExternalAccess::Unrestricted),
+            Some("open"),
             None,
         )
         .await
-        .expect("create_focus_settings must succeed");
+        .expect("update_focus_settings must succeed");
 
         let settings =
             focus_settings_store::get_focus_settings(&pool, PERSONA_ID, TIER3_DRAFT_FOCUS_ID)
@@ -1672,19 +1675,10 @@ mod tests {
         )
         .await
         .expect("create_persona must succeed in test setup");
-        focus_settings_store::create_focus_settings(
-            &pool,
-            PERSONA_ID,
-            TIER3_DRAFT_FOCUS_ID,
-            "bidirectional",
-            "shared",
-            2,
-            ExternalAccess::AnonymousRequired,
-            "open",
-            None,
-        )
-        .await
-        .expect("create_focus_settings must succeed");
+        // create_persona already seeds a "quick-ask" focus_settings row
+        // (persona_store::SEEDED_FOCUS_IDS) with exactly these defaults
+        // (bidirectional/shared/privacy_tier=2/AnonymousRequired/open) --
+        // no separate create_focus_settings call needed here.
 
         let original_request = crate::commands::persona::UpdateFocusSettingsRequest {
             persona_id: PERSONA_ID.to_owned(),

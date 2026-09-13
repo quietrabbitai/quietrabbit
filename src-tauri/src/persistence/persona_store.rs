@@ -54,10 +54,26 @@ pub struct Persona {
     /// (items.id=237).
     pub extra_metadata: serde_json::Value,
     /// COUNT of this persona's focus_settings rows (items.id=237). Computed
-    /// via LEFT JOIN in every read query below; hardcoded 0 in create_persona
-    /// since a freshly created persona has no focus_settings rows yet.
+    /// via LEFT JOIN in every read query below; hardcoded to
+    /// SEEDED_FOCUS_IDS.len() in create_persona, which seeds exactly those
+    /// rows for every new persona (see create_persona's own doc comment).
     pub focus_count: i64,
 }
+
+/// Focuses provisioned with default focus_settings for every persona at
+/// creation time (create_persona below). Mirrors shared_001.sql's original
+/// three-Focus seed (research-and-buy, quick-ask, writing-assistant), which
+/// only ever seeded the first-created persona (`ORDER BY created_at LIMIT 1`
+/// -- a dev-only fixture, by its own comment) and provisioned no later
+/// persona. quick-ask is the permanent shared Tier-3 drafting path
+/// (FOCUS_ROADMAP.md, TIER3_ACCESS_MODEL.md), so any persona missing this
+/// row hits a hard AUTHORIZE-equivalent failure the first time it drafts a
+/// Tier-3 chat (commands::consent::request_tier3_gate3_review). Does NOT
+/// include role-assessment -- that Focus's shared_001.sql seed already
+/// covers every persona (`FROM personas p`, no LIMIT), so it isn't part of
+/// this gap.
+pub(crate) const SEEDED_FOCUS_IDS: [&str; 3] =
+    ["research-and-buy", "quick-ask", "writing-assistant"];
 
 // ---------------------------------------------------------------------------
 // DB opener (shared.db — unencrypted)
@@ -265,6 +281,31 @@ pub async fn create_persona(
         .execute(&mut *conn)
         .await?;
 
+        // Seed focus_settings for this persona (see SEEDED_FOCUS_IDS doc
+        // comment) -- Open profile defaults matching shared_001.sql's
+        // original seed: bidirectional, shared, privacy_tier=2,
+        // max_permitted_tier=2, focus_profile='open'. Inserted on the same
+        // `conn` inside this savepoint (not via focus_settings_store::
+        // create_focus_settings, which would acquire a separate pooled
+        // connection -- shared.db enforces foreign_keys(true), and a
+        // separate connection cannot see this persona row until this
+        // savepoint commits).
+        for focus_id in SEEDED_FOCUS_IDS {
+            sqlx::query(
+                "INSERT INTO focus_settings
+                 (persona_id, focus_id, context_flow, library_visibility,
+                  privacy_tier, max_permitted_tier, focus_profile, voice_override,
+                  created_at, updated_at)
+                 VALUES (?, ?, 'bidirectional', 'shared', 2, 2, 'open', NULL, ?, ?)",
+            )
+            .bind(persona_id)
+            .bind(focus_id)
+            .bind(&created_at)
+            .bind(&created_at)
+            .execute(&mut *conn)
+            .await?;
+        }
+
         Ok(())
     }
     .await;
@@ -296,7 +337,7 @@ pub async fn create_persona(
         created_at,
         extra_metadata: serde_json::from_str(&extra_metadata_json)
             .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
-        focus_count: 0,
+        focus_count: SEEDED_FOCUS_IDS.len() as i64,
     })
 }
 

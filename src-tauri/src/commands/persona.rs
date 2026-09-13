@@ -584,11 +584,12 @@ mod tests {
             .await
             .expect("list_personas must succeed");
         assert_eq!(
-            before[0].focus_count, 0,
-            "a fresh persona has no Focuses yet"
+            before[0].focus_count as usize,
+            persona_store::SEEDED_FOCUS_IDS.len(),
+            "create_persona must seed focus_settings rows for the default Focuses"
         );
 
-        for focus_id in ["quick-ask", "writing-assistant"] {
+        for focus_id in ["role-assessment", "some-other-focus"] {
             focus_settings_store::create_focus_settings(
                 &_env.pool,
                 PERSONA_ID,
@@ -608,9 +609,69 @@ mod tests {
             .await
             .expect("list_personas must succeed");
         assert_eq!(
-            after[0].focus_count, 2,
+            after[0].focus_count as usize,
+            persona_store::SEEDED_FOCUS_IDS.len() + 2,
             "focus_count must reflect the real number of focus_settings rows, not a default"
         );
+    }
+
+    /// items.id (this fix): the seed bug that shipped unnoticed -- every
+    /// persona after the first-created one got zero focus_settings rows,
+    /// because shared_001.sql's original seed only ever ran once, against
+    /// whatever personas existed at migration time. Guards
+    /// persona_store::create_persona's explicit per-persona provisioning
+    /// (SEEDED_FOCUS_IDS) by asserting a SECOND persona -- not the first --
+    /// gets working focus_settings rows for all three affected Focuses
+    /// immediately on creation.
+    #[tokio::test]
+    async fn create_persona_seeds_focus_settings_for_a_second_persona() {
+        let _env = setup().await;
+        const SECOND_PERSONA_ID: &str = "persona-persona-test-second";
+
+        persona_store::create_persona(
+            &_env.pool,
+            PERSONA_ID,
+            "First Persona",
+            "personal",
+            USER_ID,
+            None,
+        )
+        .await
+        .expect("create_persona must succeed for the first persona");
+
+        persona_store::create_persona(
+            &_env.pool,
+            SECOND_PERSONA_ID,
+            "Second Persona",
+            "personal",
+            USER_ID,
+            None,
+        )
+        .await
+        .expect("create_persona must succeed for the second persona");
+
+        for focus_id in persona_store::SEEDED_FOCUS_IDS {
+            let settings =
+                focus_settings_store::get_focus_settings(&_env.pool, SECOND_PERSONA_ID, focus_id)
+                    .await
+                    .expect("get_focus_settings must succeed")
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "second persona must have a focus_settings row for '{focus_id}' -- \
+                             this is exactly the gap where only the first-created persona was \
+                             seeded"
+                        )
+                    });
+
+            assert_eq!(settings.context_flow, "bidirectional");
+            assert_eq!(settings.library_visibility, "shared");
+            assert_eq!(settings.privacy_tier, 2);
+            assert_eq!(
+                settings.max_permitted_tier,
+                ExternalAccess::AnonymousRequired
+            );
+            assert_eq!(settings.focus_profile, "open");
+        }
     }
 
     #[tokio::test]
@@ -626,19 +687,9 @@ mod tests {
         )
         .await
         .expect("create_persona must succeed");
-        focus_settings_store::create_focus_settings(
-            &_env.pool,
-            PERSONA_ID,
-            "quick-ask",
-            "bidirectional",
-            "shared",
-            2,
-            ExternalAccess::AnonymousRequired,
-            "open",
-            None,
-        )
-        .await
-        .expect("create_focus_settings must succeed");
+        // create_persona seeds a "quick-ask" focus_settings row automatically
+        // (persona_store::SEEDED_FOCUS_IDS) -- no separate create_focus_settings
+        // call needed here.
 
         let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
@@ -674,19 +725,9 @@ mod tests {
         )
         .await
         .expect("create_persona must succeed");
-        focus_settings_store::create_focus_settings(
-            &_env.pool,
-            PERSONA_ID,
-            "quick-ask",
-            "bidirectional",
-            "shared",
-            2,
-            ExternalAccess::AnonymousRequired,
-            "open",
-            None,
-        )
-        .await
-        .expect("create_focus_settings must succeed");
+        // create_persona seeds a "quick-ask" focus_settings row automatically
+        // (persona_store::SEEDED_FOCUS_IDS) -- no separate create_focus_settings
+        // call needed here.
         output_store::test_seed_focus_run(
             USER_ID,
             PERSONA_ID,
@@ -731,19 +772,9 @@ mod tests {
         )
         .await
         .expect("create_persona must succeed");
-        focus_settings_store::create_focus_settings(
-            &_env.pool,
-            PERSONA_ID,
-            "quick-ask",
-            "bidirectional",
-            "shared",
-            2,
-            ExternalAccess::AnonymousRequired,
-            "open",
-            None,
-        )
-        .await
-        .expect("create_focus_settings must succeed");
+        // create_persona seeds a "quick-ask" focus_settings row automatically
+        // (persona_store::SEEDED_FOCUS_IDS) -- no separate create_focus_settings
+        // call needed here.
         output_store::test_seed_focus_run(
             USER_ID,
             PERSONA_ID,
@@ -763,9 +794,17 @@ mod tests {
             .await
             .expect("list_focuses must succeed");
 
-        assert_eq!(focuses.len(), 1);
+        assert_eq!(
+            focuses.len(),
+            persona_store::SEEDED_FOCUS_IDS.len(),
+            "create_persona seeds one focus_settings row per SEEDED_FOCUS_IDS entry"
+        );
+        let quick_ask = focuses
+            .iter()
+            .find(|f| f.focus_id == "quick-ask")
+            .expect("quick-ask must be among the seeded Focuses");
         assert!(
-            focuses[0].last_used.is_some(),
+            quick_ask.last_used.is_some(),
             "list_focuses' batched last_used map must surface the same real value \
              get_focus_settings' single-focus lookup does"
         );
@@ -784,19 +823,9 @@ mod tests {
         )
         .await
         .expect("create_persona must succeed");
-        focus_settings_store::create_focus_settings(
-            &_env.pool,
-            PERSONA_ID,
-            "quick-ask",
-            "bidirectional",
-            "shared",
-            2,
-            ExternalAccess::AnonymousRequired,
-            "open",
-            None,
-        )
-        .await
-        .expect("create_focus_settings must succeed");
+        // create_persona seeds a "quick-ask" focus_settings row automatically
+        // (persona_store::SEEDED_FOCUS_IDS) -- no separate create_focus_settings
+        // call needed here.
 
         let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
