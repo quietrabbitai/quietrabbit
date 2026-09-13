@@ -611,14 +611,19 @@ mod tests {
         let (_tempdir, pool) = setup_real_db().await;
 
         let outcome = async {
-            // require_not_trains_on_data=1 alone matches duckai and groq
-            // (items.id=440 Part A curated groq as not training on data by
-            // default -- no longer just duckai, as it was when this test was
-            // first written against groq's pre-curation placeholder seed).
+            // require_not_trains_on_data=1 alone matches duckai, groq, and
+            // groqchat (items.id=440 Part A curated groq as not training on
+            // data by default -- no longer just duckai, as it was when this
+            // test was first written against groq's pre-curation placeholder
+            // seed. shared_018.sql -- items.id=347/486-adjacent provider
+            // catalog work -- added groqchat, Groq's own Tier 3 web-chat row,
+            // reusing the same items.id=440 no-training finding since it's
+            // the same real-world entity/policy, not a new curation).
             // deny=[duckai] excludes it anyway despite passing the
             // requirement; allow=[claude] carves claude in despite it
-            // failing the requirement (trains_on_data=1); groq passes the
-            // requirement on its own merits and needs neither list.
+            // failing the requirement (trains_on_data=1); groq and groqchat
+            // both pass the requirement on their own merits and need neither
+            // list.
             set_criteria(
                 &pool,
                 "f1",
@@ -634,10 +639,10 @@ mod tests {
             let ids: Vec<&str> = eligible.iter().map(|p| p.id.as_str()).collect();
             assert_eq!(
                 ids,
-                vec!["groq", "claude"],
+                vec!["groq", "claude", "groqchat"],
                 "deny must beat a passing require match (duckai), allow must beat a failing \
-                 require match (claude), and groq must pass the requirement on its own \
-                 merits -- everything else fails the requirement"
+                 require match (claude), and groq/groqchat must each pass the requirement on \
+                 their own merits -- everything else fails the requirement"
             );
             Ok::<(), FocusProviderCriteriaStoreError>(())
         }

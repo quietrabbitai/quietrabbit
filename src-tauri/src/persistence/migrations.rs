@@ -270,6 +270,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/shared_017.sql"),
     },
     SchemaFile {
+        prefix: "shared",
+        version: 18,
+        sql: include_str!("../../schema/shared_018.sql"),
+    },
+    SchemaFile {
         prefix: "tier3_cookies",
         version: 1,
         sql: include_str!("../../schema/tier3_cookies_001.sql"),
@@ -1781,15 +1786,15 @@ mod tests {
             .await
             .expect("shared migration chain must apply cleanly on a fresh db");
         assert_eq!(
-            applied, 17,
-            "expected all seventeen shared schema versions to apply"
+            applied, 18,
+            "expected all eighteen shared schema versions to apply"
         );
 
         let version: (i64,) = sqlx::query_as("SELECT MAX(version) FROM schema_version")
             .fetch_one(&mut conn)
             .await
             .unwrap();
-        assert_eq!(version.0, 17);
+        assert_eq!(version.0, 18);
     }
 
     #[tokio::test]
@@ -1860,8 +1865,8 @@ mod tests {
             .expect("drift-healing run must succeed");
 
         assert_eq!(
-            applied, 16,
-            "shared v2 through v17 should count as newly applied from a stale v1 database"
+            applied, 17,
+            "shared v2 through v18 should count as newly applied from a stale v1 database"
         );
 
         // items.id=427: shared_013.sql drops tier3_providers (generalized
