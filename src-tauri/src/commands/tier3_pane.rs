@@ -543,7 +543,12 @@ pub async fn list_active_providers(
 
     Ok(providers
         .into_iter()
-        .filter(|p| matches!(p.provider_type.as_str(), "split_screen_web" | "external_service"))
+        .filter(|p| {
+            matches!(
+                p.provider_type.as_str(),
+                "split_screen_web" | "external_service"
+            )
+        })
         .map(|p| Tier3ProviderSummary {
             id: p.id,
             display_name: p.display_name,

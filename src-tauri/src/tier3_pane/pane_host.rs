@@ -2099,8 +2099,7 @@ fn fix_webview_click_handlers(webview_widget: &gtk::Widget) {
         use gtk::glib::{gobject_ffi, translate::IntoGlib};
         let obj = webview_widget.upcast_ref::<gtk::glib::Object>();
         let widget_gtype = obj.type_().into_glib();
-        for (signal_name, expected_count) in
-            [(c"button-press-event", 2u32), (c"touch-event", 1u32)]
+        for (signal_name, expected_count) in [(c"button-press-event", 2u32), (c"touch-event", 1u32)]
         {
             // SAFETY:
             // - obj.as_ptr() is valid and the referenced GObject is
@@ -2126,8 +2125,7 @@ fn fix_webview_click_handlers(webview_widget: &gtk::Widget) {
             //   argument to these two FFI calls below, never stored,
             //   returned, or captured into anything longer-lived.
             unsafe {
-                let signal_id =
-                    gobject_ffi::g_signal_lookup(signal_name.as_ptr(), widget_gtype);
+                let signal_id = gobject_ffi::g_signal_lookup(signal_name.as_ptr(), widget_gtype);
                 if signal_id == 0 {
                     log::warn!(
                         "tier3_pane::pane_host: g_signal_lookup found no {signal_name:?} \
@@ -2239,8 +2237,8 @@ fn fix_webview_click_handlers(webview_widget: &gtk::Widget) {
             gtk::gdk::EventMask::BUTTON1_MOTION_MASK | gtk::gdk::EventMask::BUTTON_PRESS_MASK,
         );
         let press_state: Rc<RefCell<u8>> = Rc::new(RefCell::new(0));
-        webview_widget.connect_button_press_event(
-            move |_widget, event: &gtk::gdk::EventButton| match event.button() {
+        webview_widget.connect_button_press_event(move |_widget, event: &gtk::gdk::EventButton| {
+            match event.button() {
                 8 | 9 => {
                     let held = {
                         let mut state = press_state.borrow_mut();
@@ -2257,8 +2255,8 @@ fn fix_webview_click_handlers(webview_widget: &gtk::Widget) {
                     glib::Propagation::Stop
                 }
                 _ => glib::Propagation::Proceed,
-            },
-        );
+            }
+        });
     } else {
         log::warn!(
             "tier3_pane::pane_host: main window's webview widget is not a \
@@ -2462,8 +2460,7 @@ fn handle_glarea_realize(
                 // removed, since a permanently-empty shape is the
                 // smallest change that provably avoids the freeze.
                 event_window.set_pass_through(false);
-                event_window
-                    .input_shape_combine_region(&gtk::cairo::Region::create(), 0, 0);
+                event_window.input_shape_combine_region(&gtk::cairo::Region::create(), 0, 0);
                 log::info!(
                     "tier3_pane::pane_host: GLArea private event_window \
                      found, input shape set permanently empty (items.id=257 \
@@ -2965,7 +2962,14 @@ impl PaneHost {
                     &layout,
                 );
                 pump_begin_frames(&manager);
-                render_and_present(&render_state, &gl_context, &manager, &layout, &tick, captured_fbo);
+                render_and_present(
+                    &render_state,
+                    &gl_context,
+                    &manager,
+                    &layout,
+                    &tick,
+                    captured_fbo,
+                );
 
                 glib::Propagation::Stop
             });
