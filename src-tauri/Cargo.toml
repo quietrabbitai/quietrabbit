@@ -47,6 +47,27 @@ gethostname = "0.4"
 log = "0.4"
 zeroize = { version = "1.8", features = ["derive"] }
 
+# Upload-time text extraction for ingested PDF/.docx documents (items.id=386),
+# extending commands/ingest.rs's existing plain-text mirror allowlist so
+# these formats become FTS5-searchable too. Both pure Rust -- no shelling
+# out to pdftotext/LibreOffice/system binaries, required for this app's
+# local-first/offline operation.
+#
+# pdf-extract: MIT, ~4.9M downloads, actively maintained (0.12.0, Jun 2026).
+# Its own issue tracker documents open panics on malformed/untrusted PDF
+# input (jrmuizel/pdf-extract#141 "Security hardening: ~50 panic/crash
+# fixes for untrusted PDF input", and others, all confirmed open) -- exactly
+# this crate's threat model, since PDFs here are arbitrary user uploads.
+# Never call extract_text*() unwrapped; the ingest.rs call site wraps it in
+# std::panic::catch_unwind and degrades to content: None on any failure.
+pdf-extract = "0.12"
+# docx-rust: MIT, fork of docx-rs (cstkingkey), ~2.25M downloads, last
+# release Jan 2026. No documented panic-hardening effort the way
+# pdf-extract has one, but it parses the same class of untrusted
+# zip+XML input -- same catch_unwind treatment applies defensively at the
+# call site.
+docx-rust = "0.1"
+
 # Argon2id master-key derivation (items.id=205, Architecture Section 4.1).
 # default-features disabled deliberately: no PHC-string/PasswordVerifier
 # password-hash convenience API is used directly by this codebase (QR never
