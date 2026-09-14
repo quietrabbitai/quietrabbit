@@ -119,6 +119,35 @@ ignore = [
 
     # --- specta (tauri-specta's IPC type-generation layer) ---
     { id = "RUSTSEC-2024-0436", reason = "unmaintained: paste, pulled by specta 2.0.0-rc.25 (tauri-specta's own dependency, used for IPC TypeScript type export). No CVE, build-time proc-macro only, no upgrade path until specta moves off paste." },
+
+    # --- pdf-extract (items.id=386 PDF/.docx upload-time text extraction) ---
+    # RUSTSEC-2026-0192: ttf-parser is unmaintained (no CVE), reached via
+    # pdf-extract 0.12.0 -> lopdf 0.42.0 -> ttf-parser 0.25.1. All three are
+    # the newest published versions of their crate (`cargo update --dry-run`
+    # on each locks 0 packages) -- pdf-extract 0.12.0 itself pins
+    # lopdf = "^0.42", which excludes lopdf's current 0.45.0. Notably, lopdf
+    # 0.45.0 has already dropped ttf-parser in favor of an optional
+    # skrifa-based font_embedding feature -- skrifa being the exact crate
+    # this advisory recommends -- so this will most likely resolve on its
+    # own the day pdf-extract cuts a release that bumps its own lopdf pin;
+    # we are blocked on that pin, not on skrifa's availability.
+    #
+    # UNLIKE every other entry in this list: RUSTSEC-2024-0429 above is
+    # confirmed NOT REACHABLE at runtime (items.id=480's dedicated
+    # investigation), and the urlpattern/specta entries are reachable only
+    # from tauri's own internal URL-pattern matching or a build-time
+    # proc-macro. ttf-parser here is not unreachable and not build-time-only
+    # -- it executes on every user-uploaded PDF via ingest.rs's
+    # extract_document_text(), which already treats this dependency pair as
+    # hostile-input-adjacent (catch_unwind around both parsers). This entry
+    # is a forward-looking risk acceptance, not a proven-safe case like
+    # 0429's -- said plainly here, not softened.
+    #
+    # Revisit trigger (tracked as a named condition on items.id=502, not
+    # just this comment): drop this entry once pdf-extract ships a release
+    # whose own lopdf pin reaches 0.45+, OR immediately if RUSTSEC files an
+    # actual vulnerability (not merely "unmaintained") against ttf-parser.
+    { id = "RUSTSEC-2026-0192", reason = "unmaintained: ttf-parser, reached via pdf-extract 0.12.0 -> lopdf 0.42.0 (items.id=386). All three are newest-published; pdf-extract's own lopdf=\"^0.42\" pin excludes lopdf 0.45.0, which has already moved off ttf-parser onto skrifa (this advisory's own recommended alternative) -- no cargo-update path exists today. UNLIKE every other entry above, this crate is NOT confirmed unreachable and is NOT build-time-only: ttf-parser executes on every user-uploaded PDF via ingest.rs's extract_document_text(). This is a forward-looking risk acceptance (advisory is 'unmaintained', not a disclosed CVE), not a proven-safe case. Revisit (tracked on items.id=502) if pdf-extract ships a lopdf-0.45+-compatible release, or if RUSTSEC files an actual vulnerability against ttf-parser." },
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.
