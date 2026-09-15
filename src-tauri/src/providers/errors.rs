@@ -62,8 +62,8 @@ pub enum ProviderError {
         plain_language: String,
     },
 
-    /// Model ID missing provider prefix or prefix mismatch.
-    /// Expected format: `"provider_id:model-name"` (e.g. `"groq:llama-3.1-8b-instant"`).
+    /// Request has no provider set, or its resolved provider doesn't match
+    /// the `Tier2Provider` handling it.
     #[error("unknown provider '{}'", provider)]
     UnknownProvider {
         provider: String,

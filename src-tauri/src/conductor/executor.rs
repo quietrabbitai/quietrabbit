@@ -173,7 +173,9 @@ fn tier2_provider_registry() -> &'static HashMap<&'static str, &'static dyn Tier
 ///   set (providers.provider_type='cloud_inference_api', items.id=430) --
 ///   not the legacy users.tier2_provider_preference column. Only populated
 ///   when execution_tier >= 2.
-///   Some("mistral") | Some("groq") -> dispatch to that provider.
+///   Some(provider_id) -> dispatch to that provider via tier2_provider_registry()
+///   (items.id=465 — an open HashMap keyed by each provider's own provider_id(),
+///   not a closed two-value set).
 ///   None -> no provider chosen (or the resolved preference was ambiguous
 ///   across candidates); StepExecutor raises F10 MissingTier2Config rather
 ///   than guessing (architecture: "no prescribed default"). Always None at
@@ -214,7 +216,7 @@ pub struct StepContext {
     pub abstraction_tier: u8,
     pub raw_abstraction: u8,
     pub floor_consent_preference: Option<String>, // "modified" | "local" | None
-    pub tier2_provider_preference: Option<String>, // "mistral" | "groq" | None
+    pub tier2_provider_preference: Option<String>, // provider_id from tier2_provider_registry(), or None
     pub next_execution_tier: Option<u8>,
     pub retry_count: u32,
     /// Display name of the Focus, passed to gate3 for the consent modal header.
@@ -422,7 +424,7 @@ impl StepExecutor {
             ));
         }
 
-        let model_id = select_model(
+        let selected_model = select_model(
             pool,
             &ctx.step.task_type,
             execution_tier,
@@ -445,11 +447,7 @@ impl StepExecutor {
                 abstraction_tier,
                 raw_abstraction,
                 execution_tier,
-                if execution_tier >= 2 {
-                    Some(model_id.clone())
-                } else {
-                    None
-                },
+                selected_model.provider_id.clone(),
             )
             .await
             .map_err(|e| ConductorError::DisclosureLogWrite {
@@ -480,11 +478,7 @@ impl StepExecutor {
                         focus_run_id: ctx.focus_run_id.clone(),
                         execution_tier,
                         abstraction_tier: Some(abstraction_tier),
-                        provider: if execution_tier >= 2 {
-                            Some(model_id.clone())
-                        } else {
-                            None
-                        },
+                        provider: selected_model.provider_id.clone(),
                         fields_shared: projected_fields.keys().cloned().collect(),
                         fields_abstracted: IndexMap::new(),
                         fields_withheld: g1.withheld_fields.clone(),
@@ -580,7 +574,14 @@ impl StepExecutor {
 
         let effective_ctx = match options_raw.get("num_ctx").and_then(|v| v.as_u64()) {
             Some(v) => v as u32,
-            None => get_context_window(pool, &model_id).await,
+            None => {
+                get_context_window(
+                    pool,
+                    selected_model.provider_id.as_deref(),
+                    &selected_model.model_id,
+                )
+                .await
+            }
         };
 
         let ctx_status = check_context_window(&prompt, &ctx.step.task_type, effective_ctx);
@@ -602,7 +603,8 @@ impl StepExecutor {
         let options = build_options(&options_raw, effective_ctx);
 
         let request = GenerateRequest {
-            model: model_id.clone(),
+            provider_id: selected_model.provider_id.clone(),
+            model_id: selected_model.model_id.clone(),
             prompt,
             task_type: ctx.step.task_type.clone(),
             stream: Some(false), // always false in Release 1 — resolved by StepExecutor
@@ -681,11 +683,7 @@ impl StepExecutor {
                 &response.content,
                 &gate_track,
                 execution_tier,
-                if execution_tier >= 2 {
-                    Some(model_id.clone())
-                } else {
-                    None
-                },
+                selected_model.provider_id.clone(),
                 Some(&g1.fields_shared),
             )
             .await
@@ -1001,7 +999,20 @@ async fn scan_voice_profile<L: DisclosureLogger>(
 // Model selection and options
 // ---------------------------------------------------------------------------
 
-/// Select model ID based on task_type, execution tier, and (at tier>=2)
+/// Resolved model selection, carrying `provider_store::ProviderModel`'s own
+/// `provider_id`/`model_id` columns directly (decisions.id=813 — an id is an
+/// opaque key, never parsed to recover data the table already holds).
+/// `provider_id` is `None` exactly at Tier 1 (Ollama has no `provider_models`
+/// row to resolve against yet); `Some(id)` at Tier 2, from the row's own
+/// `provider_id` column. Not `specta::Type` — internal to the executor, never
+/// crosses IPC.
+#[derive(Debug)]
+struct SelectedModel {
+    provider_id: Option<String>,
+    model_id: String,
+}
+
+/// Select a model based on task_type, execution tier, and (at tier>=2)
 /// the user's Tier 2 provider preference.
 /// Python oracle: StepExecutor._select_model()
 ///
@@ -1024,12 +1035,17 @@ async fn select_model(
     task_type: &str,
     tier: u8,
     tier2_provider: Option<&str>,
-) -> Result<String, ConductorError> {
+) -> Result<SelectedModel, ConductorError> {
     if tier == 1 {
-        return Ok(match task_type {
-            "code" => "qwen2.5:7b".to_owned(),
-            "quick_response" | "summarization" => "llama3.2:3b".to_owned(),
-            _ => "llama3.1:8b".to_owned(),
+        let model_id = match task_type {
+            "code" => "qwen2.5:7b",
+            "quick_response" | "summarization" => "llama3.2:3b",
+            _ => "llama3.1:8b",
+        }
+        .to_owned();
+        return Ok(SelectedModel {
+            provider_id: None,
+            model_id,
         });
     }
 
@@ -1044,7 +1060,10 @@ async fn select_model(
     };
 
     match crate::persistence::provider_store::get_default_model(pool, provider_id).await {
-        Ok(Some(model)) => Ok(model.id),
+        Ok(Some(model)) => Ok(SelectedModel {
+            provider_id: Some(model.provider_id),
+            model_id: model.model_id,
+        }),
         Ok(None) => Err(ConductorError::UnknownProvider {
             plain_language: format!(
                 "Tier 2 provider '{provider_id}' has no default model configured \
@@ -1060,22 +1079,30 @@ async fn select_model(
     }
 }
 
-/// Context window size for a given model ID.
+/// Context window size for a resolved model selection.
 /// Python oracle: StepExecutor._get_context_window()
 ///
-/// items.id=465 (PARTIAL close of B4 -- confirmed acceptable scope,
-/// chat_session_handoffs.id=316): checks provider_models first, by the
-/// full "provider:model" id, falling back to this 3-entry hardcoded map
-/// ONLY for the local Ollama ids -- those have no providers row to hang a
+/// items.id=465/items.id=504 (PARTIAL close of B4 -- confirmed acceptable
+/// scope, chat_session_handoffs.id=316): at Tier 2 (`provider_id: Some(_)`),
+/// checks provider_models by its real `provider_id`/`model_id` columns
+/// (never a reconstructed composite id -- decisions.id=813) before falling
+/// back to the 3-entry hardcoded map. At Tier 1 (`provider_id: None`) the
+/// catalog is skipped entirely -- Ollama ids have no providers row to hang a
 /// catalog entry off yet (Ollama-as-Tier1 wiring is a separate, larger,
 /// out-of-scope initiative). Not a full close of B4.
-async fn get_context_window(pool: &sqlx::SqlitePool, model_id: &str) -> u32 {
-    let from_catalog = crate::persistence::provider_store::get_model(pool, model_id)
+async fn get_context_window(pool: &sqlx::SqlitePool, provider_id: Option<&str>, model_id: &str) -> u32 {
+    if let Some(provider_id) = provider_id {
+        let from_catalog = crate::persistence::provider_store::get_model_by_provider_and_model_id(
+            pool,
+            provider_id,
+            model_id,
+        )
         .await
         .ok()
         .flatten();
-    if let Some(model) = from_catalog {
-        return model.context_window_tokens;
+        if let Some(model) = from_catalog {
+            return model.context_window_tokens;
+        }
     }
 
     match model_id {
@@ -1602,55 +1629,50 @@ mod tests {
     #[tokio::test]
     async fn select_model_tier1_code() {
         // Tier 1 never touches provider_store -- no DB setup needed.
-        assert_eq!(
-            select_model(&dummy_pool(), "code", 1, None).await.unwrap(),
-            "qwen2.5:7b"
-        );
+        let selected = select_model(&dummy_pool(), "code", 1, None).await.unwrap();
+        assert_eq!(selected.provider_id, None);
+        assert_eq!(selected.model_id, "qwen2.5:7b");
     }
 
     #[tokio::test]
     async fn select_model_tier1_quick_response() {
-        assert_eq!(
-            select_model(&dummy_pool(), "quick_response", 1, None)
-                .await
-                .unwrap(),
-            "llama3.2:3b"
-        );
+        let selected = select_model(&dummy_pool(), "quick_response", 1, None)
+            .await
+            .unwrap();
+        assert_eq!(selected.provider_id, None);
+        assert_eq!(selected.model_id, "llama3.2:3b");
     }
 
     #[tokio::test]
     async fn select_model_tier1_summarization() {
-        assert_eq!(
-            select_model(&dummy_pool(), "summarization", 1, None)
-                .await
-                .unwrap(),
-            "llama3.2:3b"
-        );
+        let selected = select_model(&dummy_pool(), "summarization", 1, None)
+            .await
+            .unwrap();
+        assert_eq!(selected.provider_id, None);
+        assert_eq!(selected.model_id, "llama3.2:3b");
     }
 
     #[tokio::test]
     async fn select_model_tier1_general() {
-        assert_eq!(
-            select_model(&dummy_pool(), "general", 1, None)
-                .await
-                .unwrap(),
-            "llama3.1:8b"
-        );
+        let selected = select_model(&dummy_pool(), "general", 1, None)
+            .await
+            .unwrap();
+        assert_eq!(selected.provider_id, None);
+        assert_eq!(selected.model_id, "llama3.1:8b");
     }
 
     #[tokio::test]
     async fn select_model_tier2_groq_any_type() {
         with_temp_shared_db(|pool| async move {
-            assert_eq!(
-                select_model(&pool, "code", 2, Some("groq")).await.unwrap(),
-                "groq:llama-3.1-8b-instant"
-            );
-            assert_eq!(
-                select_model(&pool, "general", 2, Some("groq"))
-                    .await
-                    .unwrap(),
-                "groq:llama-3.1-8b-instant"
-            );
+            let by_code = select_model(&pool, "code", 2, Some("groq")).await.unwrap();
+            assert_eq!(by_code.provider_id.as_deref(), Some("groq"));
+            assert_eq!(by_code.model_id, "llama-3.1-8b-instant");
+
+            let by_general = select_model(&pool, "general", 2, Some("groq"))
+                .await
+                .unwrap();
+            assert_eq!(by_general.provider_id.as_deref(), Some("groq"));
+            assert_eq!(by_general.model_id, "llama-3.1-8b-instant");
         })
         .await;
     }
@@ -1658,18 +1680,17 @@ mod tests {
     #[tokio::test]
     async fn select_model_tier2_mistral_any_type() {
         with_temp_shared_db(|pool| async move {
-            assert_eq!(
-                select_model(&pool, "code", 2, Some("mistral"))
-                    .await
-                    .unwrap(),
-                "mistral:mistral-small-latest"
-            );
-            assert_eq!(
-                select_model(&pool, "general", 2, Some("mistral"))
-                    .await
-                    .unwrap(),
-                "mistral:mistral-small-latest"
-            );
+            let by_code = select_model(&pool, "code", 2, Some("mistral"))
+                .await
+                .unwrap();
+            assert_eq!(by_code.provider_id.as_deref(), Some("mistral"));
+            assert_eq!(by_code.model_id, "mistral-small-latest");
+
+            let by_general = select_model(&pool, "general", 2, Some("mistral"))
+                .await
+                .unwrap();
+            assert_eq!(by_general.provider_id.as_deref(), Some("mistral"));
+            assert_eq!(by_general.model_id, "mistral-small-latest");
         })
         .await;
     }
@@ -1687,9 +1708,11 @@ mod tests {
             let mistral_model = select_model(&pool, "general", 2, Some("mistral"))
                 .await
                 .unwrap();
-            assert_ne!(groq_model, mistral_model);
-            assert_eq!(groq_model, "groq:llama-3.1-8b-instant");
-            assert_eq!(mistral_model, "mistral:mistral-small-latest");
+            assert_ne!(groq_model.model_id, mistral_model.model_id);
+            assert_eq!(groq_model.provider_id.as_deref(), Some("groq"));
+            assert_eq!(groq_model.model_id, "llama-3.1-8b-instant");
+            assert_eq!(mistral_model.provider_id.as_deref(), Some("mistral"));
+            assert_eq!(mistral_model.model_id, "mistral-small-latest");
         })
         .await;
     }
@@ -1722,15 +1745,15 @@ mod tests {
     #[tokio::test]
     async fn context_window_known_models() {
         with_temp_shared_db(|pool| async move {
-            assert_eq!(get_context_window(&pool, "llama3.2:3b").await, 4096);
-            assert_eq!(get_context_window(&pool, "llama3.1:8b").await, 8192);
-            assert_eq!(get_context_window(&pool, "qwen2.5:7b").await, 8192);
+            assert_eq!(get_context_window(&pool, None, "llama3.2:3b").await, 4096);
+            assert_eq!(get_context_window(&pool, None, "llama3.1:8b").await, 8192);
+            assert_eq!(get_context_window(&pool, None, "qwen2.5:7b").await, 8192);
             assert_eq!(
-                get_context_window(&pool, "groq:llama-3.1-8b-instant").await,
+                get_context_window(&pool, Some("groq"), "llama-3.1-8b-instant").await,
                 8192
             );
             assert_eq!(
-                get_context_window(&pool, "mistral:mistral-small-latest").await,
+                get_context_window(&pool, Some("mistral"), "mistral-small-latest").await,
                 32768
             );
         })
@@ -1740,7 +1763,10 @@ mod tests {
     #[tokio::test]
     async fn context_window_unknown_model_defaults() {
         with_temp_shared_db(|pool| async move {
-            assert_eq!(get_context_window(&pool, "unknown:model").await, 2048);
+            assert_eq!(
+                get_context_window(&pool, Some("unknown"), "model").await,
+                2048
+            );
         })
         .await;
     }

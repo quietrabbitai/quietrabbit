@@ -190,7 +190,7 @@ impl OllamaClient {
         });
 
         let payload = serde_json::json!({
-            "model": request.model,
+            "model": request.model_id,
             "prompt": request.prompt,
             "stream": false,
             "options": {
@@ -255,7 +255,7 @@ impl OllamaClient {
 
         Ok(GenerateResponse {
             content: data["response"].as_str().unwrap_or("").to_owned(),
-            model: data["model"].as_str().unwrap_or(&request.model).to_owned(),
+            model: data["model"].as_str().unwrap_or(&request.model_id).to_owned(),
             prompt_token_count: data["prompt_eval_count"].as_u64().unwrap_or(0) as u32,
             output_token_count: data["eval_count"].as_u64().unwrap_or(0) as u32,
             latency_ms,

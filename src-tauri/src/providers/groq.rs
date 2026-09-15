@@ -214,7 +214,7 @@ impl Tier2Provider for GroqProvider {
 
         Ok(GenerateResponse {
             content,
-            model: request.model.clone(),
+            model: request.model_id.clone(),
             prompt_token_count: prompt_tokens,
             output_token_count: completion_tokens,
             latency_ms,

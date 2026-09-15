@@ -292,7 +292,8 @@ Conversation:
     );
 
     let request = GenerateRequest {
-        model: EXTRACT_MODEL.to_owned(),
+        provider_id: None,
+        model_id: EXTRACT_MODEL.to_owned(),
         prompt,
         task_type: "extraction".to_owned(),
         stream: Some(false),

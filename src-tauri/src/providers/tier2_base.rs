@@ -91,53 +91,39 @@ pub trait Tier2Provider: Send + Sync {
     /// `tokio::time::timeout`, etc.).
     async fn health_check(&self) -> ProviderHealth;
 
-    /// Extract the bare model name from a `GenerateRequest.model` string.
+    /// Return the bare wire model name from a `GenerateRequest`, after
+    /// asserting the request was actually routed to this provider.
     ///
-    /// Expected format: `"provider_id:model_name"`
-    /// (e.g. `"groq:llama-3.1-8b-instant"`).
-    ///
-    /// Validates that the prefix matches `self.provider_id()` and that
-    /// the model name segment is non-empty.
+    /// `request.provider_id`/`request.model_id` are already-resolved fields
+    /// (see `GenerateRequest` doc, decisions.id=813) — this validates
+    /// `request.provider_id` against `self.provider_id()` and returns
+    /// `request.model_id` directly. No string parsing.
     ///
     /// Returns `Err(ConductorError::UnknownProvider)` if:
-    /// - the model string contains no `:`
-    /// - the prefix does not match `self.provider_id()`
-    /// - the model name segment after `:` is empty
+    /// - `request.provider_id` is `None` (request never resolved a Tier 2 provider)
+    /// - `request.provider_id` does not match `self.provider_id()`
     ///
     /// Python oracle: `Tier2Provider.model_id_from_request()`
     fn model_id_from_request<'a>(
         &self,
         request: &'a GenerateRequest,
     ) -> Result<&'a str, ConductorError> {
-        let model = request.model.as_str();
-        match model.split_once(':') {
+        match request.provider_id.as_deref() {
+            Some(id) if id == self.provider_id() => Ok(request.model_id.as_str()),
+            Some(other) => Err(ConductorError::UnknownProvider {
+                plain_language: format!(
+                    "Request provider '{}' does not match provider '{}'. \
+                     Check routing configuration. [Get help]",
+                    other,
+                    self.provider_id(),
+                ),
+            }),
             None => Err(ConductorError::UnknownProvider {
                 plain_language: format!(
-                    "Model ID '{}' is missing a provider prefix. \
-                     Expected format: '{}:model-name'. [Get help]",
-                    model,
+                    "Request has no provider set; expected '{}'. [Get help]",
                     self.provider_id(),
                 ),
             }),
-            Some((prefix, _)) if prefix != self.provider_id() => {
-                Err(ConductorError::UnknownProvider {
-                    plain_language: format!(
-                        "Model prefix '{}' does not match provider '{}'. \
-                         Check path routing configuration. [Get help]",
-                        prefix,
-                        self.provider_id(),
-                    ),
-                })
-            }
-            Some((_, "")) => Err(ConductorError::UnknownProvider {
-                plain_language: format!(
-                    "Model ID '{}' has an empty model name after the provider prefix. \
-                     Expected format: '{}:model-name'. [Get help]",
-                    model,
-                    self.provider_id(),
-                ),
-            }),
-            Some((_, model_name)) => Ok(model_name),
         }
     }
 }

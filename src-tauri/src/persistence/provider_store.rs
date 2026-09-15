@@ -682,22 +682,25 @@ pub async fn get_default_model(
     }
 }
 
-/// Look up a catalog model by its full "provider_id:model_id" id --
-/// conductor/executor.rs's get_context_window() reads this first, before
-/// falling back to its own small hardcoded map for the local Ollama ids
-/// that have no providers row to hang a catalog entry off yet.
-pub async fn get_model(
+/// Look up a catalog model by its real `provider_id`/`model_id` columns --
+/// used by conductor/executor.rs's get_context_window() at Tier 2 instead of
+/// reconstructing the composite `id` PK from those same two fields
+/// (decisions.id=813: an id's internal structure is never treated as data,
+/// in either direction -- parsing it apart or rebuilding it to use as a key).
+pub async fn get_model_by_provider_and_model_id(
     pool: &sqlx::SqlitePool,
-    id: &str,
+    provider_id: &str,
+    model_id: &str,
 ) -> Result<Option<ProviderModel>, ProviderStoreError> {
     let mut conn = pool.acquire().await?;
 
     let row = sqlx::query(
         "SELECT id, provider_id, model_id, context_window_tokens, is_default, created_at
          FROM provider_models
-         WHERE id = ?",
+         WHERE provider_id = ? AND model_id = ?",
     )
-    .bind(id)
+    .bind(provider_id)
+    .bind(model_id)
     .fetch_optional(&mut *conn)
     .await?;
 

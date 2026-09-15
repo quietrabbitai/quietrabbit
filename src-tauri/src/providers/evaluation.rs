@@ -280,7 +280,8 @@ impl EvaluationHarness {
 
         let response = client
             .generate(&GenerateRequest {
-                model: model_id.to_owned(),
+                provider_id: None,
+                model_id: model_id.to_owned(),
                 prompt: task.prompt.clone(),
                 task_type: task.task_type.clone(),
                 stream: None,
