@@ -1090,7 +1090,11 @@ async fn select_model(
 /// catalog is skipped entirely -- Ollama ids have no providers row to hang a
 /// catalog entry off yet (Ollama-as-Tier1 wiring is a separate, larger,
 /// out-of-scope initiative). Not a full close of B4.
-async fn get_context_window(pool: &sqlx::SqlitePool, provider_id: Option<&str>, model_id: &str) -> u32 {
+async fn get_context_window(
+    pool: &sqlx::SqlitePool,
+    provider_id: Option<&str>,
+    model_id: &str,
+) -> u32 {
     if let Some(provider_id) = provider_id {
         let from_catalog = crate::persistence::provider_store::get_model_by_provider_and_model_id(
             pool,
