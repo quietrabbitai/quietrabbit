@@ -652,7 +652,7 @@ export const commands = {
 	 *  OS-level focus round-trip).
 	 */
 	forwardPopupKey: (providerId: string, eventType: PaneKeyEventType, windowsKeyCode: number, character: number, modifiers: PaneEventModifiers) => typedError<null, string>(__TAURI_INVOKE("forward_popup_key", { providerId, eventType, windowsKeyCode, character, modifiers })),
-	sendMessage: (userId: string, personaId: string, contextKey: string, content: string, focusId: string, gate3Track: boolean) => typedError<MessageInfo[], string>(__TAURI_INVOKE("send_message", { userId, personaId, contextKey, content, focusId, gate3Track })),
+	sendMessage: (request: SendMessageRequest) => typedError<MessageInfo[], string>(__TAURI_INVOKE("send_message", { request })),
 	listMessages: (userId: string, personaId: string, contextKey: string) => typedError<MessageInfo[], string>(__TAURI_INVOKE("list_messages", { userId, personaId, contextKey })),
 	/**
 	 *  Configure (or reconfigure) this install's folder-sync destination for a
@@ -1239,6 +1239,34 @@ export type ResumeRunRequest = {
 	run_id: string,
 	user_id: string,
 	persona_id: string,
+};
+
+/**
+ *  Bundled to keep send_message's own parameter count under specta's 10-arg
+ *  SpectaFn ceiling once confirmed_cross_persona_fact_ids (decisions.id=815,
+ *  items.id=27) is added — the 4 Tauri-injected params (app_handle,
+ *  scheduler, pool, key_registry) plus 7 business fields would otherwise be
+ *  11. Mirrors SubmitFocusRunRequest's existing convention of one request DTO
+ *  per command rather than a growing positional-arg list.
+ */
+export type SendMessageRequest = {
+	user_id: string,
+	persona_id: string,
+	context_key: string,
+	content: string,
+	focus_id: string,
+	gate3_track: boolean,
+	/**
+	 *  entity_facts.id values the user already confirmed this session, via
+	 *  the frontend's pre-send commands::consent::get_pending_cross_persona_
+	 *  confirmations() query + confirmation UI, BEFORE calling send_message.
+	 *  Threaded straight into SubmitFocusRunRequest — previously hardcoded to
+	 *  vec![] here, which silently omitted every legitimate cross-Persona
+	 *  export on every QR Chat message (decisions.id=815's rescoping of this
+	 *  item). No is_quick_ask branch: decisions.id=815 holds Quick Ask to the
+	 *  identical standard as a named Focus run.
+	 */
+	confirmed_cross_persona_fact_ids: string[],
 };
 
 /**

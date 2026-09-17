@@ -7,7 +7,8 @@
 import { useCallback, useEffect, useRef, useState, type ClipboardEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { commands, type MessageInfo } from '../bindings'
+import { commands, type MessageInfo, type PendingCrossPersonaFact } from '../bindings'
+import { CrossPersonaConfirmModal, type CrossPersonaFactDecision } from './CrossPersonaConfirmModal'
 import './ChatPane.css'
 
 export interface ChatPaneProps {
@@ -89,6 +90,22 @@ interface RunStatusPayload {
    *  Tier 3 pause or step failure -- mutually exclusive with step_content in
    *  practice. */
   crisis_resource_block: string | null
+  /** Cross-Persona entity_facts omitted from this run's context
+   *  (decisions.id=815, items.id=27) -- declined, or caught by the
+   *  documented pre-send-query/INITIALIZE-read race decisions.id=639
+   *  accepts. Empty when nothing was omitted. No field_value, matching
+   *  PendingCrossPersonaFact's own no-raw-values convention -- this only
+   *  ever drives a generic notice, never names the actual value withheld. */
+  provenance_omissions: OmittedCrossPersonaFact[]
+}
+
+/** Hand-declared, same convention as RunStatusPayload above -- mirrors
+ *  conductor/types.rs::OmittedCrossPersonaFact, which is likewise only
+ *  reachable via the run-status-update event, not any #[tauri::command]. */
+interface OmittedCrossPersonaFact {
+  field_name: string
+  sensitivity: string
+  origin_persona_id: string | null
 }
 
 /** Hand-declared, same convention/rationale as RunStatusPayload above --
@@ -208,6 +225,40 @@ export function ChatPane({
   const [contentTimedOut, setContentTimedOut] = useState(false)
   const elapsedIntervalRef = useRef<number | null>(null)
 
+  /** Cross-Persona export confirmation (decisions.id=546/639/815,
+   *  items.id=27): per-Persona, per-session (never persisted) bookkeeping of
+   *  which entity_facts.id values this user has already answered -- keyed
+   *  by personaId, not reset on a Persona switch (this component isn't
+   *  remounted for one -- see Tier3AccessPane.tsx's `{personaId ? <ChatPane
+   *  .../> : ...}` branch), only ever cleared by this component unmounting
+   *  (logout), matching KeyRegistry's own clear-on-logout lifetime. Declines
+   *  are remembered too, so declining a fact once doesn't re-prompt on every
+   *  following send -- if that's not the wanted behavior, drop the
+   *  declinedFactIdsRef half and always re-offer declined facts instead. */
+  const confirmedFactIdsRef = useRef<Map<string, Set<string>>>(new Map())
+  const declinedFactIdsRef = useRef<Map<string, Set<string>>>(new Map())
+  /** null = no confirmation prompt showing. Non-null = the facts newly
+   *  pending as of the most recent pre-send query, awaiting a decision. */
+  const [pendingCrossPersonaFacts, setPendingCrossPersonaFacts] = useState<
+    PendingCrossPersonaFact[] | null
+  >(null)
+  /** Resolves the in-flight resolveCrossPersonaConfirmation() promise once
+   *  the modal above is answered -- null (cancelled) aborts the send. */
+  const crossPersonaResolverRef = useRef<((decisions: CrossPersonaFactDecision[] | null) => void) | null>(
+    null,
+  )
+  /** Set when the most recent run's run-status-update carried a non-empty
+   *  provenance_omissions -- the race/decline case decisions.id=815's
+   *  live-signal requirement covers (see this item's plan). */
+  const [provenanceOmitted, setProvenanceOmitted] = useState(false)
+  /** Set when getPendingCrossPersonaConfirmations itself fails (network/IPC
+   *  error, not a user decision) -- previously only a console.warn, invisible
+   *  to the user. Fail-open behavior is unchanged: the send still proceeds
+   *  with whatever was already confirmed this session; this only makes that
+   *  fallback visible instead of silent. Cleared on the next send attempt,
+   *  same convention as sendError. */
+  const [crossPersonaCheckError, setCrossPersonaCheckError] = useState<string | null>(null)
+
   const isGenerating = activeRunId !== null
 
   useEffect(() => {
@@ -220,10 +271,12 @@ export function ChatPane({
   // job, not MiddleZone's.
   useEffect(() => {
     setSendError(null)
+    setCrossPersonaCheckError(null)
     setActiveRunId(null)
     setLiveContent('')
     setLiveStepDisplayName(null)
     setContentTimedOut(false)
+    setProvenanceOmitted(false)
 
     setLoadError(null)
     commands.listMessages(userId, personaId, contextKey).then(
@@ -338,6 +391,9 @@ export function ChatPane({
         setLiveContent(payload.step_content)
       }
       setLiveStepDisplayName(payload.step_display_name)
+      if (payload.provenance_omissions && payload.provenance_omissions.length > 0) {
+        setProvenanceOmitted(true)
+      }
     }).then((fn) => {
       if (cancelled) {
         fn()
@@ -418,26 +474,118 @@ export function ChatPane({
     }
   }, [isGenerating])
 
+  // Cross-Persona export confirmation (decisions.id=546/639/815, items.id=27):
+  // the pre-Focus-start IPC query decisions.id=639 specifies, run before
+  // every send -- not once per mount/Persona -- since a fact can flip to
+  // cross_persona_export=true at any point in the session. Cheap on the
+  // common path: an empty/already-answered result returns immediately with
+  // no modal. Returns null if the user cancels the prompt (abort the send,
+  // draft is preserved by the caller); otherwise the full accumulated
+  // confirmed-id set for this Persona, ready to pass to sendMessage.
+  const resolveCrossPersonaConfirmation = useCallback(async (): Promise<string[] | null> => {
+    let confirmedSet = confirmedFactIdsRef.current.get(personaId)
+    if (!confirmedSet) {
+      confirmedSet = new Set()
+      confirmedFactIdsRef.current.set(personaId, confirmedSet)
+    }
+    let declinedSet = declinedFactIdsRef.current.get(personaId)
+    if (!declinedSet) {
+      declinedSet = new Set()
+      declinedFactIdsRef.current.set(personaId, declinedSet)
+    }
+
+    const result = await commands.getPendingCrossPersonaConfirmations({
+      user_id: userId,
+      persona_id: personaId,
+    })
+    if (result.status !== 'ok') {
+      // Fail open on the query only -- apply_entity_fact_provenance_check
+      // (lifecycle.rs) still omits anything unconfirmed regardless of why
+      // this query didn't run; that omission then surfaces via this file's
+      // own provenance_omissions notice instead of a pre-send prompt, this
+      // one time. Never block sending over a failed pre-flight read -- but
+      // the fallback must be visible, not just a console.warn (code-review
+      // finding: crossPersonaConfirmCheckError was added to en.json but
+      // never wired to anything).
+      console.warn('getPendingCrossPersonaConfirmations failed:', result.error)
+      setCrossPersonaCheckError(result.error)
+      return Array.from(confirmedSet)
+    }
+
+    const newPending = result.data.filter(
+      (f) => !confirmedSet!.has(f.fact_id) && !declinedSet!.has(f.fact_id),
+    )
+    if (newPending.length === 0) {
+      return Array.from(confirmedSet)
+    }
+
+    setPendingCrossPersonaFacts(newPending)
+    const decisions = await new Promise<CrossPersonaFactDecision[] | null>((resolve) => {
+      crossPersonaResolverRef.current = resolve
+    })
+    setPendingCrossPersonaFacts(null)
+    crossPersonaResolverRef.current = null
+
+    if (decisions === null) {
+      return null
+    }
+    for (const d of decisions) {
+      if (d.include) {
+        confirmedSet.add(d.fact_id)
+        declinedSet.delete(d.fact_id)
+      } else {
+        declinedSet.add(d.fact_id)
+      }
+    }
+    return Array.from(confirmedSet)
+  }, [userId, personaId])
+
+  const handleCrossPersonaResolve = useCallback((decisions: CrossPersonaFactDecision[]) => {
+    crossPersonaResolverRef.current?.(decisions)
+  }, [])
+
+  const handleCrossPersonaCancel = useCallback(() => {
+    crossPersonaResolverRef.current?.(null)
+  }, [])
+
   const handleSend = useCallback(() => {
     const text = draft.trim()
     if (!text) return
-    setDraft('')
 
     setSendError(null)
-    commands
-      .sendMessage(userId, personaId, contextKey, text, focusId, gate3Track)
-      .then((result) => {
-        if (result.status === 'ok') {
-          setMessages(result.data)
-          const lastAssistant = [...result.data]
-            .reverse()
-            .find((m) => m.sender === 'assistant')
-          setActiveRunId(lastAssistant?.focus_run_id ?? null)
-        } else {
-          setSendError(result.error)
-        }
-      })
-  }, [draft, userId, personaId, contextKey, focusId, gate3Track])
+    setCrossPersonaCheckError(null)
+    resolveCrossPersonaConfirmation().then((confirmedFactIds) => {
+      if (confirmedFactIds === null) {
+        // User cancelled the confirmation prompt -- abort the send. Draft
+        // text is untouched (never cleared before this point), matching the
+        // rest of this file's "don't lose what the user typed" convention.
+        return
+      }
+      setDraft('')
+      setProvenanceOmitted(false)
+      commands
+        .sendMessage({
+          user_id: userId,
+          persona_id: personaId,
+          context_key: contextKey,
+          content: text,
+          focus_id: focusId,
+          gate3_track: gate3Track,
+          confirmed_cross_persona_fact_ids: confirmedFactIds,
+        })
+        .then((result) => {
+          if (result.status === 'ok') {
+            setMessages(result.data)
+            const lastAssistant = [...result.data]
+              .reverse()
+              .find((m) => m.sender === 'assistant')
+            setActiveRunId(lastAssistant?.focus_run_id ?? null)
+          } else {
+            setSendError(result.error)
+          }
+        })
+    })
+  }, [draft, userId, personaId, contextKey, focusId, gate3Track, resolveCrossPersonaConfirmation])
 
   // The transcript row that should render liveContent instead of its own
   // (still-empty, not-yet-backfilled) content -- the placeholder assistant
@@ -838,13 +986,31 @@ export function ChatPane({
               {t('navShell.chat.sendError', { message: sendError })}
             </p>
           )}
+          {crossPersonaCheckError && (
+            <p role="alert" className="chat-pane__send-error">
+              {t('navShell.chat.crossPersonaConfirmCheckError', {
+                message: crossPersonaCheckError,
+              })}
+            </p>
+          )}
           {contentTimedOut && (
             <p role="alert" className="chat-pane__content-timeout">
               {t('navShell.chat.contentTimeout')}
             </p>
           )}
+          {provenanceOmitted && (
+            <p role="alert" className="chat-pane__send-error">
+              {t('navShell.chat.provenanceOmissionNotice')}
+            </p>
+          )}
         </div>
       )}
+      <CrossPersonaConfirmModal
+        open={pendingCrossPersonaFacts !== null}
+        facts={pendingCrossPersonaFacts ?? []}
+        onResolve={handleCrossPersonaResolve}
+        onCancel={handleCrossPersonaCancel}
+      />
       <form
         className="chat-pane__input-row"
         onSubmit={(e) => {

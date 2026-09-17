@@ -616,6 +616,16 @@ pub struct RunStatusPayload {
     /// only on the same emit call as a "failed"/"awaiting_user" transition
     /// for a crisis-flagged run; None otherwise.
     pub crisis_resource_block: Option<String>,
+    /// Cross-Persona entity_facts omitted from this run's context
+    /// (decisions.id=815, items.id=27) — declined, or caught by the
+    /// documented pre-run-query/INITIALIZE-read race decisions.id=639
+    /// accepts. Same "travels over the live push event" rationale as
+    /// crisis_resource_block above: RunResult never reaches the frontend on
+    /// any current call path (submit_focus_run spawns-and-forgets it;
+    /// send_message awaits it internally but returns Vec<MessageInfo>, not
+    /// RunResult). Empty when nothing was omitted. Populated from
+    /// self.personal_track — see emit_status_with_content.
+    pub provenance_omissions: Vec<crate::conductor::types::OmittedCrossPersonaFact>,
 }
 
 // ---------------------------------------------------------------------------
@@ -825,6 +835,11 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             return; // no handle in tests — silent no-op
         };
         let total = self.focus_def.as_ref().map(|d| d.steps.len()).unwrap_or(0);
+        let provenance_omissions = self
+            .personal_track
+            .as_ref()
+            .map(|t| t.omitted_cross_persona_facts().to_vec())
+            .unwrap_or_default();
         let payload = RunStatusPayload {
             focus_run_id: self.focus_run_id.clone().unwrap_or_default(),
             status: status.to_owned(),
@@ -833,6 +848,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             step_display_name: step_display_name.map(|s| s.to_owned()),
             step_content: step_content.map(|s| s.to_owned()),
             crisis_resource_block: crisis_resource_block.map(|s| s.to_owned()),
+            provenance_omissions,
         };
         use tauri::Emitter;
         if let Err(e) = handle.emit("run-status-update", &payload) {
@@ -1275,9 +1291,25 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             // to assert the entry shape directly. See the module doc
             // comment's "Privacy gateway" section.
             //
-            // No emit() here on purpose: nothing listens yet, and naming an
-            // event now would prejudge decisions.id=639's still-unbuilt
-            // frontend confirmation flow.
+            // Recorded on `track` too (decisions.id=815, items.id=27): the
+            // frontend's pre-Focus-start query only sees facts pending as of
+            // that read, so an omission here still happens on a real race
+            // (a fact flips to cross_persona_export=true between that query
+            // and this INITIALIZE-phase read) or a plain decline. Read back
+            // by FocusRun::emit_status_with_content and carried on
+            // RunStatusPayload.provenance_omissions — no separate emit()
+            // call site needed here, since every terminal status emission
+            // already reads the track fresh.
+            if let Err(e) = track.add_omitted_cross_persona_fact(
+                crate::conductor::types::OmittedCrossPersonaFact {
+                    field_name: fact.field_name.clone(),
+                    sensitivity: fact.sensitivity.clone(),
+                    origin_persona_id: fact.origin_persona_id.clone(),
+                },
+            ) {
+                log::warn!("lifecycle: failed to record omitted cross-Persona fact on track: {e}");
+            }
+
             if let Some(gateway) = self.privacy_gateway.as_ref() {
                 use crate::conductor::privacy::logger::DisclosureLogEntry;
                 let entry = DisclosureLogEntry {
@@ -2902,6 +2934,10 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(track.entity_facts().len(), 1);
+        // decisions.id=815: a confirmed/included fact is not an omission —
+        // must not show up in the RunStatusPayload.provenance_omissions
+        // source either.
+        assert_eq!(track.omitted_cross_persona_facts().len(), 0);
     }
 
     #[tokio::test]
@@ -2925,6 +2961,17 @@ mod tests {
             track.entity_facts().len(),
             0,
             "declined fact must be omitted, not included"
+        );
+        // decisions.id=815, items.id=27: the omission must also be recorded
+        // on the track, for RunStatusPayload.provenance_omissions to surface
+        // it as a live signal (previously only a disclosure_log row).
+        let omitted = track.omitted_cross_persona_facts();
+        assert_eq!(omitted.len(), 1);
+        assert_eq!(omitted[0].field_name, "gpa");
+        assert_eq!(omitted[0].sensitivity, "personal");
+        assert_eq!(
+            omitted[0].origin_persona_id.as_deref(),
+            Some("persona-student")
         );
     }
 

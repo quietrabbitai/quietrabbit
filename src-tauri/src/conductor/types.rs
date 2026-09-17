@@ -136,6 +136,22 @@ impl EntityFact {
     }
 }
 
+/// A cross-Persona entity_facts row that `apply_entity_fact_provenance_check`
+/// omitted from context this run (lifecycle.rs) — either the user declined it
+/// via decisions.id=639's pre-Focus-start IPC flow, or it was never presented
+/// (created between that pre-run query and this INITIALIZE-phase read, the
+/// race decisions.id=639's extended notes name and accept). Carried on
+/// RunStatusPayload (decisions.id=815, items.id=27) so the frontend has a live
+/// signal beyond the disclosure_log row this same omission already writes.
+/// No field_value, matching EntityFact/PendingCrossPersonaFact's
+/// no-raw-values convention.
+#[derive(Debug, Clone, Serialize, specta::Type)]
+pub struct OmittedCrossPersonaFact {
+    pub field_name: String,
+    pub sensitivity: String,
+    pub origin_persona_id: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // GroupFact
 // ---------------------------------------------------------------------------
@@ -228,6 +244,12 @@ pub struct PersonalTrack {
     voice_profile: IndexMap<String, String>,
     persona_context: IndexMap<String, String>,
     source_versions: IndexMap<String, String>,
+    /// Cross-Persona entity_facts rows omitted this run by
+    /// apply_entity_fact_provenance_check (decisions.id=815, items.id=27).
+    /// Not keyed/deduped — one entry per omitted fact, in the order
+    /// encountered. Read by FocusRun::emit_status_with_content to populate
+    /// RunStatusPayload.provenance_omissions.
+    omitted_cross_persona_facts: Vec<OmittedCrossPersonaFact>,
     sealed: bool,
 }
 
@@ -240,6 +262,7 @@ impl PersonalTrack {
             voice_profile: IndexMap::new(),
             persona_context: IndexMap::new(),
             source_versions: IndexMap::new(),
+            omitted_cross_persona_facts: Vec::new(),
             sealed: false,
         }
     }
@@ -311,6 +334,21 @@ impl PersonalTrack {
         Ok(())
     }
 
+    /// Record a cross-Persona fact omitted by apply_entity_fact_provenance_check
+    /// (decisions.id=815, items.id=27). Same sealed-guard convention as
+    /// add_entity_fact/add_group_fact — this only ever runs during INITIALIZE,
+    /// before seal().
+    pub fn add_omitted_cross_persona_fact(
+        &mut self,
+        f: OmittedCrossPersonaFact,
+    ) -> Result<(), TrackError> {
+        if self.sealed {
+            return Err(TrackError::SealedTrack);
+        }
+        self.omitted_cross_persona_facts.push(f);
+        Ok(())
+    }
+
     pub fn seal(&mut self) {
         self.sealed = true;
     }
@@ -347,6 +385,11 @@ impl PersonalTrack {
 
     pub fn is_sealed(&self) -> bool {
         self.sealed
+    }
+
+    /// Cross-Persona facts omitted this run. Read-only.
+    pub fn omitted_cross_persona_facts(&self) -> &[OmittedCrossPersonaFact] {
+        &self.omitted_cross_persona_facts
     }
 
     /// Returns a clone of the field — prevents downstream mutation of stored

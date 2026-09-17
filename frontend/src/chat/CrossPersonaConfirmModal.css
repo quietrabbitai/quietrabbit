@@ -1,0 +1,75 @@
+/* Cross-Persona export confirmation (decisions.id=546/639/815, items.id=27).
+ * Same visual weight as ChatPane's own .chat-pane__copy-withheld-confirm --
+ * an inline alertdialog box, not a full-screen overlay like
+ * PrivacyGuardianModal.css (this has no tiers/spans to justify that scale). */
+
+.cross-persona-confirm-modal {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 14px;
+  color: var(--text);
+  padding: 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--code-bg);
+}
+
+.cross-persona-confirm-modal__title {
+  font-weight: 600;
+}
+
+.cross-persona-confirm-modal__body {
+  color: var(--text);
+}
+
+.cross-persona-confirm-modal__list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.cross-persona-confirm-modal__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.cross-persona-confirm-modal__sensitivity {
+  color: var(--text-muted, var(--text));
+  font-size: 12px;
+}
+
+.cross-persona-confirm-modal__choices {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.cross-persona-confirm-modal__choice {
+  font-size: 13px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+}
+
+.cross-persona-confirm-modal__choice--selected {
+  border-color: var(--accent-border, var(--border));
+  background: var(--accent-bg, var(--code-bg));
+}
+
+.cross-persona-confirm-modal__footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}

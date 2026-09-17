@@ -43,7 +43,15 @@
       "copyWithheldConfirmTitle": "You previously declined to send this.",
       "copyWithheldConfirmBody": "Are you sure you want to copy it anyway?",
       "copyWithheldConfirmConfirm": "Copy anyway",
-      "copyWithheldConfirmCancel": "Cancel"
+      "copyWithheldConfirmCancel": "Cancel",
+      "crossPersonaConfirmTitle": "Include information from another Persona?",
+      "crossPersonaConfirmBody": "The following was shared in a different Persona and marked shareable. Choose what to include in this conversation -- this choice is remembered for the rest of this session, not saved permanently.",
+      "crossPersonaConfirmInclude": "Include",
+      "crossPersonaConfirmOmit": "Don't include",
+      "crossPersonaConfirmContinue": "Continue",
+      "crossPersonaConfirmCancel": "Cancel",
+      "crossPersonaConfirmCheckError": "Could not check for shareable information from other Personas ({{message}}) -- sending without it.",
+      "provenanceOmissionNotice": "Some information from another Persona wasn't included in this response."
     },
     "libraryPane": {
       "listHeading": "Outputs",

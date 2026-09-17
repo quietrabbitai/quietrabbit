@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use specta::Type;
 use tauri::State;
 
@@ -30,6 +30,35 @@ use crate::auth::registry::{key_hex, KeyRegistry};
 use crate::commands::execution::{self, SubmitFocusRunRequest};
 use crate::conductor::concurrency::ConductorScheduler;
 use crate::persistence::{message_store, output_store};
+
+// ---------------------------------------------------------------------------
+// Request DTO
+// ---------------------------------------------------------------------------
+
+/// Bundled to keep send_message's own parameter count under specta's 10-arg
+/// SpectaFn ceiling once confirmed_cross_persona_fact_ids (decisions.id=815,
+/// items.id=27) is added — the 4 Tauri-injected params (app_handle,
+/// scheduler, pool, key_registry) plus 7 business fields would otherwise be
+/// 11. Mirrors SubmitFocusRunRequest's existing convention of one request DTO
+/// per command rather than a growing positional-arg list.
+#[derive(Debug, Deserialize, Type)]
+pub struct SendMessageRequest {
+    pub user_id: String,
+    pub persona_id: String,
+    pub context_key: String,
+    pub content: String,
+    pub focus_id: String,
+    pub gate3_track: bool,
+    /// entity_facts.id values the user already confirmed this session, via
+    /// the frontend's pre-send commands::consent::get_pending_cross_persona_
+    /// confirmations() query + confirmation UI, BEFORE calling send_message.
+    /// Threaded straight into SubmitFocusRunRequest — previously hardcoded to
+    /// vec![] here, which silently omitted every legitimate cross-Persona
+    /// export on every QR Chat message (decisions.id=815's rescoping of this
+    /// item). No is_quick_ask branch: decisions.id=815 holds Quick Ask to the
+    /// identical standard as a named Focus run.
+    pub confirmed_cross_persona_fact_ids: Vec<String>,
+}
 
 // ---------------------------------------------------------------------------
 // Response DTO
@@ -208,7 +237,6 @@ pub async fn list_messages(
     Ok(records.into_iter().map(to_message_info).collect())
 }
 
-#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
 #[tauri::command]
 #[specta::specta]
 pub async fn send_message(
@@ -216,13 +244,18 @@ pub async fn send_message(
     scheduler: tauri::State<'_, Arc<ConductorScheduler>>,
     pool: tauri::State<'_, sqlx::SqlitePool>,
     key_registry: State<'_, KeyRegistry>,
-    user_id: String,
-    persona_id: String,
-    context_key: String,
-    content: String,
-    focus_id: String,
-    gate3_track: bool,
+    request: SendMessageRequest,
 ) -> Result<Vec<MessageInfo>, String> {
+    let SendMessageRequest {
+        user_id,
+        persona_id,
+        context_key,
+        content,
+        focus_id,
+        gate3_track,
+        confirmed_cross_persona_fact_ids,
+    } = request;
+
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.master_key))
         .await
@@ -267,7 +300,7 @@ pub async fn send_message(
         user_id: user_id.clone(),
         persona_id: persona_id.clone(),
         topic_id: None,
-        confirmed_cross_persona_fact_ids: vec![],
+        confirmed_cross_persona_fact_ids,
     };
     let mut run = execution::load_and_authorize_run(
         app_handle,
