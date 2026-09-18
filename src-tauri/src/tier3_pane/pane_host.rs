@@ -97,7 +97,7 @@ use cef::{
     MenuId, MouseButtonType, MouseEvent,
 };
 
-use crate::commands::tier3_pane::{
+use crate::commands::cloud_chat_pane::{
     PaneEventModifiers, PaneKeyEventType, PaneLayoutState, PaneMouseButton, PaneRectFraction,
     PopupClosedPayload, PopupOpenedPayload, ZoomDirection,
 };
@@ -129,7 +129,7 @@ enum BrowserLifecycleState {
 #[derive(Debug)]
 #[allow(dead_code)] // SetCookie: explicit stub -- no cookie-manager API is
                     // wired at this layer (cookie persistence is handled at
-                    // the commands::tier3_pane layer, around this pane's
+                    // the commands::cloud_chat_pane layer, around this pane's
                     // open/close, not per-action here).
 enum PendingAction {
     Navigate(String),
@@ -282,7 +282,7 @@ const ZOOM_LEVEL_MAX: f64 = 6.0;
 const DEFAULT_ZOOM_LEVEL: f64 = 5.0 * ZOOM_LEVEL_STEP;
 
 /// The two operations `PaneHost::open_pane`/`close_pane` perform, dispatched
-/// via `AppHandle::run_on_main_thread` from `commands::tier3_pane`'s async
+/// via `AppHandle::run_on_main_thread` from `commands::cloud_chat_pane`'s async
 /// IPC handlers -- kept as a named enum (rather than inlining two separate
 /// methods at each call site) purely for the same call-site clarity/logging
 /// the old winit-user-event design had, even though there is no event queue
@@ -307,7 +307,7 @@ pub enum PaneCommand {
     /// DOM-forwarded mouse press/release (items.id=257 Path B -- see the
     /// "Pane content click/mouse forwarding" section doc above). `x`/`y`
     /// arrive already pane-local, in CEF-logical pixels -- see
-    /// `forward_pane_mouse_click`'s own doc (commands/tier3_pane.rs).
+    /// `forward_pane_mouse_click`'s own doc (commands/cloud_chat_pane.rs).
     MouseClick {
         key: PaneKey,
         x: f64,
@@ -336,7 +336,7 @@ pub enum PaneCommand {
     },
     /// items.id=332: `windows_key_code`/`character` are already resolved
     /// from the DOM `KeyboardEvent` on the frontend side (see
-    /// `forward_pane_key`'s own doc, commands/tier3_pane.rs) -- this arm's
+    /// `forward_pane_key`'s own doc, commands/cloud_chat_pane.rs) -- this arm's
     /// job is only to build CEF's `KeyEvent` and call `send_key_event`.
     KeyEvent {
         key: PaneKey,
@@ -379,7 +379,7 @@ pub enum PaneCommand {
     /// items.id=364: steps `key`'s tracked `PaneState.zoom_level` up/down/to
     /// zero and applies the resulting absolute level via
     /// `PendingAction::SetZoomLevel`. Not wired to a pane's popup, if it has
-    /// one open -- see `adjust_pane_zoom`'s own doc (commands/tier3_pane.rs)
+    /// one open -- see `adjust_pane_zoom`'s own doc (commands/cloud_chat_pane.rs)
     /// for why, and `drain_popup_events` (items.id=366) for how a popup
     /// still gets `DEFAULT_ZOOM_LEVEL` applied once, just not via this path.
     AdjustZoom {
@@ -389,7 +389,7 @@ pub enum PaneCommand {
     /// items.id=367: popup counterpart to `KeyEvent` above -- same shape,
     /// `key` is the *parent* pane's key (see `PopupMouseClick`'s own doc for
     /// why). Previously missing entirely -- see `forward_popup_key`'s own
-    /// doc (commands/tier3_pane.rs) for the confirmed symptom this fixes.
+    /// doc (commands/cloud_chat_pane.rs) for the confirmed symptom this fixes.
     PopupKeyEvent {
         key: PaneKey,
         event_type: PaneKeyEventType,
@@ -417,7 +417,7 @@ pub enum PaneCommand {
     /// gesture (see its own doc for why it's not gated on equality); this is
     /// the same reclaim, just triggered by an OS-level focus round-trip
     /// instead of an in-app pane switch. Diagnostic logging elsewhere in
-    /// this session (commands/tier3_pane.rs, PaneCommand::MouseClick/
+    /// this session (commands/cloud_chat_pane.rs, PaneCommand::MouseClick/
     /// KeyEvent above) already confirmed the click/key IPC path itself
     /// reaches CEF fine after such a round-trip -- this targets CEF's own
     /// browser-side activation state instead, since `set_focus(true)` alone
@@ -700,7 +700,7 @@ impl PaneManager {
         // CEF's one working global context (request_context=None below).
         // Per-provider cookie *persistence* across app restarts is handled
         // at the QR application layer instead -- see
-        // commands/tier3_pane.rs::open_tier3_panes/close_tier3_pane.
+        // commands/cloud_chat_pane.rs::open_tier3_panes/close_tier3_pane.
         let mut browser_lifecycle = BrowserLifecycle::new();
         let (tx, rx) = std::sync::mpsc::channel();
         browser_lifecycle.start_creation();
@@ -726,7 +726,7 @@ impl PaneManager {
         if created != 0 {
             browser_lifecycle.enqueue(PendingAction::Navigate(url));
             // items.id=359 piece 4: a newly-opened pane starts deactivated
-            // by default -- the caller (commands::tier3_pane::open_tier3_panes)
+            // by default -- the caller (commands::cloud_chat_pane::open_tier3_panes)
             // always follows Open with an explicit set_active_pane call for
             // the "idle row -> load and activate in one step" case, but
             // defaulting to hidden here (rather than assuming the caller's
@@ -1647,7 +1647,7 @@ fn mouse_backforward_mousedown_js(event: &gtk::gdk::EventButton, held: u8) -> St
 // hit-testing already scopes correctly -- no GDK-level scoping needed.
 // Those events are forwarded over `forward_pane_mouse_click`/
 // `forward_pane_mouse_move`/`forward_pane_mouse_wheel`
-// (commands/tier3_pane.rs) to `PaneCommand::MouseClick`/`MouseMove`/
+// (commands/cloud_chat_pane.rs) to `PaneCommand::MouseClick`/`MouseMove`/
 // `MouseWheel`, handled in `PaneHost::dispatch` below -- see
 // `cef_modifiers_from_dom`'s own doc for why event coordinates arrive
 // already pane-local, needing no origin-subtraction or scale-factor
@@ -2593,7 +2593,7 @@ fn capture_draw_framebuffer(gl_context: &Rc<RefCell<Option<glow::Context>>>) -> 
 /// an incidental resize finally synced it, so clicks landed off-target
 /// until then. `connect_render` already recomputes `layout`/`glarea_size`
 /// every tick and fires on `queue_render()` (see `PaneHost::queue_draw`'s
-/// doc), which `set_pane_layout` (commands/tier3_pane.rs) already calls
+/// doc), which `set_pane_layout` (commands/cloud_chat_pane.rs) already calls
 /// right after a pane's first layout fractions land -- so syncing here
 /// closes the gap on the very next render tick after open, no new call
 /// site needed. Cheap on every other frame: both syncs no-op via
@@ -3000,7 +3000,7 @@ impl PaneHost {
     /// real physical pixels (that fix's own finding -- CEF's OSR paint buffer
     /// comes back at exactly the reported size, not size x
     /// `device_scale_factor`), but `forward_pane_mouse_click`/`_move`/`_wheel`
-    /// (commands/tier3_pane.rs) still forward the DOM hit-div's
+    /// (commands/cloud_chat_pane.rs) still forward the DOM hit-div's
     /// `PointerEvent.offsetX`/`offsetY` verbatim -- CSS pixels, per that
     /// command's own (now-stale) doc comment claiming CSS pixels are "the
     /// same logical-pixel convention CEF's `MouseEvent` expects". On any
@@ -3020,7 +3020,7 @@ impl PaneHost {
         (x * scale, y * scale)
     }
 
-    /// Dispatches one `PaneCommand` -- called from `commands::tier3_pane`'s
+    /// Dispatches one `PaneCommand` -- called from `commands::cloud_chat_pane`'s
     /// async IPC handlers via `AppHandle::run_on_main_thread`, which is the
     /// real cross-thread mechanism now (previously a fire-and-forget
     /// `EventLoopProxy::send_event` into a winit user-event queue that
@@ -3562,7 +3562,7 @@ impl PaneHost {
 
     /// Requests the next GTK frame draw this pane host's GLArea -- called
     /// from main.rs's GLib timeout, gated on `open_pane_count() > 0`, and
-    /// from `set_pane_layout` (commands/tier3_pane.rs) for an immediate
+    /// from `set_pane_layout` (commands/cloud_chat_pane.rs) for an immediate
     /// resync the moment the frontend reports new layout fractions, same
     /// intent as the old design's immediate `sync_tx` push. No longer also
     /// rebuilds a GDK input shape (items.id=257 Path A, removed) -- pane
@@ -3594,7 +3594,7 @@ impl PaneHost {
 // ---------------------------------------------------------------------------
 //
 // `PaneHost` (GTK objects throughout) is not `Send`, so it cannot be reached
-// via `tauri::State` from `commands::tier3_pane`'s async (tokio-side)
+// via `tauri::State` from `commands::cloud_chat_pane`'s async (tokio-side)
 // handlers the way the old `EventLoopProxy<PaneCommand>` -- Send + Sync by
 // winit's own guarantee -- was. The replacement is Tauri's own
 // `AppHandle::run_on_main_thread(closure)`: the closure itself must be
@@ -3627,7 +3627,7 @@ pub fn install(window: &tauri::WebviewWindow, app_handle: tauri::AppHandle) -> A
 /// Runs `command` against the process-wide pane host. Must be called from
 /// the main thread -- the intended call site is inside an
 /// `AppHandle::run_on_main_thread` closure (see
-/// `commands::tier3_pane::open_tier3_panes`/`close_tier3_pane`), which
+/// `commands::cloud_chat_pane::open_tier3_panes`/`close_tier3_pane`), which
 /// guarantees that. A call before `install()` (shouldn't happen -- the main
 /// window exists long before any pane can open) is logged and dropped, not a
 /// panic.
@@ -3640,7 +3640,7 @@ pub fn dispatch(command: PaneCommand) {
 
 /// Requests a redraw on the process-wide pane host's GLArea. Same
 /// main-thread-only contract as `dispatch`. Used by
-/// `commands::tier3_pane::set_pane_layout` for an immediate resync the
+/// `commands::cloud_chat_pane::set_pane_layout` for an immediate resync the
 /// moment the frontend reports new layout fractions.
 pub fn queue_draw() {
     HOST.with(|h| {

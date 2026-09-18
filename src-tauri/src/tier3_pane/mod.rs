@@ -125,7 +125,7 @@
 //!   browser's own hit-testing scopes correctly -- no GDK involvement at
 //!   all. Those events are forwarded over
 //!   `forward_pane_mouse_click`/`forward_pane_mouse_move`/
-//!   `forward_pane_mouse_wheel` (commands/tier3_pane.rs) to
+//!   `forward_pane_mouse_wheel` (commands/cloud_chat_pane.rs) to
 //!   `PaneHost::dispatch`, which forwards to CEF via the same
 //!   `send_mouse_click_event`/`send_mouse_move_event`/`send_mouse_wheel_event`
 //!   accessors Path A used. `glarea` itself is a pure compositor now -- it

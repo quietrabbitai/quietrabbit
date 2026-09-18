@@ -66,4 +66,4 @@ pub mod persona_view_sync;
 pub mod personal;
 pub mod system;
 pub mod tier2;
-pub mod tier3_pane;
+pub mod cloud_chat_pane;

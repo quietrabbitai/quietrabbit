@@ -20,7 +20,7 @@
 // SAVEPOINT-wrapped delete-then-insert, rather than diffing individual
 // cookies. This matches how the caller actually has the data: a full
 // visit_url_cookies() read-back of CEF's jar for that provider's domain at
-// pane-close (see commands/tier3_pane.rs), not a single changed cookie. A
+// pane-close (see commands/cloud_chat_pane.rs), not a single changed cookie. A
 // cookie deleted from the live jar since the last save (e.g. the provider
 // itself expired/cleared it) must not resurrect on the next load -- a
 // per-cookie upsert would leave stale rows behind; a full replace can't.
@@ -50,7 +50,7 @@ pub enum Tier3CookieStoreError {
 /// crate v151.1.0+151.3.12) minus `size` (a wire-protocol field, not data)
 /// -- see schema/tier3_cookies_001.sql's header for the full field-by-field
 /// rationale. Conversions to/from cef::Cookie live in
-/// commands/tier3_pane.rs, the only caller that touches the CEF type --
+/// commands/cloud_chat_pane.rs, the only caller that touches the CEF type --
 /// this module stays CEF-agnostic, matching entity_store.rs/
 /// integration_keys_store.rs's own convention of not importing cef here.
 #[derive(Debug, Clone, PartialEq)]
@@ -118,7 +118,7 @@ async fn open_tier3_cookies_db(
 // ---------------------------------------------------------------------------
 
 /// All stored cookies for (user_id, provider_id) -- the pane-open restore
-/// path (commands/tier3_pane.rs::open_tier3_panes).
+/// path (commands/cloud_chat_pane.rs::open_tier3_panes).
 pub async fn list_cookies(
     user_id: &str,
     key_hex: &str,
@@ -155,7 +155,7 @@ pub(crate) async fn list_cookies_conn(
 
 /// Replace the entire stored cookie set for (user_id, provider_id) with
 /// `cookies` -- the pane-close persist path
-/// (commands/tier3_pane.rs::close_tier3_pane). See module header on why
+/// (commands/cloud_chat_pane.rs::close_tier3_pane). See module header on why
 /// this is a full replace, not a per-cookie upsert. SAVEPOINT-wrapped
 /// delete-then-insert, mirroring personal_store.rs's own
 /// supersede-then-insert atomicity pattern (same rationale: a failure

@@ -13,7 +13,7 @@
 // (is_local, is_anonymous, retains_data, trains_on_data_by_default,
 // qr_internal_eligible, risk_rating, privacy_guardian_default_level).
 // Tier labels are a display-layer-only concern computed from provider_type
-// by callers that need one (e.g. commands::tier3_pane::lane_str) -- never
+// by callers that need one (e.g. commands::cloud_chat_pane::lane_str) -- never
 // read back into this module or into any decision logic.
 //
 // Backs TIER3_ACCESS_MODEL.md's selector screen (State 3, decisions.id=681)
@@ -192,7 +192,7 @@ pub struct Provider {
     /// Open vocabulary, no CHECK -- mechanical integration shape
     /// ('local_model' | 'cloud_inference_api' | 'split_screen_web' |
     /// 'external_service'), not a classification. Never branched on for
-    /// eligibility -- only display grouping (see commands::tier3_pane).
+    /// eligibility -- only display grouping (see commands::cloud_chat_pane).
     pub provider_type: String,
     pub mode: ProviderMode,
     pub launch_url: Option<String>,

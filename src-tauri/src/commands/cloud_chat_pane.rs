@@ -1,4 +1,4 @@
-// src-tauri/src/commands/tier3_pane.rs
+// src-tauri/src/commands/cloud_chat_pane.rs
 //
 // Group 13 -- Cloud Chat pane lifecycle & provider catalog.
 // Commands: list_active_providers, open_tier3_panes, close_tier3_pane,

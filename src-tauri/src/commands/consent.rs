@@ -759,7 +759,7 @@ pub async fn request_tier3_gate3_review(
     app_handle: tauri::AppHandle,
     request: RequestTier3Gate3ReviewRequest,
     key_registry: State<'_, KeyRegistry>,
-    layout_state: State<'_, crate::commands::tier3_pane::PaneLayoutState>,
+    layout_state: State<'_, crate::commands::cloud_chat_pane::PaneLayoutState>,
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<Gate3ReviewResult, String> {
     let key_hex_str = key_registry
@@ -818,7 +818,7 @@ pub async fn request_tier3_gate3_review(
     // items.id=406 (decisions.id=753): destination risk is now read live
     // from whatever providers are actually active/selected in the rail at
     // review time, rather than assumed always-High from target_tier=3
-    // alone. `PaneLayoutState` (commands/tier3_pane.rs) is the backend-truth
+    // alone. `PaneLayoutState` (commands/cloud_chat_pane.rs) is the backend-truth
     // mirror of "providers currently laid out on screen" -- the frontend
     // keeps it current via set_pane_layout on every openPaneIds/layout
     // change, and unlike PaneManager/PaneHost it's plain Send+Sync state
@@ -964,7 +964,7 @@ pub async fn request_chat_copy_gate3_review(
     app_handle: tauri::AppHandle,
     request: RequestChatCopyGate3ReviewRequest,
     key_registry: State<'_, KeyRegistry>,
-    layout_state: State<'_, crate::commands::tier3_pane::PaneLayoutState>,
+    layout_state: State<'_, crate::commands::cloud_chat_pane::PaneLayoutState>,
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<Gate3ReviewResult, String> {
     let key_hex_str = key_registry

@@ -83,13 +83,13 @@ async fn async_main() {
     // T: Send + Sync, and GTK types aren't (same class of constraint
     // winit's X11 IME pointers used to impose here). PaneHost instead lives
     // in a main-thread-only thread-local (see tier3_pane::pane_host's own
-    // module docs on why, and how commands::tier3_pane reaches it via
+    // module docs on why, and how commands::cloud_chat_pane reaches it via
     // AppHandle::run_on_main_thread instead of Tauri-managed state).
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(scheduler)
         .manage(ollama_client)
-        .manage(quietrabbit_lib::commands::tier3_pane::PaneLayoutState::default())
+        .manage(quietrabbit_lib::commands::cloud_chat_pane::PaneLayoutState::default())
         // OllamaSource: initialized to Unavailable; the setup task writes the
         // real value after detect-first completes. get_health() reads via
         // read lock — zero contention after the first ~2 s of startup.
@@ -625,7 +625,7 @@ async fn async_main() {
     // exist yet -- installing the host creates nothing but the GLArea
     // widget itself; panes are created on demand via
     // pane_host::dispatch(PaneCommand::Open) in response to a real Cloud Chat
-    // selection (commands::tier3_pane).
+    // selection (commands::cloud_chat_pane).
     //
     // FOUND THE HARD WAY (2026-08-07, manual verification): installing
     // right here -- between `.build()` returning and `.run()` starting --

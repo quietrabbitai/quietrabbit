@@ -53,7 +53,7 @@ use crate::auth::kdf;
 /// Hex-encode a resident master key for use as a store's `key_hex: &str`
 /// parameter (e.g. the SQLCipher PRAGMA key value). Shared implementation --
 /// items.id=268 found three independent byte-identical private copies
-/// (commands/tier2.rs, commands/system.rs, commands/tier3_pane.rs) that had
+/// (commands/tier2.rs, commands/system.rs, commands/cloud_chat_pane.rs) that had
 /// accreted before this was ever unified; those three, plus every command
 /// migrated in that item, call this one instead.
 pub(crate) fn key_hex(key: &[u8; kdf::MASTER_KEY_LEN]) -> String {

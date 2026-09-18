@@ -45,7 +45,7 @@ use cef::ImplContextMenuParams;
 use wgpu::util::DeviceExt;
 use wgpu_hal::Adapter as _;
 
-use crate::commands::tier3_pane::PaneRectFraction;
+use crate::commands::cloud_chat_pane::PaneRectFraction;
 use crate::tier3_pane::PaneKey;
 
 /// items.id=334: `on_paint`/`on_accelerated_paint` only ever stashed fresh
@@ -302,7 +302,7 @@ impl RenderState {
     /// one render pass. `layout` is `PaneLayoutState`'s live contents --
     /// fractions (0..1) of the whole window's content area, unchanged
     /// semantics from the old per-window `sync_to` design (see
-    /// `commands::tier3_pane::PaneRectFraction`'s own doc) -- multiplied
+    /// `commands::cloud_chat_pane::PaneRectFraction`'s own doc) -- multiplied
     /// here against `self.size` (the GLArea's own physical pixel size,
     /// which already *is* the window's content area, since the GLArea fills
     /// it) instead of against a `PhysicalRect` obtained from
@@ -913,7 +913,7 @@ pub struct LogicalSize {
 
 /// Extracted, plain-int copy of the `PopupFeatures` CEF hands to
 /// `on_before_popup` -- not the CEF struct itself, matching this codebase's
-/// established practice (see `commands/tier3_pane.rs`'s `CollectCookiesVisitor`
+/// established practice (see `commands/cloud_chat_pane.rs`'s `CollectCookiesVisitor`
 /// doc) of never forwarding a CEF-owned type across the CEF-UI-thread ->
 /// GTK-main-thread boundary. `x`/`y` are captured but currently unused --
 /// `pane_host::resolve_popup_rect` centers the popup over its parent pane
