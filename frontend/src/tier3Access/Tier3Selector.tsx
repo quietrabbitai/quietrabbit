@@ -125,7 +125,7 @@ export function Tier3Selector({
 }: Tier3SelectorProps) {
   const { t } = useTranslation()
 
-  const rows = escalateMode ? providers.filter((p) => p.lane === 'tier3') : providers
+  const rows = escalateMode ? providers.filter((p) => p.lane === 'cloud_frontier') : providers
 
   return (
     <ul className="tier3-rail" aria-label={t('tier3Selector.railLabel')}>
@@ -192,13 +192,13 @@ export function Tier3Selector({
               <span
                 className="tier3-rail__tierbadge"
                 title={
-                  provider.lane === 'tier2'
+                  provider.lane === 'cloud_anonymous'
                     ? t('tier3Selector.tier2BadgeTitle')
                     : t('tier3Selector.tier3BadgeTitle')
                 }
                 aria-hidden="true"
               >
-                {provider.lane === 'tier2' ? '⚡' : '☁'}
+                {provider.lane === 'cloud_anonymous' ? '⚡' : '☁'}
               </span>
             </button>
             {state !== 'idle' && (

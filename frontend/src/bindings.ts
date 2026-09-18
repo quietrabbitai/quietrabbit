@@ -22,7 +22,7 @@ export const commands = {
 	 *  #[cfg(debug_assertions)]: compiled only into debug builds -- absent
 	 *  entirely from a release binary, not just unreachable. See ipc.rs's
 	 *  specta_builder for the matching debug-only command registration; both
-	 *  halves must be removed together once items.id=329's Tier 3 pane work no
+	 *  halves must be removed together once items.id=329's Cloud Chat pane work no
 	 *  longer needs fast iteration.
 	 */
 	devSeedTier3DraftMessage: (userId: string, personaId: string, contextKey: string) => typedError<string, string>(__TAURI_INVOKE("dev_seed_tier3_draft_message", { userId, personaId, contextKey })),
@@ -185,8 +185,8 @@ export const commands = {
 	 *  call site was conductor/executor.rs's own step-execution loop, with no
 	 *  StepContext/PersonalTrack available here.
 	 * 
-	 *  This call site reviews arbitrary message content drafted ahead of Tier 3
-	 *  access, via any entry path (direct chat, escalation, or a Focus-run
+	 *  This call site reviews arbitrary message content drafted ahead of
+	 *  cloud_frontier access, via any entry path (direct chat, escalation, or a Focus-run
 	 *  handoff) -- it is NOT specific to Quick-Ask-Focus-generated content, and
 	 *  makes no claim that no personal fields ever flow through it. quick-ask.focus's
 	 *  step id and display_name are reused below purely as a synthetic label for
@@ -194,7 +194,7 @@ export const commands = {
 	 *  content's structure.
 	 * 
 	 *  Parameter sourcing:
-	 *    - target_tier=3: this flow only exists ahead of Tier 3 access.
+	 *    - target_tier=3: this flow only exists ahead of cloud_frontier access.
 	 *    - execution_tier=1, content_sensitivity_severity=1: no PersonalTrack is
 	 *      available at this call site to compute a real severity, so this is a
 	 *      fixed placeholder, not a real assessment.
@@ -282,17 +282,17 @@ export const commands = {
 	 *  command does NOT mirror request_tier3_gate3_review's target_tier=3 --
 	 *  confirmed live (2026-09-04) that reusing 3 unconditionally makes gate3's
 	 *  own zero_spans_safe_to_auto_approve (destination_risk >= 3 forces High
-	 *  review regardless of content) fire for every single copy when no Tier 3
-	 *  provider pane happens to be open, defeating the "silent on a fast,
+	 *  review regardless of content) fire for every single copy when no Cloud Chat
+	 *  pane happens to be open, defeating the "silent on a fast,
 	 *  unflagged pass" UX this whole feature is built around: request_tier3_gate3_review's
 	 *  target_tier=3 is correct there because that flow's own precondition is
-	 *  "the user is literally about to access Tier 3" (its own doc comment) -- a
+	 *  "the user is literally about to access cloud_frontier" (its own doc comment) -- a
 	 *  native copy gesture on this transcript carries no such precondition; the
-	 *  destination could just as easily be a text editor as a Tier 3 pane.
+	 *  destination could just as easily be a text editor as a Cloud Chat pane.
 	 *  target_tier=1 here means an unknown/no-Tier-3-destination copy is judged
 	 *  on its own content severity alone (correct, most copies pass silently and
 	 *  fast), while destination_risk_rating below still reflects any ACTUALLY
-	 *  active Tier 3 provider's real risk -- so a copy made while a genuinely
+	 *  active cloud_frontier provider's real risk -- so a copy made while a genuinely
 	 *  risky destination is open still gets the stricter review, preserving
 	 *  decisions.id=755's original intent for that real case.
 	 *  severity_authoritative=false (items.id=458, corrected scope of the
@@ -399,7 +399,7 @@ export const commands = {
 	 *  instead of the legacy users.tier2_provider_preference column (dropped by
 	 *  items.id=433 -- this command wrote it as a dual-write in the interim, now
 	 *  removed along with the column). Selecting a provider marks its
-	 *  account-wide row Preferred and downgrades any OTHER Tier 1.5 candidate's
+	 *  account-wide row Preferred and downgrades any OTHER qr_hosted candidate's
 	 *  account-wide row that was previously Preferred to Allowed, preserving
 	 *  find_preferred_provider()'s "at most one Preferred" assumption. Clearing
 	 *  (`provider: None`) downgrades any currently-Preferred candidate the same
@@ -462,11 +462,12 @@ export const commands = {
 	 *  for that function's other caller (focus_provider_criteria_store's
 	 *  eligible_providers_for_focus, which deliberately wants the full active
 	 *  pool including cloud_inference_api rows), but wrong here. This screen is
-	 *  the Tier 2/Tier 3 pane selector specifically, so it must only surface
+	 *  the Cloud Chat pane selector specifically, so it must only surface
 	 *  the two provider_type shapes lane_str() knows how to label
-	 *  ('split_screen_web' -> tier2, 'external_service' -> tier3) -- filtered
-	 *  out here rather than in the shared store function, so cloud_inference_api
-	 *  (Tier 1.5: groq/mistral) and local_model rows never reach this list.
+	 *  ('split_screen_web' -> cloud_anonymous, 'external_service' ->
+	 *  cloud_frontier) -- filtered out here rather than in the shared store
+	 *  function, so cloud_inference_api (qr_hosted: groq/mistral) and
+	 *  local_model rows never reach this list.
 	 */
 	listActiveProviders: () => typedError<Tier3ProviderSummary[], string>(__TAURI_INVOKE("list_active_providers")),
 	/**
@@ -938,10 +939,10 @@ export type HealthResponse = {
 	 */
 	ollama_source: string,
 	/**
-	 *  True iff an active user-global key exists for ANY Tier 1.5 provider
+	 *  True iff an active user-global key exists for ANY qr_hosted provider
 	 *  (providers.provider_type='cloud_inference_api' -- items.id=430; was a
 	 *  hardcoded ["mistral","groq"] array before this) -- a capability-status
-	 *  signal ("is Tier 1.5 usable at all," e.g. for an onboarding nudge),
+	 *  signal ("is qr_hosted usable at all," e.g. for an onboarding nudge),
 	 *  not a report of which provider is active. Provider *selection* at
 	 *  execution time is a separate concern, wired through
 	 *  user_provider_preference_store::resolve_preference() (items.id=432) --
@@ -1146,9 +1147,9 @@ export type PersonaViewShareSyncSettingsInfo = {
 export type PersonalFieldInfo = {
 	field_name: string,
 	sensitivity: string,
-	/**  Abstracted display value for Tier 2 routing contexts. */
+	/**  Abstracted display value for cloud_anonymous routing contexts. */
 	abstraction_tier2: string,
-	/**  Abstracted display value for Tier 3 routing contexts. */
+	/**  Abstracted display value for cloud_frontier routing contexts. */
 	abstraction_tier3: string,
 };
 
@@ -1398,9 +1399,9 @@ export type Tier2Config = {
  *  display layer"). Output is byte-identical to the old tier-based
  *  derivation for the 4 known providers; a future provider_type this match
  *  doesn't recognize falls back to the raw provider_type string, which
- *  won't satisfy the frontend's closed `'tier2' | 'tier3'` type -- that's
- *  Part 3c/5a's problem to solve when a new lane is actually needed, not
- *  this one.
+ *  won't satisfy the frontend's closed `'cloud_anonymous' | 'cloud_frontier'`
+ *  type -- that's Part 3c/5a's problem to solve when a new lane is
+ *  actually needed, not this one.
  */
 export type Tier3ProviderSummary = {
 	id: string,

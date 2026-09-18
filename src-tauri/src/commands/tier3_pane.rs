@@ -102,9 +102,9 @@ const COOKIE_OP_TIMEOUT: Duration = Duration::from_millis(500);
 /// display layer"). Output is byte-identical to the old tier-based
 /// derivation for the 4 known providers; a future provider_type this match
 /// doesn't recognize falls back to the raw provider_type string, which
-/// won't satisfy the frontend's closed `'tier2' | 'tier3'` type -- that's
-/// Part 3c/5a's problem to solve when a new lane is actually needed, not
-/// this one.
+/// won't satisfy the frontend's closed `'cloud_anonymous' | 'cloud_frontier'`
+/// type -- that's Part 3c/5a's problem to solve when a new lane is
+/// actually needed, not this one.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, specta::Type)]
 pub struct Tier3ProviderSummary {
     pub id: String,
@@ -131,8 +131,8 @@ pub struct Tier3ProviderSummary {
 
 fn lane_str(provider_type: &str) -> &str {
     match provider_type {
-        "split_screen_web" => "tier2",
-        "external_service" => "tier3",
+        "split_screen_web" => "cloud_anonymous",
+        "external_service" => "cloud_frontier",
         other => other,
     }
 }
@@ -529,9 +529,10 @@ async fn persist_cookies_from_jar(
 /// pool including cloud_inference_api rows), but wrong here. This screen is
 /// the Cloud Chat pane selector specifically, so it must only surface
 /// the two provider_type shapes lane_str() knows how to label
-/// ('split_screen_web' -> tier2, 'external_service' -> tier3) -- filtered
-/// out here rather than in the shared store function, so cloud_inference_api
-/// (qr_hosted: groq/mistral) and local_model rows never reach this list.
+/// ('split_screen_web' -> cloud_anonymous, 'external_service' ->
+/// cloud_frontier) -- filtered out here rather than in the shared store
+/// function, so cloud_inference_api (qr_hosted: groq/mistral) and
+/// local_model rows never reach this list.
 #[tauri::command]
 #[specta::specta]
 pub async fn list_active_providers(

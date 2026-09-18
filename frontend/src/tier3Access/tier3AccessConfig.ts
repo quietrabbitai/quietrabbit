@@ -25,10 +25,12 @@
 // replaces the prior PLACEHOLDER_PROVIDERS stand-in array -- real data now
 // comes from commands.listActiveProviders(), backed by
 // provider_store::list_active_providers() (commit 4e5147f). The IPC
-// response's `lane` field is already "tier2"/"tier3" (mirrors
-// provider_store::ProviderTier's own serde rendering exactly), so no
-// tier-to-lane transformation happens here -- just a field rename
-// (display_name -> name) to match this file's own Provider shape.
+// response's `lane` field is computed by commands/tier3_pane.rs's
+// lane_str() from provider_type (providers has no tier column of its own
+// -- items.id=427) and already renders "cloud_anonymous"/"cloud_frontier"
+// literally, so no tier-to-lane transformation happens here -- just a
+// field rename (display_name -> name) to match this file's own Provider
+// shape.
 
 // Deep component imports, not the top-level `@lobehub/icons` barrel: each
 // icon's barrel `index.js` unconditionally builds a "compounded" object
@@ -54,7 +56,7 @@ import duckLogoUrl from './assets/duckduckgo-dax-solo.svg'
  *  number -- the doc's own selector boxes are labeled by defining
  *  property ("No login required" / "Account required, data retained"),
  *  not by tier name. This type exists for internal routing only. */
-export type ProviderLane = 'tier2' | 'tier3'
+export type ProviderLane = 'cloud_anonymous' | 'cloud_frontier'
 
 /** One selectable destination in the selector screen. Backed by the real
  *  provider catalog (provider_store::tier3_providers, decisions.id=684/710)
