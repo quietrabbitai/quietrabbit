@@ -32,7 +32,7 @@
 // still re-derives physical-pixel rects from whatever fraction this
 // module computes, same division of labor as before.
 //
-// Same placeholder discipline as tier3AccessConfig.ts/middleZoneConfig.ts:
+// Same placeholder discipline as cloudChatAccessConfig.ts/middleZoneConfig.ts:
 // structural only, no QR branding/visual grammar applied here.
 
 export interface PaneRectFraction {

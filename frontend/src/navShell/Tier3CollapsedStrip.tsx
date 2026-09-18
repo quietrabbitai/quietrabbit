@@ -39,7 +39,7 @@
 //                   rather than a dead-feeling button.
 
 import { useTranslation } from 'react-i18next'
-import type { Provider } from '../tier3Access/tier3AccessConfig'
+import type { Provider } from '../tier3Access/cloudChatAccessConfig'
 import './Tier3CollapsedStrip.css'
 
 export interface Tier3CollapsedStripProps {

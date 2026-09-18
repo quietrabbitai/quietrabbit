@@ -22,11 +22,11 @@
 // which are loaded, which is active) and callbacks.
 //
 // VISUAL DESIGN NOTE: structural/functional CSS only -- see
-// tier3AccessConfig.ts's header for why (the whole app is still on the
-// generic template palette). The one exception is per-row brand-color
-// tinting (decisions.id=732), applied via tier3AccessConfig.ts's
-// providerBrandColor() -- a narrow, decision-backed carve-out, not a
-// broader visual pass.
+// cloudChatAccessConfig.ts's header for why (the whole app is still on
+// the generic template palette). The one exception is per-row
+// brand-color tinting (decisions.id=732), applied via
+// cloudChatAccessConfig.ts's providerBrandColor() -- a narrow,
+// decision-backed carve-out, not a broader visual pass.
 
 import { useTranslation } from 'react-i18next'
 import './Tier3Selector.css'
@@ -36,7 +36,7 @@ import {
   privacyLevelColor,
   providerBrandColor,
   type Provider,
-} from './tier3AccessConfig'
+} from './cloudChatAccessConfig'
 
 /** items.id=418: generic, non-branded glyphs for the two new indicator
  *  badges -- hand-drawn shapes (cloud/person/mask), not reproductions of

@@ -1,10 +1,11 @@
 /* Tier 2/Tier 3 access -- provider rail, structural/functional CSS only.
  *
- * NOT a Chat-BRAND visual pass -- see tier3AccessConfig.ts's header for
- * why (the whole app is still on the generic template palette). The one
- * exception is --row-brand-color (decisions.id=732), a narrow, explicit
- * carve-out applied via inline style from tier3AccessConfig.ts's
- * providerBrandColor(), not a broader visual pass on this file. */
+ * NOT a Chat-BRAND visual pass -- see cloudChatAccessConfig.ts's header
+ * for why (the whole app is still on the generic template palette). The
+ * one exception is --row-brand-color (decisions.id=732), a narrow,
+ * explicit carve-out applied via inline style from
+ * cloudChatAccessConfig.ts's providerBrandColor(), not a broader visual
+ * pass on this file. */
 
 .tier3-rail {
   list-style: none;

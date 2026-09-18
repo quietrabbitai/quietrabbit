@@ -92,7 +92,7 @@ const COOKIE_OP_TIMEOUT: Duration = Duration::from_millis(500);
 // ---------------------------------------------------------------------------
 
 /// Selector-screen-facing provider summary. `lane` matches the frontend's
-/// `ProviderLane` string type (tier3AccessConfig.ts) verbatim -- no further
+/// `ProviderLane` string type (cloudChatAccessConfig.ts) verbatim -- no further
 /// transformation needed on the TypeScript side.
 ///
 /// items.id=427: providers has no tier column any more (Part 1's core
@@ -520,7 +520,7 @@ async fn persist_cookies_from_jar(
 
 /// The selector screen's primary read path (TIER3_ACCESS_MODEL.md State 3,
 /// items.id=202 piece 1's remaining wiring) -- replaces
-/// tier3AccessConfig.ts's PLACEHOLDER_PROVIDERS stand-in array.
+/// cloudChatAccessConfig.ts's PLACEHOLDER_PROVIDERS stand-in array.
 ///
 /// items.id=488: provider_store::list_active_providers() returns every
 /// activation_status='active' row regardless of provider_type -- correct

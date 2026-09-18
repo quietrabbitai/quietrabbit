@@ -4,7 +4,7 @@
  * custom properties rather than declaring its own colors, so it tracks
  * the app's light/dark theme automatically. Persona-color accents
  * (left-border on cards, filter-pill dots) are the one deliberate
- * exception -- same carve-out rationale as tier3AccessConfig.ts's
+ * exception -- same carve-out rationale as cloudChatAccessConfig.ts's
  * PROVIDER_BRAND_COLORS (decisions.id=732): these identify something
  * that isn't QR's own palette (here, which Persona a card belongs to),
  * not a Palette v3 violation. */

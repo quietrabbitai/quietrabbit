@@ -72,7 +72,7 @@ import { Tier3Selector } from '../tier3Access/Tier3Selector'
 import {
   fetchActiveProviders,
   type Provider,
-} from '../tier3Access/tier3AccessConfig'
+} from '../tier3Access/cloudChatAccessConfig'
 
 type ReviewOutcome = 'pending' | 'approved' | 'withheld' | 'blocked'
 
