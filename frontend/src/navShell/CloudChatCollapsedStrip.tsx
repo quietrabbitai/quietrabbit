@@ -21,7 +21,7 @@
 // START a review. Both gaps close here: this bar is now ALWAYS rendered
 // whenever Cloud Chat isn't the expanded region (never null), one row among
 // the three peer bars (Board / Chat / Second opinion) WorkspaceShell.tsx
-// and Tier3AccessPane.tsx stack together -- Jason's own framing: "a second
+// and CloudChatAccessPane.tsx stack together -- Jason's own framing: "a second
 // opinion bar always visible." Tier3AccessPane now derives which of three
 // states applies whenever openProviderIds is empty (no provider pane open
 // this round):
@@ -31,7 +31,7 @@
 //   'reviewable' -- there's a real last assistant response that hasn't
 //                   been sent through Gate3 review yet. onReview starts
 //                   that review -- this replaces the old chat-toolbar "2nd
-//                   opinion" button (removed, Tier3AccessPane.tsx), which
+//                   opinion" button (removed, CloudChatAccessPane.tsx), which
 //                   is now redundant with this always-visible bar doing
 //                   the same job.
 //   'none'       -- no assistant response at all yet. Genuinely nothing to
@@ -39,7 +39,7 @@
 //                   rather than a dead-feeling button.
 
 import { useTranslation } from 'react-i18next'
-import type { Provider } from '../tier3Access/cloudChatAccessConfig'
+import type { Provider } from '../cloudChatAccess/cloudChatAccessConfig'
 import './Tier3CollapsedStrip.css'
 
 export interface Tier3CollapsedStripProps {

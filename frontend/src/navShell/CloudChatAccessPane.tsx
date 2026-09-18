@@ -57,22 +57,22 @@ import { ChatHistoryList } from '../chat/ChatHistoryList'
 import { NewChatPersonaPicker } from '../chat/NewChatPersonaPicker'
 import { FocusSettingsControls } from './FocusSettingsControls'
 import { requireCurrentUserId, type DominancePairState } from './navShellConfig'
-import { Tier3CollapsedStrip } from './Tier3CollapsedStrip'
+import { Tier3CollapsedStrip } from './CloudChatCollapsedStrip'
 import { useDominancePair } from './useDominancePair'
-import { computeActivePaneRect, pixelRectToFraction, type PanePixelRect } from '../tier3Access/paneLayout'
-import { PaneHitLayer } from '../tier3Access/PaneHitLayer'
-import { PopupHitLayer } from '../tier3Access/PopupHitLayer'
+import { computeActivePaneRect, pixelRectToFraction, type PanePixelRect } from '../cloudChatAccess/paneLayout'
+import { PaneHitLayer } from '../cloudChatAccess/PaneHitLayer'
+import { PopupHitLayer } from '../cloudChatAccess/PopupHitLayer'
 import {
   PrivacyGuardianModal,
   type ConsentRequestPayload,
   type ElementDecision,
-} from '../tier3Access/PrivacyGuardianModal'
-import { isAllKeptPrivate } from '../tier3Access/consentDecisions'
-import { Tier3Selector } from '../tier3Access/Tier3Selector'
+} from '../cloudChatAccess/PrivacyGuardianModal'
+import { isAllKeptPrivate } from '../cloudChatAccess/consentDecisions'
+import { Tier3Selector } from '../cloudChatAccess/CloudChatSelector'
 import {
   fetchActiveProviders,
   type Provider,
-} from '../tier3Access/cloudChatAccessConfig'
+} from '../cloudChatAccess/cloudChatAccessConfig'
 
 type ReviewOutcome = 'pending' | 'approved' | 'withheld' | 'blocked'
 
@@ -684,7 +684,7 @@ export function Tier3AccessPane({
    *  Originally the mockup's "2nd opinion" chat-toolbar button; as of the
    *  tenth pass ("three bars, one expanded" redesign) it's invoked from
    *  Tier3CollapsedStrip's always-visible bar instead (its 'reviewable'
-   *  empty state, WorkspaceShell.tsx/Tier3CollapsedStrip.tsx) -- same
+   *  empty state, WorkspaceShell.tsx/CloudChatCollapsedStrip.tsx) -- same
    *  handler, new caller, the toolbar button itself is removed as
    *  redundant with that bar.
    *

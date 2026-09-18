@@ -17,7 +17,7 @@
 //
 // Scope: rail row rendering + activation/close callbacks only. Does NOT
 // render the content pane itself, the QR collapse behavior, or own any
-// pane-lifecycle IPC calls -- Tier3AccessPane.tsx owns all three and
+// pane-lifecycle IPC calls -- CloudChatAccessPane.tsx owns all three and
 // passes this component only the read-only state (which providers exist,
 // which are loaded, which is active) and callbacks.
 //

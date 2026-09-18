@@ -2,7 +2,7 @@
 // consentDecisions.test.ts's own convention: run directly on Node's
 // built-in TypeScript support, no framework.
 //
-//   node --experimental-strip-types src/tier3Access/reviewSections.test.ts
+//   node --experimental-strip-types src/cloudChatAccess/reviewSections.test.ts
 import assert from 'node:assert/strict'
 import { groupSpansByTier, type ReviewTierSpan } from './reviewSections.ts'
 

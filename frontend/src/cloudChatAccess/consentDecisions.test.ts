@@ -2,7 +2,7 @@
 // framework exists in this frontend yet, so this runs directly on Node's
 // built-in TypeScript support -- no new dependency for one function:
 //
-//   node --experimental-strip-types src/tier3Access/consentDecisions.test.ts
+//   node --experimental-strip-types src/cloudChatAccess/consentDecisions.test.ts
 //
 // (also wired as `npm test`.) If this grows into a real suite, that's the
 // point to bring in vitest instead of adding more of these by hand.
