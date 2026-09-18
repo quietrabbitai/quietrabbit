@@ -65,10 +65,10 @@ pub struct Persona {
 /// three-Focus seed (research-and-buy, quick-ask, writing-assistant), which
 /// only ever seeded the first-created persona (`ORDER BY created_at LIMIT 1`
 /// -- a dev-only fixture, by its own comment) and provisioned no later
-/// persona. quick-ask is the permanent shared Tier-3 drafting path
+/// persona. quick-ask is the permanent shared Cloud Chat drafting path
 /// (FOCUS_ROADMAP.md, TIER3_ACCESS_MODEL.md), so any persona missing this
 /// row hits a hard AUTHORIZE-equivalent failure the first time it drafts a
-/// Tier-3 chat (commands::consent::request_tier3_gate3_review). Does NOT
+/// Cloud Chat (commands::consent::request_tier3_gate3_review). Does NOT
 /// include role-assessment -- that Focus's shared_001.sql seed already
 /// covers every persona (`FROM personas p`, no LIMIT), so it isn't part of
 /// this gap.

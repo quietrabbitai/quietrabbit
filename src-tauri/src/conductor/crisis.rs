@@ -4,7 +4,7 @@
 // per decisions.id=593 -- not gated to Medical Persona or any Focus.
 //
 // Four-part spec:
-//   1. Detection  -- Tier 1, local-only, always-on, no network call, no
+//   1. Detection  -- qr_local, local-only, always-on, no network call, no
 //      exception. Fires on specificity of imminent risk (expressed intent,
 //      means, or a plan, in the user's own words) -- not on topic or
 //      sentiment alone. Deliberately narrow: ordinary grief, stress, or
@@ -25,7 +25,7 @@
 //   4. Placement  -- named floor entry, applied everywhere unconditionally.
 //      See lifecycle.rs FocusRun.crisis_floor_triggered, checked at every
 //      Phase 4 EXECUTE exit that can leave a run without reaching OUTPUT
-//      (Tier 3 boundary and handle_step_failure(), items.id=297) as well as
+//      (cloud_frontier boundary and handle_step_failure(), items.id=297) as well as
 //      output() itself. Phase 1/2 (LOAD/AUTHORIZE) failure paths are not
 //      covered -- a run that never reaches EXECUTE was never assessed for
 //      crisis_floor_triggered in the first place.
@@ -35,7 +35,7 @@
 // real disclosures phrased in ways the list didn't anticipate -- different
 // wording, indirect language, typos. This is not a defect in the specific
 // list below; it is the cost decisions.id=607 already accepted in exchange
-// for the Tier-1/no-network/no-LLM guarantee that sensitive candor never
+// for the qr_local/no-network/no-LLM guarantee that sensitive candor never
 // leaves the device to be classified. The tests below demonstrate the list
 // behaves as intended on the cases it was built for -- they do not
 // demonstrate completeness.

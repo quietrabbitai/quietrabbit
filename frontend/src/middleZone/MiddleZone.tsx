@@ -2,9 +2,9 @@
 //
 // Traces to: 03_ProjectDocs/Specifications/INFORMATION_ARCHITECTURE_SPEC.md
 // Section 3, adopted 2026-07-27, decisions.id=652-656, items.id=8 (CLOSED).
-// Reused by Tier 3 access per Section 9 (Tier 3 internals deferred,
+// Reused by Cloud Chat access per Section 9 (Cloud Chat internals deferred,
 // items.id=177/199-201, decisions.id=699 -- this component is the shared
-// mechanism both are built on, not Tier 3-specific).
+// mechanism both are built on, not Cloud Chat-specific).
 //
 // Scope of this file: Section 3a (structure), 3b (contextual, not global,
 // left to the caller via contextKey), 3c (three-state ratio profile),

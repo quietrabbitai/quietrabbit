@@ -195,11 +195,11 @@ fn crisis_block_from_result(
 }
 
 /// items.id=317: same Ok(None) gap as crisis_block_from_result above, for the
-/// ordinary (non-crisis) Tier 3 pause -- the assistant placeholder's content
+/// ordinary (non-crisis) cloud_frontier pause -- the assistant placeholder's content
 /// must be backfilled with the draft awaiting Gate3 review, or
 /// request_tier3_gate3_review's content.is_empty() guard fails every time
 /// (consent.rs). RunResult.output_content is only populated by lifecycle.rs
-/// for a Tier 3 boundary pause (status == "awaiting_user"); other paused/failed
+/// for a cloud_frontier boundary pause (status == "awaiting_user"); other paused/failed
 /// statuses leave it None, so this stays a no-op for them.
 fn draft_content_from_result(
     result: &Result<
@@ -362,14 +362,14 @@ pub async fn send_message(
             }
             Ok(None) => {
                 // No saved `outputs` row -- true for every run that paused or
-                // failed before reaching output() (Tier 3, consent gates,
+                // failed before reaching output() (cloud_frontier, consent gates,
                 // Gate3 review, step failure). R1 crisis-handling floor
                 // (items.id=297): if the run was crisis-flagged, persist the
                 // resource block into the placeholder now, so it survives a
                 // reload/reopen even if the live "run-status-update" event
                 // that also carries it was missed by the frontend -- this
                 // takes priority over an ordinary draft backfill below.
-                // items.id=317: otherwise, an ordinary Tier 3 pause backfills
+                // items.id=317: otherwise, an ordinary cloud_frontier pause backfills
                 // the draft awaiting Gate3 review, so
                 // request_tier3_gate3_review's content.is_empty() guard
                 // (consent.rs) doesn't fail on every gate3_track message.
@@ -454,7 +454,7 @@ pub async fn send_message(
 /// #[cfg(debug_assertions)]: compiled only into debug builds -- absent
 /// entirely from a release binary, not just unreachable. See ipc.rs's
 /// specta_builder for the matching debug-only command registration; both
-/// halves must be removed together once items.id=329's Tier 3 pane work no
+/// halves must be removed together once items.id=329's Cloud Chat pane work no
 /// longer needs fast iteration.
 #[cfg(debug_assertions)]
 #[tauri::command]

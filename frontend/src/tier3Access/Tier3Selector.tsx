@@ -1,4 +1,4 @@
-// Tier 2/Tier 3 access -- provider rail.
+// Cloud Chat -- provider rail.
 //
 // Traces to: 03_ProjectDocs/Specifications/TIER3_ACCESS_MODEL.md
 // (tracked_files.id=54), States section 3 ("Rail + content-pane
@@ -90,8 +90,8 @@ export interface Tier3SelectorProps {
   openPaneIds: string[]
   /** The one provider currently shown in the content pane, or null. */
   activeProviderId: string | null
-  /** decisions.id=683: Escalate skips the general Tier 2/Tier 3 choice
-   *  entirely and filters the rail to Tier 3 rows only -- unchanged
+  /** decisions.id=683: Escalate skips the general cloud_anonymous/cloud_frontier choice
+   *  entirely and filters the rail to cloud_frontier rows only -- unchanged
    *  intent from the retired two-box design's bottom-box-only filtering,
    *  new mechanism (a rail filter, not a hidden box). */
   escalateMode?: boolean

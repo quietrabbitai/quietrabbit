@@ -56,8 +56,8 @@
 //   a decision record, unlike the other consent commands in this file.
 //
 // request_tier3_gate3_review / resolve_tier3_gate3_review (items.id=233's
-//   remaining stub): the outbound Privacy Guardian review ahead of Tier 3
-//   access. Unlike every other command in this file, request_tier3_gate3_review
+//   remaining stub): the outbound Privacy Guardian review ahead of
+//   cloud_frontier access. Unlike every other command in this file, request_tier3_gate3_review
 //   *triggers* a gate rather than *responding to* one already fired --
 //   gate3()'s only prior call site was conductor/executor.rs's own
 //   step-execution loop, never exposed over IPC. See each command's own doc
@@ -700,7 +700,7 @@ pub async fn get_pending_cross_persona_confirmations(
 }
 
 /// The focus_id every gate3-reviewed drafted message is generated under.
-/// Tier 3 access has no dedicated Focus of its own -- FOCUS_ROADMAP.md:346
+/// cloud_frontier access has no dedicated Focus of its own -- FOCUS_ROADMAP.md:346
 /// ("Tier 3 -- shared infrastructure, built on-demand, not standalone
 /// Focuses") and TIER3_ACCESS_MODEL.md:413 both confirm the starter-drafting
 /// pre-conversation reuses the same "quick-ask" path Persona hub chat uses.
@@ -718,8 +718,8 @@ const TIER3_DRAFT_FOCUS_ID: &str = "quick-ask";
 /// call site was conductor/executor.rs's own step-execution loop, with no
 /// StepContext/PersonalTrack available here.
 ///
-/// This call site reviews arbitrary message content drafted ahead of Tier 3
-/// access, via any entry path (direct chat, escalation, or a Focus-run
+/// This call site reviews arbitrary message content drafted ahead of
+/// cloud_frontier access, via any entry path (direct chat, escalation, or a Focus-run
 /// handoff) -- it is NOT specific to Quick-Ask-Focus-generated content, and
 /// makes no claim that no personal fields ever flow through it. quick-ask.focus's
 /// step id and display_name are reused below purely as a synthetic label for
@@ -727,7 +727,7 @@ const TIER3_DRAFT_FOCUS_ID: &str = "quick-ask";
 /// content's structure.
 ///
 /// Parameter sourcing:
-///   - target_tier=3: this flow only exists ahead of Tier 3 access.
+///   - target_tier=3: this flow only exists ahead of cloud_frontier access.
 ///   - execution_tier=1, content_sensitivity_severity=1: no PersonalTrack is
 ///     available at this call site to compute a real severity, so this is a
 ///     fixed placeholder, not a real assessment.
@@ -852,7 +852,7 @@ pub async fn request_tier3_gate3_review(
             // target_tier stays legacy-typed, see gate3.rs's own doc
             // comment). 3 == ExternalAccess::Unrestricted-equivalent; this
             // pane's own precondition is "the user is literally about to
-            // access Tier 3" (see this fn's doc comment above).
+            // access cloud_frontier" (see this fn's doc comment above).
             3,
             settings.max_permitted_tier,
             1, // execution_tier
@@ -937,17 +937,17 @@ pub async fn request_tier3_gate3_review(
 /// command does NOT mirror request_tier3_gate3_review's target_tier=3 --
 /// confirmed live (2026-09-04) that reusing 3 unconditionally makes gate3's
 /// own zero_spans_safe_to_auto_approve (destination_risk >= 3 forces High
-/// review regardless of content) fire for every single copy when no Tier 3
-/// provider pane happens to be open, defeating the "silent on a fast,
+/// review regardless of content) fire for every single copy when no Cloud Chat
+/// pane happens to be open, defeating the "silent on a fast,
 /// unflagged pass" UX this whole feature is built around: request_tier3_gate3_review's
 /// target_tier=3 is correct there because that flow's own precondition is
-/// "the user is literally about to access Tier 3" (its own doc comment) -- a
+/// "the user is literally about to access cloud_frontier" (its own doc comment) -- a
 /// native copy gesture on this transcript carries no such precondition; the
-/// destination could just as easily be a text editor as a Tier 3 pane.
+/// destination could just as easily be a text editor as a Cloud Chat pane.
 /// target_tier=1 here means an unknown/no-Tier-3-destination copy is judged
 /// on its own content severity alone (correct, most copies pass silently and
 /// fast), while destination_risk_rating below still reflects any ACTUALLY
-/// active Tier 3 provider's real risk -- so a copy made while a genuinely
+/// active cloud_frontier provider's real risk -- so a copy made while a genuinely
 /// risky destination is open still gets the stricter review, preserving
 /// decisions.id=755's original intent for that real case.
 /// severity_authoritative=false (items.id=458, corrected scope of the

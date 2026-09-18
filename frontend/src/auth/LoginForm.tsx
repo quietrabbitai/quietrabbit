@@ -64,11 +64,11 @@ export function LoginForm({ onLoggedIn }: LoginFormProps) {
   // DIAG_329 (items.id=329): dev-only test scaffolding -- logs straight into
   // the local dev/test account ("jason"/"jason", auto-created by login()'s
   // own bootstrap-on-first-call branch same as any other display name) with
-  // no typing, so Tier 3 pane-testing iterations don't each pay for a manual
+  // no typing, so Cloud Chat pane-testing iterations don't each pay for a manual
   // login. import.meta.env.DEV is Vite's build-time flag (false, and this
   // whole branch dead-code-eliminated, in a production build -- see
   // MiddleZone.tsx:59 for the only other use of this convention in the
-  // codebase). Remove once items.id=329's Tier 3 pane work no longer needs
+  // codebase). Remove once items.id=329's Cloud Chat pane work no longer needs
   // fast iteration.
   const handleDevLogin = () => {
     void performLogin('jason', 'jason')

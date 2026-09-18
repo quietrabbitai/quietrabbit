@@ -16,7 +16,7 @@
 // to cross a tier boundary during a run. This scan fires POST-generation,
 // on finalized output immediately before a write/download/export
 // boundary crossing -- it may run even when no tier promotion is
-// involved at all (e.g. writing a local-only Tier 1 result to disk).
+// involved at all (e.g. writing a local-only qr_local result to disk).
 // Per project_guide: privacy_guardian_scope, "Privacy Guardian is an
 // egress gate, not a retention/curation manager -- fires when content is
 // about to cross a tier boundary, never on data-at-rest" -- write/

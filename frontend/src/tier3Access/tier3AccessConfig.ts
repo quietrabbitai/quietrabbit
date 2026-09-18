@@ -1,4 +1,4 @@
-// Tier 2/Tier 3 access -- rail types and constants.
+// Cloud Chat -- rail types and constants.
 //
 // Traces to: 03_ProjectDocs/Specifications/TIER3_ACCESS_MODEL.md
 // (tracked_files.id=54), decisions.id=680-684 (2026-07-29, Session 2

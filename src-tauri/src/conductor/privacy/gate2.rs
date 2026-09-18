@@ -17,9 +17,10 @@
 //   Using chars().count() is the correct Rust equivalent.
 //
 // Disclosure log written ONLY when flagged=true (mirrors Python).
-// Fatality split (matches gate1): T1 log write failure is non-fatal (swallow,
+// Fatality split (matches gate1): qr_local log write failure is non-fatal (swallow,
 // continue). T2+ log write failure is fatal (halt execution). The split lives
 // here in the gate function, not in the logger implementation.
+// TODO(tier-terminology): needs a combined term for cloud_anonymous+cloud_frontier before this converts
 
 use indexmap::IndexMap;
 
@@ -74,7 +75,8 @@ pub async fn gate2<L: DisclosureLogger>(
     let flagged = !matched.is_empty();
 
     // Disclosure log written only on flagged result.
-    // Fatality split: T1 non-fatal (swallow), T2+ fatal (propagate).
+    // Fatality split: qr_local non-fatal (swallow), T2+ fatal (propagate).
+    // TODO(tier-terminology): needs a combined term for cloud_anonymous+cloud_frontier before this converts
     if flagged {
         let write_result = logger
             .write(DisclosureLogEntry {
@@ -94,9 +96,10 @@ pub async fn gate2<L: DisclosureLogger>(
             .await;
         if let Err(e) = write_result {
             if execution_tier > 1 {
+                // TODO(tier-terminology): needs a combined term for cloud_anonymous+cloud_frontier before this converts
                 return Err(e); // FATAL at tier 2+
             }
-            // Non-fatal at tier 1: swallow, continue.
+            // Non-fatal at qr_local: swallow, continue.
         }
     }
 

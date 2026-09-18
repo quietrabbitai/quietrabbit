@@ -23,7 +23,7 @@ pub struct GenerateOptions {
 ///
 /// `provider_id`/`model_id` carry the fields already resolved by
 /// `StepExecutor::select_model()` (Tier 2: `provider_store::ProviderModel`'s
-/// own columns; Tier 1: `provider_id: None`, `model_id` the bare Ollama tag).
+/// own columns; qr_local: `provider_id: None`, `model_id` the bare Ollama tag).
 /// Nothing downstream may derive one from the other by parsing — see
 /// decisions.id=813.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]

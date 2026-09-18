@@ -1,11 +1,11 @@
-// Tier 3's own collapsed bar -- items.id=384 slice 4, decisions.id=738.
-// Shown in place of the rail+content-pane whenever Tier 3 is NOT the
+// Cloud Chat's own collapsed bar -- items.id=384 slice 4, decisions.id=738.
+// Shown in place of the rail+content-pane whenever Cloud Chat is NOT the
 // expanded region. Per the reference mockup's tier3-floor element:
 // click-to-expand only, NO live entry field -- that's the resolved answer
 // to decisions.id=738's flagged "does Tier 3's side get the same treatment
 // as QR's collapsed floor" question (no, by design: QR's collapsed floor
-// keeps a real entry field because it's QR's OWN conversation; a Tier 3
-// provider's page has no equivalent QR-owned input to keep live).
+// keeps a real entry field because it's QR's OWN conversation; a
+// cloud_frontier provider's page has no equivalent QR-owned input to keep live).
 //
 // Deliberately does NOT show a text snippet of the provider's own last
 // response (unlike the mockup's illustrative "Claude: '...still
@@ -19,7 +19,7 @@
 // was open and no draft had been Gate3-approved yet, and only otherwise
 // showed a generic "second opinion ready" bar with no way to actually
 // START a review. Both gaps close here: this bar is now ALWAYS rendered
-// whenever Tier 3 isn't the expanded region (never null), one row among
+// whenever Cloud Chat isn't the expanded region (never null), one row among
 // the three peer bars (Board / Chat / Second opinion) WorkspaceShell.tsx
 // and Tier3AccessPane.tsx stack together -- Jason's own framing: "a second
 // opinion bar always visible." Tier3AccessPane now derives which of three

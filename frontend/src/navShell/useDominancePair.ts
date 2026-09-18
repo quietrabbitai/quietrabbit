@@ -1,4 +1,4 @@
-// The QR Chat <-> Tier 3 dominance pair's state and activate/close/reclaim
+// The QR Chat <-> Cloud Chat dominance pair's state and activate/close/reclaim
 // actions -- items.id=384 slice 4 (decisions.id=735). Extracted from
 // Tier3AccessPane.tsx's own local useState so the pair survives
 // Tier3AccessPane unmounting: WorkspaceShell.tsx (slice 3) unmounts it
@@ -82,7 +82,7 @@ export interface DominancePairHandle {
    *  without closing anything -- same behavior as the pre-extraction
    *  handleExpandQR. */
   reclaimChat: () => void
-  /** Makes Tier 3 dominant without activating any specific provider --
+  /** Makes Cloud Chat dominant without activating any specific provider --
    *  the "Gate3 just approved a draft" trigger. A no-op (same object
    *  reference, no re-render) if already dominant, so Tier3AccessPane's
    *  effect can call this every time reviewOutcome is 'approved' without

@@ -1,4 +1,4 @@
-// Tier 2/Tier 3 access -- rail + content-pane hosting (items.id=359,
+// Cloud Chat -- rail + content-pane hosting (items.id=359,
 // replacing the former two-box selector + fixed-split-column model,
 // items.id=3/202/223's original harness-derived layout). items.id=384
 // slice 4 (decisions.id=735) generalized the collapse mechanic into a
@@ -20,9 +20,9 @@
 // response in the collapsed floor, not a placeholder.
 //
 // decisions.id=735/738 (items.id=384 slice 4): the pair is now
-// symmetric. When Tier 3 is the expanded region (dominant === 'tier3' and
+// symmetric. When Cloud Chat is the expanded region (dominant === 'tier3' and
 // Board isn't expanded either), the layout is the rail+content-pane, QR
-// collapsed to its own row above it. Whenever Tier 3 is NOT the expanded
+// collapsed to its own row above it. Whenever Cloud Chat is NOT the expanded
 // region -- Chat dominant, or Board expanded (floor) -- the rail+
 // content-pane is replaced by Tier3CollapsedStrip, an always-present
 // click-to-expand bar (items.id=391 tenth pass: never hidden outright any
@@ -34,7 +34,7 @@
 // live). Gate3 review UI (PrivacyGuardianModal and the blocked/withheld/
 // ceiling-raise messaging) is rendered OUTSIDE this dominant-conditional
 // -- deliberately: a draft can enter Gate3 review from a full-screen
-// Chat send regardless of whether Tier 3 currently has any pane loaded,
+// Chat send regardless of whether Cloud Chat currently has any pane loaded,
 // so that UI must stay visible no matter which side is dominant. It was
 // previously nested inside the rail column, which happened to always be
 // visible pre-merge (the rail+content-pane never used to be hidden) --
@@ -112,14 +112,14 @@ export interface Tier3AccessPaneProps {
   pair: DominancePairState
   onUpdatePair: (updater: (prev: DominancePairState) => DominancePairState) => void
   /** items.id=391 (tenth pass), generalized by items.id=404: true whenever
-   *  neither Chat nor Tier3 is the outer 5-rail dock's dominant rail
+   *  neither Chat nor Cloud Chat is the outer 5-rail dock's dominant rail
    *  (WorkspaceShell's `dominantRail !== 'chat' && dominantRail !== 'tier3'`
    *  -- Board, Library, or History being dominant all set this now, not
    *  just Board as pre-404). Collapses QR to a one-row floor (ChatPane's
    *  own collapsed strip: mark + last-message snippet + a real, focusable
    *  entry bar, matching the mockup's chat-floor) instead of unmounting
    *  it. No CEF-lifecycle reason to unmount: the concern was always about
-   *  Tier 3's own open panes, and Board/Library/History becoming dominant
+   *  Cloud Chat's own open panes, and Board/Library/History becoming dominant
    *  already forces dominantRail away from 'tier3' first (each of their
    *  own dock-bar click handlers sets dominantRail directly, never
    *  through pair.dominant), so there's never an open pane actively
@@ -139,8 +139,8 @@ export interface Tier3AccessPaneProps {
    *  be a no-op. */
   onFloorExpand?: () => void
   /** items.id=404: fires whenever an action INSIDE this component means
-   *  "make Chat or Tier3 the outer 5-rail dock's dominant rail" --
-   *  Tier3CollapsedStrip's own expand, the Tier3 content-head's "back to
+   *  "make Chat or Cloud Chat the outer 5-rail dock's dominant rail" --
+   *  Tier3CollapsedStrip's own expand, the Cloud Chat content-head's "back to
    *  chat" click, and ChatPane's own non-floor collapsed-strip click (the
    *  dominant === 'tier3' case). See WorkspaceShell.tsx's own header
    *  comment for why this is a set of direct calls at those specific
@@ -257,7 +257,7 @@ export function Tier3AccessPane({
     content: string
   } | null>(null)
 
-  // items.id=404: the three internal actions that mean "make Tier3/Chat
+  // items.id=404: the three internal actions that mean "make Cloud Chat/Chat
   // the outer dock's dominant rail" -- see this component's own
   // onDominantRailChange doc comment and WorkspaceShell.tsx's header
   // comment for why these are direct wraps, not a generic effect.
@@ -373,7 +373,7 @@ export function Tier3AccessPane({
   // items.id=384 slice 4: the bridge between Gate3 review and dominance.
   // Pre-merge, the rail was simply always visible once reviewOutcome
   // reached 'approved' -- there was no separate "dominant" concept to
-  // update. Post-merge, Tier3 must actually BECOME dominant at that same
+  // update. Post-merge, Cloud Chat must actually BECOME dominant at that same
   // moment (see useDominancePair.ts's own header comment for why
   // markTier3Ready is a distinct trigger from activate/reclaimChat, and
   // why dominant is no longer purely derived from activeProviderId).
@@ -451,11 +451,11 @@ export function Tier3AccessPane({
     const body = contentBodyRef.current
     if (!body) {
       // BUG FOUND + FIXED (2026-09-02, live-verification pass): reclaiming
-      // Chat (or otherwise leaving Tier3 dominant) unmounts .content-body
+      // Chat (or otherwise leaving Cloud Chat dominant) unmounts .content-body
       // -- syncPaneLayout itself never runs in that case (this early
       // return used to skip even calling it), so nothing ever told Rust
       // the active pane's rect was gone. Confirmed live (Jason): the
-      // Tier3 pane visually stayed on screen after reclaiming ("not
+      // Cloud Chat pane visually stayed on screen after reclaiming ("not
       // closing"), even though reclaimChat's own setActivePane(null) call
       // already fires was_hidden(true) CEF-side -- that alone was never
       // enough. This mirrors exactly what the mount/unmount effect
@@ -503,11 +503,11 @@ export function Tier3AccessPane({
   }, [])
 
   // items.id=384 slice 4: this component can now unmount for a reason
-  // that ISN'T "the user left Tier 3 entirely" -- WorkspaceShell.tsx
+  // that ISN'T "the user left Cloud Chat entirely" -- WorkspaceShell.tsx
   // unmounts it whenever Board is 'full' (a real unmount, not
   // CSS-hiding, per that file's own doc on why). Pre-slice-4, unmounting
   // always meant "gone for good in practice" (no other way back short of
-  // re-selecting the Persona and reopening Tier 3), so closing every open
+  // re-selecting the Persona and reopening Cloud Chat), so closing every open
   // pane on unmount was correct. Now, with the pair's own state persisted
   // in NavState.workspace.pair, an unmount here can be purely cosmetic --
   // the user may toggle straight back to 'compact'/'minimized' a moment
@@ -696,7 +696,7 @@ export function Tier3AccessPane({
    *  button exists for (a message approved before an earlier trip to
    *  Board). Branches on the message's own gate3_review_status instead
    *  (VALID_GATE3_REVIEW_STATUS, message_store.rs): 'approved' just needs
-   *  Tier 3 dominant again, no new review request; 'withheld' was an
+   *  Cloud Chat dominant again, no new review request; 'withheld' was an
    *  explicit privacy choice, not something to silently retry -- surfaces
    *  the same "kept private" banner a real withheld outcome shows;
    *  anything else (drafted, or a client-side "blocked" outcome, which
@@ -1152,7 +1152,7 @@ export function Tier3AccessPane({
       {/* items.id=391 (tenth pass): this is the SECOND of the three peer
           bars/regions (Board's own bar/region lives in WorkspaceShell.tsx,
           above this component; QR's row is above, within .qr). Exactly
-          one of the three is ever the fully-expanded region -- Tier3 gets
+          one of the three is ever the fully-expanded region -- Cloud Chat gets
           the rail+content-pane split ONLY while it's the expanded one
           (!floor && dominant === 'tier3'); every other combination
           (floor, or dominant === 'chat') renders Tier3CollapsedStrip
@@ -1160,7 +1160,7 @@ export function Tier3AccessPane({
           "a second opinion bar always visible." No redundant "back to
           Board" button here any more either -- WorkspaceShell's own
           board-bar already covers that whenever Board isn't expanded,
-          which is exactly whenever Tier3 CAN be the expanded region. */}
+          which is exactly whenever Cloud Chat CAN be the expanded region. */}
       {!floor && dominant === 'tier3' ? (
         <>
           {/* items.id=391 (eleventh pass): promoted out of the rail
@@ -1171,7 +1171,7 @@ export function Tier3AccessPane({
               full-width header bar no matter how it was styled; this bar
               is the SAME .section-header class QR's own header uses
               (NavShell.css), just title-only -- no controls, unlike QR's
-              (History/persona picker have no Tier3 equivalent). */}
+              (History/persona picker have no Cloud Chat equivalent). */}
           <div className="tier3-access-pane__section-header">
             <span className="tier3-access-pane__section-header-name">
               {t('navShell.tier3AccessPane.heading')}
@@ -1231,7 +1231,7 @@ export function Tier3AccessPane({
               // .content-body's bounding rect (that element's own doc
               // comment), so a click handler there would fight the real
               // page's own interactivity -- every click meant for the
-              // external provider's page would also collapse Tier 3.
+              // external provider's page would also collapse Cloud Chat.
               // The head is plain DOM chrome, nothing composited over it,
               // so it's a safe, always-available "back to chat" target.
               // This does NOT touch boardSize -- reclaimChat only ever

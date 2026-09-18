@@ -126,7 +126,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         // Group 12 -- System
         commands::system::get_health,
         commands::system::get_capability_profile,
-        // Group 13 -- Tier 2/Tier 3 pane lifecycle & provider catalog
+        // Group 13 -- Cloud Chat pane lifecycle & provider catalog
         // (items.id=202 piece 5 / items.id=223, 2026-08-04)
         commands::tier3_pane::list_active_providers,
         commands::tier3_pane::open_tier3_panes,
@@ -251,7 +251,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         // Group 12 -- System
         commands::system::get_health,
         commands::system::get_capability_profile,
-        // Group 13 -- Tier 2/Tier 3 pane lifecycle & provider catalog
+        // Group 13 -- Cloud Chat pane lifecycle & provider catalog
         // (items.id=202 piece 5 / items.id=223, 2026-08-04)
         commands::tier3_pane::list_active_providers,
         commands::tier3_pane::open_tier3_panes,

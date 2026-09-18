@@ -33,9 +33,9 @@ use crate::persistence::personal_store;
 pub struct PersonalFieldInfo {
     pub field_name: String,
     pub sensitivity: String,
-    /// Abstracted display value for Tier 2 routing contexts.
+    /// Abstracted display value for cloud_anonymous routing contexts.
     pub abstraction_tier2: String,
-    /// Abstracted display value for Tier 3 routing contexts.
+    /// Abstracted display value for cloud_frontier routing contexts.
     pub abstraction_tier3: String,
 }
 

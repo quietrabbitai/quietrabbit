@@ -233,7 +233,7 @@ pub struct Provider {
     /// Deliberately its own column, not folded into documentation_gate's
     /// freeform display JSON -- see shared_012.sql's header for why.
     pub risk_rating: u8,
-    /// Tier 1/1.5 rows only. Min RAM/VRAM class, expected tokens/sec on a
+    /// qr_local/qr_hosted rows only. Min RAM/VRAM class, expected tokens/sec on a
     /// reference hardware class -- objectively measurable, so JSON is an
     /// acceptable escape hatch here unlike the flag columns above.
     pub hardware_requirement: Option<serde_json::Value>,
@@ -559,7 +559,7 @@ pub async fn list_active_providers(
 /// items.id=430/432: active providers of a given `provider_type` --
 /// the flag-based replacement for hardcoded provider-name arrays
 /// (commands/system.rs's retired TIER2_PROVIDERS const, conductor/
-/// lifecycle.rs's Tier-1.5 candidate set). `provider_type` is a decided,
+/// lifecycle.rs's qr_hosted candidate set). `provider_type` is a decided,
 /// open-vocabulary column (Part 2), not a tier label -- filtering on it is
 /// exactly the flag-based eligibility this table exists to provide (core
 /// rule 2), not a reintroduction of the old hardcoding problem.
@@ -1105,7 +1105,7 @@ mod tests {
 
     /// items.id=430/432: list_providers_by_type is the flag-based
     /// replacement for a hardcoded ["mistral", "groq"] array -- must return
-    /// exactly the seeded Tier 1.5 set and nothing else (Duck.ai/Claude/
+    /// exactly the seeded qr_hosted set and nothing else (Duck.ai/Claude/
     /// ChatGPT/Gemini are a different provider_type).
     #[tokio::test]
     async fn list_providers_by_type_returns_only_matching_active_providers() {

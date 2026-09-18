@@ -4,8 +4,8 @@
 // list_chats, archive_chat.
 //
 // items.id=384 slice 6 (decisions.id=739/740): backs the persona-scoped
-// chat-history list/switcher UI (slice 7) that ChatPane.tsx's Tier3
-// Access / merged-workspace usage gets, per the reference mockup's
+// chat-history list/switcher UI (slice 7) that ChatPane.tsx's Cloud Chat
+// / merged-workspace usage gets, per the reference mockup's
 // chat-history icon. Backed by persistence/chat_store.rs, itself living
 // in the same messages.db message_store.rs already owns.
 //

@@ -1,6 +1,6 @@
 // src-tauri/src/commands/tier3_pane.rs
 //
-// Group 13 -- Tier 2/Tier 3 pane lifecycle & provider catalog.
+// Group 13 -- Cloud Chat pane lifecycle & provider catalog.
 // Commands: list_active_providers, open_tier3_panes, close_tier3_pane,
 // set_pane_layout, forward_pane_mouse_click, forward_pane_mouse_move,
 // forward_pane_mouse_wheel, forward_popup_mouse_click,
@@ -527,11 +527,11 @@ async fn persist_cookies_from_jar(
 /// for that function's other caller (focus_provider_criteria_store's
 /// eligible_providers_for_focus, which deliberately wants the full active
 /// pool including cloud_inference_api rows), but wrong here. This screen is
-/// the Tier 2/Tier 3 pane selector specifically, so it must only surface
+/// the Cloud Chat pane selector specifically, so it must only surface
 /// the two provider_type shapes lane_str() knows how to label
 /// ('split_screen_web' -> tier2, 'external_service' -> tier3) -- filtered
 /// out here rather than in the shared store function, so cloud_inference_api
-/// (Tier 1.5: groq/mistral) and local_model rows never reach this list.
+/// (qr_hosted: groq/mistral) and local_model rows never reach this list.
 #[tauri::command]
 #[specta::specta]
 pub async fn list_active_providers(

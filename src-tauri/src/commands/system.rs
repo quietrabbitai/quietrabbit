@@ -40,10 +40,10 @@ pub struct HealthResponse {
     /// Set during app setup by OllamaSidecar::ensure_available().
     /// "unavailable" is returned during the brief startup detection window.
     pub ollama_source: String,
-    /// True iff an active user-global key exists for ANY Tier 1.5 provider
+    /// True iff an active user-global key exists for ANY qr_hosted provider
     /// (providers.provider_type='cloud_inference_api' -- items.id=430; was a
     /// hardcoded ["mistral","groq"] array before this) -- a capability-status
-    /// signal ("is Tier 1.5 usable at all," e.g. for an onboarding nudge),
+    /// signal ("is qr_hosted usable at all," e.g. for an onboarding nudge),
     /// not a report of which provider is active. Provider *selection* at
     /// execution time is a separate concern, wired through
     /// user_provider_preference_store::resolve_preference() (items.id=432) --
@@ -88,11 +88,11 @@ pub async fn get_health(
 
 /// False (not an error) with no resident session -- see HealthResponse's
 /// own doc comment on why get_health must stay usable pre-login. True as
-/// soon as ANY Tier 1.5 provider has an active user-global key;
+/// soon as ANY qr_hosted provider has an active user-global key;
 /// short-circuits on the first hit rather than checking every candidate
 /// unconditionally. items.id=430: the candidate set is read from
 /// providers.provider_type='cloud_inference_api' instead of a hardcoded
-/// ["mistral","groq"] array, so a future Tier 1.5 provider is picked up
+/// ["mistral","groq"] array, so a future qr_hosted provider is picked up
 /// automatically once curated into the providers table.
 async fn tier2_is_configured(
     pool: &sqlx::SqlitePool,
@@ -190,7 +190,7 @@ mod tests {
         crate::persistence::migrations::migrate_keys_db(user_id, &key_hex(master_key))
             .await
             .expect("integration_keys.db migration must succeed in test setup");
-        // items.id=430: tier2_is_configured() now reads the Tier 1.5
+        // items.id=430: tier2_is_configured() now reads the qr_hosted
         // candidate set from providers (shared.db) instead of a hardcoded
         // array -- shared.db must be migrated too so list_providers_by_type
         // finds the seeded groq/mistral rows.

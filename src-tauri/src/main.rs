@@ -624,7 +624,7 @@ async fn async_main() {
     // sync_tx/sync_rx) or the freeze-bug heartbeat below it. Zero panes
     // exist yet -- installing the host creates nothing but the GLArea
     // widget itself; panes are created on demand via
-    // pane_host::dispatch(PaneCommand::Open) in response to a real Tier 2/3
+    // pane_host::dispatch(PaneCommand::Open) in response to a real Cloud Chat
     // selection (commands::tier3_pane).
     //
     // FOUND THE HARD WAY (2026-08-07, manual verification): installing
@@ -694,7 +694,7 @@ async fn async_main() {
             // GTK's own main loop -- not a workaround for a blind spot,
             // just the normal way to drive a periodic redraw. Gated on
             // open_pane_count > 0 for the same on-demand-cost reason as
-            // before (items.id=223): a user who never opens Tier 2/3 pays
+            // before (items.id=223): a user who never opens Cloud Chat pays
             // nothing here. 16ms matches the old cadence (~60fps) and
             // CEF's own windowless_frame_rate: 60 (pane_host.rs).
             let diag_tick = std::cell::Cell::new(0u64);

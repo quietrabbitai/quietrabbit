@@ -85,7 +85,8 @@ pub async fn gate1<L: DisclosureLogger>(
         .collect();
 
     // Write disclosure log BEFORE returning result (write-before-send invariant).
-    // Fatality split applied here: tier 1 swallows, tier 2+ propagates.
+    // Fatality split applied here: qr_local swallows, tier 2+ propagates.
+    // TODO(tier-terminology): needs a combined term for cloud_anonymous+cloud_frontier before this converts
     let log_id = {
         let result = logger
             .write(DisclosureLogEntry {
@@ -108,9 +109,10 @@ pub async fn gate1<L: DisclosureLogger>(
             Ok(id) => id,
             Err(e) => {
                 if execution_tier > 1 {
+                    // TODO(tier-terminology): needs a combined term for cloud_anonymous+cloud_frontier before this converts
                     return Err(e); // FATAL at tier 2+
                 }
-                // Non-fatal at tier 1: swallow, use empty sentinel.
+                // Non-fatal at qr_local: swallow, use empty sentinel.
                 String::new()
             }
         }

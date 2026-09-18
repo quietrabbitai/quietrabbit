@@ -34,8 +34,8 @@ export interface ChatPaneProps {
    *  the existing entry bar below (kept mounted and focusable either
    *  way) -- instead of the full transcript. Driven by the caller
    *  (Tier3AccessPane), never by this component's own state: this
-   *  component owns message data, not the layout decision of whether a
-   *  Tier 3 provider currently has focus. Omitted/false renders exactly
+   *  component owns message data, not the layout decision of whether
+   *  Cloud Chat currently has focus. Omitted/false renders exactly
    *  as before this prop existed. */
   collapsed?: boolean
   /** Fires when the collapsed strip is clicked, or its entry input
@@ -87,7 +87,7 @@ interface RunStatusPayload {
   /** R1 crisis-handling floor (items.id=297): mirrors RunResult's field of
    *  the same name (conductor/lifecycle.rs). Some(...) only on the same
    *  "failed"/"awaiting_user" emit that accompanies a crisis-flagged run's
-   *  Tier 3 pause or step failure -- mutually exclusive with step_content in
+   *  cloud_frontier pause or step failure -- mutually exclusive with step_content in
    *  practice. */
   crisis_resource_block: string | null
   /** Cross-Persona entity_facts omitted from this run's context
@@ -116,7 +116,7 @@ interface OmittedCrossPersonaFact {
  *  send_message's background backfill task even starts -- so no status on
  *  that event can be trusted to mean "list_messages will now show real
  *  content." This event is emitted unconditionally, once, only after that
- *  backfill attempt (success, crisis block, Tier 3/gate3 draft, or genuinely
+ *  backfill attempt (success, crisis block, cloud_frontier/gate3 draft, or genuinely
  *  nothing to backfill) has finished. */
 interface MessageContentReadyPayload {
   focus_run_id: string
@@ -807,7 +807,7 @@ export function ChatPane({
   // items.id=391 (Jason, 2026-09-02): the transcript never auto-scrolled
   // to the newest message at all -- confirmed as the actual blocker
   // behind "click 2nd opinion, forget to copy the QR chat message, quickly
-  // click QR chat to copy it and go back to the Tier 3 screen": the
+  // click QR chat to copy it and go back to the Cloud Chat screen": the
   // approved starter message (this transcript's own copy affordance,
   // above) is always the LATEST message when it exists, but reclaiming
   // Chat re-expands the transcript wherever it happened to be scrolled --
@@ -844,7 +844,7 @@ export function ChatPane({
           <span className="chat-pane__collapsed-mark" aria-hidden="true" />
           {/* items.id=391 (eleventh pass): confirmed live (Jason) -- "on
               the second opinion screen, there is no qr chat bar." Board's
-              and Tier3's own collapsed bars both lead with a name
+              and Cloud Chat's own collapsed bars both lead with a name
               (tier3-collapsed-strip__name -- "Active Board", "Second
               opinion ready"/a provider name); this row led with the
               snippet instead, with nothing identifying it as QR's own bar

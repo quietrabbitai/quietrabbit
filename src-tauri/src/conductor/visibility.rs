@@ -51,7 +51,9 @@ pub enum SurfaceClass {
     /// hide_from_shared_surfaces does not apply here. redact_identification
     /// still applies at export/Tier 2/3 boundaries reached from a Direct
     /// surface. Type policy suppression does not apply.
+    // TODO(tier-terminology): needs a combined term for cloud_anonymous+cloud_frontier before this converts
     Direct,
+    // TODO(tier-terminology): needs a combined term for cloud_anonymous+cloud_frontier before this converts
     /// Export, print, Tier 2/3 context assembly. Both flags apply at
     /// maximum strength. Invariant: no Focus declaration, type policy,
     /// surface override, user preference, or escape valve changes Boundary
@@ -227,6 +229,7 @@ pub fn evaluate_object_visibility<T: VisibilityFlags>(
             // passing Boundary when a Direct-surface action itself crosses
             // into export/Tier 2/3 -- this function only sees the
             // classification it is given.
+            // TODO(tier-terminology): needs a combined term for cloud_anonymous+cloud_frontier before this converts
             if redact {
                 VisibilityDecision::Redacted
             } else {

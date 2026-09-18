@@ -288,7 +288,7 @@ pub async fn resolve_preference(
 }
 
 /// items.id=432: picks the Preferred provider across several candidates
-/// (e.g. the Tier 1.5 set -- resolve_preference() itself only answers "what
+/// (e.g. the qr_hosted set -- resolve_preference() itself only answers "what
 /// is the preference for this ONE provider_id," but lifecycle.rs needs to
 /// choose BETWEEN groq and mistral, not resolve one named provider).
 /// Resolves each candidate independently at the given scope and returns the

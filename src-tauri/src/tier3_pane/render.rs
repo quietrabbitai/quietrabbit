@@ -182,7 +182,7 @@ impl RenderState {
         // GTK/glycin's unrelated EGL calls too, which is the confirmed source of the
         // constant `[ERROR wgpu_hal::gles::egl] EGL 'eglSwapInterval' ...
         // EGL_BAD_SURFACE` log spam (verified live: bursts occurred during glycin
-        // icon loading with zero Tier 3 panes open, so unrelated to this instance's
+        // icon loading with zero Cloud Chat panes open, so unrelated to this instance's
         // own render path). This `instance` is only ever used for
         // `create_adapter_from_hal` below -- the real adapter/device are hand-wired
         // from GTK's external GL context via `Adapter::new_external`/`open_device`
@@ -337,7 +337,7 @@ impl RenderState {
     /// app's `GtkGLArea` (GTK3, this Wayland/GLES setup) renders into its
     /// OWN internal FBO (confirmed live: framebuffer 3, never 0). Every
     /// pane composite was silently drawn into FBO 0, which nothing ever
-    /// presented -- Tier 3 panes have never been visible as a result. Fixed
+    /// presented -- Cloud Chat panes have never been visible as a result. Fixed
     /// by wrapping `target_fbo` directly via wgpu-hal's
     /// `TextureInner::ExternalNativeFramebuffer` (built for exactly this:
     /// "Useful when the framebuffer to draw to has a non-zero framebuffer
@@ -889,7 +889,7 @@ pub struct LogicalSize {
 //
 // Scope: `window.open()`-style new-browser-window popups only (CEF
 // `LifeSpanHandler::on_before_popup`, see `PaneLifeSpanHandler::on_before_popup`
-// below) -- used for OAuth provider logins launched from an open Tier 3
+// below) -- used for OAuth provider logins launched from an open Cloud Chat
 // pane. NOT `<select>` dropdowns/autofill/context menus: those are a
 // structurally different, same-browser CEF mechanism
 // (`RenderHandler::on_popup_show`/`on_popup_size` + `PaintElementType::Popup`

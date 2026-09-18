@@ -2185,11 +2185,11 @@ fn fix_webview_click_handlers(webview_widget: &gtk::Widget) {
         use webkit2gtk::{ContextMenuExt, HitTestResultExt, WebViewExt};
 
         // items.id=379 follow-up: custom right-click menu for the main
-        // chat UI -- mirrors the Tier 3 pane behavior (Copy when
+        // chat UI -- mirrors the Cloud Chat pane behavior (Copy when
         // selected, Cut/Paste/Select-All when editable) by trimming
         // WebKit's own already-correctly-positioned/dismissed
         // `ContextMenu` in place, rather than reimplementing any of
-        // that. Unlike the Tier 3 CEF case (items.id=379's own
+        // that. Unlike the Cloud Chat CEF case (items.id=379's own
         // `run_context_menu`), this is a real windowed webview
         // receiving a real triggering `gdk::Event` synchronously, on
         // this same GTK main thread -- none of that item's async/OSR
@@ -2291,7 +2291,7 @@ fn build_overlay_and_glarea(webview_widget: gtk::Widget) -> (gtk::Overlay, gtk::
     // timeout below, gated on open_pane_count > 0) -- not on every GTK
     // frame-clock tick regardless of whether any pane is open. Matches
     // items.id=223's on-demand-cost discipline: a user who never opens
-    // Tier 2/3 should not pay for a continuously re-rendering GLArea.
+    // Cloud Chat should not pay for a continuously re-rendering GLArea.
     glarea.set_auto_render(false);
 
     overlay.add_overlay(&glarea);

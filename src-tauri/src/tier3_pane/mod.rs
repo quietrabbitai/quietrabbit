@@ -1,4 +1,4 @@
-//! Tier 2/Tier 3 external session embedding -- CEF off-screen rendering.
+//! Cloud Chat external session embedding -- CEF off-screen rendering.
 //!
 //! Traces to: items.id=3 (Frontend SPA build), States 4-5 (split screen /
 //! pane compaction) in 03_ProjectDocs/Specifications/TIER3_ACCESS_MODEL.md.

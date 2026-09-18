@@ -573,9 +573,9 @@ mod tests {
         outcome.expect("no-row assertions must pass");
     }
 
-    /// No Tier 1 (is_local=1) provider rows exist yet (greenfield) -- this
+    /// No qr_local (is_local=1) provider rows exist yet (greenfield) -- this
     /// currently, correctly, yields zero eligible providers. Not a bug in
-    /// this table; the same reason the spec itself calls Tier 1 metadata
+    /// this table; the same reason the spec itself calls qr_local metadata
     /// "genuinely greenfield."
     #[tokio::test]
     async fn eligible_providers_for_focus_local_only_currently_empty() {
@@ -616,7 +616,7 @@ mod tests {
             // data by default -- no longer just duckai, as it was when this
             // test was first written against groq's pre-curation placeholder
             // seed. shared_018.sql -- items.id=347/486-adjacent provider
-            // catalog work -- added groqchat, Groq's own Tier 3 web-chat row,
+            // catalog work -- added groqchat, Groq's own cloud_frontier web-chat row,
             // reusing the same items.id=440 no-training finding since it's
             // the same real-world entity/policy, not a new curation).
             // deny=[duckai] excludes it anyway despite passing the

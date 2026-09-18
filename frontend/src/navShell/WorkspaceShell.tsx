@@ -1,28 +1,28 @@
-// The 5-rail navigation dock -- Board / Chat / Tier 3 / Library / History,
+// The 5-rail navigation dock -- Board / Chat / Cloud Chat / Library / History,
 // exactly one dominant (fills the majority of the screen) at a time.
 // items.id=404, generalizing items.id=391's "three peer bars, exactly one
 // expanded" model (decisions.id=747) from 3 rails to 5. Full design:
 // 03_ProjectDocs/Specifications/HIERARCHICAL_NAV_SHELL_DESIGN_20260902.md.
 //
-// The fixed vertical order (Board / Chat+Tier3 / Library / History, top to
-// bottom) mirrors the old file's Board/Chat/Tier3 order, with Library and
+// The fixed vertical order (Board / Chat+Cloud Chat / Library / History, top to
+// bottom) mirrors the old file's Board/Chat/Cloud Chat order, with Library and
 // History appended below. Exactly one region is "dominant" (gets the big
 // remaining space) at a time -- the rest render as compact bars, reusing
 // `.tier3-collapsed-strip` verbatim (Tier3CollapsedStrip.css) the same way
 // Board's own bar already did pre-404, so all four non-dominant bars read
 // as the same kind of row.
 //
-// Chat and Tier3 are NOT two separate top-level regions in this file's own
+// Chat and Cloud Chat are NOT two separate top-level regions in this file's own
 // JSX -- they stay nested inside one Tier3AccessPane mount, exactly as
 // pre-404 (never unmounted, see that component's own header comment on
 // why). What changes is what drives their split:
 //   - `floor` (Chat's own passive-but-functional compact form) generalizes
 //     from "true only while Board is expanded" to "true whenever neither
-//     Chat nor Tier3 is the outer-dominant rail" -- Library or History
+//     Chat nor Cloud Chat is the outer-dominant rail" -- Library or History
 //     being dominant now ALSO floors Chat, which pre-404 was impossible
 //     (there was no Library/History rail to be dominant instead).
-//   - Tier3's own compact form needed ZERO changes: Tier3CollapsedStrip
-//     already rendered unconditionally whenever Tier3 wasn't the expanded
+//   - Cloud Chat's own compact form needed ZERO changes: Tier3CollapsedStrip
+//     already rendered unconditionally whenever Cloud Chat wasn't the expanded
 //     region, regardless of floor -- that already IS the "plain inert
 //     dock bar" the design doc asks for, just previously only reachable
 //     via the Board/pair split.
@@ -40,7 +40,7 @@
 // dominant -- confirmed by tracing the click through by hand):
 //   1. Tier3AccessPane calls the new `onDominantRailChange` prop directly,
 //      at the exact handful of ITS OWN internal call sites where a user
-//      action genuinely means "make Chat/Tier3 the outer-dominant rail"
+//      action genuinely means "make Chat/Cloud Chat the outer-dominant rail"
 //      (Tier3CollapsedStrip's expand, the content-head's reclaim click,
 //      ChatPane's own non-floor collapsed-strip click) -- see that file's
 //      own header comment for the full list. Board's bar (below, this
@@ -50,7 +50,7 @@
 //      `dominantRail` IS 'chat' or 'tier3' but `pair.dominant` disagrees,
 //      force `pair.dominant` to match. This is real, load-bearing
 //      correctness, not just tidiness -- it's what stops a stale
-//      pair.dominant='tier3' from silently showing Tier3's rail+content
+//      pair.dominant='tier3' from silently showing Cloud Chat's rail+content
 //      instead of Chat right after an EXTERNAL jump into Chat (History's
 //      "Chat" row-action, or Chat's own floor-click), neither of which
 //      goes through Tier3AccessPane's own wrapped call sites.

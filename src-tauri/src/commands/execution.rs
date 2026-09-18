@@ -334,7 +334,7 @@ pub async fn resume_run(
                 .to_string());
         }
 
-        // Tier 3 boundary (lifecycle.rs execute(), routing_tier == 3) or a
+        // cloud_frontier boundary (lifecycle.rs execute(), routing_tier == 3) or a
         // consent-gate pause (handle_step_failure()'s AwaitUser/HoldForGate/
         // OfferTier2/OfferCompact/AwaitFloorConsent/AwaitConsent actions).
         // consent.rs's own module header ("lifecycle checks consent_decisions

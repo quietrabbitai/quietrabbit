@@ -1,15 +1,18 @@
 //! Provider-local error type for Tier 2+ HTTP client errors.
+//! TODO(tier-terminology): needs a combined term for cloud_anonymous+cloud_frontier before this converts
 //!
 //! `ProviderError` carries provider-specific diagnostic fields (provider name,
 //! HTTP status codes) until the subsystem boundary, then converts to
-//! `ConductorError` via `From`. Ollama (Tier 1) maps directly to
+//! `ConductorError` via `From`. Ollama (qr_local) maps directly to
 //! `ConductorError` at call sites — this enum covers Tier 2+ only.
+//! TODO(tier-terminology): needs a combined term for cloud_anonymous+cloud_frontier before this converts
 
 use thiserror::Error;
 
 use crate::conductor::failure::ConductorError;
 
 /// Tier 2+ provider errors with full diagnostic context.
+/// TODO(tier-terminology): needs a combined term for cloud_anonymous+cloud_frontier before this converts
 ///
 /// Each variant carries `plain_language` — the user-facing message composed
 /// at the raising site, following the Python oracle pattern where call sites

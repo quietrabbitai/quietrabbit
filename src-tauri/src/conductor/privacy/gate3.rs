@@ -1091,9 +1091,9 @@ mod tests {
 
     #[test]
     fn low_destination_risk_does_not_force_high() {
-        // items.id=406 (decisions.id=753): a Low-rated destination (e.g. an
-        // anonymous Tier 2 provider) must not force High the way the old
-        // hardcoded target_tier>=3 assumption did for every Tier 3 provider
+        // items.id=406 (decisions.id=753): a Low-rated destination (e.g. a
+        // cloud_anonymous provider) must not force High the way the old
+        // hardcoded target_tier>=3 assumption did for every cloud_frontier provider
         // regardless of its actual posture.
         let e = entity(0.95, "private_email");
         assert!(matches!(

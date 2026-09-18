@@ -10,7 +10,7 @@
 // Phase 3 INITIALIZE: build + seal PersonalTrack; assemble TaskTrack + SharedStateTrack;
 //                     construct PrivacyGateway; assemble persona context (async);
 //                     promote focus_run to running
-// Phase 4 EXECUTE:    step loop — Tier 3 steps are terminal boundaries;
+// Phase 4 EXECUTE:    step loop — cloud_frontier steps are terminal boundaries;
 //                     current_step: usize is an explicit field (not an implicit counter)
 // Phase 5 OUTPUT:     save output to outputs.db; purge snapshots; write run_history
 // Phase 6 FEEDBACK:   out of scope for this module (async paste-back)
@@ -573,7 +573,7 @@ pub struct RunResult {
     pub failure: Option<FailureResult>,
     /// R1 crisis-handling floor (decisions.id=607, items.id=265, items.id=297):
     /// Some(crisis::resource_block()) iff crisis_floor_triggered was set on
-    /// this run, at every construction site reachable from EXECUTE (Tier 3
+    /// this run, at every construction site reachable from EXECUTE (cloud_frontier
     /// boundary, handle_step_failure(), output()). Phase 1/2 (LOAD/AUTHORIZE)
     /// failure paths deliberately do not populate this — see crisis.rs module
     /// doc for the scope boundary.
@@ -612,7 +612,7 @@ pub struct RunStatusPayload {
     /// the frontend can show the block the moment a run pauses/fails, without
     /// waiting on the awaited IPC call that never actually carries RunResult
     /// back to the UI on any current call path (see lifecycle.rs's
-    /// handle_step_failure() and the Tier 3 boundary in execute()). Some(...)
+    /// handle_step_failure() and the cloud_frontier boundary in execute()). Some(...)
     /// only on the same emit call as a "failed"/"awaiting_user" transition
     /// for a crisis-flagged run; None otherwise.
     pub crisis_resource_block: Option<String>,
@@ -814,14 +814,14 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
 
     /// step_content: the just-completed step's real generated content
     /// (TaskStep.content, via task_track.last_output()). Passed by the
-    /// step-completion call site in execute(), and by the Tier 3 boundary
+    /// step-completion call site in execute(), and by the cloud_frontier boundary
     /// pause (items.id=317 -- the last completed step's output is the draft
     /// awaiting Gate3 review); every other caller (including plain
     /// emit_status above) passes None.
     ///
     /// crisis_resource_block: R1 crisis-handling floor (items.id=297). Some(...)
     /// only on the same "failed"/"awaiting_user" emit that accompanies a
-    /// crisis-flagged run's Tier 3 pause or handle_step_failure() exit — see
+    /// crisis-flagged run's cloud_frontier pause or handle_step_failure() exit — see
     /// RunStatusPayload's own field doc for why this travels over the push
     /// event rather than relying solely on RunResult.
     fn emit_status_with_content(
@@ -1439,7 +1439,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
     // Phase 4 — EXECUTE
     // =========================================================================
 
-    /// Run the step loop. Returns Some(RunResult) on early exit (Tier 3 boundary
+    /// Run the step loop. Returns Some(RunResult) on early exit (cloud_frontier boundary
     /// or step failure), None when all steps complete normally -> proceed to output().
     /// Python oracle: FocusRun.execute()
     pub async fn execute(&mut self) -> Result<Option<RunResult>, LifecycleError> {
@@ -1498,7 +1498,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                     }
                 }
                 self.write_focus_run_record_logged("awaiting_user").await;
-                // R1 crisis-handling floor (items.id=297): Tier 3 is a pause
+                // R1 crisis-handling floor (items.id=297): cloud_frontier is a pause
                 // before OUTPUT, so without this the crisis-flagged run's
                 // resource block would never surface -- see crisis.rs module
                 // doc for the scope boundary this closes.
@@ -1770,7 +1770,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
     ) -> Result<RunResult, LifecycleError> {
         // R1 crisis-handling floor (items.id=297): every exit this function
         // can take (Stop/failed, and AwaitUser/HoldForGate/OfferTier2/
-        // OfferCompact/AwaitFloorConsent/AwaitConsent -- Tier 3, consent
+        // OfferCompact/AwaitFloorConsent/AwaitConsent -- cloud_frontier, consent
         // gates, and Gate3-hold all funnel through here) is a pause/failure
         // before OUTPUT, so without this the crisis-flagged run's resource
         // block would never surface -- see crisis.rs module doc.
@@ -1929,9 +1929,9 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         // (never replace) the model's real response with the static local
         // resource block. This is the run's success-path content-finalization
         // point, reached identically regardless of Persona/Focus/tier -- see
-        // crisis.rs module doc for the full reasoning. Tier 3 pauses and step
+        // crisis.rs module doc for the full reasoning. cloud_frontier pauses and step
         // failures don't reach here at all (they return early from execute());
-        // items.id=297 covers those via the Tier 3 boundary and
+        // items.id=297 covers those via the cloud_frontier boundary and
         // handle_step_failure() instead, each with its own identical check.
         let crisis_resource_block = if self.crisis_floor_triggered {
             Some(crate::conductor::crisis::resource_block())
@@ -2386,7 +2386,7 @@ mod tests {
     /// test fixtures that never exercise a DB-touching method
     /// (get_focus_tier_ceiling/authorize, or execute()'s tier>=1 model
     /// selection) -- every fixture below stops well short of those paths
-    /// (pure in-memory methods, or execute() on a pre-sealed Tier 3 run,
+    /// (pure in-memory methods, or execute() on a pre-sealed cloud_frontier run,
     /// which is a terminal boundary that returns before StepExecutor is
     /// ever reached). connect_lazy_with never opens a real connection until
     /// something is actually acquired against it, so this is safe to
@@ -3158,7 +3158,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // R1 crisis-handling floor -- Tier 3 boundary and handle_step_failure()
+    // R1 crisis-handling floor -- cloud_frontier boundary and handle_step_failure()
     // (items.id=297). Both are Phase 4 EXECUTE exits that leave a run
     // without ever reaching output() (the pre-existing, already-tested-by-
     // hand crisis-append point), so RunResult.crisis_resource_block must be
@@ -3189,8 +3189,8 @@ mod tests {
         result
     }
 
-    /// A FocusDefinition with a single Tier 3 step -- enough for execute()'s
-    /// loop to hit the Tier 3 boundary on its very first iteration, before
+    /// A FocusDefinition with a single cloud_frontier step -- enough for execute()'s
+    /// loop to hit the cloud_frontier boundary on its very first iteration, before
     /// execute_step() (and everything it would otherwise require) ever runs.
     fn single_tier3_step_focus_def() -> FocusDefinition {
         let mut steps_map = IndexMap::new();
@@ -3296,7 +3296,7 @@ mod tests {
         .await;
     }
 
-    /// items.id=317: the Tier 3 pause must carry the prior step's real
+    /// items.id=317: the cloud_frontier pause must carry the prior step's real
     /// output as RunResult.output_content -- this is the only place the
     /// draft awaiting Gate3 review (consent.rs::request_tier3_gate3_review)
     /// ever gets captured, since execute() returns before reaching output()
@@ -3328,7 +3328,7 @@ mod tests {
     }
 
     /// Symmetric to the above: with no prior step (single_tier3_step_focus_def's
-    /// Tier 3 step is the very first step), task_track.last_output() is
+    /// cloud_frontier step is the very first step), task_track.last_output() is
     /// legitimately None -- output_content must stay None too, not panic or
     /// substitute a placeholder.
     #[tokio::test]
@@ -3350,7 +3350,7 @@ mod tests {
     }
 
     /// Minimal FocusRun for handle_step_failure() directly -- unlike the
-    /// Tier 3 boundary, handle_step_failure() takes its FailureResult as a
+    /// cloud_frontier boundary, handle_step_failure() takes its FailureResult as a
     /// plain parameter rather than deriving it from self.failure_handler /
     /// self.privacy_gateway / a real step, so it needs none of those: just
     /// focus_run_id + key_hex (write_focus_run_record() panics without

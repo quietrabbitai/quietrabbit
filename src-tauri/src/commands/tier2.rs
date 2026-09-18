@@ -23,7 +23,7 @@
 // decision outside this item's scope -- flagged in this session's handoff.
 //
 // key_type is hardcoded to "tier2" in both commands -- this module's only
-// concern is Tier 2 provider configuration (Groq, Mistral); Tier 3 and
+// concern is Tier 2 provider configuration (Groq, Mistral); cloud_frontier and
 // future non-AI integrations use the same table via a different key_type,
 // through their own future command modules.
 //
@@ -145,7 +145,7 @@ pub async fn set_tier2_provider(
 /// instead of the legacy users.tier2_provider_preference column (dropped by
 /// items.id=433 -- this command wrote it as a dual-write in the interim, now
 /// removed along with the column). Selecting a provider marks its
-/// account-wide row Preferred and downgrades any OTHER Tier 1.5 candidate's
+/// account-wide row Preferred and downgrades any OTHER qr_hosted candidate's
 /// account-wide row that was previously Preferred to Allowed, preserving
 /// find_preferred_provider()'s "at most one Preferred" assumption. Clearing
 /// (`provider: None`) downgrades any currently-Preferred candidate the same

@@ -12,9 +12,9 @@
 // all; Persona selection happens inside the History rail's row-stack, not
 // via a separate button cluster.
 //
-// items.id=404: the 3-peer accordion (Board/Chat/Tier3, decisions.id=747's
+// items.id=404: the 3-peer accordion (Board/Chat/Cloud Chat, decisions.id=747's
 // "three peer bars, exactly one expanded") generalizes to 5 peer rails
-// (Board/Chat/Tier3/Library/History) under ONE dominance field --
+// (Board/Chat/Cloud Chat/Library/History) under ONE dominance field --
 // `dominantRail` below -- replacing the old two-axis
 // boardSize/pair.dominant split. See WorkspaceShell.tsx's own header
 // comment for the full mechanics (in particular the two-way sync between
@@ -47,9 +47,9 @@
  *  of decisions.id=747's three-peer-bar model. */
 export type DockRailId = 'board' | 'chat' | 'tier3' | 'library' | 'history'
 
-/** decisions.id=735: the QR Chat <-> Tier 3 dominance pair. Which side
+/** decisions.id=735: the QR Chat <-> Cloud Chat dominance pair. Which side
  *  fills the main slot (when the pair itself is dominant -- see
- *  WorkspaceShell.tsx's sync effects), and Tier 3's own rail/pane
+ *  WorkspaceShell.tsx's sync effects), and Cloud Chat's own rail/pane
  *  bookkeeping -- lifted here (rather than left local to Tier3AccessPane's
  *  component state) so it survives navigating to Board/Library/History and
  *  back. Live as of slice 4 -- read/written via useDominancePair.ts, the

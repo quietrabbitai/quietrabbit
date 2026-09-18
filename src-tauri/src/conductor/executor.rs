@@ -8,7 +8,7 @@
 // Step sequence (Architecture Section 6.3):
 //   Floor invariants  — explicit Err(ConductorError), not assert! (D6-348)
 //   Step 3  — tier ceiling gate
-//   Step 4  — Tier 3 handled by lifecycle; never reaches executor
+//   Step 4  — cloud_frontier handled by lifecycle; never reaches executor
 //   Steps 6-7 — PG_GATE_1 (field approval + abstraction)
 //   Field projection — step-scope boundary
 //   Floor Consent Gate — await_floor_consent or floor_consent_auto event
@@ -28,7 +28,7 @@
 //     char-level implementations with semantically identical behaviour to the Python
 //     oracle's re.compile() patterns.
 //   - scan_voice_profile() is async and returns Result<HashMap, ConductorError>
-//     rather than raising. Tier 1: Ok(cleaned), contaminated attrs stripped.
+//     rather than raising. qr_local: Ok(cleaned), contaminated attrs stripped.
 //     Tier 2+: Err(ConductorError::VoiceProfileContamination) on first hit.
 //   - VP contamination audit uses privacy_gateway.logger.write() directly;
 //     PrivacyGateway has no record_voice_profile_contamination() method.
@@ -169,7 +169,7 @@ fn tier2_provider_registry() -> &'static HashMap<&'static str, &'static dyn Tier
 ///
 /// tier2_provider_preference: resolved by lifecycle (items.id=251, repointed
 ///   items.id=432) via user_provider_preference_store::resolve_preference()'s
-///   Focus -> Persona -> account precedence across the Tier 1.5 candidate
+///   Focus -> Persona -> account precedence across the qr_hosted candidate
 ///   set (providers.provider_type='cloud_inference_api', items.id=430) --
 ///   not the legacy users.tier2_provider_preference column. Only populated
 ///   when execution_tier >= 2.
@@ -400,7 +400,7 @@ impl StepExecutor {
             }
         }
 
-        // -- Step 4 — Tier 3 boundary handled by lifecycle; executor never reached --
+        // -- Step 4 — cloud_frontier boundary handled by lifecycle; executor never reached --
 
         // -- Step 4.5 — Tier 2 provider preference gate (F10) --
         // No prescribed default (architecture: "User choice at install. No
@@ -708,7 +708,7 @@ impl StepExecutor {
 
         // -- Step 12 — update TaskTrack --
         // D4-040: content = model output ONLY — never prompt-expanded input.
-        // step_sensitivity: from projected fields (Tier 2) or template token scan (Tier 1).
+        // step_sensitivity: from projected fields (Tier 2) or template token scan (qr_local).
         let step_sensitivity =
             compute_step_sensitivity(ctx, personal_track, &projected_fields, execution_tier);
 
@@ -833,7 +833,7 @@ fn render_template(
     result.trim().to_owned()
 }
 
-/// Tier 1 prompt render. Never reads disclosure buffer.
+/// qr_local prompt render. Never reads disclosure buffer.
 /// Token merge order: output_vars -> SYSTEM_TOKENS.
 /// Python oracle: StepExecutor._render_prompt()
 fn render_prompt(
@@ -904,7 +904,7 @@ fn render_prompt_with_disclosure(
 ///   2. email_pattern — '@' present with non-empty parts and '.' after '@'.
 ///   3. digit_dense — 7+ consecutive ASCII digits.
 ///
-/// Tier 1: contaminated attrs stripped and logged; execution continues. Ok(cleaned).
+/// qr_local: contaminated attrs stripped and logged; execution continues. Ok(cleaned).
 /// Tier 2+: Err(ConductorError::VoiceProfileContamination) on first contamination.
 ///   Audit event written before returning Err.
 ///
@@ -986,7 +986,7 @@ async fn scan_voice_profile<L: DisclosureLogger>(
                         .to_owned(),
                 });
             }
-            // Tier 1: strip attr, continue scanning remaining attrs.
+            // qr_local: strip attr, continue scanning remaining attrs.
         } else {
             cleaned.insert(attr.to_string(), value);
         }
@@ -1002,7 +1002,7 @@ async fn scan_voice_profile<L: DisclosureLogger>(
 /// Resolved model selection, carrying `provider_store::ProviderModel`'s own
 /// `provider_id`/`model_id` columns directly (decisions.id=813 — an id is an
 /// opaque key, never parsed to recover data the table already holds).
-/// `provider_id` is `None` exactly at Tier 1 (Ollama has no `provider_models`
+/// `provider_id` is `None` exactly at qr_local (Ollama has no `provider_models`
 /// row to resolve against yet); `Some(id)` at Tier 2, from the row's own
 /// `provider_id` column. Not `specta::Type` — internal to the executor, never
 /// crosses IPC.
@@ -1086,9 +1086,9 @@ async fn select_model(
 /// scope, chat_session_handoffs.id=316): at Tier 2 (`provider_id: Some(_)`),
 /// checks provider_models by its real `provider_id`/`model_id` columns
 /// (never a reconstructed composite id -- decisions.id=813) before falling
-/// back to the 3-entry hardcoded map. At Tier 1 (`provider_id: None`) the
+/// back to the 3-entry hardcoded map. At qr_local (`provider_id: None`) the
 /// catalog is skipped entirely -- Ollama ids have no providers row to hang a
-/// catalog entry off yet (Ollama-as-Tier1 wiring is a separate, larger,
+/// catalog entry off yet (Ollama-as-qr_local wiring is a separate, larger,
 /// out-of-scope initiative). Not a full close of B4.
 async fn get_context_window(
     pool: &sqlx::SqlitePool,
@@ -1146,11 +1146,11 @@ fn build_options(
 // ---------------------------------------------------------------------------
 
 /// Derive step sensitivity severity from projected fields (Tier 2) or
-/// template token scan (Tier 1).
+/// template token scan (qr_local).
 ///
 /// Tier 2: max sensitivity_severity across fields actually referenced in
 ///   projected_fields that are present in personal_track.
-/// Tier 1: max sensitivity_severity across personal_track fields whose
+/// qr_local: max sensitivity_severity across personal_track fields whose
 ///   field_name appears as a {token} in the prompt template.
 /// Default: 1 (general) when no personal fields involved.
 ///
@@ -1622,7 +1622,7 @@ mod tests {
         result
     }
 
-    /// Tier 1 never touches provider_store -- an in-memory, unmigrated pool
+    /// qr_local never touches provider_store -- an in-memory, unmigrated pool
     /// is fine here (never acquired against).
     fn dummy_pool() -> sqlx::SqlitePool {
         sqlx::SqlitePool::connect_lazy_with(
@@ -1632,7 +1632,7 @@ mod tests {
 
     #[tokio::test]
     async fn select_model_tier1_code() {
-        // Tier 1 never touches provider_store -- no DB setup needed.
+        // qr_local never touches provider_store -- no DB setup needed.
         let selected = select_model(&dummy_pool(), "code", 1, None).await.unwrap();
         assert_eq!(selected.provider_id, None);
         assert_eq!(selected.model_id, "qwen2.5:7b");

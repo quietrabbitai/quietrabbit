@@ -1,8 +1,8 @@
-//! Ollama Tier 1 HTTP client.
+//! Ollama qr_local HTTP client.
 //!
-//! Ollama is Tier 1 — it does NOT implement [`Tier2Provider`].
+//! Ollama is qr_local — it does NOT implement [`Tier2Provider`].
 //! Errors map directly to [`ConductorError`] at every raise site.
-//! No [`ProviderError`] intermediary — Tier 1 maps directly.
+//! No [`ProviderError`] intermediary — qr_local maps directly.
 //!
 //! `stream` is always `false` in Release 1 — resolved by `StepExecutor`.
 //!
@@ -69,7 +69,7 @@ fn context_hard_limit() -> f64 {
 // Client
 // ---------------------------------------------------------------------------
 
-/// Ollama Tier 1 HTTP client.
+/// Ollama qr_local HTTP client.
 ///
 /// Holds three `reqwest::Client` instances with different timeouts:
 /// - `client` (120s): inference calls (`/api/generate`, `/api/chat`).
@@ -166,13 +166,13 @@ impl OllamaClient {
     // Single-turn generation
     // -----------------------------------------------------------------------
 
-    /// Primary Tier 1 inference call.
+    /// Primary qr_local inference call.
     ///
     /// Latency is always tracked — never hardcoded to 0.
     /// `stream` is always `false` in Release 1 (resolved by `StepExecutor`).
     ///
     /// When `request.options` is `None`, all four fields fall back to
-    /// the sane Tier 1 defaults. This matches the Python oracle's explicit
+    /// the sane qr_local defaults. This matches the Python oracle's explicit
     /// fallback construction in `generate()`.
     ///
     /// Errors map directly to [`ConductorError`] — no `ProviderError` boundary.

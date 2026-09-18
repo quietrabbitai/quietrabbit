@@ -1,9 +1,10 @@
 // src-tauri/src/conductor/privacy/logger.rs
 //
 // DisclosureLogger trait + NoopLogger + TestLogger + FailLogger.
-// The fatality split (non-fatal at tier 1, fatal at tier 2+) lives in the
+// The fatality split (non-fatal at qr_local, fatal at tier 2+) lives in the
 // gate functions, not here. This trait always returns a Result — gates decide
 // whether to propagate or swallow based on execution_tier.
+// TODO(tier-terminology): needs a combined term for cloud_anonymous+cloud_frontier before this converts
 
 use async_trait::async_trait;
 use indexmap::IndexMap;
@@ -40,7 +41,8 @@ pub struct DisclosureLogEntry {
 pub trait DisclosureLogger: Send + Sync {
     /// Write a disclosure log entry. Returns the log entry id on success.
     /// Always returns a Result — gate functions decide fatality based on
-    /// execution_tier (non-fatal at tier 1, fatal at tier 2+).
+    /// execution_tier (non-fatal at qr_local, fatal at tier 2+).
+    /// TODO(tier-terminology): needs a combined term for cloud_anonymous+cloud_frontier before this converts
     async fn write(&self, entry: DisclosureLogEntry) -> Result<String, DisclosureLogWriteError>;
 }
 
@@ -118,8 +120,9 @@ impl DisclosureLoggerForRun for TestLogger {
 // -- FailLogger ---------------------------------------------------------------
 // Used by golden-vector tests for disclosure-log failure path verification.
 // Always returns Err. Gates apply fatality split based on execution_tier:
-//   tier 1 -> non-fatal (gate swallows error, returns empty log id)
+//   qr_local -> non-fatal (gate swallows error, returns empty log id)
 //   tier 2+ -> fatal (gate propagates DisclosureLogWriteError, run halts)
+// TODO(tier-terminology): needs a combined term for cloud_anonymous+cloud_frontier before this converts
 pub struct FailLogger;
 
 #[async_trait]
