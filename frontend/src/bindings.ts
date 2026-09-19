@@ -816,12 +816,17 @@ export type CreatePersonaResponse = {
  *  (focus_settings.privacy_tier, items.id=444 — untouched by this enum).
  * 
  *  Declaration order IS the ordering derive(Ord) uses — local_only is the
- *  tightest, unrestricted the loosest. anonymous_preferred is new: it never
- *  existed as a tier number (Part 6b), so from_legacy_tier() can never
- *  produce it — only a Focus/step authored directly against this enum can.
+ *  tightest, unrestricted the loosest. anonymous_preferred means either an
+ *  anonymous or a full-account provider is usable, anonymous preferred when
+ *  there's a real choice among eligible providers (Jason, 2026-09-19) — a
+ *  genuine 4th level, not a hypothetical.
  * 
- *  Style mirrors NamedPolicy (persistence/focus_provider_criteria_store.rs):
- *  as_str()/from_str()-shaped helpers, snake_case serde.
+ *  items.id=529: storage is this enum's own string form end to end
+ *  (shared_020.sql: TEXT CHECK (col IN ('local_only', 'anonymous_required',
+ *  'anonymous_preferred', 'unrestricted'))) — no numeric legacy-tier
+ *  round-trip. Style mirrors NamedPolicy (persistence/
+ *  focus_provider_criteria_store.rs): as_str() plus a real FromStr impl,
+ *  snake_case serde matching as_str()/FromStr exactly.
  */
 export type ExternalAccess = "local_only" | "anonymous_required" | "anonymous_preferred" | "unrestricted";
 

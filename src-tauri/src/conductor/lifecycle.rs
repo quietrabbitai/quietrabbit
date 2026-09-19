@@ -275,6 +275,54 @@ fn parse_offset(raw: &str) -> Result<Duration, String> {
     }
 }
 
+/// Converts a .focus YAML file's raw routing_tier/max_routing_tier number
+/// (1, 2, or 3) to ExternalAccess. items.id=529: the only remaining
+/// numeric-literal -> ExternalAccess conversion in the codebase, since
+/// storage is string-native now (ExternalAccess::from_str()) -- this one
+/// exists solely because the .focus YAML authoring surface itself still
+/// uses the raw number (no YAML field-name/format change in this item's
+/// scope; AnonymousPreferred has no YAML-authorable form yet). Panics on an
+/// out-of-range value exactly as the retired ExternalAccess::from_legacy_tier()
+/// did -- .focus files are shipped/curated content, not user input.
+fn external_access_from_routing_tier_yaml(raw: u8) -> ExternalAccess {
+    match raw {
+        1 => ExternalAccess::LocalOnly,
+        2 => ExternalAccess::AnonymousRequired,
+        3 => ExternalAccess::Unrestricted,
+        other => unreachable!(
+            "routing_tier/max_routing_tier value {other} is not 1, 2, or 3 -- \
+             .focus YAML authoring does not yet support AnonymousPreferred \
+             (items.id=529 scope item 4, unresolved)"
+        ),
+    }
+}
+
+/// Bridges an ExternalAccess value down to the numeric execution_tier axis
+/// (StepContext.execution_tier: u8 and its downstream consumers --
+/// executor.rs, gate1.rs/gate2.rs, abstraction.rs, MemoryBroker::
+/// assemble_context(), scan_output()). items.id=529 deliberately left that
+/// axis's own >1/>=2/==1/==2 magnitude checks as raw-integer comparisons
+/// (items.id=528 Job 2 #2 territory, sequenced after this item) -- this is
+/// NOT a legacy-storage round-trip (that concept is retired entirely; see
+/// ExternalAccess's own doc comment), just the numeric side of a still-
+/// numeric axis that this item's Axis-1 ceiling calc must keep feeding.
+///
+/// AnonymousPreferred -> 2: every current consumer only tests the
+/// LocalOnly/not-LocalOnly boundary (>1, >=2, ==1) or the exact-1 case --
+/// none distinguishes 2 from 3 today, so this choice is behaviorally inert
+/// for all of them. 2 (not 3) because AnonymousPreferred's *legacy-era*
+/// analog was "anonymous is available" (the Tier-1.5-equivalent case this
+/// enum exists to express), even though its actual provider eligibility
+/// (any provider, anonymous or full-account) matches Unrestricted's.
+fn execution_tier_ordinal(access: ExternalAccess) -> u8 {
+    match access {
+        ExternalAccess::LocalOnly => 1,
+        ExternalAccess::AnonymousRequired => 2,
+        ExternalAccess::AnonymousPreferred => 2,
+        ExternalAccess::Unrestricted => 3,
+    }
+}
+
 /// Convert RawFocusFile -> FocusDefinition.
 /// Replaces Python's hand-written _parse_focus_definition() with serde_yaml.
 /// Applies the same shims: guide_id inheritance, output_types->output_type,
@@ -386,10 +434,11 @@ fn parse_focus_definition(raw: RawFocusFile) -> Result<FocusDefinition, Lifecycl
             // (inherits the Focus's), matching Part 6d exactly.
             let raw_routing_tier = raw_step.routing_tier.unwrap_or(1);
             let requires_user_handoff = raw_routing_tier == 3;
+            let routing_tier = external_access_from_routing_tier_yaml(raw_routing_tier);
             let external_access_override = if requires_user_handoff {
                 None
             } else {
-                Some(ExternalAccess::from_legacy_tier(raw_routing_tier))
+                Some(routing_tier)
             };
 
             steps.push(StepDefinition {
@@ -399,7 +448,7 @@ fn parse_focus_definition(raw: RawFocusFile) -> Result<FocusDefinition, Lifecycl
                     .guide_id
                     .unwrap_or_else(|| default_guide_id.clone()),
                 task_type: raw_step.task_type.unwrap_or_else(|| "general".to_owned()),
-                routing_tier: raw_routing_tier,
+                routing_tier,
                 step_type,
                 output_var: raw_step.output_var,
                 prompt_template: raw_step.prompt_template.unwrap_or_default(),
@@ -411,19 +460,22 @@ fn parse_focus_definition(raw: RawFocusFile) -> Result<FocusDefinition, Lifecycl
         }
     }
 
-    let max_routing_tier = raw.max_routing_tier.unwrap_or(1);
+    let max_routing_tier =
+        external_access_from_routing_tier_yaml(raw.max_routing_tier.unwrap_or(1));
 
     Ok(FocusDefinition {
         display_name: raw.display_name.unwrap_or_else(|| focus_id.clone()),
         description: raw.description.unwrap_or_default(),
-        max_routing_tier,
-        // items.id=439 (Part 6, Jason's three-way-fold resolution): a
-        // second structural ceiling, .focus-authored like
-        // step.external_access_override, folded into FocusRun's
+        // items.id=439 (Part 6, Jason's three-way-fold resolution): the
+        // Focus-author structural ceiling, folded into FocusRun's
         // _focus_external_access alongside focus_settings.max_permitted_tier
-        // -- see authorize() below. Derived from the same YAML key as
-        // max_routing_tier; no separate YAML field.
-        max_external_access: ExternalAccess::from_legacy_tier(max_routing_tier),
+        // -- see authorize() below. items.id=529: this field used to be a
+        // raw u8 with a separate max_external_access: ExternalAccess field
+        // derived from it at parse time (a typed shadow, needed only
+        // because this field itself had to stay numeric for the
+        // execution_tier calc); now that the field is ExternalAccess
+        // natively, that shadow field was a pure duplicate and was removed.
+        max_routing_tier,
         multi_source_validation: raw.multi_source_validation.unwrap_or(false),
         focus_id,
         version,
@@ -515,12 +567,13 @@ pub struct FocusDefinition {
     pub display_name: String,
     pub description: String,
     pub version: String,
-    pub max_routing_tier: u8,
-    /// items.id=439 (Part 6, Jason's three-way-fold resolution): derived
-    /// from max_routing_tier at parse time. See FocusRun's
+    /// items.id=439 (Part 6, Jason's three-way-fold resolution): the
+    /// Focus-author structural ceiling. See FocusRun's
     /// _focus_external_access field for how it combines with
-    /// focus_settings.max_permitted_tier.
-    pub max_external_access: ExternalAccess,
+    /// focus_settings.max_permitted_tier. items.id=529: retyped from a raw
+    /// u8 to ExternalAccess directly (removing the separate
+    /// max_external_access shadow field this used to require).
+    pub max_routing_tier: ExternalAccess,
     pub steps: Vec<StepDefinition>,
     pub output_type: String,
     pub suggest_in_focuses: Vec<String>,
@@ -717,11 +770,17 @@ pub struct FocusRun<L: DisclosureLoggerForRun = SqliteDisclosureLogger> {
     pub privacy_gateway: Option<PrivacyGateway<L>>,
 
     // Tier configuration (set at AUTHORIZE, used throughout EXECUTE)
-    _focus_max_permitted_tier: u8,
+    /// items.id=529: retyped from u8 to ExternalAccess directly (focus_settings
+    /// storage is string-native now; see get_focus_tier_ceiling()). Still
+    /// bridged to a raw u8 for the numeric execution_tier axis's own
+    /// downstream consumers (MemoryBroker::assemble_context(), scan_output())
+    /// via execution_tier_ordinal() -- that separate axis is out of this
+    /// item's scope (items.id=528 territory).
+    _focus_max_permitted_tier: ExternalAccess,
     _focus_privacy_tier: u8,
     /// items.id=439: the Focus-level external_access ceiling, excluding any
-    /// step's own override -- min(from_legacy_tier(_focus_max_permitted_tier),
-    /// focus_def.max_external_access). Set at AUTHORIZE (Jason's
+    /// step's own override -- min(_focus_max_permitted_tier,
+    /// focus_def.max_routing_tier). Set at AUTHORIZE (Jason's
     /// three-way-fold resolution; see plan doc), used by authorize()'s
     /// per-step tighten-only check, FailureHandler::new(), and threaded into
     /// every StepContext as focus_external_access.
@@ -788,7 +847,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             shared_state: None,
             failure_handler: None,
             privacy_gateway: None,
-            _focus_max_permitted_tier: 1,
+            _focus_max_permitted_tier: ExternalAccess::LocalOnly,
             _focus_privacy_tier: 1,
             _focus_external_access: ExternalAccess::LocalOnly,
             _output_id: None,
@@ -895,10 +954,9 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         // items.id=439 (Part 6, Jason's three-way-fold resolution): the
         // Focus-level ceiling excluding any step's own override -- folds the
         // user preference (focus_settings.max_permitted_tier) together with
-        // the Focus-author structural ceiling (focus_def.max_external_access)
+        // the Focus-author structural ceiling (focus_def.max_routing_tier)
         // without collapsing either into a single legacy number.
-        self._focus_external_access =
-            ExternalAccess::from_legacy_tier(max_permitted).min(focus_def.max_external_access);
+        self._focus_external_access = max_permitted.min(focus_def.max_routing_tier);
 
         for step in &focus_def.steps {
             if let Some(override_) = step.external_access_override {
@@ -922,7 +980,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
     /// Read (max_permitted_tier, privacy_tier) from focus_settings.
     /// Asserts focus_settings row exists — missing row is a hard error (D6-303).
     /// Python oracle: FocusRun._get_focus_tier_ceiling()
-    async fn get_focus_tier_ceiling(&self) -> Result<(u8, u8), LifecycleError> {
+    async fn get_focus_tier_ceiling(&self) -> Result<(ExternalAccess, u8), LifecycleError> {
         use crate::persistence::focus_settings_store::get_focus_settings;
         use crate::persistence::persona_store::get_persona_for_user;
 
@@ -947,22 +1005,16 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                 ))
             })?;
 
-        Ok((
-            // items.id=448 retyped FocusSettings.max_permitted_tier from i32
-            // to ExternalAccess. The numeric execution_tier ceiling calc in
-            // this file (u8::min() against focus_def.max_routing_tier /
-            // step.routing_tier) is a deliberately separate axis, out of
-            // that item's scope -- as_legacy_tier() round-trips it back to
-            // the legacy 1/2/3 value this function has always returned.
-            // Safe specifically because shared_001.sql's schema CHECK
-            // (max_permitted_tier BETWEEN 1 AND 3) guarantees the DB value
-            // this was read from can only ever be 1, 2, or 3 -- so
-            // from_legacy_tier() (in row_to_focus_settings) could never have
-            // produced AnonymousPreferred here, the one variant
-            // as_legacy_tier() cannot round-trip losslessly.
-            settings.max_permitted_tier.as_legacy_tier(),
-            settings.privacy_tier as u8,
-        ))
+        // items.id=448 retyped FocusSettings.max_permitted_tier from i32 to
+        // ExternalAccess. items.id=529: storage itself is string-native now
+        // (shared_020.sql), so this returns the enum directly -- no more
+        // legacy round-trip, and AnonymousPreferred is a real, storable
+        // value here for the first time. The numeric execution_tier
+        // ceiling calc in this file (execute_step()'s Axis-1) is a
+        // deliberately separate axis, bridged via ExternalAccess::min() +
+        // execution_tier_ordinal(), out of this item's scope to unify
+        // further (items.id=528 territory).
+        Ok((settings.max_permitted_tier, settings.privacy_tier as u8))
     }
 
     /// Write or update the focus_run record in outputs.db.
@@ -1083,7 +1135,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                 &self.focus_id,
                 self.topic_id.as_deref(),
                 key_hex,
-                self._focus_max_permitted_tier as i32,
+                execution_tier_ordinal(self._focus_max_permitted_tier) as i32,
                 model_context_window,
                 self.is_quick_ask,
                 None, // tier_a_ceiling — use QR_TIER_A_TOKEN_CEILING env default
@@ -1591,13 +1643,20 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         step: &StepDefinition,
         step_index: usize,
     ) -> Result<Option<FailureResult>, LifecycleError> {
-        // Axis 1: execution_tier — min(focus_max_permitted, focus_max_routing, step.routing_tier)
+        // Axis 1: execution_tier — min(focus_max_permitted, focus_max_routing, step.routing_tier).
+        // items.id=529: computed via ExternalAccess::min() (correct regardless
+        // of any numbering) rather than raw u8::min() (which depended on the
+        // legacy numbers' ordering matching ExternalAccess's real ordering —
+        // a dependency that would have made AnonymousPreferred unsafe to
+        // store numerically; see shared_020.sql's header comment). Bridged
+        // back to u8 via execution_tier_ordinal() for this axis's own
+        // downstream consumers, left untouched (items.id=528 territory).
         let execution_tier = {
             let fd = self.focus_def.as_ref().unwrap();
-            u8::min(
-                u8::min(self._focus_max_permitted_tier, fd.max_routing_tier),
+            execution_tier_ordinal(ExternalAccess::min(
+                ExternalAccess::min(self._focus_max_permitted_tier, fd.max_routing_tier),
                 step.routing_tier,
-            )
+            ))
         };
 
         // Axis 2 input: this step's actual effective access, folding in its own
@@ -1633,10 +1692,10 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             let fd = self.focus_def.as_ref().unwrap();
             if step_index + 1 < fd.steps.len() {
                 let next = &fd.steps[step_index + 1];
-                Some(u8::min(
-                    u8::min(self._focus_max_permitted_tier, fd.max_routing_tier),
+                Some(execution_tier_ordinal(ExternalAccess::min(
+                    ExternalAccess::min(self._focus_max_permitted_tier, fd.max_routing_tier),
                     next.routing_tier,
-                ))
+                )))
             } else {
                 None
             }
@@ -1964,7 +2023,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             "output-creation",
             &focus_run_id,
             &final_content,
-            self._focus_max_permitted_tier,
+            execution_tier_ordinal(self._focus_max_permitted_tier),
             sensitivity_severity(&sensitivity),
             ScanIntensity::Full,
         )
@@ -2436,7 +2495,7 @@ mod tests {
         assert_eq!(def.display_name, "Quick Ask");
         assert_eq!(def.output_type, "quick_ask");
         assert_eq!(def.version, "1.0");
-        assert_eq!(def.max_routing_tier, 1);
+        assert_eq!(def.max_routing_tier, ExternalAccess::LocalOnly);
         assert!(def.steps.is_empty());
         assert!(!def.multi_source_validation);
         assert!(def.suggest_in_focuses.is_empty());
@@ -2783,14 +2842,16 @@ mod tests {
     fn effective_access_smoke_test_voice_steps_not_floor_clamped() {
         // writing-assistant.focus: voice_analysis/voice_transform declare
         // routing_tier: 1 -> external_access_override: Some(LocalOnly).
-        // Focus max_routing_tier: 2 -> max_external_access: AnonymousRequired.
-        // Regardless of the user's focus_settings.max_permitted_tier (2 or
-        // 3), these two steps must NOT have their abstraction floor
-        // clamped -- confirms items.id=444's fix on the exact shipping
-        // Focus that motivated it (spec Part 7d).
-        for focus_max_permitted_tier in [2u8, 3u8] {
-            let focus_external_access = ExternalAccess::from_legacy_tier(focus_max_permitted_tier)
-                .min(ExternalAccess::AnonymousRequired);
+        // Focus max_routing_tier: 2 -> AnonymousRequired.
+        // Regardless of the user's focus_settings.max_permitted_tier
+        // (AnonymousRequired or Unrestricted), these two steps must NOT have
+        // their abstraction floor clamped -- confirms items.id=444's fix on
+        // the exact shipping Focus that motivated it (spec Part 7d).
+        for focus_max_permitted_tier in
+            [ExternalAccess::AnonymousRequired, ExternalAccess::Unrestricted]
+        {
+            let focus_external_access =
+                focus_max_permitted_tier.min(ExternalAccess::AnonymousRequired);
             let step_override = Some(ExternalAccess::LocalOnly);
             let effective_access = step_override
                 .map(|o| o.min(focus_external_access))
@@ -2806,7 +2867,7 @@ mod tests {
             };
             assert_eq!(
                 abstraction_tier, raw_abstraction,
-                "voice step must not be floor-clamped at focus_max_permitted_tier={focus_max_permitted_tier}"
+                "voice step must not be floor-clamped at focus_max_permitted_tier={focus_max_permitted_tier:?}"
             );
         }
     }

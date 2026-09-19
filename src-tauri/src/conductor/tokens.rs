@@ -130,12 +130,17 @@ impl FromStr for FieldRequirement {
 /// (focus_settings.privacy_tier, items.id=444 — untouched by this enum).
 ///
 /// Declaration order IS the ordering derive(Ord) uses — local_only is the
-/// tightest, unrestricted the loosest. anonymous_preferred is new: it never
-/// existed as a tier number (Part 6b), so from_legacy_tier() can never
-/// produce it — only a Focus/step authored directly against this enum can.
+/// tightest, unrestricted the loosest. anonymous_preferred means either an
+/// anonymous or a full-account provider is usable, anonymous preferred when
+/// there's a real choice among eligible providers (Jason, 2026-09-19) — a
+/// genuine 4th level, not a hypothetical.
 ///
-/// Style mirrors NamedPolicy (persistence/focus_provider_criteria_store.rs):
-/// as_str()/from_str()-shaped helpers, snake_case serde.
+/// items.id=529: storage is this enum's own string form end to end
+/// (shared_020.sql: TEXT CHECK (col IN ('local_only', 'anonymous_required',
+/// 'anonymous_preferred', 'unrestricted'))) — no numeric legacy-tier
+/// round-trip. Style mirrors NamedPolicy (persistence/
+/// focus_provider_criteria_store.rs): as_str() plus a real FromStr impl,
+/// snake_case serde matching as_str()/FromStr exactly.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, specta::Type,
 )]
@@ -156,46 +161,22 @@ impl ExternalAccess {
             Self::Unrestricted => "unrestricted",
         }
     }
+}
 
-    /// Converts a legacy 1/2/3 ordinal (focus_settings.max_permitted_tier,
-    /// FocusDefinition.max_routing_tier, StepDefinition.routing_tier) to its
-    /// ExternalAccess equivalent. 1 -> LocalOnly, 2 -> AnonymousRequired,
-    /// 3 -> Unrestricted. Every caller of this function reads a value
-    /// already bounds-checked to 1..=3 (schema CHECK constraint or
-    /// validate_step()) — an out-of-range value here means that check was
-    /// bypassed, a bug to fail loudly on rather than silently misroute,
-    /// matching this codebase's existing unreachable!() idiom for
-    /// schema-guaranteed invariants (e.g. executor.rs's select_model()).
-    pub fn from_legacy_tier(tier: u8) -> Self {
-        match tier {
-            1 => Self::LocalOnly,
-            2 => Self::AnonymousRequired,
-            3 => Self::Unrestricted,
-            other => unreachable!(
-                "legacy tier value {other} is not 1, 2, or 3 -- schema CHECK \
-                 (focus_settings.max_permitted_tier) or validate_step() \
-                 (StepDefinition.routing_tier) should have rejected this \
-                 before it ever reached ExternalAccess::from_legacy_tier()"
-            ),
-        }
-    }
+impl FromStr for ExternalAccess {
+    type Err = String;
 
-    /// The reverse of from_legacy_tier(), needed only where a caller must
-    /// still populate a legacy u8 field it does not own the shape of this
-    /// session (lifecycle.rs's get_focus_tier_ceiling(), items.id=448 --
-    /// the numeric execution_tier ceiling calc there is a deliberately
-    /// separate axis from ExternalAccess, out of this item's scope).
-    /// AnonymousPreferred has no legacy slot of its own -- it maps to 3
-    /// (Unrestricted's legacy value), a lossy round-trip acceptable only
-    /// where the caller can prove the value never actually holds
-    /// AnonymousPreferred (see that call site's own comment), not for any
-    /// enforcement decision in general.
-    pub fn as_legacy_tier(self) -> u8 {
-        match self {
-            Self::LocalOnly => 1,
-            Self::AnonymousRequired => 2,
-            Self::AnonymousPreferred => 3,
-            Self::Unrestricted => 3,
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "local_only" => Ok(Self::LocalOnly),
+            "anonymous_required" => Ok(Self::AnonymousRequired),
+            "anonymous_preferred" => Ok(Self::AnonymousPreferred),
+            "unrestricted" => Ok(Self::Unrestricted),
+            other => Err(format!(
+                "unknown external_access '{}'. Must be: local_only | anonymous_required | \
+                 anonymous_preferred | unrestricted",
+                other
+            )),
         }
     }
 }
@@ -211,12 +192,19 @@ impl ExternalAccess {
 /// dict fields (field_requirements, options_override) are owned values;
 /// Rust ownership enforces immutability once the struct is built.
 ///
-/// routing_tier: stored as u8 with runtime validation in validate_step().
-/// Still feeds the numeric execution_tier calc (abstraction floor, model
-/// selection, sensitivity — lifecycle.rs/executor.rs, out of scope for
-/// items.id=439). external_access_override/requires_user_handoff (below)
-/// are derived from this same value at parse time (lifecycle.rs's
-/// parse_focus_definition()) — no separate .focus YAML field for either.
+/// routing_tier: items.id=529 retyped this from a numeric u8 to
+/// ExternalAccess directly -- invalid values are unrepresentable by
+/// construction (same reasoning already applied to FocusSettings.
+/// max_permitted_tier, persistence/focus_settings_store.rs), so
+/// validate_step() no longer bounds-checks it. Still feeds the numeric
+/// execution_tier calc via ExternalAccess::min() + a bridging ordinal
+/// (abstraction floor, model selection, sensitivity — lifecycle.rs/
+/// executor.rs, that numeric axis itself out of scope for items.id=529).
+/// external_access_override/requires_user_handoff (below) are derived from
+/// this same value at parse time (lifecycle.rs's parse_focus_definition())
+/// — no separate .focus YAML field for either; the YAML field itself is
+/// still the raw numeric 1/2/3 today, converted to ExternalAccess at parse
+/// time (AnonymousPreferred has no YAML-authorable form yet).
 ///
 /// options_override: HashMap<String, serde_json::Value> mirrors Python's
 /// dict[str, object]. Schema is intentionally open-ended at this layer;
@@ -227,7 +215,7 @@ pub struct StepDefinition {
     pub display_name: String,
     pub guide_id: String,
     pub task_type: String, // validated against task_types.yaml at LOAD
-    pub routing_tier: u8,  // 1, 2, or 3 — see validate_step()
+    pub routing_tier: ExternalAccess,
     pub step_type: StepType,
     pub output_var: Option<String>,
     pub prompt_template: String,
@@ -255,10 +243,13 @@ pub struct StepDefinition {
 ///
 /// Checks:
 ///   1. output_var does not collide with a SYSTEM_TOKEN
-///   2. routing_tier is 1, 2, or 3
 ///
 /// step_type validation is omitted: StepType enum makes invalid values
-/// impossible to construct (replaces Python string check).
+/// impossible to construct (replaces Python string check). routing_tier
+/// validation is likewise omitted as of items.id=529: ExternalAccess makes
+/// an invalid value unrepresentable, so the out-of-range .focus YAML case
+/// (routing_tier: 0, 4, 7, ...) is now rejected at parse time
+/// (lifecycle.rs::parse_focus_definition()) rather than deferred here.
 pub fn validate_step(step: &StepDefinition) -> Vec<String> {
     let mut errors = Vec::new();
 
@@ -270,13 +261,6 @@ pub fn validate_step(step: &StepDefinition) -> Vec<String> {
                 step.step_id, var, SYSTEM_TOKENS,
             ));
         }
-    }
-
-    if step.routing_tier == 0 || step.routing_tier > 3 {
-        errors.push(format!(
-            "Step '{}': routing_tier must be 1, 2, or 3. Got: {}",
-            step.step_id, step.routing_tier
-        ));
     }
 
     errors
@@ -292,26 +276,29 @@ mod tests {
 
     fn minimal_step(output_var: Option<&str>, routing_tier: u8) -> StepDefinition {
         // Mirrors lifecycle.rs's parse_focus_definition() derivation exactly
-        // (mechanical migration -- see items.id=439 plan), including its
-        // reliance on routing_tier already being in 1..=3: a handful of
-        // these tests intentionally pass out-of-range values (0, 4, 7) to
-        // exercise validate_step()'s own bounds check, so from_legacy_tier()
-        // must not be called on those -- external_access_override stays None
-        // for anything outside 1..=3 (harmless: validate_step() rejects the
-        // step before external_access_override is ever consulted).
+        // (items.id=439 plan; re-confirmed identical shape by items.id=529 --
+        // this was the second, uncoupled copy of routing_tier==3 flagged by
+        // that item, now brought back in line with lifecycle.rs:388's
+        // canonical derivation instead of also guarding against out-of-range
+        // input lifecycle.rs's own code never guarded against).
         let requires_user_handoff = routing_tier == 3;
-        let external_access_override = if requires_user_handoff || !(1..=3).contains(&routing_tier)
-        {
+        let access = match routing_tier {
+            1 => ExternalAccess::LocalOnly,
+            2 => ExternalAccess::AnonymousRequired,
+            3 => ExternalAccess::Unrestricted,
+            other => panic!("minimal_step(): routing_tier must be 1, 2, or 3, got {other}"),
+        };
+        let external_access_override = if requires_user_handoff {
             None
         } else {
-            Some(ExternalAccess::from_legacy_tier(routing_tier))
+            Some(access)
         };
         StepDefinition {
             step_id: "test-step".to_owned(),
             display_name: "Test Step".to_owned(),
             guide_id: "writing-voice".to_owned(),
             task_type: "generate_text".to_owned(),
-            routing_tier,
+            routing_tier: access,
             step_type: StepType::Generate,
             output_var: output_var.map(|s| s.to_owned()),
             prompt_template: "Hello {user_input}".to_owned(),
@@ -340,35 +327,6 @@ mod tests {
         let errs = validate_step(&step);
         assert_eq!(errs.len(), 1);
         assert!(errs[0].contains("collides with a system token"));
-    }
-
-    #[test]
-    fn multiple_validation_failures() {
-        // output_var collides + routing_tier out of range → 2 errors
-        let step = minimal_step(Some("user_input"), 7);
-        let errs = validate_step(&step);
-        assert_eq!(errs.len(), 2);
-    }
-
-    #[test]
-    fn routing_tier_zero_is_invalid() {
-        let step = minimal_step(None, 0);
-        let errs = validate_step(&step);
-        assert_eq!(errs.len(), 1);
-        assert!(errs[0].contains("routing_tier must be 1, 2, or 3"));
-    }
-
-    #[test]
-    fn routing_tier_4_is_invalid() {
-        let step = minimal_step(None, 4);
-        let errs = validate_step(&step);
-        assert_eq!(errs.len(), 1);
-    }
-
-    #[test]
-    fn routing_tier_3_is_valid() {
-        let step = minimal_step(Some("result"), 3);
-        assert!(validate_step(&step).is_empty());
     }
 
     #[test]
@@ -435,29 +393,24 @@ mod tests {
     }
 
     #[test]
-    fn external_access_from_legacy_tier() {
-        assert_eq!(
-            ExternalAccess::from_legacy_tier(1),
-            ExternalAccess::LocalOnly
-        );
-        assert_eq!(
-            ExternalAccess::from_legacy_tier(2),
-            ExternalAccess::AnonymousRequired
-        );
-        assert_eq!(
-            ExternalAccess::from_legacy_tier(3),
-            ExternalAccess::Unrestricted
-        );
+    fn external_access_from_str_round_trips_with_as_str() {
+        // items.id=529: all 4 variants, AnonymousPreferred included -- the
+        // whole point of retiring the legacy 1/2/3 round-trip was to give it
+        // a real, round-trippable string form (it had no legacy tier slot).
+        for access in [
+            ExternalAccess::LocalOnly,
+            ExternalAccess::AnonymousRequired,
+            ExternalAccess::AnonymousPreferred,
+            ExternalAccess::Unrestricted,
+        ] {
+            assert_eq!(access.as_str().parse::<ExternalAccess>().unwrap(), access);
+        }
     }
 
     #[test]
-    fn external_access_as_legacy_tier_roundtrip_for_legacy_values() {
-        for tier in 1..=3u8 {
-            assert_eq!(
-                ExternalAccess::from_legacy_tier(tier).as_legacy_tier(),
-                tier
-            );
-        }
+    fn external_access_from_str_rejects_unknown() {
+        assert!("tier_2".parse::<ExternalAccess>().is_err());
+        assert!("".parse::<ExternalAccess>().is_err());
     }
 
     #[test]

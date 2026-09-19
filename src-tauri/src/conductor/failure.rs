@@ -724,7 +724,17 @@ mod tests {
     use super::*;
 
     fn handler(tier: u8) -> FailureHandler {
-        FailureHandler::new(ExternalAccess::from_legacy_tier(tier))
+        // items.id=529: ExternalAccess::from_legacy_tier() is retired
+        // (storage is string-native now) -- this test helper keeps its own
+        // small numeric-literal conversion, same shape as tokens.rs's
+        // minimal_step() and lifecycle.rs's parse-time conversion.
+        let access = match tier {
+            1 => ExternalAccess::LocalOnly,
+            2 => ExternalAccess::AnonymousRequired,
+            3 => ExternalAccess::Unrestricted,
+            other => panic!("handler(): tier must be 1, 2, or 3, got {other}"),
+        };
+        FailureHandler::new(access)
     }
 
     fn err(variant: ConductorError) -> ConductorError {

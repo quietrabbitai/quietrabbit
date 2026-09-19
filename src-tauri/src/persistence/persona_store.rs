@@ -284,19 +284,20 @@ pub async fn create_persona(
         // Seed focus_settings for this persona (see SEEDED_FOCUS_IDS doc
         // comment) -- Open profile defaults matching shared_001.sql's
         // original seed: bidirectional, shared, privacy_tier=2,
-        // max_permitted_tier=2, focus_profile='open'. Inserted on the same
-        // `conn` inside this savepoint (not via focus_settings_store::
-        // create_focus_settings, which would acquire a separate pooled
-        // connection -- shared.db enforces foreign_keys(true), and a
-        // separate connection cannot see this persona row until this
-        // savepoint commits).
+        // max_permitted_tier='anonymous_required' (items.id=529: string-
+        // native storage, formerly numeric 2), focus_profile='open'.
+        // Inserted on the same `conn` inside this savepoint (not via
+        // focus_settings_store::create_focus_settings, which would acquire
+        // a separate pooled connection -- shared.db enforces
+        // foreign_keys(true), and a separate connection cannot see this
+        // persona row until this savepoint commits).
         for focus_id in SEEDED_FOCUS_IDS {
             sqlx::query(
                 "INSERT INTO focus_settings
                  (persona_id, focus_id, context_flow, library_visibility,
                   privacy_tier, max_permitted_tier, focus_profile, voice_override,
                   created_at, updated_at)
-                 VALUES (?, ?, 'bidirectional', 'shared', 2, 2, 'open', NULL, ?, ?)",
+                 VALUES (?, ?, 'bidirectional', 'shared', 2, 'anonymous_required', 'open', NULL, ?, ?)",
             )
             .bind(persona_id)
             .bind(focus_id)

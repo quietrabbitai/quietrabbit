@@ -5,7 +5,7 @@
 // Gate ordering is load-bearing — do NOT reorder:
 //   1. External-access ceiling block (items.id=439, Part 6e): blocked when
 //      the candidate destination requires leaving the device
-//      (ExternalAccess::from_legacy_tier(target_tier) != LocalOnly) AND the
+//      (target_tier != 1, i.e. not LocalOnly's legacy value) AND the
 //      Focus's own ceiling is LocalOnly. Deliberate behavior change at one
 //      edge vs. the old target_tier > space_max_permitted_tier ordinal
 //      check (e.g. ceiling=anonymous_required/target=unrestricted no longer
@@ -100,8 +100,11 @@ pub async fn gate3<L: DisclosureLogger>(
     // gate3_with_pf's destination_risk_rating.unwrap_or(target_tier)
     // fallback (an unrelated risk-rating axis, item 406's territory).
     // Retyping would break that fallback's only source of a u8 when no live
-    // per-provider rating is known. Converted internally, once, for Check 1
-    // only via ExternalAccess::from_legacy_tier(target_tier) below.
+    // per-provider rating is known. items.id=529 retired
+    // ExternalAccess::from_legacy_tier() entirely (storage is string-native
+    // now) -- Check 1 below no longer converts through the enum at all,
+    // just compares target_tier directly against 1 (LocalOnly's legacy
+    // value, the only mapping that conversion was ever doing here).
     target_tier: u8,
     // items.id=439 (Part 6e): retyped from the former space_max_permitted_tier: u8.
     // Unlike target_tier below, this param has exactly one other use besides
@@ -147,8 +150,11 @@ pub async fn gate3<L: DisclosureLogger>(
     // Check 1: external-access ceiling block — fires first, before any other
     // check. See this function's header comment for why this is a
     // deliberate behavior change at one edge vs. the old ordinal comparison.
-    let candidate_requires_external =
-        ExternalAccess::from_legacy_tier(target_tier) != ExternalAccess::LocalOnly;
+    // items.id=529: target_tier != 1 replaces the retired
+    // ExternalAccess::from_legacy_tier(target_tier) != LocalOnly -- 1 was
+    // and remains LocalOnly's only legacy value, so this is not a behavior
+    // change, just dropping the now-defunct enum round-trip.
+    let candidate_requires_external = target_tier != 1;
     if candidate_requires_external && focus_external_access == ExternalAccess::LocalOnly {
         logger
             .write(DisclosureLogEntry {

@@ -104,13 +104,14 @@ fn row_to_focus_settings(row: &sqlx::sqlite::SqliteRow) -> Result<FocusSettings,
         context_flow: row.try_get("context_flow")?,
         library_visibility: row.try_get("library_visibility")?,
         privacy_tier: row.try_get::<i64, _>("privacy_tier")? as i32,
-        // Schema CHECK (max_permitted_tier BETWEEN 1 AND 3, shared_001.sql)
-        // guarantees this is always 1/2/3 -- from_legacy_tier()'s
-        // unreachable!() is the correct failure mode if that ever stops
-        // being true, not a silent fallback here.
-        max_permitted_tier: ExternalAccess::from_legacy_tier(
-            row.try_get::<i64, _>("max_permitted_tier")? as u8,
-        ),
+        // items.id=529: schema CHECK (max_permitted_tier IN (...),
+        // shared_020.sql) guarantees this is always one of the 4 known
+        // strings, so parse() failing here means that check was bypassed --
+        // a bug to surface as a decode error, not silently misroute.
+        max_permitted_tier: row
+            .try_get::<String, _>("max_permitted_tier")?
+            .parse::<ExternalAccess>()
+            .map_err(|e: String| sqlx::Error::Decode(e.into()))?,
         focus_profile: row.try_get("focus_profile")?,
         voice_override,
         created_at: row.try_get("created_at")?,
@@ -263,7 +264,7 @@ pub async fn create_focus_settings(
     .bind(context_flow)
     .bind(library_visibility)
     .bind(privacy_tier)
-    .bind(max_permitted_tier.as_legacy_tier() as i32)
+    .bind(max_permitted_tier.as_str())
     .bind(focus_profile)
     .bind(&voice_json)
     .bind(&created_at)
@@ -349,7 +350,7 @@ pub async fn update_focus_settings(
     .bind(new_flow)
     .bind(new_vis)
     .bind(new_ptier)
-    .bind(new_mtier.as_legacy_tier() as i32)
+    .bind(new_mtier.as_str())
     .bind(new_profile)
     .bind(&new_voice_json)
     .bind(&updated_at)
@@ -446,10 +447,10 @@ pub async fn record_friction_gate_decision(
     .bind(decision)
     .bind(requested_privacy_tier)
     .bind(requested_focus_profile)
-    .bind(requested_max_permitted_tier.map(|t| t.as_legacy_tier() as i32))
+    .bind(requested_max_permitted_tier.map(|t| t.as_str()))
     .bind(existing_privacy_tier)
     .bind(existing_focus_profile)
-    .bind(existing_max_permitted_tier.map(|t| t.as_legacy_tier() as i32))
+    .bind(existing_max_permitted_tier.map(|t| t.as_str()))
     .bind(&created_at)
     .execute(&mut *conn)
     .await?;

@@ -592,7 +592,7 @@ TABLE focus_settings
   context_flow TEXT notnull=1 pk=0 default=Some("'bidirectional'")
   library_visibility TEXT notnull=1 pk=0 default=Some("'shared'")
   privacy_tier INTEGER notnull=1 pk=0 default=Some("2")
-  max_permitted_tier INTEGER notnull=1 pk=0 default=Some("2")
+  max_permitted_tier TEXT notnull=1 pk=0 default=Some("'anonymous_required'")
   focus_profile TEXT notnull=1 pk=0 default=Some("'open'")
   voice_override TEXT notnull=0 pk=0 default=None
   created_at TEXT notnull=1 pk=0 default=None
@@ -604,10 +604,10 @@ TABLE focus_settings_friction_decisions
   decision TEXT notnull=1 pk=0 default=None
   requested_privacy_tier INTEGER notnull=0 pk=0 default=None
   requested_focus_profile TEXT notnull=0 pk=0 default=None
-  requested_max_permitted_tier INTEGER notnull=0 pk=0 default=None
+  requested_max_permitted_tier TEXT notnull=0 pk=0 default=None
   existing_privacy_tier INTEGER notnull=1 pk=0 default=None
   existing_focus_profile TEXT notnull=1 pk=0 default=None
-  existing_max_permitted_tier INTEGER notnull=0 pk=0 default=None
+  existing_max_permitted_tier TEXT notnull=0 pk=0 default=None
   created_at TEXT notnull=1 pk=0 default=None
 TABLE group_departures
   group_id TEXT notnull=1 pk=1 default=None
