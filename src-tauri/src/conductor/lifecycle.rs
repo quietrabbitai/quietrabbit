@@ -228,6 +228,11 @@ struct RawStep {
     guide_id: Option<String>, // overrides focus-level default if present
     task_type: Option<String>,
     routing_tier: Option<u8>,
+    // items.id=528 Phase 2: authored directly by the step, decoupled from
+    // routing_tier. Absent -> falls back to routing_tier == 3 (see
+    // parse_focus_definition's own derivation) for back-compat with every
+    // .focus file authored before this field existed.
+    requires_user_handoff: Option<bool>,
     step_type: Option<String>,
     output_var: Option<String>,
     prompt_template: Option<String>,
@@ -427,15 +432,37 @@ fn parse_focus_definition(raw: RawFocusFile) -> Result<FocusDefinition, Lifecycl
                 })
                 .unwrap_or_default();
 
-            // items.id=439 (Part 6c/6d): mechanical derivation, no separate
-            // .focus YAML field for either. requires_user_handoff fully
-            // decouples the old routing_tier==3 pause signal from capability
-            // -- such a step makes no external_access claim of its own
-            // (inherits the Focus's), matching Part 6d exactly.
+            // items.id=439 (Part 6c/6d), corrected by items.id=528 Phase 2:
+            // requires_user_handoff and external_access_override are now
+            // independently derived, not coupled through each other.
+            //
+            // requires_user_handoff: authored directly via the step's own
+            // .focus YAML field (added this pass) when present; falls back
+            // to raw_routing_tier == 3 when absent -- byte-identical for
+            // every .focus file authored before this field existed (none of
+            // the 4 shipped Focuses use routing_tier: 3).
+            //
+            // external_access_override: derived from routing_tier ALONE --
+            // None only when routing_tier is Unrestricted, Some(routing_tier)
+            // otherwise. Deliberately NOT gated on requires_user_handoff
+            // (before this fix the two conditions always coincided --
+            // routing_tier==3 was the only way to get requires_user_handoff
+            // true -- which is exactly why a step author setting
+            // routing_tier: 2 + requires_user_handoff: true together would
+            // previously have silently collapsed to external_access_override
+            // = None). Also deliberately never Some(Unrestricted): that
+            // would trip authorize()'s tighten-only ceiling check and
+            // executor.rs's Step 3 re-check the moment the Focus's own
+            // ceiling is anything less than Unrestricted, which every
+            // shipped Focus's max_routing_tier is today -- a step with no
+            // capability claim of its own (Part 6c's "inherits the Focus's")
+            // must stay None regardless of why routing_tier is Unrestricted.
             let raw_routing_tier = raw_step.routing_tier.unwrap_or(1);
-            let requires_user_handoff = raw_routing_tier == 3;
+            let requires_user_handoff = raw_step
+                .requires_user_handoff
+                .unwrap_or(raw_routing_tier == 3);
             let routing_tier = external_access_from_routing_tier_yaml(raw_routing_tier);
-            let external_access_override = if requires_user_handoff {
+            let external_access_override = if routing_tier == ExternalAccess::Unrestricted {
                 None
             } else {
                 Some(routing_tier)
@@ -2677,6 +2704,7 @@ mod tests {
                 guide_id: None,
                 task_type: Some("general".to_owned()),
                 routing_tier: Some(1),
+                requires_user_handoff: None,
                 step_type: None,
                 output_var: Some("result".to_owned()),
                 prompt_template: Some("Hello {user_input}".to_owned()),
@@ -2705,6 +2733,7 @@ mod tests {
                 guide_id: None,
                 task_type: None,
                 routing_tier: None,
+                requires_user_handoff: None,
                 step_type: None,
                 output_var: None,
                 prompt_template: None,
@@ -2718,6 +2747,133 @@ mod tests {
 
         let def = parse_focus_definition(raw).unwrap();
         assert_eq!(def.steps[0].guide_id, "quick-ask-guide");
+    }
+
+    // -- requires_user_handoff / external_access_override decoupling
+    //    (items.id=528 Phase 2) --------------------------------------------
+    //
+    // Before this fix, external_access_override was derived from
+    // requires_user_handoff (itself always == routing_tier==3), so the two
+    // could never actually diverge. These tests exercise the real
+    // parse_focus_definition() derivation -- not just tokens.rs's test
+    // mirror -- for the case that coupling would have gotten wrong: a step
+    // whose routing_tier is NOT Unrestricted but which still declares
+    // requires_user_handoff: true via its own .focus YAML field.
+
+    fn single_step_raw(routing_tier: Option<u8>, requires_user_handoff: Option<bool>) -> RawStep {
+        RawStep {
+            display_name: Some("Step A".to_owned()),
+            guide_id: None,
+            task_type: Some("general".to_owned()),
+            routing_tier,
+            requires_user_handoff,
+            step_type: None,
+            output_var: Some("result".to_owned()),
+            prompt_template: Some("Hello {user_input}".to_owned()),
+            field_requirements: None,
+            options_override: None,
+        }
+    }
+
+    fn parse_single_step_focus(
+        routing_tier: Option<u8>,
+        requires_user_handoff: Option<bool>,
+    ) -> StepDefinition {
+        let mut steps_map = IndexMap::new();
+        steps_map.insert(
+            "step_a".to_owned(),
+            single_step_raw(routing_tier, requires_user_handoff),
+        );
+        let mut raw = minimal_raw();
+        raw.max_routing_tier = Some(3); // permissive ceiling -- these tests exercise the step's own derivation, not the authorize()-time ceiling check
+        raw.steps = Some(steps_map);
+        parse_focus_definition(raw).unwrap().steps.remove(0)
+    }
+
+    #[test]
+    fn requires_user_handoff_absent_falls_back_to_routing_tier_3() {
+        // Back-compat: a .focus file authored before this field existed
+        // (every shipped Focus today) must behave identically.
+        let step = parse_single_step_focus(Some(3), None);
+        assert!(step.requires_user_handoff);
+        assert_eq!(step.external_access_override, None);
+    }
+
+    #[test]
+    fn requires_user_handoff_true_at_anonymous_required_keeps_override() {
+        let step = parse_single_step_focus(Some(2), Some(true));
+        assert!(step.requires_user_handoff);
+        assert_eq!(
+            step.external_access_override,
+            Some(ExternalAccess::AnonymousRequired)
+        );
+    }
+
+    #[test]
+    fn requires_user_handoff_true_at_local_only_keeps_override() {
+        let step = parse_single_step_focus(Some(1), Some(true));
+        assert!(step.requires_user_handoff);
+        assert_eq!(
+            step.external_access_override,
+            Some(ExternalAccess::LocalOnly)
+        );
+    }
+
+    #[test]
+    fn shipped_focus_files_parse_unchanged_after_requires_user_handoff_field_added() {
+        // items.id=528 Phase 2: confirms the new Option<bool> RawStep field
+        // is genuinely optional to serde_yaml (missing key -> None) against
+        // REAL production YAML, not just hand-constructed RawStep literals --
+        // and that every shipped step's derivation is unaffected by this
+        // change (none use routing_tier: 3, so requires_user_handoff must be
+        // false and external_access_override must be Some(..) for all of
+        // them, exactly as before this item).
+        for filename in [
+            "quick-ask.focus",
+            "writing-assistant.focus",
+            "research-and-buy.focus",
+            "role-assessment.focus",
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../app/core_artifacts/focuses")
+                .join(filename);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("failed to read {path:?}: {e}"));
+            let raw: RawFocusFile = serde_yaml::from_str(&text)
+                .unwrap_or_else(|e| panic!("failed to parse {filename}: {e}"));
+            let def = parse_focus_definition(raw)
+                .unwrap_or_else(|e| panic!("failed to build FocusDefinition for {filename}: {e}"));
+            assert!(
+                !def.steps.is_empty(),
+                "{filename}: expected at least one step"
+            );
+            for step in &def.steps {
+                assert!(
+                    !step.requires_user_handoff,
+                    "{filename}: step '{}' unexpectedly requires_user_handoff -- \
+                     no shipped Focus uses routing_tier: 3",
+                    step.step_id
+                );
+                assert!(
+                    step.external_access_override.is_some(),
+                    "{filename}: step '{}' has no external_access_override -- \
+                     every step here uses routing_tier 1 or 2, never Unrestricted",
+                    step.step_id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn requires_user_handoff_explicit_false_overrides_legacy_fallback_at_unrestricted() {
+        // The YAML field, when present, is authoritative -- it is not just
+        // a fallback default. external_access_override stays None regardless
+        // (Unrestricted never claims its own capability), but
+        // requires_user_handoff itself must reflect the explicit false, not
+        // the legacy routing_tier==3 rule.
+        let step = parse_single_step_focus(Some(3), Some(false));
+        assert!(!step.requires_user_handoff);
+        assert_eq!(step.external_access_override, None);
     }
 
     #[test]
@@ -3263,6 +3419,7 @@ mod tests {
                 guide_id: None,
                 task_type: Some("general".to_owned()),
                 routing_tier: Some(3),
+                requires_user_handoff: None,
                 step_type: None,
                 output_var: Some("result".to_owned()),
                 prompt_template: Some("Hello {user_input}".to_owned()),

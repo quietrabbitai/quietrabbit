@@ -200,11 +200,13 @@ impl FromStr for ExternalAccess {
 /// execution_tier calc via ExternalAccess::min() + a bridging ordinal
 /// (abstraction floor, model selection, sensitivity — lifecycle.rs/
 /// executor.rs, that numeric axis itself out of scope for items.id=529).
-/// external_access_override/requires_user_handoff (below) are derived from
-/// this same value at parse time (lifecycle.rs's parse_focus_definition())
-/// — no separate .focus YAML field for either; the YAML field itself is
-/// still the raw numeric 1/2/3 today, converted to ExternalAccess at parse
-/// time (AnonymousPreferred has no YAML-authorable form yet).
+/// external_access_override (below) is derived from this same value at
+/// parse time (lifecycle.rs's parse_focus_definition()) — no separate
+/// .focus YAML field for it; the YAML field itself is still the raw numeric
+/// 1/2/3 today, converted to ExternalAccess at parse time (AnonymousPreferred
+/// has no YAML-authorable form yet). requires_user_handoff (below) is a
+/// genuinely separate .focus YAML field as of items.id=528 Phase 2 — see its
+/// own doc comment; the two are independently derived, not coupled.
 ///
 /// options_override: HashMap<String, serde_json::Value> mirrors Python's
 /// dict[str, object]. Schema is intentionally open-ended at this layer;
@@ -224,12 +226,20 @@ pub struct StepDefinition {
     /// items.id=439 (Part 6c): tighten-only capability override relative to
     /// the Focus's own external_access ceiling. None means "inherit" — this
     /// step makes no capability claim of its own. Derived mechanically from
-    /// routing_tier at parse time; never Some when requires_user_handoff is
-    /// true (Part 6d: the handoff signal is fully decoupled from capability).
+    /// routing_tier ALONE at parse time: never Some when routing_tier is
+    /// Unrestricted (corrected by items.id=528 Phase 2 — previously gated on
+    /// requires_user_handoff instead, which silently broke the moment the
+    /// two could diverge; see lifecycle.rs::parse_focus_definition()'s own
+    /// derivation comment for the full reasoning). Do not gate this field on
+    /// requires_user_handoff — the two are independently derived.
     pub external_access_override: Option<ExternalAccess>,
-    /// items.id=439 (Part 6d): the old routing_tier==3 "pause and hand off
-    /// to the user" signal, fully decoupled from external_access. Checked
-    /// directly in lifecycle.rs's EXECUTE step loop.
+    /// items.id=439 (Part 6d): the "pause and hand off to the user" signal,
+    /// fully decoupled from external_access — checked directly in
+    /// lifecycle.rs's EXECUTE step loop. As of items.id=528 Phase 2, authored
+    /// directly via its own .focus YAML field (`requires_user_handoff`) when
+    /// present; falls back to the legacy `routing_tier == 3` rule when the
+    /// YAML field is absent, for back-compat with every Focus authored
+    /// before this field existed.
     pub requires_user_handoff: bool,
 }
 
@@ -274,21 +284,25 @@ pub fn validate_step(step: &StepDefinition) -> Vec<String> {
 mod tests {
     use super::*;
 
-    fn minimal_step(output_var: Option<&str>, routing_tier: u8) -> StepDefinition {
+    fn minimal_step(
+        output_var: Option<&str>,
+        routing_tier: u8,
+        requires_user_handoff: bool,
+    ) -> StepDefinition {
         // Mirrors lifecycle.rs's parse_focus_definition() derivation exactly
-        // (items.id=439 plan; re-confirmed identical shape by items.id=529 --
-        // this was the second, uncoupled copy of routing_tier==3 flagged by
-        // that item, now brought back in line with lifecycle.rs:388's
-        // canonical derivation instead of also guarding against out-of-range
-        // input lifecycle.rs's own code never guarded against).
-        let requires_user_handoff = routing_tier == 3;
+        // (items.id=528 Phase 2): external_access_override depends on
+        // routing_tier ALONE (None only for Unrestricted) -- independent of
+        // requires_user_handoff, which callers now pass directly instead of
+        // this helper re-deriving it from routing_tier==3 (the second,
+        // uncoupled copy of that derivation items.id=529 already flagged and
+        // this item finishes decoupling).
         let access = match routing_tier {
             1 => ExternalAccess::LocalOnly,
             2 => ExternalAccess::AnonymousRequired,
             3 => ExternalAccess::Unrestricted,
             other => panic!("minimal_step(): routing_tier must be 1, 2, or 3, got {other}"),
         };
-        let external_access_override = if requires_user_handoff {
+        let external_access_override = if access == ExternalAccess::Unrestricted {
             None
         } else {
             Some(access)
@@ -311,19 +325,19 @@ mod tests {
 
     #[test]
     fn valid_step_no_errors() {
-        let step = minimal_step(Some("draft_output"), 1);
+        let step = minimal_step(Some("draft_output"), 1, false);
         assert!(validate_step(&step).is_empty());
     }
 
     #[test]
     fn valid_step_no_output_var() {
-        let step = minimal_step(None, 2);
+        let step = minimal_step(None, 2, false);
         assert!(validate_step(&step).is_empty());
     }
 
     #[test]
     fn output_var_collides_with_system_token() {
-        let step = minimal_step(Some("user_input"), 2);
+        let step = minimal_step(Some("user_input"), 2, false);
         let errs = validate_step(&step);
         assert_eq!(errs.len(), 1);
         assert!(errs[0].contains("collides with a system token"));
@@ -429,15 +443,46 @@ mod tests {
 
     #[test]
     fn minimal_step_routing_tier_3_has_handoff_not_override() {
-        let step = minimal_step(Some("result"), 3);
+        let step = minimal_step(Some("result"), 3, true);
         assert!(step.requires_user_handoff);
         assert_eq!(step.external_access_override, None);
     }
 
     #[test]
     fn minimal_step_routing_tier_1_has_override_not_handoff() {
-        let step = minimal_step(None, 1);
+        let step = minimal_step(None, 1, false);
         assert!(!step.requires_user_handoff);
+        assert_eq!(
+            step.external_access_override,
+            Some(ExternalAccess::LocalOnly)
+        );
+    }
+
+    // -- requires_user_handoff / external_access_override decoupling
+    //    (items.id=528 Phase 2) --------------------------------------------
+    //
+    // Before this fix, external_access_override was gated on
+    // requires_user_handoff instead of routing_tier, which happened to be
+    // invisible because the two conditions always coincided (routing_tier==3
+    // was the only way to get requires_user_handoff==true). These tests
+    // exercise exactly the case that coupling would have gotten wrong: a
+    // step whose routing_tier is NOT Unrestricted but which still declares
+    // requires_user_handoff: true via its own .focus YAML field.
+
+    #[test]
+    fn requires_user_handoff_true_at_anonymous_required_keeps_override() {
+        let step = minimal_step(None, 2, true);
+        assert!(step.requires_user_handoff);
+        assert_eq!(
+            step.external_access_override,
+            Some(ExternalAccess::AnonymousRequired)
+        );
+    }
+
+    #[test]
+    fn requires_user_handoff_true_at_local_only_keeps_override() {
+        let step = minimal_step(None, 1, true);
+        assert!(step.requires_user_handoff);
         assert_eq!(
             step.external_access_override,
             Some(ExternalAccess::LocalOnly)
