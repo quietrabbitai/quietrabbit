@@ -711,7 +711,7 @@ const TIER3_DRAFT_FOCUS_ID: &str = "quick-ask";
 /// commands::messages::send_message's gate3_track=true path). Completes
 /// items.id=233's remaining stub -- see the former "NO OUTBOUND PRIVACY
 /// GUARDIAN REVIEW HAPPENS" marker this command replaces in
-/// Tier3AccessPane.tsx for the investigation that scoped it.
+/// CloudChatAccessPane.tsx for the investigation that scoped it.
 ///
 /// Unlike every other command in this file, this one *triggers* gate3()
 /// rather than *responding to* an already-fired one -- gate3()'s only prior
@@ -1037,7 +1037,7 @@ pub async fn request_chat_copy_gate3_review(
 
 /// items.id=406 (decisions.id=755) -- the provider-selection re-check
 /// trigger. Fires when the user activates a rail provider not covered by
-/// the message's original copy-time review (Tier3AccessPane.tsx, provider
+/// the message's original copy-time review (CloudChatAccessPane.tsx, provider
 /// row activation -- a QR-owned UI event, unlike paste inside an embedded
 /// CEF pane, which QR cannot observe). Frontend-side clipboard provenance
 /// (only re-checking content QR can prove it wrote itself) gates whether

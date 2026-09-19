@@ -244,7 +244,7 @@ pub struct PopupOpenedPayload {
 /// self-closing (`window.close()` after a completed OAuth login) and the
 /// parent pane navigating away. NOT emitted when the parent pane itself
 /// closes (that popup teardown is synchronous inside `close_pane`, not
-/// queued through the same per-tick drain) -- `Tier3AccessPane.tsx`
+/// queued through the same per-tick drain) -- `CloudChatAccessPane.tsx`
 /// proactively clears its own popup state on pane-close instead, without
 /// waiting for an event.
 #[derive(Debug, Clone, serde::Serialize, specta::Type)]
