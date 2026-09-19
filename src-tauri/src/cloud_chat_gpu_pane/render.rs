@@ -6,7 +6,7 @@
 //! (single pane, in-memory CEF context) narrowed this to one static texture
 //! slot and no cookie-jar wiring; Phase B (items.id=202 piece 5 / items.id=
 //! 223) generalized both -- one texture slot per pane, keyed by
-//! `tier3_pane::PaneKey`, and real per-provider `RequestContext` isolation
+//! `cloud_chat_gpu_pane::PaneKey`, and real per-provider `RequestContext` isolation
 //! (see pane_host.rs). items.id=234 (host-owned popup subsystem) added a
 //! second, parallel texture slot per pane (`POPUP_TEXTURES`, keyed by the
 //! *parent* pane's `PaneKey`) for `window.open()`-style OAuth popups --
@@ -45,8 +45,8 @@ use cef::ImplContextMenuParams;
 use wgpu::util::DeviceExt;
 use wgpu_hal::Adapter as _;
 
+use crate::cloud_chat_gpu_pane::PaneKey;
 use crate::commands::cloud_chat_pane::PaneRectFraction;
-use crate::tier3_pane::PaneKey;
 
 /// items.id=334: `on_paint`/`on_accelerated_paint` only ever stashed fresh
 /// pixels into `PANE_PENDING_PAINT`/`POPUP_PENDING_PAINT` -- nothing told
@@ -59,8 +59,9 @@ use crate::tier3_pane::PaneKey;
 /// `queue_draw()` is main-thread-only (a thread-local lookup) and these
 /// paint callbacks run on CEF's own thread, so this marshals across.
 fn request_redraw(app_handle: &tauri::AppHandle) {
-    if let Err(e) = app_handle.run_on_main_thread(crate::tier3_pane::pane_host::queue_draw) {
-        log::warn!("tier3_pane::render: run_on_main_thread(queue_draw) failed: {e}");
+    if let Err(e) = app_handle.run_on_main_thread(crate::cloud_chat_gpu_pane::pane_host::queue_draw)
+    {
+        log::warn!("cloud_chat_gpu_pane::render: run_on_main_thread(queue_draw) failed: {e}");
     }
 }
 
@@ -158,7 +159,7 @@ impl RenderState {
             wgpu_hal::gles::Adapter::new_external(loader, wgpu_types::GlBackendOptions::default())
         }
         .expect(
-            "tier3_pane::render: failed to create wgpu-hal GLES adapter from GTK's external GL context",
+            "cloud_chat_gpu_pane::render: failed to create wgpu-hal GLES adapter from GTK's external GL context",
         );
 
         let required_limits = wgpu_types::Limits {
@@ -170,7 +171,7 @@ impl RenderState {
                 .adapter
                 .open(exposed.features, &required_limits, &Default::default())
         }
-        .expect("tier3_pane::render: failed to open wgpu-hal GLES device");
+        .expect("cloud_chat_gpu_pane::render: failed to open wgpu-hal GLES device");
 
         // `flags` deliberately overridden to `empty()` instead of taking
         // `new_without_display_handle()`'s own default --
@@ -203,7 +204,7 @@ impl RenderState {
             )
         }
         .expect(
-            "tier3_pane::render: failed to create wgpu Device/Queue from external GLES adapter",
+            "cloud_chat_gpu_pane::render: failed to create wgpu Device/Queue from external GLES adapter",
         );
 
         // GL's own default framebuffer is natively RGBA (unlike Vulkan/D3D/
@@ -214,16 +215,16 @@ impl RenderState {
 
         let texture_bind_group_layout = texture_bind_group_layout(&device);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("tier3_pane cef texture shader"),
+            label: Some("cloud_chat_gpu_pane cef texture shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("tier3_pane cef pipeline layout"),
+            label: Some("cloud_chat_gpu_pane cef pipeline layout"),
             bind_group_layouts: &[Some(&texture_bind_group_layout)],
             immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("tier3_pane cef render pipeline"),
+            label: Some("cloud_chat_gpu_pane cef render pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -405,7 +406,7 @@ impl RenderState {
             self.device.create_texture_from_hal::<wgpu_hal::api::Gles>(
                 hal_texture,
                 &wgpu::TextureDescriptor {
-                    label: Some("tier3_pane GLArea default framebuffer"),
+                    label: Some("cloud_chat_gpu_pane GLArea default framebuffer"),
                     size: wgpu::Extent3d {
                         width: self.size.0,
                         height: self.size.1,
@@ -429,7 +430,7 @@ impl RenderState {
             )
         };
         let view = target.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("tier3_pane GLArea framebuffer view"),
+            label: Some("cloud_chat_gpu_pane GLArea framebuffer view"),
             format: Some(self.surface_format),
             ..Default::default()
         });
@@ -437,7 +438,7 @@ impl RenderState {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("tier3_pane render encoder"),
+                label: Some("cloud_chat_gpu_pane render encoder"),
             });
         {
             let pane_textures = PANE_TEXTURES.lock().unwrap();
@@ -449,7 +450,7 @@ impl RenderState {
             // single-window coexistence mechanism, not an approximation of
             // it.
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("tier3_pane render pass"),
+                label: Some("cloud_chat_gpu_pane render pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
@@ -539,7 +540,7 @@ impl RenderState {
 
 fn texture_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("tier3_pane cef texture bind group layout"),
+        label: Some("cloud_chat_gpu_pane cef texture bind group layout"),
         entries: &[
             wgpu::BindGroupLayoutEntry {
                 binding: 0,
@@ -686,7 +687,9 @@ impl Drop for DupedAcceleratedPaintInfo {
 fn capture_accelerated_paint(info: &cef::AcceleratedPaintInfo) -> Option<PendingPaint> {
     use cef::osr_texture_import::shared_texture_handle::SharedTextureHandle;
     if let SharedTextureHandle::Unsupported = SharedTextureHandle::new(info) {
-        log::warn!("tier3_pane::render: platform does not support accelerated OSR painting");
+        log::warn!(
+            "cloud_chat_gpu_pane::render: platform does not support accelerated OSR painting"
+        );
         return None;
     }
 
@@ -696,7 +699,7 @@ fn capture_accelerated_paint(info: &cef::AcceleratedPaintInfo) -> Option<Pending
         let dup_fd = unsafe { libc::dup(owned.planes[i].fd) };
         if dup_fd < 0 {
             log::error!(
-                "tier3_pane::render: items.id=312: dup() failed capturing accelerated \
+                "cloud_chat_gpu_pane::render: items.id=312: dup() failed capturing accelerated \
                  paint plane {i}/{plane_count}, errno={}",
                 std::io::Error::last_os_error()
             );
@@ -742,7 +745,7 @@ fn resolve_bind_group(
             height,
         } => {
             let texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("tier3_pane cef paint texture (software path)"),
+                label: Some("cloud_chat_gpu_pane cef paint texture (software path)"),
                 size: wgpu::Extent3d {
                     width,
                     height,
@@ -786,7 +789,7 @@ fn resolve_bind_group(
                 }
                 Err(e) => {
                     log::warn!(
-                        "tier3_pane::render: items.id=312: failed to import shared texture: {e:?}"
+                        "cloud_chat_gpu_pane::render: items.id=312: failed to import shared texture: {e:?}"
                     );
                     None
                 }
@@ -874,7 +877,7 @@ pub fn remove_popup_pending_paint(key: &PaneKey) {
     POPUP_PENDING_PAINT.lock().unwrap().remove(key);
 }
 
-/// Replaces `winit::dpi::LogicalSize<f32>` (winit dropped from `tier3_pane`
+/// Replaces `winit::dpi::LogicalSize<f32>` (winit dropped from `cloud_chat_gpu_pane`
 /// entirely, items.id=202 real positioning fix, 2026-08-07 -- see
 /// pane_host.rs's module docs) -- same two fields, no winit dependency.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -963,7 +966,7 @@ pub struct PaneRenderHandler {
     // thread-safety audit (2026-08-03).
     size: std::sync::Arc<std::sync::Mutex<LogicalSize>>,
     /// Which `PANE_TEXTURES` slot on_paint/on_accelerated_paint (CEF's own
-    /// UI thread) write into. See PaneKey docs (tier3_pane::mod) -- this is
+    /// UI thread) write into. See PaneKey docs (cloud_chat_gpu_pane::mod) -- this is
     /// the provider ID the pane this handler belongs to was opened for.
     pane_key: PaneKey,
     /// items.id=334: needed for `request_redraw` -- see its own doc.
@@ -1359,14 +1362,14 @@ fn build_bind_group(device: &wgpu::Device, texture: &wgpu::Texture) -> wgpu::Bin
     });
     let layout = texture_bind_group_layout(device);
     device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("tier3_pane cef texture bind group"),
+        label: Some("cloud_chat_gpu_pane cef texture bind group"),
         layout: &layout,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
                 resource: wgpu::BindingResource::TextureView(&texture.create_view(
                     &wgpu::TextureViewDescriptor {
-                        label: Some("tier3_pane cef texture view"),
+                        label: Some("cloud_chat_gpu_pane cef texture view"),
                         ..Default::default()
                     },
                 )),
@@ -1551,7 +1554,7 @@ wrap_life_span_handler! {
     impl LifeSpanHandler {
         fn on_after_created(&self, browser: Option<&mut cef::Browser>) {
             let Some(browser) = browser else { return; };
-            log::info!("tier3_pane::render: on_after_created fired, browser constructed");
+            log::info!("cloud_chat_gpu_pane::render: on_after_created fired, browser constructed");
             // A closed receiver (pane window already torn down) just means
             // this browser has nowhere to report to anymore -- not a
             // condition worth panicking over.
@@ -1592,7 +1595,7 @@ wrap_life_span_handler! {
             _no_javascript_access: Option<&mut ::std::os::raw::c_int>,
         ) -> ::std::os::raw::c_int {
             log::info!(
-                "tier3_pane::render: on_before_popup fired for pane={} target_url={:?}",
+                "cloud_chat_gpu_pane::render: on_before_popup fired for pane={} target_url={:?}",
                 self.handler.pane_key,
                 target_url.map(|u| u.to_string()),
             );
@@ -1693,7 +1696,7 @@ wrap_life_span_handler! {
     impl LifeSpanHandler {
         fn on_after_created(&self, browser: Option<&mut cef::Browser>) {
             let Some(browser) = browser else { return; };
-            log::info!("tier3_pane::render: popup on_after_created fired");
+            log::info!("cloud_chat_gpu_pane::render: popup on_after_created fired");
             let _ = self
                 .handler
                 .events_tx
@@ -1701,7 +1704,7 @@ wrap_life_span_handler! {
         }
 
         fn on_before_close(&self, _browser: Option<&mut cef::Browser>) {
-            log::info!("tier3_pane::render: popup on_before_close fired (self-closed)");
+            log::info!("cloud_chat_gpu_pane::render: popup on_before_close fired (self-closed)");
             let _ = self.handler.events_tx.send(PopupLifecycleEvent::Closed);
         }
     }
@@ -1756,7 +1759,7 @@ wrap_load_handler! {
             failed_url: Option<&cef::CefString>,
         ) {
             log::warn!(
-                "tier3_pane::render: on_load_error: code={error_code:?} url={failed_url:?} \
+                "cloud_chat_gpu_pane::render: on_load_error: code={error_code:?} url={failed_url:?} \
                  text={error_text:?}"
             );
         }
@@ -1767,7 +1770,7 @@ wrap_load_handler! {
             _frame: Option<&mut cef::Frame>,
             http_status_code: ::std::os::raw::c_int,
         ) {
-            log::info!("tier3_pane::render: on_load_end: status={http_status_code}");
+            log::info!("cloud_chat_gpu_pane::render: on_load_end: status={http_status_code}");
         }
 
         // items.id=234: unconditional -- any main-frame navigation of this
@@ -1828,7 +1831,7 @@ wrap_load_handler! {
             failed_url: Option<&cef::CefString>,
         ) {
             log::warn!(
-                "tier3_pane::render: popup on_load_error: code={error_code:?} \
+                "cloud_chat_gpu_pane::render: popup on_load_error: code={error_code:?} \
                  url={failed_url:?} text={error_text:?}"
             );
         }
@@ -1839,7 +1842,7 @@ wrap_load_handler! {
             _frame: Option<&mut cef::Frame>,
             http_status_code: ::std::os::raw::c_int,
         ) {
-            log::info!("tier3_pane::render: popup on_load_end: status={http_status_code}");
+            log::info!("cloud_chat_gpu_pane::render: popup on_load_end: status={http_status_code}");
         }
     }
 }
@@ -2093,7 +2096,7 @@ impl Geometry {
             },
         ];
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("tier3_pane quad vertex buffer"),
+            label: Some("cloud_chat_gpu_pane quad vertex buffer"),
             contents: bytemuck::cast_slice(&vertices),
             usage: wgpu::BufferUsages::VERTEX,
         });

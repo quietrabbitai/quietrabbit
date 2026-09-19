@@ -37,7 +37,7 @@
 //! not designed here -- same practice as the rest of this track (ship the
 //! Linux-verified result, scope other platforms as explicit future work).
 //!
-//! # winit is gone from `tier3_pane` entirely
+//! # winit is gone from `cloud_chat_gpu_pane` entirely
 //! CEF's panes were never windowed to begin with
 //! (`windowless_rendering_enabled: true` -- true off-screen rendering, per
 //! decisions.id=699). The old per-pane `winit::Window` existed only to give
@@ -97,15 +97,15 @@ use cef::{
     MenuId, MouseButtonType, MouseEvent,
 };
 
+use crate::cloud_chat_gpu_pane::render::{
+    ClientBuilder, ContextMenuRequested, ContextMenuSurface, LogicalSize, PaneRenderHandler,
+    PopupLifecycleEvent, PopupRequested, RenderState,
+};
+use crate::cloud_chat_gpu_pane::PaneKey;
 use crate::commands::cloud_chat_pane::{
     PaneEventModifiers, PaneKeyEventType, PaneLayoutState, PaneMouseButton, PaneRectFraction,
     PopupClosedPayload, PopupOpenedPayload, ZoomDirection,
 };
-use crate::tier3_pane::render::{
-    ClientBuilder, ContextMenuRequested, ContextMenuSurface, LogicalSize, PaneRenderHandler,
-    PopupLifecycleEvent, PopupRequested, RenderState,
-};
-use crate::tier3_pane::PaneKey;
 
 /// Lifecycle of one pane's CEF browser -- unchanged from the prior design.
 #[allow(dead_code)] // Closing/Closed: no code path drives these yet --
@@ -195,7 +195,7 @@ impl BrowserLifecycle {
         self.state = BrowserLifecycleState::Ready(browser.clone());
         for action in self.pending.drain(..) {
             if let Err(e) = apply_action(&browser, &action) {
-                log::warn!("tier3_pane: queued action failed on drain: {action:?}: {e}");
+                log::warn!("cloud_chat_gpu_pane: queued action failed on drain: {action:?}: {e}");
             }
         }
     }
@@ -204,7 +204,7 @@ impl BrowserLifecycle {
         match &self.state {
             BrowserLifecycleState::Ready(browser) => {
                 if let Err(e) = apply_action(browser, &action) {
-                    log::warn!("tier3_pane: action failed immediately: {action:?}: {e}");
+                    log::warn!("cloud_chat_gpu_pane: action failed immediately: {action:?}: {e}");
                 }
             }
             _ => self.pending.push(action),
@@ -644,7 +644,7 @@ impl PaneManager {
     ) {
         if self.panes.contains_key(&key) {
             log::warn!(
-                "tier3_pane::pane_host: open requested for already-open pane {key:?} -- ignoring"
+                "cloud_chat_gpu_pane::pane_host: open requested for already-open pane {key:?} -- ignoring"
             );
             return;
         }
@@ -700,7 +700,7 @@ impl PaneManager {
         // CEF's one working global context (request_context=None below).
         // Per-provider cookie *persistence* across app restarts is handled
         // at the QR application layer instead -- see
-        // commands/cloud_chat_pane.rs::open_tier3_panes/close_tier3_pane.
+        // commands/cloud_chat_pane.rs::open_cloud_chat_gpu_panes/close_cloud_chat_gpu_pane.
         let mut browser_lifecycle = BrowserLifecycle::new();
         let (tx, rx) = std::sync::mpsc::channel();
         browser_lifecycle.start_creation();
@@ -721,12 +721,12 @@ impl PaneManager {
             None,
         );
         log::info!(
-            "tier3_pane::pane_host: browser_host_create_browser (async, pane={key}) dispatched -> {created}"
+            "cloud_chat_gpu_pane::pane_host: browser_host_create_browser (async, pane={key}) dispatched -> {created}"
         );
         if created != 0 {
             browser_lifecycle.enqueue(PendingAction::Navigate(url));
             // items.id=359 piece 4: a newly-opened pane starts deactivated
-            // by default -- the caller (commands::cloud_chat_pane::open_tier3_panes)
+            // by default -- the caller (commands::cloud_chat_pane::open_cloud_chat_gpu_panes)
             // always follows Open with an explicit set_active_pane call for
             // the "idle row -> load and activate in one step" case, but
             // defaulting to hidden here (rather than assuming the caller's
@@ -779,9 +779,9 @@ impl PaneManager {
             }
             host.close_browser(true as _);
         }
-        crate::tier3_pane::render::remove_pane_texture(key);
-        crate::tier3_pane::render::remove_pane_pending_paint(key);
-        crate::tier3_pane::render::remove_pane_selected_text(key);
+        crate::cloud_chat_gpu_pane::render::remove_pane_texture(key);
+        crate::cloud_chat_gpu_pane::render::remove_pane_pending_paint(key);
+        crate::cloud_chat_gpu_pane::render::remove_pane_selected_text(key);
         self.open_pane_count.fetch_sub(1, Ordering::Relaxed);
         // force_close_popup above already dropped this pane's own popup, if
         // any -- clear last_focus for either variant keyed to this pane
@@ -928,7 +928,9 @@ impl PaneManager {
         for pane in self.panes.values_mut() {
             if let Some(rx) = pane.browser_ready_rx.as_ref() {
                 if let Ok(browser) = rx.try_recv() {
-                    log::info!("tier3_pane::pane_host: browser delivered via on_after_created");
+                    log::info!(
+                        "cloud_chat_gpu_pane::pane_host: browser delivered via on_after_created"
+                    );
                     pane.browser_lifecycle.on_created(browser);
                 }
             }
@@ -1050,9 +1052,9 @@ impl PaneManager {
             host.send_capture_lost_event();
             host.close_browser(true as _);
         }
-        crate::tier3_pane::render::remove_popup_texture(key);
-        crate::tier3_pane::render::remove_popup_pending_paint(key);
-        crate::tier3_pane::render::remove_popup_selected_text(key);
+        crate::cloud_chat_gpu_pane::render::remove_popup_texture(key);
+        crate::cloud_chat_gpu_pane::render::remove_popup_pending_paint(key);
+        crate::cloud_chat_gpu_pane::render::remove_popup_selected_text(key);
 
         if let Some(host) = self
             .panes
@@ -1128,7 +1130,7 @@ impl PaneManager {
             };
             match event {
                 PopupLifecycleEvent::Ready(browser) => {
-                    log::info!("tier3_pane::pane_host: popup delivered for pane={key}");
+                    log::info!("cloud_chat_gpu_pane::pane_host: popup delivered for pane={key}");
                     // items.id=364/366: applied once, right here, rather
                     // than via BrowserLifecycle's pending-queue mechanism --
                     // popups have no such queue (see PopupState's own doc),
@@ -1146,7 +1148,7 @@ impl PaneManager {
         let mut notifications = Vec::new();
         for key in closed_keys {
             self.popups.remove(&key);
-            crate::tier3_pane::render::remove_popup_texture(&key);
+            crate::cloud_chat_gpu_pane::render::remove_popup_texture(&key);
             notifications.push(PopupNotification::Closed { key });
         }
         notifications
@@ -1292,7 +1294,7 @@ fn show_context_menu(
 
     let Some(window) = glarea.window() else {
         log::warn!(
-            "tier3_pane::pane_host: items.id=379: GLArea has no GdkWindow yet, \
+            "cloud_chat_gpu_pane::pane_host: items.id=379: GLArea has no GdkWindow yet, \
              cannot position context menu"
         );
         callback.cancel();
@@ -1351,7 +1353,7 @@ fn show_context_menu(
     }
 
     log::debug!(
-        "tier3_pane::pane_host: items.id=379: pointer button still held, \
+        "cloud_chat_gpu_pane::pane_host: items.id=379: pointer button still held, \
          deferring context menu until release"
     );
     let app_handle = app_handle.clone();
@@ -1426,14 +1428,14 @@ fn present_context_menu(
                 // `cont` below, proceeds independently and is harmless if
                 // it silently no-ops.
                 let selected = if is_popup {
-                    crate::tier3_pane::render::popup_selected_text(&key)
+                    crate::cloud_chat_gpu_pane::render::popup_selected_text(&key)
                 } else {
-                    crate::tier3_pane::render::pane_selected_text(&key)
+                    crate::cloud_chat_gpu_pane::render::pane_selected_text(&key)
                 };
                 if let Some(text) = selected.filter(|t| !t.is_empty()) {
                     if let Err(e) = app_handle.clipboard().write_text(text) {
                         log::warn!(
-                            "tier3_pane::pane_host: items.id=379 clipboard write \
+                            "cloud_chat_gpu_pane::pane_host: items.id=379 clipboard write \
                              failed, pane={key}: {e}"
                         );
                     }
@@ -1487,7 +1489,7 @@ fn present_context_menu(
 fn resolve_popup_rect(
     glarea_size: (u32, u32),
     parent_pixel_rect: Option<(u32, u32, u32, u32)>,
-    features: &crate::tier3_pane::render::PopupFeatureInts,
+    features: &crate::cloud_chat_gpu_pane::render::PopupFeatureInts,
 ) -> PaneRectFraction {
     const DEFAULT_WIDTH: u32 = 480;
     const DEFAULT_HEIGHT: u32 = 640;
@@ -2128,7 +2130,7 @@ fn fix_webview_click_handlers(webview_widget: &gtk::Widget) {
                 let signal_id = gobject_ffi::g_signal_lookup(signal_name.as_ptr(), widget_gtype);
                 if signal_id == 0 {
                     log::warn!(
-                        "tier3_pane::pane_host: g_signal_lookup found no {signal_name:?} \
+                        "cloud_chat_gpu_pane::pane_host: g_signal_lookup found no {signal_name:?} \
                          signal on the webview widget's type -- nothing disconnected"
                     );
                     continue;
@@ -2144,14 +2146,14 @@ fn fix_webview_click_handlers(webview_widget: &gtk::Widget) {
                 );
                 if disconnected == expected_count {
                     log::info!(
-                        "tier3_pane::pane_host: disconnected {disconnected} \
+                        "cloud_chat_gpu_pane::pane_host: disconnected {disconnected} \
                          {signal_name:?} handler(s) from the webview widget as \
                          expected (removing tauri-runtime-wry's undecorated-resize \
                          crash path -- items.id=227)"
                     );
                 } else {
                     log::error!(
-                        "tier3_pane::pane_host: EXPECTED COUNT MISMATCH disconnecting \
+                        "cloud_chat_gpu_pane::pane_host: EXPECTED COUNT MISMATCH disconnecting \
                          {signal_name:?} from the webview widget -- removed \
                          {disconnected}, expected {expected_count}. items.id=227's \
                          blanket disconnect assumed exactly the handlers known at the \
@@ -2259,7 +2261,7 @@ fn fix_webview_click_handlers(webview_widget: &gtk::Widget) {
         });
     } else {
         log::warn!(
-            "tier3_pane::pane_host: main window's webview widget is not a \
+            "cloud_chat_gpu_pane::pane_host: main window's webview widget is not a \
              webkit2gtk::WebView -- items.id=227's mouse back/forward \
              reimplementation was not installed"
         );
@@ -2296,7 +2298,7 @@ fn build_overlay_and_glarea(webview_widget: gtk::Widget) -> (gtk::Overlay, gtk::
 
     overlay.add_overlay(&glarea);
     // Input forwarding into CEF does not exist yet at any layer (a real,
-    // pre-existing gap -- see tier3_pane/mod.rs docs) -- until it does,
+    // pre-existing gap -- see cloud_chat_gpu_pane/mod.rs docs) -- until it does,
     // mouse/keyboard events must keep reaching the webview underneath,
     // not be swallowed by an overlay child that can't yet do anything
     // with them.
@@ -2341,11 +2343,11 @@ fn handle_glarea_realize(
     area: &gtk::GLArea,
     render_state: &Rc<RefCell<Option<RenderState>>>,
     gl_context: &Rc<RefCell<Option<glow::Context>>>,
-    gl_loader: &Rc<RefCell<Option<crate::tier3_pane::gl_loader::GlProcLoader>>>,
+    gl_loader: &Rc<RefCell<Option<crate::cloud_chat_gpu_pane::gl_loader::GlProcLoader>>>,
 ) {
     area.make_current();
     if let Some(err) = area.error() {
-        log::error!("tier3_pane::pane_host: GLArea realize error: {err}");
+        log::error!("cloud_chat_gpu_pane::pane_host: GLArea realize error: {err}");
         return;
     }
     // ROOT CAUSE FOUND (items.id=227, 2026-08-08, confirmed against
@@ -2462,7 +2464,7 @@ fn handle_glarea_realize(
                 event_window.set_pass_through(false);
                 event_window.input_shape_combine_region(&gtk::cairo::Region::create(), 0, 0);
                 log::info!(
-                    "tier3_pane::pane_host: GLArea private event_window \
+                    "cloud_chat_gpu_pane::pane_host: GLArea private event_window \
                      found, input shape set permanently empty (items.id=257 \
                      Path B -- glarea is a pure compositor now, pane click \
                      routing goes through the frontend's DOM hit-layer \
@@ -2473,7 +2475,7 @@ fn handle_glarea_realize(
                 );
             }
             [] => log::warn!(
-                "tier3_pane::pane_host: GLArea's parent_window has no \
+                "cloud_chat_gpu_pane::pane_host: GLArea's parent_window has no \
                  INPUT_ONLY child at realize -- expected \
                  priv->event_window (see gtk_gl_area_realize upstream) \
                  was not found. Harmless to pane click/mouse forwarding \
@@ -2483,7 +2485,7 @@ fn handle_glarea_realize(
                  some other reason."
             ),
             multiple => log::error!(
-                "tier3_pane::pane_host: GLArea's parent_window has \
+                "cloud_chat_gpu_pane::pane_host: GLArea's parent_window has \
                  {} INPUT_ONLY children at realize -- expected exactly \
                  one (priv->event_window). Refusing to guess which one \
                  is the real one; none had their input shape reset to \
@@ -2497,7 +2499,7 @@ fn handle_glarea_realize(
         }
     } else {
         log::warn!(
-            "tier3_pane::pane_host: GLArea has no GdkWindow at realize -- \
+            "cloud_chat_gpu_pane::pane_host: GLArea has no GdkWindow at realize -- \
              cannot reassert pass_through"
         );
     }
@@ -2510,7 +2512,7 @@ fn handle_glarea_realize(
     // function pointers from this same still-alive instance
     // instead of two that would otherwise be dropped (and
     // `dlclose`d) the moment this closure returns.
-    *gl_loader.borrow_mut() = Some(crate::tier3_pane::gl_loader::GlProcLoader::open());
+    *gl_loader.borrow_mut() = Some(crate::cloud_chat_gpu_pane::gl_loader::GlProcLoader::open());
     let loader_ref = gl_loader.borrow();
     let loader = loader_ref.as_ref().expect("just set above");
     let state = pollster::block_on(RenderState::new(loader.loader_fn(), (width, height)));
@@ -2518,7 +2520,7 @@ fn handle_glarea_realize(
     let gl = unsafe { glow::Context::from_loader_function(loader.loader_fn()) };
     *gl_context.borrow_mut() = Some(gl);
     drop(loader_ref);
-    log::info!("tier3_pane::pane_host: shared RenderState constructed from GTK's external GL context ({width}x{height})");
+    log::info!("cloud_chat_gpu_pane::pane_host: shared RenderState constructed from GTK's external GL context ({width}x{height})");
 }
 
 /// Body of the GLArea's `resize` signal handler, wired up in
@@ -2644,7 +2646,7 @@ fn drain_and_emit_popup_notifications(
                     };
                     if let Err(e) = app_handle.emit("tier3-popup-opened", &payload) {
                         log::warn!(
-                            "tier3_pane::pane_host: failed to emit \
+                            "cloud_chat_gpu_pane::pane_host: failed to emit \
                              tier3-popup-opened: {e}"
                         );
                     }
@@ -2653,7 +2655,7 @@ fn drain_and_emit_popup_notifications(
                     let payload = PopupClosedPayload { provider_id: key };
                     if let Err(e) = app_handle.emit("tier3-popup-closed", &payload) {
                         log::warn!(
-                            "tier3_pane::pane_host: failed to emit \
+                            "cloud_chat_gpu_pane::pane_host: failed to emit \
                              tier3-popup-closed: {e}"
                         );
                     }
@@ -2817,12 +2819,11 @@ impl PaneHost {
     pub fn install(window: &tauri::WebviewWindow, app_handle: tauri::AppHandle) -> Self {
         let vbox = window
             .default_vbox()
-            .expect("tier3_pane::pane_host: could not get main window's default_vbox");
+            .expect("cloud_chat_gpu_pane::pane_host: could not get main window's default_vbox");
 
-        let webview_widget =
-            vbox.children().into_iter().next().expect(
-                "tier3_pane::pane_host: main window's default_vbox has no child to overlay",
-            );
+        let webview_widget = vbox.children().into_iter().next().expect(
+            "cloud_chat_gpu_pane::pane_host: main window's default_vbox has no child to overlay",
+        );
         vbox.remove(&webview_widget);
 
         fix_webview_click_handlers(&webview_widget);
@@ -2879,7 +2880,7 @@ impl PaneHost {
         // it is only valid once the GLArea's context is current
         // (`area.make_current()`, called first thing in `connect_realize`
         // below) -- it cannot be constructed before the GLArea is realized.
-        let gl_loader: Rc<RefCell<Option<crate::tier3_pane::gl_loader::GlProcLoader>>> =
+        let gl_loader: Rc<RefCell<Option<crate::cloud_chat_gpu_pane::gl_loader::GlProcLoader>>> =
             Rc::new(RefCell::new(None));
         let manager = build_pane_manager(app_handle.clone());
         let open_pane_count = manager.borrow().open_pane_count.clone();
@@ -2981,7 +2982,7 @@ impl PaneHost {
         vbox.add(&overlay);
         overlay.show_all();
         log::info!(
-            "tier3_pane::pane_host: post-show_all state -- overlay(realized={}, mapped={}, visible={}) glarea(realized={}, mapped={}, visible={}) webview(realized={}, mapped={}, visible={})",
+            "cloud_chat_gpu_pane::pane_host: post-show_all state -- overlay(realized={}, mapped={}, visible={}) glarea(realized={}, mapped={}, visible={}) webview(realized={}, mapped={}, visible={})",
             overlay.is_realized(), overlay.is_mapped(), overlay.get_visible(),
             glarea.is_realized(), glarea.is_mapped(), glarea.get_visible(),
             webview_widget.is_realized(), webview_widget.is_mapped(), webview_widget.get_visible(),
@@ -3012,7 +3013,7 @@ impl PaneHost {
     /// email field never received focus, so keyboard forwarding (which only
     /// carries key codes, no coordinates, and was otherwise unchanged) had
     /// nothing focused to type into. Scaling here, not in `commands::
-    /// tier3_pane` or the frontend, matches this file's existing precedent
+    /// cloud_chat_gpu_pane` or the frontend, matches this file's existing precedent
     /// (`cef_modifiers_from_dom`'s own doc: "the one place that knows CEF's
     /// actual flag constants stays in pane_host.rs").
     fn dom_pixels_to_cef(&self, x: f64, y: f64) -> (f64, f64) {
@@ -3025,7 +3026,7 @@ impl PaneHost {
     /// real cross-thread mechanism now (previously a fire-and-forget
     /// `EventLoopProxy::send_event` into a winit user-event queue that
     /// needed a *separate* explicit wake call to actually get dispatched
-    /// promptly -- see the old design's `open_tier3_panes` doc for the wake
+    /// promptly -- see the old design's `open_cloud_chat_gpu_panes` doc for the wake
     /// bug that required). `run_on_main_thread` already guarantees this
     /// runs on the GTK main thread before returning control, so there is no
     /// analogous wake-timing gap here.
@@ -3036,7 +3037,7 @@ impl PaneHost {
                     Some(rs) => rs,
                     None => {
                         log::warn!(
-                            "tier3_pane::pane_host: open requested before shared RenderState \
+                            "cloud_chat_gpu_pane::pane_host: open requested before shared RenderState \
                              was ready (GLArea not realized yet) -- pane={key} not opened"
                         );
                         return;
@@ -3229,11 +3230,13 @@ impl PaneHost {
                         && modifiers.ctrl
                         && matches!(windows_key_code, VK_C | VK_X)
                     {
-                        if let Some(text) = crate::tier3_pane::render::pane_selected_text(&key) {
+                        if let Some(text) =
+                            crate::cloud_chat_gpu_pane::render::pane_selected_text(&key)
+                        {
                             if !text.is_empty() {
                                 if let Err(e) = mgr.app_handle.clipboard().write_text(text) {
                                     log::warn!(
-                                        "tier3_pane::pane_host: items.id=369 clipboard write failed, pane={key}: {e}"
+                                        "cloud_chat_gpu_pane::pane_host: items.id=369 clipboard write failed, pane={key}: {e}"
                                     );
                                 }
                             }
@@ -3605,7 +3608,7 @@ impl PaneHost {
 // own main-thread queue, serviced as part of GTK's ordinary main-loop
 // operation) -- the old design's `EventLoopProxy::send_event` needed a
 // *separate*, explicit `run_on_main_thread(|| {})` wake call right after it
-// (see the old `open_tier3_panes` doc), because sending into winit's queue
+// (see the old `open_cloud_chat_gpu_panes` doc), because sending into winit's queue
 // alone did not guarantee `tao` would notice and dispatch it promptly. That
 // whole class of bug has no equivalent here.
 
@@ -3627,14 +3630,14 @@ pub fn install(window: &tauri::WebviewWindow, app_handle: tauri::AppHandle) -> A
 /// Runs `command` against the process-wide pane host. Must be called from
 /// the main thread -- the intended call site is inside an
 /// `AppHandle::run_on_main_thread` closure (see
-/// `commands::cloud_chat_pane::open_tier3_panes`/`close_tier3_pane`), which
+/// `commands::cloud_chat_pane::open_cloud_chat_gpu_panes`/`close_cloud_chat_gpu_pane`), which
 /// guarantees that. A call before `install()` (shouldn't happen -- the main
 /// window exists long before any pane can open) is logged and dropped, not a
 /// panic.
 pub fn dispatch(command: PaneCommand) {
     HOST.with(|h| match h.borrow().as_ref() {
         Some(host) => host.dispatch(command),
-        None => log::warn!("tier3_pane::pane_host: dispatch called before install()"),
+        None => log::warn!("cloud_chat_gpu_pane::pane_host: dispatch called before install()"),
     });
 }
 

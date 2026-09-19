@@ -51,14 +51,14 @@ pub fn dispatch_cef_subprocess() -> bool {
 
     let args = Args::new();
     let cmd = args.as_cmd_line().expect(
-        "tier3_pane::bootstrap: CEF could not parse this process's command line -- \
+        "cloud_chat_gpu_pane::bootstrap: CEF could not parse this process's command line -- \
          cannot safely determine subprocess vs. browser-process invocation",
     );
 
     let type_switch = cef::CefString::from("type");
     let is_browser_process = cmd.has_switch(Some(&type_switch)) != 1;
 
-    let mut app = AppBuilder::build(Tier3PaneApp::new());
+    let mut app = AppBuilder::build(CloudChatGpuPaneApp::new());
     let ret = cef::execute_process(
         Some(args.as_main_args()),
         Some(&mut app),
@@ -74,12 +74,12 @@ pub fn dispatch_cef_subprocess() -> bool {
         // not a recoverable runtime condition.
         assert_eq!(
             ret, -1,
-            "tier3_pane::bootstrap: execute_process returned {ret} for what CEF's own \
+            "cloud_chat_gpu_pane::bootstrap: execute_process returned {ret} for what CEF's own \
              command-line parse identified as the browser process -- expected -1"
         );
         false
     } else {
-        log::info!("tier3_pane::bootstrap: dispatched CEF subprocess, exit_code={ret}");
+        log::info!("cloud_chat_gpu_pane::bootstrap: dispatched CEF subprocess, exit_code={ret}");
         true
     }
 }
@@ -192,7 +192,7 @@ pub fn initialize_cef_with_pump_setting(
     let pending_work: std::sync::Arc<std::sync::Mutex<Option<i64>>> =
         std::sync::Arc::new(std::sync::Mutex::new(None));
 
-    let mut app = AppBuilder::build(Tier3PaneApp::new_with_pump(pending_work.clone()));
+    let mut app = AppBuilder::build(CloudChatGpuPaneApp::new_with_pump(pending_work.clone()));
 
     let root_cache_path_str = root_cache_path.to_string_lossy().into_owned();
     let settings = Settings {
@@ -212,11 +212,11 @@ pub fn initialize_cef_with_pump_setting(
 
     assert_eq!(
         init_ret, 1,
-        "tier3_pane::bootstrap: cef::initialize failed (returned {init_ret})"
+        "cloud_chat_gpu_pane::bootstrap: cef::initialize failed (returned {init_ret})"
     );
 
     log::info!(
-        "tier3_pane::bootstrap: CEF initialized, root_cache_path={root_cache_path_str}, multi_threaded_message_loop=true"
+        "cloud_chat_gpu_pane::bootstrap: CEF initialized, root_cache_path={root_cache_path_str}, multi_threaded_message_loop=true"
     );
     CefInitResult { pending_work }
 }
@@ -230,11 +230,11 @@ pub fn initialize_cef_with_pump_setting(
 // for a value that's always None there.
 
 #[derive(Clone)]
-pub struct Tier3PaneApp {
+pub struct CloudChatGpuPaneApp {
     pending_work: Option<std::sync::Arc<std::sync::Mutex<Option<i64>>>>,
 }
 
-impl Tier3PaneApp {
+impl CloudChatGpuPaneApp {
     fn new() -> Self {
         Self { pending_work: None }
     }
@@ -248,7 +248,7 @@ impl Tier3PaneApp {
 
 wrap_app! {
     pub(crate) struct AppBuilder {
-        app: Tier3PaneApp,
+        app: CloudChatGpuPaneApp,
     }
 
     impl App {
@@ -305,24 +305,24 @@ wrap_app! {
 
         fn browser_process_handler(&self) -> Option<cef::BrowserProcessHandler> {
             self.app.pending_work.clone().map(|pending_work| {
-                BrowserProcessHandlerBuilder::build(Tier3PaneBrowserProcessHandler::new(pending_work))
+                BrowserProcessHandlerBuilder::build(CloudChatGpuPaneBrowserProcessHandler::new(pending_work))
             })
         }
     }
 }
 
 impl AppBuilder {
-    pub(crate) fn build(app: Tier3PaneApp) -> cef::App {
+    pub(crate) fn build(app: CloudChatGpuPaneApp) -> cef::App {
         Self::new(app)
     }
 }
 
 #[derive(Clone)]
-pub struct Tier3PaneBrowserProcessHandler {
+pub struct CloudChatGpuPaneBrowserProcessHandler {
     pending_work: std::sync::Arc<std::sync::Mutex<Option<i64>>>,
 }
 
-impl Tier3PaneBrowserProcessHandler {
+impl CloudChatGpuPaneBrowserProcessHandler {
     fn new(pending_work: std::sync::Arc<std::sync::Mutex<Option<i64>>>) -> Self {
         Self { pending_work }
     }
@@ -330,7 +330,7 @@ impl Tier3PaneBrowserProcessHandler {
 
 wrap_browser_process_handler! {
     pub(crate) struct BrowserProcessHandlerBuilder {
-        handler: Tier3PaneBrowserProcessHandler,
+        handler: CloudChatGpuPaneBrowserProcessHandler,
     }
 
     impl BrowserProcessHandler {
@@ -344,7 +344,7 @@ wrap_browser_process_handler! {
 }
 
 impl BrowserProcessHandlerBuilder {
-    pub(crate) fn build(handler: Tier3PaneBrowserProcessHandler) -> BrowserProcessHandler {
+    pub(crate) fn build(handler: CloudChatGpuPaneBrowserProcessHandler) -> BrowserProcessHandler {
         Self::new(handler)
     }
 }

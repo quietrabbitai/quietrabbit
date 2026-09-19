@@ -13,14 +13,14 @@ use quietrabbit_lib::providers::ollama_client::OllamaClient;
 
 /// Plain, synchronous entry point -- NOT `#[tokio::main]`.
 ///
-/// CEF's subprocess dispatch (`tier3_pane::dispatch_cef_subprocess`) must
+/// CEF's subprocess dispatch (`cloud_chat_gpu_pane::dispatch_cef_subprocess`) must
 /// run before Tokio initializes anything in this process. Per Tokio's own
 /// documentation, forking without an immediate exec is only supported
 /// "before the parent process has used Tokio in any way" -- and CEF's
 /// multi-process architecture forks+execs helper processes internally.
 /// `#[tokio::main] async fn main()` would enter the Tokio runtime as the
 /// first thing that happens, before this dispatch could run. See
-/// tier3_pane::bootstrap module docs for the full rationale.
+/// cloud_chat_gpu_pane::bootstrap module docs for the full rationale.
 ///
 /// Restructured 2026-08-01 for items.id=3 States 4-5 (Phase A), approved by
 /// Jason -- the async body that used to be the whole of `main()` is now
@@ -51,7 +51,7 @@ fn main() {
         env_logger::init();
     }
 
-    if quietrabbit_lib::tier3_pane::dispatch_cef_subprocess() {
+    if quietrabbit_lib::cloud_chat_gpu_pane::dispatch_cef_subprocess() {
         // This invocation was a CEF-spawned helper process (renderer, GPU,
         // utility, etc). CEF's own subprocess entry point has already run
         // to completion inside dispatch_cef_subprocess(). Nothing else in
@@ -82,7 +82,7 @@ async fn async_main() {
     // Tauri's .manage()/.state() -- Tauri's Manager::state<T>() requires
     // T: Send + Sync, and GTK types aren't (same class of constraint
     // winit's X11 IME pointers used to impose here). PaneHost instead lives
-    // in a main-thread-only thread-local (see tier3_pane::pane_host's own
+    // in a main-thread-only thread-local (see cloud_chat_gpu_pane::pane_host's own
     // module docs on why, and how commands::cloud_chat_pane reaches it via
     // AppHandle::run_on_main_thread instead of Tauri-managed state).
     let app = tauri::Builder::default()
@@ -571,8 +571,8 @@ async fn async_main() {
             // is needed here -- matches how queue_draw() is already called
             // bare elsewhere in this file.
             tauri::WindowEvent::Focused(true) => {
-                quietrabbit_lib::tier3_pane::pane_host::dispatch(
-                    quietrabbit_lib::tier3_pane::pane_host::PaneCommand::ReassertOsFocus,
+                quietrabbit_lib::cloud_chat_gpu_pane::pane_host::dispatch(
+                    quietrabbit_lib::cloud_chat_gpu_pane::pane_host::PaneCommand::ReassertOsFocus,
                 );
             }
             _ => {}
@@ -599,22 +599,23 @@ async fn async_main() {
     // still does.
     let app_data_dir = app.path().app_data_dir().unwrap_or_else(|e| {
         log::warn!(
-            "main: could not resolve app_data_dir for tier3_pane root_cache_path: {e} \
+            "main: could not resolve app_data_dir for cloud_chat_gpu_pane root_cache_path: {e} \
              -- falling back to a temp dir (persistence across restarts will not work \
              correctly at this fallback location)"
         );
         std::env::temp_dir().join("quietrabbit")
     });
     let root_cache_path = app_data_dir.join("tier3_pane_cache");
-    // Uses multi_threaded_message_loop=true (see tier3_pane::bootstrap docs
+    // Uses multi_threaded_message_loop=true (see cloud_chat_gpu_pane::bootstrap docs
     // for the full root-cause history) -- CEF runs its own UI thread
     // separately from Tauri's GTK main thread, which is what avoids the
     // GTK/GLib main-loop busy-poll that a same-thread external-pump
     // approach hit.
-    let _cef_init = quietrabbit_lib::tier3_pane::bootstrap::initialize_cef(&root_cache_path);
+    let _cef_init =
+        quietrabbit_lib::cloud_chat_gpu_pane::bootstrap::initialize_cef(&root_cache_path);
 
     // Single-window GTK/wgpu pane host (items.id=202 real positioning fix,
-    // 2026-08-07 -- see tier3_pane::pane_host's module docs for the full
+    // 2026-08-07 -- see cloud_chat_gpu_pane::pane_host's module docs for the full
     // architecture). Reparents Tauri's own webview widget into a
     // gtk::Overlay and adds the shared GLArea every open pane composites
     // into, on top of it, inside THIS window -- no separate OS window, no
@@ -655,7 +656,7 @@ async fn async_main() {
             // its GPU resources in the order it expects, instead of having
             // them torn out from under it.
             log::info!("main: RunEvent::Exit — closing panes and shutting down CEF");
-            quietrabbit_lib::tier3_pane::pane_host::close_all_panes();
+            quietrabbit_lib::cloud_chat_gpu_pane::pane_host::close_all_panes();
             cef::shutdown();
             // items.id=315 (3rd attempt): tao's own event loop calls
             // std::process::exit() unconditionally right after this closure
@@ -682,8 +683,10 @@ async fn async_main() {
             let main_window = app_handle
                 .get_webview_window("main")
                 .expect("quietrabbit: main window not found on RunEvent::Ready");
-            let open_pane_count =
-                quietrabbit_lib::tier3_pane::pane_host::install(&main_window, app_handle.clone());
+            let open_pane_count = quietrabbit_lib::cloud_chat_gpu_pane::pane_host::install(
+                &main_window,
+                app_handle.clone(),
+            );
 
             // Replaces the old freeze-bug heartbeat thread (a 16ms
             // run_on_main_thread(|| {}) loop whose entire purpose was
@@ -708,7 +711,7 @@ async fn async_main() {
                     );
                 }
                 if count > 0 {
-                    quietrabbit_lib::tier3_pane::pane_host::queue_draw();
+                    quietrabbit_lib::cloud_chat_gpu_pane::pane_host::queue_draw();
                 }
                 glib::ControlFlow::Continue
             });

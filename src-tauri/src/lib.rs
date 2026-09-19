@@ -2,6 +2,7 @@
 // Quiet Rabbit -- library root.
 
 pub mod auth;
+pub mod cloud_chat_gpu_pane;
 pub mod commands;
 pub mod conductor;
 pub mod group_sync;
@@ -14,4 +15,3 @@ pub mod providers;
 pub mod task_supervision;
 #[cfg(test)]
 pub mod test_support;
-pub mod tier3_pane;

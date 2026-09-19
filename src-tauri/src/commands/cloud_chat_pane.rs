@@ -72,10 +72,10 @@ use tauri::State;
 use tokio::sync::oneshot;
 
 use crate::auth::registry::{key_hex, KeyRegistry};
+use crate::cloud_chat_gpu_pane::pane_host::{self, PaneCommand};
+use crate::cloud_chat_gpu_pane::PaneKey;
 use crate::persistence::provider_store;
 use crate::persistence::tier3_cookie_store::{self, StoredCookie};
-use crate::tier3_pane::pane_host::{self, PaneCommand};
-use crate::tier3_pane::PaneKey;
 
 /// How long to wait for a single CEF cookie-jar round trip
 /// (set_cookie's completion callback, or visit_url_cookies' last-cookie

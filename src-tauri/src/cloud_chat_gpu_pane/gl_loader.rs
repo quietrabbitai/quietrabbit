@@ -88,7 +88,7 @@ impl GlProcLoader {
             libloading::Library::new("libGLESv2.so.2")
                 .or_else(|_| libloading::Library::new("libGLESv2.so"))
                 .expect(
-                    "tier3_pane::gl_loader: could not dlopen libGLESv2 -- required for GTK GL \
+                    "cloud_chat_gpu_pane::gl_loader: could not dlopen libGLESv2 -- required for GTK GL \
                      interop on Linux/EGL",
                 )
         };
@@ -96,7 +96,7 @@ impl GlProcLoader {
             libloading::Library::new("libEGL.so.1")
                 .or_else(|_| libloading::Library::new("libEGL.so"))
                 .expect(
-                    "tier3_pane::gl_loader: could not dlopen libEGL -- required for GTK GL \
+                    "cloud_chat_gpu_pane::gl_loader: could not dlopen libEGL -- required for GTK GL \
                      interop on Linux/EGL",
                 )
         };
@@ -105,7 +105,7 @@ impl GlProcLoader {
                 b"eglGetProcAddress\0",
             )
             .expect(
-                "tier3_pane::gl_loader: eglGetProcAddress symbol not found in libEGL -- \
+                "cloud_chat_gpu_pane::gl_loader: eglGetProcAddress symbol not found in libEGL -- \
                  confirmed present via `nm -D` this session, so a missing symbol here means \
                  a different libEGL than the one checked is being loaded",
             )
