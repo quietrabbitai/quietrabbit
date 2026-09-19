@@ -1,6 +1,6 @@
 // src-tauri/src/commands/tier2.rs
 //
-// Group 9 — Tier 2 configuration.
+// Group 9 — Tier 1.5 (qr_hosted) configuration.
 // Commands: get_tier2_config, set_tier2_provider.
 //
 // Wired (items.id=185, 2026-08-02) against persistence::integration_keys_store
@@ -23,7 +23,7 @@
 // decision outside this item's scope -- flagged in this session's handoff.
 //
 // key_type is hardcoded to "tier2" in both commands -- this module's only
-// concern is Tier 2 provider configuration (Groq, Mistral); cloud_frontier and
+// concern is Tier 1.5 (qr_hosted) provider configuration (Groq, Mistral); cloud_frontier and
 // future non-AI integrations use the same table via a different key_type,
 // through their own future command modules.
 //
@@ -55,7 +55,7 @@ const TIER2_KEY_TYPE: &str = "tier2";
 // IPC types
 // ---------------------------------------------------------------------------
 
-/// Non-secret Tier 2 configuration state -- never carries the credential
+/// Non-secret Tier 1.5 (qr_hosted) configuration state -- never carries the credential
 /// itself. `configured` is true iff an active user-global tier2 key exists
 /// for `provider`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, specta::Type)]
@@ -69,7 +69,7 @@ pub struct Tier2Config {
 // Commands
 // ---------------------------------------------------------------------------
 
-/// Report configuration state for a Tier 2 provider. Returns
+/// Report configuration state for a Tier 1.5 (qr_hosted) provider. Returns
 /// configured=false (not an error) when no key is set yet -- an
 /// unconfigured provider is a normal, expected state, not a failure.
 #[tauri::command]
@@ -108,7 +108,7 @@ pub async fn get_tier2_config(
     })
 }
 
-/// Set (or replace) the credential for a Tier 2 provider, user-global scope.
+/// Set (or replace) the credential for a Tier 1.5 (qr_hosted) provider, user-global scope.
 #[tauri::command]
 #[specta::specta]
 pub async fn set_tier2_provider(
@@ -136,8 +136,8 @@ pub async fn set_tier2_provider(
     .map_err(|e| e.to_string())
 }
 
-/// Set (or clear, with `provider: None`) the current user's Tier 2 provider
-/// preference -- distinct from set_tier2_provider above, which stores a
+/// Set (or clear, with `provider: None`) the current user's Tier 1.5 (qr_hosted)
+/// provider preference -- distinct from set_tier2_provider above, which stores a
 /// credential. This is the "which provider should QR actually use" choice.
 ///
 /// items.id=432: lifecycle.rs resolves an account-wide user_provider_preference

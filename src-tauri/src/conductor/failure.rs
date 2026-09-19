@@ -111,7 +111,7 @@ pub enum ConductorError {
     #[error("{plain_language}")]
     VoiceProfileContamination { plain_language: String },
 
-    // F10 subtype — no Tier 2 provider configured (install interview not completed)
+    // F10 subtype — no Tier 1.5 (qr_hosted) provider configured (install interview not completed)
     #[error("{plain_language}")]
     MissingTier2Config { plain_language: String },
 
@@ -497,7 +497,7 @@ impl FailureHandler {
                 metadata: None,
             },
 
-            // F10 subtype — no Tier 2 provider configured
+            // F10 subtype — no Tier 1.5 (qr_hosted) provider configured
             ConductorError::MissingTier2Config { .. } => FailureResult {
                 action: FailureAction::AwaitUser,
                 failure_mode: Some("F10".to_owned()),

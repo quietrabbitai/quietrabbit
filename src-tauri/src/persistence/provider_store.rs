@@ -654,8 +654,8 @@ fn row_to_provider_model(
     })
 }
 
-/// The model conductor/executor.rs's select_model() resolves for a Tier 2
-/// provider -- replaces the hardcoded `match tier2_provider { Some("mistral")
+/// The model conductor/executor.rs's select_model() resolves for a Tier 1.5
+/// (qr_hosted) provider -- replaces the hardcoded `match tier2_provider { Some("mistral")
 /// => ..., Some("groq") => ... }` literal-string dispatch. `None` when
 /// `provider_id` has no default row in provider_models (an unknown provider,
 /// or a known one not yet curated with a model) -- callers must treat that
@@ -683,7 +683,7 @@ pub async fn get_default_model(
 }
 
 /// Look up a catalog model by its real `provider_id`/`model_id` columns --
-/// used by conductor/executor.rs's get_context_window() at Tier 2 instead of
+/// used by conductor/executor.rs's get_context_window() at Tier 1.5 (qr_hosted) instead of
 /// reconstructing the composite `id` PK from those same two fields
 /// (decisions.id=813: an id's internal structure is never treated as data,
 /// in either direction -- parsing it apart or rebuilding it to use as a key).

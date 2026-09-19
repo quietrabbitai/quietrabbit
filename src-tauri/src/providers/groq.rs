@@ -1,5 +1,5 @@
 // src-tauri/src/providers/groq.rs
-// Groq Tier 2 provider — implements Tier2Provider for Groq API.
+// Groq Tier 1.5 (qr_hosted) provider — implements Tier2Provider for Groq API.
 //
 // Model: llama-3.1-8b-instant (drafting — fast, good quality, free tier)
 // Provider: Groq (US-based, free tier available)
@@ -33,7 +33,7 @@ const GROQ_API_BASE: &str = "https://api.groq.com/openai/v1";
 const GROQ_TIMEOUT_SECONDS: u64 = 30;
 const GROQ_HEALTH_TIMEOUT_SECONDS: u64 = 3;
 
-/// Groq Tier 2 provider using OpenAI-compatible chat/completions endpoint.
+/// Groq Tier 1.5 (qr_hosted) provider using OpenAI-compatible chat/completions endpoint.
 /// Stateless — no session, no memory, no tools.
 /// HTTP transport: reqwest (async).
 pub struct GroqProvider {

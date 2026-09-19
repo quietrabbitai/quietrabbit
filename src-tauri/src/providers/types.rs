@@ -1,4 +1,4 @@
-//! Provider data types shared across Conductor, Ollama, Tier 2 providers,
+//! Provider data types shared across Conductor, Ollama, Tier 1.5 (qr_hosted) providers,
 //! and the IPC layer.
 //!
 //! `GenerateRequest.stream` is always resolved by `StepExecutor` —
@@ -22,7 +22,7 @@ pub struct GenerateOptions {
 /// `stream` is resolved by `StepExecutor` — callers must not set it directly.
 ///
 /// `provider_id`/`model_id` carry the fields already resolved by
-/// `StepExecutor::select_model()` (Tier 2: `provider_store::ProviderModel`'s
+/// `StepExecutor::select_model()` (Tier 1.5 (qr_hosted): `provider_store::ProviderModel`'s
 /// own columns; qr_local: `provider_id: None`, `model_id` the bare Ollama tag).
 /// Nothing downstream may derive one from the other by parsing — see
 /// decisions.id=813.

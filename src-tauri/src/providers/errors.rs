@@ -73,8 +73,8 @@ pub enum ProviderError {
         plain_language: String,
     },
 
-    /// No Tier 2 provider configured — install interview not completed.
-    #[error("no Tier 2 provider configured")]
+    /// No Tier 1.5 (qr_hosted) provider configured — install interview not completed.
+    #[error("no Tier 1.5 (qr_hosted) provider configured")]
     MissingTier2Config { plain_language: String },
 }
 

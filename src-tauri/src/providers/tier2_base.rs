@@ -1,8 +1,8 @@
-//! Abstract base trait for all Tier 2 external providers.
+//! Abstract base trait for all Tier 1.5 (qr_hosted) external providers.
 //! Concrete implementations: `groq.rs`, and future `mistral.rs`.
 //!
 //! CONTRACT:
-//! - All Tier 2 providers receive abstracted field values only.
+//! - All Tier 1.5 (qr_hosted) providers receive abstracted field values only.
 //!   Raw personal field values never appear in prompts routed here.
 //!   The disclosure buffer enforces this upstream in `StepExecutor` Step 8.
 //! - `generate()` is the primary interface. Called by `StepExecutor` Step 10
@@ -31,7 +31,7 @@ use async_trait::async_trait;
 use crate::conductor::failure::ConductorError;
 use crate::providers::types::{GenerateRequest, GenerateResponse, ProviderHealth};
 
-/// Abstract base for Tier 2 external providers.
+/// Abstract base for Tier 1.5 (qr_hosted) external providers.
 ///
 /// Stateless single-request completion model — no tools, no memory,
 /// no multi-turn state. All state management is in `TaskTrack` (executor).
@@ -100,7 +100,7 @@ pub trait Tier2Provider: Send + Sync {
     /// `request.model_id` directly. No string parsing.
     ///
     /// Returns `Err(ConductorError::UnknownProvider)` if:
-    /// - `request.provider_id` is `None` (request never resolved a Tier 2 provider)
+    /// - `request.provider_id` is `None` (request never resolved a Tier 1.5 (qr_hosted) provider)
     /// - `request.provider_id` does not match `self.provider_id()`
     ///
     /// Python oracle: `Tier2Provider.model_id_from_request()`

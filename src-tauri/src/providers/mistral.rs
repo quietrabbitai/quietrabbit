@@ -1,5 +1,5 @@
 // src-tauri/src/providers/mistral.rs
-// Mistral Tier 2 provider — implements Tier2Provider for Mistral's La Plateforme API.
+// Mistral Tier 1.5 (qr_hosted) provider — implements Tier2Provider for Mistral's La Plateforme API.
 //
 // Model: mistral-small-latest (drafting — fast, cheap paid tier)
 // Provider: Mistral (EU-based, GDPR)
@@ -33,7 +33,7 @@ const MISTRAL_API_BASE: &str = "https://api.mistral.ai/v1";
 const MISTRAL_TIMEOUT_SECONDS: u64 = 30;
 const MISTRAL_HEALTH_TIMEOUT_SECONDS: u64 = 3;
 
-/// Mistral Tier 2 provider using OpenAI-compatible chat/completions endpoint.
+/// Mistral Tier 1.5 (qr_hosted) provider using OpenAI-compatible chat/completions endpoint.
 /// Stateless — no session, no memory, no tools.
 /// HTTP transport: reqwest (async).
 pub struct MistralProvider {

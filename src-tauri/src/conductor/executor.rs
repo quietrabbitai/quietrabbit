@@ -126,11 +126,11 @@ fn ollama_client() -> &'static OllamaClient {
     OLLAMA_CLIENT.get_or_init(OllamaClient::new)
 }
 
-/// items.id=465 (closes B2): a small registry keyed by each Tier 2
-/// provider's own `Tier2Provider::provider_id()`, replacing the old
+/// items.id=465 (closes B2): a small registry keyed by each Tier 1.5
+/// (qr_hosted) provider's own `Tier2Provider::provider_id()`, replacing the old
 /// hardcoded `match tier2_provider_preference.as_deref() { Some("mistral")
 /// => ..., Some("groq") => ..., Some(other) => unreachable!(...) }`
-/// dispatch. Adding a third Tier 2 provider now means adding one entry
+/// dispatch. Adding a third qr_hosted provider now means adding one entry
 /// here, not a new match arm at every dispatch site that switches on a
 /// provider string.
 static TIER2_PROVIDER_REGISTRY: OnceLock<HashMap<&'static str, &'static dyn Tier2Provider>> =
@@ -402,7 +402,7 @@ impl StepExecutor {
 
         // -- Step 4 — cloud_frontier boundary handled by lifecycle; executor never reached --
 
-        // -- Step 4.5 — Tier 2 provider preference gate (F10) --
+        // -- Step 4.5 — Tier 1.5 (qr_hosted) provider preference gate (F10) --
         // No prescribed default (architecture: "User choice at install. No
         // prescribed default."). An unset preference is a real gap, not
         // silently resolved to Groq — short-circuits before any provider
@@ -412,7 +412,7 @@ impl StepExecutor {
             return Ok(Some(
                 failure_handler.handle(
                     &ConductorError::MissingTier2Config {
-                        plain_language: "No Tier 2 AI provider is set up yet. \
+                        plain_language: "No Tier 1.5 AI provider is set up yet. \
                         Choose Groq or Mistral in Settings to continue. \
                         [Open Settings] [Get help]"
                             .to_owned(),
@@ -645,7 +645,7 @@ impl StepExecutor {
                     Some(provider) => provider.generate(&request).await,
                     None => Err(ConductorError::UnknownProvider {
                         plain_language: format!(
-                            "Tier 2 provider '{provider_id}' is not registered with this \
+                            "Tier 1.5 provider '{provider_id}' is not registered with this \
                              build of Quiet Rabbit."
                         ),
                     }),
@@ -1003,7 +1003,7 @@ async fn scan_voice_profile<L: DisclosureLogger>(
 /// `provider_id`/`model_id` columns directly (decisions.id=813 — an id is an
 /// opaque key, never parsed to recover data the table already holds).
 /// `provider_id` is `None` exactly at qr_local (Ollama has no `provider_models`
-/// row to resolve against yet); `Some(id)` at Tier 2, from the row's own
+/// row to resolve against yet); `Some(id)` at Tier 1.5 (qr_hosted), from the row's own
 /// `provider_id` column. Not `specta::Type` — internal to the executor, never
 /// crosses IPC.
 #[derive(Debug)]
@@ -1013,13 +1013,13 @@ struct SelectedModel {
 }
 
 /// Select a model based on task_type, execution tier, and (at tier>=2)
-/// the user's Tier 2 provider preference.
+/// the user's Tier 1.5 (qr_hosted) provider preference.
 /// Python oracle: StepExecutor._select_model()
 ///
-/// items.id=465 (closes B3): the Tier 2 branch now queries
+/// items.id=465 (closes B3): the Tier 1.5 (qr_hosted) branch now queries
 /// provider_store::get_default_model() (provider_models WHERE
 /// provider_id = ? AND is_default = 1) instead of matching on the literal
-/// provider string -- adding a third Tier 2 provider is now a catalog row,
+/// provider string -- adding a third qr_hosted provider is now a catalog row,
 /// not a new match arm here.
 ///
 /// tier2_provider must be Some(...) whenever tier >= 2 — the caller
@@ -1066,13 +1066,13 @@ async fn select_model(
         }),
         Ok(None) => Err(ConductorError::UnknownProvider {
             plain_language: format!(
-                "Tier 2 provider '{provider_id}' has no default model configured \
+                "Tier 1.5 provider '{provider_id}' has no default model configured \
                  in the provider catalog."
             ),
         }),
         Err(e) => Err(ConductorError::UnknownProvider {
             plain_language: format!(
-                "could not look up the default model for Tier 2 provider \
+                "could not look up the default model for Tier 1.5 provider \
                  '{provider_id}': {e}"
             ),
         }),
@@ -1584,7 +1584,7 @@ mod tests {
         assert_eq!(format_voice_profile(&vp), "");
     }
 
-    /// items.id=465: select_model()'s Tier 2 branch and get_context_window()
+    /// items.id=465: select_model()'s Tier 1.5 (qr_hosted) branch and get_context_window()
     /// now read provider_models (shared.db) instead of matching on literal
     /// provider/model strings -- these tests need a real, migrated shared.db
     /// (shared_016.sql's own curation pass seeds groq/mistral's default
