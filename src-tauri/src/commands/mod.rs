@@ -51,6 +51,7 @@ pub struct NotImplementedPlaceholder {}
 pub mod active_board;
 pub mod auth;
 pub mod chats;
+pub mod cloud_chat_pane;
 pub mod consent;
 pub mod execution;
 pub mod focus_builder;
@@ -66,4 +67,3 @@ pub mod persona_view_sync;
 pub mod personal;
 pub mod system;
 pub mod tier2;
-pub mod cloud_chat_pane;

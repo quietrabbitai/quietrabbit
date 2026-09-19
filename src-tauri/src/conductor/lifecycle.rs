@@ -2847,9 +2847,10 @@ mod tests {
         // (AnonymousRequired or Unrestricted), these two steps must NOT have
         // their abstraction floor clamped -- confirms items.id=444's fix on
         // the exact shipping Focus that motivated it (spec Part 7d).
-        for focus_max_permitted_tier in
-            [ExternalAccess::AnonymousRequired, ExternalAccess::Unrestricted]
-        {
+        for focus_max_permitted_tier in [
+            ExternalAccess::AnonymousRequired,
+            ExternalAccess::Unrestricted,
+        ] {
             let focus_external_access =
                 focus_max_permitted_tier.min(ExternalAccess::AnonymousRequired);
             let step_override = Some(ExternalAccess::LocalOnly);
