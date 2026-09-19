@@ -957,7 +957,12 @@ async fn test_gate3() {
             "test content",
             severity,
             target_tier,
-            ExternalAccess::from_legacy_tier(space_max),
+            match space_max {
+                1 => ExternalAccess::LocalOnly,
+                2 => ExternalAccess::AnonymousRequired,
+                3 => ExternalAccess::Unrestricted,
+                other => panic!("{label}: unexpected space_max_permitted_tier {other}"),
+            },
             execution_tier,
             None, // app_handle: None -- every vector here exercises only the
             // tier-ceiling (check 1) / legacy-sensitivity (check 2b) paths,
