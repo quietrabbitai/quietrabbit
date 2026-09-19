@@ -16,8 +16,8 @@
 // (integration_keys_store::get_active_key/upsert_key called with
 // persona_id=None) -- neither command signature carries a persona_id
 // parameter today (the stub this replaces did not have one, and no
-// frontend caller exists yet to have specified one). Persona-scoped Tier 2
-// keys are supported by the underlying schema and store (keys_001.sql's
+// frontend caller exists yet to have specified one). Persona-scoped Tier 1.5
+// (qr_hosted) keys are supported by the underlying schema and store (keys_001.sql's
 // persona_id column, integration_keys_store::get_active_key's persona_id
 // parameter) but adding that to the IPC surface is a frontend-contract
 // decision outside this item's scope -- flagged in this session's handoff.
