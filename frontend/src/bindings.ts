@@ -382,16 +382,16 @@ export const commands = {
 	getFocusBuilderSession: (focusId: string | null) => typedError<NotImplementedPlaceholder, string>(__TAURI_INVOKE("get_focus_builder_session", { focusId })),
 	submitFocusBuilderStep: (sessionId: string, input: NotImplementedPlaceholder) => typedError<NotImplementedPlaceholder, string>(__TAURI_INVOKE("submit_focus_builder_step", { sessionId, input })),
 	/**
-	 *  Report configuration state for a Tier 2 provider. Returns
+	 *  Report configuration state for a Tier 1.5 (qr_hosted) provider. Returns
 	 *  configured=false (not an error) when no key is set yet -- an
 	 *  unconfigured provider is a normal, expected state, not a failure.
 	 */
 	getTier2Config: (provider: string) => typedError<Tier2Config, string>(__TAURI_INVOKE("get_tier2_config", { provider })),
-	/**  Set (or replace) the credential for a Tier 2 provider, user-global scope. */
+	/**  Set (or replace) the credential for a Tier 1.5 (qr_hosted) provider, user-global scope. */
 	setTier2Provider: (provider: string, apiKey: string) => typedError<null, string>(__TAURI_INVOKE("set_tier2_provider", { provider, apiKey })),
 	/**
-	 *  Set (or clear, with `provider: None`) the current user's Tier 2 provider
-	 *  preference -- distinct from set_tier2_provider above, which stores a
+	 *  Set (or clear, with `provider: None`) the current user's Tier 1.5 (qr_hosted)
+	 *  provider preference -- distinct from set_tier2_provider above, which stores a
 	 *  credential. This is the "which provider should QR actually use" choice.
 	 * 
 	 *  items.id=432: lifecycle.rs resolves an account-wide user_provider_preference
@@ -1377,7 +1377,7 @@ export type SubmitFrictionGateDecisionRequest = {
 export type SubscriptionStatus = "free" | "paid";
 
 /**
- *  Non-secret Tier 2 configuration state -- never carries the credential
+ *  Non-secret Tier 1.5 (qr_hosted) configuration state -- never carries the credential
  *  itself. `configured` is true iff an active user-global tier2 key exists
  *  for `provider`.
  */
