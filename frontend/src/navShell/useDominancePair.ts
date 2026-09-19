@@ -1,7 +1,7 @@
 // The QR Chat <-> Cloud Chat dominance pair's state and activate/close/reclaim
 // actions -- items.id=384 slice 4 (decisions.id=735). Extracted from
-// Tier3AccessPane.tsx's own local useState so the pair survives
-// Tier3AccessPane unmounting: WorkspaceShell.tsx (slice 3) unmounts it
+// CloudChatAccessPane.tsx's own local useState so the pair survives
+// CloudChatAccessPane unmounting: WorkspaceShell.tsx (slice 3) unmounts it
 // entirely when Board is 'full', by design (its own header comment
 // explains why a real unmount, not CSS-hiding, is required for the CEF
 // pane lifecycle below) -- so the pair's state can no longer live in that
@@ -21,11 +21,11 @@
 // `dominant` is an EXPLICITLY set field, not derived from
 // activeProviderId !== null -- an earlier version of this hook derived it
 // that way and shipped a real regression: pre-extraction, the rail
-// (Tier3Selector) was visible whenever reviewOutcome === 'approved', full
+// (CloudChatSelector) was visible whenever reviewOutcome === 'approved', full
 // stop, independent of whether any specific provider had been activated
 // yet or since closed ("the rail is persistent once the gate clears...
 // it does not disappear once a pane opens," items.id=359's own comment,
-// carried into Tier3AccessPane.tsx unchanged). Deriving dominant purely
+// carried into CloudChatAccessPane.tsx unchanged). Deriving dominant purely
 // from activeProviderId made the rail vanish the instant activeProviderId
 // went back to null (right after Gate3 first approves, before the user
 // has clicked anything; or after closing whichever pane was active) --
@@ -41,9 +41,9 @@
 //     the rail itself stays visible.
 //
 // Gate3 review state (reviewOutcome/consentPayload/pendingMessageId/etc.)
-// stays local to Tier3AccessPane, entirely untouched by this extraction --
+// stays local to CloudChatAccessPane, entirely untouched by this extraction --
 // it's per-in-flight-message state, not part of "which side is dominant."
-// markTier3Ready() is the one narrow exception: Tier3AccessPane calls it
+// markTier3Ready() is the one narrow exception: CloudChatAccessPane calls it
 // from an effect watching reviewOutcome, but this hook still has no idea
 // what Gate3 review even is -- it just exposes a plain "make tier3
 // dominant" action, same shape as reclaimChat's "make chat dominant."
@@ -57,7 +57,7 @@ export interface DominancePairHandle {
   openProviderIds: string[]
   activeProviderId: string | null
   openError: string | null
-  /** Exposed (not just openError itself) so Tier3AccessPane can surface
+  /** Exposed (not just openError itself) so CloudChatAccessPane can surface
    *  its OWN failures -- syncPaneLayout's setPaneLayout call, the
    *  dev-only force-escalation scaffolding -- through this same shared
    *  error slot, exactly as the pre-extraction code's single local
@@ -71,7 +71,7 @@ export interface DominancePairHandle {
    *  pre-extraction handleActivate. */
   activate: (providerId: string) => void
   /** onClosed fires after a successful close, before this function
-   *  returns control -- Tier3AccessPane uses it to clear its own local
+   *  returns control -- CloudChatAccessPane uses it to clear its own local
    *  popupRects entry for the closed provider (items.id=234's popup
    *  bookkeeping stays local to that component, not this hook's
    *  concern; see this hook's header comment on scope). Does NOT change
@@ -84,7 +84,7 @@ export interface DominancePairHandle {
   reclaimChat: () => void
   /** Makes Cloud Chat dominant without activating any specific provider --
    *  the "Gate3 just approved a draft" trigger. A no-op (same object
-   *  reference, no re-render) if already dominant, so Tier3AccessPane's
+   *  reference, no re-render) if already dominant, so CloudChatAccessPane's
    *  effect can call this every time reviewOutcome is 'approved' without
    *  worrying about redundant updates. */
   markTier3Ready: () => void

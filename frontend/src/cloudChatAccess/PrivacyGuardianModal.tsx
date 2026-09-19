@@ -4,13 +4,13 @@
 // decisions.id=753/754, and built out here, items.id=406). No modal component
 // existed anywhere in this codebase before the original build -- built from
 // the spec directly, following this codebase's plain-global-CSS / useState /
-// t() conventions (Tier3Selector.tsx is the closest sibling for those idioms).
+// t() conventions (CloudChatSelector.tsx is the closest sibling for those idioms).
 //
-// Mounted by Tier3AccessPane.tsx once request_tier3_gate3_review reports
+// Mounted by CloudChatAccessPane.tsx once request_tier3_gate3_review reports
 // pending_consent=true. `open` covers both the pre-payload scanning state
 // (gate3() is still running server-side, bounded by gate3.rs's own 10s
 // PF_TIMEOUT_SECS) and the post-payload tiered review; `payload` arrives via
-// Tier3AccessPane's own consent_request listener once gate3() emits it.
+// CloudChatAccessPane's own consent_request listener once gate3() emits it.
 //
 // ConsentRequestPayload / ConsentSpanItem / ReviewTier / ElementDecision are
 // hand-declared here, not generated: consent_request is emitted via

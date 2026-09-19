@@ -10,7 +10,7 @@
 // display metadata -- which providers exist, which lane they're in, and
 // (new, items.id=359) each provider's brand-tint color. It does NOT cover
 // the pane-hosting mechanics themselves (PaneHitLayer.tsx, paneLayout.ts,
-// Tier3AccessPane.tsx own that).
+// CloudChatAccessPane.tsx own that).
 //
 // VISUAL DESIGN NOTE: this is a structural/behavioral build only, same
 // placeholder discipline as middleZone/ -- the whole app still runs the

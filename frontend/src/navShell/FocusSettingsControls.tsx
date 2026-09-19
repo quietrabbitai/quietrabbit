@@ -1,7 +1,7 @@
 // items.id=321 / decisions.id=729 -- shared control for raising a Focus's
 // privacy_tier / max_permitted_tier, used two ways: the full settings
 // screen (FocusSettingsPane, mode="full") and the inline "raise it now"
-// affordance Tier3AccessPane mounts in place of Gate3's dead
+// affordance CloudChatAccessPane mounts in place of Gate3's dead
 // "[Change Focus settings]" block text (mode="ceilingOnly", just the one
 // field). One component, not two, so the friction-gate-confirm logic below
 // only has to be written once.
@@ -112,7 +112,7 @@ export interface FocusSettingsControlsProps {
   /** ceilingOnly only: prefills the select, e.g. from Gate3Result's own
    *  target_tier on the block that mounted this control, converted to its
    *  ExternalAccess equivalent by the caller (items.id=448 -- target_tier
-   *  itself stays a plain number; see Tier3AccessPane.tsx's own
+   *  itself stays a plain number; see CloudChatAccessPane.tsx's own
    *  externalAccessFromLegacyTier helper). */
   suggestedMaxPermittedTier?: ExternalAccess
   /** Fires after a save applies cleanly, whether directly or via the

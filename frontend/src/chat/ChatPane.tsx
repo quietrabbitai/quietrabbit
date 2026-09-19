@@ -1,6 +1,6 @@
 // Real chat/transcript component -- the thing behind MiddleZone's chatPane
 // prop, replacing the placeholder <p> stubs previously in NavShell.tsx's
-// personaHub branch and Tier3AccessPane.tsx's conversation pane. One
+// personaHub branch and CloudChatAccessPane.tsx's conversation pane. One
 // component for both: gate3Track is the only behavioral difference (whether
 // the assistant reply gets gate3_review_status="drafted").
 
@@ -26,14 +26,14 @@ export interface ChatPaneProps {
    *  been backfilled with real content and is still gate3_review_status
    *  'drafted' -- the signal that it's ready for Privacy Guardian review.
    *  Only ever fires when gate3Track is true; ignored (never called) for
-   *  Persona-hub usage. The caller (Tier3AccessPane) is responsible for
+   *  Persona-hub usage. The caller (CloudChatAccessPane) is responsible for
    *  invoking commands.requestTier3Gate3Review with the given messageId. */
   onDraftReady?: (messageId: string) => void
   /** items.id=359 (decisions.id=731): when true, renders only a minimal
    *  floor -- QR's mark, the latest assistant response as a snippet, and
    *  the existing entry bar below (kept mounted and focusable either
    *  way) -- instead of the full transcript. Driven by the caller
-   *  (Tier3AccessPane), never by this component's own state: this
+   *  (CloudChatAccessPane), never by this component's own state: this
    *  component owns message data, not the layout decision of whether
    *  Cloud Chat currently has focus. Omitted/false renders exactly
    *  as before this prop existed. */
@@ -46,7 +46,7 @@ export interface ChatPaneProps {
   /** items.id=391: fires whenever the latest assistant message changes
    *  (including to null, on mount/contextKey change before any messages
    *  have loaded, or for a transcript with no assistant turns yet) --
-   *  lets the caller (Tier3AccessPane's chat toolbar) offer an on-demand
+   *  lets the caller (CloudChatAccessPane's chat toolbar) offer an on-demand
    *  "2nd opinion" action against the real last response, reusing this
    *  component's own existing lastAssistantMessage lookup rather than
    *  duplicating message-list tracking one level up. Carries
@@ -59,7 +59,7 @@ export interface ChatPaneProps {
     message: { id: string; gate3_review_status: string | null } | null,
   ) => void
   /** items.id=406 (decisions.id=755): fires on every "Copy starter" click,
-   *  after the clipboard write -- lets the caller (Tier3AccessPane) record
+   *  after the clipboard write -- lets the caller (CloudChatAccessPane) record
    *  which message/text was last copied, for the provider-selection
    *  re-check trigger's clipboard-provenance check (QR only ever evaluates
    *  clipboard content it can prove it wrote itself). Purely an
@@ -229,7 +229,7 @@ export function ChatPane({
    *  items.id=27): per-Persona, per-session (never persisted) bookkeeping of
    *  which entity_facts.id values this user has already answered -- keyed
    *  by personaId, not reset on a Persona switch (this component isn't
-   *  remounted for one -- see Tier3AccessPane.tsx's `{personaId ? <ChatPane
+   *  remounted for one -- see CloudChatAccessPane.tsx's `{personaId ? <ChatPane
    *  .../> : ...}` branch), only ever cleared by this component unmounting
    *  (logout), matching KeyRegistry's own clear-on-logout lifetime. Declines
    *  are remembered too, so declining a fact once doesn't re-prompt on every
@@ -292,7 +292,7 @@ export function ChatPane({
 
   // First listen() call in this frontend (see this file's header comment on
   // RunStatusPayload) -- effect-returns-cleanup-closure shape, matching
-  // MiddleZone's debounce-timer cleanup and Tier3AccessPane's ResizeObserver
+  // MiddleZone's debounce-timer cleanup and CloudChatAccessPane's ResizeObserver
   // cleanup, per CLAUDE.md's "Tauri event listeners must be explicitly
   // detached on SPA view unmount."
   //

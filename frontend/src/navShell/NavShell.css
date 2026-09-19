@@ -41,7 +41,7 @@
  * 3 design reference. QR takes a resting share of the height when
  * expanded and collapses toward its own content's natural (small)
  * height when a provider is active -- driven by data-collapsed, set from
- * ChatPane's own `collapsed` prop's caller (Tier3AccessPane.tsx), not by
+ * ChatPane's own `collapsed` prop's caller (CloudChatAccessPane.tsx), not by
  * anything in this file. */
 .tier3-access-pane {
   display: flex;
@@ -72,7 +72,7 @@
    * .qr-banner, this file's own comment on that rule), so the default
    * arrangement is that bar ON TOP of .qr-panel's real content, not
    * beside it. Only the floor case still needs a row: the floor-picker
-   * sits BESIDE the one-row collapsed floor (Tier3AccessPane.tsx), see
+   * sits BESIDE the one-row collapsed floor (CloudChatAccessPane.tsx), see
    * the [data-floor] override just below. */
   flex-direction: column;
   gap: 10px;
@@ -89,7 +89,7 @@
 }
 
 /* items.id=384 slice 4: when Chat is dominant, there's no split-area
- * sibling to share height with any more (Tier3CollapsedStrip is a small
+ * sibling to share height with any more (CloudChatCollapsedStrip is a small
  * fixed-height row, not a flex:1 region) -- QR needs to actually fill the
  * remaining space instead of keeping its old 34% resting share. */
 .tier3-access-pane[data-dominant='chat'] .tier3-access-pane__qr {
@@ -101,7 +101,7 @@
  * dominant === 'chat' (by construction -- Board always forces Chat
  * dominance first), so the rule above would otherwise override
  * .qr[data-collapsed]'s own flex:0 0 auto and stretch the one-row floor
- * to fill Tier3AccessPane's entire height. Four class-level selectors
+ * to fill CloudChatAccessPane's entire height. Four class-level selectors
  * here vs three above -- wins on specificity regardless of source order. */
 .tier3-access-pane[data-dominant='chat'] .tier3-access-pane__qr[data-collapsed] {
   flex: 0 0 auto;
@@ -135,7 +135,7 @@
 /* items.id=384 slice 5, decisions.id=743 / items.id=391 (eleventh pass):
  * the shared "expanded region header" bar -- ONE class, used by every
  * region's own full-content header, not just QR's: QR's own title+
- * History+persona-picker row (Tier3AccessPane.tsx, below .qr), Tier3's
+ * History+persona-picker row (CloudChatAccessPane.tsx, below .qr), Tier3's
  * own "Second opinion" title row (same file, above .split-area), AND
  * Board's own "Active Board"+density-toggle row (WorkspaceShell.tsx,
  * which imports this stylesheet for exactly this class). Confirmed live

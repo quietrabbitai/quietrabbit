@@ -1,6 +1,6 @@
 // Shared pure logic for classifying a resolved Gate3 consent decision set.
 // Extracted out of PrivacyGuardianModal.tsx's handleSend and
-// Tier3AccessPane.tsx's handleModalResolve (items.id=377): both had their
+// CloudChatAccessPane.tsx's handleModalResolve (items.id=377): both had their
 // own inline `decisions.length === keptPrivate` / `decisions.every(...)`
 // check, and `Array.prototype.every` on an empty array is vacuously true --
 // with zero spans to review (gate3's zero-spans-forced-High branch,
