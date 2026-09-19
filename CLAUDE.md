@@ -76,9 +76,14 @@ but keep it in mind if you add other CWD-relative paths in this codebase.
 
 Key commands:
   cargo build                                          — compile check
-  cargo test 2>&1 | grep -E "^error|test result"      — test summary
+  cargo fmt --check                                    — formatting (CI gate; fix with plain `cargo fmt` over the whole crate, never scoped to one file)
+  cargo clippy -- -D warnings                          — lint (CI gate)
+  cargo deny check                                     — advisories/licenses/bans/sources (CI gate)
+  cargo test 2>&1 | grep -E "^error|test result"      — test summary (PLAIN, never --lib: --lib skips the src-tauri/tests/ targets)
   git branch --show-current                            — verify branch (must show main)
   git log --oneline main | head -10                    — commit verification
+
+The cargo commands above run from src-tauri/. CI's check job (.github/workflows/tauri-ci.yml) runs fmt, clippy, deny and plain test; a change is not verified until build, fmt, clippy, deny and plain test all pass locally. Build plus test alone has let both a compile break and a fmt failure reach unpushed main undetected (items.id=532).
 
 ## Ollama (D6-353)
 QR checks for a running Ollama instance at 127.0.0.1:11434 on startup.
