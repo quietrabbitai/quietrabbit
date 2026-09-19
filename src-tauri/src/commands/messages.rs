@@ -3,7 +3,7 @@
 // Group 14 — Messages/transcript. Commands: send_message, list_messages.
 //
 // Backs ChatPane.tsx, the real component behind MiddleZone's chatPane prop
-// for both Persona hub chat and Tier3AccessPane's starter-drafting pane.
+// for both Persona hub chat and CloudChatAccessPane's starter-drafting pane.
 // list_messages doubles as "get transcript" -- a context_key-scoped fetch
 // already is the transcript, so no separate command exists for it.
 //

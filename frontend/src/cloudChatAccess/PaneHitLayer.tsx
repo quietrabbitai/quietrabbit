@@ -2,7 +2,7 @@
 // GDK input-shape click-routing mechanism (see pane_host.rs's module doc
 // for why that mechanism froze the whole client's Wayland pointer input and
 // had to go). One absolutely-positioned, invisible <div> per open pane,
-// positioned from the exact same PanePixelRect Tier3AccessPane already
+// positioned from the exact same PanePixelRect CloudChatAccessPane already
 // computes for the PaneRectFraction it sends to Rust via set_pane_layout --
 // see paneLayout.ts's own module doc for why that's one computation, not
 // two independently-maintained ones. The browser's own native hit-testing

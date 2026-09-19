@@ -81,7 +81,7 @@ function IncognitoGlyph() {
 
 export type RailRowState = 'idle' | 'loaded' | 'active'
 
-export interface Tier3SelectorProps {
+export interface CloudChatSelectorProps {
   /** Full candidate list; every provider gets a row, no cap
    *  (decisions.id=733). */
   providers: Provider[]
@@ -115,14 +115,14 @@ function rowState(
   return 'idle'
 }
 
-export function Tier3Selector({
+export function CloudChatSelector({
   providers,
   openPaneIds,
   activeProviderId,
   escalateMode = false,
   onActivate,
   onClose,
-}: Tier3SelectorProps) {
+}: CloudChatSelectorProps) {
   const { t } = useTranslation()
 
   const rows = escalateMode ? providers.filter((p) => p.lane === 'cloud_frontier') : providers

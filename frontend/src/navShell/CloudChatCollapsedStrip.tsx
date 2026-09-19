@@ -10,7 +10,7 @@
 // Deliberately does NOT show a text snippet of the provider's own last
 // response (unlike the mockup's illustrative "Claude: '...still
 // responding'" flavor text) -- this component has no access to that
-// content. Tier3AccessPane never reads inside a provider's CEF-rendered
+// content. CloudChatAccessPane never reads inside a provider's CEF-rendered
 // page; showing a fabricated snippet here would be inventing data that
 // doesn't exist, not reflecting real state.
 //
@@ -22,7 +22,7 @@
 // whenever Cloud Chat isn't the expanded region (never null), one row among
 // the three peer bars (Board / Chat / Second opinion) WorkspaceShell.tsx
 // and CloudChatAccessPane.tsx stack together -- Jason's own framing: "a second
-// opinion bar always visible." Tier3AccessPane now derives which of three
+// opinion bar always visible." CloudChatAccessPane now derives which of three
 // states applies whenever openProviderIds is empty (no provider pane open
 // this round):
 //   'approved'   -- a draft already cleared Gate3, waiting on the rail.
@@ -42,7 +42,7 @@ import { useTranslation } from 'react-i18next'
 import type { Provider } from '../cloudChatAccess/cloudChatAccessConfig'
 import './Tier3CollapsedStrip.css'
 
-export interface Tier3CollapsedStripProps {
+export interface CloudChatCollapsedStripProps {
   providers: Provider[]
   openProviderIds: string[]
   /** The provider to feature (its name shown on the strip) and the one
@@ -57,7 +57,7 @@ export interface Tier3CollapsedStripProps {
    *  rail itself (markTier3Ready), not a specific provider. */
   onExpandRail: () => void
   /** Fires when clicked in the 'reviewable' empty state -- starts a real
-   *  Gate3 review of the current last response (Tier3AccessPane's
+   *  Gate3 review of the current last response (CloudChatAccessPane's
    *  handleSecondOpinion). */
   onReview: () => void
   /** True while a Gate3 review is already in flight (reviewOutcome ===
@@ -66,7 +66,7 @@ export interface Tier3CollapsedStripProps {
   reviewDisabled?: boolean
 }
 
-export function Tier3CollapsedStrip({
+export function CloudChatCollapsedStrip({
   providers,
   openProviderIds,
   activeProviderId,
@@ -75,7 +75,7 @@ export function Tier3CollapsedStrip({
   onExpandRail,
   onReview,
   reviewDisabled = false,
-}: Tier3CollapsedStripProps) {
+}: CloudChatCollapsedStripProps) {
   const { t } = useTranslation()
 
   if (openProviderIds.length === 0) {

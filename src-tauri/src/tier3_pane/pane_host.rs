@@ -2282,7 +2282,7 @@ fn build_overlay_and_glarea(webview_widget: gtk::Widget) -> (gtk::Overlay, gtk::
     // DIAGNOSTIC (items.id=225, 2026-08-07): the GLArea overlay appears
     // to swallow all pointer input across the whole window even with
     // overlay pass-through set below -- confirmed via direct click
-    // testing (Tier3Selector checkboxes and the harness's own
+    // testing (CloudChatSelector rows and the harness's own
     // "Simulate response generating" button are both completely inert).
     // set_can_focus(false) rules out one candidate cause (the GLArea
     // grabbing keyboard/click-to-focus before pass-through routing).

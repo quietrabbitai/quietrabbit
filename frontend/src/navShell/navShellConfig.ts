@@ -18,7 +18,7 @@
 // `dominantRail` below -- replacing the old two-axis
 // boardSize/pair.dominant split. See WorkspaceShell.tsx's own header
 // comment for the full mechanics (in particular the two-way sync between
-// `dominantRail` and `pair.dominant`, needed because Tier3AccessPane's
+// `dominantRail` and `pair.dominant`, needed because CloudChatAccessPane's
 // internal chat<->tier3 split still keys off `pair.dominant` and isn't
 // being rewritten).
 //
@@ -50,18 +50,18 @@ export type DockRailId = 'board' | 'chat' | 'tier3' | 'library' | 'history'
 /** decisions.id=735: the QR Chat <-> Cloud Chat dominance pair. Which side
  *  fills the main slot (when the pair itself is dominant -- see
  *  WorkspaceShell.tsx's sync effects), and Cloud Chat's own rail/pane
- *  bookkeeping -- lifted here (rather than left local to Tier3AccessPane's
+ *  bookkeeping -- lifted here (rather than left local to CloudChatAccessPane's
  *  component state) so it survives navigating to Board/Library/History and
  *  back. Live as of slice 4 -- read/written via useDominancePair.ts, the
  *  only place that constructs a new value of this shape (its own
  *  withDominance() keeps `dominant` in sync with `activeProviderId` in one
  *  place, rather than each call site setting it separately).
  *
- *  items.id=404: `dominant` here is a narrower, Tier3AccessPane-internal
+ *  items.id=404: `dominant` here is a narrower, CloudChatAccessPane-internal
  *  echo of the real source of truth (`workspace.dominantRail` below), kept
  *  in sync by WorkspaceShell.tsx rather than read directly by anything
- *  outside Tier3AccessPane. Not collapsed into one field because
- *  Tier3AccessPane's internals key off `pair.dominant` in enough places
+ *  outside CloudChatAccessPane. Not collapsed into one field because
+ *  CloudChatAccessPane's internals key off `pair.dominant` in enough places
  *  that rewriting them wasn't worth the risk for this item. */
 export interface DominancePairState {
   dominant: 'chat' | 'tier3'
@@ -103,7 +103,7 @@ export const DEFAULT_NAV_STATE: NavState = {
 
 /** decisions.id=740 (items.id=384 slice 7): a "quiet" persona switch --
  *  updates activePersonaId only, without navigating anywhere. Originally
- *  built for the new-chat persona dot-picker inside Tier3AccessPane;
+ *  built for the new-chat persona dot-picker inside CloudChatAccessPane;
  *  items.id=404 reuses it unchanged for both of its cross-navigation
  *  actions (History's Persona-row "Chat" action, and Chat's own "Chat
  *  history" toggle jumping into History) -- exactly the "already wired"

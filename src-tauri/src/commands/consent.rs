@@ -1477,7 +1477,7 @@ mod tests {
 
     /// TIER3_DRAFT_FOCUS_ID must stay "quick-ask" -- a silent rename here
     /// would desync request_tier3_gate3_review's focus_settings lookup from
-    /// the actual focus_id ChatPane/Tier3AccessPane draft against
+    /// the actual focus_id ChatPane/CloudChatAccessPane draft against
     /// (app/core_artifacts/focuses/quick-ask.focus) without any compiler
     /// error to catch it.
     #[test]

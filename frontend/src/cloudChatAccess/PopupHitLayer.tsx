@@ -13,7 +13,7 @@
 // pixel-conversion helper needed, since there's nothing in CSS-pixel space
 // to convert from).
 //
-// Mounted as a sibling AFTER PaneHitLayer in Tier3AccessPane's JSX -- DOM
+// Mounted as a sibling AFTER PaneHitLayer in CloudChatAccessPane's JSX -- DOM
 // source order alone resolves "this click is for the popup, not its parent
 // pane" in any overlapping region (later siblings hit-test on top), no
 // coordinate-exclusion math needed. The parent pane's own hit-div stays

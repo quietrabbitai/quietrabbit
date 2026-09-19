@@ -13,7 +13,7 @@
 // as the same kind of row.
 //
 // Chat and Cloud Chat are NOT two separate top-level regions in this file's own
-// JSX -- they stay nested inside one Tier3AccessPane mount, exactly as
+// JSX -- they stay nested inside one CloudChatAccessPane mount, exactly as
 // pre-404 (never unmounted, see that component's own header comment on
 // why). What changes is what drives their split:
 //   - `floor` (Chat's own passive-but-functional compact form) generalizes
@@ -21,7 +21,7 @@
 //     Chat nor Cloud Chat is the outer-dominant rail" -- Library or History
 //     being dominant now ALSO floors Chat, which pre-404 was impossible
 //     (there was no Library/History rail to be dominant instead).
-//   - Cloud Chat's own compact form needed ZERO changes: Tier3CollapsedStrip
+//   - Cloud Chat's own compact form needed ZERO changes: CloudChatCollapsedStrip
 //     already rendered unconditionally whenever Cloud Chat wasn't the expanded
 //     region, regardless of floor -- that already IS the "plain inert
 //     dock bar" the design doc asks for, just previously only reachable
@@ -29,7 +29,7 @@
 //
 // Two dominance REPRESENTATIONS now coexist and must be kept from
 // drifting: `dominantRail` (this file's own prop, the one true source of
-// truth for the outer 5-way choice) and `pair.dominant` (Tier3AccessPane's
+// truth for the outer 5-way choice) and `pair.dominant` (CloudChatAccessPane's
 // own internal 'chat'|'tier3' echo, which its ~10 existing internal call
 // sites still key off -- not rewritten for this item, too much surface for
 // the value). The two are kept in sync by TWO complementary mechanisms,
@@ -38,10 +38,10 @@
 // actively fought Board's-bar-reclaimChat, which sets pair.dominant='chat'
 // as pure cleanup while deliberately promoting Board, not Chat, to
 // dominant -- confirmed by tracing the click through by hand):
-//   1. Tier3AccessPane calls the new `onDominantRailChange` prop directly,
+//   1. CloudChatAccessPane calls the new `onDominantRailChange` prop directly,
 //      at the exact handful of ITS OWN internal call sites where a user
 //      action genuinely means "make Chat/Cloud Chat the outer-dominant rail"
-//      (Tier3CollapsedStrip's expand, the content-head's reclaim click,
+//      (CloudChatCollapsedStrip's expand, the content-head's reclaim click,
 //      ChatPane's own non-floor collapsed-strip click) -- see that file's
 //      own header comment for the full list. Board's bar (below, this
 //      file) does the same directly for its own reclaimChat+dominantRail
@@ -53,7 +53,7 @@
 //      pair.dominant='tier3' from silently showing Cloud Chat's rail+content
 //      instead of Chat right after an EXTERNAL jump into Chat (History's
 //      "Chat" row-action, or Chat's own floor-click), neither of which
-//      goes through Tier3AccessPane's own wrapped call sites.
+//      goes through CloudChatAccessPane's own wrapped call sites.
 
 import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -61,7 +61,7 @@ import type { ChatInfo, PersonaInfo } from '../bindings'
 import { ActiveBoardPane } from './ActiveBoardPane'
 import { HistoryScreen, type HistoryOpenTarget } from './HistoryScreen'
 import { LibraryPane } from '../library/LibraryPane'
-import { Tier3AccessPane } from './CloudChatAccessPane'
+import { CloudChatAccessPane } from './CloudChatAccessPane'
 import { useDominancePair } from './useDominancePair'
 import type { DockRailId, DominancePairState } from './navShellConfig'
 import './Tier3CollapsedStrip.css'
@@ -109,7 +109,7 @@ export function WorkspaceShell({
   // this hook -- see useDominancePair.ts's own shape, no internal state of
   // its own besides a local `openError` this file never reads. Lets
   // Board's own bar (below) call reclaimChat without lifting
-  // Tier3AccessPane's whole prop surface up into this file.
+  // CloudChatAccessPane's whole prop surface up into this file.
   const { reclaimChat } = useDominancePair(pair, onUpdatePair)
 
   // items.id=404's two cross-navigation bridges (design doc's Q1: "a
@@ -165,7 +165,7 @@ export function WorkspaceShell({
         </button>
       )}
 
-      <Tier3AccessPane
+      <CloudChatAccessPane
         key="tier3-access-pane"
         personaId={activePersonaId}
         onPersonaChange={onActivePersonaIdChange}

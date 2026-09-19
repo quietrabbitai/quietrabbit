@@ -5,7 +5,7 @@
 //
 // Backs commands/messages.rs (send_message/list_messages), which in turn
 // backs ChatPane.tsx -- the real component behind MiddleZone's chatPane prop
-// for both Persona hub chat and Tier3AccessPane's starter-drafting pane.
+// for both Persona hub chat and CloudChatAccessPane's starter-drafting pane.
 //
 // QUERY STYLE: runtime sqlx::query() only — no query!() macros.
 // PRAGMA key applied via SqliteConnectOptions (D6-346).

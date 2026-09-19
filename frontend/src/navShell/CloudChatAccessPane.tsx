@@ -24,11 +24,11 @@
 // Board isn't expanded either), the layout is the rail+content-pane, QR
 // collapsed to its own row above it. Whenever Cloud Chat is NOT the expanded
 // region -- Chat dominant, or Board expanded (floor) -- the rail+
-// content-pane is replaced by Tier3CollapsedStrip, an always-present
+// content-pane is replaced by CloudChatCollapsedStrip, an always-present
 // click-to-expand bar (items.id=391 tenth pass: never hidden outright any
 // more, just one of the three peer rows -- see WorkspaceShell.tsx's own
 // header comment on the "three bars, one expanded" model). No live entry
-// field on Tier3CollapsedStrip regardless (that's the resolved answer to
+// field on CloudChatCollapsedStrip regardless (that's the resolved answer to
 // decisions.id=738's flagged question: only QR's own collapsed floor gets
 // a live entry field, since only QR has a QR-owned conversation to keep
 // live). Gate3 review UI (PrivacyGuardianModal and the blocked/withheld/
@@ -57,7 +57,7 @@ import { ChatHistoryList } from '../chat/ChatHistoryList'
 import { NewChatPersonaPicker } from '../chat/NewChatPersonaPicker'
 import { FocusSettingsControls } from './FocusSettingsControls'
 import { requireCurrentUserId, type DominancePairState } from './navShellConfig'
-import { Tier3CollapsedStrip } from './CloudChatCollapsedStrip'
+import { CloudChatCollapsedStrip } from './CloudChatCollapsedStrip'
 import { useDominancePair } from './useDominancePair'
 import { computeActivePaneRect, pixelRectToFraction, type PanePixelRect } from '../cloudChatAccess/paneLayout'
 import { PaneHitLayer } from '../cloudChatAccess/PaneHitLayer'
@@ -68,7 +68,7 @@ import {
   type ElementDecision,
 } from '../cloudChatAccess/PrivacyGuardianModal'
 import { isAllKeptPrivate } from '../cloudChatAccess/consentDecisions'
-import { Tier3Selector } from '../cloudChatAccess/CloudChatSelector'
+import { CloudChatSelector } from '../cloudChatAccess/CloudChatSelector'
 import {
   fetchActiveProviders,
   type Provider,
@@ -89,7 +89,7 @@ interface PopupClosedPayload {
   provider_id: string
 }
 
-export interface Tier3AccessPaneProps {
+export interface CloudChatAccessPaneProps {
   /** The currently-active Persona (navShellConfig.ts's NavState.activePersonaId,
    *  a standing field independent of which top-level screen is showing --
    *  items.id=384 slice 1 removed the earlier capture-on-transition
@@ -140,7 +140,7 @@ export interface Tier3AccessPaneProps {
   onFloorExpand?: () => void
   /** items.id=404: fires whenever an action INSIDE this component means
    *  "make Chat or Cloud Chat the outer 5-rail dock's dominant rail" --
-   *  Tier3CollapsedStrip's own expand, the Cloud Chat content-head's "back to
+   *  CloudChatCollapsedStrip's own expand, the Cloud Chat content-head's "back to
    *  chat" click, and ChatPane's own non-floor collapsed-strip click (the
    *  dominant === 'tier3' case). See WorkspaceShell.tsx's own header
    *  comment for why this is a set of direct calls at those specific
@@ -182,7 +182,7 @@ function externalAccessFromLegacyTier(tier: number): ExternalAccess {
   }
 }
 
-export function Tier3AccessPane({
+export function CloudChatAccessPane({
   personaId,
   onPersonaChange,
   personas,
@@ -194,7 +194,7 @@ export function Tier3AccessPane({
   onOpenHistory,
   pendingChatSelection = null,
   onPendingChatSelectionConsumed,
-}: Tier3AccessPaneProps) {
+}: CloudChatAccessPaneProps) {
   const { t } = useTranslation()
   const [providers, setProviders] = useState<Provider[]>([])
   const [providerError, setProviderError] = useState<string | null>(null)
@@ -683,7 +683,7 @@ export function Tier3AccessPane({
    *  transcript's most recent response, without composing a new message.
    *  Originally the mockup's "2nd opinion" chat-toolbar button; as of the
    *  tenth pass ("three bars, one expanded" redesign) it's invoked from
-   *  Tier3CollapsedStrip's always-visible bar instead (its 'reviewable'
+   *  CloudChatCollapsedStrip's always-visible bar instead (its 'reviewable'
    *  empty state, WorkspaceShell.tsx/CloudChatCollapsedStrip.tsx) -- same
    *  handler, new caller, the toolbar button itself is removed as
    *  redundant with that bar.
@@ -916,7 +916,7 @@ export function Tier3AccessPane({
   // used verbatim, not reconstructed client-side.
   const chatContextKey = activeChat ? activeChat.context_key : `tier3-access-${personaId}`
 
-  // items.id=391 (tenth pass): drives Tier3CollapsedStrip's own
+  // items.id=391 (tenth pass): drives CloudChatCollapsedStrip's own
   // `emptyState` prop, consulted only when openProviderIds is empty --
   // see that component's header comment for what each value means. This
   // used to gate a separate chat-toolbar "2nd opinion" button (removed --
@@ -953,7 +953,7 @@ export function Tier3AccessPane({
             not one consistent design. Folded into THIS bar instead --
             same row that used to carry only the "Quiet Rabbit -- this
             conversation" title, restyled (NavShell.css) to match Board's
-            and Tier3's own bars (WorkspaceShell.tsx / Tier3CollapsedStrip)
+            and Tier3's own bars (WorkspaceShell.tsx / CloudChatCollapsedStrip)
             so all three read as the same kind of row. Un-gated from
             personaId, same as the toolbar it replaces -- the persona
             picker inside it is how a user with no Persona yet picks
@@ -1155,7 +1155,7 @@ export function Tier3AccessPane({
           one of the three is ever the fully-expanded region -- Cloud Chat gets
           the rail+content-pane split ONLY while it's the expanded one
           (!floor && dominant === 'tier3'); every other combination
-          (floor, or dominant === 'chat') renders Tier3CollapsedStrip
+          (floor, or dominant === 'chat') renders CloudChatCollapsedStrip
           instead, unconditionally -- Jason's own framing for this pass:
           "a second opinion bar always visible." No redundant "back to
           Board" button here any more either -- WorkspaceShell's own
@@ -1209,7 +1209,7 @@ export function Tier3AccessPane({
               // same fact reviewOutcome === 'approved' used to capture, but
               // via a field that actually survives the remount reviewOutcome
               // doesn't.
-              <Tier3Selector
+              <CloudChatSelector
                 providers={providers}
                 openPaneIds={openProviderIds}
                 activeProviderId={activeProviderId}
@@ -1279,7 +1279,7 @@ export function Tier3AccessPane({
           </div>
         </>
       ) : (
-        <Tier3CollapsedStrip
+        <CloudChatCollapsedStrip
           providers={providers}
           openProviderIds={openProviderIds}
           activeProviderId={activeProviderId}

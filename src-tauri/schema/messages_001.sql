@@ -4,7 +4,7 @@
 -- Path: /users/{user_id}/personas/{persona_id}/messages.db
 --
 -- Backs ChatPane (frontend/src/chat/ChatPane.tsx), the real component behind
--- MiddleZone's chatPane prop for both Persona hub chat and Tier3AccessPane's
+-- MiddleZone's chatPane prop for both Persona hub chat and CloudChatAccessPane's
 -- starter-drafting pane (items.id=245-ish -- see that item's plan for the
 -- full design). One shared table for both purposes: gate3_review_status is
 -- NULL for persona-hub messages, populated only for Tier3-context messages.

@@ -21,7 +21,7 @@
 // items.id=359 (rail+content-pane redesign, 2026-08-30): replaces the
 // former items.id=334 full-width-row-stacking model entirely. Exactly one
 // pane is ever composited at a time -- the one whose provider id is
-// Tier3AccessPane's own `activeProviderId` -- rendered at (near-)full
+// CloudChatAccessPane's own `activeProviderId` -- rendered at (near-)full
 // size inside the content pane, rather than every open pane getting its
 // own fixed-height row in a scrolling dock. This is simpler than the row-
 // stacking code it replaces, not more complex: there is no longer a
@@ -43,7 +43,7 @@ export interface PaneRectFraction {
 }
 
 /** One pane's on-screen rect in CSS pixels, viewport-relative --
- *  `Tier3AccessPane`'s `syncPaneLayout` computes this once per pane and
+ *  `CloudChatAccessPane`'s `syncPaneLayout` computes this once per pane and
  *  derives both consumers from it: `pixelRectToFraction` for the
  *  `PaneRectFraction` sent to Rust, and this same rect passed straight to
  *  `PaneHitLayer` for its invisible per-pane hit-divs' CSS position -- one
