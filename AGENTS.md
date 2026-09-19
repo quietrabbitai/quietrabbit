@@ -31,8 +31,12 @@ When in doubt: stop and ask rather than invent.
   Never use sqlx::query!() macros — no static DATABASE_URL in many-small-encrypted-DB topology.
 - Master key never persisted: keys live only in Rust AppState/KeyRegistry for the
   duration of the session. Never written to disk, never in IPC responses.
-- Tier 2 = user choice: Mistral (EU/GDPR, paid) or Groq (US, free tier).
-  Honest trade-off framing. No prescribed default.
+- Tier 1.5 = user choice: Groq (US, free tier) or Mistral (EU/GDPR, paid) --
+  fast hosted inference, same capability class as local Tier 1, non-anonymous.
+  Honest trade-off framing. No prescribed default. (decisions.id=665/727 --
+  both providers moved off "Tier 2" once that label was clarified as
+  split-screen-only; Tier 2 itself is Duck.ai/Brave Leo, anonymous,
+  no-retention, not yet shipped.)
 - Silent operator: personal context informs output, never narrated.
   Never "Since you mentioned..." or "Based on your preference..."
 - Human in the loop: all auto-improvements require explicit approval.

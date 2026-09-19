@@ -33,7 +33,7 @@
 -- v151.1.0+151.3.12, confirmed against the actual Rust bindings, not
 -- assumed from the C++ API): secure/httponly/has_expires are CEF's own
 -- c_int booleans, stored here as INTEGER 0/1 same as this codebase's other
--- boolean columns (e.g. tier3_providers.login_required). same_site/priority
+-- boolean columns (e.g. providers.login_required). same_site/priority
 -- are CEF's own C enums (CookieSameSite/CookiePriority) -- stored as their
 -- raw i32 value via get_raw(), round-tripped back through the matching
 -- From impl at read time, never reinterpreted by this schema. creation/
@@ -46,12 +46,12 @@
 -- must check has_expires, not expires IS NULL, exactly mirroring
 -- cef::Cookie's own has_expires-gates-expires contract).
 --
--- No REFERENCES tier3_providers(id) -- tier3_providers lives in shared.db,
+-- No REFERENCES providers(id) -- providers lives in shared.db,
 -- a separate physical SQLite file from tier3_cookies.db. SQLite has no
 -- cross-database foreign key support (same reasoning keys_001.sql's own
 -- header already gives for dropping persona_id's FK -- see that file).
 -- provider_id validity against the live catalog is an application-layer
--- concern (commands/tier3_pane.rs already resolves provider_id ->
+-- concern (commands/cloud_chat_pane.rs already resolves provider_id ->
 -- provider via provider_store::get_provider before this table is ever
 -- touched).
 
