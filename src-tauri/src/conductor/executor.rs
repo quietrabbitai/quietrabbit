@@ -73,7 +73,7 @@ use crate::conductor::types::{PersonalTrack, SharedStateTrack, TaskStep, TaskTra
 use crate::providers::groq::GroqProvider;
 use crate::providers::mistral::MistralProvider;
 use crate::providers::ollama_client::{check_context_window, OllamaClient};
-use crate::providers::tier2_base::Tier2Provider;
+use crate::providers::qr_hosted_base::QrHostedProvider;
 use crate::providers::types::{ContextWindowStatusKind, GenerateOptions, GenerateRequest};
 
 // ---------------------------------------------------------------------------
@@ -127,20 +127,20 @@ fn ollama_client() -> &'static OllamaClient {
 }
 
 /// items.id=465 (closes B2): a small registry keyed by each Tier 1.5
-/// (qr_hosted) provider's own `Tier2Provider::provider_id()`, replacing the old
-/// hardcoded `match tier2_provider_preference.as_deref() { Some("mistral")
+/// (qr_hosted) provider's own `QrHostedProvider::provider_id()`, replacing the old
+/// hardcoded `match qr_hosted_provider_preference.as_deref() { Some("mistral")
 /// => ..., Some("groq") => ..., Some(other) => unreachable!(...) }`
 /// dispatch. Adding a third qr_hosted provider now means adding one entry
 /// here, not a new match arm at every dispatch site that switches on a
 /// provider string.
-static TIER2_PROVIDER_REGISTRY: OnceLock<HashMap<&'static str, &'static dyn Tier2Provider>> =
+static QR_HOSTED_PROVIDER_REGISTRY: OnceLock<HashMap<&'static str, &'static dyn QrHostedProvider>> =
     OnceLock::new();
 
-fn tier2_provider_registry() -> &'static HashMap<&'static str, &'static dyn Tier2Provider> {
-    TIER2_PROVIDER_REGISTRY.get_or_init(|| {
-        let mut m: HashMap<&'static str, &'static dyn Tier2Provider> = HashMap::new();
-        let groq: &'static dyn Tier2Provider = groq_provider();
-        let mistral: &'static dyn Tier2Provider = mistral_provider();
+fn qr_hosted_provider_registry() -> &'static HashMap<&'static str, &'static dyn QrHostedProvider> {
+    QR_HOSTED_PROVIDER_REGISTRY.get_or_init(|| {
+        let mut m: HashMap<&'static str, &'static dyn QrHostedProvider> = HashMap::new();
+        let groq: &'static dyn QrHostedProvider = groq_provider();
+        let mistral: &'static dyn QrHostedProvider = mistral_provider();
         m.insert(groq.provider_id(), groq);
         m.insert(mistral.provider_id(), mistral);
         m
@@ -167,17 +167,19 @@ fn tier2_provider_registry() -> &'static HashMap<&'static str, &'static dyn Tier
 ///   None       -> normal Floor Consent Gate evaluation.
 ///   One-run scope: applies for this context only; not persisted.
 ///
-/// tier2_provider_preference: resolved by lifecycle (items.id=251, repointed
+/// qr_hosted_provider_preference: resolved by lifecycle (items.id=251, repointed
 ///   items.id=432) via user_provider_preference_store::resolve_preference()'s
 ///   Focus -> Persona -> account precedence across the qr_hosted candidate
 ///   set (providers.provider_type='cloud_inference_api', items.id=430) --
-///   not the legacy users.tier2_provider_preference column. Only populated
+///   not the legacy users.tier2_provider_preference column (dropped by
+///   items.id=433 -- a real, historical column name, not this codebase's
+///   current vocabulary). Only populated
 ///   when execution_tier >= 2.
-///   Some(provider_id) -> dispatch to that provider via tier2_provider_registry()
+///   Some(provider_id) -> dispatch to that provider via qr_hosted_provider_registry()
 ///   (items.id=465 — an open HashMap keyed by each provider's own provider_id(),
 ///   not a closed two-value set).
 ///   None -> no provider chosen (or the resolved preference was ambiguous
-///   across candidates); StepExecutor raises F10 MissingTier2Config rather
+///   across candidates); StepExecutor raises F10 MissingQrHostedConfig rather
 ///   than guessing (architecture: "no prescribed default"). Always None at
 ///   execution_tier == 1.
 pub struct StepContext {
@@ -216,7 +218,7 @@ pub struct StepContext {
     pub abstraction_tier: u8,
     pub raw_abstraction: u8,
     pub floor_consent_preference: Option<String>, // "modified" | "local" | None
-    pub tier2_provider_preference: Option<String>, // provider_id from tier2_provider_registry(), or None
+    pub qr_hosted_provider_preference: Option<String>, // provider_id from qr_hosted_provider_registry(), or None
     pub next_execution_tier: Option<u8>,
     pub retry_count: u32,
     /// Display name of the Focus, passed to gate3 for the consent modal header.
@@ -408,10 +410,10 @@ impl StepExecutor {
         // silently resolved to Groq — short-circuits before any provider
         // is touched. Only checked at tier>=2; Tier 1 never needs a
         // provider.
-        if execution_tier >= 2 && ctx.tier2_provider_preference.is_none() {
+        if execution_tier >= 2 && ctx.qr_hosted_provider_preference.is_none() {
             return Ok(Some(
                 failure_handler.handle(
-                    &ConductorError::MissingTier2Config {
+                    &ConductorError::MissingQrHostedConfig {
                         plain_language: "No Tier 1.5 AI provider is set up yet. \
                         Choose Groq or Mistral in Settings to continue. \
                         [Open Settings] [Get help]"
@@ -428,7 +430,7 @@ impl StepExecutor {
             pool,
             &ctx.step.task_type,
             execution_tier,
-            ctx.tier2_provider_preference.as_deref(),
+            ctx.qr_hosted_provider_preference.as_deref(),
         )
         .await?;
 
@@ -632,16 +634,16 @@ impl StepExecutor {
         }
 
         let generate_result: Result<_, ConductorError> = if execution_tier >= 2 {
-            // Step 4.5 above already guarantees tier2_provider_preference is
+            // Step 4.5 above already guarantees qr_hosted_provider_preference is
             // Some(...) at this point -- no silent fallback to any default
             // provider for a None preference (matches select_model()'s
             // policy). A provider id that IS present but isn't registered
-            // in tier2_provider_registry() (items.id=465: closes B2) is a
+            // in qr_hosted_provider_registry() (items.id=465: closes B2) is a
             // real ConductorError, not a panic -- unlike the old hardcoded
             // match, this dispatch no longer assumes the schema-permitted
             // value set is exactly {"mistral", "groq"}.
-            match ctx.tier2_provider_preference.as_deref() {
-                Some(provider_id) => match tier2_provider_registry().get(provider_id) {
+            match ctx.qr_hosted_provider_preference.as_deref() {
+                Some(provider_id) => match qr_hosted_provider_registry().get(provider_id) {
                     Some(provider) => provider.generate(&request).await,
                     None => Err(ConductorError::UnknownProvider {
                         plain_language: format!(
@@ -651,9 +653,9 @@ impl StepExecutor {
                     }),
                 },
                 None => unreachable!(
-                    "execution_tier >= 2 with no tier2_provider_preference -- \
+                    "execution_tier >= 2 with no qr_hosted_provider_preference -- \
                      the Step 4.5 guard above must already have \
-                     short-circuited to MissingTier2Config"
+                     short-circuited to MissingQrHostedConfig"
                 ),
             }
         } else {
@@ -1022,9 +1024,9 @@ struct SelectedModel {
 /// provider string -- adding a third qr_hosted provider is now a catalog row,
 /// not a new match arm here.
 ///
-/// tier2_provider must be Some(...) whenever tier >= 2 — the caller
+/// qr_hosted_provider must be Some(...) whenever tier >= 2 — the caller
 /// (execute_once's Step 4.5 guard) short-circuits to the F10
-/// MissingTier2Config failure before ever reaching this function with
+/// MissingQrHostedConfig failure before ever reaching this function with
 /// tier >= 2 and None; that invariant is untouched by this fix, so the
 /// None arm below still panics rather than silently misrouting. A
 /// provider id that IS present but has no default model curated in the
@@ -1034,7 +1036,7 @@ async fn select_model(
     pool: &sqlx::SqlitePool,
     task_type: &str,
     tier: u8,
-    tier2_provider: Option<&str>,
+    qr_hosted_provider: Option<&str>,
 ) -> Result<SelectedModel, ConductorError> {
     if tier == 1 {
         let model_id = match task_type {
@@ -1049,13 +1051,13 @@ async fn select_model(
         });
     }
 
-    let provider_id = match tier2_provider {
+    let provider_id = match qr_hosted_provider {
         Some(id) => id,
         None => unreachable!(
-            "select_model called with tier>=2 and no tier2_provider -- \
-             caller must guard on ctx.tier2_provider_preference.is_none() \
+            "select_model called with tier>=2 and no qr_hosted_provider -- \
+             caller must guard on ctx.qr_hosted_provider_preference.is_none() \
              before calling select_model (see the Step 4.5 \
-             MissingTier2Config check in execute_once)"
+             MissingQrHostedConfig check in execute_once)"
         ),
     };
 
@@ -1666,7 +1668,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn select_model_tier2_groq_any_type() {
+    async fn select_model_qr_hosted_groq_any_type() {
         with_temp_shared_db(|pool| async move {
             let by_code = select_model(&pool, "code", 2, Some("groq")).await.unwrap();
             assert_eq!(by_code.provider_id.as_deref(), Some("groq"));
@@ -1682,7 +1684,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn select_model_tier2_mistral_any_type() {
+    async fn select_model_qr_hosted_mistral_any_type() {
         with_temp_shared_db(|pool| async move {
             let by_code = select_model(&pool, "code", 2, Some("mistral"))
                 .await
@@ -1702,9 +1704,9 @@ mod tests {
     /// items.id=251 — the test proving provider selection actually
     /// switches behavior, not just that a preference can be stored.
     /// Same task_type and tier; the only thing that differs is
-    /// tier2_provider, and the two calls must produce different models.
+    /// qr_hosted_provider, and the two calls must produce different models.
     #[tokio::test]
-    async fn select_model_switches_on_tier2_provider_preference() {
+    async fn select_model_switches_on_qr_hosted_provider_preference() {
         with_temp_shared_db(|pool| async move {
             let groq_model = select_model(&pool, "general", 2, Some("groq"))
                 .await
@@ -1722,8 +1724,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "select_model called with tier>=2 and no tier2_provider")]
-    async fn select_model_tier2_none_preference_panics() {
+    #[should_panic(expected = "select_model called with tier>=2 and no qr_hosted_provider")]
+    async fn select_model_qr_hosted_none_preference_panics() {
         // Panics before ever touching provider_store -- no DB setup needed.
         let _ = select_model(&dummy_pool(), "general", 2, None).await;
     }
@@ -1733,7 +1735,7 @@ mod tests {
     /// see select_model()'s own doc on why the old hardcoded-match panic
     /// for this case no longer applies.
     #[tokio::test]
-    async fn select_model_tier2_unknown_provider_returns_unknown_provider_error() {
+    async fn select_model_qr_hosted_unknown_provider_returns_unknown_provider_error() {
         with_temp_shared_db(|pool| async move {
             let err = select_model(&pool, "general", 2, Some("openai"))
                 .await
@@ -1917,7 +1919,7 @@ mod tests {
             abstraction_tier: 2,
             raw_abstraction: 1,
             floor_consent_preference: None,
-            tier2_provider_preference: None,
+            qr_hosted_provider_preference: None,
             next_execution_tier: None,
             retry_count: 0,
             focus_name: "test".to_owned(),
@@ -1970,7 +1972,7 @@ mod tests {
             abstraction_tier: 1,
             raw_abstraction: 1,
             floor_consent_preference: None,
-            tier2_provider_preference: None,
+            qr_hosted_provider_preference: None,
             next_execution_tier: None,
             retry_count: 0,
             focus_name: "test".to_owned(),
@@ -2009,7 +2011,7 @@ mod tests {
             abstraction_tier: 1,
             raw_abstraction: 1,
             floor_consent_preference: None,
-            tier2_provider_preference: None,
+            qr_hosted_provider_preference: None,
             next_execution_tier: None,
             retry_count: 0,
             focus_name: "test".to_owned(),

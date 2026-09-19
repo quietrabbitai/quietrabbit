@@ -1,5 +1,5 @@
 // src-tauri/src/providers/groq.rs
-// Groq Tier 1.5 (qr_hosted) provider — implements Tier2Provider for Groq API.
+// Groq Tier 1.5 (qr_hosted) provider — implements QrHostedProvider for Groq API.
 //
 // Model: llama-3.1-8b-instant (drafting — fast, good quality, free tier)
 // Provider: Groq (US-based, free tier available)
@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 
 use crate::conductor::failure::ConductorError;
 use crate::providers::errors::ProviderError;
-use crate::providers::tier2_base::Tier2Provider;
+use crate::providers::qr_hosted_base::QrHostedProvider;
 use crate::providers::types::{
     CompletionStatus, GenerateRequest, GenerateResponse, ProviderHealth, ProviderStatus,
 };
@@ -85,7 +85,7 @@ impl Default for GroqProvider {
 }
 
 #[async_trait]
-impl Tier2Provider for GroqProvider {
+impl QrHostedProvider for GroqProvider {
     fn provider_id(&self) -> &str {
         "groq"
     }

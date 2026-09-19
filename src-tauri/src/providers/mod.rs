@@ -5,6 +5,6 @@ pub mod evaluation;
 pub mod groq;
 pub mod mistral;
 pub mod ollama_client;
-pub mod tier2_base;
+pub mod qr_hosted_base;
 pub mod types;
 pub mod utils;

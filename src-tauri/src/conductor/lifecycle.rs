@@ -1751,8 +1751,8 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         // outright by items.id=433. DB read failure or
         // an unresolved/ambiguous preference collapses to None, same as "no
         // preference set" -- StepExecutor turns None into the F10
-        // MissingTier2Config failure rather than guessing a provider.
-        let tier2_provider_preference: Option<String> = if execution_tier >= 2 {
+        // MissingQrHostedConfig failure rather than guessing a provider.
+        let qr_hosted_provider_preference: Option<String> = if execution_tier >= 2 {
             let candidates = crate::persistence::provider_store::list_providers_by_type(
                 &self.pool,
                 "cloud_inference_api",
@@ -1785,7 +1785,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             abstraction_tier,
             raw_abstraction,
             floor_consent_preference,
-            tier2_provider_preference,
+            qr_hosted_provider_preference,
             next_execution_tier,
             retry_count: 0,
             focus_name: self

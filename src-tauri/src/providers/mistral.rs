@@ -1,5 +1,5 @@
 // src-tauri/src/providers/mistral.rs
-// Mistral Tier 1.5 (qr_hosted) provider — implements Tier2Provider for Mistral's La Plateforme API.
+// Mistral Tier 1.5 (qr_hosted) provider — implements QrHostedProvider for Mistral's La Plateforme API.
 //
 // Model: mistral-small-latest (drafting — fast, cheap paid tier)
 // Provider: Mistral (EU-based, GDPR)
@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 
 use crate::conductor::failure::ConductorError;
 use crate::providers::errors::ProviderError;
-use crate::providers::tier2_base::Tier2Provider;
+use crate::providers::qr_hosted_base::QrHostedProvider;
 use crate::providers::types::{
     CompletionStatus, GenerateRequest, GenerateResponse, ProviderHealth, ProviderStatus,
 };
@@ -85,7 +85,7 @@ impl Default for MistralProvider {
 }
 
 #[async_trait]
-impl Tier2Provider for MistralProvider {
+impl QrHostedProvider for MistralProvider {
     fn provider_id(&self) -> &str {
         "mistral"
     }

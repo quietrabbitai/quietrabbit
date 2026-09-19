@@ -294,7 +294,7 @@ pub async fn resolve_preference(
 /// Resolves each candidate independently at the given scope and returns the
 /// single one whose resolved preference is Preferred. Zero matches -> None,
 /// matching this codebase's existing "no prescribed default" behavior
-/// (surfaces MissingTier2Config downstream, same as today). More than one
+/// (surfaces MissingQrHostedConfig downstream, same as today). More than one
 /// match is a data anomaly the schema doesn't prevent (nothing stops two
 /// different providers both being marked Preferred at the same scope) --
 /// also returns None rather than an arbitrary pick, consistent with this

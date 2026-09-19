@@ -113,7 +113,7 @@ pub enum ConductorError {
 
     // F10 subtype — no Tier 1.5 (qr_hosted) provider configured (install interview not completed)
     #[error("{plain_language}")]
-    MissingTier2Config { plain_language: String },
+    MissingQrHostedConfig { plain_language: String },
 
     // F_SYSTEM — fatal: integrity, audit, misconfiguration
     #[error("{plain_language}")]
@@ -172,7 +172,7 @@ impl ConductorError {
             | Self::DisclosureLogWrite { plain_language }
             | Self::UnknownProvider { plain_language }
             | Self::VoiceProfileContamination { plain_language }
-            | Self::MissingTier2Config { plain_language }
+            | Self::MissingQrHostedConfig { plain_language }
             | Self::TierBoundaryViolation { plain_language }
             | Self::InsecureKeychain { plain_language }
             | Self::NotImplemented { plain_language } => plain_language.as_str(),
@@ -498,7 +498,7 @@ impl FailureHandler {
             },
 
             // F10 subtype — no Tier 1.5 (qr_hosted) provider configured
-            ConductorError::MissingTier2Config { .. } => FailureResult {
+            ConductorError::MissingQrHostedConfig { .. } => FailureResult {
                 action: FailureAction::AwaitUser,
                 failure_mode: Some("F10".to_owned()),
                 plain_language: msg,
@@ -1182,10 +1182,10 @@ mod tests {
     }
 
     #[test]
-    fn f10_missing_tier2_config_awaits_user() {
+    fn f10_missing_qr_hosted_config_awaits_user() {
         let h = handler(1);
         let r = h.handle(
-            &err(ConductorError::MissingTier2Config {
+            &err(ConductorError::MissingQrHostedConfig {
                 plain_language: "no external provider configured".to_owned(),
             }),
             None,

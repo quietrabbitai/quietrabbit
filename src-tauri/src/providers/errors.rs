@@ -66,7 +66,7 @@ pub enum ProviderError {
     },
 
     /// Request has no provider set, or its resolved provider doesn't match
-    /// the `Tier2Provider` handling it.
+    /// the `QrHostedProvider` handling it.
     #[error("unknown provider '{}'", provider)]
     UnknownProvider {
         provider: String,
@@ -75,7 +75,7 @@ pub enum ProviderError {
 
     /// No Tier 1.5 (qr_hosted) provider configured — install interview not completed.
     #[error("no Tier 1.5 (qr_hosted) provider configured")]
-    MissingTier2Config { plain_language: String },
+    MissingQrHostedConfig { plain_language: String },
 }
 
 impl From<ProviderError> for ConductorError {
@@ -102,8 +102,8 @@ impl From<ProviderError> for ConductorError {
             ProviderError::UnknownProvider { plain_language, .. } => {
                 ConductorError::UnknownProvider { plain_language }
             }
-            ProviderError::MissingTier2Config { plain_language } => {
-                ConductorError::MissingTier2Config { plain_language }
+            ProviderError::MissingQrHostedConfig { plain_language } => {
+                ConductorError::MissingQrHostedConfig { plain_language }
             }
         }
     }

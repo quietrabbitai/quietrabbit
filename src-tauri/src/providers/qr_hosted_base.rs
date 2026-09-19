@@ -39,7 +39,7 @@ use crate::providers::types::{GenerateRequest, GenerateResponse, ProviderHealth}
 /// Implementors must be `Send + Sync` — provider instances are shared
 /// across async tasks within the Conductor actor.
 #[async_trait]
-pub trait Tier2Provider: Send + Sync {
+pub trait QrHostedProvider: Send + Sync {
     /// Short stable identifier used in `disclosure_log.provider`,
     /// model prefix validation, and error messages.
     ///
@@ -103,7 +103,7 @@ pub trait Tier2Provider: Send + Sync {
     /// - `request.provider_id` is `None` (request never resolved a Tier 1.5 (qr_hosted) provider)
     /// - `request.provider_id` does not match `self.provider_id()`
     ///
-    /// Python oracle: `Tier2Provider.model_id_from_request()`
+    /// Python oracle: `QrHostedProvider.model_id_from_request()`
     fn model_id_from_request<'a>(
         &self,
         request: &'a GenerateRequest,

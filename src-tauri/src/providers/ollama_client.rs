@@ -1,6 +1,6 @@
 //! Ollama qr_local HTTP client.
 //!
-//! Ollama is qr_local — it does NOT implement [`Tier2Provider`].
+//! Ollama is qr_local — it does NOT implement [`QrHostedProvider`].
 //! Errors map directly to [`ConductorError`] at every raise site.
 //! No [`ProviderError`] intermediary — qr_local maps directly.
 //!
