@@ -24,7 +24,7 @@ use indexmap::IndexMap;
 use crate::conductor::tokens::ExternalAccess;
 
 use super::{
-    abstraction::apply_abstraction,
+    abstraction::{apply_abstraction, AbstractionLevel},
     errors::DisclosureLogWriteError,
     logger::{DisclosureLogEntry, DisclosureLogger},
     types::{Gate1Result, PersonalTrack},
@@ -47,7 +47,10 @@ pub async fn gate1<L: DisclosureLogger>(
 
     // Evaluate every field in insertion order (IndexMap preserves order).
     for (field_name, personal_field) in personal_track.fields() {
-        match apply_abstraction(personal_field, abstraction_tier) {
+        match apply_abstraction(
+            personal_field,
+            AbstractionLevel::from_tier(abstraction_tier),
+        ) {
             Some(abstracted) => {
                 approved.insert(field_name.clone(), abstracted);
             }
@@ -62,7 +65,8 @@ pub async fn gate1<L: DisclosureLogger>(
     let mut floor_clamped: Vec<String> = Vec::new();
     if raw_abstraction != abstraction_tier {
         for (field_name, personal_field) in personal_track.fields() {
-            let raw_result = apply_abstraction(personal_field, raw_abstraction);
+            let raw_result =
+                apply_abstraction(personal_field, AbstractionLevel::from_tier(raw_abstraction));
             let clamped_result = approved.get(field_name).cloned();
             if raw_result != clamped_result {
                 floor_clamped.push(field_name.clone());

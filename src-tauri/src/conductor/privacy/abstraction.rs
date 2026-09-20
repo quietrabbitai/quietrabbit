@@ -14,23 +14,51 @@
 //
 // Hotspot 2: fail-safe defaults.
 //   Unknown policy -> None (omit). Matches Python's final `return None`.
-//   tier <= 1 -> return raw field_value regardless of policy.
+//   AbstractionLevel::Raw -> return raw field_value regardless of policy.
 
 use super::types::{AbstractionPolicy, PersonalField, Sensitivity};
 
-/// Apply abstraction policy for the given tier.
-/// Returns Some(abstracted_value) or None if the field should be omitted.
-/// `tier` is abstraction_tier -- never execution_tier.
-pub fn apply_abstraction(field: &PersonalField, tier: u8) -> Option<String> {
-    // Tier 1: always return raw value regardless of policy.
-    if tier <= 1 {
-        return Some(field.field_value.clone());
-    }
+/// Which of a PersonalField's two abstraction policies applies, or whether
+/// abstraction is skipped entirely.
+///
+/// items.id=528 Phase 2: replaces apply_abstraction's former raw `tier: u8`
+/// parameter. Deliberately NOT a stand-in for execution_tier or
+/// providers.is_anonymous -- abstraction_tier (what this is actually built
+/// from, at each call site) is `focus_privacy_tier.min(execution_tier)`
+/// (lifecycle.rs), which mixes in the user's own privacy preference. A
+/// provider's real anonymity is a different question this enum does not
+/// answer; see this item's own handoff notes for why `is_anonymous` was
+/// rejected as this type's basis. `from_tier` builds this from exactly the
+/// same tier<=1 / ==2 / else rule this function always used -- bit-identical
+/// behavior, just named at the call site instead of inlined here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbstractionLevel {
+    /// No abstraction -- raw field_value regardless of policy.
+    Raw,
+    Level2,
+    Level3,
+}
 
-    let policy = if tier == 2 {
-        &field.abstraction_tier2
-    } else {
-        &field.abstraction_tier3
+impl AbstractionLevel {
+    pub fn from_tier(tier: u8) -> Self {
+        if tier <= 1 {
+            Self::Raw
+        } else if tier == 2 {
+            Self::Level2
+        } else {
+            Self::Level3
+        }
+    }
+}
+
+/// Apply abstraction policy for the given level.
+/// Returns Some(abstracted_value) or None if the field should be omitted.
+pub fn apply_abstraction(field: &PersonalField, level: AbstractionLevel) -> Option<String> {
+    let policy = match level {
+        // Raw: always return raw value regardless of policy.
+        AbstractionLevel::Raw => return Some(field.field_value.clone()),
+        AbstractionLevel::Level2 => &field.abstraction_tier2,
+        AbstractionLevel::Level3 => &field.abstraction_tier3,
     };
 
     match policy {

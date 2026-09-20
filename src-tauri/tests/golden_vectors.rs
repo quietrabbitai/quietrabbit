@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use quietrabbit_lib::conductor::privacy::{
-    abstraction::apply_abstraction,
+    abstraction::{apply_abstraction, AbstractionLevel},
     gate1::gate1,
     gate2::gate2,
     gate3::gate3,
@@ -573,7 +573,7 @@ fn test_apply_abstraction_valid() {
         };
 
         let f = field(field_name, field_value, sensitivity, t2, t3);
-        let result = apply_abstraction(&f, tier);
+        let result = apply_abstraction(&f, AbstractionLevel::from_tier(tier));
 
         assert_eq!(
             result, expected,
@@ -614,7 +614,7 @@ fn test_apply_abstraction_invalid() {
             abstraction_tier2: AbstractionPolicy::Unknown(policy_injected.to_string()),
             abstraction_tier3: AbstractionPolicy::Unknown(policy_injected.to_string()),
         };
-        let result = apply_abstraction(&f, tier);
+        let result = apply_abstraction(&f, AbstractionLevel::from_tier(tier));
 
         assert_eq!(
             result, expected,
