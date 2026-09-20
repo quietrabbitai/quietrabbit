@@ -917,6 +917,78 @@ async fn run_migrations_at(
     result
 }
 
+/// A table this codebase has retired but which a v1 schema file still
+/// unconditionally (re-)creates on every startup (see the module header's
+/// "v1 files always re-run" rule). A single `DROP TABLE IF EXISTS` in a
+/// later versioned migration is NOT sufficient to retire such a table: the
+/// very next startup's v1 re-run recreates it again via its own
+/// `CREATE TABLE IF NOT EXISTS` (and any seed `INSERT OR IGNORE`). This list
+/// is swept unconditionally at the end of every `run_pending()` call
+/// instead, specifically to counteract that recreation -- not gated on
+/// "already applied this version," since the whole point is undoing
+/// something v1 may have just redone moments earlier in this exact call.
+///
+/// items.id=528 Phase 2: discovered via `tier3_providers` (created by
+/// shared_001.sql, correctly `DROP`ped once by shared_013.sql, but
+/// recreated on every subsequent startup by shared_001.sql's own
+/// unconditional v1 re-run -- confirmed the real Garuda shared.db has both
+/// `providers` and a resurrected `tier3_providers` with 4 rows) and
+/// `context_groups`/`context_group_members` (same pattern, dropped once by
+/// shared_017.sql, no reader anywhere). Do NOT "fix" this by editing
+/// shared_001.sql/shared_012.sql/shared_013.sql/shared_017.sql directly --
+/// 012 `ALTER TABLE`s tier3_providers and 013 copies its rows into
+/// providers; both are load-bearing history for real installs, not dead
+/// code, and per the "never edit an applied v2+ file" rule are exactly what
+/// this mechanism exists to route around rather than touch.
+struct RetiredObject {
+    prefix: &'static str,
+    retired_at_version: u32,
+    name: &'static str,
+}
+
+/// Order matters within a prefix: a child/member table must be dropped
+/// before its parent -- context_group_members has a real
+/// `REFERENCES context_groups` foreign key.
+static RETIRED_OBJECTS: &[RetiredObject] = &[
+    RetiredObject {
+        prefix: "shared",
+        retired_at_version: 13,
+        name: "tier3_providers",
+    },
+    RetiredObject {
+        prefix: "shared",
+        retired_at_version: 17,
+        name: "context_group_members",
+    },
+    RetiredObject {
+        prefix: "shared",
+        retired_at_version: 17,
+        name: "context_groups",
+    },
+];
+
+/// Drops every RETIRED_OBJECTS entry for `prefix` whose retired_at_version
+/// has been reached, unconditionally -- see RETIRED_OBJECTS's own doc
+/// comment for why this must run every call, not just once. Queries the
+/// applied version fresh (not the `current_version` captured before
+/// run_pending's own per-version loop ran) so a database catching up from a
+/// stale version to the latest in this same call is evaluated against its
+/// post-catch-up version, not its pre-call version.
+async fn sweep_retired_objects(
+    conn: &mut SqliteConnection,
+    prefix: &str,
+) -> Result<(), sqlx::Error> {
+    let applied_version = get_applied_version(conn).await;
+    for obj in RETIRED_OBJECTS {
+        if obj.prefix == prefix && obj.retired_at_version <= applied_version {
+            sqlx::query(&format!("DROP TABLE IF EXISTS {}", obj.name))
+                .execute(&mut *conn)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 /// Inner migration loop — runs after lock is acquired.
 async fn run_pending(
     conn: &mut SqliteConnection,
@@ -1008,6 +1080,20 @@ async fn run_pending(
         if !already_applied {
             applied += 1;
         }
+    }
+
+    // items.id=528 Phase 2: unconditional every-call sweep, after the
+    // per-version loop (which may have just re-created a retired table via
+    // a v1 re-run moments ago) and before the trailing consistency check --
+    // see RETIRED_OBJECTS's own doc comment.
+    if let Err(e) = sweep_retired_objects(conn, prefix).await {
+        return Err(MigrationError::Failed {
+            db_path: prefix.to_owned(),
+            plain_language: "Quiet Rabbit couldn't finish setting up. \
+                Your data is safe. [Get help]"
+                .to_owned(),
+            diagnostic: Some(e.to_string()),
+        });
     }
 
     // items.id=484 (Option D): gate the trailing consistency check so a
@@ -1925,6 +2011,93 @@ mod tests {
             "shared_001.sql's seeded provider rows, migrated into providers by shared_013.sql, \
              must also be healed in"
         );
+    }
+
+    // -- RETIRED_OBJECTS: tier3_providers/context_groups/context_group_members
+    //    must not resurrect (items.id=528 Phase 2) ---------------------------
+    //
+    // The bug this guards against: v1 schema files re-run on every startup,
+    // so a single DROP TABLE IF EXISTS in a later versioned migration is not
+    // enough to retire a table a v1 file still unconditionally (re-)creates
+    // -- the very next startup's v1 re-run recreates it again. The existing
+    // run_pending_heals_content_drift_in_stale_v1_database test above only
+    // asserts post-SINGLE-run state, which is exactly what let this bug
+    // class go undetected before (tier3_providers correctly absent after
+    // one run, then silently back after the next). These tests run the
+    // chain TWICE, asserting absence after each run.
+
+    async fn assert_retired_objects_absent(conn: &mut SqliteConnection, context: &str) {
+        for table in ["tier3_providers", "context_group_members", "context_groups"] {
+            assert!(
+                !table_exists(conn, table).await,
+                "{table} must not exist ({context})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn retired_objects_stay_absent_after_two_runs_on_fresh_db() {
+        let mut conn = make_test_conn().await;
+
+        run_migrations(&mut conn, "shared", None)
+            .await
+            .expect("first run must succeed");
+        assert_retired_objects_absent(&mut conn, "after first run on a fresh DB").await;
+
+        let applied_second_run = run_migrations(&mut conn, "shared", None)
+            .await
+            .expect("second run (simulating the next app startup) must succeed");
+        assert_retired_objects_absent(&mut conn, "after second run on a fresh DB").await;
+        assert_eq!(
+            applied_second_run, 0,
+            "nothing should count as newly applied on a second run against an \
+             already-fully-migrated database"
+        );
+    }
+
+    #[tokio::test]
+    async fn retired_objects_stay_absent_after_two_runs_on_stale_v1_db() {
+        // Same hand-built stale shape as run_pending_heals_content_drift_in_
+        // stale_v1_database above: schema_version=1 recorded, none of the
+        // real v1 tables actually created (SCHEMA_FILES is a compile-time
+        // static and can't be swapped to an old shared_001.sql revision at
+        // test time) -- run_pending must heal this all the way through on
+        // its own, exactly as a real stale install would experience it.
+        let mut conn = make_test_conn().await;
+        sqlx::query(
+            "CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, description TEXT NOT NULL
+            )",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO schema_version (version, applied_at, description) \
+             VALUES (1, '2026-01-01T00:00:00Z', 'stale pre-retirement shared v1')",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        run_migrations(&mut conn, "shared", None)
+            .await
+            .expect("first healing run must succeed");
+        assert_retired_objects_absent(&mut conn, "after first run on a stale-v1 DB").await;
+
+        let applied_second_run = run_migrations(&mut conn, "shared", None)
+            .await
+            .expect("second run (simulating the next app startup) must succeed");
+        assert_retired_objects_absent(&mut conn, "after second run on a stale-v1 DB").await;
+        assert_eq!(
+            applied_second_run, 0,
+            "nothing should count as newly applied on a second run against an \
+             already-healed database"
+        );
+
+        // Confirm the sweep didn't collaterally damage the tables that
+        // replaced the retired ones.
+        assert!(table_exists(&mut conn, "providers").await);
     }
 
     // -- tier3_provider_cookies -> cloud_chat_provider_cookies rename
