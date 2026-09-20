@@ -18,16 +18,25 @@ Handled automatically via CLA Assistant at cla-assistant.io.
 
 ## Development Setup
 
-Requirements: Docker Desktop (Windows, Mac, or Linux)
+Quiet Rabbit is a Tauri/Rust desktop app. No Docker or server is involved.
+
+Requirements:
+
+- Rust (stable) and the Tauri CLI (`cargo install tauri-cli`)
+- Node.js and npm (the frontend dev server starts automatically)
+- Linux system libraries: see the "Install Linux dependencies" step in `.github/workflows/tauri-ci.yml`
+- SQLCipher built with FTS5 (`sqlcipher` on Arch; Ubuntu's apt package lacks FTS5, so CI builds v4.14.0 from source)
+
+Linux is the verified development platform (CI runs on Ubuntu).
 
 ```bash
 git clone https://github.com/quietrabbitai/quietrabbit.git
-cd quietrabbit
-cp .env.example .env  # add your API keys
-docker compose up
+cd quietrabbit/frontend && npm install
+cd ../src-tauri && cargo tauri dev
 ```
 
-Open http://localhost:5000 (Phase 1 UI).
+Before opening a pull request, all of these must pass from `src-tauri/`:
+`cargo build`, `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo deny check`, and `cargo test` (plain, not `--lib`).
 
 ## Terminology
 
