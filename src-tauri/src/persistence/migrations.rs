@@ -90,6 +90,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/keys_001.sql"),
     },
     SchemaFile {
+        prefix: "keys",
+        version: 2,
+        sql: include_str!("../../schema/keys_002.sql"),
+    },
+    SchemaFile {
         prefix: "messages",
         version: 1,
         sql: include_str!("../../schema/messages_001.sql"),
@@ -2459,7 +2464,9 @@ mod tests {
             std::env::remove_var("QR_DATA_ROOT");
         }
 
-        assert_eq!(result.expect("migration must apply cleanly"), 1);
+        // items.id=528 Phase 2: 2, not 1, since keys_002.sql added a second
+        // real version (key_type 'tier2' -> 'qr_hosted' rename).
+        assert_eq!(result.expect("migration must apply cleanly"), 2);
 
         let mut conn = open_verify_conn(&db_path, Some(TEST_KEY_HEX)).await;
         assert!(table_exists(&mut conn, "integration_keys").await);
@@ -2467,7 +2474,7 @@ mod tests {
         let invalid = sqlx::query(
             "INSERT INTO integration_keys \
                 (id, provider, key_type, credential_label, credential, auth_type, created_at) \
-             VALUES ('k-bad', 'groq', 'tier2', 'groq', 'secret', 'bogus_type', '2026-01-01T00:00:00Z')",
+             VALUES ('k-bad', 'groq', 'qr_hosted', 'groq', 'secret', 'bogus_type', '2026-01-01T00:00:00Z')",
         )
         .execute(&mut conn)
         .await;
@@ -2479,7 +2486,7 @@ mod tests {
         let valid = sqlx::query(
             "INSERT INTO integration_keys \
                 (id, provider, key_type, credential_label, credential, auth_type, created_at) \
-             VALUES ('k-good', 'groq', 'tier2', 'groq', 'secret', 'api_key', '2026-01-01T00:00:00Z')",
+             VALUES ('k-good', 'groq', 'qr_hosted', 'groq', 'secret', 'api_key', '2026-01-01T00:00:00Z')",
         )
         .execute(&mut conn)
         .await;

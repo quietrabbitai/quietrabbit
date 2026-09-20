@@ -27,7 +27,7 @@ use crate::persistence::{integration_keys_store, provider_store};
 use crate::providers::ollama_client::OllamaClient;
 use crate::providers::types::{ProviderHealth, ProviderStatus};
 
-const TIER2_KEY_TYPE: &str = "tier2";
+const QR_HOSTED_KEY_TYPE: &str = "qr_hosted";
 
 // ---------------------------------------------------------------------------
 // Response structs
@@ -113,7 +113,7 @@ async fn tier2_is_configured(
             &user_id,
             &key_hex_str,
             &provider.id,
-            TIER2_KEY_TYPE,
+            QR_HOSTED_KEY_TYPE,
             None,
         )
         .await
@@ -249,7 +249,7 @@ mod tests {
             "user-d",
             &key_hex(&master_key),
             "groq",
-            TIER2_KEY_TYPE,
+            QR_HOSTED_KEY_TYPE,
             "gsk_super_secret_value",
             None,
             Some("api_key"),
@@ -279,7 +279,7 @@ mod tests {
             "user-e",
             &key_hex(&master_key),
             "mistral",
-            TIER2_KEY_TYPE,
+            QR_HOSTED_KEY_TYPE,
             "mistral_super_secret_value",
             None,
             Some("api_key"),

@@ -6,9 +6,12 @@
 // and built per Architecture/AUTH_MULTIUSER_ARCHITECTURE.md Section 8.3,
 // which explicitly assigns "exact columns are an implementation detail for
 // whoever builds items.id=185 against this" -- decisions.id=65's schema
-// (keys_001.sql, extended in place, not a separate keys_002.sql migration
-// per that file's own CONSOLIDATION NOTE) is the live, built schema this
-// module operates against.
+// (keys_001.sql, extended in place rather than a rebuild migration --
+// its own CONSOLIDATION NOTE explains why the persona_id/auth_type/
+// expires_at SHAPE change didn't need one) is the live, built schema this
+// module operates against. keys_002.sql (items.id=528 Phase 2) exists now,
+// but only for a stored-VALUE rename (key_type 'tier2' -> 'qr_hosted'), not
+// a shape change -- the table shape keys_001.sql describes is still current.
 //
 // SCOPE (items.id=185, narrowed 2026-08-01): this module plus
 // commands/tier2.rs's consumer-side wiring only. Does NOT touch:
@@ -296,6 +299,12 @@ async fn upsert_key_conn(
 mod tests {
     use super::*;
 
+    /// items.id=528 Phase 2: key_type's real stored value, renamed from the
+    /// retired 'tier2' by keys_002.sql. A named constant here so a future
+    /// rename touches one line, not the ~17 call sites below that were
+    /// previously scattered raw literals.
+    const TEST_KEY_TYPE: &str = "qr_hosted";
+
     /// In-memory SQLite seeded directly from the CREATE TABLE statement
     /// this module depends on -- mirrors entity_store.rs's *_conn testing
     /// pattern (test the query logic against a real schema, without
@@ -336,7 +345,7 @@ mod tests {
         upsert_key_conn(
             &mut conn,
             "groq",
-            "tier2",
+            TEST_KEY_TYPE,
             "gsk_abc123",
             None,
             Some("api_key"),
@@ -345,7 +354,7 @@ mod tests {
         .await
         .unwrap();
 
-        let found = get_active_key_conn(&mut conn, "groq", "tier2", None)
+        let found = get_active_key_conn(&mut conn, "groq", TEST_KEY_TYPE, None)
             .await
             .unwrap();
         assert!(found.is_some());
@@ -358,12 +367,28 @@ mod tests {
     #[tokio::test]
     async fn upsert_on_same_scope_replaces_not_duplicates() {
         let mut conn = seeded_conn().await;
-        upsert_key_conn(&mut conn, "groq", "tier2", "old-key", None, None, None)
-            .await
-            .unwrap();
-        upsert_key_conn(&mut conn, "groq", "tier2", "new-key", None, None, None)
-            .await
-            .unwrap();
+        upsert_key_conn(
+            &mut conn,
+            "groq",
+            TEST_KEY_TYPE,
+            "old-key",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        upsert_key_conn(
+            &mut conn,
+            "groq",
+            TEST_KEY_TYPE,
+            "new-key",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM integration_keys")
             .fetch_one(&mut conn)
@@ -374,7 +399,7 @@ mod tests {
             "same (provider, key_type, integration_id, persona_id) must replace, not add a row"
         );
 
-        let found = get_active_key_conn(&mut conn, "groq", "tier2", None)
+        let found = get_active_key_conn(&mut conn, "groq", TEST_KEY_TYPE, None)
             .await
             .unwrap()
             .unwrap();
@@ -388,13 +413,21 @@ mod tests {
         // credentials, not a duplicate -- this is the scenario the
         // UNIQUE constraint's inclusion of persona_id exists to allow.
         let mut conn = seeded_conn().await;
-        upsert_key_conn(&mut conn, "groq", "tier2", "global-key", None, None, None)
-            .await
-            .unwrap();
         upsert_key_conn(
             &mut conn,
             "groq",
-            "tier2",
+            TEST_KEY_TYPE,
+            "global-key",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        upsert_key_conn(
+            &mut conn,
+            "groq",
+            TEST_KEY_TYPE,
             "work-persona-key",
             Some("persona-work"),
             None,
@@ -403,11 +436,11 @@ mod tests {
         .await
         .unwrap();
 
-        let global = get_active_key_conn(&mut conn, "groq", "tier2", None)
+        let global = get_active_key_conn(&mut conn, "groq", TEST_KEY_TYPE, None)
             .await
             .unwrap()
             .unwrap();
-        let scoped = get_active_key_conn(&mut conn, "groq", "tier2", Some("persona-work"))
+        let scoped = get_active_key_conn(&mut conn, "groq", TEST_KEY_TYPE, Some("persona-work"))
             .await
             .unwrap()
             .unwrap();
@@ -422,7 +455,7 @@ mod tests {
         upsert_key_conn(
             &mut conn,
             "groq",
-            "tier2",
+            TEST_KEY_TYPE,
             "work-persona-key",
             Some("persona-work"),
             None,
@@ -433,7 +466,7 @@ mod tests {
 
         // No global key exists -- a global lookup must not silently
         // return the persona-scoped one.
-        let global = get_active_key_conn(&mut conn, "groq", "tier2", None)
+        let global = get_active_key_conn(&mut conn, "groq", TEST_KEY_TYPE, None)
             .await
             .unwrap();
         assert!(global.is_none());
@@ -442,7 +475,7 @@ mod tests {
     #[tokio::test]
     async fn get_active_key_returns_none_when_absent() {
         let mut conn = seeded_conn().await;
-        let found = get_active_key_conn(&mut conn, "nonexistent", "tier2", None)
+        let found = get_active_key_conn(&mut conn, "nonexistent", TEST_KEY_TYPE, None)
             .await
             .unwrap();
         assert!(found.is_none());
@@ -533,7 +566,7 @@ mod tests {
             user_id,
             TEST_KEY_HEX,
             "groq",
-            "tier2",
+            TEST_KEY_TYPE,
             "old-key",
             None,
             None,
@@ -545,7 +578,7 @@ mod tests {
             user_id,
             TEST_KEY_HEX,
             "groq",
-            "tier2",
+            TEST_KEY_TYPE,
             "new-key",
             None,
             None,
@@ -562,7 +595,7 @@ mod tests {
             .await
             .unwrap();
 
-        let found = get_active_key(user_id, TEST_KEY_HEX, "groq", "tier2", None).await;
+        let found = get_active_key(user_id, TEST_KEY_HEX, "groq", TEST_KEY_TYPE, None).await;
 
         if let Some(v) = saved_root {
             std::env::set_var("QR_DATA_ROOT", v);
@@ -598,7 +631,7 @@ mod tests {
             user_id,
             TEST_KEY_HEX,
             "groq",
-            "tier2",
+            TEST_KEY_TYPE,
             "some-key",
             None,
             None,
@@ -607,7 +640,7 @@ mod tests {
         .await
         .expect("upsert_key must succeed with the correct key");
 
-        let result = get_active_key(user_id, WRONG_KEY_HEX, "groq", "tier2", None).await;
+        let result = get_active_key(user_id, WRONG_KEY_HEX, "groq", TEST_KEY_TYPE, None).await;
 
         if let Some(v) = saved_root {
             std::env::set_var("QR_DATA_ROOT", v);

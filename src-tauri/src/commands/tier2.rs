@@ -22,7 +22,8 @@
 // parameter) but adding that to the IPC surface is a frontend-contract
 // decision outside this item's scope -- flagged in this session's handoff.
 //
-// key_type is hardcoded to "tier2" in both commands -- this module's only
+// key_type is hardcoded to "qr_hosted" in both commands (renamed from
+// "tier2" by keys_002.sql, items.id=528 Phase 2) -- this module's only
 // concern is Tier 1.5 (qr_hosted) provider configuration (Groq, Mistral); cloud_frontier and
 // future non-AI integrations use the same table via a different key_type,
 // through their own future command modules.
@@ -49,7 +50,7 @@ use crate::persistence::user_provider_preference_store::{
     self, NewUserProviderPreference, UserPreference, UserProviderPreference,
 };
 
-const TIER2_KEY_TYPE: &str = "tier2";
+const QR_HOSTED_KEY_TYPE: &str = "qr_hosted";
 
 // ---------------------------------------------------------------------------
 // IPC types
@@ -88,7 +89,7 @@ pub async fn get_tier2_config(
         &user_id,
         &key_hex_str,
         &provider,
-        TIER2_KEY_TYPE,
+        QR_HOSTED_KEY_TYPE,
         None,
     )
     .await
@@ -126,7 +127,7 @@ pub async fn set_tier2_provider(
         &user_id,
         &key_hex_str,
         &provider,
-        TIER2_KEY_TYPE,
+        QR_HOSTED_KEY_TYPE,
         &api_key,
         None,
         Some("api_key"),

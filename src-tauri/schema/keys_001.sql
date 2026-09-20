@@ -86,7 +86,10 @@
 -- split is needed here.
 --
 -- key_type: open TEXT — no CHECK constraint.
---   Current values: 'tier2', 'tier3'
+--   Current values: 'qr_hosted' (renamed from 'tier2' by keys_002.sql,
+--   items.id=528 Phase 2, decisions.id=818 vocabulary retirement). 'tier3'
+--   was never real -- confirmed dead, zero production code ever wrote it --
+--   and is not carried forward.
 --   Phase 2 additions: 'integration' (Notion, Calendar, GitHub, etc.)
 --   Application layer validates key_type values.
 -- integration_id: distinguishes multiple integrations from same provider
