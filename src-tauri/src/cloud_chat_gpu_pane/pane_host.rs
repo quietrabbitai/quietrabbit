@@ -2621,7 +2621,7 @@ fn sync_frame_sizes(
 /// items.id=234: resolves any new popup requests, reacts to popup
 /// lifecycle events (self-close/first-paint-ready), and acts on any
 /// parent-navigate-away close requests -- then forwards whatever happened
-/// this tick to the frontend as tier3-popup-opened/-closed events.
+/// this tick to the frontend as cloud-chat-popup-opened/-closed events.
 fn drain_and_emit_popup_notifications(
     manager: &Rc<RefCell<PaneManager>>,
     app_handle: &tauri::AppHandle,
@@ -2644,19 +2644,19 @@ fn drain_and_emit_popup_notifications(
                         provider_id: key,
                         rect,
                     };
-                    if let Err(e) = app_handle.emit("tier3-popup-opened", &payload) {
+                    if let Err(e) = app_handle.emit("cloud-chat-popup-opened", &payload) {
                         log::warn!(
                             "cloud_chat_gpu_pane::pane_host: failed to emit \
-                             tier3-popup-opened: {e}"
+                             cloud-chat-popup-opened: {e}"
                         );
                     }
                 }
                 PopupNotification::Closed { key } => {
                     let payload = PopupClosedPayload { provider_id: key };
-                    if let Err(e) = app_handle.emit("tier3-popup-closed", &payload) {
+                    if let Err(e) = app_handle.emit("cloud-chat-popup-closed", &payload) {
                         log::warn!(
                             "cloud_chat_gpu_pane::pane_host: failed to emit \
-                             tier3-popup-closed: {e}"
+                             cloud-chat-popup-closed: {e}"
                         );
                     }
                 }

@@ -292,7 +292,7 @@ pub async fn login(
             // via Display covers all four correctly.
             .map_err(|e| e.to_string())?;
 
-        // Establishes tier3_cookies.db fresh, same create-or-migrate call
+        // Establishes cloud_chat_cookies.db fresh, same create-or-migrate call
         // shape as integration_keys.db just above (items.id=224 resolution,
         // decisions.id=711) -- see tier3_cookies_001.sql's own header.
         crate::persistence::migrations::migrate_tier3_cookies_db(&user_id, &key_hex(&master_key))
@@ -591,7 +591,7 @@ pub async fn record_activity(
 /// 32-byte master key directly, not a wrapper key -- `Mnemonic::parse()` on
 /// the returned phrase later recovers the exact original bytes, no
 /// unwrapping step. Requires a resident session (KeyRegistry) the same way
-/// tier2::get_tier2_config does; "not logged in" is the same error string
+/// qr_hosted::get_qr_hosted_config does; "not logged in" is the same error string
 /// for the same reason -- there is no key to derive a mnemonic from yet.
 #[tauri::command]
 #[specta::specta]

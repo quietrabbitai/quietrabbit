@@ -6,7 +6,7 @@
 // the spec directly, following this codebase's plain-global-CSS / useState /
 // t() conventions (CloudChatSelector.tsx is the closest sibling for those idioms).
 //
-// Mounted by CloudChatAccessPane.tsx once request_tier3_gate3_review reports
+// Mounted by CloudChatAccessPane.tsx once request_cloud_frontier_gate3_review reports
 // pending_consent=true. `open` covers both the pre-payload scanning state
 // (gate3() is still running server-side, bounded by gate3.rs's own 10s
 // PF_TIMEOUT_SECS) and the post-payload tiered review; `payload` arrives via
@@ -49,7 +49,7 @@
 //     precedent elsewhere in this codebase; the bounded scrollable list
 //     with a bottom fade is implemented, just not the live count.
 //   - The >10s "taking longer than expected" Cancel button is a *soft*
-//     cancel: request_tier3_gate3_review is a single bounded async command
+//     cancel: request_cloud_frontier_gate3_review is a single bounded async command
 //     (gate3()'s own PF_TIMEOUT_SECS already caps it at ~10s), not a
 //     cancelable in-flight operation with its own IPC cancel path the way
 //     the spec's "tapping Cancel stops the run" phrasing implies. Tapping

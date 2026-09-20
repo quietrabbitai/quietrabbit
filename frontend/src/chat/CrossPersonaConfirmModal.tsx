@@ -1,7 +1,7 @@
 // Cross-Persona export confirmation (decisions.id=546/639/815, items.id=27).
 //
 // No generic confirm-dialog component exists anywhere in this frontend --
-// PrivacyGuardianModal.tsx (tier3Access/) is a heavyweight, Gate3-specific
+// PrivacyGuardianModal.tsx (cloudChatAccess/) is a heavyweight, Gate3-specific
 // tiered-review modal built around ConsentRequestPayload/ElementDecision[]
 // and a live consent_request event; the FocusSettingsControls.tsx
 // friction-gate pattern is inline component state with no separate

@@ -7,9 +7,9 @@
 //   ollama_source: "system" | "sidecar" | "unavailable" — written during app
 //   setup by OllamaSidecar::ensure_available(); read from RwLock<OllamaSource>.
 //   Returns "unavailable" during the brief startup detection window.
-//   tier2_configured wired items.id=229 (2026-08-10) against
-//   integration_keys_store::get_active_key, the same lookup tier2.rs's
-//   get_tier2_config already uses (items.id=185, 2026-08-02) -- see that
+//   qr_hosted_configured wired items.id=229 (2026-08-10) against
+//   integration_keys_store::get_active_key, the same lookup qr_hosted.rs's
+//   get_qr_hosted_config already uses (items.id=185, 2026-08-02) -- see that
 //   command's read path just below for the full aggregate-vs-per-provider
 //   and no-session reasoning.
 // get_capability_profile: returns installed models and benchmark status.
@@ -51,7 +51,7 @@ pub struct HealthResponse {
     /// downstream to feed. False, not an error, when no session is resident
     /// -- get_health must stay callable pre-login (Ollama status has no such
     /// requirement).
-    pub tier2_configured: bool,
+    pub qr_hosted_configured: bool,
 }
 
 #[derive(Debug, Serialize, Type)]
@@ -77,12 +77,12 @@ pub async fn get_health(
 ) -> Result<HealthResponse, String> {
     let ollama = client.check_health().await;
     let source = ollama_source.read().await.as_str().to_owned();
-    let tier2_configured = tier2_is_configured(&pool, &key_registry).await?;
+    let qr_hosted_configured = qr_hosted_is_configured(&pool, &key_registry).await?;
 
     Ok(HealthResponse {
         ollama,
         ollama_source: source,
-        tier2_configured,
+        qr_hosted_configured,
     })
 }
 
@@ -94,7 +94,7 @@ pub async fn get_health(
 /// providers.provider_type='cloud_inference_api' instead of a hardcoded
 /// ["mistral","groq"] array, so a future qr_hosted provider is picked up
 /// automatically once curated into the providers table.
-async fn tier2_is_configured(
+async fn qr_hosted_is_configured(
     pool: &sqlx::SqlitePool,
     key_registry: &KeyRegistry,
 ) -> Result<bool, String> {
@@ -152,10 +152,10 @@ pub async fn get_capability_profile(
     })
 }
 
-// Tests target tier2_is_configured() directly rather than the get_health
+// Tests target qr_hosted_is_configured() directly rather than the get_health
 // command -- it's the only new logic here; get_health itself is glue over
 // OllamaClient::check_health() (a real network call, irrelevant to this
-// field) plus this function. Harness mirrors tier2.rs's own test module
+// field) plus this function. Harness mirrors qr_hosted.rs's own test module
 // (setup/mock_app_with_registry/populate_registry) -- same real
 // SQLCipher-file-backed integration_keys.db, same reasoning for why.
 #[cfg(test)]
@@ -190,7 +190,7 @@ mod tests {
         crate::persistence::migrations::migrate_keys_db(user_id, &key_hex(master_key))
             .await
             .expect("integration_keys.db migration must succeed in test setup");
-        // items.id=430: tier2_is_configured() now reads the qr_hosted
+        // items.id=430: qr_hosted_is_configured() now reads the qr_hosted
         // candidate set from providers (shared.db) instead of a hardcoded
         // array -- shared.db must be migrated too so list_providers_by_type
         // finds the seeded groq/mistral rows.
@@ -219,7 +219,7 @@ mod tests {
             sqlx::sqlite::SqliteConnectOptions::new().filename(":memory:"),
         );
         let registry = KeyRegistry::default();
-        let result = tier2_is_configured(&pool, &registry).await;
+        let result = qr_hosted_is_configured(&pool, &registry).await;
         assert_eq!(result, Ok(false));
     }
 
@@ -232,7 +232,7 @@ mod tests {
         populate_registry(&registry, "user-c", master_key).await;
         let pool = app.state::<sqlx::SqlitePool>();
 
-        let result = tier2_is_configured(&pool, &registry).await;
+        let result = qr_hosted_is_configured(&pool, &registry).await;
         assert_eq!(result, Ok(false));
     }
 
@@ -258,7 +258,7 @@ mod tests {
         .await
         .expect("upsert_key must succeed in test setup");
 
-        let result = tier2_is_configured(&pool, &registry).await;
+        let result = qr_hosted_is_configured(&pool, &registry).await;
         assert_eq!(result, Ok(true));
     }
 
@@ -288,7 +288,7 @@ mod tests {
         .await
         .expect("upsert_key must succeed in test setup");
 
-        let result = tier2_is_configured(&pool, &registry).await;
+        let result = qr_hosted_is_configured(&pool, &registry).await;
         assert_eq!(result, Ok(true));
     }
 }

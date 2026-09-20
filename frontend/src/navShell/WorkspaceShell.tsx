@@ -30,7 +30,7 @@
 // Two dominance REPRESENTATIONS now coexist and must be kept from
 // drifting: `dominantRail` (this file's own prop, the one true source of
 // truth for the outer 5-way choice) and `pair.dominant` (CloudChatAccessPane's
-// own internal 'chat'|'tier3' echo, which its ~10 existing internal call
+// own internal 'chat'|'cloudChat' echo, which its ~10 existing internal call
 // sites still key off -- not rewritten for this item, too much surface for
 // the value). The two are kept in sync by TWO complementary mechanisms,
 // not one bidirectional effect (an earlier draft of this file tried a
@@ -47,10 +47,10 @@
 //      file) does the same directly for its own reclaimChat+dominantRail
 //      pairing.
 //   2. A one-directional correction effect (below): whenever
-//      `dominantRail` IS 'chat' or 'tier3' but `pair.dominant` disagrees,
+//      `dominantRail` IS 'chat' or 'cloudChat' but `pair.dominant` disagrees,
 //      force `pair.dominant` to match. This is real, load-bearing
 //      correctness, not just tidiness -- it's what stops a stale
-//      pair.dominant='tier3' from silently showing Cloud Chat's rail+content
+//      pair.dominant='cloudChat' from silently showing Cloud Chat's rail+content
 //      instead of Chat right after an EXTERNAL jump into Chat (History's
 //      "Chat" row-action, or Chat's own floor-click), neither of which
 //      goes through CloudChatAccessPane's own wrapped call sites.
@@ -100,8 +100,8 @@ export function WorkspaceShell({
   useEffect(() => {
     if (dominantRail === 'chat' && pair.dominant !== 'chat') {
       onUpdatePair((prev) => ({ ...prev, dominant: 'chat' }))
-    } else if (dominantRail === 'tier3' && pair.dominant !== 'tier3') {
-      onUpdatePair((prev) => ({ ...prev, dominant: 'tier3' }))
+    } else if (dominantRail === 'cloudChat' && pair.dominant !== 'cloudChat') {
+      onUpdatePair((prev) => ({ ...prev, dominant: 'cloudChat' }))
     }
   }, [dominantRail, pair.dominant, onUpdatePair])
 
@@ -172,7 +172,7 @@ export function WorkspaceShell({
         personas={personas}
         pair={pair}
         onUpdatePair={onUpdatePair}
-        floor={dominantRail !== 'chat' && dominantRail !== 'tier3'}
+        floor={dominantRail !== 'chat' && dominantRail !== 'cloudChat'}
         onFloorExpand={() => onDominantRailChange('chat')}
         onDominantRailChange={onDominantRailChange}
         onOpenHistory={(target) => {

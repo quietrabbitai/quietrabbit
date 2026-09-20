@@ -27,7 +27,7 @@ export interface ChatPaneProps {
    *  'drafted' -- the signal that it's ready for Privacy Guardian review.
    *  Only ever fires when gate3Track is true; ignored (never called) for
    *  Persona-hub usage. The caller (CloudChatAccessPane) is responsible for
-   *  invoking commands.requestTier3Gate3Review with the given messageId. */
+   *  invoking commands.requestCloudFrontierGate3Review with the given messageId. */
   onDraftReady?: (messageId: string) => void
   /** items.id=359 (decisions.id=731): when true, renders only a minimal
    *  floor -- QR's mark, the latest assistant response as a snippet, and
@@ -51,7 +51,7 @@ export interface ChatPaneProps {
    *  component's own existing lastAssistantMessage lookup rather than
    *  duplicating message-list tracking one level up. Carries
    *  gate3_review_status alongside the id -- confirmed live (Jason,
-   *  2026-09-02): requestTier3Gate3Review hard-rejects a message whose
+   *  2026-09-02): requestCloudFrontierGate3Review hard-rejects a message whose
    *  status is already terminal ("not awaiting gate3 review"), so the
    *  caller needs the status to decide whether "2nd opinion" should
    *  re-request review at all, not just which id to send. */

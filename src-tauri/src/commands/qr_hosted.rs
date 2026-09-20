@@ -1,13 +1,14 @@
-// src-tauri/src/commands/tier2.rs
+// src-tauri/src/commands/qr_hosted.rs
 //
 // Group 9 — Tier 1.5 (qr_hosted) configuration.
-// Commands: get_tier2_config, set_tier2_provider.
+// Commands: get_qr_hosted_config, set_qr_hosted_provider.
 //
 // Wired (items.id=185, 2026-08-02) against persistence::integration_keys_store
 // and auth::registry::KeyRegistry, per Architecture/AUTH_MULTIUSER_ARCHITECTURE.md
 // Section 4.2: "every encrypted-store open() call reads key_hex from this
 // registry instead of taking it as a bare caller-supplied parameter." This
-// item is a deliberate narrow first slice of that contract (tier2.rs only) --
+// item is a deliberate narrow first slice of that contract (qr_hosted.rs
+// only, renamed from tier2.rs by items.id=528 Phase 2) --
 // every other store in this codebase still takes key_hex as a bare parameter,
 // confirmed unchanged this session; that is a separate, larger, later
 // migration, not part of this item.
@@ -29,8 +30,8 @@
 // through their own future command modules.
 //
 // api_key/credential must NEVER be returned to the frontend (write-only per
-// this module's own original spec comment) -- Tier2Config below carries no
-// credential field; get_tier2_config only reports whether a key is
+// this module's own original spec comment) -- QrHostedConfig below carries no
+// credential field; get_qr_hosted_config only reports whether a key is
 // configured and which provider is active, never the key value itself.
 //
 // FOLLOW-ON NOT DONE HERE (flagged to Chat-PM in this session's handoff):
@@ -57,10 +58,10 @@ const QR_HOSTED_KEY_TYPE: &str = "qr_hosted";
 // ---------------------------------------------------------------------------
 
 /// Non-secret Tier 1.5 (qr_hosted) configuration state -- never carries the credential
-/// itself. `configured` is true iff an active user-global tier2 key exists
+/// itself. `configured` is true iff an active user-global qr_hosted key exists
 /// for `provider`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, specta::Type)]
-pub struct Tier2Config {
+pub struct QrHostedConfig {
     pub provider: String,
     pub configured: bool,
     pub expires_at: Option<String>,
@@ -75,10 +76,10 @@ pub struct Tier2Config {
 /// unconfigured provider is a normal, expected state, not a failure.
 #[tauri::command]
 #[specta::specta]
-pub async fn get_tier2_config(
+pub async fn get_qr_hosted_config(
     provider: String,
     key_registry: State<'_, KeyRegistry>,
-) -> Result<Tier2Config, String> {
+) -> Result<QrHostedConfig, String> {
     let session = key_registry
         .with_key(|k| (k.user_id.clone(), key_hex(&k.master_key)))
         .await
@@ -96,12 +97,12 @@ pub async fn get_tier2_config(
     .map_err(|e| e.to_string())?;
 
     Ok(match existing {
-        Some(key) => Tier2Config {
+        Some(key) => QrHostedConfig {
             provider: key.provider,
             configured: true,
             expires_at: key.expires_at,
         },
-        None => Tier2Config {
+        None => QrHostedConfig {
             provider,
             configured: false,
             expires_at: None,
@@ -112,7 +113,7 @@ pub async fn get_tier2_config(
 /// Set (or replace) the credential for a Tier 1.5 (qr_hosted) provider, user-global scope.
 #[tauri::command]
 #[specta::specta]
-pub async fn set_tier2_provider(
+pub async fn set_qr_hosted_provider(
     provider: String,
     api_key: String,
     key_registry: State<'_, KeyRegistry>,
@@ -138,7 +139,7 @@ pub async fn set_tier2_provider(
 }
 
 /// Set (or clear, with `provider: None`) the current user's Tier 1.5 (qr_hosted)
-/// provider preference -- distinct from set_tier2_provider above, which stores a
+/// provider preference -- distinct from set_qr_hosted_provider above, which stores a
 /// credential. This is the "which provider should QR actually use" choice.
 ///
 /// items.id=432: lifecycle.rs resolves an account-wide user_provider_preference
@@ -153,7 +154,7 @@ pub async fn set_tier2_provider(
 /// way, without picking a new one.
 #[tauri::command]
 #[specta::specta]
-pub async fn set_tier2_provider_preference(
+pub async fn set_qr_hosted_provider_preference(
     provider: Option<String>,
     key_registry: State<'_, KeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
@@ -175,7 +176,7 @@ pub async fn set_tier2_provider_preference(
                 .collect::<Vec<_>>()
                 .join(", ");
             return Err(format!(
-                "invalid Tier 2 provider: {p}. Valid: {valid}, or null to clear"
+                "invalid Tier 1.5 provider: {p}. Valid: {valid}, or null to clear"
             ));
         }
     }
@@ -242,7 +243,7 @@ pub async fn set_tier2_provider_preference(
 /// settings-surface listing. items.id=254 Part 1.
 #[tauri::command]
 #[specta::specta]
-pub async fn get_tier2_provider_preferences(
+pub async fn get_qr_hosted_provider_preferences(
     key_registry: State<'_, KeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<Vec<UserProviderPreference>, String> {
@@ -312,16 +313,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_tier2_config_reports_unconfigured_when_no_key_set() {
+    async fn get_qr_hosted_config_reports_unconfigured_when_no_key_set() {
         let master_key = [0x11u8; crate::auth::kdf::MASTER_KEY_LEN];
         let _env = setup("user-a", &master_key).await;
         let app = mock_app_with_registry(dummy_pool());
         let registry = app.state::<KeyRegistry>();
         populate_registry(&registry, "user-a", master_key).await;
 
-        let config = get_tier2_config("groq".to_owned(), registry.clone())
+        let config = get_qr_hosted_config("groq".to_owned(), registry.clone())
             .await
-            .expect("get_tier2_config must succeed when logged in");
+            .expect("get_qr_hosted_config must succeed when logged in");
 
         assert!(!config.configured);
         assert_eq!(config.provider, "groq");
@@ -336,38 +337,39 @@ mod tests {
         let registry = app.state::<KeyRegistry>();
         populate_registry(&registry, "user-b", master_key).await;
 
-        set_tier2_provider(
+        set_qr_hosted_provider(
             "groq".to_owned(),
             "gsk_super_secret_value".to_owned(),
             registry.clone(),
         )
         .await
-        .expect("set_tier2_provider must succeed when logged in");
+        .expect("set_qr_hosted_provider must succeed when logged in");
 
-        let config = get_tier2_config("groq".to_owned(), registry.clone())
+        let config = get_qr_hosted_config("groq".to_owned(), registry.clone())
             .await
-            .expect("get_tier2_config must succeed after set_tier2_provider");
+            .expect("get_qr_hosted_config must succeed after set_qr_hosted_provider");
 
         assert!(config.configured);
         assert_eq!(config.provider, "groq");
-        // Tier2Config has no field capable of carrying the credential --
+        // QrHostedConfig has no field capable of carrying the credential --
         // a structural guarantee checked at compile time by the struct
         // definition itself, not something this test could violate even
         // if it tried. Asserted here as documentation of that intent.
     }
 
     #[tokio::test]
-    async fn set_tier2_provider_fails_cleanly_when_not_logged_in() {
+    async fn set_qr_hosted_provider_fails_cleanly_when_not_logged_in() {
         let app = tauri::test::mock_app();
         app.manage(KeyRegistry::default());
         let registry = app.state::<KeyRegistry>();
 
-        let result = set_tier2_provider("groq".to_owned(), "some-key".to_owned(), registry).await;
+        let result =
+            set_qr_hosted_provider("groq".to_owned(), "some-key".to_owned(), registry).await;
         assert!(result.is_err());
     }
 
     // -----------------------------------------------------------------------
-    // set_tier2_provider_preference tests
+    // set_qr_hosted_provider_preference tests
     //
     // This command touches shared.db (via auth::user_store), not
     // integration_keys.db -- the TestEnv/setup() above (which migrates the
@@ -434,14 +436,14 @@ mod tests {
         }
     }
 
-    /// items.id=432/433: set_tier2_provider_preference must write an
+    /// items.id=432/433: set_qr_hosted_provider_preference must write an
     /// account-wide Preferred row in user_provider_preference -- the table
     /// lifecycle.rs::find_preferred_provider() actually reads. Switching
     /// the choice must downgrade the previously-Preferred candidate to
     /// Allowed rather than leaving two candidates both Preferred (which
     /// would make find_preferred_provider() return an ambiguous None).
     #[tokio::test]
-    async fn set_tier2_provider_preference_downgrades_other_candidate() {
+    async fn set_qr_hosted_provider_preference_downgrades_other_candidate() {
         let master_key = [0x66u8; crate::auth::kdf::MASTER_KEY_LEN];
         let _env = setup_shared_db("user-f").await;
         let app = mock_app_with_registry(_env.pool.clone());
@@ -449,9 +451,9 @@ mod tests {
         populate_registry(&registry, "user-f", master_key).await;
         let pool = app.state::<sqlx::SqlitePool>();
 
-        set_tier2_provider_preference(Some("groq".to_owned()), registry.clone(), pool.clone())
+        set_qr_hosted_provider_preference(Some("groq".to_owned()), registry.clone(), pool.clone())
             .await
-            .expect("set_tier2_provider_preference must succeed when logged in");
+            .expect("set_qr_hosted_provider_preference must succeed when logged in");
 
         let groq_pref = user_provider_preference_store::get_preference_at_scope(
             &pool, "user-f", None, None, "groq",
@@ -464,9 +466,13 @@ mod tests {
         // Switch to mistral -- groq's row must be downgraded to Allowed, not
         // left Preferred (which would make find_preferred_provider return
         // an ambiguous None instead of "mistral").
-        set_tier2_provider_preference(Some("mistral".to_owned()), registry.clone(), pool.clone())
-            .await
-            .expect("switching provider must succeed");
+        set_qr_hosted_provider_preference(
+            Some("mistral".to_owned()),
+            registry.clone(),
+            pool.clone(),
+        )
+        .await
+        .expect("switching provider must succeed");
 
         let groq_after = user_provider_preference_store::get_preference_at_scope(
             &pool, "user-f", None, None, "groq",
@@ -497,7 +503,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_tier2_provider_preference_rejects_unknown_provider() {
+    async fn set_qr_hosted_provider_preference_rejects_unknown_provider() {
         let master_key = [0x44u8; crate::auth::kdf::MASTER_KEY_LEN];
         let _env = setup_shared_db("user-d").await;
         let app = mock_app_with_registry(_env.pool.clone());
@@ -505,20 +511,22 @@ mod tests {
         populate_registry(&registry, "user-d", master_key).await;
         let pool = app.state::<sqlx::SqlitePool>();
 
-        let result = set_tier2_provider_preference(Some("openai".to_owned()), registry, pool).await;
-        let err = result.expect_err("openai is not a valid Tier 2 provider");
-        assert!(err.contains("invalid Tier 2 provider"), "got: {err}");
+        let result =
+            set_qr_hosted_provider_preference(Some("openai".to_owned()), registry, pool).await;
+        let err = result.expect_err("openai is not a valid Tier 1.5 provider");
+        assert!(err.contains("invalid Tier 1.5 provider"), "got: {err}");
     }
 
     #[tokio::test]
-    async fn set_tier2_provider_preference_fails_cleanly_when_not_logged_in() {
+    async fn set_qr_hosted_provider_preference_fails_cleanly_when_not_logged_in() {
         let app = tauri::test::mock_app();
         app.manage(KeyRegistry::default());
         app.manage(dummy_pool());
         let registry = app.state::<KeyRegistry>();
         let pool = app.state::<sqlx::SqlitePool>();
 
-        let result = set_tier2_provider_preference(Some("groq".to_owned()), registry, pool).await;
+        let result =
+            set_qr_hosted_provider_preference(Some("groq".to_owned()), registry, pool).await;
         assert!(result.is_err());
     }
 }

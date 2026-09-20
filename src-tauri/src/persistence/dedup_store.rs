@@ -581,7 +581,7 @@ const CANDIDATE_COLUMNS: &str =
 /// "dedup_store::" src-tauri/src/commands/` returning nothing -- so there is
 /// no IPC boundary to migrate here yet. Noted rather than silently skipped;
 /// whichever command eventually wires this up should derive key_hex from
-/// auth::registry::KeyRegistry server-side, matching commands/tier2.rs.
+/// auth::registry::KeyRegistry server-side, matching commands/qr_hosted.rs.
 pub async fn scan_for_duplicates(
     user_id: &str,
     persona_id: &str,

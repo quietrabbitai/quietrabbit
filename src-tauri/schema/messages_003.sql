@@ -6,8 +6,8 @@
 -- records the destination risk rating that review was actually scored
 -- against (providers.risk_rating, MAX across whatever providers were
 -- active in the rail at approval time -- see commands/consent.rs's
--- request_tier3_gate3_review). When the user later activates a NEW
--- provider row not covered by that review, recheck_tier3_provider_selection
+-- request_cloud_frontier_gate3_review). When the user later activates a NEW
+-- provider row not covered by that review, recheck_cloud_frontier_provider_selection
 -- compares the newly-active set's max risk against this stored value: only
 -- a STRICTLY HIGHER risk triggers a fresh review pass -- a newly-selected
 -- provider that is the same or lower risk than what was already reviewed

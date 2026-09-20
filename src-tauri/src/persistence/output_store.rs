@@ -151,7 +151,7 @@ fn get_outputs_db_path(user_id: &str, persona_id: &str) -> PathBuf {
 /// directly from this file's own tests and from background tasks. What
 /// changed is who calls them: every command-layer caller now derives
 /// key_hex from auth::registry::KeyRegistry server-side (see
-/// commands/tier2.rs for the reference pattern) instead of accepting it as
+/// commands/qr_hosted.rs for the reference pattern) instead of accepting it as
 /// a bare IPC parameter from the frontend.
 // items.id=406: bumped from private to pub(crate) -- the fact-identity
 // persistence cascade (conductor/privacy/gate3.rs) needs its own outputs.db

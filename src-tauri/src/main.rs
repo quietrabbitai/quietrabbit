@@ -183,7 +183,7 @@ async fn async_main() {
                         // panics ("Cannot start a runtime from within a
                         // runtime"). Tokio's nested-block_on check is
                         // thread-local, not tied to which Runtime instance
-                        // is entered; commands/tier2.rs's own test module
+                        // is entered; commands/qr_hosted.rs's own test module
                         // already documents hitting this exact panic for
                         // the analogous #[tokio::test] case.
                         // block_in_place() + Handle::current().block_on()

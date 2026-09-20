@@ -15,7 +15,7 @@
 // in place before keyboard support existed (see onPointerDown), is what
 // gives this div real DOM focus to receive onKeyDown/onKeyUp from -- no
 // separate focus wiring needed. See forward_pane_key's own doc
-// (commands/tier3_pane.rs) for the windows_key_code/native_key_code
+// (commands/cloud_chat_pane.rs) for the windows_key_code/native_key_code
 // scoping.
 
 import { useCallback, useEffect, useRef } from 'react'
@@ -76,7 +76,7 @@ const PROVIDER_ID_ATTR = 'data-provider-id'
  *  populated by every engine following the long-standing web-platform
  *  convention of matching Windows virtual-key codes -- exactly what CEF's
  *  `KeyEvent::windows_key_code` expects regardless of platform. See
- *  `forward_pane_key`'s own doc (commands/tier3_pane.rs) for why there's no
+ *  `forward_pane_key`'s own doc (commands/cloud_chat_pane.rs) for why there's no
  *  real native/hardware code to send alongside it. */
 function forwardKey(providerId: string, e: KeyboardEvent, type: PaneKeyEventType) {
   const character = e.key.length === 1 ? e.key.charCodeAt(0) : 0
@@ -87,7 +87,7 @@ function forwardKey(providerId: string, e: KeyboardEvent, type: PaneKeyEventType
  *  forwarded to CEF as ordinary keys -- a Chrome-runtime CEF browser has no
  *  window chrome of its own to bind these as a zoom accelerator (that's
  *  normally a browser-UI concern), so this app applies the zoom itself via
- *  `adjustPaneZoom` (see `ZoomDirection`'s own doc, commands/tier3_pane.rs).
+ *  `adjustPaneZoom` (see `ZoomDirection`'s own doc, commands/cloud_chat_pane.rs).
  *  `'='`/`'+'` both map to zoom-in since the physical key that types '+' on
  *  a US layout requires Shift, and browsers report that combo's `e.key` as
  *  `'+'`, not `'='`. */

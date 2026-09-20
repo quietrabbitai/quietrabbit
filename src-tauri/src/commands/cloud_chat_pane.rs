@@ -1,7 +1,7 @@
 // src-tauri/src/commands/cloud_chat_pane.rs
 //
 // Group 13 -- Cloud Chat pane lifecycle & provider catalog.
-// Commands: list_active_providers, open_tier3_panes, close_tier3_pane,
+// Commands: list_active_providers, open_cloud_chat_panes, close_cloud_chat_pane,
 // set_pane_layout, forward_pane_mouse_click, forward_pane_mouse_move,
 // forward_pane_mouse_wheel, forward_popup_mouse_click,
 // forward_popup_mouse_move, forward_popup_mouse_wheel (items.id=234),
@@ -11,22 +11,22 @@
 // items.id=202 piece 5 / items.id=223 connective tissue: neither item's own
 // description enumerates an IPC command, but on-demand pane creation
 // (items.id=223's whole point) needs something to actually call
-// tier3_pane::pane_host's open/close from the frontend side -- this module
+// cloud_chat_gpu_pane::pane_host's open/close from the frontend side -- this module
 // is that something.
 //
 // list_active_providers wraps persistence::provider_store::list_active_providers()
 // (commit 4e5147f) in a frontend-facing DTO rather than exposing
 // provider_store::Provider directly -- that type isn't specta::Type (a
 // persistence-layer type shouldn't carry an IPC-serialization derive just
-// for this one caller, same reasoning as tier2.rs's Tier2Config being a
+// for this one caller, same reasoning as qr_hosted.rs's QrHostedConfig being a
 // distinct non-secret DTO rather than the full stored credential type) and
 // carries several fields (documentation_gate, review bookkeeping) this
 // screen has no use for.
 //
-// open_tier3_panes/close_tier3_pane dispatch PaneCommand::Open/Close via
+// open_cloud_chat_panes/close_cloud_chat_pane dispatch PaneCommand::Open/Close via
 // AppHandle::run_on_main_thread (items.id=202 real positioning fix,
 // 2026-08-07 -- replaces the old EventLoopProxy<PaneCommand>, dropped along
-// with the rest of winit; see tier3_pane::pane_host's module docs).
+// with the rest of winit; see cloud_chat_gpu_pane::pane_host's module docs).
 // PaneHost lives in a main-thread-only thread-local (GTK objects aren't
 // Send), reached via pane_host::dispatch() from inside the
 // run_on_main_thread closure -- that closure itself only needs to be Send,
@@ -40,10 +40,10 @@
 // every pane now shares CEF's one working global context/cookie jar
 // instead (pane_host.rs no longer builds a per-pane context at all). This
 // module is the actual lifecycle hook for per-provider persistence across
-// app restarts: open_tier3_panes restores a provider's stored cookies into
+// app restarts: open_cloud_chat_panes restores a provider's stored cookies into
 // that shared jar (via CookieManager::set_cookie, awaited) *before*
 // dispatching PaneCommand::Open, so they're already in place before the
-// pane's first navigation; close_tier3_pane reads the jar back (via
+// pane's first navigation; close_cloud_chat_pane reads the jar back (via
 // CookieManager::visit_url_cookies, awaited with a bounded timeout -- see
 // that function's own doc on why a timeout is required, not optional) and
 // persists via persistence::cloud_chat_cookie_store *before* dispatching
@@ -106,7 +106,7 @@ const COOKIE_OP_TIMEOUT: Duration = Duration::from_millis(500);
 /// type -- that's Part 3c/5a's problem to solve when a new lane is
 /// actually needed, not this one.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, specta::Type)]
-pub struct Tier3ProviderSummary {
+pub struct CloudChatProviderSummary {
     pub id: String,
     pub display_name: String,
     pub lane: String,
@@ -227,7 +227,7 @@ pub enum ZoomDirection {
     Reset,
 }
 
-/// items.id=234: `tier3-popup-opened` event payload -- emitted the moment
+/// items.id=234: `cloud-chat-popup-opened` event payload -- emitted the moment
 /// `pane_host.rs`'s `drain_popup_requests` resolves and inserts a new
 /// `PopupState` (immediately, not gated on the popup's first paint, so the
 /// frontend can show the overlay promptly). Hand-declared here rather than
@@ -239,7 +239,7 @@ pub struct PopupOpenedPayload {
     pub rect: PaneRectFraction,
 }
 
-/// items.id=234: `tier3-popup-closed` event payload -- emitted for the two
+/// items.id=234: `cloud-chat-popup-closed` event payload -- emitted for the two
 /// close paths the frontend has no other way to learn about: the popup
 /// self-closing (`window.close()` after a completed OAuth login) and the
 /// parent pane navigating away. NOT emitted when the parent pane itself
@@ -414,9 +414,9 @@ async fn restore_cookies_into_jar(
             Ok(c) => c,
             Err(e) => {
                 log::warn!(
-                    "tier3_pane: could not read stored cookies for provider={provider_id}: {e} \
+                "cloud_chat_pane: could not read stored cookies for provider={provider_id}: {e} \
                  -- opening pane without cookie restore"
-                );
+            );
                 return;
             }
         };
@@ -426,7 +426,7 @@ async fn restore_cookies_into_jar(
 
     let Some(manager) = cef::cookie_manager_get_global_manager(None) else {
         log::warn!(
-            "tier3_pane: CEF's global cookie manager unavailable -- cannot restore \
+            "cloud_chat_pane: CEF's global cookie manager unavailable -- cannot restore \
              cookies for provider={provider_id}"
         );
         return;
@@ -446,7 +446,7 @@ async fn restore_cookies_into_jar(
         };
         if dispatched == 0 {
             log::warn!(
-                "tier3_pane: set_cookie rejected for provider={provider_id} name={} \
+                "cloud_chat_pane: set_cookie rejected for provider={provider_id} name={} \
                  (invalid URL or cookies inaccessible)",
                 cookie.name
             );
@@ -456,11 +456,11 @@ async fn restore_cookies_into_jar(
         match tokio::time::timeout(COOKIE_OP_TIMEOUT, rx).await {
             Ok(Ok(true)) => {}
             Ok(Ok(false)) => log::warn!(
-                "tier3_pane: CEF reported failure restoring cookie provider={provider_id} name={}",
+                "cloud_chat_pane: CEF reported failure restoring cookie provider={provider_id} name={}",
                 cookie.name
             ),
             Ok(Err(_)) | Err(_) => log::warn!(
-                "tier3_pane: timed out waiting for set_cookie completion, \
+                "cloud_chat_pane: timed out waiting for set_cookie completion, \
                  provider={provider_id} name={}",
                 cookie.name
             ),
@@ -480,7 +480,7 @@ async fn persist_cookies_from_jar(
 ) {
     let Some(manager) = cef::cookie_manager_get_global_manager(None) else {
         log::warn!(
-            "tier3_pane: CEF's global cookie manager unavailable -- cannot persist \
+            "cloud_chat_pane: CEF's global cookie manager unavailable -- cannot persist \
              cookies for provider={provider_id}"
         );
         return;
@@ -511,7 +511,7 @@ async fn persist_cookies_from_jar(
     if let Err(e) =
         cloud_chat_cookie_store::upsert_cookies(user_id, key_hex_str, provider_id, &collected).await
     {
-        log::warn!("tier3_pane: could not persist cookies for provider={provider_id}: {e}");
+        log::warn!("cloud_chat_pane: could not persist cookies for provider={provider_id}: {e}");
     }
 }
 
@@ -538,7 +538,7 @@ async fn persist_cookies_from_jar(
 #[specta::specta]
 pub async fn list_active_providers(
     pool: State<'_, sqlx::SqlitePool>,
-) -> Result<Vec<Tier3ProviderSummary>, String> {
+) -> Result<Vec<CloudChatProviderSummary>, String> {
     let providers = provider_store::list_active_providers(&pool)
         .await
         .map_err(|e| e.to_string())?;
@@ -551,7 +551,7 @@ pub async fn list_active_providers(
                 "split_screen_web" | "external_service"
             )
         })
-        .map(|p| Tier3ProviderSummary {
+        .map(|p| CloudChatProviderSummary {
             id: p.id,
             display_name: p.display_name,
             lane: lane_str(&p.provider_type).to_string(),
@@ -566,7 +566,7 @@ pub async fn list_active_providers(
 }
 
 /// Opens one pane per confirmed provider selection (items.id=223's actual
-/// trigger -- nothing in tier3_pane/ creates a pane except in response to
+/// trigger -- nothing in cloud_chat_gpu_pane/ creates a pane except in response to
 /// this). `launch_url` is looked up server-side; the frontend only ever
 /// passes provider IDs. Best-effort across the batch: the first provider
 /// that fails to resolve or send aborts the remaining opens rather than
@@ -586,7 +586,7 @@ pub async fn list_active_providers(
 /// confirmed dispatch-delay bug that required exactly that workaround).
 #[tauri::command]
 #[specta::specta]
-pub async fn open_tier3_panes(
+pub async fn open_cloud_chat_panes(
     provider_ids: Vec<String>,
     key_registry: State<'_, KeyRegistry>,
     app_handle: tauri::AppHandle,
@@ -616,7 +616,7 @@ pub async fn open_tier3_panes(
             restore_cookies_into_jar(user_id, key_hex_str, &provider_id, &launch_url).await;
         } else {
             log::warn!(
-                "tier3_pane: no resident session key -- opening provider={provider_id} \
+                "cloud_chat_pane: no resident session key -- opening provider={provider_id} \
                  without cookie restore"
             );
         }
@@ -636,7 +636,7 @@ pub async fn open_tier3_panes(
 /// Closes one pane by provider ID. A no-op (not an error) if that provider
 /// has no open pane -- `PaneManager::close_pane` already tolerates this
 /// (pane_host.rs), and a caller racing a close against an already-closed
-/// pane is a normal condition, not a failure. See open_tier3_panes' doc on
+/// pane is a normal condition, not a failure. See open_cloud_chat_panes' doc on
 /// why a single `run_on_main_thread` call is dispatch and guaranteed-prompt
 /// delivery in one step now.
 ///
@@ -653,7 +653,7 @@ pub async fn open_tier3_panes(
 /// logged, never a reason this command returns an error.
 #[tauri::command]
 #[specta::specta]
-pub async fn close_tier3_pane(
+pub async fn close_cloud_chat_pane(
     provider_id: String,
     key_registry: State<'_, KeyRegistry>,
     app_handle: tauri::AppHandle,
@@ -682,15 +682,15 @@ pub async fn close_tier3_pane(
             }
         }
         (None, _) => log::warn!(
-            "tier3_pane: no resident session key -- closed provider={provider_id} \
+            "cloud_chat_pane: no resident session key -- closed provider={provider_id} \
              without cookie persist"
         ),
         (_, Ok(None)) => log::warn!(
-            "tier3_pane: provider={provider_id} not found in catalog -- closed without \
+            "cloud_chat_pane: provider={provider_id} not found in catalog -- closed without \
              cookie persist"
         ),
         (_, Err(e)) => log::warn!(
-            "tier3_pane: could not resolve provider={provider_id} for cookie persist: {e}"
+            "cloud_chat_pane: could not resolve provider={provider_id} for cookie persist: {e}"
         ),
     }
 
@@ -704,7 +704,7 @@ pub async fn close_tier3_pane(
 /// open (e.g. a race against a just-closed pane) is likewise a no-op at
 /// the `pane_host::PaneManager::set_active_pane` layer (`panes.get_mut`
 /// simply finds nothing), not an error -- same "a stale reference to a
-/// pane is a normal race, not a failure" framing `close_tier3_pane`
+/// pane is a normal race, not a failure" framing `close_cloud_chat_pane`
 /// already documents.
 #[tauri::command]
 #[specta::specta]
@@ -778,7 +778,7 @@ pub async fn set_pane_layout(
 ///
 /// A no-op (not an error) if `provider_id` names a pane that has already
 /// closed by the time this arrives -- an event racing a close is expected,
-/// not a failure, matching `close_tier3_pane`'s own framing.
+/// not a failure, matching `close_cloud_chat_pane`'s own framing.
 #[tauri::command]
 #[specta::specta]
 // IPC command signature mirrors the DOM event shape 1:1 (see doc above) --
@@ -983,7 +983,7 @@ pub async fn forward_popup_key(
 
 /// items.id=234: popup counterpart to `forward_pane_mouse_click` -- same
 /// coordinate/no-op contract, except `x`/`y` are local to the popup's own
-/// on-screen rect (`tier3-popup-opened`'s reported `rect`), not the parent
+/// on-screen rect (`cloud-chat-popup-opened`'s reported `rect`), not the parent
 /// pane's. `provider_id` names the *parent* pane (popups have no separate
 /// id-keyspace, see `PaneManager.popups`'s own doc, pane_host.rs).
 #[tauri::command]

@@ -1,7 +1,8 @@
-// src-tauri/src/persistence/tier3_cookie_store.rs
+// src-tauri/src/persistence/cloud_chat_cookie_store.rs
 //
 // cloud_chat_provider_cookies CRUD — per-user, SQLCipher-encrypted
-// tier3_cookies.db. items.id=224 resolution (decisions.id=711): CEF's one
+// cloud_chat_cookies.db (renamed from tier3_cookies.db, items.id=528 Phase 2).
+// items.id=224 resolution (decisions.id=711): CEF's one
 // working global RequestContext holds the live, working cookie jar; this
 // store is the source of truth across app restarts. See
 // schema/tier3_cookies_001.sql's own header for the full column rationale
@@ -94,7 +95,7 @@ fn get_tier3_cookies_db_path(user_id: &str) -> std::path::PathBuf {
     crate::providers::utils::db_path_tier3_cookies(user_id)
 }
 
-/// Open tier3_cookies.db with SQLCipher key. Mirrors
+/// Open cloud_chat_cookies.db with SQLCipher key. Mirrors
 /// integration_keys_store.rs::open_integration_keys_db's shape exactly.
 async fn open_tier3_cookies_db(
     user_id: &str,
@@ -118,7 +119,7 @@ async fn open_tier3_cookies_db(
 // ---------------------------------------------------------------------------
 
 /// All stored cookies for (user_id, provider_id) -- the pane-open restore
-/// path (commands/cloud_chat_pane.rs::open_tier3_panes).
+/// path (commands/cloud_chat_pane.rs::open_cloud_chat_panes).
 pub async fn list_cookies(
     user_id: &str,
     key_hex: &str,
@@ -155,7 +156,7 @@ pub(crate) async fn list_cookies_conn(
 
 /// Replace the entire stored cookie set for (user_id, provider_id) with
 /// `cookies` -- the pane-close persist path
-/// (commands/cloud_chat_pane.rs::close_tier3_pane). See module header on why
+/// (commands/cloud_chat_pane.rs::close_cloud_chat_pane). See module header on why
 /// this is a full replace, not a per-cookie upsert. SAVEPOINT-wrapped
 /// delete-then-insert, mirroring personal_store.rs's own
 /// supersede-then-insert atomicity pattern (same rationale: a failure

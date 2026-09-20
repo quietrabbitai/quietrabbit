@@ -175,8 +175,8 @@ pub async fn create_group(
 // user-initiated, no internal hook to eventually attach to.
 //
 // user_id is deliberately NOT a command parameter -- derived from
-// key_registry instead (same convention get_tier2_config/
-// set_tier2_provider_preference already use), so it can't be spoofed by
+// key_registry instead (same convention get_qr_hosted_config/
+// set_qr_hosted_provider_preference already use), so it can't be spoofed by
 // whatever the frontend happens to pass.
 
 /// Opt (or opt back out) `persona_id`'s context assembly into checking

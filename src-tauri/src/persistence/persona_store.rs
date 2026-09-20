@@ -68,7 +68,7 @@ pub struct Persona {
 /// persona. quick-ask is the permanent shared Cloud Chat drafting path
 /// (FOCUS_ROADMAP.md, TIER3_ACCESS_MODEL.md), so any persona missing this
 /// row hits a hard AUTHORIZE-equivalent failure the first time it drafts a
-/// Cloud Chat (commands::consent::request_tier3_gate3_review). Does NOT
+/// Cloud Chat (commands::consent::request_cloud_frontier_gate3_review). Does NOT
 /// include role-assessment -- that Focus's shared_001.sql seed already
 /// covers every persona (`FROM personas p`, no LIMIT), so it isn't part of
 /// this gap.

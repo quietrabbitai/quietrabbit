@@ -31,7 +31,7 @@ pub static ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(())
 // ---------------------------------------------------------------------------
 // KeyRegistry test harness (items.id=268)
 //
-// SAME ROOT CAUSE AS ABOVE, caught before it spread further: tier2.rs and
+// SAME ROOT CAUSE AS ABOVE, caught before it spread further: qr_hosted.rs and
 // system.rs had each independently written a byte-identical
 // mock_app_with_registry()/populate_registry() pair for standing up a
 // KeyRegistry-backed #[tauri::command] test. items.id=268 added
@@ -65,7 +65,7 @@ pub fn mock_app_with_registry(pool: sqlx::SqlitePool) -> tauri::App<tauri::test:
 /// mock_app_with_registry() (which only constructs the app) because
 /// populating requires an .await, and #[tokio::test] already runs in a
 /// Tokio runtime: tauri::async_runtime::block_on inside that context panics
-/// ("cannot start a runtime from within a runtime") -- see tier2.rs's
+/// ("cannot start a runtime from within a runtime") -- see qr_hosted.rs's
 /// original version of this comment for the full history.
 #[cfg(test)]
 pub async fn populate_registry(

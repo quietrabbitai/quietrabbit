@@ -15,7 +15,7 @@
 // decisions.id=741: Active Board defaults to showing ALL personas, with
 // an optional filter -- independent of whatever Persona (if any) is
 // active elsewhere in the shell. The top-strip 'activeBoard' button has
-// never been persona-scoped to begin with (unlike 'tier3', gated behind
+// never been persona-scoped to begin with (unlike 'cloudChat', gated behind
 // selecting a Persona first), so there's no single-persona precursor to
 // build before this: fanning out across every Persona is the natural
 // shape from the start. commands.getActiveBoard itself is

@@ -12,7 +12,7 @@
 // one level up in NavShell.tsx, which never unmounts. `setPair` takes a
 // functional updater (not a plain value) for the same reason the
 // pre-extraction code's setOpenPaneIds/setActiveProviderId calls did:
-// openTier3Panes/setActivePane/closeTier3Pane are async Rust commands,
+// openCloudChatPanes/setActivePane/closeCloudChatPane are async Rust commands,
 // and computing the next state against whatever `pair` was at CALL time
 // (rather than at RESOLUTION time) would silently reintroduce exactly the
 // stale-closure race the original functional-setState calls were already
@@ -31,8 +31,8 @@
 // has clicked anything; or after closing whichever pane was active) --
 // exactly the cases the pre-merge design deliberately kept the rail
 // visible for. The four real triggers for a dominant change are:
-//   - Gate3 approves a draft for the first time this "round" -> markTier3Ready()
-//   - activate(providerId) -> 'tier3' (redundant with the above in
+//   - Gate3 approves a draft for the first time this "round" -> markCloudChatReady()
+//   - activate(providerId) -> 'cloudChat' (redundant with the above in
 //     practice, set directly anyway rather than relying on ordering)
 //   - reclaimChat() -> 'chat' (the only user-driven path back to chat)
 //   - close(providerId) does NOT touch dominant at all -- matches "the
@@ -43,9 +43,9 @@
 // Gate3 review state (reviewOutcome/consentPayload/pendingMessageId/etc.)
 // stays local to CloudChatAccessPane, entirely untouched by this extraction --
 // it's per-in-flight-message state, not part of "which side is dominant."
-// markTier3Ready() is the one narrow exception: CloudChatAccessPane calls it
+// markCloudChatReady() is the one narrow exception: CloudChatAccessPane calls it
 // from an effect watching reviewOutcome, but this hook still has no idea
-// what Gate3 review even is -- it just exposes a plain "make tier3
+// what Gate3 review even is -- it just exposes a plain "make cloudChat
 // dominant" action, same shape as reclaimChat's "make chat dominant."
 
 import { useCallback, useState } from 'react'
@@ -53,7 +53,7 @@ import { commands } from '../bindings'
 import type { DominancePairState } from './navShellConfig'
 
 export interface DominancePairHandle {
-  dominant: 'chat' | 'tier3'
+  dominant: 'chat' | 'cloudChat'
   openProviderIds: string[]
   activeProviderId: string | null
   openError: string | null
@@ -87,7 +87,7 @@ export interface DominancePairHandle {
    *  reference, no re-render) if already dominant, so CloudChatAccessPane's
    *  effect can call this every time reviewOutcome is 'approved' without
    *  worrying about redundant updates. */
-  markTier3Ready: () => void
+  markCloudChatReady: () => void
 }
 
 export function useDominancePair(
@@ -100,20 +100,20 @@ export function useDominancePair(
     (providerId: string) => {
       setOpenError(null)
       if (pair.openProviderIds.includes(providerId)) {
-        setPair((prev) => ({ ...prev, dominant: 'tier3', activeProviderId: providerId }))
+        setPair((prev) => ({ ...prev, dominant: 'cloudChat', activeProviderId: providerId }))
         commands.setActivePane(providerId).then((result) => {
           if (result.status !== 'ok') setOpenError(result.error)
         })
         return
       }
-      commands.openTier3Panes([providerId]).then((result) => {
+      commands.openCloudChatPanes([providerId]).then((result) => {
         if (result.status !== 'ok') {
           setOpenError(result.error)
           return
         }
         setPair((prev) => ({
           ...prev,
-          dominant: 'tier3',
+          dominant: 'cloudChat',
           openProviderIds: prev.openProviderIds.includes(providerId)
             ? prev.openProviderIds
             : [...prev.openProviderIds, providerId],
@@ -129,7 +129,7 @@ export function useDominancePair(
 
   const close = useCallback(
     (providerId: string, onClosed?: () => void) => {
-      commands.closeTier3Pane(providerId).then((result) => {
+      commands.closeCloudChatPane(providerId).then((result) => {
         if (result.status !== 'ok') {
           setOpenError(result.error)
           return
@@ -152,8 +152,8 @@ export function useDominancePair(
     })
   }, [setPair])
 
-  const markTier3Ready = useCallback(() => {
-    setPair((prev) => (prev.dominant === 'tier3' ? prev : { ...prev, dominant: 'tier3' }))
+  const markCloudChatReady = useCallback(() => {
+    setPair((prev) => (prev.dominant === 'cloudChat' ? prev : { ...prev, dominant: 'cloudChat' }))
   }, [setPair])
 
   return {
@@ -165,6 +165,6 @@ export function useDominancePair(
     activate,
     close,
     reclaimChat,
-    markTier3Ready,
+    markCloudChatReady,
   }
 }

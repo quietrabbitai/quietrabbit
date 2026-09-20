@@ -424,7 +424,7 @@ mod tests {
     }
 
     /// Real shared.db + real encrypted outputs.db via the actual migration
-    /// path, plus a persona row -- mirrors auth.rs/tier2.rs's setup()
+    /// path, plus a persona row -- mirrors auth.rs/qr_hosted.rs's setup()
     /// pattern. Exercises the real store queries end to end, not mocks.
     ///
     /// Also migrates personal.db (items.id=243): prepare_clipboard_copy's

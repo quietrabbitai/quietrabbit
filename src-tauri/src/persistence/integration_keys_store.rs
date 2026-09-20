@@ -1,7 +1,7 @@
 // src-tauri/src/persistence/integration_keys_store.rs
 //
 // integration_keys CRUD — per-user, SQLCipher-encrypted integration_keys.db.
-// Fills the gap named in commands/tier2.rs's own header ("Both commands
+// Fills the gap named in commands/qr_hosted.rs's own header ("Both commands
 // require integration_keys_store (not yet ported)... Flagged to Chat-PM")
 // and built per Architecture/AUTH_MULTIUSER_ARCHITECTURE.md Section 8.3,
 // which explicitly assigns "exact columns are an implementation detail for
@@ -14,7 +14,7 @@
 // a shape change -- the table shape keys_001.sql describes is still current.
 //
 // SCOPE (items.id=185, narrowed 2026-08-01): this module plus
-// commands/tier2.rs's consumer-side wiring only. Does NOT touch:
+// commands/qr_hosted.rs's consumer-side wiring only. Does NOT touch:
 //   - providers/groq.rs's get_api_key() -- its own doc comment names this
 //     as a distinct future "Layer 8" swap with a stable signature/error
 //     contract, synchronous today, unlike this module's async functions.
@@ -25,11 +25,11 @@
 //     topic_store.rs) bare key_hex: &str parameter -- Architecture Section
 //     4.2's "every encrypted-store open() reads from KeyRegistry" end
 //     state is not yet reached anywhere in the codebase; this item is a
-//     deliberate first slice (tier2.rs only), not the full migration.
+//     deliberate first slice (qr_hosted.rs only), not the full migration.
 //
 // api_key/credential must NEVER be returned to the frontend (write-only
-// per commands/tier2.rs's own IPC surface comment) -- get_active_key's
-// caller in commands/tier2.rs is responsible for stripping `credential`
+// per commands/qr_hosted.rs's own IPC surface comment) -- get_active_key's
+// caller in commands/qr_hosted.rs is responsible for stripping `credential`
 // before constructing any frontend-facing response; this module returns
 // the full row because it has legitimate internal callers (e.g. a future
 // provider client actually needing the credential to make a request) that
@@ -72,7 +72,7 @@ pub enum IntegrationKeysStoreError {
 /// (protected only by SQLCipher file-level encryption, per keys_001.sql's
 /// own header on why no field-level layer is needed) -- callers that
 /// construct an IPC response from this struct MUST NOT include
-/// `credential` in it (commands/tier2.rs's own doc comment: "api_key must
+/// `credential` in it (commands/qr_hosted.rs's own doc comment: "api_key must
 /// NEVER be returned to the frontend").
 #[derive(Debug, Clone)]
 pub struct IntegrationKey {
@@ -193,7 +193,7 @@ async fn get_active_key_conn(
 /// persona_id) -- matches the table's own UNIQUE constraint exactly, so
 /// this is a true upsert on that key, not a blind insert. credential_label
 /// defaults to provider if not given a more specific one by the caller
-/// (commands/tier2.rs does not currently collect a separate label from the
+/// (commands/qr_hosted.rs does not currently collect a separate label from the
 /// frontend).
 #[allow(clippy::too_many_arguments)]
 pub async fn upsert_key(

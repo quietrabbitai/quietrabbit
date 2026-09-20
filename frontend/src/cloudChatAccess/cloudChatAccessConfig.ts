@@ -25,7 +25,7 @@
 // replaces the prior PLACEHOLDER_PROVIDERS stand-in array -- real data now
 // comes from commands.listActiveProviders(), backed by
 // provider_store::list_active_providers() (commit 4e5147f). The IPC
-// response's `lane` field is computed by commands/tier3_pane.rs's
+// response's `lane` field is computed by commands/cloud_chat_pane.rs's
 // lane_str() from provider_type (providers has no tier column of its own
 // -- items.id=427) and already renders "cloud_anonymous"/"cloud_frontier"
 // literally, so no tier-to-lane transformation happens here -- just a
@@ -59,7 +59,7 @@ import duckLogoUrl from './assets/duckduckgo-dax-solo.svg'
 export type ProviderLane = 'cloud_anonymous' | 'cloud_frontier'
 
 /** One selectable destination in the selector screen. Backed by the real
- *  provider catalog (provider_store::tier3_providers, decisions.id=684/710)
+ *  provider catalog (provider_store::providers, decisions.id=684/710)
  *  via commands.listActiveProviders() -- see fetchActiveProviders() below.
  *  loginRequired/isAnonymous/privacyGuardianDefaultLevel (items.id=418) are
  *  the provider indicator badges' real, existing data source -- no other

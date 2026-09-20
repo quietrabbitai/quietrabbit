@@ -22,7 +22,7 @@ use specta::Type;
 /// (onboarding::get_onboarding_focus_suggestions,
 /// onboarding::submit_onboarding_focus_selection,
 /// focus_builder::get_focus_builder_session,
-/// focus_builder::submit_focus_builder_step, tier2::get_tier2_config)
+/// focus_builder::submit_focus_builder_step, qr_hosted::get_qr_hosted_config)
 /// previously used serde_json::Value as an argument or return type.
 /// serde_json::Value is self-referential (Array(Vec<Value>),
 /// Object(Map<String, Value>)), and specta's TypeScript exporter recurses
@@ -36,9 +36,10 @@ use specta::Type;
 /// be given its real request/response struct when its feature is designed --
 /// this is deliberately not a contract to build against.
 ///
-/// UPDATE (items.id=185, 2026-08-02): tier2::get_tier2_config now has a real
-/// return type (commands::tier2::Tier2Config) and no longer uses this
-/// placeholder -- four of the original five remain unbuilt.
+/// UPDATE (items.id=185, 2026-08-02): qr_hosted::get_qr_hosted_config (then
+/// tier2::get_tier2_config -- module renamed by items.id=528 Phase 2) now
+/// has a real return type (commands::qr_hosted::QrHostedConfig) and no
+/// longer uses this placeholder -- four of the original five remain unbuilt.
 ///
 /// UPDATE (items.id=229, 2026-08-09): auth::get_recovery_key_display also
 /// stopped using this placeholder (commands::auth::RecoveryKeyDisplay) --
@@ -65,5 +66,5 @@ pub mod persona;
 pub mod persona_sync;
 pub mod persona_view_sync;
 pub mod personal;
+pub mod qr_hosted;
 pub mod system;
-pub mod tier2;

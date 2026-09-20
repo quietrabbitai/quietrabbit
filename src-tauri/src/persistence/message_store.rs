@@ -40,7 +40,7 @@ pub struct MessageRecord {
     pub created_at: String,
     /// items.id=406 (decisions.id=755): the destination risk rating this
     /// message's cloud_frontier approval was scored against -- None until the
-    /// approval write path (request_tier3_gate3_review) populates it, and
+    /// approval write path (request_cloud_frontier_gate3_review) populates it, and
     /// for every message that predates messages_003.sql.
     pub reviewed_at_risk_rating: Option<i64>,
 }
@@ -341,8 +341,8 @@ pub async fn update_gate3_review_status(
 
 /// items.id=406 (decisions.id=755): records the destination risk rating a
 /// cloud_frontier approval was actually scored against -- written by
-/// request_tier3_gate3_review on approval, and re-written by
-/// recheck_tier3_provider_selection when a later re-check broadens the
+/// request_cloud_frontier_gate3_review on approval, and re-written by
+/// recheck_cloud_frontier_provider_selection when a later re-check broadens the
 /// covered risk. Narrow single-column update, same shape as
 /// update_gate3_review_status.
 pub async fn update_reviewed_at_risk_rating(

@@ -170,7 +170,7 @@ export const commands = {
 	 *  keeps the row retry-able rather than overloading 'withheld' (a status
 	 *  meaning the user declined, not that gate3 itself refused).
 	 */
-	requestTier3Gate3Review: (request: RequestTier3Gate3ReviewRequest) => typedError<Gate3ReviewResult, string>(__TAURI_INVOKE("request_tier3_gate3_review", { request })),
+	requestCloudFrontierGate3Review: (request: RequestCloudFrontierGate3ReviewRequest) => typedError<Gate3ReviewResult, string>(__TAURI_INVOKE("request_cloud_frontier_gate3_review", { request })),
 	/**
 	 *  Records the user's resolution of a Privacy Guardian consent review
 	 *  (pending-review -> approved | withheld). Separate from
@@ -181,7 +181,7 @@ export const commands = {
 	 *  user resolves the Privacy Guardian modal (submit_element_consent_decision
 	 *  first, then this).
 	 */
-	resolveTier3Gate3Review: (request: ResolveTier3Gate3ReviewRequest) => typedError<null, string>(__TAURI_INVOKE("resolve_tier3_gate3_review", { request })),
+	resolveCloudFrontierGate3Review: (request: ResolveCloudFrontierGate3ReviewRequest) => typedError<null, string>(__TAURI_INVOKE("resolve_cloud_frontier_gate3_review", { request })),
 	/**
 	 *  items.id=406 (decisions.id=755) -- the provider-selection re-check
 	 *  trigger. Fires when the user activates a rail provider not covered by
@@ -198,7 +198,7 @@ export const commands = {
 	 *  already covered (messages.reviewed_at_risk_rating) -- a same-or-lower-
 	 *  risk destination needs no re-check.
 	 */
-	recheckTier3ProviderSelection: (request: RecheckTier3ProviderSelectionRequest) => typedError<Gate3ReviewResult, string>(__TAURI_INVOKE("recheck_tier3_provider_selection", { request })),
+	recheckCloudFrontierProviderSelection: (request: RecheckCloudFrontierProviderSelectionRequest) => typedError<Gate3ReviewResult, string>(__TAURI_INVOKE("recheck_cloud_frontier_provider_selection", { request })),
 	/**
 	 *  items.id=416 (decisions.id=766): extends Gate3 review to every native
 	 *  copy path on ChatPane's transcript (Ctrl+C / right-click-copy), not just
@@ -211,7 +211,7 @@ export const commands = {
 	 *  rendered content, never a poll, per the same locked
 	 *  no-passive-clipboard-monitoring rule handleCopyStarter documents.
 	 * 
-	 *  Unlike request_tier3_gate3_review, there is no single message row to
+	 *  Unlike request_cloud_frontier_gate3_review, there is no single message row to
 	 *  read from -- a selection may span multiple messages (items.id=416's
 	 *  cross-message-selection resolution: treated as ONE new composition, one
 	 *  combined review, not fragmented per-message sub-reviews) -- so
@@ -221,19 +221,19 @@ export const commands = {
 	 *  any persisted row (confirmed in gate3.rs: neither is used for a DB
 	 *  lookup, only pushed into the audit entry's fields_shared/fields_withheld).
 	 * 
-	 *  Parameter sourcing mostly mirrors request_tier3_gate3_review's own
+	 *  Parameter sourcing mostly mirrors request_cloud_frontier_gate3_review's own
 	 *  quick-ask constants (content_sensitivity_severity=1, execution_tier=1) --
 	 *  both are fixed placeholders reflecting the absence of a PersonalTrack at
 	 *  this call site, not a claim about the reviewed content's structure. Like
-	 *  request_tier3_gate3_review, this command reviews arbitrary
+	 *  request_cloud_frontier_gate3_review, this command reviews arbitrary
 	 *  message/clipboard content, not Quick-Ask-Focus output specifically;
 	 *  quick-ask.focus's identifiers are borrowed only as a synthetic label. This
-	 *  command does NOT mirror request_tier3_gate3_review's target_tier=3 --
+	 *  command does NOT mirror request_cloud_frontier_gate3_review's target_tier=3 --
 	 *  confirmed live (2026-09-04) that reusing 3 unconditionally makes gate3's
 	 *  own zero_spans_safe_to_auto_approve (destination_risk >= 3 forces High
 	 *  review regardless of content) fire for every single copy when no Cloud Chat
 	 *  pane happens to be open, defeating the "silent on a fast,
-	 *  unflagged pass" UX this whole feature is built around: request_tier3_gate3_review's
+	 *  unflagged pass" UX this whole feature is built around: request_cloud_frontier_gate3_review's
 	 *  target_tier=3 is correct there because that flow's own precondition is
 	 *  "the user is literally about to access cloud_frontier" (its own doc comment) -- a
 	 *  native copy gesture on this transcript carries no such precondition; the
@@ -335,12 +335,12 @@ export const commands = {
 	 *  configured=false (not an error) when no key is set yet -- an
 	 *  unconfigured provider is a normal, expected state, not a failure.
 	 */
-	getTier2Config: (provider: string) => typedError<Tier2Config, string>(__TAURI_INVOKE("get_tier2_config", { provider })),
+	getQrHostedConfig: (provider: string) => typedError<QrHostedConfig, string>(__TAURI_INVOKE("get_qr_hosted_config", { provider })),
 	/**  Set (or replace) the credential for a Tier 1.5 (qr_hosted) provider, user-global scope. */
-	setTier2Provider: (provider: string, apiKey: string) => typedError<null, string>(__TAURI_INVOKE("set_tier2_provider", { provider, apiKey })),
+	setQrHostedProvider: (provider: string, apiKey: string) => typedError<null, string>(__TAURI_INVOKE("set_qr_hosted_provider", { provider, apiKey })),
 	/**
 	 *  Set (or clear, with `provider: None`) the current user's Tier 1.5 (qr_hosted)
-	 *  provider preference -- distinct from set_tier2_provider above, which stores a
+	 *  provider preference -- distinct from set_qr_hosted_provider above, which stores a
 	 *  credential. This is the "which provider should QR actually use" choice.
 	 * 
 	 *  items.id=432: lifecycle.rs resolves an account-wide user_provider_preference
@@ -354,13 +354,13 @@ export const commands = {
 	 *  (`provider: None`) downgrades any currently-Preferred candidate the same
 	 *  way, without picking a new one.
 	 */
-	setTier2ProviderPreference: (provider: string | null) => typedError<null, string>(__TAURI_INVOKE("set_tier2_provider_preference", { provider })),
+	setQrHostedProviderPreference: (provider: string | null) => typedError<null, string>(__TAURI_INVOKE("set_qr_hosted_provider_preference", { provider })),
 	/**
 	 *  List every provider preference row for the current user, across every
 	 *  scope (account-wide, Persona-wide, Focus-specific) -- for a future
 	 *  settings-surface listing. items.id=254 Part 1.
 	 */
-	getTier2ProviderPreferences: () => typedError<UserProviderPreference[], string>(__TAURI_INVOKE("get_tier2_provider_preferences")),
+	getQrHostedProviderPreferences: () => typedError<UserProviderPreference[], string>(__TAURI_INVOKE("get_qr_hosted_provider_preferences")),
 	dismissNotification: (notificationId: string) => typedError<null, string>(__TAURI_INVOKE("dismiss_notification", { notificationId })),
 	login: (displayName: string, password: string) => typedError<null, string>(__TAURI_INVOKE("login", { displayName, password })),
 	logout: () => typedError<null, string>(__TAURI_INVOKE("logout")),
@@ -370,7 +370,7 @@ export const commands = {
 	 *  32-byte master key directly, not a wrapper key -- `Mnemonic::parse()` on
 	 *  the returned phrase later recovers the exact original bytes, no
 	 *  unwrapping step. Requires a resident session (KeyRegistry) the same way
-	 *  tier2::get_tier2_config does; "not logged in" is the same error string
+	 *  qr_hosted::get_qr_hosted_config does; "not logged in" is the same error string
 	 *  for the same reason -- there is no key to derive a mnemonic from yet.
 	 */
 	getRecoveryKeyDisplay: () => typedError<RecoveryKeyDisplay, string>(__TAURI_INVOKE("get_recovery_key_display")),
@@ -418,10 +418,10 @@ export const commands = {
 	 *  function, so cloud_inference_api (qr_hosted: groq/mistral) and
 	 *  local_model rows never reach this list.
 	 */
-	listActiveProviders: () => typedError<Tier3ProviderSummary[], string>(__TAURI_INVOKE("list_active_providers")),
+	listActiveProviders: () => typedError<CloudChatProviderSummary[], string>(__TAURI_INVOKE("list_active_providers")),
 	/**
 	 *  Opens one pane per confirmed provider selection (items.id=223's actual
-	 *  trigger -- nothing in tier3_pane/ creates a pane except in response to
+	 *  trigger -- nothing in cloud_chat_gpu_pane/ creates a pane except in response to
 	 *  this). `launch_url` is looked up server-side; the frontend only ever
 	 *  passes provider IDs. Best-effort across the batch: the first provider
 	 *  that fails to resolve or send aborts the remaining opens rather than
@@ -440,12 +440,12 @@ export const commands = {
 	 *  (see the old design's now-deleted note here about a real, empirically
 	 *  confirmed dispatch-delay bug that required exactly that workaround).
 	 */
-	openTier3Panes: (providerIds: string[]) => typedError<null, string>(__TAURI_INVOKE("open_tier3_panes", { providerIds })),
+	openCloudChatPanes: (providerIds: string[]) => typedError<null, string>(__TAURI_INVOKE("open_cloud_chat_panes", { providerIds })),
 	/**
 	 *  Closes one pane by provider ID. A no-op (not an error) if that provider
 	 *  has no open pane -- `PaneManager::close_pane` already tolerates this
 	 *  (pane_host.rs), and a caller racing a close against an already-closed
-	 *  pane is a normal condition, not a failure. See open_tier3_panes' doc on
+	 *  pane is a normal condition, not a failure. See open_cloud_chat_panes' doc on
 	 *  why a single `run_on_main_thread` call is dispatch and guaranteed-prompt
 	 *  delivery in one step now.
 	 * 
@@ -461,7 +461,7 @@ export const commands = {
 	 *  has already been torn down or not. Its failure is still only ever
 	 *  logged, never a reason this command returns an error.
 	 */
-	closeTier3Pane: (providerId: string) => typedError<null, string>(__TAURI_INVOKE("close_tier3_pane", { providerId })),
+	closeCloudChatPane: (providerId: string) => typedError<null, string>(__TAURI_INVOKE("close_cloud_chat_pane", { providerId })),
 	/**
 	 *  items.id=202 piece 4, real positioning fix 2026-08-07 -- stores the
 	 *  frontend's live layout fractions (unchanged `PaneRectFraction` semantics:
@@ -489,7 +489,7 @@ export const commands = {
 	 *  open (e.g. a race against a just-closed pane) is likewise a no-op at
 	 *  the `pane_host::PaneManager::set_active_pane` layer (`panes.get_mut`
 	 *  simply finds nothing), not an error -- same "a stale reference to a
-	 *  pane is a normal race, not a failure" framing `close_tier3_pane`
+	 *  pane is a normal race, not a failure" framing `close_cloud_chat_pane`
 	 *  already documents.
 	 */
 	setActivePane: (providerId: string | null) => typedError<null, string>(__TAURI_INVOKE("set_active_pane", { providerId })),
@@ -516,7 +516,7 @@ export const commands = {
 	 * 
 	 *  A no-op (not an error) if `provider_id` names a pane that has already
 	 *  closed by the time this arrives -- an event racing a close is expected,
-	 *  not a failure, matching `close_tier3_pane`'s own framing.
+	 *  not a failure, matching `close_cloud_chat_pane`'s own framing.
 	 */
 	forwardPaneMouseClick: (providerId: string, x: number | null, y: number | null, button: PaneMouseButton, mouseup: boolean, clickCount: number, buttons: number, modifiers: PaneEventModifiers) => typedError<null, string>(__TAURI_INVOKE("forward_pane_mouse_click", { providerId, x, y, button, mouseup, clickCount, buttons, modifiers })),
 	/**
@@ -581,7 +581,7 @@ export const commands = {
 	/**
 	 *  items.id=234: popup counterpart to `forward_pane_mouse_click` -- same
 	 *  coordinate/no-op contract, except `x`/`y` are local to the popup's own
-	 *  on-screen rect (`tier3-popup-opened`'s reported `rect`), not the parent
+	 *  on-screen rect (`cloud-chat-popup-opened`'s reported `rect`), not the parent
 	 *  pane's. `provider_id` names the *parent* pane (popups have no separate
 	 *  id-keyspace, see `PaneManager.popups`'s own doc, pane_host.rs).
 	 */
@@ -797,6 +797,51 @@ export type ChatInfo = {
 	last_message_at: string,
 };
 
+/**
+ *  Selector-screen-facing provider summary. `lane` matches the frontend's
+ *  `ProviderLane` string type (cloudChatAccessConfig.ts) verbatim -- no further
+ *  transformation needed on the TypeScript side.
+ * 
+ *  items.id=427: providers has no tier column any more (Part 1's core
+ *  rule -- tier is a display label only, never stored). `lane` is now
+ *  derived here, at the display layer, from `provider_type` instead --
+ *  exactly the pattern the spec permits ("tier labels computed only at the
+ *  display layer"). Output is byte-identical to the old tier-based
+ *  derivation for the 4 known providers; a future provider_type this match
+ *  doesn't recognize falls back to the raw provider_type string, which
+ *  won't satisfy the frontend's closed `'cloud_anonymous' | 'cloud_frontier'`
+ *  type -- that's Part 3c/5a's problem to solve when a new lane is
+ *  actually needed, not this one.
+ */
+export type CloudChatProviderSummary = {
+	id: string,
+	display_name: string,
+	lane: string,
+	login_required: boolean,
+	is_anonymous: boolean,
+	privacy_guardian_default_level: PrivacyGuardianDefaultLevel | null,
+	/**
+	 *  items.id=465: whether QR itself recommends this provider, within its
+	 *  own provider_type slot -- not a cross-slot ranking (see
+	 *  provider_store::Provider::qr_recommended's own doc).
+	 */
+	qr_recommended: boolean,
+	/**
+	 *  items.id=465: throughput/latency class, nullable. Serialized to a
+	 *  JSON string rather than carried as serde_json::Value -- that type is
+	 *  self-referential and specta's TypeScript exporter recurses through
+	 *  it without terminating (see commands/mod.rs's PlaceholderPayload doc
+	 *  for the same constraint hitting this codebase before). The frontend
+	 *  JSON.parse()s this field if it needs the structured shape.
+	 */
+	performance_profile: string | null,
+	/**
+	 *  items.id=465: contractual vs. policy-only privacy commitment,
+	 *  human-curated, NULL until assessed.
+	 */
+	privacy_commitment_basis: PrivacyCommitmentBasis | null,
+};
+
 export type CreatePersonaRequest = {
 	user_id: string,
 	name: string,
@@ -905,7 +950,7 @@ export type HealthResponse = {
 	 *  -- get_health must stay callable pre-login (Ollama status has no such
 	 *  requirement).
 	 */
-	tier2_configured: boolean,
+	qr_hosted_configured: boolean,
 };
 
 export type MessageInfo = {
@@ -926,7 +971,7 @@ export type MessageInfo = {
  *  (onboarding::get_onboarding_focus_suggestions,
  *  onboarding::submit_onboarding_focus_selection,
  *  focus_builder::get_focus_builder_session,
- *  focus_builder::submit_focus_builder_step, tier2::get_tier2_config)
+ *  focus_builder::submit_focus_builder_step, qr_hosted::get_qr_hosted_config)
  *  previously used serde_json::Value as an argument or return type.
  *  serde_json::Value is self-referential (Array(Vec<Value>),
  *  Object(Map<String, Value>)), and specta's TypeScript exporter recurses
@@ -940,9 +985,10 @@ export type MessageInfo = {
  *  be given its real request/response struct when its feature is designed --
  *  this is deliberately not a contract to build against.
  * 
- *  UPDATE (items.id=185, 2026-08-02): tier2::get_tier2_config now has a real
- *  return type (commands::tier2::Tier2Config) and no longer uses this
- *  placeholder -- four of the original five remain unbuilt.
+ *  UPDATE (items.id=185, 2026-08-02): qr_hosted::get_qr_hosted_config (then
+ *  tier2::get_tier2_config -- module renamed by items.id=528 Phase 2) now
+ *  has a real return type (commands::qr_hosted::QrHostedConfig) and no
+ *  longer uses this placeholder -- four of the original five remain unbuilt.
  * 
  *  UPDATE (items.id=229, 2026-08-09): auth::get_recovery_key_display also
  *  stopped using this placeholder (commands::auth::RecoveryKeyDisplay) --
@@ -1135,14 +1181,25 @@ export type ProviderHealth = {
 export type ProviderStatus = "available" | "degraded" | "unavailable";
 
 /**
+ *  Non-secret Tier 1.5 (qr_hosted) configuration state -- never carries the credential
+ *  itself. `configured` is true iff an active user-global qr_hosted key exists
+ *  for `provider`.
+ */
+export type QrHostedConfig = {
+	provider: string,
+	configured: boolean,
+	expires_at: string | null,
+};
+
+/**
  *  items.id=406 (decisions.id=755): the provider-selection re-check
  *  trigger's request. `newly_active_provider_ids` is whatever the rail
  *  reports as active/laid-out at the moment of this call -- same
- *  PaneLayoutState-backed source of truth request_tier3_gate3_review
+ *  PaneLayoutState-backed source of truth request_cloud_frontier_gate3_review
  *  itself reads, just supplied here explicitly since this command fires
  *  from a provider-activation event, not a fresh gate3 draft-review pass.
  */
-export type RecheckTier3ProviderSelectionRequest = {
+export type RecheckCloudFrontierProviderSelectionRequest = {
 	user_id: string,
 	persona_id: string,
 	message_id: string,
@@ -1171,20 +1228,20 @@ export type RequestChatCopyGate3ReviewRequest = {
 	content_text: string,
 };
 
-export type RequestTier3Gate3ReviewRequest = {
+export type RequestCloudFrontierGate3ReviewRequest = {
 	user_id: string,
 	persona_id: string,
 	message_id: string,
 };
 
-export type ResolveTier3Gate3ReviewRequest = {
+export type ResolveCloudFrontierGate3ReviewRequest = {
 	user_id: string,
 	persona_id: string,
 	message_id: string,
 	/**
 	 *  "approved" | "withheld" -- the two terminal states a resolved
 	 *  consent review can reach. "drafted"/"pending-review" are gate3's own
-	 *  transitions (request_tier3_gate3_review writes those), not valid
+	 *  transitions (request_cloud_frontier_gate3_review writes those), not valid
 	 *  input here.
 	 */
 	status: string,
@@ -1329,62 +1386,6 @@ export type SubmitFrictionGateDecisionRequest = {
 };
 
 export type SubscriptionStatus = "free" | "paid";
-
-/**
- *  Non-secret Tier 1.5 (qr_hosted) configuration state -- never carries the credential
- *  itself. `configured` is true iff an active user-global tier2 key exists
- *  for `provider`.
- */
-export type Tier2Config = {
-	provider: string,
-	configured: boolean,
-	expires_at: string | null,
-};
-
-/**
- *  Selector-screen-facing provider summary. `lane` matches the frontend's
- *  `ProviderLane` string type (cloudChatAccessConfig.ts) verbatim -- no further
- *  transformation needed on the TypeScript side.
- * 
- *  items.id=427: providers has no tier column any more (Part 1's core
- *  rule -- tier is a display label only, never stored). `lane` is now
- *  derived here, at the display layer, from `provider_type` instead --
- *  exactly the pattern the spec permits ("tier labels computed only at the
- *  display layer"). Output is byte-identical to the old tier-based
- *  derivation for the 4 known providers; a future provider_type this match
- *  doesn't recognize falls back to the raw provider_type string, which
- *  won't satisfy the frontend's closed `'cloud_anonymous' | 'cloud_frontier'`
- *  type -- that's Part 3c/5a's problem to solve when a new lane is
- *  actually needed, not this one.
- */
-export type Tier3ProviderSummary = {
-	id: string,
-	display_name: string,
-	lane: string,
-	login_required: boolean,
-	is_anonymous: boolean,
-	privacy_guardian_default_level: PrivacyGuardianDefaultLevel | null,
-	/**
-	 *  items.id=465: whether QR itself recommends this provider, within its
-	 *  own provider_type slot -- not a cross-slot ranking (see
-	 *  provider_store::Provider::qr_recommended's own doc).
-	 */
-	qr_recommended: boolean,
-	/**
-	 *  items.id=465: throughput/latency class, nullable. Serialized to a
-	 *  JSON string rather than carried as serde_json::Value -- that type is
-	 *  self-referential and specta's TypeScript exporter recurses through
-	 *  it without terminating (see commands/mod.rs's PlaceholderPayload doc
-	 *  for the same constraint hitting this codebase before). The frontend
-	 *  JSON.parse()s this field if it needs the structured shape.
-	 */
-	performance_profile: string | null,
-	/**
-	 *  items.id=465: contractual vs. policy-only privacy commitment,
-	 *  human-curated, NULL until assessed.
-	 */
-	privacy_commitment_basis: PrivacyCommitmentBasis | null,
-};
 
 export type TopicInfo = {
 	id: string,

@@ -8,7 +8,7 @@
 // popup has no corresponding DOM node in this app's own page to measure --
 // `window.open()` has nothing here to observe. `popups` is therefore
 // backend-authoritative: the exact `PaneRectFraction` pane_host.rs's
-// `resolve_popup_rect` computed and reported via the `tier3-popup-opened`
+// `resolve_popup_rect` computed and reported via the `cloud-chat-popup-opened`
 // event, trusted verbatim and rendered directly as inset percentages (no
 // pixel-conversion helper needed, since there's nothing in CSS-pixel space
 // to convert from).
@@ -68,7 +68,7 @@ const PROVIDER_ID_ATTR = 'data-popup-provider-id'
 /** items.id=367: popup counterpart to PaneHitLayer's own `forwardKey` --
  *  see that file's doc for why `windows_key_code`/no-native-code. Missing
  *  entirely until now (see `forward_popup_key`'s own doc,
- *  commands/tier3_pane.rs, for the confirmed symptom this fixes). */
+ *  commands/cloud_chat_pane.rs, for the confirmed symptom this fixes). */
 function forwardKey(providerId: string, e: KeyboardEvent, type: PaneKeyEventType) {
   const character = e.key.length === 1 ? e.key.charCodeAt(0) : 0
   void commands.forwardPopupKey(providerId, type, e.keyCode, character, domModifiers(e))

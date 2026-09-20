@@ -3524,7 +3524,7 @@ mod tests {
 
     /// items.id=317: the cloud_frontier pause must carry the prior step's real
     /// output as RunResult.output_content -- this is the only place the
-    /// draft awaiting Gate3 review (consent.rs::request_tier3_gate3_review)
+    /// draft awaiting Gate3 review (consent.rs::request_cloud_frontier_gate3_review)
     /// ever gets captured, since execute() returns before reaching output()
     /// on this path and output_store is never written to for this run.
     #[tokio::test]

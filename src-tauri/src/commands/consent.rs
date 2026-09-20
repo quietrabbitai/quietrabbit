@@ -55,9 +55,9 @@
 //   "per-session, non-persisted") -- there is no submit_ command here writing
 //   a decision record, unlike the other consent commands in this file.
 //
-// request_tier3_gate3_review / resolve_tier3_gate3_review (items.id=233's
+// request_cloud_frontier_gate3_review / resolve_cloud_frontier_gate3_review (items.id=233's
 //   remaining stub): the outbound Privacy Guardian review ahead of
-//   cloud_frontier access. Unlike every other command in this file, request_tier3_gate3_review
+//   cloud_frontier access. Unlike every other command in this file, request_cloud_frontier_gate3_review
 //   *triggers* a gate rather than *responding to* one already fired --
 //   gate3()'s only prior call site was conductor/executor.rs's own
 //   step-execution loop, never exposed over IPC. See each command's own doc
@@ -147,7 +147,7 @@ pub struct GetPendingCrossPersonaConfirmationsRequest {
 }
 
 #[derive(Debug, Deserialize, Type)]
-pub struct RequestTier3Gate3ReviewRequest {
+pub struct RequestCloudFrontierGate3ReviewRequest {
     pub user_id: String,
     pub persona_id: String,
     pub message_id: String,
@@ -168,11 +168,11 @@ pub struct RequestChatCopyGate3ReviewRequest {
 /// items.id=406 (decisions.id=755): the provider-selection re-check
 /// trigger's request. `newly_active_provider_ids` is whatever the rail
 /// reports as active/laid-out at the moment of this call -- same
-/// PaneLayoutState-backed source of truth request_tier3_gate3_review
+/// PaneLayoutState-backed source of truth request_cloud_frontier_gate3_review
 /// itself reads, just supplied here explicitly since this command fires
 /// from a provider-activation event, not a fresh gate3 draft-review pass.
 #[derive(Debug, Deserialize, Type)]
-pub struct RecheckTier3ProviderSelectionRequest {
+pub struct RecheckCloudFrontierProviderSelectionRequest {
     pub user_id: String,
     pub persona_id: String,
     pub message_id: String,
@@ -180,13 +180,13 @@ pub struct RecheckTier3ProviderSelectionRequest {
 }
 
 #[derive(Debug, Deserialize, Type)]
-pub struct ResolveTier3Gate3ReviewRequest {
+pub struct ResolveCloudFrontierGate3ReviewRequest {
     pub user_id: String,
     pub persona_id: String,
     pub message_id: String,
     /// "approved" | "withheld" -- the two terminal states a resolved
     /// consent review can reach. "drafted"/"pending-review" are gate3's own
-    /// transitions (request_tier3_gate3_review writes those), not valid
+    /// transitions (request_cloud_frontier_gate3_review writes those), not valid
     /// input here.
     pub status: String,
 }
@@ -704,7 +704,7 @@ pub async fn get_pending_cross_persona_confirmations(
 /// ("Tier 3 -- shared infrastructure, built on-demand, not standalone
 /// Focuses") and TIER3_ACCESS_MODEL.md:413 both confirm the starter-drafting
 /// pre-conversation reuses the same "quick-ask" path Persona hub chat uses.
-const TIER3_DRAFT_FOCUS_ID: &str = "quick-ask";
+const CLOUD_FRONTIER_DRAFT_FOCUS_ID: &str = "quick-ask";
 
 /// PG_GATE_3, invoked against a drafted Tier-3-starter message
 /// (messages.gate3_review_status = 'drafted', written by
@@ -755,9 +755,9 @@ const TIER3_DRAFT_FOCUS_ID: &str = "quick-ask";
 /// meaning the user declined, not that gate3 itself refused).
 #[tauri::command]
 #[specta::specta]
-pub async fn request_tier3_gate3_review(
+pub async fn request_cloud_frontier_gate3_review(
     app_handle: tauri::AppHandle,
-    request: RequestTier3Gate3ReviewRequest,
+    request: RequestCloudFrontierGate3ReviewRequest,
     key_registry: State<'_, KeyRegistry>,
     layout_state: State<'_, crate::commands::cloud_chat_pane::PaneLayoutState>,
     pool: State<'_, sqlx::SqlitePool>,
@@ -798,16 +798,19 @@ pub async fn request_tier3_gate3_review(
         )
     })?;
 
-    let settings =
-        focus_settings_store::get_focus_settings(&pool, &request.persona_id, TIER3_DRAFT_FOCUS_ID)
-            .await
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| {
-                format!(
-                    "no focus_settings row for persona='{}' focus='{}'",
-                    request.persona_id, TIER3_DRAFT_FOCUS_ID
-                )
-            })?;
+    let settings = focus_settings_store::get_focus_settings(
+        &pool,
+        &request.persona_id,
+        CLOUD_FRONTIER_DRAFT_FOCUS_ID,
+    )
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| {
+        format!(
+            "no focus_settings row for persona='{}' focus='{}'",
+            request.persona_id, CLOUD_FRONTIER_DRAFT_FOCUS_ID
+        )
+    })?;
 
     let gateway = PrivacyGateway::new(SqliteDisclosureLogger::new(
         &request.user_id,
@@ -890,7 +893,7 @@ pub async fn request_tier3_gate3_review(
         // items.id=406 (decisions.id=755): record what this review was
         // actually scored against -- fixed at copy-time (this call), not at
         // whatever point the user later finishes resolving the modal (if
-        // one was even surfaced). recheck_tier3_provider_selection compares
+        // one was even surfaced). recheck_cloud_frontier_provider_selection compares
         // a newly-activated provider's risk against this value.
         message_store::update_reviewed_at_risk_rating(
             &request.user_id,
@@ -917,7 +920,7 @@ pub async fn request_tier3_gate3_review(
 /// rendered content, never a poll, per the same locked
 /// no-passive-clipboard-monitoring rule handleCopyStarter documents.
 ///
-/// Unlike request_tier3_gate3_review, there is no single message row to
+/// Unlike request_cloud_frontier_gate3_review, there is no single message row to
 /// read from -- a selection may span multiple messages (items.id=416's
 /// cross-message-selection resolution: treated as ONE new composition, one
 /// combined review, not fragmented per-message sub-reviews) -- so
@@ -927,19 +930,19 @@ pub async fn request_tier3_gate3_review(
 /// any persisted row (confirmed in gate3.rs: neither is used for a DB
 /// lookup, only pushed into the audit entry's fields_shared/fields_withheld).
 ///
-/// Parameter sourcing mostly mirrors request_tier3_gate3_review's own
+/// Parameter sourcing mostly mirrors request_cloud_frontier_gate3_review's own
 /// quick-ask constants (content_sensitivity_severity=1, execution_tier=1) --
 /// both are fixed placeholders reflecting the absence of a PersonalTrack at
 /// this call site, not a claim about the reviewed content's structure. Like
-/// request_tier3_gate3_review, this command reviews arbitrary
+/// request_cloud_frontier_gate3_review, this command reviews arbitrary
 /// message/clipboard content, not Quick-Ask-Focus output specifically;
 /// quick-ask.focus's identifiers are borrowed only as a synthetic label. This
-/// command does NOT mirror request_tier3_gate3_review's target_tier=3 --
+/// command does NOT mirror request_cloud_frontier_gate3_review's target_tier=3 --
 /// confirmed live (2026-09-04) that reusing 3 unconditionally makes gate3's
 /// own zero_spans_safe_to_auto_approve (destination_risk >= 3 forces High
 /// review regardless of content) fire for every single copy when no Cloud Chat
 /// pane happens to be open, defeating the "silent on a fast,
-/// unflagged pass" UX this whole feature is built around: request_tier3_gate3_review's
+/// unflagged pass" UX this whole feature is built around: request_cloud_frontier_gate3_review's
 /// target_tier=3 is correct there because that flow's own precondition is
 /// "the user is literally about to access cloud_frontier" (its own doc comment) -- a
 /// native copy gesture on this transcript carries no such precondition; the
@@ -972,16 +975,19 @@ pub async fn request_chat_copy_gate3_review(
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
-    let settings =
-        focus_settings_store::get_focus_settings(&pool, &request.persona_id, TIER3_DRAFT_FOCUS_ID)
-            .await
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| {
-                format!(
-                    "no focus_settings row for persona='{}' focus='{}'",
-                    request.persona_id, TIER3_DRAFT_FOCUS_ID
-                )
-            })?;
+    let settings = focus_settings_store::get_focus_settings(
+        &pool,
+        &request.persona_id,
+        CLOUD_FRONTIER_DRAFT_FOCUS_ID,
+    )
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| {
+        format!(
+            "no focus_settings row for persona='{}' focus='{}'",
+            request.persona_id, CLOUD_FRONTIER_DRAFT_FOCUS_ID
+        )
+    })?;
 
     let gateway = PrivacyGateway::new(SqliteDisclosureLogger::new(
         &request.user_id,
@@ -1051,9 +1057,9 @@ pub async fn request_chat_copy_gate3_review(
 /// risk destination needs no re-check.
 #[tauri::command]
 #[specta::specta]
-pub async fn recheck_tier3_provider_selection(
+pub async fn recheck_cloud_frontier_provider_selection(
     app_handle: tauri::AppHandle,
-    request: RecheckTier3ProviderSelectionRequest,
+    request: RecheckCloudFrontierProviderSelectionRequest,
     key_registry: State<'_, KeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<Gate3ReviewResult, String> {
@@ -1116,16 +1122,19 @@ pub async fn recheck_tier3_provider_selection(
         return Ok(no_op_result());
     }
 
-    let settings =
-        focus_settings_store::get_focus_settings(&pool, &request.persona_id, TIER3_DRAFT_FOCUS_ID)
-            .await
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| {
-                format!(
-                    "no focus_settings row for persona='{}' focus='{}'",
-                    request.persona_id, TIER3_DRAFT_FOCUS_ID
-                )
-            })?;
+    let settings = focus_settings_store::get_focus_settings(
+        &pool,
+        &request.persona_id,
+        CLOUD_FRONTIER_DRAFT_FOCUS_ID,
+    )
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| {
+        format!(
+            "no focus_settings row for persona='{}' focus='{}'",
+            request.persona_id, CLOUD_FRONTIER_DRAFT_FOCUS_ID
+        )
+    })?;
 
     let gateway = PrivacyGateway::new(SqliteDisclosureLogger::new(
         &request.user_id,
@@ -1157,7 +1166,7 @@ pub async fn recheck_tier3_provider_selection(
             1, // execution_tier
             Some(&app_handle),
             Some(new_risk),
-            // items.id=458 scoped this bypass to request_tier3_gate3_review
+            // items.id=458 scoped this bypass to request_cloud_frontier_gate3_review
             // and request_chat_copy_gate3_review only -- this call site has
             // the same hardcoded-severity/no-PersonalTrack shape but is
             // explicitly out of scope for that fix (flagged separately for
@@ -1212,8 +1221,8 @@ pub async fn recheck_tier3_provider_selection(
 /// first, then this).
 #[tauri::command]
 #[specta::specta]
-pub async fn resolve_tier3_gate3_review(
-    request: ResolveTier3Gate3ReviewRequest,
+pub async fn resolve_cloud_frontier_gate3_review(
+    request: ResolveCloudFrontierGate3ReviewRequest,
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<(), String> {
     if !matches!(request.status.as_str(), "approved" | "withheld") {
@@ -1297,7 +1306,7 @@ async fn write_floor_consent_preference(
 // Tests
 // ---------------------------------------------------------------------------
 //
-// request_tier3_gate3_review is NOT unit-tested at the command-function
+// request_cloud_frontier_gate3_review is NOT unit-tested at the command-function
 // level here -- it takes `app_handle: tauri::AppHandle`, which (like every
 // other AppHandle-taking command in this codebase -- submit_extract_confirm
 // in this same file, commands::execution::load_and_authorize_run,
@@ -1365,7 +1374,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_tier3_gate3_review_rejects_invalid_status() {
+    async fn resolve_cloud_frontier_gate3_review_rejects_invalid_status() {
         let _env = setup().await;
 
         let app = mock_app_with_registry(sqlx::SqlitePool::connect_lazy_with(
@@ -1374,8 +1383,8 @@ mod tests {
         let registry = app.state::<KeyRegistry>();
         populate_registry(&registry, USER_ID, MASTER_KEY).await;
 
-        let result = resolve_tier3_gate3_review(
-            ResolveTier3Gate3ReviewRequest {
+        let result = resolve_cloud_frontier_gate3_review(
+            ResolveCloudFrontierGate3ReviewRequest {
                 user_id: USER_ID.to_owned(),
                 persona_id: PERSONA_ID.to_owned(),
                 message_id: "msg-1".to_owned(),
@@ -1392,14 +1401,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_tier3_gate3_review_transitions_to_approved() {
+    async fn resolve_cloud_frontier_gate3_review_transitions_to_approved() {
         let _env = setup().await;
 
         let record = message_store::save_message(
             USER_ID,
             PERSONA_ID,
             &key_hex_str(),
-            "tier3-access-persona-1",
+            "cloud-frontier-access-persona-1",
             "assistant",
             "drafted starter text",
             Some("run-1"),
@@ -1414,8 +1423,8 @@ mod tests {
         let registry = app.state::<KeyRegistry>();
         populate_registry(&registry, USER_ID, MASTER_KEY).await;
 
-        resolve_tier3_gate3_review(
-            ResolveTier3Gate3ReviewRequest {
+        resolve_cloud_frontier_gate3_review(
+            ResolveCloudFrontierGate3ReviewRequest {
                 user_id: USER_ID.to_owned(),
                 persona_id: PERSONA_ID.to_owned(),
                 message_id: record.id.clone(),
@@ -1424,7 +1433,7 @@ mod tests {
             registry,
         )
         .await
-        .expect("resolve_tier3_gate3_review must succeed");
+        .expect("resolve_cloud_frontier_gate3_review must succeed");
 
         let fetched = message_store::get_message(USER_ID, PERSONA_ID, &key_hex_str(), &record.id)
             .await
@@ -1434,14 +1443,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_tier3_gate3_review_transitions_to_withheld() {
+    async fn resolve_cloud_frontier_gate3_review_transitions_to_withheld() {
         let _env = setup().await;
 
         let record = message_store::save_message(
             USER_ID,
             PERSONA_ID,
             &key_hex_str(),
-            "tier3-access-persona-1",
+            "cloud-frontier-access-persona-1",
             "assistant",
             "drafted starter text",
             Some("run-1"),
@@ -1456,8 +1465,8 @@ mod tests {
         let registry = app.state::<KeyRegistry>();
         populate_registry(&registry, USER_ID, MASTER_KEY).await;
 
-        resolve_tier3_gate3_review(
-            ResolveTier3Gate3ReviewRequest {
+        resolve_cloud_frontier_gate3_review(
+            ResolveCloudFrontierGate3ReviewRequest {
                 user_id: USER_ID.to_owned(),
                 persona_id: PERSONA_ID.to_owned(),
                 message_id: record.id.clone(),
@@ -1466,7 +1475,7 @@ mod tests {
             registry,
         )
         .await
-        .expect("resolve_tier3_gate3_review must succeed");
+        .expect("resolve_cloud_frontier_gate3_review must succeed");
 
         let fetched = message_store::get_message(USER_ID, PERSONA_ID, &key_hex_str(), &record.id)
             .await
@@ -1475,17 +1484,17 @@ mod tests {
         assert_eq!(fetched.gate3_review_status.as_deref(), Some("withheld"));
     }
 
-    /// TIER3_DRAFT_FOCUS_ID must stay "quick-ask" -- a silent rename here
-    /// would desync request_tier3_gate3_review's focus_settings lookup from
+    /// CLOUD_FRONTIER_DRAFT_FOCUS_ID must stay "quick-ask" -- a silent rename here
+    /// would desync request_cloud_frontier_gate3_review's focus_settings lookup from
     /// the actual focus_id ChatPane/CloudChatAccessPane draft against
     /// (app/core_artifacts/focuses/quick-ask.focus) without any compiler
     /// error to catch it.
     #[test]
-    fn tier3_draft_focus_id_is_quick_ask() {
-        assert_eq!(TIER3_DRAFT_FOCUS_ID, "quick-ask");
+    fn cloud_frontier_draft_focus_id_is_quick_ask() {
+        assert_eq!(CLOUD_FRONTIER_DRAFT_FOCUS_ID, "quick-ask");
     }
 
-    /// Guards the focus_settings lookup shape request_tier3_gate3_review
+    /// Guards the focus_settings lookup shape request_cloud_frontier_gate3_review
     /// depends on (get_focus_settings(persona_id, "quick-ask")) without
     /// needing an AppHandle -- confirms a real row round-trips the
     /// max_permitted_tier value the command reads as space_max_permitted_tier.
@@ -1535,7 +1544,7 @@ mod tests {
         focus_settings_store::update_focus_settings(
             &pool,
             PERSONA_ID,
-            TIER3_DRAFT_FOCUS_ID,
+            CLOUD_FRONTIER_DRAFT_FOCUS_ID,
             None,
             None,
             Some(1),
@@ -1546,11 +1555,14 @@ mod tests {
         .await
         .expect("update_focus_settings must succeed");
 
-        let settings =
-            focus_settings_store::get_focus_settings(&pool, PERSONA_ID, TIER3_DRAFT_FOCUS_ID)
-                .await
-                .expect("get_focus_settings must succeed")
-                .expect("row must exist");
+        let settings = focus_settings_store::get_focus_settings(
+            &pool,
+            PERSONA_ID,
+            CLOUD_FRONTIER_DRAFT_FOCUS_ID,
+        )
+        .await
+        .expect("get_focus_settings must succeed")
+        .expect("row must exist");
         assert_eq!(settings.max_permitted_tier, ExternalAccess::Unrestricted);
     }
 
@@ -1602,7 +1614,7 @@ mod tests {
 
         let original_request = crate::commands::persona::UpdateFocusSettingsRequest {
             persona_id: PERSONA_ID.to_owned(),
-            focus_id: TIER3_DRAFT_FOCUS_ID.to_owned(),
+            focus_id: CLOUD_FRONTIER_DRAFT_FOCUS_ID.to_owned(),
             context_flow: None,
             library_visibility: None,
             privacy_tier: None,
@@ -1625,11 +1637,14 @@ mod tests {
 
         assert_eq!(applied.max_permitted_tier, ExternalAccess::Unrestricted);
 
-        let settings =
-            focus_settings_store::get_focus_settings(&pool, PERSONA_ID, TIER3_DRAFT_FOCUS_ID)
-                .await
-                .expect("get_focus_settings must succeed")
-                .expect("row must exist");
+        let settings = focus_settings_store::get_focus_settings(
+            &pool,
+            PERSONA_ID,
+            CLOUD_FRONTIER_DRAFT_FOCUS_ID,
+        )
+        .await
+        .expect("get_focus_settings must succeed")
+        .expect("row must exist");
         assert_eq!(
             settings.max_permitted_tier,
             ExternalAccess::Unrestricted,

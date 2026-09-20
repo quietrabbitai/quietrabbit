@@ -63,9 +63,9 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::consent::submit_friction_gate_decision,
         commands::consent::submit_extract_confirm,
         commands::consent::get_pending_cross_persona_confirmations,
-        commands::consent::request_tier3_gate3_review,
-        commands::consent::resolve_tier3_gate3_review,
-        commands::consent::recheck_tier3_provider_selection,
+        commands::consent::request_cloud_frontier_gate3_review,
+        commands::consent::resolve_cloud_frontier_gate3_review,
+        commands::consent::recheck_cloud_frontier_provider_selection,
         commands::consent::request_chat_copy_gate3_review,
         // Group 3 -- Onboarding
         commands::onboarding::get_onboarding_focus_suggestions,
@@ -93,11 +93,12 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         // Group 8 -- Focus Builder (stubs)
         commands::focus_builder::get_focus_builder_session,
         commands::focus_builder::submit_focus_builder_step,
-        // Group 9 -- Tier 1.5 (qr_hosted) configuration (items.id=185, 2026-08-02)
-        commands::tier2::get_tier2_config,
-        commands::tier2::set_tier2_provider,
-        commands::tier2::set_tier2_provider_preference,
-        commands::tier2::get_tier2_provider_preferences,
+        // Group 9 -- Tier 1.5 (qr_hosted) configuration (items.id=185, 2026-08-02;
+        // module renamed from tier2.rs by items.id=528 Phase 2)
+        commands::qr_hosted::get_qr_hosted_config,
+        commands::qr_hosted::set_qr_hosted_provider,
+        commands::qr_hosted::set_qr_hosted_provider_preference,
+        commands::qr_hosted::get_qr_hosted_provider_preferences,
         // Group 10 -- Notifications (stub)
         commands::notifications::dismiss_notification,
         // Group 11 -- Auth (items.id=205, 2026-08-01; get_recovery_key_display
@@ -115,8 +116,8 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         // Group 13 -- Cloud Chat pane lifecycle & provider catalog
         // (items.id=202 piece 5 / items.id=223, 2026-08-04)
         commands::cloud_chat_pane::list_active_providers,
-        commands::cloud_chat_pane::open_tier3_panes,
-        commands::cloud_chat_pane::close_tier3_pane,
+        commands::cloud_chat_pane::open_cloud_chat_panes,
+        commands::cloud_chat_pane::close_cloud_chat_pane,
         commands::cloud_chat_pane::set_pane_layout,
         // items.id=359 pieces 4/5 -- rail+content-pane single-active-pane model
         commands::cloud_chat_pane::set_active_pane,

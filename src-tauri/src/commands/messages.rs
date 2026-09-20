@@ -197,7 +197,7 @@ fn crisis_block_from_result(
 /// items.id=317: same Ok(None) gap as crisis_block_from_result above, for the
 /// ordinary (non-crisis) cloud_frontier pause -- the assistant placeholder's content
 /// must be backfilled with the draft awaiting Gate3 review, or
-/// request_tier3_gate3_review's content.is_empty() guard fails every time
+/// request_cloud_frontier_gate3_review's content.is_empty() guard fails every time
 /// (consent.rs). RunResult.output_content is only populated by lifecycle.rs
 /// for a cloud_frontier boundary pause (status == "awaiting_user"); other paused/failed
 /// statuses leave it None, so this stays a no-op for them.
@@ -371,7 +371,7 @@ pub async fn send_message(
                 // takes priority over an ordinary draft backfill below.
                 // items.id=317: otherwise, an ordinary cloud_frontier pause backfills
                 // the draft awaiting Gate3 review, so
-                // request_tier3_gate3_review's content.is_empty() guard
+                // request_cloud_frontier_gate3_review's content.is_empty() guard
                 // (consent.rs) doesn't fail on every gate3_track message.
                 // Any other paused/failed status keeps prior behavior -- the
                 // placeholder stays empty, just logged.

@@ -19,7 +19,7 @@
 // boardSize/pair.dominant split. See WorkspaceShell.tsx's own header
 // comment for the full mechanics (in particular the two-way sync between
 // `dominantRail` and `pair.dominant`, needed because CloudChatAccessPane's
-// internal chat<->tier3 split still keys off `pair.dominant` and isn't
+// internal chat<->cloudChat split still keys off `pair.dominant` and isn't
 // being rewritten).
 //
 // What got deleted, not just left unwired, and why: FixedButtonId,
@@ -45,7 +45,7 @@
 /** One of the five peer rails, exactly one dominant (fills the majority of
  *  the screen) at a time -- see WorkspaceShell.tsx. Direct generalization
  *  of decisions.id=747's three-peer-bar model. */
-export type DockRailId = 'board' | 'chat' | 'tier3' | 'library' | 'history'
+export type DockRailId = 'board' | 'chat' | 'cloudChat' | 'library' | 'history'
 
 /** decisions.id=735: the QR Chat <-> Cloud Chat dominance pair. Which side
  *  fills the main slot (when the pair itself is dominant -- see
@@ -64,7 +64,7 @@ export type DockRailId = 'board' | 'chat' | 'tier3' | 'library' | 'history'
  *  CloudChatAccessPane's internals key off `pair.dominant` in enough places
  *  that rewriting them wasn't worth the risk for this item. */
 export interface DominancePairState {
-  dominant: 'chat' | 'tier3'
+  dominant: 'chat' | 'cloudChat'
   openProviderIds: string[]
   activeProviderId: string | null
 }

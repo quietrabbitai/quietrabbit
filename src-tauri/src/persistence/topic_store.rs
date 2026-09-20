@@ -229,7 +229,7 @@ fn row_to_classification_preference(
 /// keep taking key_hex: &str -- that hasn't changed, and shouldn't, since
 /// these are plain library functions (not #[tauri::command]s). What changed
 /// is who calls them: every command-layer caller now derives key_hex from
-/// auth::registry::KeyRegistry server-side (see commands/tier2.rs for the
+/// auth::registry::KeyRegistry server-side (see commands/qr_hosted.rs for the
 /// reference pattern) instead of accepting it as a bare IPC parameter from
 /// the frontend.
 async fn open_outputs_db(

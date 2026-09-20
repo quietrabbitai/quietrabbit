@@ -26,7 +26,7 @@
 // states applies whenever openProviderIds is empty (no provider pane open
 // this round):
 //   'approved'   -- a draft already cleared Gate3, waiting on the rail.
-//                   onExpandRail (markTier3Ready) brings the rail back,
+//                   onExpandRail (markCloudChatReady) brings the rail back,
 //                   same as before this pass.
 //   'reviewable' -- there's a real last assistant response that hasn't
 //                   been sent through Gate3 review yet. onReview starts
@@ -54,7 +54,7 @@ export interface CloudChatCollapsedStripProps {
    *  header comment for what each value means. */
   emptyState: 'approved' | 'reviewable' | 'none'
   /** Fires when clicked in the 'approved' empty state -- brings back the
-   *  rail itself (markTier3Ready), not a specific provider. */
+   *  rail itself (markCloudChatReady), not a specific provider. */
   onExpandRail: () => void
   /** Fires when clicked in the 'reviewable' empty state -- starts a real
    *  Gate3 review of the current last response (CloudChatAccessPane's

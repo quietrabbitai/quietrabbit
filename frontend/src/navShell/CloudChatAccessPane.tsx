@@ -20,7 +20,7 @@
 // response in the collapsed floor, not a placeholder.
 //
 // decisions.id=735/738 (items.id=384 slice 4): the pair is now
-// symmetric. When Cloud Chat is the expanded region (dominant === 'tier3' and
+// symmetric. When Cloud Chat is the expanded region (dominant === 'cloudChat' and
 // Board isn't expanded either), the layout is the rail+content-pane, QR
 // collapsed to its own row above it. Whenever Cloud Chat is NOT the expanded
 // region -- Chat dominant, or Board expanded (floor) -- the rail+
@@ -79,7 +79,7 @@ type ReviewOutcome = 'pending' | 'approved' | 'withheld' | 'blocked'
 // items.id=234 -- host-owned popup subsystem. Hand-declared, not generated:
 // event payloads, not command args, same convention as
 // PrivacyGuardianModal.tsx's own ConsentRequestPayload -- see
-// commands/tier3_pane.rs's PopupOpenedPayload/PopupClosedPayload for the
+// commands/cloud_chat_pane.rs's PopupOpenedPayload/PopupClosedPayload for the
 // Rust side these mirror.
 interface PopupOpenedPayload {
   provider_id: string
@@ -113,14 +113,14 @@ export interface CloudChatAccessPaneProps {
   onUpdatePair: (updater: (prev: DominancePairState) => DominancePairState) => void
   /** items.id=391 (tenth pass), generalized by items.id=404: true whenever
    *  neither Chat nor Cloud Chat is the outer 5-rail dock's dominant rail
-   *  (WorkspaceShell's `dominantRail !== 'chat' && dominantRail !== 'tier3'`
+   *  (WorkspaceShell's `dominantRail !== 'chat' && dominantRail !== 'cloudChat'`
    *  -- Board, Library, or History being dominant all set this now, not
    *  just Board as pre-404). Collapses QR to a one-row floor (ChatPane's
    *  own collapsed strip: mark + last-message snippet + a real, focusable
    *  entry bar, matching the mockup's chat-floor) instead of unmounting
    *  it. No CEF-lifecycle reason to unmount: the concern was always about
    *  Cloud Chat's own open panes, and Board/Library/History becoming dominant
-   *  already forces dominantRail away from 'tier3' first (each of their
+   *  already forces dominantRail away from 'cloudChat' first (each of their
    *  own dock-bar click handlers sets dominantRail directly, never
    *  through pair.dominant), so there's never an open pane actively
    *  compositing while floor is true. The dominant rail's own bar and the
@@ -134,7 +134,7 @@ export interface CloudChatAccessPaneProps {
    *  making Chat the expanded region (a one-step swap as of the tenth
    *  pass, not a multi-stage growth -- see WorkspaceShell.tsx's own
    *  header comment). Distinct from reclaimChat (which this component
-   *  uses for its OTHER collapse case, dominant === 'tier3'): dominant is
+   *  uses for its OTHER collapse case, dominant === 'cloudChat'): dominant is
    *  already 'chat' whenever floor is true, so reclaiming it again would
    *  be a no-op. */
   onFloorExpand?: () => void
@@ -142,10 +142,10 @@ export interface CloudChatAccessPaneProps {
    *  "make Chat or Cloud Chat the outer 5-rail dock's dominant rail" --
    *  CloudChatCollapsedStrip's own expand, the Cloud Chat content-head's "back to
    *  chat" click, and ChatPane's own non-floor collapsed-strip click (the
-   *  dominant === 'tier3' case). See WorkspaceShell.tsx's own header
+   *  dominant === 'cloudChat' case). See WorkspaceShell.tsx's own header
    *  comment for why this is a set of direct calls at those specific
    *  sites rather than a generic effect mirroring pair.dominant. */
-  onDominantRailChange: (rail: 'chat' | 'tier3') => void
+  onDominantRailChange: (rail: 'chat' | 'cloudChat') => void
   /** items.id=404: ChatHistoryList's toggle no longer opens its own
    *  dropdown -- it calls this instead, which WorkspaceShell wires to
    *  make the History rail dominant with this Persona pre-selected. */
@@ -241,7 +241,7 @@ export function CloudChatAccessPane({
     activate,
     close,
     reclaimChat,
-    markTier3Ready,
+    markCloudChatReady,
   } = useDominancePair(pair, onUpdatePair)
 
   // items.id=406 (decisions.id=755): the provider-selection re-check
@@ -263,7 +263,7 @@ export function CloudChatAccessPane({
   // comment for why these are direct wraps, not a generic effect.
   const activateAndPromote = useCallback(
     (providerId: string) => {
-      onDominantRailChange('tier3')
+      onDominantRailChange('cloudChat')
       activate(providerId)
 
       // items.id=406 (decisions.id=755): provider-selection re-check --
@@ -287,7 +287,7 @@ export function CloudChatAccessPane({
             setReviewMessage(null)
             setReviewCeiling(null)
             setPendingMessageId(messageId)
-            return commands.recheckTier3ProviderSelection({
+            return commands.recheckCloudFrontierProviderSelection({
               user_id: requireCurrentUserId(),
               persona_id: personaId,
               message_id: messageId,
@@ -327,10 +327,10 @@ export function CloudChatAccessPane({
     },
     [activate, onDominantRailChange, lastCopiedStarter, personaId, openProviderIds, t],
   )
-  const markTier3ReadyAndPromote = useCallback(() => {
-    onDominantRailChange('tier3')
-    markTier3Ready()
-  }, [markTier3Ready, onDominantRailChange])
+  const markCloudChatReadyAndPromote = useCallback(() => {
+    onDominantRailChange('cloudChat')
+    markCloudChatReady()
+  }, [markCloudChatReady, onDominantRailChange])
   const reclaimChatAndPromote = useCallback(() => {
     onDominantRailChange('chat')
     reclaimChat()
@@ -367,7 +367,7 @@ export function CloudChatAccessPane({
   // ConsentRequestPayload carries focus_run_id, not message_id -- gate3()
   // only knows about content_key/step_id/focus_run_id, never the
   // messages.db row that triggered it. Stashed here from handleDraftReady
-  // so handleModalResolve has the right id to pass to resolveTier3Gate3Review.
+  // so handleModalResolve has the right id to pass to resolveCloudFrontierGate3Review.
   const [pendingMessageId, setPendingMessageId] = useState<string | null>(null)
 
   // items.id=384 slice 4: the bridge between Gate3 review and dominance.
@@ -375,7 +375,7 @@ export function CloudChatAccessPane({
   // reached 'approved' -- there was no separate "dominant" concept to
   // update. Post-merge, Cloud Chat must actually BECOME dominant at that same
   // moment (see useDominancePair.ts's own header comment for why
-  // markTier3Ready is a distinct trigger from activate/reclaimChat, and
+  // markCloudChatReady is a distinct trigger from activate/reclaimChat, and
   // why dominant is no longer purely derived from activeProviderId).
   // Fires from both paths that can set reviewOutcome to 'approved'
   // (handleDraftReady, handleModalResolve -- handleSecondOpinion below
@@ -386,14 +386,14 @@ export function CloudChatAccessPane({
   // slice 7): the original version of this effect fired
   // `if (reviewOutcome === 'approved')` unconditionally on every render,
   // not just on the actual transition INTO 'approved' -- a LEVEL trigger
-  // where an EDGE trigger was needed. markTier3Ready's own identity is
+  // where an EDGE trigger was needed. markCloudChatReady's own identity is
   // unstable across renders (it closes over `setPair`, which is
   // NavShell.tsx's `onUpdatePair` prop, itself a fresh closure on every
   // NavShell render, never memoized) -- so this effect's dependency array
   // never actually settles, and it re-ran on essentially every render
   // while reviewOutcome stayed 'approved'. In practice this meant
   // reclaimChat's own dominant:'chat' update got silently overwritten
-  // back to 'tier3' on the very next render, PERMANENTLY breaking the
+  // back to 'cloudChat' on the very next render, PERMANENTLY breaking the
   // "click QR's collapsed floor to reclaim it" gesture for the rest of
   // the session, the instant any draft had ever been approved once.
   // Confirmed live: clicking the collapsed strip, its "Expand" label, and
@@ -401,11 +401,11 @@ export function CloudChatAccessPane({
   // three were silently reverted a moment later.
   //
   // Fix: track the PREVIOUS reviewOutcome in a ref and only call
-  // markTier3Ready on an actual null/blocked/withheld -> 'approved'
+  // markCloudChatReady on an actual null/blocked/withheld -> 'approved'
   // transition, matching what this effect was always meant to express
   // ("Gate3 just cleared") rather than what it accidentally implemented
   // ("Gate3 has cleared at some point and something else re-rendered").
-  // This makes the effect correct regardless of markTier3Ready's own
+  // This makes the effect correct regardless of markCloudChatReady's own
   // identity stability -- the deeper fix (memoizing onUpdatePair through
   // the whole prop chain so callback identities stay stable) is a real,
   // separate improvement flagged for its own pass, not applied here.
@@ -417,10 +417,10 @@ export function CloudChatAccessPane({
       // to a bar next render via the old effectiveBoardSize guard. The
       // 5-rail model needs the promotion made explicit since there's no
       // such guard any more (dominantRail is set directly, not derived).
-      markTier3ReadyAndPromote()
+      markCloudChatReadyAndPromote()
     }
     prevReviewOutcomeRef.current = reviewOutcome
-  }, [reviewOutcome, markTier3ReadyAndPromote])
+  }, [reviewOutcome, markCloudChatReadyAndPromote])
 
   const syncPaneLayout = useCallback(() => {
     const body = contentBodyRef.current
@@ -516,7 +516,7 @@ export function CloudChatAccessPane({
   //
   // Fix: HIDE the active pane on unmount instead of closing it, reusing
   // commands.setActivePane's own existing was_hidden side effect
-  // (commands/tier3_pane.rs -- the same mechanism reclaimChat already
+  // (commands/cloud_chat_pane.rs -- the same mechanism reclaimChat already
   // relies on for "Chat reclaims dominance without closing anything").
   // Re-activate it on (re)mount if NavState still says one should be
   // active. NavState.workspace.pair.activeProviderId is deliberately NOT
@@ -597,7 +597,7 @@ export function CloudChatAccessPane({
   useEffect(() => {
     const closeAllOpenPanes = () => {
       for (const id of openProviderIdsRef.current) {
-        void commands.closeTier3Pane(id)
+        void commands.closeCloudChatPane(id)
       }
     }
     window.addEventListener('beforeunload', closeAllOpenPanes)
@@ -611,7 +611,7 @@ export function CloudChatAccessPane({
       close(providerId, () => {
         // items.id=234: close_pane's own popup teardown is synchronous on
         // the Rust side, not queued through the same per-tick drain that
-        // fires tier3-popup-closed for the other close paths (self-close,
+        // fires cloud-chat-popup-closed for the other close paths (self-close,
         // navigate-away) -- see PopupClosedPayload's own doc. Clear
         // proactively here rather than waiting for an event that never
         // comes for this specific path.
@@ -641,7 +641,7 @@ export function CloudChatAccessPane({
       setReviewCeiling(null)
       setPendingMessageId(messageId)
       commands
-        .requestTier3Gate3Review({
+        .requestCloudFrontierGate3Review({
           user_id: requireCurrentUserId(),
           persona_id: personaId,
           message_id: messageId,
@@ -664,7 +664,7 @@ export function CloudChatAccessPane({
             return
           }
           // blocked or timeout -- gate3_review_status stays 'drafted'
-          // server-side (see request_tier3_gate3_review's own doc comment);
+          // server-side (see request_cloud_frontier_gate3_review's own doc comment);
           // surface the plain_language message, no modal.
           setReviewOutcome('blocked')
           setReviewMessage(data.plain_language)
@@ -690,7 +690,7 @@ export function CloudChatAccessPane({
    *
    *  BUG FOUND + FIXED (2026-09-02 live verification pass): the first
    *  version of this handler called handleDraftReady unconditionally,
-   *  which just resends requestTier3Gate3Review -- confirmed live this
+   *  which just resends requestCloudFrontierGate3Review -- confirmed live this
    *  hard-errors ("... is not awaiting gate3 review") the moment the last
    *  message's status is already terminal, exactly the common case this
    *  button exists for (a message approved before an earlier trip to
@@ -708,7 +708,7 @@ export function CloudChatAccessPane({
     if (!lastAssistantMessage) return
     switch (lastAssistantMessage.gate3_review_status) {
       case 'approved':
-        markTier3ReadyAndPromote()
+        markCloudChatReadyAndPromote()
         return
       case 'withheld':
         setReviewOutcome('withheld')
@@ -716,7 +716,7 @@ export function CloudChatAccessPane({
       default:
         handleDraftReady(lastAssistantMessage.id)
     }
-  }, [lastAssistantMessage, handleDraftReady, markTier3ReadyAndPromote])
+  }, [lastAssistantMessage, handleDraftReady, markCloudChatReadyAndPromote])
 
   // Same cancelled/unlisten cleanup idiom as ChatPane's own first listen()
   // effect (run-status-update), per CLAUDE.md's "Tauri event listeners must
@@ -742,7 +742,7 @@ export function CloudChatAccessPane({
   }, [])
 
   // items.id=234: same cancelled/unlisten idiom as the consent_request
-  // listener above. tier3-popup-opened/-closed are the two popup-close
+  // listener above. cloud-chat-popup-opened/-closed are the two popup-close
   // paths the frontend has no other way to learn about (self-close,
   // parent navigate-away) -- see PopupClosedPayload's own doc for why the
   // parent-pane-close path (handleClose above) does not rely on this.
@@ -751,7 +751,7 @@ export function CloudChatAccessPane({
     let unlistenClosed: UnlistenFn | undefined
     let cancelled = false
 
-    listen<PopupOpenedPayload>('tier3-popup-opened', (event) => {
+    listen<PopupOpenedPayload>('cloud-chat-popup-opened', (event) => {
       const { provider_id, rect } = event.payload
       setPopupRects((rects) => ({ ...rects, [provider_id]: rect }))
     }).then((fn) => {
@@ -762,7 +762,7 @@ export function CloudChatAccessPane({
       }
     })
 
-    listen<PopupClosedPayload>('tier3-popup-closed', (event) => {
+    listen<PopupClosedPayload>('cloud-chat-popup-closed', (event) => {
       const { provider_id } = event.payload
       setPopupRects((rects) => {
         if (!(provider_id in rects)) return rects
@@ -797,7 +797,7 @@ export function CloudChatAccessPane({
         decisions_json: JSON.stringify(decisions),
       })
       .then(() =>
-        commands.resolveTier3Gate3Review({
+        commands.resolveCloudFrontierGate3Review({
           user_id: requireCurrentUserId(),
           persona_id: personaId,
           message_id: pendingMessageId,
@@ -817,7 +817,7 @@ export function CloudChatAccessPane({
   // devBypassTier3Gate3Review) is REMOVED, not just hidden -- the chat
   // toolbar's real "2nd opinion" button (below, handleSecondOpinion) now
   // covers the same fast-iteration need through the real
-  // requestTier3Gate3Review path, on the real last message, no synthetic
+  // requestCloudFrontierGate3Review path, on the real last message, no synthetic
   // seed or gate3() bypass required. The Rust-side dev-only commands
   // themselves are untouched (out of scope here; a separate cleanup if
   // nothing else ever calls them).
@@ -890,7 +890,7 @@ export function CloudChatAccessPane({
   // items.id=368: switching the active pane (setActivePane, Rust) hides the
   // OUTGOING pane's own popup CEF-side (was_hidden(true)) but does not close
   // it -- it stays alive/tracked (PaneManager::popups, "one active popup per
-  // pane", not cleared until a real tier3-popup-closed event) so it can be
+  // pane", not cleared until a real cloud-chat-popup-closed event) so it can be
   // reactivated without reloading. This app never emits that close event
   // just because a pane got deactivated, so popupRects (state, keyed by
   // parent pane id) still carried that now-hidden popup's rect -- and its
@@ -942,7 +942,7 @@ export function CloudChatAccessPane({
 
       <div
         className="tier3-access-pane__qr"
-        data-collapsed={floor || dominant === 'tier3' ? '' : undefined}
+        data-collapsed={floor || dominant === 'cloudChat' ? '' : undefined}
         data-floor={floor ? '' : undefined}
       >
         {/* items.id=391 (tenth pass -- "three bars, one expanded"
@@ -953,7 +953,7 @@ export function CloudChatAccessPane({
             not one consistent design. Folded into THIS bar instead --
             same row that used to carry only the "Quiet Rabbit -- this
             conversation" title, restyled (NavShell.css) to match Board's
-            and Tier3's own bars (WorkspaceShell.tsx / CloudChatCollapsedStrip)
+            and Cloud Chat's own bars (WorkspaceShell.tsx / CloudChatCollapsedStrip)
             so all three read as the same kind of row. Un-gated from
             personaId, same as the toolbar it replaces -- the persona
             picker inside it is how a user with no Persona yet picks
@@ -962,7 +962,7 @@ export function CloudChatAccessPane({
             ChatHistoryList is the one piece that still needs a real
             personaId (list_chats is Persona-scoped) -- guarded inline.
             Only while QR is fully expanded (dominant === 'chat') AND not
-            floored: QR's collapsed floor (dominant === 'tier3', or floor
+            floored: QR's collapsed floor (dominant === 'cloudChat', or floor
             === true) has its own compact mark via ChatPane's collapsed
             strip already, which has no room for this bar beside it.
             Lives as a SIBLING of .qr-panel (below), never an ancestor of
@@ -1030,7 +1030,7 @@ export function CloudChatAccessPane({
               focusId="quick-ask"
               gate3Track={true}
               onDraftReady={handleDraftReady}
-              collapsed={floor || dominant === 'tier3'}
+              collapsed={floor || dominant === 'cloudChat'}
               onExpand={floor ? onFloorExpand : reclaimChatAndPromote}
               onLastAssistantMessageChange={setLastAssistantMessage}
               onCopyStarter={(messageId, content) => setLastCopiedStarter({ messageId, content })}
@@ -1154,14 +1154,14 @@ export function CloudChatAccessPane({
           above this component; QR's row is above, within .qr). Exactly
           one of the three is ever the fully-expanded region -- Cloud Chat gets
           the rail+content-pane split ONLY while it's the expanded one
-          (!floor && dominant === 'tier3'); every other combination
+          (!floor && dominant === 'cloudChat'); every other combination
           (floor, or dominant === 'chat') renders CloudChatCollapsedStrip
           instead, unconditionally -- Jason's own framing for this pass:
           "a second opinion bar always visible." No redundant "back to
           Board" button here any more either -- WorkspaceShell's own
           board-bar already covers that whenever Board isn't expanded,
           which is exactly whenever Cloud Chat CAN be the expanded region. */}
-      {!floor && dominant === 'tier3' ? (
+      {!floor && dominant === 'cloudChat' ? (
         <>
           {/* items.id=391 (eleventh pass): promoted out of the rail
               column's own <h3> -- confirmed live (Jason): "the QR chat
@@ -1189,7 +1189,7 @@ export function CloudChatAccessPane({
             {providers.length === 0 && !providerError && (
               <p>{t('navShell.tier3AccessPane.loadingProviders')}</p>
             )}
-            {providers.length > 0 && dominant === 'tier3' && (
+            {providers.length > 0 && dominant === 'cloudChat' && (
               // items.id=359: the rail is persistent once the gate clears --
               // unlike the retired selector screen, it does not disappear
               // once a pane opens (TIER3_ACCESS_MODEL.md States section 3).
@@ -1202,10 +1202,10 @@ export function CloudChatAccessPane({
               // openProviderIds, all in NavState.workspace.pair) correctly
               // persisted -- confirmed live, 2026-09-01 verification pass.
               // dominant is the right signal: this whole block is already
-              // inside the dominant === 'tier3' branch (see below), so this
+              // inside the dominant === 'cloudChat' branch (see below), so this
               // check is really just making explicit what's already true --
-              // dominant only ever becomes 'tier3' downstream of Gate3
-              // having cleared at least once (markTier3Ready/activate), the
+              // dominant only ever becomes 'cloudChat' downstream of Gate3
+              // having cleared at least once (markCloudChatReady/activate), the
               // same fact reviewOutcome === 'approved' used to capture, but
               // via a field that actually survives the remount reviewOutcome
               // doesn't.
@@ -1285,7 +1285,7 @@ export function CloudChatAccessPane({
           activeProviderId={activeProviderId}
           onExpand={activateAndPromote}
           emptyState={secondOpinionEmptyState}
-          onExpandRail={markTier3ReadyAndPromote}
+          onExpandRail={markCloudChatReadyAndPromote}
           onReview={handleSecondOpinion}
           reviewDisabled={reviewOutcome === 'pending'}
         />
