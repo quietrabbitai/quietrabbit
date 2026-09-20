@@ -1,6 +1,6 @@
 // src-tauri/src/persistence/tier3_cookie_store.rs
 //
-// tier3_provider_cookies CRUD — per-user, SQLCipher-encrypted
+// cloud_chat_provider_cookies CRUD — per-user, SQLCipher-encrypted
 // tier3_cookies.db. items.id=224 resolution (decisions.id=711): CEF's one
 // working global RequestContext holds the live, working cookie jar; this
 // store is the source of truth across app restarts. See
@@ -35,7 +35,7 @@ use thiserror::Error;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Error)]
-pub enum Tier3CookieStoreError {
+pub enum CloudChatCookieStoreError {
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("Migration error: {0}")]
@@ -99,7 +99,7 @@ fn get_tier3_cookies_db_path(user_id: &str) -> std::path::PathBuf {
 async fn open_tier3_cookies_db(
     user_id: &str,
     key_hex: &str,
-) -> Result<SqliteConnection, Tier3CookieStoreError> {
+) -> Result<SqliteConnection, CloudChatCookieStoreError> {
     let db_path = get_tier3_cookies_db_path(user_id);
 
     if !db_path.exists() {
@@ -123,7 +123,7 @@ pub async fn list_cookies(
     user_id: &str,
     key_hex: &str,
     provider_id: &str,
-) -> Result<Vec<StoredCookie>, Tier3CookieStoreError> {
+) -> Result<Vec<StoredCookie>, CloudChatCookieStoreError> {
     let mut conn = open_tier3_cookies_db(user_id, key_hex).await?;
     list_cookies_conn(&mut conn, provider_id).await
 }
@@ -131,11 +131,11 @@ pub async fn list_cookies(
 pub(crate) async fn list_cookies_conn(
     conn: &mut SqliteConnection,
     provider_id: &str,
-) -> Result<Vec<StoredCookie>, Tier3CookieStoreError> {
+) -> Result<Vec<StoredCookie>, CloudChatCookieStoreError> {
     let rows = sqlx::query(
         "SELECT name, value, domain, path, secure, httponly, same_site,
                 priority, has_expires, expires, creation, last_access
-         FROM tier3_provider_cookies
+         FROM cloud_chat_provider_cookies
          WHERE provider_id = ?",
     )
     .bind(provider_id)
@@ -165,7 +165,7 @@ pub async fn upsert_cookies(
     key_hex: &str,
     provider_id: &str,
     cookies: &[StoredCookie],
-) -> Result<(), Tier3CookieStoreError> {
+) -> Result<(), CloudChatCookieStoreError> {
     let mut conn = open_tier3_cookies_db(user_id, key_hex).await?;
     upsert_cookies_conn(&mut conn, provider_id, cookies).await
 }
@@ -174,13 +174,13 @@ pub(crate) async fn upsert_cookies_conn(
     conn: &mut SqliteConnection,
     provider_id: &str,
     cookies: &[StoredCookie],
-) -> Result<(), Tier3CookieStoreError> {
+) -> Result<(), CloudChatCookieStoreError> {
     sqlx::query("SAVEPOINT upsert_tier3_cookies")
         .execute(&mut *conn)
         .await?;
 
     let step: Result<(), sqlx::Error> = async {
-        sqlx::query("DELETE FROM tier3_provider_cookies WHERE provider_id = ?")
+        sqlx::query("DELETE FROM cloud_chat_provider_cookies WHERE provider_id = ?")
             .bind(provider_id)
             .execute(&mut *conn)
             .await?;
@@ -189,7 +189,7 @@ pub(crate) async fn upsert_cookies_conn(
         for cookie in cookies {
             let id = uuid::Uuid::new_v4().to_string();
             sqlx::query(
-                "INSERT INTO tier3_provider_cookies
+                "INSERT INTO cloud_chat_provider_cookies
                  (id, provider_id, name, value, domain, path, secure,
                   httponly, same_site, priority, has_expires, expires,
                   creation, last_access, updated_at)
@@ -235,7 +235,7 @@ pub(crate) async fn upsert_cookies_conn(
             let _ = sqlx::query("RELEASE upsert_tier3_cookies")
                 .execute(&mut *conn)
                 .await;
-            Err(Tier3CookieStoreError::Database(e))
+            Err(CloudChatCookieStoreError::Database(e))
         }
     }
 }

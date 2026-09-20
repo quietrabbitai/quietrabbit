@@ -788,15 +788,7 @@ TABLE users
   created_at TEXT notnull=1 pk=0 default=None
   extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
 === tier3_cookies ===
-TABLE migration_lock
-  id INTEGER notnull=0 pk=1 default=None
-  locked_at TEXT notnull=0 pk=0 default=None
-  locked_by TEXT notnull=0 pk=0 default=None
-TABLE schema_version
-  version INTEGER notnull=0 pk=1 default=None
-  applied_at TEXT notnull=1 pk=0 default=None
-  description TEXT notnull=1 pk=0 default=None
-TABLE tier3_provider_cookies
+TABLE cloud_chat_provider_cookies
   id TEXT notnull=0 pk=1 default=None
   provider_id TEXT notnull=1 pk=0 default=None
   name TEXT notnull=1 pk=0 default=None
@@ -812,6 +804,14 @@ TABLE tier3_provider_cookies
   creation INTEGER notnull=1 pk=0 default=None
   last_access INTEGER notnull=1 pk=0 default=None
   updated_at TEXT notnull=1 pk=0 default=None
+TABLE migration_lock
+  id INTEGER notnull=0 pk=1 default=None
+  locked_at TEXT notnull=0 pk=0 default=None
+  locked_by TEXT notnull=0 pk=0 default=None
+TABLE schema_version
+  version INTEGER notnull=0 pk=1 default=None
+  applied_at TEXT notnull=1 pk=0 default=None
+  description TEXT notnull=1 pk=0 default=None
 === view_cache ===
 TABLE migration_lock
   id INTEGER notnull=0 pk=1 default=None

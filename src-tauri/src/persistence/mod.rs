@@ -1,6 +1,7 @@
 // src-tauri/src/persistence/mod.rs
 
 pub mod chat_store;
+pub mod cloud_chat_cookie_store;
 pub mod dedup_store;
 pub mod disclosure_log_store;
 pub mod document_fork_store;
@@ -22,7 +23,6 @@ pub mod personal_store;
 pub mod plan_state_store;
 pub mod provider_store;
 pub mod source_registry_store;
-pub mod tier3_cookie_store;
 pub mod topic_store;
 pub mod user_provider_preference_store;
 pub mod view_cache_store;

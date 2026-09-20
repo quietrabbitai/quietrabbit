@@ -295,6 +295,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/tier3_cookies_001.sql"),
     },
     SchemaFile {
+        prefix: "tier3_cookies",
+        version: 2,
+        sql: include_str!("../../schema/tier3_cookies_002.sql"),
+    },
+    SchemaFile {
         prefix: "view_cache",
         version: 1,
         sql: include_str!("../../schema/view_cache_001.sql"),
@@ -1919,6 +1924,182 @@ mod tests {
             seeded.0 > 0,
             "shared_001.sql's seeded provider rows, migrated into providers by shared_013.sql, \
              must also be healed in"
+        );
+    }
+
+    // -- tier3_provider_cookies -> cloud_chat_provider_cookies rename
+    //    (items.id=528 Phase 2) --------------------------------------------
+
+    async fn index_exists(conn: &mut SqliteConnection, index: &str) -> bool {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT name FROM sqlite_master WHERE type='index' AND name = ?")
+                .bind(index)
+                .fetch_optional(conn)
+                .await
+                .unwrap();
+        row.is_some()
+    }
+
+    #[tokio::test]
+    async fn tier3_cookies_migration_fresh_db_ends_with_new_table_only() {
+        let mut conn = make_test_conn().await;
+        run_migrations(&mut conn, "tier3_cookies", None)
+            .await
+            .expect("migration must apply cleanly to a fresh database");
+
+        assert!(
+            table_exists(&mut conn, "cloud_chat_provider_cookies").await,
+            "fresh DB must end up with the new-named table"
+        );
+        assert!(
+            !table_exists(&mut conn, "tier3_provider_cookies").await,
+            "fresh DB must never have the old-named table at all -- v1 only \
+             creates the new name now, and v2's shim (created only if \
+             absent) must be dropped again by the same migration pass"
+        );
+        assert!(
+            index_exists(&mut conn, "idx_cloud_chat_provider_cookies_lookup").await,
+            "fresh DB's new table must have its lookup index"
+        );
+    }
+
+    /// Hand-builds the pre-rename shape (schema_version=1, real data under
+    /// the old table name) since SCHEMA_FILES is a compile-time static and
+    /// can't be swapped to the old tier3_cookies_001.sql revision at test
+    /// time -- same technique as run_pending_heals_content_drift_in_stale_
+    /// v1_database above.
+    async fn seed_stale_tier3_cookies_v1_with_real_data(conn: &mut SqliteConnection) {
+        sqlx::query(
+            "CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, description TEXT NOT NULL
+            )",
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO schema_version (version, applied_at, description) \
+             VALUES (1, '2026-01-01T00:00:00Z', 'stale pre-rename tier3_cookies v1')",
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE tier3_provider_cookies (
+                id              TEXT PRIMARY KEY,
+                provider_id     TEXT NOT NULL,
+                name            TEXT NOT NULL,
+                value           TEXT NOT NULL,
+                domain          TEXT NOT NULL,
+                path            TEXT NOT NULL,
+                secure          INTEGER NOT NULL DEFAULT 0,
+                httponly        INTEGER NOT NULL DEFAULT 0,
+                same_site       INTEGER NOT NULL DEFAULT 0,
+                priority        INTEGER NOT NULL DEFAULT 0,
+                has_expires     INTEGER NOT NULL DEFAULT 0,
+                expires         INTEGER,
+                creation        INTEGER NOT NULL,
+                last_access     INTEGER NOT NULL,
+                updated_at      TEXT NOT NULL,
+                UNIQUE (provider_id, domain, path, name)
+            )",
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE INDEX idx_tier3_provider_cookies_lookup
+                ON tier3_provider_cookies (provider_id)",
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO tier3_provider_cookies
+                (id, provider_id, name, value, domain, path, secure, httponly,
+                 same_site, priority, has_expires, expires, creation,
+                 last_access, updated_at)
+             VALUES ('cookie-1', 'claude', 'session', 'real-session-value',
+                      'claude.ai', '/', 1, 1, 1, 1, 1, 1700000000, 1600000000,
+                      1600000000, '2026-01-01T00:00:00Z')",
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn tier3_cookies_migration_heals_stale_v1_with_real_old_named_data() {
+        let mut conn = make_test_conn().await;
+        seed_stale_tier3_cookies_v1_with_real_data(&mut conn).await;
+
+        run_migrations(&mut conn, "tier3_cookies", None)
+            .await
+            .expect("healing run must succeed");
+
+        assert!(
+            !table_exists(&mut conn, "tier3_provider_cookies").await,
+            "old-named table must be dropped once its data is copied across"
+        );
+        assert!(
+            table_exists(&mut conn, "cloud_chat_provider_cookies").await,
+            "new-named table must exist after healing a stale v1 database"
+        );
+        assert!(
+            index_exists(&mut conn, "idx_cloud_chat_provider_cookies_lookup").await,
+            "new table must have its lookup index after healing"
+        );
+
+        let row: (String, String, String) = sqlx::query_as(
+            "SELECT id, name, value FROM cloud_chat_provider_cookies WHERE provider_id = 'claude'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .expect("the real cookie row must have been copied across, not dropped");
+        assert_eq!(
+            row,
+            (
+                "cookie-1".to_owned(),
+                "session".to_owned(),
+                "real-session-value".to_owned()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn tier3_cookies_migration_apply_twice_stays_clean() {
+        // items.id=528 Phase 2 regression guard: v1 files re-run on every
+        // startup, which is exactly what let tier3_providers/context_groups
+        // resurrect on shared.db (see Group 4b/RETIRED_OBJECTS). This proves
+        // the tier3_cookies rename does NOT have the same bug -- unlike that
+        // case, v1 here was itself amended to the new shape, so its rerun is
+        // consistent with the desired end state rather than fighting it.
+        let mut conn = make_test_conn().await;
+        seed_stale_tier3_cookies_v1_with_real_data(&mut conn).await;
+
+        run_migrations(&mut conn, "tier3_cookies", None)
+            .await
+            .expect("first run must succeed");
+        let applied_second_run = run_migrations(&mut conn, "tier3_cookies", None)
+            .await
+            .expect("second run (simulating the next app startup) must succeed");
+
+        assert_eq!(
+            applied_second_run, 0,
+            "nothing should count as newly applied on a second run -- v1 is a \
+             no-op re-create (table already exists), v2 already recorded"
+        );
+        assert!(
+            !table_exists(&mut conn, "tier3_provider_cookies").await,
+            "old-named table must not be resurrected by v1's second re-run"
+        );
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM cloud_chat_provider_cookies")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            count.0, 1,
+            "the migrated row must not be duplicated by re-running the chain"
         );
     }
 

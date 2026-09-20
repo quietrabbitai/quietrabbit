@@ -46,7 +46,7 @@
 // pane's first navigation; close_tier3_pane reads the jar back (via
 // CookieManager::visit_url_cookies, awaited with a bounded timeout -- see
 // that function's own doc on why a timeout is required, not optional) and
-// persists via persistence::tier3_cookie_store *before* dispatching
+// persists via persistence::cloud_chat_cookie_store *before* dispatching
 // PaneCommand::Close. Both directions are best-effort: a cookie
 // restore/persist failure is logged, never silently dropped, but must not
 // block the pane open/close itself -- worse cookie fidelity is a real but
@@ -74,8 +74,8 @@ use tokio::sync::oneshot;
 use crate::auth::registry::{key_hex, KeyRegistry};
 use crate::cloud_chat_gpu_pane::pane_host::{self, PaneCommand};
 use crate::cloud_chat_gpu_pane::PaneKey;
+use crate::persistence::cloud_chat_cookie_store::{self, StoredCookie};
 use crate::persistence::provider_store;
-use crate::persistence::tier3_cookie_store::{self, StoredCookie};
 
 /// How long to wait for a single CEF cookie-jar round trip
 /// (set_cookie's completion callback, or visit_url_cookies' last-cookie
@@ -398,7 +398,7 @@ wrap_cookie_visitor! {
 // Cookie restore/persist helpers
 // ---------------------------------------------------------------------------
 
-/// Loads provider_id's stored cookies (tier3_cookie_store) into CEF's one
+/// Loads provider_id's stored cookies (cloud_chat_cookie_store) into CEF's one
 /// global jar, scoped to `launch_url`. Best-effort per cookie: a rejected
 /// or timed-out set_cookie is logged and skipped, never aborts the batch --
 /// a partially-restored session (or none at all) is still a working pane,
@@ -409,16 +409,17 @@ async fn restore_cookies_into_jar(
     provider_id: &str,
     launch_url: &str,
 ) {
-    let stored = match tier3_cookie_store::list_cookies(user_id, key_hex_str, provider_id).await {
-        Ok(c) => c,
-        Err(e) => {
-            log::warn!(
-                "tier3_pane: could not read stored cookies for provider={provider_id}: {e} \
+    let stored =
+        match cloud_chat_cookie_store::list_cookies(user_id, key_hex_str, provider_id).await {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!(
+                    "tier3_pane: could not read stored cookies for provider={provider_id}: {e} \
                  -- opening pane without cookie restore"
-            );
-            return;
-        }
-    };
+                );
+                return;
+            }
+        };
     if stored.is_empty() {
         return;
     }
@@ -468,7 +469,7 @@ async fn restore_cookies_into_jar(
 }
 
 /// Reads back every cookie CEF's jar currently holds for `launch_url` and
-/// persists them (full-replace) via tier3_cookie_store. Best-effort: a
+/// persists them (full-replace) via cloud_chat_cookie_store. Best-effort: a
 /// failure here is logged, never propagated as a reason the pane can't
 /// close.
 async fn persist_cookies_from_jar(
@@ -508,7 +509,7 @@ async fn persist_cookies_from_jar(
     let collected: Vec<StoredCookie> = cookies.lock().unwrap().clone();
 
     if let Err(e) =
-        tier3_cookie_store::upsert_cookies(user_id, key_hex_str, provider_id, &collected).await
+        cloud_chat_cookie_store::upsert_cookies(user_id, key_hex_str, provider_id, &collected).await
     {
         log::warn!("tier3_pane: could not persist cookies for provider={provider_id}: {e}");
     }

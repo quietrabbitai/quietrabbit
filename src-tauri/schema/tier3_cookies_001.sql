@@ -66,7 +66,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
     description     TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS tier3_provider_cookies (
+CREATE TABLE IF NOT EXISTS cloud_chat_provider_cookies (
     id              TEXT PRIMARY KEY,
     provider_id     TEXT NOT NULL,
     name            TEXT NOT NULL,
@@ -85,5 +85,13 @@ CREATE TABLE IF NOT EXISTS tier3_provider_cookies (
     UNIQUE (provider_id, domain, path, name)
 );
 
-CREATE INDEX IF NOT EXISTS idx_tier3_provider_cookies_lookup
-    ON tier3_provider_cookies (provider_id);
+-- items.id=528 Phase 2: index name deliberately NOT reused from the old
+-- idx_tier3_provider_cookies_lookup -- SQLite index names are global per
+-- database, not per-table. On an existing DB (real old-named table still
+-- present when this v1 file re-runs), reusing the old name would make this
+-- CREATE INDEX IF NOT EXISTS a silent no-op (the old index, still bound to
+-- the old table, already satisfies the name), leaving the new table with no
+-- lookup index at all until the old table is later dropped out from under
+-- the name collision.
+CREATE INDEX IF NOT EXISTS idx_cloud_chat_provider_cookies_lookup
+    ON cloud_chat_provider_cookies (provider_id);
