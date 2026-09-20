@@ -471,6 +471,7 @@ impl StepExecutor {
                 abstraction_tier,
                 raw_abstraction,
                 execution_tier,
+                ctx.effective_access,
                 selected_model.provider_id.clone(),
             )
             .await
@@ -708,6 +709,7 @@ impl StepExecutor {
                 &response.content,
                 &gate_track,
                 execution_tier,
+                ctx.effective_access,
                 selected_model.provider_id.clone(),
                 Some(&g1.fields_shared),
             )

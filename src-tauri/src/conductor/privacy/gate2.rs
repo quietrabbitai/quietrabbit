@@ -18,11 +18,16 @@
 //
 // Disclosure log written ONLY when flagged=true (mirrors Python).
 // Fatality split (matches gate1): qr_local log write failure is non-fatal (swallow,
-// continue). T2+ log write failure is fatal (halt execution). The split lives
-// here in the gate function, not in the logger implementation.
-// TODO(tier-terminology): needs a combined term for cloud_anonymous+cloud_frontier before this converts
+// continue). External-access-live log write failure is fatal (halt execution).
+// The split lives here in the gate function, not in the logger implementation.
+// items.id=528 Phase 2: re-keyed from execution_tier > 1 to effective_access
+// != LocalOnly -- execution_tier itself is kept as a separate parameter
+// purely for the disclosure log's own numeric audit field below, not for
+// this decision.
 
 use indexmap::IndexMap;
+
+use crate::conductor::tokens::ExternalAccess;
 
 use super::{
     errors::DisclosureLogWriteError,
@@ -40,6 +45,7 @@ pub async fn gate2<L: DisclosureLogger>(
     response_content: &str,
     personal_track: &PersonalTrack,
     execution_tier: u8,
+    effective_access: ExternalAccess,
     provider: Option<String>,
     fields_shared: Option<&[String]>,
 ) -> Result<Gate2Result, DisclosureLogWriteError> {
@@ -75,8 +81,7 @@ pub async fn gate2<L: DisclosureLogger>(
     let flagged = !matched.is_empty();
 
     // Disclosure log written only on flagged result.
-    // Fatality split: qr_local non-fatal (swallow), T2+ fatal (propagate).
-    // TODO(tier-terminology): needs a combined term for cloud_anonymous+cloud_frontier before this converts
+    // Fatality split: qr_local non-fatal (swallow), external access live fatal (propagate).
     if flagged {
         let write_result = logger
             .write(DisclosureLogEntry {
@@ -95,9 +100,8 @@ pub async fn gate2<L: DisclosureLogger>(
             })
             .await;
         if let Err(e) = write_result {
-            if execution_tier > 1 {
-                // TODO(tier-terminology): needs a combined term for cloud_anonymous+cloud_frontier before this converts
-                return Err(e); // FATAL at tier 2+
+            if effective_access != ExternalAccess::LocalOnly {
+                return Err(e); // FATAL when external access is live
             }
             // Non-fatal at qr_local: swallow, continue.
         }

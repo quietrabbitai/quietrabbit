@@ -47,6 +47,7 @@ impl<L: DisclosureLogger> PrivacyGateway<L> {
         abstraction_tier: u8,
         raw_abstraction: u8,
         execution_tier: u8,
+        effective_access: ExternalAccess,
         provider: Option<String>,
     ) -> Result<Gate1Result, DisclosureLogWriteError> {
         gate1::gate1(
@@ -57,6 +58,7 @@ impl<L: DisclosureLogger> PrivacyGateway<L> {
             abstraction_tier,
             raw_abstraction,
             execution_tier,
+            effective_access,
             provider,
         )
         .await
@@ -70,6 +72,7 @@ impl<L: DisclosureLogger> PrivacyGateway<L> {
         response_content: &str,
         personal_track: &PersonalTrack,
         execution_tier: u8,
+        effective_access: ExternalAccess,
         provider: Option<String>,
         fields_shared: Option<&[String]>,
     ) -> Result<Gate2Result, DisclosureLogWriteError> {
@@ -80,6 +83,7 @@ impl<L: DisclosureLogger> PrivacyGateway<L> {
             response_content,
             personal_track,
             execution_tier,
+            effective_access,
             provider,
             fields_shared,
         )

@@ -9,13 +9,19 @@
 //            before this function returns. Caller cannot proceed without log.
 //
 // Fatality split (ADR-012, D5-091):
-//   execution_tier == 1 -> disclosure log write failure is non-fatal.
+//   effective_access == LocalOnly -> disclosure log write failure is non-fatal.
 //                          Gate swallows error, returns empty log id, continues.
-//   execution_tier >  1 -> disclosure log write failure is FATAL.
+//   effective_access != LocalOnly -> disclosure log write failure is FATAL.
 //                          Gate propagates DisclosureLogWriteError, run halts.
 // The split lives here in the gate function, not in the logger implementation.
+// items.id=528 Phase 2: re-keyed from execution_tier > 1 to effective_access
+// != LocalOnly -- execution_tier itself is kept as a separate parameter
+// purely for the disclosure log's own numeric audit field below, not for
+// this decision.
 
 use indexmap::IndexMap;
+
+use crate::conductor::tokens::ExternalAccess;
 
 use super::{
     abstraction::apply_abstraction,
@@ -33,6 +39,7 @@ pub async fn gate1<L: DisclosureLogger>(
     abstraction_tier: u8,
     raw_abstraction: u8,
     execution_tier: u8,
+    effective_access: ExternalAccess,
     provider: Option<String>,
 ) -> Result<Gate1Result, DisclosureLogWriteError> {
     let mut approved: IndexMap<String, String> = IndexMap::new();
@@ -85,8 +92,7 @@ pub async fn gate1<L: DisclosureLogger>(
         .collect();
 
     // Write disclosure log BEFORE returning result (write-before-send invariant).
-    // Fatality split applied here: qr_local swallows, tier 2+ propagates.
-    // TODO(tier-terminology): needs a combined term for cloud_anonymous+cloud_frontier before this converts
+    // Fatality split applied here: qr_local swallows, external access propagates.
     let log_id = {
         let result = logger
             .write(DisclosureLogEntry {
@@ -108,9 +114,8 @@ pub async fn gate1<L: DisclosureLogger>(
         match result {
             Ok(id) => id,
             Err(e) => {
-                if execution_tier > 1 {
-                    // TODO(tier-terminology): needs a combined term for cloud_anonymous+cloud_frontier before this converts
-                    return Err(e); // FATAL at tier 2+
+                if effective_access != ExternalAccess::LocalOnly {
+                    return Err(e); // FATAL when external access is live
                 }
                 // Non-fatal at qr_local: swallow, use empty sentinel.
                 String::new()

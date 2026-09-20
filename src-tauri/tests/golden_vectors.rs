@@ -94,6 +94,19 @@ fn empty_track() -> PersonalTrack {
     t
 }
 
+/// items.id=528 Phase 2: gate1()/gate2() now take effective_access alongside
+/// their pre-existing execution_tier -- this fixture's inputs are still
+/// keyed by legacy tier numbers (1/2/3), so this mirrors the same 1/2/3
+/// mapping conductor/lifecycle.rs's own external_access_from_routing_tier_yaml
+/// uses, exclusively for constructing that new argument in these tests.
+fn access_for_tier(tier: u8) -> ExternalAccess {
+    match tier {
+        1 => ExternalAccess::LocalOnly,
+        2 => ExternalAccess::AnonymousRequired,
+        _ => ExternalAccess::Unrestricted,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Gate1 input table (label -> inputs)
 // Reconstructs (track, abstraction_tier, raw_abstraction, execution_tier, provider)
@@ -651,6 +664,7 @@ async fn test_gate1_normal_paths() {
             abstraction_tier,
             raw_abstraction,
             execution_tier,
+            access_for_tier(execution_tier),
             provider,
         )
         .await
@@ -752,6 +766,7 @@ async fn test_gate1_disclosure_failure_tier1_nonfatal() {
         1,
         1,
         1,
+        ExternalAccess::LocalOnly,
         None,
     )
     .await;
@@ -782,6 +797,7 @@ async fn test_gate1_disclosure_failure_tier2_fatal() {
         2,
         2,
         2,
+        ExternalAccess::AnonymousRequired,
         Some("ollama".into()),
     )
     .await;
@@ -830,6 +846,7 @@ async fn test_gate2() {
             &response,
             &trk,
             execution_tier,
+            access_for_tier(execution_tier),
             None,
             fields_shared_ref,
         )
@@ -887,6 +904,7 @@ async fn test_gate2_t1_log_failure_nonfatal() {
         response,
         &trk,
         1,
+        ExternalAccess::LocalOnly,
         None,
         None,
     )
@@ -916,6 +934,7 @@ async fn test_gate2_t1_log_failure_nonfatal() {
         response,
         &trk2,
         2,
+        ExternalAccess::AnonymousRequired,
         None,
         None,
     )
