@@ -173,15 +173,14 @@ fn qr_hosted_provider_registry() -> &'static HashMap<&'static str, &'static dyn 
 ///   set (providers.provider_type='cloud_inference_api', items.id=430) --
 ///   not the legacy users.tier2_provider_preference column (dropped by
 ///   items.id=433 -- a real, historical column name, not this codebase's
-///   current vocabulary). Only populated
-///   when execution_tier >= 2.
+///   current vocabulary). Only populated when effective_access != LocalOnly.
 ///   Some(provider_id) -> dispatch to that provider via qr_hosted_provider_registry()
 ///   (items.id=465 — an open HashMap keyed by each provider's own provider_id(),
 ///   not a closed two-value set).
 ///   None -> no provider chosen (or the resolved preference was ambiguous
 ///   across candidates); StepExecutor raises F10 MissingQrHostedConfig rather
-///   than guessing (architecture: "no prescribed default"). Always None at
-///   execution_tier == 1.
+///   than guessing (architecture: "no prescribed default"). Always None when
+///   effective_access == LocalOnly.
 pub struct StepContext {
     pub step: StepDefinition,
     pub focus_id: String,
@@ -214,6 +213,27 @@ pub struct StepContext {
     /// effective_access and PROVIDER_REGISTRY_AND_TIER_MODEL_SPEC.md Part 7
     /// (items.id=444) for the regression this would otherwise cause.
     pub focus_external_access: ExternalAccess,
+    /// items.id=528 Phase 2: this step's own effective external-access
+    /// ceiling -- focus_external_access folded with the step's own
+    /// external_access_override (StepDefinition::external_access_override)
+    /// via ExternalAccess::min(). Previously computed by lifecycle.rs and
+    /// used only locally there (the ADR-012 floor clamp below), then
+    /// discarded; promoted onto StepContext so the "does this step require
+    /// external access at all" checks throughout this file can test the
+    /// typed value directly (`!= ExternalAccess::LocalOnly`) instead of
+    /// re-deriving the same answer from execution_tier's numeric bridge
+    /// (execution_tier_ordinal() collapses LocalOnly -> 1 and everything
+    /// else -> 2/3, so `execution_tier >= 2` and `!= LocalOnly` were always
+    /// the same question, just one of them asked through a lossy proxy).
+    ///
+    /// Deliberately NOT used by the floor invariant below (Step 1): that
+    /// check cross-verifies execution_tier against abstraction_tier as two
+    /// independently-computed axes (abstraction_tier itself mixes in the
+    /// user's own privacy_tier preference, lifecycle.rs's
+    /// _focus_privacy_tier.min(execution_tier)) — keying it on this field,
+    /// an input to only one side of that comparison, would make the check
+    /// test itself instead of catching real divergence between the two axes.
+    pub effective_access: ExternalAccess,
     pub execution_tier: u8,
     pub abstraction_tier: u8,
     pub raw_abstraction: u8,
@@ -408,9 +428,11 @@ impl StepExecutor {
         // No prescribed default (architecture: "User choice at install. No
         // prescribed default."). An unset preference is a real gap, not
         // silently resolved to Groq — short-circuits before any provider
-        // is touched. Only checked at tier>=2; Tier 1 never needs a
-        // provider.
-        if execution_tier >= 2 && ctx.qr_hosted_provider_preference.is_none() {
+        // is touched. Only checked when this step requires external access
+        // at all; qr_local never needs a provider.
+        if ctx.effective_access != ExternalAccess::LocalOnly
+            && ctx.qr_hosted_provider_preference.is_none()
+        {
             return Ok(Some(
                 failure_handler.handle(
                     &ConductorError::MissingQrHostedConfig {
@@ -429,7 +451,7 @@ impl StepExecutor {
         let selected_model = select_model(
             pool,
             &ctx.step.task_type,
-            execution_tier,
+            ctx.effective_access,
             ctx.qr_hosted_provider_preference.as_deref(),
         )
         .await?;
@@ -549,7 +571,7 @@ impl StepExecutor {
             scan_voice_profile(ctx, personal_track, privacy_gateway).await?;
         let voice_profile_str = format_voice_profile(&cleaned_voice_profile);
 
-        let prompt = if execution_tier >= 2 {
+        let prompt = if ctx.effective_access != ExternalAccess::LocalOnly {
             let disclosure = shared_state.read_disclosure_buffer(&ctx.step.step_id);
             render_prompt_with_disclosure(
                 ctx,
@@ -633,34 +655,35 @@ impl StepExecutor {
             ));
         }
 
-        let generate_result: Result<_, ConductorError> = if execution_tier >= 2 {
-            // Step 4.5 above already guarantees qr_hosted_provider_preference is
-            // Some(...) at this point -- no silent fallback to any default
-            // provider for a None preference (matches select_model()'s
-            // policy). A provider id that IS present but isn't registered
-            // in qr_hosted_provider_registry() (items.id=465: closes B2) is a
-            // real ConductorError, not a panic -- unlike the old hardcoded
-            // match, this dispatch no longer assumes the schema-permitted
-            // value set is exactly {"mistral", "groq"}.
-            match ctx.qr_hosted_provider_preference.as_deref() {
-                Some(provider_id) => match qr_hosted_provider_registry().get(provider_id) {
-                    Some(provider) => provider.generate(&request).await,
-                    None => Err(ConductorError::UnknownProvider {
-                        plain_language: format!(
-                            "Tier 1.5 provider '{provider_id}' is not registered with this \
+        let generate_result: Result<_, ConductorError> =
+            if ctx.effective_access != ExternalAccess::LocalOnly {
+                // Step 4.5 above already guarantees qr_hosted_provider_preference is
+                // Some(...) at this point -- no silent fallback to any default
+                // provider for a None preference (matches select_model()'s
+                // policy). A provider id that IS present but isn't registered
+                // in qr_hosted_provider_registry() (items.id=465: closes B2) is a
+                // real ConductorError, not a panic -- unlike the old hardcoded
+                // match, this dispatch no longer assumes the schema-permitted
+                // value set is exactly {"mistral", "groq"}.
+                match ctx.qr_hosted_provider_preference.as_deref() {
+                    Some(provider_id) => match qr_hosted_provider_registry().get(provider_id) {
+                        Some(provider) => provider.generate(&request).await,
+                        None => Err(ConductorError::UnknownProvider {
+                            plain_language: format!(
+                                "Tier 1.5 provider '{provider_id}' is not registered with this \
                              build of Quiet Rabbit."
-                        ),
-                    }),
-                },
-                None => unreachable!(
-                    "execution_tier >= 2 with no qr_hosted_provider_preference -- \
+                            ),
+                        }),
+                    },
+                    None => unreachable!(
+                        "effective_access != LocalOnly with no qr_hosted_provider_preference -- \
                      the Step 4.5 guard above must already have \
                      short-circuited to MissingQrHostedConfig"
-                ),
-            }
-        } else {
-            ollama_client().generate(&request).await
-        };
+                    ),
+                }
+            } else {
+                ollama_client().generate(&request).await
+            };
 
         // Python oracle: finally block — always release regardless of generate result.
         scheduler.release_inference_slot(&ctx.focus_run_id);
@@ -711,8 +734,7 @@ impl StepExecutor {
         // -- Step 12 — update TaskTrack --
         // D4-040: content = model output ONLY — never prompt-expanded input.
         // step_sensitivity: from projected fields (Tier 2) or template token scan (qr_local).
-        let step_sensitivity =
-            compute_step_sensitivity(ctx, personal_track, &projected_fields, execution_tier);
+        let step_sensitivity = compute_step_sensitivity(ctx, personal_track, &projected_fields);
 
         let output_var = ctx
             .step
@@ -978,8 +1000,8 @@ async fn scan_voice_profile<L: DisclosureLogger>(
                 })
                 .await;
 
-            if ctx.execution_tier >= 2 {
-                // Tier 2+: halt — contaminated data must not leave the device.
+            if ctx.effective_access != ExternalAccess::LocalOnly {
+                // External access live: halt — contaminated data must not leave the device.
                 return Err(ConductorError::VoiceProfileContamination {
                     plain_language: "One of your communication style settings appears to contain \
                          personal information. Quiet Rabbit stopped this request \
@@ -1014,8 +1036,9 @@ struct SelectedModel {
     model_id: String,
 }
 
-/// Select a model based on task_type, execution tier, and (at tier>=2)
-/// the user's Tier 1.5 (qr_hosted) provider preference.
+/// Select a model based on task_type, the step's effective external-access
+/// ceiling, and (when that ceiling requires external access) the user's
+/// Tier 1.5 (qr_hosted) provider preference.
 /// Python oracle: StepExecutor._select_model()
 ///
 /// items.id=465 (closes B3): the Tier 1.5 (qr_hosted) branch now queries
@@ -1024,21 +1047,21 @@ struct SelectedModel {
 /// provider string -- adding a third qr_hosted provider is now a catalog row,
 /// not a new match arm here.
 ///
-/// qr_hosted_provider must be Some(...) whenever tier >= 2 — the caller
-/// (execute_once's Step 4.5 guard) short-circuits to the F10
+/// qr_hosted_provider must be Some(...) whenever effective_access != LocalOnly
+/// — the caller (execute_once's Step 4.5 guard) short-circuits to the F10
 /// MissingQrHostedConfig failure before ever reaching this function with
-/// tier >= 2 and None; that invariant is untouched by this fix, so the
-/// None arm below still panics rather than silently misrouting. A
-/// provider id that IS present but has no default model curated in the
-/// catalog (unknown provider, or a known one not yet given a
+/// effective_access != LocalOnly and None; that invariant is untouched by
+/// this fix, so the None arm below still panics rather than silently
+/// misrouting. A provider id that IS present but has no default model
+/// curated in the catalog (unknown provider, or a known one not yet given a
 /// provider_models row) is a real ConductorError, not a panic.
 async fn select_model(
     pool: &sqlx::SqlitePool,
     task_type: &str,
-    tier: u8,
+    effective_access: ExternalAccess,
     qr_hosted_provider: Option<&str>,
 ) -> Result<SelectedModel, ConductorError> {
-    if tier == 1 {
+    if effective_access == ExternalAccess::LocalOnly {
         let model_id = match task_type {
             "code" => "qwen2.5:7b",
             "quick_response" | "summarization" => "llama3.2:3b",
@@ -1054,10 +1077,11 @@ async fn select_model(
     let provider_id = match qr_hosted_provider {
         Some(id) => id,
         None => unreachable!(
-            "select_model called with tier>=2 and no qr_hosted_provider -- \
-             caller must guard on ctx.qr_hosted_provider_preference.is_none() \
-             before calling select_model (see the Step 4.5 \
-             MissingQrHostedConfig check in execute_once)"
+            "select_model called with effective_access != LocalOnly and no \
+             qr_hosted_provider -- caller must guard on \
+             ctx.qr_hosted_provider_preference.is_none() before calling \
+             select_model (see the Step 4.5 MissingQrHostedConfig check in \
+             execute_once)"
         ),
     };
 
@@ -1147,23 +1171,27 @@ fn build_options(
 // Step sensitivity computation
 // ---------------------------------------------------------------------------
 
-/// Derive step sensitivity severity from projected fields (Tier 2) or
-/// template token scan (qr_local).
+/// Derive step sensitivity severity from projected fields (external access
+/// live) or template token scan (qr_local).
 ///
-/// Tier 2: max sensitivity_severity across fields actually referenced in
-///   projected_fields that are present in personal_track.
+/// External access live: max sensitivity_severity across fields actually
+///   referenced in projected_fields that are present in personal_track.
 /// qr_local: max sensitivity_severity across personal_track fields whose
 ///   field_name appears as a {token} in the prompt template.
 /// Default: 1 (general) when no personal fields involved.
 ///
 /// Python oracle: Step 12 sensitivity logic in StepExecutor._execute_once()
+///
+/// items.id=528 Phase 2: ctx.execution_tier's redundant `execution_tier: u8`
+/// parameter dropped -- ctx is already passed, so this reads
+/// ctx.effective_access directly instead of a second copy of the same
+/// magnitude question threaded in separately.
 fn compute_step_sensitivity(
     ctx: &StepContext,
     personal_track: &PersonalTrack,
     projected_fields: &HashMap<String, String>,
-    execution_tier: u8,
 ) -> i32 {
-    if execution_tier >= 2 && !projected_fields.is_empty() {
+    if ctx.effective_access != ExternalAccess::LocalOnly && !projected_fields.is_empty() {
         let severities: Vec<i32> = projected_fields
             .keys()
             .filter_map(|name| personal_track.fields().get(name))
@@ -1172,7 +1200,7 @@ fn compute_step_sensitivity(
         return severities.into_iter().max().unwrap_or(1);
     }
 
-    if execution_tier == 1 {
+    if ctx.effective_access == ExternalAccess::LocalOnly {
         let used_fields: Vec<i32> = find_tokens(&ctx.step.prompt_template)
             .into_iter()
             .filter_map(|token| personal_track.fields().get(&token))
@@ -1635,32 +1663,44 @@ mod tests {
     #[tokio::test]
     async fn select_model_tier1_code() {
         // qr_local never touches provider_store -- no DB setup needed.
-        let selected = select_model(&dummy_pool(), "code", 1, None).await.unwrap();
+        let selected = select_model(&dummy_pool(), "code", ExternalAccess::LocalOnly, None)
+            .await
+            .unwrap();
         assert_eq!(selected.provider_id, None);
         assert_eq!(selected.model_id, "qwen2.5:7b");
     }
 
     #[tokio::test]
     async fn select_model_tier1_quick_response() {
-        let selected = select_model(&dummy_pool(), "quick_response", 1, None)
-            .await
-            .unwrap();
+        let selected = select_model(
+            &dummy_pool(),
+            "quick_response",
+            ExternalAccess::LocalOnly,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(selected.provider_id, None);
         assert_eq!(selected.model_id, "llama3.2:3b");
     }
 
     #[tokio::test]
     async fn select_model_tier1_summarization() {
-        let selected = select_model(&dummy_pool(), "summarization", 1, None)
-            .await
-            .unwrap();
+        let selected = select_model(
+            &dummy_pool(),
+            "summarization",
+            ExternalAccess::LocalOnly,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(selected.provider_id, None);
         assert_eq!(selected.model_id, "llama3.2:3b");
     }
 
     #[tokio::test]
     async fn select_model_tier1_general() {
-        let selected = select_model(&dummy_pool(), "general", 1, None)
+        let selected = select_model(&dummy_pool(), "general", ExternalAccess::LocalOnly, None)
             .await
             .unwrap();
         assert_eq!(selected.provider_id, None);
@@ -1670,13 +1710,25 @@ mod tests {
     #[tokio::test]
     async fn select_model_qr_hosted_groq_any_type() {
         with_temp_shared_db(|pool| async move {
-            let by_code = select_model(&pool, "code", 2, Some("groq")).await.unwrap();
+            let by_code = select_model(
+                &pool,
+                "code",
+                ExternalAccess::AnonymousRequired,
+                Some("groq"),
+            )
+            .await
+            .unwrap();
             assert_eq!(by_code.provider_id.as_deref(), Some("groq"));
             assert_eq!(by_code.model_id, "llama-3.1-8b-instant");
 
-            let by_general = select_model(&pool, "general", 2, Some("groq"))
-                .await
-                .unwrap();
+            let by_general = select_model(
+                &pool,
+                "general",
+                ExternalAccess::AnonymousRequired,
+                Some("groq"),
+            )
+            .await
+            .unwrap();
             assert_eq!(by_general.provider_id.as_deref(), Some("groq"));
             assert_eq!(by_general.model_id, "llama-3.1-8b-instant");
         })
@@ -1686,15 +1738,25 @@ mod tests {
     #[tokio::test]
     async fn select_model_qr_hosted_mistral_any_type() {
         with_temp_shared_db(|pool| async move {
-            let by_code = select_model(&pool, "code", 2, Some("mistral"))
-                .await
-                .unwrap();
+            let by_code = select_model(
+                &pool,
+                "code",
+                ExternalAccess::AnonymousRequired,
+                Some("mistral"),
+            )
+            .await
+            .unwrap();
             assert_eq!(by_code.provider_id.as_deref(), Some("mistral"));
             assert_eq!(by_code.model_id, "mistral-small-latest");
 
-            let by_general = select_model(&pool, "general", 2, Some("mistral"))
-                .await
-                .unwrap();
+            let by_general = select_model(
+                &pool,
+                "general",
+                ExternalAccess::AnonymousRequired,
+                Some("mistral"),
+            )
+            .await
+            .unwrap();
             assert_eq!(by_general.provider_id.as_deref(), Some("mistral"));
             assert_eq!(by_general.model_id, "mistral-small-latest");
         })
@@ -1708,12 +1770,22 @@ mod tests {
     #[tokio::test]
     async fn select_model_switches_on_qr_hosted_provider_preference() {
         with_temp_shared_db(|pool| async move {
-            let groq_model = select_model(&pool, "general", 2, Some("groq"))
-                .await
-                .unwrap();
-            let mistral_model = select_model(&pool, "general", 2, Some("mistral"))
-                .await
-                .unwrap();
+            let groq_model = select_model(
+                &pool,
+                "general",
+                ExternalAccess::AnonymousRequired,
+                Some("groq"),
+            )
+            .await
+            .unwrap();
+            let mistral_model = select_model(
+                &pool,
+                "general",
+                ExternalAccess::AnonymousRequired,
+                Some("mistral"),
+            )
+            .await
+            .unwrap();
             assert_ne!(groq_model.model_id, mistral_model.model_id);
             assert_eq!(groq_model.provider_id.as_deref(), Some("groq"));
             assert_eq!(groq_model.model_id, "llama-3.1-8b-instant");
@@ -1724,10 +1796,16 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "select_model called with tier>=2 and no qr_hosted_provider")]
+    #[should_panic(expected = "select_model called with effective_access != LocalOnly and no")]
     async fn select_model_qr_hosted_none_preference_panics() {
         // Panics before ever touching provider_store -- no DB setup needed.
-        let _ = select_model(&dummy_pool(), "general", 2, None).await;
+        let _ = select_model(
+            &dummy_pool(),
+            "general",
+            ExternalAccess::AnonymousRequired,
+            None,
+        )
+        .await;
     }
 
     /// items.id=465: an unrecognized-but-present provider id is now a real
@@ -1737,9 +1815,14 @@ mod tests {
     #[tokio::test]
     async fn select_model_qr_hosted_unknown_provider_returns_unknown_provider_error() {
         with_temp_shared_db(|pool| async move {
-            let err = select_model(&pool, "general", 2, Some("openai"))
-                .await
-                .unwrap_err();
+            let err = select_model(
+                &pool,
+                "general",
+                ExternalAccess::AnonymousRequired,
+                Some("openai"),
+            )
+            .await
+            .unwrap_err();
             assert!(
                 matches!(err, ConductorError::UnknownProvider { .. }),
                 "got: {err:?}"
@@ -1915,6 +1998,7 @@ mod tests {
             user_input: "".to_owned(),
             persona_context: "".to_owned(),
             focus_external_access: ExternalAccess::AnonymousRequired,
+            effective_access: ExternalAccess::AnonymousRequired,
             execution_tier: 2,
             abstraction_tier: 2,
             raw_abstraction: 1,
@@ -1929,7 +2013,7 @@ mod tests {
         };
         let mut projected = HashMap::new();
         projected.insert("name".to_owned(), "Alice (abstracted)".to_owned());
-        assert_eq!(compute_step_sensitivity(&ctx, &pt, &projected, 2), 2);
+        assert_eq!(compute_step_sensitivity(&ctx, &pt, &projected), 2);
     }
 
     #[test]
@@ -1968,6 +2052,7 @@ mod tests {
             user_input: "".to_owned(),
             persona_context: "".to_owned(),
             focus_external_access: ExternalAccess::LocalOnly,
+            effective_access: ExternalAccess::LocalOnly,
             execution_tier: 1,
             abstraction_tier: 1,
             raw_abstraction: 1,
@@ -1980,7 +2065,7 @@ mod tests {
             persona_id: "p".to_owned(),
             key_hex: String::new(),
         };
-        assert_eq!(compute_step_sensitivity(&ctx, &pt, &HashMap::new(), 1), 2);
+        assert_eq!(compute_step_sensitivity(&ctx, &pt, &HashMap::new()), 2);
     }
 
     #[test]
@@ -2007,6 +2092,7 @@ mod tests {
             user_input: "".to_owned(),
             persona_context: "".to_owned(),
             focus_external_access: ExternalAccess::LocalOnly,
+            effective_access: ExternalAccess::LocalOnly,
             execution_tier: 1,
             abstraction_tier: 1,
             raw_abstraction: 1,
@@ -2019,6 +2105,6 @@ mod tests {
             persona_id: "p".to_owned(),
             key_hex: String::new(),
         };
-        assert_eq!(compute_step_sensitivity(&ctx, &pt, &HashMap::new(), 1), 1);
+        assert_eq!(compute_step_sensitivity(&ctx, &pt, &HashMap::new()), 1);
     }
 }
