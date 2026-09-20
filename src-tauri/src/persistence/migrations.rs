@@ -1339,16 +1339,62 @@ pub async fn migrate_keys_db(user_id: &str, key_hex: &str) -> Result<u32, Migrat
     migrate_db_file(&db_path, "keys", Some(key_hex)).await
 }
 
-/// Migrate a user's tier3_cookies.db (encrypted). key_hex: bare hex bytes
-/// only. Per-user, not per-persona -- mirrors migrate_keys_db's path shape
-/// exactly (items.id=224 resolution, decisions.id=711: cookie identity is
-/// keyed by (user, provider), matching KeyRegistry's own user_id-only
-/// scoping -- see tier3_cookies_001.sql's own header).
+/// Guards a one-time atomic same-directory rename of a legacy on-disk file
+/// against both data loss and accidental overwrite. items.id=528 Phase 2:
+/// tier3_cookies.db -> cloud_chat_cookies.db. The same guard shape (new-name
+/// -exists check, never-overwrite) is reused in main.rs for the CEF cache
+/// directory rename; the `-wal`/`-shm` sidecar check below is specific to
+/// SQLite database files and has no cache-directory equivalent.
+///
+/// - If `new_path` already exists: does nothing (never overwrites -- covers
+///   a prior partial/failed rename attempt, or any other reason the
+///   destination is already occupied).
+/// - If `old_path` doesn't exist: does nothing (fresh install, or an
+///   already-completed rename from an earlier call).
+/// - If a `-wal`/`-shm` sidecar exists for `old_path` (WAL is the live
+///   runtime journal mode unless QR_NETWORK_STORAGE=true forces DELETE
+///   mode): skips this call -- uncommitted WAL data hasn't been
+///   checkpointed into the main file yet, and a raw rename of just the main
+///   file would orphan the sidecars. Logged; every call to
+///   migrate_tier3_cookies_db retries this, so a later startup (after a
+///   clean shutdown checkpoints the WAL) picks it up automatically.
+fn rename_legacy_db_file_if_safe(old_path: &Path, new_path: &Path) {
+    if new_path.exists() || !old_path.exists() {
+        return;
+    }
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = old_path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        if Path::new(&sidecar).exists() {
+            log::warn!(
+                "migrations: {old_path:?} has a {suffix} sidecar present -- \
+                 skipping rename to {new_path:?} this run (uncommitted WAL \
+                 data not yet checkpointed); will retry on a later startup"
+            );
+            return;
+        }
+    }
+    match std::fs::rename(old_path, new_path) {
+        Ok(()) => log::info!("migrations: renamed {old_path:?} -> {new_path:?}"),
+        Err(e) => log::warn!("migrations: failed to rename {old_path:?} -> {new_path:?}: {e}"),
+    }
+}
+
+/// Migrate a user's cloud_chat_cookies.db (encrypted). key_hex: bare hex
+/// bytes only. Per-user, not per-persona -- mirrors migrate_keys_db's path
+/// shape exactly (items.id=224 resolution, decisions.id=711: cookie
+/// identity is keyed by (user, provider), matching KeyRegistry's own
+/// user_id-only scoping -- see tier3_cookies_001.sql's own header).
+///
+/// items.id=528 Phase 2: renamed from tier3_cookies.db. Attempts the
+/// one-time atomic rename on every call (see rename_legacy_db_file_if_safe)
+/// -- cheap and idempotent once the rename has actually happened (old_path
+/// no longer exists, so the guard short-circuits immediately).
 pub async fn migrate_tier3_cookies_db(user_id: &str, key_hex: &str) -> Result<u32, MigrationError> {
-    let db_path = get_data_root()
-        .join("users")
-        .join(user_id)
-        .join("tier3_cookies.db");
+    let dir = get_data_root().join("users").join(user_id);
+    let old_path = dir.join("tier3_cookies.db");
+    let db_path = dir.join("cloud_chat_cookies.db");
+    rename_legacy_db_file_if_safe(&old_path, &db_path);
     migrate_db_file(&db_path, "tier3_cookies", Some(key_hex)).await
 }
 
@@ -2098,6 +2144,110 @@ mod tests {
         // Confirm the sweep didn't collaterally damage the tables that
         // replaced the retired ones.
         assert!(table_exists(&mut conn, "providers").await);
+    }
+
+    // -- rename_legacy_db_file_if_safe (items.id=528 Phase 2) ----------------
+
+    #[test]
+    fn rename_legacy_db_file_renames_when_safe() {
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        let old_path = tempdir.path().join("tier3_cookies.db");
+        let new_path = tempdir.path().join("cloud_chat_cookies.db");
+        std::fs::write(&old_path, b"fake sqlite content").unwrap();
+
+        rename_legacy_db_file_if_safe(&old_path, &new_path);
+
+        assert!(
+            !old_path.exists(),
+            "old-named file must be gone after a safe rename"
+        );
+        assert!(
+            new_path.exists(),
+            "new-named file must exist after a safe rename"
+        );
+        assert_eq!(std::fs::read(&new_path).unwrap(), b"fake sqlite content");
+    }
+
+    #[test]
+    fn rename_legacy_db_file_noop_when_old_absent() {
+        // Fresh install, or an already-completed rename from an earlier call.
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        let old_path = tempdir.path().join("tier3_cookies.db");
+        let new_path = tempdir.path().join("cloud_chat_cookies.db");
+
+        rename_legacy_db_file_if_safe(&old_path, &new_path);
+
+        assert!(
+            !new_path.exists(),
+            "nothing to rename -- new path must not appear"
+        );
+    }
+
+    #[test]
+    fn rename_legacy_db_file_never_overwrites_existing_new_path() {
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        let old_path = tempdir.path().join("tier3_cookies.db");
+        let new_path = tempdir.path().join("cloud_chat_cookies.db");
+        std::fs::write(&old_path, b"old content").unwrap();
+        std::fs::write(&new_path, b"already-migrated content").unwrap();
+
+        rename_legacy_db_file_if_safe(&old_path, &new_path);
+
+        assert!(
+            old_path.exists(),
+            "old-named file must be left alone when the new name is already occupied"
+        );
+        assert_eq!(
+            std::fs::read(&new_path).unwrap(),
+            b"already-migrated content",
+            "existing new-named file must never be overwritten"
+        );
+    }
+
+    #[test]
+    fn rename_legacy_db_file_skips_when_wal_sidecar_present() {
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        let old_path = tempdir.path().join("tier3_cookies.db");
+        let new_path = tempdir.path().join("cloud_chat_cookies.db");
+        std::fs::write(&old_path, b"main file content").unwrap();
+        std::fs::write(
+            tempdir.path().join("tier3_cookies.db-wal"),
+            b"uncommitted WAL data",
+        )
+        .unwrap();
+
+        rename_legacy_db_file_if_safe(&old_path, &new_path);
+
+        assert!(
+            old_path.exists(),
+            "a -wal sidecar present means uncommitted data -- the rename must be \
+             skipped this run rather than orphaning it"
+        );
+        assert!(
+            !new_path.exists(),
+            "new-named file must not appear while the rename is skipped"
+        );
+    }
+
+    #[test]
+    fn rename_legacy_db_file_skips_when_shm_sidecar_present() {
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        let old_path = tempdir.path().join("tier3_cookies.db");
+        let new_path = tempdir.path().join("cloud_chat_cookies.db");
+        std::fs::write(&old_path, b"main file content").unwrap();
+        std::fs::write(
+            tempdir.path().join("tier3_cookies.db-shm"),
+            b"shared memory index",
+        )
+        .unwrap();
+
+        rename_legacy_db_file_if_safe(&old_path, &new_path);
+
+        assert!(
+            old_path.exists(),
+            "a -shm sidecar present must also skip the rename"
+        );
+        assert!(!new_path.exists());
     }
 
     // -- tier3_provider_cookies -> cloud_chat_provider_cookies rename

@@ -11,6 +11,31 @@ use quietrabbit_lib::ipc::specta_builder;
 use quietrabbit_lib::ollama_sidecar::{OllamaSidecar, OllamaSource};
 use quietrabbit_lib::providers::ollama_client::OllamaClient;
 
+/// One-time atomic same-directory rename of the CEF cache directory,
+/// tier3_pane_cache -> cloud_chat_gpu_pane_cache (items.id=528 Phase 2).
+/// Never overwrites (does nothing if the new-named directory already
+/// exists -- covers a prior partial/failed rename attempt, or any other
+/// reason the destination is already occupied) and is a no-op once the
+/// rename has actually happened (old_path no longer exists). Same guard
+/// shape as persistence::migrations's rename_legacy_db_file_if_safe, minus
+/// the WAL/SHM sidecar check -- this is a plain directory, not a SQLite
+/// database file, so that concern has no equivalent here. A blanket
+/// identifier rename in the cloud_chat_gpu_pane module itself deliberately
+/// did NOT touch this on-disk name -- orphaning real users' existing cached
+/// Cloud Chat login sessions was exactly the risk this careful, separate
+/// step exists to avoid.
+fn rename_legacy_cef_cache_dir_if_safe(old_path: &std::path::Path, new_path: &std::path::Path) {
+    if new_path.exists() || !old_path.exists() {
+        return;
+    }
+    match std::fs::rename(old_path, new_path) {
+        Ok(()) => log::info!("main: renamed CEF cache dir {old_path:?} -> {new_path:?}"),
+        Err(e) => {
+            log::warn!("main: failed to rename CEF cache dir {old_path:?} -> {new_path:?}: {e}")
+        }
+    }
+}
+
 /// Plain, synchronous entry point -- NOT `#[tokio::main]`.
 ///
 /// CEF's subprocess dispatch (`cloud_chat_gpu_pane::dispatch_cef_subprocess`) must
@@ -605,7 +630,8 @@ async fn async_main() {
         );
         std::env::temp_dir().join("quietrabbit")
     });
-    let root_cache_path = app_data_dir.join("tier3_pane_cache");
+    let root_cache_path = app_data_dir.join("cloud_chat_gpu_pane_cache");
+    rename_legacy_cef_cache_dir_if_safe(&app_data_dir.join("tier3_pane_cache"), &root_cache_path);
     // Uses multi_threaded_message_loop=true (see cloud_chat_gpu_pane::bootstrap docs
     // for the full root-cause history) -- CEF runs its own UI thread
     // separately from Tauri's GTK main thread, which is what avoids the
@@ -717,4 +743,78 @@ async fn async_main() {
             });
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rename_legacy_cef_cache_dir_renames_when_safe() {
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        let old_path = tempdir.path().join("tier3_pane_cache");
+        let new_path = tempdir.path().join("cloud_chat_gpu_pane_cache");
+        std::fs::create_dir_all(old_path.join("blob_storage")).unwrap();
+        std::fs::write(
+            old_path.join("blob_storage").join("cached.bin"),
+            b"cef cache data",
+        )
+        .unwrap();
+
+        rename_legacy_cef_cache_dir_if_safe(&old_path, &new_path);
+
+        assert!(
+            !old_path.exists(),
+            "old-named cache dir must be gone after a safe rename"
+        );
+        assert!(
+            new_path.exists(),
+            "new-named cache dir must exist after a safe rename"
+        );
+        assert!(
+            new_path.join("blob_storage").join("cached.bin").exists(),
+            "the real cached data underneath must survive the rename, not just the top-level dir"
+        );
+    }
+
+    #[test]
+    fn rename_legacy_cef_cache_dir_noop_when_old_absent() {
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        let old_path = tempdir.path().join("tier3_pane_cache");
+        let new_path = tempdir.path().join("cloud_chat_gpu_pane_cache");
+
+        rename_legacy_cef_cache_dir_if_safe(&old_path, &new_path);
+
+        assert!(
+            !new_path.exists(),
+            "nothing to rename -- new path must not appear"
+        );
+    }
+
+    #[test]
+    fn rename_legacy_cef_cache_dir_never_overwrites_existing_new_path() {
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        let old_path = tempdir.path().join("tier3_pane_cache");
+        let new_path = tempdir.path().join("cloud_chat_gpu_pane_cache");
+        std::fs::create_dir_all(&old_path).unwrap();
+        std::fs::write(old_path.join("old.bin"), b"old cache").unwrap();
+        std::fs::create_dir_all(&new_path).unwrap();
+        std::fs::write(
+            new_path.join("already-there.bin"),
+            b"already-migrated cache",
+        )
+        .unwrap();
+
+        rename_legacy_cef_cache_dir_if_safe(&old_path, &new_path);
+
+        assert!(
+            old_path.exists(),
+            "old-named dir must be left alone when the new name is already occupied"
+        );
+        assert!(
+            new_path.join("already-there.bin").exists(),
+            "existing new-named dir's contents must never be overwritten"
+        );
+        assert!(!new_path.join("old.bin").exists());
+    }
 }

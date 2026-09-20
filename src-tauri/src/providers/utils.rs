@@ -115,14 +115,19 @@ pub fn db_path_integration_keys(user_id: &str) -> PathBuf {
         .join("integration_keys.db")
 }
 
-/// Path to a user's tier3_cookies.db (encrypted). Per-user, not per-persona
-/// -- mirrors db_path_integration_keys's shape exactly (items.id=224
-/// resolution, decisions.id=711; see tier3_cookies_001.sql's own header).
+/// Path to a user's cloud_chat_cookies.db (encrypted). Per-user, not
+/// per-persona -- mirrors db_path_integration_keys's shape exactly
+/// (items.id=224 resolution, decisions.id=711; see
+/// tier3_cookies_001.sql's own header). Function name kept as-is (items.id=
+/// 528 Phase 2) -- correlated with migrations.rs's "tier3_cookies" schema
+/// prefix, deliberately left unrenamed there (internal-only, zero
+/// externally-visible cost); only the on-disk filename this function
+/// returns changed, via migrate_tier3_cookies_db's one-time atomic rename.
 pub fn db_path_tier3_cookies(user_id: &str) -> PathBuf {
     get_data_root()
         .join("users")
         .join(user_id)
-        .join("tier3_cookies.db")
+        .join("cloud_chat_cookies.db")
 }
 
 // ---------------------------------------------------------------------------
