@@ -534,6 +534,15 @@ async fn persist_cookies_from_jar(
 /// cloud_frontier) -- filtered out here rather than in the shared store
 /// function, so cloud_inference_api (qr_hosted: groq/mistral) and
 /// local_model rows never reach this list.
+///
+/// items.id=539: also filters to preference_tier='preferred' -- shared_018.sql
+/// added preference_tier specifically so 'supported' rows (groqchat,
+/// mistralvibe, deepseek: vetted and usable, but not QR-recommended) stay
+/// hidden from this screen "unless a user specifically requests it." That
+/// reveal mechanism doesn't exist yet (deferred to a future onboarding/
+/// settings design session per shared_018.sql's own header), so until it
+/// does, this screen must default to 'preferred' only -- this filter was
+/// simply never wired up when the column was added.
 #[tauri::command]
 #[specta::specta]
 pub async fn list_active_providers(
@@ -549,7 +558,7 @@ pub async fn list_active_providers(
             matches!(
                 p.provider_type.as_str(),
                 "split_screen_web" | "external_service"
-            )
+            ) && p.preference_tier == "preferred"
         })
         .map(|p| CloudChatProviderSummary {
             id: p.id,

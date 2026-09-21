@@ -251,6 +251,14 @@ pub struct Provider {
     /// nullable), decoupled from hardware_requirement -- any provider row
     /// can carry a performance_profile regardless of install footprint.
     pub performance_profile: Option<serde_json::Value>,
+    /// items.id=347/486-adjacent (shared_018.sql): QR's own curation
+    /// judgment -- 'preferred' (recommended, shown by default) vs.
+    /// 'supported' (vetted and usable, but hidden from the Cloud Chat
+    /// selector unless a user specifically requests it -- that reveal
+    /// mechanism is deferred to a future onboarding/settings design
+    /// session, not built yet). Open vocabulary, no CHECK, same precedent
+    /// as provider_type. DEFAULT 'supported' at the schema level.
+    pub preference_tier: String,
 }
 
 /// Input to create_provider(). A plain struct rather than 15+ positional
@@ -293,7 +301,8 @@ const SELECT_COLUMNS: &str = "id, display_name, provider_type, mode, launch_url,
                 retains_data, trains_on_data_by_default, login_required,
                 qr_internal_eligible, privacy_guardian_default_level,
                 risk_rating, hardware_requirement, user_privacy_summary,
-                qr_recommended, privacy_commitment_basis, performance_profile";
+                qr_recommended, privacy_commitment_basis, performance_profile,
+                preference_tier";
 
 // ---------------------------------------------------------------------------
 // Row extraction
@@ -343,6 +352,9 @@ fn row_to_provider(row: &sqlx::sqlite::SqliteRow) -> Result<Provider, ProviderSt
         .map_err(ProviderStoreError::Database)?;
     let performance_profile_raw: Option<String> = row
         .try_get("performance_profile")
+        .map_err(ProviderStoreError::Database)?;
+    let preference_tier: String = row
+        .try_get("preference_tier")
         .map_err(ProviderStoreError::Database)?;
 
     let documentation_gate: serde_json::Value =
@@ -438,6 +450,7 @@ fn row_to_provider(row: &sqlx::sqlite::SqliteRow) -> Result<Provider, ProviderSt
         qr_recommended: qr_recommended_raw != 0,
         privacy_commitment_basis,
         performance_profile,
+        preference_tier,
     })
 }
 
@@ -808,6 +821,11 @@ pub async fn create_provider(
         qr_recommended: new.qr_recommended,
         privacy_commitment_basis: new.privacy_commitment_basis,
         performance_profile: new.performance_profile,
+        // Not part of NewProvider -- the INSERT above doesn't set this
+        // column, so it takes the schema's own DEFAULT 'supported'
+        // (shared_018.sql), mirrored here to keep this in-memory value
+        // consistent with what's actually in the DB.
+        preference_tier: "supported".to_owned(),
     })
 }
 

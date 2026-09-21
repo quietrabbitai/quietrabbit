@@ -417,6 +417,15 @@ export const commands = {
 	 *  cloud_frontier) -- filtered out here rather than in the shared store
 	 *  function, so cloud_inference_api (qr_hosted: groq/mistral) and
 	 *  local_model rows never reach this list.
+	 * 
+	 *  items.id=539: also filters to preference_tier='preferred' -- shared_018.sql
+	 *  added preference_tier specifically so 'supported' rows (groqchat,
+	 *  mistralvibe, deepseek: vetted and usable, but not QR-recommended) stay
+	 *  hidden from this screen "unless a user specifically requests it." That
+	 *  reveal mechanism doesn't exist yet (deferred to a future onboarding/
+	 *  settings design session per shared_018.sql's own header), so until it
+	 *  does, this screen must default to 'preferred' only -- this filter was
+	 *  simply never wired up when the column was added.
 	 */
 	listActiveProviders: () => typedError<CloudChatProviderSummary[], string>(__TAURI_INVOKE("list_active_providers")),
 	/**
