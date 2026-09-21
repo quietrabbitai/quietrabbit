@@ -98,7 +98,7 @@ export interface CloudChatAccessPaneProps {
    *  selected before this screen is even reachable (WorkspaceShell.tsx
    *  mounts this component regardless), so null here means "no Persona
    *  chosen yet," a real, expected state, not just a brief render-order
-   *  gap -- see the tier3ChatUnavailable branch below. */
+   *  gap -- see the cloudChatUnavailable branch below. */
   personaId: string | null
   /** items.id=384 slice 7: the new-chat persona dot-picker's "quiet"
    *  switch -- see navShellConfig.ts's setActivePersonaId for why this is
@@ -299,7 +299,7 @@ export function CloudChatAccessPane({
             if (result.status !== 'ok') {
               setReviewOutcome('blocked')
               setReviewMessage(
-                t('navShell.tier3AccessPane.gate3ReviewError', { message: result.error }),
+                t('navShell.cloudChatAccessPane.gate3ReviewError', { message: result.error }),
               )
               return
             }
@@ -650,7 +650,7 @@ export function CloudChatAccessPane({
           if (result.status !== 'ok') {
             setReviewOutcome('blocked')
             setReviewMessage(
-              t('navShell.tier3AccessPane.gate3ReviewError', { message: result.error }),
+              t('navShell.cloudChatAccessPane.gate3ReviewError', { message: result.error }),
             )
             return
           }
@@ -914,6 +914,11 @@ export function CloudChatAccessPane({
   // before this slice; a real chat's own context_key (already
   // "chat-{uuid}", assigned server-side by chat_store::create_chat) is
   // used verbatim, not reconstructed client-side.
+  // items.id=534 (Option B): this literal is a persisted context_key
+  // format (messages_001.sql/messages_002.sql), intentionally kept
+  // unchanged by the tier-vocabulary rename -- do not "fix" it to
+  // cloud-chat-access-{personaId}, that would orphan every existing
+  // user's default-view chat history.
   const chatContextKey = activeChat ? activeChat.context_key : `tier3-access-${personaId}`
 
   // items.id=391 (tenth pass): drives CloudChatCollapsedStrip's own
@@ -930,7 +935,7 @@ export function CloudChatAccessPane({
 
   return (
     <div
-      className="tier3-access-pane"
+      className="cloud-chat-access-pane"
       data-dominant={dominant}
       data-floor={floor ? '' : undefined}
     >
@@ -941,7 +946,7 @@ export function CloudChatAccessPane({
       <PopupHitLayer popups={activePopupRects} />
 
       <div
-        className="tier3-access-pane__qr"
+        className="cloud-chat-access-pane__qr"
         data-collapsed={floor || dominant === 'cloudChat' ? '' : undefined}
         data-floor={floor ? '' : undefined}
       >
@@ -972,13 +977,13 @@ export function CloudChatAccessPane({
             prop is what's supposed to preserve message state, not a
             fresh mount). */}
         {!floor && dominant === 'chat' && (
-          <div className="tier3-access-pane__section-header">
-            <span className="tier3-access-pane__section-header-name">
+          <div className="cloud-chat-access-pane__section-header">
+            <span className="cloud-chat-access-pane__section-header-name">
               {personaId
-                ? t('navShell.tier3AccessPane.qrBannerName')
-                : t('navShell.content.tier3ChatUnavailable')}
+                ? t('navShell.cloudChatAccessPane.qrBannerName')
+                : t('navShell.content.cloudChatUnavailable')}
             </span>
-            <div className="tier3-access-pane__section-header-controls">
+            <div className="cloud-chat-access-pane__section-header-controls">
               {personaId && (
                 <ChatHistoryList
                   onOpenHistory={() => onOpenHistory({ personaId })}
@@ -1006,7 +1011,7 @@ export function CloudChatAccessPane({
           // unlike the banner case above, which needs .qr in its default
           // column direction (bar on top, .qr-panel's real content
           // below).
-          <div className="tier3-access-pane__floor-picker">
+          <div className="cloud-chat-access-pane__floor-picker">
             <NewChatPersonaPicker
               personas={personas}
               activePersonaId={personaId}
@@ -1015,7 +1020,7 @@ export function CloudChatAccessPane({
             />
           </div>
         )}
-        <div className="tier3-access-pane__qr-panel">
+        <div className="cloud-chat-access-pane__qr-panel">
           {personaId ? (
             // decisions.id=743: QR's own identity header now lives above
             // this element (.section-header, this file's own comment on
@@ -1069,24 +1074,24 @@ export function CloudChatAccessPane({
                     real collapsed-strip -- see its comment on why this
                     name is needed at all ("no qr chat bar"). */}
                 <span className="chat-pane__collapsed-name">
-                  {t('navShell.tier3AccessPane.qrBannerName')}
+                  {t('navShell.cloudChatAccessPane.qrBannerName')}
                 </span>
                 <span className="chat-pane__collapsed-snippet">
-                  {t('navShell.content.tier3ChatUnavailable')}
+                  {t('navShell.content.cloudChatUnavailable')}
                 </span>
                 <span className="chat-pane__collapsed-expand" aria-hidden="true">
-                  {t('navShell.tier3CollapsedStrip.expandLabel')}
+                  {t('navShell.cloudChatCollapsedStrip.expandLabel')}
                 </span>
               </button>
               <div className="chat-pane__input-row">
                 <label
                   className="chat-pane__input-label"
-                  htmlFor="tier3-access-pane-floor-empty-input"
+                  htmlFor="cloud-chat-access-pane-floor-empty-input"
                 >
                   {t('navShell.chat.inputLabel')}
                 </label>
                 <input
-                  id="tier3-access-pane-floor-empty-input"
+                  id="cloud-chat-access-pane-floor-empty-input"
                   type="text"
                   className="chat-pane__input"
                   placeholder={t('navShell.chat.inputPlaceholder')}
@@ -1121,7 +1126,7 @@ export function CloudChatAccessPane({
                 <ul className="chat-pane__message-list">
                   <li className="chat-pane__message chat-pane__message--assistant">
                     <span className="chat-pane__message-content">
-                      {t('navShell.content.tier3ChatUnavailable')}
+                      {t('navShell.content.cloudChatUnavailable')}
                     </span>
                   </li>
                 </ul>
@@ -1129,12 +1134,12 @@ export function CloudChatAccessPane({
               <div className="chat-pane__input-row">
                 <label
                   className="chat-pane__input-label"
-                  htmlFor="tier3-access-pane-empty-input"
+                  htmlFor="cloud-chat-access-pane-empty-input"
                 >
                   {t('navShell.chat.inputLabel')}
                 </label>
                 <input
-                  id="tier3-access-pane-empty-input"
+                  id="cloud-chat-access-pane-empty-input"
                   type="text"
                   className="chat-pane__input"
                   placeholder={t('navShell.chat.inputPlaceholder')}
@@ -1172,22 +1177,22 @@ export function CloudChatAccessPane({
               is the SAME .section-header class QR's own header uses
               (NavShell.css), just title-only -- no controls, unlike QR's
               (History/persona picker have no Cloud Chat equivalent). */}
-          <div className="tier3-access-pane__section-header">
-            <span className="tier3-access-pane__section-header-name">
-              {t('navShell.tier3AccessPane.heading')}
+          <div className="cloud-chat-access-pane__section-header">
+            <span className="cloud-chat-access-pane__section-header-name">
+              {t('navShell.cloudChatAccessPane.heading')}
             </span>
           </div>
-          <div className="tier3-access-pane__split-area">
-          <div className="tier3-access-pane__rail-col">
+          <div className="cloud-chat-access-pane__split-area">
+          <div className="cloud-chat-access-pane__rail-col">
             {providerError && (
               <p role="alert">
-                {t('navShell.tier3AccessPane.providerError', {
+                {t('navShell.cloudChatAccessPane.providerError', {
                   message: providerError,
                 })}
               </p>
             )}
             {providers.length === 0 && !providerError && (
-              <p>{t('navShell.tier3AccessPane.loadingProviders')}</p>
+              <p>{t('navShell.cloudChatAccessPane.loadingProviders')}</p>
             )}
             {providers.length > 0 && dominant === 'cloudChat' && (
               // items.id=359: the rail is persistent once the gate clears --
@@ -1219,7 +1224,7 @@ export function CloudChatAccessPane({
             )}
           </div>
 
-          <div className="tier3-access-pane__content-pane">
+          <div className="cloud-chat-access-pane__content-pane">
             {activeProviderId !== null && (
               // items.id=391 (Jason, 2026-09-02): the mockup's own
               // content-head/content-body both carry "click to collapse
@@ -1240,7 +1245,7 @@ export function CloudChatAccessPane({
               // started), never jumping to full/dominant the way the
               // rail's separate "Active Board" button deliberately does.
               <div
-                className="tier3-access-pane__content-head"
+                className="cloud-chat-access-pane__content-head"
                 onClick={reclaimChatAndPromote}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' || e.key === ' ') {
@@ -1250,15 +1255,15 @@ export function CloudChatAccessPane({
                 }}
                 role="button"
                 tabIndex={0}
-                title={t('navShell.tier3AccessPane.contentHeadReclaimTitle')}
+                title={t('navShell.cloudChatAccessPane.contentHeadReclaimTitle')}
               >
-                <span className="tier3-access-pane__content-head-name">
+                <span className="cloud-chat-access-pane__content-head-name">
                   {activeProvider?.name ?? activeProviderId}
                 </span>
                 <button
                   type="button"
-                  className="tier3-access-pane__content-head-close"
-                  title={t('navShell.tier3AccessPane.contentCloseButton')}
+                  className="cloud-chat-access-pane__content-head-close"
+                  title={t('navShell.cloudChatAccessPane.contentCloseButton')}
                   onClick={(e) => {
                     e.stopPropagation()
                     handleClose(activeProviderId)
@@ -1268,10 +1273,10 @@ export function CloudChatAccessPane({
                 </button>
               </div>
             )}
-            <div ref={contentBodyRef} className="tier3-access-pane__content-body">
+            <div ref={contentBodyRef} className="cloud-chat-access-pane__content-body">
               {activeProviderId === null && (
-                <p className="tier3-access-pane__content-empty">
-                  {t('navShell.tier3AccessPane.contentEmptyPrompt')}
+                <p className="cloud-chat-access-pane__content-empty">
+                  {t('navShell.cloudChatAccessPane.contentEmptyPrompt')}
                 </p>
               )}
             </div>
@@ -1294,7 +1299,7 @@ export function CloudChatAccessPane({
       {/* Gate3 review surfaces -- deliberately OUTSIDE the dominant
           branches above, see this file's own header comment on why. */}
       {reviewOutcome === 'blocked' && (
-        <p role="alert">{reviewMessage ?? t('navShell.tier3AccessPane.gate3BlockedFallback')}</p>
+        <p role="alert">{reviewMessage ?? t('navShell.cloudChatAccessPane.gate3BlockedFallback')}</p>
       )}
       {reviewOutcome === 'blocked' && reviewCeiling && personaId && (
         <FocusSettingsControls
@@ -1309,7 +1314,7 @@ export function CloudChatAccessPane({
           }}
         />
       )}
-      {reviewOutcome === 'withheld' && <p>{t('navShell.tier3AccessPane.gate3Withheld')}</p>}
+      {reviewOutcome === 'withheld' && <p>{t('navShell.cloudChatAccessPane.gate3Withheld')}</p>}
       <PrivacyGuardianModal
         open={reviewOutcome === 'pending'}
         payload={consentPayload}
@@ -1318,7 +1323,7 @@ export function CloudChatAccessPane({
       />
       {openError && (
         <p role="alert">
-          {t('navShell.tier3AccessPane.openError', { message: openError })}
+          {t('navShell.cloudChatAccessPane.openError', { message: openError })}
         </p>
       )}
     </div>

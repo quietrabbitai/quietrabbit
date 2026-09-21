@@ -4,7 +4,7 @@
  * on button" / "selected-state" visual treatment decisions.id=654 and
  * Section 2e's own open visual-design question actually call for is
  * applied here -- this is a functional skeleton, same placeholder
- * discipline as middleZone/MiddleZone.css and tier3Access/Tier3Selector.css.
+ * discipline as middleZone/MiddleZone.css and cloudChatAccess/CloudChatSelector.css.
  * data-selected="anchor"|"alias" and the color-dot span are left for that
  * pass to style; both exist structurally already. */
 
@@ -43,7 +43,7 @@
  * height when a provider is active -- driven by data-collapsed, set from
  * ChatPane's own `collapsed` prop's caller (CloudChatAccessPane.tsx), not by
  * anything in this file. */
-.tier3-access-pane {
+.cloud-chat-access-pane {
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -58,12 +58,12 @@
  * left the way the base rule above (flex:1, for every other boardSize)
  * does. One extra attribute selector vs the base rule -- wins on
  * specificity regardless of source order. */
-.tier3-access-pane[data-floor] {
+.cloud-chat-access-pane[data-floor] {
   flex: 0 0 auto;
   min-height: 0;
 }
 
-.tier3-access-pane__qr {
+.cloud-chat-access-pane__qr {
   flex: 0 0 34%;
   min-height: 170px;
   display: flex;
@@ -79,11 +79,11 @@
   transition: flex-basis 220ms ease, min-height 220ms ease;
 }
 
-.tier3-access-pane__qr[data-floor] {
+.cloud-chat-access-pane__qr[data-floor] {
   flex-direction: row;
 }
 
-.tier3-access-pane__qr[data-collapsed] {
+.cloud-chat-access-pane__qr[data-collapsed] {
   flex: 0 0 auto;
   min-height: 0;
 }
@@ -92,7 +92,7 @@
  * sibling to share height with any more (CloudChatCollapsedStrip is a small
  * fixed-height row, not a flex:1 region) -- QR needs to actually fill the
  * remaining space instead of keeping its old 34% resting share. */
-.tier3-access-pane[data-dominant='chat'] .tier3-access-pane__qr {
+.cloud-chat-access-pane[data-dominant='chat'] .cloud-chat-access-pane__qr {
   flex: 1;
   min-height: 0;
 }
@@ -103,7 +103,7 @@
  * .qr[data-collapsed]'s own flex:0 0 auto and stretch the one-row floor
  * to fill CloudChatAccessPane's entire height. Four class-level selectors
  * here vs three above -- wins on specificity regardless of source order. */
-.tier3-access-pane[data-dominant='chat'] .tier3-access-pane__qr[data-collapsed] {
+.cloud-chat-access-pane[data-dominant='chat'] .cloud-chat-access-pane__qr[data-collapsed] {
   flex: 0 0 auto;
   min-height: 0;
 }
@@ -112,13 +112,13 @@
  * persona picker -- sits beside .qr-panel in the row-direction .qr
  * (.qr[data-floor], above), vertically centered since a floor row is
  * much shorter than a full bar. */
-.tier3-access-pane__floor-picker {
+.cloud-chat-access-pane__floor-picker {
   flex: 0 0 auto;
   display: flex;
   align-items: center;
 }
 
-.tier3-access-pane__qr-panel {
+.cloud-chat-access-pane__qr-panel {
   flex: 1;
   min-width: 0;
   min-height: 0;
@@ -126,7 +126,7 @@
   flex-direction: column;
 }
 
-.tier3-access-pane__qr-panel > * {
+.cloud-chat-access-pane__qr-panel > * {
   flex: 1;
   min-width: 0;
   min-height: 0;
@@ -135,13 +135,13 @@
 /* items.id=384 slice 5, decisions.id=743 / items.id=391 (eleventh pass):
  * the shared "expanded region header" bar -- ONE class, used by every
  * region's own full-content header, not just QR's: QR's own title+
- * History+persona-picker row (CloudChatAccessPane.tsx, below .qr), Tier3's
+ * History+persona-picker row (CloudChatAccessPane.tsx, below .qr), Cloud Chat's
  * own "Second opinion" title row (same file, above .split-area), AND
  * Board's own "Active Board"+density-toggle row (WorkspaceShell.tsx,
  * which imports this stylesheet for exactly this class). Confirmed live
  * (Jason, two rounds): first, that QR's banner and the other two bars
  * needed the SAME bordered-strip look when COLLAPSED (fixed the round
- * before this one -- matched properties against .tier3-collapsed-strip,
+ * before this one -- matched properties against .cloud-chat-collapsed-strip,
  * not a shared class, since collapsed bars are standalone clickable rows
  * while this is a static header sitting above real content); second,
  * that "the active bar needs a header when it's fully expanded and the
@@ -149,10 +149,10 @@
  * expanded partially or fully" -- i.e. the EXPANDED-state headers needed
  * to match EACH OTHER too, not just match the collapsed bars. A literal
  * shared class (this rule) is what actually guarantees that for the
- * expanded case, the way importing Tier3CollapsedStrip.css directly
+ * expanded case, the way importing CloudChatCollapsedStrip.css directly
  * (rather than re-declaring matched values) guarantees it for Board's and
- * Tier3's own collapsed bars. */
-.tier3-access-pane__section-header {
+ * Cloud Chat's own collapsed bars. */
+.cloud-chat-access-pane__section-header {
   flex: 0 0 auto;
   display: flex;
   align-items: center;
@@ -164,7 +164,7 @@
   background: var(--bg);
 }
 
-.tier3-access-pane__section-header-name {
+.cloud-chat-access-pane__section-header-name {
   font-size: 13px;
   font-weight: 500;
   color: var(--text-h);
@@ -174,14 +174,14 @@
   min-width: 0;
 }
 
-.tier3-access-pane__section-header-controls {
+.cloud-chat-access-pane__section-header-controls {
   flex: 0 0 auto;
   display: flex;
   align-items: center;
   gap: 8px;
 }
 
-.tier3-access-pane__split-area {
+.cloud-chat-access-pane__split-area {
   display: flex;
   flex-direction: row;
   gap: 8px;
@@ -196,7 +196,7 @@
  * helps each provider's own page layout, which is its ENTIRE webpage --
  * sidebar, history, menus, not just a chat transcript -- render sensibly
  * instead of being squeezed). */
-.tier3-access-pane__rail-col {
+.cloud-chat-access-pane__rail-col {
   flex: 0 0 220px;
   min-width: 0;
   overflow-y: auto;
@@ -205,7 +205,7 @@
   padding: 4px;
 }
 
-.tier3-access-pane__content-pane {
+.cloud-chat-access-pane__content-pane {
   flex: 1;
   min-width: 0;
   min-height: 0;
@@ -216,7 +216,7 @@
   overflow: hidden;
 }
 
-.tier3-access-pane__content-head {
+.cloud-chat-access-pane__content-head {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -228,7 +228,7 @@
   cursor: pointer;
 }
 
-.tier3-access-pane__content-head-name {
+.cloud-chat-access-pane__content-head-name {
   font-size: 13px;
   font-weight: 500;
   flex: 1;
@@ -238,7 +238,7 @@
   white-space: nowrap;
 }
 
-.tier3-access-pane__content-head-close {
+.cloud-chat-access-pane__content-head-close {
   flex: 0 0 auto;
   width: 22px;
   height: 22px;
@@ -251,7 +251,7 @@
   line-height: 1;
 }
 
-.tier3-access-pane__content-head-close:hover {
+.cloud-chat-access-pane__content-head-close:hover {
   background: var(--border);
 }
 
@@ -261,12 +261,12 @@
  * visible on top of it (the header above) may live inside it. Only ever
  * has DOM content (the empty-state prompt) when NO pane is active, since
  * that's the only time nothing is composited into this rect. */
-.tier3-access-pane__content-body {
+.cloud-chat-access-pane__content-body {
   flex: 1;
   min-height: 0;
 }
 
-.tier3-access-pane__content-empty {
+.cloud-chat-access-pane__content-empty {
   height: 100%;
   display: flex;
   align-items: center;

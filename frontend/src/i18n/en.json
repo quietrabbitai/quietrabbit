@@ -14,7 +14,7 @@
     "content": {
       "myFactsPlaceholder": "My Facts -- not yet built.",
       "chatPlaceholder": "Chat -- not yet wired for this screen.",
-      "tier3ChatUnavailable": "Choose a Persona to start chatting."
+      "cloudChatUnavailable": "Choose a Persona to start chatting."
     },
     "chat": {
       "emptyTranscript": "No messages yet.",
@@ -87,12 +87,6 @@
       "fullBoardButton": "Full view",
       "boardBarLabel": "Active Board"
     },
-    "tier3CollapsedStrip": {
-      "expandLabel": "Tap to view",
-      "extraCount": "+{{count}} more loaded",
-      "readyLabel": "Second opinion ready",
-      "emptyLabel": "No second opinion yet"
-    },
     "personaHub": {
       "focusesHeading": "Focuses",
       "noFocuses": "No Focuses yet.",
@@ -111,20 +105,6 @@
     "newChatPersonaPicker": {
       "groupLabel": "New chat as…",
       "buttonTitle": "Start a new chat as {{persona}}"
-    },
-    "tier3AccessPane": {
-      "secondOpinionButton": "2nd opinion",
-      "heading": "Second opinion",
-      "qrBannerName": "Quiet Rabbit — this conversation",
-      "loadingProviders": "Loading providers…",
-      "providerError": "Could not load providers: {{message}}",
-      "openError": "Could not open pane(s): {{message}}",
-      "contentEmptyPrompt": "Select a provider to start a second opinion.",
-      "contentCloseButton": "Close this session",
-      "contentHeadReclaimTitle": "Click to collapse Cloud Chat and bring QR chat forward",
-      "gate3BlockedFallback": "This content can't be shared with Cloud Chat right now.",
-      "gate3Withheld": "Kept private — nothing was sent to Cloud Chat.",
-      "gate3ReviewError": "Could not start the privacy review: {{message}}"
     },
     "focusSettings": {
       "crumbLabel": "Focus settings",
@@ -149,20 +129,27 @@
       "gateConfirmMaxPermittedTier": "Maximum permitted tier: {{from}} → {{to}}",
       "confirmProceed": "Confirm",
       "confirmCancel": "Cancel"
-    }
-  },
-  "tier3Selector": {
-    "railLabel": "Second opinion providers",
-    "rowState": {
-      "idle": "Not loaded",
-      "loaded": "Loaded — tap to view",
-      "active": "Active"
     },
-    "tier2BadgeTitle": "No login required",
-    "tier3BadgeTitle": "Account required, data retained",
-    "closeRowTitle": "Close {{name}}",
-    "hostingBadgeTitle": "Cloud-hosted",
-    "badgeDefaultPostureNotice": "Shows this provider's default privacy posture, not your account settings there. If you've changed a setting on {{providerName}}'s own site (e.g. turned off training), this badge won't reflect that — QR can't see your account there."
+    "cloudChatCollapsedStrip": {
+      "expandLabel": "Tap to view",
+      "extraCount": "+{{count}} more loaded",
+      "readyLabel": "Second opinion ready",
+      "emptyLabel": "No second opinion yet"
+    },
+    "cloudChatAccessPane": {
+      "secondOpinionButton": "2nd opinion",
+      "heading": "Second opinion",
+      "qrBannerName": "Quiet Rabbit — this conversation",
+      "loadingProviders": "Loading providers…",
+      "providerError": "Could not load providers: {{message}}",
+      "openError": "Could not open pane(s): {{message}}",
+      "contentEmptyPrompt": "Select a provider to start a second opinion.",
+      "contentCloseButton": "Close this session",
+      "contentHeadReclaimTitle": "Click to collapse Cloud Chat and bring QR chat forward",
+      "gate3BlockedFallback": "This content can't be shared with Cloud Chat right now.",
+      "gate3Withheld": "Kept private — nothing was sent to Cloud Chat.",
+      "gate3ReviewError": "Could not start the privacy review: {{message}}"
+    }
   },
   "privacyGuardianModal": {
     "headerTitle": "PRIVACY GUARDIAN",
@@ -202,5 +189,18 @@
       "high": "High risk"
     },
     "rememberForPersona": "Remember this decision"
+  },
+  "cloudChatSelector": {
+    "railLabel": "Second opinion providers",
+    "rowState": {
+      "idle": "Not loaded",
+      "loaded": "Loaded — tap to view",
+      "active": "Active"
+    },
+    "closeRowTitle": "Close {{name}}",
+    "hostingBadgeTitle": "Cloud-hosted",
+    "badgeDefaultPostureNotice": "Shows this provider's default privacy posture, not your account settings there. If you've changed a setting on {{providerName}}'s own site (e.g. turned off training), this badge won't reflect that — QR can't see your account there.",
+    "cloudAnonymousBadgeTitle": "No login required",
+    "cloudFrontierBadgeTitle": "Account required, data retained"
   }
 }

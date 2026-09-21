@@ -1,4 +1,4 @@
-.tier3-collapsed-strip {
+.cloud-chat-collapsed-strip {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -13,16 +13,16 @@
   cursor: pointer;
 }
 
-.tier3-collapsed-strip:hover {
+.cloud-chat-collapsed-strip:hover {
   border-color: var(--accent-border);
 }
 
-.tier3-collapsed-strip:disabled {
+.cloud-chat-collapsed-strip:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
 
-.tier3-collapsed-strip:disabled:hover {
+.cloud-chat-collapsed-strip:disabled:hover {
   border-color: var(--border);
 }
 
@@ -35,29 +35,29 @@
  * like one consistent bar" fix this pass is about. The border/background
  * stay at full strength; only the label's own color communicates "nothing
  * to act on here." */
-.tier3-collapsed-strip--empty {
+.cloud-chat-collapsed-strip--empty {
   cursor: default;
   color: var(--text);
 }
 
-.tier3-collapsed-strip--empty:hover {
+.cloud-chat-collapsed-strip--empty:hover {
   border-color: var(--border);
 }
 
-.tier3-collapsed-strip--empty .tier3-collapsed-strip__name {
+.cloud-chat-collapsed-strip--empty .cloud-chat-collapsed-strip__name {
   font-weight: 400;
 }
 
-.tier3-collapsed-strip__name {
+.cloud-chat-collapsed-strip__name {
   font-weight: 500;
 }
 
-.tier3-collapsed-strip__expand {
+.cloud-chat-collapsed-strip__expand {
   color: var(--text);
   font-size: 12px;
 }
 
-.tier3-collapsed-strip__extra {
+.cloud-chat-collapsed-strip__extra {
   margin-left: auto;
   font-size: 11px;
   color: var(--text);

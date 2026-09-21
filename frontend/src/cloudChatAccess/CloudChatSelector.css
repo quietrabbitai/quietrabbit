@@ -1,4 +1,4 @@
-/* Tier 2/Tier 3 access -- provider rail, structural/functional CSS only.
+/* Cloud Chat access -- provider rail, structural/functional CSS only.
  *
  * NOT a Chat-BRAND visual pass -- see cloudChatAccessConfig.ts's header
  * for why (the whole app is still on the generic template palette). The
@@ -7,7 +7,7 @@
  * cloudChatAccessConfig.ts's providerBrandColor(), not a broader visual
  * pass on this file. */
 
-.tier3-rail {
+.cloud-chat-rail {
   list-style: none;
   margin: 0;
   padding: 4px;
@@ -17,7 +17,7 @@
   overflow-y: auto;
 }
 
-.tier3-rail__row {
+.cloud-chat-rail__row {
   position: relative;
   display: flex;
   align-items: stretch;
@@ -25,12 +25,12 @@
   border: 1px solid transparent;
 }
 
-.tier3-rail__row--active {
+.cloud-chat-rail__row--active {
   background: color-mix(in srgb, var(--row-brand-color, var(--border)) 12%, transparent);
   border-color: color-mix(in srgb, var(--row-brand-color, var(--border)) 35%, transparent);
 }
 
-.tier3-rail__row-main {
+.cloud-chat-rail__row-main {
   flex: 1;
   min-width: 0;
   display: flex;
@@ -45,7 +45,7 @@
   color: inherit;
 }
 
-.tier3-rail__icon {
+.cloud-chat-rail__icon {
   flex: 0 0 auto;
   width: 22px;
   height: 22px;
@@ -59,39 +59,39 @@
   font-weight: 600;
 }
 
-.tier3-rail__row--idle .tier3-rail__icon {
+.cloud-chat-rail__row--idle .cloud-chat-rail__icon {
   opacity: 0.5;
 }
 
-.tier3-rail__meta {
+.cloud-chat-rail__meta {
   flex: 1;
   min-width: 0;
   display: flex;
   flex-direction: column;
 }
 
-.tier3-rail__name {
+.cloud-chat-rail__name {
   font-size: 13px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.tier3-rail__row--idle .tier3-rail__name {
+.cloud-chat-rail__row--idle .cloud-chat-rail__name {
   color: var(--text);
   opacity: 0.75;
 }
 
-.tier3-rail__state {
+.cloud-chat-rail__state {
   font-size: 10.5px;
   opacity: 0.65;
 }
 
 /* items.id=418: two indicator badges, shown on every row regardless of
- * idle/loaded/active state (unlike .tier3-rail__icon's idle dimming) --
+ * idle/loaded/active state (unlike .cloud-chat-rail__icon's idle dimming) --
  * provider-level info, not pane-lifecycle state. Sized to match
- * .tier3-rail__close's 20px width. */
-.tier3-rail__badge {
+ * .cloud-chat-rail__close's 20px width. */
+.cloud-chat-rail__badge {
   flex: 0 0 auto;
   width: 20px;
   height: 20px;
@@ -102,24 +102,24 @@
   align-self: center;
 }
 
-.tier3-rail__badge--hosting {
+.cloud-chat-rail__badge--hosting {
   background: var(--border);
   color: var(--text);
   opacity: 0.65;
 }
 
-.tier3-rail__badge--identity {
+.cloud-chat-rail__badge--identity {
   color: var(--bg);
 }
 
-.tier3-rail__tierbadge {
+.cloud-chat-rail__access-badge {
   flex: 0 0 auto;
   font-size: 11px;
   opacity: 0.55;
   align-self: center;
 }
 
-.tier3-rail__close {
+.cloud-chat-rail__close {
   flex: 0 0 auto;
   display: none;
   align-items: center;
@@ -136,11 +136,11 @@
   line-height: 1;
 }
 
-.tier3-rail__row:hover .tier3-rail__close,
-.tier3-rail__close:focus-visible {
+.cloud-chat-rail__row:hover .cloud-chat-rail__close,
+.cloud-chat-rail__close:focus-visible {
   display: flex;
 }
 
-.tier3-rail__close:hover {
+.cloud-chat-rail__close:hover {
   background: var(--border);
 }

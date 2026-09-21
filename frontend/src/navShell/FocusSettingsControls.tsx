@@ -60,7 +60,7 @@ const MAX_PERMITTED_TIER_VALUES: ExternalAccess[] = [
 
 // items.id=448: plain-language labels, not "anonymous"/"external" (backend
 // vocabulary) -- mirrors the plain-language pattern already shipped on
-// tier3Selector's own badges ("No login required" / "Account required,
+// cloudChatSelector's own badges ("No login required" / "Account required,
 // data retained"). Decided live with Jason this session; see this draft's
 // own "Vocabulary decisions" section for the full reasoning trail.
 function maxPermittedTierLabelKey(value: ExternalAccess): string {

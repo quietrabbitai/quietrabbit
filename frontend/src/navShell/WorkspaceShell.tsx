@@ -8,7 +8,7 @@
 // bottom) mirrors the old file's Board/Chat/Cloud Chat order, with Library and
 // History appended below. Exactly one region is "dominant" (gets the big
 // remaining space) at a time -- the rest render as compact bars, reusing
-// `.tier3-collapsed-strip` verbatim (Tier3CollapsedStrip.css) the same way
+// `.cloud-chat-collapsed-strip` verbatim (CloudChatCollapsedStrip.css) the same way
 // Board's own bar already did pre-404, so all four non-dominant bars read
 // as the same kind of row.
 //
@@ -64,7 +64,7 @@ import { LibraryPane } from '../library/LibraryPane'
 import { CloudChatAccessPane } from './CloudChatAccessPane'
 import { useDominancePair } from './useDominancePair'
 import type { DockRailId, DominancePairState } from './navShellConfig'
-import './Tier3CollapsedStrip.css'
+import './CloudChatCollapsedStrip.css'
 import './NavShell.css'
 import './WorkspaceShell.css'
 
@@ -126,11 +126,11 @@ export function WorkspaceShell({
     <div className="workspace-shell" data-dominant-rail={dominantRail}>
       {boardExpanded ? (
         <div key="board-region" className="workspace-shell__board-region">
-          <div className="tier3-access-pane__section-header">
-            <span className="tier3-access-pane__section-header-name">
+          <div className="cloud-chat-access-pane__section-header">
+            <span className="cloud-chat-access-pane__section-header-name">
               {t('navShell.workspaceShell.boardBarLabel')}
             </span>
-            <div className="tier3-access-pane__section-header-controls">
+            <div className="cloud-chat-access-pane__section-header-controls">
               <button
                 type="button"
                 className="workspace-shell__board-density-button"
@@ -150,23 +150,23 @@ export function WorkspaceShell({
         <button
           key="board-bar"
           type="button"
-          className="tier3-collapsed-strip"
+          className="cloud-chat-collapsed-strip"
           onClick={() => {
             reclaimChat()
             onDominantRailChange('board')
           }}
         >
-          <span className="tier3-collapsed-strip__name">
+          <span className="cloud-chat-collapsed-strip__name">
             {t('navShell.workspaceShell.boardBarLabel')}
           </span>
-          <span className="tier3-collapsed-strip__expand">
-            {t('navShell.tier3CollapsedStrip.expandLabel')}
+          <span className="cloud-chat-collapsed-strip__expand">
+            {t('navShell.cloudChatCollapsedStrip.expandLabel')}
           </span>
         </button>
       )}
 
       <CloudChatAccessPane
-        key="tier3-access-pane"
+        key="cloud-chat-access-pane"
         personaId={activePersonaId}
         onPersonaChange={onActivePersonaIdChange}
         personas={personas}
@@ -185,8 +185,8 @@ export function WorkspaceShell({
 
       {dominantRail === 'library' ? (
         <div key="library-region" className="workspace-shell__library-region">
-          <div className="tier3-access-pane__section-header">
-            <span className="tier3-access-pane__section-header-name">
+          <div className="cloud-chat-access-pane__section-header">
+            <span className="cloud-chat-access-pane__section-header-name">
               {t('navShell.library')}
             </span>
           </div>
@@ -196,20 +196,20 @@ export function WorkspaceShell({
         <button
           key="library-bar"
           type="button"
-          className="tier3-collapsed-strip"
+          className="cloud-chat-collapsed-strip"
           onClick={() => onDominantRailChange('library')}
         >
-          <span className="tier3-collapsed-strip__name">{t('navShell.library')}</span>
-          <span className="tier3-collapsed-strip__expand">
-            {t('navShell.tier3CollapsedStrip.expandLabel')}
+          <span className="cloud-chat-collapsed-strip__name">{t('navShell.library')}</span>
+          <span className="cloud-chat-collapsed-strip__expand">
+            {t('navShell.cloudChatCollapsedStrip.expandLabel')}
           </span>
         </button>
       )}
 
       {dominantRail === 'history' ? (
         <div key="history-region" className="workspace-shell__history-region">
-          <div className="tier3-access-pane__section-header">
-            <span className="tier3-access-pane__section-header-name">
+          <div className="cloud-chat-access-pane__section-header">
+            <span className="cloud-chat-access-pane__section-header-name">
               {t('navShell.historyLabel')}
             </span>
           </div>
@@ -234,12 +234,12 @@ export function WorkspaceShell({
         <button
           key="history-bar"
           type="button"
-          className="tier3-collapsed-strip"
+          className="cloud-chat-collapsed-strip"
           onClick={() => onDominantRailChange('history')}
         >
-          <span className="tier3-collapsed-strip__name">{t('navShell.historyLabel')}</span>
-          <span className="tier3-collapsed-strip__expand">
-            {t('navShell.tier3CollapsedStrip.expandLabel')}
+          <span className="cloud-chat-collapsed-strip__name">{t('navShell.historyLabel')}</span>
+          <span className="cloud-chat-collapsed-strip__expand">
+            {t('navShell.cloudChatCollapsedStrip.expandLabel')}
           </span>
         </button>
       )}

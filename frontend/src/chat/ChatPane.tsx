@@ -845,14 +845,14 @@ export function ChatPane({
           {/* items.id=391 (eleventh pass): confirmed live (Jason) -- "on
               the second opinion screen, there is no qr chat bar." Board's
               and Cloud Chat's own collapsed bars both lead with a name
-              (tier3-collapsed-strip__name -- "Active Board", "Second
+              (cloud-chat-collapsed-strip__name -- "Active Board", "Second
               opinion ready"/a provider name); this row led with the
               snippet instead, with nothing identifying it as QR's own bar
               at all. Same name QR's own expanded header uses
-              (tier3AccessPane.qrBannerName) -- one string, reused, not a
+              (cloudChatAccessPane.qrBannerName) -- one string, reused, not a
               shorter alternate that could drift from it. */}
           <span className="chat-pane__collapsed-name">
-            {t('navShell.tier3AccessPane.qrBannerName')}
+            {t('navShell.cloudChatAccessPane.qrBannerName')}
           </span>
           <span className="chat-pane__collapsed-snippet">
             {lastAssistantSnippet ?? t('navShell.chat.collapsedEmptySnippet')}

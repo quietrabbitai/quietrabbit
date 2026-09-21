@@ -6,7 +6,7 @@
 // anything beyond glancing, not these rows themselves). One component so
 // the two renderings can't visually drift apart, matching this codebase's
 // existing discipline of importing a shared stylesheet rather than
-// duplicating it (e.g. WorkspaceShell.tsx / Tier3CollapsedStrip.css).
+// duplicating it (e.g. WorkspaceShell.tsx / CloudChatCollapsedStrip.css).
 
 import { useTranslation } from 'react-i18next'
 import type { OutputInfo } from '../bindings'

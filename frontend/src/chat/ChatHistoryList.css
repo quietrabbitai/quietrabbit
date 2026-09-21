@@ -19,7 +19,7 @@
  * because HistoryScreen.tsx now reuses these exact class names for its
  * Persona row's Chat History action-pane rows, so the two "past chat" row
  * renderings can't visually drift apart -- same discipline as
- * WorkspaceShell.tsx importing Tier3CollapsedStrip.css rather than
+ * WorkspaceShell.tsx importing CloudChatCollapsedStrip.css rather than
  * duplicating it. */
 
 .chat-history-list__empty {

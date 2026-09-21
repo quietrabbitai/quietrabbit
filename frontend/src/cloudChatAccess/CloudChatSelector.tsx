@@ -29,7 +29,7 @@
 // decision-backed carve-out, not a broader visual pass.
 
 import { useTranslation } from 'react-i18next'
-import './Tier3Selector.css'
+import './CloudChatSelector.css'
 import {
   DUCK_LOGO_URL,
   PROVIDER_LOGO_COMPONENTS,
@@ -128,7 +128,7 @@ export function CloudChatSelector({
   const rows = escalateMode ? providers.filter((p) => p.lane === 'cloud_frontier') : providers
 
   return (
-    <ul className="tier3-rail" aria-label={t('tier3Selector.railLabel')}>
+    <ul className="cloud-chat-rail" aria-label={t('cloudChatSelector.railLabel')}>
       {rows.map((provider) => {
         const state = rowState(provider.id, openPaneIds, activeProviderId)
         const LogoComponent = PROVIDER_LOGO_COMPONENTS[provider.id]
@@ -137,7 +137,7 @@ export function CloudChatSelector({
         return (
           <li
             key={provider.id}
-            className={`tier3-rail__row tier3-rail__row--${state}`}
+            className={`cloud-chat-rail__row cloud-chat-rail__row--${state}`}
             data-provider={provider.id}
             data-state={state}
             style={
@@ -148,11 +148,11 @@ export function CloudChatSelector({
           >
             <button
               type="button"
-              className="tier3-rail__row-main"
+              className="cloud-chat-rail__row-main"
               onClick={() => onActivate(provider.id)}
             >
               <span
-                className="tier3-rail__icon"
+                className="cloud-chat-rail__icon"
                 aria-hidden="true"
                 style={
                   !hasRealLogo && state !== 'idle'
@@ -168,33 +168,33 @@ export function CloudChatSelector({
                   provider.name.slice(0, 1)
                 )}
               </span>
-              <span className="tier3-rail__meta">
-                <span className="tier3-rail__name">{provider.name}</span>
-                <span className="tier3-rail__state">
-                  {t(`tier3Selector.rowState.${state}`)}
+              <span className="cloud-chat-rail__meta">
+                <span className="cloud-chat-rail__name">{provider.name}</span>
+                <span className="cloud-chat-rail__state">
+                  {t(`cloudChatSelector.rowState.${state}`)}
                 </span>
               </span>
               <span
-                className="tier3-rail__badge tier3-rail__badge--hosting"
-                title={t('tier3Selector.hostingBadgeTitle')}
+                className="cloud-chat-rail__badge cloud-chat-rail__badge--hosting"
+                title={t('cloudChatSelector.hostingBadgeTitle')}
                 aria-hidden="true"
               >
                 <CloudGlyph />
               </span>
               <span
-                className="tier3-rail__badge tier3-rail__badge--identity"
+                className="cloud-chat-rail__badge cloud-chat-rail__badge--identity"
                 style={{ backgroundColor: privacyLevelColor(provider.privacyGuardianDefaultLevel) }}
-                title={t('tier3Selector.badgeDefaultPostureNotice', { providerName: provider.name })}
+                title={t('cloudChatSelector.badgeDefaultPostureNotice', { providerName: provider.name })}
                 aria-hidden="true"
               >
                 {provider.isAnonymous ? <IncognitoGlyph /> : <PersonGlyph />}
               </span>
               <span
-                className="tier3-rail__tierbadge"
+                className="cloud-chat-rail__access-badge"
                 title={
                   provider.lane === 'cloud_anonymous'
-                    ? t('tier3Selector.tier2BadgeTitle')
-                    : t('tier3Selector.tier3BadgeTitle')
+                    ? t('cloudChatSelector.cloudAnonymousBadgeTitle')
+                    : t('cloudChatSelector.cloudFrontierBadgeTitle')
                 }
                 aria-hidden="true"
               >
@@ -204,8 +204,8 @@ export function CloudChatSelector({
             {state !== 'idle' && (
               <button
                 type="button"
-                className="tier3-rail__close"
-                title={t('tier3Selector.closeRowTitle', { name: provider.name })}
+                className="cloud-chat-rail__close"
+                title={t('cloudChatSelector.closeRowTitle', { name: provider.name })}
                 onClick={(e) => {
                   e.stopPropagation()
                   onClose(provider.id)

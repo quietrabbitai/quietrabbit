@@ -151,14 +151,14 @@
 
 /* items.id=391 (tenth pass -- "three bars, one expanded" redesign):
  * QR's own collapsed floor is one of the three peer bars (Board's own
- * bar, WorkspaceShell.tsx; the second-opinion bar, Tier3CollapsedStrip.
+ * bar, WorkspaceShell.tsx; the second-opinion bar, CloudChatCollapsedStrip.
  * css) whenever Chat isn't the expanded region -- confirmed live (Jason):
  * this row rendering with no border/background at all (its own prior
  * `border: none; background: none`) while the other two are bordered
  * pills was a big part of "it still looks like three different screens."
  * Wraps BOTH rows this state renders (the strip below, and the still-
  * live .chat-pane__input-row beneath it) in one bordered card matching
- * .tier3-collapsed-strip's own border/radius/background exactly -- a
+ * .cloud-chat-collapsed-strip's own border/radius/background exactly -- a
  * divider between the two takes the place of the strip's own border. */
 .chat-pane[data-collapsed] {
   border: 1px solid var(--border);
@@ -197,9 +197,9 @@
 }
 
 /* items.id=391 (eleventh pass): same name/weight/color as
- * .tier3-collapsed-strip__name and .tier3-access-pane__section-header-name
- * (NavShell.css/Tier3CollapsedStrip.css) -- QR's own collapsed bar needed
- * the same "name leads the row" shape Board's and Tier3's bars already
+ * .cloud-chat-collapsed-strip__name and .cloud-chat-access-pane__section-header-name
+ * (NavShell.css/CloudChatCollapsedStrip.css) -- QR's own collapsed bar needed
+ * the same "name leads the row" shape Board's and Cloud Chat's bars already
  * have, not just a snippet with nothing identifying whose bar it is. */
 .chat-pane__collapsed-name {
   flex: 0 0 auto;

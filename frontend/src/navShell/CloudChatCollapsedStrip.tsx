@@ -40,7 +40,7 @@
 
 import { useTranslation } from 'react-i18next'
 import type { Provider } from '../cloudChatAccess/cloudChatAccessConfig'
-import './Tier3CollapsedStrip.css'
+import './CloudChatCollapsedStrip.css'
 
 export interface CloudChatCollapsedStripProps {
   providers: Provider[]
@@ -81,9 +81,9 @@ export function CloudChatCollapsedStrip({
   if (openProviderIds.length === 0) {
     if (emptyState === 'none') {
       return (
-        <div className="tier3-collapsed-strip tier3-collapsed-strip--empty">
-          <span className="tier3-collapsed-strip__name">
-            {t('navShell.tier3CollapsedStrip.emptyLabel')}
+        <div className="cloud-chat-collapsed-strip cloud-chat-collapsed-strip--empty">
+          <span className="cloud-chat-collapsed-strip__name">
+            {t('navShell.cloudChatCollapsedStrip.emptyLabel')}
           </span>
         </div>
       )
@@ -92,14 +92,14 @@ export function CloudChatCollapsedStrip({
       return (
         <button
           type="button"
-          className="tier3-collapsed-strip"
+          className="cloud-chat-collapsed-strip"
           onClick={() => onExpandRail()}
         >
-          <span className="tier3-collapsed-strip__name">
-            {t('navShell.tier3CollapsedStrip.readyLabel')}
+          <span className="cloud-chat-collapsed-strip__name">
+            {t('navShell.cloudChatCollapsedStrip.readyLabel')}
           </span>
-          <span className="tier3-collapsed-strip__expand">
-            {t('navShell.tier3CollapsedStrip.expandLabel')}
+          <span className="cloud-chat-collapsed-strip__expand">
+            {t('navShell.cloudChatCollapsedStrip.expandLabel')}
           </span>
         </button>
       )
@@ -107,15 +107,15 @@ export function CloudChatCollapsedStrip({
     return (
       <button
         type="button"
-        className="tier3-collapsed-strip"
+        className="cloud-chat-collapsed-strip"
         onClick={() => onReview()}
         disabled={reviewDisabled}
       >
-        <span className="tier3-collapsed-strip__name">
-          {t('navShell.tier3AccessPane.secondOpinionButton')}
+        <span className="cloud-chat-collapsed-strip__name">
+          {t('navShell.cloudChatAccessPane.secondOpinionButton')}
         </span>
-        <span className="tier3-collapsed-strip__expand">
-          {t('navShell.tier3CollapsedStrip.expandLabel')}
+        <span className="cloud-chat-collapsed-strip__expand">
+          {t('navShell.cloudChatCollapsedStrip.expandLabel')}
         </span>
       </button>
     )
@@ -128,18 +128,18 @@ export function CloudChatCollapsedStrip({
   return (
     <button
       type="button"
-      className="tier3-collapsed-strip"
+      className="cloud-chat-collapsed-strip"
       onClick={() => onExpand(featuredId)}
     >
-      <span className="tier3-collapsed-strip__name">
+      <span className="cloud-chat-collapsed-strip__name">
         {featured?.name ?? null}
       </span>
-      <span className="tier3-collapsed-strip__expand">
-        {t('navShell.tier3CollapsedStrip.expandLabel')}
+      <span className="cloud-chat-collapsed-strip__expand">
+        {t('navShell.cloudChatCollapsedStrip.expandLabel')}
       </span>
       {extraCount > 0 && (
-        <span className="tier3-collapsed-strip__extra">
-          {t('navShell.tier3CollapsedStrip.extraCount', { count: extraCount })}
+        <span className="cloud-chat-collapsed-strip__extra">
+          {t('navShell.cloudChatCollapsedStrip.extraCount', { count: extraCount })}
         </span>
       )}
     </button>

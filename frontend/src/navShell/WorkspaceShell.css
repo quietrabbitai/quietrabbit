@@ -7,14 +7,14 @@
  * 'compact' putting board-region and pair-region on screen TOGETHER at
  * differing flex shares -- is gone. 'compact' now means only "Board
  * expanded, dense density," structurally identical to 'full' (see
- * WorkspaceShell.tsx's own header comment); Chat/Tier3 are always
+ * WorkspaceShell.tsx's own header comment); Chat/Cloud Chat are always
  * compressed to a bar whenever Board is expanded, regardless of Board's
  * own density. That removed the former --compact/--medium/--floor
  * modifier rules and the pair-expand-button entirely -- CloudChatAccessPane
  * is a direct flex child of .workspace-shell now (its own [data-floor]
  * rule in NavShell.css governs its size), no wrapper needed.
  *
- * items.id=404: generalized from 3 peer bars to 5 (Board/Chat/Tier3/
+ * items.id=404: generalized from 3 peer bars to 5 (Board/Chat/Cloud Chat/
  * Library/History) -- the root element's own dominance modifier is now
  * data-dominant-rail (was data-board-size), still not a className for the
  * same reason as before (CloudChatAccessPane and, now, Library/History all
