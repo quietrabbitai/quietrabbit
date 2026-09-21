@@ -312,18 +312,26 @@ fn external_access_from_routing_tier_yaml(raw: u8) -> ExternalAccess {
 /// ExternalAccess's own doc comment), just the numeric side of a still-
 /// numeric axis that this item's Axis-1 ceiling calc must keep feeding.
 ///
-/// AnonymousPreferred -> 2: every current consumer only tests the
-/// LocalOnly/not-LocalOnly boundary (>1, >=2, ==1) or the exact-1 case --
-/// none distinguishes 2 from 3 today, so this choice is behaviorally inert
-/// for all of them. 2 (not 3) because AnonymousPreferred's *legacy-era*
-/// analog was "anonymous is available" (the Tier-1.5-equivalent case this
-/// enum exists to express), even though its actual provider eligibility
-/// (any provider, anonymous or full-account) matches Unrestricted's.
+/// AnonymousPreferred -> 3, matching Unrestricted (items.id=537, decisions.id=820):
+/// fail closed. AnonymousPreferred's actual provider eligibility (any
+/// provider, anonymous or full-account) matches Unrestricted's exactly
+/// (tokens.rs's ExternalAccess doc comment) -- this axis abstracts and
+/// gates on reach, not on which provider a run happens to prefer, so a run
+/// that may reach a full-account provider must be treated at the same
+/// tier as one that always does. This DOES change behavior at the three
+/// call sites that distinguish 2 from 3 (items.id=537 consumer audit):
+/// privacy/abstraction.rs AbstractionLevel::from_tier (AnonymousPreferred
+/// now abstracts at Level3, not Level2), the memory-store tier-eligibility
+/// tables (domain_context_store.rs, plan_state_store.rs), and gate3's
+/// cross-tier promotion check in executor.rs (next_tier > execution_tier
+/// now fires AnonymousRequired -> AnonymousPreferred, and no longer fires
+/// AnonymousPreferred -> Unrestricted, since reach is equal and nothing
+/// widens). See items.id=537's description for the full audit.
 fn execution_tier_ordinal(access: ExternalAccess) -> u8 {
     match access {
         ExternalAccess::LocalOnly => 1,
         ExternalAccess::AnonymousRequired => 2,
-        ExternalAccess::AnonymousPreferred => 2,
+        ExternalAccess::AnonymousPreferred => 3,
         ExternalAccess::Unrestricted => 3,
     }
 }
@@ -3056,6 +3064,78 @@ mod tests {
             raw_abstraction
         };
         assert_eq!(abstraction_tier, 2);
+    }
+
+    // -------------------------------------------------------------------------
+    // execution_tier_ordinal (items.id=537: AnonymousPreferred -> 3, fail closed)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn execution_tier_ordinal_anonymous_preferred_matches_unrestricted() {
+        // AnonymousPreferred's provider reach equals Unrestricted's, so both
+        // must abstract at the same level -- AbstractionLevel::from_tier only
+        // distinguishes tier==2 (Level2) from tier>2 (Level3).
+        let anonymous_preferred = execution_tier_ordinal(ExternalAccess::AnonymousPreferred);
+        let unrestricted = execution_tier_ordinal(ExternalAccess::Unrestricted);
+        assert_eq!(anonymous_preferred, unrestricted);
+        assert_eq!(anonymous_preferred, 3);
+        assert_eq!(
+            crate::conductor::privacy::abstraction::AbstractionLevel::from_tier(
+                anonymous_preferred
+            ),
+            crate::conductor::privacy::abstraction::AbstractionLevel::from_tier(unrestricted),
+        );
+    }
+
+    #[test]
+    fn execution_tier_ordinal_pins_against_external_access_order() {
+        // Declaration order is ExternalAccess's derive(Ord) order (tokens.rs).
+        // execution_tier_ordinal must be non-decreasing across that order,
+        // and must NOT collapse AnonymousRequired into AnonymousPreferred/
+        // Unrestricted -- only AnonymousPreferred and Unrestricted may tie.
+        let ordered = [
+            ExternalAccess::LocalOnly,
+            ExternalAccess::AnonymousRequired,
+            ExternalAccess::AnonymousPreferred,
+            ExternalAccess::Unrestricted,
+        ];
+        let ordinals: Vec<u8> = ordered
+            .iter()
+            .copied()
+            .map(execution_tier_ordinal)
+            .collect();
+        assert_eq!(ordinals, vec![1, 2, 3, 3]);
+        for pair in ordinals.windows(2) {
+            assert!(
+                pair[0] <= pair[1],
+                "ordinal must be non-decreasing: {ordinals:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gate3_promotion_now_fires_anonymous_required_to_anonymous_preferred() {
+        // executor.rs's gate3 look-ahead: `next_tier > execution_tier`.
+        // Before items.id=537, AnonymousPreferred ordinal was 2, same as
+        // AnonymousRequired, so this transition did not cross-tier-promote.
+        let execution_tier = execution_tier_ordinal(ExternalAccess::AnonymousRequired);
+        let next_tier = execution_tier_ordinal(ExternalAccess::AnonymousPreferred);
+        assert!(
+            next_tier > execution_tier,
+            "AnonymousRequired -> AnonymousPreferred must now trigger gate3 promotion"
+        );
+    }
+
+    #[test]
+    fn gate3_promotion_no_longer_fires_anonymous_preferred_to_unrestricted() {
+        // Reach is equal for these two -- nothing widens, so no promotion.
+        // Before items.id=537 this pair DID cross-tier-promote (2 -> 3).
+        let execution_tier = execution_tier_ordinal(ExternalAccess::AnonymousPreferred);
+        let next_tier = execution_tier_ordinal(ExternalAccess::Unrestricted);
+        assert!(
+            !(next_tier > execution_tier),
+            "AnonymousPreferred -> Unrestricted must no longer trigger gate3 promotion"
+        );
     }
 
     // -------------------------------------------------------------------------
