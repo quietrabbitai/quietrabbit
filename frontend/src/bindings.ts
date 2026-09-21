@@ -73,7 +73,7 @@ export const commands = {
 	focus_profile: string,
 	context_flow: string,
 	library_visibility: string,
-	privacy_tier: number,
+	privacy_tier: PrivacyPreference,
 	max_permitted_tier: ExternalAccess,
 	updated_at: string,
 	/**
@@ -884,7 +884,7 @@ export type FocusInfo = {
 	focus_profile: string,
 	context_flow: string,
 	library_visibility: string,
-	privacy_tier: number,
+	privacy_tier: PrivacyPreference,
 	max_permitted_tier: ExternalAccess,
 	updated_at: string,
 	/**
@@ -1169,6 +1169,30 @@ export type PrivacyCommitmentBasis = "contractual" | "policy_only";
  */
 export type PrivacyGuardianDefaultLevel = "low" | "medium" | "high";
 
+/**
+ *  IPC-boundary enum for focus_settings.privacy_tier (items.id=533).
+ *  Deliberately distinct from ExternalAccess (max_permitted_tier) -- CLAUDE.md:
+ *  never conflate focus_settings.privacy_tier with max_permitted_tier. Lives
+ *  here, not conductor/tokens.rs (ExternalAccess's home), to stay colocated
+ *  with the IPC structs it exists for and reinforce that it is not part of
+ *  the Conductor's own tier model.
+ * 
+ *  IPC BOUNDARY ONLY: the DB column, focus_settings_store.rs, persona_store.rs,
+ *  and lifecycle.rs's focus_privacy_tier.min(execution_tier) arithmetic all
+ *  stay a plain i32 -- out of scope for this item. Conversion happens only in
+ *  this file and consent.rs, at the point a FocusSettings (store, i32) value
+ *  crosses into or out of an IPC struct.
+ * 
+ *  Explicit discriminants double as the numeric mapping (Red=1/Yellow=2/
+ *  Green=3, matching focus_settings_store.rs's header comment and
+ *  decisions.id=649) -- derive(Ord) on a fieldless enum orders by
+ *  discriminant value, so Red < Yellow < Green requires the discriminants
+ *  to stay in ascending declaration order (verified against rustc 1.97.1).
+ *  This exactly matches the existing "numeric increase loosens privacy"
+ *  direction this module's TIER DIRECTION NOTE (above) already documents.
+ */
+export type PrivacyPreference = "red" | "yellow" | "green";
+
 export type ProviderHealth = {
 	provider: string,
 	status: ProviderStatus,
@@ -1400,7 +1424,7 @@ export type UpdateFocusSettingsRequest = {
 	focus_id: string,
 	context_flow: string | null,
 	library_visibility: string | null,
-	privacy_tier: number | null,
+	privacy_tier: PrivacyPreference | null,
 	max_permitted_tier: ExternalAccess | null,
 	focus_profile: string | null,
 };

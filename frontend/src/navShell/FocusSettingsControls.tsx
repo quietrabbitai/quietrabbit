@@ -6,21 +6,17 @@
 // field). One component, not two, so the friction-gate-confirm logic below
 // only has to be written once.
 //
-// FrictionGateDetail is hand-declared here, not generated: update_focus_
-// settings returns Result<FocusInfo, String>, and the gate trip is a
-// JSON-serialized FrictionGateDetail *inside* that Err(String) -- not a
-// distinct typed error -- so tauri-specta's collect_commands! never sees it
-// even though the Rust struct derives specta::Type. Same convention
-// PrivacyGuardianModal.tsx uses for ConsentRequestPayload (see that file's
-// header comment). Keep in sync by hand with commands/persona.rs's
-// FrictionGateDetail.
+// items.id=533: FrictionGateDetail and its parser moved to
+// ./frictionGateDetail.ts (a non-JSX module, importable by a plain Node
+// test) -- see that file's own header for why it's hand-declared rather
+// than generated, and for the sync-with-persona.rs convention.
 //
 // items.id=448: max_permitted_tier fields (here and throughout this file)
 // retyped from a 1/2/3 ordinal to the 4-value ExternalAccess enum
 // (local_only/anonymous_required/anonymous_preferred/unrestricted),
-// matching commands/persona.rs's live retype. privacy_tier fields are
-// untouched (still i32/number) -- items.id=446's separate, still-deferred
-// territory, confirmed against live source this session.
+// matching commands/persona.rs's live retype.
+// items.id=533: privacy_tier fields retyped the same way, to the 3-value
+// PrivacyPreference enum (red/yellow/green).
 
 import { useCallback, useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -28,44 +24,28 @@ import {
   commands,
   type ExternalAccess,
   type FocusInfo,
+  type PrivacyPreference,
   type UpdateFocusSettingsRequest,
 } from '../bindings'
+import { parseFrictionGateDetail, type FrictionGateDetail } from './frictionGateDetail.ts'
 
-export interface FrictionGateDetail {
-  persona_id: string
-  focus_id: string
-  requested_privacy_tier: number | null
-  requested_focus_profile: string | null
-  requested_max_permitted_tier: ExternalAccess | null
-  existing_privacy_tier: number
-  existing_focus_profile: string
-  existing_max_permitted_tier: ExternalAccess
-  privacy_would_loosen: boolean
-  moves_to_protected: boolean
-  max_permitted_tier_would_loosen: boolean
-}
+const PRIVACY_TIER_VALUES: PrivacyPreference[] = ['red', 'yellow', 'green']
 
-function parseFrictionGateDetail(errorText: string): FrictionGateDetail | null {
-  try {
-    const parsed: unknown = JSON.parse(errorText)
-    if (
-      parsed !== null &&
-      typeof parsed === 'object' &&
-      'persona_id' in parsed &&
-      'privacy_would_loosen' in parsed &&
-      'max_permitted_tier_would_loosen' in parsed
-    ) {
-      return parsed as FrictionGateDetail
-    }
-  } catch {
-    // Not JSON -- a plain error string (not_found, tier bounds check, ...).
+// items.id=533: labels re-keyed from the old navShell.focusSettings.tier${n}Label
+// dynamic-key form to one key per variant (tierRedLabel/tierYellowLabel/
+// tierGreenLabel) -- English text carried over unchanged, including the
+// retired "Tier 1.5/2" wording in tierYellowLabel; that copy fix is a
+// separate, deliberately untouched decision (see en.json).
+function privacyTierLabelKey(value: PrivacyPreference): string {
+  switch (value) {
+    case 'red':
+      return 'navShell.focusSettings.tierRedLabel'
+    case 'yellow':
+      return 'navShell.focusSettings.tierYellowLabel'
+    case 'green':
+      return 'navShell.focusSettings.tierGreenLabel'
   }
-  return null
 }
-
-// privacy_tier is untouched by items.id=448 -- still a plain 1/2/3 ordinal,
-// feeding only the privacy-tier select below.
-const PRIVACY_TIER_VALUES = [1, 2, 3] as const
 
 // items.id=448: max_permitted_tier's 4 ExternalAccess values, replacing the
 // old shared TIER_VALUES=[1,2,3] this select used to reuse from the
@@ -131,7 +111,10 @@ export function FocusSettingsControls({
 }: FocusSettingsControlsProps) {
   const { t } = useTranslation()
   const [settings, setSettings] = useState<FocusInfo | null>(null)
-  const [draftPrivacyTier, setDraftPrivacyTier] = useState(2)
+  // items.id=533: default 'yellow' -- the practical equivalent of the old
+  // numeric default (2). Overwritten immediately once real settings load
+  // (see the effect below), same as the old numeric default was.
+  const [draftPrivacyTier, setDraftPrivacyTier] = useState<PrivacyPreference>('yellow')
   // items.id=448: default 'anonymous_required' -- the practical equivalent
   // of the old numeric default (2), via ExternalAccess::from_legacy_tier's
   // own 2->AnonymousRequired mapping. Overwritten immediately once real
@@ -249,11 +232,11 @@ export function FocusSettingsControls({
           <select
             id={privacyTierId}
             value={draftPrivacyTier}
-            onChange={(event) => setDraftPrivacyTier(Number(event.target.value))}
+            onChange={(event) => setDraftPrivacyTier(event.target.value as PrivacyPreference)}
           >
             {PRIVACY_TIER_VALUES.map((tier) => (
               <option key={tier} value={tier}>
-                {t(`navShell.focusSettings.tier${tier}Label`)}
+                {t(privacyTierLabelKey(tier))}
               </option>
             ))}
           </select>
@@ -292,8 +275,12 @@ export function FocusSettingsControls({
             {pendingGate.privacy_would_loosen && (
               <li>
                 {t('navShell.focusSettings.gateConfirmPrivacyTier', {
-                  from: pendingGate.existing_privacy_tier,
-                  to: pendingGate.requested_privacy_tier,
+                  from: t(privacyTierLabelKey(pendingGate.existing_privacy_tier)),
+                  to: t(
+                    privacyTierLabelKey(
+                      pendingGate.requested_privacy_tier ?? pendingGate.existing_privacy_tier,
+                    ),
+                  ),
                 })}
               </li>
             )}

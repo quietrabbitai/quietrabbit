@@ -77,6 +77,7 @@ use sqlx::Row;
 use tauri::State;
 
 use crate::auth::registry::{key_hex, KeyRegistry};
+use crate::commands::persona::PrivacyPreference;
 use crate::conductor::extract;
 use crate::conductor::privacy::types::{ExtractConfirmDecision, Gate3ReviewResult};
 use crate::conductor::privacy::PrivacyGateway;
@@ -355,7 +356,7 @@ pub async fn submit_friction_gate_decision(
 
     let privacy_would_loosen = orig
         .privacy_tier
-        .map(|t| t > existing.privacy_tier)
+        .map(|t| t.as_i32() > existing.privacy_tier)
         .unwrap_or(false);
     let moves_to_protected = orig
         .focus_profile
@@ -373,7 +374,7 @@ pub async fn submit_friction_gate_decision(
         &orig.focus_id,
         &request.decision,
         if privacy_would_loosen {
-            orig.privacy_tier
+            orig.privacy_tier.map(PrivacyPreference::as_i32)
         } else {
             None
         },
@@ -399,15 +400,11 @@ pub async fn submit_friction_gate_decision(
     }
 
     // decision == "proceed": apply the originally-requested change.
-    // privacy_tier is bounds-checked here (1-3); max_permitted_tier needs no
-    // such check -- items.id=448 retyped it to ExternalAccess, so an invalid
-    // value is unrepresentable (same reasoning already applied to
-    // FailureHandler::new(), conductor/failure.rs).
-    if let Some(v) = orig.privacy_tier {
-        if !(1..=3).contains(&v) {
-            return Err(format!("privacy_tier must be between 1 and 3, got {v}"));
-        }
-    }
+    // No manual bounds check needed for either tier field -- items.id=448
+    // retyped max_permitted_tier to ExternalAccess and items.id=533 retyped
+    // privacy_tier to PrivacyPreference, so an out-of-range value is
+    // unrepresentable by construction for both (same reasoning already
+    // applied to FailureHandler::new(), conductor/failure.rs).
 
     let s = focus_settings_store::update_focus_settings(
         &pool,
@@ -415,7 +412,7 @@ pub async fn submit_friction_gate_decision(
         &orig.focus_id,
         orig.context_flow.as_deref(),
         orig.library_visibility.as_deref(),
-        orig.privacy_tier,
+        orig.privacy_tier.map(PrivacyPreference::as_i32),
         orig.max_permitted_tier,
         orig.focus_profile.as_deref(),
         None, // voice_override: not exposed in IPC surface v1
@@ -428,7 +425,7 @@ pub async fn submit_friction_gate_decision(
         focus_profile: s.focus_profile,
         context_flow: s.context_flow,
         library_visibility: s.library_visibility,
-        privacy_tier: s.privacy_tier,
+        privacy_tier: PrivacyPreference::try_from(s.privacy_tier)?,
         max_permitted_tier: s.max_permitted_tier,
         updated_at: s.updated_at,
         // last_used: not exposed here -- SubmitFrictionGateDecisionRequest

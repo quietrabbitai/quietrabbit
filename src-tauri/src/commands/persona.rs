@@ -71,6 +71,59 @@ use crate::persistence::output_store;
 use crate::persistence::persona_store;
 
 // ---------------------------------------------------------------------------
+// PrivacyPreference (items.id=533)
+// ---------------------------------------------------------------------------
+
+/// IPC-boundary enum for focus_settings.privacy_tier (items.id=533).
+/// Deliberately distinct from ExternalAccess (max_permitted_tier) -- CLAUDE.md:
+/// never conflate focus_settings.privacy_tier with max_permitted_tier. Lives
+/// here, not conductor/tokens.rs (ExternalAccess's home), to stay colocated
+/// with the IPC structs it exists for and reinforce that it is not part of
+/// the Conductor's own tier model.
+///
+/// IPC BOUNDARY ONLY: the DB column, focus_settings_store.rs, persona_store.rs,
+/// and lifecycle.rs's focus_privacy_tier.min(execution_tier) arithmetic all
+/// stay a plain i32 -- out of scope for this item. Conversion happens only in
+/// this file and consent.rs, at the point a FocusSettings (store, i32) value
+/// crosses into or out of an IPC struct.
+///
+/// Explicit discriminants double as the numeric mapping (Red=1/Yellow=2/
+/// Green=3, matching focus_settings_store.rs's header comment and
+/// decisions.id=649) -- derive(Ord) on a fieldless enum orders by
+/// discriminant value, so Red < Yellow < Green requires the discriminants
+/// to stay in ascending declaration order (verified against rustc 1.97.1).
+/// This exactly matches the existing "numeric increase loosens privacy"
+/// direction this module's TIER DIRECTION NOTE (above) already documents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivacyPreference {
+    Red = 1,
+    Yellow = 2,
+    Green = 3,
+}
+
+impl PrivacyPreference {
+    pub fn as_i32(self) -> i32 {
+        self as i32
+    }
+}
+
+impl TryFrom<i32> for PrivacyPreference {
+    type Error = String;
+
+    fn try_from(v: i32) -> Result<Self, Self::Error> {
+        match v {
+            1 => Ok(Self::Red),
+            2 => Ok(Self::Yellow),
+            3 => Ok(Self::Green),
+            other => Err(format!(
+                "invalid privacy_tier {other}: must be 1 (red), 2 (yellow), or 3 (green)"
+            )),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Response structs
 // ---------------------------------------------------------------------------
 
@@ -109,7 +162,7 @@ pub struct FocusInfo {
     pub focus_profile: String,
     pub context_flow: String,
     pub library_visibility: String,
-    pub privacy_tier: i32,
+    pub privacy_tier: PrivacyPreference,
     pub max_permitted_tier: ExternalAccess,
     pub updated_at: String,
     /// Most recent focus_runs.started_at for this Focus (outputs.db), or
@@ -124,7 +177,7 @@ pub struct UpdateFocusSettingsRequest {
     pub focus_id: String,
     pub context_flow: Option<String>,
     pub library_visibility: Option<String>,
-    pub privacy_tier: Option<i32>,
+    pub privacy_tier: Option<PrivacyPreference>,
     pub max_permitted_tier: Option<ExternalAccess>,
     pub focus_profile: Option<String>,
 }
@@ -138,14 +191,14 @@ pub struct UpdateFocusSettingsRequest {
 /// actually tripped the gate. Both are echoed even though only one may be
 /// gate-relevant, so the frontend can show the complete requested state
 /// without a second get_focus_settings round trip.
-#[derive(Debug, Serialize, Deserialize, Type)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct FrictionGateDetail {
     pub persona_id: String,
     pub focus_id: String,
-    pub requested_privacy_tier: Option<i32>,
+    pub requested_privacy_tier: Option<PrivacyPreference>,
     pub requested_focus_profile: Option<String>,
     pub requested_max_permitted_tier: Option<ExternalAccess>,
-    pub existing_privacy_tier: i32,
+    pub existing_privacy_tier: PrivacyPreference,
     pub existing_focus_profile: String,
     pub existing_max_permitted_tier: ExternalAccess,
     /// True when privacy_tier would numerically increase (loosen -- see
@@ -247,22 +300,27 @@ pub async fn list_focuses(
 
     let last_used_map = output_store::get_last_used_map(&user_id, &persona_id, &key_hex_str).await;
 
-    Ok(settings
+    // Collected into a Result, not a bare Vec via .map() -- privacy_tier's
+    // i32 -> PrivacyPreference conversion (items.id=533) is fallible (a
+    // corrupt DB value is a real, if unlikely, failure mode), so a single
+    // bad row must fail the whole call rather than being silently dropped
+    // or defaulted.
+    settings
         .into_iter()
         .map(|s| {
             let last_used = last_used_map.get(&s.focus_id).cloned();
-            FocusInfo {
+            Ok(FocusInfo {
                 focus_id: s.focus_id,
                 focus_profile: s.focus_profile,
                 context_flow: s.context_flow,
                 library_visibility: s.library_visibility,
-                privacy_tier: s.privacy_tier,
+                privacy_tier: PrivacyPreference::try_from(s.privacy_tier)?,
                 max_permitted_tier: s.max_permitted_tier,
                 updated_at: s.updated_at,
                 last_used,
-            }
+            })
         })
-        .collect())
+        .collect()
 }
 
 /// get_focus_settings takes both persona_id and focus_id — the store key is
@@ -294,7 +352,7 @@ pub async fn get_focus_settings(
         focus_profile: s.focus_profile,
         context_flow: s.context_flow,
         library_visibility: s.library_visibility,
-        privacy_tier: s.privacy_tier,
+        privacy_tier: PrivacyPreference::try_from(s.privacy_tier)?,
         max_permitted_tier: s.max_permitted_tier,
         updated_at: s.updated_at,
         last_used,
@@ -328,19 +386,19 @@ pub async fn update_focus_settings(
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
-    // Tier bounds check: privacy_tier is valid 1-3. max_permitted_tier needs
-    // no such check -- items.id=448 retyped it to ExternalAccess, so an
-    // invalid value is unrepresentable (same reasoning already applied to
-    // FailureHandler::new(), conductor/failure.rs).
-    if let Some(v) = request.privacy_tier {
-        if !(1..=3).contains(&v) {
-            return Err(format!("privacy_tier must be between 1 and 3, got {v}"));
-        }
-    }
+    // No manual bounds check needed for either tier field -- items.id=448
+    // retyped max_permitted_tier to ExternalAccess and items.id=533 retyped
+    // privacy_tier to PrivacyPreference, so an out-of-range value is
+    // unrepresentable by construction for both (same reasoning already
+    // applied to FailureHandler::new(), conductor/failure.rs).
 
-    // Friction gate check (items.id=92). privacy_tier is 1=red (most
-    // restrictive) .. 3=green (least restrictive) -- see module header's
-    // TIER DIRECTION NOTE. A numeric increase LOOSENS privacy.
+    // Friction gate check (items.id=92). privacy_tier is red (most
+    // restrictive) .. green (least restrictive) -- see module header's
+    // TIER DIRECTION NOTE. A PrivacyPreference increase LOOSENS privacy;
+    // existing.privacy_tier is the store's own i32 (out of scope for
+    // items.id=533), so the comparison converts request.privacy_tier to i32
+    // rather than converting existing.privacy_tier to PrivacyPreference --
+    // cheaper and this comparison never needs to construct the enum value.
     let existing =
         focus_settings_store::get_focus_settings(&pool, &request.persona_id, &request.focus_id)
             .await
@@ -349,7 +407,7 @@ pub async fn update_focus_settings(
 
     let privacy_would_loosen = request
         .privacy_tier
-        .map(|t| t > existing.privacy_tier)
+        .map(|t| t.as_i32() > existing.privacy_tier)
         .unwrap_or(false);
     let moves_to_protected = request
         .focus_profile
@@ -380,7 +438,7 @@ pub async fn update_focus_settings(
             } else {
                 None
             },
-            existing_privacy_tier: existing.privacy_tier,
+            existing_privacy_tier: PrivacyPreference::try_from(existing.privacy_tier)?,
             existing_focus_profile: existing.focus_profile.clone(),
             existing_max_permitted_tier: existing.max_permitted_tier,
             privacy_would_loosen,
@@ -398,7 +456,7 @@ pub async fn update_focus_settings(
         &request.focus_id,
         request.context_flow.as_deref(),
         request.library_visibility.as_deref(),
-        request.privacy_tier,
+        request.privacy_tier.map(PrivacyPreference::as_i32),
         request.max_permitted_tier,
         request.focus_profile.as_deref(),
         None, // voice_override: not exposed in IPC surface v1
@@ -419,7 +477,7 @@ pub async fn update_focus_settings(
         focus_profile: s.focus_profile,
         context_flow: s.context_flow,
         library_visibility: s.library_visibility,
-        privacy_tier: s.privacy_tier,
+        privacy_tier: PrivacyPreference::try_from(s.privacy_tier)?,
         max_permitted_tier: s.max_permitted_tier,
         updated_at: s.updated_at,
         last_used,
@@ -865,5 +923,163 @@ mod tests {
             !detail.privacy_would_loosen && !detail.moves_to_protected,
             "only max_permitted_tier changed -- the other two flags must stay false"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // PrivacyPreference (items.id=533)
+    // -----------------------------------------------------------------------
+
+    /// UpdateFocusSettingsRequest derives Deserialize only (frontend -> backend,
+    /// never serialized in production code), so this is not a bidirectional
+    /// round trip -- it locks the wire shape the frontend is expected to send
+    /// and asserts it deserializes into the right PrivacyPreference variant.
+    /// This is what actually catches a frontend/backend spelling mismatch
+    /// (e.g. frictionGateDetail.ts or FocusSettingsControls.tsx ever sending
+    /// "Green" or "privacy-green" instead of "green").
+    #[test]
+    fn update_focus_settings_request_json_shape() {
+        let json = r#"{
+            "persona_id": "p1",
+            "focus_id": "f1",
+            "context_flow": null,
+            "library_visibility": null,
+            "privacy_tier": "green",
+            "max_permitted_tier": null,
+            "focus_profile": null
+        }"#;
+        let req: UpdateFocusSettingsRequest =
+            serde_json::from_str(json).expect("valid privacy_tier spelling must deserialize");
+        assert_eq!(req.privacy_tier, Some(PrivacyPreference::Green));
+
+        let json_null = r#"{
+            "persona_id": "p1",
+            "focus_id": "f1",
+            "context_flow": null,
+            "library_visibility": null,
+            "privacy_tier": null,
+            "max_permitted_tier": null,
+            "focus_profile": null
+        }"#;
+        let req_null: UpdateFocusSettingsRequest =
+            serde_json::from_str(json_null).expect("null privacy_tier must deserialize to None");
+        assert_eq!(req_null.privacy_tier, None);
+    }
+
+    /// Negative case: a wire value that isn't one of PrivacyPreference's three
+    /// snake_case spellings must fail deserialization, not silently coerce or
+    /// panic -- this is the exact "wire drift fails visibly" requirement
+    /// items.id=533 exists to satisfy. Covers both an unknown-spelling string
+    /// and a bare number (the OLD wire shape, pre-items.id=533).
+    #[test]
+    fn update_focus_settings_request_rejects_invalid_privacy_tier() {
+        let bad_spelling = r#"{
+            "persona_id": "p1",
+            "focus_id": "f1",
+            "context_flow": null,
+            "library_visibility": null,
+            "privacy_tier": "Green",
+            "max_permitted_tier": null,
+            "focus_profile": null
+        }"#;
+        assert!(
+            serde_json::from_str::<UpdateFocusSettingsRequest>(bad_spelling).is_err(),
+            "PascalCase spelling must not silently deserialize"
+        );
+
+        let old_numeric = r#"{
+            "persona_id": "p1",
+            "focus_id": "f1",
+            "context_flow": null,
+            "library_visibility": null,
+            "privacy_tier": 3,
+            "max_permitted_tier": null,
+            "focus_profile": null
+        }"#;
+        assert!(
+            serde_json::from_str::<UpdateFocusSettingsRequest>(old_numeric).is_err(),
+            "the old pre-items.id=533 bare-number wire shape must be rejected, not silently \
+             accepted -- a frontend that hasn't migrated must fail loudly"
+        );
+    }
+
+    /// FrictionGateDetail derives both Serialize and Deserialize (serialized
+    /// on the way out as update_focus_settings' Err(String) payload,
+    /// deserialized back in update_focus_settings_max_permitted_tier_loosen_
+    /// trips_gate above). This test locks the exact JSON text
+    /// frictionGateDetail.ts depends on for its two PrivacyPreference fields,
+    /// then confirms the round trip is lossless.
+    #[test]
+    fn friction_gate_detail_json_round_trip() {
+        let detail = FrictionGateDetail {
+            persona_id: "p1".to_owned(),
+            focus_id: "f1".to_owned(),
+            requested_privacy_tier: Some(PrivacyPreference::Green),
+            requested_focus_profile: None,
+            requested_max_permitted_tier: None,
+            existing_privacy_tier: PrivacyPreference::Yellow,
+            existing_focus_profile: "open".to_owned(),
+            existing_max_permitted_tier: ExternalAccess::AnonymousRequired,
+            privacy_would_loosen: true,
+            moves_to_protected: false,
+            max_permitted_tier_would_loosen: false,
+        };
+
+        let json = serde_json::to_string(&detail).expect("FrictionGateDetail must serialize");
+        assert!(
+            json.contains(r#""requested_privacy_tier":"green""#),
+            "wire text must spell the variant \"green\", got: {json}"
+        );
+        assert!(
+            json.contains(r#""existing_privacy_tier":"yellow""#),
+            "wire text must spell the variant \"yellow\", got: {json}"
+        );
+
+        let round_tripped: FrictionGateDetail =
+            serde_json::from_str(&json).expect("serialized FrictionGateDetail must deserialize");
+        assert_eq!(round_tripped, detail);
+    }
+
+    /// Exhaustive 3x3 matrix, not just the three monotonic Ord assertions
+    /// ExternalAccess's own test uses (conductor/tokens.rs) -- this module's
+    /// own header already documents one prior tier-direction naming bug
+    /// (variable names once said the opposite of what the numeric comparison
+    /// actually did); this test locks the actual comparison the friction
+    /// gate runs (`requested > existing`) for every pair, not just Ord in
+    /// the abstract.
+    #[test]
+    fn privacy_preference_ordering_matrix() {
+        use PrivacyPreference::{Green, Red, Yellow};
+
+        let variants = [Red, Yellow, Green];
+        let expected_loosens = [
+            // (existing, requested) -> requested > existing
+            (Red, Red, false),
+            (Red, Yellow, true),
+            (Red, Green, true),
+            (Yellow, Red, false),
+            (Yellow, Yellow, false),
+            (Yellow, Green, true),
+            (Green, Red, false),
+            (Green, Yellow, false),
+            (Green, Green, false),
+        ];
+        assert_eq!(expected_loosens.len(), variants.len() * variants.len());
+
+        for (existing, requested, expect_loosen) in expected_loosens {
+            assert_eq!(
+                requested > existing,
+                expect_loosen,
+                "requested={requested:?} existing={existing:?}: expected loosen={expect_loosen}"
+            );
+            // Ordinal cross-check: PrivacyPreference's Ord must agree with
+            // its own as_i32() mapping, the invariant the whole enum exists
+            // to preserve alongside the DB's numeric storage.
+            assert_eq!(
+                requested.as_i32() > existing.as_i32(),
+                expect_loosen,
+                "as_i32() comparison disagreed with derived Ord for \
+                 requested={requested:?} existing={existing:?}"
+            );
+        }
     }
 }

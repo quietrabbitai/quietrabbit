@@ -8,7 +8,7 @@
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview",
-    "test": "node --experimental-strip-types src/cloudChatAccess/consentDecisions.test.ts && node --experimental-strip-types src/cloudChatAccess/reviewSections.test.ts"
+    "test": "node --experimental-strip-types src/cloudChatAccess/consentDecisions.test.ts && node --experimental-strip-types src/cloudChatAccess/reviewSections.test.ts && node --experimental-strip-types src/navShell/frictionGateDetail.test.ts"
   },
   "dependencies": {
     "@lobehub/icons": "1.58.0",
