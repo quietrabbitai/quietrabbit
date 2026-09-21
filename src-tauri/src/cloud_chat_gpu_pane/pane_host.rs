@@ -511,6 +511,19 @@ struct PopupState {
     /// plan, Judgment call 6.5: no page-initiated popup resize support).
     rect: PaneRectFraction,
     last_applied_size: Option<(u32, u32)>,
+    /// DIAG items.id=539: when this popup was requested. Used only to log a
+    /// one-shot warning if it sits in `PopupLifecycleState::Creating` far
+    /// longer than a real popup ever should -- evidence for the still-
+    /// unconfirmed stuck-grab hypothesis from
+    /// ITEMS257_INPUT_FREEZE_INVESTIGATION_20260822.md (a popup that never
+    /// resolves and is never force-closed would leave any grab CEF took on
+    /// its behalf held forever, with none of the three existing
+    /// `force_close_popup` call sites ever firing to release it).
+    created_at: std::time::Instant,
+    /// DIAG items.id=539: set once the stuck-in-`Creating` warning below has
+    /// fired, so it logs a single time per popup instead of spamming every
+    /// render tick.
+    stuck_warned: bool,
 }
 
 /// One notification `drain_popup_requests`/`drain_popup_events`/
@@ -763,7 +776,7 @@ impl PaneManager {
         // its browser goes away -- must run before shift_remove below,
         // since force_close_popup's own defensive parent-grab-release
         // still needs to find this pane in self.panes.
-        self.force_close_popup(key);
+        self.force_close_popup(key, "parent pane closing");
 
         let Some(pane) = self.panes.shift_remove(key) else {
             return;
@@ -1044,7 +1057,7 @@ impl PaneManager {
     /// 6.6) -- unconditional, not gated on first confirming the
     /// `ITEMS257_INPUT_FREEZE_INVESTIGATION_20260822.md` stuck-grab
     /// hypothesis; cheap and idempotent if nothing was actually grabbed.
-    fn force_close_popup(&mut self, key: &PaneKey) {
+    fn force_close_popup(&mut self, key: &PaneKey, reason: &'static str) {
         let Some(popup) = self.popups.remove(key) else {
             return;
         };
@@ -1065,6 +1078,15 @@ impl PaneManager {
             host.send_capture_lost_event();
         }
         if let Some(seat) = gtk::gdk::Display::default().and_then(|d| d.default_seat()) {
+            // DIAG items.id=539: makes the defensive ungrab this fn already
+            // performs (Judgment call 6.6, added speculatively and never
+            // confirmed against a real repro) visible in the log, alongside
+            // which of the three call sites triggered it -- see
+            // ITEMS257_INPUT_FREEZE_INVESTIGATION_20260822.md's still-open
+            // stuck-grab hypothesis.
+            log::info!(
+                "cloud_chat_gpu_pane::pane_host: DIAG items.id=539: releasing seat grab for popup pane={key} (force_close_popup reason: {reason})"
+            );
             seat.ungrab();
         }
     }
@@ -1088,9 +1110,16 @@ impl PaneManager {
 
         let mut notifications = Vec::new();
         for req in requests {
+            // DIAG items.id=539: confirms whether a given interaction (e.g.
+            // a Cloudflare/Turnstile challenge) actually reaches
+            // `on_before_popup` at all -- see this fn's own doc.
+            log::info!(
+                "cloud_chat_gpu_pane::pane_host: DIAG items.id=539: popup requested for pane={}",
+                req.parent_key
+            );
             // One popup per pane (Judgment call 6.1): a second request for
             // an already-open popup replaces the first.
-            self.force_close_popup(&req.parent_key);
+            self.force_close_popup(&req.parent_key, "replaced by new popup request");
 
             let parent_pixel_rect = layout
                 .get(&req.parent_key)
@@ -1105,6 +1134,8 @@ impl PaneManager {
                     size: req.size,
                     rect,
                     last_applied_size: None,
+                    created_at: std::time::Instant::now(),
+                    stuck_warned: false,
                 },
             );
             notifications.push(PopupNotification::Opened {
@@ -1125,6 +1156,21 @@ impl PaneManager {
     fn drain_popup_events(&mut self) -> Vec<PopupNotification> {
         let mut closed_keys = Vec::new();
         for (key, popup) in self.popups.iter_mut() {
+            // DIAG items.id=539: one-shot warning if a popup never resolves
+            // out of `Creating` -- see `PopupState::stuck_warned`'s own doc.
+            // A popup stuck here forever is never covered by any of
+            // `force_close_popup`'s three call sites, so whatever grab CEF
+            // may have taken opening it would never be released either.
+            if !popup.stuck_warned
+                && matches!(popup.lifecycle, PopupLifecycleState::Creating)
+                && popup.created_at.elapsed() > std::time::Duration::from_secs(2)
+            {
+                popup.stuck_warned = true;
+                log::warn!(
+                    "cloud_chat_gpu_pane::pane_host: DIAG items.id=539: popup for pane={key} still Creating after {:.1}s -- never force-closed, any CEF-side grab it took would still be held",
+                    popup.created_at.elapsed().as_secs_f32()
+                );
+            }
             let Ok(event) = popup.events_rx.try_recv() else {
                 continue;
             };
@@ -1166,7 +1212,7 @@ impl PaneManager {
         let mut notifications = Vec::new();
         for key in keys {
             if self.popups.contains_key(&key) {
-                self.force_close_popup(&key);
+                self.force_close_popup(&key, "parent navigated away");
                 notifications.push(PopupNotification::Closed { key });
             }
         }
