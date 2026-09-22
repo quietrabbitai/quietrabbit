@@ -843,7 +843,23 @@ export function CloudChatAccessPane({
   // themselves are untouched (out of scope here; a separate cleanup if
   // nothing else ever calls them).
 
+  // items.id=540: Cancel used to only reset local state, leaving the
+  // message stuck at gate3_review_status='pending-review' server-side
+  // forever -- any retry (handleSecondOpinion's default arm, or resending)
+  // then hard-erred because requestCloudFrontierGate3Review only accepts
+  // 'drafted'. Reverts the message via cancelCloudFrontierGate3Review
+  // first, same fire-and-forget-on-cleanup shape as handleModalResolve:
+  // the modal closes and local state clears regardless of the call's
+  // outcome (a failed revert just leaves the message stuck, the same
+  // failure mode as before this fix, not a new one).
   const handleModalCancel = () => {
+    if (personaId && pendingMessageId) {
+      void commands.cancelCloudFrontierGate3Review({
+        user_id: requireCurrentUserId(),
+        persona_id: personaId,
+        message_id: pendingMessageId,
+      })
+    }
     setConsentPayload(null)
     setPendingMessageId(null)
     setReviewOutcome(null)

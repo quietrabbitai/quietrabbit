@@ -183,6 +183,32 @@ export const commands = {
 	 */
 	resolveCloudFrontierGate3Review: (request: ResolveCloudFrontierGate3ReviewRequest) => typedError<null, string>(__TAURI_INVOKE("resolve_cloud_frontier_gate3_review", { request })),
 	/**
+	 *  items.id=540: reverts a message stuck at gate3_review_status='pending-review'
+	 *  back to 'drafted' after the user cancels the Privacy Guardian consent
+	 *  modal without deciding. Before this command existed,
+	 *  CloudChatAccessPane.tsx's handleModalCancel only reset local React state
+	 *  -- the message row never left 'pending-review', so any retry (the "second
+	 *  opinion" button, or resending) called request_cloud_frontier_gate3_review
+	 *  again, which hard-rejects anything not 'drafted', permanently bricking
+	 *  that message for the rest of the session.
+	 * 
+	 *  Deliberately a separate command from resolve_cloud_frontier_gate3_review
+	 *  rather than a third accepted `status` value there: that command's own doc
+	 *  comment states 'drafted'/'pending-review' are gate3's own transitions, not
+	 *  valid `resolve` input, and 'withheld' is reserved for an actual, audited
+	 *  user decision to keep content private -- a Cancel never reached that
+	 *  decision (no review completed, nothing was disclosed or declined), so
+	 *  recording it as 'withheld' would misrepresent the audit trail and would
+	 *  also be terminal, permanently blocking retry on that message.
+	 * 
+	 *  Guarded the same way request_cloud_frontier_gate3_review guards its own
+	 *  'drafted' precondition: only a message currently at 'pending-review' may
+	 *  be reverted. update_gate3_review_status itself only validates the new
+	 *  value against the CHECK constraint, not the FROM state, so this guard
+	 *  belongs here.
+	 */
+	cancelCloudFrontierGate3Review: (request: CancelCloudFrontierGate3ReviewRequest) => typedError<null, string>(__TAURI_INVOKE("cancel_cloud_frontier_gate3_review", { request })),
+	/**
 	 *  items.id=406 (decisions.id=755) -- the provider-selection re-check
 	 *  trigger. Fires when the user activates a rail provider not covered by
 	 *  the message's original copy-time review (CloudChatAccessPane.tsx, provider
@@ -784,6 +810,19 @@ export type ActiveBoardResponse = {
 	 *  high-priority container and the full list.
 	 */
 	high_priority: TopicInfo[],
+};
+
+/**
+ *  items.id=540: the user's Cancel on the Privacy Guardian consent modal --
+ *  no `status` field, since the only valid destination is "drafted". See
+ *  cancel_cloud_frontier_gate3_review's own doc comment for why this is a
+ *  separate command from resolve_cloud_frontier_gate3_review rather than a
+ *  third accepted status value there.
+ */
+export type CancelCloudFrontierGate3ReviewRequest = {
+	user_id: string,
+	persona_id: string,
+	message_id: string,
 };
 
 export type CapabilityProfileResponse = {

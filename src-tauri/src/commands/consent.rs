@@ -192,6 +192,18 @@ pub struct ResolveCloudFrontierGate3ReviewRequest {
     pub status: String,
 }
 
+/// items.id=540: the user's Cancel on the Privacy Guardian consent modal --
+/// no `status` field, since the only valid destination is "drafted". See
+/// cancel_cloud_frontier_gate3_review's own doc comment for why this is a
+/// separate command from resolve_cloud_frontier_gate3_review rather than a
+/// third accepted status value there.
+#[derive(Debug, Deserialize, Type)]
+pub struct CancelCloudFrontierGate3ReviewRequest {
+    pub user_id: String,
+    pub persona_id: String,
+    pub message_id: String,
+}
+
 /// items.id=92 -- the user's proceed/cancel answer to a FrictionGateDetail
 /// the frontend received from a blocked update_focus_settings call.
 ///
@@ -1245,6 +1257,68 @@ pub async fn resolve_cloud_frontier_gate3_review(
     .map_err(|e| e.to_string())
 }
 
+/// items.id=540: reverts a message stuck at gate3_review_status='pending-review'
+/// back to 'drafted' after the user cancels the Privacy Guardian consent
+/// modal without deciding. Before this command existed,
+/// CloudChatAccessPane.tsx's handleModalCancel only reset local React state
+/// -- the message row never left 'pending-review', so any retry (the "second
+/// opinion" button, or resending) called request_cloud_frontier_gate3_review
+/// again, which hard-rejects anything not 'drafted', permanently bricking
+/// that message for the rest of the session.
+///
+/// Deliberately a separate command from resolve_cloud_frontier_gate3_review
+/// rather than a third accepted `status` value there: that command's own doc
+/// comment states 'drafted'/'pending-review' are gate3's own transitions, not
+/// valid `resolve` input, and 'withheld' is reserved for an actual, audited
+/// user decision to keep content private -- a Cancel never reached that
+/// decision (no review completed, nothing was disclosed or declined), so
+/// recording it as 'withheld' would misrepresent the audit trail and would
+/// also be terminal, permanently blocking retry on that message.
+///
+/// Guarded the same way request_cloud_frontier_gate3_review guards its own
+/// 'drafted' precondition: only a message currently at 'pending-review' may
+/// be reverted. update_gate3_review_status itself only validates the new
+/// value against the CHECK constraint, not the FROM state, so this guard
+/// belongs here.
+#[tauri::command]
+#[specta::specta]
+pub async fn cancel_cloud_frontier_gate3_review(
+    request: CancelCloudFrontierGate3ReviewRequest,
+    key_registry: State<'_, KeyRegistry>,
+) -> Result<(), String> {
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
+    let message = message_store::get_message(
+        &request.user_id,
+        &request.persona_id,
+        &key_hex_str,
+        &request.message_id,
+    )
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| "not_found".to_string())?;
+
+    if message.gate3_review_status.as_deref() != Some("pending-review") {
+        return Err(format!(
+            "message {} is not awaiting a consent decision (gate3_review_status: {:?})",
+            request.message_id, message.gate3_review_status
+        ));
+    }
+
+    message_store::update_gate3_review_status(
+        &request.user_id,
+        &request.persona_id,
+        &key_hex_str,
+        &request.message_id,
+        "drafted",
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -1479,6 +1553,92 @@ mod tests {
             .expect("get_message must succeed")
             .expect("message must exist");
         assert_eq!(fetched.gate3_review_status.as_deref(), Some("withheld"));
+    }
+
+    #[tokio::test]
+    async fn cancel_cloud_frontier_gate3_review_transitions_pending_review_to_drafted() {
+        let _env = setup().await;
+
+        let record = message_store::save_message(
+            USER_ID,
+            PERSONA_ID,
+            &key_hex_str(),
+            "cloud-frontier-access-persona-1",
+            "assistant",
+            "drafted starter text",
+            Some("run-1"),
+            Some("pending-review"),
+        )
+        .await
+        .expect("save_message must succeed");
+
+        let app = mock_app_with_registry(sqlx::SqlitePool::connect_lazy_with(
+            sqlx::sqlite::SqliteConnectOptions::new().filename(":memory:"),
+        ));
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(&registry, USER_ID, MASTER_KEY).await;
+
+        cancel_cloud_frontier_gate3_review(
+            CancelCloudFrontierGate3ReviewRequest {
+                user_id: USER_ID.to_owned(),
+                persona_id: PERSONA_ID.to_owned(),
+                message_id: record.id.clone(),
+            },
+            registry,
+        )
+        .await
+        .expect("cancel_cloud_frontier_gate3_review must succeed");
+
+        let fetched = message_store::get_message(USER_ID, PERSONA_ID, &key_hex_str(), &record.id)
+            .await
+            .expect("get_message must succeed")
+            .expect("message must exist");
+        assert_eq!(fetched.gate3_review_status.as_deref(), Some("drafted"));
+    }
+
+    #[tokio::test]
+    async fn cancel_cloud_frontier_gate3_review_rejects_non_pending_review() {
+        let _env = setup().await;
+
+        let record = message_store::save_message(
+            USER_ID,
+            PERSONA_ID,
+            &key_hex_str(),
+            "cloud-frontier-access-persona-1",
+            "assistant",
+            "already-approved text",
+            Some("run-1"),
+            Some("approved"),
+        )
+        .await
+        .expect("save_message must succeed");
+
+        let app = mock_app_with_registry(sqlx::SqlitePool::connect_lazy_with(
+            sqlx::sqlite::SqliteConnectOptions::new().filename(":memory:"),
+        ));
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(&registry, USER_ID, MASTER_KEY).await;
+
+        let result = cancel_cloud_frontier_gate3_review(
+            CancelCloudFrontierGate3ReviewRequest {
+                user_id: USER_ID.to_owned(),
+                persona_id: PERSONA_ID.to_owned(),
+                message_id: record.id.clone(),
+            },
+            registry,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("is not awaiting a consent decision"));
+
+        let fetched = message_store::get_message(USER_ID, PERSONA_ID, &key_hex_str(), &record.id)
+            .await
+            .expect("get_message must succeed")
+            .expect("message must exist");
+        assert_eq!(fetched.gate3_review_status.as_deref(), Some("approved"));
     }
 
     /// CLOUD_FRONTIER_DRAFT_FOCUS_ID must stay "quick-ask" -- a silent rename here
