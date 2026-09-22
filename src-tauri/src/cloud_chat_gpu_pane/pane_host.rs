@@ -137,14 +137,6 @@ enum PendingAction {
         name: String,
         value: String,
     },
-    /// items.id=359 piece 5: fire-and-forget JS run via
-    /// `Frame::execute_java_script` -- currently only used for the blind
-    /// scroll-to-bottom-on-deactivation trigger (a generic
-    /// `window.scrollTo`, no per-provider knowledge), but kept as a
-    /// general string-of-JS variant rather than a single-purpose
-    /// `ScrollToBottom` marker, matching `Navigate`'s own precedent of
-    /// carrying the actual payload rather than a symbolic action name.
-    ExecuteScript(String),
     /// items.id=359 piece 4: the actual "deactivated/minimized pane"
     /// mechanism -- CEF's own hook for "keep this browser's state alive
     /// but stop painting/compositing it" (`ImplBrowserHost::was_hidden`).
@@ -231,13 +223,6 @@ fn apply_action(browser: &cef::Browser, action: &PendingAction) -> Result<(), St
         PendingAction::SetCookie { .. } => {
             Err("SetCookie not yet supported at this layer".to_string())
         }
-        PendingAction::ExecuteScript(code) => {
-            let Some(frame) = browser.main_frame() else {
-                return Err("browser has no main_frame yet".to_string());
-            };
-            frame.execute_java_script(Some(&cef::CefString::from(code.as_str())), None, 0);
-            Ok(())
-        }
         PendingAction::SetHidden(hidden) => {
             let Some(host) = browser.host() else {
                 return Err("browser has no host yet".to_string());
@@ -254,16 +239,6 @@ fn apply_action(browser: &cef::Browser, action: &PendingAction) -> Result<(), St
         }
     }
 }
-
-/// items.id=359 piece 5: the blind scroll-to-bottom trigger fired on a
-/// pane's own deactivation (`PaneManager::set_active_pane`) -- generic,
-/// no per-provider DOM knowledge, confirmed feasible via
-/// `Frame::execute_java_script` (items.id=358, handoff id=245). "Blind"
-/// deliberately: landing precisely on the last chat response (rather
-/// than just the bottom of the page) shares the response-detection
-/// question's DOM-introspection dependency, which is explicitly NOT part
-/// of this item's scope (see items.id=360).
-const SCROLL_TO_BOTTOM_JS: &str = "window.scrollTo(0, document.body.scrollHeight);";
 
 /// items.id=364: see `PaneManager::adjust_zoom`'s own doc for why 0.5.
 const ZOOM_LEVEL_STEP: f64 = 0.5;
@@ -296,11 +271,9 @@ pub enum PaneCommand {
     Close {
         key: PaneKey,
     },
-    /// items.id=359 pieces 4/5: makes `key` (or none) the one pane that's
+    /// items.id=359 piece 4: makes `key` (or none) the one pane that's
     /// actually composited/painted -- see `PaneManager::active_pane`'s own
-    /// doc for the single-active-pane invariant this enforces. The
-    /// outgoing active pane (if any, and if different from `key`) gets a
-    /// scroll-to-bottom trigger fired just before it's hidden.
+    /// doc for the single-active-pane invariant this enforces.
     SetActivePane {
         key: Option<PaneKey>,
     },
@@ -807,9 +780,7 @@ impl PaneManager {
             _ => {}
         }
         // items.id=359: a closed active pane must not leave active_pane
-        // dangling -- no scroll-to-bottom trigger needed here (unlike
-        // set_active_pane's own deactivation path), since this pane is
-        // gone, not being minimized for later reactivation.
+        // dangling.
         if self.active_pane.as_ref() == Some(key) {
             self.active_pane = None;
         }
@@ -827,13 +798,6 @@ impl PaneManager {
         if previous != key {
             if let Some(old_key) = previous {
                 if let Some(pane) = self.panes.get_mut(&old_key) {
-                    // Scroll-to-bottom fires on the OUTGOING pane, before
-                    // it's hidden, so reactivating it later lands back on
-                    // its last response rather than wherever it was
-                    // scrolled (items.id=359 piece 5).
-                    pane.browser_lifecycle.enqueue(PendingAction::ExecuteScript(
-                        SCROLL_TO_BOTTOM_JS.to_string(),
-                    ));
                     pane.browser_lifecycle
                         .enqueue(PendingAction::SetHidden(true));
                 }

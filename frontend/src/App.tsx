@@ -76,6 +76,22 @@ function App() {
     }
   }, [bootState])
 
+  // items.id=542: WebKitGTK (the outer Tauri webview) shows its own default
+  // context menu (Inspect Element, etc.) on any right-click that isn't
+  // already handled -- PaneHitLayer/PopupHitLayer suppress it for clicks
+  // inside a CEF pane/popup, but nothing did for the rest of the app.
+  // preventDefault() here is a harmless no-op on events already handled by
+  // those two (they don't stopPropagation), and doesn't touch the separate
+  // pointer-forwarding path that sends right-clicks into CEF. Not gated on
+  // bootState -- the login screen is in scope too.
+  useEffect(() => {
+    const handleContextMenu = (event: MouseEvent) => {
+      event.preventDefault()
+    }
+    window.addEventListener('contextmenu', handleContextMenu)
+    return () => window.removeEventListener('contextmenu', handleContextMenu)
+  }, [])
+
   if (bootState === 'checking') {
     return <p>{t('auth.checkingSession')}</p>
   }
