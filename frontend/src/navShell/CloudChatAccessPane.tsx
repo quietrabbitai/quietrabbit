@@ -54,7 +54,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { commands, type ChatInfo, type ExternalAccess, type PaneRectFraction, type PersonaInfo } from '../bindings'
 import { ChatPane } from '../chat/ChatPane'
 import { ChatHistoryList } from '../chat/ChatHistoryList'
-import { NewChatPersonaPicker } from '../chat/NewChatPersonaPicker'
+import { PersonaBox } from './persona/PersonaBox'
 import { FocusSettingsControls } from './FocusSettingsControls'
 import { requireCurrentUserId, type DominancePairState } from './navShellConfig'
 import { CloudChatCollapsedStrip } from './CloudChatCollapsedStrip'
@@ -201,12 +201,21 @@ export function CloudChatAccessPane({
   // items.id=384 slice 7 (decisions.id=739): null means "the pre-existing
   // flat tier3-access-{personaId} conversation" -- the default view, not
   // a loading state. Set to a real ChatInfo by either starting a new chat
-  // (NewChatPersonaPicker) or picking a past one (ChatHistoryList).
+  // (PersonaBox's onChange, wired to handleStartNewChat -- items.id=543
+  // retired the standalone NewChatPersonaPicker this used to say) or
+  // picking a past one (ChatHistoryList).
   // Deliberately NOT persisted to NavState -- unlike `pair`, losing this
   // selection on a Board-toggle remount just means the default view
   // reappears, not any data loss (nothing here is hidden/torn down the
   // way a live CEF pane would be).
   const [activeChat, setActiveChat] = useState<ChatInfo | null>(null)
+
+  // items.id=543: PersonaBox's selector popover -- controlled here (not
+  // internal to PersonaBox) because two triggers need to open the SAME
+  // popover: the box itself, and clicking Chat's empty rail body while no
+  // Persona is active yet (PERSONA_SELECTOR_DESIGN_ITEM543_20260921.md
+  // Section 2.1).
+  const [personaBoxOpen, setPersonaBoxOpen] = useState(false)
 
   // items.id=391: mirrors ChatPane's own lastAssistantMessage lookup --
   // see ChatPane.tsx's onLastAssistantMessageChange doc comment for why
@@ -252,9 +261,20 @@ export function CloudChatAccessPane({
   // timer -- a stale entry is harmless: if the clipboard no longer holds
   // this exact text (the user copied something else, or pasted already),
   // the provenance check below simply won't match and no re-check fires.
+  //
+  // items.id=543 (Chat-BRAND finding, confirmed live this session): also
+  // stores the copied message's own owning personaId, sourced from
+  // ChatPane's personaId prop at copy time (see onCopyStarter below and
+  // ChatPane.tsx's handleCopyStarter) -- NOT the live `personaId` prop on
+  // this component. Persona is now freely switchable mid-session (this
+  // whole item's point), so those two can genuinely diverge between a
+  // copy and the later provider click; activateAndPromote below must key
+  // its recheck off the message's real owning persona, not whatever's
+  // active right now.
   const [lastCopiedStarter, setLastCopiedStarter] = useState<{
     messageId: string
     content: string
+    personaId: string
   } | null>(null)
 
   // items.id=404: the three internal actions that mean "make Cloud Chat/Chat
@@ -274,11 +294,12 @@ export function CloudChatAccessPane({
       // is set to 'pending' BEFORE the command resolves so the modal is
       // already primed if the independent consent_request listener (below)
       // delivers a payload for it.
-      if (lastCopiedStarter && personaId) {
+      if (lastCopiedStarter) {
         const activeIds = openProviderIds.includes(providerId)
           ? openProviderIds
           : [...openProviderIds, providerId]
         const messageId = lastCopiedStarter.messageId
+        const starterPersonaId = lastCopiedStarter.personaId
         void navigator.clipboard
           .readText()
           .then((clipboardText) => {
@@ -289,7 +310,7 @@ export function CloudChatAccessPane({
             setPendingMessageId(messageId)
             return commands.recheckCloudFrontierProviderSelection({
               user_id: requireCurrentUserId(),
-              persona_id: personaId,
+              persona_id: starterPersonaId,
               message_id: messageId,
               newly_active_provider_ids: activeIds,
             })
@@ -325,7 +346,7 @@ export function CloudChatAccessPane({
           })
       }
     },
-    [activate, onDominantRailChange, lastCopiedStarter, personaId, openProviderIds, t],
+    [activate, onDominantRailChange, lastCopiedStarter, openProviderIds, t],
   )
   const markCloudChatReadyAndPromote = useCallback(() => {
     onDominantRailChange('cloudChat')
@@ -841,14 +862,22 @@ export function CloudChatAccessPane({
     setPendingMessageId(null)
   }
 
-  /** decisions.id=740: the new-chat persona dot-picker's one action --
+  /** decisions.id=740, superseded by decisions.id=823 (items.id=543):
    *  create a fresh chat for `persona` and make it the one showing,
-   *  switching activePersonaId too if `persona` isn't already the current
-   *  one. See NewChatPersonaPicker's own header comment for why this is
-   *  the ONLY way to start a new chat in this build (no separate "New
-   *  chat" button). */
+   *  switching activePersonaId too. Originally NewChatPersonaPicker's one
+   *  action (a standalone dot-picker, now retired); this is now
+   *  PersonaBox's onChange, both the expanded and floor-mode instances
+   *  below. Still the ONLY way to start a new chat in this build (no
+   *  separate "New chat" button) -- but only for an ACTUAL persona
+   *  switch. Confirmed live (Jason, click-through): reselecting the
+   *  already-active persona in PersonaBox's popover used to still call
+   *  commands.createChat, silently replacing whatever conversation was
+   *  open even though nothing changed -- corrected below to a no-op in
+   *  that case (the popover still closes regardless; that's PersonaBox's
+   *  own onClick, not gated here). */
   const handleStartNewChat = useCallback(
     (persona: PersonaInfo) => {
+      if (persona.id === personaId) return
       commands.createChat(requireCurrentUserId(), persona.id).then((result) => {
         if (result.status !== 'ok') {
           setOpenError(result.error)
@@ -856,9 +885,7 @@ export function CloudChatAccessPane({
         }
         resetGate3State()
         setActiveChat(result.data)
-        if (persona.id !== personaId) {
-          onPersonaChange(persona.id)
-        }
+        onPersonaChange(persona.id)
       })
     },
     [personaId, onPersonaChange, setOpenError],
@@ -990,10 +1017,12 @@ export function CloudChatAccessPane({
                   disabled={reviewOutcome === 'pending'}
                 />
               )}
-              <NewChatPersonaPicker
+              <PersonaBox
                 personas={personas}
                 activePersonaId={personaId}
-                onStartNewChat={handleStartNewChat}
+                onChange={handleStartNewChat}
+                open={personaBoxOpen}
+                onOpenChange={setPersonaBoxOpen}
                 disabled={reviewOutcome === 'pending'}
               />
             </div>
@@ -1012,10 +1041,12 @@ export function CloudChatAccessPane({
           // column direction (bar on top, .qr-panel's real content
           // below).
           <div className="cloud-chat-access-pane__floor-picker">
-            <NewChatPersonaPicker
+            <PersonaBox
               personas={personas}
               activePersonaId={personaId}
-              onStartNewChat={handleStartNewChat}
+              onChange={handleStartNewChat}
+              open={personaBoxOpen}
+              onOpenChange={setPersonaBoxOpen}
               disabled={reviewOutcome === 'pending'}
             />
           </div>
@@ -1038,7 +1069,9 @@ export function CloudChatAccessPane({
               collapsed={floor || dominant === 'cloudChat'}
               onExpand={floor ? onFloorExpand : reclaimChatAndPromote}
               onLastAssistantMessageChange={setLastAssistantMessage}
-              onCopyStarter={(messageId, content) => setLastCopiedStarter({ messageId, content })}
+              onCopyStarter={(messageId, content, starterPersonaId) =>
+                setLastCopiedStarter({ messageId, content, personaId: starterPersonaId })
+              }
             />
           ) : floor ? (
             // items.id=391 (Jason, 2026-09-02, second pass): "compressed"
@@ -1115,13 +1148,35 @@ export function CloudChatAccessPane({
             // just disabled -- there is nowhere to send a message to yet.
             // No picker down here any more (a second copy of it, right
             // above -- see the section-header's own comment on why it's
-            // un-gated from personaId now): one picker, not two. Picking a Persona
-            // there calls handleStartNewChat, which sets personaId via
-            // onPersonaChange and creates a real chat, dropping this
-            // component into the normal ChatPane branch above on the next
-            // render -- the disabled input here is never wired to a
-            // draft, so nothing needs to carry over.
-            <div className="chat-pane">
+            // un-gated from personaId now): one picker, not two. Picking a
+            // Persona there calls handleStartNewChat (via PersonaBox's
+            // onChange), which creates a real chat and switches personaId,
+            // dropping this component into the normal ChatPane branch
+            // above on the next render -- the disabled input here is
+            // never wired to a draft, so nothing needs to carry over.
+            //
+            // items.id=543 (Section 2.1): clicking this empty rail body
+            // itself, not just the PersonaBox above, also opens the same
+            // forced selector popover -- the "no Persona active" case has
+            // no real content to interact with otherwise. A plain div, not
+            // a <button>, because it nests real interactive children (the
+            // disabled input/send button below) -- same role="button" +
+            // tabIndex + matching onKeyDown convention as PrivacyGuardianModal.tsx's
+            // PgCell, for the same reason.
+            <div
+              className="chat-pane"
+              data-empty-persona-body=""
+              role="button"
+              tabIndex={0}
+              aria-label={t('navShell.personaBox.popoverTitleChoose')}
+              onClick={() => setPersonaBoxOpen(true)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault()
+                  setPersonaBoxOpen(true)
+                }
+              }}
+            >
               <div className="chat-pane__transcript">
                 <ul className="chat-pane__message-list">
                   <li className="chat-pane__message chat-pane__message--assistant">

@@ -38,6 +38,8 @@
 import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { commands, type PersonaInfo, type TopicInfo } from '../bindings'
+import { PersonaPillRow } from './persona/PersonaPillRow'
+import { usePersonaLocalFilter } from './persona/usePersonaLocalFilter'
 import './ActiveBoardPane.css'
 
 interface BoardTopic {
@@ -53,6 +55,11 @@ export interface ActiveBoardPaneProps {
    *  doesn't read well at the reduced width 'compact' gives it. Card
    *  content is unchanged, only the layout. */
   dense?: boolean
+  /** items.id=543: the shared, app-wide active persona (NavState.
+   *  activePersonaId) -- read only, drives PersonaPillRow's ring mark.
+   *  Board's own filter stays fully independent of it (decisions.id=741,
+   *  unchanged by this item). */
+  activePersonaId: string | null
 }
 
 // items.id=391 (eleventh pass): this component no longer renders its own
@@ -60,13 +67,16 @@ export interface ActiveBoardPaneProps {
 // .section-header bar above this component whenever Board is expanded
 // (matching QR's and Cloud Chat's own expanded headers, NavShell.css), so an
 // internal heading here would just duplicate it under a different style.
-export function ActiveBoardPane({ userId, dense = false }: ActiveBoardPaneProps) {
+export function ActiveBoardPane({ userId, dense = false, activePersonaId }: ActiveBoardPaneProps) {
   const { t } = useTranslation()
   const [personas, setPersonas] = useState<PersonaInfo[]>([])
   const [topics, setTopics] = useState<BoardTopic[]>([])
   const [highPriorityIds, setHighPriorityIds] = useState<Set<string>>(new Set())
   const [loadError, setLoadError] = useState<string | null>(null)
-  const [personaFilter, setPersonaFilter] = useState<string | null>(null)
+  const { filterId: personaFilter, select: selectPersonaFilter } = usePersonaLocalFilter(
+    activePersonaId,
+    true,
+  )
 
   useEffect(() => {
     let cancelled = false
@@ -125,33 +135,13 @@ export function ActiveBoardPane({ userId, dense = false }: ActiveBoardPaneProps)
   return (
     <div className="active-board-pane">
       {personas.length > 1 && (
-        <fieldset className="active-board-pane__persona-filter">
-          <legend>{t('navShell.activeBoardPane.filterLabel')}</legend>
-          <button
-            type="button"
-            className="active-board-pane__filter-pill"
-            data-selected={personaFilter === null ? '' : undefined}
-            onClick={() => setPersonaFilter(null)}
-          >
-            {t('navShell.activeBoardPane.filterAll')}
-          </button>
-          {personas.map((persona) => (
-            <button
-              key={persona.id}
-              type="button"
-              className="active-board-pane__filter-pill"
-              data-selected={personaFilter === persona.id ? '' : undefined}
-              onClick={() => setPersonaFilter(persona.id)}
-            >
-              <span
-                className="active-board-pane__persona-dot"
-                style={persona.color ? { background: persona.color } : undefined}
-                aria-hidden="true"
-              />
-              {persona.display_name}
-            </button>
-          ))}
-        </fieldset>
+        <PersonaPillRow
+          personas={personas}
+          activePersonaId={activePersonaId}
+          filterId={personaFilter}
+          onSelect={selectPersonaFilter}
+          allowAll
+        />
       )}
 
       {loadError && (

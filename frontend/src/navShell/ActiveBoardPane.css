@@ -2,12 +2,13 @@
  *
  * Same convention as LibraryPane.css/ChatPane.css: consumes index.css's
  * custom properties rather than declaring its own colors, so it tracks
- * the app's light/dark theme automatically. Persona-color accents
- * (left-border on cards, filter-pill dots) are the one deliberate
- * exception -- same carve-out rationale as cloudChatAccessConfig.ts's
- * PROVIDER_BRAND_COLORS (decisions.id=732): these identify something
- * that isn't QR's own palette (here, which Persona a card belongs to),
- * not a Palette v3 violation. */
+ * the app's light/dark theme automatically. The card left-border is the
+ * one deliberate persona-color exception -- same carve-out rationale as
+ * cloudChatAccessConfig.ts's PROVIDER_BRAND_COLORS (decisions.id=732):
+ * it identifies something that isn't QR's own palette (here, which
+ * Persona a card belongs to), not a Palette v3 violation. The persona
+ * filter row itself moved to ../persona/persona.css (items.id=543) and
+ * deliberately carries no color, per that design's own Section 2.4. */
 
 .active-board-pane {
   display: flex;
@@ -18,49 +19,6 @@
   padding: 8px 12px;
   overflow-y: auto;
   text-align: left;
-}
-
-.active-board-pane__persona-filter {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 6px;
-  border: none;
-  padding: 0;
-  margin: 0;
-}
-
-.active-board-pane__persona-filter legend {
-  font-size: 12px;
-  color: var(--text);
-  padding: 0 6px 0 0;
-}
-
-.active-board-pane__filter-pill {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  padding: 4px 10px;
-  font-size: 12px;
-  color: var(--text);
-  background: var(--bg);
-  cursor: pointer;
-}
-
-.active-board-pane__filter-pill[data-selected] {
-  color: var(--text-h);
-  background: var(--code-bg);
-  border-color: var(--accent-border);
-}
-
-.active-board-pane__persona-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--text);
-  flex: 0 0 auto;
 }
 
 .active-board-pane__high-priority {

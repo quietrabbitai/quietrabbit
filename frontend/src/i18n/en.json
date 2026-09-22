@@ -75,8 +75,6 @@
       "openFullLibrary": "Open full Library →"
     },
     "activeBoardPane": {
-      "filterLabel": "Persona",
-      "filterAll": "All",
       "loadError": "Could not load the board: {{message}}",
       "empty": "Nothing on the board yet.",
       "highPriorityLabel": "High priority",
@@ -102,9 +100,16 @@
       "empty": "No past chats yet.",
       "untitled": "Untitled chat"
     },
-    "newChatPersonaPicker": {
-      "groupLabel": "New chat as…",
-      "buttonTitle": "Start a new chat as {{persona}}"
+    "personaBox": {
+      "buttonLabel": "Active persona",
+      "popoverGroupLabel": "Choose a persona",
+      "popoverTitleChoose": "Choose a persona to begin",
+      "popoverTitleSwitch": "Switch active persona"
+    },
+    "personaPillRow": {
+      "groupLabel": "Persona filter",
+      "allLabel": "All",
+      "activeMarkTitle": "This is the active persona elsewhere in the app"
     },
     "focusSettings": {
       "crumbLabel": "Focus settings",

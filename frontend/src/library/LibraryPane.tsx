@@ -12,27 +12,45 @@
 // actions this screen already had) is this item's own extrapolation of
 // "same pattern" onto Library's existing two actions, not something the
 // mockup itself specifies.
+//
+// items.id=543 (PERSONA_SELECTOR_DESIGN_ITEM543_20260921.md Section 2.2):
+// reworked again -- Library now has its own local persona filter
+// (libraryFilter, usePersonaLocalFilter), decoupled from the shared
+// activePersonaId this component used to scope its fetches with directly.
+// This was a deliberate mid-session reversal in the design doc: an earlier
+// draft had Library's pills write straight to activePersonaId, matching
+// Chat, which meant browsing Library while hunting for a document could
+// silently switch (and appear to lose) the user's open Chat conversation.
+// libraryFilter defaults from activePersonaId once on mount and is
+// independent of it afterward -- see usePersonaLocalFilter.ts's own header
+// comment for the exact mechanism, mirrored from ActiveBoardPane.tsx's
+// pre-existing personaFilter.
 
 import { useCallback, useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { commands, type OutputInfo } from '../bindings'
+import { commands, type OutputInfo, type PersonaInfo } from '../bindings'
 import { DocumentRow } from './DocumentRow'
+import { PersonaPillRow } from '../navShell/persona/PersonaPillRow'
+import { usePersonaLocalFilter } from '../navShell/persona/usePersonaLocalFilter'
 import './LibraryPane.css'
 
 export interface LibraryPaneProps {
   userId: string
-  /** items.id=404: Library is now a dock rail, scoped by the same
-   *  activePersonaId NavState field Chat/History use -- the old
-   *  content.personaFilter per-crumb mechanism (there is no more crumb
-   *  chain to carry a filter on) is superseded. null means no Persona is
-   *  active yet -- Outputs cannot be scoped without one. */
-  personaId: string | null
+  personas: PersonaInfo[]
+  /** The shared, app-wide active persona (NavState.activePersonaId) --
+   *  read only here: drives PersonaPillRow's ring mark and libraryFilter's
+   *  first-open default. Library's own selection never writes this. */
+  activePersonaId: string | null
 }
 
 type LibraryAction = 'view' | 'copy' | null
 
-export function LibraryPane({ userId, personaId }: LibraryPaneProps) {
+export function LibraryPane({ userId, personas, activePersonaId }: LibraryPaneProps) {
   const { t } = useTranslation()
+  const { filterId: libraryFilter, select: selectLibraryFilter } = usePersonaLocalFilter(
+    activePersonaId,
+    false,
+  )
   const [outputs, setOutputs] = useState<OutputInfo[]>([])
   const [listError, setListError] = useState<string | null>(null)
   const [selectedOutputId, setSelectedOutputId] = useState<string | null>(null)
@@ -58,7 +76,7 @@ export function LibraryPane({ userId, personaId }: LibraryPaneProps) {
     setListError(null)
     resetSelection()
 
-    if (personaId === null) {
+    if (libraryFilter === null) {
       // Nothing was ever really listable for this identity -- honest
       // empty state, not a fetch failure.
       return
@@ -69,40 +87,40 @@ export function LibraryPane({ userId, personaId }: LibraryPaneProps) {
     // null keeps today's default behavior unchanged (list_outputs treats
     // a missing source as 'qr_generated', excluding ingested/external
     // documents from this default view).
-    commands.listOutputs(userId, personaId, null, null, null, null).then((result) => {
+    commands.listOutputs(userId, libraryFilter, null, null, null, null).then((result) => {
       if (result.status === 'ok') {
         setOutputs(result.data)
       } else {
         setListError(result.error)
       }
     })
-  }, [userId, personaId, resetSelection])
+  }, [userId, libraryFilter, resetSelection])
 
   // View action -- re-fetches via getOutput rather than trusting the list
   // row's own cached content, matching ChatPane's reconcile-over-cache
   // discipline and giving Privacy Guardian a fresh per-access check point.
   useEffect(() => {
-    if (action !== 'view' || selectedOutputId === null || personaId === null) return
+    if (action !== 'view' || selectedOutputId === null || libraryFilter === null) return
     setViewedOutput(null)
     setViewError(null)
-    commands.getOutput(selectedOutputId, userId, personaId).then((result) => {
+    commands.getOutput(selectedOutputId, userId, libraryFilter).then((result) => {
       if (result.status === 'ok') {
         setViewedOutput(result.data)
       } else {
         setViewError(result.error)
       }
     })
-  }, [action, selectedOutputId, userId, personaId])
+  }, [action, selectedOutputId, userId, libraryFilter])
 
   const handleCopy = useCallback(() => {
-    // personaId is guaranteed non-null here: this whole component returns
-    // its own notice-only render above before ever reaching UI that could
-    // call this.
-    if (selectedOutputId === null || personaId === null) return
+    // libraryFilter is guaranteed non-null here: this whole component
+    // returns its own notice-only render above before ever reaching UI
+    // that could call this.
+    if (selectedOutputId === null || libraryFilter === null) return
     setAction('copy')
     setCopyStatus('pending')
     setCopyError(null)
-    commands.copyOutputToClipboard(selectedOutputId, userId, personaId).then((result) => {
+    commands.copyOutputToClipboard(selectedOutputId, userId, libraryFilter).then((result) => {
       if (result.status === 'ok') {
         setCopyStatus('success')
       } else {
@@ -112,7 +130,7 @@ export function LibraryPane({ userId, personaId }: LibraryPaneProps) {
         setCopyError(result.error)
       }
     })
-  }, [selectedOutputId, userId, personaId])
+  }, [selectedOutputId, userId, libraryFilter])
 
   const handleSelectRow = (outputId: string) => {
     if (outputId === selectedOutputId) {
@@ -127,64 +145,70 @@ export function LibraryPane({ userId, personaId }: LibraryPaneProps) {
     setCopyError(null)
   }
 
-  if (personaId === null) {
-    return (
-      <div className="library-pane">
-        <p className="library-pane__notice">{t('navShell.libraryPane.noPersonaContext')}</p>
-      </div>
-    )
-  }
-
   return (
     <div className="library-pane">
-      <h2 className="library-pane__heading">{t('navShell.libraryPane.listHeading')}</h2>
-      {listError && (
-        <p role="alert">{t('navShell.libraryPane.listLoadError', { message: listError })}</p>
-      )}
-      {outputs.length === 0 && !listError && <p>{t('navShell.libraryPane.emptyList')}</p>}
-      {outputs.length > 0 && (
-        <ul className="library-pane__list">
-          {outputs.map((output) => (
-            <li key={output.id} className="library-pane__list-item">
-              <DocumentRow
-                output={output}
-                selected={output.id === selectedOutputId}
-                onSelect={() => handleSelectRow(output.id)}
-              />
-              {output.id === selectedOutputId && (
-                <div className="library-pane__row-actions">
-                  <button type="button" onClick={() => setAction('view')}>
-                    {t('navShell.libraryPane.viewButton')}
-                  </button>
-                  <button type="button" onClick={handleCopy}>
-                    {t('navShell.libraryPane.copyButton')}
-                  </button>
-                </div>
-              )}
-            </li>
-          ))}
-        </ul>
-      )}
+      <PersonaPillRow
+        personas={personas}
+        activePersonaId={activePersonaId}
+        filterId={libraryFilter}
+        onSelect={selectLibraryFilter}
+        allowAll={false}
+      />
 
-      {action === 'view' && (
-        <div className="library-pane__action-pane">
-          {viewError && (
-            <p role="alert">
-              {t('navShell.libraryPane.detailLoadError', { message: viewError })}
-            </p>
+      {libraryFilter === null ? (
+        <p className="library-pane__notice">{t('navShell.libraryPane.noPersonaContext')}</p>
+      ) : (
+        <>
+          <h2 className="library-pane__heading">{t('navShell.libraryPane.listHeading')}</h2>
+          {listError && (
+            <p role="alert">{t('navShell.libraryPane.listLoadError', { message: listError })}</p>
           )}
-          {viewedOutput && <pre className="library-pane__content">{viewedOutput.content}</pre>}
-        </div>
-      )}
-      {action === 'copy' && (
-        <div className="library-pane__action-pane">
-          {copyStatus === 'success' && <p>{t('navShell.libraryPane.copySuccess')}</p>}
-          {copyStatus === 'error' && (
-            <p role="alert" className="library-pane__copy-error">
-              {copyError}
-            </p>
+          {outputs.length === 0 && !listError && <p>{t('navShell.libraryPane.emptyList')}</p>}
+          {outputs.length > 0 && (
+            <ul className="library-pane__list">
+              {outputs.map((output) => (
+                <li key={output.id} className="library-pane__list-item">
+                  <DocumentRow
+                    output={output}
+                    selected={output.id === selectedOutputId}
+                    onSelect={() => handleSelectRow(output.id)}
+                  />
+                  {output.id === selectedOutputId && (
+                    <div className="library-pane__row-actions">
+                      <button type="button" onClick={() => setAction('view')}>
+                        {t('navShell.libraryPane.viewButton')}
+                      </button>
+                      <button type="button" onClick={handleCopy}>
+                        {t('navShell.libraryPane.copyButton')}
+                      </button>
+                    </div>
+                  )}
+                </li>
+              ))}
+            </ul>
           )}
-        </div>
+
+          {action === 'view' && (
+            <div className="library-pane__action-pane">
+              {viewError && (
+                <p role="alert">
+                  {t('navShell.libraryPane.detailLoadError', { message: viewError })}
+                </p>
+              )}
+              {viewedOutput && <pre className="library-pane__content">{viewedOutput.content}</pre>}
+            </div>
+          )}
+          {action === 'copy' && (
+            <div className="library-pane__action-pane">
+              {copyStatus === 'success' && <p>{t('navShell.libraryPane.copySuccess')}</p>}
+              {copyStatus === 'error' && (
+                <p role="alert" className="library-pane__copy-error">
+                  {copyError}
+                </p>
+              )}
+            </div>
+          )}
+        </>
       )}
     </div>
   )

@@ -144,7 +144,11 @@ export function WorkspaceShell({
               </button>
             </div>
           </div>
-          <ActiveBoardPane userId={userId} dense={boardDensity === 'compact'} />
+          <ActiveBoardPane
+            userId={userId}
+            dense={boardDensity === 'compact'}
+            activePersonaId={activePersonaId}
+          />
         </div>
       ) : (
         <button
@@ -190,7 +194,7 @@ export function WorkspaceShell({
               {t('navShell.library')}
             </span>
           </div>
-          <LibraryPane userId={userId} personaId={activePersonaId} />
+          <LibraryPane userId={userId} personas={personas} activePersonaId={activePersonaId} />
         </div>
       ) : (
         <button

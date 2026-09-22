@@ -64,8 +64,14 @@ export interface ChatPaneProps {
    *  re-check trigger's clipboard-provenance check (QR only ever evaluates
    *  clipboard content it can prove it wrote itself). Purely an
    *  observation of this component's own existing click-initiated copy
-   *  action -- does not change what handleCopyStarter itself does. */
-  onCopyStarter?: (messageId: string, content: string) => void
+   *  action -- does not change what handleCopyStarter itself does.
+   *  items.id=543 (Chat-BRAND finding): also carries this component's own
+   *  `personaId` prop -- the copied message's real owning persona, not
+   *  whatever persona happens to be active when the caller later acts on
+   *  this. The message record itself carries no persona field (messages
+   *  live in separate per-persona databases instead), so this is the only
+   *  correct source for it. */
+  onCopyStarter?: (messageId: string, content: string, personaId: string) => void
 }
 
 /** Hand-declared, not generated: RunStatusPayload (conductor/lifecycle.rs)
@@ -631,12 +637,12 @@ export function ChatPane({
     (messageId: string, content: string) => {
       void navigator.clipboard.writeText(content)
       setCopiedStarterId(messageId)
-      onCopyStarter?.(messageId, content)
+      onCopyStarter?.(messageId, content, personaId)
       window.setTimeout(() => {
         setCopiedStarterId((current) => (current === messageId ? null : current))
       }, 1400)
     },
-    [onCopyStarter],
+    [onCopyStarter, personaId],
   )
 
   // items.id=416 (decisions.id=766): shows a copy-review outcome, then

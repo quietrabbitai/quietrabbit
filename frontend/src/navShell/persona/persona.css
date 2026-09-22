@@ -1,0 +1,174 @@
+/* items.id=543: shared styles for PersonaBox, PersonaPillRow, PersonaIdentity
+ * and the selector popover -- same convention as ActiveBoardPane.css/
+ * NewChatPersonaPicker.css, consumes index.css's custom properties so it
+ * tracks the app's light/dark theme automatically. No persona-color accents
+ * here (PERSONA_SELECTOR_DESIGN_ITEM543_20260921.md Section 2.4) -- that's
+ * the one deliberate difference from ActiveBoardPane.css's own carve-out. */
+
+/* ---- PersonaIdentity ---- */
+
+.persona-identity {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.persona-identity__icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--code-bg);
+  color: var(--text-h);
+  font-size: 10px;
+  font-weight: 600;
+  flex: 0 0 auto;
+}
+
+.persona-identity[data-size='md'] .persona-identity__icon {
+  width: 22px;
+  height: 22px;
+  font-size: 11px;
+}
+
+.persona-identity__icon[data-empty] {
+  background: transparent;
+  border: 1.5px dashed var(--border);
+}
+
+.persona-identity__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---- PersonaBox ---- */
+
+.persona-box-wrap {
+  position: relative;
+}
+
+.persona-box {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px 10px 4px 6px;
+  font-size: 12px;
+  color: var(--text-h);
+  background: var(--bg);
+  cursor: pointer;
+}
+
+.persona-box:hover {
+  background: var(--code-bg);
+}
+
+.persona-box:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.persona-box[data-empty] {
+  border-style: dashed;
+  color: var(--text);
+}
+
+.persona-box__chevron {
+  font-size: 9px;
+  color: var(--text);
+}
+
+.persona-selector-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 10;
+  min-width: 200px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px;
+  box-shadow: var(--shadow);
+}
+
+.persona-selector-popover__title {
+  margin: 0 0 8px;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.persona-selector-popover__option {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 7px 8px;
+  font-size: 13px;
+  color: var(--text-h);
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+
+.persona-selector-popover__option + .persona-selector-popover__option {
+  margin-top: 2px;
+}
+
+.persona-selector-popover__option:hover {
+  background: var(--code-bg);
+  border-color: var(--border);
+}
+
+/* ---- PersonaPillRow ---- */
+
+.persona-pill-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.persona-pill-row__pill {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--bg);
+  cursor: pointer;
+}
+
+.persona-pill-row__pill[data-selected] {
+  color: var(--text-h);
+  background: var(--code-bg);
+  border-color: var(--accent-border);
+  font-weight: 500;
+}
+
+.persona-pill-row__pill--all {
+  border-style: dashed;
+}
+
+.persona-pill-row__divider {
+  width: 1px;
+  align-self: stretch;
+  background: var(--border);
+  margin: 0 2px;
+}
+
+.persona-pill-row__active-mark {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  border: 1.5px solid var(--text-h);
+}
