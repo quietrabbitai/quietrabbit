@@ -781,15 +781,6 @@ export const commands = {
 	 *  here.
 	 */
 	getIngestedDocumentBytes: (outputId: string, userId: string, personaId: string) => typedError<number[], string>(__TAURI_INVOKE("get_ingested_document_bytes", { outputId, userId, personaId })),
-	/**
-	 *  Starts a new chat for a Persona. decisions.id=739: the previously
-	 *  current chat is not touched by this call at all -- its messages stay
-	 *  exactly where they were saved (message_store::save_message persists
-	 *  per-message, not per-chat-on-close), so "new chat auto-saves to
-	 *  history" is satisfied by this command simply handing back a fresh
-	 *  chat_id/context_key, not by any explicit save step here.
-	 */
-	createChat: (userId: string, personaId: string) => typedError<ChatInfo, string>(__TAURI_INVOKE("create_chat", { userId, personaId })),
 	/**  Lists a Persona's non-archived chats, most-recent-first. */
 	listChats: (userId: string, personaId: string) => typedError<ChatInfo[], string>(__TAURI_INVOKE("list_chats", { userId, personaId })),
 	/**

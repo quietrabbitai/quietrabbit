@@ -29,7 +29,7 @@ use tauri::State;
 use crate::auth::registry::{key_hex, KeyRegistry};
 use crate::commands::execution::{self, SubmitFocusRunRequest};
 use crate::conductor::concurrency::ConductorScheduler;
-use crate::persistence::{message_store, output_store};
+use crate::persistence::{chat_store, message_store, output_store};
 
 // ---------------------------------------------------------------------------
 // Request DTO
@@ -88,6 +88,19 @@ pub struct MessageInfo {
 pub struct MessageContentReadyPayload {
     pub focus_run_id: String,
     pub message_id: String,
+}
+
+/// Push event payload for "chat-activity-updated" (items.id=546). Emitted
+/// once, right after send_message's call to
+/// chat_store::ensure_chat_and_bump_activity successfully creates or bumps
+/// a real `chats` row for the message just sent -- never for a
+/// context_key with no backing chats row (the legacy flat
+/// "tier3-access-{persona_id}" pseudo-conversation). HistoryScreen's
+/// ChatHistoryAction listens for this to refresh its chat list live,
+/// without needing to remount.
+#[derive(Debug, Clone, Serialize, Type)]
+pub struct ChatActivityUpdatedPayload {
+    pub persona_id: String,
 }
 
 fn to_message_info(r: message_store::MessageRecord) -> MessageInfo {
@@ -152,6 +165,28 @@ async fn update_message_content_logged(
         Err(_) => {
             log::warn!("send_message: update_message_content timed out after 10s (non-fatal)")
         }
+    }
+}
+
+/// items.id=546: auto-title candidate for a chat's first message, derived
+/// from the raw user turn -- whitespace-collapsed to a single line, bounded
+/// so a long first message doesn't blow out History's row layout. None for
+/// empty/whitespace-only content, so ensure_chat_and_bump_activity's
+/// `COALESCE(chats.title, excluded.title)` leaves title NULL
+/// (HistoryScreen falls back to its own "untitled" string) rather than
+/// persisting an empty title forever.
+const CHAT_TITLE_MAX_CHARS: usize = 60;
+
+fn derive_chat_title(content: &str) -> Option<String> {
+    let collapsed: String = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    if collapsed.chars().count() > CHAT_TITLE_MAX_CHARS {
+        let truncated: String = collapsed.chars().take(CHAT_TITLE_MAX_CHARS).collect();
+        Some(format!("{truncated}…"))
+    } else {
+        Some(collapsed)
     }
 }
 
@@ -261,7 +296,37 @@ pub async fn send_message(
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
-    // 1. Persist the user's turn.
+    // 1. items.id=546: ensure the owning chat row exists (lazily -- created
+    // right here, on the first message under this context_key, not eagerly
+    // on persona switch) and bump its activity/title-once. Non-fatal: an
+    // Err here is logged and the send proceeds anyway -- see
+    // chat_store::ensure_chat_and_bump_activity's own doc comment for why
+    // that's safe. Ok(false) means context_key isn't chat-shaped (the flat
+    // pseudo-conversation), nothing to announce.
+    let title_candidate = derive_chat_title(&content);
+    match chat_store::ensure_chat_and_bump_activity(
+        &user_id,
+        &persona_id,
+        &key_hex_str,
+        &context_key,
+        title_candidate.as_deref(),
+    )
+    .await
+    {
+        Ok(true) => {
+            use tauri::Emitter;
+            let payload = ChatActivityUpdatedPayload {
+                persona_id: persona_id.clone(),
+            };
+            if let Err(e) = app_handle.emit("chat-activity-updated", &payload) {
+                log::warn!("send_message: emit chat-activity-updated failed: {e}");
+            }
+        }
+        Ok(false) => {}
+        Err(e) => log::warn!("send_message: ensure_chat_and_bump_activity failed (non-fatal): {e}"),
+    }
+
+    // 1.1. Persist the user's turn.
     message_store::save_message(
         &user_id,
         &persona_id,

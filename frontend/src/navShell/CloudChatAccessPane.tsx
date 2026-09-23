@@ -890,21 +890,39 @@ export function CloudChatAccessPane({
    *  commands.createChat, silently replacing whatever conversation was
    *  open even though nothing changed -- corrected below to a no-op in
    *  that case (the popover still closes regardless; that's PersonaBox's
-   *  own onClick, not gated here). */
+   *  own onClick, not gated here).
+   *
+   *  items.id=546: no longer calls an IPC command at all. A `chats` row
+   *  used to be created here, eagerly, the moment a persona was picked --
+   *  before any message existed -- which let empty, message-less chats
+   *  accumulate and be indistinguishable from real ones in History. Chat
+   *  creation is now lazy: this just mints a fresh "chat-{uuid}"
+   *  context_key client-side (same format chat_store::
+   *  ensure_chat_and_bump_activity expects) and holds it as a local,
+   *  not-yet-persisted placeholder -- the real `chats` row is created
+   *  server-side on the first actual send under that context_key. Safe
+   *  because nothing in this component ever reads activeChat.id/.title/
+   *  .created_at/.last_message_at -- only activeChat.context_key, via
+   *  chatContextKey below -- so the placeholder's other fields never need
+   *  to be reconciled with the server's real row. */
   const handleStartNewChat = useCallback(
     (persona: PersonaInfo) => {
       if (persona.id === personaId) return
-      commands.createChat(requireCurrentUserId(), persona.id).then((result) => {
-        if (result.status !== 'ok') {
-          setOpenError(result.error)
-          return
-        }
-        resetGate3State()
-        setActiveChat(result.data)
-        onPersonaChange(persona.id)
+      resetGate3State()
+      const chatId = crypto.randomUUID()
+      const now = new Date().toISOString()
+      setActiveChat({
+        id: chatId,
+        persona_id: persona.id,
+        context_key: `chat-${chatId}`,
+        title: null,
+        archived_at: null,
+        created_at: now,
+        last_message_at: now,
       })
+      onPersonaChange(persona.id)
     },
-    [personaId, onPersonaChange, setOpenError],
+    [personaId, onPersonaChange],
   )
 
   /** ChatHistoryList's own action -- switch to viewing a past chat.
@@ -954,9 +972,11 @@ export function CloudChatAccessPane({
   // comment already calls contextKey "the caller-owned transcript
   // identity," which is exactly what this is). activeChat === null is
   // the pre-existing flat conversation's context_key, unchanged from
-  // before this slice; a real chat's own context_key (already
-  // "chat-{uuid}", assigned server-side by chat_store::create_chat) is
-  // used verbatim, not reconstructed client-side.
+  // before this slice. items.id=546: a real chat's own context_key
+  // ("chat-{uuid}") is now minted client-side by handleStartNewChat above,
+  // not assigned server-side by a create-chat call -- the `chats` row
+  // itself is only created lazily, server-side, on the first message
+  // actually sent under that context_key.
   // items.id=534 (Option B): this literal is a persisted context_key
   // format (messages_001.sql/messages_002.sql), intentionally kept
   // unchanged by the tier-vocabulary rename -- do not "fix" it to

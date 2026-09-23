@@ -10,12 +10,24 @@
 // Backs commands/chats.rs, which in turn backs the persona-scoped
 // chat-history list/switcher UI (items.id=384 slice 7).
 //
-// context_key for a chat created here is always "chat-{id}" -- a NEW
-// transcript identity distinct from the pre-existing "persona-hub-*"/
-// "tier3-access-*" strings ChatPane already uses. Those older context
-// keys have no `chats` row and no `chat_id` on their messages -- this
-// module does not touch them, and list_chats never surfaces them (there
-// is nothing in `chats` to list until create_chat makes a row).
+// context_key for a chat is always "chat-{id}" -- a NEW transcript
+// identity distinct from the pre-existing "persona-hub-*"/"tier3-access-*"
+// strings ChatPane already uses. Those older context keys have no `chats`
+// row and no `chat_id` on their messages -- this module does not touch
+// them, and list_chats never surfaces them.
+//
+// items.id=546: chats are created LAZILY, not eagerly. There used to be a
+// standalone create_chat() called the instant a user picked a persona in
+// the picker, before any message existed -- that let empty, message-less
+// chats accumulate and be indistinguishable from real ones in History, and
+// nothing ever bumped last_message_at/title after creation either. Both
+// problems share one fix: ensure_chat_and_bump_activity() below is called
+// from commands/messages.rs::send_message, once, right before the user's
+// turn is persisted -- it creates the row on the first message under a
+// given context_key and bumps activity/sets title-once on every later one.
+// A context_key with no chats row simply has no chat yet (or never will,
+// for the legacy flat pseudo-conversations) -- there is nothing to list
+// until a real message actually sends under a "chat-*" context_key.
 //
 // QUERY STYLE: runtime sqlx::query() only — no query!() macros, matching
 // message_store.rs (D6-346's many-small-encrypted-DB topology has no
@@ -73,45 +85,62 @@ fn row_to_chat_record(r: &sqlx::sqlite::SqliteRow) -> Result<ChatRecord, sqlx::E
 // Write
 // ---------------------------------------------------------------------------
 
-/// Start a new chat for a Persona. decisions.id=739's "starting a new chat
-/// auto-saves the current conversation to history" is satisfied by
-/// construction, not by any explicit save call here: messages are already
-/// persisted per-message under whatever chat_id/context_key was current
-/// (message_store::save_message), so "new chat" is simply "hand out a
-/// fresh chat_id/context_key going forward" -- the previous chat's rows
-/// are untouched, not moved or copied.
-pub async fn create_chat(
+/// items.id=546: creates the owning `chats` row on the FIRST message sent
+/// under `context_key` (a chats row no longer exists eagerly from a mere
+/// persona switch -- CloudChatAccessPane's handleStartNewChat now only
+/// mints a fresh "chat-{uuid}" context_key client-side, never calls an
+/// eager create-chat command), and bumps last_message_at/sets title-once
+/// on every later message. One statement, one round trip -- deliberately
+/// not a separate create-then-update pair, so "does this chat exist yet"
+/// is never a race between this and a later send under the same
+/// context_key.
+///
+/// Only touches `context_key`s that look like a real chat (the "chat-"
+/// prefix, this module's own established convention) -- the legacy flat
+/// "tier3-access-{persona_id}"/"persona-hub-*" pseudo-conversations must
+/// keep having no chats row at all (see this module's header comment), or
+/// they'd start silently appearing in History the first time anyone sends
+/// a message from the app's default, un-switched state.
+///
+/// Returns Ok(true) if a chats row now exists for context_key (created or
+/// bumped), Ok(false) if context_key isn't chat-shaped and nothing was
+/// touched. Caller (commands/messages.rs::send_message) treats Err as
+/// non-fatal -- the message itself still saves under context_key even if
+/// this fails; the chat just won't have a `chats` row (won't appear in
+/// History) until a later successful send retries this for the same key.
+pub async fn ensure_chat_and_bump_activity(
     user_id: &str,
     persona_id: &str,
     key_hex: &str,
-) -> Result<ChatRecord, ChatStoreError> {
-    let id = uuid::Uuid::new_v4().to_string();
-    let context_key = format!("chat-{id}");
-    let timestamp = crate::providers::utils::now();
+    context_key: &str,
+    title_candidate: Option<&str>,
+) -> Result<bool, ChatStoreError> {
+    if !context_key.starts_with("chat-") {
+        return Ok(false);
+    }
+
     let mut conn = message_store::open_messages_db(user_id, persona_id, key_hex).await?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let timestamp = crate::providers::utils::now();
 
     sqlx::query(
         "INSERT INTO chats
          (id, persona_id, context_key, title, archived_at, created_at, last_message_at)
-         VALUES (?, ?, ?, NULL, NULL, ?, ?)",
+         VALUES (?, ?, ?, ?, NULL, ?, ?)
+         ON CONFLICT(context_key) DO UPDATE SET
+             last_message_at = excluded.last_message_at,
+             title = COALESCE(chats.title, excluded.title)",
     )
     .bind(&id)
     .bind(persona_id)
-    .bind(&context_key)
+    .bind(context_key)
+    .bind(title_candidate)
     .bind(&timestamp)
     .bind(&timestamp)
     .execute(&mut conn)
     .await?;
 
-    Ok(ChatRecord {
-        id,
-        persona_id: persona_id.to_owned(),
-        context_key,
-        title: None,
-        archived_at: None,
-        created_at: timestamp.clone(),
-        last_message_at: timestamp,
-    })
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -228,36 +257,121 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_chat_then_list_chats_round_trips() {
+    async fn ensure_chat_and_bump_activity_creates_a_row_on_first_call() {
         let _env = setup().await;
 
-        let created = create_chat(USER_ID, PERSONA_ID, KEY_HEX)
-            .await
-            .expect("create_chat must succeed");
-
-        assert!(created.context_key.starts_with("chat-"));
-        assert_eq!(created.title, None);
-        assert_eq!(created.archived_at, None);
+        let touched = ensure_chat_and_bump_activity(
+            USER_ID,
+            PERSONA_ID,
+            KEY_HEX,
+            "chat-round-trip",
+            Some("first title"),
+        )
+        .await
+        .expect("ensure_chat_and_bump_activity must succeed");
+        assert!(touched, "a chat-shaped context_key must create a row");
 
         let chats = list_chats(USER_ID, PERSONA_ID, KEY_HEX)
             .await
             .expect("list_chats must succeed");
 
         assert_eq!(chats.len(), 1);
-        assert_eq!(chats[0].id, created.id);
-        assert_eq!(chats[0].context_key, created.context_key);
+        assert_eq!(chats[0].context_key, "chat-round-trip");
+        assert_eq!(chats[0].title.as_deref(), Some("first title"));
+        assert_eq!(chats[0].archived_at, None);
+    }
+
+    #[tokio::test]
+    async fn ensure_chat_and_bump_activity_bumps_and_preserves_title_on_second_call() {
+        let _env = setup().await;
+
+        ensure_chat_and_bump_activity(
+            USER_ID,
+            PERSONA_ID,
+            KEY_HEX,
+            "chat-bump",
+            Some("original title"),
+        )
+        .await
+        .expect("first call must succeed");
+
+        // Force a real ordering difference the same way a real later
+        // message would, rather than asserting on possibly-equal
+        // now()-derived timestamps (second-resolution).
+        let mut conn = message_store::open_messages_db(USER_ID, PERSONA_ID, KEY_HEX)
+            .await
+            .expect("open_messages_db must succeed");
+        sqlx::query("UPDATE chats SET last_message_at = ? WHERE context_key = ?")
+            .bind("2026-09-01T00:00:01Z")
+            .bind("chat-bump")
+            .execute(&mut conn)
+            .await
+            .expect("update must succeed");
+
+        let touched = ensure_chat_and_bump_activity(
+            USER_ID,
+            PERSONA_ID,
+            KEY_HEX,
+            "chat-bump",
+            Some("a later message's title -- must not win"),
+        )
+        .await
+        .expect("second call must succeed");
+        assert!(touched);
+
+        let chats = list_chats(USER_ID, PERSONA_ID, KEY_HEX)
+            .await
+            .expect("list_chats must succeed");
+
+        assert_eq!(chats.len(), 1);
+        assert_eq!(
+            chats[0].title.as_deref(),
+            Some("original title"),
+            "title must be set once, from the first message, never overwritten"
+        );
+        assert_ne!(
+            chats[0].last_message_at, "2026-09-01T00:00:01Z",
+            "last_message_at must be bumped by the second call"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_chat_and_bump_activity_is_a_noop_for_a_non_chat_context_key() {
+        let _env = setup().await;
+
+        let touched = ensure_chat_and_bump_activity(
+            USER_ID,
+            PERSONA_ID,
+            KEY_HEX,
+            "tier3-access-persona-chat-test",
+            Some("should never be used"),
+        )
+        .await
+        .expect("must not error for a non-chat-shaped context_key");
+        assert!(
+            !touched,
+            "a non-chat-shaped context_key must not create a row"
+        );
+
+        let chats = list_chats(USER_ID, PERSONA_ID, KEY_HEX)
+            .await
+            .expect("list_chats must succeed");
+        assert!(
+            chats.is_empty(),
+            "no row should exist for a non-chat context_key"
+        );
     }
 
     #[tokio::test]
     async fn list_chats_sorts_most_recent_first() {
         let _env = setup().await;
 
-        let first = create_chat(USER_ID, PERSONA_ID, KEY_HEX)
+        ensure_chat_and_bump_activity(USER_ID, PERSONA_ID, KEY_HEX, "chat-first", None)
             .await
-            .expect("create_chat must succeed");
-        let second = create_chat(USER_ID, PERSONA_ID, KEY_HEX)
+            .expect("ensure_chat_and_bump_activity must succeed");
+        ensure_chat_and_bump_activity(USER_ID, PERSONA_ID, KEY_HEX, "chat-second", None)
             .await
-            .expect("create_chat must succeed");
+            .expect("ensure_chat_and_bump_activity must succeed");
 
         // Two chats created back-to-back can legitimately share the same
         // now()-derived last_message_at timestamp (second-resolution) --
@@ -267,15 +381,15 @@ mod tests {
         let mut conn = message_store::open_messages_db(USER_ID, PERSONA_ID, KEY_HEX)
             .await
             .expect("open_messages_db must succeed");
-        sqlx::query("UPDATE chats SET last_message_at = ? WHERE id = ?")
+        sqlx::query("UPDATE chats SET last_message_at = ? WHERE context_key = ?")
             .bind("2026-09-01T00:00:01Z")
-            .bind(&first.id)
+            .bind("chat-first")
             .execute(&mut conn)
             .await
             .expect("update must succeed");
-        sqlx::query("UPDATE chats SET last_message_at = ? WHERE id = ?")
+        sqlx::query("UPDATE chats SET last_message_at = ? WHERE context_key = ?")
             .bind("2026-09-01T00:00:02Z")
-            .bind(&second.id)
+            .bind("chat-second")
             .execute(&mut conn)
             .await
             .expect("update must succeed");
@@ -285,19 +399,27 @@ mod tests {
             .expect("list_chats must succeed");
 
         assert_eq!(chats.len(), 2);
-        assert_eq!(chats[0].id, second.id, "most recent last_message_at first");
-        assert_eq!(chats[1].id, first.id);
+        assert_eq!(
+            chats[0].context_key, "chat-second",
+            "most recent last_message_at first"
+        );
+        assert_eq!(chats[1].context_key, "chat-first");
     }
 
     #[tokio::test]
     async fn list_chats_excludes_archived() {
         let _env = setup().await;
 
-        let chat = create_chat(USER_ID, PERSONA_ID, KEY_HEX)
+        ensure_chat_and_bump_activity(USER_ID, PERSONA_ID, KEY_HEX, "chat-archive-me", None)
             .await
-            .expect("create_chat must succeed");
+            .expect("ensure_chat_and_bump_activity must succeed");
 
-        archive_chat(USER_ID, PERSONA_ID, KEY_HEX, &chat.id)
+        let chats = list_chats(USER_ID, PERSONA_ID, KEY_HEX)
+            .await
+            .expect("list_chats must succeed");
+        let chat_id = chats[0].id.clone();
+
+        archive_chat(USER_ID, PERSONA_ID, KEY_HEX, &chat_id)
             .await
             .expect("archive_chat must succeed");
 
@@ -312,16 +434,16 @@ mod tests {
     async fn list_chats_scopes_by_persona_id() {
         let _env = setup().await;
 
-        create_chat(USER_ID, PERSONA_ID, KEY_HEX)
+        ensure_chat_and_bump_activity(USER_ID, PERSONA_ID, KEY_HEX, "chat-mine", None)
             .await
-            .expect("create_chat must succeed");
+            .expect("ensure_chat_and_bump_activity must succeed");
 
         // A different persona_id sharing the same messages.db row set
-        // (this test inserts directly rather than via create_chat, since
-        // create_chat's own DB path is keyed by persona_id -- this
-        // exercises list_chats' WHERE persona_id = ? scoping directly
-        // against a row that's physically present but belongs to another
-        // persona).
+        // (this test inserts directly rather than via
+        // ensure_chat_and_bump_activity, since that function's own DB path
+        // is keyed by persona_id -- this exercises list_chats' WHERE
+        // persona_id = ? scoping directly against a row that's physically
+        // present but belongs to another persona).
         let mut conn = message_store::open_messages_db(USER_ID, PERSONA_ID, KEY_HEX)
             .await
             .expect("open_messages_db must succeed");
@@ -380,15 +502,19 @@ mod tests {
         // context_key-based rows still work with chat_id left NULL.
         let _env = setup().await;
 
-        let chat = create_chat(USER_ID, PERSONA_ID, KEY_HEX)
+        ensure_chat_and_bump_activity(USER_ID, PERSONA_ID, KEY_HEX, "chat-msg-id-test", None)
             .await
-            .expect("create_chat must succeed");
+            .expect("ensure_chat_and_bump_activity must succeed");
+        let chats = list_chats(USER_ID, PERSONA_ID, KEY_HEX)
+            .await
+            .expect("list_chats must succeed");
+        let chat_id = chats[0].id.clone();
 
         let saved = message_store::save_message(
             USER_ID,
             PERSONA_ID,
             KEY_HEX,
-            &chat.context_key,
+            "chat-msg-id-test",
             "user",
             "hello",
             None,
@@ -401,7 +527,7 @@ mod tests {
             .await
             .expect("open_messages_db must succeed");
         sqlx::query("UPDATE messages SET chat_id = ? WHERE id = ?")
-            .bind(&chat.id)
+            .bind(&chat_id)
             .bind(&saved.id)
             .execute(&mut conn)
             .await
@@ -412,7 +538,7 @@ mod tests {
             .fetch_one(&mut conn)
             .await
             .expect("query failed");
-        let chat_id: Option<String> = row.try_get("chat_id").unwrap();
-        assert_eq!(chat_id.as_deref(), Some(chat.id.as_str()));
+        let chat_id_col: Option<String> = row.try_get("chat_id").unwrap();
+        assert_eq!(chat_id_col.as_deref(), Some(chat_id.as_str()));
     }
 }

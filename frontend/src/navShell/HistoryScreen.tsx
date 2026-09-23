@@ -28,10 +28,25 @@
 
 import { useCallback, useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { commands, type ChatInfo, type OutputInfo, type PersonaInfo } from '../bindings'
 import { DocumentRow } from '../library/DocumentRow'
 import '../chat/ChatHistoryList.css'
 import './HistoryScreen.css'
+
+/** Hand-declared, not generated: ChatActivityUpdatedPayload
+ *  (commands/messages.rs) is emitted via AppHandle::emit(), not
+ *  returned/accepted by any #[tauri::command] -- tauri-specta's
+ *  collect_commands! only walks types reachable from the registered
+ *  command surface, so specta::Type on the Rust struct alone doesn't get
+ *  it into bindings.ts. This codebase has no typed-event registration
+ *  (no collect_events!/mount_events anywhere) to fix that with -- same
+ *  convention as ChatPane.tsx's RunStatusPayload/MessageContentReadyPayload.
+ *  Keep this in sync by hand with ChatActivityUpdatedPayload's field list
+ *  if that struct changes. */
+interface ChatActivityUpdatedPayload {
+  persona_id: string
+}
 
 export interface HistoryOpenTarget {
   personaId: string
@@ -253,9 +268,7 @@ function ChatHistoryAction({
   const [chats, setChats] = useState<ChatInfo[]>([])
   const [error, setError] = useState<string | null>(null)
 
-  useEffect(() => {
-    setChats([])
-    setError(null)
+  const fetchChats = useCallback(() => {
     commands.listChats(userId, personaId).then((result) => {
       if (result.status === 'ok') {
         setChats(result.data)
@@ -264,6 +277,40 @@ function ChatHistoryAction({
       }
     })
   }, [userId, personaId])
+
+  useEffect(() => {
+    setChats([])
+    setError(null)
+    fetchChats()
+  }, [fetchChats])
+
+  // items.id=546: the effect above only fetches on mount/persona change --
+  // a chat updated elsewhere (a message sent while this panel is already
+  // open) wouldn't otherwise show until this component remounted. Same
+  // cancelled/unlisten cleanup idiom as ChatPane.tsx's own
+  // run-status-update/message-content-ready effect (CLAUDE.md: Tauri event
+  // listeners must be explicitly detached on SPA view unmount).
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined
+    let cancelled = false
+
+    listen<ChatActivityUpdatedPayload>('chat-activity-updated', (event) => {
+      if (event.payload.persona_id === personaId) {
+        fetchChats()
+      }
+    }).then((fn) => {
+      if (cancelled) {
+        fn()
+      } else {
+        unlisten = fn
+      }
+    })
+
+    return () => {
+      cancelled = true
+      unlisten?.()
+    }
+  }, [personaId, fetchChats])
 
   return (
     <div className="history-screen__chat-history">

@@ -1,13 +1,21 @@
 // src-tauri/src/commands/chats.rs
 //
-// Group 22 — Persona-scoped chat history. Commands: create_chat,
-// list_chats, archive_chat.
+// Group 22 — Persona-scoped chat history. Commands: list_chats,
+// archive_chat.
 //
 // items.id=384 slice 6 (decisions.id=739/740): backs the persona-scoped
 // chat-history list/switcher UI (slice 7) that ChatPane.tsx's Cloud Chat
 // / merged-workspace usage gets, per the reference mockup's
 // chat-history icon. Backed by persistence/chat_store.rs, itself living
 // in the same messages.db message_store.rs already owns.
+//
+// items.id=546: there used to be a create_chat command here too, called
+// eagerly the instant a persona was picked in the UI, before any message
+// existed. Removed -- chat creation is now lazy, folded into
+// commands/messages.rs::send_message's own call to
+// chat_store::ensure_chat_and_bump_activity, which creates the row on the
+// first message actually sent under a given context_key. See that
+// function's doc comment for why.
 //
 // user_id/persona_id via IPC, key_hex derived server-side from
 // KeyRegistry: same Release-1-no-auth-layer-yet convention
@@ -50,30 +58,6 @@ fn to_chat_info(r: chat_store::ChatRecord) -> ChatInfo {
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
-
-/// Starts a new chat for a Persona. decisions.id=739: the previously
-/// current chat is not touched by this call at all -- its messages stay
-/// exactly where they were saved (message_store::save_message persists
-/// per-message, not per-chat-on-close), so "new chat auto-saves to
-/// history" is satisfied by this command simply handing back a fresh
-/// chat_id/context_key, not by any explicit save step here.
-#[tauri::command]
-#[specta::specta]
-pub async fn create_chat(
-    user_id: String,
-    persona_id: String,
-    key_registry: State<'_, KeyRegistry>,
-) -> Result<ChatInfo, String> {
-    let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
-        .await
-        .ok_or_else(|| "not logged in".to_owned())?;
-
-    let record = chat_store::create_chat(&user_id, &persona_id, &key_hex_str)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(to_chat_info(record))
-}
 
 /// Lists a Persona's non-archived chats, most-recent-first.
 #[tauri::command]

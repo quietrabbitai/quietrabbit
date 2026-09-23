@@ -161,8 +161,8 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::ingest::store_ingested_document,
         commands::ingest::get_ingested_document_bytes,
         // Group 22 -- Persona-scoped chat history (items.id=384 slice 6,
-        // decisions.id=739/740)
-        commands::chats::create_chat,
+        // decisions.id=739/740; create_chat removed items.id=546, chat
+        // creation is now lazy inside commands::messages::send_message)
         commands::chats::list_chats,
         commands::chats::archive_chat,
     ])
