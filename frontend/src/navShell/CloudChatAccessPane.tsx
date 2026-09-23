@@ -290,10 +290,25 @@ export function CloudChatAccessPane({
       // fires alongside activation (not blocking it; see design doc's own
       // "achievable version" framing -- QR cannot observe paste itself,
       // only the two moments it CAN observe: copy, and selecting a new
-      // destination). Mirrors handleDraftReady's own shape: reviewOutcome
-      // is set to 'pending' BEFORE the command resolves so the modal is
-      // already primed if the independent consent_request listener (below)
-      // delivers a payload for it.
+      // destination).
+      //
+      // BUG FOUND + FIXED (2026-09-23): this used to set reviewOutcome to
+      // 'pending' BEFORE even sending the command, on the theory that the
+      // modal would then already be "primed" if the independent
+      // consent_request listener (below) delivered a payload for it. In
+      // practice this recheck is usually a no-op (every fact already
+      // resolved, or nothing new to review -- see the data.approved branch
+      // below) and resolves in milliseconds, so 'pending' flipped straight
+      // back to 'approved'/'blocked' a frame or two later -- PrivacyGuardianModal's
+      // own `open` prop is driven purely by reviewOutcome === 'pending'
+      // (see its render below), so this was a real open-then-close of the
+      // modal's scanning state on every send, not just a state-value blip.
+      // Fix: only set 'pending' once the result actually says
+      // pending_consent -- by then consentPayload is already populated
+      // (gate3()'s write-before-surface invariant, same one
+      // handleDraftReady's own doc comment relies on), so the modal opens
+      // straight into the real review UI, never the scanning placeholder,
+      // and the no-op path never opens the modal at all.
       if (lastCopiedStarter) {
         const activeIds = openProviderIds.includes(providerId)
           ? openProviderIds
@@ -304,10 +319,6 @@ export function CloudChatAccessPane({
           .readText()
           .then((clipboardText) => {
             if (clipboardText !== lastCopiedStarter.content) return
-            setReviewOutcome('pending')
-            setReviewMessage(null)
-            setReviewCeiling(null)
-            setPendingMessageId(messageId)
             return commands.recheckCloudFrontierProviderSelection({
               user_id: requireCurrentUserId(),
               persona_id: starterPersonaId,
@@ -326,7 +337,10 @@ export function CloudChatAccessPane({
             }
             const data = result.data
             if (data.pending_consent) {
-              // Payload arrives via the consent_request listener.
+              setReviewOutcome('pending')
+              setReviewMessage(null)
+              setReviewCeiling(null)
+              setPendingMessageId(messageId)
               return
             }
             if (data.approved) {
