@@ -1,7 +1,8 @@
 # Quiet Rabbit — Claude Code Context
-# Last updated: August 29, 2026 (Chat-PM staleness sweep -- Architecture
-# Reference and IPC command count corrected; see those sections for what
-# changed and why. Sections not touched this pass were not re-verified.)
+# Last updated: September 23, 2026 (Chat-PM staleness sweep -- Naming
+# Architecture term map corrected: Plan->Topic and Task->Action rows added,
+# "all migrations applied" framing fixed (Task->Action never propagated to
+# code -- see below). Sections not touched this pass were not re-verified.)
 
 ## Session Discipline
 - Respond with code only. No preamble, no recap, no explanation unless asked.
@@ -92,9 +93,12 @@ No duplicate model downloads. No contention between instances.
 Dev: Ollama runs on Garuda at http://192.168.88.238:11434 — already running, always detected.
 127.0.0.1:11434 also works locally (system Ollama, always detected first).
 
-## Naming Architecture — complete term map (all migrations applied)
+## Naming Architecture — term map
 
-All legacy terms retired. Canonical terms only in all new code.
+Most legacy terms are retired; canonical terms are used in all new code.
+Two exceptions below (Plan->Topic, Task->Action) are ADR-013-locked
+canonical pairs whose code-level rename status differs -- check the Notes
+column, don't assume every row here is fully propagated to code.
 
 | Retired term         | Canonical term      | Notes                                        |
 |----------------------|---------------------|----------------------------------------------|
@@ -121,6 +125,19 @@ All legacy terms retired. Canonical terms only in all new code.
 | Personal Specialist  | (no named term)     | User sees: "What QR knows about you"         |
 |                      |                     | personal-specialist.operator display_name    |
 |                      |                     | needs update before Focus builds             |
+| Plan                 | Topic               | plan_id → topic_id; migration complete,      |
+|                      |                     | topic_id/topic_store.rs used throughout      |
+| Task                 | Action              | ADR-013-locked (D6-214--D6-225) but NOT      |
+|                      |                     | propagated to code (confirmed 2026-09-23):   |
+|                      |                     | action_id appears only in                    |
+|                      |                     | plan_state_store.rs as a bind parameter.     |
+|                      |                     | Runtime code still uses step_id/             |
+|                      |                     | StepDefinition throughout conductor/         |
+|                      |                     | lifecycle.rs, executor.rs, and 8 other       |
+|                      |                     | files. Rename tracked as items.id=552 --     |
+|                      |                     | until that lands, use step_id/               |
+|                      |                     | StepDefinition when writing/reading code,    |
+|                      |                     | Action/action_id only in ADR-013/design docs.|
 
 ## R1 Focuses
 Canonical R1 Focus list: FOCUS_ROADMAP.md → § R1 Confirmed scope
