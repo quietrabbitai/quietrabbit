@@ -3187,12 +3187,11 @@ impl PaneHost {
                         _ => {}
                     }
                 }
-                if let Some(host) = mgr
+                let browser_opt = mgr
                     .panes
                     .get(&key)
-                    .and_then(|p| p.browser_lifecycle.browser())
-                    .and_then(|b| b.host())
-                {
+                    .and_then(|p| p.browser_lifecycle.browser());
+                if let Some(host) = browser_opt.as_ref().and_then(|b| b.host()) {
                     let cef_type = match event_type {
                         PaneKeyEventType::RawKeyDown => KeyEventType::RAWKEYDOWN,
                         PaneKeyEventType::Char => KeyEventType::CHAR,
@@ -3249,6 +3248,71 @@ impl PaneHost {
                                         "cloud_chat_gpu_pane::pane_host: items.id=369 clipboard write failed, pane={key}: {e}"
                                     );
                                 }
+                            }
+                        }
+                    }
+
+                    // items.id=547: `host.send_key_event` above delivers
+                    // Ctrl+V's RawKeyDown/Char/KeyUp to CEF exactly like any
+                    // other key (confirmed live: no DIAG items.id=365 drop
+                    // warning fires for it, and plain typing into this same
+                    // pane works correctly, so CEF-side focus/input routing
+                    // itself was never the gap) -- but nothing pasted.
+                    // `Frame::paste()` (CEF's own "Paste" editing command)
+                    // reached the correct, focused main frame with no error
+                    // and still had no effect, live-confirmed via temporary
+                    // DIAG logging -- consistent with items.id=369's
+                    // "CEF's clipboard write path is broken under Wayland"
+                    // finding extending to the read direction too (paste's
+                    // internal ExecuteEditCommand reads through the same
+                    // platform clipboard service that write goes through),
+                    // even though that item's own doc only ever confirmed
+                    // write. Reads the OS clipboard on QR's own
+                    // already-working native path instead and inserts it
+                    // directly via `ime_commit_text` -- CEF's IME
+                    // text-insertion API, which never touches CEF's own
+                    // clipboard. The `replacement_range: None` on the first
+                    // attempt also silently no-op'd; explicitly passing
+                    // CEF's `{u32::MAX, u32::MAX}` sentinel (documented as
+                    // "no replacement, insert at cursor") fixed that.
+                    // Confirmed the Rust binding itself is not the cause --
+                    // the generated binding (cef 151.1.0+151.3.12,
+                    // x86_64_unknown_linux_gnu.rs) marshals
+                    // `replacement_range: Option<&Range>` via
+                    // `.map(...).unwrap_or(std::ptr::null())`, so `None`
+                    // correctly crosses the FFI boundary as a true null
+                    // pointer, not a zero-initialized struct. Why CEF/
+                    // Chromium's own native handling of a null
+                    // `replacement_range` no-ops for this specific
+                    // ime_commit_text path on this CEF build is unconfirmed
+                    // -- flagging as an open question rather than asserting
+                    // a mechanism, not worth chasing further given the
+                    // explicit sentinel is simpler and live-confirmed
+                    // working end to end regardless. RawKeyDown only, same
+                    // reasoning as the copy/cut bridge: purely additive,
+                    // CEF's own (currently inert) attempt via the
+                    // already-forwarded key event proceeds independently.
+                    const VK_V: i32 = 0x56;
+                    if matches!(event_type, PaneKeyEventType::RawKeyDown)
+                        && modifiers.ctrl
+                        && windows_key_code == VK_V
+                    {
+                        match mgr.app_handle.clipboard().read_text() {
+                            Ok(text) if !text.is_empty() => {
+                                host.ime_commit_text(
+                                    Some(&cef::CefString::from(text.as_str())),
+                                    Some(&cef::Range {
+                                        from: u32::MAX,
+                                        to: u32::MAX,
+                                    }),
+                                    0,
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                log::warn!(
+                                    "cloud_chat_gpu_pane::pane_host: items.id=547 clipboard read failed, pane={key}: {e}"
+                                );
                             }
                         }
                     }

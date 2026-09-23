@@ -4,7 +4,7 @@
 // component for both: gate3Track is the only behavioral difference (whether
 // the assistant reply gets gate3_review_status="drafted").
 
-import { useCallback, useEffect, useRef, useState, type ClipboardEvent } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { commands, type MessageInfo, type PendingCrossPersonaFact } from '../bindings'
@@ -777,17 +777,41 @@ export function ChatPane({
   // navigator.clipboard.readText() -- strictly reactive to a copy gesture
   // on QR's own rendered content, per the locked
   // no-passive-clipboard-monitoring rule.
-  const handleTranscriptCopy = useCallback(
-    (e: ClipboardEvent<HTMLUListElement>) => {
-      e.preventDefault() // synchronous, before any async work
+  //
+  // items.id=547 fix: a native `copy` event's target/bubble path is the
+  // FOCUSED element (or body/document if nothing is focused), never the
+  // selection's own container (Clipboard API spec + confirmed live) --
+  // message content here (<li>/<span>) has no tabIndex, so a mouse-drag
+  // selection over transcript text never moves focus into a JSX
+  // `onCopy`-bound <ul>, and that handler silently never fired. Attaching
+  // at `document` instead sidesteps focus entirely -- `copy` always
+  // bubbles to `document` regardless of what's focused -- and relevance is
+  // determined the same way the per-li filter below already did: whether
+  // the actual selection Range intersects this transcript's own list
+  // element, a purely geometric check independent of focus. Deliberately
+  // does NOT preventDefault until that check passes, so a copy elsewhere
+  // in the app (including out of an <input>/<textarea>, whose own internal
+  // selection window.getSelection() can't see at all) is left completely
+  // untouched -- same passthrough-by-default safety the old bubble-scoped
+  // handler had implicitly, just made explicit now that this listens
+  // app-wide.
+  const messageListRef = useRef<HTMLUListElement>(null)
+  useEffect(() => {
+    const handleDocumentCopy = (e: ClipboardEvent) => {
+      const listEl = messageListRef.current
+      if (!listEl) return
 
       const selection = window.getSelection()
       const text = selection?.toString() ?? ''
       if (!text || !selection || selection.rangeCount === 0) return
 
       const range = selection.getRangeAt(0)
+      if (!range.intersectsNode(listEl)) return // copy is unrelated to this transcript
+
+      e.preventDefault() // synchronous, before any async work
+
       const selectedMessages = Array.from(
-        e.currentTarget.querySelectorAll<HTMLLIElement>('li[data-message-id]'),
+        listEl.querySelectorAll<HTMLLIElement>('li[data-message-id]'),
       ).filter((li) => range.intersectsNode(li))
 
       if (selectedMessages.length === 0) {
@@ -806,9 +830,11 @@ export function ChatPane({
       }
 
       runCopyReview(text, includesWithheld)
-    },
-    [runCopyReview, requestWithheldReconfirm],
-  )
+    }
+
+    document.addEventListener('copy', handleDocumentCopy)
+    return () => document.removeEventListener('copy', handleDocumentCopy)
+  }, [runCopyReview, requestWithheldReconfirm])
 
   // items.id=391 (Jason, 2026-09-02): the transcript never auto-scrolled
   // to the newest message at all -- confirmed as the actual blocker
@@ -877,7 +903,7 @@ export function ChatPane({
           {messages.length === 0 && !loadError && (
             <p>{t('navShell.chat.emptyTranscript')}</p>
           )}
-          <ul className="chat-pane__message-list" onCopy={handleTranscriptCopy}>
+          <ul className="chat-pane__message-list" ref={messageListRef}>
             {messages.map((m) => {
               // items.id=359 piece 6: an approved gate3 draft is a
               // visually distinct message type, not another plain bubble
