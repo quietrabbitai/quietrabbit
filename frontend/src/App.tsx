@@ -85,6 +85,9 @@ function App() {
   // pointer-forwarding path that sends right-clicks into CEF. Not gated on
   // bootState -- the login screen is in scope too.
   useEffect(() => {
+    if (import.meta.env.DEV) {
+      return
+    }
     const handleContextMenu = (event: MouseEvent) => {
       event.preventDefault()
     }
