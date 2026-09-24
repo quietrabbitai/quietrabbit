@@ -45,6 +45,12 @@ export interface LibraryPaneProps {
 
 type LibraryAction = 'view' | 'copy' | 'import' | null
 
+// items.id=558: the two Library views -- qr_generated is the existing
+// default, external_ingested is the new Imported view. Mirrors
+// OutputInfo.source's own two values (items.id=383) exactly, so this type
+// is passed straight through to listOutputs' `source` param.
+type LibrarySourceView = 'qr_generated' | 'external_ingested'
+
 // Mirrors ingest.rs's own TEXT_MIRROR_EXTENSIONS -- Import new version reads
 // the picked file as text in-browser (no @tauri-apps file-dialog plugin
 // wired yet for a real filesystem path), so it's limited to the same
@@ -62,6 +68,8 @@ export function LibraryPane({ userId, personas, activePersonaId }: LibraryPanePr
     activePersonaId,
     false,
   )
+  const [sourceView, setSourceView] = useState<LibrarySourceView>('qr_generated')
+  const [otherSourceHasDocs, setOtherSourceHasDocs] = useState(false)
   const [outputs, setOutputs] = useState<OutputInfo[]>([])
   const [listError, setListError] = useState<string | null>(null)
   const [selectedOutputId, setSelectedOutputId] = useState<string | null>(null)
@@ -85,8 +93,18 @@ export function LibraryPane({ userId, personas, activePersonaId }: LibraryPanePr
     setImportError(null)
   }, [])
 
-  // Re-fetch on mount / identity change, mirrors ChatPane.tsx's own
-  // identity-keyed re-fetch effect.
+  // items.id=558: switching Persona (libraryFilter is Library's own local
+  // persona filter, decoupled from activePersonaId -- see
+  // usePersonaLocalFilter.ts's header comment) always lands back on the
+  // default qr_generated view, per the design's own "resetting to the
+  // default qr_generated view on persona switch" -- an Imported-view
+  // selection from one Persona shouldn't silently carry over to the next.
+  useEffect(() => {
+    setSourceView('qr_generated')
+  }, [userId, libraryFilter])
+
+  // Re-fetch on mount / identity / source-view change, mirrors ChatPane.tsx's
+  // own identity-keyed re-fetch effect.
   useEffect(() => {
     setOutputs([])
     setListError(null)
@@ -98,19 +116,36 @@ export function LibraryPane({ userId, personas, activePersonaId }: LibraryPanePr
       return
     }
 
-    // items.id=404: passes all 6 params explicitly (source: null) -- the
-    // pre-rework call site omitted the trailing `source` arg entirely.
-    // null keeps today's default behavior unchanged (list_outputs treats
-    // a missing source as 'qr_generated', excluding ingested/external
-    // documents from this default view).
-    commands.listOutputs(userId, libraryFilter, null, null, null, null).then((result) => {
+    // items.id=404 / items.id=558: passes all 6 params explicitly. `source`
+    // is sourceView itself now rather than a hardcoded null -- list_outputs
+    // treats a missing source as 'qr_generated' anyway, but making the
+    // param explicit keeps this call site honest about which of the two
+    // views it's asking for.
+    commands.listOutputs(userId, libraryFilter, null, null, null, sourceView).then((result) => {
       if (result.status === 'ok') {
         setOutputs(result.data)
       } else {
         setListError(result.error)
       }
     })
-  }, [userId, libraryFilter, resetSelection])
+  }, [userId, libraryFilter, sourceView, resetSelection])
+
+  // items.id=558: probes the *other* source so the "View imported
+  // documents ->" / "View library ->" entry point can stay hidden unless
+  // it actually leads somewhere.
+  useEffect(() => {
+    setOtherSourceHasDocs(false)
+
+    if (libraryFilter === null) return
+
+    const otherSource: LibrarySourceView =
+      sourceView === 'qr_generated' ? 'external_ingested' : 'qr_generated'
+    commands.listOutputs(userId, libraryFilter, null, null, null, otherSource).then((result) => {
+      if (result.status === 'ok') {
+        setOtherSourceHasDocs(result.data.length > 0)
+      }
+    })
+  }, [userId, libraryFilter, sourceView])
 
   // View action -- re-fetches via getOutput rather than trusting the list
   // row's own cached content, matching ChatPane's reconcile-over-cache
@@ -210,7 +245,7 @@ export function LibraryPane({ userId, personas, activePersonaId }: LibraryPanePr
                 return
               }
               setImportStatus('success')
-              commands.listOutputs(userId, libraryFilter, null, null, null, null).then((result) => {
+              commands.listOutputs(userId, libraryFilter, null, null, null, sourceView).then((result) => {
                 if (result.status === 'ok') setOutputs(result.data)
               })
             })
@@ -220,8 +255,15 @@ export function LibraryPane({ userId, personas, activePersonaId }: LibraryPanePr
           setImportError(err instanceof Error ? err.message : String(err))
         })
     },
-    [selectedOutputId, userId, libraryFilter, outputs, t],
+    [selectedOutputId, userId, libraryFilter, outputs, sourceView, t],
   )
+
+  // items.id=558: the discoverable entry point toggles between the two
+  // views -- no separate "close" affordance needed, since re-clicking it
+  // from the Imported view just flips straight back.
+  const handleToggleSourceView = () => {
+    setSourceView((prev) => (prev === 'qr_generated' ? 'external_ingested' : 'qr_generated'))
+  }
 
   const handleSelectRow = (outputId: string) => {
     if (outputId === selectedOutputId) {
@@ -238,6 +280,11 @@ export function LibraryPane({ userId, personas, activePersonaId }: LibraryPanePr
     setImportError(null)
   }
 
+  const otherSourceLinkKey =
+    sourceView === 'qr_generated'
+      ? 'navShell.libraryPane.viewImportedLink'
+      : 'navShell.libraryPane.viewLibraryLink'
+
   return (
     <div className="library-pane">
       <PersonaPillRow
@@ -252,11 +299,51 @@ export function LibraryPane({ userId, personas, activePersonaId }: LibraryPanePr
         <p className="library-pane__notice">{t('navShell.libraryPane.noPersonaContext')}</p>
       ) : (
         <>
-          <h2 className="library-pane__heading">{t('navShell.libraryPane.listHeading')}</h2>
+          <div className="library-pane__heading-row">
+            <h2 className="library-pane__heading">
+              {t(
+                sourceView === 'qr_generated'
+                  ? 'navShell.libraryPane.listHeading'
+                  : 'navShell.libraryPane.importedListHeading',
+              )}
+            </h2>
+            {/* items.id=558: shown next to the heading once there's a list
+             *  to look at; when the current view is empty this same link
+             *  collapses into the empty-state message below instead. */}
+            {otherSourceHasDocs && outputs.length > 0 && (
+              <button
+                type="button"
+                className="library-pane__link-button"
+                onClick={handleToggleSourceView}
+              >
+                {t(otherSourceLinkKey)}
+              </button>
+            )}
+          </div>
           {listError && (
             <p role="alert">{t('navShell.libraryPane.listLoadError', { message: listError })}</p>
           )}
-          {outputs.length === 0 && !listError && <p>{t('navShell.libraryPane.emptyList')}</p>}
+          {outputs.length === 0 && !listError && (
+            <p>
+              {t(
+                sourceView === 'qr_generated'
+                  ? 'navShell.libraryPane.emptyList'
+                  : 'navShell.libraryPane.emptyListImported',
+              )}
+              {otherSourceHasDocs && (
+                <>
+                  {' '}
+                  <button
+                    type="button"
+                    className="library-pane__link-button"
+                    onClick={handleToggleSourceView}
+                  >
+                    {t(otherSourceLinkKey)}
+                  </button>
+                </>
+              )}
+            </p>
+          )}
           {outputs.length > 0 && (
             <ul className="library-pane__list">
               {outputs.map((output) => (

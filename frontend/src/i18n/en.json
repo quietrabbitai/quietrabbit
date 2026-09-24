@@ -55,9 +55,13 @@
     },
     "libraryPane": {
       "listHeading": "Outputs",
+      "importedListHeading": "Imported documents",
       "noPersonaContext": "Open Library from a Persona to see its outputs -- there's no Persona selected here yet.",
       "listLoadError": "Could not load outputs: {{message}}",
       "emptyList": "No outputs yet.",
+      "emptyListImported": "No imported documents yet.",
+      "viewImportedLink": "View imported documents →",
+      "viewLibraryLink": "View library →",
       "itemLabel": "{{type}} -- {{date}}",
       "detailLoadError": "Could not load this output: {{message}}",
       "viewButton": "View",
