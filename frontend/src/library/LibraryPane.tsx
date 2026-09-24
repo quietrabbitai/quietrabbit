@@ -26,7 +26,7 @@
 // comment for the exact mechanism, mirrored from ActiveBoardPane.tsx's
 // pre-existing personaFilter.
 
-import { useCallback, useEffect, useState } from 'react'
+import { type ChangeEvent, useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { commands, type OutputInfo, type PersonaInfo } from '../bindings'
 import { DocumentRow } from './DocumentRow'
@@ -43,7 +43,18 @@ export interface LibraryPaneProps {
   activePersonaId: string | null
 }
 
-type LibraryAction = 'view' | 'copy' | null
+type LibraryAction = 'view' | 'copy' | 'import' | null
+
+// Mirrors ingest.rs's own TEXT_MIRROR_EXTENSIONS -- Import new version reads
+// the picked file as text in-browser (no @tauri-apps file-dialog plugin
+// wired yet for a real filesystem path), so it's limited to the same
+// trivially-UTF-8-decodable formats the backend already mirrors verbatim.
+const TEXT_IMPORT_EXTENSIONS = ['txt', 'md', 'markdown', 'html', 'htm']
+
+function hasTextImportExtension(filename: string): boolean {
+  const ext = filename.split('.').pop()?.toLowerCase()
+  return ext !== undefined && TEXT_IMPORT_EXTENSIONS.includes(ext)
+}
 
 export function LibraryPane({ userId, personas, activePersonaId }: LibraryPaneProps) {
   const { t } = useTranslation()
@@ -59,6 +70,9 @@ export function LibraryPane({ userId, personas, activePersonaId }: LibraryPanePr
   const [viewError, setViewError] = useState<string | null>(null)
   const [copyStatus, setCopyStatus] = useState<'pending' | 'success' | 'error' | null>(null)
   const [copyError, setCopyError] = useState<string | null>(null)
+  const [importStatus, setImportStatus] = useState<'pending' | 'success' | 'error' | null>(null)
+  const [importError, setImportError] = useState<string | null>(null)
+  const importInputRef = useRef<HTMLInputElement>(null)
 
   const resetSelection = useCallback(() => {
     setSelectedOutputId(null)
@@ -67,6 +81,8 @@ export function LibraryPane({ userId, personas, activePersonaId }: LibraryPanePr
     setViewError(null)
     setCopyStatus(null)
     setCopyError(null)
+    setImportStatus(null)
+    setImportError(null)
   }, [])
 
   // Re-fetch on mount / identity change, mirrors ChatPane.tsx's own
@@ -132,6 +148,81 @@ export function LibraryPane({ userId, personas, activePersonaId }: LibraryPanePr
     })
   }, [selectedOutputId, userId, libraryFilter])
 
+  // Import new version (decisions.id=827): the button itself is the only
+  // gate -- opening the native file picker *is* the confirmation, no extra
+  // dialog. Picking a file stores it as a fresh ingested output tagged with
+  // the selected document's own focus_slug/project_entity_id/sensitivity,
+  // then supersedes the selected document via updateActiveDocument, exactly
+  // as decisions.id=827's rationale describes ("tags result with
+  // parent_output_id/superseded_by against the currently-selected document").
+  const handleImportClick = () => {
+    importInputRef.current?.click()
+  }
+
+  const handleImportFileChange = useCallback(
+    (event: ChangeEvent<HTMLInputElement>) => {
+      const file = event.target.files?.[0] ?? null
+      event.target.value = ''
+      if (file === null || selectedOutputId === null || libraryFilter === null) return
+
+      setAction('import')
+      setImportStatus('pending')
+      setImportError(null)
+
+      const selected = outputs.find((o) => o.id === selectedOutputId)
+      const focusSlug = selected?.focus_slug ?? null
+      if (!selected || focusSlug === null) {
+        setImportStatus('error')
+        setImportError(t('navShell.libraryPane.importMissingFocusError'))
+        return
+      }
+      if (!hasTextImportExtension(file.name)) {
+        setImportStatus('error')
+        setImportError(t('navShell.libraryPane.importUnsupportedFileError'))
+        return
+      }
+
+      file
+        .text()
+        .then((content) =>
+          commands.storeIngestedDocument(
+            userId,
+            libraryFilter,
+            focusSlug,
+            selected.project_entity_id,
+            selected.sensitivity,
+            content,
+            null,
+          ),
+        )
+        .then((storeResult) => {
+          if (storeResult.status !== 'ok') {
+            setImportStatus('error')
+            setImportError(storeResult.error)
+            return
+          }
+          return commands
+            .updateActiveDocument(storeResult.data.output_id, selectedOutputId, userId, libraryFilter)
+            .then((linkResult) => {
+              if (linkResult.status !== 'ok') {
+                setImportStatus('error')
+                setImportError(linkResult.error)
+                return
+              }
+              setImportStatus('success')
+              commands.listOutputs(userId, libraryFilter, null, null, null, null).then((result) => {
+                if (result.status === 'ok') setOutputs(result.data)
+              })
+            })
+        })
+        .catch((err: unknown) => {
+          setImportStatus('error')
+          setImportError(err instanceof Error ? err.message : String(err))
+        })
+    },
+    [selectedOutputId, userId, libraryFilter, outputs, t],
+  )
+
   const handleSelectRow = (outputId: string) => {
     if (outputId === selectedOutputId) {
       resetSelection()
@@ -143,6 +234,8 @@ export function LibraryPane({ userId, personas, activePersonaId }: LibraryPanePr
     setViewError(null)
     setCopyStatus(null)
     setCopyError(null)
+    setImportStatus(null)
+    setImportError(null)
   }
 
   return (
@@ -181,6 +274,10 @@ export function LibraryPane({ userId, personas, activePersonaId }: LibraryPanePr
                       <button type="button" onClick={handleCopy}>
                         {t('navShell.libraryPane.copyButton')}
                       </button>
+                      <span className="library-pane__row-actions-divider" aria-hidden="true" />
+                      <button type="button" onClick={handleImportClick}>
+                        {t('navShell.libraryPane.importButton')}
+                      </button>
                     </div>
                   )}
                 </li>
@@ -208,8 +305,26 @@ export function LibraryPane({ userId, personas, activePersonaId }: LibraryPanePr
               )}
             </div>
           )}
+          {action === 'import' && (
+            <div className="library-pane__action-pane">
+              {importStatus === 'pending' && <p>{t('navShell.libraryPane.importPending')}</p>}
+              {importStatus === 'success' && <p>{t('navShell.libraryPane.importSuccess')}</p>}
+              {importStatus === 'error' && (
+                <p role="alert" className="library-pane__copy-error">
+                  {importError}
+                </p>
+              )}
+            </div>
+          )}
         </>
       )}
+      <input
+        ref={importInputRef}
+        type="file"
+        accept=".txt,.md,.markdown,.html,.htm,text/plain,text/html,text/markdown"
+        className="library-pane__import-input"
+        onChange={handleImportFileChange}
+      />
     </div>
   )
 }

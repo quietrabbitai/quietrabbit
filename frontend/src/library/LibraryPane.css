@@ -40,8 +40,23 @@
 
 .library-pane__row-actions {
   display: flex;
+  align-items: center;
   gap: 6px;
   padding: 4px 8px 8px 16px;
+}
+
+/* Divider plus wide spacing (decisions.id=827) between the safe pair
+ * (View/Copy) and the harder-to-undo pair (Import new version), to reduce
+ * accidental clicks. */
+.library-pane__row-actions-divider {
+  width: 1px;
+  align-self: stretch;
+  background: var(--border);
+  margin: 0 14px;
+}
+
+.library-pane__import-input {
+  display: none;
 }
 
 .library-pane__action-pane {

@@ -45,8 +45,21 @@
   min-width: 0;
 }
 
+.document-row__date-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
 .document-row__date {
   font-size: 10.5px;
   color: var(--text);
   flex-shrink: 0;
+}
+
+.document-row__exported-mark {
+  display: inline-flex;
+  color: var(--text);
+  opacity: 0.65;
 }

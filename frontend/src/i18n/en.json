@@ -62,7 +62,13 @@
       "detailLoadError": "Could not load this output: {{message}}",
       "viewButton": "View",
       "copyButton": "Copy to clipboard",
-      "copySuccess": "Copied to clipboard."
+      "copySuccess": "Copied to clipboard.",
+      "importButton": "Import new version",
+      "importPending": "Importing…",
+      "importSuccess": "Imported as a new version.",
+      "importUnsupportedFileError": "Only plain text files (.txt, .md, .markdown, .html, .htm) can be imported here.",
+      "importMissingFocusError": "This document has no Focus to import into.",
+      "exportedTooltip": "Exported: {{when}}"
     },
     "history": {
       "userRowLabel": "User",

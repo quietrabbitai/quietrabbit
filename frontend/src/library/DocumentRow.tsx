@@ -12,6 +12,30 @@ import { useTranslation } from 'react-i18next'
 import type { OutputInfo } from '../bindings'
 import './DocumentRow.css'
 
+// Option C (decisions.id=827): small glyph beside the date, full
+// "Exported: [date][time]" text lives in the title/aria-label tooltip only.
+function ExportedGlyph() {
+  return (
+    <svg viewBox="0 0 16 16" width="10" height="10" aria-hidden="true">
+      <path
+        d="M8 2.4v7.3M8 2.4 5.3 5.1M8 2.4l2.7 2.7"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.3"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M3 10.6v1.3c0 .7.6 1.3 1.3 1.3h7.4c.7 0 1.3-.6 1.3-1.3v-1.3"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.3"
+        strokeLinecap="round"
+      />
+    </svg>
+  )
+}
+
 export interface DocumentRowProps {
   output: OutputInfo
   /** false for History's glance-only preview rows -- no click behavior,
@@ -38,12 +62,32 @@ export function DocumentRow({
       date: output.created_at,
     })
   const date = new Date(output.created_at).toLocaleString()
+  const exportedTooltip = output.exported_at
+    ? t('navShell.libraryPane.exportedTooltip', {
+        when: new Date(output.exported_at).toLocaleString(),
+      })
+    : null
+
+  const dateGroup = (
+    <span className="document-row__date-group">
+      <span className="document-row__date">{date}</span>
+      {exportedTooltip && (
+        <span
+          className="document-row__exported-mark"
+          title={exportedTooltip}
+          aria-hidden="true"
+        >
+          <ExportedGlyph />
+        </span>
+      )}
+    </span>
+  )
 
   if (!interactive) {
     return (
       <div className="document-row">
         <span className="document-row__name">{name}</span>
-        <span className="document-row__date">{date}</span>
+        {dateGroup}
       </div>
     )
   }
@@ -56,7 +100,7 @@ export function DocumentRow({
       onClick={onSelect}
     >
       <span className="document-row__name">{name}</span>
-      <span className="document-row__date">{date}</span>
+      {dateGroup}
     </button>
   )
 }
