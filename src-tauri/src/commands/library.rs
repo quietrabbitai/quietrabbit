@@ -97,6 +97,13 @@ pub struct OutputInfo {
     /// Derived from storage_path.is_some() -- whether get_ingested_document_bytes
     /// (commands/ingest.rs) can retrieve a real original file for this output.
     pub has_original_document: bool,
+    /// prime | update | fork | reference | continue_draft (decisions.id=422).
+    pub document_relationship: String,
+    pub superseded_by: Option<String>,
+    /// Set on the finalized->potentially-stale Export transition
+    /// (decisions.id=421/826), cleared on return. Library's "Exported:
+    /// [date][time]" label (items.id=557) is sourced from this field.
+    pub exported_at: Option<String>,
 }
 
 fn to_output_info(record: output_store::OutputRecord) -> OutputInfo {
@@ -113,6 +120,9 @@ fn to_output_info(record: output_store::OutputRecord) -> OutputInfo {
         focus_slug: record.focus_slug,
         original_filename: record.original_filename,
         has_original_document: record.storage_path.is_some(),
+        document_relationship: record.document_relationship,
+        superseded_by: record.superseded_by,
+        exported_at: record.exported_at,
     }
 }
 
@@ -264,6 +274,60 @@ pub async fn delete_output(
     output_store::delete_output(&user_id, &persona_id, &key_hex_str, &output_id, deep_purge)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Fires the Library Export action (decisions.id=421/826, items.id=557):
+/// finalized -> potentially-stale, stamps exported_at. Same shape as
+/// delete_output above -- no is_protected check, matching that command's
+/// existing precedent for a mutating Library command (unlike the read-path
+/// get_output/list_outputs above, which do check it).
+#[tauri::command]
+#[specta::specta]
+pub async fn export_output(
+    output_id: String,
+    user_id: String,
+    persona_id: String,
+    key_registry: State<'_, KeyRegistry>,
+) -> Result<(), String> {
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
+    output_store::export_output(&user_id, &persona_id, &key_hex_str, &output_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Wires the Library "Update active document" action (decisions.id=826,
+/// items.id=557): `output_id` becomes canonical (document_relationship set
+/// to 'update'), `previous_output_id` is marked superseded_by `output_id`.
+/// Works regardless of either record's `source` -- an ingested document can
+/// supersede a qr_generated one and vice versa (the decoupling
+/// decisions.id=826 asked for).
+#[tauri::command]
+#[specta::specta]
+pub async fn update_active_document(
+    output_id: String,
+    previous_output_id: String,
+    user_id: String,
+    persona_id: String,
+    key_registry: State<'_, KeyRegistry>,
+) -> Result<(), String> {
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
+    output_store::update_active_document(
+        &user_id,
+        &persona_id,
+        &key_hex_str,
+        &output_id,
+        &previous_output_id,
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// The real clipboard gate (items.id=243), replacing the retired gate4.rs

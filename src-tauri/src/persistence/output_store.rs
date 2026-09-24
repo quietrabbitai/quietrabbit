@@ -106,6 +106,23 @@ pub struct OutputRecord {
     /// call scan_output) -- the signal callers use to decide whether
     /// pg_scan_blocked is trustworthy cache or just an unset default.
     pub pg_scan_completed_at: Option<String>,
+    /// One of prime/update/fork/reference/continue_draft (decisions.id=422,
+    /// outputs_007.sql). Defaults to 'prime' for qr_generated rows and
+    /// 'reference' for external_ingested rows (see save_ingested_output) --
+    /// both defaults, not hard restrictions; any of the five values is
+    /// assignable regardless of `source` (decisions.id=826).
+    pub document_relationship: String,
+    /// Set for document_relationship='fork' rows. NULL otherwise.
+    pub parent_output_id: Option<String>,
+    /// Set on the prior/previously-active record when
+    /// update_active_document() supersedes it with a newer one -- points at
+    /// the new record's id. NULL until superseded.
+    pub superseded_by: Option<String>,
+    /// Set by export_output() on the finalized->potentially-stale
+    /// transition (decisions.id=421/826), cleared by
+    /// return_output_from_export() on the way back to finalized. NULL means
+    /// never exported (or already returned).
+    pub exported_at: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -247,6 +264,10 @@ fn row_to_output_record(r: &sqlx::sqlite::SqliteRow) -> Result<OutputRecord, sql
         pg_scan_plain_language: r.try_get("pg_scan_plain_language")?,
         pg_scan_findings_json: r.try_get("pg_scan_findings_json")?,
         pg_scan_completed_at: r.try_get("pg_scan_completed_at")?,
+        document_relationship: r.try_get("document_relationship")?,
+        parent_output_id: r.try_get("parent_output_id")?,
+        superseded_by: r.try_get("superseded_by")?,
+        exported_at: r.try_get("exported_at")?,
     })
 }
 
@@ -425,7 +446,9 @@ pub async fn get_output(
                 o.source, o.project_entity_id, o.focus_slug, o.storage_path,
                 o.storage_version, o.original_filename,
                 o.pg_scan_blocked, o.pg_scan_timed_out, o.pg_scan_plain_language,
-                o.pg_scan_findings_json, o.pg_scan_completed_at
+                o.pg_scan_findings_json, o.pg_scan_completed_at,
+                o.document_relationship, o.parent_output_id, o.superseded_by,
+                o.exported_at
          FROM outputs o
          JOIN focus_runs r ON r.id = o.focus_run_id
          WHERE o.id = ? AND o.deleted_at IS NULL",
@@ -459,7 +482,9 @@ pub async fn get_output_for_run(
                 o.source, o.project_entity_id, o.focus_slug, o.storage_path,
                 o.storage_version, o.original_filename,
                 o.pg_scan_blocked, o.pg_scan_timed_out, o.pg_scan_plain_language,
-                o.pg_scan_findings_json, o.pg_scan_completed_at
+                o.pg_scan_findings_json, o.pg_scan_completed_at,
+                o.document_relationship, o.parent_output_id, o.superseded_by,
+                o.exported_at
          FROM outputs o
          JOIN focus_runs r ON r.id = o.focus_run_id
          WHERE o.focus_run_id = ? AND o.deleted_at IS NULL
@@ -688,7 +713,9 @@ pub async fn list_outputs(
                 o.source, o.project_entity_id, o.focus_slug, o.storage_path,
                 o.storage_version, o.original_filename,
                 o.pg_scan_blocked, o.pg_scan_timed_out, o.pg_scan_plain_language,
-                o.pg_scan_findings_json, o.pg_scan_completed_at
+                o.pg_scan_findings_json, o.pg_scan_completed_at,
+                o.document_relationship, o.parent_output_id, o.superseded_by,
+                o.exported_at
          FROM outputs o
          JOIN focus_runs r ON r.id = o.focus_run_id
          WHERE o.deleted_at IS NULL AND o.status != 'archived'",
@@ -1319,12 +1346,19 @@ pub async fn save_ingested_output(
     let timestamp = crate::providers::utils::now();
     let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
 
+    // document_relationship explicitly 'reference' (decisions.id=826), not
+    // left to the schema's own DEFAULT 'prime' -- 'reference' is the
+    // intended default for an ingested document (decisions.id=422: "inspired
+    // by existing document, fully independent content"), while remaining
+    // reassignable to any of the five types afterward (e.g. via
+    // update_active_document below) regardless of `source`.
     sqlx::query(
         "INSERT INTO outputs
          (id, focus_run_id, output_type, content, sensitivity,
           status, created_at, updated_at, source, focus_slug,
-          project_entity_id, storage_path, storage_version, original_filename)
-         VALUES (?, ?, ?, ?, ?, 'finalized', ?, ?, 'external_ingested', ?, ?, ?, 1, ?)",
+          project_entity_id, storage_path, storage_version, original_filename,
+          document_relationship)
+         VALUES (?, ?, ?, ?, ?, 'finalized', ?, ?, 'external_ingested', ?, ?, ?, 1, ?, 'reference')",
     )
     .bind(output_id)
     .bind(focus_run_id)
@@ -1381,6 +1415,181 @@ pub async fn bump_ingested_document_version(
 }
 
 // ---------------------------------------------------------------------------
+// Document relationship + export lifecycle (items.id=556, decisions.id=826)
+// ---------------------------------------------------------------------------
+
+/// Wires the Library "Update active document" action (items.id=557):
+/// `new_output_id` becomes the canonical version, `previous_output_id` is
+/// the record it supersedes. Sets `document_relationship='update'` on
+/// `new_output_id` and `superseded_by=new_output_id` on `previous_output_id`
+/// -- exactly decisions.id=422's own definition of the `update` relationship
+/// type ("prior version remains finalized but gets superseded_by set; new
+/// version becomes canonical"). `parent_output_id` is untouched -- that
+/// field belongs to `fork`, not `update` (decisions.id=422).
+///
+/// No `source` check anywhere here: works in either direction (an ingested
+/// document can supersede a qr_generated one and vice versa), the
+/// decoupling decisions.id=826 asked for.
+pub async fn update_active_document(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    new_output_id: &str,
+    previous_output_id: &str,
+) -> Result<(), OutputStoreError> {
+    if new_output_id == previous_output_id {
+        return Err(OutputStoreError::Validation(
+            "new_output_id and previous_output_id must differ".to_string(),
+        ));
+    }
+
+    let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
+    let timestamp = crate::providers::utils::now();
+
+    sqlx::query("SAVEPOINT update_active_document_sp")
+        .execute(&mut conn)
+        .await?;
+
+    let new_row = sqlx::query(
+        "UPDATE outputs SET document_relationship = 'update', updated_at = ?
+         WHERE id = ? RETURNING id",
+    )
+    .bind(&timestamp)
+    .bind(new_output_id)
+    .fetch_optional(&mut conn)
+    .await?;
+
+    if new_row.is_none() {
+        let _ = sqlx::query("ROLLBACK TO update_active_document_sp")
+            .execute(&mut conn)
+            .await;
+        return Err(OutputStoreError::Validation(format!(
+            "no such output: '{new_output_id}'"
+        )));
+    }
+
+    let prev_row = sqlx::query(
+        "UPDATE outputs SET superseded_by = ?, updated_at = ?
+         WHERE id = ? RETURNING id",
+    )
+    .bind(new_output_id)
+    .bind(&timestamp)
+    .bind(previous_output_id)
+    .fetch_optional(&mut conn)
+    .await?;
+
+    if prev_row.is_none() {
+        let _ = sqlx::query("ROLLBACK TO update_active_document_sp")
+            .execute(&mut conn)
+            .await;
+        return Err(OutputStoreError::Validation(format!(
+            "no such output: '{previous_output_id}'"
+        )));
+    }
+
+    sqlx::query("RELEASE update_active_document_sp")
+        .execute(&mut conn)
+        .await?;
+
+    Ok(())
+}
+
+/// Wires the Library Export action (decisions.id=421/826): fires the
+/// finalized -> potentially-stale transition and stamps `exported_at`.
+/// Rejects any other starting status -- this is a defined single-arrow
+/// transition, not an idempotent no-op like delete/cancel_focus_run.
+pub async fn export_output(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    output_id: &str,
+) -> Result<(), OutputStoreError> {
+    let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
+    let timestamp = crate::providers::utils::now();
+
+    let status: Option<String> = sqlx::query("SELECT status FROM outputs WHERE id = ?")
+        .bind(output_id)
+        .fetch_optional(&mut conn)
+        .await?
+        .map(|r| r.try_get("status"))
+        .transpose()?;
+
+    match status.as_deref() {
+        None => {
+            return Err(OutputStoreError::Validation(format!(
+                "no such output: '{output_id}'"
+            )))
+        }
+        Some("finalized") => {}
+        Some(other) => {
+            return Err(OutputStoreError::Validation(format!(
+                "cannot export output in status '{other}': must be finalized"
+            )))
+        }
+    }
+
+    sqlx::query(
+        "UPDATE outputs SET status = 'potentially-stale', exported_at = ?, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(&timestamp)
+    .bind(&timestamp)
+    .bind(output_id)
+    .execute(&mut conn)
+    .await?;
+
+    Ok(())
+}
+
+/// Reverse of export_output (decisions.id=421/826): fires the
+/// potentially-stale -> finalized transition on return/re-import and clears
+/// `exported_at`. Standalone primitive -- this codebase has no
+/// `import_external_draft` flow yet to wire it into (out of this item's
+/// scope; see items.id=559), but the column-clearing contract holds
+/// regardless of what eventually calls it.
+pub async fn return_output_from_export(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    output_id: &str,
+) -> Result<(), OutputStoreError> {
+    let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
+    let timestamp = crate::providers::utils::now();
+
+    let status: Option<String> = sqlx::query("SELECT status FROM outputs WHERE id = ?")
+        .bind(output_id)
+        .fetch_optional(&mut conn)
+        .await?
+        .map(|r| r.try_get("status"))
+        .transpose()?;
+
+    match status.as_deref() {
+        None => {
+            return Err(OutputStoreError::Validation(format!(
+                "no such output: '{output_id}'"
+            )))
+        }
+        Some("potentially-stale") => {}
+        Some(other) => {
+            return Err(OutputStoreError::Validation(format!(
+                "cannot return output in status '{other}': must be potentially-stale"
+            )))
+        }
+    }
+
+    sqlx::query(
+        "UPDATE outputs SET status = 'finalized', exported_at = NULL, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(&timestamp)
+    .bind(output_id)
+    .execute(&mut conn)
+    .await?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1406,6 +1615,9 @@ mod tests {
     const OUTPUTS_SCHEMA_V4: &str = include_str!("../../schema/outputs_004.sql");
     const OUTPUTS_SCHEMA_V6: &str = include_str!("../../schema/outputs_006.sql");
     const OUTPUTS_SCHEMA_V7: &str = include_str!("../../schema/outputs_007.sql");
+    // items.id=556: exported_at is a plain additive column on top of 007's
+    // rebuilt table -- no new hard prerequisite beyond 007 itself.
+    const OUTPUTS_SCHEMA_V8: &str = include_str!("../../schema/outputs_008.sql");
 
     async fn test_db() -> SqliteConnection {
         let mut conn = SqliteConnectOptions::new()
@@ -1419,6 +1631,7 @@ mod tests {
             .chain(parse_statements(OUTPUTS_SCHEMA_V5))
             .chain(parse_statements(OUTPUTS_SCHEMA_V6))
             .chain(parse_statements(OUTPUTS_SCHEMA_V7))
+            .chain(parse_statements(OUTPUTS_SCHEMA_V8))
         {
             sqlx::query(&stmt)
                 .execute(&mut conn)
@@ -2407,6 +2620,457 @@ mod tests {
                 .await
                 .unwrap();
         assert!(same_run.is_some());
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // items.id=556 -- document relationship + export lifecycle
+    // -----------------------------------------------------------------
+
+    /// Test-only: flips an output's status directly (bypassing the
+    /// lifecycle state machine, which is out of this item's scope) so
+    /// export_output/return_output_from_export have a row in the right
+    /// starting state to act on.
+    async fn set_status_for_test(
+        user_id: &str,
+        persona_id: &str,
+        key_hex: &str,
+        output_id: &str,
+        status: &str,
+    ) {
+        let mut conn = open_outputs_db(user_id, persona_id, key_hex).await.unwrap();
+        sqlx::query("UPDATE outputs SET status = ? WHERE id = ?")
+            .bind(status)
+            .bind(output_id)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn save_ingested_output_defaults_document_relationship_to_reference() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "docrel-user-1";
+        let persona_id = "docrel-persona-1";
+
+        let verify = async {
+            let focus_run_id = create_ingest_focus_run(user_id, persona_id, INGEST_KEY_HEX)
+                .await
+                .unwrap();
+            save_ingested_output(
+                user_id,
+                persona_id,
+                INGEST_KEY_HEX,
+                "ingested-1",
+                &focus_run_id,
+                "ingested_document",
+                "general",
+                "travel",
+                None,
+                "/fake/v1.enc",
+                "doc.txt",
+                Some("v1 text"),
+            )
+            .await
+            .unwrap();
+
+            let record = get_output(user_id, persona_id, INGEST_KEY_HEX, "ingested-1")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                record.document_relationship, "reference",
+                "an ingested document must default to 'reference', not the \
+                 schema's own 'prime' default -- decisions.id=826"
+            );
+        };
+        verify.await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    #[tokio::test]
+    async fn update_active_document_lets_an_ingested_document_supersede_a_qr_generated_one() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "docrel-user-2";
+        let persona_id = "docrel-persona-2";
+
+        let verify = async {
+            let qr_run_id = "run-qr";
+            test_seed_focus_run(user_id, persona_id, INGEST_KEY_HEX, qr_run_id, "focus-1")
+                .await
+                .unwrap();
+            save_output(
+                user_id,
+                persona_id,
+                INGEST_KEY_HEX,
+                qr_run_id,
+                "note",
+                "the original qr-generated note",
+                "general",
+                Some("qr-doc"),
+                None,
+            )
+            .await
+            .unwrap();
+
+            let ingest_run_id = create_ingest_focus_run(user_id, persona_id, INGEST_KEY_HEX)
+                .await
+                .unwrap();
+            save_ingested_output(
+                user_id,
+                persona_id,
+                INGEST_KEY_HEX,
+                "ingested-doc",
+                &ingest_run_id,
+                "ingested_document",
+                "general",
+                "focus-1",
+                None,
+                "/fake/v1.enc",
+                "doc.txt",
+                Some("newer text"),
+            )
+            .await
+            .unwrap();
+
+            // An ingested document (source=external_ingested) supersedes a
+            // qr_generated one -- the decoupled direction decisions.id=826
+            // specifically calls out.
+            update_active_document(
+                user_id,
+                persona_id,
+                INGEST_KEY_HEX,
+                "ingested-doc",
+                "qr-doc",
+            )
+            .await
+            .expect("update_active_document must succeed across source types");
+
+            let new_record = get_output(user_id, persona_id, INGEST_KEY_HEX, "ingested-doc")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(new_record.document_relationship, "update");
+
+            let prev_record = get_output(user_id, persona_id, INGEST_KEY_HEX, "qr-doc")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(prev_record.superseded_by.as_deref(), Some("ingested-doc"));
+            assert!(
+                prev_record.parent_output_id.is_none(),
+                "parent_output_id belongs to 'fork', not 'update' -- must stay untouched"
+            );
+        };
+        verify.await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    #[tokio::test]
+    async fn update_active_document_rejects_matching_ids() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "docrel-user-3";
+        let persona_id = "docrel-persona-3";
+
+        let verify = async {
+            let result =
+                update_active_document(user_id, persona_id, INGEST_KEY_HEX, "same-id", "same-id")
+                    .await;
+            assert!(matches!(result, Err(OutputStoreError::Validation(_))));
+        };
+        verify.await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    #[tokio::test]
+    async fn update_active_document_rolls_back_when_previous_output_id_does_not_exist() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "docrel-user-4";
+        let persona_id = "docrel-persona-4";
+
+        let verify = async {
+            let run_id = "run-qr";
+            test_seed_focus_run(user_id, persona_id, INGEST_KEY_HEX, run_id, "focus-1")
+                .await
+                .unwrap();
+            save_output(
+                user_id,
+                persona_id,
+                INGEST_KEY_HEX,
+                run_id,
+                "note",
+                "a lone qr-generated note",
+                "general",
+                Some("qr-doc-2"),
+                None,
+            )
+            .await
+            .unwrap();
+
+            let result = update_active_document(
+                user_id,
+                persona_id,
+                INGEST_KEY_HEX,
+                "qr-doc-2",
+                "does-not-exist",
+            )
+            .await;
+            assert!(matches!(result, Err(OutputStoreError::Validation(_))));
+
+            // Rolled back -- the first UPDATE must not have stuck.
+            let record = get_output(user_id, persona_id, INGEST_KEY_HEX, "qr-doc-2")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                record.document_relationship, "prime",
+                "a failed update_active_document call must leave document_relationship untouched"
+            );
+        };
+        verify.await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    #[tokio::test]
+    async fn export_output_transitions_finalized_to_potentially_stale_and_stamps_exported_at() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "export-user-1";
+        let persona_id = "export-persona-1";
+
+        let verify = async {
+            let run_id = "run-1";
+            test_seed_focus_run(user_id, persona_id, INGEST_KEY_HEX, run_id, "focus-1")
+                .await
+                .unwrap();
+            save_output(
+                user_id,
+                persona_id,
+                INGEST_KEY_HEX,
+                run_id,
+                "note",
+                "a finished note",
+                "general",
+                Some("exp-doc"),
+                None,
+            )
+            .await
+            .unwrap();
+            set_status_for_test(user_id, persona_id, INGEST_KEY_HEX, "exp-doc", "finalized").await;
+
+            export_output(user_id, persona_id, INGEST_KEY_HEX, "exp-doc")
+                .await
+                .expect("export must succeed from finalized");
+
+            let record = get_output(user_id, persona_id, INGEST_KEY_HEX, "exp-doc")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.status, "potentially-stale");
+            assert!(record.exported_at.is_some());
+        };
+        verify.await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    #[tokio::test]
+    async fn export_output_rejects_a_non_finalized_status() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "export-user-2";
+        let persona_id = "export-persona-2";
+
+        let verify = async {
+            let run_id = "run-1";
+            test_seed_focus_run(user_id, persona_id, INGEST_KEY_HEX, run_id, "focus-1")
+                .await
+                .unwrap();
+            // save_output leaves the row in status='draft'.
+            save_output(
+                user_id,
+                persona_id,
+                INGEST_KEY_HEX,
+                run_id,
+                "note",
+                "still a draft",
+                "general",
+                Some("draft-doc"),
+                None,
+            )
+            .await
+            .unwrap();
+
+            let result = export_output(user_id, persona_id, INGEST_KEY_HEX, "draft-doc").await;
+            assert!(matches!(result, Err(OutputStoreError::Validation(_))));
+        };
+        verify.await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    #[tokio::test]
+    async fn return_output_from_export_transitions_back_and_clears_exported_at() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "export-user-3";
+        let persona_id = "export-persona-3";
+
+        let verify = async {
+            let run_id = "run-1";
+            test_seed_focus_run(user_id, persona_id, INGEST_KEY_HEX, run_id, "focus-1")
+                .await
+                .unwrap();
+            save_output(
+                user_id,
+                persona_id,
+                INGEST_KEY_HEX,
+                run_id,
+                "note",
+                "a finished note",
+                "general",
+                Some("return-doc"),
+                None,
+            )
+            .await
+            .unwrap();
+            set_status_for_test(
+                user_id,
+                persona_id,
+                INGEST_KEY_HEX,
+                "return-doc",
+                "finalized",
+            )
+            .await;
+            export_output(user_id, persona_id, INGEST_KEY_HEX, "return-doc")
+                .await
+                .unwrap();
+
+            return_output_from_export(user_id, persona_id, INGEST_KEY_HEX, "return-doc")
+                .await
+                .expect("return must succeed from potentially-stale");
+
+            let record = get_output(user_id, persona_id, INGEST_KEY_HEX, "return-doc")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.status, "finalized");
+            assert!(record.exported_at.is_none());
+        };
+        verify.await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    #[tokio::test]
+    async fn return_output_from_export_rejects_a_non_potentially_stale_status() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "export-user-4";
+        let persona_id = "export-persona-4";
+
+        let verify = async {
+            let run_id = "run-1";
+            test_seed_focus_run(user_id, persona_id, INGEST_KEY_HEX, run_id, "focus-1")
+                .await
+                .unwrap();
+            save_output(
+                user_id,
+                persona_id,
+                INGEST_KEY_HEX,
+                run_id,
+                "note",
+                "already finalized, never exported",
+                "general",
+                Some("never-exported-doc"),
+                None,
+            )
+            .await
+            .unwrap();
+            set_status_for_test(
+                user_id,
+                persona_id,
+                INGEST_KEY_HEX,
+                "never-exported-doc",
+                "finalized",
+            )
+            .await;
+
+            let result = return_output_from_export(
+                user_id,
+                persona_id,
+                INGEST_KEY_HEX,
+                "never-exported-doc",
+            )
+            .await;
+            assert!(matches!(result, Err(OutputStoreError::Validation(_))));
+        };
+        verify.await;
 
         if let Some(v) = saved_root {
             std::env::set_var("QR_DATA_ROOT", v);

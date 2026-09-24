@@ -264,6 +264,7 @@ TABLE outputs
   pg_scan_plain_language TEXT notnull=0 pk=0 default=None
   pg_scan_findings_json TEXT notnull=0 pk=0 default=None
   pg_scan_completed_at TEXT notnull=0 pk=0 default=None
+  exported_at TEXT notnull=0 pk=0 default=None
 TABLE outputs_fts
   content  notnull=0 pk=0 default=None
   output_type  notnull=0 pk=0 default=None

@@ -354,6 +354,23 @@ export const commands = {
 	 *  (tested) logic.
 	 */
 	copyOutputToClipboard: (outputId: string, userId: string, personaId: string) => typedError<null, string>(__TAURI_INVOKE("copy_output_to_clipboard", { outputId, userId, personaId })),
+	/**
+	 *  Fires the Library Export action (decisions.id=421/826, items.id=557):
+	 *  finalized -> potentially-stale, stamps exported_at. Same shape as
+	 *  delete_output above -- no is_protected check, matching that command's
+	 *  existing precedent for a mutating Library command (unlike the read-path
+	 *  get_output/list_outputs above, which do check it).
+	 */
+	exportOutput: (outputId: string, userId: string, personaId: string) => typedError<null, string>(__TAURI_INVOKE("export_output", { outputId, userId, personaId })),
+	/**
+	 *  Wires the Library "Update active document" action (decisions.id=826,
+	 *  items.id=557): `output_id` becomes canonical (document_relationship set
+	 *  to 'update'), `previous_output_id` is marked superseded_by `output_id`.
+	 *  Works regardless of either record's `source` -- an ingested document can
+	 *  supersede a qr_generated one and vice versa (the decoupling
+	 *  decisions.id=826 asked for).
+	 */
+	updateActiveDocument: (outputId: string, previousOutputId: string, userId: string, personaId: string) => typedError<null, string>(__TAURI_INVOKE("update_active_document", { outputId, previousOutputId, userId, personaId })),
 	getFocusBuilderSession: (focusId: string | null) => typedError<NotImplementedPlaceholder, string>(__TAURI_INVOKE("get_focus_builder_session", { focusId })),
 	submitFocusBuilderStep: (sessionId: string, input: NotImplementedPlaceholder) => typedError<NotImplementedPlaceholder, string>(__TAURI_INVOKE("submit_focus_builder_step", { sessionId, input })),
 	/**
@@ -1060,6 +1077,15 @@ export type OutputInfo = {
 	 *  (commands/ingest.rs) can retrieve a real original file for this output.
 	 */
 	has_original_document: boolean,
+	/**  prime | update | fork | reference | continue_draft (decisions.id=422). */
+	document_relationship: string,
+	superseded_by: string | null,
+	/**
+	 *  Set on the finalized->potentially-stale Export transition
+	 *  (decisions.id=421/826), cleared on return. Library's "Exported:
+	 *  [date][time]" label (items.id=557) is sourced from this field.
+	 */
+	exported_at: string | null,
 };
 
 /**
