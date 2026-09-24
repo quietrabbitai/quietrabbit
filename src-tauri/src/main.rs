@@ -248,69 +248,6 @@ async fn async_main() {
                 ),
             }
 
-            // DIAG items.id=227: GTK3-level click-input trace. The Wayland
-            // protocol layer is now confirmed clean (WAYLAND_DEBUG capture,
-            // 2026-08-08 -- wl_pointer.button press+release for BTN_LEFT
-            // arrives at the app's own wl_surface with correct state/timing).
-            // This adds a button-press/release snoop on the top-level GTK
-            // window (gtk 0.18 = GTK3, confirmed against Cargo.toml this
-            // session) to determine whether GTK's own event system ever
-            // receives the click before any widget-specific handling
-            // downstream. GTK3's ::button-press-event/::button-release-event
-            // signals fire during the bubble/emission GTK already does --
-            // no true separate "capture phase" API exists in GTK3 the way
-            // GTK4's EventControllerLegacy has one (that was this session's
-            // first, incorrect draft, corrected via ChatGPT review against
-            // this project's actual gtk-rs 0.18 dependency). Returning
-            // glib::Propagation::Proceed from both handlers is deliberate: this must
-            // stay strictly observational and never consume/alter the
-            // event or affect real click behavior. Does not attempt to
-            // resolve or log a specific target widget -- GTK3's event
-            // struct does not straightforwardly expose that at the
-            // top-level-window connection point without deeper widget-tree
-            // walking, which is out of scope for this first diagnostic
-            // pass. Removed once 227 is resolved.
-            if let Some(webview_window) = app.get_webview_window("main") {
-                match webview_window.gtk_window() {
-                    Ok(gtk_window) => {
-                        use gtk::prelude::{WidgetExt, WidgetExtManual};
-                        gtk_window.add_events(
-                            gtk::gdk::EventMask::BUTTON_PRESS_MASK
-                                | gtk::gdk::EventMask::BUTTON_RELEASE_MASK,
-                        );
-                        gtk_window.connect_button_press_event(|_widget, event| {
-                            log::debug!(
-                                "DIAG items.id=227: GTK button-press-event -- \
-                                 button={:?} position={:?} time={}",
-                                event.button(),
-                                event.position(),
-                                event.time(),
-                            );
-                            glib::Propagation::Proceed
-                        });
-                        gtk_window.connect_button_release_event(|_widget, event| {
-                            log::debug!(
-                                "DIAG items.id=227: GTK button-release-event -- \
-                                 button={:?} position={:?} time={}",
-                                event.button(),
-                                event.position(),
-                                event.time(),
-                            );
-                            glib::Propagation::Proceed
-                        });
-                    }
-                    Err(e) => log::warn!(
-                        "main: DIAG items.id=227 setup could not resolve GTK \
-                         window: {e} -- click trace will not be installed"
-                    ),
-                }
-            } else {
-                log::warn!(
-                    "main: DIAG items.id=227 setup could not find main webview \
-                     window -- GTK click trace will not be installed"
-                );
-            }
-
             // Must run synchronously here, before any command handler could
             // trigger gate3's first Privacy Filter classification — ggml's
             // backend loader (see privacy_filter.rs) runs once, lazily, on
@@ -726,16 +663,8 @@ async fn async_main() {
             // before (items.id=223): a user who never opens Cloud Chat pays
             // nothing here. 16ms matches the old cadence (~60fps) and
             // CEF's own windowless_frame_rate: 60 (pane_host.rs).
-            let diag_tick = std::cell::Cell::new(0u64);
             glib::source::timeout_add_local(std::time::Duration::from_millis(16), move || {
                 let count = open_pane_count.load(std::sync::atomic::Ordering::Relaxed);
-                let tick = diag_tick.get() + 1;
-                diag_tick.set(tick);
-                if tick.is_multiple_of(60) {
-                    log::debug!(
-                        "DIAG items.id=227: 16ms timeout tick={tick} open_pane_count={count}"
-                    );
-                }
                 if count > 0 {
                     quietrabbit_lib::cloud_chat_gpu_pane::pane_host::queue_draw();
                 }
