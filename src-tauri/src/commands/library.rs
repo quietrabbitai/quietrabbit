@@ -15,7 +15,10 @@
 // Focus profile visibility enforcement (items.id=230, fixed 2026-08-09):
 //   list_outputs/get_output now enforce focus_settings.focus_profile
 //   (open/organized/protected, D6-294) on top of output_store's existing
-//   status='active' + per-scope DB isolation. An output whose owning Focus
+//   not-deleted/not-archived filtering (deleted_at IS NULL, and for
+//   list_outputs also status != 'archived' -- outputs_007.sql, items.id=559;
+//   this superseded the original status='active' filter this comment used
+//   to describe) + per-scope DB isolation. An output whose owning Focus
 //   is 'protected' is excluded from list_outputs and get_output returns
 //   the same "not_found" error a genuinely missing id would -- existence
 //   of a Protected output is not distinguishable from a nonexistent one.

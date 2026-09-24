@@ -241,7 +241,11 @@ TABLE outputs
   validation_provider TEXT notnull=0 pk=0 default=None
   validation_delta TEXT notnull=0 pk=0 default=None
   quality_rating INTEGER notnull=0 pk=0 default=None
-  status TEXT notnull=1 pk=0 default=Some("'active'")
+  status TEXT notnull=1 pk=0 default=Some("'draft'")
+  deleted_at TEXT notnull=0 pk=0 default=None
+  document_relationship TEXT notnull=1 pk=0 default=Some("'prime'")
+  parent_output_id TEXT notnull=0 pk=0 default=None
+  superseded_by TEXT notnull=0 pk=0 default=None
   created_at TEXT notnull=1 pk=0 default=None
   updated_at TEXT notnull=1 pk=0 default=None
   purge_scheduled_at TEXT notnull=0 pk=0 default=None

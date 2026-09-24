@@ -15,7 +15,11 @@
 // Architecture Section 3.4 deletion sequence:
 //   1. Zero content:  UPDATE outputs SET content = '' WHERE id = ?
 //   2. FTS5 update:   automatic via outputs_fts_update trigger (outputs_001.sql)
-//   3. Mark deleted:  UPDATE outputs SET status = 'deleted', updated_at = ? WHERE id = ?
+//   3. Mark deleted:  UPDATE outputs SET deleted_at = ?, updated_at = ? WHERE id = ?
+// deleted_at (outputs_007.sql, items.id=559) is independent of the four-state
+// status column (decisions.id=421) -- deletion is an audit/visibility fact
+// layered on top of, not a value within, the lifecycle enum. See
+// delete_output_conn's own doc comment for the full reasoning.
 // Row is never hard-deleted — audit record preserved permanently.
 // deep_purge parameter accepted but not implemented — Some(true) returns
 // Err("deep_purge_not_implemented"). See delete_output's own doc comment.
@@ -331,7 +335,7 @@ pub async fn save_output(
           status, created_at, updated_at,
           pg_scan_blocked, pg_scan_timed_out, pg_scan_plain_language,
           pg_scan_findings_json, pg_scan_completed_at)
-         VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&oid)
     .bind(focus_run_id)
@@ -405,8 +409,8 @@ pub async fn backfill_scan_result(
 // Read
 // ---------------------------------------------------------------------------
 
-/// Fetch a single active output by id.
-/// Returns None if not found or not active.
+/// Fetch a single output by id.
+/// Returns None if not found or deleted.
 pub async fn get_output(
     user_id: &str,
     persona_id: &str,
@@ -424,7 +428,7 @@ pub async fn get_output(
                 o.pg_scan_findings_json, o.pg_scan_completed_at
          FROM outputs o
          JOIN focus_runs r ON r.id = o.focus_run_id
-         WHERE o.id = ? AND o.status = 'active'",
+         WHERE o.id = ? AND o.deleted_at IS NULL",
     )
     .bind(output_id)
     .fetch_optional(&mut conn)
@@ -438,8 +442,8 @@ pub async fn get_output(
     }
 }
 
-/// Fetch the most recent active output for a focus run.
-/// Returns None if no active output exists.
+/// Fetch the most recent non-deleted output for a focus run.
+/// Returns None if no such output exists.
 /// Used by UI output display endpoint.
 pub async fn get_output_for_run(
     user_id: &str,
@@ -458,7 +462,7 @@ pub async fn get_output_for_run(
                 o.pg_scan_findings_json, o.pg_scan_completed_at
          FROM outputs o
          JOIN focus_runs r ON r.id = o.focus_run_id
-         WHERE o.focus_run_id = ? AND o.status = 'active'
+         WHERE o.focus_run_id = ? AND o.deleted_at IS NULL
          ORDER BY o.created_at DESC
          LIMIT 1",
     )
@@ -644,9 +648,13 @@ pub async fn get_last_used_map(
 // List
 // ---------------------------------------------------------------------------
 
-/// List active outputs, optionally filtered by focus_id, topic_id, and/or
-/// output_type. Joins through focus_runs for focus_id/topic_id since those
-/// columns live there, not on outputs itself.
+/// List library-visible outputs, optionally filtered by focus_id, topic_id,
+/// and/or output_type. Joins through focus_runs for focus_id/topic_id since
+/// those columns live there, not on outputs itself.
+///
+/// Excludes soft-deleted rows (deleted_at IS NOT NULL) and archived rows
+/// (status = 'archived') -- decisions.id=421 defines archived as "excluded
+/// from default library views," and this function is that default view.
 ///
 /// Ordered most-recent-first (outputs.created_at DESC) — the Library's
 /// natural browse order.
@@ -683,7 +691,7 @@ pub async fn list_outputs(
                 o.pg_scan_findings_json, o.pg_scan_completed_at
          FROM outputs o
          JOIN focus_runs r ON r.id = o.focus_run_id
-         WHERE o.status = 'active'",
+         WHERE o.deleted_at IS NULL AND o.status != 'archived'",
     );
     if let Some(fid) = focus_id {
         qb.push(" AND r.focus_id = ");
@@ -725,8 +733,14 @@ pub async fn list_outputs(
 ///   2. FTS5 update:   automatic — outputs_fts_update trigger (outputs_001.sql)
 ///      fires on this UPDATE and removes the old content from the FTS5 index
 ///      as part of the same statement. No separate step is issued here.
-///   3. Mark deleted:  UPDATE outputs SET status = 'deleted', updated_at = ?
+///   3. Mark deleted:  UPDATE outputs SET deleted_at = ?, updated_at = ?
 ///      WHERE id = ?
+///
+/// deleted_at (outputs_007.sql) is independent of status -- deletion is an
+/// audit/visibility fact layered on top of the four-state document lifecycle
+/// (decisions.id=421), not a lifecycle state itself, so this no longer
+/// mutates status. The row's status at time of delete is left exactly as it
+/// was.
 ///
 /// Row is never hard-deleted — audit record preserved permanently. Both
 /// UPDATEs are unconditional on id match; deleting an already-deleted or
@@ -744,7 +758,8 @@ async fn delete_output_conn(
         .execute(&mut *conn)
         .await?;
 
-    sqlx::query("UPDATE outputs SET status = 'deleted', updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE outputs SET deleted_at = ?, updated_at = ? WHERE id = ?")
+        .bind(&timestamp)
         .bind(&timestamp)
         .bind(output_id)
         .execute(&mut *conn)
@@ -1309,7 +1324,7 @@ pub async fn save_ingested_output(
          (id, focus_run_id, output_type, content, sensitivity,
           status, created_at, updated_at, source, focus_slug,
           project_entity_id, storage_path, storage_version, original_filename)
-         VALUES (?, ?, ?, ?, ?, 'active', ?, ?, 'external_ingested', ?, ?, ?, 1, ?)",
+         VALUES (?, ?, ?, ?, ?, 'finalized', ?, ?, 'external_ingested', ?, ?, ?, 1, ?)",
     )
     .bind(output_id)
     .bind(focus_run_id)
@@ -1379,8 +1394,18 @@ mod tests {
     // items.id=406: consent_decisions.category/fact_key/original_text and
     // pf_fact_mentions are added in outputs_005.sql, not outputs_001.sql --
     // this in-memory test DB must apply both (005 only touches tables 001
-    // already defines, so no need for 002/003/004 in between).
+    // already defines, so no need for 002/003 in between).
     const OUTPUTS_SCHEMA_V5: &str = include_str!("../../schema/outputs_005.sql");
+    // items.id=559: outputs_007.sql's table rebuild (INSERT INTO outputs_new
+    // ... SELECT ... FROM outputs) selects source/project_entity_id/
+    // focus_slug/storage_path/storage_version/original_filename (004) and
+    // pg_scan_* (006) unconditionally -- unlike 005, these are hard
+    // prerequisites for 007 to apply cleanly here, not just tables it
+    // happens to also touch. 002/003 remain unnecessary (extract_confirm_
+    // candidates.source and a focus_runs index, neither read by 007).
+    const OUTPUTS_SCHEMA_V4: &str = include_str!("../../schema/outputs_004.sql");
+    const OUTPUTS_SCHEMA_V6: &str = include_str!("../../schema/outputs_006.sql");
+    const OUTPUTS_SCHEMA_V7: &str = include_str!("../../schema/outputs_007.sql");
 
     async fn test_db() -> SqliteConnection {
         let mut conn = SqliteConnectOptions::new()
@@ -1390,7 +1415,10 @@ mod tests {
             .expect("in-memory connection failed");
         for stmt in parse_statements(OUTPUTS_SCHEMA)
             .into_iter()
+            .chain(parse_statements(OUTPUTS_SCHEMA_V4))
             .chain(parse_statements(OUTPUTS_SCHEMA_V5))
+            .chain(parse_statements(OUTPUTS_SCHEMA_V6))
+            .chain(parse_statements(OUTPUTS_SCHEMA_V7))
         {
             sqlx::query(&stmt)
                 .execute(&mut conn)
@@ -1400,7 +1428,7 @@ mod tests {
         conn
     }
 
-    /// Insert a focus_run and one active output row directly, bypassing
+    /// Insert a focus_run and one output row directly, bypassing
     /// save_output (which requires a real outputs.db path). Returns the
     /// output id.
     async fn seed_output(conn: &mut SqliteConnection, content: &str) -> String {
@@ -1422,7 +1450,7 @@ mod tests {
             "INSERT INTO outputs
              (id, focus_run_id, output_type, content, sensitivity,
               status, created_at, updated_at)
-             VALUES (?, ?, 'note', ?, 'general', 'active', ?, ?)",
+             VALUES (?, ?, 'note', ?, 'general', 'draft', ?, ?)",
         )
         .bind(&output_id)
         .bind(&run_id)
@@ -1459,7 +1487,7 @@ mod tests {
             .await
             .expect("delete_output_conn failed");
 
-        let row = sqlx::query("SELECT content, status FROM outputs WHERE id = ?")
+        let row = sqlx::query("SELECT content, deleted_at FROM outputs WHERE id = ?")
             .bind(&output_id)
             .fetch_optional(&mut conn)
             .await
@@ -1467,9 +1495,9 @@ mod tests {
             .expect("row must still exist — never hard-deleted");
 
         let content: String = row.try_get("content").unwrap();
-        let status: String = row.try_get("status").unwrap();
+        let deleted_at: Option<String> = row.try_get("deleted_at").unwrap();
         assert_eq!(content, "", "content must be zeroed");
-        assert_eq!(status, "deleted", "status must be marked deleted");
+        assert!(deleted_at.is_some(), "deleted_at must be set");
     }
 
     #[tokio::test]
@@ -1507,6 +1535,128 @@ mod tests {
         let mut conn = test_db().await;
         let result = delete_output_conn(&mut conn, "does-not-exist").await;
         assert!(result.is_ok(), "deleting a nonexistent id must not error");
+    }
+
+    #[tokio::test]
+    async fn outputs_007_migration_preserves_fts_and_backfills_status_correctly() {
+        // Builds the outputs.db schema as it existed immediately before
+        // outputs_007.sql (001+004+005+006 -- the two-state active/deleted
+        // status world), seeds one 'active' row and one 'deleted' row
+        // directly against that schema, then applies 007 on top. This is
+        // the only way to exercise the table rebuild's rowid reassignment
+        // against the outputs_fts external-content index -- test_db() above
+        // builds the fully-migrated schema fresh, so it never has a
+        // pre-existing row at migration time and would not catch a rowid
+        // desync regression, nor the value-mapped backfill.
+        let mut conn = SqliteConnectOptions::new()
+            .filename(":memory:")
+            .connect()
+            .await
+            .expect("in-memory connection failed");
+        for stmt in parse_statements(OUTPUTS_SCHEMA)
+            .into_iter()
+            .chain(parse_statements(OUTPUTS_SCHEMA_V4))
+            .chain(parse_statements(OUTPUTS_SCHEMA_V5))
+            .chain(parse_statements(OUTPUTS_SCHEMA_V6))
+        {
+            sqlx::query(&stmt)
+                .execute(&mut conn)
+                .await
+                .unwrap_or_else(|e| panic!("pre-007 schema statement failed: {e}\n{stmt}"));
+        }
+
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let now = "2026-07-26T00:00:00Z";
+        sqlx::query(
+            "INSERT INTO focus_runs (id, focus_id, status, started_at)
+             VALUES (?, 'focus-1', 'complete', ?)",
+        )
+        .bind(&run_id)
+        .bind(now)
+        .execute(&mut conn)
+        .await
+        .expect("focus_runs insert failed");
+
+        let active_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO outputs
+             (id, focus_run_id, output_type, content, sensitivity,
+              status, created_at, updated_at)
+             VALUES (?, ?, 'note', 'findable pre-migration content', 'general',
+                     'active', ?, ?)",
+        )
+        .bind(&active_id)
+        .bind(&run_id)
+        .bind(now)
+        .bind(now)
+        .execute(&mut conn)
+        .await
+        .expect("active-row outputs insert failed");
+
+        let deleted_id = uuid::Uuid::new_v4().to_string();
+        let deleted_at_ts = "2026-08-01T00:00:00Z";
+        sqlx::query(
+            "INSERT INTO outputs
+             (id, focus_run_id, output_type, content, sensitivity,
+              status, created_at, updated_at)
+             VALUES (?, ?, 'note', '', 'general', 'deleted', ?, ?)",
+        )
+        .bind(&deleted_id)
+        .bind(&run_id)
+        .bind(now)
+        .bind(deleted_at_ts)
+        .execute(&mut conn)
+        .await
+        .expect("deleted-row outputs insert failed");
+
+        for stmt in parse_statements(OUTPUTS_SCHEMA_V7) {
+            sqlx::query(&stmt)
+                .execute(&mut conn)
+                .await
+                .unwrap_or_else(|e| panic!("outputs_007.sql statement failed: {e}\n{stmt}"));
+        }
+
+        let found = sqlx::query("SELECT rowid FROM outputs_fts WHERE outputs_fts MATCH 'findable'")
+            .fetch_all(&mut conn)
+            .await
+            .expect("fts query failed");
+        assert!(
+            !found.is_empty(),
+            "pre-existing row's content must remain findable via FTS after the outputs_007 rebuild"
+        );
+
+        let active_row = sqlx::query("SELECT status, deleted_at FROM outputs WHERE id = ?")
+            .bind(&active_id)
+            .fetch_one(&mut conn)
+            .await
+            .expect("active row must survive the migration");
+        let active_status: String = active_row.try_get("status").unwrap();
+        let active_deleted_at: Option<String> = active_row.try_get("deleted_at").unwrap();
+        assert_eq!(
+            active_status, "finalized",
+            "pre-existing 'active' row must be backfilled to 'finalized'"
+        );
+        assert!(
+            active_deleted_at.is_none(),
+            "pre-existing 'active' row must not gain a deleted_at"
+        );
+
+        let deleted_row = sqlx::query("SELECT status, deleted_at FROM outputs WHERE id = ?")
+            .bind(&deleted_id)
+            .fetch_one(&mut conn)
+            .await
+            .expect("deleted row must survive the migration");
+        let deleted_status: String = deleted_row.try_get("status").unwrap();
+        let deleted_deleted_at: Option<String> = deleted_row.try_get("deleted_at").unwrap();
+        assert_eq!(
+            deleted_status, "archived",
+            "pre-existing 'deleted' row must be backfilled to 'archived'"
+        );
+        assert_eq!(
+            deleted_deleted_at.as_deref(),
+            Some(deleted_at_ts),
+            "pre-existing 'deleted' row's deleted_at must be backfilled from its updated_at"
+        );
     }
 
     #[tokio::test]
