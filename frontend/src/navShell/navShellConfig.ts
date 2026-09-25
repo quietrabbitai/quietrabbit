@@ -13,14 +13,20 @@
 // via a separate button cluster.
 //
 // items.id=404: the 3-peer accordion (Board/Chat/Cloud Chat, decisions.id=747's
-// "three peer bars, exactly one expanded") generalizes to 5 peer rails
-// (Board/Chat/Cloud Chat/Library/History) under ONE dominance field --
-// `dominantRail` below -- replacing the old two-axis
+// "three peer bars, exactly one expanded") generalized to peer rails under
+// ONE dominance field -- `dominantRail` below -- replacing the old two-axis
 // boardSize/pair.dominant split. See WorkspaceShell.tsx's own header
 // comment for the full mechanics (in particular the two-way sync between
 // `dominantRail` and `pair.dominant`, needed because CloudChatAccessPane's
 // internal chat<->cloudChat split still keys off `pair.dominant` and isn't
 // being rewritten).
+//
+// items.id=568 (decisions.id=834, 2026-09-24): the 'library' rail was
+// retired -- Library's separate dock entry is gone, absorbed into the
+// renamed 'history' rail (displayed as "Library" now; the DockRailId value
+// itself stays 'history', see HistoryScreen.tsx's own header comment for
+// why the internal identifier wasn't renamed too). Current shape: 4 peer
+// rails (Board/Chat+Cloud Chat/Library[='history']).
 //
 // What got deleted, not just left unwired, and why: FixedButtonId,
 // FIXED_BUTTON_ORDER, TopLevel, TemporaryCrumb, chain,
@@ -42,10 +48,11 @@
 // no UI path to view a Persona's Focus list at all (flagged in this item's
 // session handoff, not silently absorbed).
 
-/** One of the five peer rails, exactly one dominant (fills the majority of
+/** One of the peer rails, exactly one dominant (fills the majority of
  *  the screen) at a time -- see WorkspaceShell.tsx. Direct generalization
- *  of decisions.id=747's three-peer-bar model. */
-export type DockRailId = 'board' | 'chat' | 'cloudChat' | 'library' | 'history'
+ *  of decisions.id=747's three-peer-bar model. 'library' was retired by
+ *  items.id=568 -- see this file's own header comment. */
+export type DockRailId = 'board' | 'chat' | 'cloudChat' | 'history'
 
 /** decisions.id=735: the QR Chat <-> Cloud Chat dominance pair. Which side
  *  fills the main slot (when the pair itself is dominant -- see

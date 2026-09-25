@@ -1,36 +1,40 @@
-// The unified History screen -- items.id=404. Row-stack by ownership
-// level (User / Group / Persona rows -- Focus explicitly deferred, held
-// open pending items.id=400/401), bottom action-pane reusing the same
-// resolve-to-a-descriptor idea navShellConfig.ts's old currentContent used
-// (NavShell.tsx), "applied per-row" per the design doc: HistoryActionContent
-// below is that same pattern, sized to this screen's own local state
-// instead of NavShell's removed global one.
+// The consolidated Library screen -- items.id=568 (decisions.id=834),
+// reworking items.id=404's row-stack + action-pane History screen into a
+// flat, always-visible button frame: PersonaPillRow (Library's own
+// local-filter variant, per decisions.id=833) at top, then Documents /
+// Facts / Chat History / User Info / Group Info as sibling buttons,
+// Documents pre-selected on entry. The file/component/prop names
+// (HistoryScreen, HistoryScreenProps, HistoryOpenTarget) are deliberately
+// NOT renamed to match -- only the user-facing label changes (WorkspaceShell
+// now shows this rail as "Library", reusing the navShell.library string
+// freed up once the old separate Library rail was deleted). Renaming the
+// internal identifiers too would be a much larger mechanical diff than this
+// item's scope calls for; the design doc itself treats that as a separate,
+// non-blocking documentation-cleanup flag, not a build requirement.
 //
-// Absorbs two things that used to be separate: Chat History (previously
-// ChatHistoryList.tsx's own self-fetching dropdown, now this screen's
-// Persona-row "Chat History" action) and My Facts (previously an unbuilt
-// placeholder behind its own top-strip button, now the exact same
-// placeholder string reused as a "Facts" row-action at every level -- not
-// a new build, just placed structurally per the design doc).
+// Absorbs what the old row-stack absorbed (Chat History, My Facts) plus
+// what used to be a separate Library rail entirely: Documents is now this
+// screen's own persona-scoped Library view (LibraryPane, mounted directly --
+// no more "preview + Open full Library escape hatch", since there's no
+// second screen to escape to any more).
 //
-// Group row (items.id=404 follow-up, Jason 2026-09-03): built for real,
-// not a static placeholder, but conditionally hidden -- shown only when
-// `commands.listPersonaGroupIds(activePersonaId)` (persistence::
-// group_key_store::list_group_keys, wrapped for IPC this item) returns
-// non-empty for whichever Persona is currently active elsewhere in the
-// app. No groups-metadata table exists anywhere to source a real display
-// name from (list_group_keys/list_persona_group_ids only returns opaque
-// group_ids) -- the row renders a generic "Group" / "{{count}} Groups"
-// label, never a fabricated name. items.id=407 tracks the real
-// Group/household-sharing GUI (creation, invitation, permission
-// management, a real display-name mechanism) this row is deliberately NOT
-// attempting to be.
+// One PersonaPillRow now governs every view (Documents/Facts/Chat History/
+// User Info/Group Info alike) -- previously LibraryPane owned its own copy
+// of this selector just for Documents. User Info's content (the session
+// display name) is NOT persona-scoped -- it's account/session-level, same
+// as the old User row's label always was. Group Info's underlying
+// listPersonaGroupIds fetch IS keyed off this screen's own persona
+// selection now (previously keyed off the shared, app-wide activePersonaId)
+// -- Jason, 2026-09-24: consistent with every other view here using the
+// local filter, not the app-wide one.
 
 import { useCallback, useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { commands, type ChatInfo, type OutputInfo, type PersonaInfo } from '../bindings'
-import { DocumentRow } from '../library/DocumentRow'
+import { commands, type ChatInfo, type PersonaInfo } from '../bindings'
+import { LibraryPane } from '../library/LibraryPane'
+import { PersonaPillRow } from './persona/PersonaPillRow'
+import { usePersonaLocalFilter } from './persona/usePersonaLocalFilter'
 import '../chat/ChatHistoryList.css'
 import './HistoryScreen.css'
 
@@ -56,42 +60,33 @@ export interface HistoryOpenTarget {
 export interface HistoryScreenProps {
   userId: string
   personas: PersonaInfo[]
-  /** Whichever Persona is active elsewhere (Chat/Library) -- used only to
-   *  decide the Group row's visibility (Jason, 2026-09-03: scoped to "the
-   *  active Persona", not evaluated per-row across every Persona). */
+  /** The shared, app-wide active persona (NavState.activePersonaId) --
+   *  read only here: drives PersonaPillRow's ring mark and this screen's
+   *  own local filter's first-open default. This screen's own selection
+   *  never writes back to it (decisions.id=833). */
   activePersonaId: string | null
-  /** History's Persona-row "Chat" action, and Chat History's own
-   *  "resume this chat" row-action -- chat is null for the former (lands
-   *  on whatever Chat's own default view is), set for the latter. */
-  onOpenPersonaChat: (personaId: string, chat: ChatInfo | null) => void
-  /** The Library preview's "Open full Library ->" escape hatch. */
-  onOpenFullLibrary: (personaId: string) => void
+  /** Chat History's "resume this chat" row-action. */
+  onOpenPersonaChat: (personaId: string, chat: ChatInfo) => void
   /** Chat's own "Chat history" toggle jumping in from outside -- consumed
    *  once (see onOpenTargetConsumed). */
   openTarget: HistoryOpenTarget | null
   onOpenTargetConsumed: () => void
 }
 
-type RowId = 'user' | 'group' | `persona:${string}`
-
-type HistoryActionContent =
-  | { type: 'facts' }
-  | { type: 'chatHistory'; personaId: string }
-  | { type: 'libraryPreview'; personaId: string }
-  | null
+type LibraryView = 'documents' | 'facts' | 'chatHistory' | 'userInfo' | 'groupInfo'
 
 export function HistoryScreen({
   userId,
   personas,
   activePersonaId,
   onOpenPersonaChat,
-  onOpenFullLibrary,
   openTarget,
   onOpenTargetConsumed,
 }: HistoryScreenProps) {
   const { t } = useTranslation()
-  const [expandedRow, setExpandedRow] = useState<RowId | null>(null)
-  const [actionContent, setActionContent] = useState<HistoryActionContent>(null)
+  const { filterId: libraryFilter, select: selectLibraryFilter, setFilter: setLibraryFilter } =
+    usePersonaLocalFilter(activePersonaId, false)
+  const [view, setView] = useState<LibraryView>('documents')
   const [sessionDisplayName, setSessionDisplayName] = useState<string | null>(null)
   const [groupIds, setGroupIds] = useState<string[]>([])
 
@@ -104,153 +99,129 @@ export function HistoryScreen({
   }, [])
 
   // Fail-closed: an error checking group membership is treated the same
-  // as "no groups" (hide the row) -- this is a visibility check, not a
+  // as "no groups" (hide the button) -- this is a visibility check, not a
   // page a user is trying to use, so there's nothing useful an error
   // banner here would let them do differently.
   useEffect(() => {
     setGroupIds([])
-    if (activePersonaId === null) return
-    commands.listPersonaGroupIds(activePersonaId).then((result) => {
+    if (libraryFilter === null) return
+    commands.listPersonaGroupIds(libraryFilter).then((result) => {
       if (result.status === 'ok') setGroupIds(result.data)
     })
-  }, [activePersonaId])
+  }, [libraryFilter])
 
-  // Chat's "Chat history" toggle jumping in -- expands the right Persona
-  // row and pre-selects Chat History as the showing action-pane content,
-  // matching the design doc's transition description verbatim ("'Chat
-  // History' already showing in the action-pane").
+  // items.id=558 precedent (LibraryPane's own persona-switch reset, now
+  // relocated here alongside the selector itself): switching Persona always
+  // lands back on the default Documents view, so a Facts/Chat History/Group
+  // Info selection from one Persona doesn't silently carry over to the next.
+  useEffect(() => {
+    setView('documents')
+  }, [libraryFilter])
+
+  // Chat's "Chat history" toggle jumping in -- forces this screen's own
+  // persona selection to the target (via setFilter, not select: see
+  // usePersonaLocalFilter.ts's header comment on why the toggle-to-fallback
+  // select() would be wrong here) and pre-selects Chat History as the
+  // showing view, matching the design doc's transition description verbatim
+  // ("'Chat History' already showing in the action-pane").
   useEffect(() => {
     if (!openTarget) return
-    setExpandedRow(`persona:${openTarget.personaId}`)
-    setActionContent({ type: 'chatHistory', personaId: openTarget.personaId })
+    setLibraryFilter(openTarget.personaId)
+    setView('chatHistory')
     onOpenTargetConsumed()
-  }, [openTarget, onOpenTargetConsumed])
+  }, [openTarget, onOpenTargetConsumed, setLibraryFilter])
 
-  const handleSelectRow = useCallback((rowId: RowId) => {
-    setExpandedRow((prev) => {
-      if (prev === rowId) {
-        setActionContent(null)
-        return null
-      }
-      setActionContent(null)
-      return rowId
-    })
-  }, [])
-
-  const showGroupRow = groupIds.length > 0
+  const showGroupInfo = groupIds.length > 0
 
   return (
     <div className="history-screen">
-      <ul className="history-screen__rows">
-        <li className="history-screen__row">
+      <PersonaPillRow
+        personas={personas}
+        activePersonaId={activePersonaId}
+        filterId={libraryFilter}
+        onSelect={selectLibraryFilter}
+        allowAll={false}
+      />
+
+      <div className="history-screen__view-buttons">
+        <button
+          type="button"
+          className="history-screen__view-button"
+          data-selected={view === 'documents' ? '' : undefined}
+          onClick={() => setView('documents')}
+        >
+          {t('navShell.history.documentsAction')}
+        </button>
+        <button
+          type="button"
+          className="history-screen__view-button"
+          data-selected={view === 'facts' ? '' : undefined}
+          onClick={() => setView('facts')}
+        >
+          {t('navShell.history.factsAction')}
+        </button>
+        <button
+          type="button"
+          className="history-screen__view-button"
+          data-selected={view === 'chatHistory' ? '' : undefined}
+          onClick={() => setView('chatHistory')}
+        >
+          {t('navShell.history.chatHistoryAction')}
+        </button>
+        <button
+          type="button"
+          className="history-screen__view-button"
+          data-selected={view === 'userInfo' ? '' : undefined}
+          onClick={() => setView('userInfo')}
+        >
+          {t('navShell.history.userInfoAction')}
+        </button>
+        {showGroupInfo && (
           <button
             type="button"
-            className="history-screen__row-header"
-            data-selected={expandedRow === 'user' ? '' : undefined}
-            onClick={() => handleSelectRow('user')}
+            className="history-screen__view-button"
+            data-selected={view === 'groupInfo' ? '' : undefined}
+            onClick={() => setView('groupInfo')}
           >
-            <span className="history-screen__row-label">
-              {sessionDisplayName ?? t('navShell.history.userRowLabel')}
-            </span>
+            {t('navShell.history.groupInfoAction')}
           </button>
-          {expandedRow === 'user' && (
-            <div className="history-screen__row-actions">
-              <button type="button" onClick={() => setActionContent({ type: 'facts' })}>
-                {t('navShell.history.factsAction')}
-              </button>
-            </div>
-          )}
-        </li>
-
-        {showGroupRow && (
-          <li className="history-screen__row">
-            <button
-              type="button"
-              className="history-screen__row-header"
-              data-selected={expandedRow === 'group' ? '' : undefined}
-              onClick={() => handleSelectRow('group')}
-            >
-              <span className="history-screen__row-label">
-                {groupIds.length === 1
-                  ? t('navShell.history.groupRowLabel')
-                  : t('navShell.history.groupRowLabelCount', { count: groupIds.length })}
-              </span>
-            </button>
-            {expandedRow === 'group' && (
-              <div className="history-screen__row-actions">
-                <button type="button" onClick={() => setActionContent({ type: 'facts' })}>
-                  {t('navShell.history.factsAction')}
-                </button>
-              </div>
-            )}
-          </li>
         )}
+      </div>
 
-        {personas.map((persona) => {
-          const rowId: RowId = `persona:${persona.id}`
-          return (
-            <li key={persona.id} className="history-screen__row">
-              <button
-                type="button"
-                className="history-screen__row-header"
-                data-selected={expandedRow === rowId ? '' : undefined}
-                onClick={() => handleSelectRow(rowId)}
-              >
-                <span className="history-screen__row-label">{persona.display_name}</span>
-              </button>
-              {expandedRow === rowId && (
-                <div className="history-screen__row-actions">
-                  <button type="button" onClick={() => setActionContent({ type: 'facts' })}>
-                    {t('navShell.history.factsAction')}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setActionContent({ type: 'chatHistory', personaId: persona.id })
-                    }
-                  >
-                    {t('navShell.history.chatHistoryAction')}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setActionContent({ type: 'libraryPreview', personaId: persona.id })
-                    }
-                  >
-                    {t('navShell.history.libraryAction')}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => onOpenPersonaChat(persona.id, null)}
-                  >
-                    {t('navShell.history.chatAction')}
-                  </button>
-                </div>
-              )}
-            </li>
-          )
-        })}
-      </ul>
-
-      {actionContent && (
-        <div className="history-screen__action-pane">
-          {actionContent.type === 'facts' && <p>{t('navShell.content.myFactsPlaceholder')}</p>}
-          {actionContent.type === 'chatHistory' && (
+      <div className="history-screen__content-pane">
+        {view === 'documents' &&
+          (libraryFilter === null ? (
+            <p className="history-screen__notice">{t('navShell.history.noPersonaSelected')}</p>
+          ) : (
+            <LibraryPane userId={userId} personaId={libraryFilter} />
+          ))}
+        {view === 'facts' &&
+          (libraryFilter === null ? (
+            <p className="history-screen__notice">{t('navShell.history.noPersonaSelected')}</p>
+          ) : (
+            <p>{t('navShell.content.myFactsPlaceholder')}</p>
+          ))}
+        {view === 'chatHistory' &&
+          (libraryFilter === null ? (
+            <p className="history-screen__notice">{t('navShell.history.noPersonaSelected')}</p>
+          ) : (
             <ChatHistoryAction
               userId={userId}
-              personaId={actionContent.personaId}
-              onResumeChat={(chat) => onOpenPersonaChat(actionContent.personaId, chat)}
+              personaId={libraryFilter}
+              onResumeChat={(chat) => onOpenPersonaChat(libraryFilter, chat)}
             />
-          )}
-          {actionContent.type === 'libraryPreview' && (
-            <LibraryPreviewAction
-              userId={userId}
-              personaId={actionContent.personaId}
-              onOpenFullLibrary={() => onOpenFullLibrary(actionContent.personaId)}
-            />
-          )}
-        </div>
-      )}
+          ))}
+        {view === 'userInfo' && (
+          <p>{sessionDisplayName ?? t('navShell.history.userRowLabel')}</p>
+        )}
+        {view === 'groupInfo' && showGroupInfo && (
+          <p>
+            {groupIds.length === 1
+              ? t('navShell.history.groupRowLabel')
+              : t('navShell.history.groupRowLabelCount', { count: groupIds.length })}
+          </p>
+        )}
+      </div>
     </div>
   )
 }
@@ -340,61 +311,6 @@ function ChatHistoryAction({
           ))}
         </ul>
       )}
-    </div>
-  )
-}
-
-function LibraryPreviewAction({
-  userId,
-  personaId,
-  onOpenFullLibrary,
-}: {
-  userId: string
-  personaId: string
-  onOpenFullLibrary: () => void
-}) {
-  const { t } = useTranslation()
-  const [outputs, setOutputs] = useState<OutputInfo[]>([])
-  const [error, setError] = useState<string | null>(null)
-
-  useEffect(() => {
-    setOutputs([])
-    setError(null)
-    commands.listOutputs(userId, personaId, null, null, null, null).then((result) => {
-      if (result.status === 'ok') {
-        setOutputs(result.data)
-      } else {
-        setError(result.error)
-      }
-    })
-  }, [userId, personaId])
-
-  return (
-    <div className="history-screen__library-preview">
-      {error && (
-        <p role="alert">{t('navShell.libraryPane.listLoadError', { message: error })}</p>
-      )}
-      {outputs.length === 0 && !error && (
-        <p className="history-screen__empty">{t('navShell.libraryPane.emptyList')}</p>
-      )}
-      {outputs.length > 0 && (
-        <ul className="history-screen__library-preview-scroll">
-          {outputs.map((output) => (
-            <li key={output.id}>
-              <DocumentRow output={output} interactive={false} />
-            </li>
-          ))}
-        </ul>
-      )}
-      <div className="history-screen__library-preview-footer">
-        <button
-          type="button"
-          className="history-screen__link-button"
-          onClick={onOpenFullLibrary}
-        >
-          {t('navShell.history.openFullLibrary')}
-        </button>
-      </div>
     </div>
   )
 }

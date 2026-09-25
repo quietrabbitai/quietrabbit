@@ -92,7 +92,6 @@
   overflow-y: auto;
 }
 
-.library-pane__notice,
 .library-pane__copy-error {
   font-size: 14px;
   color: var(--text);

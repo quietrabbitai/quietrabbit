@@ -1,15 +1,22 @@
-// The 5-rail navigation dock -- Board / Chat / Cloud Chat / Library / History,
-// exactly one dominant (fills the majority of the screen) at a time.
-// items.id=404, generalizing items.id=391's "three peer bars, exactly one
-// expanded" model (decisions.id=747) from 3 rails to 5. Full design:
+// The navigation dock -- Board / Chat / Cloud Chat / Library, exactly one
+// dominant (fills the majority of the screen) at a time. items.id=404,
+// generalizing items.id=391's "three peer bars, exactly one expanded" model
+// (decisions.id=747) from 3 rails to more. Full design:
 // 03_ProjectDocs/Specifications/HIERARCHICAL_NAV_SHELL_DESIGN_20260902.md.
 //
-// The fixed vertical order (Board / Chat+Cloud Chat / Library / History, top to
-// bottom) mirrors the old file's Board/Chat/Cloud Chat order, with Library and
-// History appended below. Exactly one region is "dominant" (gets the big
-// remaining space) at a time -- the rest render as compact bars, reusing
+// items.id=568 (decisions.id=834, 2026-09-24): the separate Library rail
+// (Session 1's 5-rail shape) was retired -- Library absorbed the old
+// History rail instead, renamed "Library" for the user (the DockRailId
+// value/region below is still 'history' internally; see HistoryScreen.tsx's
+// own header comment for why that identifier wasn't renamed too). Current
+// shape: 4 rails (Board / Chat+Cloud Chat / Library[='history']).
+//
+// The fixed vertical order (Board / Chat+Cloud Chat / Library, top to
+// bottom) mirrors the old file's Board/Chat/Cloud Chat order, with Library
+// appended below. Exactly one region is "dominant" (gets the big remaining
+// space) at a time -- the rest render as compact bars, reusing
 // `.cloud-chat-collapsed-strip` verbatim (CloudChatCollapsedStrip.css) the same way
-// Board's own bar already did pre-404, so all four non-dominant bars read
+// Board's own bar already did pre-404, so all non-dominant bars read
 // as the same kind of row.
 //
 // Chat and Cloud Chat are NOT two separate top-level regions in this file's own
@@ -18,9 +25,9 @@
 // why). What changes is what drives their split:
 //   - `floor` (Chat's own passive-but-functional compact form) generalizes
 //     from "true only while Board is expanded" to "true whenever neither
-//     Chat nor Cloud Chat is the outer-dominant rail" -- Library or History
-//     being dominant now ALSO floors Chat, which pre-404 was impossible
-//     (there was no Library/History rail to be dominant instead).
+//     Chat nor Cloud Chat is the outer-dominant rail" -- Library being
+//     dominant now ALSO floors Chat, which pre-404 was impossible (there
+//     was no Library/History rail to be dominant instead).
 //   - Cloud Chat's own compact form needed ZERO changes: CloudChatCollapsedStrip
 //     already rendered unconditionally whenever Cloud Chat wasn't the expanded
 //     region, regardless of floor -- that already IS the "plain inert
@@ -60,7 +67,6 @@ import { useTranslation } from 'react-i18next'
 import type { ChatInfo, PersonaInfo } from '../bindings'
 import { ActiveBoardPane } from './ActiveBoardPane'
 import { HistoryScreen, type HistoryOpenTarget } from './HistoryScreen'
-import { LibraryPane } from '../library/LibraryPane'
 import { CloudChatAccessPane } from './CloudChatAccessPane'
 import { useDominancePair } from './useDominancePair'
 import type { DockRailId, DominancePairState } from './navShellConfig'
@@ -187,34 +193,11 @@ export function WorkspaceShell({
         onPendingChatSelectionConsumed={() => setPendingChatSelection(null)}
       />
 
-      {dominantRail === 'library' ? (
-        <div key="library-region" className="workspace-shell__library-region">
-          <div className="cloud-chat-access-pane__section-header">
-            <span className="cloud-chat-access-pane__section-header-name">
-              {t('navShell.library')}
-            </span>
-          </div>
-          <LibraryPane userId={userId} personas={personas} activePersonaId={activePersonaId} />
-        </div>
-      ) : (
-        <button
-          key="library-bar"
-          type="button"
-          className="cloud-chat-collapsed-strip"
-          onClick={() => onDominantRailChange('library')}
-        >
-          <span className="cloud-chat-collapsed-strip__name">{t('navShell.library')}</span>
-          <span className="cloud-chat-collapsed-strip__expand">
-            {t('navShell.cloudChatCollapsedStrip.expandLabel')}
-          </span>
-        </button>
-      )}
-
       {dominantRail === 'history' ? (
         <div key="history-region" className="workspace-shell__history-region">
           <div className="cloud-chat-access-pane__section-header">
             <span className="cloud-chat-access-pane__section-header-name">
-              {t('navShell.historyLabel')}
+              {t('navShell.library')}
             </span>
           </div>
           <HistoryScreen
@@ -223,12 +206,8 @@ export function WorkspaceShell({
             activePersonaId={activePersonaId}
             onOpenPersonaChat={(personaId, chat) => {
               onActivePersonaIdChange(personaId)
-              if (chat) setPendingChatSelection(chat)
+              setPendingChatSelection(chat)
               onDominantRailChange('chat')
-            }}
-            onOpenFullLibrary={(personaId) => {
-              onActivePersonaIdChange(personaId)
-              onDominantRailChange('library')
             }}
             openTarget={pendingHistoryTarget}
             onOpenTargetConsumed={() => setPendingHistoryTarget(null)}
@@ -241,7 +220,7 @@ export function WorkspaceShell({
           className="cloud-chat-collapsed-strip"
           onClick={() => onDominantRailChange('history')}
         >
-          <span className="cloud-chat-collapsed-strip__name">{t('navShell.historyLabel')}</span>
+          <span className="cloud-chat-collapsed-strip__name">{t('navShell.library')}</span>
           <span className="cloud-chat-collapsed-strip__expand">
             {t('navShell.cloudChatCollapsedStrip.expandLabel')}
           </span>

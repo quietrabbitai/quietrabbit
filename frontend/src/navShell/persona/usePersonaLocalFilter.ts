@@ -28,6 +28,14 @@ export interface UsePersonaLocalFilterResult {
    *  active elsewhere (activePersonaId), or stays put if nothing is active
    *  anywhere to fall back to. Selecting anything else just selects it. */
   select: (id: string | null) => void
+  /** items.id=568: a raw setter, for external forced-selection jumps that
+   *  must land on a specific persona regardless of the current filter
+   *  (e.g. Chat's "Chat history" toggle jumping into Library, pre-scoped
+   *  to a specific persona). Deliberately NOT routed through `select` --
+   *  `select`'s toggle-to-fallback semantics are built for pill clicks and
+   *  would silently flip away from the intended persona if it happened to
+   *  already equal the current filter. */
+  setFilter: (id: string | null) => void
 }
 
 export function usePersonaLocalFilter(
@@ -42,5 +50,5 @@ export function usePersonaLocalFilter(
     setFilterId(id === filterId ? activePersonaId : id)
   }
 
-  return { filterId, select }
+  return { filterId, select, setFilter: setFilterId }
 }

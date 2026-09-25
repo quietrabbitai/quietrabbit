@@ -13,34 +13,31 @@
 // "same pattern" onto Library's existing two actions, not something the
 // mockup itself specifies.
 //
-// items.id=543 (PERSONA_SELECTOR_DESIGN_ITEM543_20260921.md Section 2.2):
-// reworked again -- Library now has its own local persona filter
-// (libraryFilter, usePersonaLocalFilter), decoupled from the shared
-// activePersonaId this component used to scope its fetches with directly.
-// This was a deliberate mid-session reversal in the design doc: an earlier
-// draft had Library's pills write straight to activePersonaId, matching
-// Chat, which meant browsing Library while hunting for a document could
-// silently switch (and appear to lose) the user's open Chat conversation.
-// libraryFilter defaults from activePersonaId once on mount and is
-// independent of it afterward -- see usePersonaLocalFilter.ts's own header
-// comment for the exact mechanism, mirrored from ActiveBoardPane.tsx's
-// pre-existing personaFilter.
+// items.id=568 (decisions.id=834): this component no longer owns its own
+// persona selection. The consolidated Library screen (HistoryScreen.tsx)
+// now mounts one PersonaPillRow (Library's own local-filter variant, per
+// decisions.id=833) governing every one of its views, not just Documents
+// -- so that selector moved up to the parent. This component just takes
+// the already-resolved `personaId` as a prop; the parent only mounts it
+// once a persona is actually selected, so there's no null case to handle
+// here any more. (Previously: items.id=543 gave this component its own
+// local persona filter, decoupled from activePersonaId, specifically so
+// browsing Library couldn't silently switch/lose the user's open Chat
+// conversation -- that reasoning is unchanged, it's just enforced one
+// level up now.)
 
 import { type ChangeEvent, useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { commands, type OutputInfo, type PersonaInfo } from '../bindings'
+import { commands, type OutputInfo } from '../bindings'
 import { DocumentRow } from './DocumentRow'
-import { PersonaPillRow } from '../navShell/persona/PersonaPillRow'
-import { usePersonaLocalFilter } from '../navShell/persona/usePersonaLocalFilter'
 import './LibraryPane.css'
 
 export interface LibraryPaneProps {
   userId: string
-  personas: PersonaInfo[]
-  /** The shared, app-wide active persona (NavState.activePersonaId) --
-   *  read only here: drives PersonaPillRow's ring mark and libraryFilter's
-   *  first-open default. Library's own selection never writes this. */
-  activePersonaId: string | null
+  /** The persona this Documents view is scoped to -- resolved by the
+   *  parent Library screen's own PersonaPillRow selection. The parent
+   *  never mounts this component without one selected. */
+  personaId: string
 }
 
 type LibraryAction = 'view' | 'copy' | 'import' | null
@@ -62,12 +59,8 @@ function hasTextImportExtension(filename: string): boolean {
   return ext !== undefined && TEXT_IMPORT_EXTENSIONS.includes(ext)
 }
 
-export function LibraryPane({ userId, personas, activePersonaId }: LibraryPaneProps) {
+export function LibraryPane({ userId, personaId }: LibraryPaneProps) {
   const { t } = useTranslation()
-  const { filterId: libraryFilter, select: selectLibraryFilter } = usePersonaLocalFilter(
-    activePersonaId,
-    false,
-  )
   const [sourceView, setSourceView] = useState<LibrarySourceView>('qr_generated')
   const [otherSourceHasDocs, setOtherSourceHasDocs] = useState(false)
   const [outputs, setOutputs] = useState<OutputInfo[]>([])
@@ -93,15 +86,13 @@ export function LibraryPane({ userId, personas, activePersonaId }: LibraryPanePr
     setImportError(null)
   }, [])
 
-  // items.id=558: switching Persona (libraryFilter is Library's own local
-  // persona filter, decoupled from activePersonaId -- see
-  // usePersonaLocalFilter.ts's header comment) always lands back on the
-  // default qr_generated view, per the design's own "resetting to the
-  // default qr_generated view on persona switch" -- an Imported-view
-  // selection from one Persona shouldn't silently carry over to the next.
+  // items.id=558: switching Persona always lands back on the default
+  // qr_generated view, per the design's own "resetting to the default
+  // qr_generated view on persona switch" -- an Imported-view selection
+  // from one Persona shouldn't silently carry over to the next.
   useEffect(() => {
     setSourceView('qr_generated')
-  }, [userId, libraryFilter])
+  }, [userId, personaId])
 
   // Re-fetch on mount / identity / source-view change, mirrors ChatPane.tsx's
   // own identity-keyed re-fetch effect.
@@ -110,25 +101,19 @@ export function LibraryPane({ userId, personas, activePersonaId }: LibraryPanePr
     setListError(null)
     resetSelection()
 
-    if (libraryFilter === null) {
-      // Nothing was ever really listable for this identity -- honest
-      // empty state, not a fetch failure.
-      return
-    }
-
     // items.id=404 / items.id=558: passes all 6 params explicitly. `source`
     // is sourceView itself now rather than a hardcoded null -- list_outputs
     // treats a missing source as 'qr_generated' anyway, but making the
     // param explicit keeps this call site honest about which of the two
     // views it's asking for.
-    commands.listOutputs(userId, libraryFilter, null, null, null, sourceView).then((result) => {
+    commands.listOutputs(userId, personaId, null, null, null, sourceView).then((result) => {
       if (result.status === 'ok') {
         setOutputs(result.data)
       } else {
         setListError(result.error)
       }
     })
-  }, [userId, libraryFilter, sourceView, resetSelection])
+  }, [userId, personaId, sourceView, resetSelection])
 
   // items.id=558: probes the *other* source so the "View imported
   // documents ->" / "View library ->" entry point can stay hidden unless
@@ -136,42 +121,37 @@ export function LibraryPane({ userId, personas, activePersonaId }: LibraryPanePr
   useEffect(() => {
     setOtherSourceHasDocs(false)
 
-    if (libraryFilter === null) return
-
     const otherSource: LibrarySourceView =
       sourceView === 'qr_generated' ? 'external_ingested' : 'qr_generated'
-    commands.listOutputs(userId, libraryFilter, null, null, null, otherSource).then((result) => {
+    commands.listOutputs(userId, personaId, null, null, null, otherSource).then((result) => {
       if (result.status === 'ok') {
         setOtherSourceHasDocs(result.data.length > 0)
       }
     })
-  }, [userId, libraryFilter, sourceView])
+  }, [userId, personaId, sourceView])
 
   // View action -- re-fetches via getOutput rather than trusting the list
   // row's own cached content, matching ChatPane's reconcile-over-cache
   // discipline and giving Privacy Guardian a fresh per-access check point.
   useEffect(() => {
-    if (action !== 'view' || selectedOutputId === null || libraryFilter === null) return
+    if (action !== 'view' || selectedOutputId === null) return
     setViewedOutput(null)
     setViewError(null)
-    commands.getOutput(selectedOutputId, userId, libraryFilter).then((result) => {
+    commands.getOutput(selectedOutputId, userId, personaId).then((result) => {
       if (result.status === 'ok') {
         setViewedOutput(result.data)
       } else {
         setViewError(result.error)
       }
     })
-  }, [action, selectedOutputId, userId, libraryFilter])
+  }, [action, selectedOutputId, userId, personaId])
 
   const handleCopy = useCallback(() => {
-    // libraryFilter is guaranteed non-null here: this whole component
-    // returns its own notice-only render above before ever reaching UI
-    // that could call this.
-    if (selectedOutputId === null || libraryFilter === null) return
+    if (selectedOutputId === null) return
     setAction('copy')
     setCopyStatus('pending')
     setCopyError(null)
-    commands.copyOutputToClipboard(selectedOutputId, userId, libraryFilter).then((result) => {
+    commands.copyOutputToClipboard(selectedOutputId, userId, personaId).then((result) => {
       if (result.status === 'ok') {
         setCopyStatus('success')
       } else {
@@ -181,7 +161,7 @@ export function LibraryPane({ userId, personas, activePersonaId }: LibraryPanePr
         setCopyError(result.error)
       }
     })
-  }, [selectedOutputId, userId, libraryFilter])
+  }, [selectedOutputId, userId, personaId])
 
   // Import new version (decisions.id=827): the button itself is the only
   // gate -- opening the native file picker *is* the confirmation, no extra
@@ -198,7 +178,7 @@ export function LibraryPane({ userId, personas, activePersonaId }: LibraryPanePr
     (event: ChangeEvent<HTMLInputElement>) => {
       const file = event.target.files?.[0] ?? null
       event.target.value = ''
-      if (file === null || selectedOutputId === null || libraryFilter === null) return
+      if (file === null || selectedOutputId === null) return
 
       setAction('import')
       setImportStatus('pending')
@@ -222,7 +202,7 @@ export function LibraryPane({ userId, personas, activePersonaId }: LibraryPanePr
         .then((content) =>
           commands.storeIngestedDocument(
             userId,
-            libraryFilter,
+            personaId,
             focusSlug,
             selected.project_entity_id,
             selected.sensitivity,
@@ -237,7 +217,7 @@ export function LibraryPane({ userId, personas, activePersonaId }: LibraryPanePr
             return
           }
           return commands
-            .updateActiveDocument(storeResult.data.output_id, selectedOutputId, userId, libraryFilter)
+            .updateActiveDocument(storeResult.data.output_id, selectedOutputId, userId, personaId)
             .then((linkResult) => {
               if (linkResult.status !== 'ok') {
                 setImportStatus('error')
@@ -245,7 +225,7 @@ export function LibraryPane({ userId, personas, activePersonaId }: LibraryPanePr
                 return
               }
               setImportStatus('success')
-              commands.listOutputs(userId, libraryFilter, null, null, null, sourceView).then((result) => {
+              commands.listOutputs(userId, personaId, null, null, null, sourceView).then((result) => {
                 if (result.status === 'ok') setOutputs(result.data)
               })
             })
@@ -255,7 +235,7 @@ export function LibraryPane({ userId, personas, activePersonaId }: LibraryPanePr
           setImportError(err instanceof Error ? err.message : String(err))
         })
     },
-    [selectedOutputId, userId, libraryFilter, outputs, sourceView, t],
+    [selectedOutputId, userId, personaId, outputs, sourceView, t],
   )
 
   // items.id=558: the discoverable entry point toggles between the two
@@ -287,30 +267,40 @@ export function LibraryPane({ userId, personas, activePersonaId }: LibraryPanePr
 
   return (
     <div className="library-pane">
-      <PersonaPillRow
-        personas={personas}
-        activePersonaId={activePersonaId}
-        filterId={libraryFilter}
-        onSelect={selectLibraryFilter}
-        allowAll={false}
-      />
-
-      {libraryFilter === null ? (
-        <p className="library-pane__notice">{t('navShell.libraryPane.noPersonaContext')}</p>
-      ) : (
-        <>
-          <div className="library-pane__heading-row">
-            <h2 className="library-pane__heading">
-              {t(
-                sourceView === 'qr_generated'
-                  ? 'navShell.libraryPane.listHeading'
-                  : 'navShell.libraryPane.importedListHeading',
-              )}
-            </h2>
-            {/* items.id=558: shown next to the heading once there's a list
-             *  to look at; when the current view is empty this same link
-             *  collapses into the empty-state message below instead. */}
-            {otherSourceHasDocs && outputs.length > 0 && (
+      <div className="library-pane__heading-row">
+        <h2 className="library-pane__heading">
+          {t(
+            sourceView === 'qr_generated'
+              ? 'navShell.libraryPane.listHeading'
+              : 'navShell.libraryPane.importedListHeading',
+          )}
+        </h2>
+        {/* items.id=558: shown next to the heading once there's a list
+         *  to look at; when the current view is empty this same link
+         *  collapses into the empty-state message below instead. */}
+        {otherSourceHasDocs && outputs.length > 0 && (
+          <button
+            type="button"
+            className="library-pane__link-button"
+            onClick={handleToggleSourceView}
+          >
+            {t(otherSourceLinkKey)}
+          </button>
+        )}
+      </div>
+      {listError && (
+        <p role="alert">{t('navShell.libraryPane.listLoadError', { message: listError })}</p>
+      )}
+      {outputs.length === 0 && !listError && (
+        <p>
+          {t(
+            sourceView === 'qr_generated'
+              ? 'navShell.libraryPane.emptyList'
+              : 'navShell.libraryPane.emptyListImported',
+          )}
+          {otherSourceHasDocs && (
+            <>
+              {' '}
               <button
                 type="button"
                 className="library-pane__link-button"
@@ -318,92 +308,68 @@ export function LibraryPane({ userId, personas, activePersonaId }: LibraryPanePr
               >
                 {t(otherSourceLinkKey)}
               </button>
-            )}
-          </div>
-          {listError && (
-            <p role="alert">{t('navShell.libraryPane.listLoadError', { message: listError })}</p>
+            </>
           )}
-          {outputs.length === 0 && !listError && (
-            <p>
-              {t(
-                sourceView === 'qr_generated'
-                  ? 'navShell.libraryPane.emptyList'
-                  : 'navShell.libraryPane.emptyListImported',
-              )}
-              {otherSourceHasDocs && (
-                <>
-                  {' '}
-                  <button
-                    type="button"
-                    className="library-pane__link-button"
-                    onClick={handleToggleSourceView}
-                  >
-                    {t(otherSourceLinkKey)}
+        </p>
+      )}
+      {outputs.length > 0 && (
+        <ul className="library-pane__list">
+          {outputs.map((output) => (
+            <li key={output.id} className="library-pane__list-item">
+              <DocumentRow
+                output={output}
+                selected={output.id === selectedOutputId}
+                onSelect={() => handleSelectRow(output.id)}
+              />
+              {output.id === selectedOutputId && (
+                <div className="library-pane__row-actions">
+                  <button type="button" onClick={() => setAction('view')}>
+                    {t('navShell.libraryPane.viewButton')}
                   </button>
-                </>
+                  <button type="button" onClick={handleCopy}>
+                    {t('navShell.libraryPane.copyButton')}
+                  </button>
+                  <span className="library-pane__row-actions-divider" aria-hidden="true" />
+                  <button type="button" onClick={handleImportClick}>
+                    {t('navShell.libraryPane.importButton')}
+                  </button>
+                </div>
               )}
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {action === 'view' && (
+        <div className="library-pane__action-pane">
+          {viewError && (
+            <p role="alert">
+              {t('navShell.libraryPane.detailLoadError', { message: viewError })}
             </p>
           )}
-          {outputs.length > 0 && (
-            <ul className="library-pane__list">
-              {outputs.map((output) => (
-                <li key={output.id} className="library-pane__list-item">
-                  <DocumentRow
-                    output={output}
-                    selected={output.id === selectedOutputId}
-                    onSelect={() => handleSelectRow(output.id)}
-                  />
-                  {output.id === selectedOutputId && (
-                    <div className="library-pane__row-actions">
-                      <button type="button" onClick={() => setAction('view')}>
-                        {t('navShell.libraryPane.viewButton')}
-                      </button>
-                      <button type="button" onClick={handleCopy}>
-                        {t('navShell.libraryPane.copyButton')}
-                      </button>
-                      <span className="library-pane__row-actions-divider" aria-hidden="true" />
-                      <button type="button" onClick={handleImportClick}>
-                        {t('navShell.libraryPane.importButton')}
-                      </button>
-                    </div>
-                  )}
-                </li>
-              ))}
-            </ul>
+          {viewedOutput && <pre className="library-pane__content">{viewedOutput.content}</pre>}
+        </div>
+      )}
+      {action === 'copy' && (
+        <div className="library-pane__action-pane">
+          {copyStatus === 'success' && <p>{t('navShell.libraryPane.copySuccess')}</p>}
+          {copyStatus === 'error' && (
+            <p role="alert" className="library-pane__copy-error">
+              {copyError}
+            </p>
           )}
-
-          {action === 'view' && (
-            <div className="library-pane__action-pane">
-              {viewError && (
-                <p role="alert">
-                  {t('navShell.libraryPane.detailLoadError', { message: viewError })}
-                </p>
-              )}
-              {viewedOutput && <pre className="library-pane__content">{viewedOutput.content}</pre>}
-            </div>
+        </div>
+      )}
+      {action === 'import' && (
+        <div className="library-pane__action-pane">
+          {importStatus === 'pending' && <p>{t('navShell.libraryPane.importPending')}</p>}
+          {importStatus === 'success' && <p>{t('navShell.libraryPane.importSuccess')}</p>}
+          {importStatus === 'error' && (
+            <p role="alert" className="library-pane__copy-error">
+              {importError}
+            </p>
           )}
-          {action === 'copy' && (
-            <div className="library-pane__action-pane">
-              {copyStatus === 'success' && <p>{t('navShell.libraryPane.copySuccess')}</p>}
-              {copyStatus === 'error' && (
-                <p role="alert" className="library-pane__copy-error">
-                  {copyError}
-                </p>
-              )}
-            </div>
-          )}
-          {action === 'import' && (
-            <div className="library-pane__action-pane">
-              {importStatus === 'pending' && <p>{t('navShell.libraryPane.importPending')}</p>}
-              {importStatus === 'success' && <p>{t('navShell.libraryPane.importSuccess')}</p>}
-              {importStatus === 'error' && (
-                <p role="alert" className="library-pane__copy-error">
-                  {importError}
-                </p>
-              )}
-            </div>
-          )}
-        </>
+        </div>
       )}
       <input
         ref={importInputRef}

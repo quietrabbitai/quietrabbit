@@ -50,9 +50,7 @@ const PRE_EXISTING_ORPHAN_CLASSES: string[] = [
   'focus-settings-controls', // FocusSettingsControls.tsx has no FocusSettingsControls.css
   'focus-settings-controls__gate-confirm', // same
   'focus-settings-pane', // FocusSettingsPane.tsx has no FocusSettingsPane.css
-  'history-screen__row', // HistoryScreen.css only defines __row-header/__row-actions, not __row
-  'history-screen__row-label', // same mismatch
-  'history-screen__chat-history', // same mismatch
+  'history-screen__chat-history', // ChatHistoryAction wraps its list in this class; no CSS rule defines it
   'persona-hub', // PersonaHub.tsx has no PersonaHub.css
   'persona-hub__focus-list', // same
   'cloud-chat-rail__row--loaded', // CloudChatSelector.tsx's rowState can be 'loaded', but only

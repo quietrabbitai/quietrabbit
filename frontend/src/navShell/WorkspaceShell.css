@@ -14,10 +14,11 @@
  * is a direct flex child of .workspace-shell now (its own [data-floor]
  * rule in NavShell.css governs its size), no wrapper needed.
  *
- * items.id=404: generalized from 3 peer bars to 5 (Board/Chat/Cloud Chat/
- * Library/History) -- the root element's own dominance modifier is now
+ * items.id=404: generalized from 3 peer bars to more (Board/Chat/Cloud Chat/
+ * Library[='history'], items.id=568 having retired the separate Library
+ * rail) -- the root element's own dominance modifier is now
  * data-dominant-rail (was data-board-size), still not a className for the
- * same reason as before (CloudChatAccessPane and, now, Library/History all
+ * same reason as before (CloudChatAccessPane and, now, Library all
  * render non-stable JSX shapes across dominance changes -- fine for them,
  * per this file's own header comment on why only CloudChatAccessPane itself
  * needs positional stability). Nothing here currently targets
@@ -35,7 +36,6 @@
 }
 
 .workspace-shell__board-region,
-.workspace-shell__library-region,
 .workspace-shell__history-region {
   flex: 1;
   min-height: 0;

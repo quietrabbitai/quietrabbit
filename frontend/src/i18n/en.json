@@ -10,7 +10,6 @@
   "navShell": {
     "personaLoadError": "Could not load personas: {{message}}",
     "library": "Library",
-    "historyLabel": "History",
     "content": {
       "myFactsPlaceholder": "My Facts -- not yet built.",
       "chatPlaceholder": "Chat -- not yet wired for this screen.",
@@ -56,7 +55,6 @@
     "libraryPane": {
       "listHeading": "Outputs",
       "importedListHeading": "Imported documents",
-      "noPersonaContext": "Open Library from a Persona to see its outputs -- there's no Persona selected here yet.",
       "listLoadError": "Could not load outputs: {{message}}",
       "emptyList": "No outputs yet.",
       "emptyListImported": "No imported documents yet.",
@@ -78,11 +76,12 @@
       "userRowLabel": "User",
       "groupRowLabel": "Group",
       "groupRowLabelCount": "{{count}} Groups",
+      "documentsAction": "Documents",
       "factsAction": "Facts",
       "chatHistoryAction": "Chat History",
-      "libraryAction": "Library",
-      "chatAction": "Chat",
-      "openFullLibrary": "Open full Library →"
+      "userInfoAction": "User Info",
+      "groupInfoAction": "Group Info",
+      "noPersonaSelected": "Select a Persona above to see its content."
     },
     "activeBoardPane": {
       "loadError": "Could not load the board: {{message}}",

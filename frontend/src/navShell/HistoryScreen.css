@@ -1,6 +1,8 @@
-/* HistoryScreen.tsx -- row-stack + action-pane. Same convention as
- * LibraryPane.css/ChatHistoryList.css: consumes index.css's custom
- * properties rather than declaring its own colors. */
+/* HistoryScreen.tsx -- items.id=568's flat button-frame (Documents / Facts /
+ * Chat History / User Info / Group Info), replacing the old row-stack +
+ * per-row action-pane. Same convention as LibraryPane.css/ChatHistoryList.css:
+ * consumes index.css's custom properties rather than declaring its own
+ * colors. */
 
 .history-screen {
   display: flex;
@@ -12,18 +14,13 @@
   overflow-y: auto;
 }
 
-.history-screen__rows {
-  list-style: none;
-  margin: 0;
-  padding: 0;
+.history-screen__view-buttons {
   display: flex;
-  flex-direction: column;
-  gap: 2px;
+  flex-wrap: wrap;
+  gap: 6px;
 }
 
-.history-screen__row-header {
-  display: flex;
-  width: 100%;
+.history-screen__view-button {
   padding: 8px 10px;
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -35,23 +32,16 @@
   cursor: pointer;
 }
 
-.history-screen__row-header:hover {
+.history-screen__view-button:hover {
   background: var(--code-bg);
 }
 
-.history-screen__row-header[data-selected] {
+.history-screen__view-button[data-selected] {
   background: var(--accent-bg);
   border-color: var(--accent);
 }
 
-.history-screen__row-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  padding: 6px 10px 10px 20px;
-}
-
-.history-screen__action-pane {
+.history-screen__content-pane {
   margin-top: 4px;
   padding: 8px 10px;
   border-radius: 8px;
@@ -62,54 +52,9 @@
   min-height: 0;
 }
 
+.history-screen__notice,
 .history-screen__empty {
   font-size: 12px;
   color: var(--text);
   padding: 4px 2px;
-}
-
-/* Library preview -- Working/LIBRARY_ROW_INTEGRATION_MOCKUP_20260902.html's
- * Option B: fixed-height scroll area, no item cap, footer with the "Open
- * full Library" escape hatch pinned below it. */
-
-.history-screen__library-preview {
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-  max-height: 220px;
-}
-
-.history-screen__library-preview-scroll {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  overflow-y: auto;
-  flex: 1;
-  min-height: 0;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--bg);
-}
-
-.history-screen__library-preview-footer {
-  display: flex;
-  justify-content: flex-end;
-  padding-top: 6px;
-}
-
-/* items.id=404 judgment call: a real <button> (this triggers a same-screen
- * dominance switch, not a hyperlink) styled to read as a link, matching
- * the mockup's own ".pane__link" visual treatment. */
-.history-screen__link-button {
-  border: none;
-  background: none;
-  padding: 0;
-  font-size: 12px;
-  color: var(--accent);
-  cursor: pointer;
-  text-decoration: none;
-}
-
-.history-screen__link-button:hover {
-  text-decoration: underline;
 }
