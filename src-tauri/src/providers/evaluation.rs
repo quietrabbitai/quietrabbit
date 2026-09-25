@@ -283,6 +283,7 @@ impl EvaluationHarness {
                 provider_id: None,
                 model_id: model_id.to_owned(),
                 prompt: task.prompt.clone(),
+                images: None,
                 task_type: task.task_type.clone(),
                 stream: None,
                 options: Some(opts),

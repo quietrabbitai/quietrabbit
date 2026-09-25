@@ -631,6 +631,7 @@ impl StepExecutor {
             provider_id: selected_model.provider_id.clone(),
             model_id: selected_model.model_id.clone(),
             prompt,
+            images: None,
             task_type: ctx.step.task_type.clone(),
             stream: Some(false), // always false in Release 1 — resolved by StepExecutor
             options: Some(options),

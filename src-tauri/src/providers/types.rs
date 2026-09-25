@@ -31,6 +31,11 @@ pub struct GenerateRequest {
     pub provider_id: Option<String>,
     pub model_id: String,
     pub prompt: String,
+    /// Base64-encoded image data (no `data:` URI prefix), one entry per image,
+    /// following Ollama's `/api/generate` `images` convention. `None` or an
+    /// empty vec means text-only — unchanged behavior. Populated by callers;
+    /// this struct does no encoding or validation itself.
+    pub images: Option<Vec<String>>,
     pub task_type: String,
     /// Resolved by `StepExecutor`. External callers must leave this `None`.
     pub(crate) stream: Option<bool>,

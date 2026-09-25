@@ -295,6 +295,7 @@ Conversation:
         provider_id: None,
         model_id: EXTRACT_MODEL.to_owned(),
         prompt,
+        images: None,
         task_type: "extraction".to_owned(),
         stream: Some(false),
         options: Some(GenerateOptions {

@@ -189,7 +189,7 @@ impl OllamaClient {
             num_predict: 2048,
         });
 
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "model": request.model_id,
             "prompt": request.prompt,
             "stream": false,
@@ -200,6 +200,11 @@ impl OllamaClient {
                 "num_predict": options.num_predict,
             }
         });
+        if let Some(images) = &request.images {
+            if !images.is_empty() {
+                payload["images"] = serde_json::json!(images);
+            }
+        }
 
         let url = format!("{}/api/generate", base_url());
         let start = std::time::Instant::now();
