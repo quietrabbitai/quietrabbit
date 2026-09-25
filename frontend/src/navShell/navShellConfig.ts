@@ -58,8 +58,8 @@ export type DockRailId = 'board' | 'chat' | 'cloudChat' | 'history'
  *  fills the main slot (when the pair itself is dominant -- see
  *  WorkspaceShell.tsx's sync effects), and Cloud Chat's own rail/pane
  *  bookkeeping -- lifted here (rather than left local to CloudChatAccessPane's
- *  component state) so it survives navigating to Board/Library/History and
- *  back. Live as of slice 4 -- read/written via useDominancePair.ts, the
+ *  component state) so it survives navigating to Board/Library[='history']
+ *  and back. Live as of slice 4 -- read/written via useDominancePair.ts, the
  *  only place that constructs a new value of this shape (its own
  *  withDominance() keeps `dominant` in sync with `activeProviderId` in one
  *  place, rather than each call site setting it separately).
@@ -77,8 +77,10 @@ export interface DominancePairState {
 }
 
 export interface NavState {
-  /** Which Persona is currently active -- read by Chat, Library, and
-   *  History's Persona-row selection alike. Set via setActivePersonaId
+  /** Which Persona is currently active -- read by Chat and Library's
+   *  (DockRailId 'history') Persona-row selection alike -- Library and
+   *  History are one screen now, not two separate consumers. Set via
+   *  setActivePersonaId
    *  (the "quiet" switch, reused by items.id=404's two cross-navigation
    *  actions) -- there is no other way to change it any more now that the
    *  Persona-button cluster is gone. */

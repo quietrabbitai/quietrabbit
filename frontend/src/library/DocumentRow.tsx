@@ -1,12 +1,12 @@
-// A single Output/document row -- shared between LibraryPane.tsx's own
-// row-stack (items.id=404, interactive: selecting a row reveals its
-// [View]/[Copy] actions) and HistoryScreen.tsx's Persona-row Library
-// preview (glance-only, per the Working/LIBRARY_ROW_INTEGRATION_MOCKUP_
-// 20260902.html mockup -- "Open full Library" is the escape hatch for
-// anything beyond glancing, not these rows themselves). One component so
-// the two renderings can't visually drift apart, matching this codebase's
-// existing discipline of importing a shared stylesheet rather than
-// duplicating it (e.g. WorkspaceShell.tsx / CloudChatCollapsedStrip.css).
+// A single Output/document row -- LibraryPane.tsx's own row-stack
+// (items.id=404, interactive: selecting a row reveals its [View]/[Copy]
+// actions). Previously also shared with HistoryScreen.tsx's Persona-row
+// Library preview (glance-only, per the Working/LIBRARY_ROW_INTEGRATION_
+// MOCKUP_20260902.html mockup -- "Open full Library" was the escape hatch
+// for anything beyond glancing, not these rows themselves). items.id=568
+// (decisions.id=834) removed that preview and its escape hatch --
+// HistoryScreen.tsx now mounts LibraryPane directly instead, so
+// LibraryPane.tsx is this component's only caller.
 
 import { useTranslation } from 'react-i18next'
 import type { OutputInfo } from '../bindings'

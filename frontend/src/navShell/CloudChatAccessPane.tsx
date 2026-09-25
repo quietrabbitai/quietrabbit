@@ -112,14 +112,14 @@ export interface CloudChatAccessPaneProps {
   pair: DominancePairState
   onUpdatePair: (updater: (prev: DominancePairState) => DominancePairState) => void
   /** items.id=391 (tenth pass), generalized by items.id=404: true whenever
-   *  neither Chat nor Cloud Chat is the outer 5-rail dock's dominant rail
+   *  neither Chat nor Cloud Chat is the outer 4-rail dock's dominant rail
    *  (WorkspaceShell's `dominantRail !== 'chat' && dominantRail !== 'cloudChat'`
-   *  -- Board, Library, or History being dominant all set this now, not
+   *  -- Board or Library[='history'] being dominant both set this now, not
    *  just Board as pre-404). Collapses QR to a one-row floor (ChatPane's
    *  own collapsed strip: mark + last-message snippet + a real, focusable
    *  entry bar, matching the mockup's chat-floor) instead of unmounting
    *  it. No CEF-lifecycle reason to unmount: the concern was always about
-   *  Cloud Chat's own open panes, and Board/Library/History becoming dominant
+   *  Cloud Chat's own open panes, and Board/Library[='history'] becoming dominant
    *  already forces dominantRail away from 'cloudChat' first (each of their
    *  own dock-bar click handlers sets dominantRail directly, never
    *  through pair.dominant), so there's never an open pane actively
