@@ -112,6 +112,7 @@ async fn async_main() {
     // AppHandle::run_on_main_thread instead of Tauri-managed state).
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(scheduler)
         .manage(ollama_client)
         .manage(quietrabbit_lib::commands::cloud_chat_pane::PaneLayoutState::default())

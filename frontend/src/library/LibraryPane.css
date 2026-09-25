@@ -79,10 +79,6 @@
   margin: 0 14px;
 }
 
-.library-pane__import-input {
-  display: none;
-}
-
 /* items.id=573, Surface 1 -- inline backward/forward lineage links under a
  * selected row, sitting below .library-pane__row-actions. */
 .library-pane__row-lineage {

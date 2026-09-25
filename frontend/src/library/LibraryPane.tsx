@@ -26,7 +26,8 @@
 // conversation -- that reasoning is unchanged, it's just enforced one
 // level up now.)
 
-import { type ChangeEvent, useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
+import { open } from '@tauri-apps/plugin-dialog'
 import { useTranslation } from 'react-i18next'
 import { commands, type OutputInfo } from '../bindings'
 import { DocumentRow, getDocumentDisplayName } from './DocumentRow'
@@ -47,17 +48,6 @@ type LibraryAction = 'view' | 'copy' | 'import' | null
 // OutputInfo.source's own two values (items.id=383) exactly, so this type
 // is passed straight through to listOutputs' `source` param.
 type LibrarySourceView = 'qr_generated' | 'external_ingested'
-
-// Mirrors ingest.rs's own TEXT_MIRROR_EXTENSIONS -- Import new version reads
-// the picked file as text in-browser (no @tauri-apps file-dialog plugin
-// wired yet for a real filesystem path), so it's limited to the same
-// trivially-UTF-8-decodable formats the backend already mirrors verbatim.
-const TEXT_IMPORT_EXTENSIONS = ['txt', 'md', 'markdown', 'html', 'htm']
-
-function hasTextImportExtension(filename: string): boolean {
-  const ext = filename.split('.').pop()?.toLowerCase()
-  return ext !== undefined && TEXT_IMPORT_EXTENSIONS.includes(ext)
-}
 
 // items.id=573 -- DocumentRow lineage display + cross-row navigation,
 // per DOCUMENTROW_LINEAGE_DESIGN_20260924.md's Transitions section.
@@ -178,7 +168,6 @@ export function LibraryPane({ userId, personaId }: LibraryPaneProps) {
   const [copyError, setCopyError] = useState<string | null>(null)
   const [importStatus, setImportStatus] = useState<'pending' | 'success' | 'error' | null>(null)
   const [importError, setImportError] = useState<string | null>(null)
-  const importInputRef = useRef<HTMLInputElement>(null)
 
   // items.id=573: set when a lineage link jumps across the qr_generated/
   // external_ingested toggle -- the sourceView-change effect below resets
@@ -317,80 +306,76 @@ export function LibraryPane({ userId, personaId }: LibraryPaneProps) {
     })
   }, [selectedOutputId, userId, personaId])
 
-  // Import new version (decisions.id=827): the button itself is the only
-  // gate -- opening the native file picker *is* the confirmation, no extra
-  // dialog. Picking a file stores it as a fresh ingested output tagged with
-  // the selected document's own focus_slug/project_entity_id/sensitivity,
-  // then supersedes the selected document via updateActiveDocument, exactly
-  // as decisions.id=827's rationale describes ("tags result with
-  // parent_output_id/superseded_by against the currently-selected document").
-  const handleImportClick = () => {
-    importInputRef.current?.click()
-  }
+  // Import new version (decisions.id=827/items.id=565): the native picker
+  // itself is the only gate -- no extra confirmation dialog, and no
+  // sensitivity/focus picker either. decisions.id=827 confirmed the button
+  // only renders when a document is selected (enforced again below in JSX),
+  // so focus_slug/sensitivity always have a source to inherit from -- there's
+  // no unselected case for a picker to disambiguate. Every picked file is
+  // passed to store_ingested_document as file_path (never content, unlike
+  // the old hidden-input/File.text() flow this replaces) -- the backend
+  // already mirrors text extensions and real-extracts PDF/.docx
+  // (items.id=386) uniformly off the file's own extension regardless of
+  // which parameter supplied it, so no extension allowlist is needed
+  // client-side any more. This also fixes original_filename for text files:
+  // the content path always hardcoded "pasted-content.txt".
+  const handleImportClick = useCallback(() => {
+    if (selectedOutputId === null) return
 
-  const handleImportFileChange = useCallback(
-    (event: ChangeEvent<HTMLInputElement>) => {
-      const file = event.target.files?.[0] ?? null
-      event.target.value = ''
-      if (file === null || selectedOutputId === null) return
+    open({ multiple: false, directory: false })
+      .then((path) => {
+        if (path === null) return // dialog cancelled
 
-      setAction('import')
-      setImportStatus('pending')
-      setImportError(null)
+        const selected = outputs.find((o) => o.id === selectedOutputId)
+        const focusSlug = selected?.focus_slug ?? null
 
-      const selected = outputs.find((o) => o.id === selectedOutputId)
-      const focusSlug = selected?.focus_slug ?? null
-      if (!selected || focusSlug === null) {
-        setImportStatus('error')
-        setImportError(t('navShell.libraryPane.importMissingFocusError'))
-        return
-      }
-      if (!hasTextImportExtension(file.name)) {
-        setImportStatus('error')
-        setImportError(t('navShell.libraryPane.importUnsupportedFileError'))
-        return
-      }
+        setAction('import')
+        setImportStatus('pending')
+        setImportError(null)
 
-      file
-        .text()
-        .then((content) =>
-          commands.storeIngestedDocument(
+        if (!selected || focusSlug === null) {
+          setImportStatus('error')
+          setImportError(t('navShell.libraryPane.importMissingFocusError'))
+          return
+        }
+
+        return commands
+          .storeIngestedDocument(
             userId,
             personaId,
             focusSlug,
             selected.project_entity_id,
             selected.sensitivity,
-            content,
             null,
-          ),
-        )
-        .then((storeResult) => {
-          if (storeResult.status !== 'ok') {
-            setImportStatus('error')
-            setImportError(storeResult.error)
-            return
-          }
-          return commands
-            .updateActiveDocument(storeResult.data.output_id, selectedOutputId, userId, personaId)
-            .then((linkResult) => {
-              if (linkResult.status !== 'ok') {
-                setImportStatus('error')
-                setImportError(linkResult.error)
-                return
-              }
-              setImportStatus('success')
-              commands.listOutputs(userId, personaId, null, null, null, sourceView).then((result) => {
-                if (result.status === 'ok') setOutputs(result.data)
+            path,
+          )
+          .then((storeResult) => {
+            if (storeResult.status !== 'ok') {
+              setImportStatus('error')
+              setImportError(storeResult.error)
+              return
+            }
+            return commands
+              .updateActiveDocument(storeResult.data.output_id, selectedOutputId, userId, personaId)
+              .then((linkResult) => {
+                if (linkResult.status !== 'ok') {
+                  setImportStatus('error')
+                  setImportError(linkResult.error)
+                  return
+                }
+                setImportStatus('success')
+                commands.listOutputs(userId, personaId, null, null, null, sourceView).then((result) => {
+                  if (result.status === 'ok') setOutputs(result.data)
+                })
               })
-            })
-        })
-        .catch((err: unknown) => {
-          setImportStatus('error')
-          setImportError(err instanceof Error ? err.message : String(err))
-        })
-    },
-    [selectedOutputId, userId, personaId, outputs, sourceView, t],
-  )
+          })
+      })
+      .catch((err: unknown) => {
+        setAction('import')
+        setImportStatus('error')
+        setImportError(err instanceof Error ? err.message : String(err))
+      })
+  }, [selectedOutputId, userId, personaId, outputs, sourceView, t])
 
   // items.id=558: the discoverable entry point toggles between the two
   // views -- no separate "close" affordance needed, since re-clicking it
@@ -559,13 +544,6 @@ export function LibraryPane({ userId, personaId }: LibraryPaneProps) {
           )}
         </div>
       )}
-      <input
-        ref={importInputRef}
-        type="file"
-        accept=".txt,.md,.markdown,.html,.htm,text/plain,text/html,text/markdown"
-        className="library-pane__import-input"
-        onChange={handleImportFileChange}
-      />
     </div>
   )
 }

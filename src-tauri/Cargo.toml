@@ -20,6 +20,11 @@ serde_json = "1"
 # Framework & Runtime
 tauri = { version = "2", features = [] }
 tauri-plugin-clipboard-manager = "2"
+# Native OS file picker for Library's Import new version (items.id=565) --
+# resolves a real filesystem path client-side so store_ingested_document's
+# existing file_path parameter (PDF/.docx parsing, items.id=386) is reachable
+# from that flow instead of only from content (in-browser File.text()).
+tauri-plugin-dialog = "2"
 tokio = { version = "1", features = ["full"] }
 
 # Serialization & Parsing
