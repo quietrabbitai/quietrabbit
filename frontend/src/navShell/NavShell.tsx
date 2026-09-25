@@ -5,7 +5,7 @@
 // Specifications/HIERARCHICAL_NAV_SHELL_DESIGN_20260902.md: there is no
 // flat top strip in the target design at all. This file now just fetches
 // the two small pieces of shared data every rail needs (personas, the
-// current session id) and mounts WorkspaceShell -- the 5-rail dock -- as
+// current session id) and mounts WorkspaceShell -- the 4-rail dock -- as
 // the only thing this screen ever shows.
 //
 // What used to live here and is now gone, not just unwired: the top-strip

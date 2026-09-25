@@ -139,7 +139,7 @@ export interface CloudChatAccessPaneProps {
    *  be a no-op. */
   onFloorExpand?: () => void
   /** items.id=404: fires whenever an action INSIDE this component means
-   *  "make Chat or Cloud Chat the outer 5-rail dock's dominant rail" --
+   *  "make Chat or Cloud Chat the outer 4-rail dock's dominant rail" --
    *  CloudChatCollapsedStrip's own expand, the Cloud Chat content-head's "back to
    *  chat" click, and ChatPane's own non-floor collapsed-strip click (the
    *  dominant === 'cloudChat' case). See WorkspaceShell.tsx's own header
@@ -450,7 +450,7 @@ export function CloudChatAccessPane({
       // items.id=404: preserves pre-existing behavior -- pre-404, this
       // pair.dominant flip would already force Board (if expanded) back
       // to a bar next render via the old effectiveBoardSize guard. The
-      // 5-rail model needs the promotion made explicit since there's no
+      // 4-rail model needs the promotion made explicit since there's no
       // such guard any more (dominantRail is set directly, not derived).
       markCloudChatReadyAndPromote()
     }

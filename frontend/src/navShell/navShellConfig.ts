@@ -1,4 +1,4 @@
-// Navigation-shell structural types and constants -- the 5-rail dock model.
+// Navigation-shell structural types and constants -- the 4-rail dock model.
 //
 // Traces to: 03_ProjectDocs/Specifications/HIERARCHICAL_NAV_SHELL_DESIGN_20260902.md
 // (items.id=404, decisions.id=748-752), which supersedes
