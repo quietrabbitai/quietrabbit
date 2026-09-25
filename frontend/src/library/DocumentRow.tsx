@@ -8,9 +8,27 @@
 // HistoryScreen.tsx now mounts LibraryPane directly instead, so
 // LibraryPane.tsx is this component's only caller.
 
+import type { TFunction } from 'i18next'
 import { useTranslation } from 'react-i18next'
 import type { OutputInfo } from '../bindings'
 import './DocumentRow.css'
+
+// decisions.id=422: the five document_relationship values on the wire --
+// plain string on OutputInfo, this local union just catches typos in the
+// literal comparisons below and in LibraryPane.tsx's lineage-fetch hook.
+export type DocumentRelationship = 'prime' | 'update' | 'fork' | 'reference' | 'continue_draft'
+
+// Shared with LibraryPane.tsx's lineage link labels so a jump target's
+// display name matches exactly what a row shows for itself.
+export function getDocumentDisplayName(output: OutputInfo, t: TFunction): string {
+  return (
+    output.original_filename ??
+    t('navShell.libraryPane.itemLabel', {
+      type: output.output_type,
+      date: output.created_at,
+    })
+  )
+}
 
 // Option C (decisions.id=827): small glyph beside the date, full
 // "Exported: [date][time]" text lives in the title/aria-label tooltip only.
@@ -52,16 +70,27 @@ export function DocumentRow({
   onSelect,
 }: DocumentRowProps) {
   const { t } = useTranslation()
-  // original_filename is null for QR-generated (non-ingested) outputs --
-  // falls back to the same type+date label LibraryPane's list already
-  // used before this rework.
-  const name =
-    output.original_filename ??
-    t('navShell.libraryPane.itemLabel', {
-      type: output.output_type,
-      date: output.created_at,
-    })
+  const name = getDocumentDisplayName(output, t)
   const date = new Date(output.created_at).toLocaleString()
+  const relationship = output.document_relationship as DocumentRelationship
+
+  // items.id=573: relationship badge -- never shown for prime (default,
+  // uninteresting) or continue_draft (same row before/after, nothing
+  // relational to display per DOCUMENTROW_LINEAGE_DESIGN_20260924.md's
+  // Transitions section).
+  const relationshipBadge =
+    relationship === 'update'
+      ? { label: t('navShell.libraryPane.relationshipBadgeUpdate'), tooltip: t('navShell.libraryPane.relationshipBadgeUpdateTooltip') }
+      : relationship === 'fork'
+        ? { label: t('navShell.libraryPane.relationshipBadgeFork'), tooltip: t('navShell.libraryPane.relationshipBadgeForkTooltip') }
+        : relationship === 'reference'
+          ? { label: t('navShell.libraryPane.relationshipBadgeReference'), tooltip: t('navShell.libraryPane.relationshipBadgeReferenceTooltip') }
+          : null
+
+  // Independent of relationship type (design doc: "a distinct piece of
+  // state" from document_relationship) -- but continue_draft still shows
+  // nothing, matching "NO lineage UI at all" for that type.
+  const showSupersededBadge = output.superseded_by !== null && relationship !== 'continue_draft'
   const exportedTooltip = output.exported_at
     ? t('navShell.libraryPane.exportedTooltip', {
         when: new Date(output.exported_at).toLocaleString(),
@@ -70,6 +99,19 @@ export function DocumentRow({
 
   const dateGroup = (
     <span className="document-row__date-group">
+      {relationshipBadge && (
+        <span className="document-row__lineage-badge" title={relationshipBadge.tooltip}>
+          {relationshipBadge.label}
+        </span>
+      )}
+      {showSupersededBadge && (
+        <span
+          className="document-row__lineage-badge"
+          title={t('navShell.libraryPane.supersededBadgeTooltip')}
+        >
+          {t('navShell.libraryPane.supersededBadge')}
+        </span>
+      )}
       <span className="document-row__date">{date}</span>
       {exportedTooltip && (
         <span

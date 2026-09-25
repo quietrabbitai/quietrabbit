@@ -83,6 +83,42 @@
   display: none;
 }
 
+/* items.id=573, Surface 1 -- inline backward/forward lineage links under a
+ * selected row, sitting below .library-pane__row-actions. */
+.library-pane__row-lineage {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 0 8px 6px 16px;
+}
+
+.library-pane__lineage-link {
+  border: none;
+  background: none;
+  padding: 0;
+  font-size: 11.5px;
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.library-pane__lineage-link:hover {
+  text-decoration: underline;
+}
+
+/* items.id=573, Surface 2 -- backward/forward lineage links shown above
+ * content, only while View is open. */
+.library-pane__document-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding-bottom: 6px;
+  margin-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+
 .library-pane__action-pane {
   margin-top: 4px;
   padding: 8px 10px;

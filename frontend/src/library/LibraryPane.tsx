@@ -29,7 +29,7 @@
 import { type ChangeEvent, useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { commands, type OutputInfo } from '../bindings'
-import { DocumentRow } from './DocumentRow'
+import { DocumentRow, getDocumentDisplayName } from './DocumentRow'
 import './LibraryPane.css'
 
 export interface LibraryPaneProps {
@@ -59,6 +59,111 @@ function hasTextImportExtension(filename: string): boolean {
   return ext !== undefined && TEXT_IMPORT_EXTENSIONS.includes(ext)
 }
 
+// items.id=573 -- DocumentRow lineage display + cross-row navigation,
+// per DOCUMENTROW_LINEAGE_DESIGN_20260924.md's Transitions section.
+interface DocumentLineage {
+  backward: OutputInfo | null
+  forward: OutputInfo[]
+}
+
+// Backward-link semantics differ by relationship type and are NOT
+// symmetric in the backend: get_predecessor only answers the `update`
+// case (reverse lookup on superseded_by). `fork`'s backward link is a
+// direct field read -- parent_output_id is already on the row, fetched
+// via a plain getOutput call rather than get_predecessor. `prime`/
+// `reference` never have a backward link. `continue_draft` gets no
+// lineage UI at all (same row before/after -- nothing relational to
+// display), so it skips fetching entirely rather than just hiding the
+// result.
+function useDocumentLineage(
+  output: OutputInfo | null,
+  userId: string,
+  personaId: string,
+): DocumentLineage {
+  const [lineage, setLineage] = useState<DocumentLineage>({ backward: null, forward: [] })
+
+  useEffect(() => {
+    if (output === null || output.document_relationship === 'continue_draft') {
+      setLineage({ backward: null, forward: [] })
+      return
+    }
+
+    let cancelled = false
+
+    const backward: Promise<OutputInfo | null> =
+      output.document_relationship === 'fork' && output.parent_output_id !== null
+        ? commands
+            .getOutput(output.parent_output_id, userId, personaId)
+            .then((r) => (r.status === 'ok' ? r.data : null))
+        : output.document_relationship === 'update'
+          ? commands
+              .getPredecessor(output.id, userId, personaId)
+              .then((r) => (r.status === 'ok' ? r.data : null))
+          : Promise.resolve(null)
+
+    const forward = commands
+      .listForwardLinks(output.id, userId, personaId)
+      .then((r) => (r.status === 'ok' ? r.data : []))
+
+    Promise.all([backward, forward]).then(([b, f]) => {
+      if (!cancelled) setLineage({ backward: b, forward: f })
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [output, userId, personaId])
+
+  return lineage
+}
+
+// Shared by both navigation surfaces (row-actions inline area and the
+// document header shown while View is open) -- renders nothing if there's
+// nothing to show, matching the "earn its place" framing for a row with no
+// real lineage. `openView` distinguishes Surface 1 (select-in-place) from
+// Surface 2 (jump-into-View) per the design doc's Transitions section.
+function LineageLinks({
+  lineage,
+  onNavigate,
+  openView,
+}: {
+  lineage: DocumentLineage
+  onNavigate: (target: OutputInfo, openView: boolean) => void
+  openView: boolean
+}) {
+  const { t } = useTranslation()
+
+  if (lineage.backward === null && lineage.forward.length === 0) return null
+
+  return (
+    <>
+      {lineage.backward && (
+        <button
+          type="button"
+          className="library-pane__lineage-link"
+          onClick={() => onNavigate(lineage.backward as OutputInfo, openView)}
+        >
+          {t('navShell.libraryPane.lineageBackwardLink', {
+            name: getDocumentDisplayName(lineage.backward, t),
+          })}
+        </button>
+      )}
+      {lineage.forward.map((target) => (
+        <button
+          key={target.id}
+          type="button"
+          className="library-pane__lineage-link"
+          onClick={() => onNavigate(target, openView)}
+        >
+          {t('navShell.libraryPane.lineageForwardLink', {
+            name: getDocumentDisplayName(target, t),
+          })}
+        </button>
+      ))}
+    </>
+  )
+}
+
 export function LibraryPane({ userId, personaId }: LibraryPaneProps) {
   const { t } = useTranslation()
   const [sourceView, setSourceView] = useState<LibrarySourceView>('qr_generated')
@@ -74,6 +179,16 @@ export function LibraryPane({ userId, personaId }: LibraryPaneProps) {
   const [importStatus, setImportStatus] = useState<'pending' | 'success' | 'error' | null>(null)
   const [importError, setImportError] = useState<string | null>(null)
   const importInputRef = useRef<HTMLInputElement>(null)
+
+  // items.id=573: set when a lineage link jumps across the qr_generated/
+  // external_ingested toggle -- the sourceView-change effect below resets
+  // selection and re-fetches `outputs` from scratch, so the actual
+  // selection can't happen until the target is confirmed present in that
+  // fresh list (see the effect further down).
+  const [pendingLineageTarget, setPendingLineageTarget] = useState<{
+    outputId: string
+    openView: boolean
+  } | null>(null)
 
   const resetSelection = useCallback(() => {
     setSelectedOutputId(null)
@@ -145,6 +260,45 @@ export function LibraryPane({ userId, personaId }: LibraryPaneProps) {
       }
     })
   }, [action, selectedOutputId, userId, personaId])
+
+  // items.id=573, Surface 1 -- inline actions area: computed for whichever
+  // row is selected, regardless of which action (if any) is currently open.
+  const selectedOutput = outputs.find((o) => o.id === selectedOutputId) ?? null
+  const selectedLineage = useDocumentLineage(selectedOutput, userId, personaId)
+
+  // items.id=573, Surface 2 -- document header: computed for the row
+  // actually being viewed, gated on View being open so Copy/Import don't
+  // trigger a wasted lineage fetch.
+  const viewedLineage = useDocumentLineage(
+    action === 'view' ? viewedOutput : null,
+    userId,
+    personaId,
+  )
+
+  // Shared by handleSelectRow-equivalent lineage jumps (Surface 1: openView
+  // false, mimics handleSelectRow exactly; Surface 2: openView true, jumps
+  // straight into View) and by the cross-sourceView completion effect below.
+  const applyLineageSelection = useCallback((outputId: string, openView: boolean) => {
+    setSelectedOutputId(outputId)
+    setAction(openView ? 'view' : null)
+    setViewedOutput(null)
+    setViewError(null)
+    setCopyStatus(null)
+    setCopyError(null)
+    setImportStatus(null)
+    setImportError(null)
+  }, [])
+
+  // Completes a cross-sourceView lineage jump once the target is confirmed
+  // present in the freshly-loaded `outputs` list (see navigateToLineageTarget
+  // below for why this can't happen in the same tick as setSourceView).
+  useEffect(() => {
+    if (!pendingLineageTarget) return
+    const match = outputs.find((o) => o.id === pendingLineageTarget.outputId)
+    if (!match) return
+    applyLineageSelection(match.id, pendingLineageTarget.openView)
+    setPendingLineageTarget(null)
+  }, [outputs, pendingLineageTarget, applyLineageSelection])
 
   const handleCopy = useCallback(() => {
     if (selectedOutputId === null) return
@@ -260,6 +414,25 @@ export function LibraryPane({ userId, personaId }: LibraryPaneProps) {
     setImportError(null)
   }
 
+  // items.id=573: entry point for both lineage surfaces. A link may cross
+  // the qr_generated/external_ingested toggle (decisions.id=826, Update is
+  // bidirectional across source types) -- when it does, setSourceView fires
+  // first and the pending-target effect above finishes the selection once
+  // the new list has loaded, since the sourceView-change effect resets
+  // selection and refetches `outputs` from scratch in the same tick.
+  const navigateToLineageTarget = useCallback(
+    (target: OutputInfo, openView: boolean) => {
+      const targetSourceView = target.source as LibrarySourceView
+      if (targetSourceView !== sourceView) {
+        setPendingLineageTarget({ outputId: target.id, openView })
+        setSourceView(targetSourceView)
+        return
+      }
+      applyLineageSelection(target.id, openView)
+    },
+    [sourceView, applyLineageSelection],
+  )
+
   const otherSourceLinkKey =
     sourceView === 'qr_generated'
       ? 'navShell.libraryPane.viewImportedLink'
@@ -335,6 +508,16 @@ export function LibraryPane({ userId, personaId }: LibraryPaneProps) {
                   </button>
                 </div>
               )}
+              {output.id === selectedOutputId &&
+                (selectedLineage.backward !== null || selectedLineage.forward.length > 0) && (
+                  <div className="library-pane__row-lineage">
+                    <LineageLinks
+                      lineage={selectedLineage}
+                      onNavigate={navigateToLineageTarget}
+                      openView={false}
+                    />
+                  </div>
+                )}
             </li>
           ))}
         </ul>
@@ -342,6 +525,11 @@ export function LibraryPane({ userId, personaId }: LibraryPaneProps) {
 
       {action === 'view' && (
         <div className="library-pane__action-pane">
+          {(viewedLineage.backward !== null || viewedLineage.forward.length > 0) && (
+            <div className="library-pane__document-header">
+              <LineageLinks lineage={viewedLineage} onNavigate={navigateToLineageTarget} openView={true} />
+            </div>
+          )}
           {viewError && (
             <p role="alert">
               {t('navShell.libraryPane.detailLoadError', { message: viewError })}
