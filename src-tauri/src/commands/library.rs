@@ -99,6 +99,7 @@ pub struct OutputInfo {
     pub has_original_document: bool,
     /// prime | update | fork | reference | continue_draft (decisions.id=422).
     pub document_relationship: String,
+    pub parent_output_id: Option<String>,
     pub superseded_by: Option<String>,
     /// Set on the finalized->potentially-stale Export transition
     /// (decisions.id=421/826), cleared on return. Library's "Exported:
@@ -121,6 +122,7 @@ fn to_output_info(record: output_store::OutputRecord) -> OutputInfo {
         original_filename: record.original_filename,
         has_original_document: record.storage_path.is_some(),
         document_relationship: record.document_relationship,
+        parent_output_id: record.parent_output_id,
         superseded_by: record.superseded_by,
         exported_at: record.exported_at,
     }

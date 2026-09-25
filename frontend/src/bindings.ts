@@ -1079,6 +1079,7 @@ export type OutputInfo = {
 	has_original_document: boolean,
 	/**  prime | update | fork | reference | continue_draft (decisions.id=422). */
 	document_relationship: string,
+	parent_output_id: string | null,
 	superseded_by: string | null,
 	/**
 	 *  Set on the finalized->potentially-stale Export transition
