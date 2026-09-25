@@ -73,6 +73,11 @@ pdf-extract = "0.12"
 # call site.
 docx-rust = "0.1"
 
+# Base64-encodes image bytes for GenerateRequest.images (items.id=150 Part 2,
+# OCR-at-ingestion) -- that field's own doc comment requires base64 with no
+# `data:` prefix, and nothing in this tree produced that encoding until now.
+base64 = "0.22"
+
 # Argon2id master-key derivation (items.id=205, Architecture Section 4.1).
 # default-features disabled deliberately: no PHC-string/PasswordVerifier
 # password-hash convenience API is used directly by this codebase (QR never

@@ -1477,6 +1477,37 @@ pub async fn save_ingested_output(
     Ok(output_id.to_string())
 }
 
+/// Backfills an ingested document's content with OCR'd text once the
+/// detached background OCR task (commands/ingest.rs, items.id=150 Part 2)
+/// finishes -- mirrors backfill_scan_result's "nullable column doubles as
+/// the pending sentinel, UPDATE fills it in later" shape above. The
+/// outputs_fts trigger fires on this UPDATE same as any other, so the row
+/// becomes FTS5-searchable with no extra work here. The `source` guard
+/// mirrors bump_ingested_document_version's own guard below.
+pub async fn backfill_ingested_content(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    output_id: &str,
+    content: &str,
+) -> Result<(), OutputStoreError> {
+    let timestamp = crate::providers::utils::now();
+    let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
+
+    sqlx::query(
+        "UPDATE outputs
+         SET content = ?, updated_at = ?
+         WHERE id = ? AND source = 'external_ingested'",
+    )
+    .bind(content)
+    .bind(&timestamp)
+    .bind(output_id)
+    .execute(&mut conn)
+    .await?;
+
+    Ok(())
+}
+
 /// Record an edited version of an ingested document: bumps storage_version
 /// and repoints storage_path at the new file. Prior version files are NOT
 /// deleted here -- the caller (commands/ingest.rs) writes the new encrypted

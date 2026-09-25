@@ -47,13 +47,16 @@
 
 use std::path::Path;
 
+use base64::Engine as _;
 use serde::Serialize;
 use specta::Type;
-use tauri::State;
+use tauri::{Manager, State};
 
 use crate::auth::registry::{key_hex, KeyRegistry};
 use crate::persistence::ingest_blob;
 use crate::persistence::output_store;
+use crate::providers::ollama_client::OllamaClient;
+use crate::providers::types::{GenerateOptions, GenerateRequest};
 
 /// Extensions this build will mirror into outputs.content as plain text for
 /// FTS5 search. Anything else is still stored via ingest_blob -- just not
@@ -65,6 +68,75 @@ fn is_text_mirror_extension(path: &Path) -> bool {
         .and_then(|e| e.to_str())
         .map(|e| e.to_lowercase())
         .is_some_and(|ext| TEXT_MIRROR_EXTENSIONS.contains(&ext.as_str()))
+}
+
+/// Image extensions eligible for OCR-at-ingestion (items.id=150 Part 2).
+/// Deliberately separate from TEXT_MIRROR_EXTENSIONS/extract_document_text:
+/// OCR is an async network call to Ollama, run detached in the background
+/// after store_ingested_document has already returned -- it does not fit
+/// extract_document_text's sync/spawn_blocking/awaited-inline contract,
+/// which exists for CPU-bound in-process parsing (see that fn's own doc
+/// comment). See the module header comment above this dispatch's plan for
+/// the full reasoning.
+const OCR_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "tiff", "tif"];
+
+fn is_ocr_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .is_some_and(|ext| OCR_EXTENSIONS.contains(&ext.as_str()))
+}
+
+/// Vision-OCR model tag -- single point of change. items.id=150 Part 3
+/// evaluates this against PaddleOCR-VL-class alternatives; nothing else in
+/// this module should assume this exact tag survives that evaluation.
+const OCR_MODEL: &str = "qwen2.5vl:7b";
+
+const OCR_PROMPT: &str = "Transcribe all text visible in this image, verbatim, \
+    preserving reading order and line breaks. Output only the transcribed \
+    text -- no commentary, no markdown fences, no description of the image.";
+
+/// Best-effort OCR for a single image, run outside extract_document_text's
+/// sync contract (see OCR_EXTENSIONS's doc comment). None on any failure --
+/// Ollama unavailable, timeout, bad model, or an empty response -- same
+/// "never fail the upload, just lose the mirror" philosophy as
+/// extract_document_text. Mirrors conductor/extract.rs's extract_candidates:
+/// a plain async fn against a named model constant, calling
+/// OllamaClient::generate() directly, outside the Focus-run/StepExecutor
+/// pipeline.
+async fn ocr_image_text(client: &OllamaClient, bytes: &[u8]) -> Option<String> {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let request = GenerateRequest {
+        provider_id: None,
+        model_id: OCR_MODEL.to_owned(),
+        prompt: OCR_PROMPT.to_owned(),
+        images: Some(vec![encoded]),
+        task_type: "ocr".to_owned(),
+        stream: Some(false),
+        options: Some(GenerateOptions {
+            temperature: 0.1,
+            top_p: 0.90,
+            num_ctx: 4096,
+            num_predict: 2048,
+        }),
+    };
+    match client.generate(&request).await {
+        Ok(resp) if !resp.content.trim().is_empty() => Some(resp.content),
+        Ok(_) => None,
+        Err(e) => {
+            log::warn!("ocr_image_text: model call failed (non-fatal): {e}");
+            None
+        }
+    }
+}
+
+/// Push event payload for "ingested-document-content-ready" (items.id=150
+/// Part 2). Fires once the detached OCR task finishes, success or failure --
+/// same bare "stop waiting, safe to re-fetch" signal as messages.rs's
+/// MessageContentReadyPayload/"message-content-ready".
+#[derive(Debug, Clone, Serialize, Type)]
+pub struct IngestedDocumentContentReadyPayload {
+    pub output_id: String,
 }
 
 /// Best-effort text extraction for PDF/.docx, run synchronously -- caller is
@@ -135,6 +207,7 @@ pub struct StoreIngestedDocumentResponse {
 #[specta::specta]
 #[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
 pub async fn store_ingested_document(
+    app_handle: tauri::AppHandle,
     user_id: String,
     persona_id: String,
     key_registry: State<'_, KeyRegistry>,
@@ -153,40 +226,45 @@ pub async fn store_ingested_document(
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
-    let (bytes, mirrored_content, original_filename): (Vec<u8>, Option<String>, String) =
-        match (content, file_path) {
-            (Some(text), None) => {
-                let bytes = text.clone().into_bytes();
-                (bytes, Some(text), "pasted-content.txt".to_owned())
-            }
-            (None, Some(path_str)) => {
-                let path = Path::new(&path_str);
-                let bytes = tokio::fs::read(path)
-                    .await
-                    .map_err(|e| format!("could not read file at '{path_str}': {e}"))?;
-                let original_filename = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path_str.clone());
-                let mirrored = if is_text_mirror_extension(path) {
-                    // Explicit error would be the wrong call here -- an
-                    // extension in the mirror allowlist that fails to
-                    // decode as UTF-8 is still a legitimate file to store,
-                    // it just doesn't get a searchable text mirror.
-                    String::from_utf8(bytes.clone()).ok()
-                } else {
-                    let path_owned = path.to_path_buf();
-                    let bytes_for_extract = bytes.clone();
-                    tokio::task::spawn_blocking(move || {
-                        extract_document_text(&path_owned, &bytes_for_extract)
-                    })
-                    .await
-                    .unwrap_or(None)
-                };
-                (bytes, mirrored, original_filename)
-            }
-            _ => unreachable!("validated exactly one of content/file_path above"),
-        };
+    let (bytes, mirrored_content, original_filename, ocr_eligible): (
+        Vec<u8>,
+        Option<String>,
+        String,
+        bool,
+    ) = match (content, file_path) {
+        (Some(text), None) => {
+            let bytes = text.clone().into_bytes();
+            (bytes, Some(text), "pasted-content.txt".to_owned(), false)
+        }
+        (None, Some(path_str)) => {
+            let path = Path::new(&path_str);
+            let bytes = tokio::fs::read(path)
+                .await
+                .map_err(|e| format!("could not read file at '{path_str}': {e}"))?;
+            let original_filename = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path_str.clone());
+            let ocr_eligible = is_ocr_extension(path);
+            let mirrored = if is_text_mirror_extension(path) {
+                // Explicit error would be the wrong call here -- an
+                // extension in the mirror allowlist that fails to
+                // decode as UTF-8 is still a legitimate file to store,
+                // it just doesn't get a searchable text mirror.
+                String::from_utf8(bytes.clone()).ok()
+            } else {
+                let path_owned = path.to_path_buf();
+                let bytes_for_extract = bytes.clone();
+                tokio::task::spawn_blocking(move || {
+                    extract_document_text(&path_owned, &bytes_for_extract)
+                })
+                .await
+                .unwrap_or(None)
+            };
+            (bytes, mirrored, original_filename, ocr_eligible)
+        }
+        _ => unreachable!("validated exactly one of content/file_path above"),
+    };
 
     let output_id = uuid::Uuid::new_v4().to_string();
     let storage_path = ingest_blob::ingest_blob_path(&user_id, &persona_id, &output_id, 1);
@@ -215,6 +293,45 @@ pub async fn store_ingested_document(
     )
     .await
     .map_err(|e| e.to_string())?;
+
+    // items.id=150 Part 2: OCR runs detached in the background -- it must
+    // never delay this command's IPC response (see OCR_EXTENSIONS's doc
+    // comment). Failure just leaves content NULL, logged, no retry.
+    if ocr_eligible {
+        let bg_user_id = user_id.clone();
+        let bg_persona_id = persona_id.clone();
+        let bg_key_hex = key_hex_str.clone();
+        let bg_output_id = output_id.clone();
+        let bg_bytes = bytes.clone();
+        tokio::spawn(async move {
+            let client = app_handle.state::<OllamaClient>();
+            if let Some(text) = ocr_image_text(&client, &bg_bytes).await {
+                if let Err(e) = output_store::backfill_ingested_content(
+                    &bg_user_id,
+                    &bg_persona_id,
+                    &bg_key_hex,
+                    &bg_output_id,
+                    &text,
+                )
+                .await
+                {
+                    log::warn!(
+                        "store_ingested_document: OCR backfill failed for {bg_output_id} (non-fatal): {e}"
+                    );
+                }
+            }
+
+            use tauri::Emitter;
+            let payload = IngestedDocumentContentReadyPayload {
+                output_id: bg_output_id.clone(),
+            };
+            if let Err(e) = app_handle.emit("ingested-document-content-ready", &payload) {
+                log::warn!(
+                    "store_ingested_document: emit ingested-document-content-ready failed: {e}"
+                );
+            }
+        });
+    }
 
     Ok(StoreIngestedDocumentResponse { output_id })
 }
@@ -364,5 +481,13 @@ mod tests {
     fn unrelated_extensions_are_not_extracted() {
         let bytes = b"whatever bytes an image would have".to_vec();
         assert_eq!(extract_document_text(Path::new("upload.png"), &bytes), None);
+    }
+
+    #[test]
+    fn recognizes_ocr_eligible_extensions() {
+        assert!(is_ocr_extension(Path::new("scan.png")));
+        assert!(is_ocr_extension(Path::new("photo.JPG")));
+        assert!(!is_ocr_extension(Path::new("doc.pdf")));
+        assert!(!is_ocr_extension(Path::new("notes.txt")));
     }
 }
