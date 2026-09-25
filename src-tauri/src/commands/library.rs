@@ -1,7 +1,8 @@
 // src-tauri/src/commands/library.rs
 //
 // Group 7 — Library.
-// Commands: list_outputs, get_output, delete_output.
+// Commands: list_outputs, get_output, delete_output, list_forward_links,
+//   get_predecessor.
 //
 // list_outputs: wired to output_store::list_outputs() (items.id=91 part 1,
 //   fixed 2026-07-26). Supports optional focus_id/topic_id/output_type
@@ -249,6 +250,78 @@ pub async fn get_output(
     }
 
     Ok(to_output_info(record))
+}
+
+/// Forward set of `output_id` -- every row that names it as predecessor
+/// (items.id=572; fork children via `parent_output_id`, update successor via
+/// `output_id`'s own `superseded_by` -- see output_store::list_forward_links
+/// for why both collapse into one query). Enforces the same
+/// focus_settings.focus_profile visibility as list_outputs/get_output
+/// (items.id=230) -- a Protected-Focus row is dropped from the set rather
+/// than surfaced.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_forward_links(
+    output_id: String,
+    user_id: String,
+    persona_id: String,
+    key_registry: State<'_, KeyRegistry>,
+    pool: State<'_, sqlx::SqlitePool>,
+) -> Result<Vec<OutputInfo>, String> {
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
+    let records = output_store::list_forward_links(&user_id, &persona_id, &key_hex_str, &output_id)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut visible = Vec::with_capacity(records.len());
+    for record in records {
+        if !is_protected(&pool, &persona_id, visibility_focus_id(&record)).await? {
+            visible.push(to_output_info(record));
+        }
+    }
+
+    Ok(visible)
+}
+
+/// Backward link for an `update`-type row -- the row it superseded, if any
+/// (items.id=572; see output_store::find_predecessor for why this needs its
+/// own reverse query rather than a direct field read like fork's
+/// `parent_output_id`). `None` covers both "no predecessor" (e.g. a `prime`
+/// row) and a predecessor hidden behind focus_settings.focus_profile
+/// visibility (items.id=230) -- the two are not distinguishable, matching
+/// get_output's existing not-found convention.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_predecessor(
+    output_id: String,
+    user_id: String,
+    persona_id: String,
+    key_registry: State<'_, KeyRegistry>,
+    pool: State<'_, sqlx::SqlitePool>,
+) -> Result<Option<OutputInfo>, String> {
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
+    let record = output_store::find_predecessor(&user_id, &persona_id, &key_hex_str, &output_id)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match record {
+        None => Ok(None),
+        Some(record) => {
+            if is_protected(&pool, &persona_id, visibility_focus_id(&record)).await? {
+                Ok(None)
+            } else {
+                Ok(Some(to_output_info(record)))
+            }
+        }
+    }
 }
 
 /// Deletes an output (items.id=91, part 2, complete 2026-07-26). Soft-delete

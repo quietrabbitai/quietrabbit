@@ -371,6 +371,59 @@ export const commands = {
 	 *  decisions.id=826 asked for).
 	 */
 	updateActiveDocument: (outputId: string, previousOutputId: string, userId: string, personaId: string) => typedError<null, string>(__TAURI_INVOKE("update_active_document", { outputId, previousOutputId, userId, personaId })),
+	/**
+	 *  Forward set of `output_id` -- every row that names it as predecessor
+	 *  (items.id=572; fork children via `parent_output_id`, update successor via
+	 *  `output_id`'s own `superseded_by` -- see output_store::list_forward_links
+	 *  for why both collapse into one query). Enforces the same
+	 *  focus_settings.focus_profile visibility as list_outputs/get_output
+	 *  (items.id=230) -- a Protected-Focus row is dropped from the set rather
+	 *  than surfaced.
+	 */
+	listForwardLinks: (outputId: string, userId: string, personaId: string) => typedError<OutputInfo[], string>(__TAURI_INVOKE("list_forward_links", { outputId, userId, personaId })),
+	/**
+	 *  Backward link for an `update`-type row -- the row it superseded, if any
+	 *  (items.id=572; see output_store::find_predecessor for why this needs its
+	 *  own reverse query rather than a direct field read like fork's
+	 *  `parent_output_id`). `None` covers both "no predecessor" (e.g. a `prime`
+	 *  row) and a predecessor hidden behind focus_settings.focus_profile
+	 *  visibility (items.id=230) -- the two are not distinguishable, matching
+	 *  get_output's existing not-found convention.
+	 */
+	getPredecessor: (outputId: string, userId: string, personaId: string) => typedError<{
+	id: string,
+	focus_run_id: string,
+	output_type: string,
+	/**
+	 *  NULL for an ingested document stored as opaque bytes -- see
+	 *  has_original_document. See output_store::OutputRecord's own doc
+	 *  comment.
+	 */
+	content: string | null,
+	sensitivity: string,
+	status: string,
+	created_at: string,
+	/**  'qr_generated' | 'external_ingested' (items.id=383). */
+	source: string,
+	project_entity_id: string | null,
+	focus_slug: string | null,
+	original_filename: string | null,
+	/**
+	 *  Derived from storage_path.is_some() -- whether get_ingested_document_bytes
+	 *  (commands/ingest.rs) can retrieve a real original file for this output.
+	 */
+	has_original_document: boolean,
+	/**  prime | update | fork | reference | continue_draft (decisions.id=422). */
+	document_relationship: string,
+	parent_output_id: string | null,
+	superseded_by: string | null,
+	/**
+	 *  Set on the finalized->potentially-stale Export transition
+	 *  (decisions.id=421/826), cleared on return. Library's "Exported:
+	 *  [date][time]" label (items.id=557) is sourced from this field.
+	 */
+	exported_at: string | null,
+} | null, string>(__TAURI_INVOKE("get_predecessor", { outputId, userId, personaId })),
 	getFocusBuilderSession: (focusId: string | null) => typedError<NotImplementedPlaceholder, string>(__TAURI_INVOKE("get_focus_builder_session", { focusId })),
 	submitFocusBuilderStep: (sessionId: string, input: NotImplementedPlaceholder) => typedError<NotImplementedPlaceholder, string>(__TAURI_INVOKE("submit_focus_builder_step", { sessionId, input })),
 	/**

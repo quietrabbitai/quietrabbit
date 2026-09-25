@@ -748,6 +748,106 @@ pub async fn list_outputs(
 }
 
 // ---------------------------------------------------------------------------
+// Lineage (items.id=572)
+// ---------------------------------------------------------------------------
+
+/// Forward set of `output_id` -- every row that names it as predecessor.
+/// Two cases collapse into one query:
+///   - fork children: rows whose `parent_output_id` = `output_id` (genuinely
+///     one-to-many -- a resume forked into "Job A" and "Job B" both point
+///     back to the original, per DOCUMENTROW_LINEAGE_DESIGN_20260924.md).
+///   - update successor: `output_id`'s own `superseded_by`, if set -- already
+///     the forward pointer, stored directly on this row (update_active_document
+///     sets it on the *previous* row, pointing at the new one). Folded into
+///     the same result so callers get one unified answer regardless of
+///     relationship type, rather than special-casing update vs fork.
+///
+/// Uses `idx_outputs_parent` (outputs_007.sql) for the first branch; the
+/// second is an indexed primary-key point lookup.
+pub async fn list_forward_links(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    output_id: &str,
+) -> Result<Vec<OutputRecord>, OutputStoreError> {
+    let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
+
+    let rows = sqlx::query(
+        "SELECT o.id, o.focus_run_id, r.focus_id, o.output_type, o.content,
+                o.sensitivity, o.status, o.created_at, o.updated_at,
+                o.source, o.project_entity_id, o.focus_slug, o.storage_path,
+                o.storage_version, o.original_filename,
+                o.pg_scan_blocked, o.pg_scan_timed_out, o.pg_scan_plain_language,
+                o.pg_scan_findings_json, o.pg_scan_completed_at,
+                o.document_relationship, o.parent_output_id, o.superseded_by,
+                o.exported_at
+         FROM outputs o
+         JOIN focus_runs r ON r.id = o.focus_run_id
+         WHERE o.deleted_at IS NULL
+           AND (
+             o.parent_output_id = ?
+             OR o.id = (SELECT superseded_by FROM outputs
+                        WHERE id = ? AND deleted_at IS NULL)
+           )
+         ORDER BY o.created_at",
+    )
+    .bind(output_id)
+    .bind(output_id)
+    .fetch_all(&mut conn)
+    .await?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for r in &rows {
+        out.push(row_to_output_record(r).map_err(OutputStoreError::Database)?);
+    }
+    Ok(out)
+}
+
+/// Backward link for an `update`-type row -- the row (if any) whose
+/// `superseded_by` points at `output_id`. Necessary because `update`
+/// deliberately leaves `parent_output_id` untouched on the new row (see
+/// update_active_document above -- that field belongs to fork, not update):
+/// an `update`-type row carries no column of its own recording what it
+/// superseded, only the *old* row's `superseded_by` records the link,
+/// pointing forward. `LIMIT 1` makes the at-most-one-predecessor assumption
+/// explicit rather than implicit -- update_active_document's current
+/// single-caller contract never points two rows' `superseded_by` at the
+/// same target, but nothing at the schema level forbids it.
+pub async fn find_predecessor(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    output_id: &str,
+) -> Result<Option<OutputRecord>, OutputStoreError> {
+    let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
+
+    let row = sqlx::query(
+        "SELECT o.id, o.focus_run_id, r.focus_id, o.output_type, o.content,
+                o.sensitivity, o.status, o.created_at, o.updated_at,
+                o.source, o.project_entity_id, o.focus_slug, o.storage_path,
+                o.storage_version, o.original_filename,
+                o.pg_scan_blocked, o.pg_scan_timed_out, o.pg_scan_plain_language,
+                o.pg_scan_findings_json, o.pg_scan_completed_at,
+                o.document_relationship, o.parent_output_id, o.superseded_by,
+                o.exported_at
+         FROM outputs o
+         JOIN focus_runs r ON r.id = o.focus_run_id
+         WHERE o.deleted_at IS NULL AND o.superseded_by = ?
+         LIMIT 1",
+    )
+    .bind(output_id)
+    .fetch_optional(&mut conn)
+    .await?;
+
+    match row {
+        None => Ok(None),
+        Some(r) => Ok(Some(
+            row_to_output_record(&r).map_err(OutputStoreError::Database)?,
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Delete
 // ---------------------------------------------------------------------------
 
@@ -2462,6 +2562,302 @@ mod tests {
                 2,
                 "source: None must mean no filter, same convention as focus_id/topic_id/output_type"
             );
+        };
+        verify.await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    // -- items.id=572: DocumentRow lineage forward/backward lookup -----------
+
+    #[tokio::test]
+    async fn list_forward_links_returns_fork_children_and_update_successor() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "lineage-user-1";
+        let persona_id = "lineage-persona-1";
+
+        let verify = async {
+            let run_id = "run-lineage-1";
+            test_seed_focus_run(user_id, persona_id, INGEST_KEY_HEX, run_id, "focus-1")
+                .await
+                .unwrap();
+
+            for (id, content) in [
+                ("prime-1", "original"),
+                ("fork-a", "job a"),
+                ("fork-b", "job b"),
+                ("updated-1", "revised"),
+            ] {
+                save_output(
+                    user_id,
+                    persona_id,
+                    INGEST_KEY_HEX,
+                    run_id,
+                    "note",
+                    content,
+                    "general",
+                    Some(id),
+                    None,
+                )
+                .await
+                .unwrap();
+            }
+
+            // No fork-creation write path exists yet (design doc's Open
+            // Question 1) -- set parent_output_id directly, same as a real
+            // fork writer eventually would.
+            let mut conn = open_outputs_db(user_id, persona_id, INGEST_KEY_HEX)
+                .await
+                .unwrap();
+            for child in ["fork-a", "fork-b"] {
+                sqlx::query(
+                    "UPDATE outputs SET document_relationship = 'fork',
+                     parent_output_id = 'prime-1' WHERE id = ?",
+                )
+                .bind(child)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            }
+            drop(conn);
+
+            update_active_document(user_id, persona_id, INGEST_KEY_HEX, "updated-1", "prime-1")
+                .await
+                .unwrap();
+
+            let forward = list_forward_links(user_id, persona_id, INGEST_KEY_HEX, "prime-1")
+                .await
+                .unwrap();
+            let mut ids: Vec<&str> = forward.iter().map(|r| r.id.as_str()).collect();
+            ids.sort();
+            assert_eq!(ids, vec!["fork-a", "fork-b", "updated-1"]);
+        };
+        verify.await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    #[tokio::test]
+    async fn list_forward_links_returns_empty_for_row_with_no_children_or_successor() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "lineage-user-2";
+        let persona_id = "lineage-persona-2";
+
+        let verify = async {
+            let run_id = "run-lineage-2";
+            test_seed_focus_run(user_id, persona_id, INGEST_KEY_HEX, run_id, "focus-1")
+                .await
+                .unwrap();
+            save_output(
+                user_id,
+                persona_id,
+                INGEST_KEY_HEX,
+                run_id,
+                "note",
+                "lonely",
+                "general",
+                Some("solo-1"),
+                None,
+            )
+            .await
+            .unwrap();
+
+            let forward = list_forward_links(user_id, persona_id, INGEST_KEY_HEX, "solo-1")
+                .await
+                .unwrap();
+            assert!(forward.is_empty());
+        };
+        verify.await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    #[tokio::test]
+    async fn list_forward_links_excludes_soft_deleted_fork_child() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "lineage-user-3";
+        let persona_id = "lineage-persona-3";
+
+        let verify = async {
+            let run_id = "run-lineage-3";
+            test_seed_focus_run(user_id, persona_id, INGEST_KEY_HEX, run_id, "focus-1")
+                .await
+                .unwrap();
+            save_output(
+                user_id,
+                persona_id,
+                INGEST_KEY_HEX,
+                run_id,
+                "note",
+                "original",
+                "general",
+                Some("prime-3"),
+                None,
+            )
+            .await
+            .unwrap();
+            save_output(
+                user_id,
+                persona_id,
+                INGEST_KEY_HEX,
+                run_id,
+                "note",
+                "deleted fork",
+                "general",
+                Some("fork-3"),
+                None,
+            )
+            .await
+            .unwrap();
+
+            let mut conn = open_outputs_db(user_id, persona_id, INGEST_KEY_HEX)
+                .await
+                .unwrap();
+            sqlx::query(
+                "UPDATE outputs SET document_relationship = 'fork',
+                 parent_output_id = 'prime-3' WHERE id = 'fork-3'",
+            )
+            .execute(&mut conn)
+            .await
+            .unwrap();
+            delete_output_conn(&mut conn, "fork-3").await.unwrap();
+            drop(conn);
+
+            let forward = list_forward_links(user_id, persona_id, INGEST_KEY_HEX, "prime-3")
+                .await
+                .unwrap();
+            assert!(
+                forward.is_empty(),
+                "soft-deleted fork child must not appear in the forward set"
+            );
+        };
+        verify.await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    #[tokio::test]
+    async fn find_predecessor_returns_the_row_it_superseded() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "lineage-user-4";
+        let persona_id = "lineage-persona-4";
+
+        let verify = async {
+            let run_id = "run-lineage-4";
+            test_seed_focus_run(user_id, persona_id, INGEST_KEY_HEX, run_id, "focus-1")
+                .await
+                .unwrap();
+            save_output(
+                user_id,
+                persona_id,
+                INGEST_KEY_HEX,
+                run_id,
+                "note",
+                "old",
+                "general",
+                Some("old-4"),
+                None,
+            )
+            .await
+            .unwrap();
+            save_output(
+                user_id,
+                persona_id,
+                INGEST_KEY_HEX,
+                run_id,
+                "note",
+                "new",
+                "general",
+                Some("new-4"),
+                None,
+            )
+            .await
+            .unwrap();
+
+            update_active_document(user_id, persona_id, INGEST_KEY_HEX, "new-4", "old-4")
+                .await
+                .unwrap();
+
+            let predecessor = find_predecessor(user_id, persona_id, INGEST_KEY_HEX, "new-4")
+                .await
+                .unwrap()
+                .expect("new-4 must have a predecessor");
+            assert_eq!(predecessor.id, "old-4");
+        };
+        verify.await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    #[tokio::test]
+    async fn find_predecessor_returns_none_when_nothing_points_at_the_row() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "lineage-user-5";
+        let persona_id = "lineage-persona-5";
+
+        let verify = async {
+            let run_id = "run-lineage-5";
+            test_seed_focus_run(user_id, persona_id, INGEST_KEY_HEX, run_id, "focus-1")
+                .await
+                .unwrap();
+            save_output(
+                user_id,
+                persona_id,
+                INGEST_KEY_HEX,
+                run_id,
+                "note",
+                "lonely",
+                "general",
+                Some("solo-5"),
+                None,
+            )
+            .await
+            .unwrap();
+
+            let predecessor = find_predecessor(user_id, persona_id, INGEST_KEY_HEX, "solo-5")
+                .await
+                .unwrap();
+            assert!(predecessor.is_none());
         };
         verify.await;
 

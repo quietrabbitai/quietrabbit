@@ -93,6 +93,9 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::library::copy_output_to_clipboard,
         commands::library::export_output,
         commands::library::update_active_document,
+        // items.id=572 -- DocumentRow lineage forward/backward lookup
+        commands::library::list_forward_links,
+        commands::library::get_predecessor,
         // Group 8 -- Focus Builder (stubs)
         commands::focus_builder::get_focus_builder_session,
         commands::focus_builder::submit_focus_builder_step,
