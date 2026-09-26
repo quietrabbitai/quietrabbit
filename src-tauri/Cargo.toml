@@ -244,6 +244,13 @@ anno = { version = "=0.11.0", default-features = false }
 tokio = { version = "1", features = ["full", "test-util"] }
 unicode-normalization = "0.1"
 tempfile = "3"
+# Character Error Rate (Levenshtein) for the OCR accuracy eval
+# (providers/ocr_eval.rs, items.id=150 Part 3) -- already resolved
+# transitively via clap_builder/darling_core at this same version, so this
+# is not a new duplicate in the dependency tree. dev-dependencies only --
+# the eval module is #[cfg(test)]-gated and never compiles into the
+# production binary.
+strsim = "0.11"
 # tauri::test::mock_app()/mock_builder() for testing #[tauri::command]
 # functions that take tauri::State<T> (items.id=205, commands/auth.rs
 # login/logout tests) without needing the full webview/IPC layer -- "test"

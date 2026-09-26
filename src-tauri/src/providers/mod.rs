@@ -4,6 +4,8 @@ pub mod errors;
 pub mod evaluation;
 pub mod groq;
 pub mod mistral;
+#[cfg(test)]
+mod ocr_eval;
 pub mod ollama_client;
 pub mod qr_hosted_base;
 pub mod types;

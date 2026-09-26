@@ -4160,6 +4160,7 @@ dependencies = [
  "specta",
  "specta-typescript",
  "sqlx",
+ "strsim",
  "tauri",
  "tauri-build",
  "tauri-plugin-clipboard-manager",
