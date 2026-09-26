@@ -1,6 +1,11 @@
-//! One-time OCR accuracy go/no-go eval — items.id=150 Part 3.
+//! OCR accuracy check against real document images — originally a two-model
+//! go/no-go eval (items.id=150 Part 3), simplified to the single production
+//! model once that eval was decided (Part 5: PaddleOCR-VL won, Qwen2.5-VL
+//! was removed rather than kept as a dead comparison target — see git
+//! history/commit messages for the rejected candidate's constants and the
+//! reasoning for dropping them instead of relabeling them).
 //!
-//! Compares candidate Ollama vision models against real document images
+//! Compares the production vision-OCR model against real document images
 //! with known ground-truth transcriptions. This is NOT the routing/hardware
 //! calibration harness (`providers::evaluation`) — that harness scores
 //! latency + structural format compliance for text-only models, which has
@@ -32,19 +37,18 @@
 //!
 //! Reports Character Error Rate (Levenshtein distance over a
 //! whitespace-normalized, case/punctuation-preserving comparison) and
-//! latency per model, per document, plus an aggregate summary. Deliberately
-//! has no pass/fail threshold — this is measurement for a human go/no-go
-//! call, not a verdict. In `ocr_accuracy_eval`, only filenames/doc IDs and
-//! numbers are ever printed — never the transcribed text or ground truth
-//! themselves.
+//! latency per document, plus an aggregate summary. Deliberately has no
+//! pass/fail threshold — this is measurement for a human go/no-go call, not
+//! a verdict. In `ocr_accuracy_eval`, only filenames/doc IDs and numbers are
+//! ever printed — never the transcribed text or ground truth themselves.
 //!
 //! `ocr_dump_transcriptions` is a second, independent mode for when typing
 //! up ground truth isn't practical (e.g. a batch of large, text-heavy real
 //! documents). It needs no `manifest.json` -- it reads every supported file
-//! directly from `QR_OCR_EVAL_DIR` and prints each candidate's raw
-//! transcription so a human can eyeball quality directly. This is the one
-//! deliberate exception to the no-content-printed rule above: its entire
-//! purpose is showing the transcribed text.
+//! directly from `QR_OCR_EVAL_DIR` and prints the model's raw transcription
+//! so a human can eyeball quality directly. This is the one deliberate
+//! exception to the no-content-printed rule above: its entire purpose is
+//! showing the transcribed text.
 //! ```text
 //! cargo test ocr_dump_transcriptions -- --ignored --nocapture
 //! ```
@@ -58,93 +62,39 @@ use serde::Deserialize;
 use crate::providers::ollama_client::OllamaClient;
 use crate::providers::types::{GenerateOptions, GenerateRequest};
 
-/// A candidate model plus the prompt convention it expects. Kept together
-/// at the point of definition (rather than a `match model_id { .. }` lookup
-/// elsewhere) so a new candidate can't be added without also supplying its
-/// prompt -- a match would need a fallback arm that could silently paper
-/// over a missing case.
-struct Candidate {
-    model_id: &'static str,
-    prompt: &'static str,
-}
-
-/// Vision-OCR model already wired into production ingestion
+/// Vision-OCR model wired into production ingestion
 /// (`commands::ingest::OCR_MODEL`). Duplicated here rather than imported:
 /// `ingest.rs`'s constant isn't `pub`, and exporting it solely to serve this
-/// one-time eval isn't worth touching Part 2's shipped code for. Must be
-/// kept in sync by hand if that tag ever changes.
-const QWEN_MODEL: &str = "qwen2.5vl:7b";
-
-/// Confirmed via `ollama show --modelfile` on the actual pulled model: the
-/// official PaddleOCR-VL GGUF release, byte-identical tensors
-/// (sha256-verified), correctly-converted Ollama prompt template, vision
-/// projector included.
+/// eval isn't worth touching shipped code for. Must be kept in sync by hand
+/// if that tag ever changes. Confirmed via `ollama show --modelfile` on the
+/// actual pulled model: the official PaddleOCR-VL GGUF release,
+/// byte-identical tensors (sha256-verified), correctly-converted Ollama
+/// prompt template, vision projector included.
+///
+/// items.id=150 Part 3 evaluated this against Qwen2.5-VL and rejected Qwen
+/// (reproducible immediate-stop-token/empty-output failure on real document
+/// images); Part 5 removed Qwen's constants from this file entirely rather
+/// than keeping them as a labeled dead comparison target -- see git history
+/// if that baseline is ever needed again.
 const PADDLEOCR_VL_MODEL: &str = "seriouswebby/paddleocr-vl-1.6:latest";
 
-/// Literal copy of `commands::ingest::OCR_PROMPT` — kept identical so the
-/// comparison matches what production actually sends. Qwen2.5-VL is a
-/// general instruction-following vision model, so this prose instruction is
-/// a fair prompt for it.
-const QWEN_OCR_PROMPT: &str = "Transcribe all text visible in this image, verbatim, \
-    preserving reading order and line breaks. Output only the transcribed \
-    text -- no commentary, no markdown fences, no description of the image.";
-
-/// PaddleOCR-VL is NOT instruction-following -- it selects its output mode
-/// from a literal short task-prefix ("OCR:", "Table Recognition:",
-/// "Spotting:", etc.), per the model's official usage docs and the GGUF
-/// card's llama.cpp example (`-p 'OCR:'`). "OCR:" is the plain-document
-/// -parsing mode, the correct one for this comparison -- sending it the
-/// Qwen-style prose instruction would test the wrong prompt convention and
-/// invalidate the comparison.
+/// Literal copy of `commands::ingest::OCR_PROMPT` — kept identical so this
+/// eval matches what production actually sends. PaddleOCR-VL is NOT
+/// instruction-following -- it selects its output mode from a literal short
+/// task-prefix ("OCR:", "Table Recognition:", "Spotting:", etc.), per the
+/// model's official usage docs and the GGUF card's llama.cpp example
+/// (`-p 'OCR:'`). "OCR:" is the plain-document-parsing mode, the correct one
+/// here.
 const PADDLEOCR_VL_PROMPT: &str = "OCR:";
 
-const CANDIDATES: [Candidate; 2] = [
-    Candidate {
-        model_id: QWEN_MODEL,
-        prompt: QWEN_OCR_PROMPT,
-    },
-    Candidate {
-        model_id: PADDLEOCR_VL_MODEL,
-        prompt: PADDLEOCR_VL_PROMPT,
-    },
-];
-
 fn ocr_options() -> GenerateOptions {
-    // NOT the same as production ocr_image_text() anymore -- that still uses
-    // num_ctx: 4096, a known, separate defect (flagged, not fixed here; this
-    // dispatch is eval-only). 4096 silently caps out on real full-page
-    // documents: confirmed live against Ollama (journalctl -u ollama) that a
-    // real page's prompt hit 4130-4148 tokens and got a hard 400 ("request
-    // (4130 tokens) exceeds the available context size (4096 tokens)").
-    //
-    // num_ctx is prompt + generation, not prompt-only, so the right target
-    // is worst-case prompt + num_predict. Both candidates' image-token cost
-    // is architecturally capped by their own mtmd projector's
-    // image_max_pixels, not something that grows open-endedly with DPI or
-    // document density -- confirmed via ollama's load_hparams log lines and
-    // matching task.n_tokens on a synthetic full-page 300 DPI image:
-    //   Qwen2.5-VL:7b      image_max_pixels 3211264 -> hard cap of exactly
-    //                      4096 image tokens (3211264 / 28px-merged-patch^2).
-    //                      Worst case ~= 4096 + ~60 (prompt text) + 2048
-    //                      (num_predict) ~= 6204.
-    //   PaddleOCR-VL       image_max_pixels 1605632 -> ~2048 image tokens,
-    //                      roughly half Qwen's -- its smaller vision encoder
-    //                      does not scale per-pixel the same way Qwen's
-    //                      does. Worst case ~= 2048 + ~5 ("OCR:") + 2048
-    //                      ~= 4101.
-    // 8192 is the next clean power-of-two above the higher (Qwen) worst
-    // case, giving both real headroom without being wastefully large next
-    // to either model's actual context_length (128000/131072). Shared
-    // rather than per-candidate (contrast `prompt`, which had to split):
-    // both worst cases fit comfortably under one generous value, and the
-    // memory cost of the smaller PaddleOCR-VL model running at 8192 instead
-    // of a tighter number is negligible.
-    GenerateOptions {
-        temperature: 0.1,
-        top_p: 0.90,
-        num_ctx: 8192,
-        num_predict: 2048,
-    }
+    // Single source of truth is now commands::ingest::ocr_generate_options()
+    // (items.id=150 Part 4) -- see its doc comment for the num_ctx=8192
+    // derivation (both candidates' architecturally-capped image-token cost,
+    // measured live against Ollama). This wrapper exists only so call sites
+    // here keep reading "ocr eval's options" rather than reaching into
+    // commands::ingest twice.
+    crate::commands::ingest::ocr_generate_options()
 }
 
 // ---------------------------------------------------------------------------
@@ -295,7 +245,7 @@ fn load_image_bytes(dir: &Path, image_name: &str) -> Vec<u8> {
 /// Mirrors `commands::ingest::OCR_EXTENSIONS` plus `pdf` (which production
 /// ingestion doesn't handle -- see the PDF-handling section above).
 /// Duplicated locally for the same reason `OCR_MODEL` is: not `pub` there.
-const SAMPLE_EXTENSIONS: &[&str] = &["pdf", "png", "jpg", "jpeg", "webp", "bmp", "tiff", "tif"];
+const SAMPLE_EXTENSIONS: &[&str] = &["pdf", "png", "jpg", "jpeg", "webp", "bmp"];
 
 fn is_supported_sample(name: &str) -> bool {
     Path::new(name)
@@ -369,89 +319,76 @@ fn compute_cer(output: &str, ground_truth: &str) -> Option<f64> {
 enum Row {
     Ok {
         doc: String,
-        model: &'static str,
         cer: f64,
         latency_ms: f64,
     },
     NoGroundTruth {
         doc: String,
-        model: &'static str,
     },
     Failed {
         doc: String,
-        model: &'static str,
         reason: String,
     },
 }
 
 fn print_report(rows: &[Row]) {
-    println!("\n=== Per-document results ===");
-    println!(
-        "{:<20} {:<20} {:>10} {:>12}",
-        "model_id", "doc_id", "cer", "latency_ms"
-    );
+    println!("\n=== Per-document results ({PADDLEOCR_VL_MODEL}) ===");
+    println!("{:<20} {:>10} {:>12}", "doc_id", "cer", "latency_ms");
     for row in rows {
         match row {
             Row::Ok {
                 doc,
-                model,
                 cer,
                 latency_ms,
-            } => println!("{model:<20} {doc:<20} {cer:>10.4} {latency_ms:>12.1}"),
-            Row::NoGroundTruth { doc, model } => {
-                println!("{model:<20} {doc:<20} {:>10} {:>12}", "N/A", "-")
+            } => println!("{doc:<20} {cer:>10.4} {latency_ms:>12.1}"),
+            Row::NoGroundTruth { doc } => {
+                println!("{doc:<20} {:>10} {:>12}", "N/A", "-")
             }
-            Row::Failed { doc, model, reason } => {
-                println!("{model:<20} {doc:<20} FAILED (reason: {reason})")
+            Row::Failed { doc, reason } => {
+                println!("{doc:<20} FAILED (reason: {reason})")
             }
         }
     }
 
     println!("\n=== Aggregate summary ===");
     println!(
-        "{:<20} {:>6} {:>10} {:>10} {:>12} {:>10} {:>16}",
-        "model_id", "n_ok", "n_failed", "mean_cer", "median_cer", "max_cer", "mean_latency_ms"
+        "{:>6} {:>10} {:>10} {:>12} {:>10} {:>16}",
+        "n_ok", "n_failed", "mean_cer", "median_cer", "max_cer", "mean_latency_ms"
     );
-    for candidate in &CANDIDATES {
-        let model = candidate.model_id;
-        let oks: Vec<(f64, f64)> = rows
-            .iter()
-            .filter_map(|r| match r {
-                Row::Ok {
-                    model: m,
-                    cer,
-                    latency_ms,
-                    ..
-                } if *m == model => Some((*cer, *latency_ms)),
-                _ => None,
-            })
-            .collect();
-        let n_failed = rows
-            .iter()
-            .filter(|r| matches!(r, Row::Failed { model: m, .. } if *m == model))
-            .count();
+    let oks: Vec<(f64, f64)> = rows
+        .iter()
+        .filter_map(|r| match r {
+            Row::Ok {
+                cer, latency_ms, ..
+            } => Some((*cer, *latency_ms)),
+            _ => None,
+        })
+        .collect();
+    let n_failed = rows
+        .iter()
+        .filter(|r| matches!(r, Row::Failed { .. }))
+        .count();
 
-        if oks.is_empty() {
-            println!(
-                "{model:<20} {:>6} {:>10} {:>10} {:>12} {:>10} {:>16}",
-                0, n_failed, "-", "-", "-", "-"
-            );
-            continue;
-        }
-
-        let mut cers: Vec<f64> = oks.iter().map(|(c, _)| *c).collect();
-        cers.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let mean_cer = cers.iter().sum::<f64>() / cers.len() as f64;
-        let median_cer = cers[cers.len() / 2];
-        let max_cer = *cers.last().unwrap();
-        let mean_latency = oks.iter().map(|(_, l)| *l).sum::<f64>() / oks.len() as f64;
-
+    if oks.is_empty() {
         println!(
-            "{model:<20} {:>6} {:>10} {mean_cer:>10.4} {median_cer:>12.4} {max_cer:>10.4} {mean_latency:>16.1}",
-            oks.len(),
-            n_failed,
+            "{:>6} {:>10} {:>10} {:>12} {:>10} {:>16}",
+            0, n_failed, "-", "-", "-", "-"
         );
+        return;
     }
+
+    let mut cers: Vec<f64> = oks.iter().map(|(c, _)| *c).collect();
+    cers.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mean_cer = cers.iter().sum::<f64>() / cers.len() as f64;
+    let median_cer = cers[cers.len() / 2];
+    let max_cer = *cers.last().unwrap();
+    let mean_latency = oks.iter().map(|(_, l)| *l).sum::<f64>() / oks.len() as f64;
+
+    println!(
+        "{:>6} {:>10} {mean_cer:>10.4} {median_cer:>12.4} {max_cer:>10.4} {mean_latency:>16.1}",
+        oks.len(),
+        n_failed,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -468,60 +405,45 @@ async fn ocr_accuracy_eval() {
     // Health check up front -- never send doomed requests to a model that
     // isn't actually pulled.
     let health = client.check_health().await;
-    let runnable: Vec<&Candidate> = CANDIDATES
-        .iter()
-        .filter(|c| {
-            let ok = health.available_models.iter().any(|a| a == c.model_id);
-            if !ok {
-                let m = c.model_id;
-                println!(
-                    "[SKIP] {m} not found in Ollama available_models -- `ollama pull {m}` first"
-                );
-            }
-            ok
-        })
-        .collect();
     assert!(
-        !runnable.is_empty(),
-        "no candidate models available -- nothing to evaluate"
+        health
+            .available_models
+            .iter()
+            .any(|a| a == PADDLEOCR_VL_MODEL),
+        "{PADDLEOCR_VL_MODEL} not found in Ollama available_models -- \
+         `ollama pull {PADDLEOCR_VL_MODEL}` first"
     );
 
-    // Paired per-document run: every runnable model against the same image.
     let mut rows = Vec::new();
     for entry in &entries {
         let bytes = load_image_bytes(&dir, &entry.image);
         let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
 
-        for &candidate in &runnable {
-            let request = GenerateRequest {
-                provider_id: None,
-                model_id: candidate.model_id.to_owned(),
-                prompt: candidate.prompt.to_owned(),
-                images: Some(vec![encoded.clone()]),
-                task_type: "ocr".to_owned(),
-                stream: Some(false),
-                options: Some(ocr_options()),
-            };
+        let request = GenerateRequest {
+            provider_id: None,
+            model_id: PADDLEOCR_VL_MODEL.to_owned(),
+            prompt: PADDLEOCR_VL_PROMPT.to_owned(),
+            images: Some(vec![encoded]),
+            task_type: "ocr".to_owned(),
+            stream: Some(false),
+            options: Some(ocr_options()),
+        };
 
-            match client.generate(&request).await {
-                Ok(resp) => match compute_cer(&resp.content, &entry.ground_truth) {
-                    Some(cer) => rows.push(Row::Ok {
-                        doc: entry.image.clone(),
-                        model: candidate.model_id,
-                        cer,
-                        latency_ms: resp.latency_ms,
-                    }),
-                    None => rows.push(Row::NoGroundTruth {
-                        doc: entry.image.clone(),
-                        model: candidate.model_id,
-                    }),
-                },
-                Err(e) => rows.push(Row::Failed {
+        match client.generate(&request).await {
+            Ok(resp) => match compute_cer(&resp.content, &entry.ground_truth) {
+                Some(cer) => rows.push(Row::Ok {
                     doc: entry.image.clone(),
-                    model: candidate.model_id,
-                    reason: e.to_string(),
+                    cer,
+                    latency_ms: resp.latency_ms,
                 }),
-            }
+                None => rows.push(Row::NoGroundTruth {
+                    doc: entry.image.clone(),
+                }),
+            },
+            Err(e) => rows.push(Row::Failed {
+                doc: entry.image.clone(),
+                reason: e.to_string(),
+            }),
         }
     }
 
@@ -533,9 +455,9 @@ async fn ocr_accuracy_eval() {
 // ---------------------------------------------------------------------------
 
 /// For when typing up ground truth isn't practical (e.g. a batch of large,
-/// text-heavy real documents). Runs both candidates against every supported
-/// file in `QR_OCR_EVAL_DIR` directly (no `manifest.json`) and prints each
-/// model's raw transcription so a human can eyeball quality directly --
+/// text-heavy real documents). Runs the production model against every
+/// supported file in `QR_OCR_EVAL_DIR` directly (no `manifest.json`) and
+/// prints its raw transcription so a human can eyeball quality directly --
 /// dates, dollar amounts, names -- instead of a numeric score against
 /// hand-typed ground truth. See the module doc comment for the printed-
 /// content exception this makes.
@@ -547,22 +469,13 @@ async fn ocr_dump_transcriptions() {
     let client = OllamaClient::new();
 
     let health = client.check_health().await;
-    let runnable: Vec<&Candidate> = CANDIDATES
-        .iter()
-        .filter(|c| {
-            let ok = health.available_models.iter().any(|a| a == c.model_id);
-            if !ok {
-                let m = c.model_id;
-                println!(
-                    "[SKIP] {m} not found in Ollama available_models -- `ollama pull {m}` first"
-                );
-            }
-            ok
-        })
-        .collect();
     assert!(
-        !runnable.is_empty(),
-        "no candidate models available -- nothing to evaluate"
+        health
+            .available_models
+            .iter()
+            .any(|a| a == PADDLEOCR_VL_MODEL),
+        "{PADDLEOCR_VL_MODEL} not found in Ollama available_models -- \
+         `ollama pull {PADDLEOCR_VL_MODEL}` first"
     );
 
     for name in &files {
@@ -573,25 +486,22 @@ async fn ocr_dump_transcriptions() {
         let bytes = load_image_bytes(&dir, name);
         let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
 
-        for &candidate in &runnable {
-            let request = GenerateRequest {
-                provider_id: None,
-                model_id: candidate.model_id.to_owned(),
-                prompt: candidate.prompt.to_owned(),
-                images: Some(vec![encoded.clone()]),
-                task_type: "ocr".to_owned(),
-                stream: Some(false),
-                options: Some(ocr_options()),
-            };
+        let request = GenerateRequest {
+            provider_id: None,
+            model_id: PADDLEOCR_VL_MODEL.to_owned(),
+            prompt: PADDLEOCR_VL_PROMPT.to_owned(),
+            images: Some(vec![encoded]),
+            task_type: "ocr".to_owned(),
+            stream: Some(false),
+            options: Some(ocr_options()),
+        };
 
-            println!("\n--- {} ---", candidate.model_id);
-            match client.generate(&request).await {
-                Ok(resp) => {
-                    println!("(latency: {:.1}ms)", resp.latency_ms);
-                    println!("{}", resp.content);
-                }
-                Err(e) => println!("FAILED: {e}"), // non-fatal, same as ocr_accuracy_eval
+        match client.generate(&request).await {
+            Ok(resp) => {
+                println!("(latency: {:.1}ms)", resp.latency_ms);
+                println!("{}", resp.content);
             }
+            Err(e) => println!("FAILED: {e}"), // non-fatal, same as ocr_accuracy_eval
         }
     }
 }

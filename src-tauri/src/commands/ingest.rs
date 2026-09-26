@@ -78,7 +78,13 @@ fn is_text_mirror_extension(path: &Path) -> bool {
 /// which exists for CPU-bound in-process parsing (see that fn's own doc
 /// comment). See the module header comment above this dispatch's plan for
 /// the full reasoning.
-const OCR_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "tiff", "tif"];
+/// `tiff`/`tif` deliberately excluded (items.id=150 Part 5): confirmed live
+/// against Ollama that both formats hard-fail with a 400
+/// ("Failed to load image or audio file") regardless of which vision model
+/// is targeted -- this is an Ollama-level image-decoding gap, not something
+/// either OCR candidate model can work around. png/jpg/jpeg/webp/bmp all
+/// decode correctly.
+const OCR_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp"];
 
 fn is_ocr_extension(path: &Path) -> bool {
     path.extension()
@@ -87,14 +93,46 @@ fn is_ocr_extension(path: &Path) -> bool {
         .is_some_and(|ext| OCR_EXTENSIONS.contains(&ext.as_str()))
 }
 
-/// Vision-OCR model tag -- single point of change. items.id=150 Part 3
-/// evaluates this against PaddleOCR-VL-class alternatives; nothing else in
-/// this module should assume this exact tag survives that evaluation.
-const OCR_MODEL: &str = "qwen2.5vl:7b";
+/// Vision-OCR model tag -- single point of change. items.id=150 Part 3's
+/// go/no-go eval is decided: PaddleOCR-VL wins, Qwen2.5-VL is rejected
+/// (reproducibly emits an immediate stop token / empty output on real
+/// document images -- root-caused, not a mystery). See
+/// providers::ocr_eval.rs for the eval harness that produced this call.
+const OCR_MODEL: &str = "seriouswebby/paddleocr-vl-1.6:latest";
 
-const OCR_PROMPT: &str = "Transcribe all text visible in this image, verbatim, \
-    preserving reading order and line breaks. Output only the transcribed \
-    text -- no commentary, no markdown fences, no description of the image.";
+/// PaddleOCR-VL is not instruction-following -- it selects its output mode
+/// from a literal short task-prefix ("OCR:", "Table Recognition:",
+/// "Spotting:", etc.), per the model's official usage docs. "OCR:" is its
+/// plain-document-parsing mode, the correct one here. This must change in
+/// lockstep with OCR_MODEL -- a prose instruction like Qwen's old prompt is
+/// the wrong convention for this model and silently degrades output.
+const OCR_PROMPT: &str = "OCR:";
+
+/// Shared GenerateOptions for OCR generation -- single source of truth for
+/// production (`ocr_image_text`, below) and the eval harness
+/// (`providers::ocr_eval`, items.id=150 Part 3). OCR_MODEL/OCR_PROMPT are
+/// still duplicated as literal copies in ocr_eval.rs (not `pub` here, not
+/// worth exporting solely for that eval -- see its own doc comments), but
+/// these four fields were never meant to have two independently-editable
+/// copies at all, so mirroring that same duplication for them had no design
+/// purpose -- it just let num_ctx drift silently out of sync (items.id=150
+/// Part 4):
+/// eval was raised to 8192 in Part 3, production stayed at the old,
+/// too-small 4096 until this fix. num_ctx=8192: Ollama's num_ctx budgets
+/// prompt + generation, not prompt-only, and real full-page 300 DPI
+/// documents push Qwen2.5-VL:7b's image tokens to its architectural ceiling
+/// of exactly 4096 (confirmed via `ollama show` + live load_hparams/
+/// task.n_tokens, see ocr_eval.rs's `ocr_options()`/commit f2fd3d9) --
+/// 8192 covers that worst-case prompt (~4156) + num_predict (2048) with
+/// real headroom. `pub(crate)` only, to let ocr_eval.rs reuse it.
+pub(crate) fn ocr_generate_options() -> GenerateOptions {
+    GenerateOptions {
+        temperature: 0.1,
+        top_p: 0.90,
+        num_ctx: 8192,
+        num_predict: 2048,
+    }
+}
 
 /// Best-effort OCR for a single image, run outside extract_document_text's
 /// sync contract (see OCR_EXTENSIONS's doc comment). None on any failure --
@@ -113,12 +151,7 @@ async fn ocr_image_text(client: &OllamaClient, bytes: &[u8]) -> Option<String> {
         images: Some(vec![encoded]),
         task_type: "ocr".to_owned(),
         stream: Some(false),
-        options: Some(GenerateOptions {
-            temperature: 0.1,
-            top_p: 0.90,
-            num_ctx: 4096,
-            num_predict: 2048,
-        }),
+        options: Some(ocr_generate_options()),
     };
     match client.generate(&request).await {
         Ok(resp) if !resp.content.trim().is_empty() => Some(resp.content),
@@ -489,5 +522,14 @@ mod tests {
         assert!(is_ocr_extension(Path::new("photo.JPG")));
         assert!(!is_ocr_extension(Path::new("doc.pdf")));
         assert!(!is_ocr_extension(Path::new("notes.txt")));
+    }
+
+    /// Regression guard (items.id=150 Part 5): tiff/tif were removed from
+    /// OCR_EXTENSIONS after confirming live that Ollama hard-fails decoding
+    /// both formats regardless of model. Must not silently come back.
+    #[test]
+    fn rejects_tiff_extensions() {
+        assert!(!is_ocr_extension(Path::new("scan.tiff")));
+        assert!(!is_ocr_extension(Path::new("scan.tif")));
     }
 }
