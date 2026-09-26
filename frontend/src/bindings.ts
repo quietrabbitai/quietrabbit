@@ -33,16 +33,23 @@ export const commands = {
 	 *  module (async paste-back)"). Nothing is pending execution; the caller
 	 *  should fetch the already-produced output via get_run_output instead.
 	 * 
-	 *  awaiting_user, paused, running, initializing: genuinely not_implemented
-	 *  (unchanged stub behaviour). All four are blocked on the same structural
-	 *  gap, not a missing switch statement: FocusRun::new() requires
-	 *  `user_input`, and every step's prompt render threads it through
-	 *  StepContext (lifecycle.rs execute_step()) -- but user_input is never
-	 *  persisted anywhere (not on focus_runs, not in focus_run_snapshots). There
-	 *  is currently no way to reconstruct a live FocusRun to re-enter execute()
-	 *  for any of these four statuses without first adding somewhere to store
-	 *  it, which is a schema change, not a resume_run fix. See each match arm
-	 *  below for the state-specific detail on top of that shared blocker.
+	 *  awaiting_user, paused, running, initializing (items.id=245): the
+	 *  structural gap the previous revision of this doc comment described here
+	 *  -- FocusRun::new() requires `user_input`, but user_input was never
+	 *  persisted anywhere, so a live FocusRun could not be reconstructed to
+	 *  re-enter execute() -- is closed: focus_runs.user_input (outputs_010.sql)
+	 *  plus lifecycle::rehydrate_focus_run() (items.id=574 Part 1) now do
+	 *  exactly that reconstruction, from the focus_runs row + the latest
+	 *  focus_run_snapshots row + a fresh PersonalTrack fetch. All four statuses
+	 *  collapse to identical handling here: rehydrate_focus_run() itself derives
+	 *  the correct resume index from the row's own persisted status (AT the
+	 *  checkpointed step for awaiting_user's consent-gate/handoff pause, AFTER
+	 *  it for paused/running/initializing's periodic-or-crash checkpoint -- see
+	 *  that function's own doc comment), so there is no per-status branching
+	 *  left for this command layer to do. Execution resumes via
+	 *  FocusRun::resume_execution(), spawned in the background exactly like
+	 *  submit_focus_run's execute_full() -- progress arrives via the same
+	 *  run_status_update push events, not this command's return value.
 	 */
 	resumeRun: (request: ResumeRunRequest) => typedError<string, string>(__TAURI_INVOKE("resume_run", { request })),
 	submitConsentDecision: (request: SubmitConsentDecisionRequest) => typedError<null, string>(__TAURI_INVOKE("submit_consent_decision", { request })),

@@ -17,9 +17,12 @@
 //   complete/cancelled/failed: distinct "run_already_finished" error (terminal,
 //   nothing to resume). awaiting_feedback: distinct "no_resume_needed" error
 //   (output already saved, Phase 6 feedback out of scope). awaiting_user/
-//   paused/running/initializing: still not_implemented -- blocked on
-//   user_input never being persisted, so a live FocusRun can't be
-//   reconstructed to re-enter execute() (see resume_run()'s own doc comment).
+//   paused/running/initializing (items.id=245): rehydrate_focus_run() rebuilds
+//   a live FocusRun from focus_runs.user_input + the latest focus_run_snapshots
+//   row + a fresh PersonalTrack fetch, then resume_execution() promotes it to
+//   'running' and continues execute() from current_step -- spawned in the
+//   background, same fire-and-forget shape as submit_focus_run (see resume_run()'s
+//   own doc comment).
 //
 // Lifecycle ownership for awaiting_extract_confirm (item 20):
 //   resume_run() = crash recovery + UI rehydration only.
@@ -44,7 +47,7 @@ use tauri::State;
 
 use crate::auth::registry::{key_hex, KeyRegistry};
 use crate::conductor::concurrency::ConductorScheduler;
-use crate::conductor::lifecycle::FocusRun;
+use crate::conductor::lifecycle::{rehydrate_focus_run, FocusRun};
 use crate::persistence::output_store;
 
 // ---------------------------------------------------------------------------
@@ -277,21 +280,29 @@ pub async fn cancel_run(
 /// module (async paste-back)"). Nothing is pending execution; the caller
 /// should fetch the already-produced output via get_run_output instead.
 ///
-/// awaiting_user, paused, running, initializing: genuinely not_implemented
-/// (unchanged stub behaviour). All four are blocked on the same structural
-/// gap, not a missing switch statement: FocusRun::new() requires
-/// `user_input`, and every step's prompt render threads it through
-/// StepContext (lifecycle.rs execute_step()) -- but user_input is never
-/// persisted anywhere (not on focus_runs, not in focus_run_snapshots). There
-/// is currently no way to reconstruct a live FocusRun to re-enter execute()
-/// for any of these four statuses without first adding somewhere to store
-/// it, which is a schema change, not a resume_run fix. See each match arm
-/// below for the state-specific detail on top of that shared blocker.
+/// awaiting_user, paused, running, initializing (items.id=245): the
+/// structural gap the previous revision of this doc comment described here
+/// -- FocusRun::new() requires `user_input`, but user_input was never
+/// persisted anywhere, so a live FocusRun could not be reconstructed to
+/// re-enter execute() -- is closed: focus_runs.user_input (outputs_010.sql)
+/// plus lifecycle::rehydrate_focus_run() (items.id=574 Part 1) now do
+/// exactly that reconstruction, from the focus_runs row + the latest
+/// focus_run_snapshots row + a fresh PersonalTrack fetch. All four statuses
+/// collapse to identical handling here: rehydrate_focus_run() itself derives
+/// the correct resume index from the row's own persisted status (AT the
+/// checkpointed step for awaiting_user's consent-gate/handoff pause, AFTER
+/// it for paused/running/initializing's periodic-or-crash checkpoint -- see
+/// that function's own doc comment), so there is no per-status branching
+/// left for this command layer to do. Execution resumes via
+/// FocusRun::resume_execution(), spawned in the background exactly like
+/// submit_focus_run's execute_full() -- progress arrives via the same
+/// run_status_update push events, not this command's return value.
 #[tauri::command]
 #[specta::specta]
 pub async fn resume_run(
     app_handle: tauri::AppHandle,
-    _scheduler: tauri::State<'_, Arc<ConductorScheduler>>,
+    scheduler: tauri::State<'_, Arc<ConductorScheduler>>,
+    pool: tauri::State<'_, sqlx::SqlitePool>,
     key_registry: State<'_, KeyRegistry>,
     request: ResumeRunRequest,
 ) -> Result<String, String> {
@@ -334,34 +345,48 @@ pub async fn resume_run(
                 .to_string());
         }
 
-        // cloud_frontier boundary (lifecycle.rs execute(), routing_tier == 3) or a
+        // cloud_frontier boundary (lifecycle.rs execute(), routing_tier == 3), a
         // consent-gate pause (handle_step_failure()'s AwaitUser/HoldForGate/
-        // OfferTier2/OfferCompact/AwaitFloorConsent/AwaitConsent actions).
-        // consent.rs's own module header ("lifecycle checks consent_decisions
-        // when the run is resumed") names resume_run as the intended
-        // re-attachment point once the user answers the consent_decisions
-        // row those commands write -- but reattaching means rebuilding
-        // PersonalTrack/TaskTrack/SharedStateTrack from focus_run_snapshots
-        // and continuing execute() from current_step, which hits the
-        // missing-user_input blocker described above.
-        "awaiting_user" => return Err("not_implemented".to_string()),
+        // OfferTier2/OfferCompact/AwaitFloorConsent/AwaitConsent actions -- each
+        // now checkpointed at the pausing step, items.id=245), a crash-demoted
+        // run (demote_interrupted_runs() sweeps stale 'running'/'initializing'
+        // to 'paused'), or a very recent crash not yet swept: all four collapse
+        // to the same handling. rehydrate_focus_run() rebuilds a live FocusRun
+        // from the focus_runs row (focus_id/user_input/topic_id/is_quick_ask)
+        // plus the latest focus_run_snapshots row plus a fresh PersonalTrack
+        // fetch, deriving the correct resume index from the row's own
+        // persisted status itself -- see that function's doc comment for why
+        // no per-status branching is needed here. confirmed_cross_persona_fact_ids
+        // is empty here (ResumeRunRequest carries no such field, unlike
+        // SubmitFocusRunRequest): any cross-Persona fact the original run had
+        // confirmed is re-omitted on resume, same "declined-or-unasked" fallback
+        // build_personal_track()'s provenance check already applies -- it does
+        // not hard-block, so the resumed run still completes on its other,
+        // permitted facts.
+        "awaiting_user" | "paused" | "running" | "initializing" => {
+            let scheduler = Arc::clone(&*scheduler);
+            let mut run: FocusRun = rehydrate_focus_run(
+                request.user_id.clone(),
+                request.persona_id.clone(),
+                request.run_id.clone(),
+                pool.inner().clone(),
+                scheduler,
+                Some(key_hex_str.clone()),
+                std::collections::HashSet::new(),
+                Some(app_handle),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
 
-        // Crash-demoted by demote_interrupted_runs() (stale 'running' or
-        // 'initializing', see that function's own doc comment) -- the
-        // FocusRun actor that held the live tracks is gone. Same
-        // missing-user_input blocker; additionally needs the
-        // focus_run_snapshots -> PersonalTrack/TaskTrack/SharedStateTrack
-        // rehydration that reentry.rs explicitly declined to build (see its
-        // module header: it only computes a plan, it does not resume).
-        "paused" => return Err("not_implemented".to_string()),
+            // Spawn resume_execution() in the background, matching
+            // submit_focus_run's fire-and-forget shape -- progress arrives via
+            // run_status_update push events, not this command's return value.
+            tokio::spawn(async move {
+                let _result = run.resume_execution().await;
+            });
 
-        // Set at Phase 3 INITIALIZE (lifecycle.rs initialize(), before the
-        // EXECUTE loop starts) or Phase 2 AUTHORIZE (authorize(), before
-        // tracks even exist). A row seen in either state via resume_run
-        // implies either a very recent crash (not yet demoted to 'paused' by
-        // demote_interrupted_runs()) or that demotion never ran -- same
-        // missing-user_input blocker as 'paused' either way.
-        "running" | "initializing" => return Err("not_implemented".to_string()),
+            return Ok(request.run_id);
+        }
 
         other => return Err(format!("not_implemented:unrecognized_status:{other}")),
     }

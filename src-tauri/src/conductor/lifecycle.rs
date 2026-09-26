@@ -1915,6 +1915,23 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                 | FailureAction::AwaitFloorConsent
                 | FailureAction::AwaitConsent
         ) {
+            // Checkpoint the paused step before parking (items.id=245): unlike
+            // execute()'s Tier 3 requires_user_handoff branch, which already
+            // checkpoints itself before pausing, this generic consent-gate
+            // pause path previously had no checkpoint at all. rehydrate_focus_run()'s
+            // status=='awaiting_user' branch resumes AT the last-checkpointed
+            // step, so without this write a resume would land on a stale
+            // periodic checkpoint (or step 0, if none exists yet) instead of
+            // the step that actually paused. failure.step_id is always Some()
+            // on this path: every real call site threads Some(&ctx.step.step_id)
+            // into failure_handler.handle() (see executor.rs/failure.rs).
+            if !self._checkpointing_suspended {
+                if let Some(step_id) = failure.step_id.clone() {
+                    if let Err(e) = self.write_checkpoint(&step_id).await {
+                        log::warn!("lifecycle: consent-gate pause checkpoint write failed: {e}");
+                    }
+                }
+            }
             self.write_focus_run_record_logged("awaiting_user").await;
             self.emit_status_with_content(
                 "awaiting_user",
@@ -2309,7 +2326,20 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             "execute_full() requires load()+authorize() to have already run"
         );
         self.initialize().await?;
+        self.execute_and_finish().await
+    }
 
+    /// Phase 4 EXECUTE onward: run remaining steps from `self.current_step`,
+    /// then Phase 5 OUTPUT, the extraction pass, and cleanup.
+    ///
+    /// Split out of execute_full_inner() (items.id=245) so resume_execution()
+    /// (below) can share this tail without re-running initialize() --
+    /// initialize() unconditionally resets task_track/shared_state to empty
+    /// and current_step is never touched by it, so calling it again on a
+    /// rehydrated run would silently discard the state rehydrate_focus_run()
+    /// just restored. execute_full_inner() still calls initialize() first,
+    /// same as before this split; only the post-initialize tail moved.
+    async fn execute_and_finish(&mut self) -> Result<RunResult, LifecycleError> {
         if let Some(early_result) = self.execute().await? {
             let status = early_result.status.clone();
             self.cleanup(&status).await;
@@ -2461,6 +2491,27 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         // 'awaiting_feedback' to 'complete' and purges snapshots.
         self.cleanup("complete").await;
         Ok(output_result)
+    }
+
+    /// Resume a rehydrated FocusRun: promote it to 'running' and continue
+    /// execution from `self.current_step` onward (items.id=245).
+    ///
+    /// rehydrate_focus_run() (below) deliberately never writes to focus_runs
+    /// (see its own doc comment: "its status is the caller's to change, not
+    /// this function's") -- this is that write. Mirrors initialize()'s own
+    /// write_focus_run_record("running") + emit_status("running", None)
+    /// tail, since a rehydrated run skips initialize() entirely (see
+    /// execute_and_finish()'s doc comment for why: initialize() would wipe
+    /// the just-restored task_track/shared_state).
+    ///
+    /// Callers must have already produced `self` via rehydrate_focus_run()
+    /// -- this method assumes personal_track/task_track/shared_state/
+    /// focus_def/focus_run_id/failure_handler/privacy_gateway are all
+    /// populated (the same preconditions execute() itself asserts).
+    pub async fn resume_execution(&mut self) -> Result<RunResult, LifecycleError> {
+        self.write_focus_run_record("running").await?;
+        self.emit_status("running", None);
+        self.execute_and_finish().await
     }
 }
 
@@ -3880,6 +3931,13 @@ mod tests {
     /// self.privacy_gateway / a real step, so it needs none of those: just
     /// focus_run_id + key_hex (write_focus_run_record() panics without
     /// either) and the crisis flag under test.
+    ///
+    /// personal_track/task_track/shared_state ARE required, though (items.id=245):
+    /// the awaiting_user branch now calls write_checkpoint(), which unwrap()s
+    /// all three -- unlike execute()'s own callers of write_checkpoint(),
+    /// which get there only after execute()'s top-level assert!()s already
+    /// guarantee these are Some, a test that calls handle_step_failure()
+    /// directly bypasses that guarantee and must supply it here instead.
     fn failure_ready_run(crisis_floor_triggered: bool) -> FocusRun {
         let scheduler = Arc::new(ConductorScheduler::new());
         let mut run: FocusRun = FocusRun::new(
@@ -3898,6 +3956,11 @@ mod tests {
         );
         run.focus_run_id = Some(uuid::Uuid::new_v4().to_string());
         run.crisis_floor_triggered = crisis_floor_triggered;
+        let mut personal_track = PersonalTrack::new();
+        personal_track.seal();
+        run.personal_track = Some(personal_track);
+        run.task_track = Some(TaskTrack::new());
+        run.shared_state = Some(SharedStateTrack::new());
         run
     }
 
@@ -3975,6 +4038,308 @@ mod tests {
                 await_result.crisis_resource_block.is_none(),
                 "neither branch should populate the block for a non-crisis-flagged run"
             );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn handle_step_failure_await_user_branch_checkpoints_the_paused_step() {
+        // items.id=245: without this checkpoint, rehydrate_focus_run()'s
+        // status=='awaiting_user' branch (which resumes AT the last-checkpointed
+        // step) would resume at a stale earlier checkpoint -- or find none at
+        // all -- instead of the step that actually paused.
+        with_temp_data_root(async {
+            let mut run = failure_ready_run(false);
+            let focus_run_id = run.focus_run_id.clone().unwrap();
+
+            // Seed the focus_runs row write_checkpoint()'s FK
+            // (focus_run_snapshots.focus_run_id REFERENCES focus_runs(id),
+            // enforced -- connect_options_encrypted sets foreign_keys(true))
+            // requires. In production this row always exists already (AUTHORIZE
+            // writes it before EXECUTE ever starts); failure_ready_run() skips
+            // AUTHORIZE, so this test must seed it directly instead.
+            crate::persistence::output_store::test_seed_focus_run(
+                &run.user_id,
+                &run.persona_id,
+                CRISIS_TEST_KEY_HEX,
+                &focus_run_id,
+                "f",
+            )
+            .await
+            .expect("test_seed_focus_run must succeed");
+
+            run.handle_step_failure(await_user_failure()).await.unwrap();
+
+            let mut conn = open_outputs_db(&run.user_id, &run.persona_id, CRISIS_TEST_KEY_HEX)
+                .await
+                .expect("open_outputs_db must succeed");
+            let row = sqlx::query("SELECT step_id FROM focus_run_snapshots WHERE focus_run_id = ?")
+                .bind(&focus_run_id)
+                .fetch_optional(&mut conn)
+                .await
+                .expect("snapshot query must succeed");
+            let row = row.expect(
+                "handle_step_failure's awaiting_user branch must write a checkpoint \
+                 for the paused step",
+            );
+            let step_id: String = row.try_get("step_id").unwrap();
+            assert_eq!(
+                step_id, "step_a",
+                "checkpoint must be keyed to the step that actually paused \
+                 (await_user_failure()'s FailureResult.step_id), not some other step"
+            );
+        })
+        .await;
+    }
+
+    // -------------------------------------------------------------------------
+    // rehydrate_focus_run / resume_execution (items.id=245, building on the
+    // items.id=574 Part 1 foundation: focus_runs.user_input + rehydrate_focus_run()).
+    // -------------------------------------------------------------------------
+
+    const RESUME_TEST_KEY_HEX: &str =
+        "3344556677889900334455667788990033445566778899003344556677889900";
+
+    /// Real shared.db, migrated, with a persona for "quick-ask" --
+    /// rehydrate_focus_run()'s resolve_tier_config() call requires both the
+    /// persona and a focus_settings row to exist (same precondition
+    /// authorize() has always had). No explicit focus_settings insert here:
+    /// create_persona() below already seeds one for "quick-ask" (one of
+    /// persona_store::SEEDED_FOCUS_IDS) for every persona it creates.
+    /// Mirrors commands::persona's own setup() (persona.rs:519-569).
+    async fn setup_shared_and_persona_for_resume_test(
+        user_id: &str,
+        persona_id: &str,
+    ) -> sqlx::SqlitePool {
+        crate::persistence::migrations::migrate_shared_db()
+            .await
+            .expect("shared.db migration must succeed in test setup");
+
+        let pool =
+            sqlx::SqlitePool::connect_with(crate::providers::utils::connect_options_unencrypted(
+                &crate::providers::utils::db_path_shared(),
+            ))
+            .await
+            .expect("shared.db pool must connect");
+
+        crate::auth::user_store::create_user(
+            &pool,
+            user_id,
+            "Resume Test User",
+            "user",
+            false,
+            &[0u8; crate::auth::kdf::SALT_LEN],
+            crate::auth::kdf::DEFAULT_ARGON2_MEMORY_KIB,
+            crate::auth::kdf::DEFAULT_ARGON2_ITERATIONS,
+            crate::auth::kdf::DEFAULT_ARGON2_PARALLELISM,
+            &[0u8; 32],
+        )
+        .await
+        .expect("create_user must succeed in test setup");
+
+        crate::persistence::persona_store::create_persona(
+            &pool,
+            persona_id,
+            "Resume Test Persona",
+            "personal",
+            user_id,
+            None,
+        )
+        .await
+        .expect("create_persona must succeed in test setup");
+
+        pool
+    }
+
+    /// End-to-end (minus the model call) proof that a paused quick-ask run
+    /// survives a rehydrate: real shared.db + real quick-ask.focus (the
+    /// shipped artifact, one step: "draft") + a real checkpoint written via
+    /// write_checkpoint() itself (production code, not hand-crafted JSON) +
+    /// a hand-seeded focus_runs row standing in for AUTHORIZE (which never
+    /// ran in this test, same as failure_ready_run()'s reasoning above).
+    #[tokio::test]
+    async fn rehydrate_focus_run_restores_a_paused_runs_checkpoint_and_user_input() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "resume-user";
+        let persona_id = "resume-persona";
+        let pool = setup_shared_and_persona_for_resume_test(user_id, persona_id).await;
+        let focus_run_id = uuid::Uuid::new_v4().to_string();
+
+        // Seed the focus_runs row first -- stands in for AUTHORIZE, which
+        // never ran in this test (same reasoning as failure_ready_run()
+        // above). Must come before the checkpoint write below:
+        // focus_run_snapshots.focus_run_id REFERENCES focus_runs(id), enforced
+        // (connect_options_encrypted sets foreign_keys(true)).
+        {
+            let mut conn = open_outputs_db(user_id, persona_id, RESUME_TEST_KEY_HEX)
+                .await
+                .expect("open_outputs_db must succeed");
+            sqlx::query(
+                "INSERT INTO focus_runs
+                 (id, focus_id, status, is_fast_lane, is_quick_ask, topic_id, user_input, started_at)
+                 VALUES (?, 'quick-ask', 'paused', 0, 1, NULL, ?, ?)",
+            )
+            .bind(&focus_run_id)
+            .bind("Test user input for resume")
+            .bind(now())
+            .execute(&mut conn)
+            .await
+            .expect("seed focus_runs insert must succeed");
+        }
+
+        // Seed a real checkpoint via write_checkpoint() itself.
+        {
+            let scheduler = Arc::new(ConductorScheduler::new());
+            let mut seed_run: FocusRun = FocusRun::new(
+                user_id.to_owned(),
+                persona_id.to_owned(),
+                "quick-ask".to_owned(),
+                pool.clone(),
+                scheduler,
+                "Test user input for resume".to_owned(),
+                false,
+                Some(RESUME_TEST_KEY_HEX.to_owned()),
+                None,
+                true,
+                std::collections::HashSet::new(),
+                None,
+            );
+            seed_run.focus_run_id = Some(focus_run_id.clone());
+            let mut personal_track = PersonalTrack::new();
+            personal_track.seal();
+            seed_run.personal_track = Some(personal_track);
+            let mut task_track = TaskTrack::new();
+            task_track.add_step(TaskStep {
+                step_id: "draft".to_owned(),
+                output_var: Some("draft_output".to_owned()),
+                content: "Original draft output".to_owned(),
+                sensitivity_severity: 1,
+                routing_tier_used: 1,
+            });
+            seed_run.task_track = Some(task_track);
+            seed_run.shared_state = Some(SharedStateTrack::new());
+            seed_run
+                .write_checkpoint("draft")
+                .await
+                .expect("write_checkpoint must succeed");
+        }
+
+        let scheduler = Arc::new(ConductorScheduler::new());
+        let run: FocusRun = rehydrate_focus_run(
+            user_id.to_owned(),
+            persona_id.to_owned(),
+            focus_run_id.clone(),
+            pool.clone(),
+            scheduler,
+            Some(RESUME_TEST_KEY_HEX.to_owned()),
+            std::collections::HashSet::new(),
+            None,
+        )
+        .await
+        .expect("rehydrate_focus_run must succeed");
+
+        assert_eq!(run.focus_id, "quick-ask");
+        assert_eq!(
+            run.user_input, "Test user input for resume",
+            "user_input must round-trip from focus_runs.user_input (outputs_010.sql)"
+        );
+        assert!(run.is_quick_ask);
+        assert_eq!(
+            run.current_step, 1,
+            "status='paused' resumes AFTER the checkpointed step -- 'draft' is \
+             quick-ask.focus's only step, at index 0, so 1 means execute() will \
+             correctly find no remaining steps rather than re-running 'draft'"
+        );
+        assert_eq!(
+            run.task_track.as_ref().unwrap().last_output(),
+            Some("Original draft output"),
+            "task_track must be rebuilt from the checkpoint's stored JSON, not left empty"
+        );
+        assert!(
+            run.personal_track.as_ref().unwrap().is_sealed(),
+            "rehydrate_focus_run must seal the freshly-fetched PersonalTrack, same as initialize()"
+        );
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    /// resume_execution() itself: promotes to 'running', then drives a run
+    /// with zero remaining steps straight through Phase 5 OUTPUT to
+    /// 'complete' -- without calling initialize() (which would be the bug:
+    /// initialize() unconditionally resets task_track/shared_state and would
+    /// be silently "fine" here only because this fixture's task_track is
+    /// already empty; the real guarantee is structural -- execute_and_finish()
+    /// contains no call to initialize() at all, see its own doc comment).
+    /// task_track is deliberately empty (not seeded with a completed step)
+    /// so the Phase 5 extraction pass's step_outputs.is_empty() short-circuit
+    /// (extract.rs) is guaranteed to fire -- this test must never depend on
+    /// a reachable Ollama instance.
+    #[tokio::test]
+    async fn resume_execution_completes_a_run_with_no_steps_remaining() {
+        with_temp_data_root(async {
+            let scheduler = Arc::new(ConductorScheduler::new());
+            let mut run: FocusRun<crate::conductor::privacy::logger::TestLogger> = FocusRun::new(
+                "u".to_owned(),
+                "p".to_owned(),
+                "f".to_owned(),
+                dummy_pool(),
+                scheduler,
+                "".to_owned(),
+                false,
+                Some(CRISIS_TEST_KEY_HEX.to_owned()),
+                None,
+                false,
+                std::collections::HashSet::new(),
+                None,
+            );
+            run.focus_run_id = Some(uuid::Uuid::new_v4().to_string());
+            run.focus_def = Some(parse_focus_definition(minimal_raw()).unwrap());
+            let mut personal_track = PersonalTrack::new();
+            personal_track.seal();
+            run.personal_track = Some(personal_track);
+            run.task_track = Some(TaskTrack::new());
+            run.shared_state = Some(SharedStateTrack::new());
+            run.failure_handler = Some(FailureHandler::new(ExternalAccess::LocalOnly));
+            run.privacy_gateway = Some(PrivacyGateway::new(
+                crate::conductor::privacy::logger::TestLogger::for_run("u", "p", ""),
+            ));
+            run.current_step = 0;
+
+            let focus_run_id = run.focus_run_id.clone().unwrap();
+            let result = run
+                .resume_execution()
+                .await
+                .expect("resume_execution must succeed");
+
+            // output()'s own RunResult.status is always "awaiting_feedback"
+            // (pre-existing behavior, unchanged by this item -- see
+            // execute_and_finish()'s final `Ok(output_result)`, which returns
+            // output()'s result as-is even though cleanup("complete") below
+            // it has already overwritten focus_runs.status to 'complete').
+            // The real, current status lives in the DB, checked below.
+            assert_eq!(result.status, "awaiting_feedback");
+
+            // Confirm resume_execution() actually persisted 'running' then
+            // 'complete' against the real tempdir outputs.db, not just
+            // returned an in-memory RunResult.
+            let mut conn = open_outputs_db("u", "p", CRISIS_TEST_KEY_HEX)
+                .await
+                .expect("open_outputs_db must succeed");
+            let row = sqlx::query("SELECT status FROM focus_runs WHERE id = ?")
+                .bind(&focus_run_id)
+                .fetch_one(&mut conn)
+                .await
+                .expect("focus_runs row must exist after resume_execution");
+            let status: String = row.try_get("status").unwrap();
+            assert_eq!(status, "complete");
         })
         .await;
     }
