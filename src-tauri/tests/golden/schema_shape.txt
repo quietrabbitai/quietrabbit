@@ -203,6 +203,23 @@ TABLE focus_run_snapshots
   purge_after TEXT notnull=0 pk=0 default=None
   created_at TEXT notnull=1 pk=0 default=None
   extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+TABLE focus_run_steps
+  id TEXT notnull=0 pk=1 default=None
+  focus_run_id TEXT notnull=1 pk=0 default=None
+  step_id TEXT notnull=1 pk=0 default=None
+  attempt INTEGER notnull=1 pk=0 default=Some("1")
+  sequence_index INTEGER notnull=1 pk=0 default=None
+  status TEXT notnull=1 pk=0 default=Some("'pending'")
+  content TEXT notnull=0 pk=0 default=None
+  sensitivity_severity INTEGER notnull=0 pk=0 default=None
+  routing_tier_used INTEGER notnull=0 pk=0 default=None
+  output_id TEXT notnull=0 pk=0 default=None
+  scheduled_for TEXT notnull=0 pk=0 default=None
+  started_at TEXT notnull=0 pk=0 default=None
+  completed_at TEXT notnull=0 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+  updated_at TEXT notnull=1 pk=0 default=None
+  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
 TABLE focus_runs
   id TEXT notnull=0 pk=1 default=None
   focus_id TEXT notnull=1 pk=0 default=None
@@ -217,6 +234,7 @@ TABLE focus_runs
   extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
   topic_id TEXT notnull=0 pk=0 default=None
   is_quick_ask INTEGER notnull=1 pk=0 default=Some("0")
+  user_input TEXT notnull=0 pk=0 default=None
 TABLE migration_lock
   id INTEGER notnull=0 pk=1 default=None
   locked_at TEXT notnull=0 pk=0 default=None

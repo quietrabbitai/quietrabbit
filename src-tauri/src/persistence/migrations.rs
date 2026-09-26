@@ -150,6 +150,16 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/outputs_008.sql"),
     },
     SchemaFile {
+        prefix: "outputs",
+        version: 9,
+        sql: include_str!("../../schema/outputs_009.sql"),
+    },
+    SchemaFile {
+        prefix: "outputs",
+        version: 10,
+        sql: include_str!("../../schema/outputs_010.sql"),
+    },
+    SchemaFile {
         prefix: "personal",
         version: 1,
         sql: include_str!("../../schema/personal_001.sql"),
@@ -2899,9 +2909,10 @@ mod tests {
 
         assert_eq!(
             result.expect("migration must apply cleanly"),
-            8,
+            10,
             "outputs_001 + outputs_002 + outputs_003 + outputs_004 + outputs_005 + \
-             outputs_006 + outputs_007 + outputs_008 must all apply in one pass"
+             outputs_006 + outputs_007 + outputs_008 + outputs_009 + outputs_010 \
+             must all apply in one pass"
         );
 
         let mut conn = open_verify_conn(&db_path, Some(TEST_KEY_HEX)).await;
@@ -2911,6 +2922,7 @@ mod tests {
             "outputs_fts",
             "topics",
             "run_history",
+            "focus_run_steps",
         ] {
             assert!(
                 table_exists(&mut conn, table).await,
@@ -2926,6 +2938,16 @@ mod tests {
         assert!(
             columns.iter().any(|c| c.1 == "source"),
             "outputs_002's ALTER TABLE must have applied to the real file"
+        );
+
+        let focus_run_columns: Vec<(i64, String, String, i64, Option<String>, i64)> =
+            sqlx::query_as("PRAGMA table_info(focus_runs)")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        assert!(
+            focus_run_columns.iter().any(|c| c.1 == "user_input"),
+            "outputs_010's ALTER TABLE must have applied to the real file"
         );
 
         // Prove the FTS5 trigger fires for real, not just that outputs_fts

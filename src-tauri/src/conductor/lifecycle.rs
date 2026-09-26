@@ -93,7 +93,8 @@ use crate::conductor::tokens::{
     validate_step, ExternalAccess, FieldRequirement, StepDefinition, StepType,
 };
 use crate::conductor::types::{
-    PersonalContextManifest, PersonalTrack, SharedStateTrack, TaskTrack,
+    PersonalContextManifest, PersonalTrack, PromotedContentEntry, SharedStateTrack, TaskStep,
+    TaskTrack,
 };
 use crate::persistence::disclosure_log_store::SqliteDisclosureLogger;
 use crate::providers::utils::{connect_options_encrypted, db_path_outputs, now};
@@ -127,6 +128,10 @@ pub enum LifecycleError {
     PersonaNotFound(String),
     #[error("Focus settings not found: {0}")]
     FocusSettingsNotFound(String),
+
+    // Rehydrate (items.id=574 shared foundation / items.id=245)
+    #[error("Focus run not found: {0}")]
+    RunNotFound(String),
 
     // F_SYSTEM — caught in execute_full() for FailureResult mapping
     #[error("Taxonomy integrity: {0}")]
@@ -980,11 +985,31 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             return Err(LifecycleError::NoKey);
         }
 
+        self.resolve_tier_config().await?;
+        self.failure_handler = Some(FailureHandler::new(self._focus_external_access));
+        self.focus_run_id = Some(Uuid::new_v4().to_string());
+        self.write_focus_run_record("initializing").await?;
+        Ok(())
+    }
+
+    /// Compute and store the Focus-level tier ceiling
+    /// (_focus_max_permitted_tier/_focus_privacy_tier/_focus_external_access),
+    /// validating that no step's external_access_override exceeds it.
+    ///
+    /// Shared by authorize() (Phase 2, a brand-new run) and
+    /// rehydrate_focus_run() (items.id=574, reconstructing a resumed run) —
+    /// same computation, same violation check, two different entry points
+    /// into an in-memory FocusRun. Requires focus_def to already be set
+    /// (load() must have run first).
+    async fn resolve_tier_config(&mut self) -> Result<(), LifecycleError> {
         let (max_permitted, privacy_tier) = self.get_focus_tier_ceiling().await?;
         self._focus_max_permitted_tier = max_permitted;
         self._focus_privacy_tier = privacy_tier;
 
-        let focus_def = self.focus_def.as_ref().unwrap();
+        let focus_def = self
+            .focus_def
+            .as_ref()
+            .expect("resolve_tier_config() requires focus_def");
 
         // items.id=439 (Part 6, Jason's three-way-fold resolution): the
         // Focus-level ceiling excluding any step's own override -- folds the
@@ -1006,9 +1031,6 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             }
         }
 
-        self.failure_handler = Some(FailureHandler::new(self._focus_external_access));
-        self.focus_run_id = Some(Uuid::new_v4().to_string());
-        self.write_focus_run_record("initializing").await?;
         Ok(())
     }
 
@@ -2475,13 +2497,210 @@ pub async fn demote_interrupted_runs(
 }
 
 // ---------------------------------------------------------------------------
+// rehydrate_focus_run
+// ---------------------------------------------------------------------------
+
+/// Reconstruct a live, execute()-ready FocusRun from persisted state: the
+/// focus_runs row (focus_id, status, is_fast_lane, is_quick_ask, topic_id,
+/// user_input) plus the latest focus_run_snapshots row for this run
+/// (task_track_json/shared_state_json), plus a FRESH PersonalTrack fetch.
+///
+/// PersonalTrack is never deserialized from a snapshot — re-fetched fresh
+/// here exactly as initialize() does for a brand-new run. That invariant
+/// (see this file's module doc comment and write_checkpoint()'s own doc
+/// comment) is unchanged by this function.
+///
+/// Shared foundation for items.id=245 (resume_run's not_implemented arms)
+/// and this item's own follow-up dispatch (reenter_step(), not built yet).
+/// This function only rebuilds the FocusRun object in memory — it never
+/// writes to focus_runs (the row already exists; its status is the
+/// caller's to change, not this function's) and never calls execute().
+///
+/// current_step derivation: the checkpointed step_id is looked up in
+/// focus_def.steps to find its index. The two call sites that write a
+/// checkpoint (write_checkpoint(), this file) leave that step in different
+/// states:
+///   - the Tier 3 handoff-pause checkpoint (execute()'s requires_user_handoff
+///     branch) is written for the step BEFORE it runs, then the run is
+///     parked at status='awaiting_user' — resume must re-enter at that same
+///     index.
+///   - the periodic mid-run checkpoint (execute()'s checkpoint_every branch)
+///     is written AFTER a step completes — resume must continue at the next
+///     index. A crash between checkpoints leaves status='running'/
+///     'initializing', which demote_interrupted_runs() (above) sweeps to
+///     'paused' at next startup before anything ever calls this function.
+///
+/// So: status=='awaiting_user' resumes AT the checkpointed step; any other
+/// status resumes AFTER it. No snapshot row at all means the run was
+/// interrupted before its first checkpoint — current_step stays 0, exactly
+/// like a fresh run. A step_id that no longer matches any step in the
+/// current focus_def (the .focus file changed underneath the run) also
+/// falls back to 0 rather than erroring — the same "re-read fresh" posture
+/// this item's design already takes for composition changes.
+///
+/// key_hex/pool/scheduler/app_handle/confirmed_cross_persona_fact_ids are
+/// caller-supplied, not persisted — same reasoning FocusRun's own field
+/// doc comments already give for why each of those lives only in memory.
+#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346 (matches FocusRun::new()).
+pub async fn rehydrate_focus_run<L: DisclosureLoggerForRun>(
+    user_id: String,
+    persona_id: String,
+    focus_run_id: String,
+    pool: sqlx::SqlitePool,
+    scheduler: Arc<ConductorScheduler>,
+    key_hex: Option<String>,
+    confirmed_cross_persona_fact_ids: std::collections::HashSet<String>,
+    app_handle: Option<tauri::AppHandle<tauri::Wry>>,
+) -> Result<FocusRun<L>, LifecycleError> {
+    let key = match key_hex.as_deref() {
+        Some(k) if !k.is_empty() => k,
+        _ => return Err(LifecycleError::NoKey),
+    };
+
+    let mut conn = open_outputs_db(&user_id, &persona_id, key).await?;
+
+    let run_row = sqlx::query(
+        "SELECT focus_id, status, is_fast_lane, is_quick_ask, topic_id, user_input
+         FROM focus_runs WHERE id = ?",
+    )
+    .bind(&focus_run_id)
+    .fetch_optional(&mut conn)
+    .await?
+    .ok_or_else(|| LifecycleError::RunNotFound(focus_run_id.clone()))?;
+
+    let focus_id: String = run_row.try_get("focus_id")?;
+    let status: String = run_row.try_get("status")?;
+    let is_fast_lane: bool = run_row.try_get::<i64, _>("is_fast_lane")? != 0;
+    let is_quick_ask: bool = run_row.try_get::<i64, _>("is_quick_ask")? != 0;
+    let topic_id: Option<String> = run_row.try_get("topic_id")?;
+    let user_input: String = run_row
+        .try_get::<Option<String>, _>("user_input")?
+        .unwrap_or_default();
+
+    let snapshot_row = sqlx::query(
+        "SELECT step_id, task_track_json, shared_state_json
+         FROM focus_run_snapshots
+         WHERE focus_run_id = ?
+         ORDER BY created_at DESC
+         LIMIT 1",
+    )
+    .bind(&focus_run_id)
+    .fetch_optional(&mut conn)
+    .await?;
+
+    drop(conn);
+
+    let mut run = FocusRun::<L>::new(
+        user_id,
+        persona_id,
+        focus_id,
+        pool,
+        scheduler,
+        user_input,
+        is_fast_lane,
+        Some(key.to_owned()),
+        topic_id,
+        is_quick_ask,
+        confirmed_cross_persona_fact_ids,
+        app_handle,
+    );
+    run.focus_run_id = Some(focus_run_id);
+
+    run.load().await?;
+    run.resolve_tier_config().await?;
+    run.failure_handler = Some(FailureHandler::new(run._focus_external_access));
+
+    let mut personal_track = run.build_personal_track().await?;
+    personal_track.seal();
+    run.personal_track = Some(personal_track);
+    run.privacy_gateway = Some(PrivacyGateway::new(L::for_run(
+        &run.user_id,
+        &run.persona_id,
+        key,
+    )));
+    run._persona_context_rendered = run.assemble_persona_context().await;
+
+    let (task_track, shared_state, current_step) = match snapshot_row {
+        Some(row) => {
+            let step_id: String = row.try_get("step_id")?;
+            let task_json: String = row.try_get("task_track_json")?;
+            let shared_json: String = row.try_get("shared_state_json")?;
+
+            let task_track = deserialize_task_track(&task_json)?;
+            let shared_state = deserialize_shared_state_track(&shared_json)?;
+
+            let step_index = run
+                .focus_def
+                .as_ref()
+                .unwrap()
+                .steps
+                .iter()
+                .position(|s| s.step_id == step_id);
+            let resume_at = match step_index {
+                Some(i) if status == "awaiting_user" => i,
+                Some(i) => i + 1,
+                None => 0,
+            };
+            (task_track, shared_state, resume_at)
+        }
+        None => (TaskTrack::new(), SharedStateTrack::new(), 0),
+    };
+
+    run.task_track = Some(task_track);
+    run.shared_state = Some(shared_state);
+    run.current_step = current_step;
+
+    Ok(run)
+}
+
+/// Rebuild a TaskTrack from write_checkpoint()'s stored JSON shape
+/// (`{"steps": [...], "sensitivity_ceiling": N}`) by replaying add_step()
+/// for each stored step in order — add_step() is TaskTrack's only writer,
+/// so this reproduces output_vars and sensitivity_ceiling identically to
+/// the original run rather than trying to poke private fields directly.
+fn deserialize_task_track(json: &str) -> Result<TaskTrack, LifecycleError> {
+    #[derive(Deserialize)]
+    struct StoredTaskData {
+        steps: Vec<TaskStep>,
+    }
+    let stored: StoredTaskData = serde_json::from_str(json)?;
+    let mut track = TaskTrack::new();
+    for step in stored.steps {
+        track.add_step(step);
+    }
+    Ok(track)
+}
+
+/// Rebuild a SharedStateTrack from write_checkpoint()'s stored JSON shape
+/// (`{"step_disclosure_buffers": {...}, "promotions": [...]}`), replaying
+/// write_disclosure_buffer()/promote_content() — same reasoning as
+/// deserialize_task_track() above. Promotions are replayed in their
+/// stored (append) order so get_promoted()'s "most recent wins" search
+/// still resolves the same way it did in the original run.
+fn deserialize_shared_state_track(json: &str) -> Result<SharedStateTrack, LifecycleError> {
+    #[derive(Deserialize)]
+    struct StoredSharedData {
+        step_disclosure_buffers: HashMap<String, HashMap<String, String>>,
+        promotions: Vec<PromotedContentEntry>,
+    }
+    let stored: StoredSharedData = serde_json::from_str(json)?;
+    let mut track = SharedStateTrack::new();
+    for (step_id, fields) in stored.step_disclosure_buffers {
+        track.write_disclosure_buffer(step_id, fields);
+    }
+    for p in stored.promotions {
+        track.promote_content(p.step_id, p.content_key, p.content);
+    }
+    Ok(track)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conductor::types::TaskStep;
 
     /// A lazy, never-connected shared.db pool (items.id=483) for FocusRun
     /// test fixtures that never exercise a DB-touching method
