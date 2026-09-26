@@ -56,6 +56,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::execution::get_run_output,
         commands::execution::cancel_run,
         commands::execution::resume_run,
+        commands::execution::reenter_step,
         // Group 2 -- Consent and privacy gates
         commands::consent::submit_consent_decision,
         commands::consent::submit_floor_consent_decision,

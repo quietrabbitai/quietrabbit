@@ -87,6 +87,22 @@ impl StepType {
             Self::PostProcess => "post_process",
         }
     }
+
+    /// items.id=574 (reenter_step()): whether a step of this type is safe to
+    /// re-run with new information, given only what the type itself does --
+    /// never a per-instance customization choice (see StepDefinition::revisitable's
+    /// own doc comment for why there is no .focus YAML override). executor.rs
+    /// does not yet branch on step_type at all, so this is a product judgment
+    /// call, not something derivable from current execution behavior --
+    /// confirmed against every shipped .focus file (Jason, 2026-09-26):
+    /// generate appears 10 times across 4 Focuses, voice_transform exactly
+    /// once (writing-assistant.focus's "Refining your voice..." step, a real
+    /// style-refinement step, clearly safe to redo), post_process zero times
+    /// anywhere -- so PostProcess defaults false (no evidence it is safe; the
+    /// name itself suggests finalization/export/delivery side effects).
+    pub fn default_revisitable(&self) -> bool {
+        matches!(self, Self::Generate | Self::VoiceTransform)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -233,6 +249,17 @@ pub struct StepDefinition {
     /// derivation comment for the full reasoning). Do not gate this field on
     /// requires_user_handoff — the two are independently derived.
     pub external_access_override: Option<ExternalAccess>,
+    /// items.id=574 (reenter_step()): whether a user may jump back to this
+    /// step with new information and re-run forward from it. Derived
+    /// PURELY from step_type at parse time (StepType::default_revisitable())
+    /// -- unlike requires_user_handoff, there is deliberately no .focus YAML
+    /// field to author this per-instance. requires_user_handoff's
+    /// authored-with-derived-fallback pattern exists specifically for
+    /// back-compat with .focus files written before that field existed;
+    /// revisitable has no legacy files to be compatible with, so whether a
+    /// KIND of step is safe to re-run stays a property of what the step
+    /// type does, not a per-step customization choice (Jason, 2026-09-26).
+    pub revisitable: bool,
     /// items.id=439 (Part 6d): the "pause and hand off to the user" signal,
     /// fully decoupled from external_access — checked directly in
     /// lifecycle.rs's EXECUTE step loop. As of items.id=528 Phase 2, authored
@@ -320,6 +347,7 @@ mod tests {
             options_override: HashMap::new(),
             external_access_override,
             requires_user_handoff,
+            revisitable: StepType::Generate.default_revisitable(),
         }
     }
 
@@ -487,5 +515,26 @@ mod tests {
             step.external_access_override,
             Some(ExternalAccess::LocalOnly)
         );
+    }
+
+    // -- StepType::default_revisitable() (items.id=574 follow-up) ----------
+    //
+    // Confirmed against every shipped .focus file (Jason, 2026-09-26):
+    // generate x10, voice_transform x1 (a real style-refinement step),
+    // post_process x0 anywhere -- so only PostProcess defaults unsafe.
+
+    #[test]
+    fn generate_defaults_revisitable() {
+        assert!(StepType::Generate.default_revisitable());
+    }
+
+    #[test]
+    fn voice_transform_defaults_revisitable() {
+        assert!(StepType::VoiceTransform.default_revisitable());
+    }
+
+    #[test]
+    fn post_process_defaults_not_revisitable() {
+        assert!(!StepType::PostProcess.default_revisitable());
     }
 }

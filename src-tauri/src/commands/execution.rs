@@ -47,7 +47,8 @@ use tauri::State;
 
 use crate::auth::registry::{key_hex, KeyRegistry};
 use crate::conductor::concurrency::ConductorScheduler;
-use crate::conductor::lifecycle::{rehydrate_focus_run, FocusRun};
+use crate::conductor::lifecycle::{rehydrate_focus_run, FocusRun, LifecycleError};
+use crate::conductor::reentry::ReentryError;
 use crate::persistence::output_store;
 
 // ---------------------------------------------------------------------------
@@ -88,6 +89,25 @@ pub struct ResumeRunRequest {
     pub run_id: String,
     pub user_id: String,
     pub persona_id: String,
+}
+
+#[derive(Debug, Deserialize, Type)]
+pub struct ReenterStepRequest {
+    pub run_id: String,
+    pub target_step_id: String,
+    pub user_id: String,
+    pub persona_id: String,
+}
+
+#[derive(Debug, Serialize, Type)]
+pub struct ReenterStepResponse {
+    pub run_id: String,
+    // u32, not usize: specta-typescript forbids exporting BigInt-style
+    // types (usize/isize/i64/u64/i128/u128) across the IPC boundary to
+    // avoid TS precision loss. A step index safely fits u32.
+    pub resume_from_index: u32,
+    pub discarded_step_ids: Vec<String>,
+    pub stale_output_vars: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -475,4 +495,118 @@ pub async fn resume_run(
     // FocusRun actor is still resident. Snapshot replay for resume_run() on this
     // path is deferred post-Release-1.
     Err("not_implemented".to_string())
+}
+
+/// Jump back to an earlier step in an already-executed run with new
+/// information, discarding the now-stale downstream steps (items.id=574
+/// follow-up, cb-07). Rewinds and checkpoints only -- it does NOT resume
+/// execution itself; call resume_run() afterward to actually continue
+/// forward, exactly like a crash-recovered run would.
+///
+/// Status gating mirrors resume_run()'s own terminal check plus one more
+/// carve-out: 'complete'/'cancelled'/'failed' are rejected because
+/// cleanup() purges focus_run_snapshots for exactly those three statuses
+/// (lifecycle.rs cleanup()) -- there is no snapshot left to rehydrate from.
+/// 'awaiting_extract_confirm' is also rejected: ownership of finishing that
+/// run has already passed to submit_extract_confirm (commands/consent.rs),
+/// and mutating task_track/current_step concurrently with that in-flight
+/// handoff is a real race with no reentry use case that needs it -- the
+/// user can confirm/cancel the extraction first and reenter from the
+/// settled status that follows. Every other status (awaiting_user,
+/// awaiting_feedback, paused, running, initializing) keeps its snapshot on
+/// disk and is accepted, including awaiting_feedback so a user can revise
+/// an earlier step after seeing the final output (items.id=574's own
+/// job-hunting motivating example).
+#[tauri::command]
+#[specta::specta]
+pub async fn reenter_step(
+    app_handle: tauri::AppHandle,
+    scheduler: tauri::State<'_, Arc<ConductorScheduler>>,
+    pool: tauri::State<'_, sqlx::SqlitePool>,
+    key_registry: State<'_, KeyRegistry>,
+    request: ReenterStepRequest,
+) -> Result<ReenterStepResponse, String> {
+    use crate::persistence::output_store::get_focus_run_status;
+
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
+    let status = get_focus_run_status(
+        &request.user_id,
+        &request.persona_id,
+        &key_hex_str,
+        &request.run_id,
+    )
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| "not_found".to_string())?;
+
+    match status.as_str() {
+        "complete" | "cancelled" | "failed" => {
+            return Err(format!("run_already_finished:{status}"));
+        }
+        "awaiting_extract_confirm" => {
+            return Err("not_resumable:awaiting_extract_confirm".to_string());
+        }
+        "awaiting_user" | "awaiting_feedback" | "paused" | "running" | "initializing" => {}
+        other => return Err(format!("not_implemented:unrecognized_status:{other}")),
+    }
+
+    let scheduler = Arc::clone(&*scheduler);
+    let mut run: FocusRun = rehydrate_focus_run(
+        request.user_id.clone(),
+        request.persona_id.clone(),
+        request.run_id.clone(),
+        pool.inner().clone(),
+        scheduler,
+        Some(key_hex_str),
+        std::collections::HashSet::new(),
+        Some(app_handle),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // This run's resolved step list -- already customization-applied at
+    // LOAD time (focus_def.steps), not the Focus type's raw catalog.
+    let focus_step_order: Vec<String> = run
+        .focus_def
+        .as_ref()
+        .map(|fd| fd.steps.iter().map(|s| s.step_id.clone()).collect())
+        .unwrap_or_default();
+
+    let target_step = run
+        .focus_def
+        .as_ref()
+        .and_then(|fd| {
+            fd.steps
+                .iter()
+                .find(|s| s.step_id == request.target_step_id)
+        })
+        .ok_or_else(|| format!("step_not_found:{}", request.target_step_id))?;
+
+    if !target_step.revisitable {
+        return Err(format!("step_not_revisitable:{}", request.target_step_id));
+    }
+
+    let plan = run
+        .reenter_step(&focus_step_order, &request.target_step_id)
+        .await
+        .map_err(|e| match e {
+            LifecycleError::Reentry(ReentryError::StepNotFound(id)) => {
+                format!("step_not_found:{id}")
+            }
+            LifecycleError::Reentry(ReentryError::NothingToDiscard(id)) => {
+                format!("nothing_to_discard:{id}")
+            }
+            other => other.to_string(),
+        })?;
+
+    Ok(ReenterStepResponse {
+        run_id: request.run_id,
+        resume_from_index: plan.resume_from_index as u32,
+        discarded_step_ids: plan.discarded_step_ids,
+        stale_output_vars: plan.stale_output_vars,
+    })
 }

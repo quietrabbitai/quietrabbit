@@ -52,6 +52,29 @@ export const commands = {
 	 *  run_status_update push events, not this command's return value.
 	 */
 	resumeRun: (request: ResumeRunRequest) => typedError<string, string>(__TAURI_INVOKE("resume_run", { request })),
+	/**
+	 *  Jump back to an earlier step in an already-executed run with new
+	 *  information, discarding the now-stale downstream steps (items.id=574
+	 *  follow-up, cb-07). Rewinds and checkpoints only -- it does NOT resume
+	 *  execution itself; call resume_run() afterward to actually continue
+	 *  forward, exactly like a crash-recovered run would.
+	 * 
+	 *  Status gating mirrors resume_run()'s own terminal check plus one more
+	 *  carve-out: 'complete'/'cancelled'/'failed' are rejected because
+	 *  cleanup() purges focus_run_snapshots for exactly those three statuses
+	 *  (lifecycle.rs cleanup()) -- there is no snapshot left to rehydrate from.
+	 *  'awaiting_extract_confirm' is also rejected: ownership of finishing that
+	 *  run has already passed to submit_extract_confirm (commands/consent.rs),
+	 *  and mutating task_track/current_step concurrently with that in-flight
+	 *  handoff is a real race with no reentry use case that needs it -- the
+	 *  user can confirm/cancel the extraction first and reenter from the
+	 *  settled status that follows. Every other status (awaiting_user,
+	 *  awaiting_feedback, paused, running, initializing) keeps its snapshot on
+	 *  disk and is accepted, including awaiting_feedback so a user can revise
+	 *  an earlier step after seeing the final output (items.id=574's own
+	 *  job-hunting motivating example).
+	 */
+	reenterStep: (request: ReenterStepRequest) => typedError<ReenterStepResponse, string>(__TAURI_INVOKE("reenter_step", { request })),
 	submitConsentDecision: (request: SubmitConsentDecisionRequest) => typedError<null, string>(__TAURI_INVOKE("submit_consent_decision", { request })),
 	submitFloorConsentDecision: (request: SubmitFloorConsentDecisionRequest) => typedError<null, string>(__TAURI_INVOKE("submit_floor_consent_decision", { request })),
 	submitElementConsentDecision: (request: SubmitElementConsentDecisionRequest) => typedError<null, string>(__TAURI_INVOKE("submit_element_consent_decision", { request })),
@@ -1363,6 +1386,20 @@ export type RecheckCloudFrontierProviderSelectionRequest = {
  */
 export type RecoveryKeyDisplay = {
 	mnemonic: string,
+};
+
+export type ReenterStepRequest = {
+	run_id: string,
+	target_step_id: string,
+	user_id: string,
+	persona_id: string,
+};
+
+export type ReenterStepResponse = {
+	run_id: string,
+	resume_from_index: number,
+	discarded_step_ids: string[],
+	stale_output_vars: string[],
 };
 
 /**

@@ -89,6 +89,7 @@ use crate::conductor::memory_broker::MemoryBroker;
 use crate::conductor::privacy::output_scan::{scan_output, ScanIntensity};
 use crate::conductor::privacy::types::sensitivity_severity;
 use crate::conductor::privacy::{logger::DisclosureLoggerForRun, PrivacyGateway};
+use crate::conductor::reentry::{self, ReentryError, ReentryPlan};
 use crate::conductor::tokens::{
     validate_step, ExternalAccess, FieldRequirement, StepDefinition, StepType,
 };
@@ -132,6 +133,10 @@ pub enum LifecycleError {
     // Rehydrate (items.id=574 shared foundation / items.id=245)
     #[error("Focus run not found: {0}")]
     RunNotFound(String),
+
+    // reenter_step() (items.id=574 follow-up)
+    #[error("Reentry: {0}")]
+    Reentry(#[from] ReentryError),
 
     // F_SYSTEM — caught in execute_full() for FailureResult mapping
     #[error("Taxonomy integrity: {0}")]
@@ -480,6 +485,7 @@ fn parse_focus_definition(raw: RawFocusFile) -> Result<FocusDefinition, Lifecycl
             } else {
                 Some(routing_tier)
             };
+            let revisitable = step_type.default_revisitable();
 
             steps.push(StepDefinition {
                 step_id: step_id_key.clone(),
@@ -496,6 +502,7 @@ fn parse_focus_definition(raw: RawFocusFile) -> Result<FocusDefinition, Lifecycl
                 options_override,
                 external_access_override,
                 requires_user_handoff,
+                revisitable,
             });
         }
     }
@@ -2513,6 +2520,110 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         self.emit_status("running", None);
         self.execute_and_finish().await
     }
+
+    /// Named re-entry with delta scope (items.id=574 follow-up, cb-07):
+    /// jump back to `target_step_id` with new information, discard the now-
+    /// stale downstream steps, and leave the run positioned to resume
+    /// forward from there on the next call to execute()/resume_execution().
+    ///
+    /// Deliberately does NOT call execute() itself -- exactly like
+    /// rehydrate_focus_run(), this only rewinds and persists state. A
+    /// separate, already-built "fresh execution call" (resume_run's
+    /// rehydrate_focus_run() + resume_execution() path) is what actually
+    /// continues forward -- the existing execute() loop already starts
+    /// from self.current_step unconditionally (crash-resume requires
+    /// exactly that), so nothing about it needs to change for reentry.
+    ///
+    /// Callers must have already produced `self` via rehydrate_focus_run(),
+    /// same precondition resume_execution() has.
+    ///
+    /// focus_step_order is the caller's resolved step list (this run's own
+    /// focus_def.steps, in order) -- see reentry::plan_reentry()'s own doc
+    /// comment for why this can't be derived from task_track alone.
+    pub async fn reenter_step(
+        &mut self,
+        focus_step_order: &[String],
+        target_step_id: &str,
+    ) -> Result<ReentryPlan, LifecycleError> {
+        let plan = reentry::plan_reentry(
+            self.task_track.as_ref().unwrap(),
+            focus_step_order,
+            target_step_id,
+        )?;
+
+        self.task_track = Some(reentry::rebuild_preserved_track(
+            self.task_track.as_ref().unwrap(),
+            &plan,
+        ));
+
+        let focus_run_id = self.focus_run_id.as_deref().unwrap();
+        let key_hex = self.key_hex.as_deref().ok_or(LifecycleError::NoKey)?;
+        let mut conn = open_outputs_db(&self.user_id, &self.persona_id, key_hex).await?;
+        let timestamp = now();
+
+        for step_id in &plan.discarded_step_ids {
+            // No-op (0 rows) is expected and fine when this step never got a
+            // focus_run_steps row in the first place -- nothing writes rows
+            // for ordinary forward execution yet (items.id=574 follow-up,
+            // not this dispatch); this UPDATE only ever affects rows a prior
+            // reenter_step() call itself inserted.
+            sqlx::query(
+                "UPDATE focus_run_steps SET status = 'discarded', updated_at = ?
+                 WHERE focus_run_id = ? AND step_id = ? AND status != 'discarded'",
+            )
+            .bind(&timestamp)
+            .bind(focus_run_id)
+            .bind(step_id)
+            .execute(&mut conn)
+            .await?;
+        }
+
+        // HARD INVARIANT (Jason, items.id=574): focus_run_steps has no
+        // superseded_by pointer column -- the schema relies entirely on
+        // `attempt` being a monotonic integer per (focus_run_id, step_id),
+        // so the successor to any row is always MAX(attempt)+1 for that same
+        // key. Nothing in the schema enforces this -- it MUST be computed
+        // here, never a caller-supplied or independently-derived value, or
+        // the "no pointer column needed" simplification silently breaks.
+        let next_attempt: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(attempt), 0) + 1 FROM focus_run_steps
+             WHERE focus_run_id = ? AND step_id = ?",
+        )
+        .bind(focus_run_id)
+        .bind(target_step_id)
+        .fetch_one(&mut conn)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO focus_run_steps
+             (id, focus_run_id, step_id, attempt, sequence_index, status, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(focus_run_id)
+        .bind(target_step_id)
+        .bind(next_attempt)
+        .bind(plan.resume_from_index as i64)
+        .bind(&timestamp)
+        .bind(&timestamp)
+        .execute(&mut conn)
+        .await?;
+
+        drop(conn);
+
+        self.current_step = plan.resume_from_index;
+
+        // Required, not cosmetic: rehydrate_focus_run()'s own resume-index
+        // derivation only resumes AT the checkpointed step when status ==
+        // "awaiting_user" -- every other status resumes AFTER it (i + 1).
+        // We are about to checkpoint at target_step_id and need a future
+        // rehydrate (e.g. after a crash before the next execute() call) to
+        // land exactly there, not one step later.
+        self.write_focus_run_record("awaiting_user").await?;
+        self.write_checkpoint(target_step_id).await?;
+
+        Ok(plan)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3006,6 +3117,49 @@ mod tests {
         assert_eq!(def.steps[0].guide_id, "custom-guide");
         assert_eq!(def.steps[0].step_id, "step_a");
         assert_eq!(def.steps[0].output_var.as_deref(), Some("result"));
+    }
+
+    #[test]
+    fn parse_derives_revisitable_from_step_type() {
+        // Exercises the real production derivation (parse_focus_definition(),
+        // not just tokens.rs's StepType::default_revisitable() unit tests)
+        // for all 3 step_types in one fixture.
+        let mut steps_map = IndexMap::new();
+        for (id, raw_type) in [
+            ("s_generate", "generate"),
+            ("s_voice", "voice_transform"),
+            ("s_post", "post_process"),
+        ] {
+            steps_map.insert(
+                id.to_owned(),
+                RawStep {
+                    display_name: None,
+                    guide_id: None,
+                    task_type: None,
+                    routing_tier: None,
+                    requires_user_handoff: None,
+                    step_type: Some(raw_type.to_owned()),
+                    output_var: None,
+                    prompt_template: None,
+                    field_requirements: None,
+                    options_override: None,
+                },
+            );
+        }
+        let mut raw = minimal_raw();
+        raw.steps = Some(steps_map);
+        let def = parse_focus_definition(raw).unwrap();
+
+        let revisitable = |id: &str| {
+            def.steps
+                .iter()
+                .find(|s| s.step_id == id)
+                .unwrap()
+                .revisitable
+        };
+        assert!(revisitable("s_generate"));
+        assert!(revisitable("s_voice"));
+        assert!(!revisitable("s_post"));
     }
 
     #[test]
@@ -4342,5 +4496,258 @@ mod tests {
             assert_eq!(status, "complete");
         })
         .await;
+    }
+
+    // -------------------------------------------------------------------------
+    // reenter_step() (items.id=574 follow-up, cb-07)
+    // -------------------------------------------------------------------------
+
+    /// End-to-end: a real writing-assistant run (3 real steps --
+    /// voice_analysis/generate, draft_writing/generate, voice_transform/
+    /// voice_transform -- all revisitable=true) that already completed all
+    /// three steps, reentered at the middle step. Proves the plan is
+    /// applied for real: task_track rebuilt to only the preserved step,
+    /// current_step rewound, focus_runs.status flipped to 'awaiting_user'
+    /// (required for a future rehydrate to resume AT, not after, the
+    /// checkpointed step), a checkpoint written, and focus_run_steps rows
+    /// written for the first time ever against this run (this table has no
+    /// other writer anywhere in the codebase yet).
+    #[tokio::test]
+    async fn reenter_step_middle_step_rewinds_track_and_persists_state() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "reentry-user";
+        let persona_id = "reentry-persona";
+        let pool = setup_shared_and_persona_for_resume_test(user_id, persona_id).await;
+        let focus_run_id = uuid::Uuid::new_v4().to_string();
+
+        {
+            let mut conn = open_outputs_db(user_id, persona_id, RESUME_TEST_KEY_HEX)
+                .await
+                .expect("open_outputs_db must succeed");
+            sqlx::query(
+                "INSERT INTO focus_runs
+                 (id, focus_id, status, is_fast_lane, is_quick_ask, topic_id, user_input, started_at)
+                 VALUES (?, 'writing-assistant', 'awaiting_feedback', 0, 0, NULL, ?, ?)",
+            )
+            .bind(&focus_run_id)
+            .bind("Test user input for reentry")
+            .bind(now())
+            .execute(&mut conn)
+            .await
+            .expect("seed focus_runs insert must succeed");
+        }
+
+        // Seed a real checkpoint (all 3 steps complete) via write_checkpoint()
+        // itself, same pattern as the rehydrate test above.
+        {
+            let scheduler = Arc::new(ConductorScheduler::new());
+            let mut seed_run: FocusRun = FocusRun::new(
+                user_id.to_owned(),
+                persona_id.to_owned(),
+                "writing-assistant".to_owned(),
+                pool.clone(),
+                scheduler,
+                "Test user input for reentry".to_owned(),
+                false,
+                Some(RESUME_TEST_KEY_HEX.to_owned()),
+                None,
+                false,
+                std::collections::HashSet::new(),
+                None,
+            );
+            seed_run.focus_run_id = Some(focus_run_id.clone());
+            let mut personal_track = PersonalTrack::new();
+            personal_track.seal();
+            seed_run.personal_track = Some(personal_track);
+            let mut task_track = TaskTrack::new();
+            task_track.add_step(TaskStep {
+                step_id: "voice_analysis".to_owned(),
+                output_var: Some("voice_analysis_output".to_owned()),
+                content: "Analysis".to_owned(),
+                sensitivity_severity: 1,
+                routing_tier_used: 1,
+            });
+            task_track.add_step(TaskStep {
+                step_id: "draft_writing".to_owned(),
+                output_var: Some("draft_output".to_owned()),
+                content: "Original draft".to_owned(),
+                sensitivity_severity: 1,
+                routing_tier_used: 2,
+            });
+            task_track.add_step(TaskStep {
+                step_id: "voice_transform".to_owned(),
+                output_var: Some("final_output".to_owned()),
+                content: "Original final".to_owned(),
+                sensitivity_severity: 1,
+                routing_tier_used: 1,
+            });
+            seed_run.task_track = Some(task_track);
+            seed_run.shared_state = Some(SharedStateTrack::new());
+            seed_run
+                .write_checkpoint("voice_transform")
+                .await
+                .expect("write_checkpoint must succeed");
+        }
+
+        let scheduler = Arc::new(ConductorScheduler::new());
+        let mut run: FocusRun = rehydrate_focus_run(
+            user_id.to_owned(),
+            persona_id.to_owned(),
+            focus_run_id.clone(),
+            pool.clone(),
+            scheduler,
+            Some(RESUME_TEST_KEY_HEX.to_owned()),
+            std::collections::HashSet::new(),
+            None,
+        )
+        .await
+        .expect("rehydrate_focus_run must succeed");
+
+        let focus_step_order: Vec<String> = run
+            .focus_def
+            .as_ref()
+            .unwrap()
+            .steps
+            .iter()
+            .map(|s| s.step_id.clone())
+            .collect();
+        assert_eq!(
+            focus_step_order,
+            vec![
+                "voice_analysis".to_owned(),
+                "draft_writing".to_owned(),
+                "voice_transform".to_owned()
+            ]
+        );
+
+        let plan = run
+            .reenter_step(&focus_step_order, "draft_writing")
+            .await
+            .expect("reenter_step must succeed");
+
+        assert_eq!(plan.resume_from_index, 1);
+        assert_eq!(plan.preserved_step_ids, vec!["voice_analysis".to_owned()]);
+        assert_eq!(
+            plan.discarded_step_ids,
+            vec!["draft_writing".to_owned(), "voice_transform".to_owned()]
+        );
+
+        assert_eq!(run.current_step, 1);
+        assert_eq!(
+            run.task_track.as_ref().unwrap().steps().len(),
+            1,
+            "rebuilt task_track must keep only the preserved (pre-target) step"
+        );
+        assert_eq!(
+            run.task_track.as_ref().unwrap().last_output(),
+            Some("Analysis")
+        );
+
+        let mut conn = open_outputs_db(user_id, persona_id, RESUME_TEST_KEY_HEX)
+            .await
+            .expect("open_outputs_db must succeed");
+
+        let status: String = sqlx::query_scalar("SELECT status FROM focus_runs WHERE id = ?")
+            .bind(&focus_run_id)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            status, "awaiting_user",
+            "must be set so a future rehydrate resumes AT the checkpointed \
+             step (target_step_id), not one index past it"
+        );
+
+        // First-ever write to focus_run_steps for this run: only
+        // draft_writing gets a fresh row (it's the reentry target); the
+        // other discarded step (voice_transform) never had a live row to
+        // begin with, so its UPDATE was a no-op -- correct, not a bug.
+        let rows: Vec<(String, i64, String)> = sqlx::query_as(
+            "SELECT step_id, attempt, status FROM focus_run_steps
+             WHERE focus_run_id = ? ORDER BY step_id",
+        )
+        .bind(&focus_run_id)
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![("draft_writing".to_owned(), 1, "pending".to_owned())]
+        );
+        drop(conn);
+
+        // Simulate forward execution having continued past the rewind and
+        // completed draft_writing and voice_transform again -- out of scope
+        // for reenter_step() itself (that's execute()'s own forward loop,
+        // exercised separately; ticket point 3 confirms it needs no change).
+        run.task_track.as_mut().unwrap().add_step(TaskStep {
+            step_id: "draft_writing".to_owned(),
+            output_var: Some("draft_output".to_owned()),
+            content: "Second draft".to_owned(),
+            sensitivity_severity: 1,
+            routing_tier_used: 2,
+        });
+        run.task_track.as_mut().unwrap().add_step(TaskStep {
+            step_id: "voice_transform".to_owned(),
+            output_var: Some("final_output".to_owned()),
+            content: "Second final".to_owned(),
+            sensitivity_severity: 1,
+            routing_tier_used: 1,
+        });
+
+        // Reenter draft_writing again -- the HARD INVARIANT under test:
+        // attempt must be MAX(attempt)+1 for (focus_run_id, step_id) =
+        // (this run, draft_writing), i.e. 2 (the first call's row is still
+        // attempt=1/'pending'), never reset to 1 and never independently
+        // derived from anything else.
+        let plan2 = run
+            .reenter_step(&focus_step_order, "draft_writing")
+            .await
+            .expect("second reenter_step of the same step must succeed");
+        assert_eq!(plan2.resume_from_index, 1);
+        assert_eq!(plan2.preserved_step_ids, vec!["voice_analysis".to_owned()]);
+
+        let mut conn = open_outputs_db(user_id, persona_id, RESUME_TEST_KEY_HEX)
+            .await
+            .expect("open_outputs_db must succeed");
+        let rows: Vec<(String, i64, String)> = sqlx::query_as(
+            "SELECT step_id, attempt, status FROM focus_run_steps
+             WHERE focus_run_id = ? ORDER BY step_id, attempt",
+        )
+        .bind(&focus_run_id)
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("draft_writing".to_owned(), 1, "discarded".to_owned()),
+                ("draft_writing".to_owned(), 2, "pending".to_owned()),
+            ]
+        );
+        drop(conn);
+
+        // task_track was rebuilt back down to just [voice_analysis] again --
+        // reentering it now (the track's only/most recent step) must hit
+        // NothingToDiscard, same as plan_reentry's own unit test coverage.
+        let plan3 = run.reenter_step(&focus_step_order, "voice_analysis").await;
+        assert!(
+            matches!(
+                plan3,
+                Err(LifecycleError::Reentry(ReentryError::NothingToDiscard(_)))
+            ),
+            "voice_analysis is now the track's only (most recent) step -- \
+             nothing after it to discard"
+        );
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
     }
 }
