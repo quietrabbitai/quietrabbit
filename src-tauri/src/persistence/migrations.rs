@@ -160,6 +160,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/outputs_010.sql"),
     },
     SchemaFile {
+        prefix: "outputs",
+        version: 11,
+        sql: include_str!("../../schema/outputs_011.sql"),
+    },
+    SchemaFile {
         prefix: "personal",
         version: 1,
         sql: include_str!("../../schema/personal_001.sql"),
@@ -308,6 +313,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         prefix: "shared",
         version: 20,
         sql: include_str!("../../schema/shared_020.sql"),
+    },
+    SchemaFile {
+        prefix: "shared",
+        version: 21,
+        sql: include_str!("../../schema/shared_021.sql"),
     },
     SchemaFile {
         prefix: "tier3_cookies",
@@ -1958,15 +1968,15 @@ mod tests {
             .await
             .expect("shared migration chain must apply cleanly on a fresh db");
         assert_eq!(
-            applied, 20,
-            "expected all twenty shared schema versions to apply"
+            applied, 21,
+            "expected all twenty-one shared schema versions to apply"
         );
 
         let version: (i64,) = sqlx::query_as("SELECT MAX(version) FROM schema_version")
             .fetch_one(&mut conn)
             .await
             .unwrap();
-        assert_eq!(version.0, 20);
+        assert_eq!(version.0, 21);
     }
 
     #[tokio::test]
@@ -2037,8 +2047,8 @@ mod tests {
             .expect("drift-healing run must succeed");
 
         assert_eq!(
-            applied, 19,
-            "shared v2 through v20 should count as newly applied from a stale v1 database"
+            applied, 20,
+            "shared v2 through v21 should count as newly applied from a stale v1 database"
         );
 
         // items.id=427: shared_013.sql drops tier3_providers (generalized
@@ -2909,10 +2919,10 @@ mod tests {
 
         assert_eq!(
             result.expect("migration must apply cleanly"),
-            10,
+            11,
             "outputs_001 + outputs_002 + outputs_003 + outputs_004 + outputs_005 + \
-             outputs_006 + outputs_007 + outputs_008 + outputs_009 + outputs_010 \
-             must all apply in one pass"
+             outputs_006 + outputs_007 + outputs_008 + outputs_009 + outputs_010 + \
+             outputs_011 must all apply in one pass"
         );
 
         let mut conn = open_verify_conn(&db_path, Some(TEST_KEY_HEX)).await;

@@ -24,6 +24,8 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+use super::lifecycle::HighPriorityTrigger;
+
 // ---------------------------------------------------------------------------
 // SYSTEM_TOKENS
 // ---------------------------------------------------------------------------
@@ -268,6 +270,34 @@ pub struct StepDefinition {
     /// YAML field is absent, for back-compat with every Focus authored
     /// before this field existed.
     pub requires_user_handoff: bool,
+    /// items.id=496: composition-authored steps only (None for every
+    /// YAML-authored step, always). Some(id) means this step's actual
+    /// execution is delegated to a registered block handler keyed by `id`
+    /// instead of today's StepExecutor/prompt-template pipeline --
+    /// execute_step() dispatches on this field. No handler is registered
+    /// for any id yet; a composition row citing one is rejected at LOAD
+    /// (conductor::lifecycle::load_focus_definition_from_db()), never at
+    /// execute_step() itself. See lifecycle.rs's execute_step() doc comment
+    /// for the dispatch shape.
+    pub block_stable_id: Option<String>,
+    /// items.id=496: the raw customization payload for a composition row
+    /// whose block_stable_id is Some -- opaque at this layer, same
+    /// "schema intentionally open-ended, typed struct deferred" precedent
+    /// options_override already established. Always None when
+    /// block_stable_id is None (the payload becomes this struct's own
+    /// fields instead, via the same derivation path a YAML step uses --
+    /// see load_focus_definition_from_db()).
+    pub block_customization: Option<serde_json::Value>,
+    /// items.id=496 (Q2, per-composition-row placement): a one-shot,
+    /// date-anchored gate on this step's execution eligibility, reusing
+    /// decisions.id=712's HighPriorityTrigger vocabulary verbatim (same
+    /// anchor_field/offset/is_active() shape, same parse_offset()).
+    /// Composition-authored steps only -- always None for a YAML-authored
+    /// step. Checked by execute()'s loop immediately before the
+    /// requires_user_handoff check; see that loop's own comment for the
+    /// gate shape and conductor::scheduled_sweep for how a fired trigger
+    /// resumes the run (via resume_run/rehydrate_focus_run, not a bypass).
+    pub schedule_trigger: Option<HighPriorityTrigger>,
 }
 
 // ---------------------------------------------------------------------------
@@ -348,6 +378,9 @@ mod tests {
             external_access_override,
             requires_user_handoff,
             revisitable: StepType::Generate.default_revisitable(),
+            block_stable_id: None,
+            block_customization: None,
+            schedule_trigger: None,
         }
     }
 

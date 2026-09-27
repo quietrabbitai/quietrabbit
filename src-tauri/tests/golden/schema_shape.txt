@@ -599,6 +599,29 @@ TABLE auth_sessions
   ip_address TEXT notnull=0 pk=0 default=None
   user_agent TEXT notnull=0 pk=0 default=None
   is_remember_me INTEGER notnull=1 pk=0 default=Some("0")
+TABLE building_blocks
+  stable_id TEXT notnull=0 pk=1 default=None
+  display_name TEXT notnull=1 pk=0 default=None
+  invocation_mode TEXT notnull=1 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+  updated_at TEXT notnull=1 pk=0 default=None
+TABLE focus_block_compositions
+  id TEXT notnull=0 pk=1 default=None
+  focus_id TEXT notnull=1 pk=0 default=None
+  step_id TEXT notnull=1 pk=0 default=None
+  block_stable_id TEXT notnull=0 pk=0 default=None
+  sequence_index INTEGER notnull=1 pk=0 default=None
+  schedule_trigger_anchor_field TEXT notnull=0 pk=0 default=None
+  schedule_trigger_offset TEXT notnull=0 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+  updated_at TEXT notnull=1 pk=0 default=None
+TABLE focus_block_customization
+  id TEXT notnull=0 pk=1 default=None
+  composition_id TEXT notnull=1 pk=0 default=None
+  persona_id TEXT notnull=0 pk=0 default=None
+  customization TEXT notnull=1 pk=0 default=Some("'{}'")
+  created_at TEXT notnull=1 pk=0 default=None
+  updated_at TEXT notnull=1 pk=0 default=None
 TABLE focus_provider_criteria
   focus_id TEXT notnull=0 pk=1 default=None
   require_is_local INTEGER notnull=1 pk=0 default=Some("0")
@@ -632,6 +655,21 @@ TABLE focus_settings_friction_decisions
   existing_focus_profile TEXT notnull=1 pk=0 default=None
   existing_max_permitted_tier TEXT notnull=0 pk=0 default=None
   created_at TEXT notnull=1 pk=0 default=None
+TABLE focuses
+  focus_id TEXT notnull=0 pk=1 default=None
+  display_name TEXT notnull=1 pk=0 default=None
+  description TEXT notnull=1 pk=0 default=Some("''")
+  version TEXT notnull=1 pk=0 default=Some("'1.0'")
+  max_routing_tier TEXT notnull=1 pk=0 default=None
+  output_type TEXT notnull=1 pk=0 default=Some("'general'")
+  suggest_in_focuses TEXT notnull=1 pk=0 default=Some("'[]'")
+  multi_source_validation INTEGER notnull=1 pk=0 default=Some("0")
+  generic_title_template TEXT notnull=1 pk=0 default=Some("'Hidden item'")
+  high_priority_trigger_anchor_field TEXT notnull=0 pk=0 default=None
+  high_priority_trigger_offset TEXT notnull=0 pk=0 default=None
+  status TEXT notnull=1 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+  updated_at TEXT notnull=1 pk=0 default=None
 TABLE group_departures
   group_id TEXT notnull=1 pk=1 default=None
   persona_id TEXT notnull=1 pk=2 default=None

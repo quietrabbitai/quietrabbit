@@ -561,6 +561,42 @@ pub async fn get_focus_run_routing_tier(
     }
 }
 
+/// items.id=496: focus_run_id values whose live (non-discarded)
+/// focus_run_steps row has a scheduled_for timestamp at or before `now` and
+/// whose parent run is still parked at 'awaiting_schedule' --
+/// conductor::scheduled_sweep's read side. Read-only, same "run status for
+/// UI polling" carve-out get_focus_run_status above already documents for
+/// this module living outside lifecycle.rs's own state-transition
+/// boundary; the sweep itself calls back into lifecycle.rs
+/// (rehydrate_focus_run + resume_execution) to actually act on what this
+/// returns, same as every other resume_run caller.
+pub async fn list_due_scheduled_focus_runs(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    now: &str,
+) -> Result<Vec<String>, OutputStoreError> {
+    let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
+
+    let rows = sqlx::query(
+        "SELECT DISTINCT frs.focus_run_id
+         FROM focus_run_steps frs
+         JOIN focus_runs fr ON fr.id = frs.focus_run_id
+         WHERE frs.scheduled_for IS NOT NULL
+           AND frs.scheduled_for <= ?
+           AND frs.status != 'discarded'
+           AND fr.status = 'awaiting_schedule'",
+    )
+    .bind(now)
+    .fetch_all(&mut conn)
+    .await?;
+
+    rows.iter()
+        .map(|r| r.try_get::<String, _>("focus_run_id"))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(OutputStoreError::Database)
+}
+
 // ---------------------------------------------------------------------------
 // Last-used (items.id=237)
 // ---------------------------------------------------------------------------

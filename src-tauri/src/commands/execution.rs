@@ -277,9 +277,10 @@ pub async fn cancel_run(
 
 /// Resume a paused focus run.
 ///
-/// Routes by focus_runs.status (schema/outputs_001.sql CHECK — the full set
-/// is 'initializing','running','paused','awaiting_user','awaiting_feedback',
-/// 'awaiting_extract_confirm','complete','cancelled','failed').
+/// Routes by focus_runs.status (schema/outputs_001.sql CHECK, extended by
+/// outputs_011.sql — the full set is 'initializing','running','paused',
+/// 'awaiting_user','awaiting_feedback','awaiting_extract_confirm',
+/// 'awaiting_schedule','complete','cancelled','failed').
 ///
 /// awaiting_extract_confirm routing:
 ///   1. Crash-recovery replay: rows with status='confirmed' AND persisted_at IS NULL
@@ -300,7 +301,7 @@ pub async fn cancel_run(
 /// module (async paste-back)"). Nothing is pending execution; the caller
 /// should fetch the already-produced output via get_run_output instead.
 ///
-/// awaiting_user, paused, running, initializing (items.id=245): the
+/// awaiting_user, awaiting_schedule, paused, running, initializing (items.id=245, items.id=496): the
 /// structural gap the previous revision of this doc comment described here
 /// -- FocusRun::new() requires `user_input`, but user_input was never
 /// persisted anywhere, so a live FocusRun could not be reconstructed to
@@ -383,7 +384,11 @@ pub async fn resume_run(
         // build_personal_track()'s provenance check already applies -- it does
         // not hard-block, so the resumed run still completes on its other,
         // permitted facts.
-        "awaiting_user" | "paused" | "running" | "initializing" => {
+        // items.id=496: awaiting_schedule joins this same collapsed
+        // handling -- rehydrate_focus_run()'s resume-index derivation
+        // already treats it like awaiting_user (both checkpoint the step
+        // BEFORE it runs), so no new branch is needed here either.
+        "awaiting_user" | "awaiting_schedule" | "paused" | "running" | "initializing" => {
             let scheduler = Arc::clone(&*scheduler);
             let mut run: FocusRun = rehydrate_focus_run(
                 request.user_id.clone(),
@@ -513,10 +518,13 @@ pub async fn resume_run(
 /// handoff is a real race with no reentry use case that needs it -- the
 /// user can confirm/cancel the extraction first and reenter from the
 /// settled status that follows. Every other status (awaiting_user,
-/// awaiting_feedback, paused, running, initializing) keeps its snapshot on
-/// disk and is accepted, including awaiting_feedback so a user can revise
-/// an earlier step after seeing the final output (items.id=574's own
-/// job-hunting motivating example).
+/// awaiting_schedule, awaiting_feedback, paused, running, initializing)
+/// keeps its snapshot on disk and is accepted, including awaiting_feedback
+/// so a user can revise an earlier step after seeing the final output
+/// (items.id=574's own job-hunting motivating example). awaiting_schedule
+/// (items.id=496) is not purged by cleanup() either, same as the others --
+/// jumping back to an earlier step while a later one waits on its own
+/// schedule_trigger is ordinary reentry, no special-case needed.
 #[tauri::command]
 #[specta::specta]
 pub async fn reenter_step(
@@ -550,7 +558,8 @@ pub async fn reenter_step(
         "awaiting_extract_confirm" => {
             return Err("not_resumable:awaiting_extract_confirm".to_string());
         }
-        "awaiting_user" | "awaiting_feedback" | "paused" | "running" | "initializing" => {}
+        "awaiting_user" | "awaiting_schedule" | "awaiting_feedback" | "paused" | "running"
+        | "initializing" => {}
         other => return Err(format!("not_implemented:unrecognized_status:{other}")),
     }
 

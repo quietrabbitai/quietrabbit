@@ -346,6 +346,83 @@ fn execution_tier_ordinal(access: ExternalAccess) -> u8 {
     }
 }
 
+/// Already-source-normalized per-step fields, shared between the YAML path
+/// (parse_focus_definition(), below) and the DB-composition path
+/// (load_focus_definition_from_db(), items.id=496). field_requirements and
+/// options_override arrive pre-converted (Vec<{name,scope}> -> HashMap,
+/// source Value -> HashMap<String, serde_json::Value>) because that
+/// conversion is genuinely source-format-specific (serde_yaml::Value vs
+/// plain JSON); everything build_step_definition() does with these fields
+/// is not.
+struct NormalizedRawStep {
+    display_name: Option<String>,
+    guide_id: Option<String>,
+    task_type: Option<String>,
+    routing_tier: Option<u8>,
+    requires_user_handoff: Option<bool>,
+    step_type: Option<String>,
+    output_var: Option<String>,
+    prompt_template: Option<String>,
+    field_requirements: HashMap<String, FieldRequirement>,
+    options_override: HashMap<String, serde_json::Value>,
+}
+
+/// Shared StepDefinition derivation (items.id=496): the routing_tier ->
+/// requires_user_handoff / external_access_override / revisitable math
+/// (items.id=439/528/574) is identical regardless of whether a step came
+/// from a .focus YAML file or a focus_block_compositions/
+/// focus_block_customization row pair -- this is the literal code both
+/// paths run, not a re-implementation, which is what "produce the
+/// equivalent of today's fixed StepDefinition sequence" concretely means.
+/// block_stable_id/block_customization/schedule_trigger are always None
+/// here -- the DB path sets them itself afterward; a YAML-authored step
+/// never has them (see load_focus_definition_from_db()).
+fn build_step_definition(
+    step_id: String,
+    default_guide_id: &str,
+    raw: NormalizedRawStep,
+) -> StepDefinition {
+    let step_type = raw
+        .step_type
+        .as_deref()
+        .and_then(|s| s.parse::<StepType>().ok())
+        .unwrap_or_default();
+
+    // items.id=439 (Part 6c/6d), corrected by items.id=528 Phase 2:
+    // requires_user_handoff and external_access_override are independently
+    // derived, not coupled through each other -- see parse_focus_definition's
+    // historical comment (git blame) for the full reasoning; unchanged by
+    // this extraction.
+    let raw_routing_tier = raw.routing_tier.unwrap_or(1);
+    let requires_user_handoff = raw.requires_user_handoff.unwrap_or(raw_routing_tier == 3);
+    let routing_tier = external_access_from_routing_tier_yaml(raw_routing_tier);
+    let external_access_override = if routing_tier == ExternalAccess::Unrestricted {
+        None
+    } else {
+        Some(routing_tier)
+    };
+    let revisitable = step_type.default_revisitable();
+
+    StepDefinition {
+        display_name: raw.display_name.unwrap_or_else(|| step_id.clone()),
+        guide_id: raw.guide_id.unwrap_or_else(|| default_guide_id.to_owned()),
+        task_type: raw.task_type.unwrap_or_else(|| "general".to_owned()),
+        routing_tier,
+        step_type,
+        output_var: raw.output_var,
+        prompt_template: raw.prompt_template.unwrap_or_default(),
+        field_requirements: raw.field_requirements,
+        options_override: raw.options_override,
+        external_access_override,
+        requires_user_handoff,
+        revisitable,
+        block_stable_id: None,
+        block_customization: None,
+        schedule_trigger: None,
+        step_id,
+    }
+}
+
 /// Convert RawFocusFile -> FocusDefinition.
 /// Replaces Python's hand-written _parse_focus_definition() with serde_yaml.
 /// Applies the same shims: guide_id inheritance, output_types->output_type,
@@ -430,12 +507,6 @@ fn parse_focus_definition(raw: RawFocusFile) -> Result<FocusDefinition, Lifecycl
                 })
                 .collect::<HashMap<_, _>>();
 
-            let step_type = raw_step
-                .step_type
-                .as_deref()
-                .and_then(|s| s.parse::<StepType>().ok())
-                .unwrap_or_default();
-
             // options_override: YAML map -> HashMap<String, serde_json::Value>.
             // serde_yaml::Value implements Serialize; round-trip via serde_json is safe.
             let options_override = raw_step
@@ -451,59 +522,32 @@ fn parse_focus_definition(raw: RawFocusFile) -> Result<FocusDefinition, Lifecycl
                 .unwrap_or_default();
 
             // items.id=439 (Part 6c/6d), corrected by items.id=528 Phase 2:
-            // requires_user_handoff and external_access_override are now
-            // independently derived, not coupled through each other.
-            //
-            // requires_user_handoff: authored directly via the step's own
+            // requires_user_handoff authored directly via the step's own
             // .focus YAML field (added this pass) when present; falls back
             // to raw_routing_tier == 3 when absent -- byte-identical for
             // every .focus file authored before this field existed (none of
-            // the 4 shipped Focuses use routing_tier: 3).
-            //
-            // external_access_override: derived from routing_tier ALONE --
-            // None only when routing_tier is Unrestricted, Some(routing_tier)
-            // otherwise. Deliberately NOT gated on requires_user_handoff
-            // (before this fix the two conditions always coincided --
-            // routing_tier==3 was the only way to get requires_user_handoff
-            // true -- which is exactly why a step author setting
-            // routing_tier: 2 + requires_user_handoff: true together would
-            // previously have silently collapsed to external_access_override
-            // = None). Also deliberately never Some(Unrestricted): that
-            // would trip authorize()'s tighten-only ceiling check and
-            // executor.rs's Step 3 re-check the moment the Focus's own
-            // ceiling is anything less than Unrestricted, which every
-            // shipped Focus's max_routing_tier is today -- a step with no
-            // capability claim of its own (Part 6c's "inherits the Focus's")
-            // must stay None regardless of why routing_tier is Unrestricted.
-            let raw_routing_tier = raw_step.routing_tier.unwrap_or(1);
-            let requires_user_handoff = raw_step
-                .requires_user_handoff
-                .unwrap_or(raw_routing_tier == 3);
-            let routing_tier = external_access_from_routing_tier_yaml(raw_routing_tier);
-            let external_access_override = if routing_tier == ExternalAccess::Unrestricted {
-                None
-            } else {
-                Some(routing_tier)
-            };
-            let revisitable = step_type.default_revisitable();
-
-            steps.push(StepDefinition {
-                step_id: step_id_key.clone(),
-                display_name: raw_step.display_name.unwrap_or_else(|| step_id_key.clone()),
-                guide_id: raw_step
-                    .guide_id
-                    .unwrap_or_else(|| default_guide_id.clone()),
-                task_type: raw_step.task_type.unwrap_or_else(|| "general".to_owned()),
-                routing_tier,
-                step_type,
-                output_var: raw_step.output_var,
-                prompt_template: raw_step.prompt_template.unwrap_or_default(),
-                field_requirements,
-                options_override,
-                external_access_override,
-                requires_user_handoff,
-                revisitable,
-            });
+            // the 4 shipped Focuses use routing_tier: 3). See
+            // build_step_definition() for the rest of the derivation
+            // (items.id=496 extracted it for reuse by the DB-composition
+            // path) -- external_access_override deliberately NOT gated on
+            // requires_user_handoff (the two conditions used to always
+            // coincide; see git blame for the full historical reasoning).
+            steps.push(build_step_definition(
+                step_id_key.clone(),
+                &default_guide_id,
+                NormalizedRawStep {
+                    display_name: raw_step.display_name,
+                    guide_id: raw_step.guide_id,
+                    task_type: raw_step.task_type,
+                    routing_tier: raw_step.routing_tier,
+                    requires_user_handoff: raw_step.requires_user_handoff,
+                    step_type: raw_step.step_type,
+                    output_var: raw_step.output_var,
+                    prompt_template: raw_step.prompt_template,
+                    field_requirements,
+                    options_override,
+                },
+            ));
         }
     }
 
@@ -534,12 +578,262 @@ fn parse_focus_definition(raw: RawFocusFile) -> Result<FocusDefinition, Lifecycl
     })
 }
 
-/// Parse and validate a .focus YAML file by focus_id — no DB access, no
-/// FocusRun construction required. Extracted from FocusRun::load() (items.
-/// id=236) so callers that only need a FocusDefinition (e.g.
-/// commands::active_board::get_active_board) aren't forced to construct a
-/// full FocusRun (11 constructor args) just to read display_config.
-pub async fn load_focus_definition(focus_id: &str) -> Result<FocusDefinition, LifecycleError> {
+/// items.id=496: DB-composition path's per-step JSON shape -- mirrors
+/// RawStep field-for-field except options_override, which is JSON-native
+/// here (no serde_yaml::Value round-trip needed -- the source is already
+/// JSON, unlike a .focus file). Deserialized from
+/// focus_block_customization.customization when a composition row's
+/// block_stable_id is NULL (see load_focus_definition_from_db(), below).
+#[derive(Deserialize, Default)]
+struct RawStepFromDb {
+    display_name: Option<String>,
+    guide_id: Option<String>,
+    task_type: Option<String>,
+    routing_tier: Option<u8>,
+    requires_user_handoff: Option<bool>,
+    step_type: Option<String>,
+    output_var: Option<String>,
+    prompt_template: Option<String>,
+    field_requirements: Option<Vec<RawFieldRequirement>>,
+    options_override: Option<serde_json::Value>,
+}
+
+/// items.id=496: the DB-composition path. Returns Ok(None) when no
+/// `focuses` row exists for `focus_id` in shared.db -- the signal
+/// load_focus_definition() (below) uses to fall back to the .focus YAML
+/// file, not an error. Every YAML-authored Focus has no such row
+/// (decisions.id=595 explicitly defers migrating the shipped 5 -- see
+/// shared_021.sql's own header comment), so this is a pure no-op for all of
+/// them today.
+///
+/// A composition row with block_stable_id NULL runs its customization JSON
+/// through the exact same build_step_definition() helper
+/// parse_focus_definition() uses for a YAML step -- this IS what "produce
+/// the equivalent of today's fixed StepDefinition sequence" means: literal
+/// code reuse, not a re-implementation (items.id=496 judgment calls 2/5).
+/// A composition row with block_stable_id Some(id) is validated against
+/// shared.db's building_blocks mirror (LOAD-time failure if `id` is
+/// unknown or not inline_composable -- judgment call 7) and carries its raw
+/// customization JSON through opaque, for whatever handler eventually
+/// dispatches on it (execute_step(), judgment call 6) -- no handler exists
+/// yet, so no real Focus can be authored referencing one until one does.
+async fn load_focus_definition_from_db(
+    pool: &sqlx::SqlitePool,
+    focus_id: &str,
+) -> Result<Option<FocusDefinition>, LifecycleError> {
+    use crate::persistence::focus_composition_store as store;
+
+    let Some(focus_row) = store::get_focus(pool, focus_id)
+        .await
+        .map_err(LifecycleError::Database)?
+    else {
+        return Ok(None);
+    };
+
+    let max_routing_tier = focus_row
+        .max_routing_tier
+        .parse::<ExternalAccess>()
+        .map_err(LifecycleError::ValidationFailed)?;
+
+    let high_priority_trigger = parse_optional_trigger(
+        focus_id,
+        None,
+        focus_row.high_priority_trigger_anchor_field,
+        focus_row.high_priority_trigger_offset,
+    )?;
+
+    let composition_rows = store::list_compositions(pool, focus_id)
+        .await
+        .map_err(LifecycleError::Database)?;
+
+    // No `guides` column on `focuses` (items.id=496 scope: a composition
+    // row's customization JSON is expected to name guide_id explicitly --
+    // there is no per-step YAML shorthand to preserve here). Falls back to
+    // the same global default RawFocusFile.guides == None already uses.
+    let default_guide_id = "quick-ask-guide";
+
+    let mut steps = Vec::with_capacity(composition_rows.len());
+    for row in composition_rows {
+        let schedule_trigger = parse_optional_trigger(
+            focus_id,
+            Some(&row.step_id),
+            row.schedule_trigger_anchor_field,
+            row.schedule_trigger_offset,
+        )?;
+
+        let mut step = match &row.block_stable_id {
+            None => {
+                let raw_step: RawStepFromDb =
+                    serde_json::from_str(&row.customization).map_err(|e| {
+                        LifecycleError::ValidationFailed(format!(
+                            "Focus '{focus_id}' step '{}': customization JSON: {e}",
+                            row.step_id
+                        ))
+                    })?;
+                let field_requirements = raw_step
+                    .field_requirements
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|fr| {
+                        fr.scope
+                            .parse::<FieldRequirement>()
+                            .ok()
+                            .map(|req| (fr.name, req))
+                    })
+                    .collect::<HashMap<_, _>>();
+                let options_override = raw_step
+                    .options_override
+                    .and_then(|v| {
+                        if let serde_json::Value::Object(map) = v {
+                            Some(map.into_iter().collect::<HashMap<_, _>>())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default();
+                build_step_definition(
+                    row.step_id.clone(),
+                    default_guide_id,
+                    NormalizedRawStep {
+                        display_name: raw_step.display_name,
+                        guide_id: raw_step.guide_id,
+                        task_type: raw_step.task_type,
+                        routing_tier: raw_step.routing_tier,
+                        requires_user_handoff: raw_step.requires_user_handoff,
+                        step_type: raw_step.step_type,
+                        output_var: raw_step.output_var,
+                        prompt_template: raw_step.prompt_template,
+                        field_requirements,
+                        options_override,
+                    },
+                )
+            }
+            Some(stable_id) => {
+                if !store::is_inline_composable_block(pool, stable_id)
+                    .await
+                    .map_err(LifecycleError::Database)?
+                {
+                    return Err(LifecycleError::ValidationFailed(format!(
+                        "Focus '{focus_id}' step '{}': block_stable_id '{stable_id}' is not a \
+                         known inline_composable block",
+                        row.step_id
+                    )));
+                }
+                let block_customization: serde_json::Value =
+                    serde_json::from_str(&row.customization).map_err(|e| {
+                        LifecycleError::ValidationFailed(format!(
+                            "Focus '{focus_id}' step '{}': customization JSON: {e}",
+                            row.step_id
+                        ))
+                    })?;
+                // LLM-generate-shaped fields are unused for a real block
+                // (items.id=496 judgment call 5) -- execute_step()'s
+                // dispatch on block_stable_id short-circuits before any of
+                // them are read. No real handler exists yet, so this arm
+                // is unreachable in a running system: the validation check
+                // just above already rejects any Focus that would reach it.
+                StepDefinition {
+                    step_id: row.step_id.clone(),
+                    display_name: row.step_id.clone(),
+                    guide_id: default_guide_id.to_owned(),
+                    task_type: "general".to_owned(),
+                    routing_tier: ExternalAccess::LocalOnly,
+                    step_type: StepType::default(),
+                    output_var: None,
+                    prompt_template: String::new(),
+                    field_requirements: HashMap::new(),
+                    options_override: HashMap::new(),
+                    external_access_override: None,
+                    requires_user_handoff: false,
+                    revisitable: false,
+                    block_stable_id: Some(stable_id.clone()),
+                    block_customization: Some(block_customization),
+                    schedule_trigger: None,
+                }
+            }
+        };
+        step.schedule_trigger = schedule_trigger;
+        steps.push(step);
+    }
+
+    Ok(Some(FocusDefinition {
+        focus_id: focus_id.to_owned(),
+        display_name: focus_row.display_name,
+        description: focus_row.description,
+        version: focus_row.version,
+        max_routing_tier,
+        steps,
+        output_type: focus_row.output_type,
+        suggest_in_focuses: focus_row.suggest_in_focuses,
+        multi_source_validation: focus_row.multi_source_validation,
+        generic_title_template: focus_row.generic_title_template,
+        high_priority_trigger,
+    }))
+}
+
+/// Shared anchor_field+offset -> HighPriorityTrigger parse, used by both
+/// focuses.high_priority_trigger_* (Focus-level, decisions.id=712) and
+/// focus_block_compositions.schedule_trigger_* (per-step, items.id=496 Q2)
+/// -- same two-column-or-neither shape, same parse_offset() underneath.
+/// `step_id` is None for the Focus-level call, Some for the per-step call;
+/// only used to make a validation error message locate the right row.
+fn parse_optional_trigger(
+    focus_id: &str,
+    step_id: Option<&str>,
+    anchor_field: Option<String>,
+    offset: Option<String>,
+) -> Result<Option<HighPriorityTrigger>, LifecycleError> {
+    let Some(anchor_field) = anchor_field else {
+        return Ok(None);
+    };
+    let location = match step_id {
+        Some(s) => format!("Focus '{focus_id}' step '{s}'"),
+        None => format!("Focus '{focus_id}'"),
+    };
+    let offset_raw = offset.ok_or_else(|| {
+        LifecycleError::ValidationFailed(format!(
+            "{location}: a schedule/high-priority trigger's anchor_field is set without an offset"
+        ))
+    })?;
+    let offset = parse_offset(&offset_raw).map_err(|e| {
+        LifecycleError::ValidationFailed(format!("{location}: trigger offset: {e}"))
+    })?;
+    Ok(Some(HighPriorityTrigger {
+        anchor_field,
+        offset,
+    }))
+}
+
+/// Parse and validate a Focus definition by focus_id — tries shared.db's
+/// composition tables first (items.id=496), falling back to the .focus
+/// YAML file when no `focuses` row exists (every Focus shipped before this
+/// item, unconditionally). No FocusRun construction required for either
+/// path. Extracted from FocusRun::load() (items.id=236) so callers that
+/// only need a FocusDefinition (e.g. commands::active_board::
+/// get_active_board) aren't forced to construct a full FocusRun (11
+/// constructor args) just to read display_config.
+pub async fn load_focus_definition(
+    pool: &sqlx::SqlitePool,
+    focus_id: &str,
+) -> Result<FocusDefinition, LifecycleError> {
+    if let Some(focus_def) = load_focus_definition_from_db(pool, focus_id).await? {
+        for step in &focus_def.steps {
+            let errors = validate_step(step);
+            if !errors.is_empty() {
+                return Err(LifecycleError::ValidationFailed(format!(
+                    "Focus '{}' failed validation:\n{}",
+                    focus_def.focus_id,
+                    errors
+                        .iter()
+                        .map(|e| format!("  - {e}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )));
+            }
+        }
+        return Ok(focus_def);
+    }
+
     let focus_file = find_focus_file(focus_id)?;
     let text = tokio::fs::read_to_string(&focus_file).await?;
     let raw: RawFocusFile = serde_yaml::from_str(&text)?;
@@ -966,11 +1260,15 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
     // Phase 1 — LOAD
     // =========================================================================
 
-    /// Parse the .focus YAML file and validate all steps.
-    /// Populates self.focus_def. No DB access.
+    /// Parse the Focus definition and validate all steps. Populates
+    /// self.focus_def. items.id=496: now tries shared.db's composition
+    /// tables via self.pool before falling back to the .focus YAML file --
+    /// see load_focus_definition()'s own doc comment. Every Focus shipped
+    /// before this item has no shared.db `focuses` row, so this remains a
+    /// pure file read for all of them.
     /// Python oracle: FocusRun.load()
     pub async fn load(&mut self) -> Result<(), LifecycleError> {
-        self.focus_def = Some(load_focus_definition(&self.focus_id).await?);
+        self.focus_def = Some(load_focus_definition(&self.pool, &self.focus_id).await?);
         Ok(())
     }
 
@@ -1604,6 +1902,71 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
 
             self.emit_status("running", Some(&step.display_name));
 
+            // items.id=574 piece (c), pulled in by items.id=496: the
+            // schedule_trigger gate just below needs a ledger row to set
+            // scheduled_for on, and today only reenter_step() writes to
+            // focus_run_steps -- this is the ordinary-forward-path insert
+            // that piece was still missing. Non-fatal, same tolerance the
+            // periodic/Tier-3 checkpoint writes elsewhere in this loop
+            // already have -- a ledger-write failure shouldn't abort an
+            // otherwise-successful step.
+            if let Err(e) = self.ensure_focus_run_step_row(&step.step_id, i).await {
+                log::warn!("lifecycle: focus_run_steps ledger write failed: {e}");
+            }
+
+            // items.id=496 (Q2): a composition-authored step's one-shot
+            // schedule_trigger gates execution eligibility, checked before
+            // requires_user_handoff. YAML-authored steps never have one
+            // (tokens.rs::StepDefinition's own doc comment), so this is a
+            // no-op for every Focus shipped before this item. A
+            // schedule_trigger step on a run with no topic_id is a real
+            // authoring error (same Topic-anchor requirement
+            // HighPriorityTrigger already has) -- fails loudly here rather
+            // than parking forever, since resolve_trigger_anchor() alone
+            // has no way to ever resolve an anchor that structurally
+            // cannot exist.
+            if let Some(trigger) = &step.schedule_trigger {
+                if self.topic_id.is_none() {
+                    return Err(LifecycleError::ValidationFailed(format!(
+                        "step '{}' declares a schedule_trigger but this run has no topic_id",
+                        step.step_id
+                    )));
+                }
+                let anchor = self.resolve_trigger_anchor(trigger).await?;
+                let now_ts = Utc::now();
+                let is_active = anchor.is_some_and(|a| trigger.is_active(a, now_ts));
+                if !is_active {
+                    // anchor.map(...) when the Topic's anchor field isn't
+                    // set yet: scheduled_for = now(), so the sweep re-checks
+                    // every tick until the anchor appears, then correctly
+                    // transitions to active once trigger.is_active() sees
+                    // it -- a self-correcting retry, not a stuck state.
+                    let scheduled_for = anchor.map(|a| a + trigger.offset).unwrap_or(now_ts);
+                    if let Err(e) = self
+                        .mark_focus_run_step_scheduled(&step.step_id, scheduled_for)
+                        .await
+                    {
+                        log::warn!("lifecycle: schedule_trigger ledger write failed: {e}");
+                    }
+                    if !self._checkpointing_suspended {
+                        if let Err(e) = self.write_checkpoint(&step.step_id).await {
+                            log::warn!("lifecycle: schedule checkpoint write failed: {e}");
+                        }
+                    }
+                    self.write_focus_run_record_logged("awaiting_schedule")
+                        .await;
+                    self.emit_status("awaiting_schedule", Some(&step.display_name));
+                    return Ok(Some(RunResult {
+                        focus_run_id: self.focus_run_id.clone().unwrap_or_default(),
+                        status: "awaiting_schedule".to_owned(),
+                        output_id: None,
+                        output_content: None,
+                        failure: None,
+                        crisis_resource_block: None,
+                    }));
+                }
+            }
+
             // Handoff-pause boundary (items.id=439, Part 6d — fully decoupled
             // from external_access, formerly step.routing_tier == 3):
             // checkpoint (if not suspended), set status, return early.
@@ -1707,6 +2070,24 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         step: &StepDefinition,
         step_index: usize,
     ) -> Result<Option<FailureResult>, LifecycleError> {
+        // items.id=496 (judgment calls 5/6): block_stable_id dispatch. Today
+        // this match has exactly one real arm -- None, the unchanged path
+        // every YAML-authored step (and a NULL-block composition row) takes.
+        // No block handler is registered for any stable_id yet, so Some(id)
+        // is unreachable in practice: load_focus_definition_from_db()'s own
+        // LOAD-time validation (building_blocks mirror lookup) already
+        // rejects any composition row citing an unregistered block before a
+        // run can start. This is the interface a future block's generic
+        // Rust code would parameterize from step.block_customization -- see
+        // tokens.rs::StepDefinition's own doc comment for the shape.
+        if let Some(block_id) = &step.block_stable_id {
+            return Err(LifecycleError::ValidationFailed(format!(
+                "step '{}': no registered handler for block '{block_id}' -- unreachable if \
+                 LOAD-time validation ran, see execute_step()'s own doc comment",
+                step.step_id
+            )));
+        }
+
         // Axis 1: execution_tier — min(focus_max_permitted, focus_max_routing, step.routing_tier).
         // items.id=529: computed via ExternalAccess::min() (correct regardless
         // of any numbering) rather than raw u8::min() (which depended on the
@@ -2053,6 +2434,127 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         .await?;
 
         Ok(())
+    }
+
+    /// items.id=574 piece (c), pulled in as a prerequisite by items.id=496's
+    /// schedule_trigger gate (execute(), below): the ordinary forward
+    /// execute() loop had no insert path into focus_run_steps at all before
+    /// this -- only reenter_step() wrote to this table. Ensures a 'pending'
+    /// live row exists for (focus_run_id, step_id) at attempt 1; no-op if a
+    /// live row already exists (idx_focus_run_steps_live) -- e.g. a
+    /// rehydrated/resumed run re-entering a step it already has a row for.
+    /// Does not attempt items.id=574's other remaining pieces (input_vars
+    /// wiring, piece (b)) -- out of scope here.
+    async fn ensure_focus_run_step_row(
+        &self,
+        step_id: &str,
+        sequence_index: usize,
+    ) -> Result<(), LifecycleError> {
+        let focus_run_id = self.focus_run_id.as_deref().unwrap();
+        let key_hex = self.key_hex.as_deref().ok_or(LifecycleError::NoKey)?;
+        let mut conn = open_outputs_db(&self.user_id, &self.persona_id, key_hex).await?;
+        let timestamp = now();
+
+        let exists: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM focus_run_steps
+             WHERE focus_run_id = ? AND step_id = ? AND status != 'discarded'
+             LIMIT 1",
+        )
+        .bind(focus_run_id)
+        .bind(step_id)
+        .fetch_optional(&mut conn)
+        .await?;
+        if exists.is_some() {
+            return Ok(());
+        }
+
+        sqlx::query(
+            "INSERT INTO focus_run_steps
+             (id, focus_run_id, step_id, attempt, sequence_index, status, created_at, updated_at)
+             VALUES (?, ?, ?, 1, ?, 'pending', ?, ?)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(focus_run_id)
+        .bind(step_id)
+        .bind(sequence_index as i64)
+        .bind(&timestamp)
+        .bind(&timestamp)
+        .execute(&mut conn)
+        .await?;
+
+        Ok(())
+    }
+
+    /// items.id=496: sets the live focus_run_steps row's scheduled_for for
+    /// a step whose schedule_trigger has not yet fired --
+    /// conductor::scheduled_sweep queries this column to know when to nudge
+    /// resume_run. Assumes ensure_focus_run_step_row() already ran for this
+    /// step this call (execute()'s loop always calls it first).
+    async fn mark_focus_run_step_scheduled(
+        &self,
+        step_id: &str,
+        scheduled_for: DateTime<Utc>,
+    ) -> Result<(), LifecycleError> {
+        let focus_run_id = self.focus_run_id.as_deref().unwrap();
+        let key_hex = self.key_hex.as_deref().ok_or(LifecycleError::NoKey)?;
+        let mut conn = open_outputs_db(&self.user_id, &self.persona_id, key_hex).await?;
+
+        sqlx::query(
+            "UPDATE focus_run_steps SET scheduled_for = ?, updated_at = ?
+             WHERE focus_run_id = ? AND step_id = ? AND status != 'discarded'",
+        )
+        .bind(scheduled_for.to_rfc3339())
+        .bind(now())
+        .bind(focus_run_id)
+        .bind(step_id)
+        .execute(&mut conn)
+        .await?;
+
+        Ok(())
+    }
+
+    /// items.id=496 (Q2): resolves a schedule_trigger's anchor timestamp
+    /// from this run's Topic (self.topic_id) -- same extra_metadata
+    /// [anchor_field] lookup commands::active_board::topic_is_high_priority
+    /// already makes for the Focus-level HighPriorityTrigger, reused here
+    /// for the per-step schedule_trigger. Callers must check
+    /// self.topic_id.is_some() themselves first (execute()'s gate treats a
+    /// schedule_trigger step on a topic-less run as a hard LOAD-shaped
+    /// error, not a silent forever-wait) -- this fn only handles the
+    /// "topic exists but the anchor field isn't set on it yet" case,
+    /// failing closed (None, not Err) since that's a legitimate transient
+    /// state a later Topic update can resolve.
+    async fn resolve_trigger_anchor(
+        &self,
+        trigger: &HighPriorityTrigger,
+    ) -> Result<Option<DateTime<Utc>>, LifecycleError> {
+        let Some(topic_id) = self.topic_id.as_deref() else {
+            return Ok(None);
+        };
+        let Some(key_hex) = self.key_hex.as_deref() else {
+            return Ok(None);
+        };
+        let topic = crate::persistence::topic_store::get_topic(
+            &self.user_id,
+            &self.persona_id,
+            key_hex,
+            topic_id,
+        )
+        .await
+        .map_err(|e| LifecycleError::TopicStore(e.to_string()))?;
+        let Some(topic) = topic else {
+            return Ok(None);
+        };
+        let anchor_str = topic
+            .extra_metadata
+            .get(&trigger.anchor_field)
+            .and_then(|v| v.as_str());
+        let Some(anchor_str) = anchor_str else {
+            return Ok(None);
+        };
+        Ok(DateTime::parse_from_rfc3339(anchor_str)
+            .ok()
+            .map(|dt| dt.with_timezone(&Utc)))
     }
 
     // =========================================================================
@@ -2683,18 +3185,20 @@ pub async fn demote_interrupted_runs(
 /// checkpoint (write_checkpoint(), this file) leave that step in different
 /// states:
 ///   - the Tier 3 handoff-pause checkpoint (execute()'s requires_user_handoff
-///     branch) is written for the step BEFORE it runs, then the run is
-///     parked at status='awaiting_user' — resume must re-enter at that same
-///     index.
+///     branch) and the schedule_trigger gate's checkpoint (items.id=496,
+///     same branch shape) are both written for the step BEFORE it runs,
+///     then the run is parked at status='awaiting_user' or
+///     'awaiting_schedule' respectively — resume must re-enter at that same
+///     index in either case.
 ///   - the periodic mid-run checkpoint (execute()'s checkpoint_every branch)
 ///     is written AFTER a step completes — resume must continue at the next
 ///     index. A crash between checkpoints leaves status='running'/
 ///     'initializing', which demote_interrupted_runs() (above) sweeps to
 ///     'paused' at next startup before anything ever calls this function.
 ///
-/// So: status=='awaiting_user' resumes AT the checkpointed step; any other
-/// status resumes AFTER it. No snapshot row at all means the run was
-/// interrupted before its first checkpoint — current_step stays 0, exactly
+/// So: status=='awaiting_user'/'awaiting_schedule' resumes AT the
+/// checkpointed step; any other status resumes AFTER it. No snapshot row at
+/// all means the run was interrupted before its first checkpoint — current_step stays 0, exactly
 /// like a fresh run. A step_id that no longer matches any step in the
 /// current focus_def (the .focus file changed underneath the run) also
 /// falls back to 0 rather than erroring — the same "re-read fresh" posture
@@ -2799,7 +3303,13 @@ pub async fn rehydrate_focus_run<L: DisclosureLoggerForRun>(
                 .iter()
                 .position(|s| s.step_id == step_id);
             let resume_at = match step_index {
-                Some(i) if status == "awaiting_user" => i,
+                // items.id=496: awaiting_schedule's checkpoint is written
+                // for the step BEFORE it runs, same as awaiting_user's
+                // handoff-pause checkpoint (see execute()'s schedule_trigger
+                // gate) -- resume must re-enter at that same index, not the
+                // next one, or the step whose trigger just fired would be
+                // skipped entirely.
+                Some(i) if status == "awaiting_user" || status == "awaiting_schedule" => i,
                 Some(i) => i + 1,
                 None => 0,
             };
@@ -4742,6 +5252,391 @@ mod tests {
             ),
             "voice_analysis is now the track's only (most recent) step -- \
              nothing after it to discard"
+        );
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    // -- items.id=496: DB-composition Focus + schedule_trigger gate --------
+    //
+    // End-to-end (minus the model call for the "already active" half, which
+    // needs a real Ollama instance -- see the #[ignore]d test below)
+    // verification that a Focus authored entirely as shared.db rows
+    // (shared_021.sql: focuses/focus_block_compositions/
+    // focus_block_customization), not a .focus YAML file, loads correctly
+    // via load_focus_definition_from_db() and that execute()'s
+    // schedule_trigger gate parks the run at 'awaiting_schedule' with a
+    // real focus_run_steps.scheduled_for -- exactly the mechanism
+    // conductor::scheduled_sweep queries.
+
+    /// Seeds one composition-authored Focus ("sched-focus", one step,
+    /// block_stable_id NULL) with a schedule_trigger anchored on a real
+    /// Topic's extra_metadata field, plus the focus_settings row AUTHORIZE-
+    /// equivalent code (get_focus_tier_ceiling(), called from
+    /// resolve_tier_config()) hard-requires. Returns (pool, topic_id).
+    async fn seed_db_composed_focus_with_schedule_trigger(
+        user_id: &str,
+        persona_id: &str,
+        key_hex_str: &str,
+    ) -> (sqlx::SqlitePool, String) {
+        let pool = setup_shared_and_persona_for_resume_test(user_id, persona_id).await;
+
+        crate::persistence::focus_settings_store::create_focus_settings(
+            &pool,
+            persona_id,
+            "sched-focus",
+            "isolated",
+            "persona_hidden",
+            1,
+            ExternalAccess::LocalOnly,
+            "protected",
+            None,
+        )
+        .await
+        .expect("create_focus_settings must succeed in test setup");
+
+        let mut conn = pool.acquire().await.unwrap();
+        sqlx::query(
+            "INSERT INTO focuses
+                (focus_id, display_name, description, version, max_routing_tier,
+                 output_type, suggest_in_focuses, multi_source_validation,
+                 generic_title_template, status, created_at, updated_at)
+             VALUES ('sched-focus', 'Scheduled Test Focus', '', '1.0', 'local_only',
+                     'general', '[]', 0, 'Hidden item', 'shipped',
+                     datetime('now'), datetime('now'))",
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO focus_block_compositions
+                (id, focus_id, step_id, block_stable_id, sequence_index,
+                 schedule_trigger_anchor_field, schedule_trigger_offset,
+                 created_at, updated_at)
+             VALUES ('comp-sched-1', 'sched-focus', 'step_a', NULL, 0,
+                     'ship_date', '+0', datetime('now'), datetime('now'))",
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO focus_block_customization
+                (id, composition_id, persona_id, customization, created_at, updated_at)
+             VALUES ('cust-sched-1', 'comp-sched-1', NULL, ?, datetime('now'), datetime('now'))",
+        )
+        .bind(
+            serde_json::json!({
+                "task_type": "quick_response",
+                "routing_tier": 1,
+                "prompt_template": "Say hello back to {user_input}",
+                "output_var": "result"
+            })
+            .to_string(),
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        drop(conn);
+
+        let topic = crate::persistence::topic_store::create_topic(
+            &pool,
+            user_id,
+            persona_id,
+            key_hex_str,
+            "sched-focus",
+            None,
+            None,
+        )
+        .await
+        .expect("create_topic must succeed in test setup");
+
+        (pool, topic.id)
+    }
+
+    /// Direct raw-SQL update of a Topic's extra_metadata -- no
+    /// topic_store setter exists for this single field, and adding one
+    /// only for this test's sake would be scope creep past items.id=496.
+    async fn set_topic_anchor(
+        user_id: &str,
+        persona_id: &str,
+        key_hex_str: &str,
+        topic_id: &str,
+        anchor_field: &str,
+        anchor: DateTime<Utc>,
+    ) {
+        let mut conn = open_outputs_db(user_id, persona_id, key_hex_str)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE topics SET extra_metadata = ? WHERE id = ?")
+            .bind(serde_json::json!({ anchor_field: anchor.to_rfc3339() }).to_string())
+            .bind(topic_id)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn db_composed_focus_schedule_trigger_not_yet_active_parks_awaiting_schedule() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "sched-user";
+        let persona_id = "sched-persona";
+        let key_hex_str = RESUME_TEST_KEY_HEX;
+        let (pool, topic_id) =
+            seed_db_composed_focus_with_schedule_trigger(user_id, persona_id, key_hex_str).await;
+
+        // Anchor 2 hours in the future, offset '+0' -- trigger.is_active()
+        // is false, so the very first execute() iteration must park, never
+        // reaching execute_step() (no model call, matching this test's own
+        // "no ignore needed" scope).
+        set_topic_anchor(
+            user_id,
+            persona_id,
+            key_hex_str,
+            &topic_id,
+            "ship_date",
+            Utc::now() + Duration::hours(2),
+        )
+        .await;
+
+        let focus_run_id = uuid::Uuid::new_v4().to_string();
+        {
+            let mut conn = open_outputs_db(user_id, persona_id, key_hex_str)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO focus_runs
+                 (id, focus_id, status, is_fast_lane, is_quick_ask, topic_id, user_input, started_at)
+                 VALUES (?, 'sched-focus', 'initializing', 0, 0, ?, 'hello', ?)",
+            )
+            .bind(&focus_run_id)
+            .bind(&topic_id)
+            .bind(now())
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+
+        let scheduler = Arc::new(ConductorScheduler::new());
+        let mut run: FocusRun = rehydrate_focus_run(
+            user_id.to_owned(),
+            persona_id.to_owned(),
+            focus_run_id.clone(),
+            pool.clone(),
+            scheduler,
+            Some(key_hex_str.to_owned()),
+            std::collections::HashSet::new(),
+            None,
+        )
+        .await
+        .expect("rehydrate_focus_run must load the DB-composed Focus and succeed");
+
+        // Proves load_focus_definition_from_db() actually ran (not a
+        // fallback to a .focus YAML file, which has no file named
+        // 'sched-focus') and that schedule_trigger parsed correctly.
+        let step = &run.focus_def.as_ref().unwrap().steps[0];
+        assert_eq!(step.step_id, "step_a");
+        assert_eq!(step.block_stable_id, None);
+        assert_eq!(
+            step.schedule_trigger.as_ref().unwrap().anchor_field,
+            "ship_date"
+        );
+
+        let result = run
+            .resume_execution()
+            .await
+            .expect("resume_execution must succeed even when parking");
+        assert_eq!(result.status, "awaiting_schedule");
+
+        // The ledger row (items.id=574 piece (c)) exists with scheduled_for
+        // set -- exactly what conductor::scheduled_sweep's query needs.
+        let mut conn = open_outputs_db(user_id, persona_id, key_hex_str)
+            .await
+            .unwrap();
+        let scheduled_for: Option<String> = sqlx::query_scalar(
+            "SELECT scheduled_for FROM focus_run_steps
+             WHERE focus_run_id = ? AND step_id = 'step_a' AND status != 'discarded'",
+        )
+        .bind(&focus_run_id)
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert!(
+            scheduled_for.is_some(),
+            "the gate must set scheduled_for before parking"
+        );
+        drop(conn);
+
+        // The sweep's own read side must NOT surface this run yet -- the
+        // anchor is still 2 hours out.
+        let due = crate::persistence::output_store::list_due_scheduled_focus_runs(
+            user_id,
+            persona_id,
+            key_hex_str,
+            &now(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !due.contains(&focus_run_id),
+            "must not be due while the anchor is still in the future"
+        );
+
+        // Simulate wall-clock time passing: the gate wrote scheduled_for as
+        // a snapshot (anchor+offset) at park time -- the sweep's query
+        // reads that persisted column, not a live re-evaluation of the
+        // Topic's anchor, so simulating "later" means advancing
+        // scheduled_for directly, exactly what a real clock tick would do
+        // to the comparison `scheduled_for <= now()` without anyone having
+        // touched the Topic at all. A fresh rehydrate must then resume AT
+        // the same step index (0) -- not skip past it -- confirming the
+        // resume-index fix (rehydrate_focus_run's status=='awaiting_schedule'
+        // arm) actually holds against a real checkpoint written by the real
+        // gate above, not a hand-constructed one.
+        {
+            let mut conn = open_outputs_db(user_id, persona_id, key_hex_str)
+                .await
+                .unwrap();
+            sqlx::query(
+                "UPDATE focus_run_steps SET scheduled_for = ?
+                 WHERE focus_run_id = ? AND step_id = 'step_a'",
+            )
+            .bind((Utc::now() - Duration::hours(2)).to_rfc3339())
+            .bind(&focus_run_id)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+
+        let due_after = crate::persistence::output_store::list_due_scheduled_focus_runs(
+            user_id,
+            persona_id,
+            key_hex_str,
+            &now(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            due_after.contains(&focus_run_id),
+            "must be due once the anchor has passed"
+        );
+
+        let scheduler2 = Arc::new(ConductorScheduler::new());
+        let run2: FocusRun = rehydrate_focus_run(
+            user_id.to_owned(),
+            persona_id.to_owned(),
+            focus_run_id.clone(),
+            pool.clone(),
+            scheduler2,
+            Some(key_hex_str.to_owned()),
+            std::collections::HashSet::new(),
+            None,
+        )
+        .await
+        .expect("second rehydrate must succeed");
+        assert_eq!(
+            run2.current_step, 0,
+            "awaiting_schedule must resume AT the checkpointed step, not past it -- \
+             see rehydrate_focus_run()'s resume-index derivation"
+        );
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    /// Full completion proof, requiring a real local Ollama instance
+    /// (127.0.0.1:11434 or the Garuda dev address -- see CLAUDE.md) to
+    /// actually answer the "quick_response" model call once the gate lets
+    /// step_a through. #[ignore]d for the same reason providers::
+    /// ocr_eval's live eval tests are: plain `cargo test` (the CI gate)
+    /// must not depend on an external service. Run manually with
+    /// `cargo test -- --ignored db_composed_focus_schedule_trigger_active_completes_run`.
+    #[tokio::test]
+    #[ignore]
+    async fn db_composed_focus_schedule_trigger_active_completes_run() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "sched-user-2";
+        let persona_id = "sched-persona-2";
+        let key_hex_str = RESUME_TEST_KEY_HEX;
+        let (pool, topic_id) =
+            seed_db_composed_focus_with_schedule_trigger(user_id, persona_id, key_hex_str).await;
+
+        // Anchor already in the past -- trigger.is_active() is true on the
+        // very first execute() iteration, so this run never parks at all.
+        set_topic_anchor(
+            user_id,
+            persona_id,
+            key_hex_str,
+            &topic_id,
+            "ship_date",
+            Utc::now() - Duration::hours(2),
+        )
+        .await;
+
+        let focus_run_id = uuid::Uuid::new_v4().to_string();
+        {
+            let mut conn = open_outputs_db(user_id, persona_id, key_hex_str)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO focus_runs
+                 (id, focus_id, status, is_fast_lane, is_quick_ask, topic_id, user_input, started_at)
+                 VALUES (?, 'sched-focus', 'initializing', 0, 0, ?, 'the scheduler', ?)",
+            )
+            .bind(&focus_run_id)
+            .bind(&topic_id)
+            .bind(now())
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+
+        let scheduler = Arc::new(ConductorScheduler::new());
+        let mut run: FocusRun = rehydrate_focus_run(
+            user_id.to_owned(),
+            persona_id.to_owned(),
+            focus_run_id.clone(),
+            pool.clone(),
+            scheduler,
+            Some(key_hex_str.to_owned()),
+            std::collections::HashSet::new(),
+            None,
+        )
+        .await
+        .expect("rehydrate_focus_run must succeed");
+
+        let result = run
+            .resume_execution()
+            .await
+            .expect("resume_execution must complete the run against a real local model");
+        // Phase 5 OUTPUT lands at 'awaiting_feedback' (Phase 6 FEEDBACK is
+        // a separate, later paste-back step, out of scope here) -- the
+        // point of this assertion is that it got there at all, through
+        // ordinary execute_step()/StepExecutor, not stuck at
+        // 'awaiting_schedule' or any other pause.
+        assert_eq!(
+            result.status, "awaiting_feedback",
+            "an already-active schedule_trigger step must run and finish normally, \
+             exactly like any plain step -- proves the gate is not a bypass of \
+             ordinary execute_step()/StepExecutor"
+        );
+        assert!(
+            result.output_content.is_some(),
+            "the real model call must have produced content"
         );
 
         if let Some(v) = saved_root {

@@ -497,6 +497,49 @@ async fn async_main() {
                 },
             );
 
+            // items.id=496: the scheduled-trigger firing mechanism's other
+            // half. A composition-authored step's schedule_trigger parks
+            // its run at 'awaiting_schedule' (conductor::lifecycle
+            // execute()'s gate); this sweep notices when the trigger's
+            // resolved fire time has passed and nudges the run forward via
+            // resume_run's own internal path (rehydrate_focus_run +
+            // resume_execution) -- not a bypass of FocusRun. 300s cadence,
+            // same as the persona/group sync sweep above: missing a
+            // one-shot trigger by a few minutes is not security-relevant
+            // the way idle-timeout is, so this doesn't need that sweep's
+            // tighter 60s isolation. Supervised (restart=true) for the same
+            // "silent death has no visible symptom" reasoning as every
+            // other periodic checker here.
+            let scheduled_sweep_handle = app.handle().clone();
+            quietrabbit_lib::task_supervision::spawn_supervised(
+                "scheduled_step_sweep",
+                true,
+                move || {
+                    let scheduled_sweep_handle = scheduled_sweep_handle.clone();
+                    async move {
+                        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
+                        loop {
+                            ticker.tick().await;
+                            let key_registry = scheduled_sweep_handle
+                                .state::<quietrabbit_lib::auth::registry::KeyRegistry>(
+                            );
+                            let pool = scheduled_sweep_handle.state::<sqlx::SqlitePool>();
+                            let scheduler =
+                                scheduled_sweep_handle.state::<Arc<
+                                    quietrabbit_lib::conductor::concurrency::ConductorScheduler,
+                                >>();
+                            quietrabbit_lib::conductor::scheduled_sweep::run_periodic_sweep(
+                                &pool,
+                                &key_registry,
+                                &scheduler,
+                                Some(scheduled_sweep_handle.clone()),
+                            )
+                            .await;
+                        }
+                    }
+                },
+            );
+
             Ok(())
         })
         // No Moved/Resized handling here anymore (items.id=202 real

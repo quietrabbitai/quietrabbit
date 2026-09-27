@@ -121,6 +121,7 @@ pub async fn get_active_board(
     user_id: String,
     persona_id: String,
     key_registry: State<'_, KeyRegistry>,
+    pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<ActiveBoardResponse, String> {
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.master_key))
@@ -140,7 +141,7 @@ pub async fn get_active_board(
             .entry(topic.focus_id.clone())
             .or_insert_with(|| None);
         if def.is_none() {
-            match load_focus_definition(&topic.focus_id).await {
+            match load_focus_definition(&pool, &topic.focus_id).await {
                 Ok(d) => *def = Some(d),
                 Err(e) => {
                     log::warn!(

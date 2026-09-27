@@ -12,6 +12,7 @@ pub mod privacy;
 pub mod propose_route;
 pub mod quality;
 pub mod reentry;
+pub mod scheduled_sweep;
 pub mod tokens;
 pub mod types;
 pub mod visibility;
