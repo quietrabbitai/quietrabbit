@@ -540,6 +540,41 @@ async fn async_main() {
                 },
             );
 
+            // items.id=52 Part 1: nightly batch runner infrastructure. Fixed
+            // local-clock schedule, not idle-detection -- auth/idle_timeout.rs's
+            // own doc comment already concluded no reliable cross-platform
+            // sleep/suspend hook exists on this app's desktop targets.
+            // Configurable via instance_config.nightly_batch_hour (default 2,
+            // i.e. 2am local). Wall-clock gated the same way idle_timeout_check
+            // is -- a persisted last-run timestamp compared against a freshly
+            // computed boundary each tick, not tick-counting -- so it survives
+            // sleep/suspend and self-heals if QR wasn't running at the
+            // scheduled hour. 300s cadence: missing the top of the hour by a
+            // few minutes isn't time-sensitive the way idle-timeout is, same
+            // reasoning as group_persona_sync_sweep/scheduled_step_sweep's
+            // shared 300s cadence. Own isolated timer, same "one panic
+            // shouldn't take down other sweeps" precedent. Part 1 only
+            // resolves qr-admin.focus's identity as a self-check; it writes no
+            // Topic/output rows -- that's items.id=52 Part 3+ once real
+            // findings exist to attach.
+            let nightly_batch_handle = app.handle().clone();
+            quietrabbit_lib::task_supervision::spawn_supervised(
+                "nightly_batch_sweep",
+                true,
+                move || {
+                    let nightly_batch_handle = nightly_batch_handle.clone();
+                    async move {
+                        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
+                        loop {
+                            ticker.tick().await;
+                            let pool = nightly_batch_handle.state::<sqlx::SqlitePool>();
+                            quietrabbit_lib::conductor::nightly_batch::run_periodic_sweep(&pool)
+                                .await;
+                        }
+                    }
+                },
+            );
+
             Ok(())
         })
         // No Moved/Resized handling here anymore (items.id=202 real

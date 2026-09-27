@@ -1,0 +1,56 @@
+# app/core_artifacts/focuses/qr-admin.focus
+# QR Admin — identity-anchor Focus for the nightly batch runner
+# (items.id=52 Part 1).
+#
+# NOT meant to be reached through ordinary Focus selection. It exists so
+# nightly_batch_sweep (conductor::nightly_batch, main.rs) has a real,
+# resolvable focus_id for conductor::lifecycle::load_focus_definition to
+# load, and so items.id=52's later parts (quality re-assessment,
+# gap-detection, library dedup) have somewhere to attach their Topic/output
+# rows once they're built. Part 1 itself creates no Topic against this
+# focus_id — it only confirms this file loads and validates.
+#
+# Single step, quick-ask-shaped (see quick-ask.focus's own header): there is
+# no schema-supported "inert" step_type in this codebase (StepType in
+# conductor/tokens.rs has exactly three variants -- generate,
+# voice_transform, post_process -- and executor.rs doesn't branch on it), so
+# every step performs a real local-model call regardless of intent. This
+# step is kept small and coherent rather than a placeholder, in case it is
+# ever actually invoked.
+#
+# guides: qr-admin-guide is a forward reference with no backing .guide file
+# yet, same as quick-ask.focus's own quick-ask-guide reference -- the
+# runtime's guide resolution tolerates a missing guide file by design
+# (_load_guide_versions() returns {}, no crash).
+
+id: qr-admin
+display_name: QR Admin
+description: >
+  System findings from Quiet Rabbit's nightly review -- quality checks,
+  duplicate detection, and other background maintenance, surfaced here
+  for your review.
+version: "1.0"
+max_routing_tier: 1
+guides:
+  - qr-admin-guide
+output_types:
+  - qr_admin_note
+suggest_in_focuses: []
+
+steps:
+  acknowledge:
+    display_name: Reviewing note...
+    task_type: summarization
+    routing_tier: 1
+    step_type: generate
+    output_var: admin_output
+    prompt_template: >
+      Summarize the following system note in one or two plain sentences,
+      suitable for display on a review card. Do not add commentary beyond
+      the note's own content.
+
+      Note: {user_input}
+    field_requirements: []
+    options_override:
+      temperature: 0.2
+      num_predict: 64
