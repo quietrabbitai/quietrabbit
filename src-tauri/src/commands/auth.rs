@@ -439,6 +439,41 @@ async fn finish_login(
     )
     .await;
 
+    // items.id=252: crash-interrupted focus_runs recovery -- a third
+    // sibling call in this same "the moment key material becomes resident"
+    // sequence as the two pull calls immediately above. There is no
+    // per-persona "unlock" event in this codebase (key_hex is derived once
+    // per-user here; persona_id is just a routing parameter passed
+    // alongside it) so this is the correct, and only, call site --
+    // demote_interrupted_runs() (conductor::lifecycle) is otherwise never
+    // invoked, leaving crash-interrupted runs stuck at running/initializing
+    // forever. Best-effort per persona, same posture as the two calls
+    // above: logged and skipped, never turns an otherwise-successful login
+    // into an Err.
+    match persona_store::list_personas_for_user(pool, user_id).await {
+        Ok(personas) => {
+            for persona in personas {
+                if let Err(e) = crate::conductor::lifecycle::demote_interrupted_runs(
+                    user_id,
+                    &persona.id,
+                    &personal_key_hex_for_sync,
+                )
+                .await
+                {
+                    log::warn!(
+                        "finish_login: couldn't demote interrupted focus_runs for \
+                         persona={}: {e} -- skipping this persona",
+                        persona.id
+                    );
+                }
+            }
+        }
+        Err(e) => log::warn!(
+            "finish_login: couldn't list personas for user={user_id}: {e} -- \
+             skipping interrupted-run recovery entirely"
+        ),
+    }
+
     // items.id=290, decisions.id=718: rehydrate GroupKeyRegistry from every
     // one of this account's personas' personal.db group_keys tables --
     // GroupKeyRegistry itself stays deliberately volatile (auth/registry.rs's
@@ -1468,6 +1503,113 @@ mod tests {
         assert!(
             !group_key_registry.is_occupied(&persona_id, group_id).await,
             "the malformed row must be skipped, not loaded"
+        );
+    }
+
+    /// items.id=252: demote_interrupted_runs() (conductor::lifecycle) had
+    /// zero call sites before this item -- never invoked from the running
+    /// app, so a run left at status='running' by a crash stayed that way
+    /// forever. This confirms finish_login()'s new sibling call actually
+    /// reaches it: a stale running focus_runs row must come back as
+    /// 'paused' after a fresh login(), mirroring
+    /// login_rehydrates_group_key_registry_from_personal_db's persona
+    /// fixture shape immediately above.
+    #[tokio::test]
+    async fn login_demotes_a_stale_running_focus_run_to_paused() {
+        use sqlx::ConnectOptions;
+
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let registry = app.state::<KeyRegistry>();
+        let group_key_registry = app.state::<GroupKeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
+
+        login(
+            "Alice".to_owned(),
+            "password123".to_owned(),
+            registry.clone(),
+            group_key_registry.clone(),
+            pool.clone(),
+        )
+        .await
+        .unwrap();
+
+        let user = user_store::find_user_by_display_name(&pool, "Alice")
+            .await
+            .unwrap()
+            .unwrap();
+        let personal_key_hex = registry.personal_key_hex().await.unwrap();
+
+        let persona_id = uuid::Uuid::new_v4().to_string();
+        persona_store::create_persona(
+            &pool,
+            &persona_id,
+            "Test Persona",
+            "personal",
+            &user.id,
+            None,
+        )
+        .await
+        .expect("create_persona must succeed");
+
+        crate::persistence::migrations::migrate_outputs_db(
+            &user.id,
+            &persona_id,
+            &personal_key_hex,
+        )
+        .await
+        .expect("outputs.db migration must succeed");
+
+        let db_path = crate::providers::utils::db_path_outputs(&user.id, &persona_id);
+        let run_id = uuid::Uuid::new_v4().to_string();
+        {
+            let mut conn =
+                crate::providers::utils::connect_options_encrypted(&db_path, &personal_key_hex)
+                    .create_if_missing(false)
+                    .connect()
+                    .await
+                    .expect("must reopen outputs.db under its key");
+            // started_at is far enough in the past to be stale under any
+            // QR_INTERRUPT_THRESHOLD_MINUTES value -- no env var needed.
+            sqlx::query(
+                "INSERT INTO focus_runs (id, focus_id, status, started_at)
+                 VALUES (?, 'test-focus', 'running', '2020-01-01T00:00:00Z')",
+            )
+            .bind(&run_id)
+            .execute(&mut conn)
+            .await
+            .expect("seeding a stale focus_runs row must succeed");
+        }
+
+        // Simulate a process restart -- KeyRegistry loses its resident key,
+        // matching the empty state finish_login's recovery sweep must run
+        // against at next login.
+        registry.clear().await;
+
+        login(
+            "Alice".to_owned(),
+            "password123".to_owned(),
+            registry.clone(),
+            group_key_registry.clone(),
+            pool.clone(),
+        )
+        .await
+        .expect("second login must succeed");
+
+        let mut conn =
+            crate::providers::utils::connect_options_encrypted(&db_path, &personal_key_hex)
+                .create_if_missing(false)
+                .connect()
+                .await
+                .expect("must reopen outputs.db under its key");
+        let status: String = sqlx::query_scalar("SELECT status FROM focus_runs WHERE id = ?")
+            .bind(&run_id)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            status, "paused",
+            "finish_login must demote a stale running focus_run to paused"
         );
     }
 }
