@@ -6,6 +6,7 @@ pub mod cloud_chat_gpu_pane;
 pub mod commands;
 pub mod conductor;
 pub mod group_sync;
+pub mod hardware_probe;
 pub mod ipc;
 pub mod ollama_sidecar;
 pub mod persistence;

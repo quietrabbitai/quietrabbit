@@ -1,7 +1,7 @@
 // src-tauri/src/commands/system.rs
 //
 // Group 12 — System.
-// Commands: get_health, get_capability_profile.
+// Commands: get_health, get_capability_profile, get_hardware_profile.
 //
 // get_health: checks Ollama availability and returns provider health status.
 //   ollama_source: "system" | "sidecar" | "unavailable" — written during app
@@ -16,12 +16,18 @@
 //   recommended_routing omitted -- evaluation/scores DB not yet ported.
 //   Release 1 benchmark_status values: "pending" (models present, no scores
 //   yet) or "unavailable" (no models detected). "complete" requires scores DB.
+// get_hardware_profile: items.id=435 -- cached RAM/CPU/GPU capability probe
+//   (hardware_probe::get_or_detect), matchable against providers.
+//   hardware_requirement (Part 4a). No caller in this app yet -- this
+//   command exists so items.id=437's onboarding UI has something to call;
+//   the recommendation logic that consumes it is out of scope here.
 
 use serde::Serialize;
 use specta::Type;
 use tokio::sync::RwLock;
 
 use crate::auth::registry::{key_hex, KeyRegistry};
+use crate::hardware_probe::{self, HardwareProfile};
 use crate::ollama_sidecar::OllamaSource;
 use crate::persistence::{integration_keys_store, provider_store};
 use crate::providers::ollama_client::OllamaClient;
@@ -150,6 +156,14 @@ pub async fn get_capability_profile(
         installed_models,
         benchmark_status,
     })
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn get_hardware_profile(
+    pool: tauri::State<'_, sqlx::SqlitePool>,
+) -> Result<HardwareProfile, String> {
+    Ok(hardware_probe::get_or_detect(&pool).await)
 }
 
 // Tests target qr_hosted_is_configured() directly rather than the get_health

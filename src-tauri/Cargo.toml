@@ -38,6 +38,16 @@ sha2 = "0.10"
 # on that transitive path, same reasoning as getrandom above.
 regex = "1"
 
+# Hardware-capability detection (items.id=435) -- RAM/CPU probing for
+# hardware_probe.rs, matched against providers.hardware_requirement.
+# Cross-platform, no OS-specific bindings needed for this half of the probe
+# (GPU/VRAM instead reuses wgpu, already a dependency below). Version pinned
+# to the same 0.39 line llmfit-core itself resolves to, verified via its
+# published Cargo.toml this session, while evaluating and ultimately
+# rejecting a dependency on that crate (see hardware_probe.rs's own module
+# header for the full reasoning).
+sysinfo = "0.39"
+
 # Database
 sqlx = { version = "0.8", features = ["runtime-tokio-native-tls", "sqlite"] }
 # Enable the sqlcipher feature on libsqlite3-sys so the unified dependency

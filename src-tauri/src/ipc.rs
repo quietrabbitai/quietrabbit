@@ -120,6 +120,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         // Group 12 -- System
         commands::system::get_health,
         commands::system::get_capability_profile,
+        commands::system::get_hardware_profile,
         // Group 13 -- Cloud Chat pane lifecycle & provider catalog
         // (items.id=202 piece 5 / items.id=223, 2026-08-04)
         commands::cloud_chat_pane::list_active_providers,

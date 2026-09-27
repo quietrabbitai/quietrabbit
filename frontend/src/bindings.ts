@@ -531,6 +531,7 @@ export const commands = {
 	recordActivity: () => typedError<null, string>(__TAURI_INVOKE("record_activity")),
 	getHealth: () => typedError<HealthResponse, string>(__TAURI_INVOKE("get_health")),
 	getCapabilityProfile: () => typedError<CapabilityProfileResponse, string>(__TAURI_INVOKE("get_capability_profile")),
+	getHardwareProfile: () => typedError<HardwareProfile, string>(__TAURI_INVOKE("get_hardware_profile")),
 	/**
 	 *  The selector screen's primary read path (TIER3_ACCESS_MODEL.md State 3,
 	 *  items.id=202 piece 1's remaining wiring) -- replaces
@@ -1065,11 +1066,35 @@ export type GetRunOutputResponse = {
 	sensitivity: string,
 };
 
+/**
+ *  Coarse GPU/VRAM class. Deliberately does not carry a byte count -- see
+ *  this module's header comment on why precise cross-platform VRAM size
+ *  isn't attempted here. `DiscreteUnknownSize` means "a discrete GPU was
+ *  found, but this module cannot size its VRAM with current in-tree
+ *  tooling" -- not an error, a known and documented gap.
+ */
+export type GpuVramClass = "integrated" | "discrete_unknown_size";
+
 export type GroupSyncSettingsInfo = {
 	folder_path: string,
 	last_synced_at: string | null,
 	last_error: string | null,
 	updated_at: string,
+};
+
+export type HardwareProfile = {
+	ram_mb: number,
+	ram_class: RamClass,
+	cpu_cores: number,
+	gpu_present: boolean,
+	gpu_is_discrete: boolean,
+	/**
+	 *  The GPU's driver-reported name (e.g. "NVIDIA GeForce RTX 3080"),
+	 *  from wgpu's AdapterInfo.name -- not a decoded PCI vendor ID. None
+	 *  when gpu_present is false.
+	 */
+	gpu_name: string | null,
+	gpu_vram_class: GpuVramClass | null,
 };
 
 export type HealthResponse = {
@@ -1367,6 +1392,13 @@ export type QrHostedConfig = {
 	configured: boolean,
 	expires_at: string | null,
 };
+
+/**
+ *  Coarse RAM class -- see RAM_*_MAX_MB above for the exact boundaries this
+ *  is bucketed from `sysinfo::System::total_memory()`'s byte count,
+ *  converted to whole megabytes.
+ */
+export type RamClass = "low" | "medium" | "high" | "very_high";
 
 /**
  *  items.id=406 (decisions.id=755): the provider-selection re-check
