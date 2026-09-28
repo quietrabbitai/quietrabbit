@@ -216,10 +216,10 @@ pub async fn disable_local_model(
         .map_err(|e| e.to_string())
 }
 
-/// Deletes the model's on-disk weights and marks it uninstalled. The
-/// "this removes shared on-disk storage another application might depend
-/// on" warning is the frontend's responsibility to show *before* calling
-/// this -- see providers::ollama_install::run_delete's own doc comment.
+/// Deletes the model's on-disk weights and marks it uninstalled. QR's model
+/// directory is QR-private (decisions.id=840), so no other application's
+/// storage is affected. Confirming a delete with the user is still a
+/// frontend concern, but nothing here requires a shared-storage warning.
 #[tauri::command]
 #[specta::specta]
 pub async fn delete_local_model(

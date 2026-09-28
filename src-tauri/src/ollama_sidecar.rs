@@ -24,14 +24,24 @@
 //! directly — all process management is encapsulated here.
 //!
 //! # Binary bundling (build pipeline note — D6-353)
-//! The Tauri bundler packages the binary listed in `tauri.conf.json`
-//! `externalBin` with the target triple appended:
-//!   src-tauri/binaries/ollama-{target-triple}
-//! Example on Garuda: `ollama-x86_64-unknown-linux-gnu`
-//! At runtime the binary is resolved via the Tauri resource directory.
-//! See `sidecar_binary_name()` for platform-specific naming.
+//! `tauri.conf.json` `externalBin` lists `binaries/ollama`; the source file
+//! is `src-tauri/binaries/ollama-{target-triple}` (on Garuda:
+//! `ollama-x86_64-unknown-linux-gnu`). Tauri copies it next to the app
+//! executable with the triple stripped, i.e. `<exe dir>/ollama` (verified
+//! in dev: `target/debug/ollama`). It is NOT placed in the resource
+//! directory. The packaged-build layout has not been verified, so
+//! `candidate_paths()` also tries the legacy `<resource_dir>/ollama-{triple}`
+//! name from D6-353.
+//!
+//! The checked-in binary is currently a placeholder script that exits 1
+//! (real binary comes in the packaging pass). In debug builds only,
+//! `candidate_paths()` therefore ends with a PATH lookup of `ollama` so
+//! `cargo tauri dev` still gets a QR-owned instance: same dedicated port,
+//! same QR-private model directory, never the user's 11434 instance.
+//! Release builds never take that fallback.
 
-use std::path::Path;
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use reqwest::Client;
@@ -208,9 +218,10 @@ impl OllamaSidecar {
         }
     }
 
-    /// Start the bundled Ollama binary from the Tauri resource directory.
+    /// Start QR's own Ollama on the dedicated port, trying each candidate
+    /// from `candidate_paths()` in order until one becomes ready.
     ///
-    /// Returns `true` if the sidecar spawned and became ready within 5 s.
+    /// Returns `true` if a sidecar spawned and became ready.
     ///
     /// `OLLAMA_MODELS` is set to a QR-owned directory
     /// (`<QR_DATA_ROOT>/ollama_models`), fully separate from any system
@@ -220,60 +231,93 @@ impl OllamaSidecar {
     /// digest-dedup disk savings a shared directory would offer don't
     /// offset the risk of a user's independent `ollama rm` silently
     /// invalidating QR's own `providers.installed` bookkeeping).
+    async fn start_sidecar(&mut self, resource_dir: &Path) -> bool {
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf));
+        let candidates = candidate_paths(exe_dir.as_deref(), resource_dir, cfg!(debug_assertions));
+        let models_dir = crate::providers::utils::get_data_root().join("ollama_models");
+
+        for candidate in candidates {
+            let program: OsString = match &candidate {
+                SidecarCandidate::File(path) => {
+                    if !path.exists() {
+                        log::debug!(
+                            "ollama_sidecar: no binary at {} — trying next candidate",
+                            path.display()
+                        );
+                        continue;
+                    }
+                    path.clone().into_os_string()
+                }
+                SidecarCandidate::SystemPath => {
+                    log::warn!(
+                        "ollama_sidecar: DEV-ONLY fallback in use — QR's bundled Ollama \
+                         binary was not found or did not start, so `ollama` from PATH is \
+                         being launched on 127.0.0.1:{QR_OLLAMA_PORT} with QR's own model \
+                         directory. Packaging must replace the placeholder binary; release \
+                         builds never take this path."
+                    );
+                    OsString::from(system_binary_name())
+                }
+            };
+            if self.try_start(&program, &models_dir).await {
+                return true;
+            }
+        }
+
+        log::warn!("ollama_sidecar: no candidate binary started successfully");
+        false
+    }
+
+    /// Spawn `program serve` on the dedicated port and wait for readiness.
+    /// On success the child is stored for `stop()`. On failure it is killed
+    /// and released so the next candidate can bind the port.
     ///
     /// `kill_on_drop(true)` ensures the child is terminated if QR exits
     /// unexpectedly (panic, crash) before `stop()` is called.
-    async fn start_sidecar(&mut self, resource_dir: &Path) -> bool {
-        let binary = resource_dir.join(sidecar_binary_name());
-
-        if !binary.exists() {
-            log::warn!(
-                "ollama_sidecar: bundled binary not found at {}",
-                binary.display()
-            );
-            return false;
-        }
-
-        let models_dir = crate::providers::utils::get_data_root().join("ollama_models");
-
-        let child = match Command::new(&binary)
+    async fn try_start(&mut self, program: &OsStr, models_dir: &Path) -> bool {
+        let mut child = match Command::new(program)
+            .arg("serve")
             .env("OLLAMA_HOST", format!("127.0.0.1:{QR_OLLAMA_PORT}"))
-            .env("OLLAMA_MODELS", &models_dir)
+            .env("OLLAMA_MODELS", models_dir)
             .kill_on_drop(true)
             .spawn()
         {
             Ok(c) => c,
             Err(e) => {
-                log::warn!("ollama_sidecar: failed to spawn: {e}");
+                log::warn!(
+                    "ollama_sidecar: failed to spawn {}: {e}",
+                    program.to_string_lossy()
+                );
                 return false;
             }
         };
 
         log::info!(
-            "ollama_sidecar: sidecar spawned (PID {:?}) — polling for ready",
+            "ollama_sidecar: {} spawned (PID {:?}) — polling for ready",
+            program.to_string_lossy(),
             child.id()
         );
-        self.child = Some(child);
 
-        if self.wait_for_ready().await {
-            true
-        } else {
-            // Sidecar started but did not become ready — terminate and release.
-            // TODO: add early-exit detection via Child::try_wait() (post-Release 1).
-            if let Some(mut child) = self.child.take() {
-                if let Err(e) = child.kill().await {
-                    log::warn!("ollama_sidecar: cleanup kill failed: {e}");
-                }
-                let _ = child.wait().await;
-            }
-            false
+        if Self::wait_for_ready(&mut child).await {
+            self.child = Some(child);
+            return true;
         }
+
+        // Started but never became ready, or exited early — release it.
+        if let Err(e) = child.kill().await {
+            log::debug!("ollama_sidecar: cleanup kill failed: {e}");
+        }
+        let _ = child.wait().await;
+        false
     }
 
     /// Poll 127.0.0.1:{QR_OLLAMA_PORT}/api/tags every 500 ms for up to 5 s
     /// (10 attempts). This is the sidecar's own readiness check — separate
-    /// from `detect()`'s 11434 contention probe.
-    async fn wait_for_ready(&self) -> bool {
+    /// from `detect()`'s 11434 contention probe. Bails out immediately if
+    /// the child has already exited (e.g. the placeholder binary).
+    async fn wait_for_ready(child: &mut Child) -> bool {
         let client = match Client::builder().timeout(Duration::from_secs(2)).build() {
             Ok(c) => c,
             Err(_) => return false,
@@ -282,6 +326,10 @@ impl OllamaSidecar {
 
         for attempt in 1u8..=10 {
             tokio::time::sleep(Duration::from_millis(500)).await;
+            if let Ok(Some(status)) = child.try_wait() {
+                log::warn!("ollama_sidecar: process exited early ({status}) — not ready");
+                return false;
+            }
             match client.get(&url).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     log::info!("ollama_sidecar: ready after {} poll(s)", attempt);
@@ -315,5 +363,109 @@ fn sidecar_binary_name() -> String {
         format!("ollama-{arch}-pc-windows-msvc.exe")
     } else {
         format!("ollama-{arch}")
+    }
+}
+
+/// Filename Tauri gives an `externalBin` next to the app executable: the
+/// configured name with the target triple stripped.
+fn bundled_binary_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "ollama.exe"
+    } else {
+        "ollama"
+    }
+}
+
+/// Name resolved through PATH for the debug-only fallback.
+fn system_binary_name() -> &'static str {
+    bundled_binary_name()
+}
+
+/// Where the sidecar binary may be launched from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SidecarCandidate {
+    /// A file on disk; skipped if it does not exist.
+    File(PathBuf),
+    /// `ollama` resolved through PATH. Debug builds only.
+    SystemPath,
+}
+
+/// Ordered launch candidates. Pure so the release/debug difference is
+/// unit-testable: `SystemPath` appears only when `allow_dev_fallback`.
+fn candidate_paths(
+    exe_dir: Option<&Path>,
+    resource_dir: &Path,
+    allow_dev_fallback: bool,
+) -> Vec<SidecarCandidate> {
+    let mut candidates = Vec::new();
+    if let Some(dir) = exe_dir {
+        candidates.push(SidecarCandidate::File(dir.join(bundled_binary_name())));
+    }
+    candidates.push(SidecarCandidate::File(
+        resource_dir.join(sidecar_binary_name()),
+    ));
+    if allow_dev_fallback {
+        candidates.push(SidecarCandidate::SystemPath);
+    }
+    candidates
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn candidates_prefer_exe_dir_then_legacy_resource_name() {
+        let got = candidate_paths(Some(Path::new("/app/bin")), Path::new("/app/res"), false);
+        assert_eq!(
+            got,
+            vec![
+                SidecarCandidate::File(Path::new("/app/bin").join(bundled_binary_name())),
+                SidecarCandidate::File(Path::new("/app/res").join(sidecar_binary_name())),
+            ]
+        );
+    }
+
+    #[test]
+    fn release_candidates_never_include_path_fallback() {
+        for exe_dir in [Some(Path::new("/app/bin")), None] {
+            let got = candidate_paths(exe_dir, Path::new("/app/res"), false);
+            assert!(!got.contains(&SidecarCandidate::SystemPath));
+        }
+    }
+
+    #[test]
+    fn dev_candidates_end_with_path_fallback() {
+        let got = candidate_paths(Some(Path::new("/app/bin")), Path::new("/app/res"), true);
+        assert_eq!(got.last(), Some(&SidecarCandidate::SystemPath));
+        assert_eq!(got.len(), 3);
+    }
+
+    #[test]
+    fn missing_exe_dir_still_yields_legacy_candidate() {
+        let got = candidate_paths(None, Path::new("/app/res"), false);
+        assert_eq!(got.len(), 1);
+    }
+
+    /// A binary that exits immediately (like the checked-in placeholder)
+    /// must fail fast, well inside the 5 s readiness window.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn early_exiting_binary_fails_fast() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let script = dir.join("ollama");
+        std::fs::write(&script, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut sidecar = OllamaSidecar::new();
+        let started = std::time::Instant::now();
+        let ok = sidecar.try_start(script.as_os_str(), dir).await;
+        let elapsed = started.elapsed();
+
+        assert!(!ok);
+        assert!(sidecar.child.is_none());
+        assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
     }
 }

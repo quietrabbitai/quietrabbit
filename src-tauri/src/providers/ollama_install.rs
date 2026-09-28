@@ -135,12 +135,13 @@ pub async fn run_install(
 }
 
 /// Deletes `local_model_tag`'s weights via Ollama and marks `provider_id`
-/// uninstalled. The "this removes shared on-disk storage another
-/// application might depend on" confirmation is a frontend responsibility
-/// (a dialog shown before this is ever called) — this function executes
-/// unconditionally once invoked, matching how other destructive IPC-driven
-/// operations in this codebase are structured (the confirmation lives in
-/// the UI layer, not re-litigated in the command/orchestration layer).
+/// uninstalled. QR's model directory is QR-private (decisions.id=840), so
+/// no other application's storage is affected. Any delete confirmation is a
+/// frontend responsibility (a dialog shown before this is ever called) —
+/// this function executes unconditionally once invoked, matching how other
+/// destructive IPC-driven operations in this codebase are structured (the
+/// confirmation lives in the UI layer, not re-litigated in the
+/// command/orchestration layer).
 pub async fn run_delete(
     pool: &sqlx::SqlitePool,
     client: &OllamaClient,
