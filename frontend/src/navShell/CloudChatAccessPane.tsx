@@ -59,6 +59,7 @@ import { FocusSettingsControls } from './FocusSettingsControls'
 import { requireCurrentUserId, type DominancePairState } from './navShellConfig'
 import { CloudChatCollapsedStrip } from './CloudChatCollapsedStrip'
 import { useDominancePair } from './useDominancePair'
+import { keepActiveChatForPersona } from './keepActiveChatForPersona'
 import { computeActivePaneRect, pixelRectToFraction, type PanePixelRect } from '../cloudChatAccess/paneLayout'
 import { PaneHitLayer } from '../cloudChatAccess/PaneHitLayer'
 import { PopupHitLayer } from '../cloudChatAccess/PopupHitLayer'
@@ -236,8 +237,15 @@ export function CloudChatAccessPane({
   // was showing belongs to the OLD Persona and must not keep showing
   // under the new one. Falls back to the new Persona's own default view,
   // same as a fresh mount would.
+  //
+  // items.id=584: only a chat owned by a DIFFERENT Persona is stale.
+  // handleStartNewChat sets a fresh chat for the NEW Persona and calls
+  // onPersonaChange in the same tick, so this effect used to fire right
+  // after it and discard that chat, dropping the user into the persistent
+  // flat tier3-access-{personaId} thread instead of the fresh one
+  // decisions.id=823 requires. See keepActiveChatForPersona.ts.
   useEffect(() => {
-    setActiveChat(null)
+    setActiveChat((prev) => keepActiveChatForPersona(prev, personaId))
     setLastAssistantMessage(null)
   }, [personaId])
 
