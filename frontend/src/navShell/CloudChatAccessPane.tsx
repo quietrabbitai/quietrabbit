@@ -60,6 +60,7 @@ import { requireCurrentUserId, type DominancePairState } from './navShellConfig'
 import { CloudChatCollapsedStrip } from './CloudChatCollapsedStrip'
 import { useDominancePair } from './useDominancePair'
 import { keepActiveChatForPersona } from './keepActiveChatForPersona'
+import { createUnsentChat, shouldStartFreshOnReturn } from './unsentChat'
 import { computeActivePaneRect, pixelRectToFraction, type PanePixelRect } from '../cloudChatAccess/paneLayout'
 import { PaneHitLayer } from '../cloudChatAccess/PaneHitLayer'
 import { PopupHitLayer } from '../cloudChatAccess/PopupHitLayer'
@@ -931,17 +932,7 @@ export function CloudChatAccessPane({
     (persona: PersonaInfo) => {
       if (persona.id === personaId) return
       resetGate3State()
-      const chatId = crypto.randomUUID()
-      const now = new Date().toISOString()
-      setActiveChat({
-        id: chatId,
-        persona_id: persona.id,
-        context_key: `chat-${chatId}`,
-        title: null,
-        archived_at: null,
-        created_at: now,
-        last_message_at: now,
-      })
+      setActiveChat(createUnsentChat(persona.id))
       onPersonaChange(persona.id)
     },
     [personaId, onPersonaChange],
@@ -955,6 +946,25 @@ export function CloudChatAccessPane({
     resetGate3State()
     setActiveChat(chat)
   }, [])
+
+  // items.id=584: leaving Chat (Board/Library becomes the dominant rail, i.e.
+  // floor) and coming back starts a fresh unsent chat for the current Persona,
+  // instead of resuming whatever was open -- e.g. a past chat opened from
+  // History. Only the floor -> not-floor transition: Cloud Chat also collapses
+  // QR but its second-opinion review is OF the current chat, so that path
+  // must keep it. Declared BEFORE the pendingChatSelection effect below so
+  // History's "resume this chat" (which flips floor in the same commit as
+  // setting pendingChatSelection) still ends up on the chosen chat.
+  const prevFloorRef = useRef(floor)
+  useEffect(() => {
+    if (shouldStartFreshOnReturn(prevFloorRef.current, floor) && personaId) {
+      resetGate3State()
+      setActiveChat(createUnsentChat(personaId))
+      setLastAssistantMessage(null)
+    }
+    prevFloorRef.current = floor
+    // resetGate3State only closes over stable state setters.
+  }, [floor, personaId])
 
   // items.id=404: History's "resume this chat" row-action lands here --
   // WorkspaceShell sets pendingChatSelection and dominantRail='chat' in
