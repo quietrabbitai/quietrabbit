@@ -372,6 +372,16 @@ fn validate_manifest() {
         }
         max_versions.insert(f.prefix, f.version);
     }
+    for m in FK_OFF_MIGRATIONS {
+        assert!(
+            SCHEMA_FILES
+                .iter()
+                .any(|f| f.prefix == m.prefix && f.version == m.version),
+            "FK_OFF_MIGRATIONS: no schema file for {} v{}",
+            m.prefix,
+            m.version
+        );
+    }
 }
 
 /// v1 schema files are always re-run (see run_pending) to pick up in-place
@@ -461,6 +471,69 @@ fn validate_v1_file_rerun_safety(prefix: &str, sql: &str) {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Versioned migrations that rebuild a table other tables reference
+/// (CREATE `_new`, copy, DROP, RENAME) and therefore must run with foreign-
+/// key enforcement OFF. With enforcement ON, `DROP TABLE` performs an
+/// implicit `DELETE FROM`: a NO ACTION child row makes the drop fail with
+/// "FOREIGN KEY constraint failed", and an `ON DELETE CASCADE` child row is
+/// silently deleted (items.id=585, "the migration-failure task").
+///
+/// `PRAGMA foreign_keys` is a no-op inside a transaction or SAVEPOINT, so
+/// this cannot be done from the SQL file -- `run_pending` switches it off
+/// outside the per-version SAVEPOINT, follows SQLite's documented rebuild
+/// procedure (`foreign_key_check` before commit), and switches it back on.
+/// `PRAGMA defer_foreign_keys` is NOT a substitute: it delays constraint
+/// checks but the cascade still fires on the DROP. A runner-level list
+/// (rather than editing the SQL) because outputs_011 and personal_002 have
+/// already been applied on other databases -- the "never edit an applied
+/// v2+ file" rule.
+///
+/// Adding a rebuild migration? `every_drop_table_is_fk_off_or_audited`
+/// forces you to list it here or justify it in `AUDITED_NO_FK_REFERENCES`.
+struct FkOffMigration {
+    prefix: &'static str,
+    version: u32,
+}
+
+static FK_OFF_MIGRATIONS: &[FkOffMigration] = &[
+    // focus_runs is referenced by 9 tables (6 NO ACTION, 3 ON DELETE CASCADE).
+    FkOffMigration {
+        prefix: "outputs",
+        version: 11,
+    },
+    // entities is referenced by entity_facts and entity_relationships (both
+    // ON DELETE CASCADE) and by its own parent_entity_id (SET NULL).
+    FkOffMigration {
+        prefix: "personal",
+        version: 2,
+    },
+];
+
+fn fk_off_required(prefix: &str, version: u32) -> bool {
+    FK_OFF_MIGRATIONS
+        .iter()
+        .any(|m| m.prefix == prefix && m.version == version)
+}
+
+/// One versioned migration step as `run_pending` executes it.
+struct Step {
+    version: u32,
+    sql: &'static str,
+    /// Run with foreign-key enforcement off -- see `FK_OFF_MIGRATIONS`.
+    fk_off: bool,
+}
+
+fn get_migration_steps(prefix: &str) -> Vec<Step> {
+    get_migration_files(prefix)
+        .into_iter()
+        .map(|(version, sql)| Step {
+            version,
+            sql,
+            fk_off: fk_off_required(prefix, version),
+        })
+        .collect()
+}
 
 /// Return (version, sql) pairs for the given prefix, in version order.
 fn get_migration_files(prefix: &str) -> Vec<(u32, &'static str)> {
@@ -773,13 +846,18 @@ async fn acquire_lock_with_retry(conn: &mut SqliteConnection) -> Result<bool, Mi
     Ok(false)
 }
 
-/// Release migration_lock unconditionally. Errors are swallowed — mirrors
-/// Python release_lock() which uses bare except pass.
+/// Release migration_lock unconditionally. A failure is logged at warn, not
+/// propagated: the migration result is what the caller needs, and a lock
+/// that stays held is reclaimed after STALE_LOCK_THRESHOLD_SECS. (Silently
+/// swallowing it hid a real leak -- items.id=585.)
 async fn release_lock(conn: &mut SqliteConnection) {
-    let _ =
+    if let Err(e) =
         sqlx::query("UPDATE migration_lock SET locked_at = NULL, locked_by = NULL WHERE id = 1")
             .execute(&mut *conn)
-            .await;
+            .await
+    {
+        log::warn!("migrations: could not release migration_lock: {e}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -923,6 +1001,19 @@ async fn run_migrations_at(
     validate_manifest();
     validate_v1_rerun_safety();
 
+    run_migrations_with_steps(conn, prefix, key_hex, db_path, &get_migration_steps(prefix)).await
+}
+
+/// Everything `run_migrations_at` does after manifest validation, over an
+/// explicit step list so tests can drive the real key/journal/lock/release
+/// wiring with a deliberately failing step.
+async fn run_migrations_with_steps(
+    conn: &mut SqliteConnection,
+    prefix: &str,
+    key_hex: Option<&str>,
+    db_path: Option<&Path>,
+    steps: &[Step],
+) -> Result<u32, MigrationError> {
     // PRAGMA key MUST precede journal_mode — non-negotiable (CLAUDE.md).
     if let Some(key) = key_hex {
         let pragma = format!("PRAGMA key = \"x'{key}'\"");
@@ -957,7 +1048,7 @@ async fn run_migrations_at(
         return Err(MigrationError::Locked);
     }
 
-    let result = run_pending(conn, prefix, db_path).await;
+    let result = run_pending(conn, prefix, db_path, steps).await;
     release_lock(conn).await;
     result
 }
@@ -1034,17 +1125,85 @@ async fn sweep_retired_objects(
     Ok(())
 }
 
+/// The user-facing failure returned for any migration problem. The
+/// diagnostic is the underlying error string, for internal use only.
+fn migration_failed(prefix: &str, diagnostic: String) -> MigrationError {
+    MigrationError::Failed {
+        db_path: prefix.to_owned(),
+        plain_language: "Quiet Rabbit couldn't finish setting up. \
+            Your data is safe. [Get help]"
+            .to_owned(),
+        diagnostic: Some(diagnostic),
+    }
+}
+
+/// Set `PRAGMA foreign_keys` and read it back. The pragma is a silent no-op
+/// inside a transaction, so a mismatch means the connection was not in
+/// autocommit and the step must not proceed as if enforcement were off.
+async fn set_foreign_keys(conn: &mut SqliteConnection, on: bool) -> Result<(), sqlx::Error> {
+    let pragma = if on {
+        "PRAGMA foreign_keys=ON"
+    } else {
+        "PRAGMA foreign_keys=OFF"
+    };
+    sqlx::query(pragma).execute(&mut *conn).await?;
+    let (current,): (i64,) = sqlx::query_as("PRAGMA foreign_keys")
+        .fetch_one(&mut *conn)
+        .await?;
+    if (current == 1) != on {
+        return Err(sqlx::Error::Protocol(format!(
+            "PRAGMA foreign_keys did not take effect (wanted {}, got {current})",
+            if on { 1 } else { 0 }
+        )));
+    }
+    Ok(())
+}
+
+/// Current `PRAGMA foreign_key_check` violations, counted per
+/// (child table, parent table, fk id). Counts rather than rowids: a rebuilt
+/// table gets new rowids, so a pre-existing violation must not look new.
+async fn foreign_key_violation_counts(
+    conn: &mut SqliteConnection,
+) -> Result<HashMap<(String, String, i64), u32>, sqlx::Error> {
+    let rows: Vec<(String, Option<i64>, String, i64)> = sqlx::query_as("PRAGMA foreign_key_check")
+        .fetch_all(&mut *conn)
+        .await?;
+    let mut counts = HashMap::new();
+    for (table, _rowid, parent, fkid) in rows {
+        *counts.entry((table, parent, fkid)).or_insert(0) += 1;
+    }
+    Ok(counts)
+}
+
+/// Child tables whose violation count grew relative to `baseline`, sorted.
+/// Names tables only -- never row values.
+async fn new_fk_violation_tables(
+    baseline: &HashMap<(String, String, i64), u32>,
+    conn: &mut SqliteConnection,
+) -> Result<Vec<String>, sqlx::Error> {
+    let after = foreign_key_violation_counts(conn).await?;
+    let mut tables: Vec<String> = after
+        .iter()
+        .filter(|(key, n)| **n > baseline.get(*key).copied().unwrap_or(0))
+        .map(|((table, _, _), _)| table.clone())
+        .collect();
+    tables.sort();
+    tables.dedup();
+    Ok(tables)
+}
+
 /// Inner migration loop — runs after lock is acquired.
 async fn run_pending(
     conn: &mut SqliteConnection,
     prefix: &str,
     db_path: Option<&Path>,
+    steps: &[Step],
 ) -> Result<u32, MigrationError> {
     let current_version = get_applied_version(conn).await;
-    let migrations = get_migration_files(prefix);
     let mut applied: u32 = 0;
 
-    for (version, sql) in migrations {
+    for step in steps {
+        let (version, sql) = (step.version, step.sql);
         let already_applied = version <= current_version;
         // v1 schema files are this project's amend-in-place surface (see
         // CLAUDE.md Schema Authoring convention + shared_001.sql's
@@ -1061,15 +1220,32 @@ async fn run_pending(
 
         let savepoint = format!("migration_v{version}");
         let statements = parse_statements(sql);
+        // 1-based index of the statement being executed; 0 while outside
+        // the statement loop (SAVEPOINT / version bookkeeping / RELEASE).
+        // Logged on failure so the log names the failing step.
+        let mut statement_index: usize = 0;
 
         let step_result: Result<(), sqlx::Error> = async {
+            // FK-off rebuild migrations (see FK_OFF_MIGRATIONS): enforcement
+            // must be off BEFORE the SAVEPOINT opens (it is a no-op inside
+            // one), and pre-existing violations are snapshotted so only
+            // violations this step introduces can fail it.
+            let fk_baseline = if step.fk_off {
+                set_foreign_keys(conn, false).await?;
+                Some(foreign_key_violation_counts(conn).await?)
+            } else {
+                None
+            };
+
             sqlx::query(&format!("SAVEPOINT {savepoint}"))
                 .execute(&mut *conn)
                 .await?;
 
-            for stmt in &statements {
+            for (i, stmt) in statements.iter().enumerate() {
+                statement_index = i + 1;
                 sqlx::query(stmt).execute(&mut *conn).await?;
             }
+            statement_index = 0;
 
             // Record the applied version inside the SAVEPOINT so that schema
             // content and tracking record commit or rollback atomically.
@@ -1101,6 +1277,17 @@ async fn run_pending(
                 .await?;
             }
 
+            // SQLite's documented rebuild procedure: verify before commit.
+            if let Some(baseline) = &fk_baseline {
+                let tables = new_fk_violation_tables(baseline, conn).await?;
+                if !tables.is_empty() {
+                    return Err(sqlx::Error::Protocol(format!(
+                        "foreign_key_check: migration introduced new violations in: {}",
+                        tables.join(", ")
+                    )));
+                }
+            }
+
             sqlx::query(&format!("RELEASE {savepoint}"))
                 .execute(&mut *conn)
                 .await?;
@@ -1109,17 +1296,43 @@ async fn run_pending(
         }
         .await;
 
+        if let Err(e) = &step_result {
+            // Prefix, version and statement position only -- never the SQL
+            // text or a file path. SQLite constraint errors name the table/
+            // constraint, not row values, so `e` carries no user content.
+            log::warn!(
+                "migrations: {prefix} v{version} failed (statement {statement_index} of {}): {e}",
+                statements.len()
+            );
+            // ROLLBACK TO undoes the work but leaves the SAVEPOINT (the
+            // outermost transaction) open. RELEASE closes it so the
+            // connection is back in autocommit; without it release_lock's
+            // UPDATE would be discarded when the connection drops and the
+            // lock would leak (items.id=585 D2). Either can legitimately
+            // fail if the SAVEPOINT statement itself never ran.
+            for cleanup in [
+                format!("ROLLBACK TO {savepoint}"),
+                format!("RELEASE {savepoint}"),
+            ] {
+                if let Err(ce) = sqlx::query(&cleanup).execute(&mut *conn).await {
+                    log::debug!("migrations: {prefix} v{version} cleanup `{cleanup}`: {ce}");
+                }
+            }
+        }
+
+        // Restore enforcement whatever happened above, and only after the
+        // SAVEPOINT is closed (the pragma is a no-op inside one).
+        if step.fk_off {
+            if let Err(re) = set_foreign_keys(conn, true).await {
+                log::warn!(
+                    "migrations: {prefix} v{version}: could not restore foreign_keys=ON: {re}"
+                );
+                return Err(migration_failed(prefix, re.to_string()));
+            }
+        }
+
         if let Err(e) = step_result {
-            let _ = sqlx::query(&format!("ROLLBACK TO {savepoint}"))
-                .execute(&mut *conn)
-                .await;
-            return Err(MigrationError::Failed {
-                db_path: prefix.to_owned(),
-                plain_language: "Quiet Rabbit couldn't finish setting up. \
-                    Your data is safe. [Get help]"
-                    .to_owned(),
-                diagnostic: Some(e.to_string()),
-            });
+            return Err(migration_failed(prefix, e.to_string()));
         }
 
         if !already_applied {
@@ -1132,13 +1345,7 @@ async fn run_pending(
     // a v1 re-run moments ago) and before the trailing consistency check --
     // see RETIRED_OBJECTS's own doc comment.
     if let Err(e) = sweep_retired_objects(conn, prefix).await {
-        return Err(MigrationError::Failed {
-            db_path: prefix.to_owned(),
-            plain_language: "Quiet Rabbit couldn't finish setting up. \
-                Your data is safe. [Get help]"
-                .to_owned(),
-            diagnostic: Some(e.to_string()),
-        });
+        return Err(migration_failed(prefix, e.to_string()));
     }
 
     // items.id=484 (Option D): gate the trailing consistency check so a
@@ -3410,5 +3617,439 @@ mod tests {
              UPDATE_SCHEMA_SNAPSHOT=1 set, then review and commit the diff",
             golden_path.display()
         );
+    }
+
+    // -- items.id=585: FK-safe rebuild migrations ---------------------------
+    //
+    // Scratch, SQLCipher-keyed files under a tempdir -- the same engine
+    // production uses. Nothing here touches a real data root.
+
+    /// Every non-comment `DROP TABLE` in a schema file that is not an
+    /// FK-off migration must be justified here: which tables (if any)
+    /// reference the dropped table at the version it is dropped. A new
+    /// rebuild migration then cannot silently repeat items.id=585's D1 --
+    /// the author has to either list it in FK_OFF_MIGRATIONS or write down
+    /// why the drop cannot cascade or fail.
+    const AUDITED_NO_FK_REFERENCES: &[(&str, u32, &str, &str)] = &[
+        (
+            "outputs",
+            7,
+            "outputs",
+            "the only `REFERENCES outputs(` clauses at v7 are self-references inside \
+             outputs_new (parent_output_id, superseded_by, both ON DELETE SET NULL) on \
+             columns new at v7, copied as NULL, so the DROP nulls nothing. \
+             focus_run_steps.output_id (outputs_009) references outputs but is created \
+             after v7",
+        ),
+        (
+            "shared",
+            11,
+            "focus_settings_friction_decisions",
+            "no table references it",
+        ),
+        (
+            "shared",
+            13,
+            "tier3_providers",
+            "no table references it (rows were copied into providers first)",
+        ),
+        (
+            "shared",
+            17,
+            "context_group_members",
+            "child table, nothing references it, dropped before its parent",
+        ),
+        (
+            "shared",
+            17,
+            "context_groups",
+            "its only child, context_group_members, is dropped first in the same file",
+        ),
+        ("shared", 20, "focus_settings", "no table references it"),
+        (
+            "shared",
+            20,
+            "focus_settings_friction_decisions",
+            "no table references it",
+        ),
+        (
+            "tier3_cookies",
+            2,
+            "tier3_provider_cookies",
+            "no table references it (rows were copied to cloud_chat_provider_cookies first)",
+        ),
+    ];
+
+    #[test]
+    fn every_drop_table_is_fk_off_or_audited() {
+        let mut seen: Vec<(String, u32, String)> = Vec::new();
+        for f in SCHEMA_FILES {
+            for stmt in parse_statements(f.sql) {
+                let upper = stmt.trim_start().to_uppercase();
+                let Some(rest) = upper.strip_prefix("DROP TABLE") else {
+                    continue;
+                };
+                let rest = rest.trim_start();
+                let table = rest
+                    .strip_prefix("IF EXISTS")
+                    .unwrap_or(rest)
+                    .trim()
+                    .to_lowercase();
+                seen.push((f.prefix.to_owned(), f.version, table.clone()));
+                let audited = AUDITED_NO_FK_REFERENCES
+                    .iter()
+                    .any(|(p, v, t, _)| *p == f.prefix && *v == f.version && *t == table);
+                assert!(
+                    fk_off_required(f.prefix, f.version) || audited,
+                    "{} v{} drops table `{table}`: add it to FK_OFF_MIGRATIONS (if other \
+                     tables reference it) or to AUDITED_NO_FK_REFERENCES with the reason \
+                     the drop cannot cascade or fail",
+                    f.prefix,
+                    f.version
+                );
+            }
+        }
+        for (p, v, t, _) in AUDITED_NO_FK_REFERENCES {
+            assert!(
+                seen.iter()
+                    .any(|(sp, sv, st)| sp == p && sv == v && st == t),
+                "stale AUDITED_NO_FK_REFERENCES entry: {p} v{v} no longer drops `{t}`"
+            );
+        }
+    }
+
+    async fn open_keyed_scratch(path: &Path) -> SqliteConnection {
+        SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true)
+            .foreign_keys(true)
+            .pragma("key", format!("\"x'{TEST_KEY_HEX}'\""))
+            .connect()
+            .await
+            .expect("scratch db must open")
+    }
+
+    /// Builds a "before" database: applies every `prefix` schema file with
+    /// version <= `max_version`, statement by statement, leaving the
+    /// connection's foreign-key enforcement on.
+    async fn apply_versions_up_to(conn: &mut SqliteConnection, prefix: &str, max_version: u32) {
+        for (version, sql) in get_migration_files(prefix) {
+            if version > max_version {
+                break;
+            }
+            for stmt in parse_statements(sql) {
+                sqlx::query(&stmt)
+                    .execute(&mut *conn)
+                    .await
+                    .unwrap_or_else(|e| panic!("{prefix} v{version} setup failed: {e}"));
+            }
+        }
+    }
+
+    async fn exec_all(conn: &mut SqliteConnection, statements: &[&str]) {
+        for stmt in statements {
+            sqlx::query(stmt)
+                .execute(&mut *conn)
+                .await
+                .unwrap_or_else(|e| panic!("seed failed: {e}\n{stmt}"));
+        }
+    }
+
+    async fn row_count(conn: &mut SqliteConnection, table: &str) -> i64 {
+        sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap_or_else(|e| panic!("count {table}: {e}"))
+    }
+
+    async fn fk_violations(conn: &mut SqliteConnection) -> Vec<(String, Option<i64>, String, i64)> {
+        sqlx::query_as("PRAGMA foreign_key_check")
+            .fetch_all(&mut *conn)
+            .await
+            .expect("foreign_key_check")
+    }
+
+    async fn foreign_keys_pragma(conn: &mut SqliteConnection) -> i64 {
+        sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&mut *conn)
+            .await
+            .expect("PRAGMA foreign_keys")
+    }
+
+    /// The 9 tables that reference focus_runs (6 NO ACTION, 3 ON DELETE
+    /// CASCADE) plus focus_runs itself.
+    const FOCUS_RUN_TABLES: &[&str] = &[
+        "focus_runs",
+        "focus_run_snapshots",
+        "extract_confirm_candidates",
+        "focus_run_steps",
+        "model_quality_scores",
+        "drift_observations",
+        "run_history",
+        "consent_decisions",
+        "pf_fact_mentions",
+        "outputs",
+    ];
+
+    #[tokio::test]
+    async fn outputs_v10_to_v11_preserves_every_focus_run_child_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut conn = open_keyed_scratch(&tmp.path().join("outputs.db")).await;
+        apply_versions_up_to(&mut conn, "outputs", 10).await;
+        exec_all(
+            &mut conn,
+            &[
+                "INSERT INTO focus_runs (id, focus_id, started_at) \
+                 VALUES ('run1', 'f', '2026-01-01T00:00:00Z')",
+                // ON DELETE CASCADE children
+                "INSERT INTO focus_run_snapshots \
+                 (id, focus_run_id, step_id, phase, checkpoint_hash, created_at) \
+                 VALUES ('s1', 'run1', 'st', 1, 'h', '2026-01-01T00:00:00Z')",
+                "INSERT INTO extract_confirm_candidates \
+                 (focus_run_id, field_name, extracted_value, sensitivity, confidence) \
+                 VALUES ('run1', 'n', 'v', 'personal', 0.5)",
+                "INSERT INTO focus_run_steps \
+                 (id, focus_run_id, step_id, sequence_index, created_at, updated_at) \
+                 VALUES ('fs1', 'run1', 'st', 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                // NO ACTION children
+                "INSERT INTO model_quality_scores \
+                 (id, model_id, task_type, quality_score, signal_validity, focus_run_id, \
+                  recorded_at) \
+                 VALUES ('q1', 'm', 't', 0.9, 'valid', 'run1', '2026-01-01T00:00:00Z')",
+                "INSERT INTO drift_observations \
+                 (id, model_id, task_type, focus_run_id, observed_at) \
+                 VALUES ('d1', 'm', 't', 'run1', '2026-01-01T00:00:00Z')",
+                "INSERT INTO run_history \
+                 (id, focus_run_id, focus_id, persona_id, created_at) \
+                 VALUES ('h1', 'run1', 'f', 'p', '2026-01-01T00:00:00Z')",
+                "INSERT INTO consent_decisions \
+                 (id, focus_run_id, decision_type, decision, created_at) \
+                 VALUES ('c1', 'run1', 'gate3', 'approved', '2026-01-01T00:00:00Z')",
+                "INSERT INTO pf_fact_mentions \
+                 (id, focus_run_id, category, fact_key, original_text, created_at) \
+                 VALUES ('m1', 'run1', 'c', 'k', 't', '2026-01-01T00:00:00Z')",
+                "INSERT INTO outputs (id, focus_run_id, output_type, created_at, updated_at) \
+                 VALUES ('o1', 'run1', 'doc', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            ],
+        )
+        .await;
+
+        let mut before = Vec::new();
+        for table in FOCUS_RUN_TABLES {
+            let n = row_count(&mut conn, table).await;
+            assert_eq!(n, 1, "fixture must seed exactly one row in {table}");
+            before.push(n);
+        }
+
+        let applied = run_migrations(&mut conn, "outputs", Some(TEST_KEY_HEX))
+            .await
+            .expect("v11 must apply to a populated outputs.db");
+        assert_eq!(applied, 1, "only outputs_011 was pending");
+
+        for (table, expected) in FOCUS_RUN_TABLES.iter().zip(before) {
+            assert_eq!(
+                row_count(&mut conn, table).await,
+                expected,
+                "{table} row count changed across the focus_runs rebuild"
+            );
+        }
+        assert!(
+            fk_violations(&mut conn).await.is_empty(),
+            "foreign_key_check must be clean after the rebuild"
+        );
+        assert_eq!(
+            foreign_keys_pragma(&mut conn).await,
+            1,
+            "enforcement must be restored"
+        );
+        // The point of v11: the widened CHECK accepts the new status.
+        exec_all(
+            &mut conn,
+            &["INSERT INTO focus_runs (id, focus_id, status, started_at) \
+               VALUES ('run2', 'f', 'awaiting_schedule', '2026-01-01T00:00:00Z')"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn personal_v1_to_v2_preserves_entity_facts_and_relationships() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut conn = open_keyed_scratch(&tmp.path().join("personal.db")).await;
+        apply_versions_up_to(&mut conn, "personal", 1).await;
+        exec_all(
+            &mut conn,
+            &[
+                "INSERT INTO entities (id, entity_type, display_name) VALUES ('e1', 'person', 'A')",
+                "INSERT INTO entities (id, entity_type, display_name) VALUES ('e2', 'person', 'B')",
+                "INSERT INTO entity_facts \
+                 (id, entity_id, field_name, field_value, sensitivity, source_persona_id) \
+                 VALUES ('f1', 'e1', 'n', x'01', 'general', 'p')",
+                // singleton (entity_id NULL) must also survive
+                "INSERT INTO entity_facts \
+                 (id, entity_id, field_name, field_value, sensitivity, source_persona_id) \
+                 VALUES ('f2', NULL, 'n', x'02', 'general', 'p')",
+                "INSERT INTO entity_relationships \
+                 (id, from_entity_id, to_entity_id, relationship_type) \
+                 VALUES ('r1', 'e1', 'e2', 'knows')",
+            ],
+        )
+        .await;
+
+        run_migrations(&mut conn, "personal", Some(TEST_KEY_HEX))
+            .await
+            .expect("personal must upgrade a populated v1 database");
+
+        assert_eq!(row_count(&mut conn, "entities").await, 2);
+        assert_eq!(row_count(&mut conn, "entity_facts").await, 2);
+        assert_eq!(row_count(&mut conn, "entity_relationships").await, 1);
+        assert!(fk_violations(&mut conn).await.is_empty());
+        assert_eq!(foreign_keys_pragma(&mut conn).await, 1);
+        let facts_sql: String =
+            sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE name = 'entity_facts'")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert!(
+            facts_sql.contains("REFERENCES entities(") && !facts_sql.contains("entities_v2"),
+            "entity_facts must still reference `entities` after the rename"
+        );
+    }
+
+    const FAKE_V1: &str = "CREATE TABLE IF NOT EXISTS schema_version \
+        (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, description TEXT NOT NULL);\n\
+        INSERT OR IGNORE INTO schema_version (version, applied_at, description) \
+        VALUES (1, 'x', 'x');";
+
+    async fn migration_lock_row(conn: &mut SqliteConnection) -> (Option<String>, Option<String>) {
+        sqlx::query_as("SELECT locked_at, locked_by FROM migration_lock WHERE id = 1")
+            .fetch_one(&mut *conn)
+            .await
+            .expect("migration_lock row")
+    }
+
+    #[tokio::test]
+    async fn failed_step_releases_migration_lock() {
+        use sqlx::Connection;
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("fake.db");
+        let steps = [
+            Step {
+                version: 1,
+                sql: FAKE_V1,
+                fk_off: false,
+            },
+            Step {
+                version: 2,
+                sql: "CREATE TABLE IF NOT EXISTS u (id INTEGER);\n\
+                      INSERT INTO no_such_table (id) VALUES (1);",
+                fk_off: false,
+            },
+        ];
+        let mut conn = open_keyed_scratch(&db).await;
+        let result =
+            run_migrations_with_steps(&mut conn, "fake", Some(TEST_KEY_HEX), None, &steps).await;
+        assert!(matches!(result, Err(MigrationError::Failed { .. })));
+        // Closing the connection is what discarded the leaked release in
+        // production: an open transaction is rolled back on close.
+        conn.close().await.unwrap();
+
+        let mut verify = open_keyed_scratch(&db).await;
+        assert_eq!(
+            migration_lock_row(&mut verify).await,
+            (None, None),
+            "a failed step must not leave migration_lock held"
+        );
+    }
+
+    async fn fk_scratch_db(path: &Path, orphan: bool) -> SqliteConnection {
+        let mut conn = open_keyed_scratch(path).await;
+        exec_all(
+            &mut conn,
+            &[
+                "CREATE TABLE p (id INTEGER PRIMARY KEY)",
+                "CREATE TABLE c (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id))",
+                "INSERT INTO p (id) VALUES (1)",
+                "INSERT INTO c (id, pid) VALUES (1, 1)",
+            ],
+        )
+        .await;
+        if orphan {
+            // a violation that predates the migration under test
+            exec_all(
+                &mut conn,
+                &[
+                    "PRAGMA foreign_keys=OFF",
+                    "INSERT INTO c (id, pid) VALUES (2, 99)",
+                    "PRAGMA foreign_keys=ON",
+                ],
+            )
+            .await;
+        }
+        conn
+    }
+
+    #[tokio::test]
+    async fn fk_off_step_that_creates_new_orphans_is_rejected_and_restored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("fake.db");
+        let mut conn = fk_scratch_db(&db, false).await;
+        let steps = [
+            Step {
+                version: 1,
+                sql: FAKE_V1,
+                fk_off: false,
+            },
+            Step {
+                version: 2,
+                // with enforcement off this drop succeeds and orphans c(1)
+                sql: "DROP TABLE p;\n\
+                      INSERT OR IGNORE INTO schema_version (version, applied_at, description) \
+                      VALUES (2, 'x', 'x');",
+                fk_off: true,
+            },
+        ];
+        let err = run_migrations_with_steps(&mut conn, "fake", Some(TEST_KEY_HEX), None, &steps)
+            .await
+            .expect_err("a step that orphans rows must be rejected");
+        match err {
+            MigrationError::Failed { diagnostic, .. } => {
+                let d = diagnostic.unwrap_or_default();
+                assert!(d.contains("foreign_key_check") && d.contains('c'), "{d}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert_eq!(
+            row_count(&mut conn, "p").await,
+            1,
+            "the drop must roll back"
+        );
+        assert_eq!(foreign_keys_pragma(&mut conn).await, 1);
+        assert_eq!(migration_lock_row(&mut conn).await, (None, None));
+    }
+
+    #[tokio::test]
+    async fn fk_off_step_is_not_blocked_by_a_preexisting_orphan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut conn = fk_scratch_db(&tmp.path().join("fake.db"), true).await;
+        let steps = [
+            Step {
+                version: 1,
+                sql: FAKE_V1,
+                fk_off: false,
+            },
+            Step {
+                version: 2,
+                sql: "CREATE TABLE IF NOT EXISTS z (id INTEGER);\n\
+                      INSERT OR IGNORE INTO schema_version (version, applied_at, description) \
+                      VALUES (2, 'x', 'x');",
+                fk_off: true,
+            },
+        ];
+        let applied =
+            run_migrations_with_steps(&mut conn, "fake", Some(TEST_KEY_HEX), None, &steps)
+                .await
+                .expect("an existing, unrelated violation must not block the step");
+        assert_eq!(applied, 2);
+        assert_eq!(foreign_keys_pragma(&mut conn).await, 1);
     }
 }

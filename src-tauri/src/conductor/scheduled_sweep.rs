@@ -34,7 +34,8 @@ use std::sync::Arc;
 use crate::auth::registry::{key_hex, KeyRegistry};
 use crate::conductor::concurrency::ConductorScheduler;
 use crate::conductor::lifecycle::{rehydrate_focus_run, FocusRun};
-use crate::persistence::output_store::list_due_scheduled_focus_runs;
+use crate::persistence::migrations::MigrationError;
+use crate::persistence::output_store::{list_due_scheduled_focus_runs, OutputStoreError};
 use crate::persistence::persona_store::list_personas_for_user;
 use crate::providers::utils::now;
 
@@ -75,11 +76,24 @@ pub async fn run_periodic_sweep(
                 // all -- same "best-effort, log and move on" posture
                 // get_focus_run_last_used (this module's sibling reads)
                 // already takes, not escalated to a hard failure for one
-                // persona in a multi-persona sweep.
-                log::debug!(
-                    "scheduled_sweep: could not check persona '{}' for due steps: {e}",
-                    persona.id
-                );
+                // persona in a multi-persona sweep. A failed migration is
+                // the exception: it repeats every sweep and is never
+                // benign, so it is logged at warn (the failing step itself
+                // is warned by the migration runner).
+                if matches!(
+                    e,
+                    OutputStoreError::Migration(MigrationError::Failed { .. })
+                ) {
+                    log::warn!(
+                        "scheduled_sweep: could not check persona '{}' for due steps: {e}",
+                        persona.id
+                    );
+                } else {
+                    log::debug!(
+                        "scheduled_sweep: could not check persona '{}' for due steps: {e}",
+                        persona.id
+                    );
+                }
                 continue;
             }
         };
