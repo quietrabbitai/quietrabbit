@@ -1,18 +1,27 @@
 //! Ollama qr_local HTTP client.
 //!
 //! Ollama is qr_local — it does NOT implement [`QrHostedProvider`].
-//! Errors map directly to [`ConductorError`] at every raise site.
-//! No [`ProviderError`] intermediary — qr_local maps directly.
+//! Inference-call errors map directly to [`ConductorError`] at every raise
+//! site. No [`ProviderError`] intermediary — qr_local maps directly.
+//! EXCEPTION (items.id=436): `pull_model`/`delete_model` map to
+//! [`OllamaModelError`] instead — model install/delete has no
+//! step_id/FocusRun context, so it isn't a fit for `ConductorError`'s
+//! Conductor step-execution failure taxonomy. See that type's own doc
+//! comment.
 //!
 //! `stream` is always `false` in Release 1 — resolved by `StepExecutor`.
 //!
-//! Two [`reqwest::Client`] instances are held:
+//! Four [`reqwest::Client`] instances are held:
 //! - `client` (120s): inference calls (`/api/generate`, `/api/chat`, `/api/create`)
 //! - `health_client` (5s): health, model enumeration, modelfile show
+//! - `modelfile_client` (300s): modelfile application (`/api/create`)
+//! - `pull_client` (no timeout): model pull/delete (items.id=436)
 
 use std::time::Duration;
 
+use futures_util::{Stream, StreamExt};
 use reqwest::Client;
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::conductor::failure::ConductorError;
@@ -45,9 +54,17 @@ const BUFFERED_TASK_TYPES: &[&str] = &["code", "research", "creative_writing", "
 ///
 /// `OLLAMA_HOST` must be a bare hostname or IP — not a full URL.
 /// This matches Python oracle: `f"http://{host}:{port}"`.
+///
+/// Default port is `ollama_sidecar::QR_OLLAMA_PORT` (21434) — QR's own
+/// dedicated sidecar port, never 11434, never negotiated
+/// (decisions.id=840). Safe to change here as the single default: nothing
+/// in this codebase sets `OLLAMA_HOST`/`OLLAMA_PORT` on QR's own process
+/// environment today (`ollama_sidecar.rs` only sets them on the *spawned
+/// child's* environment).
 fn base_url() -> String {
     let host = std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned());
-    let port = std::env::var("OLLAMA_PORT").unwrap_or_else(|_| "11434".to_owned());
+    let port = std::env::var("OLLAMA_PORT")
+        .unwrap_or_else(|_| crate::ollama_sidecar::QR_OLLAMA_PORT.to_string());
     format!("http://{}:{}", host, port)
 }
 
@@ -71,16 +88,21 @@ fn context_hard_limit() -> f64 {
 
 /// Ollama qr_local HTTP client.
 ///
-/// Holds three `reqwest::Client` instances with different timeouts:
+/// Holds four `reqwest::Client` instances with different timeouts:
 /// - `client` (120s): inference calls (`/api/generate`, `/api/chat`).
 /// - `health_client` (5s): health check, tags, show.
 /// - `modelfile_client` (300s): modelfile application (`/api/create`).
+/// - `pull_client` (no timeout): model pull/delete (`/api/pull`,
+///   `/api/delete`, items.id=436) — a pull can legitimately run for many
+///   minutes; cancellation is via `CancellationToken`
+///   (`providers::ollama_install::run_install`), not a deadline.
 ///
 /// Construct once per Conductor actor. Not `Clone` — single owner per actor.
 pub struct OllamaClient {
     client: Client,
     health_client: Client,
     modelfile_client: Client,
+    pull_client: Client,
 }
 
 impl Default for OllamaClient {
@@ -104,6 +126,9 @@ impl OllamaClient {
                 .timeout(Duration::from_secs(OLLAMA_MODELFILE_TIMEOUT_SECS))
                 .build()
                 .expect("reqwest modelfile client build should never fail"),
+            pull_client: Client::builder()
+                .build()
+                .expect("reqwest pull client build should never fail"),
         }
     }
 
@@ -477,6 +502,205 @@ impl OllamaClient {
 
         success
     }
+
+    // -----------------------------------------------------------------------
+    // Model management (items.id=436)
+    // -----------------------------------------------------------------------
+
+    /// Pull a model via `/api/pull`, returning a stream of decoded NDJSON
+    /// progress lines.
+    ///
+    /// Unlike `apply_modelfile()` above, this genuinely streams: each
+    /// `Bytes` chunk from `reqwest::Response::bytes_stream()` is buffered
+    /// and split on `\n` as it arrives, so a caller can report live
+    /// progress on a pull that runs for minutes, rather than waiting for
+    /// the whole body and inspecting only the last line. No
+    /// `serde_json::Deserializer::from_reader`/`StreamDeserializer`
+    /// precedent existed in this codebase to reuse — this is new
+    /// streaming-parse code (`ndjson_lines` below).
+    ///
+    /// Resolves explicitly against Ollama's own configured default
+    /// registry (`registry.ollama.ai`) — `tag` is passed straight through
+    /// as `{"model": tag}` with no registry-host override in the request,
+    /// matching decisions.id=840's requirement that pulls never resolve
+    /// against a user-suppliable registry host. Callers (
+    /// `providers::ollama_install`) are additionally responsible for only
+    /// ever passing a `tag` that matches a curated `providers.local_model_tag`
+    /// row — this method itself does not re-validate the curated list.
+    ///
+    /// A per-line `{"error": "..."}` (Ollama can report this mid-stream on
+    /// an otherwise-200 response, e.g. a failed digest) is decoded into
+    /// `PullProgressLine::error`, not raised here — the caller decides how
+    /// to react, since this method's job is decoding, not orchestration.
+    pub async fn pull_model(
+        &self,
+        tag: &str,
+    ) -> Result<impl Stream<Item = Result<PullProgressLine, OllamaModelError>>, OllamaModelError>
+    {
+        let url = format!("{}/api/pull", base_url());
+        let resp = self
+            .pull_client
+            .post(&url)
+            .json(&serde_json::json!({ "model": tag }))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(OllamaModelError::UnexpectedStatus { status, body });
+        }
+
+        Ok(ndjson_lines(resp.bytes_stream()))
+    }
+
+    /// Look up a model's content digest via `/api/tags`, matching on exact
+    /// `name`. Returns `None` if the model isn't found or the request
+    /// fails — never raises, matching `check_health()`'s own
+    /// never-raises contract, since this is used only for the
+    /// bug-report/support-tracing `providers.local_model_digest` column,
+    /// not anything routing-critical.
+    ///
+    /// Deliberately re-queries `/api/tags` after a successful pull rather
+    /// than reusing a digest seen mid-stream in `/api/pull`'s NDJSON lines
+    /// — those digests identify individual manifest layers (e.g. the GGUF
+    /// weights blob), not necessarily the same digest Ollama reports for
+    /// the model as a whole via `/api/tags`.
+    pub async fn get_model_digest(&self, tag: &str) -> Option<String> {
+        let url = format!("{}/api/tags", base_url());
+        let resp = self.health_client.get(&url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let data: Value = resp.json().await.ok()?;
+        data.get("models")?
+            .as_array()?
+            .iter()
+            .find(|m| m.get("name").and_then(|n| n.as_str()) == Some(tag))
+            .and_then(|m| m.get("digest"))
+            .and_then(|d| d.as_str())
+            .map(str::to_owned)
+    }
+
+    /// Delete a locally installed model via `/api/delete`.
+    ///
+    /// Uses HTTP `DELETE`, not `POST` — confirmed live against the
+    /// installed Ollama version (0.34.4): `POST /api/delete` returns
+    /// `405 method not allowed`, `DELETE /api/delete` reaches the handler
+    /// correctly. Resolves decisions.id=840's noted open compatibility
+    /// question for that version.
+    ///
+    /// Treats `404 Not Found` ("model not found") as success — an
+    /// already-absent model is not an error for an idempotent delete
+    /// (the caller may be retrying after a partial failure, or the file
+    /// was already removed by some other path).
+    pub async fn delete_model(&self, tag: &str) -> Result<(), OllamaModelError> {
+        let url = format!("{}/api/delete", base_url());
+        let resp = self
+            .pull_client
+            .delete(&url)
+            .json(&serde_json::json!({ "model": tag }))
+            .send()
+            .await?;
+
+        match resp.status() {
+            s if s.is_success() => Ok(()),
+            reqwest::StatusCode::NOT_FOUND => Ok(()),
+            status => {
+                let body = resp.text().await.unwrap_or_default();
+                Err(OllamaModelError::UnexpectedStatus { status, body })
+            }
+        }
+    }
+}
+
+/// Errors from `pull_model`/`delete_model`. Deliberately NOT
+/// `ConductorError`: that type's variants (`OllamaUnavailable`,
+/// `OllamaTimeout`, etc.) are coupled to the Conductor step-execution
+/// failure taxonomy (`conductor/failure.rs`'s F1/F_SYSTEM handling,
+/// `step_id`/`focus_id`, retry-count branching) — a background model
+/// install/delete has no step_id or FocusRun context and isn't a
+/// candidate for that state machine's retry/tier-fallback semantics. This
+/// is its own small error type instead, surfaced to the frontend as a
+/// plain string by `commands::model_install`.
+#[derive(Debug, thiserror::Error)]
+pub enum OllamaModelError {
+    #[error("request to Ollama failed: {0}")]
+    Http(#[from] reqwest::Error),
+    #[error("Ollama returned HTTP {status}: {body}")]
+    UnexpectedStatus {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+    #[error("could not parse Ollama's response: {0}")]
+    Decode(#[from] serde_json::Error),
+    /// A mid-stream `{"error": "..."}` NDJSON line on an otherwise-200
+    /// `/api/pull` response (e.g. a failed digest). Distinct from
+    /// `UnexpectedStatus` — the HTTP status was fine, Ollama's own pull
+    /// logic reported the failure inline.
+    #[error("Ollama reported a pull failure: {0}")]
+    Reported(String),
+}
+
+/// One decoded line of Ollama's `/api/pull` NDJSON stream.
+///
+/// Field set matches Ollama's documented pull-progress shape. `error` is
+/// `Some` only on a mid-stream failure line (e.g. a digest mismatch) —
+/// `pull_model()` decodes it but leaves reacting to it to the caller.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PullProgressLine {
+    pub status: String,
+    pub digest: Option<String>,
+    pub total: Option<u64>,
+    pub completed: Option<u64>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Adapts a raw `Stream<Item = reqwest::Result<Bytes>>` (as returned by
+/// `Response::bytes_stream()`) into a stream of decoded NDJSON lines,
+/// buffering partial lines across chunk boundaries. Blank lines are
+/// skipped. On stream end, any remaining non-blank buffered content is
+/// decoded as a final line (handles a response whose last line has no
+/// trailing `\n`).
+fn ndjson_lines<B: AsRef<[u8]>>(
+    byte_stream: impl Stream<Item = reqwest::Result<B>> + Unpin,
+) -> impl Stream<Item = Result<PullProgressLine, OllamaModelError>> {
+    futures_util::stream::unfold(
+        (byte_stream, Vec::<u8>::new(), false),
+        |(mut byte_stream, mut buf, mut done)| async move {
+            loop {
+                if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                    let line: Vec<u8> = buf.drain(..=pos).collect();
+                    let line = &line[..line.len() - 1]; // strip the '\n'
+                    if line.iter().all(u8::is_ascii_whitespace) {
+                        continue;
+                    }
+                    let parsed = serde_json::from_slice::<PullProgressLine>(line)
+                        .map_err(OllamaModelError::from);
+                    return Some((parsed, (byte_stream, buf, done)));
+                }
+
+                if done {
+                    if !buf.is_empty() && !buf.iter().all(u8::is_ascii_whitespace) {
+                        let parsed = serde_json::from_slice::<PullProgressLine>(&buf)
+                            .map_err(OllamaModelError::from);
+                        buf.clear();
+                        return Some((parsed, (byte_stream, buf, done)));
+                    }
+                    return None;
+                }
+
+                match byte_stream.next().await {
+                    Some(Ok(bytes)) => buf.extend_from_slice(bytes.as_ref()),
+                    Some(Err(e)) => {
+                        return Some((Err(OllamaModelError::from(e)), (byte_stream, buf, true)))
+                    }
+                    None => done = true,
+                }
+            }
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------

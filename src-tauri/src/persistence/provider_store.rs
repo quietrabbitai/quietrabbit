@@ -33,6 +33,14 @@
 // script/migration) and any future Chat-PM-directed catalog maintenance,
 // not end-user action. Flagged here so a future reader doesn't assume a
 // missing write-path IPC command is an oversight.
+//
+// EXCEPTION (items.id=436, shared_024.sql): set_local_model_installed/
+// set_local_model_uninstalled/set_local_model_disabled ARE reachable from
+// IPC (commands::model_install) -- a narrow, deliberate carve-out. They
+// touch only installed/qr_disabled_by_user/local_model_digest/installed_at
+// on provider_type='local_model' rows; every other column on those rows
+// (hardware_requirement, risk_rating, local_model_tag, etc.) stays
+// curator-owned and still has no write path, same as every other row.
 
 use sqlx::Row;
 use thiserror::Error;
@@ -259,6 +267,36 @@ pub struct Provider {
     /// session, not built yet). Open vocabulary, no CHECK, same precedent
     /// as provider_type. DEFAULT 'supported' at the schema level.
     pub preference_tier: String,
+    /// items.id=436 (shared_024.sql): true once this local model's weights
+    /// have actually been pulled. Distinct from the catalog entry existing
+    /// at all -- a curated model can be listed here with `installed: false`.
+    /// Mutated only by set_local_model_installed/set_local_model_uninstalled.
+    pub installed: bool,
+    /// items.id=436 (shared_024.sql): "keep the files, stop QR routing to
+    /// this model" -- distinct from deletion, which removes the weights
+    /// and flips `installed` back to false instead. Mutated only by
+    /// set_local_model_disabled.
+    pub qr_disabled_by_user: bool,
+    /// items.id=436 (shared_024.sql): local_model rows only -- the literal
+    /// string Ollama's API expects (e.g. "llama3.2:3b"). Curator-set at
+    /// creation, like hardware_requirement; never mutated by the install
+    /// mechanism.
+    pub local_model_tag: Option<String>,
+    /// items.id=436 (shared_024.sql): Ollama's digest for the currently
+    /// installed weights. None until a successful install; cleared on
+    /// uninstall. Bug-report/support tracing, not read by any routing logic.
+    pub local_model_digest: Option<String>,
+    /// items.id=436 (shared_024.sql): RFC3339 UTC timestamp of the last
+    /// successful install. None until installed; cleared on uninstall.
+    pub installed_at: Option<String>,
+    /// items.id=436 (shared_024.sql): sibling flag to qr_internal_eligible
+    /// -- this model may be used to fulfill Focus execution. Curator-set,
+    /// same unmarked-is-excluded convention.
+    pub focus_eligible: bool,
+    /// items.id=436 (shared_024.sql): sibling flag to qr_internal_eligible
+    /// -- this model appears as a selectable option in the Cloud Chat
+    /// provider picker. Curator-set, same unmarked-is-excluded convention.
+    pub cloud_chat_visible: bool,
 }
 
 /// Input to create_provider(). A plain struct rather than 15+ positional
@@ -289,6 +327,12 @@ pub struct NewProvider<'a> {
     pub qr_recommended: bool,
     pub privacy_commitment_basis: Option<PrivacyCommitmentBasis>,
     pub performance_profile: Option<serde_json::Value>,
+    /// items.id=436: local_model rows only. See Provider::local_model_tag.
+    pub local_model_tag: Option<&'a str>,
+    /// items.id=436: see Provider::focus_eligible.
+    pub focus_eligible: bool,
+    /// items.id=436: see Provider::cloud_chat_visible.
+    pub cloud_chat_visible: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -302,7 +346,9 @@ const SELECT_COLUMNS: &str = "id, display_name, provider_type, mode, launch_url,
                 qr_internal_eligible, privacy_guardian_default_level,
                 risk_rating, hardware_requirement, user_privacy_summary,
                 qr_recommended, privacy_commitment_basis, performance_profile,
-                preference_tier";
+                preference_tier, installed, qr_disabled_by_user,
+                local_model_tag, local_model_digest, installed_at,
+                focus_eligible, cloud_chat_visible";
 
 // ---------------------------------------------------------------------------
 // Row extraction
@@ -355,6 +401,27 @@ fn row_to_provider(row: &sqlx::sqlite::SqliteRow) -> Result<Provider, ProviderSt
         .map_err(ProviderStoreError::Database)?;
     let preference_tier: String = row
         .try_get("preference_tier")
+        .map_err(ProviderStoreError::Database)?;
+    let installed_raw: i64 = row
+        .try_get("installed")
+        .map_err(ProviderStoreError::Database)?;
+    let qr_disabled_by_user_raw: i64 = row
+        .try_get("qr_disabled_by_user")
+        .map_err(ProviderStoreError::Database)?;
+    let local_model_tag: Option<String> = row
+        .try_get("local_model_tag")
+        .map_err(ProviderStoreError::Database)?;
+    let local_model_digest: Option<String> = row
+        .try_get("local_model_digest")
+        .map_err(ProviderStoreError::Database)?;
+    let installed_at: Option<String> = row
+        .try_get("installed_at")
+        .map_err(ProviderStoreError::Database)?;
+    let focus_eligible_raw: i64 = row
+        .try_get("focus_eligible")
+        .map_err(ProviderStoreError::Database)?;
+    let cloud_chat_visible_raw: i64 = row
+        .try_get("cloud_chat_visible")
         .map_err(ProviderStoreError::Database)?;
 
     let documentation_gate: serde_json::Value =
@@ -451,6 +518,13 @@ fn row_to_provider(row: &sqlx::sqlite::SqliteRow) -> Result<Provider, ProviderSt
         privacy_commitment_basis,
         performance_profile,
         preference_tier,
+        installed: installed_raw != 0,
+        qr_disabled_by_user: qr_disabled_by_user_raw != 0,
+        local_model_tag,
+        local_model_digest,
+        installed_at,
+        focus_eligible: focus_eligible_raw != 0,
+        cloud_chat_visible: cloud_chat_visible_raw != 0,
     })
 }
 
@@ -771,8 +845,9 @@ pub async fn create_provider(
           review_trigger_note, created_at, is_local, is_anonymous,
           retains_data, trains_on_data_by_default, qr_internal_eligible,
           privacy_guardian_default_level, risk_rating, hardware_requirement,
-          qr_recommended, privacy_commitment_basis, performance_profile)
-         VALUES (?, ?, ?, ?, ?, ?, 'active', ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          qr_recommended, privacy_commitment_basis, performance_profile,
+          local_model_tag, focus_eligible, cloud_chat_visible)
+         VALUES (?, ?, ?, ?, ?, ?, 'active', ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(new.id)
     .bind(new.display_name)
@@ -793,6 +868,9 @@ pub async fn create_provider(
     .bind(new.qr_recommended as i64)
     .bind(new.privacy_commitment_basis.map(|b| b.as_str()))
     .bind(&performance_profile_str)
+    .bind(new.local_model_tag)
+    .bind(new.focus_eligible as i64)
+    .bind(new.cloud_chat_visible as i64)
     .execute(&mut *conn)
     .await
     .map_err(|e| classify_constraint_error(new.id, e))?;
@@ -826,6 +904,18 @@ pub async fn create_provider(
         // (shared_018.sql), mirrored here to keep this in-memory value
         // consistent with what's actually in the DB.
         preference_tier: "supported".to_owned(),
+        local_model_tag: new.local_model_tag.map(|s| s.to_owned()),
+        focus_eligible: new.focus_eligible,
+        cloud_chat_visible: new.cloud_chat_visible,
+        // items.id=436: install-mechanism-owned state, not part of
+        // NewProvider -- always starts at the schema's own DEFAULT 0/NULL,
+        // mirrored here for the same reason preference_tier is above. Only
+        // set_local_model_installed/set_local_model_disabled ever change
+        // these after creation.
+        installed: false,
+        qr_disabled_by_user: false,
+        local_model_digest: None,
+        installed_at: None,
     })
 }
 
@@ -915,6 +1005,94 @@ pub async fn update_documentation_gate(
         .bind(provider_id)
         .execute(&mut *conn)
         .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(ProviderStoreError::NotFound(provider_id.to_owned()));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Local model install state (items.id=436) -- see this module's header
+// "EXCEPTION" note. Every function here is scoped with
+// `AND provider_type = 'local_model'` as a defensive check, on top of the
+// caller-side validation the IPC layer (commands::model_install) already
+// does -- these must never be reachable against a cloud/API row even if
+// called with a wrong id.
+// ---------------------------------------------------------------------------
+
+/// Marks a local model installed after a successful pull. `digest` is
+/// Ollama's reported digest for the pulled weights (bug-report/support
+/// tracing only, not read by any routing logic) -- pass `None` if the
+/// pull response didn't carry one.
+pub async fn set_local_model_installed(
+    pool: &sqlx::SqlitePool,
+    provider_id: &str,
+    digest: Option<&str>,
+) -> Result<(), ProviderStoreError> {
+    let installed_at = crate::providers::utils::now();
+    let mut conn = pool.acquire().await?;
+
+    let result = sqlx::query(
+        "UPDATE providers
+         SET installed = 1, local_model_digest = ?, installed_at = ?
+         WHERE id = ? AND provider_type = 'local_model'",
+    )
+    .bind(digest)
+    .bind(&installed_at)
+    .bind(provider_id)
+    .execute(&mut *conn)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(ProviderStoreError::NotFound(provider_id.to_owned()));
+    }
+    Ok(())
+}
+
+/// Reverses set_local_model_installed after a successful delete. Clears
+/// local_model_digest/installed_at rather than leaving stale values behind
+/// from a previous install.
+pub async fn set_local_model_uninstalled(
+    pool: &sqlx::SqlitePool,
+    provider_id: &str,
+) -> Result<(), ProviderStoreError> {
+    let mut conn = pool.acquire().await?;
+
+    let result = sqlx::query(
+        "UPDATE providers
+         SET installed = 0, local_model_digest = NULL, installed_at = NULL
+         WHERE id = ? AND provider_type = 'local_model'",
+    )
+    .bind(provider_id)
+    .execute(&mut *conn)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(ProviderStoreError::NotFound(provider_id.to_owned()));
+    }
+    Ok(())
+}
+
+/// "Keep the files, stop QR routing to this model" -- distinct from
+/// set_local_model_uninstalled, which the delete path uses instead. Does
+/// not touch `installed`: a disabled model can still be `installed: true`.
+pub async fn set_local_model_disabled(
+    pool: &sqlx::SqlitePool,
+    provider_id: &str,
+    disabled: bool,
+) -> Result<(), ProviderStoreError> {
+    let mut conn = pool.acquire().await?;
+
+    let result = sqlx::query(
+        "UPDATE providers
+         SET qr_disabled_by_user = ?
+         WHERE id = ? AND provider_type = 'local_model'",
+    )
+    .bind(disabled as i64)
+    .bind(provider_id)
+    .execute(&mut *conn)
+    .await?;
 
     if result.rows_affected() == 0 {
         return Err(ProviderStoreError::NotFound(provider_id.to_owned()));
@@ -1119,6 +1297,119 @@ mod tests {
             mistral.privacy_guardian_default_level,
             Some(PrivacyGuardianDefaultLevel::Medium)
         );
+    }
+
+    /// items.id=436: shared_024.sql seeds RELEASE_1_MODELS as one
+    /// providers row per model, uninstalled by default -- the catalog
+    /// entry existing is distinct from the model being downloaded.
+    #[tokio::test]
+    async fn ollama_release1_models_seeded_as_local_model_uninstalled() {
+        let mut conn = make_test_conn().await;
+        crate::persistence::migrations::run_migrations(&mut conn, "shared", None)
+            .await
+            .expect("run shared migrations");
+
+        for (id, tag) in [
+            ("ollama:llama3.2:3b", "llama3.2:3b"),
+            ("ollama:llama3.1:8b", "llama3.1:8b"),
+            ("ollama:qwen2.5:7b", "qwen2.5:7b"),
+        ] {
+            let p = get_provider_via_conn(&mut conn, id).await;
+            assert_eq!(p.provider_type, "local_model");
+            assert_eq!(p.mode, ProviderMode::Local);
+            assert!(p.is_local, "{id} runs on the user's own hardware");
+            assert!(p.is_anonymous, "{id} has no login, no persistent identity");
+            assert!(!p.login_required);
+            assert!(
+                p.qr_internal_eligible,
+                "{id} must be eligible for internal QR use (extraction/evaluation)"
+            );
+            assert_eq!(p.risk_rating, 1, "{id} is the most private option (Tier 1)");
+            assert_eq!(
+                p.local_model_tag.as_deref(),
+                Some(tag),
+                "{id}: local_model_tag must be the literal Ollama API tag"
+            );
+            assert!(p.focus_eligible, "{id} must be available for Focuses");
+            assert!(p.cloud_chat_visible, "{id} must be visible in Cloud Chat");
+            assert!(
+                !p.installed,
+                "{id}: catalog entry existing must not imply already downloaded"
+            );
+            assert!(!p.qr_disabled_by_user);
+            assert!(p.local_model_digest.is_none());
+            assert!(p.installed_at.is_none());
+            assert!(
+                p.hardware_requirement.is_some(),
+                "{id} needs a hardware_requirement estimate"
+            );
+        }
+    }
+
+    /// items.id=436: set_local_model_installed/set_local_model_uninstalled/
+    /// set_local_model_disabled are the only write path onto these columns
+    /// -- must actually flip installed/qr_disabled_by_user/digest/installed_at
+    /// and must refuse a non-local_model id (defensive scoping check).
+    /// Uses a real on-disk tempdir-backed shared.db (these functions take a
+    /// &SqlitePool, not a raw connection) -- same pattern as
+    /// list_providers_by_type_returns_only_matching_active_providers below.
+    #[tokio::test]
+    async fn local_model_install_state_transitions() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let result = crate::persistence::migrations::migrate_shared_db().await;
+
+        let outcome = async {
+            let pool = sqlx::SqlitePool::connect_with(
+                crate::providers::utils::connect_options_unencrypted(
+                    &crate::providers::utils::db_path_shared(),
+                ),
+            )
+            .await?;
+
+            set_local_model_installed(&pool, "ollama:llama3.2:3b", Some("sha256:abc123")).await?;
+            let p = get_provider(&pool, "ollama:llama3.2:3b")
+                .await?
+                .expect("row exists");
+            assert!(p.installed);
+            assert_eq!(p.local_model_digest.as_deref(), Some("sha256:abc123"));
+            assert!(p.installed_at.is_some());
+
+            set_local_model_disabled(&pool, "ollama:llama3.2:3b", true).await?;
+            let p = get_provider(&pool, "ollama:llama3.2:3b")
+                .await?
+                .expect("row exists");
+            assert!(p.qr_disabled_by_user);
+            assert!(p.installed, "disabling must not touch installed");
+
+            set_local_model_uninstalled(&pool, "ollama:llama3.2:3b").await?;
+            let p = get_provider(&pool, "ollama:llama3.2:3b")
+                .await?
+                .expect("row exists");
+            assert!(!p.installed);
+            assert!(p.local_model_digest.is_none());
+            assert!(p.installed_at.is_none());
+
+            let err = set_local_model_installed(&pool, "groq", Some("sha256:nope"))
+                .await
+                .expect_err("must refuse a non-local_model id");
+            assert!(matches!(err, ProviderStoreError::NotFound(_)));
+
+            Ok::<(), ProviderStoreError>(())
+        }
+        .await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+
+        result.expect("migrate_shared_db must succeed");
+        outcome.expect("local model install-state assertions must pass");
     }
 
     /// items.id=430/432: list_providers_by_type is the flag-based

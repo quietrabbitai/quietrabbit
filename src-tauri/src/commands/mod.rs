@@ -60,6 +60,7 @@ pub mod group;
 pub mod ingest;
 pub mod library;
 pub mod messages;
+pub mod model_install;
 pub mod notifications;
 pub mod onboarding;
 pub mod persona;

@@ -1,10 +1,24 @@
 //! Ollama sidecar lifecycle manager.
 //!
-//! At app startup, `ensure_available()` detects whether a system Ollama
-//! instance is already running at 127.0.0.1:11434. If found, it returns
-//! `OllamaSource::System` and no sidecar is started. If not found, it
-//! starts the bundled Ollama binary and returns `OllamaSource::Sidecar`
-//! (or `OllamaSource::Unavailable` if startup fails).
+//! # Dedicated-port trust boundary (decisions.id=840, supersedes part of
+//! # decisions.id=380)
+//! QR's bundled sidecar always runs on its own dedicated port, 21434 —
+//! never negotiated, never falls back to 11434, never shares a process
+//! with any user-installed Ollama. `ensure_available()` unconditionally
+//! starts the sidecar; it no longer branches on whether a system instance
+//! is detected. decisions.id=380's original "detect-first, reuse if
+//! found" design is retired: items.id=436's security review found QR must
+//! never load a model it did not itself pull from its own curated list
+//! (Ollama has real, exploitable GGUF/Modelfile-parsing vulnerabilities —
+//! see decisions.id=840 for the CVE list), so reusing a detected
+//! instance's models is no longer safe regardless of convenience.
+//!
+//! `ensure_available()` still probes 127.0.0.1:11434 (decisions.id=380's
+//! original detection mechanism, reused verbatim) — but purely to warn
+//! the user of possible GPU/RAM contention if their own Ollama is also
+//! running, via `SidecarStartup::system_ollama_contention`. That probe
+//! never gates whether the sidecar starts and never causes QR to read or
+//! trust the detected instance's models.
 //!
 //! No caller outside this module ever invokes `tokio::process::Command`
 //! directly — all process management is encapsulated here.
@@ -27,17 +41,27 @@ use tokio::process::{Child, Command};
 // Types
 // ---------------------------------------------------------------------------
 
-/// Where Ollama is being served from during this session.
+/// The dedicated port QR's own sidecar always binds, via
+/// `OLLAMA_HOST=127.0.0.1:21434`. Never negotiated, never 11434
+/// (decisions.id=840). Chosen outside both Linux's default ephemeral port
+/// range (32768–60999) and Windows' dynamic port range (49152–65535) —
+/// decisions.id=840's original pick, 35973, was inside the Linux range and
+/// was moved here after that was caught during this item's implementation.
+pub const QR_OLLAMA_PORT: u16 = 21434;
+
+/// Whether QR's own sidecar started, or is unavailable.
 ///
 /// Written once in `tauri::Builder::setup()`, read frequently by
 /// `get_health()`. Serialized to IPC strings only in `HealthResponse`.
+/// No `System` variant: per decisions.id=840, QR always starts its own
+/// sidecar regardless of what's detected on 11434 — a detected system
+/// Ollama is surfaced separately, as a contention warning, never as a
+/// routing choice. See `SidecarStartup`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OllamaSource {
-    /// A pre-existing system Ollama was detected at 127.0.0.1:11434.
-    System,
-    /// No system Ollama found; the bundled sidecar was started.
+    /// QR's own sidecar, on its dedicated port, started successfully.
     Sidecar,
-    /// Neither system Ollama nor sidecar is available.
+    /// The sidecar failed to start or become ready.
     Unavailable,
     // TODO (post-Release 1): add Detecting variant to distinguish
     // "detection in progress" from "detection complete, nothing found".
@@ -48,14 +72,24 @@ impl OllamaSource {
     /// IPC-safe string for `HealthResponse.ollama_source`.
     pub fn as_str(&self) -> &'static str {
         match self {
-            OllamaSource::System => "system",
             OllamaSource::Sidecar => "sidecar",
             OllamaSource::Unavailable => "unavailable",
         }
     }
 }
 
-/// Internal result of the detection probe. Not exposed to callers.
+/// Result of `ensure_available()`: QR's own sidecar outcome, plus whether
+/// a separate, untouched user Ollama was also seen on 11434.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidecarStartup {
+    pub source: OllamaSource,
+    /// True iff 127.0.0.1:11434 answered during startup. A warning signal
+    /// only (possible shared GPU/RAM contention from two Ollama processes)
+    /// — never read or trusted for models, never affects `source`.
+    pub system_ollama_contention: bool,
+}
+
+/// Internal result of the contention probe. Not exposed to callers.
 enum DetectionResult {
     SystemOllama,
     NotFound,
@@ -86,42 +120,53 @@ impl OllamaSidecar {
         Self { child: None }
     }
 
-    /// Detect system Ollama or start the bundled sidecar.
+    /// Warn-only contention check, then unconditionally start QR's own
+    /// sidecar on its dedicated port.
     ///
-    /// Single public entry point for startup. Returns the source that
-    /// will serve Ollama requests for this session.
+    /// Single public entry point for startup.
     ///
-    /// # Order of operations
-    /// 1. Probe `http://127.0.0.1:11434/api/tags` with a 2 s timeout.
-    /// 2. If found → `OllamaSource::System` (no sidecar started).
-    /// 3. If not found → start bundled sidecar from `resource_dir`.
-    /// 4. Poll every 500 ms for up to 5 s → `OllamaSource::Sidecar`.
-    /// 5. If sidecar fails to start or become ready → `OllamaSource::Unavailable`.
+    /// # Order of operations (decisions.id=840)
+    /// 1. Probe `http://127.0.0.1:11434/api/tags` with a 2 s timeout —
+    ///    purely to set `system_ollama_contention`; never gates step 2.
+    /// 2. Start QR's own bundled sidecar from `resource_dir`, always, on
+    ///    `127.0.0.1:21434` (`QR_OLLAMA_PORT`).
+    /// 3. Poll `127.0.0.1:21434` every 500 ms for up to 5 s →
+    ///    `OllamaSource::Sidecar`.
+    /// 4. If the sidecar fails to start or become ready →
+    ///    `OllamaSource::Unavailable`.
     ///
-    /// Must be called from `tauri::Builder::setup()` so the source is
+    /// Must be called from `tauri::Builder::setup()` so the result is
     /// written before any IPC handler can fire.
-    pub async fn ensure_available(&mut self, resource_dir: &Path) -> OllamaSource {
-        match self.detect().await {
+    pub async fn ensure_available(&mut self, resource_dir: &Path) -> SidecarStartup {
+        let system_ollama_contention = match self.detect().await {
             DetectionResult::SystemOllama => {
-                log::info!("ollama_sidecar: system Ollama detected at 127.0.0.1:11434");
-                OllamaSource::System
+                log::warn!(
+                    "ollama_sidecar: a system Ollama is running at 127.0.0.1:11434 — QR \
+                     starts its own sidecar on 127.0.0.1:{QR_OLLAMA_PORT} regardless \
+                     (decisions.id=840); running both may contend for GPU/RAM"
+                );
+                true
             }
-            DetectionResult::NotFound => {
-                log::info!("ollama_sidecar: no system Ollama found — starting bundled sidecar");
-                if self.start_sidecar(resource_dir).await {
-                    log::info!("ollama_sidecar: sidecar ready at 127.0.0.1:11434");
-                    OllamaSource::Sidecar
-                } else {
-                    log::warn!("ollama_sidecar: sidecar failed to start or become ready");
-                    OllamaSource::Unavailable
-                }
-            }
+            DetectionResult::NotFound => false,
+        };
+
+        let source = if self.start_sidecar(resource_dir).await {
+            log::info!("ollama_sidecar: sidecar ready at 127.0.0.1:{QR_OLLAMA_PORT}");
+            OllamaSource::Sidecar
+        } else {
+            log::warn!("ollama_sidecar: sidecar failed to start or become ready");
+            OllamaSource::Unavailable
+        };
+
+        SidecarStartup {
+            source,
+            system_ollama_contention,
         }
     }
 
     /// Stop the sidecar process if one was started by this manager.
     ///
-    /// No-op if the source was `System` or `Unavailable` (no child held).
+    /// No-op if the source was `Unavailable` (no child held).
     /// Called on `CloseRequested` from the main window event handler.
     ///
     /// # TODO
@@ -167,9 +212,14 @@ impl OllamaSidecar {
     ///
     /// Returns `true` if the sidecar spawned and became ready within 5 s.
     ///
-    /// `OLLAMA_MODELS` is set to `~/.ollama/models` so the sidecar shares
-    /// model weights with any previous system Ollama install — no duplicate
-    /// downloads. (D6-353)
+    /// `OLLAMA_MODELS` is set to a QR-owned directory
+    /// (`<QR_DATA_ROOT>/ollama_models`), fully separate from any system
+    /// Ollama's `~/.ollama/models` (decisions.id=840's implementation
+    /// choice, made during items.id=436: QR never trusts/reads a BYO
+    /// instance's models regardless of directory sharing, so the
+    /// digest-dedup disk savings a shared directory would offer don't
+    /// offset the risk of a user's independent `ollama rm` silently
+    /// invalidating QR's own `providers.installed` bookkeeping).
     ///
     /// `kill_on_drop(true)` ensures the child is terminated if QR exits
     /// unexpectedly (panic, crash) before `stop()` is called.
@@ -184,10 +234,10 @@ impl OllamaSidecar {
             return false;
         }
 
-        let models_dir = home_dir().join(".ollama").join("models");
+        let models_dir = crate::providers::utils::get_data_root().join("ollama_models");
 
         let child = match Command::new(&binary)
-            .env("OLLAMA_HOST", "127.0.0.1:11434")
+            .env("OLLAMA_HOST", format!("127.0.0.1:{QR_OLLAMA_PORT}"))
             .env("OLLAMA_MODELS", &models_dir)
             .kill_on_drop(true)
             .spawn()
@@ -220,16 +270,19 @@ impl OllamaSidecar {
         }
     }
 
-    /// Poll 127.0.0.1:11434/api/tags every 500 ms for up to 5 s (10 attempts).
+    /// Poll 127.0.0.1:{QR_OLLAMA_PORT}/api/tags every 500 ms for up to 5 s
+    /// (10 attempts). This is the sidecar's own readiness check — separate
+    /// from `detect()`'s 11434 contention probe.
     async fn wait_for_ready(&self) -> bool {
         let client = match Client::builder().timeout(Duration::from_secs(2)).build() {
             Ok(c) => c,
             Err(_) => return false,
         };
+        let url = format!("http://127.0.0.1:{QR_OLLAMA_PORT}/api/tags");
 
         for attempt in 1u8..=10 {
             tokio::time::sleep(Duration::from_millis(500)).await;
-            match client.get("http://127.0.0.1:11434/api/tags").send().await {
+            match client.get(&url).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     log::info!("ollama_sidecar: ready after {} poll(s)", attempt);
                     return true;
@@ -263,23 +316,4 @@ fn sidecar_binary_name() -> String {
     } else {
         format!("ollama-{arch}")
     }
-}
-
-/// Resolve the conventional user home directory used for locating
-/// Ollama's default model store (`~/.ollama/models`).
-///
-/// Checks `HOME` (POSIX) then `USERPROFILE` (Windows). This intentionally
-/// avoids a dependency on platform- or Tauri-specific path APIs, keeping
-/// this module free of Tauri types and independently testable.
-///
-/// Falls back to `/tmp` if neither variable is set — should not occur
-/// in practice on Linux, macOS, or Windows.
-fn home_dir() -> std::path::PathBuf {
-    std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            log::warn!("ollama_sidecar: HOME/USERPROFILE not set — using /tmp as fallback");
-            std::path::PathBuf::from("/tmp")
-        })
 }

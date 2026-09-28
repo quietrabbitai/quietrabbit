@@ -163,9 +163,26 @@ chacha20poly1305 = "0.11.0"
 hkdf = "0.12"
 
 # Networking & Errors
-reqwest = { version = "0.12", features = ["json"] }
+# "stream" (items.id=436): Response::bytes_stream() for progressively
+# parsing Ollama's /api/pull NDJSON response, instead of buffering the
+# whole body like ollama_client.rs's existing apply_modelfile() does.
+reqwest = { version = "0.12", features = ["json", "stream"] }
 thiserror = "1"
 async-trait = "0.1"
+
+# items.id=436: CancellationToken (tokio_util::sync, no feature gate
+# required) for cancellable model pulls. Already present transitively (via
+# h2/hyper, pulled in by reqwest) but added as a direct dependency rather
+# than relying on an indirect crate to keep exposing it.
+tokio-util = "0.7"
+# items.id=436: StreamExt::next() for consuming reqwest's bytes_stream()
+# line-by-line in ollama_client::pull_model(). Already present
+# transitively (tauri -> glib -> futures-executor) but not usable via
+# `use` without being a direct dependency -- Rust's extern prelude only
+# covers direct dependencies. default-features = false: only the
+# `Stream`/`StreamExt` combinator surface is needed, not futures-util's
+# executor/io/sink extras.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 # FFI
 libc = "0.2"

@@ -573,12 +573,18 @@ mod tests {
         outcome.expect("no-row assertions must pass");
     }
 
-    /// No qr_local (is_local=1) provider rows exist yet (greenfield) -- this
-    /// currently, correctly, yields zero eligible providers. Not a bug in
-    /// this table; the same reason the spec itself calls qr_local metadata
-    /// "genuinely greenfield."
+    /// Until items.id=436 (shared_024.sql), no qr_local (is_local=1)
+    /// provider rows existed at all, so local_only correctly matched none
+    /// -- the spec itself called qr_local metadata "genuinely greenfield"
+    /// at the time. shared_024.sql seeds the 3 curated Ollama local_model
+    /// rows as is_local=1, so local_only now correctly matches exactly
+    /// those three (note: this table's eligibility check is unaffected by
+    /// `installed`/`qr_disabled_by_user` -- a curated-but-not-yet-
+    /// downloaded model is still `is_local=1` and still "eligible" by this
+    /// table's own definition; whether it's actually usable right now is a
+    /// different, not-yet-built concern, out of scope here).
     #[tokio::test]
-    async fn eligible_providers_for_focus_local_only_currently_empty() {
+    async fn eligible_providers_for_focus_local_only_matches_ollama_rows() {
         let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let (_tempdir, pool) = setup_real_db().await;
@@ -586,9 +592,15 @@ mod tests {
         let outcome = async {
             populate_from_policy(&pool, "f1", NamedPolicy::LocalOnly).await?;
             let eligible = eligible_providers_for_focus(&pool, "f1").await?;
-            assert!(
-                eligible.is_empty(),
-                "no is_local=1 provider rows exist yet -- local_only correctly matches none"
+            let ids: Vec<&str> = eligible.iter().map(|p| p.id.as_str()).collect();
+            assert_eq!(
+                ids,
+                vec![
+                    "ollama:llama3.1:8b",
+                    "ollama:llama3.2:3b",
+                    "ollama:qwen2.5:7b"
+                ],
+                "local_only must match exactly the 3 curated is_local=1 Ollama rows"
             );
             Ok::<(), FocusProviderCriteriaStoreError>(())
         }
@@ -599,7 +611,7 @@ mod tests {
         } else {
             std::env::remove_var("QR_DATA_ROOT");
         }
-        outcome.expect("local_only-empty assertions must pass");
+        outcome.expect("local_only assertions must pass");
     }
 
     /// Precedence test: deny-list excludes unconditionally -> allow-list
@@ -611,8 +623,11 @@ mod tests {
         let (_tempdir, pool) = setup_real_db().await;
 
         let outcome = async {
-            // require_not_trains_on_data=1 alone matches duckai, groq, and
-            // groqchat (items.id=440 Part A curated groq as not training on
+            // require_not_trains_on_data=1 alone matches duckai, groq,
+            // groqchat, and (items.id=436, shared_024.sql) the 3 curated
+            // Ollama local_model rows -- all seeded with
+            // trains_on_data_by_default=0 (Tier 1, the most private
+            // option). (items.id=440 Part A curated groq as not training on
             // data by default -- no longer just duckai, as it was when this
             // test was first written against groq's pre-curation placeholder
             // seed. shared_018.sql -- items.id=347/486-adjacent provider
@@ -621,9 +636,9 @@ mod tests {
             // the same real-world entity/policy, not a new curation).
             // deny=[duckai] excludes it anyway despite passing the
             // requirement; allow=[claude] carves claude in despite it
-            // failing the requirement (trains_on_data=1); groq and groqchat
-            // both pass the requirement on their own merits and need neither
-            // list.
+            // failing the requirement (trains_on_data=1); groq, groqchat,
+            // and the 3 Ollama rows all pass the requirement on their own
+            // merits and need neither list.
             set_criteria(
                 &pool,
                 "f1",
@@ -639,10 +654,17 @@ mod tests {
             let ids: Vec<&str> = eligible.iter().map(|p| p.id.as_str()).collect();
             assert_eq!(
                 ids,
-                vec!["groq", "claude", "groqchat"],
+                vec![
+                    "groq",
+                    "claude",
+                    "groqchat",
+                    "ollama:llama3.1:8b",
+                    "ollama:llama3.2:3b",
+                    "ollama:qwen2.5:7b"
+                ],
                 "deny must beat a passing require match (duckai), allow must beat a failing \
-                 require match (claude), and groq/groqchat must each pass the requirement on \
-                 their own merits -- everything else fails the requirement"
+                 require match (claude), and groq/groqchat/the 3 Ollama rows must each pass \
+                 the requirement on their own merits -- everything else fails the requirement"
             );
             Ok::<(), FocusProviderCriteriaStoreError>(())
         }

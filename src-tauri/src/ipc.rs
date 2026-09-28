@@ -172,6 +172,13 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         // creation is now lazy inside commands::messages::send_message)
         commands::chats::list_chats,
         commands::chats::archive_chat,
+        // Group 24 -- Local model install/management (items.id=436)
+        commands::model_install::list_local_models,
+        commands::model_install::install_local_model,
+        commands::model_install::cancel_local_model_install,
+        commands::model_install::enable_local_model,
+        commands::model_install::disable_local_model,
+        commands::model_install::delete_local_model,
     ])
 }
 

@@ -7,6 +7,7 @@ pub mod mistral;
 #[cfg(test)]
 mod ocr_eval;
 pub mod ollama_client;
+pub mod ollama_install;
 pub mod qr_hosted_base;
 pub mod types;
 pub mod utils;

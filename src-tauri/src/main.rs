@@ -5,10 +5,11 @@ use std::sync::Arc;
 use tauri::Manager;
 use tokio::sync::{Mutex, RwLock};
 
+use quietrabbit_lib::commands::model_install::PullCancellationRegistry;
 use quietrabbit_lib::conductor::concurrency::ConductorScheduler;
 use quietrabbit_lib::conductor::privacy::privacy_filter;
 use quietrabbit_lib::ipc::specta_builder;
-use quietrabbit_lib::ollama_sidecar::{OllamaSidecar, OllamaSource};
+use quietrabbit_lib::ollama_sidecar::{OllamaSidecar, OllamaSource, SidecarStartup};
 use quietrabbit_lib::providers::ollama_client::OllamaClient;
 
 /// One-time atomic same-directory rename of the CEF cache directory,
@@ -116,14 +117,23 @@ async fn async_main() {
         .manage(scheduler)
         .manage(ollama_client)
         .manage(quietrabbit_lib::commands::cloud_chat_pane::PaneLayoutState::default())
-        // OllamaSource: initialized to Unavailable; the setup task writes the
-        // real value after detect-first completes. get_health() reads via
-        // read lock — zero contention after the first ~2 s of startup.
-        .manage(RwLock::new(OllamaSource::Unavailable))
+        // SidecarStartup: initialized to Unavailable/no-contention; the
+        // setup task writes the real value once ensure_available()
+        // completes. get_health() reads via read lock — zero contention
+        // after the first ~2 s of startup.
+        .manage(RwLock::new(SidecarStartup {
+            source: OllamaSource::Unavailable,
+            system_ollama_contention: false,
+        }))
         // OllamaSidecar: holds the child process if a sidecar was started.
         // Mutex required because tokio::process::Child is not Sync.
         // Lock is held across ensure_available() (~0–7 s at startup only).
         .manage(Mutex::new(OllamaSidecar::new()))
+        // PullCancellationRegistry (items.id=436): CancellationTokens for
+        // in-flight local-model pulls, keyed by task_id. Mutex<HashMap<...>>
+        // -- lock is only ever held for the brief insert/remove/lookup, not
+        // across the pull itself.
+        .manage(Mutex::new(PullCancellationRegistry::default()))
         // KeyRegistry: single-slot in-memory master-key registry (items.id=
         // 205, Architecture/AUTH_MULTIUSER_ARCHITECTURE.md Section 4.2).
         // Encapsulated type -- its own internal Mutex is not exposed
@@ -263,12 +273,15 @@ async fn async_main() {
                 ),
             }
 
-            // Detection runs in a spawned task — setup() is synchronous.
-            // OllamaSource stays Unavailable until detection completes
-            // (typically < 2 s on Garuda where system Ollama is running).
-            // Supervised (items.id=476): one-shot, so no restart on panic --
-            // just a loud log instead of OllamaSource silently staying
-            // Unavailable forever with no trace of why.
+            // Sidecar startup runs in a spawned task — setup() is
+            // synchronous. SidecarStartup stays at its Unavailable/
+            // no-contention default until this completes (typically < 2 s
+            // on Garuda). Supervised (items.id=476): one-shot, so no
+            // restart on panic -- just a loud log instead of
+            // SidecarStartup silently staying at its default forever with
+            // no trace of why. ensure_available() always starts QR's own
+            // sidecar now (decisions.id=840) -- it no longer branches on
+            // whether a system Ollama is detected, only warns about it.
             let handle = app.handle().clone();
             quietrabbit_lib::task_supervision::spawn_supervised(
                 "ollama_detection",
@@ -284,14 +297,14 @@ async fn async_main() {
                             }
                         };
 
-                        let source = {
+                        let startup = {
                             let sidecar_state = handle.state::<Mutex<OllamaSidecar>>();
                             let mut sidecar = sidecar_state.lock().await;
                             sidecar.ensure_available(&resource_dir).await
                         };
 
-                        let source_state = handle.state::<RwLock<OllamaSource>>();
-                        *source_state.write().await = source;
+                        let startup_state = handle.state::<RwLock<SidecarStartup>>();
+                        *startup_state.write().await = startup;
                     }
                 },
             );

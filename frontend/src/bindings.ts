@@ -893,6 +893,32 @@ export const commands = {
 	 *  implicit or bundled with create_chat -- see that command's own doc.
 	 */
 	archiveChat: (userId: string, personaId: string, chatId: string) => typedError<null, string>(__TAURI_INVOKE("archive_chat", { userId, personaId, chatId })),
+	listLocalModels: () => typedError<LocalModelSummary[], string>(__TAURI_INVOKE("list_local_models")),
+	/**
+	 *  Starts a background pull and returns a `task_id` immediately -- the
+	 *  frontend listens for `"task-progress"` events carrying that `task_id`
+	 *  rather than waiting on this call. Errors returned here are only the
+	 *  up-front validation failures (unknown id, not a local model, already
+	 *  installed, missing local_model_tag); failures during the pull itself
+	 *  surface as a `"failed"` progress event, not as this command's result.
+	 * 
+	 *  The spawned task re-fetches `SqlitePool`/`OllamaClient`/the
+	 *  cancellation registry from the cloned `AppHandle` rather than trying to
+	 *  move the borrowed `tauri::State<'_, _>` parameters into a `'static`
+	 *  task -- same pattern main.rs's own spawned background tasks
+	 *  (`ollama_detection`, the group-folder-sync sweep) already use.
+	 */
+	installLocalModel: (id: string) => typedError<string, string>(__TAURI_INVOKE("install_local_model", { id })),
+	cancelLocalModelInstall: (taskId: string) => typedError<null, string>(__TAURI_INVOKE("cancel_local_model_install", { taskId })),
+	enableLocalModel: (id: string) => typedError<null, string>(__TAURI_INVOKE("enable_local_model", { id })),
+	disableLocalModel: (id: string) => typedError<null, string>(__TAURI_INVOKE("disable_local_model", { id })),
+	/**
+	 *  Deletes the model's on-disk weights and marks it uninstalled. The
+	 *  "this removes shared on-disk storage another application might depend
+	 *  on" warning is the frontend's responsibility to show *before* calling
+	 *  this -- see providers::ollama_install::run_delete's own doc comment.
+	 */
+	deleteLocalModel: (id: string) => typedError<null, string>(__TAURI_INVOKE("delete_local_model", { id })),
 };
 
 /* Types */
@@ -1100,11 +1126,21 @@ export type HardwareProfile = {
 export type HealthResponse = {
 	ollama: ProviderHealth,
 	/**
-	 *  "system" | "sidecar" | "unavailable".
-	 *  Set during app setup by OllamaSidecar::ensure_available().
-	 *  "unavailable" is returned during the brief startup detection window.
+	 *  "sidecar" | "unavailable" -- no "system" value any more
+	 *  (decisions.id=840, items.id=436): QR always starts its own sidecar
+	 *  regardless of what's detected on 11434, so this field only ever
+	 *  describes QR's own sidecar outcome now. Set during app setup by
+	 *  OllamaSidecar::ensure_available(). "unavailable" is returned during
+	 *  the brief startup detection window.
 	 */
 	ollama_source: string,
+	/**
+	 *  items.id=436: true iff a separate, untouched user Ollama was also
+	 *  seen on 127.0.0.1:11434 at startup -- a contention warning only
+	 *  (possible shared GPU/RAM load from two Ollama processes), never a
+	 *  signal that QR is using or trusting that instance's models.
+	 */
+	system_ollama_contention: boolean,
 	/**
 	 *  True iff an active user-global key exists for ANY qr_hosted provider
 	 *  (providers.provider_type='cloud_inference_api' -- items.id=430; was a
@@ -1119,6 +1155,27 @@ export type HealthResponse = {
 	 *  requirement).
 	 */
 	qr_hosted_configured: boolean,
+};
+
+/**
+ *  IPC-facing view of a local-model `providers` row.
+ * 
+ *  `hardware_requirement` is a JSON *string*, not `serde_json::Value` --
+ *  that type is self-referential and specta's TypeScript exporter recurses
+ *  through it without terminating (same constraint documented on
+ *  `commands::cloud_chat_pane::CloudChatProviderSummary::performance_profile`
+ *  and `commands::mod::PlaceholderPayload`). The frontend `JSON.parse()`s
+ *  this field if it needs the structured shape.
+ */
+export type LocalModelSummary = {
+	id: string,
+	display_name: string,
+	local_model_tag: string | null,
+	installed: boolean,
+	qr_disabled_by_user: boolean,
+	focus_eligible: boolean,
+	cloud_chat_visible: boolean,
+	hardware_requirement: string | null,
 };
 
 export type MessageInfo = {

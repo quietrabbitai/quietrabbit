@@ -28,7 +28,7 @@ use tokio::sync::RwLock;
 
 use crate::auth::registry::{key_hex, KeyRegistry};
 use crate::hardware_probe::{self, HardwareProfile};
-use crate::ollama_sidecar::OllamaSource;
+use crate::ollama_sidecar::SidecarStartup;
 use crate::persistence::{integration_keys_store, provider_store};
 use crate::providers::ollama_client::OllamaClient;
 use crate::providers::types::{ProviderHealth, ProviderStatus};
@@ -42,10 +42,18 @@ const QR_HOSTED_KEY_TYPE: &str = "qr_hosted";
 #[derive(Debug, Serialize, Type)]
 pub struct HealthResponse {
     pub ollama: ProviderHealth,
-    /// "system" | "sidecar" | "unavailable".
-    /// Set during app setup by OllamaSidecar::ensure_available().
-    /// "unavailable" is returned during the brief startup detection window.
+    /// "sidecar" | "unavailable" -- no "system" value any more
+    /// (decisions.id=840, items.id=436): QR always starts its own sidecar
+    /// regardless of what's detected on 11434, so this field only ever
+    /// describes QR's own sidecar outcome now. Set during app setup by
+    /// OllamaSidecar::ensure_available(). "unavailable" is returned during
+    /// the brief startup detection window.
     pub ollama_source: String,
+    /// items.id=436: true iff a separate, untouched user Ollama was also
+    /// seen on 127.0.0.1:11434 at startup -- a contention warning only
+    /// (possible shared GPU/RAM load from two Ollama processes), never a
+    /// signal that QR is using or trusting that instance's models.
+    pub system_ollama_contention: bool,
     /// True iff an active user-global key exists for ANY qr_hosted provider
     /// (providers.provider_type='cloud_inference_api' -- items.id=430; was a
     /// hardcoded ["mistral","groq"] array before this) -- a capability-status
@@ -77,17 +85,18 @@ pub struct CapabilityProfileResponse {
 #[specta::specta]
 pub async fn get_health(
     client: tauri::State<'_, OllamaClient>,
-    ollama_source: tauri::State<'_, RwLock<OllamaSource>>,
+    sidecar_startup: tauri::State<'_, RwLock<SidecarStartup>>,
     key_registry: tauri::State<'_, KeyRegistry>,
     pool: tauri::State<'_, sqlx::SqlitePool>,
 ) -> Result<HealthResponse, String> {
     let ollama = client.check_health().await;
-    let source = ollama_source.read().await.as_str().to_owned();
+    let startup = sidecar_startup.read().await.clone();
     let qr_hosted_configured = qr_hosted_is_configured(&pool, &key_registry).await?;
 
     Ok(HealthResponse {
         ollama,
-        ollama_source: source,
+        ollama_source: startup.source.as_str().to_owned(),
+        system_ollama_contention: startup.system_ollama_contention,
         qr_hosted_configured,
     })
 }
