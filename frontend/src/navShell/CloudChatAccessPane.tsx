@@ -60,7 +60,7 @@ import { requireCurrentUserId, type DominancePairState } from './navShellConfig'
 import { CloudChatCollapsedStrip } from './CloudChatCollapsedStrip'
 import { useDominancePair } from './useDominancePair'
 import { keepActiveChatForPersona } from './keepActiveChatForPersona'
-import { createUnsentChat, shouldStartFreshOnReturn } from './unsentChat'
+import { createUnsentChat, returnStep, type ReturnStepState } from './unsentChat'
 import { computeActivePaneRect, pixelRectToFraction, type PanePixelRect } from '../cloudChatAccess/paneLayout'
 import { PaneHitLayer } from '../cloudChatAccess/PaneHitLayer'
 import { PopupHitLayer } from '../cloudChatAccess/PopupHitLayer'
@@ -947,6 +947,11 @@ export function CloudChatAccessPane({
     setActiveChat(chat)
   }, [])
 
+  // items.id=584 follow-up 3: fed by ChatPane's onGenerating below -- the
+  // one existing signal for "a reply is in flight," reused rather than
+  // inventing a new one.
+  const [isGenerating, setIsGenerating] = useState(false)
+
   // items.id=584: leaving Chat (Board/Library becomes the dominant rail, i.e.
   // floor) and coming back starts a fresh unsent chat for the current Persona,
   // instead of resuming whatever was open -- e.g. a past chat opened from
@@ -955,16 +960,31 @@ export function CloudChatAccessPane({
   // must keep it. Declared BEFORE the pendingChatSelection effect below so
   // History's "resume this chat" (which flips floor in the same commit as
   // setting pendingChatSelection) still ends up on the chosen chat.
-  const prevFloorRef = useRef(floor)
+  //
+  // items.id=584 follow-up 3 (decisions.id=843): "a chat in progress should
+  // not be filed to history since the user may never see the response" --
+  // so the fresh-reset above must not fire while a reply is still
+  // generating, or one finished while away and hasn't been seen yet.
+  // returnStep (unsentChat.ts) is the single pure function holding that
+  // decision AND the hasUnseenReply bookkeeping together, in the right
+  // order (decide, then update) -- this effect just carries its state in a
+  // ref and calls it.
+  const returnStateRef = useRef<ReturnStepState>({
+    floor,
+    isGenerating: false,
+    personaId,
+    hasUnseenReply: false,
+  })
   useEffect(() => {
-    if (shouldStartFreshOnReturn(prevFloorRef.current, floor) && personaId) {
+    const { startFresh, next } = returnStep(returnStateRef.current, { floor, isGenerating, personaId })
+    returnStateRef.current = next
+    if (startFresh && personaId) {
       resetGate3State()
       setActiveChat(createUnsentChat(personaId))
       setLastAssistantMessage(null)
     }
-    prevFloorRef.current = floor
     // resetGate3State only closes over stable state setters.
-  }, [floor, personaId])
+  }, [floor, isGenerating, personaId])
 
   // items.id=404: History's "resume this chat" row-action lands here --
   // WorkspaceShell sets pendingChatSelection and dominantRail='chat' in
@@ -1134,6 +1154,7 @@ export function CloudChatAccessPane({
               focusId="quick-ask"
               gate3Track={true}
               onDraftReady={handleDraftReady}
+              onGenerating={setIsGenerating}
               collapsed={floor || dominant === 'cloudChat'}
               onExpand={floor ? onFloorExpand : reclaimChatAndPromote}
               onLastAssistantMessageChange={setLastAssistantMessage}
