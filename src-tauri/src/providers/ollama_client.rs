@@ -16,6 +16,27 @@
 //! - `health_client` (5s): health, model enumeration, modelfile show
 //! - `modelfile_client` (300s): modelfile application (`/api/create`)
 //! - `pull_client` (no timeout): model pull/delete (items.id=436)
+//!
+//! # Sidecar trust gate (items.id=586)
+//! Every method that makes an HTTP call checks `ollama_sidecar::is_trusted()`
+//! first and short-circuits to the same shape each already returns for a
+//! real network failure, never making the call at all, if it's false.
+//! `OllamaClient` itself has no notion of *why* -- the gate is a single
+//! process-wide flag `ollama_sidecar.rs` owns, fail-closed by default, set
+//! true only once that module has itself confirmed the sidecar it started
+//! is ready, and false again the moment it observes that sidecar has died.
+//! Without this, `OllamaClient` would otherwise independently re-probe
+//! port `QR_OLLAMA_PORT` on every call with no knowledge of whether QR
+//! started what's answering there -- confirmed concretely this session
+//! (not hypothetically): after a `cargo tauri dev` watcher restart left an
+//! old `ollama serve` instance still bound to the port, the *new* process's
+//! own `ensure_available()` correctly logged "sidecar failed to start or
+//! become ready" (the port was taken), but prior to this gate, `generate`/
+//! `chat` calls against that same new process would still have silently
+//! talked to the stale instance regardless, since nothing connected the
+//! two. `check_modelfile_version` makes no HTTP call of its own (only
+//! calls the already-gated `get_applied_modelfile_version`), so it needs
+//! no separate check.
 
 use std::time::Duration;
 
@@ -82,6 +103,22 @@ fn context_hard_limit() -> f64 {
         .unwrap_or(CONTEXT_HARD_LIMIT_DEFAULT)
 }
 
+/// The sidecar trust gate (see module doc comment, items.id=586). Logs once
+/// per refused call rather than silently returning the unavailable shape --
+/// the refusal itself is the interesting event, distinct from an ordinary
+/// network failure.
+fn sidecar_trusted() -> bool {
+    let trusted = crate::ollama_sidecar::is_trusted();
+    if !trusted {
+        log::warn!(
+            "ollama_client: QR's own sidecar is not confirmed running -- refusing to contact \
+             127.0.0.1:{} (items.id=586)",
+            crate::ollama_sidecar::QR_OLLAMA_PORT
+        );
+    }
+    trusted
+}
+
 // ---------------------------------------------------------------------------
 // Client
 // ---------------------------------------------------------------------------
@@ -143,6 +180,16 @@ impl OllamaClient {
     ///
     /// Python oracle: `check_ollama_health()`
     pub async fn check_health(&self) -> ProviderHealth {
+        if !sidecar_trusted() {
+            return ProviderHealth {
+                provider: "ollama".to_owned(),
+                status: ProviderStatus::Unavailable,
+                checked_at: crate::providers::utils::now(),
+                error: Some("sidecar_untrusted".to_owned()),
+                available_models: vec![],
+            };
+        }
+
         let url = format!("{}/api/tags", base_url());
         match self.health_client.get(&url).send().await {
             Ok(resp) if resp.status().is_success() => {
@@ -207,6 +254,14 @@ impl OllamaClient {
         &self,
         request: &GenerateRequest,
     ) -> Result<GenerateResponse, ConductorError> {
+        if !sidecar_trusted() {
+            return Err(ConductorError::OllamaUnavailable {
+                plain_language: "The local AI isn't responding. \
+                    [Try again] [Use an external service] [Get help]"
+                    .to_owned(),
+            });
+        }
+
         let options = request.options.clone().unwrap_or(GenerateOptions {
             temperature: 0.5,
             top_p: 0.90,
@@ -319,6 +374,12 @@ impl OllamaClient {
         _task_type: &str,
         options: Option<GenerateOptions>,
     ) -> Result<GenerateResponse, ConductorError> {
+        if !sidecar_trusted() {
+            return Err(ConductorError::OllamaUnavailable {
+                plain_language: "The local AI isn't responding. [Try again] [Get help]".to_owned(),
+            });
+        }
+
         let opts = options.unwrap_or(GenerateOptions {
             temperature: 0.5,
             top_p: 0.90,
@@ -412,6 +473,10 @@ impl OllamaClient {
     ///
     /// Python oracle: `get_applied_modelfile_version()`
     async fn get_applied_modelfile_version(&self, model_name: &str) -> Option<String> {
+        if !sidecar_trusted() {
+            return None;
+        }
+
         let url = format!("{}/api/show", base_url());
         let resp = self
             .health_client
@@ -466,6 +531,10 @@ impl OllamaClient {
     ///
     /// Python oracle: `apply_modelfile()`
     pub async fn apply_modelfile(&self, model_name: &str, modelfile_content: &str) -> bool {
+        if !sidecar_trusted() {
+            return false;
+        }
+
         let url = format!("{}/api/create", base_url());
         let resp = self
             .modelfile_client
@@ -537,6 +606,10 @@ impl OllamaClient {
         tag: &str,
     ) -> Result<impl Stream<Item = Result<PullProgressLine, OllamaModelError>>, OllamaModelError>
     {
+        if !sidecar_trusted() {
+            return Err(OllamaModelError::SidecarUntrusted);
+        }
+
         let url = format!("{}/api/pull", base_url());
         let resp = self
             .pull_client
@@ -567,6 +640,10 @@ impl OllamaClient {
     /// weights blob), not necessarily the same digest Ollama reports for
     /// the model as a whole via `/api/tags`.
     pub async fn get_model_digest(&self, tag: &str) -> Option<String> {
+        if !sidecar_trusted() {
+            return None;
+        }
+
         let url = format!("{}/api/tags", base_url());
         let resp = self.health_client.get(&url).send().await.ok()?;
         if !resp.status().is_success() {
@@ -595,6 +672,10 @@ impl OllamaClient {
     /// (the caller may be retrying after a partial failure, or the file
     /// was already removed by some other path).
     pub async fn delete_model(&self, tag: &str) -> Result<(), OllamaModelError> {
+        if !sidecar_trusted() {
+            return Err(OllamaModelError::SidecarUntrusted);
+        }
+
         let url = format!("{}/api/delete", base_url());
         let resp = self
             .pull_client
@@ -640,6 +721,12 @@ pub enum OllamaModelError {
     /// logic reported the failure inline.
     #[error("Ollama reported a pull failure: {0}")]
     Reported(String),
+    /// items.id=586: refused before making any HTTP call, because QR's own
+    /// sidecar trust gate (`ollama_sidecar::is_trusted()`) is false --
+    /// distinct from `Http`/`UnexpectedStatus`, which both imply a call
+    /// was actually attempted.
+    #[error("QR's own sidecar is not confirmed running; refusing to contact it")]
+    SidecarUntrusted,
 }
 
 /// One decoded line of Ollama's `/api/pull` NDJSON stream.
@@ -808,6 +895,71 @@ pub fn check_context_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- sidecar trust gate (items.id=586) -----------------------------------
+
+    /// Proves the gate actually stops the HTTP call from happening at all,
+    /// not just that it returns an error -- a loopback listener standing in
+    /// for "an unidentified process holds the port" must see zero
+    /// connections while untrusted, even though `base_url()` points
+    /// straight at it.
+    #[tokio::test]
+    async fn untrusted_sidecar_makes_zero_network_calls() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        crate::ollama_sidecar::force_trust_for_test(false);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let connection_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = connection_count.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stream.is_ok() {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        });
+
+        let saved_host = std::env::var("OLLAMA_HOST").ok();
+        let saved_port = std::env::var("OLLAMA_PORT").ok();
+        std::env::set_var("OLLAMA_HOST", "127.0.0.1");
+        std::env::set_var("OLLAMA_PORT", port.to_string());
+
+        let client = OllamaClient::new();
+
+        let health = client.check_health().await;
+        assert_eq!(health.status, ProviderStatus::Unavailable);
+        assert_eq!(health.error.as_deref(), Some("sidecar_untrusted"));
+
+        let request = GenerateRequest {
+            provider_id: None,
+            model_id: "test-model".to_owned(),
+            prompt: "hi".to_owned(),
+            images: None,
+            task_type: "generic".to_owned(),
+            stream: Some(false),
+            options: None,
+        };
+        assert!(client.generate(&request).await.is_err());
+        assert!(client.get_model_digest("test-model").await.is_none());
+
+        // Give a real (if untrusted) call every chance to have landed.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            connection_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no HTTP call should reach the port while the sidecar is untrusted"
+        );
+
+        match saved_host {
+            Some(v) => std::env::set_var("OLLAMA_HOST", v),
+            None => std::env::remove_var("OLLAMA_HOST"),
+        }
+        match saved_port {
+            Some(v) => std::env::set_var("OLLAMA_PORT", v),
+            None => std::env::remove_var("OLLAMA_PORT"),
+        }
+    }
 
     // -- estimate_token_count ------------------------------------------------
 

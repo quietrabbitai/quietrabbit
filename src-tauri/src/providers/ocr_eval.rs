@@ -398,6 +398,12 @@ fn print_report(rows: &[Row]) {
 #[tokio::test]
 #[ignore]
 async fn ocr_accuracy_eval() {
+    // items.id=586: this test runs standalone, with no Tauri app bootstrap,
+    // so `ollama_sidecar::ensure_available()` never runs in this process
+    // and the client's trust gate would otherwise stay fail-closed forever.
+    // Test-only escape hatch -- never callable from production code.
+    crate::ollama_sidecar::force_trust_for_test(true);
+
     let entries = load_manifest();
     let dir = eval_dir();
     let client = OllamaClient::new();
@@ -464,6 +470,9 @@ async fn ocr_accuracy_eval() {
 #[tokio::test]
 #[ignore]
 async fn ocr_dump_transcriptions() {
+    // items.id=586: see ocr_accuracy_eval's identical comment above.
+    crate::ollama_sidecar::force_trust_for_test(true);
+
     let dir = eval_dir();
     let files = list_sample_files(&dir);
     let client = OllamaClient::new();

@@ -303,8 +303,42 @@ async fn async_main() {
                             sidecar.ensure_available(&resource_dir).await
                         };
 
+                        let is_sidecar = startup.source == OllamaSource::Sidecar;
                         let startup_state = handle.state::<RwLock<SidecarStartup>>();
                         *startup_state.write().await = startup;
+
+                        // items.id=586 (Jason's plan amendment 2): is_trusted()
+                        // is set true once above by ensure_available(), but
+                        // must go false again the moment the sidecar dies on
+                        // its own (not via stop()) -- otherwise a later
+                        // unidentified process taking over the now-free port
+                        // would be silently trusted. liveness_tick() is a
+                        // plain try_wait() check; the mutex is only held for
+                        // that brief check each tick, not across the sleep,
+                        // matching OllamaSidecar's own "lock held only during
+                        // startup/shutdown" documented invariant.
+                        if is_sidecar {
+                            let handle = handle.clone();
+                            quietrabbit_lib::task_supervision::spawn_supervised(
+                                "ollama_liveness_watch",
+                                false,
+                                move || {
+                                    let handle = handle.clone();
+                                    async move {
+                                        loop {
+                                            tokio::time::sleep(std::time::Duration::from_secs(2))
+                                                .await;
+                                            let sidecar_state =
+                                                handle.state::<Mutex<OllamaSidecar>>();
+                                            let mut sidecar = sidecar_state.lock().await;
+                                            if !sidecar.liveness_tick().await {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                },
+                            );
+                        }
                     }
                 },
             );
@@ -694,6 +728,30 @@ async fn async_main() {
     // existing. `.build()` returning is not the same milestone.
     app.run(move |app_handle, event| {
         if let tauri::RunEvent::Exit = event {
+            // items.id=586: the `CloseRequested` handler below spawns an
+            // async `stop()` that races this very `RunEvent::Exit` ->
+            // `_exit(0)` sequence (items.id=586's own source facts: that
+            // race just hasn't been observed to lose on this dev machine).
+            // This call is the hardening -- synchronous, so it has
+            // definitely finished (sidecar and any runner it loaded killed,
+            // pidfile removed) before `_exit(0)` below, regardless of how
+            // `RunEvent::Exit` was reached (window close, Ctrl-C, a signal
+            // tao translates into this same path). `block_in_place` +
+            // `Handle::current().block_on()` is the same pattern this
+            // file's own `setup()` already uses twice to call async code
+            // synchronously from within this same nested
+            // `Runtime::new().block_on(async_main())` call chain -- see
+            // those call sites' comments for why a bare nested `block_on`
+            // would panic here instead.
+            log::info!("main: RunEvent::Exit — stopping Ollama sidecar synchronously");
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    let sidecar_state = app_handle.state::<Mutex<OllamaSidecar>>();
+                    let mut sidecar = sidecar_state.lock().await;
+                    sidecar.stop().await;
+                });
+            });
+
             // items.id=315: crash-on-quit segfault. tao's own event loop
             // calls std::process::exit() unconditionally right after this
             // closure returns from RunEvent::Exit (Rust destructors never
