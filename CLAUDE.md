@@ -86,6 +86,17 @@ Key commands:
 
 The cargo commands above run from src-tauri/. CI's check job (.github/workflows/tauri-ci.yml) runs fmt, clippy, deny and plain test; a change is not verified until build, fmt, clippy, deny and plain test all pass locally. Build plus test alone has let both a compile break and a fmt failure reach unpushed main undetected (items.id=532).
 
+The Rust toolchain is pinned (rust-toolchain.toml at repo root, version
+matched in the CI workflow's Install Rust step) rather than left on
+`stable` -- an unpinned `dtolnay/rust-toolchain@stable` install can pick
+up a newer clippy than the one a local gate run just passed against and
+fail CI on lints that never fired locally (items.id=587, 2026-10-03: a
+`double_must_use` lint against `#[async_trait]`-generated methods, new
+or tightened on a newer stable, failed CI on pre-existing code the same
+day a local `cargo clippy -- -D warnings` run passed clean). Bump the
+version in both places together, deliberately, and re-run the full local
+gate above (including clippy -D warnings) before pushing a bump.
+
 ## Ollama (D6-353)
 QR checks for a running Ollama instance at 127.0.0.1:11434 on startup.
 If found, uses it. If not, starts the bundled Ollama sidecar.

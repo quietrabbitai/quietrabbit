@@ -25,8 +25,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      # Pinned to the same version as rust-toolchain.toml (repo root) --
+      # dtolnay/rust-toolchain@stable always installs whatever is
+      # currently latest, which can pick up a newer clippy than the one
+      # Jason's local gate ran against and fail CI on lints that never
+      # fired locally (confirmed live, 2026-10-03: a `double_must_use`
+      # lint against `#[async_trait]`-generated methods, new/tightened on
+      # a newer stable, failed CI on pre-existing code that passed a
+      # same-day local `cargo clippy -- -D warnings` run). Bump
+      # deliberately in both places together, and re-run the full local
+      # gate (including clippy -D warnings) before pushing a bump -- see
+      # CLAUDE.md.
+      - name: Install Rust 1.97.1 (pinned, see rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: rustfmt, clippy
 
