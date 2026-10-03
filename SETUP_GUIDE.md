@@ -19,10 +19,9 @@ Quiet Rabbit is a desktop application — download, install, and the interactive
 onboarding guides you through everything. No technical expertise required.
 No manual configuration.
 
-**Ollama is bundled.** If you already have Ollama installed and running, Quiet Rabbit
-detects it automatically and uses it — no duplicate model downloads, no conflicts.
-If you don't have Ollama, Quiet Rabbit starts its own sidecar automatically.
-Either way, you don't need to touch Ollama yourself.
+Quiet Rabbit runs its own bundled Ollama on a dedicated local port and never connects to
+an Ollama you installed yourself, so the two do not conflict. Models you already pulled
+are not shared.
 
 Quiet Rabbit will:
 - Detect your hardware and available models automatically
@@ -49,7 +48,7 @@ Quiet Rabbit uses a tiered routing system:
   per task.
 - **Tier 2 — Private cloud review (split-screen):** an anonymous, no-retention alternative to
   Tier 3. Quiet Rabbit prepares your context; you paste it into a provider that doesn't require
-  sign-in (e.g. Duck.ai, Brave Leo) and paste the response back. Stronger models than Tier 1.5,
+  sign-in (e.g. Duck.ai) and paste the response back. Stronger models than Tier 1.5,
   no account needed.
 - **Tier 3 — Full cloud service:** Claude, ChatGPT, or Gemini for final validation. Quiet Rabbit
   generates a chat starter from your history, and you paste it in through a split-screen view —

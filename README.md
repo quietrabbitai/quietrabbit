@@ -56,8 +56,9 @@ answer. Start a Quick Ask, or create a Topic to track it.
 Quiet Rabbit is a desktop application — download, install, and the interactive
 onboarding handles the rest. No Docker, no server setup, no technical expertise required.
 
-Ollama is included. If you already have Ollama running, Quiet Rabbit uses it automatically.
-If not, it starts its own — no duplicate downloads, no conflicts.
+Quiet Rabbit runs its own bundled Ollama on a dedicated local port and never connects to
+an Ollama you installed yourself, so the two do not conflict. Models you already pulled
+are not shared.
 
 *The installer is not yet available. Phase 1 is in active development — watch
 this repo or https://quietrabbit.ai for updates.*
