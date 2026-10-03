@@ -2456,6 +2456,107 @@ mod tests {
         }
     }
 
+    // -- get_focus_run_status (items.id=587) --------------------------------
+    //
+    // commands::execution::get_run_status is a thin wrapper with no logic of
+    // its own beyond key_hex derivation + error-stringification (the same
+    // "verified live, not re-unit-tested" convention messages.rs's own test
+    // module documents for its own thin command wrappers) -- the real
+    // behavior to pin down is this store function's own status round-trip,
+    // since ChatPane's late-reply recovery (frontend/src/chat/
+    // lateReplyRecovery.ts) branches on the exact string values this
+    // returns.
+
+    #[tokio::test]
+    async fn get_focus_run_status_round_trips_every_focus_runs_status_value() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "status-user";
+        let persona_id = "status-persona";
+
+        let verify = async {
+            // open_outputs_db self-heals a fresh file/schema on first open,
+            // same as every other public fn in this module -- no separate
+            // bootstrap needed before inserting directly.
+            let mut conn = open_outputs_db(user_id, persona_id, INGEST_KEY_HEX)
+                .await
+                .expect("open_outputs_db must self-heal a fresh file");
+
+            // The full outputs_001.sql CHECK constraint set (extended by
+            // outputs_011.sql), per resume_run's own routing doc comment
+            // (commands/execution.rs).
+            for status in [
+                "initializing",
+                "running",
+                "paused",
+                "awaiting_user",
+                "awaiting_feedback",
+                "awaiting_extract_confirm",
+                "awaiting_schedule",
+                "complete",
+                "cancelled",
+                "failed",
+            ] {
+                let run_id = format!("run-{status}");
+                sqlx::query(
+                    "INSERT INTO focus_runs (id, focus_id, status, started_at)
+                     VALUES (?, 'focus-1', ?, '2026-08-03T00:00:00Z')",
+                )
+                .bind(&run_id)
+                .bind(status)
+                .execute(&mut conn)
+                .await
+                .expect("focus_runs insert failed");
+
+                let read_status =
+                    get_focus_run_status(user_id, persona_id, INGEST_KEY_HEX, &run_id)
+                        .await
+                        .expect("query must succeed")
+                        .expect("the just-inserted row must be found");
+                assert_eq!(read_status, status);
+            }
+        };
+        verify.await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    #[tokio::test]
+    async fn get_focus_run_status_is_none_for_an_unknown_run_id() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "status-user-2";
+        let persona_id = "status-persona-2";
+
+        let verify = async {
+            let status =
+                get_focus_run_status(user_id, persona_id, INGEST_KEY_HEX, "nonexistent-run-id")
+                    .await
+                    .expect("querying an unknown run_id must not itself error");
+            assert_eq!(
+                status, None,
+                "an unknown run_id is a normal 'not found' answer, not an error"
+            );
+        };
+        verify.await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
     #[tokio::test]
     async fn bump_ingested_document_version_increments_and_repoints_storage_path() {
         let _lock = crate::test_support::ENV_MUTEX.lock().await;

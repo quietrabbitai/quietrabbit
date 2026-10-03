@@ -55,6 +55,15 @@ pub enum ConductorError {
     OllamaGeneration { plain_language: String },
     #[error("{plain_language}")]
     OllamaInvalidRequest { plain_language: String },
+    /// items.id=587: the sidecar is trusted/reachable, but the requested
+    /// model itself isn't pulled yet (Ollama's own HTTP 404 "model ...
+    /// not found" on /api/generate and /api/chat) -- distinct from
+    /// OllamaUnavailable (sidecar down/untrusted/timeout, items.id=586).
+    /// Retrying can never succeed without the user installing the model
+    /// first, so this is handled like OllamaInvalidRequest below, not
+    /// OllamaGeneration's retry branch.
+    #[error("{plain_language}")]
+    OllamaModelMissing { plain_language: String },
 
     // F2 — Quality
     #[error("{plain_language}")]
@@ -151,6 +160,7 @@ impl ConductorError {
             | Self::OllamaTimeout { plain_language }
             | Self::OllamaGeneration { plain_language }
             | Self::OllamaInvalidRequest { plain_language }
+            | Self::OllamaModelMissing { plain_language }
             | Self::QualityBelowFloor { plain_language }
             | Self::ContextWindowExceeded { plain_language }
             | Self::PrivacyGateBlocked { plain_language }
@@ -314,7 +324,11 @@ impl FailureHandler {
             }
 
             // F1 — Invalid request: non-recoverable
-            ConductorError::OllamaInvalidRequest { .. } => FailureResult {
+            // F1 — Model not installed (items.id=587): non-recoverable, same
+            // shape as InvalidRequest -- no amount of retrying fixes a
+            // model the user hasn't pulled.
+            ConductorError::OllamaInvalidRequest { .. }
+            | ConductorError::OllamaModelMissing { .. } => FailureResult {
                 action: FailureAction::Stop,
                 failure_mode: Some("F1".to_owned()),
                 plain_language: msg,

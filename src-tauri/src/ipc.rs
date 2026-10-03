@@ -54,6 +54,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         // Group 1 -- Focus execution
         commands::execution::submit_focus_run,
         commands::execution::get_run_output,
+        commands::execution::get_run_status,
         commands::execution::cancel_run,
         commands::execution::resume_run,
         commands::execution::reenter_step,

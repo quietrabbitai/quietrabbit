@@ -43,6 +43,12 @@ pub struct MessageRecord {
     /// approval write path (request_cloud_frontier_gate3_review) populates it, and
     /// for every message that predates messages_003.sql.
     pub reviewed_at_risk_rating: Option<i64>,
+    /// items.id=587 (messages_004.sql): true for a placeholder backfilled
+    /// with a plain-language failure message rather than a real reply --
+    /// build_conversation_prompt (commands/messages.rs) skips these, the
+    /// same way it already skips a still-empty placeholder, so a failure
+    /// is never replayed back into the model's own conversation history.
+    pub is_error: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +158,7 @@ fn row_to_message_record(r: &sqlx::sqlite::SqliteRow) -> Result<MessageRecord, s
         gate3_review_status: r.try_get("gate3_review_status")?,
         created_at: r.try_get("created_at")?,
         reviewed_at_risk_rating: r.try_get("reviewed_at_risk_rating")?,
+        is_error: r.try_get::<i64, _>("is_error")? != 0,
     })
 }
 
@@ -217,6 +224,7 @@ pub async fn save_message(
         gate3_review_status: gate3_review_status.map(|s| s.to_owned()),
         created_at: timestamp,
         reviewed_at_risk_rating: None,
+        is_error: false,
     })
 }
 
@@ -236,7 +244,7 @@ pub async fn list_messages(
     let mut conn = open_messages_db(user_id, persona_id, key_hex).await?;
 
     let rows = sqlx::query(
-        "SELECT id, context_key, sender, content, focus_run_id, gate3_review_status, created_at, reviewed_at_risk_rating
+        "SELECT id, context_key, sender, content, focus_run_id, gate3_review_status, created_at, reviewed_at_risk_rating, is_error
          FROM messages
          WHERE context_key = ?
          ORDER BY created_at ASC",
@@ -266,11 +274,48 @@ pub async fn get_message(
     let mut conn = open_messages_db(user_id, persona_id, key_hex).await?;
 
     let row = sqlx::query(
-        "SELECT id, context_key, sender, content, focus_run_id, gate3_review_status, created_at, reviewed_at_risk_rating
+        "SELECT id, context_key, sender, content, focus_run_id, gate3_review_status, created_at, reviewed_at_risk_rating, is_error
          FROM messages
          WHERE id = ?",
     )
     .bind(message_id)
+    .fetch_optional(&mut conn)
+    .await?;
+
+    match row {
+        None => Ok(None),
+        Some(r) => Ok(Some(
+            row_to_message_record(&r).map_err(MessageStoreError::Database)?,
+        )),
+    }
+}
+
+/// Fetch the assistant placeholder row owned by a given focus run.
+/// items.id=587: the generic lookup `finalize_chat_reply`
+/// (commands/messages.rs) uses so every place a run can finish or resume
+/// (send_message's own backfill, resume_run, scheduled_sweep.rs) can find
+/// the right message to update by `focus_run_id` alone -- none of them need
+/// to separately track/pass the message_id or context_key a send started
+/// with. `focus_run_id` is set exactly once, on the single assistant
+/// placeholder `save_message` reserves per run (commands/messages.rs's
+/// send_message, step 4) and never reused across runs, so at most one row
+/// ever matches. None means this run_id has no owning chat message at all
+/// -- e.g. a submit_focus_run/Board-originated run -- which callers treat
+/// as a safe no-op, not an error.
+pub async fn find_assistant_message_by_focus_run_id(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    focus_run_id: &str,
+) -> Result<Option<MessageRecord>, MessageStoreError> {
+    let mut conn = open_messages_db(user_id, persona_id, key_hex).await?;
+
+    let row = sqlx::query(
+        "SELECT id, context_key, sender, content, focus_run_id, gate3_review_status, created_at, reviewed_at_risk_rating, is_error
+         FROM messages
+         WHERE focus_run_id = ? AND sender = 'assistant'",
+    )
+    .bind(focus_run_id)
     .fetch_optional(&mut conn)
     .await?;
 
@@ -287,20 +332,24 @@ pub async fn get_message(
 // ---------------------------------------------------------------------------
 
 /// Backfill a placeholder assistant message's content once its focus run
-/// finishes generating (commands::messages::send_message spawns a background
-/// task that awaits execute_full() then calls this). Narrow single-column
-/// update, same shape as update_gate3_review_status below.
+/// finishes generating, pausing, or resuming (commands::messages::
+/// finalize_chat_reply calls this). `is_error` (items.id=587, messages_004.sql)
+/// marks a plain-language failure message rather than a real reply, so
+/// build_conversation_prompt (commands/messages.rs) never replays it back
+/// into the model's own conversation history on a later send.
 pub async fn update_message_content(
     user_id: &str,
     persona_id: &str,
     key_hex: &str,
     message_id: &str,
     content: &str,
+    is_error: bool,
 ) -> Result<(), MessageStoreError> {
     let mut conn = open_messages_db(user_id, persona_id, key_hex).await?;
 
-    sqlx::query("UPDATE messages SET content = ? WHERE id = ?")
+    sqlx::query("UPDATE messages SET content = ?, is_error = ? WHERE id = ?")
         .bind(content)
+        .bind(is_error)
         .bind(message_id)
         .execute(&mut conn)
         .await?;
@@ -379,6 +428,9 @@ mod tests {
     // untouched by this module's own queries, but harmless to include).
     const MESSAGES_SCHEMA_V2: &str = include_str!("../../schema/messages_002.sql");
     const MESSAGES_SCHEMA_V3: &str = include_str!("../../schema/messages_003.sql");
+    // items.id=587: is_error -- row_to_message_record now reads this column
+    // unconditionally, so this in-memory test DB must apply it too.
+    const MESSAGES_SCHEMA_V4: &str = include_str!("../../schema/messages_004.sql");
 
     async fn test_db() -> SqliteConnection {
         let mut conn = SqliteConnectOptions::new()
@@ -390,6 +442,7 @@ mod tests {
             .into_iter()
             .chain(parse_statements(MESSAGES_SCHEMA_V2))
             .chain(parse_statements(MESSAGES_SCHEMA_V3))
+            .chain(parse_statements(MESSAGES_SCHEMA_V4))
         {
             sqlx::query(&stmt)
                 .execute(&mut conn)
@@ -506,7 +559,7 @@ mod tests {
         let id = seed_message(&mut conn, "ctx-1", "user", "hello", "2026-08-09T00:00:00Z").await;
 
         let row = sqlx::query(
-            "SELECT id, context_key, sender, content, focus_run_id, gate3_review_status, created_at, reviewed_at_risk_rating
+            "SELECT id, context_key, sender, content, focus_run_id, gate3_review_status, created_at, reviewed_at_risk_rating, is_error
              FROM messages WHERE id = ?",
         )
         .bind(&id)
@@ -523,6 +576,10 @@ mod tests {
         assert_eq!(record.gate3_review_status, None);
         assert_eq!(record.created_at, "2026-08-09T00:00:00Z");
         assert_eq!(record.reviewed_at_risk_rating, None);
+        assert!(
+            !record.is_error,
+            "a freshly seeded row must default is_error to false"
+        );
     }
 
     // -----------------------------------------------------------------

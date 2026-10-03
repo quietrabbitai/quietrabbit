@@ -321,6 +321,19 @@ impl OllamaClient {
                     .to_owned(),
             });
         }
+        // items.id=587: confirmed live against a real Ollama instance --
+        // an unpulled model returns HTTP 404 {"error":"model '<name>' not
+        // found"} on /api/generate, distinct from any other generation
+        // fault. Checked before the generic !status.is_success() branch
+        // below, which would otherwise swallow this into the generic
+        // "returned an unexpected response" message.
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(ConductorError::OllamaModelMissing {
+                plain_language: "Quiet Rabbit's local models aren't installed yet. \
+                    [Get help]"
+                    .to_owned(),
+            });
+        }
         if !status.is_success() {
             return Err(ConductorError::OllamaGeneration {
                 plain_language: "The local AI returned an unexpected response. \
@@ -435,6 +448,14 @@ impl OllamaClient {
             return Err(ConductorError::OllamaInvalidRequest {
                 plain_language: "The local AI didn't understand the request. \
                     This is likely a configuration issue. [Get help]"
+                    .to_owned(),
+            });
+        }
+        // items.id=587: same model-not-found 404 as generate() above.
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(ConductorError::OllamaModelMissing {
+                plain_language: "Quiet Rabbit's local models aren't installed yet. \
+                    [Get help]"
                     .to_owned(),
             });
         }
@@ -950,6 +971,71 @@ mod tests {
             0,
             "no HTTP call should reach the port while the sidecar is untrusted"
         );
+
+        match saved_host {
+            Some(v) => std::env::set_var("OLLAMA_HOST", v),
+            None => std::env::remove_var("OLLAMA_HOST"),
+        }
+        match saved_port {
+            Some(v) => std::env::set_var("OLLAMA_PORT", v),
+            None => std::env::remove_var("OLLAMA_PORT"),
+        }
+    }
+
+    /// items.id=587: a real HTTP/1.1 404 response (confirmed live against a
+    /// real Ollama instance to be the model-not-found shape) must map to
+    /// OllamaModelMissing, not the generic OllamaGeneration branch. No HTTP-
+    /// mocking crate exists in this project yet -- a raw std TcpListener
+    /// writing the response by hand, same low-tech style as
+    /// untrusted_sidecar_makes_zero_network_calls above, avoids adding one
+    /// just for this.
+    #[tokio::test]
+    async fn generate_maps_a_404_not_found_response_to_model_missing() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        crate::ollama_sidecar::force_trust_for_test(true);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let body = r#"{"error":"model 'definitely-not-a-real-model-xyz' not found"}"#;
+                let response = format!(
+                    "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let saved_host = std::env::var("OLLAMA_HOST").ok();
+        let saved_port = std::env::var("OLLAMA_PORT").ok();
+        std::env::set_var("OLLAMA_HOST", "127.0.0.1");
+        std::env::set_var("OLLAMA_PORT", port.to_string());
+
+        let client = OllamaClient::new();
+        let request = GenerateRequest {
+            provider_id: None,
+            model_id: "definitely-not-a-real-model-xyz".to_owned(),
+            prompt: "hi".to_owned(),
+            images: None,
+            task_type: "generic".to_owned(),
+            stream: Some(false),
+            options: None,
+        };
+
+        match client.generate(&request).await {
+            Err(ConductorError::OllamaModelMissing { plain_language }) => {
+                assert!(
+                    plain_language.contains("aren't installed"),
+                    "unexpected message: {plain_language}"
+                );
+            }
+            other => panic!("expected OllamaModelMissing, got {other:?}"),
+        }
 
         match saved_host {
             Some(v) => std::env::set_var("OLLAMA_HOST", v),

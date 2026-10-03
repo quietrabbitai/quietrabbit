@@ -6,6 +6,25 @@ import { invoke as __TAURI_INVOKE } from "@tauri-apps/api/core";
 export const commands = {
 	submitFocusRun: (request: SubmitFocusRunRequest) => typedError<SubmitFocusRunResponse, string>(__TAURI_INVOKE("submit_focus_run", { request })),
 	getRunOutput: (runId: string, userId: string, personaId: string) => typedError<GetRunOutputResponse, string>(__TAURI_INVOKE("get_run_output", { runId, userId, personaId })),
+	/**
+	 *  items.id=587 (late-reply recovery): the frontend's only other read,
+	 *  get_run_output above, answers "does real output exist yet" -- it has no
+	 *  way to tell a run that's still genuinely being worked on apart from one
+	 *  that's paused, cancelled, or crashed. ChatPane needs exactly that
+	 *  distinction when it resumes tracking an empty assistant placeholder
+	 *  after a remount (e.g. reopening a chat from History while its reply is
+	 *  still generating): resume polling only for a run that is actually
+	 *  active, and stop/show a plain "didn't finish" for one that's dead,
+	 *  without resuming for one that's merely paused at a consent/Gate3 step
+	 *  (that has its own UI elsewhere -- this must not interfere with it).
+	 * 
+	 *  Thin wrapper -- output_store::get_focus_run_status already exists and is
+	 *  already used for exactly this read by resume_run and
+	 *  submit_extract_confirm above; this just exposes it to the frontend.
+	 *  Returns Ok(None) if run_id doesn't exist in focus_runs at all (never an
+	 *  error -- "unknown" is a normal, expected answer here, not a failure).
+	 */
+	getRunStatus: (runId: string, userId: string, personaId: string) => typedError<string | null, string>(__TAURI_INVOKE("get_run_status", { runId, userId, personaId })),
 	cancelRun: (runId: string, userId: string, personaId: string) => typedError<null, string>(__TAURI_INVOKE("cancel_run", { runId, userId, personaId })),
 	/**
 	 *  Resume a paused focus run.

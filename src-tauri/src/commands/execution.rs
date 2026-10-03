@@ -257,6 +257,40 @@ pub async fn get_run_output(
     })
 }
 
+/// items.id=587 (late-reply recovery): the frontend's only other read,
+/// get_run_output above, answers "does real output exist yet" -- it has no
+/// way to tell a run that's still genuinely being worked on apart from one
+/// that's paused, cancelled, or crashed. ChatPane needs exactly that
+/// distinction when it resumes tracking an empty assistant placeholder
+/// after a remount (e.g. reopening a chat from History while its reply is
+/// still generating): resume polling only for a run that is actually
+/// active, and stop/show a plain "didn't finish" for one that's dead,
+/// without resuming for one that's merely paused at a consent/Gate3 step
+/// (that has its own UI elsewhere -- this must not interfere with it).
+///
+/// Thin wrapper -- output_store::get_focus_run_status already exists and is
+/// already used for exactly this read by resume_run and
+/// submit_extract_confirm above; this just exposes it to the frontend.
+/// Returns Ok(None) if run_id doesn't exist in focus_runs at all (never an
+/// error -- "unknown" is a normal, expected answer here, not a failure).
+#[tauri::command]
+#[specta::specta]
+pub async fn get_run_status(
+    run_id: String,
+    user_id: String,
+    persona_id: String,
+    key_registry: State<'_, KeyRegistry>,
+) -> Result<Option<String>, String> {
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
+    output_store::get_focus_run_status(&user_id, &persona_id, &key_hex_str, &run_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn cancel_run(
@@ -406,8 +440,26 @@ pub async fn resume_run(
             // Spawn resume_execution() in the background, matching
             // submit_focus_run's fire-and-forget shape -- progress arrives via
             // run_status_update push events, not this command's return value.
+            // items.id=587: unlike submit_focus_run's own discard, a resumed
+            // run may be a chat's run that paused mid-reply -- finalize_chat_reply
+            // is a safe no-op for any run_id with no owning messages.db row
+            // (e.g. a Board-originated resume), so it's always correct to
+            // call it here too.
+            let bg_user_id = request.user_id.clone();
+            let bg_persona_id = request.persona_id.clone();
+            let bg_key_hex = key_hex_str.clone();
+            let bg_run_id = request.run_id.clone();
             tokio::spawn(async move {
-                let _result = run.resume_execution().await;
+                let result = run.resume_execution().await;
+                crate::commands::messages::finalize_chat_reply(
+                    &bg_user_id,
+                    &bg_persona_id,
+                    &bg_key_hex,
+                    &bg_run_id,
+                    &result,
+                    run.app_handle.as_ref(),
+                )
+                .await;
             });
 
             return Ok(request.run_id);

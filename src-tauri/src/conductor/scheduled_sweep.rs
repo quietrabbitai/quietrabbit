@@ -125,11 +125,27 @@ pub async fn run_periodic_sweep(
                 }
             };
 
-            if let Err(e) = run.resume_execution().await {
+            let result = run.resume_execution().await;
+            if let Err(e) = &result {
                 log::warn!(
                     "scheduled_sweep: resume_execution failed for run '{focus_run_id}': {e}"
                 );
             }
+            // items.id=587: this sweep resumes ANY due run regardless of
+            // origin (a chat's run that parked on a schedule_trigger, or a
+            // Board/Topic-originated one) -- finalize_chat_reply is a safe
+            // no-op when focus_run_id has no owning messages.db row, so it's
+            // always correct to call it here too, same as resume_run's own
+            // IPC handler now does.
+            crate::commands::messages::finalize_chat_reply(
+                &user_id,
+                &persona.id,
+                &key_hex_str,
+                &focus_run_id,
+                &result,
+                run.app_handle.as_ref(),
+            )
+            .await;
         }
     }
 }

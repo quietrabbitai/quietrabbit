@@ -29,6 +29,7 @@ use tauri::State;
 use crate::auth::registry::{key_hex, KeyRegistry};
 use crate::commands::execution::{self, SubmitFocusRunRequest};
 use crate::conductor::concurrency::ConductorScheduler;
+use crate::conductor::lifecycle::{LifecycleError, RunResult};
 use crate::persistence::{chat_store, message_store, output_store};
 
 // ---------------------------------------------------------------------------
@@ -153,10 +154,13 @@ async fn update_message_content_logged(
     key_hex: &str,
     message_id: &str,
     content: &str,
+    is_error: bool,
 ) {
     match tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        message_store::update_message_content(user_id, persona_id, key_hex, message_id, content),
+        message_store::update_message_content(
+            user_id, persona_id, key_hex, message_id, content, is_error,
+        ),
     )
     .await
     {
@@ -194,7 +198,11 @@ fn build_conversation_prompt(history: &[message_store::MessageRecord]) -> String
     let start = history.len().saturating_sub(HISTORY_WINDOW);
     let mut prompt = String::new();
     for m in &history[start..] {
-        if m.content.is_empty() {
+        // items.id=587: an is_error row is a plain-language failure message
+        // shown to the user, never something the model actually said --
+        // replaying it back as an "Assistant:" turn would be fabricating
+        // history, not describing it.
+        if m.content.is_empty() || m.is_error {
             continue;
         }
         let label = if m.sender == "user" {
@@ -249,6 +257,217 @@ fn draft_content_from_result(
         .and_then(|r| r.output_content.as_deref())
 }
 
+/// items.id=587: the Ok(None) arm's last real source of a human-readable
+/// outcome -- every `handle_step_failure()` exit (lifecycle.rs) populates
+/// `RunResult.failure` with a `FailureResult` carrying a plain_language
+/// string (OllamaUnavailable's "The local AI isn't responding...", the new
+/// OllamaModelMissing's "...local models aren't installed...", context-
+/// exceeded, privacy blocks, an exhausted-retry escalation, etc.) --
+/// send_message never read it before this item, so any run that failed
+/// without ever reaching output() left its placeholder silently empty. Same
+/// pure-function/directly-unit-testable shape as crisis_block_from_result/
+/// draft_content_from_result above.
+fn failure_message_from_result(
+    result: &Result<
+        crate::conductor::lifecycle::RunResult,
+        crate::conductor::lifecycle::LifecycleError,
+    >,
+) -> Option<&str> {
+    result
+        .as_ref()
+        .ok()
+        .and_then(|r| r.failure.as_ref())
+        .map(|f| f.plain_language.as_str())
+}
+
+/// items.id=587: the last-resort fallback for the one case
+/// failure_message_from_result can't cover -- `execute_full()`/
+/// `resume_execution()` returning `Err(LifecycleError)` directly (a
+/// LifecycleError variant execute_full()'s own F_SYSTEM catch didn't wrap
+/// into a FailureResult; see that function's doc comment). Rare, but
+/// previously left the placeholder empty with only a log line -- this is
+/// deliberately generic rather than echoing the raw LifecycleError string,
+/// which is a developer-facing message, not a user-facing one.
+const GENERIC_FAILURE_MESSAGE: &str =
+    "Quiet Rabbit ran into an unexpected problem and couldn't finish that reply. [Try again] [Get help]";
+
+// ---------------------------------------------------------------------------
+// finalize_chat_reply -- the single point every run completion/resumption
+// path passes through (items.id=587)
+// ---------------------------------------------------------------------------
+
+/// What `finalize_chat_reply` actually did -- lets each of its three callers
+/// (send_message's own backfill, resume_run, scheduled_sweep.rs) decide
+/// whether to emit `chat-activity-updated` without needing to re-derive the
+/// same "was this a real reply, on a chat-shaped context_key" logic
+/// themselves, and gives tests something concrete to assert on without
+/// spying on a real Tauri `emit()` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplyOutcome {
+    /// A real reply (success output, crisis block, or an awaiting_user
+    /// Gate3 draft) was written, and it belongs to a "chat-" context_key --
+    /// `ensure_chat_and_bump_activity` created or bumped a row. Caller
+    /// should emit `chat-activity-updated`.
+    ChatFiled,
+    /// A real reply was written, but its context_key isn't chat-shaped
+    /// (the flat tier3-access-*/persona-hub-* pseudo-conversations) --
+    /// `ensure_chat_and_bump_activity` is a documented no-op there
+    /// (items.id=501's boundary). No History emit.
+    RealReplyNoChat,
+    /// A plain-language failure/error message was written (`is_error=1`).
+    /// Per decisions.id=844, this never files or bumps a chats row.
+    ErrorShown,
+    /// Nothing was written -- a status this function doesn't have copy for
+    /// (e.g. a hypothetical "cancelled" with no failure attached). The
+    /// placeholder stays empty, same as before this item.
+    NothingToBackfill,
+    /// `run_id` has no owning assistant message row at all -- a
+    /// submit_focus_run/Board-originated run, not a chat send. Safe no-op;
+    /// this is what makes it safe to call this function from resume_run and
+    /// scheduled_sweep.rs, which resume ANY paused run regardless of origin.
+    NotAChatMessage,
+}
+
+/// Backfills the assistant placeholder owned by `run_id` (looked up by
+/// focus_run_id, not passed in -- see find_assistant_message_by_focus_run_id's
+/// own doc comment for why) with whatever `result` produced, and -- only for
+/// a genuine reply -- files/bumps its owning chat in History
+/// (decisions.id=844). Emits `message-content-ready` whenever a message row
+/// was found at all (matching this event's original "fires unconditionally,
+/// whichever branch ran" contract), and `chat-activity-updated` only when a
+/// chats row was actually created or bumped.
+///
+/// Self-contained by design: every caller (send_message's background task,
+/// resume_run, scheduled_sweep.rs) can call this with nothing but the
+/// run_id and its own Result<RunResult, LifecycleError> -- none of them
+/// need to separately track message_id/context_key/title_candidate across
+/// a pause-and-resume boundary that may be a completely different command
+/// invocation (and, for scheduled_sweep.rs, no user in the loop at all).
+pub(crate) async fn finalize_chat_reply(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    run_id: &str,
+    result: &Result<RunResult, LifecycleError>,
+    app_handle: Option<&tauri::AppHandle>,
+) -> ReplyOutcome {
+    let msg = match message_store::find_assistant_message_by_focus_run_id(
+        user_id, persona_id, key_hex, run_id,
+    )
+    .await
+    {
+        Ok(Some(m)) => m,
+        Ok(None) => return ReplyOutcome::NotAChatMessage,
+        Err(e) => {
+            log::warn!(
+                "finalize_chat_reply: find_assistant_message_by_focus_run_id failed for run {run_id}: {e}"
+            );
+            return ReplyOutcome::NotAChatMessage;
+        }
+    };
+
+    let mut is_real_reply = false;
+    let content: Option<String> =
+        match output_store::get_output_for_run(user_id, persona_id, key_hex, run_id).await {
+            Ok(Some(output)) => {
+                // content is only NULL for an ingested-document row
+                // (items.id=383) -- a Focus run's own output always has real
+                // text content, so this default is never actually reached here.
+                is_real_reply = true;
+                Some(output.content.unwrap_or_default())
+            }
+            Ok(None) => {
+                if let Some(block) = crisis_block_from_result(result) {
+                    is_real_reply = true;
+                    Some(block.to_owned())
+                } else if let Some(draft) = draft_content_from_result(result) {
+                    is_real_reply = true;
+                    Some(draft.to_owned())
+                } else if let Some(failure) = failure_message_from_result(result) {
+                    Some(failure.to_owned())
+                } else if let Err(e) = result {
+                    log::warn!("finalize_chat_reply: run {run_id} failed unexpectedly: {e}");
+                    Some(GENERIC_FAILURE_MESSAGE.to_owned())
+                } else {
+                    log::warn!(
+                    "finalize_chat_reply: run {run_id} finished but produced no output to backfill"
+                );
+                    None
+                }
+            }
+            Err(e) => {
+                log::warn!("finalize_chat_reply: failed to fetch output for run {run_id}: {e}");
+                None
+            }
+        };
+
+    if let Some(c) = &content {
+        update_message_content_logged(user_id, persona_id, key_hex, &msg.id, c, !is_real_reply)
+            .await;
+    }
+
+    let outcome = if is_real_reply {
+        // items.id=587 (title candidate): derived from the context_key's
+        // first stored user message, not from whatever text the triggering
+        // send happened to have in scope -- the only way a first reply that
+        // completes via resume_run (a different command invocation
+        // entirely, with no access to the original send's `content`) still
+        // gets a correct title. Harmless/ignored on every later call for
+        // the same context_key: ensure_chat_and_bump_activity's own
+        // COALESCE keeps whichever title won on the row-creating call.
+        let title_candidate =
+            message_store::list_messages(user_id, persona_id, key_hex, &msg.context_key)
+                .await
+                .ok()
+                .and_then(|msgs| msgs.into_iter().find(|m| m.sender == "user"))
+                .and_then(|m| derive_chat_title(&m.content));
+
+        match chat_store::ensure_chat_and_bump_activity(
+            user_id,
+            persona_id,
+            key_hex,
+            &msg.context_key,
+            title_candidate.as_deref(),
+        )
+        .await
+        {
+            Ok(true) => ReplyOutcome::ChatFiled,
+            Ok(false) => ReplyOutcome::RealReplyNoChat,
+            Err(e) => {
+                log::warn!(
+                    "finalize_chat_reply: ensure_chat_and_bump_activity failed (non-fatal): {e}"
+                );
+                ReplyOutcome::RealReplyNoChat
+            }
+        }
+    } else if content.is_some() {
+        ReplyOutcome::ErrorShown
+    } else {
+        ReplyOutcome::NothingToBackfill
+    };
+
+    if let Some(handle) = app_handle {
+        use tauri::Emitter;
+        if outcome == ReplyOutcome::ChatFiled {
+            let payload = ChatActivityUpdatedPayload {
+                persona_id: persona_id.to_owned(),
+            };
+            if let Err(e) = handle.emit("chat-activity-updated", &payload) {
+                log::warn!("finalize_chat_reply: emit chat-activity-updated failed: {e}");
+            }
+        }
+        let payload = MessageContentReadyPayload {
+            focus_run_id: run_id.to_owned(),
+            message_id: msg.id.clone(),
+        };
+        if let Err(e) = handle.emit("message-content-ready", &payload) {
+            log::warn!("finalize_chat_reply: emit message-content-ready failed: {e}");
+        }
+    }
+
+    outcome
+}
+
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
@@ -296,37 +515,11 @@ pub async fn send_message(
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
-    // 1. items.id=546: ensure the owning chat row exists (lazily -- created
-    // right here, on the first message under this context_key, not eagerly
-    // on persona switch) and bump its activity/title-once. Non-fatal: an
-    // Err here is logged and the send proceeds anyway -- see
-    // chat_store::ensure_chat_and_bump_activity's own doc comment for why
-    // that's safe. Ok(false) means context_key isn't chat-shaped (the flat
-    // pseudo-conversation), nothing to announce.
-    let title_candidate = derive_chat_title(&content);
-    match chat_store::ensure_chat_and_bump_activity(
-        &user_id,
-        &persona_id,
-        &key_hex_str,
-        &context_key,
-        title_candidate.as_deref(),
-    )
-    .await
-    {
-        Ok(true) => {
-            use tauri::Emitter;
-            let payload = ChatActivityUpdatedPayload {
-                persona_id: persona_id.clone(),
-            };
-            if let Err(e) = app_handle.emit("chat-activity-updated", &payload) {
-                log::warn!("send_message: emit chat-activity-updated failed: {e}");
-            }
-        }
-        Ok(false) => {}
-        Err(e) => log::warn!("send_message: ensure_chat_and_bump_activity failed (non-fatal): {e}"),
-    }
-
-    // 1.1. Persist the user's turn.
+    // 1. Persist the user's turn. items.id=587 (decisions.id=844): the
+    // owning chat row is no longer created/bumped here -- that now happens
+    // only once a real reply is actually saved, in finalize_chat_reply
+    // below (step 5), so a run that fails before ever producing a reply
+    // leaves no History entry for it.
     message_store::save_message(
         &user_id,
         &persona_id,
@@ -383,9 +576,11 @@ pub async fn send_message(
 
     // 4. Reserve a placeholder assistant row now, so list_messages has
     // something to show (and Phase 3's staged reveal has a row to render
-    // into) while generation is in flight.
+    // into) while generation is in flight. Its own id isn't needed beyond
+    // this point -- finalize_chat_reply (step 5) finds this row again by
+    // focus_run_id, not by id.
     let gate3_review_status = if gate3_track { Some("drafted") } else { None };
-    let assistant_record = message_store::save_message(
+    message_store::save_message(
         &user_id,
         &persona_id,
         &key_hex_str,
@@ -398,94 +593,28 @@ pub async fn send_message(
     .await
     .map_err(|e| e.to_string())?;
 
-    // 5. Await completion in the background and backfill the placeholder's
-    // content once the run's real output exists. Mirrors execute_full()'s
-    // own "failures logged, not panicking" convention (execution.rs) --
-    // errors here are lost sends, not crashes.
+    // 5. Await completion in the background, then hand off to
+    // finalize_chat_reply -- the single point every run completion or
+    // resumption path (this one, resume_run, scheduled_sweep.rs) passes
+    // through to backfill the placeholder and, only for a genuine reply,
+    // file/bump the owning chat in History (items.id=587). Mirrors
+    // execute_full()'s own "failures logged, not panicking" convention
+    // (execution.rs) -- errors here are lost sends, not crashes.
     let bg_user_id = user_id.clone();
     let bg_persona_id = persona_id.clone();
     let bg_key_hex = key_hex_str.clone();
     let bg_run_id = run_id.clone();
-    let bg_message_id = assistant_record.id.clone();
     tokio::spawn(async move {
         let result = run.execute_full().await;
-        match output_store::get_output_for_run(&bg_user_id, &bg_persona_id, &bg_key_hex, &bg_run_id)
-            .await
-        {
-            Ok(Some(output)) => {
-                // content is only NULL for an ingested-document row
-                // (items.id=383) -- a Focus run's own output always has
-                // real text content, so this is never actually reached here.
-                update_message_content_logged(
-                    &bg_user_id,
-                    &bg_persona_id,
-                    &bg_key_hex,
-                    &bg_message_id,
-                    output.content.as_deref().unwrap_or_default(),
-                )
-                .await;
-            }
-            Ok(None) => {
-                // No saved `outputs` row -- true for every run that paused or
-                // failed before reaching output() (cloud_frontier, consent gates,
-                // Gate3 review, step failure). R1 crisis-handling floor
-                // (items.id=297): if the run was crisis-flagged, persist the
-                // resource block into the placeholder now, so it survives a
-                // reload/reopen even if the live "run-status-update" event
-                // that also carries it was missed by the frontend -- this
-                // takes priority over an ordinary draft backfill below.
-                // items.id=317: otherwise, an ordinary cloud_frontier pause backfills
-                // the draft awaiting Gate3 review, so
-                // request_cloud_frontier_gate3_review's content.is_empty() guard
-                // (consent.rs) doesn't fail on every gate3_track message.
-                // Any other paused/failed status keeps prior behavior -- the
-                // placeholder stays empty, just logged.
-                if let Some(block) = crisis_block_from_result(&result) {
-                    update_message_content_logged(
-                        &bg_user_id,
-                        &bg_persona_id,
-                        &bg_key_hex,
-                        &bg_message_id,
-                        block,
-                    )
-                    .await;
-                } else if let Some(draft) = draft_content_from_result(&result) {
-                    update_message_content_logged(
-                        &bg_user_id,
-                        &bg_persona_id,
-                        &bg_key_hex,
-                        &bg_message_id,
-                        draft,
-                    )
-                    .await;
-                } else {
-                    log::warn!(
-                        "send_message: run {bg_run_id} finished but produced no output to backfill"
-                    );
-                }
-            }
-            Err(e) => {
-                log::warn!("send_message: failed to fetch output for run {bg_run_id}: {e}");
-            }
-        }
-
-        // items.id=320: the sole reliable "safe to re-fetch now" signal --
-        // every run-status-update status above (including
-        // "awaiting_feedback") was already emitted from inside
-        // execute_full_inner()/cleanup(), before this backfill attempt even
-        // started. Fires unconditionally, whichever branch above ran,
-        // including the genuine-no-output case: ChatPane still needs to know
-        // the backfill attempt is over so it can stop waiting.
-        if let Some(handle) = &run.app_handle {
-            use tauri::Emitter;
-            let payload = MessageContentReadyPayload {
-                focus_run_id: bg_run_id.clone(),
-                message_id: bg_message_id.clone(),
-            };
-            if let Err(e) = handle.emit("message-content-ready", &payload) {
-                log::warn!("send_message: emit message-content-ready failed: {e}");
-            }
-        }
+        finalize_chat_reply(
+            &bg_user_id,
+            &bg_persona_id,
+            &bg_key_hex,
+            &bg_run_id,
+            &result,
+            run.app_handle.as_ref(),
+        )
+        .await;
     });
 
     // 6. Return the transcript as it stands now (includes the just-reserved,
@@ -525,6 +654,14 @@ mod tests {
             gate3_review_status: None,
             created_at: "2026-08-09T00:00:00Z".to_owned(),
             reviewed_at_risk_rating: None,
+            is_error: false,
+        }
+    }
+
+    fn error_msg(content: &str) -> message_store::MessageRecord {
+        message_store::MessageRecord {
+            is_error: true,
+            ..msg("assistant", content)
         }
     }
 
@@ -544,6 +681,20 @@ mod tests {
         ];
         let prompt = build_conversation_prompt(&history);
         assert_eq!(prompt, "User: hi\nUser: still there?\n");
+    }
+
+    #[test]
+    fn build_conversation_prompt_skips_error_rows() {
+        let history = vec![
+            msg("user", "hi"),
+            error_msg("Quiet Rabbit's local models aren't installed yet."),
+            msg("user", "still there?"),
+        ];
+        let prompt = build_conversation_prompt(&history);
+        assert_eq!(
+            prompt, "User: hi\nUser: still there?\n",
+            "an is_error row must never be replayed back as a real Assistant: turn"
+        );
     }
 
     #[test]
@@ -646,6 +797,56 @@ mod tests {
             crate::conductor::lifecycle::LifecycleError::FocusNotFound("quick-ask".to_owned()),
         );
         assert_eq!(draft_content_from_result(&result), None);
+    }
+
+    // -----------------------------------------------------------------
+    // failure_message_from_result (items.id=587) -- same pure-function
+    // rationale as crisis_block_from_result/draft_content_from_result above.
+    // -----------------------------------------------------------------
+
+    fn run_result_with_failure(plain_language: &str) -> crate::conductor::lifecycle::RunResult {
+        crate::conductor::lifecycle::RunResult {
+            focus_run_id: "run-1".to_owned(),
+            status: "failed".to_owned(),
+            output_id: None,
+            output_content: None,
+            failure: Some(crate::conductor::failure::FailureResult {
+                action: crate::conductor::failure::FailureAction::Stop,
+                failure_mode: Some("F1".to_owned()),
+                plain_language: plain_language.to_owned(),
+                is_recoverable: false,
+                severity: crate::conductor::failure::FailureSeverity::Stop,
+                step_id: None,
+                focus_id: None,
+                metadata: None,
+            }),
+            crisis_resource_block: None,
+        }
+    }
+
+    #[test]
+    fn failure_message_from_result_present_for_a_failed_run() {
+        let result = Ok(run_result_with_failure(
+            "Quiet Rabbit's local models aren't installed yet. [Get help]",
+        ));
+        assert_eq!(
+            failure_message_from_result(&result),
+            Some("Quiet Rabbit's local models aren't installed yet. [Get help]")
+        );
+    }
+
+    #[test]
+    fn failure_message_from_result_absent_when_no_failure_is_attached() {
+        let result = Ok(run_result_awaiting_user(None));
+        assert_eq!(failure_message_from_result(&result), None);
+    }
+
+    #[test]
+    fn failure_message_from_result_absent_when_execute_full_itself_errored() {
+        let result: Result<_, crate::conductor::lifecycle::LifecycleError> = Err(
+            crate::conductor::lifecycle::LifecycleError::FocusNotFound("quick-ask".to_owned()),
+        );
+        assert_eq!(failure_message_from_result(&result), None);
     }
 
     // -----------------------------------------------------------------
@@ -759,6 +960,257 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    // -----------------------------------------------------------------
+    // finalize_chat_reply (items.id=587) -- integration-style, against a
+    // real temp messages.db with the real message_store/chat_store, not
+    // mocked -- per this item's own requirement that the chats-row-timing
+    // behavior (no row on failure, one row on success, bump on a
+    // follow-up) be verified against real DB state, not just asserted on
+    // a pure decision function. No Tauri `emit()` is exercised here
+    // (app_handle: None) -- this codebase has no existing pattern for
+    // asserting a real emitted event, so the returned ReplyOutcome is
+    // what's asserted instead: a real caller only emits
+    // chat-activity-updated when it sees ReplyOutcome::ChatFiled, so
+    // asserting the outcome directly tests the condition that gates it.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn finalize_chat_reply_on_failure_leaves_no_chats_row_and_marks_is_error() {
+        let _env = setup().await;
+        let key = key_hex_str();
+
+        message_store::save_message(
+            USER_ID,
+            PERSONA_ID,
+            &key,
+            "chat-fail-test",
+            "user",
+            "hi",
+            None,
+            None,
+        )
+        .await
+        .expect("save_message (user) must succeed");
+        message_store::save_message(
+            USER_ID,
+            PERSONA_ID,
+            &key,
+            "chat-fail-test",
+            "assistant",
+            "",
+            Some("run-fail-1"),
+            None,
+        )
+        .await
+        .expect("save_message (assistant placeholder) must succeed");
+
+        let result = Ok(run_result_with_failure(
+            "Quiet Rabbit's local models aren't installed yet. [Get help]",
+        ));
+
+        let outcome =
+            finalize_chat_reply(USER_ID, PERSONA_ID, &key, "run-fail-1", &result, None).await;
+
+        assert_eq!(outcome, ReplyOutcome::ErrorShown);
+
+        let chats = chat_store::list_chats(USER_ID, PERSONA_ID, &key)
+            .await
+            .expect("list_chats must succeed");
+        assert!(chats.is_empty(), "a failed run must leave no chats row");
+
+        let placeholder = message_store::find_assistant_message_by_focus_run_id(
+            USER_ID,
+            PERSONA_ID,
+            &key,
+            "run-fail-1",
+        )
+        .await
+        .expect("find_assistant_message_by_focus_run_id must succeed")
+        .expect("the placeholder row must still exist");
+        assert_eq!(
+            placeholder.content,
+            "Quiet Rabbit's local models aren't installed yet. [Get help]"
+        );
+        assert!(
+            placeholder.is_error,
+            "the backfilled error text must be flagged is_error"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_chat_reply_on_success_files_the_chat_exactly_once() {
+        let _env = setup().await;
+        let key = key_hex_str();
+
+        message_store::save_message(
+            USER_ID,
+            PERSONA_ID,
+            &key,
+            "chat-success-test",
+            "user",
+            "first message",
+            None,
+            None,
+        )
+        .await
+        .expect("save_message (user) must succeed");
+        message_store::save_message(
+            USER_ID,
+            PERSONA_ID,
+            &key,
+            "chat-success-test",
+            "assistant",
+            "",
+            Some("run-ok-1"),
+            None,
+        )
+        .await
+        .expect("save_message (assistant placeholder) must succeed");
+
+        // Enters via the awaiting_user/draft branch rather than a real
+        // outputs.db row -- finalize_chat_reply treats both identically
+        // once is_real_reply is true (the thing this test actually cares
+        // about: does a real reply file the chat), and this avoids standing
+        // up a second encrypted DB (outputs.db) just for this assertion.
+        let result = Ok(run_result_awaiting_user(Some("the real reply content")));
+
+        let outcome =
+            finalize_chat_reply(USER_ID, PERSONA_ID, &key, "run-ok-1", &result, None).await;
+
+        assert_eq!(outcome, ReplyOutcome::ChatFiled);
+
+        let chats = chat_store::list_chats(USER_ID, PERSONA_ID, &key)
+            .await
+            .expect("list_chats must succeed");
+        assert_eq!(chats.len(), 1);
+        assert_eq!(chats[0].title.as_deref(), Some("first message"));
+    }
+
+    #[tokio::test]
+    async fn finalize_chat_reply_follow_up_bumps_without_filing_a_second_row() {
+        let _env = setup().await;
+        let key = key_hex_str();
+
+        message_store::save_message(
+            USER_ID,
+            PERSONA_ID,
+            &key,
+            "chat-followup-test",
+            "user",
+            "first message",
+            None,
+            None,
+        )
+        .await
+        .expect("save_message (user 1) must succeed");
+        message_store::save_message(
+            USER_ID,
+            PERSONA_ID,
+            &key,
+            "chat-followup-test",
+            "assistant",
+            "",
+            Some("run-a"),
+            None,
+        )
+        .await
+        .expect("save_message (assistant placeholder 1) must succeed");
+        let first_result = Ok(run_result_awaiting_user(Some("reply one")));
+        let first_outcome =
+            finalize_chat_reply(USER_ID, PERSONA_ID, &key, "run-a", &first_result, None).await;
+        assert_eq!(first_outcome, ReplyOutcome::ChatFiled);
+
+        // Force a real ordering difference the same way a real later
+        // message would -- same technique chat_store.rs's own bump test
+        // uses, needed since now()-derived timestamps are second-resolution.
+        let mut conn = message_store::open_messages_db(USER_ID, PERSONA_ID, &key)
+            .await
+            .expect("open_messages_db must succeed");
+        sqlx::query("UPDATE chats SET last_message_at = ? WHERE context_key = ?")
+            .bind("2026-09-01T00:00:01Z")
+            .bind("chat-followup-test")
+            .execute(&mut conn)
+            .await
+            .expect("forcing last_message_at back must succeed");
+
+        message_store::save_message(
+            USER_ID,
+            PERSONA_ID,
+            &key,
+            "chat-followup-test",
+            "user",
+            "second message",
+            None,
+            None,
+        )
+        .await
+        .expect("save_message (user 2) must succeed");
+        message_store::save_message(
+            USER_ID,
+            PERSONA_ID,
+            &key,
+            "chat-followup-test",
+            "assistant",
+            "",
+            Some("run-b"),
+            None,
+        )
+        .await
+        .expect("save_message (assistant placeholder 2) must succeed");
+        let second_result = Ok(run_result_awaiting_user(Some("reply two")));
+        let second_outcome =
+            finalize_chat_reply(USER_ID, PERSONA_ID, &key, "run-b", &second_result, None).await;
+        assert_eq!(
+            second_outcome,
+            ReplyOutcome::ChatFiled,
+            "a follow-up's real reply must also report ChatFiled, so the caller emits chat-activity-updated"
+        );
+
+        let chats = chat_store::list_chats(USER_ID, PERSONA_ID, &key)
+            .await
+            .expect("list_chats must succeed");
+        assert_eq!(
+            chats.len(),
+            1,
+            "a follow-up must bump the existing row, not create a second one"
+        );
+        assert_eq!(
+            chats[0].title.as_deref(),
+            Some("first message"),
+            "title must stay from the first message, never overwritten by a follow-up"
+        );
+        assert_ne!(
+            chats[0].last_message_at, "2026-09-01T00:00:01Z",
+            "a follow-up's real reply must bump last_message_at"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_chat_reply_is_a_noop_for_a_run_with_no_owning_message() {
+        let _env = setup().await;
+        let key = key_hex_str();
+
+        // No save_message call at all for this run_id -- simulates a
+        // submit_focus_run/Board-originated run, which never writes a
+        // messages.db row in the first place.
+        let result = Ok(run_result_awaiting_user(Some("irrelevant")));
+        let outcome = finalize_chat_reply(
+            USER_ID,
+            PERSONA_ID,
+            &key,
+            "run-with-no-message",
+            &result,
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome, ReplyOutcome::NotAChatMessage);
+        let chats = chat_store::list_chats(USER_ID, PERSONA_ID, &key)
+            .await
+            .expect("list_chats must succeed");
+        assert!(chats.is_empty());
+    }
+
     #[test]
     fn to_message_info_maps_every_field() {
         let record = message_store::MessageRecord {
@@ -770,6 +1222,7 @@ mod tests {
             gate3_review_status: Some("drafted".to_owned()),
             created_at: "2026-08-09T00:00:00Z".to_owned(),
             reviewed_at_risk_rating: None,
+            is_error: false,
         };
         let info = to_message_info(record);
         assert_eq!(info.id, "id-1");
