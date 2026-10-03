@@ -3148,10 +3148,25 @@ pub async fn demote_interrupted_runs(
 
     let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
 
+    // items.id=587 fix (2026-10-03): started_at is written by
+    // providers::utils::now() as an RFC3339 string with a 'T' date/time
+    // separator and a '+00:00' offset suffix (chrono's to_rfc3339()).
+    // datetime('now', ...) instead produces SQLite's own space-separated,
+    // offset-less format. Comparing those two TEXT values with `<` is a
+    // plain byte-wise comparison -- 'T' (0x54) sorts after a space
+    // (0x20), so started_at always read as lexicographically "later" than
+    // the datetime() cutoff, regardless of the real elapsed time. This
+    // made the WHERE clause match zero rows, always, at any threshold --
+    // confirmed live (2026-10-03): a run left at status='running' by a
+    // killed process was still read back as 'running' after 6+ real
+    // minutes and two logins, one of them with
+    // QR_INTERRUPT_THRESHOLD_MINUTES=0. unixepoch() normalizes both sides
+    // to integer seconds regardless of which ISO8601-family format they
+    // started in, sidestepping the format mismatch entirely.
     let result = sqlx::query(
         "UPDATE focus_runs SET status = 'paused'
          WHERE status IN ('running', 'initializing')
-         AND started_at < datetime('now', ? || ' minutes')",
+         AND unixepoch(started_at) < unixepoch('now', ? || ' minutes')",
     )
     .bind(format!("-{threshold_minutes}"))
     .execute(&mut conn)
@@ -4926,6 +4941,98 @@ mod tests {
         assert!(
             run.personal_track.as_ref().unwrap().is_sealed(),
             "rehydrate_focus_run must seal the freshly-fetched PersonalTrack, same as initialize()"
+        );
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    /// items.id=587 regression test: demote_interrupted_runs()'s WHERE
+    /// clause used to compare started_at (RFC3339, 'T'-separated, a
+    /// "+00:00" offset -- see providers::utils::now()) against
+    /// datetime('now', ...)'s own space-separated, offset-less output using
+    /// a plain TEXT `<`. 'T' (0x54) sorts after a space (0x20), so
+    /// started_at always read as lexicographically later than the cutoff,
+    /// and the UPDATE matched zero rows, always, regardless of real elapsed
+    /// time -- confirmed live (2026-10-03): a run left at status='running'
+    /// by a killed process was still 'running' after 6+ real minutes and
+    /// two logins. The one existing coverage for this function
+    /// (auth.rs's login_demotes_a_stale_running_focus_run_to_paused) seeded
+    /// started_at as '2020-01-01T00:00:00Z' -- six years stale, so the YEAR
+    /// digits alone decided the lexicographic comparison and masked the
+    /// 'T'-vs-space bug entirely. This test seeds a same-day, just-stale
+    /// timestamp (now() - 10 minutes, the same RFC3339 shape real code
+    /// produces) specifically to catch that class of masking, plus a
+    /// just-started row that must survive -- guards against a fix that
+    /// over-corrects into "always demote everything".
+    #[tokio::test]
+    async fn demote_interrupted_runs_demotes_a_same_day_stale_running_run() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "demote-test-user";
+        let persona_id = "demote-test-persona";
+        setup_shared_and_persona_for_resume_test(user_id, persona_id).await;
+
+        let stale_run_id = uuid::Uuid::new_v4().to_string();
+        let fresh_run_id = uuid::Uuid::new_v4().to_string();
+        {
+            let mut conn = open_outputs_db(user_id, persona_id, RESUME_TEST_KEY_HEX)
+                .await
+                .expect("open_outputs_db must succeed");
+            let stale_started_at = (Utc::now() - Duration::minutes(10)).to_rfc3339();
+            sqlx::query(
+                "INSERT INTO focus_runs (id, focus_id, status, started_at)
+                 VALUES (?, 'quick-ask', 'running', ?)",
+            )
+            .bind(&stale_run_id)
+            .bind(&stale_started_at)
+            .execute(&mut conn)
+            .await
+            .expect("seeding the stale focus_runs row must succeed");
+
+            sqlx::query(
+                "INSERT INTO focus_runs (id, focus_id, status, started_at)
+                 VALUES (?, 'quick-ask', 'running', ?)",
+            )
+            .bind(&fresh_run_id)
+            .bind(now())
+            .execute(&mut conn)
+            .await
+            .expect("seeding the fresh focus_runs row must succeed");
+        }
+
+        let demoted = demote_interrupted_runs(user_id, persona_id, RESUME_TEST_KEY_HEX)
+            .await
+            .expect("demote_interrupted_runs must succeed");
+        assert_eq!(
+            demoted, 1,
+            "exactly the stale run must be demoted, not the fresh one"
+        );
+
+        let mut conn = open_outputs_db(user_id, persona_id, RESUME_TEST_KEY_HEX)
+            .await
+            .expect("open_outputs_db must succeed for the post-demote read");
+        let stale_status: String = sqlx::query_scalar("SELECT status FROM focus_runs WHERE id = ?")
+            .bind(&stale_run_id)
+            .fetch_one(&mut conn)
+            .await
+            .expect("stale row must still exist");
+        assert_eq!(stale_status, "paused");
+
+        let fresh_status: String = sqlx::query_scalar("SELECT status FROM focus_runs WHERE id = ?")
+            .bind(&fresh_run_id)
+            .fetch_one(&mut conn)
+            .await
+            .expect("fresh row must still exist");
+        assert_eq!(
+            fresh_status, "running",
+            "a just-started run must not be demoted"
         );
 
         if let Some(v) = saved_root {
