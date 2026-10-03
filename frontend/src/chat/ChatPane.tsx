@@ -9,6 +9,7 @@ import { useTranslation } from 'react-i18next'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { commands, type MessageInfo, type PendingCrossPersonaFact } from '../bindings'
 import { CrossPersonaConfirmModal, type CrossPersonaFactDecision } from './CrossPersonaConfirmModal'
+import { classifyRunStatus, findInFlightAssistantMessage } from './lateReplyRecovery'
 import './ChatPane.css'
 
 export interface ChatPaneProps {
@@ -136,6 +137,9 @@ interface MessageContentReadyPayload {
  *  -- comfortably clear of the ~2s extraction-pass gap observed in repro,
  *  with margin for slow-system contention. */
 const CONTENT_POLL_INTERVAL_MS = 2000
+// items.id=587: no longer a hard give-up point -- see the pollTimeoutId
+// handler below. This is purely "how long before the informational banner
+// first appears," so the original margin still applies unchanged.
 const CONTENT_POLL_TIMEOUT_MS = 25000
 
 // items.id=416 (decisions.id=766): speed-conditional copy-review UX
@@ -225,10 +229,21 @@ export function ChatPane({
   >(null)
   const [liveContent, setLiveContent] = useState('')
   const [elapsedSeconds, setElapsedSeconds] = useState(0)
-  /** items.id=320: set only if the CONTENT_POLL_TIMEOUT_MS fallback expires
+  /** items.id=320: set once the CONTENT_POLL_TIMEOUT_MS fallback elapses
    *  with the placeholder row still empty -- surfaces a visible notice
-   *  instead of silently leaving a blank bubble forever. */
+   *  instead of silently leaving a blank bubble forever. items.id=587: no
+   *  longer terminal -- polling keeps going past this point (see the
+   *  pollTimeoutId/pollIntervalId effect below), so this is purely
+   *  informational and gets cleared the moment real content arrives. */
   const [contentTimedOut, setContentTimedOut] = useState(false)
+  /** items.id=587: focus_run_ids confirmed dead (classifyRunStatus ===
+   *  'dead' -- failed or cancelled) whose placeholder is still empty.
+   *  Rendered as a plain "didn't finish" fallback in place of the empty
+   *  content for that row (see the message-list render below) -- scoped to
+   *  this mount, same lifetime as every other live-tracking state here;
+   *  re-derived fresh (via the mount effect's own status check) if the
+   *  user leaves and comes back. */
+  const [deadRunIds, setDeadRunIds] = useState<Set<string>>(new Set())
   const elapsedIntervalRef = useRef<number | null>(null)
 
   /** Cross-Persona export confirmation (decisions.id=546/639/815,
@@ -282,18 +297,101 @@ export function ChatPane({
     setLiveContent('')
     setLiveStepDisplayName(null)
     setContentTimedOut(false)
+    setDeadRunIds(new Set())
     setProvenanceOmitted(false)
+
+    let cancelledOnMount = false
+    const mountRecheckTimeoutIds: number[] = []
 
     setLoadError(null)
     commands.listMessages(userId, personaId, contextKey).then(
       (result) => {
         if (result.status === 'ok') {
           setMessages(result.data)
+          // items.id=587 (late-reply recovery): a fresh mount has no way to
+          // know a run is still in flight for this context_key except by
+          // noticing the signature a not-yet-backfilled placeholder leaves
+          // behind (findInFlightAssistantMessage). But that signature alone
+          // isn't enough -- it also matches a run that crashed, was killed,
+          // or is paused at a consent/Gate3 step (whose placeholder is
+          // intentionally still empty; that has its own UI elsewhere). A
+          // real run_status check (classifyRunStatus) is required before
+          // resuming: only 'active' plugs into the existing polling/
+          // listener effect below (the same way handleSend's own post-send
+          // setActiveRunId does, so reopening a chat via History while its
+          // reply is genuinely still generating shows "Generating..." and
+          // picks up the real content the moment it arrives); 'dead' marks
+          // the row to render a plain "didn't finish" fallback instead;
+          // 'inactive' (paused/awaiting_*/complete/unknown) does nothing --
+          // left exactly as today's pre-existing rendering already handles
+          // it.
+          const inFlight = findInFlightAssistantMessage(result.data)
+          if (inFlight?.focus_run_id) {
+            const runId = inFlight.focus_run_id
+            const inFlightId = inFlight.id
+            commands.getRunStatus(runId, userId, personaId).then((statusResult) => {
+              if (cancelledOnMount) return
+              const status = statusResult.status === 'ok' ? statusResult.data : null
+              const runClass = classifyRunStatus(status)
+              if (runClass === 'active') {
+                setActiveRunId(runId)
+                return
+              }
+              // Grace-retry guard (live-confirmed 2026-10-03): confirmed
+              // against the actual backend ordering (conductor/lifecycle.rs)
+              // that cleanup() always writes focus_runs.status to its
+              // terminal value and that write is awaited BEFORE
+              // execute_full()/resume_execution() returns -- which is
+              // BEFORE send_message's background task even calls
+              // finalize_chat_reply (messages.rs), the thing that actually
+              // writes this run's content. So this status read can land
+              // terminal while the content write is still moments away, on
+              // a success just as much as a failure -- not a rare race, a
+              // guaranteed ordering. A single immediate re-check isn't
+              // enough margin (confirmed live: a real 2500+-char reply was
+              // still missing a beat later against an earlier,
+              // single-recheck version of this guard). Retry a few times,
+              // spaced out, before concluding anything -- only 'dead'
+              // (failed/cancelled) ever marks the row as not finished;
+              // 'inactive' (overwhelmingly "complete" read a beat early)
+              // just stops trying and leaves today's pre-existing
+              // empty-bubble rendering alone, same as it always has.
+              const MOUNT_RECHECK_ATTEMPTS = 3
+              let attempt = 0
+              const tryContent = () => {
+                if (cancelledOnMount) return
+                commands.listMessages(userId, personaId, contextKey).then((recheck) => {
+                  if (cancelledOnMount) return
+                  if (recheck.status === 'ok') {
+                    const freshRow = recheck.data.find((m) => m.id === inFlightId)
+                    if (freshRow?.content) {
+                      setMessages(recheck.data)
+                      return
+                    }
+                  }
+                  attempt += 1
+                  if (attempt < MOUNT_RECHECK_ATTEMPTS) {
+                    mountRecheckTimeoutIds.push(
+                      window.setTimeout(tryContent, CONTENT_POLL_INTERVAL_MS),
+                    )
+                  } else if (runClass === 'dead') {
+                    setDeadRunIds((prev) => new Set(prev).add(runId))
+                  }
+                })
+              }
+              tryContent()
+            })
+          }
         } else {
           setLoadError(result.error)
         }
       },
     )
+
+    return () => {
+      cancelledOnMount = true
+      mountRecheckTimeoutIds.forEach((id) => window.clearTimeout(id))
+    }
   }, [contextKey, userId, personaId])
 
   // First listen() call in this frontend (see this file's header comment on
@@ -318,6 +416,15 @@ export function ChatPane({
     let contentUnlisten: UnlistenFn | undefined
     let cancelled = false
     let settled = false
+    // items.id=587: set once CONTENT_POLL_TIMEOUT_MS has already elapsed --
+    // gates the run_status check below so a normal, fast reply never pays
+    // for an extra IPC round trip on every single poll tick; only once
+    // things are already unusual is the extra check worth its cost.
+    let timedOut = false
+    // items.id=587: consecutive checkStatusAndMaybeStop calls that found
+    // the run 'dead' (failed/cancelled) with no content yet -- see that
+    // function's own comment for why a single reading isn't enough.
+    let deadStreak = 0
     let pollIntervalId: number | null = null
     let pollTimeoutId: number | null = null
 
@@ -341,6 +448,11 @@ export function ChatPane({
       if (cancelled || settled) return
       settled = true
       clearPoll()
+      // items.id=587: a late arrival (the fallback poll below now keeps
+      // running past the timeout instead of giving up) must clear a banner
+      // it already showed -- otherwise real content would render sitting
+      // right under a stale "taking longer than expected" notice forever.
+      setContentTimedOut(false)
       if (result.status === 'ok') {
         setMessages(result.data)
         // Draft-ready signal (items.id=233): only for gate3Track usage, and
@@ -367,6 +479,29 @@ export function ChatPane({
           }
         }
       }
+      setActiveRunId(null)
+      setLiveContent('')
+      setLiveStepDisplayName(null)
+    }
+
+    // items.id=587: the run_status-informed counterpart to finalize() above
+    // -- used only once a run is confirmed 'dead' (failed/cancelled) AND
+    // DEAD_STREAK_LIMIT consecutive content re-checks still found nothing
+    // (see checkStatusAndMaybeStop's own comment on why both are required).
+    // Marks the placeholder so the render below shows a plain "didn't
+    // finish" instead of an empty bubble -- a genuine dead end, nothing
+    // more will ever arrive. There is deliberately no "finalize as merely
+    // inactive" counterpart: an 'inactive' run_status reading (paused/
+    // awaiting_user/etc., but in practice overwhelmingly "complete" read a
+    // beat before finalize_chat_reply's own content write lands) is not a
+    // stop signal for a run this component is actively tracking -- content
+    // for it will still arrive via the normal listener/poll above.
+    const finalizeAsDead = () => {
+      if (cancelled || settled) return
+      settled = true
+      clearPoll()
+      setContentTimedOut(false)
+      setDeadRunIds((prev) => new Set(prev).add(activeRunId))
       setActiveRunId(null)
       setLiveContent('')
       setLiveStepDisplayName(null)
@@ -419,6 +554,69 @@ export function ChatPane({
       }
     })
 
+    // items.id=587 (redesigned after a live regression, 2026-10-03): checks
+    // real run_status for a run with no content yet. Confirmed against the
+    // actual backend ordering (conductor/lifecycle.rs's execute_full/
+    // resume_execution): cleanup() always writes focus_runs.status to its
+    // terminal value (e.g. "complete", or "failed" via handle_step_failure)
+    // and that write is awaited BEFORE execute_full()/resume_execution()
+    // returns -- which is BEFORE send_message's background task even calls
+    // finalize_chat_reply (messages.rs), the thing that actually writes the
+    // reply content. So for a run this component is actively tracking in
+    // this same session, run_status reads terminal *every single time*,
+    // on a success just as much as a failure -- this is not a rare timing
+    // race to patch around with one extra check, it is the guaranteed
+    // order of operations. Confirmed live: a perfectly good 2500+-char
+    // reply was silently dropped twice by an earlier, single-recheck
+    // version of this guard, because finalize_chat_reply's own write
+    // consistently lands more than one IPC round trip after cleanup()'s
+    // status write.
+    //
+    // Conclusion: 'inactive' (overwhelmingly "complete" read a beat early)
+    // is NOT a stop signal here -- content for this run WILL arrive, via
+    // the message-content-ready listener or the interval poll above, exactly
+    // as it always did before this item. Only 'dead' (failed/cancelled)
+    // means nothing more is coming on the success path, but
+    // finalize_chat_reply still owes this run an error-text write even
+    // then, under the same ordering -- so 'dead' requires DEAD_STREAK_LIMIT
+    // consecutive dead-and-still-no-content readings (spaced
+    // CONTENT_POLL_INTERVAL_MS apart, reusing the interval's own cadence
+    // instead of inventing a separate retry timer) before finalizeAsDead()
+    // actually gives up. `onActive` is the only caller that needs to react
+    // to 'active' (the pollTimeoutId handler, to raise the informational
+    // banner); 'inactive' and a not-yet-confirmed 'dead' both simply return
+    // and let the existing poll/listener keep going untouched.
+    const DEAD_STREAK_LIMIT = 2
+    const checkStatusAndMaybeStop = (onActive?: () => void) => {
+      commands.getRunStatus(activeRunId, userId, personaId).then((statusResult) => {
+        if (cancelled || settled) return
+        const status = statusResult.status === 'ok' ? statusResult.data : null
+        const runClass = classifyRunStatus(status)
+        if (runClass === 'active') {
+          deadStreak = 0
+          onActive?.()
+          return
+        }
+        if (runClass === 'inactive') return
+        // runClass === 'dead' from here down.
+        commands.listMessages(userId, personaId, contextKey).then((result) => {
+          if (cancelled || settled) return
+          const liveRow =
+            result.status === 'ok'
+              ? [...result.data]
+                  .reverse()
+                  .find((m) => m.sender === 'assistant' && m.focus_run_id === activeRunId)
+              : undefined
+          if (liveRow?.content) {
+            finalize(result)
+            return
+          }
+          deadStreak += 1
+          if (deadStreak >= DEAD_STREAK_LIMIT) finalizeAsDead()
+        })
+      })
+    }
+
     // Fallback safety net (items.id=320): protects against the event above
     // being lost outright (app restart mid-run, IPC hiccup, the backend's
     // own bounded DB-write timeout), not just late.
@@ -433,7 +631,9 @@ export function ChatPane({
             : undefined
         if (liveRow?.content) {
           finalize(result)
+          return
         }
+        if (timedOut) checkStatusAndMaybeStop()
       })
     }, CONTENT_POLL_INTERVAL_MS)
 
@@ -446,10 +646,23 @@ export function ChatPane({
                 .reverse()
                 .find((m) => m.sender === 'assistant' && m.focus_run_id === activeRunId)
             : undefined
-        if (!liveRow?.content) {
-          setContentTimedOut(true)
+        if (liveRow?.content) {
+          // Content arrived in the same tick the timeout fired -- resolve
+          // normally, same as the interval poll below would have.
+          finalize(result)
+          return
         }
-        finalize(result)
+        // items.id=587: still nothing after CONTENT_POLL_TIMEOUT_MS -- check
+        // real run_status right away (rather than waiting for the next
+        // interval tick) so an already-dead/inactive run resolves
+        // immediately instead of sitting under the banner for one more
+        // CONTENT_POLL_INTERVAL_MS. The informational banner only makes
+        // sense for a confirmed-active run -- onActive is the ONLY place
+        // that raises it. `timedOut` is set regardless of the outcome, so
+        // later interval ticks check status too (a no-op once this has
+        // already settled things).
+        timedOut = true
+        checkStatusAndMaybeStop(() => setContentTimedOut(true))
       })
     }, CONTENT_POLL_TIMEOUT_MS)
 
@@ -943,7 +1156,11 @@ export function ChatPane({
                   data-gate3-status={m.gate3_review_status ?? ''}
                 >
                   <span className="chat-pane__message-content">
-                    {m.id === liveMessageId && liveContent ? liveContent : m.content}
+                    {m.id === liveMessageId && liveContent
+                      ? liveContent
+                      : m.content === '' && m.focus_run_id && deadRunIds.has(m.focus_run_id)
+                        ? t('navShell.chat.replyDidNotFinish')
+                        : m.content}
                   </span>
                   {m.gate3_review_status === 'pending-review' && (
                     <span className="chat-pane__pending-review-notice">
