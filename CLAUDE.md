@@ -217,6 +217,11 @@ Classify every finding: Accepted / Rejected / Deferred / Requires empirical vali
 ## Schema Authoring Rule
 Do not use semicolons inside string literals in .sql files.
 _parse_statements() is not a general-purpose SQL parser.
+A migration that drops a table another table still references via FOREIGN
+KEY must be listed in FK_OFF_MIGRATIONS (migrations.rs) -- DROP TABLE
+triggers ON DELETE CASCADE the same as an explicit DELETE would, not just
+the latter; the every_drop_table_is_fk_off_or_audited test enforces this
+(items.id=585/586).
 
 ## Prompt Authoring Rule
 _render_prompt() uses str.replace() for {token} substitution. Templates must

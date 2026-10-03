@@ -1336,6 +1336,13 @@ async fn run_pending(
         }
 
         if !already_applied {
+            // items.id=586 rider: a successful migration was previously
+            // invisible -- "no error appeared" was the only signal a real
+            // apply had happened. `already_applied` already distinguishes
+            // a genuinely new application (any version) from v1's own
+            // every-startup idempotent re-run, so this doesn't spam the
+            // log on every launch.
+            log::info!("migrations: {prefix} v{version} applied");
             applied += 1;
         }
     }

@@ -1,5 +1,22 @@
 -- personal_002.sql
 --
+-- CORRECTION added 2026-10-02 (items.id=586 rider, from items.id=585's own
+-- finding): the "RENAME HAZARD" note below (around the "that pragma only
+-- gates DML... it never blocks DROP TABLE, so the drop itself was never at
+-- risk" line) is misleading about what was actually at risk. The pragma
+-- claim itself is correct as far as it goes, but entity_facts and
+-- entity_relationships both reference entities with ON DELETE CASCADE, and
+-- that cascade DOES fire on DROP TABLE, not only on an explicit DELETE --
+-- confirmed in migrations.rs's own FK_OFF_MIGRATIONS doc comment. On a
+-- populated v1 database this DROP TABLE entities would silently delete
+-- every entity_facts/entity_relationships row along with it; "the drop
+-- itself was never at risk" undersold that danger. This is already
+-- mitigated at the runner level -- personal/v2 is listed in
+-- FK_OFF_MIGRATIONS (migrations.rs), which runs this migration with FK
+-- enforcement off and verifies no new violations before commit -- so no
+-- behavior changes here; this block only corrects the stale prose below,
+-- left otherwise as originally written.
+--
 -- cb-11 foundation: source-of-truth / deduplication framework.
 -- items.id=128, decisions.id=502 (D6-460), decisions.id=621 §11.
 -- Second confirmed adopter: decisions.id=617 household synced grants, which
