@@ -1152,6 +1152,56 @@ pub async fn write_element_consent_decisions(
     Ok(())
 }
 
+/// focus_id and run-id prefix of the stub `focus_runs` rows that anchor a
+/// copy-time Privacy Guardian review's consent_decisions (items.id=501
+/// slice 2). The copy review's synthetic key (`clipboard-copy-chat-...`)
+/// has no real FocusRun behind it, but `consent_decisions.focus_run_id`
+/// REFERENCES `focus_runs(id)`, so a decision row cannot be written until a
+/// row exists. One stub per copy (the key embeds a timestamp): a shared id
+/// would make decisions carry across copies like a standing preference.
+pub const COPY_REVIEW_FOCUS_ID: &str = "chat-copy";
+pub const COPY_REVIEW_RUN_ID_PREFIX: &str = "clipboard-copy-chat-";
+
+async fn ensure_copy_review_run_conn(
+    conn: &mut SqliteConnection,
+    run_id: &str,
+) -> Result<(), OutputStoreError> {
+    if !run_id.starts_with(COPY_REVIEW_RUN_ID_PREFIX) {
+        return Err(OutputStoreError::Validation(format!(
+            "run_id must start with '{COPY_REVIEW_RUN_ID_PREFIX}', got '{run_id}'"
+        )));
+    }
+    sqlx::query(
+        "INSERT OR IGNORE INTO focus_runs (id, focus_id, status, started_at)
+         VALUES (?, ?, 'complete', ?)",
+    )
+    .bind(run_id)
+    .bind(COPY_REVIEW_FOCUS_ID)
+    .bind(crate::providers::utils::now())
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// Record the Privacy Guardian decisions for a copy-time review (items.id=501
+/// slice 2): creates the stub focus_runs row for `run_id` (see
+/// COPY_REVIEW_FOCUS_ID), then writes the decisions exactly as
+/// write_element_consent_decisions does. `run_id` must be a copy review's
+/// synthetic key, so this cannot be used to mint arbitrary focus_runs rows.
+pub async fn write_chat_copy_consent_decisions(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    run_id: &str,
+    decisions_json: &str,
+) -> Result<(), OutputStoreError> {
+    {
+        let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
+        ensure_copy_review_run_conn(&mut conn, run_id).await?;
+    }
+    write_element_consent_decisions(user_id, persona_id, key_hex, run_id, decisions_json).await
+}
+
 async fn write_element_consent_decisions_conn(
     conn: &mut SqliteConnection,
     run_id: &str,
@@ -2036,6 +2086,83 @@ mod tests {
             deleted_deleted_at.as_deref(),
             Some(deleted_at_ts),
             "pre-existing 'deleted' row's deleted_at must be backfilled from its updated_at"
+        );
+    }
+
+    const ONE_DECISION: &str = r#"[
+        {"span_id": "s1", "decision": "generalize", "category": "private_email",
+         "suggestion_text": "[email]", "user_modified_text": null, "fact_key": null}
+    ]"#;
+
+    #[tokio::test]
+    async fn copy_review_decisions_fail_fk_without_stub_run_and_succeed_with_it() {
+        let mut conn = test_db().await;
+        let run_id = format!("{COPY_REVIEW_RUN_ID_PREFIX}persona-1-2026-10-04T00:00:00Z");
+
+        // The reason ensure_copy_review_run_conn exists: no focus_runs row for
+        // the synthetic key -> consent_decisions FK rejects the write.
+        assert!(
+            write_element_consent_decisions_conn(&mut conn, &run_id, ONE_DECISION)
+                .await
+                .is_err(),
+            "decisions for a synthetic copy key must fail the focus_runs FK without a stub row"
+        );
+
+        ensure_copy_review_run_conn(&mut conn, &run_id)
+            .await
+            .expect("stub run insert failed");
+        // Idempotent for the same key.
+        ensure_copy_review_run_conn(&mut conn, &run_id)
+            .await
+            .expect("second stub insert must be a no-op");
+        write_element_consent_decisions_conn(&mut conn, &run_id, ONE_DECISION)
+            .await
+            .expect("decisions must write once the stub run exists");
+
+        let row = sqlx::query("SELECT focus_id, status FROM focus_runs WHERE id = ?")
+            .bind(&run_id)
+            .fetch_one(&mut conn)
+            .await
+            .expect("stub run must exist");
+        assert_eq!(
+            row.try_get::<String, _>("focus_id").unwrap(),
+            COPY_REVIEW_FOCUS_ID
+        );
+        assert_eq!(row.try_get::<String, _>("status").unwrap(), "complete");
+    }
+
+    #[tokio::test]
+    async fn copy_review_stub_run_rejects_non_copy_keys() {
+        let mut conn = test_db().await;
+        let result = ensure_copy_review_run_conn(&mut conn, "some-real-focus-run-id").await;
+        assert!(matches!(result, Err(OutputStoreError::Validation(_))));
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM focus_runs")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "a rejected key must not create a focus_runs row");
+    }
+
+    #[tokio::test]
+    async fn copy_review_decisions_are_per_copy_not_shared() {
+        let mut conn = test_db().await;
+        let run_a = format!("{COPY_REVIEW_RUN_ID_PREFIX}p-2026-10-04T00:00:01Z");
+        let run_b = format!("{COPY_REVIEW_RUN_ID_PREFIX}p-2026-10-04T00:00:02Z");
+        for run in [&run_a, &run_b] {
+            ensure_copy_review_run_conn(&mut conn, run).await.unwrap();
+        }
+        write_element_consent_decisions_conn(&mut conn, &run_a, ONE_DECISION)
+            .await
+            .unwrap();
+        let count_b: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM consent_decisions WHERE focus_run_id = ?")
+                .bind(&run_b)
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(
+            count_b, 0,
+            "a decision on one copy must not appear under another copy's run"
         );
     }
 

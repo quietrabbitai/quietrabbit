@@ -300,39 +300,54 @@ export const commands = {
 	 *  any persisted row (confirmed in gate3.rs: neither is used for a DB
 	 *  lookup, only pushed into the audit entry's fields_shared/fields_withheld).
 	 * 
-	 *  Parameter sourcing mostly mirrors request_cloud_frontier_gate3_review's own
-	 *  quick-ask constants (content_sensitivity_severity=1, execution_tier=1) --
-	 *  both are fixed placeholders reflecting the absence of a PersonalTrack at
-	 *  this call site, not a claim about the reviewed content's structure. Like
-	 *  request_cloud_frontier_gate3_review, this command reviews arbitrary
-	 *  message/clipboard content, not Quick-Ask-Focus output specifically;
-	 *  quick-ask.focus's identifiers are borrowed only as a synthetic label. This
-	 *  command does NOT mirror request_cloud_frontier_gate3_review's target_tier=3 --
-	 *  confirmed live (2026-09-04) that reusing 3 unconditionally makes gate3's
-	 *  own zero_spans_safe_to_auto_approve (destination_risk >= 3 forces High
-	 *  review regardless of content) fire for every single copy when no Cloud Chat
-	 *  pane happens to be open, defeating the "silent on a fast,
-	 *  unflagged pass" UX this whole feature is built around: request_cloud_frontier_gate3_review's
-	 *  target_tier=3 is correct there because that flow's own precondition is
-	 *  "the user is literally about to access cloud_frontier" (its own doc comment) -- a
-	 *  native copy gesture on this transcript carries no such precondition; the
-	 *  destination could just as easily be a text editor as a Cloud Chat pane.
-	 *  target_tier=1 here means an unknown/no-Tier-3-destination copy is judged
-	 *  on its own content severity alone (correct, most copies pass silently and
-	 *  fast), while destination_risk_rating below still reflects any ACTUALLY
-	 *  active cloud_frontier provider's real risk -- so a copy made while a genuinely
-	 *  risky destination is open still gets the stricter review, preserving
-	 *  decisions.id=755's original intent for that real case.
-	 *  severity_authoritative=false (items.id=458, corrected scope of the
-	 *  earlier items.id=799): content_sensitivity_severity=1 being a placeholder
-	 *  means destination_risk alone must not force the High-tier gate on zero PF
-	 *  spans -- an empty, uninformative interrupt on an otherwise silent copy.
+	 *  Parameter sourcing (items.id=501 slice 2, decisions.id=846 addendum Q5
+	 *  follow-up -- supersedes the earlier pane-derived destination rating):
+	 *  the copy review assumes a NON-PRIVATE destination, always.
+	 *    - target_tier = COPY_REVIEW_TARGET_TIER (1): the ceiling axis. 1 is
+	 *      LocalOnly's legacy value, so gate3's Check 1 (the persona's
+	 *      external-access ceiling) never fires for a copy. The ceiling governs
+	 *      QR's own routing; a copy is a manual paste QR makes no external call
+	 *      for (decisions.id=680), so a LocalOnly persona must still be able to
+	 *      copy its own chat.
+	 *    - destination_risk_rating = COPY_REVIEW_DESTINATION_RISK (Some(3)):
+	 *      flagged spans are scored as if headed somewhere High-risk. It no
+	 *      longer depends on which provider panes happen to be open (None with
+	 *      none open used to mean a milder score); the clipboard's real
+	 *      destination is unknowable to QR, so the strict assumption holds
+	 *      everywhere. There is no provider-selection re-check and no
+	 *      clipboard provenance in this design.
+	 *    - content_sensitivity_severity=1, execution_tier=1: fixed placeholders
+	 *      (no PersonalTrack at this call site), not claims about the content.
+	 *    - severity_authoritative=false (items.id=458): the placeholder severity
+	 *      plus destination 3 must not force the High-tier gate on ZERO PF
+	 *      spans -- an empty, uninformative interrupt on an otherwise silent
+	 *      copy. Only content PF actually flags reaches the modal.
+	 *    - focus_external_access: a real per-Persona focus_settings lookup
+	 *      (missing row is a hard Err, mirroring AUTHORIZE).
+	 * 
+	 *  A flagged copy returns pending_consent=true; gate3 emits consent_request
+	 *  with focus_run_id = the synthetic key below. The frontend shows the
+	 *  Privacy Guardian modal at that moment and, on confirm, records the
+	 *  decisions via submit_chat_copy_consent_decision (keyed to this same
+	 *  synthetic key) and completes the copy itself from the stored result --
+	 *  it does NOT re-run this command (a re-run mints a new key, so the
+	 *  decisions would not be found and the user would be asked again).
+	 * 
 	 *  This command intentionally does NOT touch messages.gate3_review_status
-	 *  or messages.reviewed_at_risk_rating -- those track a single drafted
-	 *  message's own lifecycle; a copy-triggered review is a fresh, ephemeral
-	 *  check with no message row of its own to update.
+	 *  or messages.reviewed_at_risk_rating -- a copy-triggered review is a
+	 *  fresh, ephemeral check with no message row of its own to update.
 	 */
 	requestChatCopyGate3Review: (request: RequestChatCopyGate3ReviewRequest) => typedError<Gate3ReviewResult, string>(__TAURI_INVOKE("request_chat_copy_gate3_review", { request })),
+	/**
+	 *  items.id=501 slice 2: records the user's Privacy Guardian decisions for a
+	 *  FLAGGED COPY (see request_chat_copy_gate3_review's doc comment). Unlike
+	 *  submit_element_consent_decision, `run_id` is the copy review's synthetic
+	 *  key (no real FocusRun exists for it), so this first creates a stub
+	 *  focus_runs row for it -- consent_decisions.focus_run_id is an FK -- via
+	 *  output_store::write_chat_copy_consent_decisions, which also rejects any
+	 *  run_id that is not a copy-review key. No messages row is involved.
+	 */
+	submitChatCopyConsentDecision: (request: SubmitElementConsentDecisionRequest) => typedError<null, string>(__TAURI_INVOKE("submit_chat_copy_consent_decision", { request })),
 	getOnboardingFocusSuggestions: (personas: string[]) => typedError<NotImplementedPlaceholder, string>(__TAURI_INVOKE("get_onboarding_focus_suggestions", { personas })),
 	submitOnboardingPersonaSelection: (personas: string[]) => typedError<string[], string>(__TAURI_INVOKE("submit_onboarding_persona_selection", { personas })),
 	submitOnboardingFocusSelection: (focusSelections: NotImplementedPlaceholder[]) => typedError<string[], string>(__TAURI_INVOKE("submit_onboarding_focus_selection", { focusSelections })),
@@ -954,6 +969,24 @@ export type ActiveBoardResponse = {
 };
 
 /**
+ *  items.id=501 slice 2: a span gate3 silently resolved from a prior or
+ *  standing decision (partition_by_prior_decision) -- so it is NOT in the
+ *  consent_request payload -- reported back with its offsets so a caller
+ *  that produces output text (the copy review) can apply the decision.
+ *  Without this, a copied text would carry the original of a span the user
+ *  had already kept private. Offsets are byte offsets into the reviewed
+ *  content, same as ConsentSpanItem's.
+ */
+export type AutoResolvedSpan = {
+	start_byte: number,
+	end_byte: number,
+	/**  "generalize" | "keep_private" | "release_original" */
+	decision: string,
+	suggestion_text: string | null,
+	user_modified_text: string | null,
+};
+
+/**
  *  items.id=540: the user's Cancel on the Privacy Guardian consent modal --
  *  no `status` field, since the only valid destination is "drafted". See
  *  cancel_cloud_frontier_gate3_review's own doc comment for why this is a
@@ -1098,6 +1131,8 @@ export type Gate3ReviewResult = {
 	plain_language: string | null,
 	target_tier: number | null,
 	space_max_permitted_tier: ExternalAccess | null,
+	/**  See Gate3Result::auto_resolved. Only the copy review consumes it. */
+	auto_resolved: AutoResolvedSpan[],
 };
 
 export type GetPendingCrossPersonaConfirmationsRequest = {
@@ -1205,6 +1240,11 @@ export type MessageInfo = {
 	focus_run_id: string | null,
 	gate3_review_status: string | null,
 	created_at: string,
+	/**
+	 *  items.id=587/501: a plain-language failure message (never a real
+	 *  model reply). The UI must not offer it for copy.
+	 */
+	is_error: boolean,
 };
 
 /**

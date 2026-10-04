@@ -144,16 +144,31 @@
   color: var(--accent);
 }
 
-.chat-pane__starter-copy-button {
-  align-self: flex-start;
-  padding: 5px 10px;
-  border: none;
+/* items.id=501 slice 2: "Copy last response" -- an outlined secondary
+ * button on its own row under the input, existing tokens only. Sits inside
+ * the compact floor's bordered card too (the card has no top divider for
+ * the input row, so this row inherits the same side padding). */
+.chat-pane__copy-last-row {
+  display: flex;
+  justify-content: flex-end;
+  padding: 0 12px 8px;
+  flex-shrink: 0;
+}
+
+.chat-pane__copy-last-button {
+  padding: 4px 10px;
+  border: 1px solid var(--border);
   border-radius: 6px;
-  background: var(--accent);
-  color: var(--bg);
+  background: transparent;
+  color: var(--text);
   font: inherit;
   font-size: 12px;
   cursor: pointer;
+}
+
+.chat-pane__copy-last-button:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
 /* items.id=391 (tenth pass -- "three bars, one expanded" redesign):

@@ -154,6 +154,12 @@ pub struct RequestCloudFrontierGate3ReviewRequest {
     pub message_id: String,
 }
 
+/// items.id=501 slice 2 (decisions.id=846 addendum Q5 follow-up): the copy
+/// review's fixed gate parameters -- see request_chat_copy_gate3_review's
+/// doc comment for the reasoning. Named so a test can pin them.
+pub(crate) const COPY_REVIEW_TARGET_TIER: u8 = 1;
+pub(crate) const COPY_REVIEW_DESTINATION_RISK: u8 = 3;
+
 /// items.id=416 (decisions.id=766): a native copy gesture on ChatPane's
 /// message transcript -- content_text is the concatenated text of whatever
 /// the user selected (one message or a span across several), supplied
@@ -939,44 +945,48 @@ pub async fn request_cloud_frontier_gate3_review(
 /// any persisted row (confirmed in gate3.rs: neither is used for a DB
 /// lookup, only pushed into the audit entry's fields_shared/fields_withheld).
 ///
-/// Parameter sourcing mostly mirrors request_cloud_frontier_gate3_review's own
-/// quick-ask constants (content_sensitivity_severity=1, execution_tier=1) --
-/// both are fixed placeholders reflecting the absence of a PersonalTrack at
-/// this call site, not a claim about the reviewed content's structure. Like
-/// request_cloud_frontier_gate3_review, this command reviews arbitrary
-/// message/clipboard content, not Quick-Ask-Focus output specifically;
-/// quick-ask.focus's identifiers are borrowed only as a synthetic label. This
-/// command does NOT mirror request_cloud_frontier_gate3_review's target_tier=3 --
-/// confirmed live (2026-09-04) that reusing 3 unconditionally makes gate3's
-/// own zero_spans_safe_to_auto_approve (destination_risk >= 3 forces High
-/// review regardless of content) fire for every single copy when no Cloud Chat
-/// pane happens to be open, defeating the "silent on a fast,
-/// unflagged pass" UX this whole feature is built around: request_cloud_frontier_gate3_review's
-/// target_tier=3 is correct there because that flow's own precondition is
-/// "the user is literally about to access cloud_frontier" (its own doc comment) -- a
-/// native copy gesture on this transcript carries no such precondition; the
-/// destination could just as easily be a text editor as a Cloud Chat pane.
-/// target_tier=1 here means an unknown/no-Tier-3-destination copy is judged
-/// on its own content severity alone (correct, most copies pass silently and
-/// fast), while destination_risk_rating below still reflects any ACTUALLY
-/// active cloud_frontier provider's real risk -- so a copy made while a genuinely
-/// risky destination is open still gets the stricter review, preserving
-/// decisions.id=755's original intent for that real case.
-/// severity_authoritative=false (items.id=458, corrected scope of the
-/// earlier items.id=799): content_sensitivity_severity=1 being a placeholder
-/// means destination_risk alone must not force the High-tier gate on zero PF
-/// spans -- an empty, uninformative interrupt on an otherwise silent copy.
+/// Parameter sourcing (items.id=501 slice 2, decisions.id=846 addendum Q5
+/// follow-up -- supersedes the earlier pane-derived destination rating):
+/// the copy review assumes a NON-PRIVATE destination, always.
+///   - target_tier = COPY_REVIEW_TARGET_TIER (1): the ceiling axis. 1 is
+///     LocalOnly's legacy value, so gate3's Check 1 (the persona's
+///     external-access ceiling) never fires for a copy. The ceiling governs
+///     QR's own routing; a copy is a manual paste QR makes no external call
+///     for (decisions.id=680), so a LocalOnly persona must still be able to
+///     copy its own chat.
+///   - destination_risk_rating = COPY_REVIEW_DESTINATION_RISK (Some(3)):
+///     flagged spans are scored as if headed somewhere High-risk. It no
+///     longer depends on which provider panes happen to be open (None with
+///     none open used to mean a milder score); the clipboard's real
+///     destination is unknowable to QR, so the strict assumption holds
+///     everywhere. There is no provider-selection re-check and no
+///     clipboard provenance in this design.
+///   - content_sensitivity_severity=1, execution_tier=1: fixed placeholders
+///     (no PersonalTrack at this call site), not claims about the content.
+///   - severity_authoritative=false (items.id=458): the placeholder severity
+///     plus destination 3 must not force the High-tier gate on ZERO PF
+///     spans -- an empty, uninformative interrupt on an otherwise silent
+///     copy. Only content PF actually flags reaches the modal.
+///   - focus_external_access: a real per-Persona focus_settings lookup
+///     (missing row is a hard Err, mirroring AUTHORIZE).
+///
+/// A flagged copy returns pending_consent=true; gate3 emits consent_request
+/// with focus_run_id = the synthetic key below. The frontend shows the
+/// Privacy Guardian modal at that moment and, on confirm, records the
+/// decisions via submit_chat_copy_consent_decision (keyed to this same
+/// synthetic key) and completes the copy itself from the stored result --
+/// it does NOT re-run this command (a re-run mints a new key, so the
+/// decisions would not be found and the user would be asked again).
+///
 /// This command intentionally does NOT touch messages.gate3_review_status
-/// or messages.reviewed_at_risk_rating -- those track a single drafted
-/// message's own lifecycle; a copy-triggered review is a fresh, ephemeral
-/// check with no message row of its own to update.
+/// or messages.reviewed_at_risk_rating -- a copy-triggered review is a
+/// fresh, ephemeral check with no message row of its own to update.
 #[tauri::command]
 #[specta::specta]
 pub async fn request_chat_copy_gate3_review(
     app_handle: tauri::AppHandle,
     request: RequestChatCopyGate3ReviewRequest,
     key_registry: State<'_, KeyRegistry>,
-    layout_state: State<'_, crate::commands::cloud_chat_pane::PaneLayoutState>,
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<Gate3ReviewResult, String> {
     let key_hex_str = key_registry
@@ -1004,19 +1014,16 @@ pub async fn request_chat_copy_gate3_review(
         &key_hex_str,
     ));
 
-    let active_provider_ids: Vec<String> = {
-        let map = layout_state.0.lock().unwrap();
-        map.keys().cloned().collect()
-    };
-    let destination_risk_rating =
-        crate::persistence::provider_store::max_risk_rating_for_providers(
-            &pool,
-            &active_provider_ids,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let synthetic_key = format!("clipboard-copy-chat-{}-{}", request.persona_id, now());
+    // Unique per call (uuid, not just the timestamp): the key anchors one
+    // copy's consent rows, and two copies in the same second must not share
+    // a run (decisions would carry across copies like a standing preference).
+    let synthetic_key = format!(
+        "{}{}-{}-{}",
+        output_store::COPY_REVIEW_RUN_ID_PREFIX,
+        request.persona_id,
+        now(),
+        uuid::Uuid::new_v4()
+    );
 
     let result = gateway
         .gate3(
@@ -1026,16 +1033,13 @@ pub async fn request_chat_copy_gate3_review(
             &synthetic_key,
             &request.content_text,
             1, // content_sensitivity_severity
-            // target_tier -- unchanged, still u8 (items.id=439: see
-            // gate3.rs's own doc comment for why this stays legacy-typed).
-            // NOT 3; see doc comment above -- 1 ==
-            // ExternalAccess::LocalOnly-equivalent, i.e. this copy is not
-            // treated as requiring external access on its own.
-            1,
+            // target_tier -- still u8 (items.id=439: gate3()'s target_tier
+            // stays legacy-typed). See the doc comment above.
+            COPY_REVIEW_TARGET_TIER,
             settings.max_permitted_tier,
             1, // execution_tier
             Some(&app_handle),
-            destination_risk_rating,
+            Some(COPY_REVIEW_DESTINATION_RISK),
             // items.id=458: no PersonalTrack here, content_sensitivity_severity
             // above is a placeholder -- destination_risk alone must not force
             // the High-tier gate on zero PF spans (see doc comment above).
@@ -1048,6 +1052,35 @@ pub async fn request_chat_copy_gate3_review(
         .map_err(|e| e.to_string())?;
 
     Ok(result.into())
+}
+
+/// items.id=501 slice 2: records the user's Privacy Guardian decisions for a
+/// FLAGGED COPY (see request_chat_copy_gate3_review's doc comment). Unlike
+/// submit_element_consent_decision, `run_id` is the copy review's synthetic
+/// key (no real FocusRun exists for it), so this first creates a stub
+/// focus_runs row for it -- consent_decisions.focus_run_id is an FK -- via
+/// output_store::write_chat_copy_consent_decisions, which also rejects any
+/// run_id that is not a copy-review key. No messages row is involved.
+#[tauri::command]
+#[specta::specta]
+pub async fn submit_chat_copy_consent_decision(
+    request: SubmitElementConsentDecisionRequest,
+    key_registry: State<'_, KeyRegistry>,
+) -> Result<(), String> {
+    let key_hex_str = key_registry
+        .with_key(|k| key_hex(&k.master_key))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+
+    output_store::write_chat_copy_consent_decisions(
+        &request.user_id,
+        &request.persona_id,
+        &key_hex_str,
+        &request.run_id,
+        &request.decisions_json,
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// items.id=406 (decisions.id=755) -- the provider-selection re-check
@@ -1110,6 +1143,7 @@ pub async fn recheck_cloud_frontier_provider_selection(
         plain_language: None,
         target_tier: None,
         space_max_permitted_tier: None,
+        auto_resolved: vec![],
     };
 
     let new_max_risk = crate::persistence::provider_store::max_risk_rating_for_providers(
@@ -1806,6 +1840,91 @@ mod tests {
             settings.max_permitted_tier,
             ExternalAccess::Unrestricted,
             "the applied change must persist, not just be echoed back"
+        );
+    }
+
+    // items.id=501 slice 2: the copy review assumes a non-private
+    // destination. The command itself takes an AppHandle (no mock path, see
+    // the note above this module), so the parameters are pinned as
+    // constants and the gate3 behavior they select is tested directly.
+    #[test]
+    fn copy_review_assumes_non_private_destination_with_unrestricting_ceiling_axis() {
+        assert_eq!(
+            COPY_REVIEW_TARGET_TIER, 1,
+            "ceiling axis: LocalOnly-equivalent, never trips Check 1"
+        );
+        assert_eq!(
+            COPY_REVIEW_DESTINATION_RISK, 3,
+            "flagged spans are scored High"
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_review_params_do_not_block_a_local_only_persona() {
+        use crate::conductor::privacy::gate3::gate3;
+        use crate::conductor::privacy::logger::TestLogger;
+
+        let logger = TestLogger::new();
+        let result = gate3(
+            &logger,
+            "chat-copy",
+            "clipboard-copy-chat-p-1",
+            "Quick Ask",
+            "clipboard-copy-chat-p-1",
+            "an ordinary sentence",
+            1,
+            COPY_REVIEW_TARGET_TIER,
+            ExternalAccess::LocalOnly,
+            1,
+            None,
+            Some(COPY_REVIEW_DESTINATION_RISK),
+            false,
+            USER_ID,
+            PERSONA_ID,
+            &key_hex_str(),
+        )
+        .await
+        .expect("gate3 must not error");
+
+        assert!(
+            !result.blocked,
+            "a LocalOnly persona's copy must not be blocked"
+        );
+        assert!(result.approved);
+        assert!(
+            logger
+                .entries()
+                .iter()
+                .all(|e| e.event_type != "gate3_tier_ceiling_block"),
+            "the external-access ceiling must not trip on a copy"
+        );
+
+        // Control: the same call with the cloud-frontier target (3) IS what
+        // the ceiling blocks -- proves the assertion above is about the
+        // target_tier axis and not a vacuous pass.
+        let control = gate3(
+            &TestLogger::new(),
+            "draft",
+            "run-1",
+            "Quick Ask",
+            "msg-1",
+            "an ordinary sentence",
+            1,
+            3,
+            ExternalAccess::LocalOnly,
+            1,
+            None,
+            Some(3),
+            false,
+            USER_ID,
+            PERSONA_ID,
+            &key_hex_str(),
+        )
+        .await
+        .expect("gate3 must not error");
+        assert!(
+            control.blocked,
+            "target_tier=3 against a LocalOnly ceiling must still block"
         );
     }
 }

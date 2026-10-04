@@ -56,6 +56,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { commands, type ChatInfo, type ExternalAccess, type PaneRectFraction, type PersonaInfo } from '../bindings'
 import { ChatPane } from '../chat/ChatPane'
 import { ChatHistoryList } from '../chat/ChatHistoryList'
+import { COPY_REVIEW_RUN_ID_PREFIX } from '../chat/copyDecisions'
 import { PersonaBox } from './persona/PersonaBox'
 import { FocusSettingsControls } from './FocusSettingsControls'
 import { requireCurrentUserId, type DominancePairState } from './navShellConfig'
@@ -262,18 +263,27 @@ export function CloudChatAccessPane({
   //
   // items.id=543 (Chat-BRAND finding, confirmed live this session): also
   // stores the copied message's own owning personaId, sourced from
-  // ChatPane's personaId prop at copy time (see onCopyStarter below and
-  // ChatPane.tsx's handleCopyStarter) -- NOT the live `personaId` prop on
+  // ChatPane's personaId prop at copy time -- NOT the live `personaId` prop on
   // this component. Persona is now freely switchable mid-session (this
   // whole item's point), so those two can genuinely diverge between a
   // copy and the later provider click; activateAndPromote below must key
   // its recheck off the message's real owning persona, not whatever's
   // active right now.
-  const [lastCopiedStarter, setLastCopiedStarter] = useState<{
+  //
+  // items.id=501 slice 2: nothing sets this any more -- the Copy starter
+  // button (its only writer) is removed, so the provider-selection re-check
+  // below can no longer fire. The state and that re-check are retired
+  // together with the per-reply review in slice 3 (decisions.id=846).
+  const [lastCopiedStarter] = useState<{
     messageId: string
     content: string
     personaId: string
   } | null>(null)
+
+  // items.id=501 slice 2: true while ChatPane's flagged-copy Privacy
+  // Guardian modal is open. A native provider pane draws above the webview,
+  // so syncPaneLayout pushes an empty layout while this is set.
+  const [copyModalOpen, setCopyModalOpen] = useState(false)
 
   // items.id=404: the three internal actions that mean "make Cloud Chat/Chat
   // the outer dock's dominant rail" -- see this component's own
@@ -409,8 +419,9 @@ export function CloudChatAccessPane({
 
   const syncPaneLayout = useCallback(() => {
     const body = contentBodyRef.current
-    if (!body) {
-      // items.id=391: reachable via the ResizeObserver effect's own
+    if (!body || copyModalOpen) {
+      // items.id=501 slice 2: copyModalOpen also lands here -- see its
+      // declaration. items.id=391: reachable via the ResizeObserver effect's own
       // requestAnimationFrame callback (below) if .content-body unmounts
       // in the gap between scheduling and the frame actually firing --
       // same stale-rect risk as the effect's own early return just above
@@ -430,7 +441,7 @@ export function CloudChatAccessPane({
         setOpenError(result.error)
       }
     })
-  }, [activeProviderId, setOpenError])
+  }, [activeProviderId, setOpenError, copyModalOpen])
 
   useEffect(() => {
     const body = contentBodyRef.current
@@ -672,6 +683,9 @@ export function CloudChatAccessPane({
     let cancelled = false
 
     listen<ConsentRequestPayload>('consent_request', (event) => {
+      // items.id=501 slice 2: a copy review's payload belongs to ChatPane's
+      // own modal, not this per-reply one.
+      if (event.payload.focus_run_id.startsWith(COPY_REVIEW_RUN_ID_PREFIX)) return
       setConsentPayload(event.payload)
     }).then((fn) => {
       if (cancelled) {
@@ -1055,9 +1069,7 @@ export function CloudChatAccessPane({
               onGenerating={setIsGenerating}
               collapsed={floor || dominant === 'cloudChat'}
               onExpand={floor ? onFloorExpand : reclaimChatAndPromote}
-              onCopyStarter={(messageId, content, starterPersonaId) =>
-                setLastCopiedStarter({ messageId, content, personaId: starterPersonaId })
-              }
+              onCopyModalOpenChange={setCopyModalOpen}
             />
           ) : floor ? (
             // items.id=391 (Jason, 2026-09-02, second pass): "compressed"

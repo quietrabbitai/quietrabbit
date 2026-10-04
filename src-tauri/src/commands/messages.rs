@@ -74,6 +74,9 @@ pub struct MessageInfo {
     pub focus_run_id: Option<String>,
     pub gate3_review_status: Option<String>,
     pub created_at: String,
+    /// items.id=587/501: a plain-language failure message (never a real
+    /// model reply). The UI must not offer it for copy.
+    pub is_error: bool,
 }
 
 /// Push event payload for "message-content-ready" (items.id=320). Emitted
@@ -113,6 +116,7 @@ fn to_message_info(r: message_store::MessageRecord) -> MessageInfo {
         focus_run_id: r.focus_run_id,
         gate3_review_status: r.gate3_review_status,
         created_at: r.created_at,
+        is_error: r.is_error,
     }
 }
 

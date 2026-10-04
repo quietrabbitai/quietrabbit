@@ -60,7 +60,7 @@ use super::{
     fact_identity,
     logger::{DisclosureLogEntry, DisclosureLogger},
     privacy_filter::{self, PfEntityDecoded},
-    types::{ConsentRequestPayload, ConsentSpanItem, Gate3Result, ReviewTier},
+    types::{AutoResolvedSpan, ConsentRequestPayload, ConsentSpanItem, Gate3Result, ReviewTier},
     PF_TIMEOUT_SECS,
 };
 
@@ -454,6 +454,7 @@ async fn gate3_with_pf<L: DisclosureLogger>(
         return Ok(result);
     }
     let entities = partition.needs_review;
+    let auto_resolved = partition.auto_resolved;
 
     // Zero spans, NOT severity/tier-forced: PF found nothing identifiable and
     // there's no independent reason to force review — approve directly.
@@ -549,6 +550,9 @@ async fn gate3_with_pf<L: DisclosureLogger>(
 
     Ok(Gate3Result {
         pending_consent: true,
+        // items.id=501 slice 2: the spans NOT in this payload because they
+        // were silently resolved -- the caller must apply them too.
+        auto_resolved,
         ..Gate3Result::default()
     })
 }
@@ -567,6 +571,11 @@ struct PartitionOutcome {
     /// (never `Some` when `entities` was empty to begin with -- that case
     /// is left to gate3_with_pf's existing zero-spans handling unchanged).
     early_result: Option<Gate3Result>,
+    /// items.id=501 slice 2: every span silently reapplied in this pass, with
+    /// offsets -- attached to whatever Gate3Result the caller returns
+    /// (early_result already carries it; the pending_consent path attaches
+    /// it itself).
+    auto_resolved: Vec<AutoResolvedSpan>,
 }
 
 /// Resolves one entity's stable fact identity via the three-layer
@@ -638,6 +647,7 @@ async fn partition_by_prior_decision<L: DisclosureLogger>(
         return Ok(PartitionOutcome {
             needs_review: vec![],
             early_result: None,
+            auto_resolved: vec![],
         });
     }
 
@@ -655,6 +665,7 @@ async fn partition_by_prior_decision<L: DisclosureLogger>(
 
     let mut needs_review = Vec::with_capacity(entities.len());
     let mut auto_resolved_decisions: Vec<String> = Vec::new();
+    let mut auto_resolved: Vec<AutoResolvedSpan> = Vec::new();
 
     for entity in entities {
         let fact_key =
@@ -752,6 +763,13 @@ async fn partition_by_prior_decision<L: DisclosureLogger>(
                     }
                 }
 
+                auto_resolved.push(AutoResolvedSpan {
+                    start_byte: u32::try_from(entity.start_byte).unwrap_or(u32::MAX),
+                    end_byte: u32::try_from(entity.end_byte).unwrap_or(u32::MAX),
+                    decision: decision.clone(),
+                    suggestion_text: suggestion_text.clone(),
+                    user_modified_text: user_modified_text.clone(),
+                });
                 auto_resolved_decisions.push(decision);
             }
             None => {
@@ -794,11 +812,13 @@ async fn partition_by_prior_decision<L: DisclosureLogger>(
                      information. [Use local only]"
                         .to_string(),
                 ),
+                auto_resolved: auto_resolved.clone(),
                 ..Gate3Result::default()
             }
         } else {
             Gate3Result {
                 approved: true,
+                auto_resolved: auto_resolved.clone(),
                 ..Gate3Result::default()
             }
         })
@@ -809,6 +829,7 @@ async fn partition_by_prior_decision<L: DisclosureLogger>(
     Ok(PartitionOutcome {
         needs_review,
         early_result,
+        auto_resolved,
     })
 }
 
@@ -1795,6 +1816,234 @@ mod tests {
         assert!(outcome.early_result.is_none());
         assert_eq!(outcome.needs_review.len(), 1);
         assert_eq!(logger.entry_count(), 0);
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    /// Entity at explicit offsets, for the auto_resolved-offset tests below.
+    fn entity_at(label: &str, span_text: &str, start: usize) -> PfEntityDecoded {
+        PfEntityDecoded {
+            start_byte: start,
+            end_byte: start + span_text.len(),
+            score: 0.95,
+            label: label.to_owned(),
+            span_text: span_text.to_owned(),
+        }
+    }
+
+    async fn seed_run_and_prefs(
+        user_id: &str,
+        persona_id: &str,
+        focus_run_id: &str,
+        prefs: &[(&str, &str, &str)], // (category, span_text, decision)
+    ) {
+        crate::persistence::output_store::test_seed_focus_run(
+            user_id,
+            persona_id,
+            TEST_KEY_HEX,
+            focus_run_id,
+            "quick-ask",
+        )
+        .await
+        .expect("seed focus_run must succeed");
+        for (category, span_text, decision) in prefs {
+            crate::persistence::personal_store::write_standing_preference(
+                user_id,
+                persona_id,
+                TEST_KEY_HEX,
+                &expected_fact_key(category, span_text),
+                category,
+                decision,
+                None,
+                None,
+            )
+            .await
+            .expect("write_standing_preference must succeed");
+        }
+    }
+
+    // items.id=501 slice 2: silently resolved spans must be reported WITH
+    // their offsets and decisions so the copy review can apply them. Three
+    // shapes: all-auto mixed, partly auto + partly interactive, all kept
+    // private (still blocked).
+
+    #[tokio::test]
+    async fn all_auto_mixed_reports_every_resolved_span_with_offsets() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let (user_id, persona_id, run) =
+            ("auto-mixed-user", "auto-mixed-persona", "run-auto-mixed");
+        let (email, phone) = ("mixed@example.com", "555-100-4000");
+        seed_run_and_prefs(
+            user_id,
+            persona_id,
+            run,
+            &[
+                ("private_email", email, "keep_private"),
+                ("private_phone", phone, "release_original"),
+            ],
+        )
+        .await;
+
+        let outcome = partition_by_prior_decision(
+            &TestLogger::new(),
+            user_id,
+            persona_id,
+            TEST_KEY_HEX,
+            "step-1",
+            run,
+            1,
+            vec![
+                entity_at("private_email", email, 6),
+                entity_at("private_phone", phone, 40),
+            ],
+        )
+        .await
+        .expect("partition must succeed");
+
+        assert!(outcome.needs_review.is_empty());
+        let result = outcome.early_result.expect("all auto-resolved");
+        assert!(result.approved, "not all kept private -> approved");
+        assert!(!result.blocked);
+        // The result itself carries the resolved spans (it is what the copy
+        // command returns), and so does the outcome.
+        for resolved in [&result.auto_resolved, &outcome.auto_resolved] {
+            assert_eq!(resolved.len(), 2);
+            let e = &resolved[0];
+            assert_eq!(
+                (e.start_byte as usize, e.end_byte as usize),
+                (6, 6 + email.len())
+            );
+            assert_eq!(e.decision, "keep_private");
+            let p = &resolved[1];
+            assert_eq!(
+                (p.start_byte as usize, p.end_byte as usize),
+                (40, 40 + phone.len())
+            );
+            assert_eq!(p.decision, "release_original");
+        }
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    #[tokio::test]
+    async fn partly_auto_partly_interactive_reports_the_auto_spans_and_defers_the_rest() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let (user_id, persona_id, run) = ("auto-part-user", "auto-part-persona", "run-auto-part");
+        let (known, fresh) = ("known@example.com", "fresh@example.com");
+        seed_run_and_prefs(
+            user_id,
+            persona_id,
+            run,
+            &[("private_email", known, "keep_private")],
+        )
+        .await;
+
+        let outcome = partition_by_prior_decision(
+            &TestLogger::new(),
+            user_id,
+            persona_id,
+            TEST_KEY_HEX,
+            "step-1",
+            run,
+            1,
+            vec![
+                entity_at("private_email", known, 0),
+                entity_at("private_email", fresh, 30),
+            ],
+        )
+        .await
+        .expect("partition must succeed");
+
+        assert!(
+            outcome.early_result.is_none(),
+            "one span still needs review"
+        );
+        assert_eq!(outcome.needs_review.len(), 1);
+        assert_eq!(outcome.needs_review[0].0.span_text, fresh);
+        assert_eq!(
+            outcome.auto_resolved.len(),
+            1,
+            "the known span must be reported, not dropped"
+        );
+        assert_eq!(outcome.auto_resolved[0].decision, "keep_private");
+        assert_eq!(
+            (
+                outcome.auto_resolved[0].start_byte as usize,
+                outcome.auto_resolved[0].end_byte as usize
+            ),
+            (0, known.len())
+        );
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    #[tokio::test]
+    async fn all_auto_kept_private_is_still_blocked_and_still_reports_spans() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let (user_id, persona_id, run) =
+            ("auto-block-user", "auto-block-persona", "run-auto-block");
+        let (a, b) = ("blocka@example.com", "555-100-5000");
+        seed_run_and_prefs(
+            user_id,
+            persona_id,
+            run,
+            &[
+                ("private_email", a, "keep_private"),
+                ("private_phone", b, "keep_private"),
+            ],
+        )
+        .await;
+
+        let outcome = partition_by_prior_decision(
+            &TestLogger::new(),
+            user_id,
+            persona_id,
+            TEST_KEY_HEX,
+            "step-1",
+            run,
+            1,
+            vec![
+                entity_at("private_email", a, 2),
+                entity_at("private_phone", b, 25),
+            ],
+        )
+        .await
+        .expect("partition must succeed");
+
+        let result = outcome.early_result.expect("all auto-resolved");
+        assert!(
+            result.blocked && !result.approved,
+            "all kept private must stay blocked"
+        );
+        assert_eq!(result.auto_resolved.len(), 2);
+        assert!(result
+            .auto_resolved
+            .iter()
+            .all(|s| s.decision == "keep_private"));
 
         if let Some(v) = saved_root {
             std::env::set_var("QR_DATA_ROOT", v);

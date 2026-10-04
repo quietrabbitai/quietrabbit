@@ -154,6 +154,27 @@ pub struct Gate2Result {
     pub matched_field_names: Vec<String>,
 }
 
+/// items.id=501 slice 2: a span gate3 silently resolved from a prior or
+/// standing decision (partition_by_prior_decision) -- so it is NOT in the
+/// consent_request payload -- reported back with its offsets so a caller
+/// that produces output text (the copy review) can apply the decision.
+/// Without this, a copied text would carry the original of a span the user
+/// had already kept private. Offsets are byte offsets into the reviewed
+/// content, same as ConsentSpanItem's.
+#[derive(Debug, Clone, Serialize, specta::Type)]
+pub struct AutoResolvedSpan {
+    // u32, not usize: this type crosses IPC (Gate3ReviewResult) and specta
+    // forbids exporting usize. An offset past u32::MAX saturates to u32::MAX,
+    // which is out of range for any real text, so the frontend's offset
+    // validation fails the copy rather than mis-applying it.
+    pub start_byte: u32,
+    pub end_byte: u32,
+    /// "generalize" | "keep_private" | "release_original"
+    pub decision: String,
+    pub suggestion_text: Option<String>,
+    pub user_modified_text: Option<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct Gate3Result {
     pub approved: bool,
@@ -178,6 +199,11 @@ pub struct Gate3Result {
     /// already has focus_external_access: ExternalAccess in hand when it
     /// populates this field, so the field's own type now matches directly.
     pub space_max_permitted_tier: Option<ExternalAccess>,
+    /// items.id=501 slice 2: spans silently resolved from a prior/standing
+    /// decision. Populated on EVERY return path that went through
+    /// partition_by_prior_decision (all-auto approved, all-auto blocked, and
+    /// the partly-auto pending_consent path); empty otherwise.
+    pub auto_resolved: Vec<AutoResolvedSpan>,
 }
 
 /// IPC-safe projection of Gate3Result — Gate3Result itself derives neither
@@ -193,6 +219,8 @@ pub struct Gate3ReviewResult {
     pub plain_language: Option<String>,
     pub target_tier: Option<u8>,
     pub space_max_permitted_tier: Option<ExternalAccess>,
+    /// See Gate3Result::auto_resolved. Only the copy review consumes it.
+    pub auto_resolved: Vec<AutoResolvedSpan>,
 }
 
 impl From<Gate3Result> for Gate3ReviewResult {
@@ -205,6 +233,7 @@ impl From<Gate3Result> for Gate3ReviewResult {
             plain_language: r.plain_language,
             target_tier: r.target_tier,
             space_max_permitted_tier: r.space_max_permitted_tier,
+            auto_resolved: r.auto_resolved,
         }
     }
 }

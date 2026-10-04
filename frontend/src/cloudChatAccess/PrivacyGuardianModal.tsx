@@ -118,6 +118,11 @@ export interface PrivacyGuardianModalProps {
   /** Fires when the user cancels out of the >10s scanning state. See this
    *  file's header comment on why this is a soft (local-only) cancel. */
   onCancel: () => void
+  /** items.id=501 slice 2: when provided, the review state shows a "Don't
+   *  copy" button that calls this and nothing else -- the caller backs out
+   *  without recording any decision. Supplied ONLY by the copy review's
+   *  modal (ChatPane); the per-reply review omits it and is unchanged. */
+  onDecline?: () => void
 }
 
 interface RowState {
@@ -169,6 +174,7 @@ export function PrivacyGuardianModal({
   payload,
   onResolve,
   onCancel,
+  onDecline,
 }: PrivacyGuardianModalProps) {
   const { t } = useTranslation()
   const [rows, setRows] = useState<Record<string, RowState>>({})
@@ -415,6 +421,11 @@ export function PrivacyGuardianModal({
                 total: highSpans.length,
               })}
             </span>
+          )}
+          {onDecline && (
+            <button type="button" className="pg-modal__cancel-button" onClick={onDecline}>
+              {t('privacyGuardianModal.dontCopyButton')}
+            </button>
           )}
           <button
             type="button"
