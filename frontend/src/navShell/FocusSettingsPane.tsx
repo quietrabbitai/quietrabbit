@@ -2,8 +2,7 @@
 // context for the fields this pass doesn't expose controls for
 // (context_flow/library_visibility/focus_profile -- out of scope, see
 // decisions.id=729), and the real editable controls via
-// FocusSettingsControls (mode="full", shared with CloudChatAccessPane's inline
-// "raise it now" affordance so the friction-gate-confirm logic exists once).
+// FocusSettingsControls.
 
 import { useTranslation } from 'react-i18next'
 import { FocusSettingsControls } from './FocusSettingsControls'
@@ -24,7 +23,6 @@ export function FocusSettingsPane({ userId, personaId, focusId }: FocusSettingsP
         userId={userId}
         personaId={personaId}
         focusId={focusId}
-        mode="full"
       />
     </div>
   )

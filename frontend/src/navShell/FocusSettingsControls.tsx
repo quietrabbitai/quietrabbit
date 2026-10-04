@@ -1,10 +1,8 @@
-// items.id=321 / decisions.id=729 -- shared control for raising a Focus's
-// privacy_tier / max_permitted_tier, used two ways: the full settings
-// screen (FocusSettingsPane, mode="full") and the inline "raise it now"
-// affordance CloudChatAccessPane mounts in place of Gate3's dead
-// "[Change Focus settings]" block text (mode="ceilingOnly", just the one
-// field). One component, not two, so the friction-gate-confirm logic below
-// only has to be written once.
+// items.id=321 / decisions.id=729 -- control for raising a Focus's
+// privacy_tier / max_permitted_tier, used by the Focus settings screen
+// (FocusSettingsPane). items.id=501 slice 3 removed the second, inline
+// "ceilingOnly" use (the Raise-ceiling affordance of the retired per-reply
+// review) along with its `mode` and `suggestedMaxPermittedTier` props.
 //
 // items.id=533: FrictionGateDetail and its parser moved to
 // ./frictionGateDetail.ts (a non-JSX module, importable by a plain Node
@@ -76,25 +74,10 @@ function maxPermittedTierLabelKey(value: ExternalAccess): string {
   }
 }
 
-export type FocusSettingsControlsMode = 'full' | 'ceilingOnly'
-
 export interface FocusSettingsControlsProps {
   userId: string
   personaId: string
   focusId: string
-  /** "full": both privacy_tier and max_permitted_tier, one Save, both
-   *  fields always sent together (decisions.id=729's batching requirement,
-   *  so a combined loosen produces one friction-gate prompt, not two).
-   *  "ceilingOnly": just max_permitted_tier, labeled "Raise" -- for the
-   *  inline Gate3-blocked affordance, which has no reason to also expose
-   *  privacy_tier. */
-  mode: FocusSettingsControlsMode
-  /** ceilingOnly only: prefills the select, e.g. from Gate3Result's own
-   *  target_tier on the block that mounted this control, converted to its
-   *  ExternalAccess equivalent by the caller (items.id=448 -- target_tier
-   *  itself stays a plain number; see CloudChatAccessPane.tsx's own
-   *  externalAccessFromLegacyTier helper). */
-  suggestedMaxPermittedTier?: ExternalAccess
   /** Fires after a save applies cleanly, whether directly or via the
    *  friction-gate's "proceed" resolution -- callers use this to retry
    *  whatever action the old settings had blocked. */
@@ -105,8 +88,6 @@ export function FocusSettingsControls({
   userId,
   personaId,
   focusId,
-  mode,
-  suggestedMaxPermittedTier,
   onSaved,
 }: FocusSettingsControlsProps) {
   const { t } = useTranslation()
@@ -137,7 +118,7 @@ export function FocusSettingsControls({
       if (result.status === 'ok') {
         setSettings(result.data)
         setDraftPrivacyTier(result.data.privacy_tier)
-        setDraftMaxPermittedTier(suggestedMaxPermittedTier ?? result.data.max_permitted_tier)
+        setDraftMaxPermittedTier(result.data.max_permitted_tier)
       } else {
         setLoadError(result.error)
       }
@@ -145,7 +126,7 @@ export function FocusSettingsControls({
     return () => {
       cancelled = true
     }
-  }, [userId, personaId, focusId, suggestedMaxPermittedTier])
+  }, [userId, personaId, focusId])
 
   const applyResult = useCallback(
     (info: FocusInfo) => {
@@ -166,7 +147,7 @@ export function FocusSettingsControls({
       focus_id: focusId,
       context_flow: null,
       library_visibility: null,
-      privacy_tier: mode === 'full' ? draftPrivacyTier : null,
+      privacy_tier: draftPrivacyTier,
       max_permitted_tier: draftMaxPermittedTier,
       focus_profile: null,
     }
@@ -226,22 +207,20 @@ export function FocusSettingsControls({
 
   return (
     <div className="focus-settings-controls">
-      {mode === 'full' && (
-        <div>
-          <label htmlFor={privacyTierId}>{t('navShell.focusSettings.privacyTierLabel')}</label>
-          <select
-            id={privacyTierId}
-            value={draftPrivacyTier}
-            onChange={(event) => setDraftPrivacyTier(event.target.value as PrivacyPreference)}
-          >
-            {PRIVACY_TIER_VALUES.map((tier) => (
-              <option key={tier} value={tier}>
-                {t(privacyTierLabelKey(tier))}
-              </option>
-            ))}
-          </select>
-        </div>
-      )}
+      <div>
+        <label htmlFor={privacyTierId}>{t('navShell.focusSettings.privacyTierLabel')}</label>
+        <select
+          id={privacyTierId}
+          value={draftPrivacyTier}
+          onChange={(event) => setDraftPrivacyTier(event.target.value as PrivacyPreference)}
+        >
+          {PRIVACY_TIER_VALUES.map((tier) => (
+            <option key={tier} value={tier}>
+              {t(privacyTierLabelKey(tier))}
+            </option>
+          ))}
+        </select>
+      </div>
 
       <div>
         <label htmlFor={maxPermittedTierId}>
@@ -261,7 +240,7 @@ export function FocusSettingsControls({
       </div>
 
       <button type="button" onClick={handleSave} disabled={saving}>
-        {t(mode === 'full' ? 'navShell.focusSettings.saveButton' : 'navShell.focusSettings.raiseButton')}
+        {t('navShell.focusSettings.saveButton')}
       </button>
 
       {saveError && (

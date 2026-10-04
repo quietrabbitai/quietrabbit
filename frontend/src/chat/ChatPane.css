@@ -89,14 +89,8 @@
   background: var(--code-bg);
 }
 
-.chat-pane__pending-review-notice {
-  font-size: 12px;
-  color: var(--text);
-  align-self: flex-start;
-}
-
 /* items.id=416: native-copy Gate3 review UX (scanning/passed/blocked/
-   needs-review/failed/withheld-flag) -- same treatment as send-error. */
+   needs-review/failed) -- same treatment as send-error. */
 .chat-pane__copy-review-notice {
   font-size: 14px;
   color: var(--text);
@@ -109,39 +103,6 @@
 .chat-pane__copy-review-notice--blocked,
 .chat-pane__copy-review-notice--failed {
   border-color: var(--danger, #c0392b);
-}
-
-.chat-pane__copy-review-flag {
-  font-style: italic;
-}
-
-.chat-pane__copy-withheld-confirm {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  font-size: 14px;
-  color: var(--text);
-  padding: 10px;
-  border-radius: 8px;
-  border: 1px solid var(--border);
-  background: var(--code-bg);
-}
-
-/* items.id=359 piece 6: the drafted-starter message type -- outlined,
- * distinct from a plain reply, with its own explicit copy affordance. */
-.chat-pane__message--starter {
-  align-self: flex-start;
-  background: var(--bg);
-  border: 1.5px solid var(--accent-border);
-  gap: 6px;
-}
-
-.chat-pane__starter-label {
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: var(--accent);
 }
 
 /* items.id=501 slice 2: "Copy last response" -- an outlined secondary

@@ -1,8 +1,8 @@
 // Real chat/transcript component -- the thing behind MiddleZone's chatPane
 // prop, replacing the placeholder <p> stubs previously in NavShell.tsx's
 // personaHub branch and CloudChatAccessPane.tsx's conversation pane. One
-// component for both: gate3Track is the only behavioral difference (whether
-// the assistant reply gets gate3_review_status="drafted").
+// component for both (items.id=501 slice 3 removed the gate3Track flag, the
+// only behavioral difference, along with the per-reply review it fed).
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -32,17 +32,9 @@ export interface ChatPaneProps {
   userId: string
   personaId: string
   focusId: string
-  gate3Track: boolean
   /** Lets the caller compute MiddleZone's isGenerating prop for real,
    *  replacing today's hardcoded false at both call sites. */
   onGenerating?: (isGenerating: boolean) => void
-  /** Fires once, per run, the moment a gate3Track=true assistant reply has
-   *  been backfilled with real content and is still gate3_review_status
-   *  'drafted' -- the signal that it's ready for Privacy Guardian review.
-   *  Only ever fires when gate3Track is true; ignored (never called) for
-   *  Persona-hub usage. The caller (CloudChatAccessPane) is responsible for
-   *  invoking commands.requestCloudFrontierGate3Review with the given messageId. */
-  onDraftReady?: (messageId: string) => void
   /** items.id=359 (decisions.id=731): when true, renders only a minimal
    *  floor -- QR's mark, the latest assistant response as a snippet, and
    *  the existing entry bar below (kept mounted and focusable either
@@ -176,7 +168,7 @@ type CopySource = 'native' | 'button'
 type CopyReviewState =
   | { phase: 'idle' }
   | { phase: 'scanning'; source: CopySource }
-  | { phase: 'passed'; source: CopySource; includesWithheld: boolean }
+  | { phase: 'passed'; source: CopySource }
   | { phase: 'blocked'; source: CopySource; message: string | null }
   | { phase: 'failed'; source: CopySource }
   /** items.id=501 slice 2 (decisions.id=846 addendum Q2): the copy review
@@ -190,25 +182,18 @@ type CopyReviewState =
       phase: 'awaiting-consent'
       source: CopySource
       text: string
-      includesWithheld: boolean
       payload: ConsentRequestPayload | null
       /** Spans gate3 resolved silently from a prior/standing decision --
        *  not in `payload`, but their decisions apply to the copied text too. */
       autoResolved: AutoResolvedSpan[]
     }
-  /** decisions.id=766's standalone-withheld carve-out: copying exactly one
-   *  previously-withheld message needs a harder re-confirmation, not the
-   *  same pass/fail scan a fresh composition gets. */
-  | { phase: 'confirm-withheld'; source: CopySource; text: string }
 
 export function ChatPane({
   contextKey,
   userId,
   personaId,
   focusId,
-  gate3Track,
   onGenerating,
-  onDraftReady,
   collapsed = false,
   onExpand,
   onCopyModalOpenChange,
@@ -460,29 +445,6 @@ export function ChatPane({
       setContentTimedOut(false)
       if (result.status === 'ok') {
         setMessages(result.data)
-        // Draft-ready signal (items.id=233): only for gate3Track usage, and
-        // only the first time this run's assistant row is seen still
-        // 'drafted' -- a later re-fetch (e.g. contextKey unchanged, a second
-        // send on the same mount) would otherwise re-fire for the same
-        // message once its status has already moved past 'drafted'.
-        if (gate3Track) {
-          const drafted = [...result.data]
-            .reverse()
-            .find(
-              (m) =>
-                m.sender === 'assistant' &&
-                m.focus_run_id === activeRunId &&
-                m.gate3_review_status === 'drafted',
-            )
-          // Hard guard, not just belt-and-suspenders: still correct under
-          // the new design too -- a run with genuinely nothing to backfill
-          // (a real failure) still fires message-content-ready, but the
-          // drafted row's content stays empty, and onDraftReady must never
-          // fire for that.
-          if (drafted && drafted.content) {
-            onDraftReady?.(drafted.id)
-          }
-        }
       }
       setActiveRunId(null)
       setLiveContent('')
@@ -677,7 +639,7 @@ export function ChatPane({
       statusUnlisten?.()
       contentUnlisten?.()
     }
-  }, [activeRunId, userId, personaId, contextKey, gate3Track, onDraftReady])
+  }, [activeRunId, userId, personaId, contextKey])
 
   // Elapsed-time-aware "generating..." messaging for the gaps between step
   // reveals -- pure frontend presentation, no backend involvement.
@@ -794,7 +756,7 @@ export function ChatPane({
           context_key: contextKey,
           content: text,
           focus_id: focusId,
-          gate3_track: gate3Track,
+          gate3_track: false,
           confirmed_cross_persona_fact_ids: confirmedFactIds,
         })
         .then((result) => {
@@ -809,7 +771,7 @@ export function ChatPane({
           }
         })
     })
-  }, [draft, userId, personaId, contextKey, focusId, gate3Track, resolveCrossPersonaConfirmation])
+  }, [draft, userId, personaId, contextKey, focusId, resolveCrossPersonaConfirmation])
 
   // The transcript row that should render liveContent instead of its own
   // (still-empty, not-yet-backfilled) content -- the placeholder assistant
@@ -837,7 +799,7 @@ export function ChatPane({
 
   // items.id=416 (decisions.id=766): shows a copy-review outcome, then
   // auto-clears it back to idle after COPY_REVIEW_DISPLAY_HOLD_MS --
-  // same "own timeout, not on every render" shape as copiedStarterId above.
+  // same "own timeout, not on every render" shape as the other timers here.
   const showCopyReviewOutcome = useCallback((state: CopyReviewState) => {
     if (copyReviewClearRef.current !== null) {
       window.clearTimeout(copyReviewClearRef.current)
@@ -850,16 +812,13 @@ export function ChatPane({
   }, [])
 
   // items.id=416 (decisions.id=766, core mechanism): extends Gate3 review to
-  // EVERY copy of chat content, not just handleCopyStarter's dedicated
-  // button -- previously an already-approved message got zero re-protection
-  // against a plain manual copy, and a withheld message (durable,
-  // permanently persisted, per messages_001.sql) rendered identically to
-  // approved with no protection at all. Cross-message selection
+  // EVERY copy of chat content (native copy and the Copy last response
+  // button alike). Cross-message selection
   // (items.id=416 Gap 1): treated as ONE new composition -- a single
   // combined gate3 call against the concatenated text, not fragmented
   // per-message sub-reviews.
   const runCopyReview = useCallback(
-    (text: string, includesWithheld: boolean, source: CopySource) => {
+    (text: string, source: CopySource) => {
       let revealed = false
       let settled = false
 
@@ -893,7 +852,6 @@ export function ChatPane({
           phase: 'awaiting-consent',
           source,
           text,
-          includesWithheld,
           payload,
           autoResolved,
         })
@@ -965,10 +923,9 @@ export function ChatPane({
               .then(() => {
                 // Silent on a fast, unflagged native pass -- "no visible
                 // interruption at all" per this item's own UX spec. The
-                // withheld-inclusion flag is informational, and the button
-                // always confirms ("Copied"); both always surface.
-                if (revealed || includesWithheld || source === 'button') {
-                  finish({ phase: 'passed', source, includesWithheld })
+                // button always confirms ("Copied").
+                if (revealed || source === 'button') {
+                  finish({ phase: 'passed', source })
                 }
               })
               .catch(() => {
@@ -1003,7 +960,7 @@ export function ChatPane({
     (decisions: ElementDecision[]) => {
       const pending = copyReview
       if (pending.phase !== 'awaiting-consent' || !pending.payload) return
-      const { source, text, includesWithheld, payload, autoResolved } = pending
+      const { source, text, payload, autoResolved } = pending
       const finalText = applyAllCopyDecisions(text, payload.spans, decisions, autoResolved)
       if (finalText === null) {
         showCopyReviewOutcome({ phase: 'failed', source })
@@ -1024,7 +981,7 @@ export function ChatPane({
           }
           return navigator.clipboard
             .writeText(finalText)
-            .then(() => showCopyReviewOutcome({ phase: 'passed', source, includesWithheld }))
+            .then(() => showCopyReviewOutcome({ phase: 'passed', source }))
         })
         .catch(() => showCopyReviewOutcome({ phase: 'failed', source }))
     },
@@ -1039,45 +996,9 @@ export function ChatPane({
     setCopyReview({ phase: 'idle' })
   }, [])
 
-  // decisions.id=766's standalone-withheld carve-out (distinct from Gap 1's
-  // multi-message flag above): copying JUST one previously-withheld message
-  // -- a decision the user already made once -- needs a harder
-  // re-confirmation, not a fresh pass/fail scan.
-  const requestWithheldReconfirm = useCallback((text: string, source: CopySource) => {
-    if (copyReviewClearRef.current !== null) {
-      window.clearTimeout(copyReviewClearRef.current)
-      copyReviewClearRef.current = null
-    }
-    setCopyReview({ phase: 'confirm-withheld', source, text })
-  }, [])
-
-  const confirmWithheldCopy = useCallback(() => {
-    if (copyReview.phase !== 'confirm-withheld') return
-    const { source, text } = copyReview
-    void navigator.clipboard
-      .writeText(text)
-      .then(() => {
-        // The button promises "Copied" on success; the native path stays
-        // silent here as before.
-        if (source === 'button') {
-          showCopyReviewOutcome({ phase: 'passed', source, includesWithheld: false })
-        } else {
-          setCopyReview({ phase: 'idle' })
-        }
-      })
-      .catch(() => {
-        showCopyReviewOutcome({ phase: 'failed', source })
-      })
-  }, [copyReview, showCopyReviewOutcome])
-
-  const cancelWithheldCopy = useCallback(() => {
-    setCopyReview({ phase: 'idle' })
-  }, [])
-
   // The consent_request event carries a copy review's payload (focus_run_id
   // = the review's synthetic key). Buffer it for the command's own response
-  // (the event fires first), or hand it to the already-open modal. Per-reply
-  // review payloads are CloudChatAccessPane's and are ignored here. Detached
+  // (the event fires first), or hand it to the already-open modal. Detached
   // on unmount per CLAUDE.md.
   useEffect(() => {
     let unlisten: UnlistenFn | undefined
@@ -1114,18 +1035,13 @@ export function ChatPane({
   const handleCopyLast = useCallback(() => {
     const reply = findLastCopyableReply(messages)
     if (!reply) return
-    if (reply.gate3_review_status === 'withheld') {
-      requestWithheldReconfirm(reply.content, 'button')
-      return
-    }
-    runCopyReview(reply.content, false, 'button')
-  }, [messages, requestWithheldReconfirm, runCopyReview])
+    runCopyReview(reply.content, 'button')
+  }, [messages, runCopyReview])
 
   // items.id=416 (decisions.id=766, core mechanism): the native `copy`
-  // event (Ctrl+C / right-click-copy) on this transcript -- same
-  // click-initiated-only discipline as handleCopyStarter's own comment
-  // above (this event IS the user's copy gesture), extended to cover every
-  // copy path instead of just the dedicated button. Hard scope boundary
+  // event (Ctrl+C / right-click-copy) on this transcript -- click-initiated
+  // only (this event IS the user's copy gesture), covering every copy path
+  // alongside the Copy last response button. Hard scope boundary
   // (must be preserved): never fires on or inspects clipboard contents from
   // outside this element, never a background poll, never
   // navigator.clipboard.readText() -- strictly reactive to a copy gesture
@@ -1175,27 +1091,18 @@ export function ChatPane({
         return
       }
 
-      const statuses = selectedMessages.map((li) => li.dataset.gate3Status)
-      const includesWithheld = statuses.includes('withheld')
-
-      if (selectedMessages.length === 1 && statuses[0] === 'withheld') {
-        requestWithheldReconfirm(text, 'native')
-        return
-      }
-
-      runCopyReview(text, includesWithheld, 'native')
+      runCopyReview(text, 'native')
     }
 
     document.addEventListener('copy', handleDocumentCopy)
     return () => document.removeEventListener('copy', handleDocumentCopy)
-  }, [runCopyReview, requestWithheldReconfirm])
+  }, [runCopyReview])
 
   // items.id=391 (Jason, 2026-09-02): the transcript never auto-scrolled
   // to the newest message at all -- confirmed as the actual blocker
   // behind "click 2nd opinion, forget to copy the QR chat message, quickly
   // click QR chat to copy it and go back to the Cloud Chat screen": the
-  // approved starter message (this transcript's own copy affordance,
-  // above) is always the LATEST message when it exists, but reclaiming
+  // newest reply is always the LATEST message when it exists, but reclaiming
   // Chat re-expands the transcript wherever it happened to be scrolled --
   // top, on a fresh mount -- not to that message, so it could be scrolled
   // well out of view in anything but a short conversation. Scrolls to the
@@ -1220,11 +1127,10 @@ export function ChatPane({
   }, [])
 
   // Disabled while a reply is generating, while a copy is in flight (scan,
-  // modal, reconfirm), and when there is no copyable newest reply.
+  // modal), and when there is no copyable newest reply.
   const copyInFlight =
     copyReview.phase === 'scanning' ||
-    copyReview.phase === 'awaiting-consent' ||
-    copyReview.phase === 'confirm-withheld'
+    copyReview.phase === 'awaiting-consent'
   const copyLastDisabled = isGenerating || copyInFlight || lastCopyableReply === null
   const copyLastLabel =
     copyReview.phase === 'scanning' || copyReview.phase === 'awaiting-consent'
@@ -1275,35 +1181,11 @@ export function ChatPane({
           )}
           <ul className="chat-pane__message-list" ref={messageListRef}>
             {messages.map((m) => {
-              // items.id=359 piece 6: an approved gate3 draft is a
-              // visually distinct message type, not another plain bubble.
-              // items.id=501 slice 2: its own "Copy starter" button is gone
-              // (it wrote the clipboard without the copy review); copying
-              // goes through "Copy last response" or a native copy. The
-              // styling itself is retired with the per-reply review in
-              // slice 3. 'pending-review' (pre-gate, below) keeps the
-              // plain-bubble rendering.
-              if (m.gate3_review_status === 'approved') {
-                return (
-                  <li
-                    key={m.id}
-                    className="chat-pane__message chat-pane__message--starter"
-                    data-message-id={m.id}
-                    data-gate3-status={m.gate3_review_status ?? ''}
-                  >
-                    <span className="chat-pane__starter-label">
-                      {t('navShell.chat.starterLabel')}
-                    </span>
-                    <span className="chat-pane__message-content">{m.content}</span>
-                  </li>
-                )
-              }
               return (
                 <li
                   key={m.id}
                   className={`chat-pane__message chat-pane__message--${m.sender}`}
                   data-message-id={m.id}
-                  data-gate3-status={m.gate3_review_status ?? ''}
                 >
                   <span className="chat-pane__message-content">
                     {m.id === liveMessageId && liveContent
@@ -1312,11 +1194,6 @@ export function ChatPane({
                         ? t('navShell.chat.replyDidNotFinish')
                         : m.content}
                   </span>
-                  {m.gate3_review_status === 'pending-review' && (
-                    <span className="chat-pane__pending-review-notice">
-                      {t('navShell.chat.pendingReviewNotice')}
-                    </span>
-                  )}
                 </li>
               )
             })}
@@ -1329,12 +1206,6 @@ export function ChatPane({
           {copyReview.phase === 'passed' && copyReview.source === 'native' && (
             <p className="chat-pane__copy-review-notice" aria-live="polite">
               {t('navShell.chat.copyScanPassed')}
-              {copyReview.includesWithheld && (
-                <span className="chat-pane__copy-review-flag">
-                  {' '}
-                  {t('navShell.chat.copyIncludesWithheldFlag')}
-                </span>
-              )}
             </p>
           )}
           {copyReview.phase === 'blocked' && copyReview.source === 'native' && (
@@ -1385,21 +1256,6 @@ export function ChatPane({
               {t('navShell.chat.provenanceOmissionNotice')}
             </p>
           )}
-        </div>
-      )}
-      {/* Outside the transcript branch on purpose: the compact floor renders
-          no transcript, and the button's single-withheld reconfirm must show
-          there too. */}
-      {copyReview.phase === 'confirm-withheld' && (
-        <div className="chat-pane__copy-withheld-confirm" role="alertdialog">
-          <p>{t('navShell.chat.copyWithheldConfirmTitle')}</p>
-          <p>{t('navShell.chat.copyWithheldConfirmBody')}</p>
-          <button type="button" onClick={confirmWithheldCopy}>
-            {t('navShell.chat.copyWithheldConfirmConfirm')}
-          </button>
-          <button type="button" onClick={cancelWithheldCopy}>
-            {t('navShell.chat.copyWithheldConfirmCancel')}
-          </button>
         </div>
       )}
       <PrivacyGuardianModal

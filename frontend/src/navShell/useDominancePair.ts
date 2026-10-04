@@ -21,8 +21,8 @@
 // `dominant` is an EXPLICITLY set field, not derived from
 // activeProviderId !== null -- an earlier version of this hook derived it
 // that way and shipped a real regression: pre-extraction, the rail
-// (CloudChatSelector) was visible whenever reviewOutcome === 'approved', full
-// stop, independent of whether any specific provider had been activated
+// (CloudChatSelector) was visible whenever the old per-reply review had
+// approved, full stop, independent of whether any specific provider had been activated
 // yet or since closed ("the rail is persistent once the gate clears...
 // it does not disappear once a pane opens," items.id=359's own comment,
 // carried into CloudChatAccessPane.tsx unchanged). Deriving dominant purely
@@ -42,13 +42,10 @@
 //     activeProviderId (content-pane goes back to its empty prompt) but
 //     the rail itself stays visible.
 //
-// Gate3 review state (reviewOutcome/consentPayload/pendingMessageId/etc.)
-// stays local to CloudChatAccessPane, entirely untouched by this extraction --
-// it's per-in-flight-message state, not part of "which side is dominant."
-// markCloudChatReady() is the one narrow exception: CloudChatAccessPane calls it
-// from the bar's click handler, and this hook has no idea what Gate3
-// review even is -- it just exposes a plain "make cloudChat dominant"
-// action, same shape as reclaimChat's "make chat dominant."
+// markCloudChatReady() is a plain "make cloudChat dominant" action, same
+// shape as reclaimChat's "make chat dominant" -- CloudChatAccessPane calls it
+// from the bar's click handler. (The per-reply Gate3 review state that used to
+// live beside this hook was retired in items.id=501 slice 3.)
 
 import { useCallback, useState } from 'react'
 import { commands } from '../bindings'

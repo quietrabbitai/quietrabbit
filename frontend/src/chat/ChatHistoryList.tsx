@@ -13,23 +13,15 @@ import './ChatHistoryList.css'
 
 export interface ChatHistoryListProps {
   onOpenHistory: () => void
-  /** items.id=384 slice 7: disabled while a Gate3 review is pending --
-   *  switching screens mid-review would leave CloudChatAccessPane's own
-   *  pending-review state pointed at a message that's no longer visible.
-   *  CloudChatAccessPane is the only caller and is the one that knows
-   *  reviewOutcome, so it passes this through rather than this component
-   *  needing to know about Gate3 at all. */
-  disabled?: boolean
 }
 
-export function ChatHistoryList({ onOpenHistory, disabled = false }: ChatHistoryListProps) {
+export function ChatHistoryList({ onOpenHistory }: ChatHistoryListProps) {
   const { t } = useTranslation()
   return (
     <button
       type="button"
       className="chat-history-list__toggle"
       onClick={onOpenHistory}
-      disabled={disabled}
       title={t('navShell.chatHistoryList.toggleLabel')}
     >
       {t('navShell.chatHistoryList.toggleLabel')}

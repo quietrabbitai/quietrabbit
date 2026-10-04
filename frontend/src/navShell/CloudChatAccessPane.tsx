@@ -4,9 +4,7 @@
 // slice 4 (decisions.id=735) generalized the collapse mechanic into a
 // true bidirectional dominance pair -- see this file's own inline notes
 // below and useDominancePair.ts's header comment for what changed and
-// why; the Gate3 outbound-review flow (handleDraftReady and everything
-// below it) is UNCHANGED by that work -- none of it ever read
-// openPaneIds/activeProviderId, only personaId/messageId.
+// why.
 //
 // TIER3_ACCESS_MODEL.md Session 3 (decisions.id=731-733): the rail lists
 // every candidate provider (no cap); at most one pane is ever composited
@@ -31,34 +29,20 @@
 // field on CloudChatCollapsedStrip regardless (that's the resolved answer to
 // decisions.id=738's flagged question: only QR's own collapsed floor gets
 // a live entry field, since only QR has a QR-owned conversation to keep
-// live). Gate3 review UI (PrivacyGuardianModal and the blocked/withheld/
-// ceiling-raise messaging) is rendered OUTSIDE this dominant-conditional
-// -- deliberately: a draft can enter Gate3 review from a full-screen
-// Chat send regardless of whether Cloud Chat currently has any pane loaded,
-// so that UI must stay visible no matter which side is dominant. It was
-// previously nested inside the rail column, which happened to always be
-// visible pre-merge (the rail+content-pane never used to be hidden) --
-// keeping it there after adding a dominant==='chat' branch that hides
-// the rail entirely would have silently made an in-progress consent
-// review invisible.
+// live).
 //
-// items.id=233's outbound Privacy Guardian gate (PG_GATE_3,
-// conductor/privacy/gate3.rs) is unchanged by this item -- see
-// handleDraftReady/the consent_request listener below, carried over from
-// the prior selector-screen version of this file. items.id=501 slice 1
-// (decisions.id=846): the gate no longer controls entry -- the Cloud Chat
-// bar is always clickable and enters Cloud Chat directly, and an approved
-// review no longer brings Cloud Chat forward.
+// items.id=501 slice 3 (decisions.id=846): the per-reply Gate3 review that used
+// to render its modal and blocked/withheld alerts here is retired. The Cloud
+// Chat bar is always clickable and enters Cloud Chat directly; the only
+// Privacy Guardian review in chat is the copy-time one, owned by ChatPane.
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { commands, type ChatInfo, type ExternalAccess, type PaneRectFraction, type PersonaInfo } from '../bindings'
+import { commands, type ChatInfo, type PaneRectFraction, type PersonaInfo } from '../bindings'
 import { ChatPane } from '../chat/ChatPane'
 import { ChatHistoryList } from '../chat/ChatHistoryList'
-import { COPY_REVIEW_RUN_ID_PREFIX } from '../chat/copyDecisions'
 import { PersonaBox } from './persona/PersonaBox'
-import { FocusSettingsControls } from './FocusSettingsControls'
 import { requireCurrentUserId, type DominancePairState } from './navShellConfig'
 import { CloudChatCollapsedStrip } from './CloudChatCollapsedStrip'
 import { useDominancePair } from './useDominancePair'
@@ -67,19 +51,11 @@ import { createUnsentChat, returnStep, type ReturnStepState } from './unsentChat
 import { computeActivePaneRect, pixelRectToFraction, type PanePixelRect } from '../cloudChatAccess/paneLayout'
 import { PaneHitLayer } from '../cloudChatAccess/PaneHitLayer'
 import { PopupHitLayer } from '../cloudChatAccess/PopupHitLayer'
-import {
-  PrivacyGuardianModal,
-  type ConsentRequestPayload,
-  type ElementDecision,
-} from '../cloudChatAccess/PrivacyGuardianModal'
-import { isAllKeptPrivate } from '../cloudChatAccess/consentDecisions'
 import { CloudChatSelector } from '../cloudChatAccess/CloudChatSelector'
 import {
   fetchActiveProviders,
   type Provider,
 } from '../cloudChatAccess/cloudChatAccessConfig'
-
-type ReviewOutcome = 'pending' | 'approved' | 'withheld' | 'blocked'
 
 // items.id=234 -- host-owned popup subsystem. Hand-declared, not generated:
 // event payloads, not command args, same convention as
@@ -164,29 +140,6 @@ export interface CloudChatAccessPaneProps {
   onPendingChatSelectionConsumed?: () => void
 }
 
-// items.id=448: Gate3ReviewResult.target_tier deliberately stays a plain
-// number (genuinely dual-purpose in gate3.rs -- also feeds
-// destination_risk_rating's fallback, an unrelated risk-rating axis; see
-// this draft's own "Flag for Chat-PM" section for the forward-looking
-// concern this raises). This mirrors Rust's own
-// ExternalAccess::from_legacy_tier mapping (conductor/tokens.rs) so the
-// inline "raise it now" affordance can prefill its select with a real
-// ExternalAccess value from that legacy number. Can never produce
-// anonymous_preferred (no legacy slot maps to it) -- acceptable here since
-// this is only a suggested starting value the user can still change.
-function externalAccessFromLegacyTier(tier: number): ExternalAccess {
-  switch (tier) {
-    case 1:
-      return 'local_only'
-    case 2:
-      return 'anonymous_required'
-    case 3:
-      return 'unrestricted'
-    default:
-      return 'unrestricted'
-  }
-}
-
 export function CloudChatAccessPane({
   personaId,
   onPersonaChange,
@@ -252,34 +205,6 @@ export function CloudChatAccessPane({
     markCloudChatReady,
   } = useDominancePair(pair, onUpdatePair)
 
-  // items.id=406 (decisions.id=755): the provider-selection re-check
-  // trigger's own memory of what was last copied -- QR only ever evaluates
-  // clipboard content it can prove it wrote itself (the hard provenance
-  // boundary from the design doc), never arbitrary/external clipboard
-  // contents. Cleared implicitly by comparison at check time, not on a
-  // timer -- a stale entry is harmless: if the clipboard no longer holds
-  // this exact text (the user copied something else, or pasted already),
-  // the provenance check below simply won't match and no re-check fires.
-  //
-  // items.id=543 (Chat-BRAND finding, confirmed live this session): also
-  // stores the copied message's own owning personaId, sourced from
-  // ChatPane's personaId prop at copy time -- NOT the live `personaId` prop on
-  // this component. Persona is now freely switchable mid-session (this
-  // whole item's point), so those two can genuinely diverge between a
-  // copy and the later provider click; activateAndPromote below must key
-  // its recheck off the message's real owning persona, not whatever's
-  // active right now.
-  //
-  // items.id=501 slice 2: nothing sets this any more -- the Copy starter
-  // button (its only writer) is removed, so the provider-selection re-check
-  // below can no longer fire. The state and that re-check are retired
-  // together with the per-reply review in slice 3 (decisions.id=846).
-  const [lastCopiedStarter] = useState<{
-    messageId: string
-    content: string
-    personaId: string
-  } | null>(null)
-
   // items.id=501 slice 2: true while ChatPane's flagged-copy Privacy
   // Guardian modal is open. A native provider pane draws above the webview,
   // so syncPaneLayout pushes an empty layout while this is set.
@@ -293,82 +218,8 @@ export function CloudChatAccessPane({
     (providerId: string) => {
       onDominantRailChange('cloudChat')
       activate(providerId)
-
-      // items.id=406 (decisions.id=755): provider-selection re-check --
-      // fires alongside activation (not blocking it; see design doc's own
-      // "achievable version" framing -- QR cannot observe paste itself,
-      // only the two moments it CAN observe: copy, and selecting a new
-      // destination).
-      //
-      // BUG FOUND + FIXED (2026-09-23): this used to set reviewOutcome to
-      // 'pending' BEFORE even sending the command, on the theory that the
-      // modal would then already be "primed" if the independent
-      // consent_request listener (below) delivered a payload for it. In
-      // practice this recheck is usually a no-op (every fact already
-      // resolved, or nothing new to review -- see the data.approved branch
-      // below) and resolves in milliseconds, so 'pending' flipped straight
-      // back to 'approved'/'blocked' a frame or two later -- PrivacyGuardianModal's
-      // own `open` prop is driven purely by reviewOutcome === 'pending'
-      // (see its render below), so this was a real open-then-close of the
-      // modal's scanning state on every send, not just a state-value blip.
-      // Fix: only set 'pending' once the result actually says
-      // pending_consent -- by then consentPayload is already populated
-      // (gate3()'s write-before-surface invariant, same one
-      // handleDraftReady's own doc comment relies on), so the modal opens
-      // straight into the real review UI, never the scanning placeholder,
-      // and the no-op path never opens the modal at all.
-      if (lastCopiedStarter) {
-        const activeIds = openProviderIds.includes(providerId)
-          ? openProviderIds
-          : [...openProviderIds, providerId]
-        const messageId = lastCopiedStarter.messageId
-        const starterPersonaId = lastCopiedStarter.personaId
-        void navigator.clipboard
-          .readText()
-          .then((clipboardText) => {
-            if (clipboardText !== lastCopiedStarter.content) return
-            return commands.recheckCloudFrontierProviderSelection({
-              user_id: requireCurrentUserId(),
-              persona_id: starterPersonaId,
-              message_id: messageId,
-              newly_active_provider_ids: activeIds,
-            })
-          })
-          .then((result) => {
-            if (!result) return // provenance mismatch -- nothing was fired
-            if (result.status !== 'ok') {
-              setReviewOutcome('blocked')
-              setReviewMessage(
-                t('navShell.cloudChatAccessPane.gate3ReviewError', { message: result.error }),
-              )
-              return
-            }
-            const data = result.data
-            if (data.pending_consent) {
-              setReviewOutcome('pending')
-              setReviewMessage(null)
-              setReviewCeiling(null)
-              setPendingMessageId(messageId)
-              return
-            }
-            if (data.approved) {
-              // No new review was actually needed (no-op path, or every
-              // fact auto-resolved) -- back to whatever it was before this
-              // check, not stuck showing 'pending'.
-              setReviewOutcome('approved')
-              return
-            }
-            setReviewOutcome('blocked')
-            setReviewMessage(data.plain_language)
-          })
-          .catch(() => {
-            // Clipboard read can reject (permissions, focus) -- a re-check
-            // we can't confirm provenance for must not fire, so failing
-            // closed (skip) is correct, not swallowed-error negligence.
-          })
-      }
     },
-    [activate, onDominantRailChange, lastCopiedStarter, openProviderIds, t],
+    [activate, onDominantRailChange],
   )
   // items.id=501 slice 1 (decisions.id=846): the Cloud Chat bar's one action.
   // Entering Cloud Chat needs no message, persona or review -- it is not
@@ -398,24 +249,6 @@ export function CloudChatAccessPane({
   // component (not lifted into useDominancePair) -- popup bookkeeping is
   // CEF-pane-specific plumbing, not part of "which side is dominant."
   const [popupRects, setPopupRects] = useState<Record<string, PaneRectFraction>>({})
-
-  const [reviewOutcome, setReviewOutcome] = useState<ReviewOutcome | null>(null)
-  const [reviewMessage, setReviewMessage] = useState<string | null>(null)
-  // items.id=321: set only when the block was Gate3's tier-ceiling check
-  // (Gate3Result.target_tier/.space_max_permitted_tier, populated only on
-  // that one path -- see conductor/privacy/gate3.rs). Drives the inline
-  // "raise it now" affordance that replaces the old dead
-  // "[Change Focus settings]" bracket text.
-  const [reviewCeiling, setReviewCeiling] = useState<{
-    targetTier: number
-    current: ExternalAccess
-  } | null>(null)
-  const [consentPayload, setConsentPayload] = useState<ConsentRequestPayload | null>(null)
-  // ConsentRequestPayload carries focus_run_id, not message_id -- gate3()
-  // only knows about content_key/step_id/focus_run_id, never the
-  // messages.db row that triggered it. Stashed here from handleDraftReady
-  // so handleModalResolve has the right id to pass to resolveCloudFrontierGate3Review.
-  const [pendingMessageId, setPendingMessageId] = useState<string | null>(null)
 
   const syncPaneLayout = useCallback(() => {
     const body = contentBodyRef.current
@@ -622,87 +455,8 @@ export function CloudChatAccessPane({
     [close],
   )
 
-  // items.id=233: fires once ChatPane has a real drafted message ready for
-  // outbound Privacy Guardian review. On pending_consent, the
-  // consent_request listener below independently picks up the payload
-  // gate3() has already emitted by the time this promise resolves
-  // (write-before-surface invariant, conductor/privacy/gate3.rs) -- this
-  // handler only needs to react to the synchronous terminal outcomes
-  // (approved/blocked/timeout) and the not-found/error path.
-  const handleDraftReady = useCallback(
-    (messageId: string) => {
-      if (!personaId) return
-      setReviewOutcome('pending')
-      setReviewMessage(null)
-      setReviewCeiling(null)
-      setPendingMessageId(messageId)
-      commands
-        .requestCloudFrontierGate3Review({
-          user_id: requireCurrentUserId(),
-          persona_id: personaId,
-          message_id: messageId,
-        })
-        .then((result) => {
-          if (result.status !== 'ok') {
-            setReviewOutcome('blocked')
-            setReviewMessage(
-              t('navShell.cloudChatAccessPane.gate3ReviewError', { message: result.error }),
-            )
-            return
-          }
-          const data = result.data
-          if (data.pending_consent) {
-            // Payload arrives via the consent_request listener.
-            return
-          }
-          if (data.approved) {
-            setReviewOutcome('approved')
-            return
-          }
-          // blocked or timeout -- gate3_review_status stays 'drafted'
-          // server-side (see request_cloud_frontier_gate3_review's own doc comment);
-          // surface the plain_language message, no modal.
-          setReviewOutcome('blocked')
-          setReviewMessage(data.plain_language)
-          if (data.target_tier != null && data.space_max_permitted_tier != null) {
-            setReviewCeiling({
-              targetTier: data.target_tier,
-              current: data.space_max_permitted_tier,
-            })
-          }
-        })
-    },
-    [personaId, t],
-  )
-
-  // Same cancelled/unlisten cleanup idiom as ChatPane's own first listen()
-  // effect (run-status-update), per CLAUDE.md's "Tauri event listeners must
-  // be explicitly detached on SPA view unmount."
-  useEffect(() => {
-    let unlisten: UnlistenFn | undefined
-    let cancelled = false
-
-    listen<ConsentRequestPayload>('consent_request', (event) => {
-      // items.id=501 slice 2: a copy review's payload belongs to ChatPane's
-      // own modal, not this per-reply one.
-      if (event.payload.focus_run_id.startsWith(COPY_REVIEW_RUN_ID_PREFIX)) return
-      setConsentPayload(event.payload)
-    }).then((fn) => {
-      if (cancelled) {
-        fn()
-      } else {
-        unlisten = fn
-      }
-    })
-
-    return () => {
-      cancelled = true
-      unlisten?.()
-    }
-  }, [])
-
-  // items.id=234: same cancelled/unlisten idiom as the consent_request
-  // listener above. cloud-chat-popup-opened/-closed are the two popup-close
+  // items.id=234: cancelled/unlisten idiom per CLAUDE.md (Tauri listeners
+  // detached on unmount). cloud-chat-popup-opened/-closed are the two popup-close
   // paths the frontend has no other way to learn about (self-close,
   // parent navigate-away) -- see PopupClosedPayload's own doc for why the
   // parent-pane-close path (handleClose above) does not rely on this.
@@ -745,78 +499,6 @@ export function CloudChatAccessPane({
     }
   }, [])
 
-  const handleModalResolve = (decisions: ElementDecision[]) => {
-    if (!consentPayload || !personaId || !pendingMessageId) return
-    const status = isAllKeptPrivate(decisions) ? 'withheld' : 'approved'
-
-    commands
-      .submitElementConsentDecision({
-        run_id: consentPayload.focus_run_id,
-        user_id: requireCurrentUserId(),
-        persona_id: personaId,
-        decisions_json: JSON.stringify(decisions),
-      })
-      .then(() =>
-        commands.resolveCloudFrontierGate3Review({
-          user_id: requireCurrentUserId(),
-          persona_id: personaId,
-          message_id: pendingMessageId,
-          status,
-        }),
-      )
-      .finally(() => {
-        setConsentPayload(null)
-        setPendingMessageId(null)
-        setReviewOutcome(status)
-      })
-  }
-
-  // items.id=391 (Jason, 2026-09-02): the dev-only force-escalation
-  // scaffolding that used to live here (DIAG_329/items.id=329,
-  // DIAG_356/items.id=356 -- devSeedTier3DraftMessage +
-  // devBypassTier3Gate3Review) is REMOVED, not just hidden -- the chat
-  // toolbar's on-demand review button (since removed, items.id=501 slice 1)
-  // covered the same fast-iteration need through the real
-  // requestCloudFrontierGate3Review path, on the real last message, no synthetic
-  // seed or gate3() bypass required. The Rust-side dev-only commands
-  // themselves are untouched (out of scope here; a separate cleanup if
-  // nothing else ever calls them).
-
-  // items.id=540: Cancel used to only reset local state, leaving the
-  // message stuck at gate3_review_status='pending-review' server-side
-  // forever -- any retry (the since-removed on-demand review button, or
-  // resending) then hard-erred because requestCloudFrontierGate3Review only accepts
-  // 'drafted'. Reverts the message via cancelCloudFrontierGate3Review
-  // first, same fire-and-forget-on-cleanup shape as handleModalResolve:
-  // the modal closes and local state clears regardless of the call's
-  // outcome (a failed revert just leaves the message stuck, the same
-  // failure mode as before this fix, not a new one).
-  const handleModalCancel = () => {
-    if (personaId && pendingMessageId) {
-      void commands.cancelCloudFrontierGate3Review({
-        user_id: requireCurrentUserId(),
-        persona_id: personaId,
-        message_id: pendingMessageId,
-      })
-    }
-    setConsentPayload(null)
-    setPendingMessageId(null)
-    setReviewOutcome(null)
-  }
-
-  // items.id=384 slice 7: shared by both switch paths below -- clears any
-  // Gate3 review state left over from whichever chat was showing before.
-  // A 'pending'/'blocked'/'withheld' banner (or a still-open consent
-  // modal) referencing a message that's no longer even on screen would be
-  // actively misleading once the transcript underneath it has changed.
-  const resetGate3State = () => {
-    setReviewOutcome(null)
-    setReviewMessage(null)
-    setReviewCeiling(null)
-    setConsentPayload(null)
-    setPendingMessageId(null)
-  }
-
   /** decisions.id=740, superseded by decisions.id=823 (items.id=543):
    *  create a fresh chat for `persona` and make it the one showing,
    *  switching activePersonaId too. Originally NewChatPersonaPicker's one
@@ -847,7 +529,6 @@ export function CloudChatAccessPane({
   const handleStartNewChat = useCallback(
     (persona: PersonaInfo) => {
       if (persona.id === personaId) return
-      resetGate3State()
       setActiveChat(createUnsentChat(persona.id))
       onPersonaChange(persona.id)
     },
@@ -859,7 +540,6 @@ export function CloudChatAccessPane({
    *  personaId), so unlike handleStartNewChat this never touches
    *  activePersonaId. */
   const handleSelectChat = useCallback((chat: ChatInfo) => {
-    resetGate3State()
     setActiveChat(chat)
   }, [])
 
@@ -895,10 +575,8 @@ export function CloudChatAccessPane({
     const { startFresh, next } = returnStep(returnStateRef.current, { floor, isGenerating, personaId })
     returnStateRef.current = next
     if (startFresh && personaId) {
-      resetGate3State()
       setActiveChat(createUnsentChat(personaId))
     }
-    // resetGate3State only closes over stable state setters.
   }, [floor, isGenerating, personaId])
 
   // items.id=404: History's "resume this chat" row-action lands here --
@@ -1014,7 +692,6 @@ export function CloudChatAccessPane({
               {personaId && (
                 <ChatHistoryList
                   onOpenHistory={() => onOpenHistory({ personaId })}
-                  disabled={reviewOutcome === 'pending'}
                 />
               )}
               <PersonaBox
@@ -1023,7 +700,6 @@ export function CloudChatAccessPane({
                 onChange={handleStartNewChat}
                 open={personaBoxOpen}
                 onOpenChange={setPersonaBoxOpen}
-                disabled={reviewOutcome === 'pending'}
               />
             </div>
           </div>
@@ -1047,7 +723,6 @@ export function CloudChatAccessPane({
               onChange={handleStartNewChat}
               open={personaBoxOpen}
               onOpenChange={setPersonaBoxOpen}
-              disabled={reviewOutcome === 'pending'}
             />
           </div>
         )}
@@ -1064,8 +739,6 @@ export function CloudChatAccessPane({
               userId={requireCurrentUserId()}
               personaId={personaId}
               focusId="quick-ask"
-              gate3Track={true}
-              onDraftReady={handleDraftReady}
               onGenerating={setIsGenerating}
               collapsed={floor || dominant === 'cloudChat'}
               onExpand={floor ? onFloorExpand : reclaimChatAndPromote}
@@ -1353,31 +1026,6 @@ export function CloudChatAccessPane({
         />
       )}
 
-      {/* Gate3 review surfaces -- deliberately OUTSIDE the dominant
-          branches above, see this file's own header comment on why. */}
-      {reviewOutcome === 'blocked' && (
-        <p role="alert">{reviewMessage ?? t('navShell.cloudChatAccessPane.gate3BlockedFallback')}</p>
-      )}
-      {reviewOutcome === 'blocked' && reviewCeiling && personaId && (
-        <FocusSettingsControls
-          userId={requireCurrentUserId()}
-          personaId={personaId}
-          focusId="quick-ask"
-          mode="ceilingOnly"
-          suggestedMaxPermittedTier={externalAccessFromLegacyTier(reviewCeiling.targetTier)}
-          onSaved={() => {
-            setReviewCeiling(null)
-            if (pendingMessageId) handleDraftReady(pendingMessageId)
-          }}
-        />
-      )}
-      {reviewOutcome === 'withheld' && <p>{t('navShell.cloudChatAccessPane.gate3Withheld')}</p>}
-      <PrivacyGuardianModal
-        open={reviewOutcome === 'pending'}
-        payload={consentPayload}
-        onResolve={handleModalResolve}
-        onCancel={handleModalCancel}
-      />
       {openError && (
         <p role="alert">
           {t('navShell.cloudChatAccessPane.openError', { message: openError })}
