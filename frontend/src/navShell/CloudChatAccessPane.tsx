@@ -43,10 +43,12 @@
 // review invisible.
 //
 // items.id=233's outbound Privacy Guardian gate (PG_GATE_3,
-// conductor/privacy/gate3.rs) ahead of the rail appearing at all is
-// unchanged by this item -- see handleDraftReady/the consent_request
-// listener below, carried over from the prior selector-screen version of
-// this file.
+// conductor/privacy/gate3.rs) is unchanged by this item -- see
+// handleDraftReady/the consent_request listener below, carried over from
+// the prior selector-screen version of this file. items.id=501 slice 1
+// (decisions.id=846): the gate no longer controls entry -- the Cloud Chat
+// bar is always clickable and enters Cloud Chat directly, and an approved
+// review no longer brings Cloud Chat forward.
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -219,18 +221,6 @@ export function CloudChatAccessPane({
   // Section 2.1).
   const [personaBoxOpen, setPersonaBoxOpen] = useState(false)
 
-  // items.id=391: mirrors ChatPane's own lastAssistantMessage lookup --
-  // see ChatPane.tsx's onLastAssistantMessageChange doc comment for why
-  // it's pushed up (id AND gate3_review_status, not just the id) rather
-  // than duplicated here. Drives the chat toolbar's "2nd opinion" button:
-  // on-demand, real Gate3 review of the most recent response, without
-  // composing a new message. Reset on personaId change for the same
-  // reason activeChat is, just below.
-  const [lastAssistantMessage, setLastAssistantMessage] = useState<{
-    id: string
-    gate3_review_status: string | null
-  } | null>(null)
-
   // A chat belongs to exactly one Persona (decisions.id=741) -- if
   // personaId changes out from under this component (the Persona hub's
   // own Persona buttons still work independently of this pane, per
@@ -247,7 +237,6 @@ export function CloudChatAccessPane({
   // decisions.id=823 requires. See keepActiveChatForPersona.ts.
   useEffect(() => {
     setActiveChat((prev) => keepActiveChatForPersona(prev, personaId))
-    setLastAssistantMessage(null)
   }, [personaId])
 
   const {
@@ -371,7 +360,11 @@ export function CloudChatAccessPane({
     },
     [activate, onDominantRailChange, lastCopiedStarter, openProviderIds, t],
   )
-  const markCloudChatReadyAndPromote = useCallback(() => {
+  // items.id=501 slice 1 (decisions.id=846): the Cloud Chat bar's one action.
+  // Entering Cloud Chat needs no message, persona or review -- it is not
+  // driven by any Gate 3 outcome any more (the old auto-promote after an
+  // approved review is gone).
+  const enterCloudChat = useCallback(() => {
     onDominantRailChange('cloudChat')
     markCloudChatReady()
   }, [markCloudChatReady, onDominantRailChange])
@@ -413,58 +406,6 @@ export function CloudChatAccessPane({
   // messages.db row that triggered it. Stashed here from handleDraftReady
   // so handleModalResolve has the right id to pass to resolveCloudFrontierGate3Review.
   const [pendingMessageId, setPendingMessageId] = useState<string | null>(null)
-
-  // items.id=384 slice 4: the bridge between Gate3 review and dominance.
-  // Pre-merge, the rail was simply always visible once reviewOutcome
-  // reached 'approved' -- there was no separate "dominant" concept to
-  // update. Post-merge, Cloud Chat must actually BECOME dominant at that same
-  // moment (see useDominancePair.ts's own header comment for why
-  // markCloudChatReady is a distinct trigger from activate/reclaimChat, and
-  // why dominant is no longer purely derived from activeProviderId).
-  // Fires from both paths that can set reviewOutcome to 'approved'
-  // (handleDraftReady, handleModalResolve -- handleSecondOpinion below
-  // reuses handleDraftReady rather than setting reviewOutcome itself) via
-  // this one effect rather than duplicating the call at each site.
-  //
-  // BUG FOUND + FIXED (2026-09-01 live verification pass, items.id=384
-  // slice 7): the original version of this effect fired
-  // `if (reviewOutcome === 'approved')` unconditionally on every render,
-  // not just on the actual transition INTO 'approved' -- a LEVEL trigger
-  // where an EDGE trigger was needed. markCloudChatReady's own identity is
-  // unstable across renders (it closes over `setPair`, which is
-  // NavShell.tsx's `onUpdatePair` prop, itself a fresh closure on every
-  // NavShell render, never memoized) -- so this effect's dependency array
-  // never actually settles, and it re-ran on essentially every render
-  // while reviewOutcome stayed 'approved'. In practice this meant
-  // reclaimChat's own dominant:'chat' update got silently overwritten
-  // back to 'cloudChat' on the very next render, PERMANENTLY breaking the
-  // "click QR's collapsed floor to reclaim it" gesture for the rest of
-  // the session, the instant any draft had ever been approved once.
-  // Confirmed live: clicking the collapsed strip, its "Expand" label, and
-  // focusing its entry field all correctly triggered reclaimChat, and all
-  // three were silently reverted a moment later.
-  //
-  // Fix: track the PREVIOUS reviewOutcome in a ref and only call
-  // markCloudChatReady on an actual null/blocked/withheld -> 'approved'
-  // transition, matching what this effect was always meant to express
-  // ("Gate3 just cleared") rather than what it accidentally implemented
-  // ("Gate3 has cleared at some point and something else re-rendered").
-  // This makes the effect correct regardless of markCloudChatReady's own
-  // identity stability -- the deeper fix (memoizing onUpdatePair through
-  // the whole prop chain so callback identities stay stable) is a real,
-  // separate improvement flagged for its own pass, not applied here.
-  const prevReviewOutcomeRef = useRef<ReviewOutcome | null>(null)
-  useEffect(() => {
-    if (reviewOutcome === 'approved' && prevReviewOutcomeRef.current !== 'approved') {
-      // items.id=404: preserves pre-existing behavior -- pre-404, this
-      // pair.dominant flip would already force Board (if expanded) back
-      // to a bar next render via the old effectiveBoardSize guard. The
-      // 4-rail model needs the promotion made explicit since there's no
-      // such guard any more (dominantRail is set directly, not derived).
-      markCloudChatReadyAndPromote()
-    }
-    prevReviewOutcomeRef.current = reviewOutcome
-  }, [reviewOutcome, markCloudChatReadyAndPromote])
 
   const syncPaneLayout = useCallback(() => {
     const body = contentBodyRef.current
@@ -723,45 +664,6 @@ export function CloudChatAccessPane({
     [personaId, t],
   )
 
-  /** items.id=391: an on-demand real Gate3 review of the current
-   *  transcript's most recent response, without composing a new message.
-   *  Originally the mockup's "2nd opinion" chat-toolbar button; as of the
-   *  tenth pass ("three bars, one expanded" redesign) it's invoked from
-   *  CloudChatCollapsedStrip's always-visible bar instead (its 'reviewable'
-   *  empty state, WorkspaceShell.tsx/CloudChatCollapsedStrip.tsx) -- same
-   *  handler, new caller, the toolbar button itself is removed as
-   *  redundant with that bar.
-   *
-   *  BUG FOUND + FIXED (2026-09-02 live verification pass): the first
-   *  version of this handler called handleDraftReady unconditionally,
-   *  which just resends requestCloudFrontierGate3Review -- confirmed live this
-   *  hard-errors ("... is not awaiting gate3 review") the moment the last
-   *  message's status is already terminal, exactly the common case this
-   *  button exists for (a message approved before an earlier trip to
-   *  Board). Branches on the message's own gate3_review_status instead
-   *  (VALID_GATE3_REVIEW_STATUS, message_store.rs): 'approved' just needs
-   *  Cloud Chat dominant again, no new review request; 'withheld' was an
-   *  explicit privacy choice, not something to silently retry -- surfaces
-   *  the same "kept private" banner a real withheld outcome shows;
-   *  anything else (drafted, or a client-side "blocked" outcome, which
-   *  message_store.rs's own doc confirms leaves gate3_review_status at
-   *  'drafted' server-side) is a genuine not-yet-resolved case, so only
-   *  THAT path calls handleDraftReady -- the real first-review flow,
-   *  unchanged. */
-  const handleSecondOpinion = useCallback(() => {
-    if (!lastAssistantMessage) return
-    switch (lastAssistantMessage.gate3_review_status) {
-      case 'approved':
-        markCloudChatReadyAndPromote()
-        return
-      case 'withheld':
-        setReviewOutcome('withheld')
-        return
-      default:
-        handleDraftReady(lastAssistantMessage.id)
-    }
-  }, [lastAssistantMessage, handleDraftReady, markCloudChatReadyAndPromote])
-
   // Same cancelled/unlisten cleanup idiom as ChatPane's own first listen()
   // effect (run-status-update), per CLAUDE.md's "Tauri event listeners must
   // be explicitly detached on SPA view unmount."
@@ -859,8 +761,8 @@ export function CloudChatAccessPane({
   // scaffolding that used to live here (DIAG_329/items.id=329,
   // DIAG_356/items.id=356 -- devSeedTier3DraftMessage +
   // devBypassTier3Gate3Review) is REMOVED, not just hidden -- the chat
-  // toolbar's real "2nd opinion" button (below, handleSecondOpinion) now
-  // covers the same fast-iteration need through the real
+  // toolbar's on-demand review button (since removed, items.id=501 slice 1)
+  // covered the same fast-iteration need through the real
   // requestCloudFrontierGate3Review path, on the real last message, no synthetic
   // seed or gate3() bypass required. The Rust-side dev-only commands
   // themselves are untouched (out of scope here; a separate cleanup if
@@ -868,8 +770,8 @@ export function CloudChatAccessPane({
 
   // items.id=540: Cancel used to only reset local state, leaving the
   // message stuck at gate3_review_status='pending-review' server-side
-  // forever -- any retry (handleSecondOpinion's default arm, or resending)
-  // then hard-erred because requestCloudFrontierGate3Review only accepts
+  // forever -- any retry (the since-removed on-demand review button, or
+  // resending) then hard-erred because requestCloudFrontierGate3Review only accepts
   // 'drafted'. Reverts the message via cancelCloudFrontierGate3Review
   // first, same fire-and-forget-on-cleanup shape as handleModalResolve:
   // the modal closes and local state clears regardless of the call's
@@ -981,7 +883,6 @@ export function CloudChatAccessPane({
     if (startFresh && personaId) {
       resetGate3State()
       setActiveChat(createUnsentChat(personaId))
-      setLastAssistantMessage(null)
     }
     // resetGate3State only closes over stable state setters.
   }, [floor, isGenerating, personaId])
@@ -1036,17 +937,14 @@ export function CloudChatAccessPane({
   // user's default-view chat history.
   const chatContextKey = activeChat ? activeChat.context_key : `tier3-access-${personaId}`
 
-  // items.id=391 (tenth pass): drives CloudChatCollapsedStrip's own
-  // `emptyState` prop, consulted only when openProviderIds is empty --
-  // see that component's header comment for what each value means. This
-  // used to gate a separate chat-toolbar "2nd opinion" button (removed --
-  // the always-visible bar below now covers the same action).
-  const secondOpinionEmptyState: 'approved' | 'reviewable' | 'none' =
-    lastAssistantMessage?.gate3_review_status === 'approved'
-      ? 'approved'
-      : lastAssistantMessage
-        ? 'reviewable'
-        : 'none'
+  // items.id=501 slice 1: see the empty-persona body below.
+  const handleEmptyPersonaBodyActivate = () => {
+    if (dominant === 'cloudChat') {
+      reclaimChatAndPromote()
+    } else {
+      setPersonaBoxOpen(true)
+    }
+  }
 
   return (
     <div
@@ -1157,7 +1055,6 @@ export function CloudChatAccessPane({
               onGenerating={setIsGenerating}
               collapsed={floor || dominant === 'cloudChat'}
               onExpand={floor ? onFloorExpand : reclaimChatAndPromote}
-              onLastAssistantMessageChange={setLastAssistantMessage}
               onCopyStarter={(messageId, content, starterPersonaId) =>
                 setLastCopiedStarter({ messageId, content, personaId: starterPersonaId })
               }
@@ -1252,17 +1149,23 @@ export function CloudChatAccessPane({
             // disabled input/send button below) -- same role="button" +
             // tabIndex + matching onKeyDown convention as PrivacyGuardianModal.tsx's
             // PgCell, for the same reason.
+            //
+            // items.id=501 slice 1: while Cloud Chat is the expanded region
+            // this body is QR's collapsed row and no PersonaBox is rendered
+            // (its header only shows while Chat is dominant), so a click
+            // brings QR chat forward instead -- otherwise a user who entered
+            // Cloud Chat with no Persona could not get back to QR chat.
             <div
               className="chat-pane"
               data-empty-persona-body=""
               role="button"
               tabIndex={0}
               aria-label={t('navShell.personaBox.popoverTitleChoose')}
-              onClick={() => setPersonaBoxOpen(true)}
+              onClick={handleEmptyPersonaBodyActivate}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' || e.key === ' ') {
                   e.preventDefault()
-                  setPersonaBoxOpen(true)
+                  handleEmptyPersonaBodyActivate()
                 }
               }}
             >
@@ -1306,7 +1209,8 @@ export function CloudChatAccessPane({
           (!floor && dominant === 'cloudChat'); every other combination
           (floor, or dominant === 'chat') renders CloudChatCollapsedStrip
           instead, unconditionally -- Jason's own framing for this pass:
-          "a second opinion bar always visible." No redundant "back to
+          "a Cloud Chat bar always visible" (originally worded "second
+          opinion"; renamed per decisions.id=811). No redundant "back to
           Board" button here any more either -- WorkspaceShell's own
           board-bar already covers that whenever Board isn't expanded,
           which is exactly whenever Cloud Chat CAN be the expanded region. */}
@@ -1314,7 +1218,7 @@ export function CloudChatAccessPane({
         <>
           {/* items.id=391 (eleventh pass): promoted out of the rail
               column's own <h3> -- confirmed live (Jason): "the QR chat
-              and second opinion need consistent headers... expanded
+              and Cloud Chat need consistent headers... expanded
               partially or fully." A heading buried inside the narrow
               220px rail column couldn't visually match QR's own
               full-width header bar no matter how it was styled; this bar
@@ -1353,11 +1257,11 @@ export function CloudChatAccessPane({
               // dominant is the right signal: this whole block is already
               // inside the dominant === 'cloudChat' branch (see below), so this
               // check is really just making explicit what's already true --
-              // dominant only ever becomes 'cloudChat' downstream of Gate3
-              // having cleared at least once (markCloudChatReady/activate), the
-              // same fact reviewOutcome === 'approved' used to capture, but
-              // via a field that actually survives the remount reviewOutcome
-              // doesn't.
+              // dominant becomes 'cloudChat' when the user enters Cloud Chat
+              // (the bar, enterCloudChat) or activates a provider -- since
+              // items.id=501 slice 1 no Gate3 outcome is involved. It lives
+              // in NavState, so it survives the remount that local state
+              // such as reviewOutcome doesn't.
               <CloudChatSelector
                 providers={providers}
                 openPaneIds={openProviderIds}
@@ -1433,10 +1337,7 @@ export function CloudChatAccessPane({
           openProviderIds={openProviderIds}
           activeProviderId={activeProviderId}
           onExpand={activateAndPromote}
-          emptyState={secondOpinionEmptyState}
-          onExpandRail={markCloudChatReadyAndPromote}
-          onReview={handleSecondOpinion}
-          reviewDisabled={reviewOutcome === 'pending'}
+          onExpandRail={enterCloudChat}
         />
       )}
 

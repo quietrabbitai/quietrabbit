@@ -44,21 +44,6 @@ export interface ChatPaneProps {
    *  whichever provider was active back to loaded (decisions.id=731's
    *  symmetric transition). Ignored when collapsed is false/omitted. */
   onExpand?: () => void
-  /** items.id=391: fires whenever the latest assistant message changes
-   *  (including to null, on mount/contextKey change before any messages
-   *  have loaded, or for a transcript with no assistant turns yet) --
-   *  lets the caller (CloudChatAccessPane's chat toolbar) offer an on-demand
-   *  "2nd opinion" action against the real last response, reusing this
-   *  component's own existing lastAssistantMessage lookup rather than
-   *  duplicating message-list tracking one level up. Carries
-   *  gate3_review_status alongside the id -- confirmed live (Jason,
-   *  2026-09-02): requestCloudFrontierGate3Review hard-rejects a message whose
-   *  status is already terminal ("not awaiting gate3 review"), so the
-   *  caller needs the status to decide whether "2nd opinion" should
-   *  re-request review at all, not just which id to send. */
-  onLastAssistantMessageChange?: (
-    message: { id: string; gate3_review_status: string | null } | null,
-  ) => void
   /** items.id=406 (decisions.id=755): fires on every "Copy starter" click,
    *  after the clipboard write -- lets the caller (CloudChatAccessPane) record
    *  which message/text was last copied, for the provider-selection
@@ -206,7 +191,6 @@ export function ChatPane({
   onDraftReady,
   collapsed = false,
   onExpand,
-  onLastAssistantMessageChange,
   onCopyStarter,
 }: ChatPaneProps) {
   const { t } = useTranslation()
@@ -823,20 +807,6 @@ export function ChatPane({
   // liveMessageId already drives for the full transcript, so a
   // still-streaming response shows up here too, not just a finished one.
   const lastAssistantMessage = [...messages].reverse().find((m) => m.sender === 'assistant')
-
-  const lastAssistantMessageId = lastAssistantMessage?.id ?? null
-  const lastAssistantMessageReviewStatus = lastAssistantMessage?.gate3_review_status ?? null
-  useEffect(() => {
-    onLastAssistantMessageChange?.(
-      lastAssistantMessageId === null
-        ? null
-        : { id: lastAssistantMessageId, gate3_review_status: lastAssistantMessageReviewStatus },
-    )
-  }, [
-    lastAssistantMessageId,
-    lastAssistantMessageReviewStatus,
-    onLastAssistantMessageChange,
-  ])
 
   const lastAssistantSnippet = lastAssistantMessage
     ? lastAssistantMessage.id === liveMessageId && liveContent

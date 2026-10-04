@@ -157,18 +157,15 @@
     },
     "cloudChatCollapsedStrip": {
       "expandLabel": "Tap to view",
-      "extraCount": "+{{count}} more loaded",
-      "readyLabel": "Second opinion ready",
-      "emptyLabel": "No second opinion yet"
+      "extraCount": "+{{count}} more loaded"
     },
     "cloudChatAccessPane": {
-      "secondOpinionButton": "2nd opinion",
-      "heading": "Second opinion",
+      "heading": "Cloud Chat",
       "qrBannerName": "Quiet Rabbit — this conversation",
       "loadingProviders": "Loading providers…",
       "providerError": "Could not load providers: {{message}}",
       "openError": "Could not open pane(s): {{message}}",
-      "contentEmptyPrompt": "Select a provider to start a second opinion.",
+      "contentEmptyPrompt": "Select a provider to start a Cloud Chat.",
       "contentCloseButton": "Close this session",
       "contentHeadReclaimTitle": "Click to collapse Cloud Chat and bring QR chat forward",
       "gate3BlockedFallback": "This content can't be shared with Cloud Chat right now.",
@@ -216,7 +213,7 @@
     "rememberForPersona": "Remember this decision"
   },
   "cloudChatSelector": {
-    "railLabel": "Second opinion providers",
+    "railLabel": "Cloud Chat providers",
     "rowState": {
       "idle": "Not loaded",
       "loaded": "Loaded — tap to view",

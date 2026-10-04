@@ -31,7 +31,9 @@
 // has clicked anything; or after closing whichever pane was active) --
 // exactly the cases the pre-merge design deliberately kept the rail
 // visible for. The four real triggers for a dominant change are:
-//   - Gate3 approves a draft for the first time this "round" -> markCloudChatReady()
+//   - the user clicks the Cloud Chat bar -> markCloudChatReady() (items.id=501
+//     slice 1: entry needs no message, persona or review; it used to fire
+//     when Gate3 first approved a draft this "round")
 //   - activate(providerId) -> 'cloudChat' (redundant with the above in
 //     practice, set directly anyway rather than relying on ordering)
 //   - reclaimChat() -> 'chat' (the only user-driven path back to chat)
@@ -44,9 +46,9 @@
 // stays local to CloudChatAccessPane, entirely untouched by this extraction --
 // it's per-in-flight-message state, not part of "which side is dominant."
 // markCloudChatReady() is the one narrow exception: CloudChatAccessPane calls it
-// from an effect watching reviewOutcome, but this hook still has no idea
-// what Gate3 review even is -- it just exposes a plain "make cloudChat
-// dominant" action, same shape as reclaimChat's "make chat dominant."
+// from the bar's click handler, and this hook has no idea what Gate3
+// review even is -- it just exposes a plain "make cloudChat dominant"
+// action, same shape as reclaimChat's "make chat dominant."
 
 import { useCallback, useState } from 'react'
 import { commands } from '../bindings'
@@ -83,10 +85,9 @@ export interface DominancePairHandle {
    *  handleExpandQR. */
   reclaimChat: () => void
   /** Makes Cloud Chat dominant without activating any specific provider --
-   *  the "Gate3 just approved a draft" trigger. A no-op (same object
-   *  reference, no re-render) if already dominant, so CloudChatAccessPane's
-   *  effect can call this every time reviewOutcome is 'approved' without
-   *  worrying about redundant updates. */
+   *  the Cloud Chat bar's entry action (items.id=501 slice 1; it used to
+   *  be the "Gate3 just approved a draft" trigger). A no-op (same object
+   *  reference, no re-render) if already dominant. */
   markCloudChatReady: () => void
 }
 

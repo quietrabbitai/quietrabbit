@@ -15,28 +15,16 @@
 // doesn't exist, not reflecting real state.
 //
 // items.id=391 (Jason, 2026-09-02, tenth pass -- the "three bars, one
-// expanded" redesign): this used to return null whenever no provider pane
-// was open and no draft had been Gate3-approved yet, and only otherwise
-// showed a generic "second opinion ready" bar with no way to actually
-// START a review. Both gaps close here: this bar is now ALWAYS rendered
-// whenever Cloud Chat isn't the expanded region (never null), one row among
-// the three peer bars (Board / Chat / Second opinion) WorkspaceShell.tsx
-// and CloudChatAccessPane.tsx stack together -- Jason's own framing: "a second
-// opinion bar always visible." CloudChatAccessPane now derives which of three
-// states applies whenever openProviderIds is empty (no provider pane open
-// this round):
-//   'approved'   -- a draft already cleared Gate3, waiting on the rail.
-//                   onExpandRail (markCloudChatReady) brings the rail back,
-//                   same as before this pass.
-//   'reviewable' -- there's a real last assistant response that hasn't
-//                   been sent through Gate3 review yet. onReview starts
-//                   that review -- this replaces the old chat-toolbar "2nd
-//                   opinion" button (removed, CloudChatAccessPane.tsx), which
-//                   is now redundant with this always-visible bar doing
-//                   the same job.
-//   'none'       -- no assistant response at all yet. Genuinely nothing to
-//                   act on -- rendered as a plain, non-interactive row
-//                   rather than a dead-feeling button.
+// expanded" redesign): this bar is ALWAYS rendered whenever Cloud Chat isn't
+// the expanded region (never null), one row among the three peer bars
+// (Board / Chat / Cloud Chat) WorkspaceShell.tsx and CloudChatAccessPane.tsx
+// stack together.
+//
+// items.id=501 slice 1 (decisions.id=846, 811): it is also ALWAYS CLICKABLE
+// and named "Cloud Chat". With no provider pane open, a click enters Cloud
+// Chat directly (onExpandRail: the provider list, nothing sent) -- no
+// message, persona or review is needed. The old "Second opinion ready" /
+// "No second opinion yet" states and the review-on-click branch are gone.
 
 import { useTranslation } from 'react-i18next'
 import type { Provider } from '../cloudChatAccess/cloudChatAccessConfig'
@@ -50,20 +38,9 @@ export interface CloudChatCollapsedStripProps {
    *  loaded provider if none was ever activated this session. */
   activeProviderId: string | null
   onExpand: (providerId: string) => void
-  /** Only consulted when openProviderIds is empty -- see this file's
-   *  header comment for what each value means. */
-  emptyState: 'approved' | 'reviewable' | 'none'
-  /** Fires when clicked in the 'approved' empty state -- brings back the
-   *  rail itself (markCloudChatReady), not a specific provider. */
+  /** Fires on click when no provider pane is open -- enters Cloud Chat
+   *  (CloudChatAccessPane's enterCloudChat), not a specific provider. */
   onExpandRail: () => void
-  /** Fires when clicked in the 'reviewable' empty state -- starts a real
-   *  Gate3 review of the current last response (CloudChatAccessPane's
-   *  handleSecondOpinion). */
-  onReview: () => void
-  /** True while a Gate3 review is already in flight (reviewOutcome ===
-   *  'pending') -- disables the 'reviewable' bar for the same reason the
-   *  old toolbar button used to disable itself in that state. */
-  reviewDisabled?: boolean
 }
 
 export function CloudChatCollapsedStrip({
@@ -71,48 +48,15 @@ export function CloudChatCollapsedStrip({
   openProviderIds,
   activeProviderId,
   onExpand,
-  emptyState,
   onExpandRail,
-  onReview,
-  reviewDisabled = false,
 }: CloudChatCollapsedStripProps) {
   const { t } = useTranslation()
 
   if (openProviderIds.length === 0) {
-    if (emptyState === 'none') {
-      return (
-        <div className="cloud-chat-collapsed-strip cloud-chat-collapsed-strip--empty">
-          <span className="cloud-chat-collapsed-strip__name">
-            {t('navShell.cloudChatCollapsedStrip.emptyLabel')}
-          </span>
-        </div>
-      )
-    }
-    if (emptyState === 'approved') {
-      return (
-        <button
-          type="button"
-          className="cloud-chat-collapsed-strip"
-          onClick={() => onExpandRail()}
-        >
-          <span className="cloud-chat-collapsed-strip__name">
-            {t('navShell.cloudChatCollapsedStrip.readyLabel')}
-          </span>
-          <span className="cloud-chat-collapsed-strip__expand">
-            {t('navShell.cloudChatCollapsedStrip.expandLabel')}
-          </span>
-        </button>
-      )
-    }
     return (
-      <button
-        type="button"
-        className="cloud-chat-collapsed-strip"
-        onClick={() => onReview()}
-        disabled={reviewDisabled}
-      >
+      <button type="button" className="cloud-chat-collapsed-strip" onClick={() => onExpandRail()}>
         <span className="cloud-chat-collapsed-strip__name">
-          {t('navShell.cloudChatAccessPane.secondOpinionButton')}
+          {t('navShell.cloudChatAccessPane.heading')}
         </span>
         <span className="cloud-chat-collapsed-strip__expand">
           {t('navShell.cloudChatCollapsedStrip.expandLabel')}

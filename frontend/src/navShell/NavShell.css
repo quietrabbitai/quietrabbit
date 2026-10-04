@@ -136,7 +136,7 @@
  * the shared "expanded region header" bar -- ONE class, used by every
  * region's own full-content header, not just QR's: QR's own title+
  * History+persona-picker row (CloudChatAccessPane.tsx, below .qr), Cloud Chat's
- * own "Second opinion" title row (same file, above .split-area), AND
+ * own "Cloud Chat" title row (same file, above .split-area), AND
  * Board's own "Active Board"+density-toggle row (WorkspaceShell.tsx,
  * which imports this stylesheet for exactly this class). Confirmed live
  * (Jason, two rounds): first, that QR's banner and the other two bars
@@ -145,8 +145,8 @@
  * not a shared class, since collapsed bars are standalone clickable rows
  * while this is a static header sitting above real content); second,
  * that "the active bar needs a header when it's fully expanded and the
- * QR chat and second opinion need consistent headers when they are
- * expanded partially or fully" -- i.e. the EXPANDED-state headers needed
+ * QR chat and second opinion [now Cloud Chat, decisions.id=811] need
+ * consistent headers when they are expanded partially or fully" -- i.e. the EXPANDED-state headers needed
  * to match EACH OTHER too, not just match the collapsed bars. A literal
  * shared class (this rule) is what actually guarantees that for the
  * expanded case, the way importing CloudChatCollapsedStrip.css directly
