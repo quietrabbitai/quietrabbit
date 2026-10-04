@@ -19,7 +19,6 @@ function msg(overrides: Partial<MessageInfo>): MessageInfo {
     sender: 'user',
     content: '',
     focus_run_id: null,
-    gate3_review_status: null,
     created_at: '2026-08-09T00:00:00Z',
     is_error: false,
     ...overrides,

@@ -71,7 +71,6 @@ pub struct MessageInfo {
     pub sender: String,
     pub content: String,
     pub focus_run_id: Option<String>,
-    pub gate3_review_status: Option<String>,
     pub created_at: String,
     /// items.id=587/501: a plain-language failure message (never a real
     /// model reply). The UI must not offer it for copy.
@@ -113,7 +112,6 @@ fn to_message_info(r: message_store::MessageRecord) -> MessageInfo {
         sender: r.sender,
         content: r.content,
         focus_run_id: r.focus_run_id,
-        gate3_review_status: r.gate3_review_status,
         created_at: r.created_at,
         is_error: r.is_error,
     }
@@ -529,7 +527,6 @@ pub async fn send_message(
         "user",
         &content,
         None,
-        None,
     )
     .await
     .map_err(|e| e.to_string())?;
@@ -588,7 +585,6 @@ pub async fn send_message(
         "assistant",
         "",
         Some(&run_id),
-        None,
     )
     .await
     .map_err(|e| e.to_string())?;
@@ -651,9 +647,7 @@ mod tests {
             sender: sender.to_owned(),
             content: content.to_owned(),
             focus_run_id: None,
-            gate3_review_status: None,
             created_at: "2026-08-09T00:00:00Z".to_owned(),
-            reviewed_at_risk_rating: None,
             is_error: false,
         }
     }
@@ -913,7 +907,6 @@ mod tests {
             "user",
             "hello",
             None,
-            None,
         )
         .await
         .expect("save_message must succeed");
@@ -987,7 +980,6 @@ mod tests {
             "user",
             "hi",
             None,
-            None,
         )
         .await
         .expect("save_message (user) must succeed");
@@ -999,7 +991,6 @@ mod tests {
             "assistant",
             "",
             Some("run-fail-1"),
-            None,
         )
         .await
         .expect("save_message (assistant placeholder) must succeed");
@@ -1050,7 +1041,6 @@ mod tests {
             "user",
             "first message",
             None,
-            None,
         )
         .await
         .expect("save_message (user) must succeed");
@@ -1062,7 +1052,6 @@ mod tests {
             "assistant",
             "",
             Some("run-ok-1"),
-            None,
         )
         .await
         .expect("save_message (assistant placeholder) must succeed");
@@ -1099,7 +1088,6 @@ mod tests {
             "user",
             "first message",
             None,
-            None,
         )
         .await
         .expect("save_message (user 1) must succeed");
@@ -1111,7 +1099,6 @@ mod tests {
             "assistant",
             "",
             Some("run-a"),
-            None,
         )
         .await
         .expect("save_message (assistant placeholder 1) must succeed");
@@ -1141,7 +1128,6 @@ mod tests {
             "user",
             "second message",
             None,
-            None,
         )
         .await
         .expect("save_message (user 2) must succeed");
@@ -1153,7 +1139,6 @@ mod tests {
             "assistant",
             "",
             Some("run-b"),
-            None,
         )
         .await
         .expect("save_message (assistant placeholder 2) must succeed");
@@ -1219,14 +1204,11 @@ mod tests {
             sender: "assistant".to_owned(),
             content: "drafted text".to_owned(),
             focus_run_id: Some("run-1".to_owned()),
-            gate3_review_status: Some("drafted".to_owned()),
             created_at: "2026-08-09T00:00:00Z".to_owned(),
-            reviewed_at_risk_rating: None,
             is_error: false,
         };
         let info = to_message_info(record);
         assert_eq!(info.id, "id-1");
         assert_eq!(info.focus_run_id.as_deref(), Some("run-1"));
-        assert_eq!(info.gate3_review_status.as_deref(), Some("drafted"));
     }
 }

@@ -719,9 +719,8 @@ const CLOUD_FRONTIER_DRAFT_FOCUS_ID: &str = "quick-ask";
 /// it does NOT re-run this command (a re-run mints a new key, so the
 /// decisions would not be found and the user would be asked again).
 ///
-/// This command intentionally does NOT touch messages.gate3_review_status
-/// or messages.reviewed_at_risk_rating -- a copy-triggered review is a
-/// fresh, ephemeral check with no message row of its own to update.
+/// A copy-triggered review is a fresh, ephemeral check with no message row of
+/// its own to update.
 #[tauri::command]
 #[specta::specta]
 pub async fn request_chat_copy_gate3_review(

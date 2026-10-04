@@ -228,9 +228,8 @@ export const commands = {
 	 *  it does NOT re-run this command (a re-run mints a new key, so the
 	 *  decisions would not be found and the user would be asked again).
 	 * 
-	 *  This command intentionally does NOT touch messages.gate3_review_status
-	 *  or messages.reviewed_at_risk_rating -- a copy-triggered review is a
-	 *  fresh, ephemeral check with no message row of its own to update.
+	 *  A copy-triggered review is a fresh, ephemeral check with no message row of
+	 *  its own to update.
 	 */
 	requestChatCopyGate3Review: (request: RequestChatCopyGate3ReviewRequest) => typedError<Gate3ReviewResult, string>(__TAURI_INVOKE("request_chat_copy_gate3_review", { request })),
 	/**
@@ -1120,7 +1119,6 @@ export type MessageInfo = {
 	sender: string,
 	content: string,
 	focus_run_id: string | null,
-	gate3_review_status: string | null,
 	created_at: string,
 	/**
 	 *  items.id=587/501: a plain-language failure message (never a real

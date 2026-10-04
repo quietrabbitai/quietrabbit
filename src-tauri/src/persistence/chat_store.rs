@@ -518,7 +518,6 @@ mod tests {
             "user",
             "hello",
             None,
-            None,
         )
         .await
         .expect("save_message must succeed");

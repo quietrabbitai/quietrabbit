@@ -23,7 +23,6 @@ use thiserror::Error;
 // ---------------------------------------------------------------------------
 
 const VALID_SENDER: &[&str] = &["user", "assistant"];
-const VALID_GATE3_REVIEW_STATUS: &[&str] = &["drafted", "pending-review", "approved", "withheld"];
 
 // ---------------------------------------------------------------------------
 // MessageRecord
@@ -36,13 +35,7 @@ pub struct MessageRecord {
     pub sender: String,
     pub content: String,
     pub focus_run_id: Option<String>,
-    pub gate3_review_status: Option<String>,
     pub created_at: String,
-    /// items.id=406 (decisions.id=755): the destination risk rating this
-    /// message's cloud_frontier approval was scored against -- None until the
-    /// approval write path (retired in items.id=501 slice 3) populated it, and
-    /// for every message that predates messages_003.sql.
-    pub reviewed_at_risk_rating: Option<i64>,
     /// items.id=587 (messages_004.sql): true for a placeholder backfilled
     /// with a plain-language failure message rather than a real reply --
     /// build_conversation_prompt (commands/messages.rs) skips these, the
@@ -155,9 +148,7 @@ fn row_to_message_record(r: &sqlx::sqlite::SqliteRow) -> Result<MessageRecord, s
         sender: r.try_get("sender")?,
         content: r.try_get("content")?,
         focus_run_id: r.try_get("focus_run_id")?,
-        gate3_review_status: r.try_get("gate3_review_status")?,
         created_at: r.try_get("created_at")?,
-        reviewed_at_risk_rating: r.try_get("reviewed_at_risk_rating")?,
         is_error: r.try_get::<i64, _>("is_error")? != 0,
     })
 }
@@ -177,7 +168,6 @@ pub async fn save_message(
     sender: &str,
     content: &str,
     focus_run_id: Option<&str>,
-    gate3_review_status: Option<&str>,
 ) -> Result<MessageRecord, MessageStoreError> {
     if !VALID_SENDER.contains(&sender) {
         return Err(MessageStoreError::Validation(format!(
@@ -186,31 +176,20 @@ pub async fn save_message(
             VALID_SENDER.join(", ")
         )));
     }
-    if let Some(status) = gate3_review_status {
-        if !VALID_GATE3_REVIEW_STATUS.contains(&status) {
-            return Err(MessageStoreError::Validation(format!(
-                "Invalid gate3_review_status '{}'. Must be one of: {}",
-                status,
-                VALID_GATE3_REVIEW_STATUS.join(", ")
-            )));
-        }
-    }
-
     let id = uuid::Uuid::new_v4().to_string();
     let timestamp = crate::providers::utils::now();
     let mut conn = open_messages_db(user_id, persona_id, key_hex).await?;
 
     sqlx::query(
         "INSERT INTO messages
-         (id, context_key, sender, content, focus_run_id, gate3_review_status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+         (id, context_key, sender, content, focus_run_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(context_key)
     .bind(sender)
     .bind(content)
     .bind(focus_run_id)
-    .bind(gate3_review_status)
     .bind(&timestamp)
     .execute(&mut conn)
     .await?;
@@ -221,9 +200,7 @@ pub async fn save_message(
         sender: sender.to_owned(),
         content: content.to_owned(),
         focus_run_id: focus_run_id.map(|s| s.to_owned()),
-        gate3_review_status: gate3_review_status.map(|s| s.to_owned()),
         created_at: timestamp,
-        reviewed_at_risk_rating: None,
         is_error: false,
     })
 }
@@ -244,7 +221,7 @@ pub async fn list_messages(
     let mut conn = open_messages_db(user_id, persona_id, key_hex).await?;
 
     let rows = sqlx::query(
-        "SELECT id, context_key, sender, content, focus_run_id, gate3_review_status, created_at, reviewed_at_risk_rating, is_error
+        "SELECT id, context_key, sender, content, focus_run_id, created_at, is_error
          FROM messages
          WHERE context_key = ?
          ORDER BY created_at ASC",
@@ -260,8 +237,8 @@ pub async fn list_messages(
     Ok(out)
 }
 
-/// Fetch a single message by id — the read a gate3-review command needs
-/// before mutating gate3_review_status. Returns None if not found (an
+/// Fetch a single message by id — the read a command needs
+/// before mutating it. Returns None if not found (an
 /// Option return, not a NotFound error variant, since "not found" is a
 /// normal caller-checkable condition here, matching
 /// focus_settings_store::get_focus_settings's own shape).
@@ -274,7 +251,7 @@ pub async fn get_message(
     let mut conn = open_messages_db(user_id, persona_id, key_hex).await?;
 
     let row = sqlx::query(
-        "SELECT id, context_key, sender, content, focus_run_id, gate3_review_status, created_at, reviewed_at_risk_rating, is_error
+        "SELECT id, context_key, sender, content, focus_run_id, created_at, is_error
          FROM messages
          WHERE id = ?",
     )
@@ -311,7 +288,7 @@ pub async fn find_assistant_message_by_focus_run_id(
     let mut conn = open_messages_db(user_id, persona_id, key_hex).await?;
 
     let row = sqlx::query(
-        "SELECT id, context_key, sender, content, focus_run_id, gate3_review_status, created_at, reviewed_at_risk_rating, is_error
+        "SELECT id, context_key, sender, content, focus_run_id, created_at, is_error
          FROM messages
          WHERE focus_run_id = ? AND sender = 'assistant'",
     )
@@ -366,6 +343,7 @@ mod tests {
     use super::*;
     use crate::persistence::migrations::parse_statements;
     use sqlx::sqlite::SqliteConnectOptions;
+    use sqlx::Connection;
 
     const MESSAGES_SCHEMA: &str = include_str!("../../schema/messages_001.sql");
     // items.id=406: reviewed_at_risk_rating is added in messages_003.sql --
@@ -376,6 +354,9 @@ mod tests {
     // items.id=587: is_error -- row_to_message_record now reads this column
     // unconditionally, so this in-memory test DB must apply it too.
     const MESSAGES_SCHEMA_V4: &str = include_str!("../../schema/messages_004.sql");
+    // items.id=501 slice 3: drops gate3_review_status/reviewed_at_risk_rating,
+    // which row_to_message_record no longer reads.
+    const MESSAGES_SCHEMA_V5: &str = include_str!("../../schema/messages_005.sql");
 
     async fn test_db() -> SqliteConnection {
         let mut conn = SqliteConnectOptions::new()
@@ -388,6 +369,7 @@ mod tests {
             .chain(parse_statements(MESSAGES_SCHEMA_V2))
             .chain(parse_statements(MESSAGES_SCHEMA_V3))
             .chain(parse_statements(MESSAGES_SCHEMA_V4))
+            .chain(parse_statements(MESSAGES_SCHEMA_V5))
         {
             sqlx::query(&stmt)
                 .execute(&mut conn)
@@ -423,31 +405,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn schema_accepts_a_full_row_including_gate3_review_status() {
-        let mut conn = test_db().await;
-        let id = uuid::Uuid::new_v4().to_string();
-
-        sqlx::query(
-            "INSERT INTO messages
-             (id, context_key, sender, content, focus_run_id, gate3_review_status, created_at)
-             VALUES (?, 'tier3-access-persona-1', 'assistant', 'draft text',
-                     'run-1', 'drafted', '2026-08-09T00:00:00Z')",
-        )
-        .bind(&id)
-        .execute(&mut conn)
-        .await
-        .expect("full row insert must succeed");
-
-        let row = sqlx::query("SELECT gate3_review_status FROM messages WHERE id = ?")
-            .bind(&id)
-            .fetch_one(&mut conn)
-            .await
-            .expect("query failed");
-        let status: Option<String> = row.try_get("gate3_review_status").unwrap();
-        assert_eq!(status.as_deref(), Some("drafted"));
-    }
-
-    #[tokio::test]
     async fn schema_rejects_invalid_sender() {
         let mut conn = test_db().await;
 
@@ -465,46 +422,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn schema_rejects_invalid_gate3_review_status() {
-        let mut conn = test_db().await;
-
-        let result = sqlx::query(
-            "INSERT INTO messages (id, context_key, sender, content, gate3_review_status, created_at)
-             VALUES ('id-1', 'ctx-1', 'assistant', 'hi', 'not_a_real_status', 'now')",
-        )
-        .execute(&mut conn)
-        .await;
-
-        assert!(
-            result.is_err(),
-            "CHECK constraint must reject an unrecognized gate3_review_status value"
-        );
-    }
-
-    #[tokio::test]
-    async fn schema_accepts_null_gate3_review_status_for_persona_hub_messages() {
-        let mut conn = test_db().await;
-
-        let result = sqlx::query(
-            "INSERT INTO messages (id, context_key, sender, content, created_at)
-             VALUES ('id-1', 'persona-hub-persona-1', 'user', 'hi', 'now')",
-        )
-        .execute(&mut conn)
-        .await;
-
-        assert!(
-            result.is_ok(),
-            "gate3_review_status must be nullable for persona-hub messages"
-        );
-    }
-
-    #[tokio::test]
     async fn row_to_message_record_maps_every_column() {
         let mut conn = test_db().await;
         let id = seed_message(&mut conn, "ctx-1", "user", "hello", "2026-08-09T00:00:00Z").await;
 
         let row = sqlx::query(
-            "SELECT id, context_key, sender, content, focus_run_id, gate3_review_status, created_at, reviewed_at_risk_rating, is_error
+            "SELECT id, context_key, sender, content, focus_run_id, created_at, is_error
              FROM messages WHERE id = ?",
         )
         .bind(&id)
@@ -518,9 +441,7 @@ mod tests {
         assert_eq!(record.sender, "user");
         assert_eq!(record.content, "hello");
         assert_eq!(record.focus_run_id, None);
-        assert_eq!(record.gate3_review_status, None);
         assert_eq!(record.created_at, "2026-08-09T00:00:00Z");
-        assert_eq!(record.reviewed_at_risk_rating, None);
         assert!(
             !record.is_error,
             "a freshly seeded row must default is_error to false"
@@ -587,7 +508,6 @@ mod tests {
             "user",
             "hello there",
             None,
-            None,
         )
         .await
         .expect("save_message (user turn) must succeed");
@@ -600,7 +520,6 @@ mod tests {
             "assistant",
             "hi, how can I help?",
             Some("run-1"),
-            None,
         )
         .await
         .expect("save_message (assistant turn) must succeed");
@@ -612,7 +531,6 @@ mod tests {
         assert_eq!(transcript.len(), 2);
         assert_eq!(transcript[0].sender, "user");
         assert_eq!(transcript[0].content, "hello there");
-        assert_eq!(transcript[0].gate3_review_status, None);
         assert_eq!(transcript[1].sender, "assistant");
         assert_eq!(transcript[1].focus_run_id.as_deref(), Some("run-1"));
     }
@@ -629,7 +547,6 @@ mod tests {
             "user",
             "persona hub message",
             None,
-            None,
         )
         .await
         .expect("save_message must succeed");
@@ -641,7 +558,6 @@ mod tests {
             "tier3-access-persona-1",
             "user",
             "tier3 message",
-            None,
             None,
         )
         .await
@@ -674,7 +590,6 @@ mod tests {
             "assistant",
             "drafted starter text",
             Some("run-1"),
-            Some("drafted"),
         )
         .await
         .expect("save_message must succeed");
@@ -687,7 +602,6 @@ mod tests {
         assert_eq!(fetched.id, record.id);
         assert_eq!(fetched.content, "drafted starter text");
         assert_eq!(fetched.focus_run_id.as_deref(), Some("run-1"));
-        assert_eq!(fetched.gate3_review_status.as_deref(), Some("drafted"));
     }
 
     #[tokio::test]
@@ -712,7 +626,6 @@ mod tests {
             "ctx-1",
             "not_a_real_sender",
             "hi",
-            None,
             None,
         )
         .await;
@@ -788,6 +701,217 @@ mod tests {
             None => std::env::remove_var("QR_DATA_ROOT"),
         }
         drop(lock);
+    }
+
+    /// Column names of the messages table, via pragma_table_info.
+    async fn messages_columns(conn: &mut SqliteConnection) -> Vec<String> {
+        sqlx::query_scalar::<_, String>("SELECT name FROM pragma_table_info('messages')")
+            .fetch_all(conn)
+            .await
+            .expect("pragma_table_info must succeed")
+    }
+
+    async fn messages_applied_versions(conn: &mut SqliteConnection) -> Vec<i64> {
+        sqlx::query_scalar::<_, i64>("SELECT version FROM schema_version ORDER BY version")
+            .fetch_all(conn)
+            .await
+            .expect("schema_version must be readable")
+    }
+
+    /// items.id=501 slice 3: messages_005.sql drops gate3_review_status and
+    /// reviewed_at_risk_rating (and their column-level CHECKs). Builds a
+    /// real v4-format SQLCipher file -- one row per old status, with risk
+    /// ratings, chat_id and is_error populated -- then lets open_messages_db
+    /// run the real migration and checks every surviving column, the index
+    /// and a fresh write. Same stale-fixture technique as
+    /// open_messages_db_heals_a_pre_existing_v1_only_database, and it runs on
+    /// the real SQLCipher linkage, so it also proves DROP COLUMN works there.
+    #[tokio::test]
+    async fn messages_005_drops_review_columns_and_preserves_every_old_row() {
+        let lock = ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "user-005-test";
+        let persona_id = "persona-005-test";
+        let db_path = get_messages_db_path(user_id, persona_id);
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+
+        // (id, status, risk) -- every value the old CHECK allowed, plus NULL.
+        let old_rows: [(&str, Option<&str>, Option<i64>); 5] = [
+            ("m-null", None, None),
+            ("m-drafted", Some("drafted"), None),
+            ("m-pending", Some("pending-review"), Some(2)),
+            ("m-approved", Some("approved"), Some(3)),
+            ("m-withheld", Some("withheld"), Some(1)),
+        ];
+        {
+            let mut conn = crate::providers::utils::connect_options_encrypted(&db_path, KEY_HEX)
+                .create_if_missing(true)
+                .connect()
+                .await
+                .expect("v4 fixture connect failed");
+            for schema in [
+                MESSAGES_SCHEMA,
+                MESSAGES_SCHEMA_V2,
+                MESSAGES_SCHEMA_V3,
+                MESSAGES_SCHEMA_V4,
+            ] {
+                for stmt in parse_statements(schema) {
+                    sqlx::query(&stmt)
+                        .execute(&mut conn)
+                        .await
+                        .unwrap_or_else(|e| panic!("v4 fixture statement failed: {e}\n{stmt}"));
+                }
+            }
+            assert_eq!(messages_applied_versions(&mut conn).await, vec![1, 2, 3, 4]);
+            assert!(messages_columns(&mut conn)
+                .await
+                .contains(&"gate3_review_status".to_owned()));
+            for (i, (id, status, risk)) in old_rows.iter().enumerate() {
+                sqlx::query(
+                    "INSERT INTO messages
+                     (id, context_key, sender, content, focus_run_id, gate3_review_status,
+                      created_at, chat_id, reviewed_at_risk_rating, is_error)
+                     VALUES (?, 'chat-1', 'assistant', ?, ?, ?, ?, 'chat-1', ?, ?)",
+                )
+                .bind(id)
+                .bind(format!("content {id}"))
+                .bind(format!("run-{id}"))
+                .bind(status)
+                .bind(format!("2026-10-0{}T00:00:00Z", i + 1))
+                .bind(risk)
+                .bind(if *id == "m-pending" { 1_i64 } else { 0_i64 })
+                .execute(&mut conn)
+                .await
+                .expect("old-format row insert must succeed");
+            }
+        }
+
+        // The real function under test: opens, finds v4, applies v5.
+        let mut conn = open_messages_db(user_id, persona_id, KEY_HEX)
+            .await
+            .expect("open_messages_db must migrate a v4 database to v5");
+
+        let cols = messages_columns(&mut conn).await;
+        assert!(!cols.contains(&"gate3_review_status".to_owned()));
+        assert!(!cols.contains(&"reviewed_at_risk_rating".to_owned()));
+        for kept in [
+            "id",
+            "context_key",
+            "sender",
+            "content",
+            "focus_run_id",
+            "created_at",
+            "chat_id",
+            "is_error",
+        ] {
+            assert!(
+                cols.contains(&kept.to_owned()),
+                "column {kept} must survive"
+            );
+        }
+        assert_eq!(
+            messages_applied_versions(&mut conn).await,
+            vec![1, 2, 3, 4, 5]
+        );
+
+        // Every old row loads through the real read path, other columns intact.
+        let transcript = list_messages(user_id, persona_id, KEY_HEX, "chat-1")
+            .await
+            .expect("list_messages must read migrated rows");
+        assert_eq!(transcript.len(), old_rows.len());
+        for (i, (id, _, _)) in old_rows.iter().enumerate() {
+            let m = &transcript[i];
+            assert_eq!(&m.id, id);
+            assert_eq!(m.content, format!("content {id}"));
+            assert_eq!(m.sender, "assistant");
+            assert_eq!(
+                m.focus_run_id.as_deref(),
+                Some(format!("run-{id}").as_str())
+            );
+            assert_eq!(m.created_at, format!("2026-10-0{}T00:00:00Z", i + 1));
+            assert_eq!(m.is_error, *id == "m-pending");
+        }
+        let chat_ids: Vec<Option<String>> =
+            sqlx::query_scalar("SELECT chat_id FROM messages ORDER BY created_at")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        assert!(chat_ids.iter().all(|c| c.as_deref() == Some("chat-1")));
+
+        let idx: Option<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_messages_context_key_created'",
+        )
+        .fetch_optional(&mut conn)
+        .await
+        .unwrap();
+        assert!(idx.is_some(), "the context_key index must survive the drop");
+
+        save_message(
+            user_id,
+            persona_id,
+            KEY_HEX,
+            "chat-1",
+            "user",
+            "written after the migration",
+            None,
+        )
+        .await
+        .expect("save_message must work on the migrated schema");
+
+        match saved_root {
+            Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+            None => std::env::remove_var("QR_DATA_ROOT"),
+        }
+        drop(lock);
+    }
+
+    /// A DB built fresh through every migration, closed, and reopened: the
+    /// columns stay absent and startup is stable. messages_001.sql (v1)
+    /// re-runs on EVERY open, and its CREATE TABLE still names the dropped
+    /// columns -- CREATE TABLE IF NOT EXISTS must not resurrect them, and
+    /// v5 must not re-apply (a second DROP COLUMN would error).
+    #[tokio::test]
+    async fn fresh_messages_db_is_stable_across_close_and_reopen() {
+        let _env = setup().await;
+
+        let mut conn = open_messages_db(USER_ID, PERSONA_ID, KEY_HEX)
+            .await
+            .expect("first open must succeed");
+        let cols = messages_columns(&mut conn).await;
+        assert!(!cols.contains(&"gate3_review_status".to_owned()));
+        assert!(!cols.contains(&"reviewed_at_risk_rating".to_owned()));
+        assert_eq!(
+            messages_applied_versions(&mut conn).await,
+            vec![1, 2, 3, 4, 5]
+        );
+        conn.close().await.expect("close must succeed");
+
+        for _ in 0..2 {
+            let mut conn = open_messages_db(USER_ID, PERSONA_ID, KEY_HEX)
+                .await
+                .expect("reopen must succeed");
+            assert_eq!(messages_columns(&mut conn).await, cols);
+            assert_eq!(
+                messages_applied_versions(&mut conn).await,
+                vec![1, 2, 3, 4, 5]
+            );
+            conn.close().await.expect("close must succeed");
+        }
+
+        save_message(
+            USER_ID,
+            PERSONA_ID,
+            KEY_HEX,
+            "ctx-1",
+            "user",
+            "after reopen",
+            None,
+        )
+        .await
+        .expect("save_message must work after reopen");
     }
 
     #[tokio::test]
