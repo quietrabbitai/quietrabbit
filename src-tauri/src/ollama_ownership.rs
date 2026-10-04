@@ -558,11 +558,20 @@ mod tests {
 
         let models_dir = Path::new("/tmp/quietrabbit-ownership-test-mixed-group");
 
+        // `exec sleep 20`, not a bare `sleep 20`: on some shells/platforms
+        // (confirmed live on the CI runner, not reproduced locally) `sh -c
+        // "sleep 20"` does NOT tail-exec-optimize away the `sh` process --
+        // `sleep` runs as `sh`'s child instead, so each spawn below would
+        // silently become two group members instead of one and the
+        // precondition assertion undercounted the real group. `exec`
+        // forces the replacement explicitly, portably, so each spawn here
+        // is provably exactly one process.
+        //
         // The group LEADER is the "shell" -- unrelated, no OLLAMA_MODELS --
         // matching the real pre-fix shape where the launching shell/
         // cargo-tauri was the leader and `ollama serve` just a member.
         let mut leader = Command::new("sh");
-        leader.arg("-c").arg("sleep 20");
+        leader.arg("-c").arg("exec sleep 20");
         leader.process_group(0);
         let mut leader = leader.spawn().expect("failed to spawn test leader");
         let leader_pid = leader.id();
@@ -572,7 +581,7 @@ mod tests {
         // directly (`process_group(pgid)` with a positive value means
         // "join this existing group", not "start a new one").
         let mut orphan = Command::new("sh");
-        orphan.arg("-c").arg("sleep 20");
+        orphan.arg("-c").arg("exec sleep 20");
         orphan.env("OLLAMA_MODELS", models_dir);
         orphan.process_group(pgid);
         let mut orphan = orphan.spawn().expect("failed to spawn test orphan");
@@ -580,10 +589,18 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(200)).await;
         let sys = fresh_sys();
-        assert_eq!(
-            group_members(pgid, &sys).len(),
-            2,
-            "expected exactly leader + orphan in group {pgid}"
+        // Membership, not an exact count: robust against any other
+        // incidental member the shell/OS happens to add, while still
+        // proving the two processes this test actually cares about are
+        // both really in the group before the kill.
+        let members = group_members(pgid, &sys);
+        assert!(
+            members.contains(&Pid::from_u32(leader_pid)),
+            "expected the leader to be a member of group {pgid}, found {members:?}"
+        );
+        assert!(
+            members.contains(&Pid::from_u32(orphan_pid)),
+            "expected the orphan to be a member of group {pgid}, found {members:?}"
         );
 
         kill_process_group(pgid, models_dir).await;
@@ -628,8 +645,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn pidfile_target_declines_on_mismatched_start_time() {
+    #[tokio::test]
+    async fn pidfile_target_declines_on_mismatched_start_time() {
         // A stand-in for "the pid was reused by an unrelated process since
         // the pidfile was written" -- same pid, same ownership/orphan
         // proof, but a start_time that no longer matches. Tested directly
@@ -638,6 +655,17 @@ mod tests {
         // after the pidfile pass would independently catch this same
         // process anyway (it doesn't key off the pidfile), making the
         // pidfile pass's own decision unobservable any other way.
+        //
+        // ENV_MUTEX + an isolated QR_DATA_ROOT even though this test never
+        // reads/writes a pidfile itself: it's in the same pidfile-domain
+        // family as the tests that do, and this makes it immune by
+        // construction to ever silently starting to touch real on-disk
+        // state if `pidfile_target_is_reclaimable` or its callers change.
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        std::env::set_var("QR_DATA_ROOT", tmp.path());
+
         let models_dir = Path::new("/tmp/quietrabbit-ownership-test-pidfile-stale");
         let mut child = spawn_sleep(&[("OLLAMA_MODELS", models_dir.to_str().unwrap())], &[]);
         let pid = child.id();
@@ -668,12 +696,28 @@ mod tests {
 
         let _ = child.kill();
         let _ = child.wait();
+        match saved_root {
+            Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+            None => std::env::remove_var("QR_DATA_ROOT"),
+        }
     }
 
     // -- reclaim_orphans ------------------------------------------------
 
     #[tokio::test]
     async fn reclaim_leaves_a_live_qr_sibling_untouched() {
+        // ENV_MUTEX + an isolated QR_DATA_ROOT: reclaim_orphans() reads and
+        // unconditionally removes the pidfile under QR_DATA_ROOT
+        // (read_pidfile/remove_pidfile). Without this, this test races
+        // write_read_pidfile_roundtrip over the process-wide QR_DATA_ROOT
+        // env var, and -- run against a real checkout with no override --
+        // would read, and then delete, a real pidfile a real running QR
+        // instance just wrote.
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        std::env::set_var("QR_DATA_ROOT", tmp.path());
+
         let models_dir = Path::new("/tmp/quietrabbit-ownership-test-reclaim-live");
         let mut child = spawn_sleep(&[("OLLAMA_MODELS", models_dir.to_str().unwrap())], &[]);
         let pid = child.id();
@@ -688,10 +732,21 @@ mod tests {
         );
         let _ = child.kill();
         let _ = child.wait();
+        match saved_root {
+            Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+            None => std::env::remove_var("QR_DATA_ROOT"),
+        }
     }
 
     #[tokio::test]
     async fn reclaim_kills_a_genuine_orphan() {
+        // ENV_MUTEX + an isolated QR_DATA_ROOT -- see
+        // reclaim_leaves_a_live_qr_sibling_untouched's own comment above.
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        std::env::set_var("QR_DATA_ROOT", tmp.path());
+
         let models_dir = Path::new("/tmp/quietrabbit-ownership-test-reclaim-orphan");
         // Backgrounds a grandchild and prints its pid, then the wrapper
         // shell exits immediately -- the grandchild is reparented away
@@ -719,6 +774,10 @@ mod tests {
             sys.process(Pid::from_u32(orphan_pid)).is_none(),
             "a genuine orphan under QR's own models dir should have been reclaimed"
         );
+        match saved_root {
+            Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+            None => std::env::remove_var("QR_DATA_ROOT"),
+        }
     }
 
     /// items.id=586 fix-up (Jason), through the full `reclaim_orphans` path
@@ -731,6 +790,13 @@ mod tests {
     #[tokio::test]
     async fn reclaim_through_mixed_group_spares_the_unrelated_leader() {
         use std::os::unix::process::CommandExt;
+
+        // ENV_MUTEX + an isolated QR_DATA_ROOT -- see
+        // reclaim_leaves_a_live_qr_sibling_untouched's own comment above.
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        std::env::set_var("QR_DATA_ROOT", tmp.path());
 
         let models_dir = Path::new("/tmp/quietrabbit-ownership-test-reclaim-mixed-group");
 
@@ -769,5 +835,9 @@ mod tests {
         let _ = orphan.wait();
         let _ = leader.kill();
         let _ = leader.wait();
+        match saved_root {
+            Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+            None => std::env::remove_var("QR_DATA_ROOT"),
+        }
     }
 }
