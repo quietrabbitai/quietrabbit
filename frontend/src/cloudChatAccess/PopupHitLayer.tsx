@@ -159,6 +159,10 @@ export function PopupHitLayer({ popups }: PopupHitLayerProps) {
       {Object.entries(popups).map(([providerId, rect]) => (
         <div
           key={providerId}
+          // Invisible input-forwarding surface, not a UI control -- the
+          // role only satisfies jsx-a11y/no-static-element-interactions
+          // (items.id=588) and has no effect on event dispatch.
+          role="presentation"
           {...{ [PROVIDER_ID_ATTR]: providerId }}
           tabIndex={-1}
           style={{

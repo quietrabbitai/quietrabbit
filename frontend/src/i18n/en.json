@@ -63,7 +63,6 @@
       "importButton": "Import new version",
       "importPending": "Importing…",
       "importSuccess": "Imported as a new version.",
-      "importUnsupportedFileError": "Only plain text files (.txt, .md, .markdown, .html, .htm) can be imported here.",
       "importMissingFocusError": "This document has no Focus to import into.",
       "exportedTooltip": "Exported: {{when}}",
       "lineageBackwardLink": "← {{name}}",
