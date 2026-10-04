@@ -175,110 +175,6 @@ export const commands = {
 	 */
 	getPendingCrossPersonaConfirmations: (request: GetPendingCrossPersonaConfirmationsRequest) => typedError<PendingCrossPersonaFact[], string>(__TAURI_INVOKE("get_pending_cross_persona_confirmations", { request })),
 	/**
-	 *  PG_GATE_3, invoked against a drafted Tier-3-starter message
-	 *  (messages.gate3_review_status = 'drafted', written by
-	 *  commands::messages::send_message's gate3_track=true path). Completes
-	 *  items.id=233's remaining stub -- see the former "NO OUTBOUND PRIVACY
-	 *  GUARDIAN REVIEW HAPPENS" marker this command replaces in
-	 *  CloudChatAccessPane.tsx for the investigation that scoped it.
-	 * 
-	 *  Unlike every other command in this file, this one *triggers* gate3()
-	 *  rather than *responding to* an already-fired one -- gate3()'s only prior
-	 *  call site was conductor/executor.rs's own step-execution loop, with no
-	 *  StepContext/PersonalTrack available here.
-	 * 
-	 *  This call site reviews arbitrary message content drafted ahead of
-	 *  cloud_frontier access, via any entry path (direct chat, escalation, or a Focus-run
-	 *  handoff) -- it is NOT specific to Quick-Ask-Focus-generated content, and
-	 *  makes no claim that no personal fields ever flow through it. quick-ask.focus's
-	 *  step id and display_name are reused below purely as a synthetic label for
-	 *  disclosure_log/audit purposes, not as a claim about the reviewed
-	 *  content's structure.
-	 * 
-	 *  Parameter sourcing:
-	 *    - target_tier=3: this flow only exists ahead of cloud_frontier access.
-	 *    - execution_tier=1, content_sensitivity_severity=1: no PersonalTrack is
-	 *      available at this call site to compute a real severity, so this is a
-	 *      fixed placeholder, not a real assessment.
-	 *    - step_id="draft", focus_name="Quick Ask": quick-ask.focus's own step
-	 *      id and display_name, borrowed as a synthetic label only -- see above.
-	 *    - severity_authoritative=false (items.id=458, corrected scope of the
-	 *      earlier items.id=799): content_sensitivity_severity=1 being a
-	 *      placeholder means a live destination_risk alone must not force
-	 *      gate3's High-tier consent gate on zero PF spans here -- that produced
-	 *      an empty, uninformative interrupt. See
-	 *      zero_spans_safe_to_auto_approve's own doc comment in gate3.rs.
-	 *    - space_max_permitted_tier: a real per-Persona focus_settings lookup,
-	 *      never a constant -- missing row is a hard Err, mirroring AUTHORIZE's
-	 *      own assertion (lifecycle.rs).
-	 * 
-	 *  Uses SqliteDisclosureLogger (FocusRun's own default logger), not
-	 *  NoopLogger/TestLogger, so the write-before-surface disclosure_log entry
-	 *  gate3() writes is real, not discarded.
-	 * 
-	 *  gate3_review_status transition: 'pending_consent' -> 'pending-review';
-	 *  'approved' (PF found nothing needing review) -> 'approved'. On
-	 *  'blocked'/'timeout' the row is left at 'drafted' -- gate3_review_status's
-	 *  CHECK constraint has no "blocked" state, and leaving it at 'drafted'
-	 *  keeps the row retry-able rather than overloading 'withheld' (a status
-	 *  meaning the user declined, not that gate3 itself refused).
-	 */
-	requestCloudFrontierGate3Review: (request: RequestCloudFrontierGate3ReviewRequest) => typedError<Gate3ReviewResult, string>(__TAURI_INVOKE("request_cloud_frontier_gate3_review", { request })),
-	/**
-	 *  Records the user's resolution of a Privacy Guardian consent review
-	 *  (pending-review -> approved | withheld). Separate from
-	 *  submit_element_consent_decision: that command writes the per-span audit
-	 *  record to outputs.db's consent_decisions (keyed by run_id); this one
-	 *  transitions messages.db's gate3_review_status (keyed by message_id) --
-	 *  two different persistence targets. The frontend calls both after the
-	 *  user resolves the Privacy Guardian modal (submit_element_consent_decision
-	 *  first, then this).
-	 */
-	resolveCloudFrontierGate3Review: (request: ResolveCloudFrontierGate3ReviewRequest) => typedError<null, string>(__TAURI_INVOKE("resolve_cloud_frontier_gate3_review", { request })),
-	/**
-	 *  items.id=540: reverts a message stuck at gate3_review_status='pending-review'
-	 *  back to 'drafted' after the user cancels the Privacy Guardian consent
-	 *  modal without deciding. Before this command existed,
-	 *  CloudChatAccessPane.tsx's handleModalCancel only reset local React state
-	 *  -- the message row never left 'pending-review', so any retry (the "second
-	 *  opinion" button, or resending) called request_cloud_frontier_gate3_review
-	 *  again, which hard-rejects anything not 'drafted', permanently bricking
-	 *  that message for the rest of the session.
-	 * 
-	 *  Deliberately a separate command from resolve_cloud_frontier_gate3_review
-	 *  rather than a third accepted `status` value there: that command's own doc
-	 *  comment states 'drafted'/'pending-review' are gate3's own transitions, not
-	 *  valid `resolve` input, and 'withheld' is reserved for an actual, audited
-	 *  user decision to keep content private -- a Cancel never reached that
-	 *  decision (no review completed, nothing was disclosed or declined), so
-	 *  recording it as 'withheld' would misrepresent the audit trail and would
-	 *  also be terminal, permanently blocking retry on that message.
-	 * 
-	 *  Guarded the same way request_cloud_frontier_gate3_review guards its own
-	 *  'drafted' precondition: only a message currently at 'pending-review' may
-	 *  be reverted. update_gate3_review_status itself only validates the new
-	 *  value against the CHECK constraint, not the FROM state, so this guard
-	 *  belongs here.
-	 */
-	cancelCloudFrontierGate3Review: (request: CancelCloudFrontierGate3ReviewRequest) => typedError<null, string>(__TAURI_INVOKE("cancel_cloud_frontier_gate3_review", { request })),
-	/**
-	 *  items.id=406 (decisions.id=755) -- the provider-selection re-check
-	 *  trigger. Fires when the user activates a rail provider not covered by
-	 *  the message's original copy-time review (CloudChatAccessPane.tsx, provider
-	 *  row activation -- a QR-owned UI event, unlike paste inside an embedded
-	 *  CEF pane, which QR cannot observe). Frontend-side clipboard provenance
-	 *  (only re-checking content QR can prove it wrote itself) gates whether
-	 *  this command is even called -- not re-validated here, since gate3's own
-	 *  fact-identity cascade only ever concerns itself with message.content,
-	 *  never the OS clipboard.
-	 * 
-	 *  No-ops (returns approved, no new review) when the newly-active provider
-	 *  set's max risk is not STRICTLY HIGHER than what the original review
-	 *  already covered (messages.reviewed_at_risk_rating) -- a same-or-lower-
-	 *  risk destination needs no re-check.
-	 */
-	recheckCloudFrontierProviderSelection: (request: RecheckCloudFrontierProviderSelectionRequest) => typedError<Gate3ReviewResult, string>(__TAURI_INVOKE("recheck_cloud_frontier_provider_selection", { request })),
-	/**
 	 *  items.id=416 (decisions.id=766): extends Gate3 review to every native
 	 *  copy path on ChatPane's transcript (Ctrl+C / right-click-copy), not just
 	 *  the dedicated "Copy starter" button -- previously an already-`approved`
@@ -290,8 +186,7 @@ export const commands = {
 	 *  rendered content, never a poll, per the same locked
 	 *  no-passive-clipboard-monitoring rule handleCopyStarter documents.
 	 * 
-	 *  Unlike request_cloud_frontier_gate3_review, there is no single message row to
-	 *  read from -- a selection may span multiple messages (items.id=416's
+	 *  There is no single message row to read from -- a selection may span multiple messages (items.id=416's
 	 *  cross-message-selection resolution: treated as ONE new composition, one
 	 *  combined review, not fragmented per-message sub-reviews) -- so
 	 *  content_text is supplied directly by the frontend (the concatenated
@@ -986,19 +881,6 @@ export type AutoResolvedSpan = {
 	user_modified_text: string | null,
 };
 
-/**
- *  items.id=540: the user's Cancel on the Privacy Guardian consent modal --
- *  no `status` field, since the only valid destination is "drafted". See
- *  cancel_cloud_frontier_gate3_review's own doc comment for why this is a
- *  separate command from resolve_cloud_frontier_gate3_review rather than a
- *  third accepted status value there.
- */
-export type CancelCloudFrontierGate3ReviewRequest = {
-	user_id: string,
-	persona_id: string,
-	message_id: string,
-};
-
 export type CapabilityProfileResponse = {
 	installed_models: string[],
 	/**
@@ -1517,21 +1399,6 @@ export type QrHostedConfig = {
 export type RamClass = "low" | "medium" | "high" | "very_high";
 
 /**
- *  items.id=406 (decisions.id=755): the provider-selection re-check
- *  trigger's request. `newly_active_provider_ids` is whatever the rail
- *  reports as active/laid-out at the moment of this call -- same
- *  PaneLayoutState-backed source of truth request_cloud_frontier_gate3_review
- *  itself reads, just supplied here explicitly since this command fires
- *  from a provider-activation event, not a fresh gate3 draft-review pass.
- */
-export type RecheckCloudFrontierProviderSelectionRequest = {
-	user_id: string,
-	persona_id: string,
-	message_id: string,
-	newly_active_provider_ids: string[],
-};
-
-/**
  *  One-time recovery mnemonic display. Never persisted anywhere past this
  *  response -- QR holds no copy of `mnemonic` or the entropy it was derived
  *  from once this call returns (Section 5/8.5 invariant).
@@ -1567,25 +1434,6 @@ export type RequestChatCopyGate3ReviewRequest = {
 	content_text: string,
 };
 
-export type RequestCloudFrontierGate3ReviewRequest = {
-	user_id: string,
-	persona_id: string,
-	message_id: string,
-};
-
-export type ResolveCloudFrontierGate3ReviewRequest = {
-	user_id: string,
-	persona_id: string,
-	message_id: string,
-	/**
-	 *  "approved" | "withheld" -- the two terminal states a resolved
-	 *  consent review can reach. "drafted"/"pending-review" are gate3's own
-	 *  transitions (request_cloud_frontier_gate3_review writes those), not valid
-	 *  input here.
-	 */
-	status: string,
-};
-
 export type ResumeRunRequest = {
 	run_id: string,
 	user_id: string,
@@ -1606,7 +1454,6 @@ export type SendMessageRequest = {
 	context_key: string,
 	content: string,
 	focus_id: string,
-	gate3_track: boolean,
 	/**
 	 *  entity_facts.id values the user already confirmed this session, via
 	 *  the frontend's pre-send commands::consent::get_pending_cross_persona_

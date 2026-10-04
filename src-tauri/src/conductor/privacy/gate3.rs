@@ -126,9 +126,8 @@ pub async fn gate3<L: DisclosureLogger>(
     destination_risk_rating: Option<u8>,
     // items.id=458 (corrected scope of the earlier items.id=799): true for
     // every caller with a real content_sensitivity_severity to consult --
-    // false only for callers with no PersonalTrack (request_cloud_frontier_gate3_review,
-    // request_chat_copy_gate3_review in commands/consent.rs) that hardcode
-    // content_sensitivity_severity=1 as a placeholder. When false, a live
+    // false only for callers with no PersonalTrack (request_chat_copy_gate3_review
+    // in commands/consent.rs) that hardcode content_sensitivity_severity=1 as a placeholder. When false, a live
     // destination_risk alone no longer forces the High-tier consent gate on
     // zero PF spans -- see zero_spans_safe_to_auto_approve's own doc comment.
     // Only affects the gate3_with_pf path; Check 1 and Check 2b below never
@@ -139,7 +138,7 @@ pub async fn gate3<L: DisclosureLogger>(
     // (prior-decision query, pf_fact_mentions, pf_standing_preferences).
     // Neither was available inside gate3 before this -- only inside the
     // DisclosureLogger passed in as `logger`, which stays scoped to just
-    // disclosure_log writes. Both real call sites (request_cloud_frontier_gate3_review
+    // disclosure_log writes. Both real call sites (request_chat_copy_gate3_review
     // and executor.rs's Step 13, via StepContext) always have real values;
     // an empty key_hex gracefully degrades the persistence cascade to
     // "always ask" (see partition_by_prior_decision), never a hard error.
@@ -876,8 +875,8 @@ fn build_consent_spans(
 ///
 /// `severity_authoritative` is false only for callers with no PersonalTrack
 /// to consult -- content_sensitivity_severity is a fixed placeholder value
-/// for them, not a real assessment (see request_cloud_frontier_gate3_review and
-/// request_chat_copy_gate3_review in commands/consent.rs). For those
+/// for them, not a real assessment (see request_chat_copy_gate3_review in
+/// commands/consent.rs). For those
 /// callers, a live destination_risk alone must not force the High-tier
 /// consent gate on zero PF spans -- that produced an empty, uninformative
 /// interrupt (items.id=458, corrected scope of the earlier items.id=799).
@@ -1025,8 +1024,8 @@ mod tests {
         assert!(!zero_spans_safe_to_auto_approve(1, 3, true));
     }
 
-    // items.id=458: callers with no PersonalTrack (request_cloud_frontier_gate3_review,
-    // request_chat_copy_gate3_review) hardcode content_sensitivity_severity=1
+    // items.id=458: callers with no PersonalTrack (request_chat_copy_gate3_review)
+    // hardcode content_sensitivity_severity=1
     // and pass severity_authoritative=false -- a live destination_risk alone
     // must no longer force the High-tier gate on zero PF spans for them.
     #[test]

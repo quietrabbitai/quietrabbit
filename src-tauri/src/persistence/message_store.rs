@@ -40,7 +40,7 @@ pub struct MessageRecord {
     pub created_at: String,
     /// items.id=406 (decisions.id=755): the destination risk rating this
     /// message's cloud_frontier approval was scored against -- None until the
-    /// approval write path (request_cloud_frontier_gate3_review) populates it, and
+    /// approval write path (retired in items.id=501 slice 3) populated it, and
     /// for every message that predates messages_003.sql.
     pub reviewed_at_risk_rating: Option<i64>,
     /// items.id=587 (messages_004.sql): true for a placeholder backfilled
@@ -357,61 +357,6 @@ pub async fn update_message_content(
     Ok(())
 }
 
-/// Update a single message's gate3_review_status. Narrow single-column
-/// update — for the future gate3-wiring item (items.id=233's remaining
-/// stub) to call once it exists; not called from anywhere in this item's own
-/// code. Included now because the schema/store boundary is the right place
-/// for it.
-pub async fn update_gate3_review_status(
-    user_id: &str,
-    persona_id: &str,
-    key_hex: &str,
-    message_id: &str,
-    status: &str,
-) -> Result<(), MessageStoreError> {
-    if !VALID_GATE3_REVIEW_STATUS.contains(&status) {
-        return Err(MessageStoreError::Validation(format!(
-            "Invalid gate3_review_status '{}'. Must be one of: {}",
-            status,
-            VALID_GATE3_REVIEW_STATUS.join(", ")
-        )));
-    }
-
-    let mut conn = open_messages_db(user_id, persona_id, key_hex).await?;
-
-    sqlx::query("UPDATE messages SET gate3_review_status = ? WHERE id = ?")
-        .bind(status)
-        .bind(message_id)
-        .execute(&mut conn)
-        .await?;
-
-    Ok(())
-}
-
-/// items.id=406 (decisions.id=755): records the destination risk rating a
-/// cloud_frontier approval was actually scored against -- written by
-/// request_cloud_frontier_gate3_review on approval, and re-written by
-/// recheck_cloud_frontier_provider_selection when a later re-check broadens the
-/// covered risk. Narrow single-column update, same shape as
-/// update_gate3_review_status.
-pub async fn update_reviewed_at_risk_rating(
-    user_id: &str,
-    persona_id: &str,
-    key_hex: &str,
-    message_id: &str,
-    risk_rating: u8,
-) -> Result<(), MessageStoreError> {
-    let mut conn = open_messages_db(user_id, persona_id, key_hex).await?;
-
-    sqlx::query("UPDATE messages SET reviewed_at_risk_rating = ? WHERE id = ?")
-        .bind(risk_rating as i64)
-        .bind(message_id)
-        .execute(&mut conn)
-        .await?;
-
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -583,8 +528,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Real-encrypted-path tests -- save_message/list_messages/
-    // update_gate3_review_status themselves, via migrate_messages_db,
+    // Real-encrypted-path tests -- save_message/list_messages
+    // themselves, via migrate_messages_db,
     // mirroring commands/library.rs's TestEnv pattern. Everything above
     // this point tests the schema/query shape directly against an
     // in-memory connection; these exercise the actual public functions
@@ -754,38 +699,6 @@ mod tests {
             .expect("get_message must succeed");
 
         assert!(fetched.is_none());
-    }
-
-    #[tokio::test]
-    async fn update_gate3_review_status_transitions_an_existing_message() {
-        let _env = setup().await;
-
-        let record = save_message(
-            USER_ID,
-            PERSONA_ID,
-            KEY_HEX,
-            "tier3-access-persona-1",
-            "assistant",
-            "drafted starter text",
-            Some("run-1"),
-            Some("drafted"),
-        )
-        .await
-        .expect("save_message must succeed");
-
-        update_gate3_review_status(USER_ID, PERSONA_ID, KEY_HEX, &record.id, "approved")
-            .await
-            .expect("update_gate3_review_status must succeed");
-
-        let transcript = list_messages(USER_ID, PERSONA_ID, KEY_HEX, "tier3-access-persona-1")
-            .await
-            .expect("list_messages must succeed");
-
-        assert_eq!(transcript.len(), 1);
-        assert_eq!(
-            transcript[0].gate3_review_status.as_deref(),
-            Some("approved")
-        );
     }
 
     #[tokio::test]

@@ -65,10 +65,6 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::consent::submit_friction_gate_decision,
         commands::consent::submit_extract_confirm,
         commands::consent::get_pending_cross_persona_confirmations,
-        commands::consent::request_cloud_frontier_gate3_review,
-        commands::consent::resolve_cloud_frontier_gate3_review,
-        commands::consent::cancel_cloud_frontier_gate3_review,
-        commands::consent::recheck_cloud_frontier_provider_selection,
         commands::consent::request_chat_copy_gate3_review,
         commands::consent::submit_chat_copy_consent_decision,
         // Group 3 -- Onboarding

@@ -756,7 +756,6 @@ export function ChatPane({
           context_key: contextKey,
           content: text,
           focus_id: focusId,
-          gate3_track: false,
           confirmed_cross_persona_fact_ids: confirmedFactIds,
         })
         .then((result) => {

@@ -55,15 +55,6 @@
 //   "per-session, non-persisted") -- there is no submit_ command here writing
 //   a decision record, unlike the other consent commands in this file.
 //
-// request_cloud_frontier_gate3_review / resolve_cloud_frontier_gate3_review (items.id=233's
-//   remaining stub): the outbound Privacy Guardian review ahead of
-//   cloud_frontier access. Unlike every other command in this file, request_cloud_frontier_gate3_review
-//   *triggers* a gate rather than *responding to* one already fired --
-//   gate3()'s only prior call site was conductor/executor.rs's own
-//   step-execution loop, never exposed over IPC. See each command's own doc
-//   comment for the parameter-sourcing rationale (all fixed/derived from
-//   quick-ask.focus, not guessed).
-//
 // All commands are fire-and-respond: lifecycle checks consent_decisions when
 // the run is resumed. No direct signalling into the background task.
 // (get_pending_cross_persona_confirmations is a plain read query -- no
@@ -83,7 +74,6 @@ use crate::conductor::privacy::types::{ExtractConfirmDecision, Gate3ReviewResult
 use crate::conductor::privacy::PrivacyGateway;
 use crate::persistence::disclosure_log_store::SqliteDisclosureLogger;
 use crate::persistence::focus_settings_store;
-use crate::persistence::message_store;
 use crate::persistence::output_store;
 use crate::persistence::output_store::{get_focus_run_status, set_focus_run_status};
 use crate::persistence::personal_store;
@@ -147,13 +137,6 @@ pub struct GetPendingCrossPersonaConfirmationsRequest {
     pub persona_id: String,
 }
 
-#[derive(Debug, Deserialize, Type)]
-pub struct RequestCloudFrontierGate3ReviewRequest {
-    pub user_id: String,
-    pub persona_id: String,
-    pub message_id: String,
-}
-
 /// items.id=501 slice 2 (decisions.id=846 addendum Q5 follow-up): the copy
 /// review's fixed gate parameters -- see request_chat_copy_gate3_review's
 /// doc comment for the reasoning. Named so a test can pin them.
@@ -170,44 +153,6 @@ pub struct RequestChatCopyGate3ReviewRequest {
     pub user_id: String,
     pub persona_id: String,
     pub content_text: String,
-}
-
-/// items.id=406 (decisions.id=755): the provider-selection re-check
-/// trigger's request. `newly_active_provider_ids` is whatever the rail
-/// reports as active/laid-out at the moment of this call -- same
-/// PaneLayoutState-backed source of truth request_cloud_frontier_gate3_review
-/// itself reads, just supplied here explicitly since this command fires
-/// from a provider-activation event, not a fresh gate3 draft-review pass.
-#[derive(Debug, Deserialize, Type)]
-pub struct RecheckCloudFrontierProviderSelectionRequest {
-    pub user_id: String,
-    pub persona_id: String,
-    pub message_id: String,
-    pub newly_active_provider_ids: Vec<String>,
-}
-
-#[derive(Debug, Deserialize, Type)]
-pub struct ResolveCloudFrontierGate3ReviewRequest {
-    pub user_id: String,
-    pub persona_id: String,
-    pub message_id: String,
-    /// "approved" | "withheld" -- the two terminal states a resolved
-    /// consent review can reach. "drafted"/"pending-review" are gate3's own
-    /// transitions (request_cloud_frontier_gate3_review writes those), not valid
-    /// input here.
-    pub status: String,
-}
-
-/// items.id=540: the user's Cancel on the Privacy Guardian consent modal --
-/// no `status` field, since the only valid destination is "drafted". See
-/// cancel_cloud_frontier_gate3_review's own doc comment for why this is a
-/// separate command from resolve_cloud_frontier_gate3_review rather than a
-/// third accepted status value there.
-#[derive(Debug, Deserialize, Type)]
-pub struct CancelCloudFrontierGate3ReviewRequest {
-    pub user_id: String,
-    pub persona_id: String,
-    pub message_id: String,
 }
 
 /// items.id=92 -- the user's proceed/cancel answer to a FrictionGateDetail
@@ -721,209 +666,6 @@ pub async fn get_pending_cross_persona_confirmations(
 /// pre-conversation reuses the same "quick-ask" path Persona hub chat uses.
 const CLOUD_FRONTIER_DRAFT_FOCUS_ID: &str = "quick-ask";
 
-/// PG_GATE_3, invoked against a drafted Tier-3-starter message
-/// (messages.gate3_review_status = 'drafted', written by
-/// commands::messages::send_message's gate3_track=true path). Completes
-/// items.id=233's remaining stub -- see the former "NO OUTBOUND PRIVACY
-/// GUARDIAN REVIEW HAPPENS" marker this command replaces in
-/// CloudChatAccessPane.tsx for the investigation that scoped it.
-///
-/// Unlike every other command in this file, this one *triggers* gate3()
-/// rather than *responding to* an already-fired one -- gate3()'s only prior
-/// call site was conductor/executor.rs's own step-execution loop, with no
-/// StepContext/PersonalTrack available here.
-///
-/// This call site reviews arbitrary message content drafted ahead of
-/// cloud_frontier access, via any entry path (direct chat, escalation, or a Focus-run
-/// handoff) -- it is NOT specific to Quick-Ask-Focus-generated content, and
-/// makes no claim that no personal fields ever flow through it. quick-ask.focus's
-/// step id and display_name are reused below purely as a synthetic label for
-/// disclosure_log/audit purposes, not as a claim about the reviewed
-/// content's structure.
-///
-/// Parameter sourcing:
-///   - target_tier=3: this flow only exists ahead of cloud_frontier access.
-///   - execution_tier=1, content_sensitivity_severity=1: no PersonalTrack is
-///     available at this call site to compute a real severity, so this is a
-///     fixed placeholder, not a real assessment.
-///   - step_id="draft", focus_name="Quick Ask": quick-ask.focus's own step
-///     id and display_name, borrowed as a synthetic label only -- see above.
-///   - severity_authoritative=false (items.id=458, corrected scope of the
-///     earlier items.id=799): content_sensitivity_severity=1 being a
-///     placeholder means a live destination_risk alone must not force
-///     gate3's High-tier consent gate on zero PF spans here -- that produced
-///     an empty, uninformative interrupt. See
-///     zero_spans_safe_to_auto_approve's own doc comment in gate3.rs.
-///   - space_max_permitted_tier: a real per-Persona focus_settings lookup,
-///     never a constant -- missing row is a hard Err, mirroring AUTHORIZE's
-///     own assertion (lifecycle.rs).
-///
-/// Uses SqliteDisclosureLogger (FocusRun's own default logger), not
-/// NoopLogger/TestLogger, so the write-before-surface disclosure_log entry
-/// gate3() writes is real, not discarded.
-///
-/// gate3_review_status transition: 'pending_consent' -> 'pending-review';
-/// 'approved' (PF found nothing needing review) -> 'approved'. On
-/// 'blocked'/'timeout' the row is left at 'drafted' -- gate3_review_status's
-/// CHECK constraint has no "blocked" state, and leaving it at 'drafted'
-/// keeps the row retry-able rather than overloading 'withheld' (a status
-/// meaning the user declined, not that gate3 itself refused).
-#[tauri::command]
-#[specta::specta]
-pub async fn request_cloud_frontier_gate3_review(
-    app_handle: tauri::AppHandle,
-    request: RequestCloudFrontierGate3ReviewRequest,
-    key_registry: State<'_, KeyRegistry>,
-    layout_state: State<'_, crate::commands::cloud_chat_pane::PaneLayoutState>,
-    pool: State<'_, sqlx::SqlitePool>,
-) -> Result<Gate3ReviewResult, String> {
-    let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
-        .await
-        .ok_or_else(|| "not logged in".to_owned())?;
-
-    let message = message_store::get_message(
-        &request.user_id,
-        &request.persona_id,
-        &key_hex_str,
-        &request.message_id,
-    )
-    .await
-    .map_err(|e| e.to_string())?
-    .ok_or_else(|| "not_found".to_string())?;
-
-    if message.gate3_review_status.as_deref() != Some("drafted") {
-        return Err(format!(
-            "message {} is not awaiting gate3 review (gate3_review_status: {:?})",
-            request.message_id, message.gate3_review_status
-        ));
-    }
-    if message.content.is_empty() {
-        return Err(format!(
-            "message {} has no content yet -- draft generation has not \
-             finished backfilling",
-            request.message_id
-        ));
-    }
-    let focus_run_id = message.focus_run_id.clone().ok_or_else(|| {
-        format!(
-            "message {} has gate3_review_status='drafted' but no \
-             focus_run_id -- invariant violated",
-            request.message_id
-        )
-    })?;
-
-    let settings = focus_settings_store::get_focus_settings(
-        &pool,
-        &request.persona_id,
-        CLOUD_FRONTIER_DRAFT_FOCUS_ID,
-    )
-    .await
-    .map_err(|e| e.to_string())?
-    .ok_or_else(|| {
-        format!(
-            "no focus_settings row for persona='{}' focus='{}'",
-            request.persona_id, CLOUD_FRONTIER_DRAFT_FOCUS_ID
-        )
-    })?;
-
-    let gateway = PrivacyGateway::new(SqliteDisclosureLogger::new(
-        &request.user_id,
-        &request.persona_id,
-        &key_hex_str,
-    ));
-
-    // items.id=406 (decisions.id=753): destination risk is now read live
-    // from whatever providers are actually active/selected in the rail at
-    // review time, rather than assumed always-High from target_tier=3
-    // alone. `PaneLayoutState` (commands/cloud_chat_pane.rs) is the backend-truth
-    // mirror of "providers currently laid out on screen" -- the frontend
-    // keeps it current via set_pane_layout on every openPaneIds/layout
-    // change, and unlike PaneManager/PaneHost it's plain Send+Sync state
-    // reachable from a #[tauri::command] via State<'_, _> directly, no
-    // main-thread hop needed. Worst case (MAX) across everything currently
-    // active covers "reviewed at copy time against every destination
-    // selected then" per the design doc's trigger model. Empty (no panes
-    // open yet) -> None -> gate3 falls back to target_tier=3 -- today's
-    // exact always-High behavior, conservative by construction.
-    let active_provider_ids: Vec<String> = {
-        let map = layout_state.0.lock().unwrap();
-        map.keys().cloned().collect()
-    };
-    let destination_risk_rating =
-        crate::persistence::provider_store::max_risk_rating_for_providers(
-            &pool,
-            &active_provider_ids,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let result = gateway
-        .gate3(
-            "draft",
-            &focus_run_id,
-            "Quick Ask",
-            &message.id,
-            &message.content,
-            1, // content_sensitivity_severity
-            // target_tier -- unchanged, still u8 (items.id=439: gate3()'s
-            // target_tier stays legacy-typed, see gate3.rs's own doc
-            // comment). 3 == ExternalAccess::Unrestricted-equivalent; this
-            // pane's own precondition is "the user is literally about to
-            // access cloud_frontier" (see this fn's doc comment above).
-            3,
-            settings.max_permitted_tier,
-            1, // execution_tier
-            Some(&app_handle),
-            destination_risk_rating,
-            // items.id=458: no PersonalTrack here, content_sensitivity_severity
-            // above is a placeholder -- destination_risk alone must not force
-            // the High-tier gate on zero PF spans (see doc comment above).
-            false,
-            &request.user_id,
-            &request.persona_id,
-            &key_hex_str,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let new_status = if result.pending_consent {
-        Some("pending-review")
-    } else if result.approved {
-        Some("approved")
-    } else {
-        None
-    };
-    if let Some(status) = new_status {
-        message_store::update_gate3_review_status(
-            &request.user_id,
-            &request.persona_id,
-            &key_hex_str,
-            &request.message_id,
-            status,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-
-        // items.id=406 (decisions.id=755): record what this review was
-        // actually scored against -- fixed at copy-time (this call), not at
-        // whatever point the user later finishes resolving the modal (if
-        // one was even surfaced). recheck_cloud_frontier_provider_selection compares
-        // a newly-activated provider's risk against this value.
-        message_store::update_reviewed_at_risk_rating(
-            &request.user_id,
-            &request.persona_id,
-            &key_hex_str,
-            &request.message_id,
-            destination_risk_rating.unwrap_or(3),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-    }
-
-    Ok(result.into())
-}
-
 /// items.id=416 (decisions.id=766): extends Gate3 review to every native
 /// copy path on ChatPane's transcript (Ctrl+C / right-click-copy), not just
 /// the dedicated "Copy starter" button -- previously an already-`approved`
@@ -935,8 +677,7 @@ pub async fn request_cloud_frontier_gate3_review(
 /// rendered content, never a poll, per the same locked
 /// no-passive-clipboard-monitoring rule handleCopyStarter documents.
 ///
-/// Unlike request_cloud_frontier_gate3_review, there is no single message row to
-/// read from -- a selection may span multiple messages (items.id=416's
+/// There is no single message row to read from -- a selection may span multiple messages (items.id=416's
 /// cross-message-selection resolution: treated as ONE new composition, one
 /// combined review, not fragmented per-message sub-reviews) -- so
 /// content_text is supplied directly by the frontend (the concatenated
@@ -1083,276 +824,6 @@ pub async fn submit_chat_copy_consent_decision(
     .map_err(|e| e.to_string())
 }
 
-/// items.id=406 (decisions.id=755) -- the provider-selection re-check
-/// trigger. Fires when the user activates a rail provider not covered by
-/// the message's original copy-time review (CloudChatAccessPane.tsx, provider
-/// row activation -- a QR-owned UI event, unlike paste inside an embedded
-/// CEF pane, which QR cannot observe). Frontend-side clipboard provenance
-/// (only re-checking content QR can prove it wrote itself) gates whether
-/// this command is even called -- not re-validated here, since gate3's own
-/// fact-identity cascade only ever concerns itself with message.content,
-/// never the OS clipboard.
-///
-/// No-ops (returns approved, no new review) when the newly-active provider
-/// set's max risk is not STRICTLY HIGHER than what the original review
-/// already covered (messages.reviewed_at_risk_rating) -- a same-or-lower-
-/// risk destination needs no re-check.
-#[tauri::command]
-#[specta::specta]
-pub async fn recheck_cloud_frontier_provider_selection(
-    app_handle: tauri::AppHandle,
-    request: RecheckCloudFrontierProviderSelectionRequest,
-    key_registry: State<'_, KeyRegistry>,
-    pool: State<'_, sqlx::SqlitePool>,
-) -> Result<Gate3ReviewResult, String> {
-    let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
-        .await
-        .ok_or_else(|| "not logged in".to_owned())?;
-
-    let message = message_store::get_message(
-        &request.user_id,
-        &request.persona_id,
-        &key_hex_str,
-        &request.message_id,
-    )
-    .await
-    .map_err(|e| e.to_string())?
-    .ok_or_else(|| "not_found".to_string())?;
-
-    if message.gate3_review_status.as_deref() != Some("approved") {
-        return Err(format!(
-            "message {} is not yet approved (gate3_review_status: {:?}) -- \
-             the provider-selection re-check only applies after the initial \
-             copy-time review has cleared",
-            request.message_id, message.gate3_review_status
-        ));
-    }
-    let focus_run_id = message.focus_run_id.clone().ok_or_else(|| {
-        format!(
-            "message {} is approved but has no focus_run_id -- invariant violated",
-            request.message_id
-        )
-    })?;
-
-    let no_op_result = || Gate3ReviewResult {
-        approved: true,
-        blocked: false,
-        pending_consent: false,
-        timeout: false,
-        plain_language: None,
-        target_tier: None,
-        space_max_permitted_tier: None,
-        auto_resolved: vec![],
-    };
-
-    let new_max_risk = crate::persistence::provider_store::max_risk_rating_for_providers(
-        &pool,
-        &request.newly_active_provider_ids,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let Some(new_risk) = new_max_risk else {
-        // No providers given (or none rated) -- nothing to compare against.
-        return Ok(no_op_result());
-    };
-    let already_covered = message
-        .reviewed_at_risk_rating
-        .map(|r| r as u8)
-        .unwrap_or(0);
-    if new_risk <= already_covered {
-        return Ok(no_op_result());
-    }
-
-    let settings = focus_settings_store::get_focus_settings(
-        &pool,
-        &request.persona_id,
-        CLOUD_FRONTIER_DRAFT_FOCUS_ID,
-    )
-    .await
-    .map_err(|e| e.to_string())?
-    .ok_or_else(|| {
-        format!(
-            "no focus_settings row for persona='{}' focus='{}'",
-            request.persona_id, CLOUD_FRONTIER_DRAFT_FOCUS_ID
-        )
-    })?;
-
-    let gateway = PrivacyGateway::new(SqliteDisclosureLogger::new(
-        &request.user_id,
-        &request.persona_id,
-        &key_hex_str,
-    ));
-
-    // Distinct content_key from the primary review's ("draft") -- this is a
-    // re-check against a stricter destination context, not a duplicate of
-    // the original pass. Fact-identity persistence (gate3.rs) is keyed by
-    // focus_run_id + fact_key, NOT content_key, so a fact already decided
-    // under the original review still auto-resolves here; only facts that
-    // never got a stable identity, or were never decided, interrupt again.
-    let content_key = format!("{}::recheck", message.id);
-
-    let result = gateway
-        .gate3(
-            "draft-recheck",
-            &focus_run_id,
-            "Quick Ask",
-            &content_key,
-            &message.content,
-            1, // content_sensitivity_severity
-            // target_tier -- unchanged, still u8 (items.id=439: see
-            // gate3.rs's own doc comment for why this stays legacy-typed).
-            // 3 == ExternalAccess::Unrestricted-equivalent.
-            3,
-            settings.max_permitted_tier,
-            1, // execution_tier
-            Some(&app_handle),
-            Some(new_risk),
-            // items.id=458 scoped this bypass to request_cloud_frontier_gate3_review
-            // and request_chat_copy_gate3_review only -- this call site has
-            // the same hardcoded-severity/no-PersonalTrack shape but is
-            // explicitly out of scope for that fix (flagged separately for
-            // Chat-PM to authorize on its own). true preserves this
-            // function's exact current behavior.
-            true,
-            &request.user_id,
-            &request.persona_id,
-            &key_hex_str,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let new_status = if result.pending_consent {
-        Some("pending-review")
-    } else if result.approved {
-        Some("approved")
-    } else {
-        None
-    };
-    if let Some(status) = new_status {
-        message_store::update_gate3_review_status(
-            &request.user_id,
-            &request.persona_id,
-            &key_hex_str,
-            &request.message_id,
-            status,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-        message_store::update_reviewed_at_risk_rating(
-            &request.user_id,
-            &request.persona_id,
-            &key_hex_str,
-            &request.message_id,
-            new_risk,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-    }
-
-    Ok(result.into())
-}
-
-/// Records the user's resolution of a Privacy Guardian consent review
-/// (pending-review -> approved | withheld). Separate from
-/// submit_element_consent_decision: that command writes the per-span audit
-/// record to outputs.db's consent_decisions (keyed by run_id); this one
-/// transitions messages.db's gate3_review_status (keyed by message_id) --
-/// two different persistence targets. The frontend calls both after the
-/// user resolves the Privacy Guardian modal (submit_element_consent_decision
-/// first, then this).
-#[tauri::command]
-#[specta::specta]
-pub async fn resolve_cloud_frontier_gate3_review(
-    request: ResolveCloudFrontierGate3ReviewRequest,
-    key_registry: State<'_, KeyRegistry>,
-) -> Result<(), String> {
-    if !matches!(request.status.as_str(), "approved" | "withheld") {
-        return Err(format!(
-            "status must be 'approved' or 'withheld', got '{}'",
-            request.status
-        ));
-    }
-
-    let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
-        .await
-        .ok_or_else(|| "not logged in".to_owned())?;
-
-    message_store::update_gate3_review_status(
-        &request.user_id,
-        &request.persona_id,
-        &key_hex_str,
-        &request.message_id,
-        &request.status,
-    )
-    .await
-    .map_err(|e| e.to_string())
-}
-
-/// items.id=540: reverts a message stuck at gate3_review_status='pending-review'
-/// back to 'drafted' after the user cancels the Privacy Guardian consent
-/// modal without deciding. Before this command existed,
-/// CloudChatAccessPane.tsx's handleModalCancel only reset local React state
-/// -- the message row never left 'pending-review', so any retry (the "second
-/// opinion" button, or resending) called request_cloud_frontier_gate3_review
-/// again, which hard-rejects anything not 'drafted', permanently bricking
-/// that message for the rest of the session.
-///
-/// Deliberately a separate command from resolve_cloud_frontier_gate3_review
-/// rather than a third accepted `status` value there: that command's own doc
-/// comment states 'drafted'/'pending-review' are gate3's own transitions, not
-/// valid `resolve` input, and 'withheld' is reserved for an actual, audited
-/// user decision to keep content private -- a Cancel never reached that
-/// decision (no review completed, nothing was disclosed or declined), so
-/// recording it as 'withheld' would misrepresent the audit trail and would
-/// also be terminal, permanently blocking retry on that message.
-///
-/// Guarded the same way request_cloud_frontier_gate3_review guards its own
-/// 'drafted' precondition: only a message currently at 'pending-review' may
-/// be reverted. update_gate3_review_status itself only validates the new
-/// value against the CHECK constraint, not the FROM state, so this guard
-/// belongs here.
-#[tauri::command]
-#[specta::specta]
-pub async fn cancel_cloud_frontier_gate3_review(
-    request: CancelCloudFrontierGate3ReviewRequest,
-    key_registry: State<'_, KeyRegistry>,
-) -> Result<(), String> {
-    let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
-        .await
-        .ok_or_else(|| "not logged in".to_owned())?;
-
-    let message = message_store::get_message(
-        &request.user_id,
-        &request.persona_id,
-        &key_hex_str,
-        &request.message_id,
-    )
-    .await
-    .map_err(|e| e.to_string())?
-    .ok_or_else(|| "not_found".to_string())?;
-
-    if message.gate3_review_status.as_deref() != Some("pending-review") {
-        return Err(format!(
-            "message {} is not awaiting a consent decision (gate3_review_status: {:?})",
-            request.message_id, message.gate3_review_status
-        ));
-    }
-
-    message_store::update_gate3_review_status(
-        &request.user_id,
-        &request.persona_id,
-        &key_hex_str,
-        &request.message_id,
-        "drafted",
-    )
-    .await
-    .map_err(|e| e.to_string())
-}
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -1411,22 +882,18 @@ async fn write_floor_consent_preference(
 // Tests
 // ---------------------------------------------------------------------------
 //
-// request_cloud_frontier_gate3_review is NOT unit-tested at the command-function
+// request_chat_copy_gate3_review is NOT unit-tested at the command-function
 // level here -- it takes `app_handle: tauri::AppHandle`, which (like every
 // other AppHandle-taking command in this codebase -- submit_extract_confirm
 // in this same file, commands::execution::load_and_authorize_run,
 // commands::messages::send_message) has no fake/mock construction path in a
 // plain #[tokio::test], and there is zero existing precedent anywhere in
-// this codebase for unit-testing one. Its guard clauses (message not found,
-// wrong gate3_review_status, empty content, missing focus_settings row) are
-// straightforward re-reads of message_store::get_message and
-// focus_settings_store::get_focus_settings, both already covered by their
-// own module's tests; gate3() itself has its own extensive test suite
-// (conductor/privacy/gate3.rs). What remains genuinely untested by
-// construction is the wiring between them, exercised instead via a real
-// dev-server run against a provisioned key_hex, matching send_message's own
-// documented verification approach (commands/messages.rs's test module
-// comment).
+// this codebase for unit-testing one. Its guard clause (missing
+// focus_settings row) is a straightforward re-read of
+// focus_settings_store::get_focus_settings, already covered by its own
+// module's tests; gate3() itself has its own extensive test suite
+// (conductor/privacy/gate3.rs), and the fixed copy-review parameters are
+// pinned by the COPY_REVIEW_* tests below.
 
 #[cfg(test)]
 mod tests {
@@ -1478,206 +945,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn resolve_cloud_frontier_gate3_review_rejects_invalid_status() {
-        let _env = setup().await;
-
-        let app = mock_app_with_registry(sqlx::SqlitePool::connect_lazy_with(
-            sqlx::sqlite::SqliteConnectOptions::new().filename(":memory:"),
-        ));
-        let registry = app.state::<KeyRegistry>();
-        populate_registry(&registry, USER_ID, MASTER_KEY).await;
-
-        let result = resolve_cloud_frontier_gate3_review(
-            ResolveCloudFrontierGate3ReviewRequest {
-                user_id: USER_ID.to_owned(),
-                persona_id: PERSONA_ID.to_owned(),
-                message_id: "msg-1".to_owned(),
-                status: "drafted".to_owned(),
-            },
-            registry,
-        )
-        .await;
-
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("must be 'approved' or 'withheld'"));
-    }
-
-    #[tokio::test]
-    async fn resolve_cloud_frontier_gate3_review_transitions_to_approved() {
-        let _env = setup().await;
-
-        let record = message_store::save_message(
-            USER_ID,
-            PERSONA_ID,
-            &key_hex_str(),
-            "cloud-frontier-access-persona-1",
-            "assistant",
-            "drafted starter text",
-            Some("run-1"),
-            Some("pending-review"),
-        )
-        .await
-        .expect("save_message must succeed");
-
-        let app = mock_app_with_registry(sqlx::SqlitePool::connect_lazy_with(
-            sqlx::sqlite::SqliteConnectOptions::new().filename(":memory:"),
-        ));
-        let registry = app.state::<KeyRegistry>();
-        populate_registry(&registry, USER_ID, MASTER_KEY).await;
-
-        resolve_cloud_frontier_gate3_review(
-            ResolveCloudFrontierGate3ReviewRequest {
-                user_id: USER_ID.to_owned(),
-                persona_id: PERSONA_ID.to_owned(),
-                message_id: record.id.clone(),
-                status: "approved".to_owned(),
-            },
-            registry,
-        )
-        .await
-        .expect("resolve_cloud_frontier_gate3_review must succeed");
-
-        let fetched = message_store::get_message(USER_ID, PERSONA_ID, &key_hex_str(), &record.id)
-            .await
-            .expect("get_message must succeed")
-            .expect("message must exist");
-        assert_eq!(fetched.gate3_review_status.as_deref(), Some("approved"));
-    }
-
-    #[tokio::test]
-    async fn resolve_cloud_frontier_gate3_review_transitions_to_withheld() {
-        let _env = setup().await;
-
-        let record = message_store::save_message(
-            USER_ID,
-            PERSONA_ID,
-            &key_hex_str(),
-            "cloud-frontier-access-persona-1",
-            "assistant",
-            "drafted starter text",
-            Some("run-1"),
-            Some("pending-review"),
-        )
-        .await
-        .expect("save_message must succeed");
-
-        let app = mock_app_with_registry(sqlx::SqlitePool::connect_lazy_with(
-            sqlx::sqlite::SqliteConnectOptions::new().filename(":memory:"),
-        ));
-        let registry = app.state::<KeyRegistry>();
-        populate_registry(&registry, USER_ID, MASTER_KEY).await;
-
-        resolve_cloud_frontier_gate3_review(
-            ResolveCloudFrontierGate3ReviewRequest {
-                user_id: USER_ID.to_owned(),
-                persona_id: PERSONA_ID.to_owned(),
-                message_id: record.id.clone(),
-                status: "withheld".to_owned(),
-            },
-            registry,
-        )
-        .await
-        .expect("resolve_cloud_frontier_gate3_review must succeed");
-
-        let fetched = message_store::get_message(USER_ID, PERSONA_ID, &key_hex_str(), &record.id)
-            .await
-            .expect("get_message must succeed")
-            .expect("message must exist");
-        assert_eq!(fetched.gate3_review_status.as_deref(), Some("withheld"));
-    }
-
-    #[tokio::test]
-    async fn cancel_cloud_frontier_gate3_review_transitions_pending_review_to_drafted() {
-        let _env = setup().await;
-
-        let record = message_store::save_message(
-            USER_ID,
-            PERSONA_ID,
-            &key_hex_str(),
-            "cloud-frontier-access-persona-1",
-            "assistant",
-            "drafted starter text",
-            Some("run-1"),
-            Some("pending-review"),
-        )
-        .await
-        .expect("save_message must succeed");
-
-        let app = mock_app_with_registry(sqlx::SqlitePool::connect_lazy_with(
-            sqlx::sqlite::SqliteConnectOptions::new().filename(":memory:"),
-        ));
-        let registry = app.state::<KeyRegistry>();
-        populate_registry(&registry, USER_ID, MASTER_KEY).await;
-
-        cancel_cloud_frontier_gate3_review(
-            CancelCloudFrontierGate3ReviewRequest {
-                user_id: USER_ID.to_owned(),
-                persona_id: PERSONA_ID.to_owned(),
-                message_id: record.id.clone(),
-            },
-            registry,
-        )
-        .await
-        .expect("cancel_cloud_frontier_gate3_review must succeed");
-
-        let fetched = message_store::get_message(USER_ID, PERSONA_ID, &key_hex_str(), &record.id)
-            .await
-            .expect("get_message must succeed")
-            .expect("message must exist");
-        assert_eq!(fetched.gate3_review_status.as_deref(), Some("drafted"));
-    }
-
-    #[tokio::test]
-    async fn cancel_cloud_frontier_gate3_review_rejects_non_pending_review() {
-        let _env = setup().await;
-
-        let record = message_store::save_message(
-            USER_ID,
-            PERSONA_ID,
-            &key_hex_str(),
-            "cloud-frontier-access-persona-1",
-            "assistant",
-            "already-approved text",
-            Some("run-1"),
-            Some("approved"),
-        )
-        .await
-        .expect("save_message must succeed");
-
-        let app = mock_app_with_registry(sqlx::SqlitePool::connect_lazy_with(
-            sqlx::sqlite::SqliteConnectOptions::new().filename(":memory:"),
-        ));
-        let registry = app.state::<KeyRegistry>();
-        populate_registry(&registry, USER_ID, MASTER_KEY).await;
-
-        let result = cancel_cloud_frontier_gate3_review(
-            CancelCloudFrontierGate3ReviewRequest {
-                user_id: USER_ID.to_owned(),
-                persona_id: PERSONA_ID.to_owned(),
-                message_id: record.id.clone(),
-            },
-            registry,
-        )
-        .await;
-
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("is not awaiting a consent decision"));
-
-        let fetched = message_store::get_message(USER_ID, PERSONA_ID, &key_hex_str(), &record.id)
-            .await
-            .expect("get_message must succeed")
-            .expect("message must exist");
-        assert_eq!(fetched.gate3_review_status.as_deref(), Some("approved"));
-    }
-
     /// CLOUD_FRONTIER_DRAFT_FOCUS_ID must stay "quick-ask" -- a silent rename here
-    /// would desync request_cloud_frontier_gate3_review's focus_settings lookup from
-    /// the actual focus_id ChatPane/CloudChatAccessPane draft against
+    /// would desync request_chat_copy_gate3_review's focus_settings lookup from
+    /// the actual focus_id ChatPane drafts against
     /// (app/core_artifacts/focuses/quick-ask.focus) without any compiler
     /// error to catch it.
     #[test]
@@ -1685,7 +955,7 @@ mod tests {
         assert_eq!(CLOUD_FRONTIER_DRAFT_FOCUS_ID, "quick-ask");
     }
 
-    /// Guards the focus_settings lookup shape request_cloud_frontier_gate3_review
+    /// Guards the focus_settings lookup shape request_chat_copy_gate3_review
     /// depends on (get_focus_settings(persona_id, "quick-ask")) without
     /// needing an AppHandle -- confirms a real row round-trips the
     /// max_permitted_tier value the command reads as space_max_permitted_tier.

@@ -573,51 +573,6 @@ pub async fn get_provider(
     }
 }
 
-/// items.id=406 (decisions.id=753): the routing-determinant read path for
-/// Privacy Guardian gate3 -- the worst-case (MAX) risk rating across
-/// whatever destinations are currently active/selected, so a copy-time
-/// review that covers several simultaneously-open providers is scored
-/// against the riskiest one, not an arbitrary single pick. `None` when
-/// `provider_ids` is empty (no known destination yet -- callers should
-/// treat this the same as "no rating available", i.e. fall back to
-/// whatever conservative default they'd otherwise use).
-///
-/// items.id=427: repointed at providers -- signature and behavior
-/// otherwise unchanged, this is a live Privacy Guardian consumer.
-pub async fn max_risk_rating_for_providers(
-    pool: &sqlx::SqlitePool,
-    provider_ids: &[String],
-) -> Result<Option<u8>, ProviderStoreError> {
-    if provider_ids.is_empty() {
-        return Ok(None);
-    }
-
-    let mut conn = pool.acquire().await?;
-
-    // Bound to (small) actual provider IDs, not user-supplied text -- an
-    // IN(...) list built from a fixed, checked-length local set is standard
-    // sqlx practice, not user-controlled SQL. Placeholders are still bound
-    // by position, never interpolated, so this carries no injection risk.
-    let placeholders = provider_ids
-        .iter()
-        .map(|_| "?")
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql =
-        format!("SELECT MAX(risk_rating) as max_risk FROM providers WHERE id IN ({placeholders})");
-
-    let mut query = sqlx::query(&sql);
-    for id in provider_ids {
-        query = query.bind(id);
-    }
-
-    let row = query.fetch_one(&mut *conn).await?;
-    let max_risk: Option<i64> = row
-        .try_get("max_risk")
-        .map_err(ProviderStoreError::Database)?;
-    Ok(max_risk.map(|r| r as u8))
-}
-
 /// The selector screen's primary read path (TIER3_ACCESS_MODEL.md State 3):
 /// all 'active' providers, ordered provider_type then display_name so a
 /// caller can group the result for display without a second query. No
@@ -1186,14 +1141,13 @@ mod tests {
         row_to_provider(&row).unwrap_or_else(|e| panic!("provider '{id}' row shape: {e}"))
     }
 
-    /// Exercises the real public API (list_active_providers,
-    /// max_risk_rating_for_providers) against a real on-disk shared.db under
+    /// Exercises the real public API (list_active_providers) against a real on-disk shared.db under
     /// a tempdir-backed QR_DATA_ROOT -- not just the migration SQL directly
     /// (the two tests above). This is the live Privacy Guardian consumer's
     /// actual call path. Pattern matches migrations.rs's own
     /// QR_DATA_ROOT-mutating tests (ENV_MUTEX serialization, save/restore).
     #[tokio::test]
-    async fn list_active_providers_and_max_risk_rating_via_public_api() {
+    async fn list_active_providers_via_public_api() {
         let _lock = crate::test_support::ENV_MUTEX.lock().await;
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
@@ -1214,19 +1168,6 @@ mod tests {
             assert!(ids.contains(&"claude"));
             assert!(ids.contains(&"chatgpt"));
             assert!(ids.contains(&"gemini"));
-
-            let max_risk =
-                max_risk_rating_for_providers(&pool, &["duckai".to_string(), "claude".to_string()])
-                    .await?;
-            assert_eq!(
-                max_risk,
-                Some(3),
-                "MAX across a Low(duckai)+High(claude) selection must be High"
-            );
-
-            let max_risk_low_only =
-                max_risk_rating_for_providers(&pool, &["duckai".to_string()]).await?;
-            assert_eq!(max_risk_low_only, Some(1));
 
             Ok::<(), ProviderStoreError>(())
         }

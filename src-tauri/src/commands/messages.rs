@@ -49,7 +49,6 @@ pub struct SendMessageRequest {
     pub context_key: String,
     pub content: String,
     pub focus_id: String,
-    pub gate3_track: bool,
     /// entity_facts.id values the user already confirmed this session, via
     /// the frontend's pre-send commands::consent::get_pending_cross_persona_
     /// confirmations() query + confirmation UI, BEFORE calling send_message.
@@ -242,12 +241,11 @@ fn crisis_block_from_result(
 }
 
 /// items.id=317: same Ok(None) gap as crisis_block_from_result above, for the
-/// ordinary (non-crisis) cloud_frontier pause -- the assistant placeholder's content
-/// must be backfilled with the draft awaiting Gate3 review, or
-/// request_cloud_frontier_gate3_review's content.is_empty() guard fails every time
-/// (consent.rs). RunResult.output_content is only populated by lifecycle.rs
-/// for a cloud_frontier boundary pause (status == "awaiting_user"); other paused/failed
-/// statuses leave it None, so this stays a no-op for them.
+/// ordinary (non-crisis) cloud_frontier pause -- the assistant placeholder's
+/// content must be backfilled with the paused run's draft output, or the
+/// reply stays an empty bubble. RunResult.output_content is only populated by
+/// lifecycle.rs for a cloud_frontier boundary pause (status == "awaiting_user");
+/// other paused/failed statuses leave it None, so this stays a no-op for them.
 fn draft_content_from_result(
     result: &Result<
         crate::conductor::lifecycle::RunResult,
@@ -510,7 +508,6 @@ pub async fn send_message(
         context_key,
         content,
         focus_id,
-        gate3_track,
         confirmed_cross_persona_fact_ids,
     } = request;
 
@@ -583,7 +580,6 @@ pub async fn send_message(
     // into) while generation is in flight. Its own id isn't needed beyond
     // this point -- finalize_chat_reply (step 5) finds this row again by
     // focus_run_id, not by id.
-    let gate3_review_status = if gate3_track { Some("drafted") } else { None };
     message_store::save_message(
         &user_id,
         &persona_id,
@@ -592,7 +588,7 @@ pub async fn send_message(
         "assistant",
         "",
         Some(&run_id),
-        gate3_review_status,
+        None,
     )
     .await
     .map_err(|e| e.to_string())?;
