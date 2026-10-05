@@ -86,6 +86,13 @@ Key commands:
 
 The cargo commands above run from src-tauri/. CI's check job (.github/workflows/tauri-ci.yml) runs fmt, clippy, deny and plain test; a change is not verified until build, fmt, clippy, deny and plain test all pass locally. Build plus test alone has let both a compile break and a fmt failure reach unpushed main undetected (items.id=532).
 
+Frontend gate (items.id=588): CI also runs a separate `frontend` job in
+tauri-ci.yml, in parallel with `check` (Node 24: npm ci, npx tsc -b, npm test,
+npm run lint, all run from frontend/). The same four commands are the local
+frontend gate -- a frontend change is not verified until all pass. oxlint
+warnings (30 as of 2026-10-04) do not fail the gate; errors do. npm test needs
+Node >= 22.6 (it runs the plain-node test files with --experimental-strip-types).
+
 The Rust toolchain is pinned (rust-toolchain.toml at repo root, version
 matched in the CI workflow's Install Rust step) rather than left on
 `stable` -- an unpinned `dtolnay/rust-toolchain@stable` install can pick
