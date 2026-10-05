@@ -7,7 +7,7 @@
   flex-direction: column;
   gap: 8px;
   font-size: 14px;
-  color: var(--text);
+  color: var(--text-muted);
   padding: 12px;
   border-radius: 8px;
   border: 1px solid var(--border);
@@ -15,11 +15,11 @@
 }
 
 .cross-persona-confirm-modal__title {
-  font-weight: 600;
+  font-weight: 500;
 }
 
 .cross-persona-confirm-modal__body {
-  color: var(--text);
+  color: var(--text-muted);
 }
 
 .cross-persona-confirm-modal__list {
@@ -39,11 +39,11 @@
   padding: 6px 8px;
   border-radius: 6px;
   border: 1px solid var(--border);
-  background: var(--bg);
+  background: var(--surface);
 }
 
 .cross-persona-confirm-modal__sensitivity {
-  color: var(--text-muted, var(--text));
+  color: var(--text-muted);
   font-size: 12px;
 }
 
@@ -58,13 +58,13 @@
   padding: 4px 8px;
   border-radius: 6px;
   border: 1px solid var(--border);
-  background: var(--bg);
-  color: var(--text);
+  background: var(--surface);
+  color: var(--text-muted);
 }
 
 .cross-persona-confirm-modal__choice--selected {
-  border-color: var(--accent-border, var(--border));
-  background: var(--accent-bg, var(--code-bg));
+  border-color: var(--accent);
+  background: var(--accent-wash);
 }
 
 .cross-persona-confirm-modal__footer {

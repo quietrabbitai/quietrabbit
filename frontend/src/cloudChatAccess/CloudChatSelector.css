@@ -53,10 +53,10 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  background: var(--border);
+  background: var(--text-muted);
   color: var(--bg);
   font-size: 11px;
-  font-weight: 600;
+  font-weight: 500;
 }
 
 .cloud-chat-rail__row--idle .cloud-chat-rail__icon {
@@ -78,12 +78,12 @@
 }
 
 .cloud-chat-rail__row--idle .cloud-chat-rail__name {
-  color: var(--text);
+  color: var(--text-muted);
   opacity: 0.75;
 }
 
 .cloud-chat-rail__state {
-  font-size: 10.5px;
+  font-size: 11px;
   opacity: 0.65;
 }
 
@@ -104,12 +104,14 @@
 
 .cloud-chat-rail__badge--hosting {
   background: var(--border);
-  color: var(--text);
+  color: var(--text-muted);
   opacity: 0.65;
 }
 
 .cloud-chat-rail__badge--identity {
-  color: var(--bg);
+  /* Fill, glyph color and (medium) ring are set inline from
+   * cloudChatAccessConfig.ts (--risk-*, --on-risk-* tokens). */
+  color: var(--on-risk-unknown);
 }
 
 .cloud-chat-rail__access-badge {

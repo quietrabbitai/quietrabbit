@@ -31,13 +31,13 @@
 }
 
 .document-row--interactive[data-selected] {
-  background: var(--accent-bg);
+  background: var(--accent-wash);
 }
 
 .document-row__name {
-  font-size: 12.5px;
+  font-size: 13px;
   font-weight: 500;
-  color: var(--text-h);
+  color: var(--text);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -53,14 +53,14 @@
 }
 
 .document-row__date {
-  font-size: 10.5px;
-  color: var(--text);
+  font-size: 11px;
+  color: var(--text-muted);
   flex-shrink: 0;
 }
 
 .document-row__exported-mark {
   display: inline-flex;
-  color: var(--text);
+  color: var(--text-muted);
   opacity: 0.65;
 }
 
@@ -74,7 +74,7 @@
   padding: 1px 5px;
   border-radius: 4px;
   border: 1px solid var(--border);
-  color: var(--text);
+  color: var(--text-muted);
   opacity: 0.75;
   white-space: nowrap;
 }

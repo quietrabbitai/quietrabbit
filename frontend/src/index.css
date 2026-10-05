@@ -1,67 +1,194 @@
+/* App-wide design tokens -- DESIGN_TOKEN_SPEC.md (decisions.id=849, items.id=582).
+ * Three layers: palette primitives (the only place hex literals live), role
+ * tokens that reference them, and the type scale. Single locked light theme
+ * (decisions.id=801): no OS light/dark following. */
+
+/* Fonts: bundled locally (src/assets/fonts, OFL 1.1, see NOTICE.txt there).
+ * No CDN, no runtime fetch. One block per subset, unicode-range picks which
+ * file the browser loads. */
+@font-face {
+  font-family: 'DM Sans';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('./assets/fonts/dm-sans-latin-ext-400-normal.woff2') format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308,
+    U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113,
+    U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: 'DM Sans';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('./assets/fonts/dm-sans-latin-400-normal.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304,
+    U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'DM Sans';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url('./assets/fonts/dm-sans-latin-ext-500-normal.woff2') format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308,
+    U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113,
+    U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: 'DM Sans';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url('./assets/fonts/dm-sans-latin-500-normal.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304,
+    U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+/* Italic: needed by the Privacy Guardian modal's suggestion text. */
+@font-face {
+  font-family: 'DM Sans';
+  font-style: italic;
+  font-weight: 400;
+  font-display: swap;
+  src: url('./assets/fonts/dm-sans-latin-ext-400-italic.woff2') format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308,
+    U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113,
+    U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: 'DM Sans';
+  font-style: italic;
+  font-weight: 400;
+  font-display: swap;
+  src: url('./assets/fonts/dm-sans-latin-400-italic.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304,
+    U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'DM Serif Display';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('./assets/fonts/dm-serif-display-latin-ext-400-normal.woff2') format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308,
+    U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113,
+    U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: 'DM Serif Display';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('./assets/fonts/dm-serif-display-latin-400-normal.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304,
+    U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
 :root {
-  --text: #6b6375;
-  --text-h: #08060d;
-  --bg: #fff;
-  --border: #e5e4e7;
+  /* --- Palette primitives (palette v3 + documented non-palette values) --- */
+  --sage-mist: #e6e9e2;
+  --ink: #242c2a;
+  --amber: #c48b1a; /* logo inner ear only -- not a UI token */
+  --ember: #b04030;
+  --dusk-blue: #2e5068;
+  --forest: #386850;
+  --warm-sage: #5c7266;
+  --warm-umber: #56482e;
+  --hop-sky: #50b8d8;
+  --slate-blue: #5a6e7f;
+  --white: #ffffff;
+  --white-soft: #fcfdfb;
+  --sage-panel: #d8ddd4;
+  --ink-10: rgba(36, 44, 42, 0.1);
+  --ink-14: rgba(36, 44, 42, 0.14);
+  --ink-28: rgba(36, 44, 42, 0.28);
+  --ink-50: rgba(36, 44, 42, 0.5);
+  --ink-70: rgba(36, 44, 42, 0.7);
+
+  /* Risk badge primitives (decisions.id=800 carve-out, provider indicator rows). */
+  --risk-low-fill: #4c7a5e;
+  --risk-medium-fill: #c19e42;
+  --risk-high-fill: #a15a4c;
+  --risk-medium-ring: #9e8236;
+
+  /* --- Role map --- */
+  --bg: var(--sage-mist);
+  --surface: var(--white);
+  --surface-sunken: var(--sage-panel);
+  --text: var(--ink);
+  --text-muted: var(--ink-70);
+  --text-label: var(--ink-50);
+  --border-subtle: var(--ink-10);
+  --border: var(--ink-14);
+  --border-strong: var(--ink-28);
+  --action: var(--ink);
+  --on-action: var(--sage-mist);
+  --action-ghost: transparent;
+  --accent: var(--warm-sage); /* fill only, never text on Sage mist */
+  --on-accent: var(--white-soft);
+  --accent-wash: rgba(92, 114, 102, 0.08);
+  --link: var(--ink);
+  --focus-ring: 2px solid var(--ink);
+  --focus-ring-offset: 2px;
+  --danger: var(--ember);
+  --on-danger: var(--white-soft);
+  --persona-work: var(--dusk-blue);
+  --persona-health: var(--forest);
+  --persona-personal: var(--warm-sage);
+  --persona-legal: var(--warm-umber);
+  --verification-icon: var(--slate-blue);
+  --internet: var(--hop-sky);
+  --tier-icon: var(--ink-50);
+
+  /* Identity-badge glyphs (spec section 6). */
+  --on-risk-low: var(--white-soft);
+  --on-risk-medium: var(--ink);
+  --on-risk-high: var(--white-soft);
+  --on-risk-unknown: var(--white-soft);
+
+  /* Not covered by the spec (items.id=582 leaves them as they were; flagged
+   * for Chat-PM): code/hover background, shadow, mono font. */
   --code-bg: #f4f3ec;
-  --accent: #aa3bff;
-  --accent-bg: rgba(170, 59, 255, 0.1);
-  --accent-border: rgba(170, 59, 255, 0.5);
-  --social-bg: rgba(244, 243, 236, 0.5);
   --shadow:
     rgba(0, 0, 0, 0.1) 0 10px 15px -3px, rgba(0, 0, 0, 0.05) 0 4px 6px -2px;
-
-  --sans: system-ui, 'Segoe UI', Roboto, sans-serif;
-  --heading: system-ui, 'Segoe UI', Roboto, sans-serif;
   --mono: ui-monospace, Consolas, monospace;
 
-  /* Privacy Guardian modal palette (PRIVACY_GUARDIAN_GATE_SPEC.md, LOCKED).
-   * Fixed values, not gated by prefers-color-scheme like the rest of this
-   * file's variables -- the spec gives exactly one hex per role with no
-   * dark-mode alternate anywhere in its 611 lines, and the modal is
-   * deliberately a fixed "authority" surface distinct from the app's own
-   * adaptive chrome ("User is still inside QR -- not a foreign surface,"
-   * but with its own recognizable identity regardless of app theme).
-   * Inventing dark-mode alternates the spec never specified would be
-   * guessing, not implementing -- see CLAUDE.md's "stop and ask rather
-   * than invent." */
-  --pg-ink: #242c2a;
-  --pg-ember: #b04030;
-  --pg-sage-mist: #e6e9e2;
+  /* --- Type --- */
+  --font-sans: 'DM Sans', system-ui, 'Segoe UI', Roboto, sans-serif;
+  --font-display: 'DM Serif Display', Georgia, serif;
+  --text-2xs: 10px;
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-base: 13px;
+  --text-md: 14px;
+  --text-lg: 16px;
+  --heading: 24px;
+  --wordmark: 22px;
+  --leading-tight: 1.3;
+  --leading-body: 1.45;
 
-  font: 18px/145% var(--sans);
-  letter-spacing: 0.18px;
-  color-scheme: light dark;
+  /* Privacy Guardian modal (PRIVACY_GUARDIAN_GATE_SPEC.md, LOCKED): fixed
+   * names, aliased to the palette primitives so each hex has one home while
+   * a later change to a role token (accent, action) cannot restyle the
+   * modal. Values are identical to the prior literals. */
+  --pg-ink: var(--ink);
+  --pg-ember: var(--ember);
+  --pg-sage-mist: var(--sage-mist);
+}
+
+html {
+  font-size: 16px;
+}
+
+body {
+  margin: 0;
+  font: 14px/1.45 var(--font-sans);
   color: var(--text);
   background: var(--bg);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-
-  @media (max-width: 1024px) {
-    font-size: 16px;
-  }
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --text: #9ca3af;
-    --text-h: #f3f4f6;
-    --bg: #16171d;
-    --border: #2e303a;
-    --code-bg: #1f2028;
-    --accent: #c084fc;
-    --accent-bg: rgba(192, 132, 252, 0.15);
-    --accent-border: rgba(192, 132, 252, 0.5);
-    --social-bg: rgba(47, 48, 58, 0.5);
-    --shadow:
-      rgba(0, 0, 0, 0.4) 0 10px 15px -3px, rgba(0, 0, 0, 0.25) 0 4px 6px -2px;
-  }
-
-  #social .button-icon {
-    filter: invert(1) brightness(2);
-  }
 }
 
 #root {
@@ -74,34 +201,21 @@
   box-sizing: border-box;
 }
 
-body {
-  margin: 0;
-}
-
 h1,
 h2 {
-  font-family: var(--heading);
-  font-weight: 500;
-  color: var(--text-h);
+  font-family: var(--font-display);
+  font-weight: 400;
+  color: var(--text);
 }
 
 h1 {
-  font-size: 56px;
-  letter-spacing: -1.68px;
-  margin: 32px 0;
-  @media (max-width: 1024px) {
-    font-size: 36px;
-    margin: 20px 0;
-  }
+  font-size: var(--heading);
+  margin: 20px 0;
 }
 h2 {
-  font-size: 24px;
-  line-height: 118%;
-  letter-spacing: -0.24px;
+  font-size: var(--heading);
+  line-height: var(--leading-tight);
   margin: 0 0 8px;
-  @media (max-width: 1024px) {
-    font-size: 20px;
-  }
 }
 p {
   margin: 0;
@@ -112,11 +226,11 @@ code,
   font-family: var(--mono);
   display: inline-flex;
   border-radius: 4px;
-  color: var(--text-h);
+  color: var(--text);
 }
 
 code {
-  font-size: 15px;
+  font-size: 14px;
   line-height: 135%;
   padding: 4px 8px;
   background: var(--code-bg);

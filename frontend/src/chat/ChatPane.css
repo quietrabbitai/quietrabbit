@@ -2,7 +2,7 @@
  *
  * Same convention as MiddleZone.css: consumes index.css's custom properties
  * (--text/--bg/--border/--accent/...) rather than declaring its own colors,
- * so it tracks the app's light/dark theme automatically. No CSS-in-JS, no
+ * so it follows the app's single locked light theme (decisions.id=801). No CSS-in-JS, no
  * CSS modules -- plain global file, class names prefixed .chat-pane, same
  * as every other component in this tree. */
 
@@ -50,13 +50,13 @@
 
 .chat-pane__message--user {
   align-self: flex-end;
-  background: var(--accent-bg);
-  border-color: var(--accent-border);
+  background: var(--accent-wash);
+  border-color: var(--accent);
 }
 
 .chat-pane__message--assistant {
   align-self: flex-start;
-  background: var(--bg);
+  background: var(--surface);
 }
 
 .chat-pane__message-content {
@@ -70,19 +70,19 @@
 
 .chat-pane__unsent-badge {
   font-size: 12px;
-  color: var(--text);
+  color: var(--text-muted);
 }
 
 .chat-pane__generating {
   font-size: 14px;
-  color: var(--text);
+  color: var(--text-muted);
   padding: 4px 10px;
 }
 
 .chat-pane__not-sent-notice,
 .chat-pane__send-error {
   font-size: 14px;
-  color: var(--text);
+  color: var(--text-muted);
   padding: 6px 10px;
   border-radius: 8px;
   border: 1px solid var(--border);
@@ -93,7 +93,7 @@
    needs-review/failed) -- same treatment as send-error. */
 .chat-pane__copy-review-notice {
   font-size: 14px;
-  color: var(--text);
+  color: var(--text-muted);
   padding: 6px 10px;
   border-radius: 8px;
   border: 1px solid var(--border);
@@ -102,7 +102,7 @@
 
 .chat-pane__copy-review-notice--blocked,
 .chat-pane__copy-review-notice--failed {
-  border-color: var(--danger, #c0392b);
+  border-color: var(--danger);
 }
 
 /* items.id=501 slice 2: "Copy last response" -- an outlined secondary
@@ -121,7 +121,7 @@
   border: 1px solid var(--border);
   border-radius: 6px;
   background: transparent;
-  color: var(--text);
+  color: var(--text-muted);
   font: inherit;
   font-size: 12px;
   cursor: pointer;
@@ -146,7 +146,7 @@
 .chat-pane[data-collapsed] {
   border: 1px solid var(--border);
   border-radius: 10px;
-  background: var(--bg);
+  background: var(--surface);
   gap: 0;
 }
 
@@ -188,7 +188,7 @@
   flex: 0 0 auto;
   font-size: 13px;
   font-weight: 500;
-  color: var(--text-h);
+  color: var(--text);
 }
 
 .chat-pane__collapsed-snippet {
@@ -197,14 +197,14 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 12.5px;
-  color: var(--text);
+  font-size: 13px;
+  color: var(--text-muted);
 }
 
 .chat-pane__collapsed-expand {
   flex: 0 0 auto;
-  font-size: 10.5px;
-  color: var(--accent);
+  font-size: 11px;
+  color: var(--text);
   font-weight: 500;
 }
 
@@ -241,7 +241,7 @@
   padding: 8px 10px;
   border-radius: 8px;
   border: 1px solid var(--border);
-  background: var(--bg);
-  color: var(--text-h);
+  background: var(--surface);
+  color: var(--text);
   font: inherit;
 }

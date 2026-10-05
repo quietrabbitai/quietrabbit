@@ -1,8 +1,8 @@
 /* Real Active Board screen -- visual treatment.
  *
  * Same convention as LibraryPane.css/ChatPane.css: consumes index.css's
- * custom properties rather than declaring its own colors, so it tracks
- * the app's light/dark theme automatically. The card left-border is the
+ * custom properties rather than declaring its own colors, so it follows
+ * the app's single locked light theme (decisions.id=801). The card left-border is the
  * one deliberate persona-color exception -- same carve-out rationale as
  * cloudChatAccessConfig.ts's PROVIDER_BRAND_COLORS (decisions.id=732):
  * it identifies something that isn't QR's own palette (here, which
@@ -22,8 +22,8 @@
 }
 
 .active-board-pane__high-priority {
-  border: 1.5px solid var(--accent-border);
-  background: var(--accent-bg);
+  border: 1.5px solid var(--accent);
+  background: var(--accent-wash);
   border-radius: 10px;
   padding: 10px 12px;
 }
@@ -34,7 +34,7 @@
   font-weight: 500;
   letter-spacing: 0.06em;
   text-transform: uppercase;
-  color: var(--accent);
+  color: var(--text-muted);
 }
 
 .active-board-pane__grid {
@@ -51,7 +51,7 @@
   border-left-width: 3px;
   border-radius: 9px;
   padding: 8px 10px;
-  background: var(--bg);
+  background: var(--surface);
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -61,7 +61,7 @@
 .active-board-pane__card-title {
   font-size: 13px;
   font-weight: 500;
-  color: var(--text-h);
+  color: var(--text);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -69,7 +69,7 @@
 
 .active-board-pane__card-sub {
   font-size: 11px;
-  color: var(--text);
+  color: var(--text-muted);
 }
 
 /* decisions.id=737's 'compact' Board size state -- single-column row

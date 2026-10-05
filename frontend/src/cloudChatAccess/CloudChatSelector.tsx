@@ -34,6 +34,8 @@ import {
   DUCK_LOGO_URL,
   PROVIDER_LOGO_COMPONENTS,
   privacyLevelColor,
+  privacyLevelGlyphColor,
+  privacyLevelRing,
   providerBrandColor,
   type Provider,
 } from './cloudChatAccessConfig'
@@ -183,7 +185,11 @@ export function CloudChatSelector({
               </span>
               <span
                 className="cloud-chat-rail__badge cloud-chat-rail__badge--identity"
-                style={{ backgroundColor: privacyLevelColor(provider.privacyGuardianDefaultLevel) }}
+                style={{
+                  backgroundColor: privacyLevelColor(provider.privacyGuardianDefaultLevel),
+                  color: privacyLevelGlyphColor(provider.privacyGuardianDefaultLevel),
+                  boxShadow: privacyLevelRing(provider.privacyGuardianDefaultLevel),
+                }}
                 title={t('cloudChatSelector.badgeDefaultPostureNotice', { providerName: provider.name })}
                 aria-hidden="true"
               >

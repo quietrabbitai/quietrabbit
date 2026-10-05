@@ -24,8 +24,8 @@
   padding: 8px 10px;
   border: 1px solid var(--border);
   border-radius: 8px;
-  background: var(--bg);
-  color: var(--text-h);
+  background: var(--surface);
+  color: var(--text);
   font-size: 13px;
   font-weight: 500;
   text-align: left;
@@ -37,7 +37,7 @@
 }
 
 .history-screen__view-button[data-selected] {
-  background: var(--accent-bg);
+  background: var(--accent-wash);
   border-color: var(--accent);
 }
 
@@ -55,6 +55,6 @@
 .history-screen__notice,
 .history-screen__empty {
   font-size: 12px;
-  color: var(--text);
+  color: var(--text-muted);
   padding: 4px 2px;
 }

@@ -6,15 +6,15 @@
   padding: 9px 14px;
   border-radius: 10px;
   border: 1px solid var(--border);
-  background: var(--bg);
-  color: var(--text-h);
+  background: var(--surface);
+  color: var(--text);
   font-size: 13px;
   text-align: left;
   cursor: pointer;
 }
 
 .cloud-chat-collapsed-strip:hover {
-  border-color: var(--accent-border);
+  border-color: var(--accent);
 }
 
 .cloud-chat-collapsed-strip__name {
@@ -22,12 +22,12 @@
 }
 
 .cloud-chat-collapsed-strip__expand {
-  color: var(--text);
+  color: var(--text-muted);
   font-size: 12px;
 }
 
 .cloud-chat-collapsed-strip__extra {
   margin-left: auto;
   font-size: 11px;
-  color: var(--text);
+  color: var(--text-muted);
 }

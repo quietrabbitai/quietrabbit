@@ -1,7 +1,7 @@
 /* items.id=543: shared styles for PersonaBox, PersonaPillRow, PersonaIdentity
  * and the selector popover -- same convention as ActiveBoardPane.css/
  * NewChatPersonaPicker.css, consumes index.css's custom properties so it
- * tracks the app's light/dark theme automatically. No persona-color accents
+ * follows the app's single locked light theme (decisions.id=801). No persona-color accents
  * here (PERSONA_SELECTOR_DESIGN_ITEM543_20260921.md Section 2.4) -- that's
  * the one deliberate difference from ActiveBoardPane.css's own carve-out. */
 
@@ -22,9 +22,9 @@
   height: 18px;
   border-radius: 50%;
   background: var(--code-bg);
-  color: var(--text-h);
+  color: var(--text);
   font-size: 10px;
-  font-weight: 600;
+  font-weight: 500;
   flex: 0 0 auto;
 }
 
@@ -59,8 +59,8 @@
   border-radius: 999px;
   padding: 4px 10px 4px 6px;
   font-size: 12px;
-  color: var(--text-h);
-  background: var(--bg);
+  color: var(--text);
+  background: var(--surface);
   cursor: pointer;
 }
 
@@ -75,12 +75,12 @@
 
 .persona-box[data-empty] {
   border-style: dashed;
-  color: var(--text);
+  color: var(--text-muted);
 }
 
 .persona-box__chevron {
-  font-size: 9px;
-  color: var(--text);
+  font-size: 10px;
+  color: var(--text-muted);
 }
 
 .persona-selector-popover {
@@ -89,7 +89,7 @@
   right: 0;
   z-index: 10;
   min-width: 200px;
-  background: var(--bg);
+  background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 10px;
@@ -99,7 +99,7 @@
 .persona-selector-popover__title {
   margin: 0 0 8px;
   font-size: 12px;
-  color: var(--text);
+  color: var(--text-muted);
 }
 
 .persona-selector-popover__option {
@@ -110,7 +110,7 @@
   border-radius: 6px;
   padding: 7px 8px;
   font-size: 13px;
-  color: var(--text-h);
+  color: var(--text);
   background: transparent;
   cursor: pointer;
   text-align: left;
@@ -142,15 +142,15 @@
   border-radius: 999px;
   padding: 4px 10px;
   font-size: 12px;
-  color: var(--text);
-  background: var(--bg);
+  color: var(--text-muted);
+  background: var(--surface);
   cursor: pointer;
 }
 
 .persona-pill-row__pill[data-selected] {
-  color: var(--text-h);
+  color: var(--text);
   background: var(--code-bg);
-  border-color: var(--accent-border);
+  border-color: var(--accent);
   font-weight: 500;
 }
 
@@ -170,5 +170,5 @@
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  border: 1.5px solid var(--text-h);
+  border: 1.5px solid var(--text);
 }

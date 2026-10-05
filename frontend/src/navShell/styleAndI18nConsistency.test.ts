@@ -468,7 +468,10 @@ function extractCssSelectors(): Map<string, { file: string; line: number }> {
   const selectors = new Map<string, { file: string; line: number }>()
   for (const file of walk(SRC_ROOT, ['.css'])) {
     const raw = fs.readFileSync(file, 'utf8')
-    const noComments = raw.replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' '))
+    // url(...) blanked too: a font file name like "x.woff2" is not a class selector.
+    const noComments = raw
+      .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' '))
+      .replace(/url\([^)]*\)/g, (m) => m.replace(/[^\n]/g, ' '))
     const re = /\.([A-Za-z_][\w-]*)/g
     let m: RegExpExecArray | null
     while ((m = re.exec(noComments))) {

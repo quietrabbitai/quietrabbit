@@ -1,0 +1,23 @@
+Bundled fonts -- third-party, not covered by the repository LICENSE (BSL 1.1).
+
+These font files are licensed under the SIL Open Font License, Version 1.1
+(SIL OFL 1.1). They are redistributed unmodified; each license text is
+shipped verbatim next to them and must stay with the font files.
+
+Source: the Fontsource npm packages (woff2 builds of the Google Fonts
+releases), vendored as files via `npm pack`. They are NOT npm dependencies of
+this project.
+
+  @fontsource/dm-sans 5.3.0
+    Files:   dm-sans-{latin,latin-ext}-{400,500}-normal.woff2,
+             dm-sans-{latin,latin-ext}-400-italic.woff2
+    License: OFL-dm-sans.txt
+    Upstream: https://github.com/googlefonts/dm-fonts
+
+  @fontsource/dm-serif-display 5.3.0
+    Files:   dm-serif-display-{latin,latin-ext}-400-normal.woff2
+    License: OFL-dm-serif-display.txt
+    Upstream: https://github.com/googlefonts/dm-fonts
+
+The @font-face rules (with unicode-range per subset) are written in
+frontend/src/index.css, not taken from the packages.

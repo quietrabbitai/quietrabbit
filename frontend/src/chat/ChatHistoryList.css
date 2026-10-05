@@ -3,8 +3,8 @@
   padding: 4px 10px;
   border-radius: 8px;
   border: 1px solid var(--border);
-  background: var(--bg);
-  color: var(--text);
+  background: var(--surface);
+  color: var(--text-muted);
   cursor: pointer;
 }
 
@@ -25,7 +25,7 @@
 .chat-history-list__empty {
   padding: 8px;
   font-size: 12px;
-  color: var(--text);
+  color: var(--text-muted);
 }
 
 .chat-history-list__items {
@@ -56,13 +56,13 @@
 }
 
 .chat-history-list__item[data-selected] {
-  background: var(--accent-bg);
+  background: var(--accent-wash);
 }
 
 .chat-history-list__item-title {
-  font-size: 12.5px;
+  font-size: 13px;
   font-weight: 500;
-  color: var(--text-h);
+  color: var(--text);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -70,6 +70,6 @@
 }
 
 .chat-history-list__item-time {
-  font-size: 10.5px;
-  color: var(--text);
+  font-size: 11px;
+  color: var(--text-muted);
 }

@@ -129,11 +129,22 @@ export function providerBrandColor(providerId: string): string {
 /** items.id=418 (decisions.id=800): rule 17 carve-out for the identity
  *  badge's fill color, same precedent and same narrow scope as
  *  PROVIDER_BRAND_COLORS above -- mapped directly to the real
- *  privacy_guardian_default_level field, no invented data. */
+ *  privacy_guardian_default_level field, no invented data.
+ *
+ *  items.id=582 (DESIGN_TOKEN_SPEC.md section 6): the fill hexes now live
+ *  once, in index.css (--risk-*-fill); this constant reads those tokens. */
 export const PRIVACY_LEVEL_COLORS: Record<PrivacyGuardianDefaultLevel, string> = {
-  low: '#4c7a5e',
-  medium: '#c19e42',
-  high: '#a15a4c',
+  low: 'var(--risk-low-fill)',
+  medium: 'var(--risk-medium-fill)',
+  high: 'var(--risk-high-fill)',
+}
+
+/** Glyph color per level, from the --on-risk-* tokens (sage-mist glyphs
+ *  fail contrast on the medium fill, spec section 6). */
+export const PRIVACY_LEVEL_GLYPH_COLORS: Record<PrivacyGuardianDefaultLevel, string> = {
+  low: 'var(--on-risk-low)',
+  medium: 'var(--on-risk-medium)',
+  high: 'var(--on-risk-high)',
 }
 
 /** Neutral fallback for a provider not yet curated (level is null) --
@@ -142,6 +153,18 @@ export const DEFAULT_PRIVACY_LEVEL_COLOR = '#5A6870'
 
 export function privacyLevelColor(level: PrivacyGuardianDefaultLevel | null): string {
   return level ? PRIVACY_LEVEL_COLORS[level] : DEFAULT_PRIVACY_LEVEL_COLOR
+}
+
+export function privacyLevelGlyphColor(level: PrivacyGuardianDefaultLevel | null): string {
+  return level ? PRIVACY_LEVEL_GLYPH_COLORS[level] : 'var(--on-risk-unknown)'
+}
+
+/** 1px ring in --risk-medium-ring on the medium badge only (its fill is
+ *  2.08 against Sage mist; the ring brings the edge to 3.00). The recipe
+ *  would be invisible on low/high, so they get none. Outer box-shadow, so
+ *  the 20px badge doesn't change size. */
+export function privacyLevelRing(level: PrivacyGuardianDefaultLevel | null): string | undefined {
+  return level === 'medium' ? '0 0 0 1px var(--risk-medium-ring)' : undefined
 }
 
 /** items.id=418: real provider logos via @lobehub/icons (MIT), replacing

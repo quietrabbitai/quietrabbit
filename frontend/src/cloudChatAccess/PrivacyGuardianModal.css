@@ -3,16 +3,14 @@
  * index.css's --text/--bg/--border/--accent set the way every other
  * component in this tree does -- this modal is a fixed "authority" surface
  * (--pg-ink/--pg-ember/--pg-sage-mist, also declared in index.css) that
- * does not track the app's light/dark theme, per that variable block's own
- * comment. rgba() opacity variants below are computed from those same two
+ * is aliased to palette primitives so role-token changes cannot restyle it
+ * (the app has a single locked light theme, decisions.id=801). rgba() opacity variants below are computed from those same two
  * colors (Ink #242c2a -> rgb(36,44,42), Ember #b04030 -> rgb(176,64,48)) --
  * plain CSS has no var()-based alpha composition available here without a
  * color-mix()/build-step this codebase doesn't otherwise use.
  *
- * Font: the spec calls for "DM Sans" throughout; this codebase has no font
- * loading mechanism for anything beyond the system stack declared in
- * index.css's --sans/--heading, so this file falls back to var(--sans)
- * rather than silently failing a @font-face that was never set up. */
+ * Font: the spec calls for "DM Sans" throughout; index.css bundles it
+ * locally (items.id=582) and exposes it as --font-sans. */
 
 .pg-modal-overlay {
   position: fixed;
@@ -34,7 +32,7 @@
   overflow: hidden;
   background: var(--pg-sage-mist);
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.18);
-  font-family: var(--sans);
+  font-family: var(--font-sans);
   text-align: left;
 }
 

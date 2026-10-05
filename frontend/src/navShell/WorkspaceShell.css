@@ -53,6 +53,6 @@
   border-radius: 8px;
   border: 1px solid var(--border);
   background: var(--code-bg);
-  color: var(--text);
+  color: var(--text-muted);
   cursor: pointer;
 }
