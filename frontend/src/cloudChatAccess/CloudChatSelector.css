@@ -83,42 +83,33 @@
 }
 
 .cloud-chat-rail__state {
+  /* Full strength: 0.65 opacity fails contrast (2.99-3.43:1). */
   font-size: 11px;
-  opacity: 0.65;
 }
 
-/* items.id=418: two indicator badges, shown on every row regardless of
- * idle/loaded/active state (unlike .cloud-chat-rail__icon's idle dimming) --
- * provider-level info, not pane-lifecycle state. Sized to match
- * .cloud-chat-rail__close's 20px width. */
-.cloud-chat-rail__badge {
-  flex: 0 0 auto;
-  width: 20px;
-  height: 20px;
-  border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+/* items.id=603 (decisions.id=851): ONE privacy-level chip per row, replacing
+ * the three hosting/identity/access icons. Fixed-width box; the label is a
+ * single text node that wraps within it to two lines ("Somewhat private").
+ * Fill, text color and (medium) ring are set inline from
+ * cloudChatAccessConfig.ts (--risk-*, --on-risk-* tokens). Shown on every
+ * row regardless of idle/loaded/active -- provider-level info, not
+ * pane-lifecycle state. */
+.cloud-chat-rail__chip {
+  flex: 0 0 56px;
+  box-sizing: border-box;
+  width: 56px;
   align-self: center;
-}
-
-.cloud-chat-rail__badge--hosting {
-  background: var(--border);
-  color: var(--text-muted);
-  opacity: 0.65;
-}
-
-.cloud-chat-rail__badge--identity {
-  /* Fill, glyph color and (medium) ring are set inline from
-   * cloudChatAccessConfig.ts (--risk-*, --on-risk-* tokens). */
-  color: var(--on-risk-unknown);
-}
-
-.cloud-chat-rail__access-badge {
-  flex: 0 0 auto;
+  padding: 2px 4px;
+  border-radius: 6px;
   font-size: 11px;
-  opacity: 0.55;
-  align-self: center;
+  font-weight: 500;
+  line-height: 1.15;
+  text-align: center;
+  overflow-wrap: normal;
+}
+
+.cloud-chat-rail__row--idle .cloud-chat-rail__chip {
+  opacity: 0.75;
 }
 
 .cloud-chat-rail__close {

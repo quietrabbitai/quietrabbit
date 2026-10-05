@@ -47,6 +47,7 @@ import GroqMono from '@lobehub/icons/es/Groq/components/Mono'
 import MistralColor from '@lobehub/icons/es/Mistral/components/Color'
 import OpenAIMono from '@lobehub/icons/es/OpenAI/components/Mono'
 import type { IconType } from '@lobehub/icons'
+import type { TFunction } from 'i18next'
 import { commands } from '../bindings'
 import type { PrivacyGuardianDefaultLevel } from '../bindings'
 import duckLogoUrl from './assets/duckduckgo-dax-solo.svg'
@@ -70,7 +71,28 @@ export interface Provider {
   lane: ProviderLane
   loginRequired: boolean
   isAnonymous: boolean
-  privacyGuardianDefaultLevel: PrivacyGuardianDefaultLevel | null
+  /** Non-null: no rail-visible provider may lack a level (items.id=603,
+   *  decisions.id=851) -- there is no "unrated" state. */
+  privacyGuardianDefaultLevel: PrivacyGuardianDefaultLevel
+  /** The curated "what this means for you" text, or null if uncurated. */
+  userPrivacySummary: string | null
+}
+
+/** Pulls the display text out of providers.user_privacy_summary (a JSON
+ *  object serialized to a string by the backend). Null on absent/malformed
+ *  -- the tooltip then simply omits the line; nothing is invented. */
+export function parseUserPrivacySummary(raw: string | null): string | null {
+  if (!raw) return null
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (parsed && typeof parsed === 'object' && 'summary' in parsed) {
+      const summary = (parsed as { summary: unknown }).summary
+      return typeof summary === 'string' && summary.trim() ? summary : null
+    }
+  } catch {
+    // fall through
+  }
+  return null
 }
 
 /** Fetches the selector screen's real provider list. Ordered tier-then-name
@@ -88,6 +110,7 @@ export async function fetchActiveProviders(): Promise<Provider[]> {
     loginRequired: p.login_required,
     isAnonymous: p.is_anonymous,
     privacyGuardianDefaultLevel: p.privacy_guardian_default_level,
+    userPrivacySummary: parseUserPrivacySummary(p.user_privacy_summary),
   }))
 }
 
@@ -147,24 +170,36 @@ export const PRIVACY_LEVEL_GLYPH_COLORS: Record<PrivacyGuardianDefaultLevel, str
   high: 'var(--on-risk-high)',
 }
 
-/** Neutral fallback for a provider not yet curated (level is null) --
- *  not a claim that its actual risk is low, medium, or high. */
-export const DEFAULT_PRIVACY_LEVEL_COLOR = '#5A6870'
-
-export function privacyLevelColor(level: PrivacyGuardianDefaultLevel | null): string {
-  return level ? PRIVACY_LEVEL_COLORS[level] : DEFAULT_PRIVACY_LEVEL_COLOR
+export function privacyLevelColor(level: PrivacyGuardianDefaultLevel): string {
+  return PRIVACY_LEVEL_COLORS[level]
 }
 
-export function privacyLevelGlyphColor(level: PrivacyGuardianDefaultLevel | null): string {
-  return level ? PRIVACY_LEVEL_GLYPH_COLORS[level] : 'var(--on-risk-unknown)'
+export function privacyLevelGlyphColor(level: PrivacyGuardianDefaultLevel): string {
+  return PRIVACY_LEVEL_GLYPH_COLORS[level]
 }
 
-/** 1px ring in --risk-medium-ring on the medium badge only (its fill is
+/** 1px ring in --risk-medium-ring on the medium chip only (its fill is
  *  2.08 against Sage mist; the ring brings the edge to 3.00). The recipe
  *  would be invisible on low/high, so they get none. Outer box-shadow, so
- *  the 20px badge doesn't change size. */
-export function privacyLevelRing(level: PrivacyGuardianDefaultLevel | null): string | undefined {
+ *  the chip doesn't change size. */
+export function privacyLevelRing(level: PrivacyGuardianDefaultLevel): string | undefined {
   return level === 'medium' ? '0 0 0 1px var(--risk-medium-ring)' : undefined
+}
+
+/** items.id=603 (decisions.id=851): the ONE place the privacy-level enum
+ *  maps to rail-chip wording. Display only -- the enum is unchanged, and
+ *  the Privacy Guardian modal keeps its own "Low / Medium / High risk"
+ *  wording. Takes `t` and calls it with literal keys here, because the
+ *  i18n consistency test only follows literal t() keys within one file. */
+export function privacyChipLabel(level: PrivacyGuardianDefaultLevel, t: TFunction): string {
+  switch (level) {
+    case 'low':
+      return t('cloudChatSelector.chip.low')
+    case 'medium':
+      return t('cloudChatSelector.chip.medium')
+    case 'high':
+      return t('cloudChatSelector.chip.high')
+  }
 }
 
 /** items.id=418: real provider logos via @lobehub/icons (MIT), replacing

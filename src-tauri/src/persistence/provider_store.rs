@@ -316,7 +316,10 @@ pub struct NewProvider<'a> {
     pub retains_data: bool,
     pub trains_on_data_by_default: bool,
     pub qr_internal_eligible: bool,
-    pub privacy_guardian_default_level: Option<PrivacyGuardianDefaultLevel>,
+    /// items.id=603 (decisions.id=851): required, not Option -- no
+    /// rail-visible provider may lack a level (there is no "unrated"
+    /// state), and create_provider is the only Rust insert path.
+    pub privacy_guardian_default_level: PrivacyGuardianDefaultLevel,
     pub risk_rating: u8,
     pub hardware_requirement: Option<serde_json::Value>,
     pub documentation_gate: &'a serde_json::Value,
@@ -817,7 +820,7 @@ pub async fn create_provider(
     .bind(new.retains_data as i64)
     .bind(new.trains_on_data_by_default as i64)
     .bind(new.qr_internal_eligible as i64)
-    .bind(new.privacy_guardian_default_level.map(|l| l.as_str()))
+    .bind(new.privacy_guardian_default_level.as_str())
     .bind(new.risk_rating as i64)
     .bind(&hardware_req_str)
     .bind(new.qr_recommended as i64)
@@ -848,7 +851,7 @@ pub async fn create_provider(
         trains_on_data_by_default: new.trains_on_data_by_default,
         login_required: new.login_required,
         qr_internal_eligible: new.qr_internal_eligible,
-        privacy_guardian_default_level: new.privacy_guardian_default_level,
+        privacy_guardian_default_level: Some(new.privacy_guardian_default_level),
         risk_rating: new.risk_rating,
         hardware_requirement: new.hardware_requirement,
         qr_recommended: new.qr_recommended,
@@ -1128,6 +1131,100 @@ mod tests {
         assert!(
             exists.is_none(),
             "tier3_providers must be dropped once generalized into providers"
+        );
+    }
+
+    fn new_provider_fixture<'a>(
+        id: &'a str,
+        level: PrivacyGuardianDefaultLevel,
+        gate: &'a serde_json::Value,
+    ) -> NewProvider<'a> {
+        NewProvider {
+            id,
+            display_name: "Fixture",
+            provider_type: "external_service",
+            mode: ProviderMode::EmbeddedWeb,
+            launch_url: Some("https://example.test/"),
+            login_required: true,
+            is_local: false,
+            is_anonymous: false,
+            retains_data: true,
+            trains_on_data_by_default: false,
+            qr_internal_eligible: false,
+            privacy_guardian_default_level: level,
+            risk_rating: 2,
+            hardware_requirement: None,
+            documentation_gate: gate,
+            qr_recommended: false,
+            privacy_commitment_basis: None,
+            performance_profile: None,
+            local_model_tag: None,
+            focus_eligible: false,
+            cloud_chat_visible: false,
+        }
+    }
+
+    /// items.id=603: NewProvider's level is non-Option, so "reject a missing
+    /// level" is enforced by the type -- this checks every level the type
+    /// admits is stored and read back, and the column is never NULL.
+    #[tokio::test]
+    async fn create_provider_persists_every_level_never_null() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory pool");
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            crate::persistence::migrations::run_migrations(&mut conn, "shared", None)
+                .await
+                .expect("run shared migrations");
+        }
+        let gate = serde_json::json!({});
+        for (id, level, want) in [
+            ("fx-low", PrivacyGuardianDefaultLevel::Low, "low"),
+            ("fx-medium", PrivacyGuardianDefaultLevel::Medium, "medium"),
+            ("fx-high", PrivacyGuardianDefaultLevel::High, "high"),
+        ] {
+            let created = create_provider(&pool, new_provider_fixture(id, level, &gate))
+                .await
+                .expect("create_provider");
+            assert_eq!(created.privacy_guardian_default_level, Some(level));
+            let stored: Option<String> = sqlx::query_scalar(
+                "SELECT privacy_guardian_default_level FROM providers WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(stored.as_deref(), Some(want));
+        }
+    }
+
+    /// items.id=603 invariant: every row the Cloud Chat rail can show
+    /// (active, a rail provider_type, preference_tier='preferred' -- the
+    /// filter in commands/cloud_chat_pane.rs) carries a level in the fully
+    /// migrated catalog. Rows reach the rail through migration SQL, which
+    /// Rust types cannot guard, so this is where the rule is enforced.
+    #[tokio::test]
+    async fn every_rail_visible_provider_has_a_level() {
+        let mut conn = make_test_conn().await;
+        crate::persistence::migrations::run_migrations(&mut conn, "shared", None)
+            .await
+            .expect("run shared migrations");
+        let missing: Vec<(String,)> = sqlx::query_as(
+            "SELECT id FROM providers
+             WHERE activation_status = 'active'
+               AND provider_type IN ('split_screen_web', 'external_service')
+               AND preference_tier = 'preferred'
+               AND privacy_guardian_default_level IS NULL",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        assert!(
+            missing.is_empty(),
+            "rail-visible rows without a level: {missing:?}"
         );
     }
 

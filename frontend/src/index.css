@@ -145,7 +145,6 @@
   --on-risk-low: var(--white-soft);
   --on-risk-medium: var(--ink);
   --on-risk-high: var(--white-soft);
-  --on-risk-unknown: var(--white-soft);
 
   /* Shadow recolored to Ink alpha (decisions.id=850, items.id=602). The mono
    * font is not covered by the spec. */

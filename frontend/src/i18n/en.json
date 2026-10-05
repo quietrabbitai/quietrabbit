@@ -206,13 +206,23 @@
     "railLabel": "Cloud Chat providers",
     "rowState": {
       "idle": "Not loaded",
-      "loaded": "Loaded — tap to view",
+      "loaded": "Loaded",
       "active": "Active"
     },
     "closeRowTitle": "Close {{name}}",
-    "hostingBadgeTitle": "Cloud-hosted",
-    "badgeDefaultPostureNotice": "Shows this provider's default privacy posture, not your account settings there. If you've changed a setting on {{providerName}}'s own site (e.g. turned off training), this badge won't reflect that — QR can't see your account there.",
-    "cloudAnonymousBadgeTitle": "No login required",
-    "cloudFrontierBadgeTitle": "Account required, data retained"
+    "stateLine": "{{state}} - {{access}}",
+    "noLogin": "No login",
+    "loginRequired": "Login required",
+    "chip": {
+      "low": "More private",
+      "medium": "Partly private",
+      "high": "Less private"
+    },
+    "tooltip": {
+      "loginRequired": "Login required",
+      "noLogin": "No login",
+      "cloudHosted": "Cloud-hosted"
+    },
+    "badgeDefaultPostureNotice": "Shows this provider's default privacy posture, not your account settings there. If you've changed a setting on {{providerName}}'s own site (e.g. turned off training), this badge won't reflect that — QR can't see your account there."
   }
 }

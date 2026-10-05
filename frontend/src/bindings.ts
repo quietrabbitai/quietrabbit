@@ -922,7 +922,18 @@ export type CloudChatProviderSummary = {
 	lane: string,
 	login_required: boolean,
 	is_anonymous: boolean,
-	privacy_guardian_default_level: PrivacyGuardianDefaultLevel | null,
+	/**
+	 *  items.id=603 (decisions.id=851): non-optional -- no rail-visible
+	 *  provider may lack a level; rows without one are skipped (see
+	 *  summarize_for_rail).
+	 */
+	privacy_guardian_default_level: PrivacyGuardianDefaultLevel,
+	/**
+	 *  items.id=603: the provider's curated "what this means for you"
+	 *  explainer, serialized to a JSON string (same reason as
+	 *  performance_profile below). NULL until curated.
+	 */
+	user_privacy_summary: string | null,
 	/**
 	 *  items.id=465: whether QR itself recommends this provider, within its
 	 *  own provider_type slot -- not a cross-slot ranking (see

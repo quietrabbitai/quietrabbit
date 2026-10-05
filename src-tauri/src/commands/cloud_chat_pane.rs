@@ -112,7 +112,14 @@ pub struct CloudChatProviderSummary {
     pub lane: String,
     pub login_required: bool,
     pub is_anonymous: bool,
-    pub privacy_guardian_default_level: Option<provider_store::PrivacyGuardianDefaultLevel>,
+    /// items.id=603 (decisions.id=851): non-optional -- no rail-visible
+    /// provider may lack a level; rows without one are skipped (see
+    /// summarize_for_rail).
+    pub privacy_guardian_default_level: provider_store::PrivacyGuardianDefaultLevel,
+    /// items.id=603: the provider's curated "what this means for you"
+    /// explainer, serialized to a JSON string (same reason as
+    /// performance_profile below). NULL until curated.
+    pub user_privacy_summary: Option<String>,
     /// items.id=465: whether QR itself recommends this provider, within its
     /// own provider_type slot -- not a cross-slot ranking (see
     /// provider_store::Provider::qr_recommended's own doc).
@@ -560,18 +567,34 @@ pub async fn list_active_providers(
                 "split_screen_web" | "external_service"
             ) && p.preference_tier == "preferred"
         })
-        .map(|p| CloudChatProviderSummary {
-            id: p.id,
-            display_name: p.display_name,
-            lane: lane_str(&p.provider_type).to_string(),
-            login_required: p.login_required,
-            is_anonymous: p.is_anonymous,
-            privacy_guardian_default_level: p.privacy_guardian_default_level,
-            qr_recommended: p.qr_recommended,
-            performance_profile: p.performance_profile.map(|v| v.to_string()),
-            privacy_commitment_basis: p.privacy_commitment_basis,
-        })
+        .filter_map(summarize_for_rail)
         .collect())
+}
+
+/// items.id=603: maps a provider row to its rail summary, or None (logged)
+/// when it has no privacy_guardian_default_level -- defensive only, since
+/// the catalog invariant (provider_store's every_rail_visible_provider_has_a_level
+/// test) means no rail row should ever lack one.
+fn summarize_for_rail(p: provider_store::Provider) -> Option<CloudChatProviderSummary> {
+    let Some(level) = p.privacy_guardian_default_level else {
+        log::error!(
+            "cloud_chat_pane: skipping rail provider '{}' -- no privacy_guardian_default_level",
+            p.id
+        );
+        return None;
+    };
+    Some(CloudChatProviderSummary {
+        id: p.id,
+        display_name: p.display_name,
+        lane: lane_str(&p.provider_type).to_string(),
+        login_required: p.login_required,
+        is_anonymous: p.is_anonymous,
+        privacy_guardian_default_level: level,
+        user_privacy_summary: p.user_privacy_summary.map(|v| v.to_string()),
+        qr_recommended: p.qr_recommended,
+        performance_profile: p.performance_profile.map(|v| v.to_string()),
+        privacy_commitment_basis: p.privacy_commitment_basis,
+    })
 }
 
 /// Opens one pane per confirmed provider selection (items.id=223's actual
@@ -1077,4 +1100,47 @@ pub async fn forward_popup_mouse_wheel(
             })
         })
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod rail_summary_tests {
+    use super::*;
+
+    async fn seeded_provider(id: &str) -> provider_store::Provider {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory pool");
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            crate::persistence::migrations::run_migrations(&mut conn, "shared", None)
+                .await
+                .expect("run shared migrations");
+        }
+        provider_store::get_provider(&pool, id)
+            .await
+            .expect("get_provider")
+            .expect("seeded provider exists")
+    }
+
+    /// items.id=603: a rail row without a level is skipped, never rendered
+    /// as an "unrated" row.
+    #[tokio::test]
+    async fn rail_row_without_a_level_is_skipped() {
+        let mut p = seeded_provider("claude").await;
+        assert!(summarize_for_rail(p.clone()).is_some());
+        p.privacy_guardian_default_level = None;
+        assert!(summarize_for_rail(p).is_none());
+    }
+
+    #[tokio::test]
+    async fn summary_carries_level() {
+        let p = seeded_provider("claude").await;
+        let s = summarize_for_rail(p.clone()).expect("claude has a level");
+        assert_eq!(
+            Some(s.privacy_guardian_default_level),
+            p.privacy_guardian_default_level
+        );
+    }
 }

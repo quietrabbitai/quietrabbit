@@ -28,58 +28,19 @@
 // cloudChatAccessConfig.ts's providerBrandColor() -- a narrow,
 // decision-backed carve-out, not a broader visual pass.
 
+import type { TFunction } from 'i18next'
 import { useTranslation } from 'react-i18next'
 import './CloudChatSelector.css'
 import {
   DUCK_LOGO_URL,
   PROVIDER_LOGO_COMPONENTS,
+  privacyChipLabel,
   privacyLevelColor,
   privacyLevelGlyphColor,
   privacyLevelRing,
   providerBrandColor,
   type Provider,
 } from './cloudChatAccessConfig'
-
-/** items.id=418: generic, non-branded glyphs for the two new indicator
- *  badges -- hand-drawn shapes (cloud/person/mask), not reproductions of
- *  any trademarked or platform-specific icon (e.g. not Chrome's incognito
- *  glyph). Sized to sit inside a 20px circular badge. */
-function CloudGlyph() {
-  return (
-    <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
-      <path
-        d="M4.6 11.5a2.6 2.6 0 0 1-.4-5.17A3.4 3.4 0 0 1 10.7 4.9a2.6 2.6 0 0 1 .7 5.1v.5h-6.8z"
-        fill="currentColor"
-      />
-    </svg>
-  )
-}
-
-function PersonGlyph() {
-  return (
-    <svg viewBox="0 0 16 16" width="10" height="10" aria-hidden="true">
-      <circle cx="8" cy="5.2" r="2.9" fill="currentColor" />
-      <path d="M2.3 14c.4-3.3 3-5.7 5.7-5.7s5.3 2.4 5.7 5.7z" fill="currentColor" />
-    </svg>
-  )
-}
-
-function IncognitoGlyph() {
-  return (
-    <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
-      <path
-        d="M2.4 9.3c0-2.9 2.6-5.1 5.6-5.1s5.6 2.2 5.6 5.1"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="1.3"
-        strokeLinecap="round"
-      />
-      <circle cx="4.7" cy="9.8" r="1.5" fill="currentColor" />
-      <circle cx="11.3" cy="9.8" r="1.5" fill="currentColor" />
-      <path d="M6.2 9.8h3.6" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" />
-    </svg>
-  )
-}
 
 export type RailRowState = 'idle' | 'loaded' | 'active'
 
@@ -115,6 +76,24 @@ function rowState(
   if (providerId === activeProviderId) return 'active'
   if (openPaneIds.includes(providerId)) return 'loaded'
   return 'idle'
+}
+
+/** items.id=603: tooltip body for the rail chip -- the level, a login line,
+ *  the curated user_privacy_summary text when present (the only retention
+ *  information shown), hosting, and the default-posture caveat. */
+function chipTooltip(provider: Provider, t: TFunction): string {
+  const lines = [
+    privacyChipLabel(provider.privacyGuardianDefaultLevel, t),
+    provider.loginRequired
+      ? t('cloudChatSelector.tooltip.loginRequired')
+      : t('cloudChatSelector.tooltip.noLogin'),
+  ]
+  if (provider.userPrivacySummary) lines.push(provider.userPrivacySummary)
+  lines.push(
+    t('cloudChatSelector.tooltip.cloudHosted'),
+    t('cloudChatSelector.badgeDefaultPostureNotice', { providerName: provider.name }),
+  )
+  return lines.join('\n')
 }
 
 export function CloudChatSelector({
@@ -173,38 +152,24 @@ export function CloudChatSelector({
               <span className="cloud-chat-rail__meta">
                 <span className="cloud-chat-rail__name">{provider.name}</span>
                 <span className="cloud-chat-rail__state">
-                  {t(`cloudChatSelector.rowState.${state}`)}
+                  {t('cloudChatSelector.stateLine', {
+                    state: t(`cloudChatSelector.rowState.${state}`),
+                    access: provider.loginRequired
+                      ? t('cloudChatSelector.loginRequired')
+                      : t('cloudChatSelector.noLogin'),
+                  })}
                 </span>
               </span>
               <span
-                className="cloud-chat-rail__badge cloud-chat-rail__badge--hosting"
-                title={t('cloudChatSelector.hostingBadgeTitle')}
-                aria-hidden="true"
-              >
-                <CloudGlyph />
-              </span>
-              <span
-                className="cloud-chat-rail__badge cloud-chat-rail__badge--identity"
+                className="cloud-chat-rail__chip"
                 style={{
                   backgroundColor: privacyLevelColor(provider.privacyGuardianDefaultLevel),
                   color: privacyLevelGlyphColor(provider.privacyGuardianDefaultLevel),
                   boxShadow: privacyLevelRing(provider.privacyGuardianDefaultLevel),
                 }}
-                title={t('cloudChatSelector.badgeDefaultPostureNotice', { providerName: provider.name })}
-                aria-hidden="true"
+                title={chipTooltip(provider, t)}
               >
-                {provider.isAnonymous ? <IncognitoGlyph /> : <PersonGlyph />}
-              </span>
-              <span
-                className="cloud-chat-rail__access-badge"
-                title={
-                  provider.lane === 'cloud_anonymous'
-                    ? t('cloudChatSelector.cloudAnonymousBadgeTitle')
-                    : t('cloudChatSelector.cloudFrontierBadgeTitle')
-                }
-                aria-hidden="true"
-              >
-                {provider.lane === 'cloud_anonymous' ? '⚡' : '☁'}
+                {privacyChipLabel(provider.privacyGuardianDefaultLevel, t)}
               </span>
             </button>
             {state !== 'idle' && (
