@@ -78,22 +78,19 @@ function rowState(
   return 'idle'
 }
 
-/** items.id=603: tooltip body for the rail chip -- the level, a login line,
- *  the curated user_privacy_summary text when present (the only retention
- *  information shown), hosting, and the default-posture caveat. */
+/** items.id=603: two-line tooltip for the rail chip (native title). The
+ *  login word reuses the state line's strings, lowercased to sit mid-sentence. */
 function chipTooltip(provider: Provider, t: TFunction): string {
-  const lines = [
-    privacyChipLabel(provider.privacyGuardianDefaultLevel, t),
-    provider.loginRequired
-      ? t('cloudChatSelector.tooltip.loginRequired')
-      : t('cloudChatSelector.tooltip.noLogin'),
-  ]
-  if (provider.userPrivacySummary) lines.push(provider.userPrivacySummary)
-  lines.push(
-    t('cloudChatSelector.tooltip.cloudHosted'),
-    t('cloudChatSelector.badgeDefaultPostureNotice', { providerName: provider.name }),
-  )
-  return lines.join('\n')
+  const login = provider.loginRequired
+    ? t('cloudChatSelector.loginRequired')
+    : t('cloudChatSelector.noLogin')
+  return [
+    t('cloudChatSelector.tooltip.summary', {
+      level: privacyChipLabel(provider.privacyGuardianDefaultLevel, t),
+      login: login.toLocaleLowerCase(),
+    }),
+    t('cloudChatSelector.tooltip.caveat'),
+  ].join('\n')
 }
 
 export function CloudChatSelector({

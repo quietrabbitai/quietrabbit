@@ -929,12 +929,6 @@ export type CloudChatProviderSummary = {
 	 */
 	privacy_guardian_default_level: PrivacyGuardianDefaultLevel,
 	/**
-	 *  items.id=603: the provider's curated "what this means for you"
-	 *  explainer, serialized to a JSON string (same reason as
-	 *  performance_profile below). NULL until curated.
-	 */
-	user_privacy_summary: string | null,
-	/**
 	 *  items.id=465: whether QR itself recommends this provider, within its
 	 *  own provider_type slot -- not a cross-slot ranking (see
 	 *  provider_store::Provider::qr_recommended's own doc).

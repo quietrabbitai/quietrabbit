@@ -219,10 +219,8 @@
       "high": "Less private"
     },
     "tooltip": {
-      "loginRequired": "Login required",
-      "noLogin": "No login",
-      "cloudHosted": "Cloud-hosted"
-    },
-    "badgeDefaultPostureNotice": "Shows this provider's default privacy posture, not your account settings there. If you've changed a setting on {{providerName}}'s own site (e.g. turned off training), this badge won't reflect that — QR can't see your account there."
+      "summary": "{{level}}: cloud-hosted, {{login}}.",
+      "caveat": "This is the provider's default; your account settings may differ."
+    }
   }
 }

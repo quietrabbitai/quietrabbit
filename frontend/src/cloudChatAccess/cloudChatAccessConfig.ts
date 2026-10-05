@@ -74,25 +74,6 @@ export interface Provider {
   /** Non-null: no rail-visible provider may lack a level (items.id=603,
    *  decisions.id=851) -- there is no "unrated" state. */
   privacyGuardianDefaultLevel: PrivacyGuardianDefaultLevel
-  /** The curated "what this means for you" text, or null if uncurated. */
-  userPrivacySummary: string | null
-}
-
-/** Pulls the display text out of providers.user_privacy_summary (a JSON
- *  object serialized to a string by the backend). Null on absent/malformed
- *  -- the tooltip then simply omits the line; nothing is invented. */
-export function parseUserPrivacySummary(raw: string | null): string | null {
-  if (!raw) return null
-  try {
-    const parsed: unknown = JSON.parse(raw)
-    if (parsed && typeof parsed === 'object' && 'summary' in parsed) {
-      const summary = (parsed as { summary: unknown }).summary
-      return typeof summary === 'string' && summary.trim() ? summary : null
-    }
-  } catch {
-    // fall through
-  }
-  return null
 }
 
 /** Fetches the selector screen's real provider list. Ordered tier-then-name
@@ -110,7 +91,6 @@ export async function fetchActiveProviders(): Promise<Provider[]> {
     loginRequired: p.login_required,
     isAnonymous: p.is_anonymous,
     privacyGuardianDefaultLevel: p.privacy_guardian_default_level,
-    userPrivacySummary: parseUserPrivacySummary(p.user_privacy_summary),
   }))
 }
 

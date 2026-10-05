@@ -116,10 +116,6 @@ pub struct CloudChatProviderSummary {
     /// provider may lack a level; rows without one are skipped (see
     /// summarize_for_rail).
     pub privacy_guardian_default_level: provider_store::PrivacyGuardianDefaultLevel,
-    /// items.id=603: the provider's curated "what this means for you"
-    /// explainer, serialized to a JSON string (same reason as
-    /// performance_profile below). NULL until curated.
-    pub user_privacy_summary: Option<String>,
     /// items.id=465: whether QR itself recommends this provider, within its
     /// own provider_type slot -- not a cross-slot ranking (see
     /// provider_store::Provider::qr_recommended's own doc).
@@ -590,7 +586,6 @@ fn summarize_for_rail(p: provider_store::Provider) -> Option<CloudChatProviderSu
         login_required: p.login_required,
         is_anonymous: p.is_anonymous,
         privacy_guardian_default_level: level,
-        user_privacy_summary: p.user_privacy_summary.map(|v| v.to_string()),
         qr_recommended: p.qr_recommended,
         performance_profile: p.performance_profile.map(|v| v.to_string()),
         privacy_commitment_basis: p.privacy_commitment_basis,
