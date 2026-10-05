@@ -21,7 +21,7 @@
   width: 18px;
   height: 18px;
   border-radius: 50%;
-  background: var(--code-bg);
+  background: var(--surface-sunken);
   color: var(--text);
   font-size: 10px;
   font-weight: 500;
@@ -65,7 +65,7 @@
 }
 
 .persona-box:hover {
-  background: var(--code-bg);
+  background: var(--surface-hover);
 }
 
 .persona-box:disabled {
@@ -121,7 +121,7 @@
 }
 
 .persona-selector-popover__option:hover {
-  background: var(--code-bg);
+  background: var(--surface-hover);
   border-color: var(--border);
 }
 
@@ -149,7 +149,7 @@
 
 .persona-pill-row__pill[data-selected] {
   color: var(--text);
-  background: var(--code-bg);
+  background: var(--accent-wash);
   border-color: var(--accent);
   font-weight: 500;
 }

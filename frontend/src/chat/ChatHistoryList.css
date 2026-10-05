@@ -52,7 +52,7 @@
 }
 
 .chat-history-list__item:hover {
-  background: var(--code-bg);
+  background: var(--surface-hover);
 }
 
 .chat-history-list__item[data-selected] {

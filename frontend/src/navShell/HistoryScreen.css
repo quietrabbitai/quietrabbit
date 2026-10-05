@@ -33,7 +33,7 @@
 }
 
 .history-screen__view-button:hover {
-  background: var(--code-bg);
+  background: var(--surface-hover);
 }
 
 .history-screen__view-button[data-selected] {
@@ -46,7 +46,7 @@
   padding: 8px 10px;
   border-radius: 8px;
   border: 1px solid var(--border);
-  background: var(--code-bg);
+  background: var(--surface);
   display: flex;
   flex-direction: column;
   min-height: 0;

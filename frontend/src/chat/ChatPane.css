@@ -86,7 +86,7 @@
   padding: 6px 10px;
   border-radius: 8px;
   border: 1px solid var(--border);
-  background: var(--code-bg);
+  background: var(--surface);
 }
 
 /* items.id=416: native-copy Gate3 review UX (scanning/passed/blocked/
@@ -97,7 +97,7 @@
   padding: 6px 10px;
   border-radius: 8px;
   border: 1px solid var(--border);
-  background: var(--code-bg);
+  background: var(--surface);
 }
 
 .chat-pane__copy-review-notice--blocked,

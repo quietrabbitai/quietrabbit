@@ -115,6 +115,7 @@
   --bg: var(--sage-mist);
   --surface: var(--white);
   --surface-sunken: var(--sage-panel);
+  --surface-hover: var(--ink-10);
   --text: var(--ink);
   --text-muted: var(--ink-70);
   --text-label: var(--ink-50);
@@ -146,11 +147,11 @@
   --on-risk-high: var(--white-soft);
   --on-risk-unknown: var(--white-soft);
 
-  /* Not covered by the spec (items.id=582 leaves them as they were; flagged
-   * for Chat-PM): code/hover background, shadow, mono font. */
-  --code-bg: #f4f3ec;
+  /* Shadow recolored to Ink alpha (decisions.id=850, items.id=602). The mono
+   * font is not covered by the spec. */
   --shadow:
-    rgba(0, 0, 0, 0.1) 0 10px 15px -3px, rgba(0, 0, 0, 0.05) 0 4px 6px -2px;
+    rgba(36, 44, 42, 0.1) 0 10px 15px -3px,
+    rgba(36, 44, 42, 0.05) 0 4px 6px -2px;
   --mono: ui-monospace, Consolas, monospace;
 
   /* --- Type --- */
@@ -219,19 +220,4 @@ h2 {
 }
 p {
   margin: 0;
-}
-
-code,
-.counter {
-  font-family: var(--mono);
-  display: inline-flex;
-  border-radius: 4px;
-  color: var(--text);
-}
-
-code {
-  font-size: 14px;
-  line-height: 135%;
-  padding: 4px 8px;
-  background: var(--code-bg);
 }

@@ -40,7 +40,6 @@ const PRE_EXISTING_ORPHAN_CLASSES: string[] = [
   'chat-pane__unsent-badge', // unsent-message UI (see unsentBadge/notSentNotice below) not wired up yet
   'chat-pane__not-sent-notice', // same unwired unsent-message feature
   'button-icon', // Vite/React template leftover in index.css, unused
-  'counter', // Vite/React template leftover in index.css, unused
   'login-form', // LoginForm.tsx has no LoginForm.css; relies on inherited/global styles only
   'chat-pane__content-timeout', // ChatPane.tsx references a class with no CSS definition anywhere
   'cross-persona-confirm-modal__field', // same: TSX class with no matching selector

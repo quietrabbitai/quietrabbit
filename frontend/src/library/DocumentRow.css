@@ -27,7 +27,7 @@
 }
 
 .document-row--interactive:hover {
-  background: var(--code-bg);
+  background: var(--surface-hover);
 }
 
 .document-row--interactive[data-selected] {

@@ -120,7 +120,7 @@
   padding: 8px 10px;
   border-radius: 8px;
   border: 1px solid var(--border);
-  background: var(--code-bg);
+  background: var(--surface);
   overflow-y: auto;
 }
 
@@ -130,7 +130,7 @@
   padding: 6px 10px;
   border-radius: 8px;
   border: 1px solid var(--border);
-  background: var(--code-bg);
+  background: var(--surface);
 }
 
 .library-pane__content {
