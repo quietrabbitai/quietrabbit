@@ -47,7 +47,9 @@
 //     Part 4a's matching logic, which this item explicitly excludes.
 // License (MIT) was fine and is not why it was rejected.
 //
-// GPU/VRAM: wgpu's adapter-enumeration API reliably gives GPU presence,
+// GPU/VRAM (items.id=435 original reasoning, superseded by items.id=606 --
+// see GpuInfo/GpuBackend below: VRAM is now measured per-OS from sysfs/NVML
+// with the same no-network, no-CLI rule): wgpu's adapter-enumeration API reliably gives GPU presence,
 // discrete-vs-integrated, and vendor/name -- it does not reliably expose
 // precise VRAM bytes cross-platform through its safe API (limits() gives
 // buffer/texture size ceilings, not raw VRAM size). Getting exact VRAM
@@ -74,6 +76,11 @@
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use sysinfo::System;
+
+#[cfg(target_os = "linux")]
+mod linux;
+mod nvml;
+mod support_table;
 
 const CACHE_KEY_PROFILE: &str = "hardware_profile_json";
 const CACHE_KEY_DETECTED_AT: &str = "hardware_profile_detected_at";
@@ -123,32 +130,129 @@ impl RamClass {
     }
 }
 
-/// Coarse GPU/VRAM class. Deliberately does not carry a byte count -- see
-/// this module's header comment on why precise cross-platform VRAM size
-/// isn't attempted here. `DiscreteUnknownSize` means "a discrete GPU was
-/// found, but this module cannot size its VRAM with current in-tree
-/// tooling" -- not an error, a known and documented gap.
+/// Bumped whenever the HardwareProfile shape or detection semantics change.
+/// A cached profile with a different (or missing) version is re-detected.
+/// v1 = pre-items.id=606 shape (gpu_present/gpu_vram_class); v2 = gpus list.
+pub const PROFILE_VERSION: u32 = 2;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "snake_case")]
-pub enum GpuVramClass {
-    Integrated,
-    DiscreteUnknownSize,
+pub enum GpuVendor {
+    Nvidia,
+    Amd,
+    Intel,
+    Apple,
+    Other,
+}
+
+impl GpuVendor {
+    fn from_pci(id: u32) -> Self {
+        match id {
+            0x10de => GpuVendor::Nvidia,
+            0x1002 => GpuVendor::Amd,
+            0x8086 => GpuVendor::Intel,
+            0x106b => GpuVendor::Apple,
+            _ => GpuVendor::Other,
+        }
+    }
+}
+
+/// Whether the pinned Ollama can use this GPU. Unusable and Unknown both
+/// mean "treat as CPU" to the engine; Unknown is never an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum OllamaUsability {
+    Usable,
+    Unusable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct GpuInfo {
+    pub vendor: GpuVendor,
+    /// Driver/product name when a source provided one.
+    pub name: Option<String>,
+    /// "gfx1032" (AMD), "sm_86" (NVIDIA), ... None when not determinable.
+    pub architecture: Option<String>,
+    /// Shares system RAM (APU / unified memory): vram_mb is None for these.
+    pub is_integrated: bool,
+    /// Dedicated VRAM in decimal megabytes (same unit as ram_mb; specta
+    /// forbids u64 across IPC). None when unknown or shared with system RAM.
+    pub vram_mb: Option<u32>,
+    pub usable_by_ollama: OllamaUsability,
+}
+
+/// A wgpu adapter reduced to what backends need: PCI ids for naming and the
+/// cross-OS fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdapterHint {
+    pub vendor_id: u32,
+    pub device_id: u32,
+    pub name: String,
+    pub is_integrated: bool,
+}
+
+/// Per-OS GPU backend. Linux is implemented (items.id=606); Windows
+/// (items.id=608) and macOS (items.id=609) implement this and replace the
+/// no-op backend below. Backends return only what they can verify; vendors
+/// they miss fall back to a wgpu-derived Unknown entry.
+pub trait GpuBackend {
+    fn probe(&self, hints: &[AdapterHint]) -> Vec<GpuInfo>;
+}
+
+/// Stand-in until 608/609 land: contributes nothing, so the wgpu fallback
+/// supplies presence-only entries with usable_by_ollama = Unknown.
+#[cfg(not(target_os = "linux"))]
+struct NoopBackend;
+#[cfg(not(target_os = "linux"))]
+impl GpuBackend for NoopBackend {
+    fn probe(&self, _hints: &[AdapterHint]) -> Vec<GpuInfo> {
+        Vec::new()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn platform_backend() -> impl GpuBackend {
+    linux::LinuxBackend
+}
+#[cfg(not(target_os = "linux"))]
+fn platform_backend() -> impl GpuBackend {
+    NoopBackend
+}
+
+/// Decimal megabytes, matching ram_mb's unit. None if it overflows u32.
+pub(crate) fn bytes_to_mb(bytes: u64) -> Option<u32> {
+    u32::try_from(bytes / 1_000_000).ok()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct HardwareProfile {
+    /// See PROFILE_VERSION. Required (no serde default) so an old-shape
+    /// cached profile fails to parse and is re-detected.
+    pub profile_version: u32,
     pub ram_mb: u32,
     pub ram_class: RamClass,
     // u32, not usize: same specta-typescript BigInt-export restriction as
     // ram_mb above. A core count safely fits u32.
     pub cpu_cores: u32,
-    pub gpu_present: bool,
-    pub gpu_is_discrete: bool,
-    /// The GPU's driver-reported name (e.g. "NVIDIA GeForce RTX 3080"),
-    /// from wgpu's AdapterInfo.name -- not a decoded PCI vendor ID. None
-    /// when gpu_present is false.
-    pub gpu_name: Option<String>,
-    pub gpu_vram_class: Option<GpuVramClass>,
+    /// Every real GPU found (software rasterizers excluded).
+    pub gpus: Vec<GpuInfo>,
+    /// The GPU a recommendation should reason about: Usable first, then
+    /// dedicated over integrated, then most VRAM. None when no GPU.
+    pub primary_gpu: Option<GpuInfo>,
+}
+
+/// Picks the primary GPU. See HardwareProfile::primary_gpu.
+pub fn select_primary(gpus: &[GpuInfo]) -> Option<GpuInfo> {
+    gpus.iter()
+        .max_by_key(|g| {
+            (
+                g.usable_by_ollama == OllamaUsability::Usable,
+                !g.is_integrated,
+                g.vram_mb.unwrap_or(0),
+            )
+        })
+        .cloned()
 }
 
 /// Pure, synchronous RAM/CPU probe -- `sysinfo::System::new_all()` refreshes
@@ -161,66 +265,77 @@ fn detect_ram_and_cpu() -> (u32, u32) {
     (ram_mb, cpu_cores)
 }
 
-/// GPU probe via wgpu's normal multi-backend adapter-enumeration path --
-/// an independent wgpu::Instance from cloud_chat_gpu_pane's compositor-
-/// specific one (see module header). Enumerates every backend available on
-/// this platform, picks the best real GPU found (discrete preferred over
-/// integrated), and ignores CPU/software-rasterizer and virtual adapters
-/// (llvmpipe, WARP, ...) -- those aren't real inference-capable hardware.
-async fn detect_gpu() -> (bool, bool, Option<String>, Option<GpuVramClass>) {
+/// wgpu adapter enumeration, real GPUs only (CPU/software-rasterizer and
+/// virtual adapters like llvmpipe/WARP are not inference hardware).
+async fn enumerate_adapters() -> Vec<AdapterHint> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-    let adapters = instance.enumerate_adapters(wgpu::Backends::all()).await;
+    instance
+        .enumerate_adapters(wgpu::Backends::all())
+        .await
+        .iter()
+        .map(|a| a.get_info())
+        .filter(|i| {
+            matches!(
+                i.device_type,
+                wgpu::DeviceType::DiscreteGpu | wgpu::DeviceType::IntegratedGpu
+            )
+        })
+        .map(|i| AdapterHint {
+            vendor_id: i.vendor,
+            device_id: i.device,
+            name: i.name,
+            is_integrated: i.device_type == wgpu::DeviceType::IntegratedGpu,
+        })
+        .collect()
+}
 
-    let mut best: Option<wgpu::AdapterInfo> = None;
-    for adapter in &adapters {
-        let info = adapter.get_info();
-        let is_candidate = matches!(
-            info.device_type,
-            wgpu::DeviceType::DiscreteGpu | wgpu::DeviceType::IntegratedGpu
-        );
-        if !is_candidate {
+/// Presence-only entries for adapter vendors the backend produced nothing for.
+fn fallback_gpus(hints: &[AdapterHint], found: &[GpuInfo]) -> Vec<GpuInfo> {
+    let mut extra: Vec<GpuInfo> = Vec::new();
+    for h in hints {
+        let vendor = GpuVendor::from_pci(h.vendor_id);
+        let covered = found.iter().chain(extra.iter()).any(|g| g.vendor == vendor);
+        if covered {
             continue;
         }
-        let is_better = match &best {
-            None => true,
-            Some(current) => {
-                info.device_type == wgpu::DeviceType::DiscreteGpu
-                    && current.device_type != wgpu::DeviceType::DiscreteGpu
-            }
-        };
-        if is_better {
-            best = Some(info);
-        }
+        extra.push(GpuInfo {
+            vendor,
+            name: Some(h.name.clone()),
+            architecture: None,
+            is_integrated: h.is_integrated,
+            vram_mb: None,
+            usable_by_ollama: OllamaUsability::Unknown,
+        });
     }
+    extra
+}
 
-    match best {
-        Some(info) => {
-            let is_discrete = info.device_type == wgpu::DeviceType::DiscreteGpu;
-            let vram_class = if is_discrete {
-                GpuVramClass::DiscreteUnknownSize
-            } else {
-                GpuVramClass::Integrated
-            };
-            (true, is_discrete, Some(info.name), Some(vram_class))
-        }
-        None => (false, false, None, None),
-    }
+async fn detect_gpus() -> Vec<GpuInfo> {
+    let hints = enumerate_adapters().await;
+    let mut gpus = platform_backend().probe(&hints);
+    let extra = fallback_gpus(&hints, &gpus);
+    gpus.extend(extra);
+    gpus
 }
 
 /// Runs a fresh probe unconditionally -- callers wanting the cache-once
 /// behavior should use `get_or_detect` instead.
 pub async fn detect() -> HardwareProfile {
     let (ram_mb, cpu_cores) = detect_ram_and_cpu();
-    let (gpu_present, gpu_is_discrete, gpu_name, gpu_vram_class) = detect_gpu().await;
+    let gpus = detect_gpus().await;
+    log::info!(
+        "hardware_probe: detected {} GPU(s); support table written against Ollama {}",
+        gpus.len(),
+        support_table::OLLAMA_SUPPORT_TABLE_VERSION
+    );
 
     HardwareProfile {
+        profile_version: PROFILE_VERSION,
         ram_mb,
         ram_class: RamClass::from_mb(ram_mb),
         cpu_cores,
-        gpu_present,
-        gpu_is_discrete,
-        gpu_name,
-        gpu_vram_class,
+        primary_gpu: select_primary(&gpus),
+        gpus,
     }
 }
 
@@ -239,7 +354,12 @@ pub async fn get_or_detect(pool: &sqlx::SqlitePool) -> HardwareProfile {
     if let Some((raw,)) = cached {
         if !raw.is_empty() {
             match serde_json::from_str::<HardwareProfile>(&raw) {
-                Ok(profile) => return profile,
+                Ok(profile) if profile.profile_version == PROFILE_VERSION => return profile,
+                Ok(profile) => log::info!(
+                    "hardware_probe: cached profile is version {}, current is {}; re-detecting",
+                    profile.profile_version,
+                    PROFILE_VERSION
+                ),
                 Err(e) => log::warn!(
                     "hardware_probe: cached hardware_profile_json failed to parse, \
                      re-detecting: {e}"
@@ -299,6 +419,75 @@ mod tests {
         assert_eq!(RamClass::from_mb(RAM_HIGH_MAX_MB + 1), RamClass::VeryHigh);
     }
 
+    fn fixture_gpu(vendor: GpuVendor, integrated: bool, vram: Option<u32>) -> GpuInfo {
+        GpuInfo {
+            vendor,
+            name: Some("Test GPU".to_string()),
+            architecture: Some("gfx1030".to_string()),
+            is_integrated: integrated,
+            vram_mb: vram,
+            usable_by_ollama: OllamaUsability::Usable,
+        }
+    }
+
+    fn fixture_profile() -> HardwareProfile {
+        let gpus = vec![fixture_gpu(GpuVendor::Amd, false, Some(8_573))];
+        HardwareProfile {
+            profile_version: PROFILE_VERSION,
+            ram_mb: 17_179,
+            ram_class: RamClass::High,
+            cpu_cores: 8,
+            primary_gpu: select_primary(&gpus),
+            gpus,
+        }
+    }
+
+    #[test]
+    fn primary_gpu_prefers_usable_then_dedicated_then_vram() {
+        let mut unusable_big = fixture_gpu(GpuVendor::Amd, false, Some(16_000));
+        unusable_big.usable_by_ollama = OllamaUsability::Unusable;
+        let usable_small = fixture_gpu(GpuVendor::Nvidia, false, Some(4_000));
+        let picked = select_primary(&[unusable_big.clone(), usable_small.clone()]).unwrap();
+        assert_eq!(picked, usable_small);
+        assert_eq!(select_primary(&[]), None);
+        let integrated = fixture_gpu(GpuVendor::Amd, true, None);
+        let dedicated = fixture_gpu(GpuVendor::Amd, false, Some(8_000));
+        assert_eq!(
+            select_primary(&[integrated, dedicated.clone()]).unwrap(),
+            dedicated
+        );
+    }
+
+    #[test]
+    fn fallback_adds_only_uncovered_vendors() {
+        let hints = vec![
+            AdapterHint {
+                vendor_id: 0x1002,
+                device_id: 1,
+                name: "amd".into(),
+                is_integrated: false,
+            },
+            AdapterHint {
+                vendor_id: 0x8086,
+                device_id: 2,
+                name: "intel".into(),
+                is_integrated: true,
+            },
+        ];
+        let found = vec![fixture_gpu(GpuVendor::Amd, false, Some(8_000))];
+        let extra = fallback_gpus(&hints, &found);
+        assert_eq!(extra.len(), 1);
+        assert_eq!(extra[0].vendor, GpuVendor::Intel);
+        assert_eq!(extra[0].usable_by_ollama, OllamaUsability::Unknown);
+        assert!(extra[0].is_integrated);
+    }
+
+    #[test]
+    fn bytes_to_mb_is_decimal_and_bounded() {
+        assert_eq!(bytes_to_mb(8_573_157_376), Some(8_573));
+        assert_eq!(bytes_to_mb(u64::MAX), None);
+    }
+
     // ------------------------------------------------------------------
     // Integration test -- real shared.db cache round-trip. Follows
     // provider_store.rs's own #[cfg(test)] + connect_options_unencrypted(
@@ -326,21 +515,13 @@ mod tests {
             .await
             .expect("shared.db pool must connect");
 
-        let fixture = HardwareProfile {
-            ram_mb: 17_179,
-            ram_class: RamClass::High,
-            cpu_cores: 8,
-            gpu_present: true,
-            gpu_is_discrete: true,
-            gpu_name: Some("Test GPU".to_string()),
-            gpu_vram_class: Some(GpuVramClass::DiscreteUnknownSize),
-        };
+        let fixture = fixture_profile();
         store_profile(&pool, &fixture).await;
 
         let reused = get_or_detect(&pool).await;
         assert_eq!(reused.ram_mb, fixture.ram_mb);
         assert_eq!(reused.cpu_cores, fixture.cpu_cores);
-        assert_eq!(reused.gpu_name, fixture.gpu_name);
+        assert_eq!(reused.primary_gpu, fixture.primary_gpu);
 
         let detected_at: (String,) = sqlx::query_as(
             "SELECT value FROM instance_config WHERE key = 'hardware_profile_detected_at'",
@@ -385,6 +566,85 @@ mod tests {
         let profile = get_or_detect(&pool).await;
         assert!(profile.ram_mb > 0);
         assert!(profile.cpu_cores > 0);
+
+        match &saved_root {
+            Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+            None => std::env::remove_var("QR_DATA_ROOT"),
+        }
+    }
+
+    async fn pool_for_cache_test() -> sqlx::SqlitePool {
+        crate::persistence::migrations::migrate_shared_db()
+            .await
+            .expect("shared.db migration must succeed in test setup");
+        sqlx::SqlitePool::connect_with(crate::providers::utils::connect_options_unencrypted(
+            &crate::providers::utils::db_path_shared(),
+        ))
+        .await
+        .expect("shared.db pool must connect")
+    }
+
+    async fn put_raw_cache(pool: &sqlx::SqlitePool, raw: &str) {
+        sqlx::query("UPDATE instance_config SET value = ? WHERE key = ?")
+            .bind(raw)
+            .bind(CACHE_KEY_PROFILE)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn old_shape_cached_profile_is_redetected() {
+        let _lock = ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+        let pool = pool_for_cache_test().await;
+
+        // The exact v1 (pre-items.id=606) serialized shape.
+        put_raw_cache(
+            &pool,
+            r#"{"ram_mb":17179,"ram_class":"high","cpu_cores":8,"gpu_present":true,
+                "gpu_is_discrete":true,"gpu_name":"Old GPU",
+                "gpu_vram_class":"discrete_unknown_size"}"#,
+        )
+        .await;
+
+        let profile = get_or_detect(&pool).await;
+        assert_eq!(profile.profile_version, PROFILE_VERSION);
+        assert_ne!(profile.ram_mb, 17_179, "must be a fresh detection");
+
+        let stored: (String,) = sqlx::query_as("SELECT value FROM instance_config WHERE key = ?")
+            .bind(CACHE_KEY_PROFILE)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(
+            stored.0.contains("profile_version"),
+            "cache must be rewritten"
+        );
+
+        match &saved_root {
+            Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+            None => std::env::remove_var("QR_DATA_ROOT"),
+        }
+    }
+
+    #[tokio::test]
+    async fn wrong_version_cached_profile_is_redetected() {
+        let _lock = ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+        let pool = pool_for_cache_test().await;
+
+        let mut stale = fixture_profile();
+        stale.profile_version = PROFILE_VERSION + 1;
+        put_raw_cache(&pool, &serde_json::to_string(&stale).unwrap()).await;
+
+        let profile = get_or_detect(&pool).await;
+        assert_eq!(profile.profile_version, PROFILE_VERSION);
+        assert_ne!(profile.ram_mb, stale.ram_mb);
 
         match &saved_root {
             Some(v) => std::env::set_var("QR_DATA_ROOT", v),

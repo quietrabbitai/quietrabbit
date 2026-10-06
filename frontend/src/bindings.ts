@@ -1032,14 +1032,23 @@ export type GetRunOutputResponse = {
 	sensitivity: string,
 };
 
-/**
- *  Coarse GPU/VRAM class. Deliberately does not carry a byte count -- see
- *  this module's header comment on why precise cross-platform VRAM size
- *  isn't attempted here. `DiscreteUnknownSize` means "a discrete GPU was
- *  found, but this module cannot size its VRAM with current in-tree
- *  tooling" -- not an error, a known and documented gap.
- */
-export type GpuVramClass = "integrated" | "discrete_unknown_size";
+export type GpuInfo = {
+	vendor: GpuVendor,
+	/**  Driver/product name when a source provided one. */
+	name: string | null,
+	/**  "gfx1032" (AMD), "sm_86" (NVIDIA), ... None when not determinable. */
+	architecture: string | null,
+	/**  Shares system RAM (APU / unified memory): vram_mb is None for these. */
+	is_integrated: boolean,
+	/**
+	 *  Dedicated VRAM in decimal megabytes (same unit as ram_mb; specta
+	 *  forbids u64 across IPC). None when unknown or shared with system RAM.
+	 */
+	vram_mb: number | null,
+	usable_by_ollama: OllamaUsability,
+};
+
+export type GpuVendor = "nvidia" | "amd" | "intel" | "apple" | "other";
 
 export type GroupSyncSettingsInfo = {
 	folder_path: string,
@@ -1049,18 +1058,21 @@ export type GroupSyncSettingsInfo = {
 };
 
 export type HardwareProfile = {
+	/**
+	 *  See PROFILE_VERSION. Required (no serde default) so an old-shape
+	 *  cached profile fails to parse and is re-detected.
+	 */
+	profile_version: number,
 	ram_mb: number,
 	ram_class: RamClass,
 	cpu_cores: number,
-	gpu_present: boolean,
-	gpu_is_discrete: boolean,
+	/**  Every real GPU found (software rasterizers excluded). */
+	gpus: GpuInfo[],
 	/**
-	 *  The GPU's driver-reported name (e.g. "NVIDIA GeForce RTX 3080"),
-	 *  from wgpu's AdapterInfo.name -- not a decoded PCI vendor ID. None
-	 *  when gpu_present is false.
+	 *  The GPU a recommendation should reason about: Usable first, then
+	 *  dedicated over integrated, then most VRAM. None when no GPU.
 	 */
-	gpu_name: string | null,
-	gpu_vram_class: GpuVramClass | null,
+	primary_gpu: GpuInfo | null,
 };
 
 export type HealthResponse = {
@@ -1166,6 +1178,12 @@ export type MessageInfo = {
  *  its removal doesn't change the "four of five" count above.
  */
 export type NotImplementedPlaceholder = Record<string, never>;
+
+/**
+ *  Whether the pinned Ollama can use this GPU. Unusable and Unknown both
+ *  mean "treat as CPU" to the engine; Unknown is never an error.
+ */
+export type OllamaUsability = "usable" | "unusable" | "unknown";
 
 export type OutputInfo = {
 	id: string,
