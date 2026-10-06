@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "identifier": "ai.quietrabbit.app",
   "build": {
-    "frontendDist": "../dist",
+    "frontendDist": "../frontend/dist",
     "devUrl": "http://localhost:1420",
     "beforeDevCommand": {
       "script": "npm run dev",

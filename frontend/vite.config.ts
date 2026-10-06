@@ -2,7 +2,7 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
 // Config aligned with src-tauri/tauri.conf.json:
-// - build.frontendDist = "../dist" -> outDir below
+// - build.frontendDist = "../frontend/dist" (relative to src-tauri/) -> outDir below
 // - build.devUrl = "http://localhost:1420" -> server.port/strictPort below
 export default defineConfig({
   plugins: [react()],
