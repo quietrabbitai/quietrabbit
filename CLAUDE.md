@@ -75,6 +75,8 @@ path relative to CARGO_MANIFEST_DIR (compile-time, fixed to src-tauri),
 not CWD, so this no longer breaks quick-ask/chat under `cargo tauri dev` —
 but keep it in mind if you add other CWD-relative paths in this codebase.
 
+`cargo tauri dev` does not enforce the CSP (tauri-2.11.2 source), so verify CSP changes with `cargo tauri build --debug --no-bundle` and the devtools console filtered on "Refused to".
+
 Key commands:
   cargo build                                          — compile check
   cargo fmt --check                                    — formatting (CI gate; fix with plain `cargo fmt` over the whole crate, never scoped to one file)
