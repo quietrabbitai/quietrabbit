@@ -1,7 +1,8 @@
 // src-tauri/src/commands/system.rs
 //
 // Group 12 — System.
-// Commands: get_health, get_capability_profile, get_hardware_profile.
+// Commands: get_health, get_capability_profile, get_hardware_profile,
+// get_provider_recommendation.
 //
 // get_health: checks Ollama availability and returns provider health status.
 //   ollama_source: "system" | "sidecar" | "unavailable" — written during app
@@ -19,19 +20,23 @@
 // get_hardware_profile: items.id=435 -- cached RAM/CPU/GPU capability probe
 //   (hardware_probe::get_or_detect), matchable against providers.
 //   hardware_requirement (Part 4a). No caller in this app yet -- this
-//   command exists so items.id=437's onboarding UI has something to call;
-//   the recommendation logic that consumes it is out of scope here.
+//   command exists so items.id=437's onboarding UI has something to call.
+// get_provider_recommendation: items.id=607 -- Step 1 engine (see
+//   recommendation.rs). Callable before login: like get_health it only
+//   needs the shared.db pool; without a resident session the hosted
+//   needs_api_key lookup degrades to "no key" instead of failing.
 
 use serde::Serialize;
 use specta::Type;
 use tokio::sync::RwLock;
 
 use crate::auth::registry::{key_hex, KeyRegistry};
-use crate::hardware_probe::{self, HardwareProfile};
+use crate::hardware_probe::{self, HardwareProfile, RamClass};
 use crate::ollama_sidecar::SidecarStartup;
 use crate::persistence::{integration_keys_store, provider_store};
 use crate::providers::ollama_client::OllamaClient;
 use crate::providers::types::{ProviderHealth, ProviderStatus};
+use crate::recommendation::{self, Candidate, CandidateKind, ProviderRecommendation};
 
 const QR_HOSTED_KEY_TYPE: &str = "qr_hosted";
 
@@ -175,6 +180,116 @@ pub async fn get_hardware_profile(
     Ok(hardware_probe::get_or_detect(&pool).await)
 }
 
+/// Decimal megabytes per curated min_vram_gb (probe vram_mb is decimal MB).
+const MB_PER_GB: u32 = 1000;
+
+/// Reduces a providers row to an engine candidate. Local candidates are
+/// is_local rows whose hardware_requirement carries a parsable
+/// min_ram_class; one that does not is skipped with a warning rather than
+/// guessed at. Hosted candidates are qr_recommended cloud_inference_api rows
+/// (the per-type recommendation slot recorded in shared_016.sql).
+fn to_candidate(p: &provider_store::Provider, has_key: bool) -> Option<Candidate> {
+    if p.is_local {
+        let req = p.hardware_requirement.as_ref()?;
+        let min_ram_class = req
+            .get("min_ram_class")
+            .and_then(|v| serde_json::from_value::<RamClass>(v.clone()).ok());
+        let Some(min_ram_class) = min_ram_class else {
+            log::warn!(
+                "provider '{}' hardware_requirement has no usable min_ram_class, skipped",
+                p.id
+            );
+            return None;
+        };
+        let min_vram_mb = req
+            .get("min_vram_gb")
+            .and_then(|v| v.as_u64())
+            .and_then(|gb| u32::try_from(gb).ok())
+            .and_then(|gb| gb.checked_mul(MB_PER_GB));
+        return Some(Candidate {
+            provider_id: p.id.clone(),
+            kind: CandidateKind::LocalModel,
+            rank: p.qr_recommendation_rank,
+            min_ram_class: Some(min_ram_class),
+            min_vram_mb,
+            installed: p.installed,
+            has_key: false,
+        });
+    }
+    if is_hosted_candidate(p) {
+        return Some(Candidate {
+            provider_id: p.id.clone(),
+            kind: CandidateKind::HostedApi,
+            rank: p.qr_recommendation_rank,
+            min_ram_class: None,
+            min_vram_mb: None,
+            installed: false,
+            has_key,
+        });
+    }
+    None
+}
+
+/// Hosted candidate = qr_recommended cloud_inference_api row (the
+/// per-type recommendation slot recorded in shared_016.sql).
+fn is_hosted_candidate(p: &provider_store::Provider) -> bool {
+    !p.is_local && p.qr_recommended && p.provider_type == "cloud_inference_api"
+}
+
+/// A failed key lookup must not fail the recommendation: it degrades to "no
+/// key" (the user is simply asked for one) and is logged.
+fn key_lookup_or_false<T, E: std::fmt::Display>(
+    provider_id: &str,
+    result: Result<Option<T>, E>,
+) -> bool {
+    match result {
+        Ok(found) => found.is_some(),
+        Err(e) => {
+            log::warn!("key lookup for provider '{provider_id}' failed, treating as no key: {e}");
+            false
+        }
+    }
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn get_provider_recommendation(
+    pool: tauri::State<'_, sqlx::SqlitePool>,
+    key_registry: tauri::State<'_, KeyRegistry>,
+) -> Result<ProviderRecommendation, String> {
+    let profile = hardware_probe::get_or_detect(&pool).await;
+    let session = key_registry
+        .with_key(|k| (k.user_id.clone(), key_hex(&k.master_key)))
+        .await;
+    let providers = provider_store::list_active_providers(&pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut catalog = Vec::new();
+    for p in &providers {
+        // The key lookup is only for hosted candidates; local rows and
+        // non-candidates never touch integration_keys.db.
+        let has_key = match &session {
+            Some((user_id, key_hex_str)) if is_hosted_candidate(p) => key_lookup_or_false(
+                &p.id,
+                integration_keys_store::get_active_key(
+                    user_id,
+                    key_hex_str,
+                    &p.id,
+                    QR_HOSTED_KEY_TYPE,
+                    None,
+                )
+                .await,
+            ),
+            _ => false,
+        };
+        if let Some(c) = to_candidate(p, has_key) {
+            catalog.push(c);
+        }
+    }
+    Ok(recommendation::recommend(&profile, &catalog))
+}
+
 // Tests target qr_hosted_is_configured() directly rather than the get_health
 // command -- it's the only new logic here; get_health itself is glue over
 // OllamaClient::check_health() (a real network call, irrelevant to this
@@ -186,6 +301,13 @@ mod tests {
     use super::*;
     use crate::test_support::{mock_app_with_registry, populate_registry, ENV_MUTEX};
     use tauri::Manager;
+
+    #[test]
+    fn key_lookup_error_degrades_to_no_key() {
+        assert!(!key_lookup_or_false::<(), _>("p", Err("db unreadable")));
+        assert!(!key_lookup_or_false::<(), &str>("p", Ok(None)));
+        assert!(key_lookup_or_false::<_, &str>("p", Ok(Some(()))));
+    }
 
     struct TestEnv {
         _tempdir: tempfile::TempDir,

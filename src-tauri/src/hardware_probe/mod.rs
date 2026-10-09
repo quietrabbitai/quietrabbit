@@ -117,7 +117,7 @@ pub enum RamClass {
 }
 
 impl RamClass {
-    fn from_mb(total_mb: u32) -> Self {
+    pub(crate) fn from_mb(total_mb: u32) -> Self {
         if total_mb <= RAM_LOW_MAX_MB {
             RamClass::Low
         } else if total_mb <= RAM_MEDIUM_MAX_MB {

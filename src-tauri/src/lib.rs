@@ -15,6 +15,7 @@ pub mod persistence;
 pub mod persona_sync;
 pub mod persona_view_sync;
 pub mod providers;
+pub mod recommendation;
 pub mod task_progress;
 pub mod task_supervision;
 #[cfg(test)]

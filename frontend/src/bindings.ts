@@ -460,6 +460,7 @@ export const commands = {
 	getHealth: () => typedError<HealthResponse, string>(__TAURI_INVOKE("get_health")),
 	getCapabilityProfile: () => typedError<CapabilityProfileResponse, string>(__TAURI_INVOKE("get_capability_profile")),
 	getHardwareProfile: () => typedError<HardwareProfile, string>(__TAURI_INVOKE("get_hardware_profile")),
+	getProviderRecommendation: () => typedError<ProviderRecommendation, string>(__TAURI_INVOKE("get_provider_recommendation")),
 	/**
 	 *  The selector screen's primary read path (TIER3_ACCESS_MODEL.md State 3,
 	 *  items.id=202 piece 1's remaining wiring) -- replaces
@@ -880,6 +881,8 @@ export type AutoResolvedSpan = {
 	user_modified_text: string | null,
 };
 
+export type CandidateKind = "local_model" | "hosted_api";
+
 export type CapabilityProfileResponse = {
 	installed_models: string[],
 	/**
@@ -982,6 +985,8 @@ export type CreatePersonaResponse = {
  *  snake_case serde matching as_str()/FromStr exactly.
  */
 export type ExternalAccess = "local_only" | "anonymous_required" | "anonymous_preferred" | "unrestricted";
+
+export type Fit = "comfortable" | "tight" | "slow";
 
 /**
  *  IPC gap: dormancy_state still missing -- split to items.id=256 (see
@@ -1399,6 +1404,17 @@ export type ProviderHealth = {
 	available_models?: string[],
 };
 
+export type ProviderRecommendation = {
+	/**  None only when the catalog is empty. */
+	recommended: Recommendation | null,
+	/**
+	 *  0 to 4 entries; fewer than 2 only when the catalog has fewer than 3
+	 *  candidates. Never an error.
+	 */
+	alternatives: Recommendation[],
+	weak_hardware: boolean,
+};
+
 export type ProviderStatus = "available" | "degraded" | "unavailable";
 
 /**
@@ -1418,6 +1434,15 @@ export type QrHostedConfig = {
  *  converted to whole megabytes.
  */
 export type RamClass = "low" | "medium" | "high" | "very_high";
+
+export type Recommendation = {
+	provider_id: string,
+	kind: CandidateKind,
+	fit: Fit,
+	needs_install: boolean,
+	needs_api_key: boolean,
+	installed: boolean,
+};
 
 /**
  *  One-time recovery mnemonic display. Never persisted anywhere past this

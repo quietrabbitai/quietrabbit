@@ -16,6 +16,13 @@
 // by callers that need one (e.g. commands::cloud_chat_pane::lane_str) -- never
 // read back into this module or into any decision logic.
 //
+// One documented exception to "never branch on provider_type": the Step 1
+// recommendation engine (items.id=607) selects hosted candidates by
+// qr_recommended = 1 AND provider_type = 'cloud_inference_api' -- the
+// per-type recommendation-slot design recorded in shared_016.sql's header
+// (items.id=465), where qr_recommended is only meaningful jointly with
+// provider_type. Local candidates are selected by is_local = 1.
+//
 // Backs TIER3_ACCESS_MODEL.md's selector screen (State 3, decisions.id=681)
 // -- list_active_providers() is that screen's primary read path.
 //
@@ -297,6 +304,12 @@ pub struct Provider {
     /// -- this model appears as a selectable option in the Cloud Chat
     /// provider picker. Curator-set, same unmarked-is-excluded convention.
     pub cloud_chat_visible: bool,
+    /// items.id=607 (shared_025.sql, decisions.id=854): curated preference
+    /// order for the Step 1 recommendation engine -- lower = more preferred,
+    /// None = no stated order. Compared only between candidates of the same
+    /// kind, never across kinds. Curator-owned: seeded by migration, not
+    /// part of NewProvider (create_provider leaves it NULL).
+    pub qr_recommendation_rank: Option<u32>,
 }
 
 /// Input to create_provider(). A plain struct rather than 15+ positional
@@ -351,7 +364,7 @@ const SELECT_COLUMNS: &str = "id, display_name, provider_type, mode, launch_url,
                 qr_recommended, privacy_commitment_basis, performance_profile,
                 preference_tier, installed, qr_disabled_by_user,
                 local_model_tag, local_model_digest, installed_at,
-                focus_eligible, cloud_chat_visible";
+                focus_eligible, cloud_chat_visible, qr_recommendation_rank";
 
 // ---------------------------------------------------------------------------
 // Row extraction
@@ -528,6 +541,10 @@ fn row_to_provider(row: &sqlx::sqlite::SqliteRow) -> Result<Provider, ProviderSt
         installed_at,
         focus_eligible: focus_eligible_raw != 0,
         cloud_chat_visible: cloud_chat_visible_raw != 0,
+        qr_recommendation_rank: row
+            .try_get::<Option<i64>, _>("qr_recommendation_rank")
+            .map_err(ProviderStoreError::Database)?
+            .and_then(|v| u32::try_from(v).ok()),
     })
 }
 
@@ -874,6 +891,7 @@ pub async fn create_provider(
         qr_disabled_by_user: false,
         local_model_digest: None,
         installed_at: None,
+        qr_recommendation_rank: None,
     })
 }
 
@@ -1335,6 +1353,50 @@ mod tests {
             mistral.privacy_guardian_default_level,
             Some(PrivacyGuardianDefaultLevel::Medium)
         );
+    }
+
+    /// items.id=607: shared_025.sql seeds the recommendation inputs -- ranks
+    /// 1/2/3 and min_vram_gb on the local models (min_ram_class preserved),
+    /// and rank 1 on every qr_recommended cloud_inference_api row, selected
+    /// by field not id.
+    #[tokio::test]
+    async fn recommendation_rank_and_vram_seeded() {
+        let mut conn = make_test_conn().await;
+        crate::persistence::migrations::run_migrations(&mut conn, "shared", None)
+            .await
+            .expect("run shared migrations");
+
+        for (id, rank, vram_gb, ram) in [
+            ("ollama:llama3.1:8b", 1, 6, "medium"),
+            ("ollama:qwen2.5:7b", 2, 6, "medium"),
+            ("ollama:llama3.2:3b", 3, 3, "low"),
+        ] {
+            let p = get_provider_via_conn(&mut conn, id).await;
+            assert_eq!(p.qr_recommendation_rank, Some(rank), "{id}");
+            let req = p.hardware_requirement.expect("hardware_requirement");
+            assert_eq!(req["min_vram_gb"], vram_gb, "{id}");
+            assert_eq!(req["min_ram_class"], ram, "{id}");
+            assert!(req.get("rank").is_none(), "{id}: rank lives in the column");
+        }
+
+        let hosted: Vec<(String, Option<i64>)> = sqlx::query_as(
+            "SELECT id, qr_recommendation_rank FROM providers
+             WHERE qr_recommended = 1 AND provider_type = 'cloud_inference_api'",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        assert!(!hosted.is_empty());
+        assert!(hosted.iter().all(|(_, r)| *r == Some(1)));
+
+        let ranked_others: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM providers WHERE qr_recommendation_rank IS NOT NULL
+             AND NOT (is_local = 1 OR (qr_recommended = 1 AND provider_type = 'cloud_inference_api'))",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(ranked_others.0, 0);
     }
 
     /// items.id=436: shared_024.sql seeds RELEASE_1_MODELS as one
