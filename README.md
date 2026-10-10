@@ -79,7 +79,7 @@ The full Focus list will be published when the first release is ready.
 - **Tiered routing, your choice at every step** — local Ollama is the default; faster hosted
   inference and private split-screen cloud review are opt-in, never automatic; full cloud
   service is always optional and explicit
-- **Sensitive Personas stay local** — Medical, Legal, Finance never leave your device
+- **You set the ceiling for each Focus** — set a Focus to "Local only" and Quiet Rabbit runs its AI steps on your own hardware
 - **No telemetry** — Quiet Rabbit never sends usage data anywhere
 - **Transparent always** — every action that touches external services asks first
 

@@ -41,7 +41,7 @@ Quiet Rabbit will:
 
 Quiet Rabbit uses a tiered routing system:
 
-- **Tier 1 — Local Ollama:** runs on your hardware, fully private, default for sensitive Personas
+- **Tier 1 — Local Ollama:** runs on your hardware, fully private; set a Focus's ceiling to "Local only" to keep it here
 - **Tier 1.5 — Faster hosted inference (opt-in):** same open-source model class as Tier 1, run on
   faster hosted hardware (e.g. Groq) when your own hardware is the bottleneck. Requires an
   account, so it's not anonymous — never automatic, never default, always your explicit choice
@@ -56,7 +56,7 @@ Quiet Rabbit uses a tiered routing system:
   was evaluated and found technically workable, but doesn't yet have a clear case for this
   release — it's parked as a possible future paid option, not part of Phase 1.
 
-Sensitive Personas (Medical, Legal, Finance) never leave Tier 1.
+For a sensitive Focus, set its ceiling (Maximum permitted tier) to "Local only" and Quiet Rabbit runs its AI steps for it on your machine.
 Every external service interaction asks before acting.
 
 ---
