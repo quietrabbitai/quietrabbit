@@ -1123,7 +1123,7 @@ pub struct FocusRun<L: DisclosureLoggerForRun = SqliteDisclosureLogger> {
     /// step's own override -- min(_focus_max_permitted_tier,
     /// focus_def.max_routing_tier). Set at AUTHORIZE (Jason's
     /// three-way-fold resolution; see plan doc), used by authorize()'s
-    /// per-step tighten-only check, FailureHandler::new(), and threaded into
+    /// per-step tighten-only check, build_failure_handler(), and threaded into
     /// every StepContext as focus_external_access.
     _focus_external_access: ExternalAccess,
 
@@ -1291,10 +1291,35 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         }
 
         self.resolve_tier_config().await?;
-        self.failure_handler = Some(FailureHandler::new(self._focus_external_access));
+        self.failure_handler = Some(self.build_failure_handler().await);
         self.focus_run_id = Some(Uuid::new_v4().to_string());
         self.write_focus_run_record("initializing").await?;
         Ok(())
+    }
+
+    /// FailureHandler for this run (items.id=692). Escalation offers are
+    /// suppressed only when provider selection would refuse them: the user's
+    /// hosted provider is excluded by the Focus-level ceiling. A user with no
+    /// provider set up (NotConfigured) still gets the offer -- accepting it
+    /// re-runs the step, which reaches the F10 setup guidance. Requires
+    /// resolve_tier_config() to have run (reads _focus_external_access).
+    async fn build_failure_handler(&self) -> FailureHandler {
+        use crate::conductor::provider_selection::{
+            resolve_external_provider, ExternalProviderResolution,
+        };
+        let escalation_available = self._focus_external_access == ExternalAccess::LocalOnly
+            || !matches!(
+                resolve_external_provider(
+                    &self.pool,
+                    &self.user_id,
+                    &self.persona_id,
+                    &self.focus_id,
+                    self._focus_external_access,
+                )
+                .await,
+                ExternalProviderResolution::ExcludedByCeiling { .. }
+            );
+        FailureHandler::with_escalation(self._focus_external_access, escalation_available)
     }
 
     /// Compute and store the Focus-level tier ceiling
@@ -2185,45 +2210,50 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         }
         .await;
 
-        // Tier 1.5 provider preference (items.id=251, repointed items.id=432).
-        // Only relevant at tier>=2 -- Tier 1 never dispatches to an external
-        // provider. Candidate set is read from providers.provider_type=
-        // 'cloud_inference_api' (items.id=430's flag-based replacement for
-        // the old hardcoded ["mistral","groq"] array), then resolved via
-        // user_provider_preference_store::resolve_preference()'s Focus ->
-        // Persona -> account precedence (items.id=428) -- the legacy
-        // users.tier2_provider_preference column this superseded was dropped
-        // outright by items.id=433. DB read failure or
-        // an unresolved/ambiguous preference collapses to None, same as "no
-        // preference set" -- StepExecutor turns None into the F10
-        // MissingQrHostedConfig failure rather than guessing a provider.
-        // items.id=528 Phase 2: gated on effective_access (the step's own
-        // typed capability ceiling, already computed above) rather than the
-        // execution_tier numeric bridge -- `!= LocalOnly` and `>= 2` were
-        // always the same question here; see StepContext::effective_access's
-        // own doc comment for why this file keeps computing both.
-        let qr_hosted_provider_preference: Option<String> =
-            if effective_access != ExternalAccess::LocalOnly {
-                let candidates = crate::persistence::provider_store::list_providers_by_type(
-                    &self.pool,
-                    "cloud_inference_api",
-                )
-                .await
-                .unwrap_or_default();
-                let candidate_ids: Vec<String> = candidates.into_iter().map(|p| p.id).collect();
-                crate::persistence::user_provider_preference_store::find_preferred_provider(
-                    &self.pool,
-                    &user_id,
-                    Some(&persona_id),
-                    Some(&focus_id),
-                    &candidate_ids,
-                )
-                .await
-                .ok()
-                .flatten()
-            } else {
-                None
+        // Hosted-provider resolution (items.id=251/432, ceiling-aware since
+        // items.id=692). Only relevant when the step's effective_access
+        // permits external execution -- a LocalOnly step never dispatches to
+        // a hosted provider. The candidate set is
+        // providers.provider_type='cloud_inference_api' (items.id=430),
+        // narrowed by the step's ceiling (anonymous_required keeps only
+        // is_anonymous providers; anonymous_preferred ranks them first), then
+        // resolved via user_provider_preference_store's Focus -> Persona ->
+        // account precedence (items.id=428). An explicit user preference wins
+        // among permitted providers. Three outcomes, see
+        // provider_selection::resolve_external_provider: a selected provider;
+        // none set up (or ambiguous, or a DB read failure) -> StepExecutor
+        // raises the F10 MissingQrHostedConfig failure rather than guessing;
+        // or the user's provider is excluded by the ceiling -> StepExecutor
+        // raises ProviderExcludedByCeiling, naming the setting to change.
+        // Gated on effective_access (the step's own typed capability ceiling,
+        // computed above) rather than the execution_tier numeric bridge --
+        // see StepContext::effective_access's own doc comment for why this
+        // file keeps computing both.
+        let (qr_hosted_provider_preference, qr_hosted_ceiling_excluded): (
+            Option<String>,
+            Option<String>,
+        ) = if effective_access != ExternalAccess::LocalOnly {
+            use crate::conductor::provider_selection::{
+                resolve_external_provider, ExternalProviderResolution,
             };
+            match resolve_external_provider(
+                &self.pool,
+                &user_id,
+                &persona_id,
+                &focus_id,
+                effective_access,
+            )
+            .await
+            {
+                ExternalProviderResolution::Selected(id) => (Some(id), None),
+                ExternalProviderResolution::NotConfigured => (None, None),
+                ExternalProviderResolution::ExcludedByCeiling { provider_name } => {
+                    (None, Some(provider_name))
+                }
+            }
+        } else {
+            (None, None)
+        };
 
         let ctx = StepContext {
             step: step.clone(),
@@ -2238,6 +2268,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             raw_abstraction,
             floor_consent_preference,
             qr_hosted_provider_preference,
+            qr_hosted_ceiling_excluded,
             next_execution_tier,
             retry_count: 0,
             focus_name: self
@@ -3289,7 +3320,7 @@ pub async fn rehydrate_focus_run<L: DisclosureLoggerForRun>(
 
     run.load().await?;
     run.resolve_tier_config().await?;
-    run.failure_handler = Some(FailureHandler::new(run._focus_external_access));
+    run.failure_handler = Some(run.build_failure_handler().await);
 
     let mut personal_track = run.build_personal_track().await?;
     personal_track.seal();

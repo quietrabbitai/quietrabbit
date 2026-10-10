@@ -307,6 +307,26 @@ pub async fn find_preferred_provider(
     focus_id: Option<&str>,
     candidate_provider_ids: &[String],
 ) -> Result<Option<String>, UserProviderPreferenceStoreError> {
+    let mut preferred =
+        preferred_providers(pool, user_id, persona_id, focus_id, candidate_provider_ids).await?;
+    match preferred.len() {
+        1 => Ok(preferred.pop()),
+        _ => Ok(None),
+    }
+}
+
+/// Every candidate whose resolved preference at the given scope is
+/// Preferred, in candidate order. find_preferred_provider() is the
+/// "exactly one" view of this; conductor::provider_selection also needs the
+/// full set so it can tell "nothing preferred" apart from "the preferred
+/// provider is excluded by the Focus's external-access ceiling".
+pub async fn preferred_providers(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    persona_id: Option<&str>,
+    focus_id: Option<&str>,
+    candidate_provider_ids: &[String],
+) -> Result<Vec<String>, UserProviderPreferenceStoreError> {
     let mut preferred: Vec<String> = Vec::new();
     for provider_id in candidate_provider_ids {
         if let Some(pref) =
@@ -317,11 +337,7 @@ pub async fn find_preferred_provider(
             }
         }
     }
-
-    match preferred.len() {
-        1 => Ok(Some(preferred.into_iter().next().unwrap())),
-        _ => Ok(None),
-    }
+    Ok(preferred)
 }
 
 /// Raw lookup at an exact scope (no cascading) -- for callers that need to

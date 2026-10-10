@@ -7,13 +7,19 @@
 // shared_014.sql's own focus_provider_criteria header for full
 // column-by-column rationale; not re-derived here.
 //
-// SCOPE, deliberate (this session's judgment call 1): this module is
-// ADDITIVE, parallel infrastructure. Nothing in this codebase reads this
-// table yet -- focus_settings.max_permitted_tier/privacy_tier remain the
-// live, authoritative Focus provider ceiling. No IPC command surface is
-// exposed (matches provider_store.rs / user_provider_preference_store.rs's
-// own "CRUD now, IPC when a real caller needs one" precedent -- Focus
-// Builder UI, spec Part 5b, is separate future work).
+// SCOPE: the focus_provider_criteria table and eligible_providers_for_focus()
+// are still ADDITIVE, parallel infrastructure -- nothing in the live
+// execution path reads that table yet (no code creates rows for a Focus, and
+// the rows are not kept in sync with the live ceiling). The live Focus
+// ceiling is focus_settings.max_permitted_tier (an ExternalAccess), and its
+// anonymity rule IS enforced at provider selection (items.id=692,
+// decisions.id=870) through providers_permitted_by_ceiling() below, which
+// conductor::provider_selection applies before the user's provider
+// preference is resolved. No IPC command surface is exposed (matches
+// provider_store.rs / user_provider_preference_store.rs's own "CRUD now, IPC
+// when a real caller needs one" precedent -- Focus Builder UI, spec Part 5b,
+// is separate future work). When the criteria table is wired in, it composes
+// with the ceiling as an additional AND filter; it does not replace it.
 //
 // NAMED POLICIES ARE TEMPLATES, NEVER RE-READ BY ENFORCEMENT: selecting a
 // policy populates this table's require_* flags once; seeded_from_policy is
@@ -43,6 +49,7 @@
 use sqlx::Row;
 use thiserror::Error;
 
+use crate::conductor::tokens::ExternalAccess;
 use crate::persistence::provider_store::{self, Provider, ProviderStoreError};
 
 // ---------------------------------------------------------------------------
@@ -339,12 +346,13 @@ async fn write_criteria(
 // Consumption
 // ---------------------------------------------------------------------------
 
-/// The actual read path a future consumer would use (spec Part 3c
+/// The criteria-table read path a future consumer would use (spec Part 3c
 /// precedence: deny-list excludes unconditionally -> allow-list includes
 /// unconditionally -> remainder filtered by require_* flags, AND-composed).
 /// No criteria row for `focus_id` -> no restriction configured yet, returns
-/// every active provider unfiltered (this table isn't wired into any
-/// enforcement path this session -- there is no live default to get wrong).
+/// every active provider unfiltered. Not called by the live execution path:
+/// provider selection applies the Focus's ExternalAccess ceiling via
+/// providers_permitted_by_ceiling() instead (items.id=692).
 pub async fn eligible_providers_for_focus(
     pool: &sqlx::SqlitePool,
     focus_id: &str,
@@ -370,6 +378,37 @@ pub async fn eligible_providers_for_focus(
                 && (!criteria.require_not_trains_on_data || !p.trains_on_data_by_default)
         })
         .collect())
+}
+
+/// Applies a Focus/step's ExternalAccess ceiling to a candidate provider
+/// list (spec Part 6b/6f, items.id=692, decisions.id=870):
+///
+/// - LocalOnly: no external execution, so no provider qualifies (empty).
+/// - AnonymousRequired: hard filter, only `is_anonymous` providers.
+/// - AnonymousPreferred: every provider qualifies; `is_anonymous` ones are
+///   ranked first (stable -- relative order within each group is kept).
+/// - Unrestricted: every provider, order untouched.
+///
+/// Pure and call-time: ranking is a runtime routing decision, not stored
+/// state (spec Part 6f). Ranking only orders the list -- it never selects a
+/// provider on the user's behalf or overrides user_provider_preference.
+pub fn providers_permitted_by_ceiling(
+    mut providers: Vec<Provider>,
+    access: ExternalAccess,
+) -> Vec<Provider> {
+    match access {
+        ExternalAccess::LocalOnly => Vec::new(),
+        ExternalAccess::AnonymousRequired => {
+            providers.retain(|p| p.is_anonymous);
+            providers
+        }
+        ExternalAccess::AnonymousPreferred => {
+            // sort_by_key is stable; `false` sorts before `true`.
+            providers.sort_by_key(|p| !p.is_anonymous);
+            providers
+        }
+        ExternalAccess::Unrestricted => providers,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -676,5 +715,112 @@ mod tests {
             std::env::remove_var("QR_DATA_ROOT");
         }
         outcome.expect("deny-beats-allow-beats-require assertions must pass");
+    }
+
+    // -- providers_permitted_by_ceiling (items.id=692, decisions.id=870) ------
+
+    fn ids(providers: &[Provider]) -> Vec<&str> {
+        providers.iter().map(|p| p.id.as_str()).collect()
+    }
+
+    /// Runs `f` against the real seeded active-provider pool (groq, mistral,
+    /// duckai, claude, ...), restoring QR_DATA_ROOT afterwards.
+    async fn with_seeded_providers<F>(f: F)
+    where
+        F: FnOnce(Vec<Provider>, Vec<Provider>),
+    {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let (_tempdir, pool) = setup_real_db().await;
+
+        let all = provider_store::list_active_providers(&pool)
+            .await
+            .expect("list_active_providers must succeed");
+        let hosted = provider_store::list_providers_by_type(&pool, "cloud_inference_api")
+            .await
+            .expect("list_providers_by_type must succeed");
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+        f(all, hosted);
+    }
+
+    #[tokio::test]
+    async fn anonymous_required_excludes_groq_and_mistral() {
+        with_seeded_providers(|all, hosted| {
+            assert_eq!(ids(&hosted), vec!["groq", "mistral"]);
+            assert!(hosted.iter().all(|p| !p.is_anonymous));
+
+            let eligible =
+                providers_permitted_by_ceiling(hosted, ExternalAccess::AnonymousRequired);
+            assert!(
+                eligible.is_empty(),
+                "no API-routable provider is anonymous in R1"
+            );
+
+            // Hard filter over the whole pool: only is_anonymous rows survive.
+            let eligible_all =
+                providers_permitted_by_ceiling(all, ExternalAccess::AnonymousRequired);
+            assert!(!eligible_all.is_empty());
+            assert!(eligible_all.iter().all(|p| p.is_anonymous));
+            assert!(!ids(&eligible_all).contains(&"groq"));
+            assert!(!ids(&eligible_all).contains(&"mistral"));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn anonymous_preferred_allows_everyone_and_ranks_anonymous_first() {
+        with_seeded_providers(|all, hosted| {
+            let original: Vec<String> = all.iter().map(|p| p.id.clone()).collect();
+            let ranked = providers_permitted_by_ceiling(all, ExternalAccess::AnonymousPreferred);
+
+            // Allows every provider, none dropped.
+            let mut got: Vec<String> = ranked.iter().map(|p| p.id.clone()).collect();
+            let mut want = original.clone();
+            got.sort();
+            want.sort();
+            assert_eq!(got, want);
+
+            // Ranked: no non-anonymous row precedes an anonymous one.
+            let first_non_anon = ranked.iter().position(|p| !p.is_anonymous);
+            let last_anon = ranked.iter().rposition(|p| p.is_anonymous);
+            if let (Some(n), Some(a)) = (first_non_anon, last_anon) {
+                assert!(a < n, "anonymous providers must all rank before the rest");
+            }
+            assert!(
+                ranked.first().is_some_and(|p| p.is_anonymous),
+                "the seeded catalog contains anonymous providers (duckai)"
+            );
+
+            // Stable within each group: relative order of the hosted pair is
+            // untouched, and hosted providers are still allowed.
+            let ranked_hosted =
+                providers_permitted_by_ceiling(hosted, ExternalAccess::AnonymousPreferred);
+            assert_eq!(ids(&ranked_hosted), vec!["groq", "mistral"]);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn unrestricted_allows_everyone_in_original_order() {
+        with_seeded_providers(|all, _hosted| {
+            let original: Vec<String> = all.iter().map(|p| p.id.clone()).collect();
+            let eligible = providers_permitted_by_ceiling(all, ExternalAccess::Unrestricted);
+            let got: Vec<String> = eligible.iter().map(|p| p.id.clone()).collect();
+            assert_eq!(got, original);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn local_only_permits_no_external_provider() {
+        with_seeded_providers(|all, _hosted| {
+            assert!(providers_permitted_by_ceiling(all, ExternalAccess::LocalOnly).is_empty());
+        })
+        .await;
     }
 }

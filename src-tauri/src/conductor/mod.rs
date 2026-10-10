@@ -11,6 +11,7 @@ pub mod memory_broker;
 pub mod nightly_batch;
 pub mod privacy;
 pub mod propose_route;
+pub mod provider_selection;
 pub mod quality;
 pub mod reentry;
 pub mod scheduled_sweep;

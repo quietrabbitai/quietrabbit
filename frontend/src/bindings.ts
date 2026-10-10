@@ -470,7 +470,9 @@ export const commands = {
 	 *  activation_status='active' row regardless of provider_type -- correct
 	 *  for that function's other caller (focus_provider_criteria_store's
 	 *  eligible_providers_for_focus, which deliberately wants the full active
-	 *  pool including cloud_inference_api rows), but wrong here. This screen is
+	 *  pool including cloud_inference_api rows -- that function is not on the live
+	 *  execution path; ceiling-aware selection lives in
+	 *  conductor::provider_selection), but wrong here. This screen is
 	 *  the Cloud Chat pane selector specifically, so it must only surface
 	 *  the two provider_type shapes lane_str() knows how to label
 	 *  ('split_screen_web' -> cloud_anonymous, 'external_service' ->

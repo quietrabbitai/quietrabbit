@@ -124,6 +124,11 @@ pub enum ConductorError {
     #[error("{plain_language}")]
     MissingQrHostedConfig { plain_language: String },
 
+    // F10 subtype — the user's hosted provider is set up, but this Focus's
+    // external-access ceiling does not permit it (items.id=692)
+    #[error("{plain_language}")]
+    ProviderExcludedByCeiling { plain_language: String },
+
     // F_SYSTEM — fatal: integrity, audit, misconfiguration
     #[error("{plain_language}")]
     TaxonomyIntegrity { plain_language: String },
@@ -183,6 +188,7 @@ impl ConductorError {
             | Self::UnknownProvider { plain_language }
             | Self::VoiceProfileContamination { plain_language }
             | Self::MissingQrHostedConfig { plain_language }
+            | Self::ProviderExcludedByCeiling { plain_language }
             | Self::TierBoundaryViolation { plain_language }
             | Self::InsecureKeychain { plain_language }
             | Self::NotImplemented { plain_language } => plain_language.as_str(),
@@ -267,11 +273,31 @@ pub struct FailureHandler {
     /// used to carry is gone — same reasoning already applied to StepType
     /// elsewhere in this codebase.
     pub external_access: ExternalAccess,
+    /// items.id=692: false when provider selection would refuse any
+    /// escalation this run could be offered (the user's hosted provider is
+    /// excluded by the ceiling's anonymity rule), so the three
+    /// offer-to-escalate sites must not offer one. True for a user with no
+    /// provider set up at all -- an accepted offer re-runs the step and
+    /// reaches the MissingQrHostedConfig setup guidance, which is the point.
+    pub escalation_available: bool,
 }
 
 impl FailureHandler {
     pub fn new(external_access: ExternalAccess) -> Self {
-        Self { external_access }
+        Self::with_escalation(external_access, true)
+    }
+
+    pub fn with_escalation(external_access: ExternalAccess, escalation_available: bool) -> Self {
+        Self {
+            external_access,
+            escalation_available,
+        }
+    }
+
+    /// Whether an offer-to-escalate may be made: the Focus ceiling permits
+    /// external execution AND selection would not refuse it.
+    fn offers_escalation(&self) -> bool {
+        self.external_access != ExternalAccess::LocalOnly && self.escalation_available
     }
 
     /// Map a ConductorError to a FailureResult.
@@ -523,6 +549,20 @@ impl FailureHandler {
                 metadata: None,
             },
 
+            // F10 subtype — hosted provider configured but excluded by this
+            // Focus's ceiling (items.id=692). Recoverable: the user changes
+            // the Focus setting, so same handling as a missing provider.
+            ConductorError::ProviderExcludedByCeiling { .. } => FailureResult {
+                action: FailureAction::AwaitUser,
+                failure_mode: Some("F10".to_owned()),
+                plain_language: msg,
+                is_recoverable: true,
+                severity: FailureSeverity::Require,
+                step_id: sid,
+                focus_id: fid,
+                metadata: None,
+            },
+
             // F_SYSTEM — tier boundary violation (Step 3)
             ConductorError::TierBoundaryViolation { .. } => FailureResult {
                 action: FailureAction::Stop,
@@ -596,7 +636,7 @@ impl FailureHandler {
         step_id: Option<String>,
         focus_id: Option<String>,
     ) -> FailureResult {
-        if self.external_access != ExternalAccess::LocalOnly {
+        if self.offers_escalation() {
             return FailureResult {
                 action: FailureAction::OfferTier2,
                 failure_mode: Some("F1".to_owned()),
@@ -632,7 +672,7 @@ impl FailureHandler {
         retry_count: u32,
     ) -> FailureResult {
         let exhausted = retry_count >= MAX_RETRIES;
-        if self.external_access != ExternalAccess::LocalOnly {
+        if self.offers_escalation() {
             return FailureResult {
                 action: FailureAction::OfferTier2,
                 failure_mode: Some("F2".to_owned()),
@@ -696,7 +736,7 @@ impl FailureHandler {
         step_id: Option<String>,
         focus_id: Option<String>,
     ) -> FailureResult {
-        if self.external_access != ExternalAccess::LocalOnly {
+        if self.offers_escalation() {
             return FailureResult {
                 action: FailureAction::OfferTier2,
                 failure_mode: Some(mode.to_owned()),
@@ -1210,6 +1250,120 @@ mod tests {
         assert_eq!(r.failure_mode.as_deref(), Some("F10"));
         assert!(r.is_recoverable);
         assert_eq!(r.severity, FailureSeverity::Require);
+    }
+
+    #[test]
+    fn f10_provider_excluded_by_ceiling_awaits_user() {
+        let h = handler(2);
+        let r = h.handle(
+            &err(ConductorError::ProviderExcludedByCeiling {
+                plain_language: "excluded".to_owned(),
+            }),
+            Some("s1"),
+            Some("f1"),
+            0,
+        );
+        assert_eq!(r.action, FailureAction::AwaitUser);
+        assert_eq!(r.failure_mode.as_deref(), Some("F10"));
+        assert!(r.is_recoverable);
+        assert_eq!(r.severity, FailureSeverity::Require);
+        assert_eq!(r.plain_language, "excluded");
+    }
+
+    // -- escalation_available (items.id=692) ---------------------------------
+    //
+    // The three offer-to-escalate sites must not offer an escalation that
+    // provider selection will refuse (hosted provider excluded by the
+    // ceiling), but must keep offering when nothing is refused -- including
+    // for a user with no provider set up, whose accepted offer re-runs the
+    // step and reaches the F10 setup guidance.
+
+    fn handler_excluded(access: ExternalAccess) -> FailureHandler {
+        FailureHandler::with_escalation(access, false)
+    }
+
+    fn f1_unavailable() -> ConductorError {
+        ConductorError::OllamaUnavailable {
+            plain_language: "down".to_owned(),
+        }
+    }
+
+    fn f1_timeout() -> ConductorError {
+        ConductorError::OllamaTimeout {
+            plain_language: "timeout".to_owned(),
+        }
+    }
+
+    fn f2_quality() -> ConductorError {
+        ConductorError::QualityBelowFloor {
+            plain_language: "low".to_owned(),
+        }
+    }
+
+    #[test]
+    fn excluded_by_ceiling_suppresses_offer_at_f1_unavailable() {
+        let r = handler_excluded(ExternalAccess::AnonymousRequired).handle(
+            &f1_unavailable(),
+            None,
+            None,
+            0,
+        );
+        assert_ne!(r.action, FailureAction::OfferTier2);
+        assert_eq!(r.action, FailureAction::Stop);
+    }
+
+    #[test]
+    fn excluded_by_ceiling_suppresses_offer_at_f2() {
+        let h = handler_excluded(ExternalAccess::AnonymousRequired);
+        for retry_count in [0, MAX_RETRIES] {
+            let r = h.handle(&f2_quality(), None, None, retry_count);
+            assert_ne!(
+                r.action,
+                FailureAction::OfferTier2,
+                "retry_count={retry_count}"
+            );
+        }
+    }
+
+    #[test]
+    fn excluded_by_ceiling_suppresses_offer_at_failed_retry_escalation() {
+        let r = handler_excluded(ExternalAccess::AnonymousRequired).handle(
+            &f1_timeout(),
+            None,
+            None,
+            MAX_RETRIES,
+        );
+        assert_ne!(r.action, FailureAction::OfferTier2);
+        assert_eq!(r.action, FailureAction::AwaitUser);
+    }
+
+    #[test]
+    fn unrestricted_with_no_preference_still_offers_at_all_three_sites() {
+        // escalation_available stays true when nothing is excluded -- an
+        // unconfigured user is not refused anything, selection just has
+        // nothing to pick yet.
+        let h = FailureHandler::with_escalation(ExternalAccess::Unrestricted, true);
+        assert_eq!(
+            h.handle(&f1_unavailable(), None, None, 0).action,
+            FailureAction::OfferTier2
+        );
+        assert_eq!(
+            h.handle(&f2_quality(), None, None, 0).action,
+            FailureAction::OfferTier2
+        );
+        assert_eq!(
+            h.handle(&f1_timeout(), None, None, MAX_RETRIES).action,
+            FailureAction::OfferTier2
+        );
+    }
+
+    #[test]
+    fn local_only_never_offers_even_when_escalation_available() {
+        let h = FailureHandler::with_escalation(ExternalAccess::LocalOnly, true);
+        assert_ne!(
+            h.handle(&f1_unavailable(), None, None, 0).action,
+            FailureAction::OfferTier2
+        );
     }
 
     #[test]

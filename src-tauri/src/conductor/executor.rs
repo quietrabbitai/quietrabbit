@@ -168,9 +168,14 @@ fn qr_hosted_provider_registry() -> &'static HashMap<&'static str, &'static dyn 
 ///   One-run scope: applies for this context only; not persisted.
 ///
 /// qr_hosted_provider_preference: resolved by lifecycle (items.id=251, repointed
-///   items.id=432) via user_provider_preference_store::resolve_preference()'s
-///   Focus -> Persona -> account precedence across the qr_hosted candidate
-///   set (providers.provider_type='cloud_inference_api', items.id=430) --
+///   items.id=432, ceiling-aware since items.id=692) via
+///   conductor::provider_selection::resolve_external_provider(), which narrows
+///   the qr_hosted candidate set (providers.provider_type=
+///   'cloud_inference_api', items.id=430) to the providers the step's
+///   effective_access permits (hard anonymity filter at anonymous_required,
+///   anonymous-first ranking at anonymous_preferred) and then applies
+///   user_provider_preference_store::resolve_preference()'s
+///   Focus -> Persona -> account precedence --
 ///   not the legacy users.tier2_provider_preference column (dropped by
 ///   items.id=433 -- a real, historical column name, not this codebase's
 ///   current vocabulary). Only populated when effective_access != LocalOnly.
@@ -178,8 +183,10 @@ fn qr_hosted_provider_registry() -> &'static HashMap<&'static str, &'static dyn 
 ///   (items.id=465 — an open HashMap keyed by each provider's own provider_id(),
 ///   not a closed two-value set).
 ///   None -> no provider chosen (or the resolved preference was ambiguous
-///   across candidates); StepExecutor raises F10 MissingQrHostedConfig rather
-///   than guessing (architecture: "no prescribed default"). Always None when
+///   across candidates, or the user's provider is excluded by the ceiling --
+///   see qr_hosted_ceiling_excluded); StepExecutor raises F10
+///   MissingQrHostedConfig / ProviderExcludedByCeiling rather than guessing
+///   (architecture: "no prescribed default"). Always None when
 ///   effective_access == LocalOnly.
 pub struct StepContext {
     pub step: StepDefinition,
@@ -239,6 +246,12 @@ pub struct StepContext {
     pub raw_abstraction: u8,
     pub floor_consent_preference: Option<String>, // "modified" | "local" | None
     pub qr_hosted_provider_preference: Option<String>, // provider_id from qr_hosted_provider_registry(), or None
+    /// items.id=692: Some(display name) iff the user HAS a hosted provider
+    /// set up but this step's ceiling excludes it, so
+    /// `qr_hosted_provider_preference` is None for that reason rather than
+    /// because nothing is configured. Always None when effective_access ==
+    /// LocalOnly. Lets Step 4.5 tell the two apart.
+    pub qr_hosted_ceiling_excluded: Option<String>,
     pub next_execution_tier: Option<u8>,
     pub retry_count: u32,
     /// Display name of the Focus, passed to gate3 for the consent modal header.
@@ -429,23 +442,20 @@ impl StepExecutor {
         // prescribed default."). An unset preference is a real gap, not
         // silently resolved to Groq — short-circuits before any provider
         // is touched. Only checked when this step requires external access
-        // at all; qr_local never needs a provider.
-        if ctx.effective_access != ExternalAccess::LocalOnly
-            && ctx.qr_hosted_provider_preference.is_none()
-        {
-            return Ok(Some(
-                failure_handler.handle(
-                    &ConductorError::MissingQrHostedConfig {
-                        plain_language: "No Tier 1.5 AI provider is set up yet. \
-                        Choose Groq or Mistral in Settings to continue. \
-                        [Open Settings] [Get help]"
-                            .to_owned(),
-                    },
-                    Some(&ctx.step.step_id),
-                    Some(&ctx.focus_id),
-                    retry_count,
-                ),
-            ));
+        // at all; qr_local never needs a provider. A provider the user HAS
+        // set up but this step's ceiling excludes (items.id=692) fails
+        // separately, naming the setting to change.
+        if let Some(error) = missing_provider_error(
+            ctx.effective_access,
+            ctx.qr_hosted_provider_preference.as_deref(),
+            ctx.qr_hosted_ceiling_excluded.as_deref(),
+        ) {
+            return Ok(Some(failure_handler.handle(
+                &error,
+                Some(&ctx.step.step_id),
+                Some(&ctx.focus_id),
+                retry_count,
+            )));
         }
 
         let selected_model = select_model(
@@ -1037,6 +1047,37 @@ async fn scan_voice_profile<L: DisclosureLogger>(
 struct SelectedModel {
     provider_id: Option<String>,
     model_id: String,
+}
+
+/// Step 4.5's provider gate (F10), pulled out so the two failure shapes are
+/// testable without a full execute_once harness. None when the step needs no
+/// hosted provider or has one selected. Otherwise: the hosted provider is
+/// excluded by the ceiling (items.id=692) -> ProviderExcludedByCeiling, or
+/// nothing is set up -> MissingQrHostedConfig (text unchanged).
+fn missing_provider_error(
+    effective_access: ExternalAccess,
+    selected_provider: Option<&str>,
+    ceiling_excluded_provider: Option<&str>,
+) -> Option<ConductorError> {
+    if effective_access == ExternalAccess::LocalOnly || selected_provider.is_some() {
+        return None;
+    }
+    Some(match ceiling_excluded_provider {
+        Some(provider_name) => ConductorError::ProviderExcludedByCeiling {
+            plain_language: format!(
+                "This Focus is set to use only providers that don't require an account, \
+                 so it can't use your hosted provider ({provider_name}). To use it, change \
+                 this Focus's 'Maximum permitted tier' setting to allow providers that \
+                 require an account. [Open Settings] [Get help]"
+            ),
+        },
+        None => ConductorError::MissingQrHostedConfig {
+            plain_language: "No Tier 1.5 AI provider is set up yet. \
+                        Choose Groq or Mistral in Settings to continue. \
+                        [Open Settings] [Get help]"
+                .to_owned(),
+        },
+    })
 }
 
 /// Select a model based on task_type, the step's effective external-access
@@ -1910,6 +1951,50 @@ mod tests {
     }
 
     #[test]
+    fn step_4_5_unset_preference_is_missing_config() {
+        let err = missing_provider_error(ExternalAccess::Unrestricted, None, None)
+            .expect("an external step with no provider must fail");
+        match err {
+            ConductorError::MissingQrHostedConfig { plain_language } => {
+                assert_eq!(
+                    plain_language,
+                    "No Tier 1.5 AI provider is set up yet. Choose Groq or Mistral in \
+                     Settings to continue. [Open Settings] [Get help]"
+                );
+            }
+            other => panic!("expected MissingQrHostedConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_4_5_ceiling_excluded_provider_is_a_distinct_failure() {
+        let err = missing_provider_error(ExternalAccess::AnonymousRequired, None, Some("Groq"))
+            .expect("an excluded provider must fail");
+        match err {
+            ConductorError::ProviderExcludedByCeiling { plain_language } => {
+                assert_eq!(
+                    plain_language,
+                    "This Focus is set to use only providers that don't require an account, \
+                     so it can't use your hosted provider (Groq). To use it, change this \
+                     Focus's 'Maximum permitted tier' setting to allow providers that \
+                     require an account. [Open Settings] [Get help]"
+                );
+                // Plain language only: no internal tier numbers.
+                assert!(!plain_language.contains("Tier 1"));
+                assert!(!plain_language.contains("Tier 2"));
+            }
+            other => panic!("expected ProviderExcludedByCeiling, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_4_5_passes_when_selected_or_local() {
+        assert!(missing_provider_error(ExternalAccess::Unrestricted, Some("groq"), None).is_none());
+        assert!(missing_provider_error(ExternalAccess::LocalOnly, None, None).is_none());
+        assert!(missing_provider_error(ExternalAccess::LocalOnly, None, Some("Groq")).is_none());
+    }
+
+    #[test]
     fn to_gate_track_converts_fields() {
         use crate::conductor::types::PersonalField as ConductorField;
         let mut ct = PersonalTrack::new();
@@ -2011,6 +2096,7 @@ mod tests {
             raw_abstraction: 1,
             floor_consent_preference: None,
             qr_hosted_provider_preference: None,
+            qr_hosted_ceiling_excluded: None,
             next_execution_tier: None,
             retry_count: 0,
             focus_name: "test".to_owned(),
@@ -2069,6 +2155,7 @@ mod tests {
             raw_abstraction: 1,
             floor_consent_preference: None,
             qr_hosted_provider_preference: None,
+            qr_hosted_ceiling_excluded: None,
             next_execution_tier: None,
             retry_count: 0,
             focus_name: "test".to_owned(),
@@ -2113,6 +2200,7 @@ mod tests {
             raw_abstraction: 1,
             floor_consent_preference: None,
             qr_hosted_provider_preference: None,
+            qr_hosted_ceiling_excluded: None,
             next_execution_tier: None,
             retry_count: 0,
             focus_name: "test".to_owned(),
