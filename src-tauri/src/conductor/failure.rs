@@ -648,14 +648,25 @@ impl FailureHandler {
                 metadata: None,
             };
         }
-        FailureResult {
-            action: FailureAction::Stop,
-            failure_mode: Some("F1".to_owned()),
-            plain_language: concat!(
+        // items.id=695: the offer was suppressed although the ceiling permits
+        // external execution -- the user's hosted provider is excluded by the
+        // ceiling (items.id=692). "doesn't allow external services" would be
+        // false here, so name the setting instead.
+        let plain_language = if self.external_access != ExternalAccess::LocalOnly {
+            concat!(
+                "The local AI isn't responding, and this Focus's 'Maximum permitted tier' ",
+                "setting doesn't allow the hosted provider you chose. [Try again] [Get help]",
+            )
+        } else {
+            concat!(
                 "The local AI isn't responding, and this life doesn't ",
                 "allow external services. [Try again] [Get help]",
             )
-            .to_owned(),
+        };
+        FailureResult {
+            action: FailureAction::Stop,
+            failure_mode: Some("F1".to_owned()),
+            plain_language: plain_language.to_owned(),
             is_recoverable: false,
             severity: FailureSeverity::Stop,
             step_id,
@@ -1310,6 +1321,89 @@ mod tests {
         );
         assert_ne!(r.action, FailureAction::OfferTier2);
         assert_eq!(r.action, FailureAction::Stop);
+    }
+
+    #[test]
+    fn f1_unavailable_suppressed_by_ceiling_names_the_setting() {
+        let r = handler_excluded(ExternalAccess::AnonymousRequired).handle(
+            &f1_unavailable(),
+            None,
+            None,
+            0,
+        );
+        assert_eq!(r.action, FailureAction::Stop);
+        assert!(!r.is_recoverable);
+        assert_eq!(r.severity, FailureSeverity::Stop);
+        assert_eq!(r.failure_mode.as_deref(), Some("F1"));
+        assert_eq!(
+            r.plain_language,
+            "The local AI isn't responding, and this Focus's 'Maximum permitted tier' \
+             setting doesn't allow the hosted provider you chose. [Try again] [Get help]"
+        );
+    }
+
+    #[test]
+    fn f1_unavailable_local_only_keeps_its_existing_text() {
+        // Same text whether or not escalation_available is set: LocalOnly
+        // never offers escalation.
+        for available in [true, false] {
+            let r = FailureHandler::with_escalation(ExternalAccess::LocalOnly, available).handle(
+                &f1_unavailable(),
+                None,
+                None,
+                0,
+            );
+            assert_eq!(r.action, FailureAction::Stop);
+            assert!(!r.is_recoverable);
+            assert_eq!(
+                r.plain_language,
+                "The local AI isn't responding, and this life doesn't \
+                 allow external services. [Try again] [Get help]"
+            );
+        }
+    }
+
+    #[test]
+    fn f1_unavailable_offer_path_is_unchanged() {
+        let r = FailureHandler::with_escalation(ExternalAccess::AnonymousRequired, true).handle(
+            &f1_unavailable(),
+            None,
+            None,
+            0,
+        );
+        assert_eq!(r.action, FailureAction::OfferTier2);
+        assert!(r.is_recoverable);
+        assert_eq!(r.severity, FailureSeverity::Require);
+        assert_eq!(r.plain_language, "down");
+    }
+
+    #[test]
+    fn f2_and_failed_retry_fallthrough_texts_unchanged_when_suppressed() {
+        // items.id=695: only F1 makes a false claim when the offer is
+        // suppressed by the ceiling; these fall-through texts stay as-is.
+        let h = handler_excluded(ExternalAccess::AnonymousRequired);
+
+        let f2_first = h.handle(&f2_quality(), None, None, 0);
+        assert_eq!(f2_first.action, FailureAction::Retry);
+        assert_eq!(
+            f2_first.plain_language,
+            "The result wasn't quite right. Trying again. [Keep this result]"
+        );
+
+        let f2_exhausted = h.handle(&f2_quality(), None, None, MAX_RETRIES);
+        assert_eq!(f2_exhausted.action, FailureAction::AwaitUser);
+        assert_eq!(
+            f2_exhausted.plain_language,
+            "The local model output quality fell below standard repeatedly. \
+             [Review output] [Try again]"
+        );
+
+        let retry_exhausted = h.handle(&f1_timeout(), None, None, MAX_RETRIES);
+        assert_eq!(retry_exhausted.action, FailureAction::AwaitUser);
+        assert_eq!(
+            retry_exhausted.plain_language,
+            "This step failed repeatedly and has been paused. [Try again] [Get help]"
+        );
     }
 
     #[test]
