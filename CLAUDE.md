@@ -44,7 +44,7 @@ resolve, rather than guessing or inventing.
   Never use sqlx::query!() macros — no static DATABASE_URL in many-small-encrypted-DB topology.
 - Master key never persisted: keys live only in Rust AppState/KeyRegistry for the
   duration of the session. Never written to disk, never in IPC responses.
-- Tier 1.5 = user choice: Groq (US, free tier) or Mistral (EU/GDPR, paid) --
+- Tier 1.5 = user choice among the curated hosted providers, which are rows in the providers table (decisions.id=872, 875) --
   fast hosted inference, same capability class as local Tier 1, non-anonymous.
   Honest trade-off framing. No prescribed default. (decisions.id=665/727 --
   both providers moved off "Tier 2" once that label was clarified as

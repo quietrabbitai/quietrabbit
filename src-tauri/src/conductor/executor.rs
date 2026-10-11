@@ -23,7 +23,9 @@
 //   - StepContext holds metadata only, not tracks or gateway (D6-342 actor model).
 //     PersonalTrack, TaskTrack, SharedStateTrack, FailureHandler,
 //     PrivacyGateway, and ConductorScheduler are separate parameters.
-//   - GroqProvider and OllamaClient are module-level OnceLock singletons (D6-349).
+//   - HostedClient and OllamaClient are module-level OnceLock singletons (D6-349).
+//     HostedClient (items.id=709) is stateless: provider row, model row and the
+//     user's stored key are resolved per call into a CallContext.
 //   - No regex crate available; TOKEN_PATTERN scanning and PII detection use manual
 //     char-level implementations with semantically identical behaviour to the Python
 //     oracle's re.compile() patterns.
@@ -70,10 +72,12 @@ use crate::conductor::privacy::types::{
 use crate::conductor::privacy::PrivacyGateway;
 use crate::conductor::tokens::{ExternalAccess, StepDefinition};
 use crate::conductor::types::{PersonalTrack, SharedStateTrack, TaskStep, TaskTrack};
-use crate::providers::groq::GroqProvider;
-use crate::providers::mistral::MistralProvider;
+use crate::persistence::integration_keys_store::{self, QR_HOSTED_KEY_TYPE};
+use crate::persistence::provider_store::{self, ProviderModel};
+use crate::providers::errors::ProviderError;
+use crate::providers::hosted_call::{CallContext, HostedRoute};
+use crate::providers::hosted_client::{HostedClient, HostedRequest};
 use crate::providers::ollama_client::{check_context_window, OllamaClient};
-use crate::providers::qr_hosted_base::QrHostedProvider;
 use crate::providers::types::{ContextWindowStatusKind, GenerateOptions, GenerateRequest};
 
 // ---------------------------------------------------------------------------
@@ -102,49 +106,28 @@ const ALLOWED_VOICE_ATTRIBUTES: &[&str] = &[
 ];
 
 // ---------------------------------------------------------------------------
-// Module-level provider singletons (D6-349)
+// Module-level client singletons (D6-349)
 // ---------------------------------------------------------------------------
-// GroqProvider and OllamaClient hold reqwest::Client instances (Send+Sync).
-// Constructed once via OnceLock — safe across threads and focus runs.
+// HostedClient and OllamaClient hold reqwest::Client instances (Send+Sync).
+// Constructed once via OnceLock -- safe across threads and focus runs.
 //
-// Python oracle: module-level _groq_provider = GroqProvider()
-// D6-349: GroqProvider instantiation at call sites in executor.rs, not in FocusRun.
+// HostedClient is stateless (items.id=709): it carries no key and no
+// provider. There is no registry of providers here any more; the dispatch
+// below resolves the provider row, model row and the user's stored key into
+// a CallContext on every call (decisions.id=875).
+//
+// Python oracle: module-level provider instances.
+// D6-349: client instantiation at call sites in executor.rs, not in FocusRun.
 
-static GROQ_PROVIDER: OnceLock<GroqProvider> = OnceLock::new();
-static MISTRAL_PROVIDER: OnceLock<MistralProvider> = OnceLock::new();
+static HOSTED_CLIENT: OnceLock<HostedClient> = OnceLock::new();
 static OLLAMA_CLIENT: OnceLock<OllamaClient> = OnceLock::new();
 
-fn groq_provider() -> &'static GroqProvider {
-    GROQ_PROVIDER.get_or_init(GroqProvider::new)
-}
-
-fn mistral_provider() -> &'static MistralProvider {
-    MISTRAL_PROVIDER.get_or_init(MistralProvider::new)
+fn hosted_client() -> &'static HostedClient {
+    HOSTED_CLIENT.get_or_init(HostedClient::new)
 }
 
 fn ollama_client() -> &'static OllamaClient {
     OLLAMA_CLIENT.get_or_init(OllamaClient::new)
-}
-
-/// items.id=465 (closes B2): a small registry keyed by each Tier 1.5
-/// (qr_hosted) provider's own `QrHostedProvider::provider_id()`, replacing the old
-/// hardcoded `match qr_hosted_provider_preference.as_deref() { Some("mistral")
-/// => ..., Some("groq") => ..., Some(other) => unreachable!(...) }`
-/// dispatch. Adding a third qr_hosted provider now means adding one entry
-/// here, not a new match arm at every dispatch site that switches on a
-/// provider string.
-static QR_HOSTED_PROVIDER_REGISTRY: OnceLock<HashMap<&'static str, &'static dyn QrHostedProvider>> =
-    OnceLock::new();
-
-fn qr_hosted_provider_registry() -> &'static HashMap<&'static str, &'static dyn QrHostedProvider> {
-    QR_HOSTED_PROVIDER_REGISTRY.get_or_init(|| {
-        let mut m: HashMap<&'static str, &'static dyn QrHostedProvider> = HashMap::new();
-        let groq: &'static dyn QrHostedProvider = groq_provider();
-        let mistral: &'static dyn QrHostedProvider = mistral_provider();
-        m.insert(groq.provider_id(), groq);
-        m.insert(mistral.provider_id(), mistral);
-        m
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -179,9 +162,9 @@ fn qr_hosted_provider_registry() -> &'static HashMap<&'static str, &'static dyn 
 ///   not the legacy users.tier2_provider_preference column (dropped by
 ///   items.id=433 -- a real, historical column name, not this codebase's
 ///   current vocabulary). Only populated when effective_access != LocalOnly.
-///   Some(provider_id) -> dispatch to that provider via qr_hosted_provider_registry()
-///   (items.id=465 — an open HashMap keyed by each provider's own provider_id(),
-///   not a closed two-value set).
+///   Some(provider_id) -> dispatch to that provider through the generic hosted
+///   client (items.id=709): the provider's row in the providers table drives
+///   the call, so there is no closed set of providers in code.
 ///   None -> no provider chosen (or the resolved preference was ambiguous
 ///   across candidates, or the user's provider is excluded by the ceiling --
 ///   see qr_hosted_ceiling_excluded); StepExecutor raises F10
@@ -245,7 +228,7 @@ pub struct StepContext {
     pub abstraction_tier: u8,
     pub raw_abstraction: u8,
     pub floor_consent_preference: Option<String>, // "modified" | "local" | None
-    pub qr_hosted_provider_preference: Option<String>, // provider_id from qr_hosted_provider_registry(), or None
+    pub qr_hosted_provider_preference: Option<String>, // providers.id of a hosted provider row, or None
     /// items.id=692: Some(display name) iff the user HAS a hosted provider
     /// set up but this step's ceiling excludes it, so
     /// `qr_hosted_provider_preference` is None for that reason rather than
@@ -440,7 +423,7 @@ impl StepExecutor {
         // -- Step 4.5 — Tier 1.5 (qr_hosted) provider preference gate (F10) --
         // No prescribed default (architecture: "User choice at install. No
         // prescribed default."). An unset preference is a real gap, not
-        // silently resolved to Groq — short-circuits before any provider
+        // silently resolved to any default — short-circuits before any provider
         // is touched. Only checked when this step requires external access
         // at all; qr_local never needs a provider. A provider the user HAS
         // set up but this step's ceiling excludes (items.id=692) fails
@@ -667,35 +650,43 @@ impl StepExecutor {
             ));
         }
 
-        let generate_result: Result<_, ConductorError> =
-            if ctx.effective_access != ExternalAccess::LocalOnly {
-                // Step 4.5 above already guarantees qr_hosted_provider_preference is
-                // Some(...) at this point -- no silent fallback to any default
-                // provider for a None preference (matches select_model()'s
-                // policy). A provider id that IS present but isn't registered
-                // in qr_hosted_provider_registry() (items.id=465: closes B2) is a
-                // real ConductorError, not a panic -- unlike the old hardcoded
-                // match, this dispatch no longer assumes the schema-permitted
-                // value set is exactly {"mistral", "groq"}.
-                match ctx.qr_hosted_provider_preference.as_deref() {
-                    Some(provider_id) => match qr_hosted_provider_registry().get(provider_id) {
-                        Some(provider) => provider.generate(&request).await,
-                        None => Err(ConductorError::UnknownProvider {
-                            plain_language: format!(
-                                "Tier 1.5 provider '{provider_id}' is not registered with this \
-                             build of Quiet Rabbit."
-                            ),
-                        }),
-                    },
-                    None => unreachable!(
-                        "effective_access != LocalOnly with no qr_hosted_provider_preference -- \
-                     the Step 4.5 guard above must already have \
-                     short-circuited to MissingQrHostedConfig"
-                    ),
+        let generate_result: Result<_, ConductorError> = if ctx.effective_access
+            != ExternalAccess::LocalOnly
+        {
+            // Step 4.5 above already guarantees qr_hosted_provider_preference is
+            // Some(...) at this point -- no silent fallback to any default
+            // provider for a None preference (matches select_model()'s
+            // policy). The provider row, model row and the user's stored
+            // key become one CallContext (items.id=709); a provider id with
+            // no row is a real ConductorError, not a panic.
+            match (
+                ctx.qr_hosted_provider_preference.as_deref(),
+                selected_model.hosted_model.as_ref(),
+            ) {
+                (Some(provider_id), Some(model)) => {
+                    let hosted_request = hosted_request_from(&ctx.step.options_override, &request);
+                    let call =
+                        resolve_hosted_inputs(pool, &ctx.user_id, &ctx.key_hex, provider_id, model)
+                            .await
+                            .and_then(|inputs| inputs.build_call());
+                    match call {
+                        Ok(call) => hosted_client()
+                            .generate(&call, &hosted_request)
+                            .await
+                            .map(|outcome| outcome.response)
+                            .map_err(ConductorError::from),
+                        Err(e) => Err(ConductorError::from(e)),
+                    }
                 }
-            } else {
-                ollama_client().generate(&request).await
-            };
+                _ => unreachable!(
+                    "effective_access != LocalOnly with no qr_hosted_provider_preference \
+                         or no resolved model -- the Step 4.5 guard and select_model() must \
+                         already have short-circuited"
+                ),
+            }
+        } else {
+            ollama_client().generate(&request).await
+        };
 
         // Python oracle: finally block — always release regardless of generate result.
         scheduler.release_inference_slot(&ctx.focus_run_id);
@@ -1047,6 +1038,9 @@ async fn scan_voice_profile<L: DisclosureLogger>(
 struct SelectedModel {
     provider_id: Option<String>,
     model_id: String,
+    /// The catalog row select_model() resolved at Tier 1.5 (qr_hosted), so the
+    /// hosted call needs no second lookup (items.id=709). `None` at qr_local.
+    hosted_model: Option<ProviderModel>,
 }
 
 /// Step 4.5's provider gate (F10), pulled out so the two failure shapes are
@@ -1073,7 +1067,7 @@ fn missing_provider_error(
         },
         None => ConductorError::MissingQrHostedConfig {
             plain_language: "No Tier 1.5 AI provider is set up yet. \
-                        Choose Groq or Mistral in Settings to continue. \
+                        Choose a provider in Settings to continue. \
                         [Open Settings] [Get help]"
                 .to_owned(),
         },
@@ -1115,6 +1109,7 @@ async fn select_model(
         return Ok(SelectedModel {
             provider_id: None,
             model_id,
+            hosted_model: None,
         });
     }
 
@@ -1131,8 +1126,9 @@ async fn select_model(
 
     match crate::persistence::provider_store::get_default_model(pool, provider_id).await {
         Ok(Some(model)) => Ok(SelectedModel {
-            provider_id: Some(model.provider_id),
-            model_id: model.model_id,
+            provider_id: Some(model.provider_id.clone()),
+            model_id: model.model_id.clone(),
+            hosted_model: Some(model),
         }),
         Ok(None) => Err(ConductorError::UnknownProvider {
             plain_language: format!(
@@ -1147,6 +1143,104 @@ async fn select_model(
             ),
         }),
     }
+}
+
+/// Map the executor's request onto the hosted client's request (items.id=709).
+///
+/// The output token budget is forwarded ONLY when the step set `num_predict`
+/// explicitly: the executor's own default (1024) is a local-model default and
+/// is not forwarded, so a hosted model's limit comes from its catalog row
+/// (`request_options`) and the client fails closed when there is none.
+fn hosted_request_from(
+    options_override: &HashMap<String, serde_json::Value>,
+    request: &GenerateRequest,
+) -> HostedRequest {
+    HostedRequest {
+        system: None,
+        prompt: request.prompt.clone(),
+        temperature: request.options.as_ref().map(|o| o.temperature),
+        max_output_tokens: options_override
+            .get("num_predict")
+            .and_then(|v| v.as_u64())
+            .and_then(|n| u32::try_from(n).ok()),
+    }
+}
+
+/// What a hosted call is built from: the two catalog rows (as a plain-data
+/// route) and the user's stored key record.
+struct HostedInputs {
+    route: HostedRoute,
+    key: integration_keys_store::IntegrationKey,
+}
+
+impl HostedInputs {
+    /// Validate and assemble the CallContext (HTTPS-only; see hosted_call.rs).
+    fn build_call(&self) -> Result<CallContext, ProviderError> {
+        CallContext::build(&self.route, &self.key.credential, &self.key.extra_metadata)
+    }
+}
+
+/// Resolve the provider row, the model row and the user's stored key
+/// (items.id=709, decisions.id=875). The key comes ONLY from integration_keys
+/// -- no environment variable is consulted. A missing key, or a store that
+/// can't be opened (empty `key_hex`: no unlocked session), is MissingApiKey,
+/// with copy that points to Settings.
+async fn resolve_hosted_inputs(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    key_hex: &str,
+    provider_id: &str,
+    model: &ProviderModel,
+) -> Result<HostedInputs, ProviderError> {
+    let provider = match provider_store::get_provider(pool, provider_id).await {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return Err(ProviderError::UnknownProvider {
+                provider: provider_id.to_owned(),
+                plain_language: "The selected AI provider is not in this build's provider \
+                    catalog. [Open Settings] [Get help]"
+                    .to_owned(),
+            })
+        }
+        Err(_) => {
+            return Err(ProviderError::UnknownProvider {
+                provider: provider_id.to_owned(),
+                plain_language: "Quiet Rabbit couldn't look up the selected AI provider. \
+                    [Try again] [Get help]"
+                    .to_owned(),
+            })
+        }
+    };
+
+    let route = HostedRoute::from_rows(&provider, model);
+    let missing = || ProviderError::MissingApiKey {
+        provider: provider.id.clone(),
+        plain_language: format!(
+            "No {} API key is saved. Add one in Settings to use it. \
+             [Open Settings] [Use local AI instead]",
+            provider.display_name
+        ),
+    };
+    if key_hex.is_empty() {
+        return Err(missing());
+    }
+    let key = integration_keys_store::get_active_key(
+        user_id,
+        key_hex,
+        provider_id,
+        QR_HOSTED_KEY_TYPE,
+        None,
+    )
+    .await
+    .map_err(|_| ProviderError::Unavailable {
+        provider: provider.id.clone(),
+        plain_language: "Quiet Rabbit couldn't read your saved API key. \
+            [Try again] [Get help]"
+            .to_owned(),
+    })?
+    .ok_or_else(missing)?;
+
+    Ok(HostedInputs { route, key })
 }
 
 /// Context window size for a resolved model selection.
@@ -1661,7 +1755,7 @@ mod tests {
     /// items.id=465: select_model()'s Tier 1.5 (qr_hosted) branch and get_context_window()
     /// now read provider_models (shared.db) instead of matching on literal
     /// provider/model strings -- these tests need a real, migrated shared.db
-    /// (shared_016.sql's own curation pass seeds groq/mistral's default
+    /// (shared_016.sql's own curation pass seeds the hosted default
     /// models), not just in-process logic. Mirrors provider_store.rs's own
     /// list_active_providers_and_max_risk_rating_via_public_api pattern:
     /// ENV_MUTEX-serialized, tempdir-backed QR_DATA_ROOT.
@@ -1953,6 +2047,355 @@ mod tests {
         .await;
     }
 
+    // -----------------------------------------------------------------------
+    // items.id=709: provider row + model row + stored key -> hosted call.
+    // Neutral fixtures only; loopback HTTP, no outside network.
+    // -----------------------------------------------------------------------
+
+    const FIXTURE_KEY_HEX_BYTE: u8 = 0x77;
+
+    fn fixture_key_hex() -> String {
+        crate::auth::registry::key_hex(&[FIXTURE_KEY_HEX_BYTE; crate::auth::kdf::MASTER_KEY_LEN])
+    }
+
+    /// Give a fixture provider row everything a hosted call needs and point
+    /// it at `base_template`; give its default model a token limit.
+    async fn make_fixture_callable(
+        pool: &sqlx::SqlitePool,
+        provider_id: &str,
+        base_template: &str,
+        user_variables: &str,
+    ) {
+        sqlx::query(
+            "UPDATE providers SET api_dialect = 'openai_chat', base_url_template = ?,
+                    auth_scheme = 'bearer', extra_headers = '{}', models_path = '/models',
+                    user_variables = ?
+             WHERE id = ?",
+        )
+        .bind(base_template)
+        .bind(user_variables)
+        .bind(provider_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE provider_models SET request_options = '{\"max_completion_tokens\":128}'
+             WHERE provider_id = ?",
+        )
+        .bind(provider_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn loopback_chat_ok() -> crate::providers::loopback_test_server::Canned {
+        crate::providers::loopback_test_server::Canned::json(
+            200,
+            r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":4,"completion_tokens":2}}"#,
+        )
+    }
+
+    fn loopback_client() -> HostedClient {
+        HostedClient::for_loopback_tests(
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(2),
+            1024 * 1024,
+        )
+    }
+
+    async fn default_model(pool: &sqlx::SqlitePool, provider_id: &str) -> ProviderModel {
+        provider_store::get_default_model(pool, provider_id)
+            .await
+            .unwrap()
+            .expect("fixture model")
+    }
+
+    fn generate_request(prompt: &str) -> GenerateRequest {
+        GenerateRequest {
+            provider_id: Some("fixture-host-a".to_owned()),
+            model_id: "fixture-model-a".to_owned(),
+            prompt: prompt.to_owned(),
+            images: None,
+            task_type: "general".to_owned(),
+            stream: Some(false),
+            options: Some(GenerateOptions {
+                temperature: 0.5,
+                top_p: 0.9,
+                num_ctx: 4096,
+                num_predict: 1024,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn hosted_call_uses_the_stored_key_and_the_rows() {
+        use crate::providers::loopback_test_server::LoopbackServer;
+        with_temp_shared_db(|pool| async move {
+            seed_fixture_hosted(&pool, "fixture-host-a", "fixture-model-a", 4096).await;
+            let server = LoopbackServer::start(vec![loopback_chat_ok()]);
+            make_fixture_callable(
+                &pool,
+                "fixture-host-a",
+                &format!("{}/v1", server.base()),
+                "[]",
+            )
+            .await;
+            let key_hex = fixture_key_hex();
+            integration_keys_store::upsert_key(
+                "user-x",
+                &key_hex,
+                "fixture-host-a",
+                QR_HOSTED_KEY_TYPE,
+                "stored-key-value",
+                None,
+                Some("api_key"),
+                None,
+            )
+            .await
+            .unwrap();
+
+            let model = default_model(&pool, "fixture-host-a").await;
+            let inputs = resolve_hosted_inputs(&pool, "user-x", &key_hex, "fixture-host-a", &model)
+                .await
+                .unwrap();
+            let call = CallContext::build_for_loopback(
+                &inputs.route,
+                &inputs.key.credential,
+                &inputs.key.extra_metadata,
+            )
+            .unwrap();
+            let request =
+                hosted_request_from(&std::collections::HashMap::new(), &generate_request("hi"));
+            let out = loopback_client().generate(&call, &request).await.unwrap();
+            assert_eq!(out.response.content, "ok");
+
+            let sent = server.captured();
+            assert_eq!(
+                sent[0].header("authorization"),
+                Some("Bearer stored-key-value")
+            );
+            let body = sent[0].json();
+            assert_eq!(body["model"], "fixture-model-a");
+            // The executor's local default of 1024 is NOT forwarded: the row's
+            // limit applies.
+            assert_eq!(body["max_completion_tokens"], 128);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn hosted_call_fills_user_variables_from_the_key_records_metadata() {
+        use crate::providers::loopback_test_server::LoopbackServer;
+        use sqlx::ConnectOptions;
+        with_temp_shared_db(|pool| async move {
+            seed_fixture_hosted(&pool, "fixture-host-a", "fixture-model-a", 4096).await;
+            let server = LoopbackServer::start(vec![loopback_chat_ok()]);
+            make_fixture_callable(
+                &pool,
+                "fixture-host-a",
+                &format!("{}/accounts/{{account_id}}/v1", server.base()),
+                r#"["account_id"]"#,
+            )
+            .await;
+            let key_hex = fixture_key_hex();
+            integration_keys_store::upsert_key(
+                "user-y",
+                &key_hex,
+                "fixture-host-a",
+                QR_HOSTED_KEY_TYPE,
+                "stored-key-value",
+                None,
+                Some("api_key"),
+                None,
+            )
+            .await
+            .unwrap();
+            // Nothing writes extra_metadata yet (items.id=714): set it directly.
+            let mut conn = crate::providers::utils::connect_options_encrypted(
+                &crate::providers::utils::db_path_integration_keys("user-y"),
+                &key_hex,
+            )
+            .create_if_missing(false)
+            .connect()
+            .await
+            .unwrap();
+            sqlx::query("UPDATE integration_keys SET extra_metadata = ?")
+                .bind(r#"{"account_id":"acct-42"}"#)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            drop(conn);
+
+            let model = default_model(&pool, "fixture-host-a").await;
+            let inputs = resolve_hosted_inputs(&pool, "user-y", &key_hex, "fixture-host-a", &model)
+                .await
+                .unwrap();
+            let call = CallContext::build_for_loopback(
+                &inputs.route,
+                &inputs.key.credential,
+                &inputs.key.extra_metadata,
+            )
+            .unwrap();
+            let request =
+                hosted_request_from(&std::collections::HashMap::new(), &generate_request("hi"));
+            loopback_client().generate(&call, &request).await.unwrap();
+            assert_eq!(
+                server.captured()[0].path,
+                "/accounts/acct-42/v1/chat/completions"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn hosted_call_without_a_stored_key_is_missing_api_key() {
+        with_temp_shared_db(|pool| async move {
+            seed_fixture_hosted(&pool, "fixture-host-a", "fixture-model-a", 4096).await;
+            make_fixture_callable(&pool, "fixture-host-a", "https://api.example.test/v1", "[]")
+                .await;
+            let model = default_model(&pool, "fixture-host-a").await;
+
+            let err = resolve_hosted_inputs(
+                &pool,
+                "user-none",
+                &fixture_key_hex(),
+                "fixture-host-a",
+                &model,
+            )
+            .await
+            .map(|_| ())
+            .unwrap_err();
+            match err {
+                ProviderError::MissingApiKey { plain_language, .. } => {
+                    assert!(plain_language.contains("Settings"), "{plain_language}");
+                    assert!(!plain_language.to_lowercase().contains("environment"));
+                }
+                other => panic!("expected MissingApiKey, got {other:?}"),
+            }
+
+            // No unlocked session (empty key_hex) reads the same way.
+            let err = resolve_hosted_inputs(&pool, "user-none", "", "fixture-host-a", &model)
+                .await
+                .map(|_| ())
+                .unwrap_err();
+            assert!(
+                matches!(err, ProviderError::MissingApiKey { .. }),
+                "{err:?}"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn hosted_call_for_a_provider_with_no_row_is_unknown_provider() {
+        with_temp_shared_db(|pool| async move {
+            seed_fixture_hosted(&pool, "fixture-host-a", "fixture-model-a", 4096).await;
+            let model = default_model(&pool, "fixture-host-a").await;
+            let err = resolve_hosted_inputs(
+                &pool,
+                "user-x",
+                &fixture_key_hex(),
+                "fixture-absent",
+                &model,
+            )
+            .await
+            .map(|_| ())
+            .unwrap_err();
+            assert!(
+                matches!(err, ProviderError::UnknownProvider { .. }),
+                "{err:?}"
+            );
+            assert!(matches!(
+                ConductorError::from(err),
+                ConductorError::UnknownProvider { .. }
+            ));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_retired_model_row_is_refused_before_any_request() {
+        use crate::providers::loopback_test_server::LoopbackServer;
+        with_temp_shared_db(|pool| async move {
+            seed_fixture_hosted(&pool, "fixture-host-a", "fixture-model-a", 4096).await;
+            let server = LoopbackServer::start(vec![loopback_chat_ok()]);
+            make_fixture_callable(
+                &pool,
+                "fixture-host-a",
+                &format!("{}/v1", server.base()),
+                "[]",
+            )
+            .await;
+            sqlx::query("UPDATE provider_models SET status = 'retired'")
+                .execute(&pool)
+                .await
+                .unwrap();
+            let key_hex = fixture_key_hex();
+            integration_keys_store::upsert_key(
+                "user-z",
+                &key_hex,
+                "fixture-host-a",
+                QR_HOSTED_KEY_TYPE,
+                "k",
+                None,
+                Some("api_key"),
+                None,
+            )
+            .await
+            .unwrap();
+            let model = default_model(&pool, "fixture-host-a").await;
+            let inputs = resolve_hosted_inputs(&pool, "user-z", &key_hex, "fixture-host-a", &model)
+                .await
+                .unwrap();
+            let err = inputs.build_call().unwrap_err();
+            assert!(
+                matches!(err, ProviderError::ModelNotFound { .. }),
+                "{err:?}"
+            );
+            assert_eq!(server.connections(), 0);
+        })
+        .await;
+    }
+
+    #[test]
+    fn hosted_request_forwards_a_budget_only_when_the_step_set_one() {
+        let request = generate_request("p");
+        let none = hosted_request_from(&std::collections::HashMap::new(), &request);
+        assert_eq!(none.max_output_tokens, None);
+        assert_eq!(none.temperature, Some(0.5));
+        assert_eq!(none.prompt, "p");
+        assert!(none.system.is_none());
+
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("num_predict".to_owned(), serde_json::json!(777));
+        let some = hosted_request_from(&overrides, &request);
+        assert_eq!(some.max_output_tokens, Some(777));
+
+        // A value that is not a usable number is not a budget.
+        overrides.insert("num_predict".to_owned(), serde_json::json!("lots"));
+        assert_eq!(
+            hosted_request_from(&overrides, &request).max_output_tokens,
+            None
+        );
+    }
+
+    /// No environment variable is a key source (items.id=709): the executor
+    /// and the hosted client sources read none.
+    #[test]
+    fn no_hosted_code_path_reads_a_key_from_the_environment() {
+        let needle_key = concat!("API", "_KEY");
+        let executor = include_str!("executor.rs");
+        assert!(!executor.contains(needle_key));
+        for source in [
+            include_str!("../providers/hosted_call.rs"),
+            include_str!("../providers/hosted_client.rs"),
+        ] {
+            assert!(!source.contains(concat!("env", "::var")));
+            assert!(!source.contains(needle_key));
+        }
+    }
+
     #[tokio::test]
     async fn context_window_unknown_model_defaults() {
         with_temp_shared_db(|pool| async move {
@@ -2018,7 +2461,7 @@ mod tests {
             ConductorError::MissingQrHostedConfig { plain_language } => {
                 assert_eq!(
                     plain_language,
-                    "No Tier 1.5 AI provider is set up yet. Choose Groq or Mistral in \
+                    "No Tier 1.5 AI provider is set up yet. Choose a provider in \
                      Settings to continue. [Open Settings] [Get help]"
                 );
             }
@@ -2028,14 +2471,18 @@ mod tests {
 
     #[test]
     fn step_4_5_ceiling_excluded_provider_is_a_distinct_failure() {
-        let err = missing_provider_error(ExternalAccess::AnonymousRequired, None, Some("Groq"))
-            .expect("an excluded provider must fail");
+        let err = missing_provider_error(
+            ExternalAccess::AnonymousRequired,
+            None,
+            Some("Fixture Host"),
+        )
+        .expect("an excluded provider must fail");
         match err {
             ConductorError::ProviderExcludedByCeiling { plain_language } => {
                 assert_eq!(
                     plain_language,
                     "This Focus is set to use only providers that don't require an account, \
-                     so it can't use your hosted provider (Groq). To use it, change this \
+                     so it can't use your hosted provider (Fixture Host). To use it, change this \
                      Focus's 'Maximum permitted tier' setting to allow providers that \
                      require an account. [Open Settings] [Get help]"
                 );
@@ -2049,9 +2496,14 @@ mod tests {
 
     #[test]
     fn step_4_5_passes_when_selected_or_local() {
-        assert!(missing_provider_error(ExternalAccess::Unrestricted, Some("groq"), None).is_none());
+        assert!(
+            missing_provider_error(ExternalAccess::Unrestricted, Some("fixture-host-a"), None)
+                .is_none()
+        );
         assert!(missing_provider_error(ExternalAccess::LocalOnly, None, None).is_none());
-        assert!(missing_provider_error(ExternalAccess::LocalOnly, None, Some("Groq")).is_none());
+        assert!(
+            missing_provider_error(ExternalAccess::LocalOnly, None, Some("Fixture Host")).is_none()
+        );
     }
 
     #[test]

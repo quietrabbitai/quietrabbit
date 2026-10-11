@@ -14,13 +14,10 @@
 // a shape change -- the table shape keys_001.sql describes is still current.
 //
 // SCOPE (items.id=185, narrowed 2026-08-01): this module plus
-// commands/qr_hosted.rs's consumer-side wiring only. Does NOT touch:
-//   - providers/groq.rs's get_api_key() -- its own doc comment names this
-//     as a distinct future "Layer 8" swap with a stable signature/error
-//     contract, synchronous today, unlike this module's async functions.
-//     Wiring it now would force a signature decision (async fn vs.
-//     block-on-async) this item does not scope. Flagged as a follow-on in
-//     this session's handoff.
+// commands/qr_hosted.rs's consumer-side wiring only. (The hosted-provider
+// client reads keys from here since items.id=709: the executor's
+// resolve_hosted_inputs() calls get_active_key; the old per-provider adapters
+// and their environment-variable bridge are deleted.) Does NOT touch:
 //   - Every other store's (output_store.rs, personal_store.rs,
 //     topic_store.rs) bare key_hex: &str parameter -- Architecture Section
 //     4.2's "every encrypted-store open() reads from KeyRegistry" end
@@ -68,13 +65,22 @@ pub enum IntegrationKeysStoreError {
 // Data type
 // ---------------------------------------------------------------------------
 
+/// key_type of the keys the hosted-provider client reads (renamed from
+/// "tier2" by keys_002.sql, items.id=528 Phase 2). One definition for the
+/// settings commands and the executor (items.id=709).
+pub const QR_HOSTED_KEY_TYPE: &str = "qr_hosted";
+
 /// One row of integration_keys. `credential` is the plaintext secret
 /// (protected only by SQLCipher file-level encryption, per keys_001.sql's
 /// own header on why no field-level layer is needed) -- callers that
 /// construct an IPC response from this struct MUST NOT include
 /// `credential` in it (commands/qr_hosted.rs's own doc comment: "api_key must
 /// NEVER be returned to the frontend").
-#[derive(Debug, Clone)]
+///
+/// Debug is hand-written and prints `credential` as a fixed marker
+/// (items.id=709): a derived Debug would put the key in any `{:?}` a caller
+/// ever writes.
+#[derive(Clone)]
 pub struct IntegrationKey {
     pub id: String,
     pub provider: String,
@@ -88,6 +94,31 @@ pub struct IntegrationKey {
     pub is_active: bool,
     pub created_at: String,
     pub last_verified_at: Option<String>,
+    /// The record's `extra_metadata` column: a JSON object holding per-user
+    /// provider variables such as an account id (decisions.id=875 point 1).
+    /// Anything that is not a JSON object reads as an empty object. Nothing
+    /// writes this column yet (credential capture is items.id=714).
+    pub extra_metadata: serde_json::Value,
+}
+
+impl std::fmt::Debug for IntegrationKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IntegrationKey")
+            .field("id", &self.id)
+            .field("provider", &self.provider)
+            .field("key_type", &self.key_type)
+            .field("integration_id", &self.integration_id)
+            .field("credential_label", &self.credential_label)
+            .field("credential", &"[redacted]")
+            .field("persona_id", &self.persona_id)
+            .field("auth_type", &self.auth_type)
+            .field("expires_at", &self.expires_at)
+            .field("is_active", &self.is_active)
+            .field("created_at", &self.created_at)
+            .field("last_verified_at", &self.last_verified_at)
+            .field("extra_metadata", &"[not printed]")
+            .finish()
+    }
 }
 
 fn row_to_integration_key(r: &sqlx::sqlite::SqliteRow) -> Result<IntegrationKey, sqlx::Error> {
@@ -104,6 +135,13 @@ fn row_to_integration_key(r: &sqlx::sqlite::SqliteRow) -> Result<IntegrationKey,
         is_active: r.try_get::<i64, _>("is_active")? != 0,
         created_at: r.try_get("created_at")?,
         last_verified_at: r.try_get("last_verified_at")?,
+        extra_metadata: {
+            let raw: String = r.try_get("extra_metadata")?;
+            match serde_json::from_str::<serde_json::Value>(&raw) {
+                Ok(v) if v.is_object() => v,
+                _ => serde_json::json!({}),
+            }
+        },
     })
 }
 
@@ -172,7 +210,8 @@ async fn get_active_key_conn(
 ) -> Result<Option<IntegrationKey>, IntegrationKeysStoreError> {
     let row = sqlx::query(
         "SELECT id, provider, key_type, integration_id, credential_label, credential,
-                persona_id, auth_type, expires_at, is_active, created_at, last_verified_at
+                persona_id, auth_type, expires_at, is_active, created_at, last_verified_at,
+                extra_metadata
          FROM integration_keys
          WHERE provider = ? AND key_type = ? AND is_active = 1
            AND ((? IS NULL AND persona_id IS NULL) OR persona_id = ?)",
@@ -794,5 +833,68 @@ mod tests {
             .expect("open must succeed on a pre-migration db")
             .expect("the pre-existing key must survive");
         assert_eq!(key.credential, "secret-value");
+    }
+    // -----------------------------------------------------------------------
+    // items.id=709: extra_metadata is readable; Debug never prints the key
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn extra_metadata_is_read_as_a_json_object() {
+        let mut conn = seeded_conn().await;
+        upsert_key_conn(&mut conn, "p1", TEST_KEY_TYPE, "k1", None, None, None)
+            .await
+            .unwrap();
+        // Default column value reads as an empty object.
+        let key = get_active_key_conn(&mut conn, "p1", TEST_KEY_TYPE, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(key.extra_metadata, serde_json::json!({}));
+
+        sqlx::query("UPDATE integration_keys SET extra_metadata = ? WHERE provider = 'p1'")
+            .bind(r#"{"account_id":"abc123"}"#)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let key = get_active_key_conn(&mut conn, "p1", TEST_KEY_TYPE, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(key.extra_metadata["account_id"], "abc123");
+
+        // Anything that is not a JSON object reads as an empty object.
+        for bad in ["not json", "[1,2]", "\"text\"", "7"] {
+            sqlx::query("UPDATE integration_keys SET extra_metadata = ? WHERE provider = 'p1'")
+                .bind(bad)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            let key = get_active_key_conn(&mut conn, "p1", TEST_KEY_TYPE, None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(key.extra_metadata, serde_json::json!({}), "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn debug_output_never_contains_the_credential() {
+        let mut conn = seeded_conn().await;
+        let secret = "sk-debug-must-not-print-this-value";
+        upsert_key_conn(&mut conn, "p1", TEST_KEY_TYPE, secret, None, None, None)
+            .await
+            .unwrap();
+        let key = get_active_key_conn(&mut conn, "p1", TEST_KEY_TYPE, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(key.credential, secret);
+        let shown = format!("{key:?}");
+        assert!(!shown.contains(secret), "{shown}");
+        assert!(shown.contains("redacted"));
+        let pretty = format!("{key:#?}");
+        assert!(!pretty.contains(secret));
+        let option = format!("{:?}", Some(&key));
+        assert!(!option.contains(secret));
     }
 }

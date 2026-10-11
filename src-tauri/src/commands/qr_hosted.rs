@@ -25,7 +25,8 @@
 //
 // key_type is hardcoded to "qr_hosted" in both commands (renamed from
 // "tier2" by keys_002.sql, items.id=528 Phase 2) -- this module's only
-// concern is Tier 1.5 (qr_hosted) provider configuration (Groq, Mistral); cloud_frontier and
+// concern is Tier 1.5 (qr_hosted) provider configuration (hosted providers are
+// rows in the providers table, items.id=708); cloud_frontier and
 // future non-AI integrations use the same table via a different key_type,
 // through their own future command modules.
 //
@@ -34,24 +35,20 @@
 // credential field; get_qr_hosted_config only reports whether a key is
 // configured and which provider is active, never the key value itself.
 //
-// FOLLOW-ON NOT DONE HERE (flagged to Chat-PM in this session's handoff):
-// providers/groq.rs::get_api_key() still reads GROQ_API_KEY from the
-// environment (Layer 6 dev bridge) -- its own doc comment names swapping
-// to integration_keys_store retrieval as a distinct future "Layer 8" step
-// with a stable signature/error contract. That function is synchronous;
-// this module's store calls are async. Wiring it now would force an
-// async-fn-vs-block-on-async decision this item does not scope.
+// KEY CONSUMER (items.id=709): the generic hosted client's executor-side
+// resolver (conductor/executor.rs) reads the key saved here with
+// integration_keys_store::get_active_key at call time. The old environment
+// variable bridge in the retired per-provider adapters is gone; a key saved
+// by set_qr_hosted_provider below is the only key a hosted call uses.
 
 use tauri::State;
 
 use crate::auth::registry::{key_hex, KeyRegistry};
-use crate::persistence::integration_keys_store;
+use crate::persistence::integration_keys_store::{self, QR_HOSTED_KEY_TYPE};
 use crate::persistence::provider_store;
 use crate::persistence::user_provider_preference_store::{
     self, NewUserProviderPreference, UserPreference, UserProviderPreference,
 };
-
-const QR_HOSTED_KEY_TYPE: &str = "qr_hosted";
 
 // ---------------------------------------------------------------------------
 // IPC types

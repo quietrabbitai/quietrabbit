@@ -360,6 +360,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/shared_026.sql"),
     },
     SchemaFile {
+        prefix: "shared",
+        version: 27,
+        sql: include_str!("../../schema/shared_027.sql"),
+    },
+    SchemaFile {
         prefix: "tier3_cookies",
         version: 1,
         sql: include_str!("../../schema/tier3_cookies_001.sql"),
@@ -2222,15 +2227,15 @@ mod tests {
             .await
             .expect("shared migration chain must apply cleanly on a fresh db");
         assert_eq!(
-            applied, 26,
-            "expected all twenty-six shared schema versions to apply"
+            applied, 27,
+            "expected all twenty-seven shared schema versions to apply"
         );
 
         let version: (i64,) = sqlx::query_as("SELECT MAX(version) FROM schema_version")
             .fetch_one(&mut conn)
             .await
             .unwrap();
-        assert_eq!(version.0, 26);
+        assert_eq!(version.0, 27);
     }
 
     /// items.id=708 / items.id=703: shared_026.sql populates the seeded
@@ -2298,6 +2303,44 @@ mod tests {
             unprovenanced.0, 0,
             "every remaining model row carries context-window provenance"
         );
+    }
+
+    /// items.id=709 (shared_027.sql): the generic hosted client fails closed
+    /// without an output token limit, so EVERY seeded hosted model row must
+    /// carry one in request_options (items.id=710's cost cap needs a worst-case
+    /// output size). Field-based: names no provider or model. Applies to the
+    /// rows items.id=724 adds later as well.
+    #[tokio::test]
+    async fn test_every_seeded_hosted_model_row_carries_a_token_limit() {
+        let mut conn = make_test_conn().await;
+        run_migrations(&mut conn, "shared", None).await.unwrap();
+
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT m.id, m.request_options FROM provider_models m
+             JOIN providers p ON p.id = m.provider_id
+             WHERE p.api_dialect IS NOT NULL",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        assert!(!rows.is_empty(), "seeded hosted model rows must exist");
+
+        for (id, options) in rows {
+            let options: serde_json::Value =
+                serde_json::from_str(options.as_deref().unwrap_or("{}"))
+                    .unwrap_or_else(|_| panic!("{id}: request_options must be JSON"));
+            let limits: Vec<u64> = ["max_completion_tokens", "max_tokens"]
+                .iter()
+                .filter_map(|k| options.get(*k))
+                .filter_map(|v| v.as_u64())
+                .collect();
+            assert_eq!(
+                limits.len(),
+                1,
+                "{id}: exactly one positive output token limit key is required"
+            );
+            assert!(limits[0] > 0, "{id}: the token limit must be positive");
+        }
     }
 
     /// items.id=708: shared_026.sql CHECK constraints reject out-of-range values.
@@ -2388,8 +2431,8 @@ mod tests {
             .expect("drift-healing run must succeed");
 
         assert_eq!(
-            applied, 25,
-            "shared v2 through v26 should count as newly applied from a stale v1 database"
+            applied, 26,
+            "shared v2 through v27 should count as newly applied from a stale v1 database"
         );
 
         // items.id=427: shared_013.sql drops tier3_providers (generalized

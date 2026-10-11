@@ -1,6 +1,6 @@
 //! Ollama qr_local HTTP client.
 //!
-//! Ollama is qr_local — it does NOT implement [`QrHostedProvider`].
+//! Ollama is qr_local — it is not routed through the generic hosted client.
 //! Inference-call errors map directly to [`ConductorError`] at every raise
 //! site. No [`ProviderError`] intermediary — qr_local maps directly.
 //! EXCEPTION (items.id=436): `pull_model`/`delete_model` map to

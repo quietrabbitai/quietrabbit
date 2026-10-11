@@ -9,7 +9,7 @@
 //
 // send_message is where this store meets Focus execution: it persists the
 // user's turn, builds a bounded conversation-history prefix (see
-// build_conversation_prompt) so a stateless-per-call QrHostedProvider still
+// build_conversation_prompt) so a stateless-per-call hosted client still
 // gets turn-to-turn continuity, starts a real Focus run via
 // commands::execution::load_and_authorize_run (the same LOAD+AUTHORIZE core
 // submit_focus_run uses), and — unlike submit_focus_run, which fires
@@ -122,8 +122,8 @@ fn to_message_info(r: message_store::MessageRecord) -> MessageInfo {
 // ---------------------------------------------------------------------------
 
 /// How many recent messages to fold into a send's user_input as context.
-/// QrHostedProvider is single-request/stateless -- no multi-turn state, no
-/// tools, no memory (providers/qr_hosted_base.rs) -- so turn-to-turn continuity
+/// The hosted client is single-request/stateless -- no multi-turn state, no
+/// tools, no memory (providers/hosted_client.rs) -- so turn-to-turn continuity
 /// has to be threaded through the one prompt string each call gets, not
 /// through the provider. Flat concatenation, bounded window: no
 /// summarization or selective relevance, a real follow-up if this needs to

@@ -33,12 +33,11 @@ use tokio::sync::RwLock;
 use crate::auth::registry::{key_hex, KeyRegistry};
 use crate::hardware_probe::{self, HardwareProfile, RamClass};
 use crate::ollama_sidecar::SidecarStartup;
-use crate::persistence::{integration_keys_store, provider_store};
+use crate::persistence::integration_keys_store::{self, QR_HOSTED_KEY_TYPE};
+use crate::persistence::provider_store;
 use crate::providers::ollama_client::OllamaClient;
 use crate::providers::types::{ProviderHealth, ProviderStatus};
 use crate::recommendation::{self, Candidate, CandidateKind, ProviderRecommendation};
-
-const QR_HOSTED_KEY_TYPE: &str = "qr_hosted";
 
 // ---------------------------------------------------------------------------
 // Response structs
