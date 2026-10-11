@@ -477,12 +477,12 @@ export const commands = {
 	 *  the two provider_type shapes lane_str() knows how to label
 	 *  ('split_screen_web' -> cloud_anonymous, 'external_service' ->
 	 *  cloud_frontier) -- filtered out here rather than in the shared store
-	 *  function, so cloud_inference_api (qr_hosted: groq/mistral) and
+	 *  function, so cloud_inference_api (qr_hosted) and
 	 *  local_model rows never reach this list.
 	 * 
 	 *  items.id=539: also filters to preference_tier='preferred' -- shared_018.sql
-	 *  added preference_tier specifically so 'supported' rows (groqchat,
-	 *  mistralvibe, deepseek: vetted and usable, but not QR-recommended) stay
+	 *  added preference_tier specifically so 'supported' rows (vetted and
+	 *  usable, but not QR-recommended) stay
 	 *  hidden from this screen "unless a user specifically requests it." That
 	 *  reveal mechanism doesn't exist yet (deferred to a future onboarding/
 	 *  settings design session per shared_018.sql's own header), so until it
@@ -1103,7 +1103,7 @@ export type HealthResponse = {
 	/**
 	 *  True iff an active user-global key exists for ANY qr_hosted provider
 	 *  (providers.provider_type='cloud_inference_api' -- items.id=430; was a
-	 *  hardcoded ["mistral","groq"] array before this) -- a capability-status
+	 *  hardcoded provider-id array before this) -- a capability-status
 	 *  signal ("is qr_hosted usable at all," e.g. for an onboarding nudge),
 	 *  not a report of which provider is active. Provider *selection* at
 	 *  execution time is a separate concern, wired through

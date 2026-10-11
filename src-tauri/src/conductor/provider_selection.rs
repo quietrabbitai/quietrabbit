@@ -1,6 +1,6 @@
 // src-tauri/src/conductor/provider_selection.rs
 //
-// Which hosted provider (Groq, Mistral, ...) a step may be sent to, given the
+// Which hosted provider a step may be sent to, given the
 // step's ExternalAccess ceiling and the user's provider preference
 // (items.id=692, decisions.id=870; spec PROVIDER_REGISTRY_AND_TIER_MODEL_SPEC.md
 // Parts 6b/6f).
@@ -30,7 +30,7 @@ use crate::persistence::provider_store;
 use crate::persistence::user_provider_preference_store::preferred_providers;
 
 /// provider_type of the hosted-inference providers QR itself can call over an
-/// API (Groq, Mistral). Cloud Chat panes (split_screen_web/external_service)
+/// API. Cloud Chat panes (split_screen_web/external_service)
 /// are never candidates here -- those are user-driven and not gated by the
 /// ceiling (decisions.id=680).
 const HOSTED_PROVIDER_TYPE: &str = "cloud_inference_api";
@@ -157,6 +157,21 @@ mod tests {
         .expect("upsert_preference must succeed");
     }
 
+    /// Two seeded hosted API providers as (id, display_name), chosen by
+    /// field so no test names a provider (decisions.id=872).
+    async fn hosted_pair(pool: &sqlx::SqlitePool) -> [(String, String); 2] {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, display_name FROM providers \
+             WHERE provider_type = 'cloud_inference_api' AND activation_status = 'active' \
+             ORDER BY id LIMIT 2",
+        )
+        .fetch_all(pool)
+        .await
+        .expect("hosted rows query");
+        rows.try_into()
+            .expect("at least two seeded hosted providers")
+    }
+
     async fn resolve(
         pool: &sqlx::SqlitePool,
         access: ExternalAccess,
@@ -182,29 +197,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn anonymous_required_excludes_a_preferred_groq() {
+    async fn anonymous_required_excludes_a_preferred_hosted_provider() {
         with_db(|pool| async move {
-            prefer(&pool, "groq").await;
-            assert_eq!(
-                resolve(&pool, ExternalAccess::AnonymousRequired).await,
-                ExternalProviderResolution::ExcludedByCeiling {
-                    provider_name: "Groq".to_owned()
-                }
-            );
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn anonymous_required_excludes_a_preferred_mistral() {
-        with_db(|pool| async move {
-            prefer(&pool, "mistral").await;
-            assert_eq!(
-                resolve(&pool, ExternalAccess::AnonymousRequired).await,
-                ExternalProviderResolution::ExcludedByCeiling {
-                    provider_name: "Mistral".to_owned()
-                }
-            );
+            for (id, name) in hosted_pair(&pool).await {
+                sqlx::query("DELETE FROM user_provider_preference")
+                    .execute(&pool)
+                    .await
+                    .expect("clear preferences");
+                prefer(&pool, &id).await;
+                assert_eq!(
+                    resolve(&pool, ExternalAccess::AnonymousRequired).await,
+                    ExternalProviderResolution::ExcludedByCeiling {
+                        provider_name: name
+                    },
+                    "{id}"
+                );
+            }
         })
         .await;
     }
@@ -212,10 +220,11 @@ mod tests {
     #[tokio::test]
     async fn anonymous_preferred_allows_the_users_preferred_provider() {
         with_db(|pool| async move {
-            prefer(&pool, "groq").await;
+            let [(first, _), _] = hosted_pair(&pool).await;
+            prefer(&pool, &first).await;
             assert_eq!(
                 resolve(&pool, ExternalAccess::AnonymousPreferred).await,
-                ExternalProviderResolution::Selected("groq".to_owned())
+                ExternalProviderResolution::Selected(first)
             );
         })
         .await;
@@ -224,10 +233,11 @@ mod tests {
     #[tokio::test]
     async fn unrestricted_allows_the_users_preferred_provider() {
         with_db(|pool| async move {
-            prefer(&pool, "mistral").await;
+            let [_, (second, _)] = hosted_pair(&pool).await;
+            prefer(&pool, &second).await;
             assert_eq!(
                 resolve(&pool, ExternalAccess::Unrestricted).await,
-                ExternalProviderResolution::Selected("mistral".to_owned())
+                ExternalProviderResolution::Selected(second)
             );
         })
         .await;
@@ -254,8 +264,9 @@ mod tests {
     #[tokio::test]
     async fn two_preferred_providers_stay_ambiguous() {
         with_db(|pool| async move {
-            prefer(&pool, "groq").await;
-            prefer(&pool, "mistral").await;
+            let [(first, _), (second, _)] = hosted_pair(&pool).await;
+            prefer(&pool, &first).await;
+            prefer(&pool, &second).await;
             assert_eq!(
                 resolve(&pool, ExternalAccess::Unrestricted).await,
                 ExternalProviderResolution::NotConfigured
@@ -267,7 +278,8 @@ mod tests {
     #[tokio::test]
     async fn local_only_never_selects_a_provider() {
         with_db(|pool| async move {
-            prefer(&pool, "groq").await;
+            let [(first, _), _] = hosted_pair(&pool).await;
+            prefer(&pool, &first).await;
             // The executor never asks for LocalOnly steps; if asked anyway
             // the ceiling permits nothing.
             assert!(!matches!(

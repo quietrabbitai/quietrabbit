@@ -93,8 +93,7 @@ const VOICE_VALUE_REJECTION_MSG: &str =
 /// commit a27a2b1~1: `_VOICE_VALUE_PII_PATTERNS`) --
 /// `r'\+?\d[\d\s\-(). ]{7,}\d'` -- an optional leading '+', a digit, 8+
 /// digit/space/punctuation characters, then a closing digit. Compiled once
-/// (OnceLock, same singleton pattern as executor.rs's GROQ_PROVIDER,
-/// D6-349) rather than per call -- validate_voice_profile_value runs on
+/// (OnceLock singleton, D6-349) rather than per call -- validate_voice_profile_value runs on
 /// every voice profile write.
 fn phone_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();

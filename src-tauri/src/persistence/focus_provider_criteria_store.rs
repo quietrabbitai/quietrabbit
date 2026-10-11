@@ -421,8 +421,9 @@ mod tests {
 
     /// Sets QR_DATA_ROOT to a fresh tempdir and migrates shared.db for real
     /// -- so tests below exercise the actual public API against a real
-    /// on-disk shared.db, including the real groq/mistral/duckai/claude/
-    /// chatgpt/gemini providers rows shared_014.sql/shared_013.sql seed.
+    /// on-disk shared.db, including the real hosted API, local model and
+    /// Cloud Chat (duckai, claude, ...) providers rows the shared_*.sql
+    /// migrations seed.
     /// Matches user_provider_preference_store.rs's own setup_real_db
     /// pattern (ENV_MUTEX serialization).
     async fn setup_real_db() -> (tempfile::TempDir, sqlx::SqlitePool) {
@@ -598,8 +599,13 @@ mod tests {
             let ids: Vec<&str> = eligible.iter().map(|p| p.id.as_str()).collect();
             assert!(ids.contains(&"duckai"));
             assert!(ids.contains(&"claude"));
-            assert!(ids.contains(&"groq"));
-            assert!(ids.contains(&"mistral"));
+            let hosted = provider_store::list_providers_by_type(&pool, "cloud_inference_api")
+                .await
+                .expect("list_providers_by_type must succeed");
+            assert!(!hosted.is_empty(), "seeded hosted rows must exist");
+            for h in &hosted {
+                assert!(ids.contains(&h.id.as_str()), "{} must be eligible", h.id);
+            }
             Ok::<(), FocusProviderCriteriaStoreError>(())
         }
         .await;
@@ -662,22 +668,16 @@ mod tests {
         let (_tempdir, pool) = setup_real_db().await;
 
         let outcome = async {
-            // require_not_trains_on_data=1 alone matches duckai, groq,
-            // groqchat, and (items.id=436, shared_024.sql) the 3 curated
-            // Ollama local_model rows -- all seeded with
-            // trains_on_data_by_default=0 (Tier 1, the most private
-            // option). (items.id=440 Part A curated groq as not training on
-            // data by default -- no longer just duckai, as it was when this
-            // test was first written against groq's pre-curation placeholder
-            // seed. shared_018.sql -- items.id=347/486-adjacent provider
-            // catalog work -- added groqchat, Groq's own cloud_frontier web-chat row,
-            // reusing the same items.id=440 no-training finding since it's
-            // the same real-world entity/policy, not a new curation).
+            // require_not_trains_on_data=1 alone matches every active row
+            // seeded with trains_on_data_by_default=0 (duckai, the curated
+            // hosted API rows that do not train, the Cloud
+            // Chat rows and the Tier 1 local models). The expectation is
+            // computed from that flag, not from provider ids, so it keeps
+            // holding as hosted rows are curated (items.id=724).
             // deny=[duckai] excludes it anyway despite passing the
-            // requirement; allow=[claude] carves claude in despite it
-            // failing the requirement (trains_on_data=1); groq, groqchat,
-            // and the 3 Ollama rows all pass the requirement on their own
-            // merits and need neither list.
+            // requirement. allow=[claude] carves claude in despite it
+            // failing the requirement (trains_on_data=1). Everything else
+            // is decided by the requirement alone.
             set_criteria(
                 &pool,
                 "f1",
@@ -689,21 +689,28 @@ mod tests {
             )
             .await?;
 
+            let all = provider_store::list_active_providers(&pool).await?;
+            let expected: Vec<String> = all
+                .iter()
+                .filter(|p| p.id == "claude" || (p.id != "duckai" && !p.trains_on_data_by_default))
+                .map(|p| p.id.clone())
+                .collect();
+            assert!(
+                expected.iter().any(|id| id == "claude"),
+                "the allow-list must carve claude in"
+            );
+            assert!(
+                all.iter()
+                    .any(|p| p.id == "duckai" && !p.trains_on_data_by_default),
+                "duckai must pass the requirement so the deny-list is what excludes it"
+            );
+
             let eligible = eligible_providers_for_focus(&pool, "f1").await?;
-            let ids: Vec<&str> = eligible.iter().map(|p| p.id.as_str()).collect();
+            let ids: Vec<String> = eligible.iter().map(|p| p.id.clone()).collect();
             assert_eq!(
-                ids,
-                vec![
-                    "groq",
-                    "claude",
-                    "groqchat",
-                    "ollama:llama3.1:8b",
-                    "ollama:llama3.2:3b",
-                    "ollama:qwen2.5:7b"
-                ],
-                "deny must beat a passing require match (duckai), allow must beat a failing \
-                 require match (claude), and groq/groqchat/the 3 Ollama rows must each pass \
-                 the requirement on their own merits -- everything else fails the requirement"
+                ids, expected,
+                "deny must beat a passing require match, allow must beat a failing require \
+                 match, and every other row is decided by trains_on_data_by_default alone"
             );
             Ok::<(), FocusProviderCriteriaStoreError>(())
         }
@@ -723,8 +730,8 @@ mod tests {
         providers.iter().map(|p| p.id.as_str()).collect()
     }
 
-    /// Runs `f` against the real seeded active-provider pool (groq, mistral,
-    /// duckai, claude, ...), restoring QR_DATA_ROOT afterwards.
+    /// Runs `f` against the real seeded active-provider pool (hosted API,
+    /// local model and Cloud Chat rows), restoring QR_DATA_ROOT afterwards.
     async fn with_seeded_providers<F>(f: F)
     where
         F: FnOnce(Vec<Provider>, Vec<Provider>),
@@ -749,9 +756,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn anonymous_required_excludes_groq_and_mistral() {
+    async fn anonymous_required_excludes_hosted_api_providers() {
         with_seeded_providers(|all, hosted| {
-            assert_eq!(ids(&hosted), vec!["groq", "mistral"]);
+            assert!(!hosted.is_empty(), "seeded hosted rows must exist");
+            let hosted_ids: Vec<String> = hosted.iter().map(|p| p.id.clone()).collect();
             assert!(hosted.iter().all(|p| !p.is_anonymous));
 
             let eligible =
@@ -766,8 +774,9 @@ mod tests {
                 providers_permitted_by_ceiling(all, ExternalAccess::AnonymousRequired);
             assert!(!eligible_all.is_empty());
             assert!(eligible_all.iter().all(|p| p.is_anonymous));
-            assert!(!ids(&eligible_all).contains(&"groq"));
-            assert!(!ids(&eligible_all).contains(&"mistral"));
+            for id in &hosted_ids {
+                assert!(!ids(&eligible_all).contains(&id.as_str()), "{id}");
+            }
         })
         .await;
     }
@@ -796,11 +805,15 @@ mod tests {
                 "the seeded catalog contains anonymous providers (duckai)"
             );
 
-            // Stable within each group: relative order of the hosted pair is
-            // untouched, and hosted providers are still allowed.
+            // Stable within each group: the relative order of the hosted rows
+            // is untouched, and hosted providers are still allowed.
+            let hosted_before: Vec<String> = hosted.iter().map(|p| p.id.clone()).collect();
             let ranked_hosted =
                 providers_permitted_by_ceiling(hosted, ExternalAccess::AnonymousPreferred);
-            assert_eq!(ids(&ranked_hosted), vec!["groq", "mistral"]);
+            assert_eq!(
+                ids(&ranked_hosted),
+                hosted_before.iter().map(String::as_str).collect::<Vec<_>>()
+            );
         })
         .await;
     }

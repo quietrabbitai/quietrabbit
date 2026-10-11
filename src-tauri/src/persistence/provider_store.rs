@@ -839,7 +839,7 @@ pub async fn list_all_providers(
 /// One catalog model entry for a provider. `id` is literally
 /// "provider_id:model_id" -- the same opaque string
 /// conductor/executor.rs's select_model()/get_context_window() already
-/// pass around (e.g. "groq:llama-3.1-8b-instant"), so callers never split
+/// pass around (e.g. "provider-id:model-id"), so callers never split
 /// or reassemble it.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProviderModel {
@@ -965,8 +965,8 @@ fn row_to_provider_model(
 }
 
 /// The model conductor/executor.rs's select_model() resolves for a Tier 1.5
-/// (qr_hosted) provider -- replaces the hardcoded `match tier2_provider { Some("mistral")
-/// => ..., Some("groq") => ... }` literal-string dispatch. `None` when
+/// (qr_hosted) provider -- replaces the retired hardcoded per-provider
+/// literal-string dispatch. `None` when
 /// `provider_id` has no default row in provider_models (an unknown provider,
 /// or a known one not yet curated with a model) -- callers must treat that
 /// as a real failure (ConductorError::UnknownProvider in executor.rs), not
@@ -1647,67 +1647,62 @@ mod tests {
         outcome.expect("public API assertions must pass");
     }
 
-    /// items.id=430/432: shared_014.sql seeds groq/mistral as
-    /// provider_type='cloud_inference_api' rows -- confirms the migration
-    /// landed the mechanically-known facts correctly. items.id=440 Part A
-    /// (this session) replaced the original placeholder seed with real,
-    /// sourced curation flags -- distinct per provider, no longer the
-    /// shared conservative defaults the placeholder left them at.
+    /// items.id=430/432, items.id=724: the seeded hosted rows (every row with
+    /// an api_dialect, curated by shared_014/026/028) are
+    /// provider_type='cloud_inference_api'. Field-based: names no provider
+    /// (decisions.id=872). Checks the mechanically-known facts and that the
+    /// curated posture columns agree with each other -- the risk rating, the
+    /// guardian default level and the recommended flag (only a clean posture
+    /// may be recommended, decisions.id=872 point 4).
     #[tokio::test]
-    async fn groq_and_mistral_seeded_as_cloud_inference_api() {
+    async fn hosted_rows_seeded_as_cloud_inference_api() {
         let mut conn = make_test_conn().await;
         crate::persistence::migrations::run_migrations(&mut conn, "shared", None)
             .await
             .expect("run shared migrations");
 
-        for id in ["groq", "mistral"] {
-            let p = get_provider_via_conn(&mut conn, id).await;
-            assert_eq!(p.provider_type, "cloud_inference_api");
-            assert_eq!(p.mode, ProviderMode::Api);
-            assert!(!p.is_local, "{id} is not local (Tier 1.5)");
-            assert!(
-                p.login_required,
-                "{id} requires login (Tier 1.5, non-anonymous)"
-            );
+        let ids: Vec<(String,)> =
+            sqlx::query_as("SELECT id FROM providers WHERE api_dialect IS NOT NULL ORDER BY id")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        assert!(!ids.is_empty(), "seeded hosted rows must exist");
+
+        for (id,) in ids {
+            let p = get_provider_via_conn(&mut conn, &id).await;
+            assert_eq!(p.provider_type, "cloud_inference_api", "{id}");
+            assert_eq!(p.mode, ProviderMode::Api, "{id}");
+            assert!(!p.is_local, "{id} is not local");
+            assert!(p.login_required, "{id} requires login");
             assert!(!p.is_anonymous, "{id} is not anonymous");
-            assert!(!p.qr_internal_eligible);
+            assert!(!p.qr_internal_eligible, "{id}");
+
+            let expected_level = match p.risk_rating {
+                1 => PrivacyGuardianDefaultLevel::Low,
+                2 => PrivacyGuardianDefaultLevel::Medium,
+                3 => PrivacyGuardianDefaultLevel::High,
+                other => panic!("{id}: risk_rating {other} out of range"),
+            };
+            assert_eq!(
+                p.privacy_guardian_default_level,
+                Some(expected_level),
+                "{id}: guardian default level must mirror risk_rating"
+            );
+            if p.qr_recommended {
+                assert!(
+                    !p.trains_on_data_by_default,
+                    "{id}: a recommended row must not train by default"
+                );
+                assert_eq!(p.risk_rating, 1, "{id}: a recommended row must be clean");
+            }
         }
-
-        let groq = get_provider_via_conn(&mut conn, "groq").await;
-        assert!(
-            !groq.retains_data,
-            "groq: not retained beyond providing the service, per its DPA"
-        );
-        assert!(
-            !groq.trains_on_data_by_default,
-            "groq: not trained on by default, per its Services Agreement"
-        );
-        assert_eq!(groq.risk_rating, 1);
-        assert_eq!(
-            groq.privacy_guardian_default_level,
-            Some(PrivacyGuardianDefaultLevel::Low)
-        );
-
-        let mistral = get_provider_via_conn(&mut conn, "mistral").await;
-        assert!(
-            mistral.retains_data,
-            "mistral: 30-day abuse-monitoring log retained by default"
-        );
-        assert!(
-            mistral.trains_on_data_by_default,
-            "mistral: training is opt-out, not excluded by default, per its DPA"
-        );
-        assert_eq!(mistral.risk_rating, 2);
-        assert_eq!(
-            mistral.privacy_guardian_default_level,
-            Some(PrivacyGuardianDefaultLevel::Medium)
-        );
     }
 
     /// items.id=607: shared_025.sql seeds the recommendation inputs -- ranks
-    /// 1/2/3 and min_vram_gb on the local models (min_ram_class preserved),
-    /// and rank 1 on every qr_recommended cloud_inference_api row, selected
-    /// by field not id.
+    /// 1/2/3 and min_vram_gb on the local models (min_ram_class preserved).
+    /// Hosted rows carry their own ranks (items.id=724, decisions.id=878), so
+    /// every recommended hosted row has a distinct non-null rank, selected by
+    /// field not id.
     #[tokio::test]
     async fn recommendation_rank_and_vram_seeded() {
         let mut conn = make_test_conn().await;
@@ -1736,7 +1731,17 @@ mod tests {
         .await
         .unwrap();
         assert!(!hosted.is_empty());
-        assert!(hosted.iter().all(|(_, r)| *r == Some(1)));
+        let mut hosted_ranks: Vec<i64> = hosted
+            .iter()
+            .map(|(id, r)| r.unwrap_or_else(|| panic!("{id}: recommended hosted rows are ranked")))
+            .collect();
+        hosted_ranks.sort_unstable();
+        hosted_ranks.dedup();
+        assert_eq!(
+            hosted_ranks.len(),
+            hosted.len(),
+            "hosted ranks are distinct"
+        );
 
         // items.id=708 (decisions.id=878): a hosted row may carry a rank
         // without the provider-level recommended flag (a WARN-posture
@@ -1846,7 +1851,13 @@ mod tests {
             assert!(p.local_model_digest.is_none());
             assert!(p.installed_at.is_none());
 
-            let err = set_local_model_installed(&pool, "groq", Some("sha256:nope"))
+            let hosted_id = list_providers_by_type(&pool, "cloud_inference_api")
+                .await?
+                .into_iter()
+                .next()
+                .expect("a seeded hosted row exists")
+                .id;
+            let err = set_local_model_installed(&pool, &hosted_id, Some("sha256:nope"))
                 .await
                 .expect_err("must refuse a non-local_model id");
             assert!(matches!(err, ProviderStoreError::NotFound(_)));
@@ -1866,9 +1877,9 @@ mod tests {
     }
 
     /// items.id=430/432: list_providers_by_type is the flag-based
-    /// replacement for a hardcoded ["mistral", "groq"] array -- must return
-    /// exactly the seeded qr_hosted set and nothing else (Duck.ai/Claude/
-    /// ChatGPT/Gemini are a different provider_type).
+    /// replacement for a hardcoded provider-id array -- must return exactly
+    /// the seeded qr_hosted set and nothing else (the Cloud Chat rows are a
+    /// different provider_type). Field-based: names no provider.
     #[tokio::test]
     async fn list_providers_by_type_returns_only_matching_active_providers() {
         let _lock = crate::test_support::ENV_MUTEX.lock().await;
@@ -1887,18 +1898,24 @@ mod tests {
             .await?;
             let cloud_api = list_providers_by_type(&pool, "cloud_inference_api").await?;
             let ids: Vec<&str> = cloud_api.iter().map(|p| p.id.as_str()).collect();
-            assert_eq!(
-                ids.len(),
-                2,
-                "only groq and mistral are cloud_inference_api"
-            );
-            assert!(ids.contains(&"groq"));
-            assert!(ids.contains(&"mistral"));
+            let expected: (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM providers
+                 WHERE provider_type = 'cloud_inference_api' AND activation_status = 'active'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert!(!ids.is_empty(), "seeded hosted rows must exist");
+            assert_eq!(ids.len() as i64, expected.0);
+            assert!(cloud_api
+                .iter()
+                .all(|p| p.provider_type == "cloud_inference_api"));
 
             let external = list_providers_by_type(&pool, "external_service").await?;
             let external_ids: Vec<&str> = external.iter().map(|p| p.id.as_str()).collect();
-            assert!(!external_ids.contains(&"groq"));
-            assert!(!external_ids.contains(&"mistral"));
+            assert!(
+                ids.iter().all(|id| !external_ids.contains(id)),
+                "no hosted row is also an external_service row"
+            );
 
             Ok::<(), ProviderStoreError>(())
         }

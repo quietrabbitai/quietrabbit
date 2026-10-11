@@ -308,7 +308,7 @@ pub async fn resolve_preference(
 /// items.id=432: picks the Preferred provider across several candidates
 /// (e.g. the qr_hosted set -- resolve_preference() itself only answers "what
 /// is the preference for this ONE provider_id," but lifecycle.rs needs to
-/// choose BETWEEN groq and mistral, not resolve one named provider).
+/// choose BETWEEN hosted providers, not resolve one named provider).
 /// Resolves each candidate independently at the given scope and returns the
 /// single one whose resolved preference is Preferred. Zero matches -> None,
 /// matching this codebase's existing "no prescribed default" behavior
@@ -753,7 +753,7 @@ mod tests {
 
     /// items.id=432: zero/one/many-candidates cases for
     /// find_preferred_provider -- this is the function lifecycle.rs uses to
-    /// choose between groq/mistral instead of resolving one named provider.
+    /// choose between hosted providers instead of resolving one named provider.
     #[tokio::test]
     async fn find_preferred_provider_zero_one_many_candidates() {
         let _lock = crate::test_support::ENV_MUTEX.lock().await;
@@ -761,23 +761,32 @@ mod tests {
         let (_tempdir, pool) = setup_real_db().await;
 
         let outcome = async {
-            // groq/mistral already exist as providers rows -- seeded by
-            // shared_014.sql (items.id=429/430/432), applied as part of
-            // setup_real_db()'s migrate_shared_db() call above.
-            let candidates = vec!["groq".to_owned(), "mistral".to_owned()];
+            // The hosted providers rows are seeded by the shared_*.sql
+            // migrations (items.id=429/430/432, 724), applied as part of
+            // setup_real_db()'s migrate_shared_db() call above. Two are
+            // chosen by field so this test names no provider.
+            let hosted: Vec<(String,)> = sqlx::query_as(
+                "SELECT id FROM providers WHERE provider_type = 'cloud_inference_api' \
+                 ORDER BY id LIMIT 2",
+            )
+            .fetch_all(&pool)
+            .await?;
+            let first = hosted[0].0.clone();
+            let second = hosted[1].0.clone();
+            let candidates = vec![first.clone(), second.clone()];
 
             // Zero: neither candidate has any row at all.
             let none = find_preferred_provider(&pool, "u1", Some("p1"), None, &candidates).await?;
             assert_eq!(none, None, "no preference set for either candidate -> None");
 
-            // One: groq marked Preferred, mistral untouched.
+            // One: the first candidate marked Preferred, the second untouched.
             upsert_preference(
                 &pool,
                 NewUserProviderPreference {
                     user_id: "u1",
                     persona_id: None,
                     focus_id: None,
-                    provider_id: "groq",
+                    provider_id: &first,
                     login_available: true,
                     user_preference: UserPreference::Preferred,
                     local_model_version: None,
@@ -788,9 +797,9 @@ mod tests {
             )
             .await?;
             let one = find_preferred_provider(&pool, "u1", Some("p1"), None, &candidates).await?;
-            assert_eq!(one, Some("groq".to_owned()));
+            assert_eq!(one, Some(first.clone()));
 
-            // Many: mistral ALSO marked Preferred (a data anomaly the schema
+            // Many: the second candidate ALSO marked Preferred (a data anomaly the schema
             // doesn't prevent) -> ambiguous, must return None rather than
             // guess, same as this codebase's unreachable!()-guarded pattern.
             upsert_preference(
@@ -799,7 +808,7 @@ mod tests {
                     user_id: "u1",
                     persona_id: None,
                     focus_id: None,
-                    provider_id: "mistral",
+                    provider_id: &second,
                     login_available: true,
                     user_preference: UserPreference::Preferred,
                     local_model_version: None,

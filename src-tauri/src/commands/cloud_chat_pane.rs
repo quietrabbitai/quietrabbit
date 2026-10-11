@@ -537,12 +537,12 @@ async fn persist_cookies_from_jar(
 /// the two provider_type shapes lane_str() knows how to label
 /// ('split_screen_web' -> cloud_anonymous, 'external_service' ->
 /// cloud_frontier) -- filtered out here rather than in the shared store
-/// function, so cloud_inference_api (qr_hosted: groq/mistral) and
+/// function, so cloud_inference_api (qr_hosted) and
 /// local_model rows never reach this list.
 ///
 /// items.id=539: also filters to preference_tier='preferred' -- shared_018.sql
-/// added preference_tier specifically so 'supported' rows (groqchat,
-/// mistralvibe, deepseek: vetted and usable, but not QR-recommended) stay
+/// added preference_tier specifically so 'supported' rows (vetted and
+/// usable, but not QR-recommended) stay
 /// hidden from this screen "unless a user specifically requests it." That
 /// reveal mechanism doesn't exist yet (deferred to a future onboarding/
 /// settings design session per shared_018.sql's own header), so until it
@@ -1111,7 +1111,7 @@ pub async fn forward_popup_mouse_wheel(
 mod rail_summary_tests {
     use super::*;
 
-    async fn seeded_provider(id: &str) -> provider_store::Provider {
+    async fn seeded_pool() -> sqlx::SqlitePool {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -1123,10 +1123,26 @@ mod rail_summary_tests {
                 .await
                 .expect("run shared migrations");
         }
+        pool
+    }
+
+    async fn seeded_provider(id: &str) -> provider_store::Provider {
+        let pool = seeded_pool().await;
         provider_store::get_provider(&pool, id)
             .await
             .expect("get_provider")
             .expect("seeded provider exists")
+    }
+
+    /// A seeded hosted API row, chosen by field so no test names a provider.
+    async fn seeded_hosted_provider() -> provider_store::Provider {
+        let pool = seeded_pool().await;
+        provider_store::list_providers_by_type(&pool, "cloud_inference_api")
+            .await
+            .expect("list_providers_by_type")
+            .into_iter()
+            .next()
+            .expect("a seeded hosted row exists")
     }
 
     /// items.id=603: a rail row without a level is skipped, never rendered
@@ -1159,10 +1175,10 @@ mod rail_summary_tests {
         assert!(!claude.is_anonymous, "claude is a non-anonymous provider");
         assert!(is_rail_visible(&claude));
 
-        let groq = seeded_provider("groq").await;
-        assert!(!groq.is_anonymous);
+        let hosted = seeded_hosted_provider().await;
+        assert!(!hosted.is_anonymous);
         assert!(
-            !is_rail_visible(&groq),
+            !is_rail_visible(&hosted),
             "hosted API rows never join the rail"
         );
     }

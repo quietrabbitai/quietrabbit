@@ -365,6 +365,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/shared_027.sql"),
     },
     SchemaFile {
+        prefix: "shared",
+        version: 28,
+        sql: include_str!("../../schema/shared_028.sql"),
+    },
+    SchemaFile {
         prefix: "tier3_cookies",
         version: 1,
         sql: include_str!("../../schema/tier3_cookies_001.sql"),
@@ -2227,20 +2232,21 @@ mod tests {
             .await
             .expect("shared migration chain must apply cleanly on a fresh db");
         assert_eq!(
-            applied, 27,
-            "expected all twenty-seven shared schema versions to apply"
+            applied, 28,
+            "expected all twenty-eight shared schema versions to apply"
         );
 
         let version: (i64,) = sqlx::query_as("SELECT MAX(version) FROM schema_version")
             .fetch_one(&mut conn)
             .await
             .unwrap();
-        assert_eq!(version.0, 27);
+        assert_eq!(version.0, 28);
     }
 
-    /// items.id=708 / items.id=703: shared_026.sql populates the seeded
-    /// hosted rows as data. Field-based on purpose -- names no provider or
-    /// model (decisions.id=872), so it keeps holding as items.id=724 adds rows.
+    /// items.id=708 / items.id=703 / items.id=724: shared_026.sql and
+    /// shared_028.sql populate the seeded hosted rows as data. Field-based on
+    /// purpose -- names no provider or model (decisions.id=872), so it keeps
+    /// holding as rows are added.
     #[tokio::test]
     async fn test_shared_026_hosted_rows_are_complete_data() {
         let mut conn = make_test_conn().await;
@@ -2262,7 +2268,10 @@ mod tests {
         for (id, base_url, auth, models_path) in hosted {
             assert!(base_url.is_some(), "{id}: base_url_template");
             assert!(auth.is_some(), "{id}: auth_scheme");
-            assert!(models_path.is_some(), "{id}: models_path");
+            // models_path is NULL where the provider docs show no list
+            // endpoint (items.id=724). A path that is set is validated by
+            // CallContext::build in test_every_seeded_hosted_route_builds.
+            let _ = models_path;
 
             let defaults: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
                 "SELECT model_id, pricing, context_window_as_of FROM provider_models \
@@ -2341,6 +2350,199 @@ mod tests {
             );
             assert!(limits[0] > 0, "{id}: the token limit must be positive");
         }
+    }
+
+    /// items.id=724: every seeded hosted (provider, model) pair must build a
+    /// valid call context -- https base, every `{placeholder}` declared in
+    /// user_variables, a models_path (when set) that is a plain path, and
+    /// request_options that are a valid object. Field-based, no network.
+    #[tokio::test]
+    async fn test_every_seeded_hosted_route_builds() {
+        use crate::persistence::provider_store::ModelStatus;
+        use crate::providers::hosted_call::{CallContext, HostedRoute};
+
+        let mut conn = make_test_conn().await;
+        run_migrations(&mut conn, "shared", None).await.unwrap();
+
+        type Row = (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+            Option<String>,
+        );
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT p.id, p.display_name, p.api_dialect, p.base_url_template, \
+                    p.auth_scheme, p.extra_headers, p.models_path, p.user_variables, \
+                    m.model_id, m.request_options \
+             FROM providers p JOIN provider_models m ON m.provider_id = p.id \
+             WHERE p.api_dialect IS NOT NULL",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        assert!(
+            !rows.is_empty(),
+            "seeded hosted (provider, model) pairs must exist"
+        );
+
+        let parse = |raw: &Option<String>| {
+            raw.as_deref()
+                .map(|r| serde_json::from_str::<serde_json::Value>(r).expect("valid JSON"))
+        };
+        for (id, name, dialect, base, auth, headers, models_path, vars, model_id, options) in rows {
+            let user_variables = parse(&vars);
+            let mut metadata = serde_json::Map::new();
+            if let Some(serde_json::Value::Array(names)) = &user_variables {
+                for n in names.iter().filter_map(|n| n.as_str()) {
+                    metadata.insert(n.to_owned(), serde_json::json!("fixture-value-1"));
+                }
+            }
+            let route = HostedRoute {
+                provider_id: id.clone(),
+                display_name: name,
+                api_dialect: dialect,
+                base_url_template: base,
+                auth_scheme: auth,
+                extra_headers: parse(&headers),
+                models_path,
+                user_variables,
+                model_id,
+                model_status: ModelStatus::Active,
+                request_options: parse(&options),
+            };
+            let ctx =
+                CallContext::build(&route, "fixture-key", &serde_json::Value::Object(metadata));
+            assert!(
+                ctx.is_ok(),
+                "{id}: seeded route must build: {:?}",
+                ctx.err()
+            );
+        }
+    }
+
+    /// items.id=724: a provider whose documentation_gate declares
+    /// required_request_options (a privacy option that must ride on every
+    /// request) must have it in EVERY model row's request_options, since the
+    /// options live on model rows. Field-based, names no provider.
+    #[tokio::test]
+    async fn test_required_request_options_ride_on_every_model_row() {
+        fn contains(have: &serde_json::Value, want: &serde_json::Value) -> bool {
+            match (have, want) {
+                (serde_json::Value::Object(h), serde_json::Value::Object(w)) => w
+                    .iter()
+                    .all(|(k, v)| h.get(k).is_some_and(|hv| contains(hv, v))),
+                _ => have == want,
+            }
+        }
+        let mut conn = make_test_conn().await;
+        run_migrations(&mut conn, "shared", None).await.unwrap();
+
+        let providers: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, documentation_gate FROM providers WHERE api_dialect IS NOT NULL",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        let mut checked = 0;
+        for (id, gate) in providers {
+            let gate: serde_json::Value = serde_json::from_str(&gate).expect("gate is JSON");
+            let Some(required) = gate.get("required_request_options") else {
+                continue;
+            };
+            let models: Vec<(String, Option<String>)> = sqlx::query_as(
+                "SELECT id, request_options FROM provider_models WHERE provider_id = ?",
+            )
+            .bind(&id)
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+            assert!(
+                !models.is_empty(),
+                "{id}: a provider with required options needs a model row"
+            );
+            for (model, options) in models {
+                let options: serde_json::Value =
+                    serde_json::from_str(options.as_deref().unwrap_or("{}")).unwrap();
+                assert!(
+                    contains(&options, required),
+                    "{model}: request_options must carry the provider required options"
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked > 0,
+            "at least one provider declares required options"
+        );
+    }
+
+    /// items.id=724 (decisions.id=872 point 4, decisions.id=878): the
+    /// provider-level recommendation is for a clean verified posture only,
+    /// and the 878 rank order is a strict order. Field-based, names no
+    /// provider.
+    #[tokio::test]
+    async fn test_seeded_hosted_rows_postures_and_ranks() {
+        let mut conn = make_test_conn().await;
+        run_migrations(&mut conn, "shared", None).await.unwrap();
+
+        type Row = (
+            String,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            String,
+            Option<i64>,
+        );
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT id, is_local, is_anonymous, login_required, qr_internal_eligible, \
+                    qr_recommended, trains_on_data_by_default, risk_rating, \
+                    verification_status, qr_recommendation_rank \
+             FROM providers WHERE api_dialect IS NOT NULL",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        assert!(!rows.is_empty());
+
+        let mut ranks = Vec::new();
+        for (id, local, anon, login, internal, rec, trains, risk, verification, rank) in rows {
+            assert_eq!(local, 0, "{id}: hosted rows are not local");
+            assert_eq!(anon, 0, "{id}: hosted rows are not anonymous");
+            assert_eq!(login, 1, "{id}: hosted rows require login");
+            assert_eq!(
+                internal, 0,
+                "{id}: hosted rows are not QR-internal eligible"
+            );
+            if rec == 1 {
+                assert_eq!(
+                    trains, 0,
+                    "{id}: a recommended row must not train by default"
+                );
+                assert_eq!(
+                    risk, 1,
+                    "{id}: a recommended row must have the lowest risk rating"
+                );
+                assert_eq!(
+                    verification, "verified",
+                    "{id}: a recommended row must be verified"
+                );
+            }
+            ranks.push(rank.unwrap_or_else(|| panic!("{id}: hosted rows carry a rank")));
+        }
+        let mut sorted = ranks.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ranks.len(), "hosted ranks must be distinct");
     }
 
     /// items.id=708: shared_026.sql CHECK constraints reject out-of-range values.
@@ -2431,8 +2633,8 @@ mod tests {
             .expect("drift-healing run must succeed");
 
         assert_eq!(
-            applied, 26,
-            "shared v2 through v27 should count as newly applied from a stale v1 database"
+            applied, 27,
+            "shared v2 through v28 should count as newly applied from a stale v1 database"
         );
 
         // items.id=427: shared_013.sql drops tier3_providers (generalized
@@ -3414,7 +3616,7 @@ mod tests {
         let invalid = sqlx::query(
             "INSERT INTO integration_keys \
                 (id, provider, key_type, credential_label, credential, auth_type, created_at) \
-             VALUES ('k-bad', 'groq', 'qr_hosted', 'groq', 'secret', 'bogus_type', '2026-01-01T00:00:00Z')",
+             VALUES ('k-bad', 'fixture-host', 'qr_hosted', 'fixture-host', 'secret', 'bogus_type', '2026-01-01T00:00:00Z')",
         )
         .execute(&mut conn)
         .await;
@@ -3426,7 +3628,7 @@ mod tests {
         let valid = sqlx::query(
             "INSERT INTO integration_keys \
                 (id, provider, key_type, credential_label, credential, auth_type, created_at) \
-             VALUES ('k-good', 'groq', 'qr_hosted', 'groq', 'secret', 'api_key', '2026-01-01T00:00:00Z')",
+             VALUES ('k-good', 'fixture-host', 'qr_hosted', 'fixture-host', 'secret', 'api_key', '2026-01-01T00:00:00Z')",
         )
         .execute(&mut conn)
         .await;

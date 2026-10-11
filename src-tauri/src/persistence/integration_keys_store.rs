@@ -387,9 +387,9 @@ mod tests {
         let mut conn = seeded_conn().await;
         upsert_key_conn(
             &mut conn,
-            "groq",
+            "fixture-host",
             TEST_KEY_TYPE,
-            "gsk_abc123",
+            "fixture-key-abc123",
             None,
             Some("api_key"),
             None,
@@ -397,12 +397,12 @@ mod tests {
         .await
         .unwrap();
 
-        let found = get_active_key_conn(&mut conn, "groq", TEST_KEY_TYPE, None)
+        let found = get_active_key_conn(&mut conn, "fixture-host", TEST_KEY_TYPE, None)
             .await
             .unwrap();
         assert!(found.is_some());
         let key = found.unwrap();
-        assert_eq!(key.credential, "gsk_abc123");
+        assert_eq!(key.credential, "fixture-key-abc123");
         assert_eq!(key.auth_type, Some("api_key".to_owned()));
         assert!(key.is_active);
     }
@@ -412,7 +412,7 @@ mod tests {
         let mut conn = seeded_conn().await;
         upsert_key_conn(
             &mut conn,
-            "groq",
+            "fixture-host",
             TEST_KEY_TYPE,
             "old-key",
             None,
@@ -423,7 +423,7 @@ mod tests {
         .unwrap();
         upsert_key_conn(
             &mut conn,
-            "groq",
+            "fixture-host",
             TEST_KEY_TYPE,
             "new-key",
             None,
@@ -442,7 +442,7 @@ mod tests {
             "same (provider, key_type, integration_id, persona_id) must replace, not add a row"
         );
 
-        let found = get_active_key_conn(&mut conn, "groq", TEST_KEY_TYPE, None)
+        let found = get_active_key_conn(&mut conn, "fixture-host", TEST_KEY_TYPE, None)
             .await
             .unwrap()
             .unwrap();
@@ -458,7 +458,7 @@ mod tests {
         let mut conn = seeded_conn().await;
         upsert_key_conn(
             &mut conn,
-            "groq",
+            "fixture-host",
             TEST_KEY_TYPE,
             "global-key",
             None,
@@ -469,7 +469,7 @@ mod tests {
         .unwrap();
         upsert_key_conn(
             &mut conn,
-            "groq",
+            "fixture-host",
             TEST_KEY_TYPE,
             "work-persona-key",
             Some("persona-work"),
@@ -479,14 +479,19 @@ mod tests {
         .await
         .unwrap();
 
-        let global = get_active_key_conn(&mut conn, "groq", TEST_KEY_TYPE, None)
+        let global = get_active_key_conn(&mut conn, "fixture-host", TEST_KEY_TYPE, None)
             .await
             .unwrap()
             .unwrap();
-        let scoped = get_active_key_conn(&mut conn, "groq", TEST_KEY_TYPE, Some("persona-work"))
-            .await
-            .unwrap()
-            .unwrap();
+        let scoped = get_active_key_conn(
+            &mut conn,
+            "fixture-host",
+            TEST_KEY_TYPE,
+            Some("persona-work"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
 
         assert_eq!(global.credential, "global-key");
         assert_eq!(scoped.credential, "work-persona-key");
@@ -497,7 +502,7 @@ mod tests {
         let mut conn = seeded_conn().await;
         upsert_key_conn(
             &mut conn,
-            "groq",
+            "fixture-host",
             TEST_KEY_TYPE,
             "work-persona-key",
             Some("persona-work"),
@@ -509,7 +514,7 @@ mod tests {
 
         // No global key exists -- a global lookup must not silently
         // return the persona-scoped one.
-        let global = get_active_key_conn(&mut conn, "groq", TEST_KEY_TYPE, None)
+        let global = get_active_key_conn(&mut conn, "fixture-host", TEST_KEY_TYPE, None)
             .await
             .unwrap();
         assert!(global.is_none());
@@ -608,7 +613,7 @@ mod tests {
         upsert_key(
             user_id,
             TEST_KEY_HEX,
-            "groq",
+            "fixture-host",
             TEST_KEY_TYPE,
             "old-key",
             None,
@@ -620,7 +625,7 @@ mod tests {
         upsert_key(
             user_id,
             TEST_KEY_HEX,
-            "groq",
+            "fixture-host",
             TEST_KEY_TYPE,
             "new-key",
             None,
@@ -638,7 +643,8 @@ mod tests {
             .await
             .unwrap();
 
-        let found = get_active_key(user_id, TEST_KEY_HEX, "groq", TEST_KEY_TYPE, None).await;
+        let found =
+            get_active_key(user_id, TEST_KEY_HEX, "fixture-host", TEST_KEY_TYPE, None).await;
 
         if let Some(v) = saved_root {
             std::env::set_var("QR_DATA_ROOT", v);
@@ -673,7 +679,7 @@ mod tests {
         upsert_key(
             user_id,
             TEST_KEY_HEX,
-            "groq",
+            "fixture-host",
             TEST_KEY_TYPE,
             "some-key",
             None,
@@ -683,7 +689,8 @@ mod tests {
         .await
         .expect("upsert_key must succeed with the correct key");
 
-        let result = get_active_key(user_id, WRONG_KEY_HEX, "groq", TEST_KEY_TYPE, None).await;
+        let result =
+            get_active_key(user_id, WRONG_KEY_HEX, "fixture-host", TEST_KEY_TYPE, None).await;
 
         if let Some(v) = saved_root {
             std::env::set_var("QR_DATA_ROOT", v);

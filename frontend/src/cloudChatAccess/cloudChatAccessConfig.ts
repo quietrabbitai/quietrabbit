@@ -43,8 +43,6 @@
 // none of the barrel's transitive weight.
 import ClaudeColor from '@lobehub/icons/es/Claude/components/Color'
 import GeminiColor from '@lobehub/icons/es/Gemini/components/Color'
-import GroqMono from '@lobehub/icons/es/Groq/components/Mono'
-import MistralColor from '@lobehub/icons/es/Mistral/components/Color'
 import OpenAIMono from '@lobehub/icons/es/OpenAI/components/Mono'
 import type { IconType } from '@lobehub/icons'
 import type { TFunction } from 'i18next'
@@ -186,16 +184,16 @@ export function privacyChipLabel(level: PrivacyGuardianDefaultLevel, t: TFunctio
  *  the letter-square placeholder for the providers it covers. Named
  *  product-branded marks (Claude, OpenAI), not the parent-company ones
  *  (Anthropic, Google) -- matches this app's existing id/name conventions.
- *  Claude/Gemini/Mistral use their multi-color mark; Groq and OpenAI's own
- *  marks are single-color by design (neither ships a `.Color` variant at
- *  all), so their Mono component *is* their real logo, not a fallback. No
- *  lobehub export exists for Duck.ai/DuckDuckGo; see DUCK_LOGO_URL. */
+ *  Claude and Gemini use their multi-color mark; OpenAI's own mark is
+ *  single-color by design (it ships no `.Color` variant at all), so its Mono
+ *  component *is* its real logo, not a fallback. No lobehub export exists
+ *  for Duck.ai/DuckDuckGo; see DUCK_LOGO_URL. This map holds Cloud Chat rows
+ *  only: hosted API providers are rows in the providers table and carry no
+ *  name in frontend code (decisions.id=872). */
 export const PROVIDER_LOGO_COMPONENTS: Record<string, IconType> = {
   claude: ClaudeColor,
   chatgpt: OpenAIMono,
   gemini: GeminiColor,
-  groq: GroqMono,
-  mistral: MistralColor,
 }
 
 /** items.id=418: DuckDuckGo has no @lobehub/icons entry. Jason's direction

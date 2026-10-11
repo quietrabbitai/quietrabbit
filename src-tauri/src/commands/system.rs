@@ -60,7 +60,7 @@ pub struct HealthResponse {
     pub system_ollama_contention: bool,
     /// True iff an active user-global key exists for ANY qr_hosted provider
     /// (providers.provider_type='cloud_inference_api' -- items.id=430; was a
-    /// hardcoded ["mistral","groq"] array before this) -- a capability-status
+    /// hardcoded provider-id array before this) -- a capability-status
     /// signal ("is qr_hosted usable at all," e.g. for an onboarding nudge),
     /// not a report of which provider is active. Provider *selection* at
     /// execution time is a separate concern, wired through
@@ -111,7 +111,7 @@ pub async fn get_health(
 /// short-circuits on the first hit rather than checking every candidate
 /// unconditionally. items.id=430: the candidate set is read from
 /// providers.provider_type='cloud_inference_api' instead of a hardcoded
-/// ["mistral","groq"] array, so a future qr_hosted provider is picked up
+/// provider-id array, so a future qr_hosted provider is picked up
 /// automatically once curated into the providers table.
 async fn qr_hosted_is_configured(
     pool: &sqlx::SqlitePool,
@@ -337,7 +337,7 @@ mod tests {
         // items.id=430: qr_hosted_is_configured() now reads the qr_hosted
         // candidate set from providers (shared.db) instead of a hardcoded
         // array -- shared.db must be migrated too so list_providers_by_type
-        // finds the seeded groq/mistral rows.
+        // finds the seeded hosted rows.
         crate::persistence::migrations::migrate_shared_db()
             .await
             .expect("shared.db migration must succeed in test setup");
@@ -380,21 +380,35 @@ mod tests {
         assert_eq!(result, Ok(false));
     }
 
+    /// The seeded hosted provider ids, by field (decisions.id=872: no test
+    /// names a provider). Ordered as list_providers_by_type returns them.
+    async fn hosted_ids(pool: &sqlx::SqlitePool) -> Vec<String> {
+        let ids: Vec<String> = provider_store::list_providers_by_type(pool, "cloud_inference_api")
+            .await
+            .expect("list_providers_by_type must succeed")
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        assert!(ids.len() >= 2, "at least two seeded hosted providers");
+        ids
+    }
+
     #[tokio::test]
-    async fn true_when_groq_is_configured() {
+    async fn true_when_the_first_hosted_provider_is_configured() {
         let master_key = [0x44u8; crate::auth::kdf::MASTER_KEY_LEN];
         let _env = setup("user-d", &master_key).await;
         let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         populate_registry(&registry, "user-d", master_key).await;
         let pool = app.state::<sqlx::SqlitePool>();
+        let first = hosted_ids(&pool).await.remove(0);
 
         integration_keys_store::upsert_key(
             "user-d",
             &key_hex(&master_key),
-            "groq",
+            &first,
             QR_HOSTED_KEY_TYPE,
-            "gsk_super_secret_value",
+            "fixture_secret_value",
             None,
             Some("api_key"),
             None,
@@ -407,24 +421,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn true_when_only_mistral_is_configured() {
-        // Aggregate-across-providers behavior: groq unset, mistral set --
-        // must still report true. Guards against a scan that only ever
-        // checked the first provider in the cloud_inference_api candidate
-        // list.
+    async fn true_when_only_the_last_hosted_provider_is_configured() {
+        // Aggregate-across-providers behavior: every candidate but the last
+        // is unset, the last is set -- must still report true. Guards against
+        // a scan that only ever checked the first provider in the
+        // cloud_inference_api candidate list.
         let master_key = [0x55u8; crate::auth::kdf::MASTER_KEY_LEN];
         let _env = setup("user-e", &master_key).await;
         let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
         populate_registry(&registry, "user-e", master_key).await;
         let pool = app.state::<sqlx::SqlitePool>();
+        let last = hosted_ids(&pool).await.pop().expect("hosted ids");
 
         integration_keys_store::upsert_key(
             "user-e",
             &key_hex(&master_key),
-            "mistral",
+            &last,
             QR_HOSTED_KEY_TYPE,
-            "mistral_super_secret_value",
+            "fixture_secret_value",
             None,
             Some("api_key"),
             None,

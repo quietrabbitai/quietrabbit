@@ -323,12 +323,12 @@ mod tests {
         let registry = app.state::<KeyRegistry>();
         populate_registry(&registry, "user-a", master_key).await;
 
-        let config = get_qr_hosted_config("groq".to_owned(), registry.clone())
+        let config = get_qr_hosted_config("fixture-host".to_owned(), registry.clone())
             .await
             .expect("get_qr_hosted_config must succeed when logged in");
 
         assert!(!config.configured);
-        assert_eq!(config.provider, "groq");
+        assert_eq!(config.provider, "fixture-host");
         assert_eq!(config.expires_at, None);
     }
 
@@ -341,19 +341,19 @@ mod tests {
         populate_registry(&registry, "user-b", master_key).await;
 
         set_qr_hosted_provider(
-            "groq".to_owned(),
-            "gsk_super_secret_value".to_owned(),
+            "fixture-host".to_owned(),
+            "fixture_secret_value".to_owned(),
             registry.clone(),
         )
         .await
         .expect("set_qr_hosted_provider must succeed when logged in");
 
-        let config = get_qr_hosted_config("groq".to_owned(), registry.clone())
+        let config = get_qr_hosted_config("fixture-host".to_owned(), registry.clone())
             .await
             .expect("get_qr_hosted_config must succeed after set_qr_hosted_provider");
 
         assert!(config.configured);
-        assert_eq!(config.provider, "groq");
+        assert_eq!(config.provider, "fixture-host");
         // QrHostedConfig has no field capable of carrying the credential --
         // a structural guarantee checked at compile time by the struct
         // definition itself, not something this test could violate even
@@ -367,7 +367,8 @@ mod tests {
         let registry = app.state::<KeyRegistry>();
 
         let result =
-            set_qr_hosted_provider("groq".to_owned(), "some-key".to_owned(), registry).await;
+            set_qr_hosted_provider("fixture-host".to_owned(), "some-key".to_owned(), registry)
+                .await;
         assert!(result.is_err());
     }
 
@@ -454,55 +455,64 @@ mod tests {
         populate_registry(&registry, "user-f", master_key).await;
         let pool = app.state::<sqlx::SqlitePool>();
 
-        set_qr_hosted_provider_preference(Some("groq".to_owned()), registry.clone(), pool.clone())
+        // Two seeded hosted providers, chosen by field so this test names no
+        // provider (decisions.id=872).
+        let hosted: Vec<(String,)> = sqlx::query_as(
+            "SELECT id FROM providers WHERE provider_type = 'cloud_inference_api' \
+             ORDER BY id LIMIT 2",
+        )
+        .fetch_all(&*pool)
+        .await
+        .unwrap();
+        let first = hosted[0].0.clone();
+        let second = hosted[1].0.clone();
+
+        set_qr_hosted_provider_preference(Some(first.clone()), registry.clone(), pool.clone())
             .await
             .expect("set_qr_hosted_provider_preference must succeed when logged in");
 
-        let groq_pref = user_provider_preference_store::get_preference_at_scope(
-            &pool, "user-f", None, None, "groq",
+        let first_pref = user_provider_preference_store::get_preference_at_scope(
+            &pool, "user-f", None, None, &first,
         )
         .await
         .unwrap()
-        .expect("an account-wide groq row must exist after selecting groq");
-        assert_eq!(groq_pref.user_preference, UserPreference::Preferred);
+        .expect("an account-wide row must exist after selecting a provider");
+        assert_eq!(first_pref.user_preference, UserPreference::Preferred);
 
-        // Switch to mistral -- groq's row must be downgraded to Allowed, not
-        // left Preferred (which would make find_preferred_provider return
-        // an ambiguous None instead of "mistral").
-        set_qr_hosted_provider_preference(
-            Some("mistral".to_owned()),
-            registry.clone(),
-            pool.clone(),
-        )
-        .await
-        .expect("switching provider must succeed");
+        // Switch to the second -- the first row must be downgraded to
+        // Allowed, not left Preferred (which would make
+        // find_preferred_provider return an ambiguous None instead of the
+        // second provider).
+        set_qr_hosted_provider_preference(Some(second.clone()), registry.clone(), pool.clone())
+            .await
+            .expect("switching provider must succeed");
 
-        let groq_after = user_provider_preference_store::get_preference_at_scope(
-            &pool, "user-f", None, None, "groq",
+        let first_after = user_provider_preference_store::get_preference_at_scope(
+            &pool, "user-f", None, None, &first,
         )
         .await
         .unwrap()
-        .expect("groq's row must still exist, just downgraded");
-        assert_eq!(groq_after.user_preference, UserPreference::Allowed);
+        .expect("the first row must still exist, just downgraded");
+        assert_eq!(first_after.user_preference, UserPreference::Allowed);
 
-        let mistral_after = user_provider_preference_store::get_preference_at_scope(
-            &pool, "user-f", None, None, "mistral",
+        let second_after = user_provider_preference_store::get_preference_at_scope(
+            &pool, "user-f", None, None, &second,
         )
         .await
         .unwrap()
-        .expect("an account-wide mistral row must exist after selecting mistral");
-        assert_eq!(mistral_after.user_preference, UserPreference::Preferred);
+        .expect("an account-wide row must exist after selecting the second provider");
+        assert_eq!(second_after.user_preference, UserPreference::Preferred);
 
         let preferred = user_provider_preference_store::find_preferred_provider(
             &pool,
             "user-f",
             None,
             None,
-            &["groq".to_owned(), "mistral".to_owned()],
+            &[first.clone(), second.clone()],
         )
         .await
         .unwrap();
-        assert_eq!(preferred, Some("mistral".to_owned()));
+        assert_eq!(preferred, Some(second));
     }
 
     #[tokio::test]
@@ -515,8 +525,9 @@ mod tests {
         let pool = app.state::<sqlx::SqlitePool>();
 
         let result =
-            set_qr_hosted_provider_preference(Some("openai".to_owned()), registry, pool).await;
-        let err = result.expect_err("openai is not a valid Tier 1.5 provider");
+            set_qr_hosted_provider_preference(Some("not-a-provider".to_owned()), registry, pool)
+                .await;
+        let err = result.expect_err("an unknown id is not a valid Tier 1.5 provider");
         assert!(err.contains("invalid Tier 1.5 provider"), "got: {err}");
     }
 
@@ -529,7 +540,8 @@ mod tests {
         let pool = app.state::<sqlx::SqlitePool>();
 
         let result =
-            set_qr_hosted_provider_preference(Some("groq".to_owned()), registry, pool).await;
+            set_qr_hosted_provider_preference(Some("fixture-host".to_owned()), registry, pool)
+                .await;
         assert!(result.is_err());
     }
 }
