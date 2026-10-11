@@ -1751,58 +1751,112 @@ mod tests {
         assert_eq!(selected.model_id, "llama3.1:8b");
     }
 
-    #[tokio::test]
-    async fn select_model_qr_hosted_groq_any_type() {
-        with_temp_shared_db(|pool| async move {
-            let by_code = select_model(
-                &pool,
-                "code",
-                ExternalAccess::AnonymousRequired,
-                Some("groq"),
-            )
-            .await
-            .unwrap();
-            assert_eq!(by_code.provider_id.as_deref(), Some("groq"));
-            assert_eq!(by_code.model_id, "llama-3.1-8b-instant");
+    /// Inserts a neutral fixture hosted provider with one default model into
+    /// the temp shared.db, and returns (provider_id, model_id, context window).
+    /// Hosted tests read rows through fixtures rather than asserting seeded
+    /// provider or model ids, so curation changes never break them
+    /// (decisions.id=854 and 872, items.id=708).
+    async fn seed_fixture_hosted(
+        pool: &sqlx::SqlitePool,
+        provider_id: &str,
+        model_id: &str,
+        context_window_tokens: u32,
+    ) {
+        crate::persistence::provider_store::create_provider(
+            pool,
+            crate::persistence::provider_store::NewProvider {
+                id: provider_id,
+                display_name: provider_id,
+                provider_type: "cloud_inference_api",
+                mode: crate::persistence::provider_store::ProviderMode::Api,
+                launch_url: None,
+                login_required: true,
+                is_local: false,
+                is_anonymous: false,
+                retains_data: false,
+                trains_on_data_by_default: false,
+                qr_internal_eligible: false,
+                privacy_guardian_default_level:
+                    crate::persistence::provider_store::PrivacyGuardianDefaultLevel::Low,
+                risk_rating: 1,
+                hardware_requirement: None,
+                documentation_gate: &serde_json::json!({}),
+                qr_recommended: false,
+                privacy_commitment_basis: None,
+                performance_profile: None,
+                local_model_tag: None,
+                focus_eligible: false,
+                cloud_chat_visible: false,
+            },
+        )
+        .await
+        .expect("fixture provider must insert");
+        sqlx::query(
+            "INSERT INTO provider_models
+                (id, provider_id, model_id, context_window_tokens, is_default, created_at)
+             VALUES (?, ?, ?, ?, 1, '2026-01-01T00:00:00Z')",
+        )
+        .bind(format!("{provider_id}:{model_id}"))
+        .bind(provider_id)
+        .bind(model_id)
+        .bind(context_window_tokens as i64)
+        .execute(pool)
+        .await
+        .expect("fixture model must insert");
+    }
 
-            let by_general = select_model(
-                &pool,
-                "general",
-                ExternalAccess::AnonymousRequired,
-                Some("groq"),
-            )
-            .await
-            .unwrap();
-            assert_eq!(by_general.provider_id.as_deref(), Some("groq"));
-            assert_eq!(by_general.model_id, "llama-3.1-8b-instant");
+    #[tokio::test]
+    async fn select_model_qr_hosted_any_type() {
+        with_temp_shared_db(|pool| async move {
+            seed_fixture_hosted(&pool, "fixture-host-a", "fixture-model-a", 4096).await;
+
+            for task_type in ["code", "general"] {
+                let selected = select_model(
+                    &pool,
+                    task_type,
+                    ExternalAccess::AnonymousRequired,
+                    Some("fixture-host-a"),
+                )
+                .await
+                .unwrap();
+                assert_eq!(selected.provider_id.as_deref(), Some("fixture-host-a"));
+                assert_eq!(selected.model_id, "fixture-model-a");
+            }
         })
         .await;
     }
 
+    /// Every seeded hosted provider that can be selected must resolve to its
+    /// own default model row. Field-based: names no provider or model
+    /// (items.id=708 / items.id=703).
     #[tokio::test]
-    async fn select_model_qr_hosted_mistral_any_type() {
+    async fn select_model_resolves_every_seeded_hosted_default() {
         with_temp_shared_db(|pool| async move {
-            let by_code = select_model(
-                &pool,
-                "code",
-                ExternalAccess::AnonymousRequired,
-                Some("mistral"),
+            let hosted: Vec<(String, String)> = sqlx::query_as(
+                "SELECT p.id, m.model_id FROM providers p
+                 JOIN provider_models m ON m.provider_id = p.id AND m.is_default = 1
+                 WHERE p.provider_type = 'cloud_inference_api' AND p.api_dialect IS NOT NULL",
             )
+            .fetch_all(&pool)
             .await
             .unwrap();
-            assert_eq!(by_code.provider_id.as_deref(), Some("mistral"));
-            assert_eq!(by_code.model_id, "mistral-small-latest");
+            assert!(
+                !hosted.is_empty(),
+                "seeded hosted rows must have default models"
+            );
 
-            let by_general = select_model(
-                &pool,
-                "general",
-                ExternalAccess::AnonymousRequired,
-                Some("mistral"),
-            )
-            .await
-            .unwrap();
-            assert_eq!(by_general.provider_id.as_deref(), Some("mistral"));
-            assert_eq!(by_general.model_id, "mistral-small-latest");
+            for (provider_id, model_id) in hosted {
+                let selected = select_model(
+                    &pool,
+                    "general",
+                    ExternalAccess::AnonymousRequired,
+                    Some(&provider_id),
+                )
+                .await
+                .unwrap();
+                assert_eq!(selected.provider_id.as_deref(), Some(provider_id.as_str()));
+                assert_eq!(selected.model_id, model_id);
+            }
         })
         .await;
     }
@@ -1814,27 +1868,30 @@ mod tests {
     #[tokio::test]
     async fn select_model_switches_on_qr_hosted_provider_preference() {
         with_temp_shared_db(|pool| async move {
-            let groq_model = select_model(
+            seed_fixture_hosted(&pool, "fixture-host-a", "fixture-model-a", 4096).await;
+            seed_fixture_hosted(&pool, "fixture-host-b", "fixture-model-b", 8192).await;
+
+            let a = select_model(
                 &pool,
                 "general",
                 ExternalAccess::AnonymousRequired,
-                Some("groq"),
+                Some("fixture-host-a"),
             )
             .await
             .unwrap();
-            let mistral_model = select_model(
+            let b = select_model(
                 &pool,
                 "general",
                 ExternalAccess::AnonymousRequired,
-                Some("mistral"),
+                Some("fixture-host-b"),
             )
             .await
             .unwrap();
-            assert_ne!(groq_model.model_id, mistral_model.model_id);
-            assert_eq!(groq_model.provider_id.as_deref(), Some("groq"));
-            assert_eq!(groq_model.model_id, "llama-3.1-8b-instant");
-            assert_eq!(mistral_model.provider_id.as_deref(), Some("mistral"));
-            assert_eq!(mistral_model.model_id, "mistral-small-latest");
+            assert_ne!(a.model_id, b.model_id);
+            assert_eq!(a.provider_id.as_deref(), Some("fixture-host-a"));
+            assert_eq!(a.model_id, "fixture-model-a");
+            assert_eq!(b.provider_id.as_deref(), Some("fixture-host-b"));
+            assert_eq!(b.model_id, "fixture-model-b");
         })
         .await;
     }
@@ -1863,7 +1920,7 @@ mod tests {
                 &pool,
                 "general",
                 ExternalAccess::AnonymousRequired,
-                Some("openai"),
+                Some("fixture-absent"),
             )
             .await
             .unwrap_err();
@@ -1878,16 +1935,19 @@ mod tests {
     #[tokio::test]
     async fn context_window_known_models() {
         with_temp_shared_db(|pool| async move {
+            seed_fixture_hosted(&pool, "fixture-host-a", "fixture-model-a", 12345).await;
+            seed_fixture_hosted(&pool, "fixture-host-b", "fixture-model-b", 54321).await;
+
             assert_eq!(get_context_window(&pool, None, "llama3.2:3b").await, 4096);
             assert_eq!(get_context_window(&pool, None, "llama3.1:8b").await, 8192);
             assert_eq!(get_context_window(&pool, None, "qwen2.5:7b").await, 8192);
             assert_eq!(
-                get_context_window(&pool, Some("groq"), "llama-3.1-8b-instant").await,
-                8192
+                get_context_window(&pool, Some("fixture-host-a"), "fixture-model-a").await,
+                12345
             );
             assert_eq!(
-                get_context_window(&pool, Some("mistral"), "mistral-small-latest").await,
-                32768
+                get_context_window(&pool, Some("fixture-host-b"), "fixture-model-b").await,
+                54321
             );
         })
         .await;

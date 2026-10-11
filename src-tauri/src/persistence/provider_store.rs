@@ -200,6 +200,74 @@ impl PrivacyCommitmentBasis {
     }
 }
 
+/// items.id=708 (shared_026.sql): whether a provider row's curated
+/// attributes have been verified against primary sources. Human-curated
+/// only, same as privacy_commitment_basis. DEFAULT 'unverified' at the
+/// schema level -- unverified providers get the strongest warning
+/// (decisions.id=875, Part 8d).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationStatus {
+    Verified,
+    Unverified,
+    Stale,
+}
+
+impl VerificationStatus {
+    fn from_str(s: &str) -> Result<Self, ProviderStoreError> {
+        match s {
+            "verified" => Ok(VerificationStatus::Verified),
+            "unverified" => Ok(VerificationStatus::Unverified),
+            "stale" => Ok(VerificationStatus::Stale),
+            other => Err(ProviderStoreError::Validation(format!(
+                "verification_status must be 'verified', 'unverified', or 'stale', got \
+                 '{other}' -- schema CHECK should have rejected this at write time."
+            ))),
+        }
+    }
+}
+
+/// items.id=708 (shared_026.sql): lifecycle of a provider_models row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelStatus {
+    Active,
+    Deprecated,
+    Retired,
+}
+
+impl ModelStatus {
+    fn from_str(s: &str) -> Result<Self, ProviderStoreError> {
+        match s {
+            "active" => Ok(ModelStatus::Active),
+            "deprecated" => Ok(ModelStatus::Deprecated),
+            "retired" => Ok(ModelStatus::Retired),
+            other => Err(ProviderStoreError::Validation(format!(
+                "provider_models.status must be 'active', 'deprecated', or 'retired', got \
+                 '{other}' -- schema CHECK should have rejected this at write time."
+            ))),
+        }
+    }
+}
+
+/// Parse an optional JSON TEXT column. A malformed value is logged and
+/// dropped, matching how hardware_requirement and performance_profile are
+/// read (the schema's json_valid CHECK makes this unreachable for rows
+/// written after shared_026.sql).
+fn parse_optional_json(
+    raw: Option<String>,
+    owner: &str,
+    column: &str,
+) -> Option<serde_json::Value> {
+    raw.and_then(|raw| {
+        serde_json::from_str(&raw)
+            .map_err(|e| {
+                log::warn!("{owner} {column} failed to parse as JSON, dropping: {e}");
+            })
+            .ok()
+    })
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Provider {
     pub id: String,
@@ -310,6 +378,30 @@ pub struct Provider {
     /// kind, never across kinds. Curator-owned: seeded by migration, not
     /// part of NewProvider (create_provider leaves it NULL).
     pub qr_recommendation_rank: Option<u32>,
+    /// items.id=708 (shared_026.sql, decisions.id=875, Part 8c): wire format
+    /// of a hosted provider's API, named by protocol (open vocabulary,
+    /// validated by the client in items.id=709). All fields from here down
+    /// are curator-owned and seeded by migration, like qr_recommendation_rank:
+    /// not part of NewProvider.
+    pub api_dialect: Option<String>,
+    /// Base URL, possibly with {user_variable} placeholders.
+    pub base_url_template: Option<String>,
+    pub auth_scheme: Option<String>,
+    pub extra_headers: Option<serde_json::Value>,
+    /// Path of the provider's live model list, relative to the base URL.
+    pub models_path: Option<String>,
+    pub user_variables: Option<serde_json::Value>,
+    /// Free-tier availability and limits, with as-of date and source link.
+    pub free_tier: Option<serde_json::Value>,
+    /// JSON list of the plans that include API use.
+    pub plan_inclusion: Option<serde_json::Value>,
+    /// None = the retention period is unstated.
+    pub retention_days: Option<u32>,
+    pub jurisdiction: Option<String>,
+    pub verification_status: VerificationStatus,
+    pub credential_acquisition: Option<serde_json::Value>,
+    pub spend_limit_url: Option<String>,
+    pub logo_key: Option<String>,
 }
 
 /// Input to create_provider(). A plain struct rather than 15+ positional
@@ -364,7 +456,11 @@ const SELECT_COLUMNS: &str = "id, display_name, provider_type, mode, launch_url,
                 qr_recommended, privacy_commitment_basis, performance_profile,
                 preference_tier, installed, qr_disabled_by_user,
                 local_model_tag, local_model_digest, installed_at,
-                focus_eligible, cloud_chat_visible, qr_recommendation_rank";
+                focus_eligible, cloud_chat_visible, qr_recommendation_rank,
+                api_dialect, base_url_template, auth_scheme, extra_headers,
+                models_path, user_variables, free_tier, plan_inclusion,
+                retention_days, jurisdiction, verification_status,
+                credential_acquisition, spend_limit_url, logo_key";
 
 // ---------------------------------------------------------------------------
 // Row extraction
@@ -492,6 +588,40 @@ fn row_to_provider(row: &sqlx::sqlite::SqliteRow) -> Result<Provider, ProviderSt
             .ok()
     });
 
+    let extra_headers = parse_optional_json(
+        row.try_get("extra_headers")
+            .map_err(ProviderStoreError::Database)?,
+        &format!("provider '{id}'"),
+        "extra_headers",
+    );
+    let user_variables = parse_optional_json(
+        row.try_get("user_variables")
+            .map_err(ProviderStoreError::Database)?,
+        &format!("provider '{id}'"),
+        "user_variables",
+    );
+    let free_tier = parse_optional_json(
+        row.try_get("free_tier")
+            .map_err(ProviderStoreError::Database)?,
+        &format!("provider '{id}'"),
+        "free_tier",
+    );
+    let plan_inclusion = parse_optional_json(
+        row.try_get("plan_inclusion")
+            .map_err(ProviderStoreError::Database)?,
+        &format!("provider '{id}'"),
+        "plan_inclusion",
+    );
+    let credential_acquisition = parse_optional_json(
+        row.try_get("credential_acquisition")
+            .map_err(ProviderStoreError::Database)?,
+        &format!("provider '{id}'"),
+        "credential_acquisition",
+    );
+    let verification_status_raw: String = row
+        .try_get("verification_status")
+        .map_err(ProviderStoreError::Database)?;
+
     Ok(Provider {
         id,
         display_name: row
@@ -545,6 +675,37 @@ fn row_to_provider(row: &sqlx::sqlite::SqliteRow) -> Result<Provider, ProviderSt
             .try_get::<Option<i64>, _>("qr_recommendation_rank")
             .map_err(ProviderStoreError::Database)?
             .and_then(|v| u32::try_from(v).ok()),
+        api_dialect: row
+            .try_get("api_dialect")
+            .map_err(ProviderStoreError::Database)?,
+        base_url_template: row
+            .try_get("base_url_template")
+            .map_err(ProviderStoreError::Database)?,
+        auth_scheme: row
+            .try_get("auth_scheme")
+            .map_err(ProviderStoreError::Database)?,
+        extra_headers,
+        models_path: row
+            .try_get("models_path")
+            .map_err(ProviderStoreError::Database)?,
+        user_variables,
+        free_tier,
+        plan_inclusion,
+        retention_days: row
+            .try_get::<Option<i64>, _>("retention_days")
+            .map_err(ProviderStoreError::Database)?
+            .and_then(|v| u32::try_from(v).ok()),
+        jurisdiction: row
+            .try_get("jurisdiction")
+            .map_err(ProviderStoreError::Database)?,
+        verification_status: VerificationStatus::from_str(&verification_status_raw)?,
+        credential_acquisition,
+        spend_limit_url: row
+            .try_get("spend_limit_url")
+            .map_err(ProviderStoreError::Database)?,
+        logo_key: row
+            .try_get("logo_key")
+            .map_err(ProviderStoreError::Database)?,
     })
 }
 
@@ -688,7 +849,36 @@ pub struct ProviderModel {
     pub context_window_tokens: u32,
     pub is_default: bool,
     pub created_at: String,
+    /// items.id=708 (shared_026.sql, decisions.id=875, Part 8c). JSON: input
+    /// and output price per million tokens, cache prices, prompt-length
+    /// tiers, as_of, source_url, source (provider_api, curated or user).
+    pub pricing: Option<serde_json::Value>,
+    pub request_options: Option<serde_json::Value>,
+    /// Tokenizer difference versus the estimator's baseline, 1.0 = none.
+    pub token_factor: f64,
+    /// Multiplier on estimated output tokens (reasoning tokens), 1.0 = none.
+    pub output_overhead: f64,
+    pub status: ModelStatus,
+    pub retires_at: Option<String>,
+    pub requires_paid: bool,
+    pub qr_recommended: bool,
+    /// Rank within the provider, lower = more preferred.
+    pub qr_recommendation_rank: Option<u32>,
+    /// Per-model overrides of the provider's privacy attributes. None =
+    /// inherit from the provider row.
+    pub retains_data_override: Option<bool>,
+    pub trains_on_data_override: Option<bool>,
+    pub retention_days_override: Option<u32>,
+    /// Provenance of context_window_tokens: provider_api, curated or user.
+    pub context_window_source: Option<String>,
+    pub context_window_as_of: Option<String>,
 }
+
+const MODEL_SELECT_COLUMNS: &str = "id, provider_id, model_id, context_window_tokens,
+                is_default, created_at, pricing, request_options, token_factor,
+                output_overhead, status, retires_at, requires_paid, qr_recommended,
+                qr_recommendation_rank, retains_data_override, trains_on_data_override,
+                retention_days_override, context_window_source, context_window_as_of";
 
 fn row_to_provider_model(
     row: &sqlx::sqlite::SqliteRow,
@@ -700,8 +890,66 @@ fn row_to_provider_model(
         .try_get("is_default")
         .map_err(ProviderStoreError::Database)?;
 
+    let id: String = row.try_get("id").map_err(ProviderStoreError::Database)?;
+    let owner = format!("provider model '{id}'");
+    let status_raw: String = row
+        .try_get("status")
+        .map_err(ProviderStoreError::Database)?;
+    let requires_paid: i64 = row
+        .try_get("requires_paid")
+        .map_err(ProviderStoreError::Database)?;
+    let qr_recommended: i64 = row
+        .try_get("qr_recommended")
+        .map_err(ProviderStoreError::Database)?;
+    let optional_u32 = |column: &str| -> Result<Option<u32>, ProviderStoreError> {
+        Ok(row
+            .try_get::<Option<i64>, _>(column)
+            .map_err(ProviderStoreError::Database)?
+            .and_then(|v| u32::try_from(v).ok()))
+    };
+    let optional_bool = |column: &str| -> Result<Option<bool>, ProviderStoreError> {
+        Ok(row
+            .try_get::<Option<i64>, _>(column)
+            .map_err(ProviderStoreError::Database)?
+            .map(|v| v != 0))
+    };
+
     Ok(ProviderModel {
-        id: row.try_get("id").map_err(ProviderStoreError::Database)?,
+        pricing: parse_optional_json(
+            row.try_get("pricing")
+                .map_err(ProviderStoreError::Database)?,
+            &owner,
+            "pricing",
+        ),
+        request_options: parse_optional_json(
+            row.try_get("request_options")
+                .map_err(ProviderStoreError::Database)?,
+            &owner,
+            "request_options",
+        ),
+        token_factor: row
+            .try_get("token_factor")
+            .map_err(ProviderStoreError::Database)?,
+        output_overhead: row
+            .try_get("output_overhead")
+            .map_err(ProviderStoreError::Database)?,
+        status: ModelStatus::from_str(&status_raw)?,
+        retires_at: row
+            .try_get("retires_at")
+            .map_err(ProviderStoreError::Database)?,
+        requires_paid: requires_paid != 0,
+        qr_recommended: qr_recommended != 0,
+        qr_recommendation_rank: optional_u32("qr_recommendation_rank")?,
+        retains_data_override: optional_bool("retains_data_override")?,
+        trains_on_data_override: optional_bool("trains_on_data_override")?,
+        retention_days_override: optional_u32("retention_days_override")?,
+        context_window_source: row
+            .try_get("context_window_source")
+            .map_err(ProviderStoreError::Database)?,
+        context_window_as_of: row
+            .try_get("context_window_as_of")
+            .map_err(ProviderStoreError::Database)?,
+        id,
         provider_id: row
             .try_get("provider_id")
             .map_err(ProviderStoreError::Database)?,
@@ -729,14 +977,14 @@ pub async fn get_default_model(
 ) -> Result<Option<ProviderModel>, ProviderStoreError> {
     let mut conn = pool.acquire().await?;
 
-    let row = sqlx::query(
-        "SELECT id, provider_id, model_id, context_window_tokens, is_default, created_at
-         FROM provider_models
-         WHERE provider_id = ? AND is_default = 1",
-    )
-    .bind(provider_id)
-    .fetch_optional(&mut *conn)
-    .await?;
+    let sql = format!(
+        "SELECT {MODEL_SELECT_COLUMNS} FROM provider_models
+         WHERE provider_id = ? AND is_default = 1"
+    );
+    let row = sqlx::query(&sql)
+        .bind(provider_id)
+        .fetch_optional(&mut *conn)
+        .await?;
 
     match row {
         None => Ok(None),
@@ -756,15 +1004,15 @@ pub async fn get_model_by_provider_and_model_id(
 ) -> Result<Option<ProviderModel>, ProviderStoreError> {
     let mut conn = pool.acquire().await?;
 
-    let row = sqlx::query(
-        "SELECT id, provider_id, model_id, context_window_tokens, is_default, created_at
-         FROM provider_models
-         WHERE provider_id = ? AND model_id = ?",
-    )
-    .bind(provider_id)
-    .bind(model_id)
-    .fetch_optional(&mut *conn)
-    .await?;
+    let sql = format!(
+        "SELECT {MODEL_SELECT_COLUMNS} FROM provider_models
+         WHERE provider_id = ? AND model_id = ?"
+    );
+    let row = sqlx::query(&sql)
+        .bind(provider_id)
+        .bind(model_id)
+        .fetch_optional(&mut *conn)
+        .await?;
 
     match row {
         None => Ok(None),
@@ -892,6 +1140,23 @@ pub async fn create_provider(
         local_model_digest: None,
         installed_at: None,
         qr_recommendation_rank: None,
+        // items.id=708: curator-owned (shared_026.sql), not part of
+        // NewProvider -- the INSERT above leaves them at the schema's own
+        // NULL / DEFAULT 'unverified', mirrored here.
+        api_dialect: None,
+        base_url_template: None,
+        auth_scheme: None,
+        extra_headers: None,
+        models_path: None,
+        user_variables: None,
+        free_tier: None,
+        plan_inclusion: None,
+        retention_days: None,
+        jurisdiction: None,
+        verification_status: VerificationStatus::Unverified,
+        credential_acquisition: None,
+        spend_limit_url: None,
+        logo_key: None,
     })
 }
 
@@ -1256,6 +1521,90 @@ mod tests {
         row_to_provider(&row).unwrap_or_else(|e| panic!("provider '{id}' row shape: {e}"))
     }
 
+    /// items.id=708: every shared_026.sql column round-trips through
+    /// row_to_provider / row_to_provider_model with a non-default value, using
+    /// neutral fixture ids (decisions.id=872).
+    #[tokio::test]
+    async fn shared_026_columns_round_trip() {
+        let mut conn = make_test_conn().await;
+        crate::persistence::migrations::run_migrations(&mut conn, "shared", None)
+            .await
+            .expect("run shared migrations");
+
+        sqlx::query(
+            "INSERT INTO providers (id, display_name, provider_type, mode, created_at,
+                 login_required, api_dialect, base_url_template, auth_scheme,
+                 extra_headers, models_path, user_variables, free_tier, plan_inclusion,
+                 retention_days, jurisdiction, verification_status,
+                 credential_acquisition, spend_limit_url, logo_key)
+             VALUES ('fixture-host', 'Fixture Host', 'cloud_inference_api', 'api', 'now',
+                 1, 'fixture_dialect', 'https://example.test/{account}/v1', 'fixture_auth',
+                 '{\"x-fixture\":\"1\"}', '/fixture-models', '[\"account\"]',
+                 '{\"available\":true}', '[\"fixture-plan\"]', 30, 'Fixtureland',
+                 'stale', '{\"method\":\"guided_paste\"}', 'https://example.test/limits',
+                 'fixture-logo')",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        let p = get_provider_via_conn(&mut conn, "fixture-host").await;
+        assert_eq!(p.api_dialect.as_deref(), Some("fixture_dialect"));
+        assert_eq!(
+            p.base_url_template.as_deref(),
+            Some("https://example.test/{account}/v1")
+        );
+        assert_eq!(p.auth_scheme.as_deref(), Some("fixture_auth"));
+        assert_eq!(p.extra_headers.unwrap()["x-fixture"], "1");
+        assert_eq!(p.models_path.as_deref(), Some("/fixture-models"));
+        assert_eq!(p.user_variables.unwrap()[0], "account");
+        assert_eq!(p.free_tier.unwrap()["available"], true);
+        assert_eq!(p.plan_inclusion.unwrap()[0], "fixture-plan");
+        assert_eq!(p.retention_days, Some(30));
+        assert_eq!(p.jurisdiction.as_deref(), Some("Fixtureland"));
+        assert_eq!(p.verification_status, VerificationStatus::Stale);
+        assert_eq!(p.credential_acquisition.unwrap()["method"], "guided_paste");
+        assert_eq!(
+            p.spend_limit_url.as_deref(),
+            Some("https://example.test/limits")
+        );
+        assert_eq!(p.logo_key.as_deref(), Some("fixture-logo"));
+
+        sqlx::query(
+            "INSERT INTO provider_models (id, provider_id, model_id, context_window_tokens,
+                 is_default, created_at, pricing, request_options, token_factor,
+                 output_overhead, status, retires_at, requires_paid, qr_recommended,
+                 qr_recommendation_rank, retains_data_override, trains_on_data_override,
+                 retention_days_override, context_window_source, context_window_as_of)
+             VALUES ('fixture-host:m', 'fixture-host', 'm', 1000, 1, 'now',
+                 '{\"input_per_mtok\":1.5}', '{\"fixture\":true}', 1.25, 1.5,
+                 'deprecated', '2027-01-01', 1, 1, 3, 1, 0, 7, 'user', '2026-10-11')",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        let sql = format!(
+            "SELECT {MODEL_SELECT_COLUMNS} FROM provider_models WHERE id = 'fixture-host:m'"
+        );
+        let row = sqlx::query(&sql).fetch_one(&mut conn).await.unwrap();
+        let m = row_to_provider_model(&row).unwrap();
+        assert_eq!(m.pricing.unwrap()["input_per_mtok"], 1.5);
+        assert_eq!(m.request_options.unwrap()["fixture"], true);
+        assert_eq!(m.token_factor, 1.25);
+        assert_eq!(m.output_overhead, 1.5);
+        assert_eq!(m.status, ModelStatus::Deprecated);
+        assert_eq!(m.retires_at.as_deref(), Some("2027-01-01"));
+        assert!(m.requires_paid);
+        assert!(m.qr_recommended);
+        assert_eq!(m.qr_recommendation_rank, Some(3));
+        assert_eq!(m.retains_data_override, Some(true));
+        assert_eq!(m.trains_on_data_override, Some(false));
+        assert_eq!(m.retention_days_override, Some(7));
+        assert_eq!(m.context_window_source.as_deref(), Some("user"));
+        assert_eq!(m.context_window_as_of.as_deref(), Some("2026-10-11"));
+    }
+
     /// Exercises the real public API (list_active_providers) against a real on-disk shared.db under
     /// a tempdir-backed QR_DATA_ROOT -- not just the migration SQL directly
     /// (the two tests above). This is the live Privacy Guardian consumer's
@@ -1389,9 +1738,13 @@ mod tests {
         assert!(!hosted.is_empty());
         assert!(hosted.iter().all(|(_, r)| *r == Some(1)));
 
+        // items.id=708 (decisions.id=878): a hosted row may carry a rank
+        // without the provider-level recommended flag (a WARN-posture
+        // provider keeps its place in the order), so only non-local,
+        // non-hosted rows must stay unranked.
         let ranked_others: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM providers WHERE qr_recommendation_rank IS NOT NULL
-             AND NOT (is_local = 1 OR (qr_recommended = 1 AND provider_type = 'cloud_inference_api'))",
+             AND NOT (is_local = 1 OR provider_type = 'cloud_inference_api')",
         )
         .fetch_one(&mut conn)
         .await

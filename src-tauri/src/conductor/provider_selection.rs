@@ -149,6 +149,8 @@ mod tests {
                 user_preference: UserPreference::Preferred,
                 local_model_version: None,
                 subscription_status: None,
+                plan_key: None,
+                model_id: None,
             },
         )
         .await

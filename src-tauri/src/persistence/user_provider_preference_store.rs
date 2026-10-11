@@ -127,6 +127,13 @@ pub struct UserProviderPreference {
     pub last_verified_at: Option<String>,
     pub subscription_status: Option<SubscriptionStatus>,
     pub created_at: String,
+    /// items.id=708 (shared_026.sql, decisions.id=875): the user's plan at
+    /// this provider, matched against providers.plan_inclusion.
+    pub plan_key: Option<String>,
+    /// items.id=708: the selected model, resolved Focus, then Persona, then
+    /// account like every other column. No FK: an uncurated model from a
+    /// live list is allowed.
+    pub model_id: Option<String>,
 }
 
 /// Input to upsert_preference(). A plain struct rather than a long
@@ -141,6 +148,11 @@ pub struct NewUserProviderPreference<'a> {
     pub user_preference: UserPreference,
     pub local_model_version: Option<&'a str>,
     pub subscription_status: Option<SubscriptionStatus>,
+    /// items.id=708. upsert_preference overwrites these two on an existing
+    /// row exactly as it overwrites subscription_status: a caller that does
+    /// not mean to change the selection must pass the current values.
+    pub plan_key: Option<&'a str>,
+    pub model_id: Option<&'a str>,
 }
 
 // ---------------------------------------------------------------------------
@@ -150,7 +162,7 @@ pub struct NewUserProviderPreference<'a> {
 const SELECT_COLUMNS: &str = "id, user_id, persona_id, focus_id, provider_id,
                 login_available, user_preference, enabled_at, declined_at,
                 local_model_version, installed_at, last_verified_at,
-                subscription_status, created_at";
+                subscription_status, created_at, plan_key, model_id";
 
 // ---------------------------------------------------------------------------
 // Row extraction
@@ -210,6 +222,12 @@ fn row_to_preference(
         subscription_status,
         created_at: row
             .try_get("created_at")
+            .map_err(UserProviderPreferenceStoreError::Database)?,
+        plan_key: row
+            .try_get("plan_key")
+            .map_err(UserProviderPreferenceStoreError::Database)?,
+        model_id: row
+            .try_get("model_id")
             .map_err(UserProviderPreferenceStoreError::Database)?,
     })
 }
@@ -431,7 +449,7 @@ pub async fn upsert_preference(
         sqlx::query(
             "UPDATE user_provider_preference
              SET login_available = ?, user_preference = ?, local_model_version = ?,
-                 subscription_status = ?,
+                 subscription_status = ?, plan_key = ?, model_id = ?,
                  enabled_at = CASE WHEN ? = 'declined' THEN enabled_at ELSE ? END,
                  declined_at = CASE WHEN ? = 'declined' THEN ? ELSE declined_at END
              WHERE id = ?",
@@ -440,6 +458,8 @@ pub async fn upsert_preference(
         .bind(new.user_preference.as_str())
         .bind(new.local_model_version)
         .bind(new.subscription_status.map(|s| s.as_str()))
+        .bind(new.plan_key)
+        .bind(new.model_id)
         .bind(new.user_preference.as_str())
         .bind(&now)
         .bind(new.user_preference.as_str())
@@ -470,8 +490,9 @@ pub async fn upsert_preference(
         "INSERT INTO user_provider_preference
          (id, user_id, persona_id, focus_id, provider_id, login_available,
           user_preference, enabled_at, declined_at, local_model_version,
-          installed_at, last_verified_at, subscription_status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)",
+          installed_at, last_verified_at, subscription_status, created_at,
+          plan_key, model_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(new.user_id)
@@ -485,6 +506,8 @@ pub async fn upsert_preference(
     .bind(new.local_model_version)
     .bind(new.subscription_status.map(|s| s.as_str()))
     .bind(&now)
+    .bind(new.plan_key)
+    .bind(new.model_id)
     .execute(&mut *conn)
     .await?;
 
@@ -503,6 +526,8 @@ pub async fn upsert_preference(
         last_verified_at: None,
         subscription_status: new.subscription_status,
         created_at: now,
+        plan_key: new.plan_key.map(|s| s.to_owned()),
+        model_id: new.model_id.map(|s| s.to_owned()),
     })
 }
 
@@ -619,6 +644,8 @@ mod tests {
                     user_preference: UserPreference::Allowed,
                     local_model_version: None,
                     subscription_status: None,
+                    plan_key: None,
+                    model_id: None,
                 },
             )
             .await?;
@@ -633,6 +660,8 @@ mod tests {
                     user_preference: UserPreference::Preferred,
                     local_model_version: None,
                     subscription_status: None,
+                    plan_key: None,
+                    model_id: None,
                 },
             )
             .await?;
@@ -647,6 +676,8 @@ mod tests {
                     user_preference: UserPreference::Declined,
                     local_model_version: None,
                     subscription_status: None,
+                    plan_key: None,
+                    model_id: None,
                 },
             )
             .await?;
@@ -751,6 +782,8 @@ mod tests {
                     user_preference: UserPreference::Preferred,
                     local_model_version: None,
                     subscription_status: None,
+                    plan_key: None,
+                    model_id: None,
                 },
             )
             .await?;
@@ -771,6 +804,8 @@ mod tests {
                     user_preference: UserPreference::Preferred,
                     local_model_version: None,
                     subscription_status: None,
+                    plan_key: None,
+                    model_id: None,
                 },
             )
             .await?;
@@ -843,5 +878,69 @@ mod tests {
             "a second account-wide row for the same user+provider must violate \
              idx_user_provider_pref_account"
         );
+    }
+
+    /// items.id=708: plan_key and model_id round-trip through both upsert
+    /// paths (insert, then update) and the Focus > Persona > account read.
+    #[tokio::test]
+    async fn plan_key_and_model_id_round_trip() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let (_tempdir, pool) = setup_real_db().await;
+
+        let outcome = async {
+            let inserted = upsert_preference(
+                &pool,
+                NewUserProviderPreference {
+                    user_id: "u1",
+                    persona_id: None,
+                    focus_id: None,
+                    provider_id: "duckai",
+                    login_available: true,
+                    user_preference: UserPreference::Allowed,
+                    local_model_version: None,
+                    subscription_status: None,
+                    plan_key: Some("fixture-plan"),
+                    model_id: Some("fixture-model-a"),
+                },
+            )
+            .await?;
+            assert_eq!(inserted.plan_key.as_deref(), Some("fixture-plan"));
+            assert_eq!(inserted.model_id.as_deref(), Some("fixture-model-a"));
+
+            let read = resolve_preference(&pool, "u1", None, None, "duckai")
+                .await?
+                .expect("row exists");
+            assert_eq!(read.plan_key.as_deref(), Some("fixture-plan"));
+            assert_eq!(read.model_id.as_deref(), Some("fixture-model-a"));
+
+            let updated = upsert_preference(
+                &pool,
+                NewUserProviderPreference {
+                    user_id: "u1",
+                    persona_id: None,
+                    focus_id: None,
+                    provider_id: "duckai",
+                    login_available: true,
+                    user_preference: UserPreference::Allowed,
+                    local_model_version: None,
+                    subscription_status: None,
+                    plan_key: None,
+                    model_id: Some("fixture-model-b"),
+                },
+            )
+            .await?;
+            assert_eq!(updated.plan_key, None);
+            assert_eq!(updated.model_id.as_deref(), Some("fixture-model-b"));
+            Ok::<_, UserProviderPreferenceStoreError>(())
+        }
+        .await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+        outcome.expect("plan_key and model_id must round-trip");
     }
 }

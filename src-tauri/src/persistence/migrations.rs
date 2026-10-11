@@ -95,6 +95,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/keys_002.sql"),
     },
     SchemaFile {
+        prefix: "keys",
+        version: 3,
+        sql: include_str!("../../schema/keys_003.sql"),
+    },
+    SchemaFile {
         prefix: "messages",
         version: 1,
         sql: include_str!("../../schema/messages_001.sql"),
@@ -348,6 +353,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         prefix: "shared",
         version: 25,
         sql: include_str!("../../schema/shared_025.sql"),
+    },
+    SchemaFile {
+        prefix: "shared",
+        version: 26,
+        sql: include_str!("../../schema/shared_026.sql"),
     },
     SchemaFile {
         prefix: "tier3_cookies",
@@ -2212,15 +2222,102 @@ mod tests {
             .await
             .expect("shared migration chain must apply cleanly on a fresh db");
         assert_eq!(
-            applied, 25,
-            "expected all twenty-five shared schema versions to apply"
+            applied, 26,
+            "expected all twenty-six shared schema versions to apply"
         );
 
         let version: (i64,) = sqlx::query_as("SELECT MAX(version) FROM schema_version")
             .fetch_one(&mut conn)
             .await
             .unwrap();
-        assert_eq!(version.0, 25);
+        assert_eq!(version.0, 26);
+    }
+
+    /// items.id=708 / items.id=703: shared_026.sql populates the seeded
+    /// hosted rows as data. Field-based on purpose -- names no provider or
+    /// model (decisions.id=872), so it keeps holding as items.id=724 adds rows.
+    #[tokio::test]
+    async fn test_shared_026_hosted_rows_are_complete_data() {
+        let mut conn = make_test_conn().await;
+        run_migrations(&mut conn, "shared", None).await.unwrap();
+
+        type HostedRow = (String, Option<String>, Option<String>, Option<String>);
+        let hosted: Vec<HostedRow> = sqlx::query_as(
+            "SELECT id, base_url_template, auth_scheme, models_path \
+                 FROM providers WHERE api_dialect IS NOT NULL",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        assert!(
+            !hosted.is_empty(),
+            "shared_026 must populate seeded hosted rows"
+        );
+
+        for (id, base_url, auth, models_path) in hosted {
+            assert!(base_url.is_some(), "{id}: base_url_template");
+            assert!(auth.is_some(), "{id}: auth_scheme");
+            assert!(models_path.is_some(), "{id}: models_path");
+
+            let defaults: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+                "SELECT model_id, pricing, context_window_as_of FROM provider_models \
+                 WHERE provider_id = ? AND is_default = 1",
+            )
+            .bind(&id)
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+            assert_eq!(defaults.len(), 1, "{id}: exactly one default model");
+            let (model_id, pricing, as_of) = &defaults[0];
+            assert!(
+                !model_id.ends_with("-latest"),
+                "{id}: default model must be pinned, not a moving alias"
+            );
+            assert!(as_of.is_some(), "{id}: context_window_as_of");
+            let pricing: serde_json::Value =
+                serde_json::from_str(pricing.as_deref().expect("pricing present"))
+                    .expect("pricing is valid JSON");
+            for key in [
+                "input_per_mtok",
+                "output_per_mtok",
+                "as_of",
+                "source_url",
+                "source",
+            ] {
+                assert!(!pricing[key].is_null(), "{id}: pricing.{key}");
+            }
+        }
+
+        let unprovenanced: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM provider_models WHERE context_window_source IS NULL",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            unprovenanced.0, 0,
+            "every remaining model row carries context-window provenance"
+        );
+    }
+
+    /// items.id=708: shared_026.sql CHECK constraints reject out-of-range values.
+    #[tokio::test]
+    async fn test_shared_026_checks_reject_bad_values() {
+        let mut conn = make_test_conn().await;
+        run_migrations(&mut conn, "shared", None).await.unwrap();
+
+        for stmt in [
+            "UPDATE providers SET verification_status = 'bogus'",
+            "UPDATE providers SET free_tier = 'not json'",
+            "UPDATE provider_models SET output_overhead = 0.5",
+            "UPDATE provider_models SET status = 'bogus'",
+            "UPDATE provider_models SET context_window_source = 'bogus'",
+        ] {
+            assert!(
+                sqlx::query(stmt).execute(&mut conn).await.is_err(),
+                "{stmt} must be rejected by a CHECK"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2291,8 +2388,8 @@ mod tests {
             .expect("drift-healing run must succeed");
 
         assert_eq!(
-            applied, 24,
-            "shared v2 through v25 should count as newly applied from a stale v1 database"
+            applied, 25,
+            "shared v2 through v26 should count as newly applied from a stale v1 database"
         );
 
         // items.id=427: shared_013.sql drops tier3_providers (generalized
@@ -3254,12 +3351,22 @@ mod tests {
             std::env::remove_var("QR_DATA_ROOT");
         }
 
-        // items.id=528 Phase 2: 2, not 1, since keys_002.sql added a second
-        // real version (key_type 'tier2' -> 'qr_hosted' rename).
-        assert_eq!(result.expect("migration must apply cleanly"), 2);
+        // items.id=528 Phase 2: keys_002.sql added a second real version
+        // (key_type 'tier2' -> 'qr_hosted' rename). items.id=708: keys_003.sql
+        // added a third (hosted-provider consent/limits/ledger tables).
+        assert_eq!(result.expect("migration must apply cleanly"), 3);
 
         let mut conn = open_verify_conn(&db_path, Some(TEST_KEY_HEX)).await;
         assert!(table_exists(&mut conn, "integration_keys").await);
+        for table in [
+            "provider_consent",
+            "provider_limits",
+            "provider_usage_ledger",
+            "price_overrides",
+            "calibration",
+        ] {
+            assert!(table_exists(&mut conn, table).await, "{table} must exist");
+        }
 
         let invalid = sqlx::query(
             "INSERT INTO integration_keys \

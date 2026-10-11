@@ -125,9 +125,13 @@ async fn open_integration_keys_db(
 ) -> Result<SqliteConnection, IntegrationKeysStoreError> {
     let db_path = get_integration_keys_db_path(user_id);
 
-    if !db_path.exists() {
-        crate::persistence::migrations::migrate_keys_db(user_id, key_hex).await?;
-    }
+    // Always migrate, not only when the file is missing (items.id=389, the
+    // same bug personal_store.rs and output_store.rs fixed): an
+    // integration_keys.db created before its latest schema version shipped
+    // (keys_003.sql, items.id=708) would otherwise stay stuck on the version
+    // it was created at. run_migrations is schema_version-tracked and only
+    // applies what is pending.
+    crate::persistence::migrations::migrate_keys_db(user_id, key_hex).await?;
 
     let conn = crate::providers::utils::connect_options_encrypted(&db_path, key_hex)
         .create_if_missing(false)
@@ -698,5 +702,97 @@ mod tests {
             !db_path.exists(),
             "validation must short-circuit before any connection attempt creates the db file"
         );
+    }
+
+    /// items.id=708 / items.id=389: an integration_keys.db created before
+    /// keys_003.sql shipped must pick the new tables up on its next open
+    /// without losing its rows. The pre-708 state is simulated by dropping
+    /// the five tables and keys v3's schema_version row from a fully
+    /// migrated file (SCHEMA_FILES is a compile-time static).
+    #[tokio::test]
+    async fn open_applies_pending_migration_to_existing_db_keeping_rows() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "test-user";
+        crate::persistence::migrations::migrate_keys_db(user_id, TEST_KEY_HEX)
+            .await
+            .expect("real migration must succeed");
+        upsert_key(
+            user_id,
+            TEST_KEY_HEX,
+            "openai",
+            "api_key",
+            "secret-value",
+            None,
+            Some("api_key"),
+            None,
+        )
+        .await
+        .expect("seed key");
+
+        {
+            let mut conn = crate::providers::utils::connect_options_encrypted(
+                &get_integration_keys_db_path(user_id),
+                TEST_KEY_HEX,
+            )
+            .create_if_missing(false)
+            .connect()
+            .await
+            .expect("open for tampering");
+            for table in [
+                "provider_consent",
+                "provider_limits",
+                "provider_usage_ledger",
+                "price_overrides",
+                "calibration",
+            ] {
+                sqlx::query(&format!("DROP TABLE {table}"))
+                    .execute(&mut conn)
+                    .await
+                    .unwrap();
+            }
+            sqlx::query("DELETE FROM schema_version WHERE version = 3")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+
+        let found = get_active_key(user_id, TEST_KEY_HEX, "openai", "api_key", None).await;
+
+        let mut conn = crate::providers::utils::connect_options_encrypted(
+            &get_integration_keys_db_path(user_id),
+            TEST_KEY_HEX,
+        )
+        .create_if_missing(false)
+        .connect()
+        .await
+        .expect("reopen to inspect");
+        let tables: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN \
+             ('provider_consent', 'provider_limits', 'provider_usage_ledger', \
+              'price_overrides', 'calibration')",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+
+        assert_eq!(
+            tables.len(),
+            5,
+            "opening must re-apply the pending migration"
+        );
+        let key = found
+            .expect("open must succeed on a pre-migration db")
+            .expect("the pre-existing key must survive");
+        assert_eq!(key.credential, "secret-value");
     }
 }

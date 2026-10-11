@@ -217,6 +217,10 @@ pub async fn set_qr_hosted_provider_preference(
             .as_ref()
             .and_then(|e| e.local_model_version.clone());
         let subscription_status = existing.as_ref().and_then(|e| e.subscription_status);
+        // items.id=708: upsert_preference overwrites these, so carry the
+        // existing plan and model selection through unchanged.
+        let plan_key = existing.as_ref().and_then(|e| e.plan_key.clone());
+        let model_id = existing.as_ref().and_then(|e| e.model_id.clone());
 
         user_provider_preference_store::upsert_preference(
             &pool,
@@ -229,6 +233,8 @@ pub async fn set_qr_hosted_provider_preference(
                 user_preference: new_preference,
                 local_model_version: local_model_version.as_deref(),
                 subscription_status,
+                plan_key: plan_key.as_deref(),
+                model_id: model_id.as_deref(),
             },
         )
         .await

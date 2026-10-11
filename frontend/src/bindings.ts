@@ -1680,6 +1680,17 @@ export type UserProviderPreference = {
 	last_verified_at: string | null,
 	subscription_status: SubscriptionStatus | null,
 	created_at: string,
+	/**
+	 *  items.id=708 (shared_026.sql, decisions.id=875): the user's plan at
+	 *  this provider, matched against providers.plan_inclusion.
+	 */
+	plan_key: string | null,
+	/**
+	 *  items.id=708: the selected model, resolved Focus, then Persona, then
+	 *  account like every other column. No FK: an uncurated model from a
+	 *  live list is allowed.
+	 */
+	model_id: string | null,
 };
 
 /**

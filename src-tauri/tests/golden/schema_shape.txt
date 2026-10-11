@@ -88,6 +88,13 @@ TABLE schema_version
   applied_at TEXT notnull=1 pk=0 default=None
   description TEXT notnull=1 pk=0 default=None
 === keys ===
+TABLE calibration
+  provider_id TEXT notnull=1 pk=1 default=None
+  model_id TEXT notnull=1 pk=2 default=None
+  input_factor REAL notnull=1 pk=0 default=Some("1.0")
+  output_factor REAL notnull=1 pk=0 default=Some("1.0")
+  sample_count INTEGER notnull=1 pk=0 default=Some("0")
+  updated_at TEXT notnull=1 pk=0 default=None
 TABLE integration_keys
   id TEXT notnull=0 pk=1 default=None
   provider TEXT notnull=1 pk=0 default=None
@@ -106,6 +113,40 @@ TABLE migration_lock
   id INTEGER notnull=0 pk=1 default=None
   locked_at TEXT notnull=0 pk=0 default=None
   locked_by TEXT notnull=0 pk=0 default=None
+TABLE price_overrides
+  provider_id TEXT notnull=1 pk=1 default=None
+  model_id TEXT notnull=1 pk=2 default=None
+  pricing TEXT notnull=1 pk=0 default=None
+  updated_at TEXT notnull=1 pk=0 default=None
+TABLE provider_consent
+  id TEXT notnull=0 pk=1 default=None
+  provider_id TEXT notnull=1 pk=0 default=None
+  attributes_hash TEXT notnull=1 pk=0 default=None
+  consented_at TEXT notnull=1 pk=0 default=None
+  revoked_at TEXT notnull=0 pk=0 default=None
+TABLE provider_limits
+  id TEXT notnull=0 pk=1 default=None
+  metric TEXT notnull=1 pk=0 default=None
+  period TEXT notnull=1 pk=0 default=None
+  scope_kind TEXT notnull=1 pk=0 default=None
+  scope_id TEXT notnull=0 pk=0 default=None
+  limit_value INTEGER notnull=1 pk=0 default=None
+  warn_at_pct INTEGER notnull=1 pk=0 default=Some("80")
+  created_at TEXT notnull=1 pk=0 default=None
+  updated_at TEXT notnull=1 pk=0 default=None
+TABLE provider_usage_ledger
+  id TEXT notnull=0 pk=1 default=None
+  recorded_at TEXT notnull=1 pk=0 default=None
+  provider_id TEXT notnull=1 pk=0 default=None
+  model_id TEXT notnull=1 pk=0 default=None
+  persona_id TEXT notnull=0 pk=0 default=None
+  focus_id TEXT notnull=0 pk=0 default=None
+  run_id TEXT notnull=0 pk=0 default=None
+  tokens_in INTEGER notnull=1 pk=0 default=Some("0")
+  tokens_out INTEGER notnull=1 pk=0 default=Some("0")
+  requests INTEGER notnull=1 pk=0 default=Some("1")
+  cost_micros INTEGER notnull=0 pk=0 default=None
+  price_source TEXT notnull=1 pk=0 default=Some("'unknown'")
 TABLE schema_version
   version INTEGER notnull=0 pk=1 default=None
   applied_at TEXT notnull=1 pk=0 default=None
@@ -760,6 +801,20 @@ TABLE provider_models
   context_window_tokens INTEGER notnull=1 pk=0 default=None
   is_default INTEGER notnull=1 pk=0 default=Some("0")
   created_at TEXT notnull=1 pk=0 default=None
+  pricing TEXT notnull=0 pk=0 default=None
+  request_options TEXT notnull=0 pk=0 default=None
+  token_factor REAL notnull=1 pk=0 default=Some("1.0")
+  output_overhead REAL notnull=1 pk=0 default=Some("1.0")
+  status TEXT notnull=1 pk=0 default=Some("'active'")
+  retires_at TEXT notnull=0 pk=0 default=None
+  requires_paid INTEGER notnull=1 pk=0 default=Some("0")
+  qr_recommended INTEGER notnull=1 pk=0 default=Some("0")
+  qr_recommendation_rank INTEGER notnull=0 pk=0 default=None
+  retains_data_override INTEGER notnull=0 pk=0 default=None
+  trains_on_data_override INTEGER notnull=0 pk=0 default=None
+  retention_days_override INTEGER notnull=0 pk=0 default=None
+  context_window_source TEXT notnull=0 pk=0 default=None
+  context_window_as_of TEXT notnull=0 pk=0 default=None
 TABLE providers
   id TEXT notnull=0 pk=1 default=None
   display_name TEXT notnull=1 pk=0 default=None
@@ -793,6 +848,20 @@ TABLE providers
   focus_eligible INTEGER notnull=1 pk=0 default=Some("0")
   cloud_chat_visible INTEGER notnull=1 pk=0 default=Some("0")
   qr_recommendation_rank INTEGER notnull=0 pk=0 default=None
+  api_dialect TEXT notnull=0 pk=0 default=None
+  base_url_template TEXT notnull=0 pk=0 default=None
+  auth_scheme TEXT notnull=0 pk=0 default=None
+  extra_headers TEXT notnull=0 pk=0 default=None
+  models_path TEXT notnull=0 pk=0 default=None
+  user_variables TEXT notnull=0 pk=0 default=None
+  free_tier TEXT notnull=0 pk=0 default=None
+  plan_inclusion TEXT notnull=0 pk=0 default=None
+  retention_days INTEGER notnull=0 pk=0 default=None
+  jurisdiction TEXT notnull=0 pk=0 default=None
+  verification_status TEXT notnull=1 pk=0 default=Some("'unverified'")
+  credential_acquisition TEXT notnull=0 pk=0 default=None
+  spend_limit_url TEXT notnull=0 pk=0 default=None
+  logo_key TEXT notnull=0 pk=0 default=None
 TABLE schema_version
   version INTEGER notnull=0 pk=1 default=None
   applied_at TEXT notnull=1 pk=0 default=None
@@ -833,6 +902,8 @@ TABLE user_provider_preference
   last_verified_at TEXT notnull=0 pk=0 default=None
   subscription_status TEXT notnull=0 pk=0 default=None
   created_at TEXT notnull=1 pk=0 default=None
+  plan_key TEXT notnull=0 pk=0 default=None
+  model_id TEXT notnull=0 pk=0 default=None
 TABLE user_salts
   user_id TEXT notnull=0 pk=1 default=None
   salt_hex TEXT notnull=1 pk=0 default=None
