@@ -12,9 +12,11 @@
 //   key_pattern  key syntax and the row-data clipboard pattern
 //   session      the in-memory "connect dialog is open" state
 //   flow         check a candidate key, then store it with its user variables
+//   oauth        part (b), items.id=734: the OpenRouter PKCE connect (pkce,
+//                the loopback callback listener, the code exchange, the flow
+//                that ties them to the session)
 //
-// What is deliberately NOT here: any OAuth listener (part (b)), any Ollama
-// sign-in (post-R1; decisions.id=840's sidecar is untouched), any scraping of
+// What is deliberately NOT here: any Ollama sign-in (post-R1; decisions.id=840's sidecar is untouched), any scraping of
 // a provider page (decisions.id=665), anything that runs on its own.
 //
 // SECRET HYGIENE. A key, clipboard text or variable value is never logged,
@@ -24,10 +26,13 @@
 pub mod clipboard;
 pub mod flow;
 pub mod key_pattern;
+pub mod oauth;
 pub mod opener;
 pub mod session;
 pub mod url_policy;
 
+#[cfg(test)]
+mod oauth_tests;
 #[cfg(test)]
 mod tests;
 
@@ -41,6 +46,13 @@ use crate::persistence::provider_store::Provider;
 pub struct Acquisition {
     pub method: Option<String>,
     pub key_pattern: Option<String>,
+    /// Where the provider asks the user to approve (`oauth_pkce` rows).
+    pub auth_url: Option<String>,
+    /// Where the approval code is exchanged for a key (`oauth_pkce` rows).
+    pub exchange_url: Option<String>,
+    /// A path under the provider's API base that needs the key and nothing
+    /// else, so a wrong key fails it. When absent the model list is the check.
+    pub key_check_path: Option<String>,
 }
 
 pub fn acquisition(provider: &Provider) -> Acquisition {
@@ -55,6 +67,9 @@ pub fn acquisition(provider: &Provider) -> Acquisition {
     Acquisition {
         method: text("method"),
         key_pattern: text("key_pattern"),
+        auth_url: text("auth_url"),
+        exchange_url: text("exchange_url"),
+        key_check_path: text("key_check_path"),
     }
 }
 

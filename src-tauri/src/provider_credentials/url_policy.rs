@@ -137,6 +137,37 @@ pub fn resolve(provider: &Provider, page: Page) -> Result<String, UrlRefusal> {
     checked_url(&raw, baseline_host(&provider.id, page).as_deref())
 }
 
+/// One of the two addresses an OAuth connect uses (items.id=734).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OauthUrl {
+    /// Where the user approves (opened in the browser).
+    Auth,
+    /// Where the approval code is exchanged for a key (called by QR).
+    Exchange,
+}
+
+/// The OAuth address for `which`, or why none.
+///
+/// Anchor: the compiled baseline carries no authorization or exchange URL (the
+/// signed catalog format has no field for either), so both are held to the
+/// host of the same provider's baseline KEYS page, the provider's own host.
+/// Both must also carry no query and no fragment: QR appends the flow's
+/// parameters itself and a stored value must not pre-load any.
+pub fn resolve_oauth(provider: &Provider, which: OauthUrl) -> Result<String, UrlRefusal> {
+    let acq = super::acquisition(provider);
+    let raw = match which {
+        OauthUrl::Auth => acq.auth_url,
+        OauthUrl::Exchange => acq.exchange_url,
+    }
+    .ok_or(UrlRefusal::NoLink)?;
+    let checked = checked_url(&raw, baseline_host(&provider.id, Page::Keys).as_deref())?;
+    let u = reqwest::Url::parse(&checked).map_err(|_| UrlRefusal::Refused)?;
+    if u.query().is_some() || u.fragment().is_some() {
+        return Err(UrlRefusal::Refused);
+    }
+    Ok(checked)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

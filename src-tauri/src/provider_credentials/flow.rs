@@ -9,9 +9,11 @@
 // (network, 5xx, rate limit) stores nothing unless the user confirmed saving
 // without one (`save_unverified`).
 //
-// NETWORK. The check is one GET of the provider's model list with the user's
-// own key, the same request refresh_available_models makes; it carries no
-// content. It only ever runs from a click on save_provider_key.
+// NETWORK. The check is one GET with the user's own key: the provider's
+// key-check path when its row names one (items.id=734: a provider whose model
+// list is public would pass any key), else its model list, the same request
+// refresh_available_models makes. It carries no content. It only ever runs
+// from a click on save_provider_key.
 
 use std::collections::BTreeMap;
 
@@ -22,7 +24,7 @@ use specta::Type;
 use sqlx::SqliteConnection;
 
 use super::key_pattern::normalise_key_text;
-use super::{declared_variables, is_hosted};
+use super::{acquisition, declared_variables, is_hosted};
 use crate::persistence::integration_keys_store::{
     save_credential_conn, NewCredential, QR_HOSTED_KEY_TYPE,
 };
@@ -114,9 +116,15 @@ pub async fn save_impl(
         .ok_or("misconfigured")?;
     let route = HostedRoute::from_rows(provider, route_model);
     let ctx_metadata = metadata.clone().unwrap_or_else(|| json!({}));
-    let ctx = build(&route, key, &ctx_metadata).map_err(|e| build_error(&e))?;
+    let mut ctx = build(&route, key, &ctx_metadata).map_err(|e| build_error(&e))?;
+    // A row that names a key-check path is checked there, not against its
+    // model list (items.id=734: a public list passes any key).
+    let key_check_path = acquisition(provider).key_check_path;
+    if let Some(path) = &key_check_path {
+        ctx = ctx.with_key_check_path(path).map_err(|e| build_error(&e))?;
+    }
 
-    let state = if provider.models_path.is_none() {
+    let state = if provider.models_path.is_none() && key_check_path.is_none() {
         CheckState::Unavailable
     } else {
         match client.check_key(&ctx).await {

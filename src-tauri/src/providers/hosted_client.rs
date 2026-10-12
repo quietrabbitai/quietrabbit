@@ -440,6 +440,26 @@ impl HostedClient {
     /// GET the provider's model list with the key. `Ok(ids)` means the key
     /// works and the endpoint is reachable; 401 or 403 is `InvalidApiKey`.
     pub async fn check_key(&self, ctx: &CallContext) -> Result<Vec<String>, ProviderError> {
+        // A row with a key-check path (items.id=734) is checked against that
+        // path, which needs the key; its reply is not a model list, so the
+        // list is empty. Without one, the model list is the check as before.
+        if let Some(url) = ctx.key_check_url() {
+            let headers = self.headers(ctx, false)?;
+            let response = self
+                .send(ctx, Method::GET, &url, headers, None, self.health_timeout)
+                .await?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(status_error(
+                    ctx,
+                    status,
+                    response.headers(),
+                    Purpose::KeyCheck,
+                ));
+            }
+            self.read_body(ctx, response).await?;
+            return Ok(Vec::new());
+        }
         Ok(self
             .list_models(ctx)
             .await?
@@ -943,6 +963,7 @@ fn parse_live_models(ctx: &CallContext, body: &Value) -> Result<Vec<LiveModel>, 
 pub(super) enum Purpose {
     Generate,
     ModelList,
+    KeyCheck,
 }
 
 pub(super) fn misconfigured_ctx(ctx: &CallContext, detail: &str) -> ProviderError {
@@ -1038,6 +1059,9 @@ pub(super) fn status_error(
                  Choose another model in Settings. [Open Settings] [Get help]"
             ),
         },
+        404 if purpose == Purpose::KeyCheck => {
+            misconfigured_ctx(ctx, "its key check address wasn't found")
+        }
         404 => misconfigured_ctx(ctx, "its model list address wasn't found"),
         408 => ProviderError::Timeout {
             provider,

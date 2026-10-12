@@ -31,9 +31,9 @@ use crate::providers::hosted_client::HostedClient;
 use crate::providers::loopback_test_server::{Canned, LoopbackServer};
 use crate::spend::fixtures::{model, provider};
 
-const KEY_HEX: &str = "0606060606060606060606060606060606060606060606060606060606060606";
-const USER: &str = "cred-user";
-const SECRET: &str = "fx_secretkey0123456789abcdef";
+pub(super) const KEY_HEX: &str = "0606060606060606060606060606060606060606060606060606060606060606";
+pub(super) const USER: &str = "cred-user";
+pub(super) const SECRET: &str = "fx_secretkey0123456789abcdef";
 const PATTERN: &str = r"fx_[A-Za-z0-9]{8,64}";
 
 // ---------------------------------------------------------------------------
@@ -43,7 +43,7 @@ const PATTERN: &str = r"fx_[A-Za-z0-9]{8,64}";
 /// A provider row whose keys and spend pages are the baseline catalog's own,
 /// so the URL policy has a shipped host to anchor to. Derived from the
 /// baseline file, not named here (decisions.id=872).
-fn baselined_provider() -> Provider {
+pub(super) fn baselined_provider() -> Provider {
     let doc: Value = serde_json::from_str(BASELINE_CATALOG_JSON).unwrap();
     let row = doc["providers"]
         .as_array()
@@ -64,7 +64,7 @@ fn baselined_provider() -> Provider {
     p
 }
 
-fn loopback_provider(server: Option<&LoopbackServer>, variables: &[&str]) -> Provider {
+pub(super) fn loopback_provider(server: Option<&LoopbackServer>, variables: &[&str]) -> Provider {
     let mut p = provider();
     p.models_path = server.map(|_| "/models".to_owned());
     let base = server.map_or("http://127.0.0.1:1".to_owned(), LoopbackServer::base);
@@ -81,11 +81,11 @@ fn loopback_provider(server: Option<&LoopbackServer>, variables: &[&str]) -> Pro
     p
 }
 
-fn models() -> Vec<ProviderModel> {
+pub(super) fn models() -> Vec<ProviderModel> {
     vec![model("fixture-model-a")]
 }
 
-fn client() -> HostedClient {
+pub(super) fn client() -> HostedClient {
     HostedClient::for_loopback_tests(
         std::time::Duration::from_secs(5),
         std::time::Duration::from_secs(2),
@@ -93,17 +93,17 @@ fn client() -> HostedClient {
     )
 }
 
-fn now_utc() -> chrono::DateTime<Utc> {
+pub(super) fn now_utc() -> chrono::DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 10, 14, 12, 0, 0).unwrap()
 }
 
-struct FakeOpener {
-    opened: Mutex<Vec<String>>,
+pub(super) struct FakeOpener {
+    pub(super) opened: Mutex<Vec<String>>,
     fail: bool,
 }
 
 impl FakeOpener {
-    fn new(fail: bool) -> Self {
+    pub(super) fn new(fail: bool) -> Self {
         Self {
             opened: Mutex::new(Vec::new()),
             fail,
@@ -146,7 +146,7 @@ impl ClipboardSource for FakeClipboard {
     }
 }
 
-async fn with_store<F, Fut>(f: F)
+pub(super) async fn with_store<F, Fut>(f: F)
 where
     F: FnOnce(sqlx::SqliteConnection) -> Fut,
     Fut: std::future::Future<Output = ()>,
@@ -163,7 +163,7 @@ where
     }
 }
 
-async fn stored(
+pub(super) async fn stored(
     provider_id: &str,
 ) -> Option<crate::persistence::integration_keys_store::IntegrationKey> {
     get_active_key(USER, KEY_HEX, provider_id, QR_HOSTED_KEY_TYPE, None)
@@ -171,7 +171,7 @@ async fn stored(
         .unwrap()
 }
 
-fn typed(
+pub(super) fn typed(
     session_id: &str,
     key: &str,
     vars: &[(&str, &str)],
@@ -190,7 +190,7 @@ fn typed(
     }
 }
 
-async fn save(
+pub(super) async fn save(
     sessions: &ConnectSessions,
     conn: &mut sqlx::SqliteConnection,
     p: &Provider,
@@ -211,7 +211,7 @@ async fn save(
     .await
 }
 
-const OK_LIST: &str = r#"{"data":[{"id":"fixture-model-a"}]}"#;
+pub(super) const OK_LIST: &str = r#"{"data":[{"id":"fixture-model-a"}]}"#;
 
 // ---------------------------------------------------------------------------
 // begin_provider_connect
@@ -367,7 +367,7 @@ fn the_opener_gets_exactly_the_checked_url_and_failure_is_a_code() {
 // check_clipboard_for_key
 // ---------------------------------------------------------------------------
 
-fn session_for(sessions: &ConnectSessions, p: &Provider) -> String {
+pub(super) fn session_for(sessions: &ConnectSessions, p: &Provider) -> String {
     begin_impl(sessions, p, USER, Instant::now())
         .unwrap()
         .session_id
@@ -823,6 +823,15 @@ async fn every_shipped_hosted_row_can_connect_by_paste_and_its_links_pass_the_po
             .unwrap_or_else(|e| panic!("{}: {e}", p.id));
         // The keys page is shipped for every curated row, and passes the policy.
         assert!(info.keys_page_available, "{}", p.id);
+        // A row that names the OAuth method (items.id=734) has both addresses
+        // on its own host and an authenticated key check.
+        if acq.method.as_deref() == Some("oauth_pkce") {
+            use crate::provider_credentials::url_policy::{resolve_oauth, OauthUrl};
+            assert!(resolve_oauth(p, OauthUrl::Auth).is_ok(), "{}", p.id);
+            assert!(resolve_oauth(p, OauthUrl::Exchange).is_ok(), "{}", p.id);
+            assert!(acq.key_check_path.is_some(), "{}", p.id);
+            assert!(info.key_check_available, "{}", p.id);
+        }
         // A spend page, where one is shipped, passes the policy too.
         if p.spend_limit_url.is_some() {
             assert!(url_policy::resolve(p, Page::Spend).is_ok(), "{}", p.id);

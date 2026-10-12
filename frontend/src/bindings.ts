@@ -908,6 +908,28 @@ export const commands = {
 	 *  unknown session is a no-op.
 	 */
 	endProviderConnect: (sessionId: string) => typedError<null, string>(__TAURI_INVOKE("end_provider_connect", { sessionId })),
+	/**
+	 *  Open the provider's approval page for an OAuth connect and start listening
+	 *  for the answer (or, in paste mode, wait for the code). A user click inside
+	 *  an open session; the page address comes from the provider row and the URL
+	 *  policy, never from the frontend.
+	 */
+	startOauthConnect: (sessionId: string, mode: OauthMode) => typedError<OauthStarted, string>(__TAURI_INVOKE("start_oauth_connect", { sessionId, mode })),
+	/**
+	 *  Paste mode: exchange the one-time code the provider showed. The code is
+	 *  write-only; the answer is a phase and, on success, the key's length.
+	 */
+	submitOauthCode: (sessionId: string, code: string) => typedError<OauthStatus, string>(__TAURI_INVOKE("submit_oauth_code", { sessionId, code })),
+	/**
+	 *  Where the OAuth connect has got to. A phase, a length and a failure code;
+	 *  never the key.
+	 */
+	getOauthConnectStatus: (sessionId: string) => typedError<OauthStatus, string>(__TAURI_INVOKE("get_oauth_connect_status", { sessionId })),
+	/**
+	 *  Stop the OAuth connect: the listener closes and a pending exchange is
+	 *  abandoned. A key that already arrived stays available to save.
+	 */
+	cancelOauthConnect: (sessionId: string) => typedError<null, string>(__TAURI_INVOKE("cancel_oauth_connect", { sessionId })),
 	cancelChatStream: (runId: string) => typedError<null, string>(__TAURI_INVOKE("cancel_chat_stream", { runId })),
 };
 
@@ -1417,7 +1439,13 @@ export type KeySource =
 	api_key: string,
 } } | 
 /**  The text `check_clipboard_for_key` matched and the user then confirmed. */
-"ClipboardCandidate";
+"ClipboardCandidate" | 
+/**
+ *  The key the session already holds: an OAuth connect's result
+ *  (`get_oauth_connect_status` says `KeyReady`), or a confirmed clipboard
+ *  key. Reads the same slot as `ClipboardCandidate`.
+ */
+"SessionCandidate";
 
 export type LimitDto = {
 	id: string,
@@ -1543,6 +1571,39 @@ export type ModelPriceDto = {
  *  its removal doesn't change the "four of five" count above.
  */
 export type NotImplementedPlaceholder = Record<string, never>;
+
+/**  How the approval gets back to QR. */
+export type OauthMode = 
+/**  The provider sends the browser to a loopback address QR listens on. */
+"Loopback" | 
+/**  The provider shows a one-time code and the user pastes it. */
+"Paste";
+
+export type OauthStarted = {
+	/**
+	 *  The mode actually used. `Paste` when `Loopback` was asked for and no
+	 *  loopback listener could be bound.
+	 */
+	mode: OauthMode,
+};
+
+export type OauthState = 
+/**  No flow in this session. */
+"Idle" | "WaitingForBrowser" | "WaitingForCode" | "Exchanging" | 
+/**
+ *  The key is held in the session; `save_provider_key` with
+ *  `SessionCandidate` stores it.
+ */
+"KeyReady" | "Failed" | "Cancelled";
+
+/**  What the dialog is told. A code, never any text from the provider. */
+export type OauthStatus = {
+	state: OauthState,
+	/**  Characters in the key; 0 unless `KeyReady`. */
+	key_length: number,
+	/**  A stable code when `Failed`. */
+	failure: string | null,
+};
 
 /**
  *  Whether the pinned Ollama can use this GPU. Unusable and Unknown both
@@ -1800,7 +1861,7 @@ export type ProviderConnectInfo = {
 	spend_limit_available: boolean,
 	/**  The row carries a usable key pattern, so the clipboard can be offered. */
 	clipboard_assist_available: boolean,
-	/**  The row has a model list, so a pasted key can be checked. */
+	/**  The row has a model list or a key-check path, so a key can be checked. */
 	key_check_available: boolean,
 };
 

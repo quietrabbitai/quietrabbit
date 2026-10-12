@@ -214,6 +214,10 @@ pub struct CallContext {
     /// Base URL with variables substituted, no trailing slash, https.
     base: String,
     models_path: Option<String>,
+    /// A path under `base` that needs the key and nothing else (items.id=734):
+    /// when set, `HostedClient::check_key` asks it instead of the model list.
+    /// Set only by the connect flow (`with_key_check_path`).
+    key_check_path: Option<String>,
     pub(crate) extra_headers: Vec<(HeaderName, HeaderValue)>,
     /// Validated `request_options` (a JSON object; forbidden keys absent).
     pub(crate) options: Map<String, Value>,
@@ -313,10 +317,36 @@ impl CallContext {
             auth,
             base,
             models_path,
+            key_check_path: None,
             extra_headers,
             options,
             key,
         })
+    }
+
+    /// Point `check_key` at a path that needs the key (items.id=734). The path
+    /// gets the same plain-path rule as the model list path, so it can only
+    /// ever be appended to the row's own base.
+    pub fn with_key_check_path(mut self, path: &str) -> Result<Self, ProviderError> {
+        if validate_path(path).is_err() {
+            return Err(ProviderError::Misconfigured {
+                provider: self.provider_id.clone(),
+                plain_language: format!(
+                    "{} can't be used because its key check address is not a plain path. \
+                     [Get help] [Use local AI instead]",
+                    self.display_name
+                ),
+            });
+        }
+        self.key_check_path = Some(path.to_owned());
+        Ok(self)
+    }
+
+    /// URL of the key check, when the connect flow set one.
+    pub(crate) fn key_check_url(&self) -> Option<String> {
+        self.key_check_path
+            .as_ref()
+            .map(|p| format!("{}{}", self.base, p))
     }
 
     /// URL for a generation request.

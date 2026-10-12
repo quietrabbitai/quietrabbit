@@ -9,10 +9,18 @@
 // session expires after `SESSION_TTL`, and every lookup also requires the
 // session to belong to the user who is signed in now, so a session cannot
 // outlive a logout-and-login as someone else.
+//
+// An OAuth connect (items.id=734) lives inside its session as an `OauthFlow`:
+// its phase, a cancel token, and in paste mode the PKCE verifier. Dropping the
+// session (end, clear at logout or idle lock, expiry, a new session) drops the
+// flow, and dropping the flow cancels it, which closes the loopback listener
+// its task owns. No secret is in the phase: a key that arrived is the
+// session's zeroized `candidate`, exactly as for a clipboard key.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 /// How long a connect dialog's session lasts without being ended.
@@ -27,15 +35,166 @@ pub enum SessionError {
     Expired,
 }
 
+/// Where an OAuth connect has got to. Carries no secret: `KeyReady` holds only
+/// the key's length (the key itself is the session's candidate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OauthPhase {
+    /// The browser was opened; the loopback listener is waiting for the callback.
+    WaitingForBrowser,
+    /// Paste mode: waiting for the user to paste the code the provider shows.
+    WaitingForCode,
+    Exchanging,
+    KeyReady(u32),
+    /// Ended without a key; the value is a stable code.
+    Failed(&'static str),
+    Cancelled,
+}
+
+/// What paste mode keeps between the click that opens the browser and the
+/// click that submits the code.
+pub struct PasteFlow {
+    pub verifier: Zeroizing<String>,
+    pub exchange_url: String,
+    pub deadline: Instant,
+}
+
+impl std::fmt::Debug for PasteFlow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PasteFlow([redacted])")
+    }
+}
+
+/// One OAuth connect inside a session. Dropping it cancels it.
+pub struct OauthFlow {
+    id: u64,
+    phase: OauthPhase,
+    cancel: CancellationToken,
+    paste: Option<PasteFlow>,
+}
+
+impl OauthFlow {
+    pub fn new(
+        id: u64,
+        phase: OauthPhase,
+        cancel: CancellationToken,
+        paste: Option<PasteFlow>,
+    ) -> Self {
+        Self {
+            id,
+            phase,
+            cancel,
+            paste,
+        }
+    }
+}
+
+impl Drop for OauthFlow {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+impl SessionError {
+    /// The stable code the IPC layer returns.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::NoSession => "no_session",
+            Self::Expired => "session_expired",
+        }
+    }
+}
+
 pub struct ConnectSession {
     pub provider_id: String,
     user_id: String,
     expires_at: Instant,
-    /// The clipboard text the user was offered and has not yet confirmed.
+    /// A key waiting for the user's confirm: clipboard text the user was
+    /// offered, or the key an OAuth exchange returned.
     candidate: Option<Zeroizing<String>>,
+    oauth: Option<OauthFlow>,
 }
 
 impl ConnectSession {
+    /// Start an OAuth flow, replacing (and cancelling) any earlier one and
+    /// dropping any candidate: a new connect starts from nothing.
+    pub fn begin_oauth(&mut self, flow: OauthFlow) {
+        self.candidate = None;
+        self.oauth = Some(flow);
+    }
+
+    pub fn oauth_phase(&self) -> Option<OauthPhase> {
+        self.oauth.as_ref().map(|f| f.phase)
+    }
+
+    /// Whether `flow_id` is the flow this session has now and it has not been
+    /// cancelled. A finished or replaced flow's task must not write anything.
+    fn live_flow(&mut self, flow_id: u64) -> Option<&mut OauthFlow> {
+        self.oauth
+            .as_mut()
+            .filter(|f| f.id == flow_id && f.phase != OauthPhase::Cancelled)
+    }
+
+    /// Move flow `flow_id` to `phase`. False when it is no longer the live flow.
+    pub fn set_oauth_phase(&mut self, flow_id: u64, phase: OauthPhase) -> bool {
+        match self.live_flow(flow_id) {
+            Some(f) => {
+                f.phase = phase;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The exchange returned `key`: hold it as the candidate and mark the flow
+    /// `KeyReady`. False (and the key is dropped, zeroized) when the flow is
+    /// no longer live.
+    pub fn finish_oauth_with_key(&mut self, flow_id: u64, key: Zeroizing<String>) -> bool {
+        let length = u32::try_from(key.chars().count()).unwrap_or(u32::MAX);
+        let live = self
+            .live_flow(flow_id)
+            .map(|f| {
+                f.phase = OauthPhase::KeyReady(length);
+                f.paste = None;
+            })
+            .is_some();
+        if live {
+            self.candidate = Some(key);
+        }
+        live
+    }
+
+    /// End the flow at the user's request: its task stops, its listener
+    /// closes, paste state is dropped. A no-op without a flow.
+    pub fn cancel_oauth(&mut self) {
+        if let Some(f) = self.oauth.as_mut() {
+            f.cancel.cancel();
+            f.paste = None;
+            if !matches!(f.phase, OauthPhase::KeyReady(_)) {
+                f.phase = OauthPhase::Cancelled;
+            }
+        }
+    }
+
+    /// Paste mode: the verifier (a zeroizing copy), the exchange URL and the
+    /// deadline of the live flow, while it is waiting for a code.
+    pub fn paste_parts(&self, flow_id: u64) -> Option<(Zeroizing<String>, String, Instant)> {
+        let f = self.oauth.as_ref().filter(|f| f.id == flow_id)?;
+        let p = f.paste.as_ref()?;
+        Some((p.verifier.clone(), p.exchange_url.clone(), p.deadline))
+    }
+
+    pub fn oauth_flow_id(&self) -> Option<u64> {
+        self.oauth.as_ref().map(|f| f.id)
+    }
+
+    /// The flow's cancel token, so a collaborator can race its work against it.
+    pub fn oauth_cancel_token(&self, flow_id: u64) -> Option<CancellationToken> {
+        self.oauth
+            .as_ref()
+            .filter(|f| f.id == flow_id)
+            .map(|f| f.cancel.clone())
+    }
+
     pub fn set_candidate(&mut self, key: Zeroizing<String>) {
         self.candidate = Some(key);
     }
@@ -53,9 +212,11 @@ impl ConnectSession {
     }
 }
 
-#[derive(Default)]
+/// Cloneable handle: the OAuth listener task holds its own to write its result
+/// back into the session it belongs to.
+#[derive(Default, Clone)]
 pub struct ConnectSessions {
-    slot: Mutex<Option<(String, ConnectSession)>>,
+    slot: Arc<Mutex<Option<(String, ConnectSession)>>>,
 }
 
 fn new_session_id() -> Result<String, String> {
@@ -73,6 +234,7 @@ impl ConnectSessions {
             user_id: user_id.to_owned(),
             expires_at: now + SESSION_TTL,
             candidate: None,
+            oauth: None,
         };
         *self.slot.lock().unwrap_or_else(|p| p.into_inner()) = Some((id.clone(), session));
         Ok(id)

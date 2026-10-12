@@ -400,6 +400,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/shared_031.sql"),
     },
     SchemaFile {
+        prefix: "shared",
+        version: 32,
+        sql: include_str!("../../schema/shared_032.sql"),
+    },
+    SchemaFile {
         prefix: "tier3_cookies",
         version: 1,
         sql: include_str!("../../schema/tier3_cookies_001.sql"),
@@ -2262,15 +2267,15 @@ mod tests {
             .await
             .expect("shared migration chain must apply cleanly on a fresh db");
         assert_eq!(
-            applied, 31,
-            "expected all thirty-one shared schema versions to apply"
+            applied, 32,
+            "expected all thirty-two shared schema versions to apply"
         );
 
         let version: (i64,) = sqlx::query_as("SELECT MAX(version) FROM schema_version")
             .fetch_one(&mut conn)
             .await
             .unwrap();
-        assert_eq!(version.0, 31);
+        assert_eq!(version.0, 32);
     }
 
     /// items.id=708 / items.id=703 / items.id=724: shared_026.sql and
@@ -2421,6 +2426,66 @@ mod tests {
             others.iter().all(|(m,)| m != "local_signin"),
             "no row names the sidecar sign-in any more"
         );
+    }
+
+    /// items.id=734 (shared_032.sql): the OpenRouter row gains the exchange URL
+    /// and the key-check path; nothing else in its acquisition block moved and
+    /// no other row has either field. Field-based apart from the one row the
+    /// migration targets by its method.
+    #[tokio::test]
+    async fn test_oauth_row_gains_exchange_url_and_key_check_path_after_shared_032() {
+        let mut conn = make_test_conn().await;
+        run_migrations(&mut conn, "shared", None).await.unwrap();
+        let rows: Vec<(
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT id, json_extract(credential_acquisition, '$.method'), \
+                        json_extract(credential_acquisition, '$.auth_url'), \
+                        json_extract(credential_acquisition, '$.keys_page_url'), \
+                        json_extract(credential_acquisition, '$.exchange_url'), \
+                        json_extract(credential_acquisition, '$.key_check_path') \
+                 FROM providers WHERE credential_acquisition IS NOT NULL ORDER BY id",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        let oauth: Vec<_> = rows
+            .iter()
+            .filter(|r| r.1.as_deref() == Some("oauth_pkce"))
+            .collect();
+        assert!(!oauth.is_empty(), "an oauth_pkce row exists");
+        let host = |u: &str| {
+            reqwest::Url::parse(u)
+                .ok()
+                .and_then(|u| u.domain().map(str::to_owned))
+        };
+        for (id, _, auth, keys, exchange, check) in oauth {
+            let (auth, keys, exchange) = (
+                auth.as_deref().expect("auth_url"),
+                keys.as_deref().expect("keys_page_url"),
+                exchange
+                    .as_deref()
+                    .unwrap_or_else(|| panic!("{id}: exchange_url")),
+            );
+            assert!(exchange.starts_with("https://"), "{id}");
+            assert_eq!(host(auth), host(keys), "{id}: auth host = keys host");
+            assert_eq!(
+                host(exchange),
+                host(keys),
+                "{id}: exchange host = keys host"
+            );
+            assert!(check.as_deref().is_some_and(|p| p.starts_with('/')), "{id}");
+        }
+        for (id, method, _, _, exchange, check) in &rows {
+            if method.as_deref() != Some("oauth_pkce") {
+                assert_eq!((exchange, check), (&None, &None), "{id}: untouched");
+            }
+        }
     }
 
     /// items.id=724: every seeded hosted (provider, model) pair must build a
@@ -2778,8 +2843,8 @@ mod tests {
             .expect("drift-healing run must succeed");
 
         assert_eq!(
-            applied, 30,
-            "shared v2 through v31 should count as newly applied from a stale v1 database"
+            applied, 31,
+            "shared v2 through v32 should count as newly applied from a stale v1 database"
         );
 
         // items.id=427: shared_013.sql drops tier3_providers (generalized
