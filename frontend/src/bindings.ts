@@ -878,6 +878,11 @@ export const commands = {
 	refreshAvailableModels: (providerId: string) => typedError<RefreshResultDto, string>(__TAURI_INVOKE("refresh_available_models", { providerId })),
 	setModelSelection: (request: SetModelSelectionRequest) => typedError<null, string>(__TAURI_INVOKE("set_model_selection", { request })),
 	setPriceOverride: (request: SetPriceOverrideRequest) => typedError<ModelPriceDto, string>(__TAURI_INVOKE("set_price_override", { request })),
+	getCatalogStatus: () => typedError<CatalogStatusDto, string>(__TAURI_INVOKE("get_catalog_status")),
+	/**  USER-CLICKED. The only command that reaches the network. */
+	checkCatalogUpdate: () => typedError<CatalogCheckDto, string>(__TAURI_INVOKE("check_catalog_update")),
+	applyCatalogUpdate: (sha256: string) => typedError<CatalogApplyDto, string>(__TAURI_INVOKE("apply_catalog_update", { sha256 })),
+	rollbackCatalog: () => typedError<CatalogApplyDto, string>(__TAURI_INVOKE("rollback_catalog")),
 };
 
 /* Types */
@@ -939,6 +944,76 @@ export type CapabilityProfileResponse = {
 	 *  STUB: recommended_routing omitted until scores DB is ported.
 	 */
 	benchmark_status: string,
+};
+
+export type CatalogApplyDto = {
+	/**  The version now in force (None after rolling back the only catalog). */
+	version: number | null,
+	changes: CatalogChangeDto[],
+	consent_effects: CatalogConsentEffectDto[],
+};
+
+export type CatalogChangeDto = {
+	provider_id: string,
+	model_id: string | null,
+	/**
+	 *  The field that changes (`pricing`, `status`, `new_model`, ...), or
+	 *  `restored` / `removed` for a rollback.
+	 */
+	field: string,
+};
+
+export type CatalogCheckDto = {
+	/**  `catalog.state.up_to_date` or `catalog.state.update_available`. */
+	state: string,
+	preview: CatalogPreviewDto | null,
+};
+
+export type CatalogConsentEffectDto = {
+	provider_id: string,
+	/**  `catalog.consent.model_added | model_retired | cost_class_changed`. */
+	reasons: string[],
+};
+
+export type CatalogPreviewDto = {
+	version: number,
+	/**
+	 *  Pass this back to `apply_catalog_update`: what is applied is exactly
+	 *  what was previewed.
+	 */
+	sha256: string,
+	changes: CatalogChangeDto[],
+	skipped: CatalogSkipDto[],
+	consent_effects: CatalogConsentEffectDto[],
+};
+
+export type CatalogSkipDto = {
+	/**
+	 *  `catalog.skip.*`: the catalog carried an older value than the one in
+	 *  force and was not applied for that field.
+	 */
+	code: string,
+	provider_id: string,
+	model_id: string | null,
+	field: string,
+};
+
+export type CatalogStatusDto = {
+	/**  The catalog in force; None = none applied (the release's own data). */
+	applied_version: number | null,
+	applied_at: string | null,
+	/**  The highest version the user rolled back, if any. */
+	declined_version: number | null,
+	/**  The catalog version this release carries. */
+	baseline_version: number,
+	can_roll_back: boolean,
+	/**
+	 *  False until the production public key is compiled in; updates are
+	 *  unavailable while it is false.
+	 */
+	trusted_key_configured: boolean,
+	/**  The only host a check contacts (for the screen's disclosure line). */
+	update_source_host: string,
 };
 
 export type ChatInfo = {

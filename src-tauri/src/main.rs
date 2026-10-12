@@ -243,6 +243,27 @@ async fn async_main() {
                         });
                         match pool_result {
                             Ok(pool) => {
+                                // items.id=713: if a signed catalog update was
+                                // applied earlier, put it back over whatever the
+                                // migrations just wrote. Local only: no network,
+                                // and it applies nothing the user has not already
+                                // applied.
+                                let reconcile_pool = pool.clone();
+                                let reconciled = tokio::task::block_in_place(|| {
+                                    tokio::runtime::Handle::current().block_on(
+                                        quietrabbit_lib::provider_catalog::flow::reconcile_after_migration(
+                                            &reconcile_pool,
+                                            chrono::Local::now().date_naive(),
+                                        ),
+                                    )
+                                });
+                                match reconciled {
+                                    Ok(r) => log::info!("main: provider catalog reconcile: {r:?}"),
+                                    Err(f) => log::warn!(
+                                        "main: provider catalog reconcile failed: {}",
+                                        f.code
+                                    ),
+                                }
                                 app.manage(pool);
                             }
                             Err(e) => log::error!(

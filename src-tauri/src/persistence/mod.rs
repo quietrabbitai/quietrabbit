@@ -22,6 +22,7 @@ pub mod output_store;
 pub mod persona_store;
 pub mod personal_store;
 pub mod plan_state_store;
+pub mod provider_catalog_store;
 pub mod provider_models_store;
 pub mod provider_spend_store;
 pub mod provider_store;

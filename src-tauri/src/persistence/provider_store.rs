@@ -755,7 +755,16 @@ pub async fn get_provider(
     provider_id: &str,
 ) -> Result<Option<Provider>, ProviderStoreError> {
     let mut conn = pool.acquire().await?;
+    get_provider_conn(&mut conn, provider_id).await
+}
 
+/// `get_provider` on a caller-held connection, so a caller inside a
+/// transaction reads its own uncommitted writes (items.id=713: the catalog
+/// preview applies an update, reads the result and rolls it back).
+pub(crate) async fn get_provider_conn(
+    conn: &mut sqlx::SqliteConnection,
+    provider_id: &str,
+) -> Result<Option<Provider>, ProviderStoreError> {
     let sql = format!("SELECT {SELECT_COLUMNS} FROM providers WHERE id = ?");
     let row = sqlx::query(&sql)
         .bind(provider_id)
@@ -1042,7 +1051,14 @@ pub async fn list_models_for_provider(
     provider_id: &str,
 ) -> Result<Vec<ProviderModel>, ProviderStoreError> {
     let mut conn = pool.acquire().await?;
+    list_models_for_provider_conn(&mut conn, provider_id).await
+}
 
+/// Connection-bound form of `list_models_for_provider` (see `get_provider_conn`).
+pub(crate) async fn list_models_for_provider_conn(
+    conn: &mut sqlx::SqliteConnection,
+    provider_id: &str,
+) -> Result<Vec<ProviderModel>, ProviderStoreError> {
     let sql = format!(
         "SELECT {MODEL_SELECT_COLUMNS} FROM provider_models
          WHERE provider_id = ? ORDER BY model_id"
@@ -1064,6 +1080,14 @@ pub async fn list_model_pricing_text(
     provider_id: &str,
 ) -> Result<Vec<(String, Option<String>)>, ProviderStoreError> {
     let mut conn = pool.acquire().await?;
+    list_model_pricing_text_conn(&mut conn, provider_id).await
+}
+
+/// Connection-bound form of `list_model_pricing_text` (see `get_provider_conn`).
+pub(crate) async fn list_model_pricing_text_conn(
+    conn: &mut sqlx::SqliteConnection,
+    provider_id: &str,
+) -> Result<Vec<(String, Option<String>)>, ProviderStoreError> {
     let rows = sqlx::query(
         "SELECT model_id, pricing FROM provider_models
          WHERE provider_id = ? ORDER BY model_id",

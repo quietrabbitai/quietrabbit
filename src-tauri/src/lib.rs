@@ -14,6 +14,8 @@ pub mod ollama_spawn_thread;
 pub mod persistence;
 pub mod persona_sync;
 pub mod persona_view_sync;
+pub mod pinned_asset;
+pub mod provider_catalog;
 pub mod providers;
 pub mod recommendation;
 pub mod spend;

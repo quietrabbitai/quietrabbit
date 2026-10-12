@@ -167,6 +167,12 @@ hkdf = "0.12"
 # parsing Ollama's /api/pull NDJSON response, instead of buffering the
 # whole body like ollama_client.rs's existing apply_modelfile() does.
 reqwest = { version = "0.12", features = ["json", "stream"] }
+# items.id=713: verifies the detached minisign signature on the provider
+# catalog manifest (decisions.id=875 point 6). Verify-only, zero dependencies,
+# MIT. Chosen over ed25519-dalek 3.0.0, which pulls sha2 0.11 and ed25519 3
+# beside this crate's sha2 0.10 (Chat-PM review of items.id=713, 2026-10-11).
+# `cargo deny check` result is reported with the items.id=713 diff.
+minisign-verify = "0.2.5"
 thiserror = "1"
 async-trait = "0.1"
 

@@ -192,6 +192,12 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::provider_models::refresh_available_models,
         commands::provider_models::set_model_selection,
         commands::provider_models::set_price_override,
+        // Group 27 -- Signed provider catalog update (items.id=713,
+        // decisions.id=875 point 6, spec Part 8f)
+        commands::provider_catalog::get_catalog_status,
+        commands::provider_catalog::check_catalog_update,
+        commands::provider_catalog::apply_catalog_update,
+        commands::provider_catalog::rollback_catalog,
     ])
 }
 
