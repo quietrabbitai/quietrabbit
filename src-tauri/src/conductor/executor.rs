@@ -66,6 +66,7 @@ use crate::conductor::failure::{
     ConductorError, FailureAction, FailureHandler, FailureResult, FailureSeverity, MAX_RETRIES,
     RETRY_AFTER_METADATA_KEY,
 };
+use crate::conductor::model_selection::{resolve_hosted_model, ModelError};
 use crate::conductor::privacy::logger::{DisclosureLogEntry, DisclosureLogger};
 use crate::conductor::privacy::types::{
     AbstractionPolicy, PersonalField as GateField, PersonalTrack as GateTrack, Sensitivity,
@@ -135,7 +136,7 @@ const ALLOWED_VOICE_ATTRIBUTES: &[&str] = &[
 static HOSTED_CLIENT: OnceLock<HostedClient> = OnceLock::new();
 static OLLAMA_CLIENT: OnceLock<OllamaClient> = OnceLock::new();
 
-fn hosted_client() -> &'static HostedClient {
+pub(crate) fn hosted_client() -> &'static HostedClient {
     HOSTED_CLIENT.get_or_init(HostedClient::new)
 }
 
@@ -469,6 +470,12 @@ impl StepExecutor {
             &ctx.step.task_type,
             ctx.effective_access,
             ctx.qr_hosted_provider_preference.as_deref(),
+            Some(SelectionLookup {
+                user_id: &ctx.user_id,
+                key_hex: &ctx.key_hex,
+                persona_id: &ctx.persona_id,
+                focus_id: &ctx.focus_id,
+            }),
         )
         .await?;
 
@@ -615,14 +622,19 @@ impl StepExecutor {
 
         let effective_ctx = match options_raw.get("num_ctx").and_then(|v| v.as_u64()) {
             Some(v) => v as u32,
-            None => {
-                get_context_window(
-                    pool,
-                    selected_model.provider_id.as_deref(),
-                    &selected_model.model_id,
-                )
-                .await
-            }
+            // A hosted step's window is the resolved row's own: a model from
+            // the user's live list has no curated row to look up again.
+            None => match &selected_model.hosted_model {
+                Some(model) => model.context_window_tokens,
+                None => {
+                    get_context_window(
+                        pool,
+                        selected_model.provider_id.as_deref(),
+                        &selected_model.model_id,
+                    )
+                    .await
+                }
+            },
         };
 
         let ctx_status = check_context_window(&prompt, &ctx.step.task_type, effective_ctx);
@@ -1120,6 +1132,7 @@ async fn select_model(
     task_type: &str,
     effective_access: ExternalAccess,
     qr_hosted_provider: Option<&str>,
+    selection: Option<SelectionLookup<'_>>,
 ) -> Result<SelectedModel, ConductorError> {
     if effective_access == ExternalAccess::LocalOnly {
         let model_id = match task_type {
@@ -1146,6 +1159,54 @@ async fn select_model(
         ),
     };
 
+    // items.id=711: the user's stored selection (Focus, then Persona, then
+    // account) wins over the provider's default model. A selection that
+    // cannot be honored is an error, never a quiet fall back to the default.
+    if let Some(lookup) = selection {
+        fn non_empty(s: &str) -> Option<&str> {
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
+        }
+        return match resolve_hosted_model(
+            pool,
+            lookup.user_id,
+            lookup.key_hex,
+            non_empty(lookup.persona_id),
+            non_empty(lookup.focus_id),
+            provider_id,
+        )
+        .await
+        {
+            Ok(resolved) => {
+                if resolved.may_be_retired || resolved.deprecated {
+                    log::info!(
+                        "selected model for provider '{provider_id}' is {}",
+                        if resolved.deprecated {
+                            "deprecated"
+                        } else {
+                            "missing from the latest model list"
+                        }
+                    );
+                }
+                Ok(SelectedModel {
+                    provider_id: Some(resolved.model.provider_id.clone()),
+                    model_id: resolved.model.model_id.clone(),
+                    hosted_model: Some(resolved.model),
+                })
+            }
+            Err(ModelError::NoModel) => Err(ConductorError::UnknownProvider {
+                plain_language: format!(
+                    "Tier 1.5 provider '{provider_id}' has no default model configured \
+                     in the provider catalog."
+                ),
+            }),
+            Err(e) => Err(model_error(&e)),
+        };
+    }
+
     match crate::persistence::provider_store::get_default_model(pool, provider_id).await {
         Ok(Some(model)) => Ok(SelectedModel {
             provider_id: Some(model.provider_id.clone()),
@@ -1165,6 +1226,27 @@ async fn select_model(
             ),
         }),
     }
+}
+
+/// Who is asking, for the stored model selection (items.id=711).
+struct SelectionLookup<'a> {
+    user_id: &'a str,
+    key_hex: &'a str,
+    persona_id: &'a str,
+    focus_id: &'a str,
+}
+
+/// A model-selection stop as the error the failure handler understands: the
+/// same F10 parking as a spend block, with its own code.
+fn model_error(e: &ModelError) -> ConductorError {
+    let (code, params) = e.block();
+    let mut block = SpendBlock::new(code);
+    if let Some(o) = params.as_object() {
+        for (k, v) in o {
+            block = block.with(k, v.clone());
+        }
+    }
+    spend_block_error(&block)
 }
 
 /// Map the executor's request onto the hosted client's request (items.id=709).
@@ -1943,7 +2025,7 @@ mod tests {
     #[tokio::test]
     async fn select_model_tier1_code() {
         // qr_local never touches provider_store -- no DB setup needed.
-        let selected = select_model(&dummy_pool(), "code", ExternalAccess::LocalOnly, None)
+        let selected = select_model(&dummy_pool(), "code", ExternalAccess::LocalOnly, None, None)
             .await
             .unwrap();
         assert_eq!(selected.provider_id, None);
@@ -1956,6 +2038,7 @@ mod tests {
             &dummy_pool(),
             "quick_response",
             ExternalAccess::LocalOnly,
+            None,
             None,
         )
         .await
@@ -1971,6 +2054,7 @@ mod tests {
             "summarization",
             ExternalAccess::LocalOnly,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1980,9 +2064,15 @@ mod tests {
 
     #[tokio::test]
     async fn select_model_tier1_general() {
-        let selected = select_model(&dummy_pool(), "general", ExternalAccess::LocalOnly, None)
-            .await
-            .unwrap();
+        let selected = select_model(
+            &dummy_pool(),
+            "general",
+            ExternalAccess::LocalOnly,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(selected.provider_id, None);
         assert_eq!(selected.model_id, "llama3.1:8b");
     }
@@ -2052,6 +2142,7 @@ mod tests {
                     task_type,
                     ExternalAccess::AnonymousRequired,
                     Some("fixture-host-a"),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -2087,6 +2178,7 @@ mod tests {
                     "general",
                     ExternalAccess::AnonymousRequired,
                     Some(&provider_id),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -2112,6 +2204,7 @@ mod tests {
                 "general",
                 ExternalAccess::AnonymousRequired,
                 Some("fixture-host-a"),
+                None,
             )
             .await
             .unwrap();
@@ -2120,6 +2213,7 @@ mod tests {
                 "general",
                 ExternalAccess::AnonymousRequired,
                 Some("fixture-host-b"),
+                None,
             )
             .await
             .unwrap();
@@ -2141,6 +2235,7 @@ mod tests {
             "general",
             ExternalAccess::AnonymousRequired,
             None,
+            None,
         )
         .await;
     }
@@ -2157,6 +2252,7 @@ mod tests {
                 "general",
                 ExternalAccess::AnonymousRequired,
                 Some("fixture-absent"),
+                None,
             )
             .await
             .unwrap_err();
@@ -3052,6 +3148,245 @@ mod tests {
             .fetch_one(&mut conn)
             .await
             .unwrap()
+    }
+
+    // -- items.id=711: the stored model selection reaches the call -------------
+
+    use crate::persistence::provider_models_store::{
+        record_refresh_conn, set_user_output_limit_conn,
+    };
+    use crate::persistence::user_provider_preference_store::{set_model_selection, SelectionScope};
+    use crate::providers::hosted_client::LiveModel;
+
+    async fn seed_user(pool: &sqlx::SqlitePool) {
+        sqlx::query(
+            "INSERT INTO users (id, display_name, role, is_primary, auth_enabled, created_at) \
+             VALUES (?, 'Fixture', 'user', 1, 1, '2026-01-01T00:00:00Z')",
+        )
+        .bind(SPEND_USER)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn add_curated_model(
+        pool: &sqlx::SqlitePool,
+        model_id: &str,
+        options: &str,
+        status: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO provider_models \
+                (id, provider_id, model_id, context_window_tokens, is_default, created_at, \
+                 pricing, request_options, status) \
+             VALUES (?, 'fixture-host-a', ?, 4096, 0, 't', ?, ?, ?)",
+        )
+        .bind(format!("fixture-host-a:{model_id}"))
+        .bind(model_id)
+        .bind(PRICE_TEXT)
+        .bind(options)
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn select_for_step(
+        pool: &sqlx::SqlitePool,
+        key_hex: &str,
+    ) -> Result<SelectedModel, ConductorError> {
+        select_model(
+            pool,
+            "general",
+            ExternalAccess::AnonymousRequired,
+            Some("fixture-host-a"),
+            Some(SelectionLookup {
+                user_id: SPEND_USER,
+                key_hex,
+                persona_id: "persona-1",
+                focus_id: "focus-1",
+            }),
+        )
+        .await
+    }
+
+    async fn pick_account_model(pool: &sqlx::SqlitePool, model_id: Option<&str>) {
+        set_model_selection(
+            pool,
+            SPEND_USER,
+            &SelectionScope::Account,
+            None,
+            "fixture-host-a",
+            model_id,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_stored_selection_decides_which_model_is_sent() {
+        with_temp_shared_db(|pool| async move {
+            let server = LoopbackServer::start(vec![loopback_chat_ok()]);
+            let (key_hex, _default) = spend_rig(&pool, &server, Some(PRICE_TEXT)).await;
+            seed_user(&pool).await;
+            add_curated_model(
+                &pool,
+                "fixture-model-b",
+                r#"{"max_completion_tokens":64}"#,
+                "active",
+            )
+            .await;
+            grant_consent(&pool, &key_hex, true).await;
+
+            // No selection: the provider's default.
+            let picked = select_for_step(&pool, &key_hex).await.unwrap();
+            assert_eq!(picked.model_id, "fixture-model-a");
+
+            pick_account_model(&pool, Some("fixture-model-b")).await;
+            let picked = select_for_step(&pool, &key_hex).await.unwrap();
+            assert_eq!(picked.model_id, "fixture-model-b");
+            let model = picked.hosted_model.expect("a hosted row");
+
+            call_hosted(&pool, &key_hex, &model, RunAttendance::Attended)
+                .await
+                .unwrap();
+            let sent = server.captured()[0].json();
+            assert_eq!(sent["model"], "fixture-model-b");
+            assert_eq!(sent["max_completion_tokens"], 64);
+            let mut conn = spend_store::open(SPEND_USER, &key_hex).await.unwrap();
+            let ledger_model: String =
+                sqlx::query_scalar("SELECT model_id FROM provider_usage_ledger")
+                    .fetch_one(&mut conn)
+                    .await
+                    .unwrap();
+            assert_eq!(ledger_model, "fixture-model-b");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_selection_that_cannot_be_honored_stops_and_never_uses_the_default() {
+        with_temp_shared_db(|pool| async move {
+            let server = LoopbackServer::start(vec![loopback_chat_ok()]);
+            let (key_hex, _default) = spend_rig(&pool, &server, Some(PRICE_TEXT)).await;
+            seed_user(&pool).await;
+            add_curated_model(
+                &pool,
+                "fixture-model-old",
+                r#"{"max_completion_tokens":64}"#,
+                "retired",
+            )
+            .await;
+
+            pick_account_model(&pool, Some("fixture-model-old")).await;
+            let err = select_for_step(&pool, &key_hex).await.unwrap_err();
+            assert_eq!(block_code(&err), "spend_block.model_retired");
+
+            pick_account_model(&pool, Some("fixture-model-ghost")).await;
+            let err = select_for_step(&pool, &key_hex).await.unwrap_err();
+            assert_eq!(block_code(&err), "spend_block.model_unavailable");
+
+            assert_eq!(server.connections(), 0);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_uncurated_model_needs_a_price_and_carries_the_providers_required_options() {
+        with_temp_shared_db(|pool| async move {
+            let server = LoopbackServer::start(vec![loopback_chat_ok()]);
+            let (key_hex, _default) = spend_rig(&pool, &server, Some(PRICE_TEXT)).await;
+            seed_user(&pool).await;
+            sqlx::query(
+                "UPDATE providers SET required_request_options = '{\"fixture_routing\":{\"fixture_collect\":\"deny\"}}' \
+                 WHERE id = 'fixture-host-a'",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            grant_consent(&pool, &key_hex, false).await;
+            set_cost_limit(&key_hex, spend_store::LimitPeriod::Month, 5_000_000, false).await;
+
+            // The user refreshed their list, picked a model QR has not
+            // reviewed and chose its output limit.
+            let mut conn = spend_store::open(SPEND_USER, &key_hex).await.unwrap();
+            record_refresh_conn(
+                &mut conn,
+                "fixture-host-a",
+                &[LiveModel { id: "live-x".into(), context_tokens: Some(9000), retires_at: None }],
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
+            set_user_output_limit_conn(&mut conn, "fixture-host-a", "live-x", Some(77)).await.unwrap();
+            pick_account_model(&pool, Some("live-x")).await;
+
+            let picked = select_for_step(&pool, &key_hex).await.unwrap();
+            assert_eq!(picked.model_id, "live-x");
+            let model = picked.hosted_model.expect("a synthesized row");
+            assert!(model.pricing.is_none());
+
+            // Unpriced: it stops and asks, and nothing leaves the machine.
+            let err = call_hosted(&pool, &key_hex, &model, RunAttendance::Attended).await.unwrap_err();
+            assert_eq!(block_code(&err), "spend_block.price_unknown");
+            assert_eq!(server.connections(), 0);
+
+            // The user prices it. Now it goes out: the model, the limit the
+            // user chose (under the key the provider's default row uses) and
+            // the provider-wide required option all ride on the request.
+            sqlx::query("INSERT INTO price_overrides (provider_id, model_id, pricing, updated_at) VALUES ('fixture-host-a', 'live-x', ?, 't')")
+                .bind(r#"{"input_per_mtok":1,"output_per_mtok":2,"as_of":"2026-10-13","source":"user"}"#)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            call_hosted(&pool, &key_hex, &model, RunAttendance::Attended).await.unwrap();
+            let sent = server.captured()[0].json();
+            assert_eq!(sent["model"], "live-x");
+            assert_eq!(sent["max_completion_tokens"], 77);
+            assert_eq!(sent["fixture_routing"]["fixture_collect"], "deny");
+            let (source, model_id): (String, String) = sqlx::query_as("SELECT price_source, model_id FROM provider_usage_ledger")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+            assert_eq!((source.as_str(), model_id.as_str()), ("user", "live-x"));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_model_row_that_weakens_the_required_option_never_reaches_the_network() {
+        with_temp_shared_db(|pool| async move {
+            let server = LoopbackServer::start(vec![loopback_chat_ok()]);
+            let (key_hex, _default) = spend_rig(&pool, &server, Some(PRICE_TEXT)).await;
+            seed_user(&pool).await;
+            sqlx::query(
+                "UPDATE providers SET required_request_options = '{\"fixture_routing\":{\"fixture_collect\":\"deny\"}}' \
+                 WHERE id = 'fixture-host-a'",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            add_curated_model(
+                &pool,
+                "fixture-model-weak",
+                r#"{"max_completion_tokens":64,"fixture_routing":{"fixture_collect":"allow"}}"#,
+                "active",
+            )
+            .await;
+            grant_consent(&pool, &key_hex, true).await;
+            pick_account_model(&pool, Some("fixture-model-weak")).await;
+
+            let picked = select_for_step(&pool, &key_hex).await.unwrap();
+            let model = picked.hosted_model.expect("a hosted row");
+            let err = call_hosted(&pool, &key_hex, &model, RunAttendance::Attended).await.unwrap_err();
+            assert!(
+                !matches!(err, ConductorError::SpendBlock { .. }),
+                "the request builder refuses before the spend gate: {err:?}"
+            );
+            assert_eq!(server.connections(), 0);
+            assert_eq!(ledger_count(&key_hex).await, 0);
+        })
+        .await;
     }
 
     #[tokio::test]

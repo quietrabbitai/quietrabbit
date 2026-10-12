@@ -33,6 +33,7 @@ fn chat_route(base: &str) -> HostedRoute {
         model_id: "fixture-model".to_owned(),
         model_status: ModelStatus::Active,
         request_options: Some(json!({"max_completion_tokens": 512})),
+        required_request_options: None,
     }
 }
 
@@ -857,6 +858,88 @@ async fn check_key_without_a_models_path_makes_no_request() {
     let ctx = ctx_for(&route);
     assert!(matches!(
         client().check_key(&ctx).await.unwrap_err(),
+        ProviderError::Misconfigured { .. }
+    ));
+    assert_eq!(server.connections(), 0);
+}
+
+#[tokio::test]
+async fn list_models_reads_context_and_retirement_where_reported() {
+    // Each context field name a list may use, a retirement date, a malformed
+    // optional value and an entry with no id. Only the id is required.
+    let server = LoopbackServer::start(vec![Canned::json(
+        200,
+        r#"{"data":[
+            {"id":"m-window","context_window":131072},
+            {"id":"m-maxctx","max_context_length":256000,"retires_at":"2027-02-01T00:00:00Z"},
+            {"id":"m-maxin","max_input_tokens":200000,"expiration_date":"2027-03-01"},
+            {"id":"m-len","context_length":8192},
+            {"id":"m-bare"},
+            {"id":"m-bad","context_window":"big","retires_at":"soon; drop table"},
+            {"id":"m-zero","context_window":0},
+            {"nothing":true}
+        ]}"#,
+    )]);
+    let ctx = ctx_for(&chat_route(&server.base()));
+    let got = client().list_models(&ctx).await.unwrap();
+    let by = |id: &str| got.iter().find(|m| m.id == id).unwrap().clone();
+
+    assert_eq!(got.len(), 7);
+    assert_eq!(by("m-window").context_tokens, Some(131_072));
+    assert_eq!(by("m-maxctx").context_tokens, Some(256_000));
+    assert_eq!(
+        by("m-maxctx").retires_at.as_deref(),
+        Some("2027-02-01T00:00:00Z")
+    );
+    assert_eq!(by("m-maxin").context_tokens, Some(200_000));
+    assert_eq!(by("m-maxin").retires_at.as_deref(), Some("2027-03-01"));
+    assert_eq!(by("m-len").context_tokens, Some(8192));
+    assert_eq!(by("m-bare").context_tokens, None);
+    assert_eq!(by("m-bare").retires_at, None);
+    // A malformed optional value is dropped; the model is still listed.
+    assert_eq!(by("m-bad").context_tokens, None);
+    assert_eq!(by("m-bad").retires_at, None);
+    assert_eq!(by("m-zero").context_tokens, None);
+
+    let sent = &server.captured()[0];
+    assert_eq!(sent.method, "GET");
+    assert_eq!(sent.path, "/v1/models");
+}
+
+#[tokio::test]
+async fn list_models_drops_unusable_ids_duplicates_and_caps_the_list() {
+    let mut entries = vec![
+        json!({"id":"ok-1"}),
+        json!({"id":"ok-1"}),
+        json!({"id":"has space"}),
+        json!({"id":"has\nnewline"}),
+        json!({"id":""}),
+        json!({"id":"x".repeat(201)}),
+        json!({"id":"@scope/ok:2"}),
+    ];
+    for i in 0..(crate::providers::hosted_client::MAX_LIVE_MODELS + 10) {
+        entries.push(json!({"id": format!("bulk-{i}")}));
+    }
+    let server = LoopbackServer::start(vec![Canned::json(
+        200,
+        &json!({ "data": entries }).to_string(),
+    )]);
+    let ctx = ctx_for(&chat_route(&server.base()));
+    let got = client().list_models(&ctx).await.unwrap();
+    assert_eq!(got.len(), crate::providers::hosted_client::MAX_LIVE_MODELS);
+    assert_eq!(got[0].id, "ok-1");
+    assert_eq!(got[1].id, "@scope/ok:2");
+    assert!(got.iter().all(|m| !m.id.contains(' ') && !m.id.is_empty()));
+}
+
+#[tokio::test]
+async fn list_models_without_a_models_path_makes_no_request() {
+    let server = LoopbackServer::start(vec![chat_ok()]);
+    let mut route = chat_route(&server.base());
+    route.models_path = None;
+    let ctx = ctx_for(&route);
+    assert!(matches!(
+        client().list_models(&ctx).await.unwrap_err(),
         ProviderError::Misconfigured { .. }
     ));
     assert_eq!(server.connections(), 0);

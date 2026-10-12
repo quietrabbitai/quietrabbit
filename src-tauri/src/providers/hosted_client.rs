@@ -426,6 +426,21 @@ impl HostedClient {
     /// GET the provider's model list with the key. `Ok(ids)` means the key
     /// works and the endpoint is reachable; 401 or 403 is `InvalidApiKey`.
     pub async fn check_key(&self, ctx: &CallContext) -> Result<Vec<String>, ProviderError> {
+        Ok(self
+            .list_models(ctx)
+            .await?
+            .into_iter()
+            .map(|m| m.id)
+            .collect())
+    }
+
+    /// GET the provider's model list with the key and read what it reports
+    /// about each model (items.id=711): the id, the context window and the
+    /// retirement date where the provider gives them. Everything but the id
+    /// is optional and a malformed optional value is dropped, not an error.
+    /// The only production caller is the user-clicked refresh command: QR
+    /// never refreshes a list by itself (decisions.id=875 point 5).
+    pub async fn list_models(&self, ctx: &CallContext) -> Result<Vec<LiveModel>, ProviderError> {
         let url = ctx
             .models_url()
             .ok_or_else(|| misconfigured_ctx(ctx, "it has no model list to check"))?;
@@ -445,7 +460,7 @@ impl HostedClient {
         let bytes = self.read_body(ctx, response).await?;
         let body: Value = serde_json::from_slice(&bytes)
             .map_err(|_| malformed(ctx, "the model list was not valid JSON"))?;
-        parse_model_ids(ctx, &body)
+        parse_live_models(ctx, &body)
     }
 
     /// Availability check. Never returns `Err` or panics: every failure is a
@@ -806,20 +821,83 @@ fn answer_or_error(
     }
 }
 
-fn parse_model_ids(ctx: &CallContext, body: &Value) -> Result<Vec<String>, ProviderError> {
+/// One model from a provider's live list (items.id=711).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveModel {
+    pub id: String,
+    /// Context window in tokens, when the list reports one.
+    pub context_tokens: Option<u32>,
+    /// Retirement date text as the provider gave it, when it reports one.
+    pub retires_at: Option<String>,
+}
+
+/// The most models one list may contribute. A longer list is cut here, in
+/// provider order, so a hostile or broken response cannot grow the store.
+pub const MAX_LIVE_MODELS: usize = 2000;
+const MAX_MODEL_ID_LEN: usize = 200;
+
+/// Wire field names under which lists report a context window, in the order
+/// tried. Names describe a wire format; none names a provider.
+const CONTEXT_FIELDS: [&str; 5] = [
+    "context_window",
+    "max_context_length",
+    "max_input_tokens",
+    "context_length",
+    "inputTokenLimit",
+];
+const RETIRES_FIELDS: [&str; 3] = ["retires_at", "expiration_date", "expires_at"];
+
+/// A model id is later sent back to the provider as a request field, so a
+/// list entry is kept only if it is plain printable ASCII with no spaces.
+fn valid_model_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= MAX_MODEL_ID_LEN && id.bytes().all(|b| (0x21..=0x7e).contains(&b))
+}
+
+fn live_context(entry: &Value) -> Option<u32> {
+    CONTEXT_FIELDS
+        .iter()
+        .find_map(|k| entry.get(*k).and_then(Value::as_u64))
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|n| *n > 0)
+}
+
+fn live_retires_at(entry: &Value) -> Option<String> {
+    RETIRES_FIELDS
+        .iter()
+        .find_map(|k| entry.get(*k).and_then(Value::as_str))
+        .filter(|t| {
+            !t.is_empty()
+                && t.len() <= 40
+                && t.bytes().all(|b| {
+                    b.is_ascii_digit() || matches!(b, b'-' | b':' | b'T' | b'Z' | b'.' | b'+')
+                })
+        })
+        .map(str::to_owned)
+}
+
+fn parse_live_models(ctx: &CallContext, body: &Value) -> Result<Vec<LiveModel>, ProviderError> {
     let list = body["data"]
         .as_array()
         .or_else(|| body["models"].as_array())
         .ok_or_else(|| malformed(ctx, "the model list had an unexpected shape"))?;
-    Ok(list
-        .iter()
-        .filter_map(|m| {
-            m["id"]
-                .as_str()
-                .or_else(|| m["name"].as_str())
-                .map(str::to_owned)
-        })
-        .collect())
+    let mut out: Vec<LiveModel> = Vec::new();
+    for entry in list {
+        let Some(id) = entry["id"].as_str().or_else(|| entry["name"].as_str()) else {
+            continue;
+        };
+        if !valid_model_id(id) || out.iter().any(|m| m.id == id) {
+            continue;
+        }
+        out.push(LiveModel {
+            id: id.to_owned(),
+            context_tokens: live_context(entry),
+            retires_at: live_retires_at(entry),
+        });
+        if out.len() >= MAX_LIVE_MODELS {
+            break;
+        }
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------

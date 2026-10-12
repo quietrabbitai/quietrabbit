@@ -95,6 +95,7 @@ TABLE calibration
   output_factor REAL notnull=1 pk=0 default=Some("1.0")
   sample_count INTEGER notnull=1 pk=0 default=Some("0")
   updated_at TEXT notnull=1 pk=0 default=None
+  output_sample_count INTEGER notnull=1 pk=0 default=Some("0")
 TABLE integration_keys
   id TEXT notnull=0 pk=1 default=None
   provider TEXT notnull=1 pk=0 default=None
@@ -136,6 +137,20 @@ TABLE provider_limits
   created_at TEXT notnull=1 pk=0 default=None
   updated_at TEXT notnull=1 pk=0 default=None
   approves_unattended INTEGER notnull=1 pk=0 default=Some("0")
+TABLE provider_live_models
+  provider_id TEXT notnull=1 pk=1 default=None
+  model_id TEXT notnull=1 pk=2 default=None
+  context_tokens INTEGER notnull=0 pk=0 default=None
+  context_as_of TEXT notnull=0 pk=0 default=None
+  retires_at TEXT notnull=0 pk=0 default=None
+  first_seen_at TEXT notnull=1 pk=0 default=None
+  last_seen_at TEXT notnull=1 pk=0 default=None
+  present INTEGER notnull=1 pk=0 default=Some("1")
+  user_output_limit INTEGER notnull=0 pk=0 default=None
+TABLE provider_model_refresh
+  provider_id TEXT notnull=0 pk=1 default=None
+  refreshed_at TEXT notnull=1 pk=0 default=None
+  listed_count INTEGER notnull=1 pk=0 default=None
 TABLE provider_rate_snapshot
   provider_id TEXT notnull=0 pk=1 default=None
   observed_at TEXT notnull=1 pk=0 default=None
@@ -878,6 +893,7 @@ TABLE providers
   credential_acquisition TEXT notnull=0 pk=0 default=None
   spend_limit_url TEXT notnull=0 pk=0 default=None
   logo_key TEXT notnull=0 pk=0 default=None
+  required_request_options TEXT notnull=0 pk=0 default=None
 TABLE schema_version
   version INTEGER notnull=0 pk=1 default=None
   applied_at TEXT notnull=1 pk=0 default=None

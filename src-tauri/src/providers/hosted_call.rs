@@ -173,6 +173,10 @@ pub struct HostedRoute {
     pub model_id: String,
     pub model_status: ModelStatus,
     pub request_options: Option<Value>,
+    /// The provider's `required_request_options` (items.id=711): merged OVER
+    /// `request_options` on every call; a conflicting model row is
+    /// Misconfigured.
+    pub required_request_options: Option<Value>,
 }
 
 impl HostedRoute {
@@ -189,6 +193,7 @@ impl HostedRoute {
             model_id: model.model_id.clone(),
             model_status: model.status,
             request_options: model.request_options.clone(),
+            required_request_options: provider.required_request_options.clone(),
         }
     }
 }
@@ -620,7 +625,75 @@ fn parse_options(
             }
         }
     }
-    Ok(obj)
+    merge_required_options(route, dialect, obj)
+}
+
+/// Apply the provider's `required_request_options` OVER the model's options
+/// (items.id=711). The required object is validated like any request options
+/// (an object, no field QR controls). A key present in both must agree: a
+/// nested object is merged key by key, anything else must be equal, otherwise
+/// the call is Misconfigured and nothing is sent, so a model row can never
+/// weaken a provider-wide privacy option.
+fn merge_required_options(
+    route: &HostedRoute,
+    dialect: Dialect,
+    mut model_options: Map<String, Value>,
+) -> Result<Map<String, Value>, ProviderError> {
+    let required = match &route.required_request_options {
+        None | Some(Value::Null) => return Ok(model_options),
+        Some(Value::Object(o)) => o,
+        Some(_) => {
+            return Err(misconfigured(
+                route,
+                "this provider's required request options are not a JSON object",
+            ))
+        }
+    };
+    for key in required.keys() {
+        let k = key.as_str();
+        let reserved = FORBIDDEN_OPTION_KEYS.contains(&k)
+            || OPENAI_LIMIT_KEYS.contains(&k)
+            || (dialect == Dialect::AnthropicMessages && k == "system");
+        if reserved {
+            return Err(misconfigured(
+                route,
+                "this provider's required request options set a field QR controls",
+            ));
+        }
+    }
+
+    fn merge(into: &mut Map<String, Value>, required: &Map<String, Value>) -> bool {
+        for (k, want) in required {
+            match into.get_mut(k) {
+                None => {
+                    into.insert(k.clone(), want.clone());
+                }
+                Some(Value::Object(have)) => match want {
+                    Value::Object(want) => {
+                        if !merge(have, want) {
+                            return false;
+                        }
+                    }
+                    _ => return false,
+                },
+                Some(have) => {
+                    if have != want {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    if merge(&mut model_options, required) {
+        Ok(model_options)
+    } else {
+        Err(misconfigured(
+            route,
+            "this model's request options conflict with the provider's required options",
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -645,6 +718,7 @@ mod tests {
             model_id: "fixture-model".to_owned(),
             model_status: ModelStatus::Active,
             request_options: Some(json!({"max_completion_tokens": 512})),
+            required_request_options: None,
         }
     }
 
@@ -909,6 +983,108 @@ mod tests {
                 Err(ProviderError::Misconfigured { .. })
             ));
         }
+    }
+
+    // -- items.id=711: provider-level required_request_options ---------------
+
+    fn with_required(model: serde_json::Value, required: serde_json::Value) -> HostedRoute {
+        let mut r = route();
+        r.request_options = Some(model);
+        r.required_request_options = Some(required);
+        r
+    }
+
+    #[test]
+    fn required_options_are_added_to_a_model_that_lacks_them() {
+        // The case the field exists for: a model with no curated options of
+        // its own still carries the provider-wide privacy option.
+        let r = with_required(
+            json!({"max_tokens": 64}),
+            json!({"fixture_routing": {"fixture_collect": "deny"}}),
+        );
+        let ctx = build(&r).unwrap();
+        assert_eq!(ctx.options["fixture_routing"]["fixture_collect"], "deny");
+        assert_eq!(ctx.options["max_tokens"], 64);
+    }
+
+    #[test]
+    fn required_options_merge_into_a_shared_nested_object() {
+        let r = with_required(
+            json!({"max_tokens": 64, "fixture_routing": {"order": ["a"]}}),
+            json!({"fixture_routing": {"fixture_collect": "deny"}}),
+        );
+        let ctx = build(&r).unwrap();
+        assert_eq!(ctx.options["fixture_routing"]["fixture_collect"], "deny");
+        assert_eq!(ctx.options["fixture_routing"]["order"], json!(["a"]));
+    }
+
+    #[test]
+    fn a_model_row_that_weakens_a_required_option_fails_closed() {
+        // The same key set to a different value, at the top level and nested,
+        // and a scalar where the provider requires an object: all are
+        // Misconfigured, so nothing is sent.
+        for model in [
+            json!({"max_tokens": 64, "fixture_routing": {"fixture_collect": "allow"}}),
+            json!({"max_tokens": 64, "fixture_routing": "anything"}),
+            json!({"max_tokens": 64, "fixture_routing": {"fixture_collect": null}}),
+        ] {
+            let r = with_required(
+                model.clone(),
+                json!({"fixture_routing": {"fixture_collect": "deny"}}),
+            );
+            assert!(
+                matches!(build(&r), Err(ProviderError::Misconfigured { .. })),
+                "{model} must fail closed"
+            );
+        }
+        let r = with_required(
+            json!({"max_tokens": 64, "fixture_flag": false}),
+            json!({"fixture_flag": true}),
+        );
+        assert!(matches!(
+            build(&r),
+            Err(ProviderError::Misconfigured { .. })
+        ));
+    }
+
+    #[test]
+    fn identical_required_options_on_the_model_row_are_accepted() {
+        let r = with_required(
+            json!({"max_tokens": 64, "fixture_routing": {"fixture_collect": "deny"}}),
+            json!({"fixture_routing": {"fixture_collect": "deny"}}),
+        );
+        assert!(build(&r).is_ok());
+    }
+
+    #[test]
+    fn required_options_cannot_set_fields_qr_controls() {
+        for reserved in [
+            "model",
+            "messages",
+            "stream",
+            "max_tokens",
+            "max_completion_tokens",
+        ] {
+            let r = with_required(json!({"max_tokens": 64}), json!({ reserved: 1 }));
+            assert!(
+                matches!(build(&r), Err(ProviderError::Misconfigured { .. })),
+                "{reserved} must be rejected in required options"
+            );
+        }
+        let r = with_required(json!({"max_tokens": 64}), json!([1]));
+        assert!(matches!(
+            build(&r),
+            Err(ProviderError::Misconfigured { .. })
+        ));
+        // `system` is reserved on the Messages dialect only.
+        let mut r = with_required(json!({"max_tokens": 64}), json!({"system": "x"}));
+        r.api_dialect = Some("anthropic_messages".to_owned());
+        r.base_url_template = Some("https://api.example.test".to_owned());
+        r.auth_scheme = Some("x-api-key".to_owned());
+        assert!(matches!(
+            build(&r),
+            Err(ProviderError::Misconfigured { .. })
+        ));
     }
 
     #[test]

@@ -80,6 +80,17 @@ pub enum Code {
     WarnDestinationRiskHigh,
     /// The content comes from a sensitive Persona. Raises the overall tier.
     WarnSensitivePersonaContent,
+    /// The selected model came from the provider's live list and QR has not
+    /// reviewed it: its price is unknown and its privacy is unverified, and
+    /// the consent the user gave covers the reviewed models only (items.id=711).
+    /// Strong.
+    WarnModelUncurated,
+    /// The provider's last list no longer includes this model; it may be
+    /// retired (items.id=711). Notice.
+    WarnModelMayBeRetired,
+    /// The model is marked deprecated, or has a retirement date (items.id=711).
+    /// Notice.
+    WarnModelDeprecated,
 
     // -- a call was stopped or parked before any network traffic --------------
     BlockConsentRequired,
@@ -94,6 +105,15 @@ pub enum Code {
     /// The spend ledger could not be read or written, so nothing can be
     /// enforced. The call is not made (fail closed).
     BlockLedgerUnavailable,
+    /// The selected model is marked retired. Nothing is sent and the default
+    /// is not substituted (items.id=711).
+    BlockModelRetired,
+    /// The selected model is neither a reviewed model nor in the user's live
+    /// list. Nothing is sent and the default is not substituted (items.id=711).
+    BlockModelUnavailable,
+    /// An uncurated model has no output token limit the user chose, and the
+    /// client will not send without one (items.id=711).
+    BlockModelOutputLimitRequired,
 
     // -- cost basis, price state, limit state, consent state ------------------
     CostBasisListPriceEstimate,
@@ -126,6 +146,9 @@ impl Code {
         Code::WarnDestinationRiskMedium,
         Code::WarnDestinationRiskHigh,
         Code::WarnSensitivePersonaContent,
+        Code::WarnModelUncurated,
+        Code::WarnModelMayBeRetired,
+        Code::WarnModelDeprecated,
         Code::BlockConsentRequired,
         Code::BlockReconsentRequired,
         Code::BlockPriceUnknown,
@@ -134,6 +157,9 @@ impl Code {
         Code::BlockBudgetApprovalRequired,
         Code::BlockRateLimitedLongWait,
         Code::BlockLedgerUnavailable,
+        Code::BlockModelRetired,
+        Code::BlockModelUnavailable,
+        Code::BlockModelOutputLimitRequired,
         Code::CostBasisListPriceEstimate,
         Code::PriceStateKnown,
         Code::PriceStateUnknown,
@@ -164,6 +190,9 @@ impl Code {
             Code::WarnDestinationRiskMedium => "warning.destination_risk_medium",
             Code::WarnDestinationRiskHigh => "warning.destination_risk_high",
             Code::WarnSensitivePersonaContent => "warning.sensitive_persona_content",
+            Code::WarnModelUncurated => "warning.model_uncurated",
+            Code::WarnModelMayBeRetired => "warning.model_may_be_retired",
+            Code::WarnModelDeprecated => "warning.model_deprecated",
             Code::BlockConsentRequired => "spend_block.consent_required",
             Code::BlockReconsentRequired => "spend_block.reconsent_required",
             Code::BlockPriceUnknown => "spend_block.price_unknown",
@@ -172,6 +201,9 @@ impl Code {
             Code::BlockBudgetApprovalRequired => "spend_block.budget_approval_required",
             Code::BlockRateLimitedLongWait => "spend_block.rate_limited_long_wait",
             Code::BlockLedgerUnavailable => "spend_block.ledger_unavailable",
+            Code::BlockModelRetired => "spend_block.model_retired",
+            Code::BlockModelUnavailable => "spend_block.model_unavailable",
+            Code::BlockModelOutputLimitRequired => "spend_block.model_output_limit_required",
             Code::CostBasisListPriceEstimate => "cost_basis.list_price_estimate",
             Code::PriceStateKnown => "price_state.known",
             Code::PriceStateUnknown => "price_state.unknown",
@@ -192,6 +224,7 @@ impl Code {
             Code::WarnUnverifiedProvider
             | Code::WarnTrainsOnDataByDefault
             | Code::WarnModelTrainsOverride
+            | Code::WarnModelUncurated
             | Code::WarnPriceUnknown
             | Code::WarnDestinationRiskHigh => WarningTier::Strong,
             Code::WarnVerificationStale
@@ -201,6 +234,8 @@ impl Code {
             | Code::WarnCommitmentPolicyOnly
             | Code::WarnCostMetered
             | Code::WarnPriceStale
+            | Code::WarnModelMayBeRetired
+            | Code::WarnModelDeprecated
             | Code::WarnDestinationRiskMedium => WarningTier::Notice,
             // The sensitive-persona code does not carry a tier of its own: it
             // raises the overall tier (see disclosure.rs).
@@ -233,6 +268,9 @@ mod tests {
             "warning.destination_risk_medium",
             "warning.destination_risk_high",
             "warning.sensitive_persona_content",
+            "warning.model_uncurated",
+            "warning.model_may_be_retired",
+            "warning.model_deprecated",
             "spend_block.consent_required",
             "spend_block.reconsent_required",
             "spend_block.price_unknown",
@@ -241,6 +279,9 @@ mod tests {
             "spend_block.budget_approval_required",
             "spend_block.rate_limited_long_wait",
             "spend_block.ledger_unavailable",
+            "spend_block.model_retired",
+            "spend_block.model_unavailable",
+            "spend_block.model_output_limit_required",
             "cost_basis.list_price_estimate",
             "price_state.known",
             "price_state.unknown",
@@ -268,9 +309,9 @@ mod tests {
     /// this length check keeps the two in step.
     #[test]
     fn all_lists_every_variant() {
-        // 14 warnings + 8 blocks + 1 cost basis + 3 price states
+        // 17 warnings + 11 blocks + 1 cost basis + 3 price states
         // + 3 limit states + 4 consent states.
-        assert_eq!(Code::ALL.len(), 33);
+        assert_eq!(Code::ALL.len(), 39);
     }
 
     #[test]
@@ -280,6 +321,10 @@ mod tests {
         assert_eq!(Code::WarnModelTrainsOverride.tier(), WarningTier::Strong);
         assert_eq!(Code::WarnPriceUnknown.tier(), WarningTier::Strong);
         assert_eq!(Code::WarnDestinationRiskHigh.tier(), WarningTier::Strong);
+        assert_eq!(Code::WarnModelUncurated.tier(), WarningTier::Strong);
+        assert_eq!(Code::WarnModelMayBeRetired.tier(), WarningTier::Notice);
+        assert_eq!(Code::WarnModelDeprecated.tier(), WarningTier::Notice);
+        assert_eq!(Code::BlockModelRetired.tier(), WarningTier::None);
         assert_eq!(Code::WarnVerificationStale.tier(), WarningTier::Notice);
         assert_eq!(Code::WarnRetainsData.tier(), WarningTier::Notice);
         assert_eq!(Code::WarnRetentionUnstated.tier(), WarningTier::Notice);

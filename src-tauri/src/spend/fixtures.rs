@@ -62,6 +62,7 @@ pub(crate) fn provider() -> Provider {
         credential_acquisition: None,
         spend_limit_url: None,
         logo_key: None,
+        required_request_options: None,
     }
 }
 

@@ -30,19 +30,25 @@ use sqlx::SqliteConnection;
 use tauri::State;
 
 use crate::auth::registry::{key_hex, KeyRegistry};
+use crate::commands::provider_models::{calibration_dto, CalibrationDto, ContextDto};
+use crate::conductor::model_selection::{
+    resolve_hosted_model, synthesize_live_model, ModelError, CONTEXT_UNKNOWN,
+};
+use crate::persistence::provider_models_store::{get_live_model_conn, get_refresh_conn};
 use crate::persistence::provider_spend_store::{
     self as store, LimitMetric, LimitPeriod, LimitRow, LimitSpec, ScopeKind, UsageFilter,
 };
 use crate::persistence::provider_store::{self, Provider, ProviderModel};
+use crate::spend::calibration::applied_from;
 use crate::spend::codes::{Code, WarningTier};
 use crate::spend::disclosure::{
     attributes_hash, compute_warnings, cost_class_of, effective_attributes,
-    provider_can_cost_money, CostClass, PriceView, Warning, WarningInput,
+    provider_can_cost_money, CostClass, ModelNotes, PriceView, Warning, WarningInput,
 };
 use crate::spend::estimate::{
     expected_micros, input_tokens_estimate, worst_case, NEUTRAL_PERMILLE,
 };
-use crate::spend::money::{permille_ceil, permille_ceil_text};
+use crate::spend::money::permille_ceil;
 use crate::spend::price::{resolve_price, PriceQuote};
 
 /// Suggested cap at first consent to a metered provider: 5 USD per month.
@@ -309,7 +315,12 @@ pub struct UsageSummary {
 #[derive(Debug, Clone, Deserialize, Type)]
 pub struct EstimateCostRequest {
     pub provider_id: String,
-    pub model_id: String,
+    /// The model to price. None = the model the next step would use at
+    /// `persona_id` and `focus_id` (the stored selection, else the default).
+    /// A model only the user's live list names is allowed (items.id=711).
+    pub model_id: Option<String>,
+    pub persona_id: Option<String>,
+    pub focus_id: Option<String>,
     /// Size of the prompt in BYTES (not characters).
     pub input_bytes: u32,
     /// The output limit to price against; the model row's limit when absent.
@@ -334,20 +345,32 @@ pub struct CostEstimate {
     pub input_micros: Option<String>,
     pub worst_case_micros: Option<String>,
     pub expected_micros: Option<String>,
+    /// The model that was priced.
+    pub model_id: String,
+    /// `curated` or `uncurated` (items.id=711).
+    pub origin: String,
+    /// The context window used, with its source and date. `tokens` is None
+    /// for an uncurated model whose list reported none.
+    pub context: ContextDto,
+    /// The calibration factors in force. Output calibration assumes the
+    /// provider's completion tokens include its reasoning tokens (verified
+    /// for one provider) and feeds only `expected_micros`; the input factor
+    /// is applied to the worst case only when it is above 1.0.
+    pub calibration: CalibrationDto,
 }
 
 // ---------------------------------------------------------------------------
 // Session
 // ---------------------------------------------------------------------------
 
-async fn session(key_registry: &KeyRegistry) -> Result<(String, String), String> {
+pub(crate) async fn session(key_registry: &KeyRegistry) -> Result<(String, String), String> {
     key_registry
         .with_key(|k| (k.user_id.clone(), key_hex(&k.master_key)))
         .await
         .ok_or_else(|| "not logged in".to_owned())
 }
 
-fn internal<E: std::fmt::Display>(what: &str, e: E) -> String {
+pub(crate) fn internal<E: std::fmt::Display>(what: &str, e: E) -> String {
     log::warn!("provider_spend: {what}: {e}");
     format!("internal:{what}")
 }
@@ -373,7 +396,10 @@ pub(crate) struct Catalog {
     pub(crate) pricing_texts: Vec<(String, Option<String>)>,
 }
 
-async fn load_catalog(pool: &sqlx::SqlitePool, provider_id: &str) -> Result<Catalog, String> {
+pub(crate) async fn load_catalog(
+    pool: &sqlx::SqlitePool,
+    provider_id: &str,
+) -> Result<Catalog, String> {
     let provider = provider_store::get_provider(pool, provider_id)
         .await
         .map_err(|e| internal("provider lookup", e))?
@@ -391,14 +417,20 @@ async fn load_catalog(pool: &sqlx::SqlitePool, provider_id: &str) -> Result<Cata
     })
 }
 
-fn pricing_text<'a>(texts: &'a [(String, Option<String>)], model_id: &str) -> Option<&'a str> {
+pub(crate) fn pricing_text<'a>(
+    texts: &'a [(String, Option<String>)],
+    model_id: &str,
+) -> Option<&'a str> {
     texts
         .iter()
         .find(|(id, _)| id == model_id)
         .and_then(|(_, t)| t.as_deref())
 }
 
-fn pick_model<'a>(cat: &'a Catalog, model_id: Option<&str>) -> Option<&'a ProviderModel> {
+pub(crate) fn pick_model<'a>(
+    cat: &'a Catalog,
+    model_id: Option<&str>,
+) -> Option<&'a ProviderModel> {
     match model_id {
         Some(id) => cat.models.iter().find(|m| m.model_id == id),
         None => cat
@@ -409,7 +441,7 @@ fn pick_model<'a>(cat: &'a Catalog, model_id: Option<&str>) -> Option<&'a Provid
     }
 }
 
-fn today_local() -> chrono::NaiveDate {
+pub(crate) fn today_local() -> chrono::NaiveDate {
     chrono::Local::now().date_naive()
 }
 
@@ -436,7 +468,37 @@ pub(crate) async fn disclosure_impl(
     model_id: Option<&str>,
     sensitive_persona: bool,
 ) -> Result<ProviderDisclosure, String> {
-    let model = pick_model(cat, model_id);
+    let curated = pick_model(cat, model_id);
+    // A model only the user's live list names is "available, not reviewed"
+    // (items.id=711): it gets the provider's attributes plus its own model_notes.
+    let mut model_notes = ModelNotes::default();
+    let mut live_model: Option<ProviderModel> = None;
+    let refreshed = get_refresh_conn(conn, &cat.provider.id)
+        .await
+        .map_err(|e| internal("refresh row", e))?
+        .is_some();
+    if let Some(c) = curated {
+        model_notes.deprecated = c.status
+            == crate::persistence::provider_store::ModelStatus::Deprecated
+            || c.retires_at.is_some();
+        if refreshed {
+            let row = get_live_model_conn(conn, &cat.provider.id, &c.model_id)
+                .await
+                .map_err(|e| internal("live model", e))?;
+            model_notes.may_be_retired = !row.is_some_and(|r| r.present);
+        }
+    } else if let Some(id) = model_id {
+        if let Some(row) = get_live_model_conn(conn, &cat.provider.id, id)
+            .await
+            .map_err(|e| internal("live model", e))?
+        {
+            model_notes.uncurated = true;
+            model_notes.may_be_retired = !row.present;
+            let default = cat.models.iter().find(|m| m.is_default);
+            live_model = Some(synthesize_live_model(default, &row));
+        }
+    }
+    let model = curated.or(live_model.as_ref());
     let hash = attributes_hash(&cat.provider, &cat.models, &cat.pricing_texts);
 
     let quote = match model {
@@ -467,6 +529,7 @@ pub(crate) async fn disclosure_impl(
     let set = compute_warnings(&WarningInput {
         provider: &cat.provider,
         model,
+        model_notes,
         price,
         price_as_of: price_as_of.clone(),
         sensitive_persona,
@@ -931,11 +994,30 @@ pub(crate) async fn estimate_impl(
     req: &EstimateCostRequest,
     today: chrono::NaiveDate,
 ) -> Result<CostEstimate, String> {
-    let model = cat
-        .models
-        .iter()
-        .find(|m| m.model_id == req.model_id)
+    // A reviewed row, else a model from the user's live list (items.id=711).
+    let wanted = req
+        .model_id
+        .as_deref()
+        .or_else(|| {
+            cat.models
+                .iter()
+                .find(|m| m.is_default)
+                .map(|m| m.model_id.as_str())
+        })
         .ok_or_else(|| "unknown_model".to_owned())?;
+    let live_synth: Option<ProviderModel>;
+    let (model, curated) = match cat.models.iter().find(|m| m.model_id == wanted) {
+        Some(m) => (m, true),
+        None => {
+            let row = get_live_model_conn(conn, &cat.provider.id, wanted)
+                .await
+                .map_err(|e| internal("live model", e))?
+                .ok_or_else(|| "unknown_model".to_owned())?;
+            let default = cat.models.iter().find(|m| m.is_default);
+            live_synth = Some(synthesize_live_model(default, &row));
+            (live_synth.as_ref().expect("just set"), false)
+        }
+    };
     let output_limit = req
         .max_output_tokens
         .filter(|n| *n > 0)
@@ -953,18 +1035,35 @@ pub(crate) async fn estimate_impl(
     let calibration = store::get_calibration_conn(conn, &cat.provider.id, &model.model_id)
         .await
         .map_err(|e| internal("calibration", e))?;
-    let input_cal = calibration
-        .as_ref()
-        .and_then(|c| permille_ceil_text(&c.input_factor))
-        .unwrap_or(NEUTRAL_PERMILLE);
-    let output_cal = calibration
-        .as_ref()
-        .and_then(|c| permille_ceil_text(&c.output_factor))
-        .unwrap_or(NEUTRAL_PERMILLE);
+    let applied = applied_from(calibration.as_ref());
     let token_factor = permille_ceil(model.token_factor).unwrap_or(NEUTRAL_PERMILLE);
     let overhead = permille_ceil(model.output_overhead).unwrap_or(NEUTRAL_PERMILLE);
 
-    let input_tokens = input_tokens_estimate(u64::from(req.input_bytes), token_factor, input_cal);
+    // The worst case (and the reported input size) use the cap-safe input
+    // factor, never below 1.0; the informational expected figure uses the
+    // factor as calibrated.
+    let input_bytes = u64::from(req.input_bytes);
+    let input_tokens =
+        input_tokens_estimate(input_bytes, token_factor, applied.cap_input_permille());
+    let expected_input_tokens =
+        input_tokens_estimate(input_bytes, token_factor, applied.input_permille);
+
+    let context = if curated {
+        ContextDto {
+            tokens: Some(model.context_window_tokens.to_string()),
+            source: model.context_window_source.clone(),
+            as_of: model.context_window_as_of.clone(),
+        }
+    } else {
+        ContextDto {
+            tokens: (model.context_window_tokens != CONTEXT_UNKNOWN)
+                .then(|| model.context_window_tokens.to_string()),
+            source: model.context_window_source.clone(),
+            as_of: model.context_window_as_of.clone(),
+        }
+    };
+    let origin = if curated { "curated" } else { "uncurated" }.to_owned();
+    let calibration_view = calibration_dto(&applied);
 
     match quote {
         PriceQuote::Unknown => Ok(CostEstimate {
@@ -978,11 +1077,21 @@ pub(crate) async fn estimate_impl(
             input_micros: None,
             worst_case_micros: None,
             expected_micros: None,
+            model_id: model.model_id.clone(),
+            origin,
+            context,
+            calibration: calibration_view,
         }),
         PriceQuote::Known(price) => {
             let est = worst_case(&price, input_tokens, output_limit);
             let expected = req.expected_output_tokens.map(|out| {
-                expected_micros(&price, input_tokens, u64::from(out), overhead, output_cal)
+                expected_micros(
+                    &price,
+                    expected_input_tokens,
+                    u64::from(out),
+                    overhead,
+                    applied.output_permille,
+                )
             });
             let stale = price.is_stale(today);
             Ok(CostEstimate {
@@ -1002,6 +1111,10 @@ pub(crate) async fn estimate_impl(
                 input_micros: Some(est.input_micros.to_string()),
                 worst_case_micros: Some(est.worst_case_micros.to_string()),
                 expected_micros: expected.map(|v| v.to_string()),
+                model_id: model.model_id.clone(),
+                origin,
+                context,
+                calibration: calibration_view,
             })
         }
     }
@@ -1016,6 +1129,27 @@ pub async fn estimate_cost(
 ) -> Result<CostEstimate, String> {
     let (user_id, key_hex_str) = session(&key_registry).await?;
     let cat = load_catalog(&pool, &request.provider_id).await?;
+    let mut request = request;
+    if request.model_id.is_none() {
+        // The model the next step would use: the stored selection, else the
+        // default. A selection that cannot be honored is reported as its code,
+        // never replaced by the default.
+        let resolved = resolve_hosted_model(
+            &pool,
+            &user_id,
+            &key_hex_str,
+            request.persona_id.as_deref(),
+            request.focus_id.as_deref(),
+            &request.provider_id,
+        )
+        .await;
+        request.model_id = match resolved {
+            Ok(r) => Some(r.model.model_id),
+            // The limit is the one thing an estimate can supply itself.
+            Err(ModelError::OutputLimitRequired { model_id }) => Some(model_id),
+            Err(e) => return Err(e.block().0.as_str().to_owned()),
+        };
+    }
     let mut conn = store::open(&user_id, &key_hex_str)
         .await
         .map_err(|e| internal("open spend store", e))?;

@@ -531,6 +531,189 @@ pub async fn upsert_preference(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Model selection (items.id=711, decisions.id=875 point 5)
+// ---------------------------------------------------------------------------
+//
+// The selected model lives in `model_id` (shared_026.sql) on the same rows as
+// the provider preference. It resolves PER COLUMN: the first non-NULL
+// `model_id` among the Focus row, the Persona row and the account row, for the
+// provider already chosen. That is deliberately not resolve_preference()'s
+// whole-row rule: a narrower row created only to hold a model must not hide
+// the account row's model.
+//
+// A narrower row IS a preference override (resolve_preference() returns the
+// narrowest row whole), so set_model_selection() never invents a preference:
+// a new narrower row copies `user_preference` and `login_available` from what
+// the scope resolves to now, or is `allowed` when the provider has no row at
+// all (never Preferred, so it cannot make a provider the choice by itself).
+// KNOWN LIMITATION, pinned by a test in conductor::provider_selection: the
+// copy goes stale if the account-level provider is later changed. Two
+// Preferred providers then resolve at that scope and the provider resolver
+// returns NotConfigured. That fails closed (the step stops and asks); it
+// never routes to a provider the user did not choose.
+
+/// Where a model selection is stored.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, specta::Type)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SelectionScope {
+    Account,
+    Persona { persona_id: String },
+    Focus { focus_id: String },
+}
+
+/// Which level a resolved selection came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, specta::Type)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionSource {
+    Focus,
+    Persona,
+    Account,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedModelSelection {
+    pub model_id: String,
+    pub source: SelectionSource,
+}
+
+/// The selected model for a provider at this Persona and Focus, per column
+/// (see the section comment). `None` when no level selects one; the caller
+/// then uses the provider's default model.
+pub async fn resolve_model_selection(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    persona_id: Option<&str>,
+    focus_id: Option<&str>,
+    provider_id: &str,
+) -> Result<Option<ResolvedModelSelection>, UserProviderPreferenceStoreError> {
+    let mut conn = pool.acquire().await?;
+
+    if let Some(focus_id) = focus_id.filter(|s| !s.is_empty()) {
+        let model: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT model_id FROM user_provider_preference
+             WHERE user_id = ? AND focus_id = ? AND provider_id = ?",
+        )
+        .bind(user_id)
+        .bind(focus_id)
+        .bind(provider_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        if let Some(Some(model_id)) = model {
+            return Ok(Some(ResolvedModelSelection {
+                model_id,
+                source: SelectionSource::Focus,
+            }));
+        }
+    }
+
+    if let Some(persona_id) = persona_id.filter(|s| !s.is_empty()) {
+        let model: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT model_id FROM user_provider_preference
+             WHERE user_id = ? AND persona_id = ? AND focus_id IS NULL AND provider_id = ?",
+        )
+        .bind(user_id)
+        .bind(persona_id)
+        .bind(provider_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        if let Some(Some(model_id)) = model {
+            return Ok(Some(ResolvedModelSelection {
+                model_id,
+                source: SelectionSource::Persona,
+            }));
+        }
+    }
+
+    let model: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT model_id FROM user_provider_preference
+         WHERE user_id = ? AND persona_id IS NULL AND focus_id IS NULL AND provider_id = ?",
+    )
+    .bind(user_id)
+    .bind(provider_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(model.flatten().map(|model_id| ResolvedModelSelection {
+        model_id,
+        source: SelectionSource::Account,
+    }))
+}
+
+/// Set (or, with `None`, clear) the model selected for `provider_id` at one
+/// scope. Writes ONLY `model_id` on an existing row at exactly that scope.
+/// With no row there, a selection creates one that copies the preference the
+/// scope resolves to (see the section comment); clearing with no row is a
+/// no-op. `persona_context` is the Persona a Focus belongs to, used only to
+/// find the preference to copy for a new Focus row.
+pub async fn set_model_selection(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    scope: &SelectionScope,
+    persona_context: Option<&str>,
+    provider_id: &str,
+    model_id: Option<&str>,
+) -> Result<(), UserProviderPreferenceStoreError> {
+    let (persona_id, focus_id): (Option<&str>, Option<&str>) = match scope {
+        SelectionScope::Account => (None, None),
+        SelectionScope::Persona { persona_id } => (Some(persona_id.as_str()), None),
+        SelectionScope::Focus { focus_id } => (None, Some(focus_id.as_str())),
+    };
+    if matches!(scope, SelectionScope::Persona { persona_id } if persona_id.is_empty())
+        || matches!(scope, SelectionScope::Focus { focus_id } if focus_id.is_empty())
+    {
+        return Err(UserProviderPreferenceStoreError::Validation(
+            "a model selection scope needs a non-empty id".to_owned(),
+        ));
+    }
+
+    let existing =
+        get_preference_at_scope(pool, user_id, persona_id, focus_id, provider_id).await?;
+
+    if let Some(existing) = existing {
+        let mut conn = pool.acquire().await?;
+        sqlx::query("UPDATE user_provider_preference SET model_id = ? WHERE id = ?")
+            .bind(model_id)
+            .bind(&existing.id)
+            .execute(&mut *conn)
+            .await?;
+        return Ok(());
+    }
+    let Some(model_id) = model_id else {
+        return Ok(());
+    };
+
+    // Nothing at this scope yet: copy what it resolves to today.
+    let resolve_persona = persona_id.or(persona_context);
+    let inherited =
+        resolve_preference(pool, user_id, resolve_persona, focus_id, provider_id).await?;
+    let (login_available, user_preference, subscription_status, plan_key) = match &inherited {
+        Some(p) => (
+            p.login_available,
+            p.user_preference,
+            p.subscription_status,
+            p.plan_key.clone(),
+        ),
+        None => (false, UserPreference::Allowed, None, None),
+    };
+    upsert_preference(
+        pool,
+        NewUserProviderPreference {
+            user_id,
+            persona_id,
+            focus_id,
+            provider_id,
+            login_available,
+            user_preference,
+            local_model_version: None,
+            subscription_status,
+            plan_key: plan_key.as_deref(),
+            model_id: Some(model_id),
+        },
+    )
+    .await?;
+    Ok(())
+}
+
 /// Record a live install/verification check (Ollama digest/tag, timestamp)
 /// -- local providers only. Never a trusted cache: callers must call this
 /// only right after an actual live check, matching
@@ -951,5 +1134,191 @@ mod tests {
             std::env::remove_var("QR_DATA_ROOT");
         }
         outcome.expect("plan_key and model_id must round-trip");
+    }
+
+    // -- items.id=711: model selection ---------------------------------------
+
+    async fn pref_of(
+        pool: &sqlx::SqlitePool,
+        persona: Option<&str>,
+        focus: Option<&str>,
+        provider: &str,
+    ) -> Option<UserProviderPreference> {
+        get_preference_at_scope(pool, "u1", persona, focus, provider)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn setting_a_model_on_an_existing_row_changes_only_the_model() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let (_tempdir, pool) = setup_real_db().await;
+
+        let outcome = async {
+            upsert_preference(
+                &pool,
+                NewUserProviderPreference {
+                    user_id: "u1",
+                    persona_id: None,
+                    focus_id: None,
+                    provider_id: "duckai",
+                    login_available: true,
+                    user_preference: UserPreference::Preferred,
+                    local_model_version: Some("v1"),
+                    subscription_status: Some(SubscriptionStatus::Paid),
+                    plan_key: Some("plan-x"),
+                    model_id: None,
+                },
+            )
+            .await?;
+            set_model_selection(
+                &pool,
+                "u1",
+                &SelectionScope::Account,
+                None,
+                "duckai",
+                Some("m-1"),
+            )
+            .await?;
+            let row = pref_of(&pool, None, None, "duckai").await.unwrap();
+            assert_eq!(row.model_id.as_deref(), Some("m-1"));
+            assert_eq!(row.user_preference, UserPreference::Preferred);
+            assert!(row.login_available);
+            assert_eq!(row.local_model_version.as_deref(), Some("v1"));
+            assert_eq!(row.subscription_status, Some(SubscriptionStatus::Paid));
+            assert_eq!(row.plan_key.as_deref(), Some("plan-x"));
+
+            // Clearing leaves the row and its preference.
+            set_model_selection(&pool, "u1", &SelectionScope::Account, None, "duckai", None)
+                .await?;
+            let row = pref_of(&pool, None, None, "duckai").await.unwrap();
+            assert_eq!(row.model_id, None);
+            assert_eq!(row.user_preference, UserPreference::Preferred);
+            Ok::<(), UserProviderPreferenceStoreError>(())
+        }
+        .await;
+
+        match saved_root {
+            Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+            None => std::env::remove_var("QR_DATA_ROOT"),
+        }
+        outcome.expect("model selection must succeed");
+    }
+
+    #[tokio::test]
+    async fn a_new_narrower_row_copies_the_resolved_preference_or_is_allowed() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let (_tempdir, pool) = setup_real_db().await;
+
+        let outcome = async {
+            upsert_preference(
+                &pool,
+                NewUserProviderPreference {
+                    user_id: "u1",
+                    persona_id: None,
+                    focus_id: None,
+                    provider_id: "duckai",
+                    login_available: true,
+                    user_preference: UserPreference::Preferred,
+                    local_model_version: None,
+                    subscription_status: None,
+                    plan_key: Some("plan-x"),
+                    model_id: Some("account-model"),
+                },
+            )
+            .await?;
+            let persona = SelectionScope::Persona {
+                persona_id: "p1".into(),
+            };
+            set_model_selection(&pool, "u1", &persona, None, "duckai", Some("persona-model"))
+                .await?;
+            let row = pref_of(&pool, Some("p1"), None, "duckai").await.unwrap();
+            assert_eq!(row.model_id.as_deref(), Some("persona-model"));
+            assert_eq!(row.user_preference, UserPreference::Preferred, "copied");
+            assert!(row.login_available);
+            assert_eq!(row.plan_key.as_deref(), Some("plan-x"));
+            // The account row is untouched.
+            let account = pref_of(&pool, None, None, "duckai").await.unwrap();
+            assert_eq!(account.model_id.as_deref(), Some("account-model"));
+
+            // A provider with no row anywhere: allowed, never Preferred.
+            set_model_selection(&pool, "u1", &persona, None, "claude", Some("m")).await?;
+            let row = pref_of(&pool, Some("p1"), None, "claude").await.unwrap();
+            assert_eq!(row.user_preference, UserPreference::Allowed);
+
+            // Clearing where no row exists writes nothing.
+            set_model_selection(
+                &pool,
+                "u1",
+                &SelectionScope::Focus {
+                    focus_id: "f9".into(),
+                },
+                Some("p1"),
+                "duckai",
+                None,
+            )
+            .await?;
+            assert!(pref_of(&pool, None, Some("f9"), "duckai").await.is_none());
+
+            // A Focus row copies what the Focus resolves to with its Persona.
+            set_model_selection(
+                &pool,
+                "u1",
+                &SelectionScope::Focus {
+                    focus_id: "f1".into(),
+                },
+                Some("p1"),
+                "duckai",
+                Some("focus-model"),
+            )
+            .await?;
+            let row = pref_of(&pool, None, Some("f1"), "duckai").await.unwrap();
+            assert_eq!(row.user_preference, UserPreference::Preferred);
+            let resolved =
+                resolve_model_selection(&pool, "u1", Some("p1"), Some("f1"), "duckai").await?;
+            assert_eq!(
+                resolved,
+                Some(ResolvedModelSelection {
+                    model_id: "focus-model".into(),
+                    source: SelectionSource::Focus
+                })
+            );
+            Ok::<(), UserProviderPreferenceStoreError>(())
+        }
+        .await;
+
+        match saved_root {
+            Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+            None => std::env::remove_var("QR_DATA_ROOT"),
+        }
+        outcome.expect("model selection must succeed");
+    }
+
+    #[tokio::test]
+    async fn an_empty_scope_id_is_refused() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let (_tempdir, pool) = setup_real_db().await;
+        let err = set_model_selection(
+            &pool,
+            "u1",
+            &SelectionScope::Persona {
+                persona_id: String::new(),
+            },
+            None,
+            "duckai",
+            Some("m"),
+        )
+        .await;
+        match saved_root {
+            Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+            None => std::env::remove_var("QR_DATA_ROOT"),
+        }
+        assert!(matches!(
+            err,
+            Err(UserProviderPreferenceStoreError::Validation(_))
+        ));
     }
 }

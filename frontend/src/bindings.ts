@@ -870,6 +870,14 @@ export const commands = {
 	listLimits: () => typedError<LimitDto[], string>(__TAURI_INVOKE("list_limits")),
 	getUsageSummary: (request: UsageSummaryRequest) => typedError<UsageSummary, string>(__TAURI_INVOKE("get_usage_summary", { request })),
 	estimateCost: (request: EstimateCostRequest) => typedError<CostEstimate, string>(__TAURI_INVOKE("estimate_cost", { request })),
+	listProviderModels: (providerId: string, personaId: string | null, focusId: string | null) => typedError<ProviderModelsView, string>(__TAURI_INVOKE("list_provider_models", { providerId, personaId, focusId })),
+	/**
+	 *  Refresh the provider's model list. USER-CLICKED ONLY: the one place QR asks
+	 *  a provider for its list, with the user's own saved key.
+	 */
+	refreshAvailableModels: (providerId: string) => typedError<RefreshResultDto, string>(__TAURI_INVOKE("refresh_available_models", { providerId })),
+	setModelSelection: (request: SetModelSelectionRequest) => typedError<null, string>(__TAURI_INVOKE("set_model_selection", { request })),
+	setPriceOverride: (request: SetPriceOverrideRequest) => typedError<ModelPriceDto, string>(__TAURI_INVOKE("set_price_override", { request })),
 };
 
 /* Types */
@@ -901,6 +909,18 @@ export type AutoResolvedSpan = {
 	decision: string,
 	suggestion_text: string | null,
 	user_modified_text: string | null,
+};
+
+export type CalibrationDto = {
+	/**  1000 = 1.0. The factor in force (neutral until enough samples). */
+	input_permille: number,
+	output_permille: number,
+	input_samples: number,
+	output_samples: number,
+	input_applied: boolean,
+	output_applied: boolean,
+	/**  Samples a factor needs before it applies. */
+	min_samples: number,
 };
 
 export type CandidateKind = "local_model" | "hosted_api";
@@ -993,6 +1013,14 @@ export type ConsentResult = {
 	cap_limit_id: string | null,
 };
 
+export type ContextDto = {
+	/**  Tokens as a decimal string; None when not known. */
+	tokens: string | null,
+	/**  `provider_api`, `curated` or `user`. */
+	source: string | null,
+	as_of: string | null,
+};
+
 /**  What using a model costs, as far as the catalog knows. */
 export type CostClass = 
 /**  The price is known and is exactly zero. */
@@ -1016,6 +1044,22 @@ export type CostEstimate = {
 	input_micros: string | null,
 	worst_case_micros: string | null,
 	expected_micros: string | null,
+	/**  The model that was priced. */
+	model_id: string,
+	/**  `curated` or `uncurated` (items.id=711). */
+	origin: string,
+	/**
+	 *  The context window used, with its source and date. `tokens` is None
+	 *  for an uncurated model whose list reported none.
+	 */
+	context: ContextDto,
+	/**
+	 *  The calibration factors in force. Output calibration assumes the
+	 *  provider's completion tokens include its reasoning tokens (verified
+	 *  for one provider) and feeds only `expected_micros`; the input factor
+	 *  is applied to the worst case only when it is above 1.0.
+	 */
+	calibration: CalibrationDto,
 };
 
 export type CreatePersonaRequest = {
@@ -1055,7 +1099,14 @@ export type DisclosedAttributes = {
 
 export type EstimateCostRequest = {
 	provider_id: string,
-	model_id: string,
+	/**
+	 *  The model to price. None = the model the next step would use at
+	 *  `persona_id` and `focus_id` (the stored selection, else the default).
+	 *  A model only the user's live list names is allowed (items.id=711).
+	 */
+	model_id: string | null,
+	persona_id: string | null,
+	focus_id: string | null,
 	/**  Size of the prompt in BYTES (not characters). */
 	input_bytes: number,
 	/**  The output limit to price against; the model row's limit when absent. */
@@ -1294,6 +1345,25 @@ export type MessageInfo = {
 	is_error: boolean,
 };
 
+export type ModelPriceDto = {
+	/**
+	 *  `price_state.known | unknown | stale`. `stale` is the "estimate may be
+	 *  stale" note: a curated or provider-reported price older than 90 days.
+	 */
+	state: string,
+	/**  `provider_api`, `curated` or `user`; None when unknown. */
+	source: string | null,
+	as_of: string | null,
+	age_days: number | null,
+	/**  Micro-USD per million tokens, decimal strings. None when unknown. */
+	input_micros_per_mtok: string | null,
+	output_micros_per_mtok: string | null,
+	tiers: PriceTierDto[],
+	is_free: boolean,
+	/**  The user's own price is in force. */
+	overridden: boolean,
+};
+
 /**
  *  Placeholder request/response shape for commands that are declared but not
  *  yet built.
@@ -1506,6 +1576,29 @@ export type PersonalFieldInfo = {
 	abstraction_tier3: string,
 };
 
+export type PriceInput = {
+	/**  USD per million tokens as exact decimal text (at most six decimals). */
+	input_per_mtok: string,
+	output_per_mtok: string,
+	tiers: PriceTierInput[],
+};
+
+export type PriceTierDto = {
+	/**  Micro-USD tier bounds as token counts, decimal strings. Exactly one set. */
+	prompt_tokens_up_to: string | null,
+	prompt_tokens_over: string | null,
+	input_micros_per_mtok: string,
+	output_micros_per_mtok: string,
+};
+
+export type PriceTierInput = {
+	prompt_tokens_up_to: number | null,
+	prompt_tokens_over: number | null,
+	/**  USD per million tokens as exact decimal text, for example `0.07`. */
+	input_per_mtok: string,
+	output_per_mtok: string,
+};
+
 /**
  *  items.id=465 (shared_016.sql): whether a provider's privacy posture is
  *  backed by contractual language (DPA/Services Agreement) or is merely
@@ -1579,6 +1672,56 @@ export type ProviderHealth = {
 	checked_at: string,
 	error: string | null,
 	available_models?: string[],
+};
+
+export type ProviderModelDto = {
+	model_id: string,
+	/**  `curated` (reviewed by QR) or `uncurated` (available, not reviewed). */
+	origin: string,
+	/**  `active`, `deprecated` or `retired`. */
+	status: string,
+	is_default: boolean,
+	/**  The model the next step will use at the asked Persona and Focus. */
+	selected: boolean,
+	/**  Named by the latest refresh. None until the user has refreshed. */
+	listed: boolean | null,
+	/**  A refresh happened and no longer names this model. */
+	may_be_retired: boolean,
+	retires_at: string | null,
+	/**  `curated` or `provider_api`; None when there is no date. */
+	retires_at_source: string | null,
+	/**
+	 *  The window QR uses. For an uncurated model whose list reported none,
+	 *  `tokens` is None and QR makes no pre-call context check.
+	 */
+	context: ContextDto,
+	/**  What the latest list reported, when it reported one. */
+	provider_context: ContextDto | null,
+	price: ModelPriceDto,
+	/**
+	 *  Tokenizer and hidden-reasoning multipliers of the curated row (1.0 for
+	 *  an uncurated model).
+	 */
+	token_factor: number | null,
+	output_overhead: number | null,
+	requires_paid: boolean,
+	qr_recommended: boolean,
+	qr_recommendation_rank: number | null,
+	/**  The output limit the user chose for an uncurated model. */
+	user_output_limit: number | null,
+	calibration: CalibrationDto | null,
+	/**  Stable warning codes that apply to this model on their own. */
+	notices: string[],
+};
+
+export type ProviderModelsView = {
+	provider_id: string,
+	/**  The provider publishes a model list QR can read (`models_path`). */
+	refresh_available: boolean,
+	refreshed_at: string | null,
+	listed_count: number | null,
+	selection: SelectionInfoDto,
+	models: ProviderModelDto[],
 };
 
 export type ProviderRecommendation = {
@@ -1714,6 +1857,16 @@ export type ReenterStepResponse = {
 	stale_output_vars: string[],
 };
 
+export type RefreshResultDto = {
+	listed: number,
+	new: number,
+	/**  Previously present, absent from this list: flagged may be retired. */
+	newly_missing: number,
+	/**  Flagged before, listed again. */
+	returned: number,
+	refreshed_at: string,
+};
+
 /**
  *  items.id=416 (decisions.id=766): a native copy gesture on ChatPane's
  *  message transcript -- content_text is the concatenated text of whatever
@@ -1734,6 +1887,20 @@ export type ResumeRunRequest = {
 };
 
 export type ScopeKind = "all" | "provider" | "persona" | "focus";
+
+export type SelectionInfoDto = {
+	/**  The stored selection at this Persona and Focus, None = the default. */
+	stored_model_id: string | null,
+	stored_from: SelectionSource | null,
+	/**  The model the next step would use. */
+	effective_model_id: string | null,
+};
+
+/**  Where a model selection is stored. */
+export type SelectionScope = { kind: "account" } | { kind: "persona"; persona_id: string } | { kind: "focus"; focus_id: string };
+
+/**  Which level a resolved selection came from. */
+export type SelectionSource = "focus" | "persona" | "account";
 
 /**
  *  Bundled to keep send_message's own parameter count under specta's 10-arg
@@ -1785,6 +1952,35 @@ export type SetLimitRequest = {
 	approves_unattended: boolean,
 	/**  Remove the limit with this (metric, period, scope) instead of setting it. */
 	remove: boolean,
+};
+
+export type SetModelSelectionRequest = {
+	provider_id: string,
+	scope: SelectionScope,
+	/**
+	 *  The Persona a Focus belongs to (used only to copy the right preference
+	 *  when a Focus scope gets its first row).
+	 */
+	persona_id: string | null,
+	/**  None clears the selection at this scope. */
+	model_id: string | null,
+	/**
+	 *  Required the first time an UNCURATED model is selected: QR sends
+	 *  nothing without an output token limit. Ignored for a curated model.
+	 */
+	max_output_tokens: number | null,
+};
+
+export type SetPriceOverrideRequest = {
+	provider_id: string,
+	model_id: string,
+	/**  None removes the override. */
+	price: PriceInput | null,
+	/**
+	 *  A price of zero makes every cap rule skip the model, so it needs this
+	 *  explicit confirmation.
+	 */
+	confirmed_free: boolean,
 };
 
 export type StoreIngestedDocumentResponse = {

@@ -105,6 +105,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/keys_004.sql"),
     },
     SchemaFile {
+        prefix: "keys",
+        version: 5,
+        sql: include_str!("../../schema/keys_005.sql"),
+    },
+    SchemaFile {
         prefix: "messages",
         version: 1,
         sql: include_str!("../../schema/messages_001.sql"),
@@ -373,6 +378,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         prefix: "shared",
         version: 28,
         sql: include_str!("../../schema/shared_028.sql"),
+    },
+    SchemaFile {
+        prefix: "shared",
+        version: 29,
+        sql: include_str!("../../schema/shared_029.sql"),
     },
     SchemaFile {
         prefix: "tier3_cookies",
@@ -2237,15 +2247,15 @@ mod tests {
             .await
             .expect("shared migration chain must apply cleanly on a fresh db");
         assert_eq!(
-            applied, 28,
-            "expected all twenty-eight shared schema versions to apply"
+            applied, 29,
+            "expected all twenty-nine shared schema versions to apply"
         );
 
         let version: (i64,) = sqlx::query_as("SELECT MAX(version) FROM schema_version")
             .fetch_one(&mut conn)
             .await
             .unwrap();
-        assert_eq!(version.0, 28);
+        assert_eq!(version.0, 29);
     }
 
     /// items.id=708 / items.id=703 / items.id=724: shared_026.sql and
@@ -2380,11 +2390,12 @@ mod tests {
             Option<String>,
             String,
             Option<String>,
+            Option<String>,
         );
         let rows: Vec<Row> = sqlx::query_as(
             "SELECT p.id, p.display_name, p.api_dialect, p.base_url_template, \
                     p.auth_scheme, p.extra_headers, p.models_path, p.user_variables, \
-                    m.model_id, m.request_options \
+                    m.model_id, m.request_options, p.required_request_options \
              FROM providers p JOIN provider_models m ON m.provider_id = p.id \
              WHERE p.api_dialect IS NOT NULL",
         )
@@ -2400,7 +2411,20 @@ mod tests {
             raw.as_deref()
                 .map(|r| serde_json::from_str::<serde_json::Value>(r).expect("valid JSON"))
         };
-        for (id, name, dialect, base, auth, headers, models_path, vars, model_id, options) in rows {
+        for (
+            id,
+            name,
+            dialect,
+            base,
+            auth,
+            headers,
+            models_path,
+            vars,
+            model_id,
+            options,
+            required,
+        ) in rows
+        {
             let user_variables = parse(&vars);
             let mut metadata = serde_json::Map::new();
             if let Some(serde_json::Value::Array(names)) = &user_variables {
@@ -2420,6 +2444,7 @@ mod tests {
                 model_id,
                 model_status: ModelStatus::Active,
                 request_options: parse(&options),
+                required_request_options: parse(&required),
             };
             let ctx =
                 CallContext::build(&route, "fixture-key", &serde_json::Value::Object(metadata));
@@ -2431,10 +2456,12 @@ mod tests {
         }
     }
 
-    /// items.id=724: a provider whose documentation_gate declares
-    /// required_request_options (a privacy option that must ride on every
-    /// request) must have it in EVERY model row's request_options, since the
-    /// options live on model rows. Field-based, names no provider.
+    /// items.id=724 / items.id=711: a provider whose documentation_gate
+    /// declares required_request_options (a privacy option that must ride on
+    /// every request) has the same object in providers.required_request_options
+    /// (shared_029.sql, the column the request builder merges), and EVERY one
+    /// of its curated model rows agrees with it. Field-based, names no
+    /// provider.
     #[tokio::test]
     async fn test_required_request_options_ride_on_every_model_row() {
         fn contains(have: &serde_json::Value, want: &serde_json::Value) -> bool {
@@ -2448,16 +2475,26 @@ mod tests {
         let mut conn = make_test_conn().await;
         run_migrations(&mut conn, "shared", None).await.unwrap();
 
-        let providers: Vec<(String, String)> = sqlx::query_as(
-            "SELECT id, documentation_gate FROM providers WHERE api_dialect IS NOT NULL",
+        let providers: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT id, documentation_gate, required_request_options FROM providers \
+             WHERE api_dialect IS NOT NULL",
         )
         .fetch_all(&mut conn)
         .await
         .unwrap();
         let mut checked = 0;
-        for (id, gate) in providers {
+        for (id, gate, column) in providers {
             let gate: serde_json::Value = serde_json::from_str(&gate).expect("gate is JSON");
-            let Some(required) = gate.get("required_request_options") else {
+            let in_gate = gate.get("required_request_options");
+            let in_column: Option<serde_json::Value> = column
+                .as_deref()
+                .map(|c| serde_json::from_str(c).expect("column is JSON"));
+            assert_eq!(
+                in_gate,
+                in_column.as_ref(),
+                "{id}: providers.required_request_options must equal the gate's value"
+            );
+            let Some(required) = in_column else {
                 continue;
             };
             let models: Vec<(String, Option<String>)> = sqlx::query_as(
@@ -2475,7 +2512,7 @@ mod tests {
                 let options: serde_json::Value =
                     serde_json::from_str(options.as_deref().unwrap_or("{}")).unwrap();
                 assert!(
-                    contains(&options, required),
+                    contains(&options, &required),
                     "{model}: request_options must carry the provider required options"
                 );
                 checked += 1;
@@ -2485,6 +2522,53 @@ mod tests {
             checked > 0,
             "at least one provider declares required options"
         );
+    }
+
+    /// items.id=711 (decisions.id=875 point 6, spec 8f): every price and every
+    /// context window carries provenance and an as-of date. A seeded hosted
+    /// model row must say where its context window and its price came from
+    /// and when they were read, so the staleness note and the provenance the
+    /// model list shows are never empty for curated data. Field-based, names
+    /// no provider.
+    #[tokio::test]
+    async fn test_seeded_hosted_models_carry_price_and_context_provenance() {
+        let mut conn = make_test_conn().await;
+        run_migrations(&mut conn, "shared", None).await.unwrap();
+
+        type Row = (String, Option<String>, Option<String>, Option<String>);
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT m.id, m.context_window_source, m.context_window_as_of, m.pricing \
+             FROM provider_models m JOIN providers p ON p.id = m.provider_id \
+             WHERE p.api_dialect IS NOT NULL",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        assert!(!rows.is_empty(), "seeded hosted model rows must exist");
+        let date = |s: &str| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok();
+        for (id, source, as_of, pricing) in rows {
+            assert!(
+                matches!(source.as_deref(), Some("provider_api" | "curated" | "user")),
+                "{id}: context_window_source must be set"
+            );
+            assert!(
+                as_of.as_deref().is_some_and(date),
+                "{id}: context_window_as_of must be a date"
+            );
+            let pricing = pricing.unwrap_or_else(|| panic!("{id}: a curated price is required"));
+            let doc: serde_json::Value = serde_json::from_str(&pricing).expect("pricing is JSON");
+            assert!(
+                matches!(
+                    doc["source"].as_str(),
+                    Some("provider_api" | "curated" | "user")
+                ),
+                "{id}: pricing.source must be set"
+            );
+            assert!(
+                doc["as_of"].as_str().is_some_and(date),
+                "{id}: pricing.as_of must be a date"
+            );
+        }
     }
 
     /// items.id=724 (decisions.id=872 point 4, decisions.id=878): the
@@ -2638,8 +2722,8 @@ mod tests {
             .expect("drift-healing run must succeed");
 
         assert_eq!(
-            applied, 27,
-            "shared v2 through v28 should count as newly applied from a stale v1 database"
+            applied, 28,
+            "shared v2 through v29 should count as newly applied from a stale v1 database"
         );
 
         // items.id=427: shared_013.sql drops tier3_providers (generalized
@@ -3606,7 +3690,9 @@ mod tests {
         // added a third (hosted-provider consent/limits/ledger tables).
         // items.id=710: keys_004.sql added a fourth (unattended-approval flag,
         // ledger settlement columns, rate-limit snapshot table).
-        assert_eq!(result.expect("migration must apply cleanly"), 4);
+        // items.id=711: keys_005.sql added a fifth (per-user live model list
+        // tables and the calibration output sample count).
+        assert_eq!(result.expect("migration must apply cleanly"), 5);
 
         let mut conn = open_verify_conn(&db_path, Some(TEST_KEY_HEX)).await;
         assert!(table_exists(&mut conn, "integration_keys").await);
@@ -3617,6 +3703,8 @@ mod tests {
             "price_overrides",
             "calibration",
             "provider_rate_snapshot",
+            "provider_live_models",
+            "provider_model_refresh",
         ] {
             assert!(table_exists(&mut conn, table).await, "{table} must exist");
         }

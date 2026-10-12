@@ -128,7 +128,15 @@ impl Price {
     }
 
     /// Older than the staleness window. A price with no date is stale.
+    ///
+    /// A price the user typed in themselves (`source` = `User`) is never
+    /// flagged: the "estimate may be stale" note warns about QR's curated
+    /// data going out of date (decisions.id=875 point 6, items.id=711), and
+    /// the user set this one knowingly.
     pub fn is_stale(&self, today: NaiveDate) -> bool {
+        if self.source == PriceSource::User {
+            return false;
+        }
         match self.age_days(today) {
             Some(days) => days > PRICE_STALE_AFTER_DAYS,
             None => true,
@@ -598,6 +606,19 @@ mod tests {
         assert_eq!(p.age_days(d(2026, 10, 21)), Some(10));
         let undated = parse_pricing(r#"{"input_per_mtok":1,"output_per_mtok":1}"#, None).unwrap();
         assert!(undated.is_stale(d(2026, 10, 11)));
+    }
+
+    #[test]
+    fn a_user_price_is_never_stale() {
+        let raw = r#"{"input_per_mtok":1,"output_per_mtok":1,"as_of":"2026-01-01"}"#;
+        let user = parse_pricing(raw, Some(PriceSource::User)).unwrap();
+        assert_eq!(user.age_days(d(2026, 10, 11)), Some(283));
+        assert!(!user.is_stale(d(2026, 10, 11)));
+        // The same document as a curated price is stale.
+        assert!(parse_pricing(raw, None).unwrap().is_stale(d(2026, 10, 11)));
+        // A provider-reported price goes stale like a curated one.
+        let api = parse_pricing(raw, Some(PriceSource::ProviderApi)).unwrap();
+        assert!(api.is_stale(d(2026, 10, 11)));
     }
 
     /// Every curated price in the shipped seed data must read exactly, or be

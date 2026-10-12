@@ -402,6 +402,12 @@ pub struct Provider {
     pub credential_acquisition: Option<serde_json::Value>,
     pub spend_limit_url: Option<String>,
     pub logo_key: Option<String>,
+    /// items.id=711 (shared_029.sql): a JSON object merged OVER every model
+    /// row's request_options on each call (a conflicting model row makes the
+    /// call Misconfigured). Holds options that must ride on every request to
+    /// the provider, such as a data-collection restriction, so a model with
+    /// no curated row gets them too.
+    pub required_request_options: Option<serde_json::Value>,
 }
 
 /// Input to create_provider(). A plain struct rather than 15+ positional
@@ -460,7 +466,8 @@ const SELECT_COLUMNS: &str = "id, display_name, provider_type, mode, launch_url,
                 api_dialect, base_url_template, auth_scheme, extra_headers,
                 models_path, user_variables, free_tier, plan_inclusion,
                 retention_days, jurisdiction, verification_status,
-                credential_acquisition, spend_limit_url, logo_key";
+                credential_acquisition, spend_limit_url, logo_key,
+                required_request_options";
 
 // ---------------------------------------------------------------------------
 // Row extraction
@@ -618,6 +625,12 @@ fn row_to_provider(row: &sqlx::sqlite::SqliteRow) -> Result<Provider, ProviderSt
         &format!("provider '{id}'"),
         "credential_acquisition",
     );
+    let required_request_options = parse_optional_json(
+        row.try_get("required_request_options")
+            .map_err(ProviderStoreError::Database)?,
+        &format!("provider '{id}'"),
+        "required_request_options",
+    );
     let verification_status_raw: String = row
         .try_get("verification_status")
         .map_err(ProviderStoreError::Database)?;
@@ -706,6 +719,7 @@ fn row_to_provider(row: &sqlx::sqlite::SqliteRow) -> Result<Provider, ProviderSt
         logo_key: row
             .try_get("logo_key")
             .map_err(ProviderStoreError::Database)?,
+        required_request_options,
     })
 }
 
@@ -1206,6 +1220,7 @@ pub async fn create_provider(
         credential_acquisition: None,
         spend_limit_url: None,
         logo_key: None,
+        required_request_options: None,
     })
 }
 

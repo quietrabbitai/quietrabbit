@@ -88,7 +88,9 @@ use crate::hardware_probe::{HardwareProfile, OllamaUsability, RamClass};
 use crate::persistence::provider_store::{
     ActivationStatus, ModelStatus, Provider, ProviderModel, VerificationStatus,
 };
-use crate::spend::disclosure::{compute_warnings, effective_attributes, PriceView, WarningInput};
+use crate::spend::disclosure::{
+    compute_warnings, effective_attributes, ModelNotes, PriceView, WarningInput,
+};
 use crate::spend::price::{resolve_price, PriceQuote};
 
 /// VRAM at or above this multiple of a model's requirement is Comfortable,
@@ -397,6 +399,7 @@ pub fn hosted_candidate(
     let set = compute_warnings(&WarningInput {
         provider,
         model: Some(model),
+        model_notes: ModelNotes::default(),
         price: PriceView::from_quote(&quote, today),
         price_as_of,
         // A recommendation is shown before any content exists.

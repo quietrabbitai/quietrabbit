@@ -11,6 +11,7 @@
 // structured parameters (`codes`), never prose: the copy renders through the
 // frontend's i18n when the consuming screens land (items.id=693, 580, 696).
 
+pub mod calibration;
 pub mod codes;
 pub mod disclosure;
 pub mod estimate;

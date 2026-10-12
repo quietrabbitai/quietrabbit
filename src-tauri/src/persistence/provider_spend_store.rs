@@ -876,7 +876,7 @@ pub async fn get_rate_snapshot_conn(
 }
 
 // ---------------------------------------------------------------------------
-// Price overrides and calibration (read side; items.id=711 owns the writers)
+// Price overrides and calibration (items.id=710 read side, items.id=711 writers)
 // ---------------------------------------------------------------------------
 
 /// The user's raw price-override JSON for a model, if any.
@@ -901,7 +901,10 @@ pub async fn get_price_override_raw_conn(
 pub struct CalibrationText {
     pub input_factor: String,
     pub output_factor: String,
+    /// Input samples (keys_003.sql `sample_count`).
     pub sample_count: i64,
+    /// Output (reasoning) samples (keys_005.sql).
+    pub output_sample_count: i64,
 }
 
 pub async fn get_calibration_conn(
@@ -911,7 +914,7 @@ pub async fn get_calibration_conn(
 ) -> Result<Option<CalibrationText>, SpendStoreError> {
     let row = sqlx::query(
         "SELECT CAST(input_factor AS TEXT) AS inf, CAST(output_factor AS TEXT) AS outf,
-                sample_count
+                sample_count, output_sample_count
          FROM calibration WHERE provider_id = ? AND model_id = ?",
     )
     .bind(provider_id)
@@ -923,9 +926,130 @@ pub async fn get_calibration_conn(
             input_factor: r.try_get("inf")?,
             output_factor: r.try_get("outf")?,
             sample_count: r.try_get("sample_count")?,
+            output_sample_count: r.try_get("output_sample_count")?,
         })
     })
     .transpose()
+}
+
+/// A calibration row to write (items.id=711). The factors are plain decimal
+/// text (for example `1.234`, produced from integer permille) and are stored
+/// as REAL by SQLite itself, so no float is handled in Rust.
+pub struct CalibrationWrite<'a> {
+    pub provider_id: &'a str,
+    pub model_id: &'a str,
+    pub input_factor: &'a str,
+    pub output_factor: &'a str,
+    pub sample_count: i64,
+    pub output_sample_count: i64,
+}
+
+pub async fn upsert_calibration_conn(
+    conn: &mut SqliteConnection,
+    row: &CalibrationWrite<'_>,
+    now: DateTime<Utc>,
+) -> Result<(), SpendStoreError> {
+    sqlx::query(
+        "INSERT INTO calibration
+            (provider_id, model_id, input_factor, output_factor, sample_count,
+             output_sample_count, updated_at)
+         VALUES (?, ?, CAST(? AS REAL), CAST(? AS REAL), ?, ?, ?)
+         ON CONFLICT (provider_id, model_id) DO UPDATE SET
+            input_factor = excluded.input_factor,
+            output_factor = excluded.output_factor,
+            sample_count = excluded.sample_count,
+            output_sample_count = excluded.output_sample_count,
+            updated_at = excluded.updated_at",
+    )
+    .bind(row.provider_id)
+    .bind(row.model_id)
+    .bind(row.input_factor)
+    .bind(row.output_factor)
+    .bind(row.sample_count)
+    .bind(row.output_sample_count)
+    .bind(ledger_timestamp(now))
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Store the user's price override for a model: JSON of the same shape as
+/// `provider_models.pricing` with source `user` (keys_003.sql).
+pub async fn upsert_price_override_conn(
+    conn: &mut SqliteConnection,
+    provider_id: &str,
+    model_id: &str,
+    pricing_json: &str,
+    now: DateTime<Utc>,
+) -> Result<(), SpendStoreError> {
+    sqlx::query(
+        "INSERT INTO price_overrides (provider_id, model_id, pricing, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT (provider_id, model_id) DO UPDATE SET
+            pricing = excluded.pricing, updated_at = excluded.updated_at",
+    )
+    .bind(provider_id)
+    .bind(model_id)
+    .bind(pricing_json)
+    .bind(ledger_timestamp(now))
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Remove the user's price override. Returns whether one existed.
+pub async fn delete_price_override_conn(
+    conn: &mut SqliteConnection,
+    provider_id: &str,
+    model_id: &str,
+) -> Result<bool, SpendStoreError> {
+    let result = sqlx::query("DELETE FROM price_overrides WHERE provider_id = ? AND model_id = ?")
+        .bind(provider_id)
+        .bind(model_id)
+        .execute(&mut *conn)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Every price override for one provider as `(model_id, raw pricing JSON)`.
+pub async fn list_price_overrides_conn(
+    conn: &mut SqliteConnection,
+    provider_id: &str,
+) -> Result<Vec<(String, String)>, SpendStoreError> {
+    Ok(sqlx::query_as(
+        "SELECT model_id, pricing FROM price_overrides WHERE provider_id = ? ORDER BY model_id",
+    )
+    .bind(provider_id)
+    .fetch_all(&mut *conn)
+    .await?)
+}
+
+/// Every calibration row for one provider, keyed by model id.
+pub async fn list_calibrations_conn(
+    conn: &mut SqliteConnection,
+    provider_id: &str,
+) -> Result<Vec<(String, CalibrationText)>, SpendStoreError> {
+    let rows = sqlx::query(
+        "SELECT model_id, CAST(input_factor AS TEXT) AS inf, CAST(output_factor AS TEXT) AS outf,
+                sample_count, output_sample_count
+         FROM calibration WHERE provider_id = ? ORDER BY model_id",
+    )
+    .bind(provider_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    rows.iter()
+        .map(|r| {
+            Ok((
+                r.try_get("model_id")?,
+                CalibrationText {
+                    input_factor: r.try_get("inf")?,
+                    output_factor: r.try_get("outf")?,
+                    sample_count: r.try_get("sample_count")?,
+                    output_sample_count: r.try_get("output_sample_count")?,
+                },
+            ))
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1703,6 +1827,120 @@ mod tests {
             assert_eq!(c.input_factor, "1.25");
             assert_eq!(c.output_factor, "1.5");
             assert_eq!(c.sample_count, 7);
+            assert_eq!(c.output_sample_count, 0);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn calibration_writer_round_trips_and_replaces() {
+        with_conn(|mut conn| async move {
+            let now = Utc::now();
+            upsert_calibration_conn(
+                &mut conn,
+                &CalibrationWrite {
+                    provider_id: "p",
+                    model_id: "m",
+                    input_factor: "1.234",
+                    output_factor: "0.5",
+                    sample_count: 3,
+                    output_sample_count: 2,
+                },
+                now,
+            )
+            .await
+            .unwrap();
+            let c = get_calibration_conn(&mut conn, "p", "m")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(c.input_factor, "1.234");
+            assert_eq!(c.output_factor, "0.5");
+            assert_eq!((c.sample_count, c.output_sample_count), (3, 2));
+            upsert_calibration_conn(
+                &mut conn,
+                &CalibrationWrite {
+                    provider_id: "p",
+                    model_id: "m",
+                    input_factor: "2",
+                    output_factor: "1",
+                    sample_count: 4,
+                    output_sample_count: 2,
+                },
+                now,
+            )
+            .await
+            .unwrap();
+            let all = list_calibrations_conn(&mut conn, "p").await.unwrap();
+            assert_eq!(all.len(), 1);
+            assert_eq!(all[0].1.sample_count, 4);
+            // A factor of zero or below is refused by the schema.
+            assert!(upsert_calibration_conn(
+                &mut conn,
+                &CalibrationWrite {
+                    provider_id: "p",
+                    model_id: "m",
+                    input_factor: "0",
+                    output_factor: "1",
+                    sample_count: 1,
+                    output_sample_count: 0,
+                },
+                now,
+            )
+            .await
+            .is_err());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn price_override_writer_round_trips_lists_and_deletes() {
+        with_conn(|mut conn| async move {
+            let now = Utc::now();
+            upsert_price_override_conn(
+                &mut conn,
+                "p",
+                "m",
+                r#"{"input_per_mtok":1,"output_per_mtok":2}"#,
+                now,
+            )
+            .await
+            .unwrap();
+            upsert_price_override_conn(
+                &mut conn,
+                "p",
+                "m",
+                r#"{"input_per_mtok":3,"output_per_mtok":4}"#,
+                now,
+            )
+            .await
+            .unwrap();
+            upsert_price_override_conn(
+                &mut conn,
+                "other",
+                "m",
+                r#"{"input_per_mtok":9,"output_per_mtok":9}"#,
+                now,
+            )
+            .await
+            .unwrap();
+            let listed = list_price_overrides_conn(&mut conn, "p").await.unwrap();
+            assert_eq!(listed.len(), 1);
+            assert!(listed[0].1.contains(":3,"));
+            assert!(delete_price_override_conn(&mut conn, "p", "m")
+                .await
+                .unwrap());
+            assert!(!delete_price_override_conn(&mut conn, "p", "m")
+                .await
+                .unwrap());
+            assert!(get_price_override_raw_conn(&mut conn, "p", "m")
+                .await
+                .unwrap()
+                .is_none());
+            assert!(get_price_override_raw_conn(&mut conn, "other", "m")
+                .await
+                .unwrap()
+                .is_some());
         })
         .await;
     }

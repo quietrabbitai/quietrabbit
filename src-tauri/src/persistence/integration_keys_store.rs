@@ -877,13 +877,21 @@ mod tests {
                     .await
                     .unwrap();
             }
-            // keys_004 alters these tables and owns provider_rate_snapshot, so
-            // it must be re-applied together with keys_003.
-            sqlx::query("DROP TABLE provider_rate_snapshot")
-                .execute(&mut conn)
-                .await
-                .unwrap();
-            sqlx::query("DELETE FROM schema_version WHERE version IN (3, 4)")
+            // keys_004 alters these tables and owns provider_rate_snapshot, and
+            // keys_005 owns the live-model tables and alters calibration, so
+            // all three must be re-applied together (the migrator applies
+            // versions above the highest recorded one).
+            for table in [
+                "provider_rate_snapshot",
+                "provider_live_models",
+                "provider_model_refresh",
+            ] {
+                sqlx::query(&format!("DROP TABLE {table}"))
+                    .execute(&mut conn)
+                    .await
+                    .unwrap();
+            }
+            sqlx::query("DELETE FROM schema_version WHERE version IN (3, 4, 5)")
                 .execute(&mut conn)
                 .await
                 .unwrap();
@@ -902,7 +910,8 @@ mod tests {
         let tables: Vec<(String,)> = sqlx::query_as(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN \
              ('provider_consent', 'provider_limits', 'provider_usage_ledger', \
-              'price_overrides', 'calibration', 'provider_rate_snapshot')",
+              'price_overrides', 'calibration', 'provider_rate_snapshot', \
+              'provider_live_models', 'provider_model_refresh')",
         )
         .fetch_all(&mut conn)
         .await
@@ -916,7 +925,7 @@ mod tests {
 
         assert_eq!(
             tables.len(),
-            6,
+            8,
             "opening must re-apply the pending migration"
         );
         let key = found

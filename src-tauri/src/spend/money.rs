@@ -81,6 +81,19 @@ pub fn parse_decimal_micros(lexeme: &str) -> Option<u64> {
     int_value.checked_mul(1_000_000)?.checked_add(frac_value)
 }
 
+/// Micro-USD per million tokens as the plain decimal text `parse_decimal_micros`
+/// reads back: 70_000 is `0.07`, 1_500_000 is `1.5`, 0 is `0`. Exact, no float.
+pub fn format_decimal_micros(micros: u64) -> String {
+    let int = micros / 1_000_000;
+    let frac = micros % 1_000_000;
+    if frac == 0 {
+        int.to_string()
+    } else {
+        let digits = format!("{frac:06}");
+        format!("{int}.{}", digits.trim_end_matches('0'))
+    }
+}
+
 /// A REAL catalog multiplier (for example `token_factor` 1.3) as integer
 /// permille, rounded UP. `None` for a non-finite, non-positive or absurdly
 /// large value. This is the only place a float is read in the spend
@@ -132,6 +145,29 @@ pub fn scale_permille_ceil(tokens: u64, permille: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decimal_text_round_trips_exactly() {
+        for micros in [
+            0u64,
+            1,
+            70_000,
+            100_000,
+            1_500_000,
+            2_500_000,
+            123_456,
+            1_000_000_000,
+        ] {
+            assert_eq!(
+                parse_decimal_micros(&format_decimal_micros(micros)),
+                Some(micros)
+            );
+        }
+        assert_eq!(format_decimal_micros(70_000), "0.07");
+        assert_eq!(format_decimal_micros(1_500_000), "1.5");
+        assert_eq!(format_decimal_micros(0), "0");
+        assert_eq!(format_decimal_micros(3_000_000), "3");
+    }
 
     #[test]
     fn decimal_prices_parse_exactly() {

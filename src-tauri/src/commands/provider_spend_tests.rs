@@ -908,7 +908,9 @@ async fn the_summary_shows_published_free_tier_limits_beside_the_latest_headers(
 fn est_req(max_out: Option<u32>, expected: Option<u32>) -> EstimateCostRequest {
     EstimateCostRequest {
         provider_id: "fixture-host-a".to_owned(),
-        model_id: "fixture-model-a".to_owned(),
+        model_id: Some("fixture-model-a".to_owned()),
+        persona_id: None,
+        focus_id: None,
         input_bytes: 4000,
         max_output_tokens: max_out,
         expected_output_tokens: expected,
@@ -1014,7 +1016,7 @@ async fn the_estimate_needs_a_known_model_and_an_output_limit() {
     with_conn(|mut conn| async move {
         let mut cat = catalog(Some(PAID));
         let mut req = est_req(None, None);
-        req.model_id = "no-such-model".to_owned();
+        req.model_id = Some("no-such-model".to_owned());
         assert_eq!(
             estimate_impl(&mut conn, &cat, &req, today())
                 .await
@@ -1035,6 +1037,191 @@ async fn the_estimate_needs_a_known_model_and_an_output_limit() {
                 .await
                 .is_ok()
         );
+    })
+    .await;
+}
+
+// -- items.id=711: calibration safety, the selected model, uncurated models ----
+
+async fn put_calibration(
+    conn: &mut SqliteConnection,
+    input: &str,
+    output: &str,
+    n: i64,
+    out_n: i64,
+) {
+    sqlx::query(&format!("INSERT OR REPLACE INTO calibration (provider_id, model_id, input_factor, output_factor, sample_count, output_sample_count, updated_at) VALUES ('fixture-host-a', 'fixture-model-a', {input}, {output}, {n}, {out_n}, 't')"))
+        .execute(conn)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_calibration_factor_below_one_lowers_the_expected_figure_but_never_the_worst_case() {
+    with_conn(|mut conn| async move {
+        let cat = catalog(Some(PAID));
+        let neutral = estimate_impl(&mut conn, &cat, &est_req(None, Some(100)), today())
+            .await
+            .unwrap();
+        assert_eq!(neutral.input_tokens, "1000");
+        assert!(!neutral.calibration.input_applied);
+
+        put_calibration(&mut conn, "0.5", "1.0", 9, 0).await;
+        let low = estimate_impl(&mut conn, &cat, &est_req(None, Some(100)), today())
+            .await
+            .unwrap();
+        // The worst case and the reported input size are unchanged.
+        assert_eq!(low.input_tokens, "1000");
+        assert_eq!(low.worst_case_micros, neutral.worst_case_micros);
+        // The informational figure follows the calibration: 500 input tokens.
+        assert!(low.calibration.input_applied);
+        assert_eq!(low.calibration.input_permille, 500);
+        let neutral_expected: i64 = neutral.expected_micros.as_deref().unwrap().parse().unwrap();
+        let low_expected: i64 = low.expected_micros.as_deref().unwrap().parse().unwrap();
+        // 500 input tokens x 0.5 = 250 against 1000 x 0.5 = 500.
+        assert_eq!(neutral_expected - low_expected, 250);
+
+        // A factor above 1.0 raises both.
+        put_calibration(&mut conn, "1.5", "1.0", 9, 0).await;
+        let high = estimate_impl(&mut conn, &cat, &est_req(None, Some(100)), today())
+            .await
+            .unwrap();
+        assert_eq!(high.input_tokens, "1500");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_calibration_factor_applies_only_after_the_minimum_samples() {
+    with_conn(|mut conn| async move {
+        let cat = catalog(Some(PAID));
+        put_calibration(&mut conn, "3.0", "2.0", 2, 2).await;
+        let e = estimate_impl(&mut conn, &cat, &est_req(None, Some(100)), today())
+            .await
+            .unwrap();
+        assert_eq!(e.input_tokens, "1000");
+        assert!(!e.calibration.input_applied && !e.calibration.output_applied);
+        assert_eq!(
+            (e.calibration.input_samples, e.calibration.min_samples),
+            (2, 3)
+        );
+
+        // Input and output samples are counted apart: output alone applies.
+        put_calibration(&mut conn, "3.0", "2.0", 2, 5).await;
+        let e = estimate_impl(&mut conn, &cat, &est_req(None, Some(100)), today())
+            .await
+            .unwrap();
+        assert!(!e.calibration.input_applied && e.calibration.output_applied);
+        assert_eq!(e.calibration.output_permille, 2000);
+        // 500 + (100 x 2.0 = 200 tokens) x 1.5 = 800 against 650 for neutral.
+        assert_eq!(e.expected_micros.as_deref(), Some("800"));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn no_model_means_the_default_and_the_result_names_the_model_and_its_window() {
+    with_conn(|mut conn| async move {
+        let cat = catalog(Some(PAID));
+        let mut req = est_req(None, None);
+        req.model_id = None;
+        let e = estimate_impl(&mut conn, &cat, &req, today()).await.unwrap();
+        assert_eq!(e.model_id, "fixture-model-a");
+        assert_eq!(e.origin, "curated");
+        assert_eq!(e.context.tokens.as_deref(), Some("8192"));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_model_only_the_live_list_names_can_be_estimated_once_it_is_priced() {
+    use crate::persistence::provider_models_store::{
+        record_refresh_conn, set_user_output_limit_conn,
+    };
+    use crate::providers::hosted_client::LiveModel;
+    with_conn(|mut conn| async move {
+        let cat = catalog(Some(PAID));
+        record_refresh_conn(
+            &mut conn,
+            "fixture-host-a",
+            &[LiveModel { id: "live-x".into(), context_tokens: Some(16_000), retires_at: None }],
+            now(),
+        )
+        .await
+        .unwrap();
+        let mut req = est_req(None, None);
+        req.model_id = Some("live-x".to_owned());
+
+        // No output limit chosen and none supplied.
+        assert_eq!(estimate_impl(&mut conn, &cat, &req, today()).await.unwrap_err(), "no_output_limit");
+
+        // The user's limit, no price: unknown, with the unreviewed origin.
+        set_user_output_limit_conn(&mut conn, "fixture-host-a", "live-x", Some(300)).await.unwrap();
+        let e = estimate_impl(&mut conn, &cat, &req, today()).await.unwrap();
+        assert_eq!(e.model_id, "live-x");
+        assert_eq!(e.origin, "uncurated");
+        assert_eq!(e.price_state, "price_state.unknown");
+        assert!(e.worst_case_micros.is_none());
+        assert_eq!(e.output_limit_tokens, "300");
+        assert_eq!(e.context.tokens.as_deref(), Some("16000"));
+        assert_eq!(e.context.source.as_deref(), Some("provider_api"));
+
+        // With the user's price it estimates.
+        sqlx::query("INSERT INTO price_overrides (provider_id, model_id, pricing, updated_at) VALUES ('fixture-host-a', 'live-x', ?, 't')")
+            .bind(r#"{"input_per_mtok":1,"output_per_mtok":2,"as_of":"2026-10-13","source":"user"}"#)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let e = estimate_impl(&mut conn, &cat, &req, today()).await.unwrap();
+        // 1000 x 1 + 300 x 2.
+        assert_eq!(e.worst_case_micros.as_deref(), Some("1600"));
+        assert_eq!(e.price_source.as_deref(), Some("user"));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn disclosure_for_an_uncurated_model_warns_strongly_and_keeps_the_consent_hash() {
+    use crate::persistence::provider_models_store::record_refresh_conn;
+    use crate::providers::hosted_client::LiveModel;
+    with_conn(|mut conn| async move {
+        let cat = catalog(Some(PAID));
+        let before = disclosure_impl(&mut conn, &cat, Some("fixture-model-a"), false).await.unwrap();
+        record_refresh_conn(
+            &mut conn,
+            "fixture-host-a",
+            &[LiveModel { id: "fixture-model-a".into(), context_tokens: None, retires_at: None }, LiveModel { id: "live-x".into(), context_tokens: None, retires_at: None }],
+            now(),
+        )
+        .await
+        .unwrap();
+
+        let d = disclosure_impl(&mut conn, &cat, Some("live-x"), false).await.unwrap();
+        let codes: Vec<&str> = d.warnings.iter().map(|w| w.code.as_str()).collect();
+        assert!(codes.contains(&"warning.model_uncurated"), "{codes:?}");
+        assert!(codes.contains(&"warning.price_unknown"), "{codes:?}");
+        assert_eq!(d.overall_tier, WarningTier::Strong);
+        assert_eq!(d.price_state, "price_state.unknown");
+        assert!(d.can_cost_money);
+        // A live list does not change what the user consented to.
+        assert_eq!(d.attributes_hash, before.attributes_hash);
+
+        // Pricing it removes the price warning, not the unreviewed one.
+        sqlx::query("INSERT INTO price_overrides (provider_id, model_id, pricing, updated_at) VALUES ('fixture-host-a', 'live-x', ?, 't')")
+            .bind(r#"{"input_per_mtok":1,"output_per_mtok":2,"as_of":"2026-10-13","source":"user"}"#)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let d = disclosure_impl(&mut conn, &cat, Some("live-x"), false).await.unwrap();
+        let codes: Vec<&str> = d.warnings.iter().map(|w| w.code.as_str()).collect();
+        assert!(codes.contains(&"warning.model_uncurated") && !codes.contains(&"warning.price_unknown"));
+
+        // A curated model absent from a later list is flagged.
+        record_refresh_conn(&mut conn, "fixture-host-a", &[LiveModel { id: "live-x".into(), context_tokens: None, retires_at: None }], now()).await.unwrap();
+        let d = disclosure_impl(&mut conn, &cat, Some("fixture-model-a"), false).await.unwrap();
+        let codes: Vec<&str> = d.warnings.iter().map(|w| w.code.as_str()).collect();
+        assert!(codes.contains(&"warning.model_may_be_retired"), "{codes:?}");
+        assert!(!codes.contains(&"warning.model_uncurated"));
     })
     .await;
 }

@@ -289,4 +289,140 @@ mod tests {
         })
         .await;
     }
+
+    // -- items.id=711 (Chat-PM ruling on Q2 = A): a model selection stored in a
+    // narrower scope must not change which provider is chosen, and what a
+    // stale copy of the preference does is pinned here, not asserted in prose.
+
+    async fn add_persona(pool: &sqlx::SqlitePool, id: &str) {
+        sqlx::query(
+            "INSERT INTO personas (id, display_name, persona_type, created_at) \
+             VALUES (?, 'Fixture', 'personal', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("persona");
+    }
+
+    async fn set_account_preference(
+        pool: &sqlx::SqlitePool,
+        provider_id: &str,
+        user_preference: UserPreference,
+    ) {
+        upsert_preference(
+            pool,
+            NewUserProviderPreference {
+                user_id: USER,
+                persona_id: None,
+                focus_id: None,
+                provider_id,
+                login_available: true,
+                user_preference,
+                local_model_version: None,
+                subscription_status: None,
+                plan_key: None,
+                model_id: None,
+            },
+        )
+        .await
+        .expect("account preference");
+    }
+
+    #[tokio::test]
+    async fn a_model_selection_in_a_narrower_scope_does_not_change_the_chosen_provider() {
+        use crate::persistence::user_provider_preference_store::{
+            set_model_selection, SelectionScope,
+        };
+        with_db(|pool| async move {
+            let [(first, _), (second, _)] = hosted_pair(&pool).await;
+            add_persona(&pool, PERSONA).await;
+            prefer(&pool, &first).await;
+            let scope = SelectionScope::Persona {
+                persona_id: PERSONA.to_owned(),
+            };
+
+            // The chosen provider: the new row copies Preferred, so the choice
+            // is unchanged.
+            set_model_selection(&pool, USER, &scope, None, &first, Some("m-1"))
+                .await
+                .unwrap();
+            assert_eq!(
+                resolve(&pool, ExternalAccess::Unrestricted).await,
+                ExternalProviderResolution::Selected(first.clone())
+            );
+
+            // A provider with no row anywhere: the new row is `allowed`, never
+            // Preferred, so storing a model for it cannot make it the choice.
+            set_model_selection(&pool, USER, &scope, None, &second, Some("m-2"))
+                .await
+                .unwrap();
+            assert_eq!(
+                resolve(&pool, ExternalAccess::Unrestricted).await,
+                ExternalProviderResolution::Selected(first)
+            );
+        })
+        .await;
+    }
+
+    /// The known limitation of keeping the selection on the preference row:
+    /// the narrower row holds a COPY of the preference. When the account-level
+    /// choice later moves to another provider, the copy still says Preferred,
+    /// two providers resolve as Preferred at that Persona, and the resolver
+    /// returns NotConfigured. It fails closed (the step asks), and other
+    /// Personas follow the new choice.
+    #[tokio::test]
+    async fn a_stale_copy_makes_two_preferred_providers_resolve_to_not_configured() {
+        use crate::persistence::user_provider_preference_store::{
+            set_model_selection, SelectionScope,
+        };
+        with_db(|pool| async move {
+            let [(first, _), (second, _)] = hosted_pair(&pool).await;
+            add_persona(&pool, PERSONA).await;
+            add_persona(&pool, "p2").await;
+            prefer(&pool, &first).await;
+            set_model_selection(
+                &pool,
+                USER,
+                &SelectionScope::Persona {
+                    persona_id: PERSONA.to_owned(),
+                },
+                None,
+                &first,
+                Some("m-1"),
+            )
+            .await
+            .unwrap();
+
+            // The user moves the account-level choice to the other provider.
+            set_account_preference(&pool, &first, UserPreference::Allowed).await;
+            set_account_preference(&pool, &second, UserPreference::Preferred).await;
+
+            // At the Persona that holds the stale copy both are Preferred.
+            let preferred =
+                crate::persistence::user_provider_preference_store::preferred_providers(
+                    &pool,
+                    USER,
+                    Some(PERSONA),
+                    Some(FOCUS),
+                    &[first.clone(), second.clone()],
+                )
+                .await
+                .unwrap();
+            assert_eq!(preferred, vec![first.clone(), second.clone()]);
+            assert_eq!(
+                resolve(&pool, ExternalAccess::Unrestricted).await,
+                ExternalProviderResolution::NotConfigured,
+                "two Preferred providers fail closed and never pick one"
+            );
+
+            // Every other Persona follows the new account-level choice.
+            assert_eq!(
+                resolve_external_provider(&pool, USER, "p2", FOCUS, ExternalAccess::Unrestricted)
+                    .await,
+                ExternalProviderResolution::Selected(second)
+            );
+        })
+        .await;
+    }
 }

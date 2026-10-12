@@ -167,9 +167,22 @@ pub struct WarningSet {
     pub overall: WarningTier,
 }
 
+/// What is known about the selected model beyond the provider's own
+/// attributes (items.id=711). All false for a reviewed, active, listed model.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ModelNotes {
+    /// From the user's live list and not reviewed by QR.
+    pub uncurated: bool,
+    /// The provider's latest list no longer includes it.
+    pub may_be_retired: bool,
+    /// Marked deprecated, or carries a retirement date.
+    pub deprecated: bool,
+}
+
 pub struct WarningInput<'a> {
     pub provider: &'a Provider,
     pub model: Option<&'a ProviderModel>,
+    pub model_notes: ModelNotes,
     pub price: PriceView,
     pub price_as_of: Option<String>,
     /// Supplied by the caller. The backend has no Persona-level sensitivity
@@ -229,6 +242,29 @@ pub fn compute_warnings(input: &WarningInput<'_>) -> WarningSet {
 
     if p.privacy_commitment_basis == Some(PrivacyCommitmentBasis::PolicyOnly) {
         out.push(warning(Code::WarnCommitmentPolicyOnly, json!({})));
+    }
+
+    let model_id = || input.model.map(|m| m.model_id.clone());
+    if input.model_notes.uncurated {
+        out.push(warning(
+            Code::WarnModelUncurated,
+            json!({"model_id": model_id()}),
+        ));
+    }
+    if input.model_notes.may_be_retired {
+        out.push(warning(
+            Code::WarnModelMayBeRetired,
+            json!({"model_id": model_id()}),
+        ));
+    }
+    if input.model_notes.deprecated {
+        out.push(warning(
+            Code::WarnModelDeprecated,
+            json!({
+                "model_id": model_id(),
+                "retires_at": input.model.and_then(|m| m.retires_at.clone()),
+            }),
+        ));
     }
 
     match input.price {
@@ -714,10 +750,46 @@ mod tests {
         WarningInput {
             provider: p,
             model: m,
+            model_notes: ModelNotes::default(),
             price,
             price_as_of: Some("2026-10-11".to_owned()),
             sensitive_persona: false,
         }
+    }
+
+    #[test]
+    fn model_notes_add_their_warnings_and_raise_the_overall_tier() {
+        let p = provider();
+        let m = model("fixture-model-a");
+        let free = PriceView::Known {
+            free: true,
+            stale: false,
+        };
+        let base = compute_warnings(&input(&p, Some(&m), free));
+        assert!(codes_of(&base).is_empty());
+
+        let mut uncurated = input(&p, Some(&m), PriceView::Unknown);
+        uncurated.model_notes = ModelNotes {
+            uncurated: true,
+            ..Default::default()
+        };
+        let set = compute_warnings(&uncurated);
+        assert!(codes_of(&set).contains(&"warning.model_uncurated"));
+        assert!(codes_of(&set).contains(&"warning.price_unknown"));
+        assert_eq!(set.overall, WarningTier::Strong);
+
+        let mut notes = input(&p, Some(&m), free);
+        notes.model_notes = ModelNotes {
+            uncurated: false,
+            may_be_retired: true,
+            deprecated: true,
+        };
+        let set = compute_warnings(&notes);
+        assert_eq!(
+            codes_of(&set),
+            vec!["warning.model_may_be_retired", "warning.model_deprecated"]
+        );
+        assert_eq!(set.overall, WarningTier::Notice);
     }
 
     #[test]

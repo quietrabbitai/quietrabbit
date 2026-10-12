@@ -186,6 +186,12 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::provider_spend::list_limits,
         commands::provider_spend::get_usage_summary,
         commands::provider_spend::estimate_cost,
+        // Group 26 -- Hosted-provider models, live model list and price
+        // overrides (items.id=711, decisions.id=875, spec Part 8f)
+        commands::provider_models::list_provider_models,
+        commands::provider_models::refresh_available_models,
+        commands::provider_models::set_model_selection,
+        commands::provider_models::set_price_override,
     ])
 }
 

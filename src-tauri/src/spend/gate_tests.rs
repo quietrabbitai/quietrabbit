@@ -642,6 +642,10 @@ fn reserved() -> Reserved {
         output_limit: 1000,
         worst_case_micros: 2000,
         notices: vec![],
+        model_id: "fixture-model-a".to_owned(),
+        prompt_bytes: 4000,
+        token_factor_permille: 1000,
+        row_overhead_permille: 1000,
     }
 }
 
@@ -853,6 +857,7 @@ fn assert_no_floats(name: &str, src: &str) {
 fn source_scan_finds_no_float_in_ledger_and_cap_paths() {
     assert_no_floats("spend/gate.rs", include_str!("gate.rs"));
     assert_no_floats("spend/estimate.rs", include_str!("estimate.rs"));
+    assert_no_floats("spend/calibration.rs", include_str!("calibration.rs"));
     assert_no_floats(
         "persistence/provider_spend_store.rs",
         include_str!("../persistence/provider_spend_store.rs"),
@@ -872,7 +877,8 @@ fn source_scan_finds_no_float_in_ledger_and_cap_paths() {
 /// No provider or model is named in the spend code or its tests (decisions.id=872).
 #[test]
 fn the_spend_code_names_no_provider() {
-    const SOURCES: [(&str, &str); 7] = [
+    const SOURCES: [(&str, &str); 8] = [
+        ("calibration.rs", include_str!("calibration.rs")),
         ("codes.rs", include_str!("codes.rs")),
         ("disclosure.rs", include_str!("disclosure.rs")),
         ("estimate.rs", include_str!("estimate.rs")),
@@ -1516,6 +1522,128 @@ async fn finish_applies_interrupt_release_and_failed() {
             .await
             .unwrap();
         assert_eq!(interrupted, 1);
+    })
+    .await;
+}
+
+// ---------------------------------------------------------------------------
+// Calibration (items.id=711)
+// ---------------------------------------------------------------------------
+
+async fn calibration_row(
+    conn: &mut SqliteConnection,
+) -> Option<crate::persistence::provider_spend_store::CalibrationText> {
+    store::get_calibration_conn(conn, "fixture-host-a", "fixture-model-a")
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn only_a_reported_ok_call_is_folded_into_calibration() {
+    with_store(|mut conn| async move {
+        let rig = Rig::new(Some(PRICE_TEXT));
+        consent_now(&mut conn, &rig, true).await;
+        let call = rig.call(RunAttendance::Attended, Some("run-1"));
+
+        // Truncated, budget exhausted, estimated usage (none reported) and a
+        // failed call teach nothing.
+        let truncated = preflight(&mut conn, &call, PROMPT_BYTES, OUT_LIMIT, &utc_tz(), t0())
+            .await
+            .unwrap();
+        finish(
+            &mut conn,
+            &truncated,
+            "fixture-host-a",
+            &attempt(
+                Ok(ok_outcome("hi", true)),
+                usage(1300, 20, None),
+                Some(200),
+                true,
+            ),
+            t0(),
+        )
+        .await;
+        let estimated = preflight(&mut conn, &call, PROMPT_BYTES, OUT_LIMIT, &utc_tz(), t0())
+            .await
+            .unwrap();
+        finish(
+            &mut conn,
+            &estimated,
+            "fixture-host-a",
+            &attempt(Ok(ok_outcome("hi", false)), None, Some(200), true),
+            t0(),
+        )
+        .await;
+        let failed = preflight(&mut conn, &call, PROMPT_BYTES, OUT_LIMIT, &utc_tz(), t0())
+            .await
+            .unwrap();
+        finish(
+            &mut conn,
+            &failed,
+            "fixture-host-a",
+            &attempt(Err(provider_err()), usage(1300, 20, None), Some(200), true),
+            t0(),
+        )
+        .await;
+        assert!(calibration_row(&mut conn).await.is_none());
+
+        // A normal answer with reported usage does. 4000 bytes estimate 1000
+        // tokens and the provider counted 1300.
+        let ok = preflight(&mut conn, &call, PROMPT_BYTES, OUT_LIMIT, &utc_tz(), t0())
+            .await
+            .unwrap();
+        finish(
+            &mut conn,
+            &ok,
+            "fixture-host-a",
+            &attempt(
+                Ok(ok_outcome("hi", false)),
+                usage(1300, 300, Some(100)),
+                Some(200),
+                true,
+            ),
+            t0(),
+        )
+        .await;
+        let c = calibration_row(&mut conn)
+            .await
+            .expect("a sample was recorded");
+        assert_eq!(c.input_factor, "1.3");
+        assert_eq!((c.sample_count, c.output_sample_count), (1, 1));
+        // 300 completion, 100 reasoning: 1.5x observed against a row of 1.0.
+        assert_eq!(c.output_factor, "1.5");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_cap_check_never_uses_a_calibration_factor_below_one() {
+    with_store(|mut conn| async move {
+        let rig = Rig::new(Some(PRICE_TEXT));
+        consent_now(&mut conn, &rig, true).await;
+        let call = rig.call(RunAttendance::Attended, Some("run-1"));
+        let insert = |factor: &'static str| {
+            format!("INSERT OR REPLACE INTO calibration (provider_id, model_id, input_factor, output_factor, sample_count, output_sample_count, updated_at) VALUES ('fixture-host-a', 'fixture-model-a', {factor}, 1.0, 9, 0, 't')")
+        };
+
+        // Without calibration: 4000 bytes -> 1000 tokens.
+        let base = preflight(&mut conn, &call, PROMPT_BYTES, OUT_LIMIT, &utc_tz(), t0()).await.unwrap();
+        assert_eq!(base.input_tokens, 1000);
+
+        // A stored factor of 0.5 (nine samples) does NOT lower the estimate.
+        sqlx::query(&insert("0.5")).execute(&mut conn).await.unwrap();
+        let low = preflight(&mut conn, &call, PROMPT_BYTES, OUT_LIMIT, &utc_tz(), t0()).await.unwrap();
+        assert_eq!(low.input_tokens, 1000, "a factor below 1.0 is not applied to the cap check");
+
+        // A stored factor of 2.0 raises it.
+        sqlx::query(&insert("2.0")).execute(&mut conn).await.unwrap();
+        let high = preflight(&mut conn, &call, PROMPT_BYTES, OUT_LIMIT, &utc_tz(), t0()).await.unwrap();
+        assert_eq!(high.input_tokens, 2000);
+
+        // Two samples are not enough to apply even a raising factor.
+        sqlx::query("UPDATE calibration SET sample_count = 2").execute(&mut conn).await.unwrap();
+        let few = preflight(&mut conn, &call, PROMPT_BYTES, OUT_LIMIT, &utc_tz(), t0()).await.unwrap();
+        assert_eq!(few.input_tokens, 1000);
     })
     .await;
 }

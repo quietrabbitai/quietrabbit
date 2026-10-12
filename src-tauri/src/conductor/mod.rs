@@ -8,6 +8,7 @@ pub mod extract;
 pub mod failure;
 pub mod lifecycle;
 pub mod memory_broker;
+pub mod model_selection;
 pub mod nightly_batch;
 pub mod privacy;
 pub mod propose_route;

@@ -54,12 +54,13 @@ use crate::providers::hosted_client::{
     effective_output_limit, missing_limit_error, HostedAttempt, HostedClient, HostedOutcome,
     HostedRequest,
 };
+use crate::spend::calibration::{self, applied_from, CallSample};
 use crate::spend::codes::Code;
 use crate::spend::disclosure::attributes_hash;
 use crate::spend::estimate::{
     actual_micros, input_tokens_estimate, worst_case, Estimate, NEUTRAL_PERMILLE,
 };
-use crate::spend::money::{permille_ceil, permille_ceil_text};
+use crate::spend::money::permille_ceil;
 use crate::spend::price::{resolve_price, PriceQuote};
 
 // ---------------------------------------------------------------------------
@@ -284,6 +285,13 @@ pub struct Reserved {
     pub output_limit: u64,
     pub worst_case_micros: i64,
     pub notices: Vec<LimitNotice>,
+    /// What settlement needs to fold the call into calibration (items.id=711):
+    /// the settlement overwrites the reservation's token columns with actual
+    /// usage, so the pre-call basis is kept here.
+    pub model_id: String,
+    pub prompt_bytes: u64,
+    pub token_factor_permille: u64,
+    pub row_overhead_permille: u64,
 }
 
 fn price_source_of(quote: &PriceQuote) -> &'static str {
@@ -353,10 +361,9 @@ async fn gather_and_decide<Tz: TimeZone>(
     let calibration = store::get_calibration_conn(conn, provider_id, model_id)
         .await
         .map_err(ledger_down)?;
-    let input_cal = calibration
-        .as_ref()
-        .and_then(|c| permille_ceil_text(&c.input_factor))
-        .unwrap_or(NEUTRAL_PERMILLE);
+    // The cap check never uses a calibration factor below 1.0 and only after
+    // the minimum sample count (items.id=711, spend::calibration).
+    let input_cal = applied_from(calibration.as_ref()).cap_input_permille();
     // A row multiplier that is unusable is a data fault: take the neutral
     // factor rather than fail the call (the worst case below stays bounded by
     // the output limit regardless).
@@ -419,6 +426,11 @@ async fn gather_and_decide<Tz: TimeZone>(
             output_limit,
             worst_case_micros: estimate.worst_case_micros,
             notices: notices.clone(),
+            model_id: model_id.to_owned(),
+            prompt_bytes,
+            token_factor_permille: token_factor,
+            row_overhead_permille: permille_ceil(call.model.output_overhead)
+                .unwrap_or(NEUTRAL_PERMILLE),
         },
         notices,
     ))
@@ -557,13 +569,41 @@ pub async fn finish(
     now: DateTime<Utc>,
 ) {
     let id = reserved.reservation_id.as_str();
+    let mut calibration_sample: Option<CallSample<'_>> = None;
     let applied = match settlement_for(reserved, attempt) {
-        SettleAction::Settle(s) => store::settle_conn(conn, id, &s).await,
+        SettleAction::Settle(s) => {
+            // Only a normal answer with usage the provider reported teaches
+            // calibration anything (spend::calibration).
+            if s.outcome == LedgerOutcome::Ok && s.usage_source == UsageSource::Reported {
+                calibration_sample = Some(CallSample {
+                    provider_id,
+                    model_id: reserved.model_id.as_str(),
+                    prompt_bytes: reserved.prompt_bytes,
+                    token_factor_permille: reserved.token_factor_permille,
+                    row_overhead_permille: reserved.row_overhead_permille,
+                    tokens_in: u64::try_from(s.tokens_in).unwrap_or(0),
+                    tokens_out: u64::try_from(s.tokens_out).unwrap_or(0),
+                    reasoning_tokens: s.reasoning_tokens.and_then(|r| u64::try_from(r).ok()),
+                });
+            }
+            store::settle_conn(conn, id, &s).await
+        }
         SettleAction::Interrupt => store::mark_interrupted_conn(conn, id).await,
         SettleAction::Release => store::release_reservation_conn(conn, id).await,
     };
-    if let Err(e) = applied {
-        log::warn!("spend settlement failed (the reservation stays counted): {e}");
+    match applied {
+        Ok(_) => {
+            if let Some(sample) = calibration_sample {
+                // Best effort, like the rest of settlement: a calibration
+                // failure never fails the user's call.
+                if let Err(e) = calibration::record_call(conn, &sample, now).await {
+                    log::warn!("spend: calibration sample not recorded: {e}");
+                }
+            }
+        }
+        Err(e) => {
+            log::warn!("spend settlement failed (the reservation stays counted): {e}");
+        }
     }
     if let Err(e) =
         store::upsert_rate_snapshot_conn(conn, provider_id, &attempt.rate_limit, now).await
