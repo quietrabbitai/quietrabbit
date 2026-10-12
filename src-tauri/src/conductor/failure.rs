@@ -84,12 +84,9 @@ pub enum ConductorError {
     ContentPromotionBlocked { plain_language: String },
 
     // F5 — Security checker
+    // (F6, inbound contamination, is retired: Gate 2 flags and never holds, items.id=735)
     #[error("{plain_language}")]
     SecurityCheckerFlag { plain_language: String },
-
-    // F6 — Inbound contamination
-    #[error("{plain_language}")]
-    InboundContamination { plain_language: String },
 
     // F7 — personal.db unavailable
     #[error("{plain_language}")]
@@ -191,7 +188,6 @@ impl ConductorError {
             | Self::PrivacyGateBlocked { plain_language }
             | Self::ContentPromotionBlocked { plain_language }
             | Self::SecurityCheckerFlag { plain_language }
-            | Self::InboundContamination { plain_language }
             | Self::PersonalDbNotFound { plain_language }
             | Self::PersonalDbDecryption { plain_language }
             | Self::SnapshotWrite { plain_language }
@@ -232,7 +228,6 @@ pub enum FailureAction {
     AwaitUser,
     Stop,
     Degrade,
-    HoldForGate,
     AwaitFloorConsent,
     /// Privacy Guardian gate3 has fired and emitted consent_request event.
     /// Run is paused awaiting per-element user decisions from the frontend.
@@ -414,25 +409,14 @@ impl FailureHandler {
                 metadata: None,
             },
 
-            // F5 — Security checker flag: non-recoverable
+            // F5 — Security checker
+            // (F6, inbound contamination, is retired: Gate 2 flags and never holds, items.id=735) flag: non-recoverable
             ConductorError::SecurityCheckerFlag { .. } => FailureResult {
                 action: FailureAction::Stop,
                 failure_mode: Some("F5".to_owned()),
                 plain_language: msg,
                 is_recoverable: false,
                 severity: FailureSeverity::Stop,
-                step_id: sid,
-                focus_id: fid,
-                metadata: None,
-            },
-
-            // F6 — Inbound contamination: hold for gate review
-            ConductorError::InboundContamination { .. } => FailureResult {
-                action: FailureAction::HoldForGate,
-                failure_mode: Some("F6".to_owned()),
-                plain_language: msg,
-                is_recoverable: true,
-                severity: FailureSeverity::Require,
                 step_id: sid,
                 focus_id: fid,
                 metadata: None,
@@ -1101,21 +1085,6 @@ mod tests {
         );
         assert_eq!(r.action, FailureAction::Stop);
         assert!(!r.is_recoverable);
-    }
-
-    #[test]
-    fn f6_inbound_contamination_holds_for_gate() {
-        let h = handler(1);
-        let r = h.handle(
-            &err(ConductorError::InboundContamination {
-                plain_language: "contaminated".to_owned(),
-            }),
-            None,
-            None,
-            0,
-        );
-        assert_eq!(r.action, FailureAction::HoldForGate);
-        assert_eq!(r.failure_mode.as_deref(), Some("F6"));
     }
 
     #[test]

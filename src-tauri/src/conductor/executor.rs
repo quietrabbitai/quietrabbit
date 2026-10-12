@@ -766,7 +766,7 @@ impl StepExecutor {
                 // retried.
                 if let Some(sink) = stream_sink.as_deref() {
                     if stream_tail.cancelled || !stream_tail.received_text.is_empty() {
-                        let g2 = streamed_gate2(
+                        let g2 = reply_gate2(
                             ctx,
                             privacy_gateway,
                             &gate_track,
@@ -796,78 +796,42 @@ impl StepExecutor {
         };
 
         // -- Step 11 — PG_GATE_2: inbound contamination scan --
+        // items.id=735 (decisions.id=883): for any external reply Gate 2
+        // flags and notifies; it never holds, discards, edits or retracts it,
+        // and the run continues to steps 12 and 13 whether or not it hit. A
+        // streamed reply and a whole-body reply take this one path.
+        let g2 = reply_gate2(
+            ctx,
+            privacy_gateway,
+            &gate_track,
+            &response.content,
+            selected_model.provider_id.clone(),
+            &g1.fields_shared,
+        )
+        .await;
         if let Some(sink) = stream_sink.as_deref() {
-            // items.id=715 (decisions.id=883): a STREAMED external reply has
-            // already been shown, so Gate 2 flags and notifies; it never
-            // holds, discards, edits or retracts it, and the run continues.
-            // (The non-streamed branch below is unchanged; items.id=735 owns
-            // that one.)
-            let g2 = streamed_gate2(
-                ctx,
-                privacy_gateway,
-                &gate_track,
-                &response.content,
-                selected_model.provider_id.clone(),
-                &g1.fields_shared,
-            )
-            .await;
             sink.end(&StreamEnd {
                 outcome: StreamOutcome::Complete,
                 personal_flagged: g2.flagged,
                 audit_unavailable: g2.audit_unavailable,
             });
-        } else {
-            let g2 = privacy_gateway
-                .gate2(
-                    &ctx.step.step_id,
-                    &ctx.focus_run_id,
-                    &response.content,
-                    &gate_track,
-                    execution_tier,
-                    ctx.effective_access,
-                    selected_model.provider_id.clone(),
-                    Some(&g1.fields_shared),
-                )
-                .await
-                .map_err(|e| ConductorError::DisclosureLogWrite {
-                    plain_language: e.plain_language.clone(),
-                })?;
-
-            if g2.flagged {
-                return Ok(Some(
-                    failure_handler.handle(
-                        &ConductorError::InboundContamination {
-                            plain_language: "The response may contain personal information. \
-                        [Review and continue] [Discard] [Get help]"
-                                .to_owned(),
-                        },
-                        Some(&ctx.step.step_id),
-                        Some(&ctx.focus_id),
-                        retry_count,
-                    ),
-                ));
-            }
         }
 
         // -- Step 12 — update TaskTrack --
         // D4-040: content = model output ONLY — never prompt-expanded input.
-        // step_sensitivity: from projected fields (Tier 2) or template token scan (qr_local).
+        // step_sensitivity: from projected fields (Tier 2) or template token scan (qr_local),
+        // raised to the highest matched Gate 2 field (completed_step).
         let step_sensitivity = compute_step_sensitivity(ctx, personal_track, &projected_fields);
 
-        let output_var = ctx
-            .step
-            .output_var
-            .clone()
-            .or_else(|| Some(ctx.step.step_id.clone()))
-            .filter(|v| !v.is_empty());
-
-        task_track.add_step(TaskStep {
-            step_id: ctx.step.step_id.clone(),
-            output_var,
-            content: response.content.clone(),
-            sensitivity_severity: step_sensitivity,
-            routing_tier_used: execution_tier as i32,
-        });
+        let step = completed_step(
+            ctx,
+            &response.content,
+            step_sensitivity,
+            execution_tier,
+            &g2,
+        );
+        let step_sensitivity = step.sensitivity_severity;
+        task_track.add_step(step);
 
         // -- Step 13 — PG_GATE_3: cross-tier content promotion (conditional) --
         // Only when next step has higher execution_tier.
@@ -1508,34 +1472,54 @@ pub(crate) struct StreamTail {
     pub cancelled: bool,
 }
 
-/// What Gate 2 found in a streamed reply.
+/// What Gate 2 found in an external reply (streamed or not).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct StreamedGate2 {
+pub(crate) struct ReplyGate2 {
     pub flagged: bool,
     pub audit_unavailable: bool,
+    /// Highest sensitivity_severity among the matched fields; 0 when nothing
+    /// matched. Severity only, never a value.
+    pub matched_severity: i32,
 }
 
-/// Gate 2 for a STREAMED external reply (items.id=715, decisions.id=883):
-/// scan the text the user was shown, write gate2's disclosure-log entry on a
-/// hit, mark the reply personal-flagged, and tell the caller to raise the
-/// notice. It never fails the step and never alters or retracts the reply.
+impl ReplyGate2 {
+    /// The step's sensitivity once Gate 2 has spoken (items.id=735,
+    /// decisions.id=883): never lower than the severity computed from the
+    /// fields projected into the prompt, and raised to the highest matched
+    /// field, because a withheld value coming back in the reply is understated
+    /// by the projected-field figure. A no-hit reply changes nothing.
+    pub fn apply_to(&self, computed_sensitivity: i32) -> i32 {
+        computed_sensitivity.max(self.matched_severity)
+    }
+}
+
+/// Gate 2 for an external reply, streamed or not (items.id=715 for the
+/// streamed path, items.id=735 for the rest; decisions.id=883): scan the text,
+/// write gate2's disclosure-log entry on a hit, mark the chat reply
+/// personal-flagged, and tell the caller to raise the notice and the step's
+/// sensitivity. It never fails the step and never alters, holds, discards or
+/// retracts the reply. This is the one implementation of the rule; both
+/// branches of step 11 call it.
 ///
-/// If the disclosure-log write fails after display (gate2 returns an error
-/// only when it matched AND external access is live), the reply is kept and
-/// still flagged, the notice says the audit entry is unavailable, and a
-/// content-free error is logged: failing the run would retract text the user
-/// already read, after the money was spent. Chat-PM accepted this
-/// 2026-10-12.
-async fn streamed_gate2<L: DisclosureLogger>(
+/// If the disclosure-log write fails (gate2 returns an error only when it
+/// matched AND external access is live), the reply is kept and still flagged,
+/// the notice says the audit entry is unavailable, and a content-free error is
+/// logged. Failing the run would drop or retract a reply whose provider cost
+/// is already spent. Chat-PM accepted this 2026-10-12 for streams and the
+/// same rule applies here.
+///
+/// qr_local is inert: Gate 1 at Raw abstraction shares every field and gate2
+/// skips shared fields, so this never flags a local step.
+async fn reply_gate2<L: DisclosureLogger>(
     ctx: &StepContext,
     privacy_gateway: &PrivacyGateway<L>,
     gate_track: &GateTrack,
     text: &str,
     provider: Option<String>,
     fields_shared: &[String],
-) -> StreamedGate2 {
+) -> ReplyGate2 {
     if text.is_empty() {
-        return StreamedGate2::default();
+        return ReplyGate2::default();
     }
     let found = privacy_gateway
         .gate2(
@@ -1550,21 +1534,34 @@ async fn streamed_gate2<L: DisclosureLogger>(
         )
         .await;
     let outcome = match found {
-        Ok(g2) if !g2.flagged => return StreamedGate2::default(),
-        Ok(_) => StreamedGate2 {
+        Ok(g2) if !g2.flagged => return ReplyGate2::default(),
+        Ok(g2) => ReplyGate2 {
             flagged: true,
             audit_unavailable: false,
+            matched_severity: i32::from(g2.matched_max_severity),
         },
         Err(_) => {
             log::error!(
-                "executor: Gate 2 matched a streamed reply but its disclosure-log entry \
+                "executor: Gate 2 matched a reply but its disclosure-log entry \
                  could not be written (run {}, step {}); the reply is kept and flagged",
                 ctx.focus_run_id,
                 ctx.step.step_id
             );
-            StreamedGate2 {
+            // The error carries no result, so recover the severity from the
+            // same pure scan.
+            let severity = crate::conductor::privacy::gate2::scan_matches(
+                text,
+                gate_track,
+                Some(fields_shared),
+            )
+            .into_iter()
+            .map(|(_, severity)| i32::from(severity))
+            .max()
+            .unwrap_or(0);
+            ReplyGate2 {
                 flagged: true,
                 audit_unavailable: true,
+                matched_severity: severity,
             }
         }
     };
@@ -1581,11 +1578,39 @@ async fn streamed_gate2<L: DisclosureLogger>(
     {
         Ok(_) => {}
         Err(e) => log::warn!(
-            "executor: could not mark the streamed reply of run {} personal-flagged: {e}",
+            "executor: could not mark the reply of run {} personal-flagged: {e}",
             ctx.focus_run_id
         ),
     }
     outcome
+}
+
+/// Step 12: the TaskStep a completed step records. `content` is the model
+/// output only (D4-040) and is never altered; Gate 2's outcome raises the
+/// sensitivity and carries the flags with the content so they survive
+/// checkpoint and resume and reach the step-completion status.
+fn completed_step(
+    ctx: &StepContext,
+    content: &str,
+    computed_sensitivity: i32,
+    execution_tier: u8,
+    g2: &ReplyGate2,
+) -> TaskStep {
+    let output_var = ctx
+        .step
+        .output_var
+        .clone()
+        .or_else(|| Some(ctx.step.step_id.clone()))
+        .filter(|v| !v.is_empty());
+    TaskStep {
+        step_id: ctx.step.step_id.clone(),
+        output_var,
+        content: content.to_owned(),
+        sensitivity_severity: g2.apply_to(computed_sensitivity),
+        routing_tier_used: execution_tier as i32,
+        personal_flagged: g2.flagged,
+        audit_unavailable: g2.audit_unavailable,
+    }
 }
 
 /// What a hosted call is built from: the two catalog rows (as a plain-data
@@ -2859,6 +2884,8 @@ mod tests {
                 content: "hello".to_owned(),
                 sensitivity_severity: 1,
                 routing_tier_used: 1,
+                personal_flagged: false,
+                audit_unavailable: false,
             },
             TaskStep {
                 step_id: "s2".to_owned(),
@@ -2866,6 +2893,8 @@ mod tests {
                 content: "world".to_owned(),
                 sensitivity_severity: 1,
                 routing_tier_used: 1,
+                personal_flagged: false,
+                audit_unavailable: false,
             },
         ];
         let vars = collect_output_vars(&steps);
@@ -2883,6 +2912,8 @@ mod tests {
                 content: "first".to_owned(),
                 sensitivity_severity: 1,
                 routing_tier_used: 1,
+                personal_flagged: false,
+                audit_unavailable: false,
             },
             TaskStep {
                 step_id: "s2".to_owned(),
@@ -2890,6 +2921,8 @@ mod tests {
                 content: "second".to_owned(),
                 sensitivity_severity: 1,
                 routing_tier_used: 1,
+                personal_flagged: false,
+                audit_unavailable: false,
             },
         ];
         let vars = collect_output_vars(&steps);
@@ -4351,23 +4384,37 @@ mod tests {
             })
             .await;
         }
+    }
 
-        // -- Gate 2 for a streamed reply (decisions.id=883) -------------------
+    // -----------------------------------------------------------------------
+    // items.id=735 (decisions.id=883): Gate 2 flags and notifies for every
+    // external reply, streamed or not. One helper, reply_gate2.
+    // -----------------------------------------------------------------------
 
-        fn gate_track_with(name: &str, value: &str) -> GateTrack {
+    mod reply_gate2_rule {
+        use super::*;
+        use crate::conductor::privacy::logger::{FailLogger, TestLogger};
+
+        fn track_of(fields: &[(&str, &str, u8)]) -> GateTrack {
             let mut gt = GateTrack::new();
-            gt.add_field(GateField {
-                field_name: name.to_owned(),
-                field_value: value.to_owned(),
-                sensitivity: Sensitivity::Personal,
-                sensitivity_severity: 2,
-                source_id: "s".to_owned(),
-                abstraction_tier2: AbstractionPolicy::Omit,
-                abstraction_tier3: AbstractionPolicy::Omit,
-            })
-            .unwrap();
+            for (name, value, severity) in fields {
+                gt.add_field(GateField {
+                    field_name: (*name).to_owned(),
+                    field_value: (*value).to_owned(),
+                    sensitivity: Sensitivity::Personal,
+                    sensitivity_severity: *severity,
+                    source_id: "s".to_owned(),
+                    abstraction_tier2: AbstractionPolicy::Omit,
+                    abstraction_tier3: AbstractionPolicy::Omit,
+                })
+                .unwrap();
+            }
             gt.seal();
             gt
+        }
+
+        fn gate_track_with(name: &str, value: &str) -> GateTrack {
+            track_of(&[(name, value, 2)])
         }
 
         /// A migrated messages.db holding the run's assistant placeholder.
@@ -4403,7 +4450,7 @@ mod tests {
                 let ctx = hosted_ctx(RunAttendance::Attended, &key_hex);
                 let gw = PrivacyGateway::new(TestLogger::new());
                 let track = gate_track_with("home_city", "Springfield");
-                let g2 = streamed_gate2(
+                let g2 = reply_gate2(
                     &ctx,
                     &gw,
                     &track,
@@ -4414,9 +4461,10 @@ mod tests {
                 .await;
                 assert_eq!(
                     g2,
-                    StreamedGate2 {
+                    ReplyGate2 {
                         flagged: true,
-                        audit_unavailable: false
+                        audit_unavailable: false,
+                        matched_severity: 2
                     }
                 );
                 assert_eq!(gw.logger.entry_count(), 1);
@@ -4453,8 +4501,8 @@ mod tests {
                     ("You live in Springfield", vec!["home_city".to_owned()]),
                     ("", vec![]),
                 ] {
-                    let g2 = streamed_gate2(&ctx, &gw, &track, text, None, &shared).await;
-                    assert_eq!(g2, StreamedGate2::default(), "{text}");
+                    let g2 = reply_gate2(&ctx, &gw, &track, text, None, &shared).await;
+                    assert_eq!(g2, ReplyGate2::default(), "{text}");
                 }
                 assert_eq!(gw.logger.entry_count(), 0);
                 assert!(!reply_flagged(&key_hex).await);
@@ -4463,22 +4511,22 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn an_audit_log_failure_after_display_keeps_the_reply_and_still_flags_it() {
+        async fn an_audit_log_failure_keeps_the_reply_flags_it_and_still_reports_severity() {
             with_temp_shared_db(|_pool| async move {
                 let key_hex = fixture_key_hex();
                 seed_reply(&key_hex, "run-1").await;
                 let ctx = hosted_ctx(RunAttendance::Attended, &key_hex);
                 let gw = PrivacyGateway::new(FailLogger);
-                let track = gate_track_with("home_city", "Springfield");
-                let g2 =
-                    streamed_gate2(&ctx, &gw, &track, "You live in Springfield", None, &[]).await;
+                let track = track_of(&[("diagnosis", "Hypertension", 3)]);
+                let g2 = reply_gate2(&ctx, &gw, &track, "You have hypertension", None, &[]).await;
                 // Not a failure of the step: flagged, with the audit entry
-                // reported as unavailable.
+                // reported as unavailable, and the severity recovered.
                 assert_eq!(
                     g2,
-                    StreamedGate2 {
+                    ReplyGate2 {
                         flagged: true,
-                        audit_unavailable: true
+                        audit_unavailable: true,
+                        matched_severity: 3
                     }
                 );
                 assert!(reply_flagged(&key_hex).await);
@@ -4487,20 +4535,219 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn the_non_streamed_gate_2_branch_is_unchanged() {
-            // Pin the source: the hold for a non-streamed step still exists,
-            // and the streamed branch has no InboundContamination.
+        async fn the_same_text_gives_the_same_outcome_streamed_or_not() {
+            with_temp_shared_db(|_pool| async move {
+                let reg = crate::chat_stream::ChatStreamRegistry::default();
+                let handle = reg.register(SPEND_USER, "run-1");
+                let mut whole = hosted_ctx(RunAttendance::Attended, "");
+                let mut streamed = hosted_ctx(RunAttendance::Attended, "");
+                whole.stream = None;
+                streamed.stream = Some(handle);
+                let track =
+                    track_of(&[("home_city", "Springfield", 2), ("bank", "Acme Credit", 4)]);
+                for text in [
+                    "Springfield and Acme Credit",
+                    "Only Springfield",
+                    "Nothing here",
+                ] {
+                    let a = reply_gate2(
+                        &whole,
+                        &PrivacyGateway::new(TestLogger::new()),
+                        &track,
+                        text,
+                        None,
+                        &[],
+                    )
+                    .await;
+                    let b = reply_gate2(
+                        &streamed,
+                        &PrivacyGateway::new(TestLogger::new()),
+                        &track,
+                        text,
+                        None,
+                        &[],
+                    )
+                    .await;
+                    assert_eq!(a, b, "{text}");
+                }
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn a_local_step_can_never_flag() {
+            // Gate 1 at Raw abstraction shares every field, and gate2 skips
+            // shared fields, so qr_local is inert (verified, not assumed).
+            let gw = PrivacyGateway::new(TestLogger::new());
+            let track = track_of(&[("home_city", "Springfield", 2), ("bank", "Acme Credit", 4)]);
+            let g1 = gw
+                .gate1(
+                    "s1",
+                    "run-1",
+                    &track,
+                    1,
+                    1,
+                    1,
+                    ExternalAccess::LocalOnly,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(g1.fields_shared.len(), 2);
+            let mut ctx = hosted_ctx(RunAttendance::Attended, "");
+            ctx.effective_access = ExternalAccess::LocalOnly;
+            ctx.execution_tier = 1;
+            let g2 = reply_gate2(
+                &ctx,
+                &gw,
+                &track,
+                "Springfield and Acme Credit",
+                None,
+                &g1.fields_shared,
+            )
+            .await;
+            assert_eq!(g2, ReplyGate2::default());
+            assert!(gw
+                .logger
+                .entries()
+                .iter()
+                .all(|e| e.event_type != "gate2_contamination_detected"));
+            // The same track under an external floor does flag.
+            let g1_ext = gw
+                .gate1(
+                    "s1",
+                    "run-1",
+                    &track,
+                    2,
+                    1,
+                    2,
+                    ExternalAccess::AnonymousRequired,
+                    None,
+                )
+                .await
+                .unwrap();
+            let ext = hosted_ctx(RunAttendance::Attended, "");
+            let g2_ext = reply_gate2(
+                &ext,
+                &gw,
+                &track,
+                "Springfield and Acme Credit",
+                None,
+                &g1_ext.fields_shared,
+            )
+            .await;
+            assert!(g2_ext.flagged);
+        }
+
+        // -- Step 12: the recorded step ---------------------------------------
+
+        fn hit(severity: i32) -> ReplyGate2 {
+            ReplyGate2 {
+                flagged: true,
+                audit_unavailable: false,
+                matched_severity: severity,
+            }
+        }
+
+        #[test]
+        fn a_hit_continues_the_run_and_records_the_flag_on_the_step() {
+            let ctx = hosted_ctx(RunAttendance::Attended, "");
+            let step = completed_step(&ctx, "the reply text", 1, 2, &hit(2));
+            assert_eq!(step.content, "the reply text");
+            assert!(step.personal_flagged);
+            assert!(!step.audit_unavailable);
+            let mut tt = TaskTrack::new();
+            tt.add_step(step);
+            assert_eq!(tt.last_output(), Some("the reply text"));
+        }
+
+        #[test]
+        fn no_hit_leaves_the_step_exactly_as_before() {
+            let ctx = hosted_ctx(RunAttendance::Attended, "");
+            let step = completed_step(&ctx, "fine", 2, 2, &ReplyGate2::default());
+            assert_eq!(step.sensitivity_severity, 2);
+            assert!(!step.personal_flagged && !step.audit_unavailable);
+            assert_eq!(step.routing_tier_used, 2);
+            assert_eq!(step.output_var.as_deref(), Some("s1"));
+        }
+
+        #[test]
+        fn a_severity_3_or_4_match_raises_the_step_and_the_ceiling() {
+            let ctx = hosted_ctx(RunAttendance::Attended, "");
+            for matched in [3, 4] {
+                let step = completed_step(&ctx, "r", 1, 2, &hit(matched));
+                assert_eq!(step.sensitivity_severity, matched);
+                let mut tt = TaskTrack::new();
+                tt.add_step(step);
+                assert_eq!(tt.sensitivity_ceiling(), matched);
+            }
+        }
+
+        #[test]
+        fn a_severity_1_or_2_match_changes_nothing_observable() {
+            let ctx = hosted_ctx(RunAttendance::Attended, "");
+            for matched in [1, 2] {
+                let step = completed_step(&ctx, "r", 2, 2, &hit(matched));
+                assert_eq!(step.sensitivity_severity, 2, "matched {matched}");
+            }
+        }
+
+        #[test]
+        fn the_raise_is_a_max_and_never_lowers_the_computed_value() {
+            let ctx = hosted_ctx(RunAttendance::Attended, "");
+            let step = completed_step(&ctx, "r", 4, 2, &hit(2));
+            assert_eq!(step.sensitivity_severity, 4);
+            assert_eq!(ReplyGate2::default().apply_to(3), 3);
+        }
+
+        #[tokio::test]
+        async fn gate_3_then_blocks_a_raised_step_toward_a_higher_tier() {
+            let ctx = hosted_ctx(RunAttendance::Attended, "");
+            async fn promote(step: &TaskStep) -> bool {
+                PrivacyGateway::new(TestLogger::new())
+                    .gate3(
+                        "s1",
+                        "run-1",
+                        "test",
+                        "s1",
+                        &step.content,
+                        step.sensitivity_severity as u8,
+                        3,
+                        ExternalAccess::Unrestricted,
+                        2,
+                        None,
+                        None,
+                        true,
+                        SPEND_USER,
+                        "persona-1",
+                        "",
+                    )
+                    .await
+                    .unwrap()
+                    .blocked
+            }
+            // The step looked general (1); the reply echoed a financial field.
+            assert!(promote(&completed_step(&ctx, "r", 1, 2, &hit(4))).await);
+            assert!(promote(&completed_step(&ctx, "r", 1, 2, &hit(3))).await);
+            // A personal-level match, or no hit, is not blocked.
+            assert!(!promote(&completed_step(&ctx, "r", 1, 2, &hit(2))).await);
+            assert!(!promote(&completed_step(&ctx, "r", 1, 2, &ReplyGate2::default())).await);
+        }
+
+        #[test]
+        fn step_11_has_one_implementation_and_no_hold() {
+            // Pin the source: the F6 hold is gone, and gate2 is called from
+            // exactly one place, reply_gate2, which both paths share.
             let src = include_str!("executor.rs");
             let production = src.split("#[cfg(test)]").next().unwrap();
-            let streamed_branch = production
-                .split("if let Some(sink) = stream_sink.as_deref() {\n            // items.id=715 (decisions.id=883)")
+            assert!(!production.contains("InboundContamination"));
+            assert_eq!(production.matches(".gate2(").count(), 1);
+            let helper = production
+                .split("async fn reply_gate2")
                 .nth(1)
-                .expect("the streamed Gate 2 branch")
-                .split("} else {")
-                .next()
-                .unwrap();
-            assert!(!streamed_branch.contains("InboundContamination"));
-            assert!(production.contains("ConductorError::InboundContamination"));
+                .expect("reply_gate2");
+            assert!(helper.contains(".gate2("));
+            assert!(production.contains("let g2 = reply_gate2("));
         }
     }
 }

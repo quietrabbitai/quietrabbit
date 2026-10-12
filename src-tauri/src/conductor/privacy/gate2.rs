@@ -24,6 +24,11 @@
 // != LocalOnly -- execution_tier itself is kept as a separate parameter
 // purely for the disclosure log's own numeric audit field below, not for
 // this decision.
+//
+// items.id=735 (decisions.id=883): the Err above is the GATE's contract and is
+// unchanged, but the executor no longer fails a step on it. A reply from an
+// external provider is flagged, never held, discarded or edited, so
+// executor.rs::reply_gate2 turns that Err into "flagged, audit unavailable".
 
 use indexmap::IndexMap;
 
@@ -37,25 +42,23 @@ use super::{
 
 const MIN_MATCH_LENGTH: usize = 4;
 
-#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
-pub async fn gate2<L: DisclosureLogger>(
-    logger: &L,
-    step_id: &str,
-    focus_run_id: &str,
+/// The pure scan behind gate2(): every field not in `fields_shared` whose
+/// value (4+ characters) appears in the response, case-insensitively, as
+/// (field name, sensitivity_severity). No I/O. items.id=735 split it out so a
+/// caller whose disclosure-log write failed can still learn the matched
+/// severity; gate2() itself is behaviour-identical.
+pub fn scan_matches(
     response_content: &str,
     personal_track: &PersonalTrack,
-    execution_tier: u8,
-    effective_access: ExternalAccess,
-    provider: Option<String>,
     fields_shared: Option<&[String]>,
-) -> Result<Gate2Result, DisclosureLogWriteError> {
+) -> Vec<(String, u8)> {
     let response_lower = response_content.to_lowercase();
 
     // Build shared-field exclusion set (None = no exclusion, all fields scanned).
     let shared_set: Option<std::collections::HashSet<&str>> =
         fields_shared.map(|s| s.iter().map(|x| x.as_str()).collect());
 
-    let mut matched: Vec<String> = Vec::new();
+    let mut matched: Vec<(String, u8)> = Vec::new();
 
     for (field_name, personal_field) in personal_track.fields() {
         // Skip fields already intentionally shared.
@@ -74,9 +77,28 @@ pub async fn gate2<L: DisclosureLogger>(
 
         // Case-insensitive substring match.
         if response_lower.contains(&value.to_lowercase()) {
-            matched.push(field_name.clone());
+            matched.push((field_name.clone(), personal_field.sensitivity_severity));
         }
     }
+
+    matched
+}
+
+#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
+pub async fn gate2<L: DisclosureLogger>(
+    logger: &L,
+    step_id: &str,
+    focus_run_id: &str,
+    response_content: &str,
+    personal_track: &PersonalTrack,
+    execution_tier: u8,
+    effective_access: ExternalAccess,
+    provider: Option<String>,
+    fields_shared: Option<&[String]>,
+) -> Result<Gate2Result, DisclosureLogWriteError> {
+    let scanned = scan_matches(response_content, personal_track, fields_shared);
+    let matched: Vec<String> = scanned.iter().map(|(name, _)| name.clone()).collect();
+    let matched_max_severity = scanned.iter().map(|(_, sev)| *sev).max().unwrap_or(0);
 
     let flagged = !matched.is_empty();
 
@@ -110,5 +132,57 @@ pub async fn gate2<L: DisclosureLogger>(
     Ok(Gate2Result {
         flagged,
         matched_field_names: matched,
+        matched_max_severity,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conductor::privacy::types::{AbstractionPolicy, PersonalField, Sensitivity};
+
+    fn track(fields: &[(&str, &str, u8)]) -> PersonalTrack {
+        let mut t = PersonalTrack::new();
+        for (name, value, severity) in fields {
+            t.add_field(PersonalField {
+                field_name: (*name).to_owned(),
+                field_value: (*value).to_owned(),
+                sensitivity: Sensitivity::General,
+                sensitivity_severity: *severity,
+                source_id: "test".to_owned(),
+                abstraction_tier2: AbstractionPolicy::Omit,
+                abstraction_tier3: AbstractionPolicy::Omit,
+            })
+            .unwrap();
+        }
+        t.seal();
+        t
+    }
+
+    #[test]
+    fn scan_matches_reports_each_matched_field_with_its_severity() {
+        let t = track(&[
+            ("home_city", "Springfield", 2),
+            ("diagnosis", "Hypertension", 3),
+            ("balance", "$12000", 4),
+            ("nickname", "Bo", 1),
+        ]);
+        let hits = scan_matches(
+            "You live in springfield and have HYPERTENSION. Bo!",
+            &t,
+            None,
+        );
+        assert_eq!(
+            hits,
+            vec![("home_city".to_owned(), 2), ("diagnosis".to_owned(), 3)]
+        );
+    }
+
+    #[test]
+    fn scan_matches_skips_shared_fields_and_finds_nothing_in_a_clean_reply() {
+        let t = track(&[("home_city", "Springfield", 2)]);
+        let shared = vec!["home_city".to_owned()];
+        assert!(scan_matches("Springfield", &t, Some(&shared)).is_empty());
+        assert!(scan_matches("Nothing personal here", &t, None).is_empty());
+    }
 }

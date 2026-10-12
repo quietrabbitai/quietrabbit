@@ -516,6 +516,16 @@ pub struct TaskStep {
     pub content: String,
     pub sensitivity_severity: i32,
     pub routing_tier_used: i32,
+    /// items.id=735 (decisions.id=883): Gate 2 found a withheld personal value
+    /// in this step's reply. The reply is intact and the run continued;
+    /// sensitivity_severity above already carries the raise. Serialized into
+    /// checkpoints; `default` keeps older checkpoints loadable.
+    #[serde(default)]
+    pub personal_flagged: bool,
+    /// items.id=735: the flagged reply's disclosure-log entry could not be
+    /// written. Only meaningful with personal_flagged.
+    #[serde(default)]
+    pub audit_unavailable: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1219,6 +1229,8 @@ mod tests {
             content: "hello".to_owned(),
             sensitivity_severity: 3,
             routing_tier_used: 2,
+            personal_flagged: false,
+            audit_unavailable: false,
         });
         assert_eq!(tt.sensitivity_ceiling(), 3);
     }
@@ -1232,6 +1244,8 @@ mod tests {
             content: "x".to_owned(),
             sensitivity_severity: 3,
             routing_tier_used: 1,
+            personal_flagged: false,
+            audit_unavailable: false,
         });
         tt.add_step(TaskStep {
             step_id: "s2".to_owned(),
@@ -1239,6 +1253,8 @@ mod tests {
             content: "y".to_owned(),
             sensitivity_severity: 1,
             routing_tier_used: 1,
+            personal_flagged: false,
+            audit_unavailable: false,
         });
         assert_eq!(tt.sensitivity_ceiling(), 3);
     }
@@ -1252,6 +1268,8 @@ mod tests {
             content: "hello world".to_owned(),
             sensitivity_severity: 1,
             routing_tier_used: 1,
+            personal_flagged: false,
+            audit_unavailable: false,
         });
         assert_eq!(tt.get_output("draft"), Some("hello world"));
         assert_eq!(tt.last_output(), Some("hello world"));
@@ -1267,6 +1285,8 @@ mod tests {
             content: "internal".to_owned(),
             sensitivity_severity: 1,
             routing_tier_used: 1,
+            personal_flagged: false,
+            audit_unavailable: false,
         });
         assert_eq!(tt.steps().len(), 1);
         assert_eq!(tt.get_output("anything"), None);
@@ -1282,6 +1302,8 @@ mod tests {
             content: "something".to_owned(),
             sensitivity_severity: 1,
             routing_tier_used: 1,
+            personal_flagged: false,
+            audit_unavailable: false,
         });
         assert_eq!(tt.steps().len(), 1);
         assert_eq!(tt.get_output(""), None);

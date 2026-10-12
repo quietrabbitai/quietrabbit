@@ -181,6 +181,8 @@ mod tests {
             content: format!("content for {id}"),
             sensitivity_severity: severity,
             routing_tier_used: 1,
+            personal_flagged: false,
+            audit_unavailable: false,
         }
     }
 

@@ -152,6 +152,9 @@ pub struct Gate1Result {
 pub struct Gate2Result {
     pub flagged: bool,
     pub matched_field_names: Vec<String>,
+    /// items.id=735: highest `sensitivity_severity` among the matched fields,
+    /// 0 when nothing matched. Severity only, never a value.
+    pub matched_max_severity: u8,
 }
 
 /// items.id=501 slice 2: a span gate3 silently resolved from a prior or

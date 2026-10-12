@@ -1076,6 +1076,16 @@ pub struct RunStatusPayload {
     /// RunResult). Empty when nothing was omitted. Populated from
     /// self.personal_track — see emit_status_with_content.
     pub provenance_omissions: Vec<crate::conductor::types::OmittedCrossPersonaFact>,
+    /// items.id=735 (decisions.id=883): Gate 2 found a withheld personal value
+    /// in the just-completed step's reply. A plain, non-blocking notice; the
+    /// reply is intact and the run continues. Some(true) only on the
+    /// step-COMPLETION emission of a flagged step, None on every other emit.
+    /// Read from the step's TaskStep, so it travels with the content it
+    /// concerns.
+    pub personal_flagged: Option<bool>,
+    /// items.id=735: the flagged reply's disclosure-log entry could not be
+    /// written. Some(true) only alongside personal_flagged, None otherwise.
+    pub audit_unavailable: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1306,16 +1316,81 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         step_content: Option<&str>,
         crisis_resource_block: Option<&str>,
     ) {
+        self.emit_status_payload(
+            status,
+            step_display_name,
+            step_content,
+            crisis_resource_block,
+            None,
+        );
+    }
+
+    /// The step-completion emit: like emit_status_with_content, plus the
+    /// Gate 2 flags of the step just recorded (items.id=735), read from the
+    /// TaskTrack so they travel with the content.
+    fn emit_step_complete(&self, step_display_name: &str, step_content: Option<&str>) {
+        self.emit_status_payload(
+            "running",
+            Some(step_display_name),
+            step_content,
+            None,
+            self.last_step_reply_flags(),
+        );
+    }
+
+    /// Some(audit_unavailable) iff the step most recently recorded in the
+    /// TaskTrack was flagged by Gate 2 (items.id=735); None otherwise.
+    fn last_step_reply_flags(&self) -> Option<bool> {
+        self.task_track
+            .as_ref()
+            .and_then(|tt| tt.steps().last())
+            .filter(|s| s.personal_flagged)
+            .map(|s| s.audit_unavailable)
+    }
+
+    /// `reply_flags`: Some(audit_unavailable) iff the step just completed was
+    /// flagged by Gate 2; None on every other emit.
+    fn emit_status_payload(
+        &self,
+        status: &str,
+        step_display_name: Option<&str>,
+        step_content: Option<&str>,
+        crisis_resource_block: Option<&str>,
+        reply_flags: Option<bool>,
+    ) {
         let Some(handle) = &self.app_handle else {
             return; // no handle in tests — silent no-op
         };
+        let payload = self.build_status_payload(
+            status,
+            step_display_name,
+            step_content,
+            crisis_resource_block,
+            reply_flags,
+        );
+        use tauri::Emitter;
+        if let Err(e) = handle.emit("run-status-update", &payload) {
+            log::warn!("lifecycle: emit run-status-update failed: {e}");
+        }
+    }
+
+    /// Build the run-status-update payload. Separate from the emit so a test
+    /// can check it without an AppHandle.
+    fn build_status_payload(
+        &self,
+        status: &str,
+        step_display_name: Option<&str>,
+        step_content: Option<&str>,
+        crisis_resource_block: Option<&str>,
+        reply_flags: Option<bool>,
+    ) -> RunStatusPayload {
         let total = self.focus_def.as_ref().map(|d| d.steps.len()).unwrap_or(0);
         let provenance_omissions = self
             .personal_track
             .as_ref()
             .map(|t| t.omitted_cross_persona_facts().to_vec())
             .unwrap_or_default();
-        let payload = RunStatusPayload {
+        RunStatusPayload {
             focus_run_id: self.focus_run_id.clone().unwrap_or_default(),
             status: status.to_owned(),
             current_step: self.current_step,
@@ -1324,10 +1399,8 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             step_content: step_content.map(|s| s.to_owned()),
             crisis_resource_block: crisis_resource_block.map(|s| s.to_owned()),
             provenance_omissions,
-        };
-        use tauri::Emitter;
-        if let Err(e) = handle.emit("run-status-update", &payload) {
-            log::warn!("lifecycle: emit run-status-update failed: {e}");
+            personal_flagged: reply_flags.map(|_| true),
+            audit_unavailable: reply_flags.filter(|unavailable| *unavailable),
         }
     }
 
@@ -2135,12 +2208,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                 .as_ref()
                 .and_then(|tt| tt.last_output())
                 .map(|s| s.to_owned());
-            self.emit_status_with_content(
-                "running",
-                Some(&step.display_name),
-                step_content.as_deref(),
-                None,
-            );
+            self.emit_step_complete(&step.display_name, step_content.as_deref());
 
             checkpoint_counter += 1;
             if checkpoint_counter >= checkpoint_every && !self._checkpointing_suspended {
@@ -2388,7 +2456,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         failure: FailureResult,
     ) -> Result<RunResult, LifecycleError> {
         // R1 crisis-handling floor (items.id=297): every exit this function
-        // can take (Stop/failed, and AwaitUser/HoldForGate/OfferTier2/
+        // can take (Stop/failed, and AwaitUser/OfferTier2/
         // OfferCompact/AwaitFloorConsent/AwaitConsent -- cloud_frontier, consent
         // gates, and Gate3-hold all funnel through here) is a pause/failure
         // before OUTPUT, so without this the crisis-flagged run's resource
@@ -2405,7 +2473,6 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         } else if matches!(
             failure.action,
             FailureAction::AwaitUser
-                | FailureAction::HoldForGate
                 | FailureAction::OfferTier2
                 | FailureAction::OfferCompact
                 | FailureAction::AwaitFloorConsent
@@ -2488,6 +2555,8 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                 "content": s.content,
                 "sensitivity_severity": s.sensitivity_severity,
                 "routing_tier_used": s.routing_tier_used,
+                "personal_flagged": s.personal_flagged,
+                "audit_unavailable": s.audit_unavailable,
             })).collect::<Vec<_>>(),
             "sensitivity_ceiling": task_track.sensitivity_ceiling(),
         });
@@ -4223,6 +4292,8 @@ mod tests {
             content: "x".to_owned(),
             sensitivity_severity: ceiling,
             routing_tier_used: 1,
+            personal_flagged: false,
+            audit_unavailable: false,
         });
         run.task_track = Some(tt);
         run
@@ -4966,6 +5037,8 @@ mod tests {
                 content: "the draft awaiting gate3 review".to_owned(),
                 sensitivity_severity: 1,
                 routing_tier_used: 1,
+                personal_flagged: false,
+                audit_unavailable: false,
             });
             let result = run
                 .execute()
@@ -5230,6 +5303,182 @@ mod tests {
         pool
     }
 
+    // -------------------------------------------------------------------------
+    // items.id=735 (decisions.id=883): Gate 2 flags on the TaskStep travel to
+    // the step-completion status and through checkpoint and resume.
+    // -------------------------------------------------------------------------
+
+    fn flagged_step(severity: i32, audit_unavailable: bool) -> TaskStep {
+        TaskStep {
+            step_id: "draft".to_owned(),
+            output_var: Some("draft_output".to_owned()),
+            content: "Reply that echoed a withheld value".to_owned(),
+            sensitivity_severity: severity,
+            routing_tier_used: 2,
+            personal_flagged: true,
+            audit_unavailable,
+        }
+    }
+
+    #[test]
+    fn an_old_checkpoint_without_the_gate_2_fields_deserializes_with_both_false() {
+        let json = r#"{"steps":[{"step_id":"s1","output_var":"o","content":"c",
+            "sensitivity_severity":3,"routing_tier_used":2}],"sensitivity_ceiling":3}"#;
+        let track = deserialize_task_track(json).unwrap();
+        let step = &track.steps()[0];
+        assert!(!step.personal_flagged && !step.audit_unavailable);
+        assert_eq!(track.sensitivity_ceiling(), 3);
+    }
+
+    #[test]
+    fn replaying_flagged_steps_restores_the_flags_and_the_raised_ceiling() {
+        let json = r#"{"steps":[
+            {"step_id":"s1","output_var":"a","content":"c1","sensitivity_severity":1,
+             "routing_tier_used":2,"personal_flagged":false,"audit_unavailable":false},
+            {"step_id":"s2","output_var":"b","content":"c2","sensitivity_severity":4,
+             "routing_tier_used":2,"personal_flagged":true,"audit_unavailable":true}
+          ],"sensitivity_ceiling":4}"#;
+        let track = deserialize_task_track(json).unwrap();
+        assert!(!track.steps()[0].personal_flagged);
+        assert!(track.steps()[1].personal_flagged && track.steps()[1].audit_unavailable);
+        assert_eq!(track.sensitivity_ceiling(), 4);
+    }
+
+    #[test]
+    fn the_step_completion_status_carries_the_flags_only_for_a_flagged_step() {
+        let mut run = failure_ready_run(false);
+        // A clean step: both absent.
+        run.task_track.as_mut().unwrap().add_step(TaskStep {
+            personal_flagged: false,
+            ..flagged_step(1, false)
+        });
+        let flags = run.last_step_reply_flags();
+        assert_eq!(flags, None);
+        let p = run.build_status_payload("running", Some("Draft"), Some("c"), None, flags);
+        assert_eq!((p.personal_flagged, p.audit_unavailable), (None, None));
+
+        // A flagged step with the audit entry written.
+        run.task_track
+            .as_mut()
+            .unwrap()
+            .add_step(flagged_step(3, false));
+        let flags = run.last_step_reply_flags();
+        assert_eq!(flags, Some(false));
+        let p = run.build_status_payload("running", Some("Draft"), Some("c"), None, flags);
+        assert_eq!(
+            (p.personal_flagged, p.audit_unavailable),
+            (Some(true), None)
+        );
+
+        // A flagged step whose audit entry could not be written.
+        run.task_track
+            .as_mut()
+            .unwrap()
+            .add_step(flagged_step(3, true));
+        let flags = run.last_step_reply_flags();
+        let p = run.build_status_payload("running", Some("Draft"), Some("c"), None, flags);
+        assert_eq!(
+            (p.personal_flagged, p.audit_unavailable),
+            (Some(true), Some(true))
+        );
+        assert_eq!(p.step_content.as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn failed_and_awaiting_user_statuses_never_carry_the_flags() {
+        let mut run = failure_ready_run(false);
+        run.task_track
+            .as_mut()
+            .unwrap()
+            .add_step(flagged_step(4, true));
+        // emit_status_with_content (the failed / awaiting_user / draft path)
+        // passes no flags whatever the last step recorded.
+        for status in ["failed", "awaiting_user", "awaiting_feedback"] {
+            let p = run.build_status_payload(status, None, None, None, None);
+            assert_eq!((p.personal_flagged, p.audit_unavailable), (None, None));
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_replays_the_gate_2_flags_and_the_raised_ceiling() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let user_id = "flag-resume-user";
+        let persona_id = "flag-resume-persona";
+        let pool = setup_shared_and_persona_for_resume_test(user_id, persona_id).await;
+        let focus_run_id = uuid::Uuid::new_v4().to_string();
+        {
+            let mut conn = open_outputs_db(user_id, persona_id, RESUME_TEST_KEY_HEX)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO focus_runs
+                 (id, focus_id, status, is_fast_lane, is_quick_ask, topic_id, user_input, started_at)
+                 VALUES (?, 'quick-ask', 'paused', 0, 1, NULL, ?, ?)",
+            )
+            .bind(&focus_run_id)
+            .bind("input")
+            .bind(now())
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+        {
+            let scheduler = Arc::new(ConductorScheduler::new());
+            let mut seed_run: FocusRun = FocusRun::new(
+                user_id.to_owned(),
+                persona_id.to_owned(),
+                "quick-ask".to_owned(),
+                pool.clone(),
+                scheduler,
+                "input".to_owned(),
+                false,
+                Some(RESUME_TEST_KEY_HEX.to_owned()),
+                None,
+                true,
+                std::collections::HashSet::new(),
+                None,
+            );
+            seed_run.focus_run_id = Some(focus_run_id.clone());
+            let mut personal_track = PersonalTrack::new();
+            personal_track.seal();
+            seed_run.personal_track = Some(personal_track);
+            let mut task_track = TaskTrack::new();
+            task_track.add_step(flagged_step(4, true));
+            seed_run.task_track = Some(task_track);
+            seed_run.shared_state = Some(SharedStateTrack::new());
+            seed_run.write_checkpoint("draft").await.unwrap();
+        }
+
+        let run: FocusRun = rehydrate_focus_run(
+            user_id.to_owned(),
+            persona_id.to_owned(),
+            focus_run_id.clone(),
+            pool.clone(),
+            Arc::new(ConductorScheduler::new()),
+            Some(RESUME_TEST_KEY_HEX.to_owned()),
+            std::collections::HashSet::new(),
+            None,
+        )
+        .await
+        .expect("rehydrate_focus_run must succeed");
+
+        let track = run.task_track.as_ref().unwrap();
+        let step = &track.steps()[0];
+        assert!(step.personal_flagged && step.audit_unavailable);
+        assert_eq!(step.sensitivity_severity, 4);
+        assert_eq!(track.sensitivity_ceiling(), 4);
+        assert_eq!(run.last_step_reply_flags(), Some(true));
+
+        match saved_root {
+            Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+            None => std::env::remove_var("QR_DATA_ROOT"),
+        }
+    }
+
     /// End-to-end (minus the model call) proof that a paused quick-ask run
     /// survives a rehydrate: real shared.db + real quick-ask.focus (the
     /// shipped artifact, one step: "draft") + a real checkpoint written via
@@ -5298,6 +5547,8 @@ mod tests {
                 content: "Original draft output".to_owned(),
                 sensitivity_severity: 1,
                 routing_tier_used: 1,
+                personal_flagged: false,
+                audit_unavailable: false,
             });
             seed_run.task_track = Some(task_track);
             seed_run.shared_state = Some(SharedStateTrack::new());
@@ -5587,6 +5838,8 @@ mod tests {
                 content: "Analysis".to_owned(),
                 sensitivity_severity: 1,
                 routing_tier_used: 1,
+                personal_flagged: false,
+                audit_unavailable: false,
             });
             task_track.add_step(TaskStep {
                 step_id: "draft_writing".to_owned(),
@@ -5594,6 +5847,8 @@ mod tests {
                 content: "Original draft".to_owned(),
                 sensitivity_severity: 1,
                 routing_tier_used: 2,
+                personal_flagged: false,
+                audit_unavailable: false,
             });
             task_track.add_step(TaskStep {
                 step_id: "voice_transform".to_owned(),
@@ -5601,6 +5856,8 @@ mod tests {
                 content: "Original final".to_owned(),
                 sensitivity_severity: 1,
                 routing_tier_used: 1,
+                personal_flagged: false,
+                audit_unavailable: false,
             });
             seed_run.task_track = Some(task_track);
             seed_run.shared_state = Some(SharedStateTrack::new());
@@ -5707,6 +5964,8 @@ mod tests {
             content: "Second draft".to_owned(),
             sensitivity_severity: 1,
             routing_tier_used: 2,
+            personal_flagged: false,
+            audit_unavailable: false,
         });
         run.task_track.as_mut().unwrap().add_step(TaskStep {
             step_id: "voice_transform".to_owned(),
@@ -5714,6 +5973,8 @@ mod tests {
             content: "Second final".to_owned(),
             sensitivity_severity: 1,
             routing_tier_used: 1,
+            personal_flagged: false,
+            audit_unavailable: false,
         });
 
         // Reenter draft_writing again -- the HARD INVARIANT under test:

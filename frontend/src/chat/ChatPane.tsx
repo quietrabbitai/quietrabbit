@@ -84,6 +84,15 @@ interface RunStatusPayload {
    *  PendingCrossPersonaFact's own no-raw-values convention -- this only
    *  ever drives a generic notice, never names the actual value withheld. */
   provenance_omissions: OmittedCrossPersonaFact[]
+  /** items.id=735 (decisions.id=883): Gate 2 found a withheld personal value
+   *  in the just-completed step's reply. Non-blocking: the reply is intact
+   *  and the run continues. Set (true) only on the step-completion emit of a
+   *  flagged step; null/absent otherwise (commands/consent.rs's raw emit
+   *  never sends it). Nothing renders it yet. */
+  personal_flagged?: boolean | null
+  /** items.id=735: the flagged reply's disclosure-log entry could not be
+   *  written. true only alongside personal_flagged. */
+  audit_unavailable?: boolean | null
 }
 
 /** Hand-declared, same convention as RunStatusPayload above -- mirrors
