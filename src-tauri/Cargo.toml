@@ -173,6 +173,15 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 # beside this crate's sha2 0.10 (Chat-PM review of items.id=713, 2026-10-11).
 # `cargo deny check` result is reported with the items.id=713 diff.
 minisign-verify = "0.2.5"
+# items.id=714: opens a provider's keys page and spend-limit page in the
+# user's default browser. Called from Rust only (provider_credentials/
+# opener.rs), with a URL read from the provider row and checked first; the
+# frontend never supplies a URL and no Tauri opener plugin or capability
+# permission is added (Chat-PM ruling on items.id=714). MIT; brings is-wsl
+# and is-docker (both small, once_cell only) beside libc, which is already
+# in the tree. `cargo deny check` result is reported with the items.id=714
+# diff.
+open = "5.4.4"
 thiserror = "1"
 async-trait = "0.1"
 

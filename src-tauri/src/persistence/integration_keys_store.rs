@@ -96,8 +96,8 @@ pub struct IntegrationKey {
     pub last_verified_at: Option<String>,
     /// The record's `extra_metadata` column: a JSON object holding per-user
     /// provider variables such as an account id (decisions.id=875 point 1).
-    /// Anything that is not a JSON object reads as an empty object. Nothing
-    /// writes this column yet (credential capture is items.id=714).
+    /// Anything that is not a JSON object reads as an empty object. Written
+    /// by `save_credential` only (credential capture, items.id=714).
     pub extra_metadata: serde_json::Value,
 }
 
@@ -365,6 +365,159 @@ async fn upsert_key_conn(
         }
     }
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Credential capture write (items.id=714)
+// ---------------------------------------------------------------------------
+
+/// Largest `extra_metadata` object `save_credential` will store, in bytes of
+/// its JSON text. It holds a handful of per-user provider variables (an
+/// account id), never content.
+pub const MAX_EXTRA_METADATA_BYTES: usize = 4096;
+
+/// One credential as the connect flow captured it.
+///
+/// `credential` is borrowed so the caller keeps it in its own zeroizing
+/// buffer. Debug is hand-written for the same reason as `IntegrationKey`'s.
+pub struct NewCredential<'a> {
+    pub provider: &'a str,
+    pub key_type: &'a str,
+    pub credential: &'a str,
+    pub persona_id: Option<&'a str>,
+    /// `api_key`, `oauth_token` or `manual_copy` (keys_001.sql CHECK).
+    pub auth_type: Option<&'a str>,
+    pub expires_at: Option<&'a str>,
+    /// When the provider accepted this exact key, or None when it was not
+    /// checked. A replaced key never inherits the old key's verification.
+    pub last_verified_at: Option<&'a str>,
+    /// `Some(object)` REPLACES the stored `extra_metadata` (the variables
+    /// belong to the key they were entered with); `None` keeps what is
+    /// stored. Must be a JSON object of string values, at most
+    /// `MAX_EXTRA_METADATA_BYTES` of text.
+    pub extra_metadata: Option<&'a serde_json::Value>,
+}
+
+impl std::fmt::Debug for NewCredential<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewCredential")
+            .field("provider", &self.provider)
+            .field("key_type", &self.key_type)
+            .field("credential", &"[redacted]")
+            .field("persona_id", &self.persona_id)
+            .field("auth_type", &self.auth_type)
+            .field("expires_at", &self.expires_at)
+            .field("last_verified_at", &self.last_verified_at)
+            .field("extra_metadata", &"[not printed]")
+            .finish()
+    }
+}
+
+fn validated_extra_metadata(
+    value: &serde_json::Value,
+) -> Result<String, IntegrationKeysStoreError> {
+    let bad = |what: &str| IntegrationKeysStoreError::Validation(what.to_owned());
+    let Some(map) = value.as_object() else {
+        return Err(bad("extra_metadata must be a JSON object"));
+    };
+    if !map.values().all(serde_json::Value::is_string) {
+        return Err(bad("extra_metadata values must be strings"));
+    }
+    let text = serde_json::to_string(value).map_err(|_| bad("extra_metadata is not JSON"))?;
+    if text.len() > MAX_EXTRA_METADATA_BYTES {
+        return Err(bad("extra_metadata is too large"));
+    }
+    Ok(text)
+}
+
+/// Insert or replace the credential for (provider, key_type, persona_id)
+/// together with its `extra_metadata` and verification time. The one writer
+/// of `extra_metadata`. Same identity rule as `upsert_key` (user-global and
+/// persona-scoped keys are two different credentials), but unlike
+/// `upsert_key` it always sets `last_verified_at` from the caller.
+pub async fn save_credential(
+    user_id: &str,
+    key_hex: &str,
+    new: &NewCredential<'_>,
+) -> Result<(), IntegrationKeysStoreError> {
+    // Validate before any file is opened.
+    check_new_credential(new)?;
+    let mut conn = open_integration_keys_db(user_id, key_hex).await?;
+    save_credential_conn(&mut conn, new).await
+}
+
+fn check_new_credential(
+    new: &NewCredential<'_>,
+) -> Result<Option<String>, IntegrationKeysStoreError> {
+    if new.credential.trim().is_empty() {
+        return Err(IntegrationKeysStoreError::Validation(
+            "credential must not be empty".to_owned(),
+        ));
+    }
+    new.extra_metadata.map(validated_extra_metadata).transpose()
+}
+
+pub(crate) async fn save_credential_conn(
+    conn: &mut SqliteConnection,
+    new: &NewCredential<'_>,
+) -> Result<(), IntegrationKeysStoreError> {
+    let metadata_text = check_new_credential(new)?;
+    let now = crate::providers::utils::now();
+    // Explicit existence check, not ON CONFLICT: see upsert_key_conn.
+    let existing_id: Option<(String,)> = sqlx::query_as(
+        "SELECT id FROM integration_keys
+         WHERE provider = ? AND key_type = ? AND integration_id = '_default'
+           AND ((? IS NULL AND persona_id IS NULL) OR persona_id = ?)",
+    )
+    .bind(new.provider)
+    .bind(new.key_type)
+    .bind(new.persona_id)
+    .bind(new.persona_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+
+    match existing_id {
+        Some((id,)) => {
+            sqlx::query(
+                "UPDATE integration_keys
+                 SET credential = ?, auth_type = ?, expires_at = ?, is_active = 1,
+                     last_verified_at = ?,
+                     extra_metadata = COALESCE(?, extra_metadata)
+                 WHERE id = ?",
+            )
+            .bind(new.credential)
+            .bind(new.auth_type)
+            .bind(new.expires_at)
+            .bind(new.last_verified_at)
+            .bind(metadata_text.as_deref())
+            .bind(&id)
+            .execute(&mut *conn)
+            .await?;
+        }
+        None => {
+            sqlx::query(
+                "INSERT INTO integration_keys
+                    (id, provider, key_type, integration_id, credential_label, credential,
+                     persona_id, auth_type, expires_at, is_active, created_at,
+                     last_verified_at, extra_metadata)
+                 VALUES (?, ?, ?, '_default', ?, ?, ?, ?, ?, 1, ?, ?, ?)",
+            )
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(new.provider)
+            .bind(new.key_type)
+            .bind(new.provider) // credential_label default: provider name
+            .bind(new.credential)
+            .bind(new.persona_id)
+            .bind(new.auth_type)
+            .bind(new.expires_at)
+            .bind(&now)
+            .bind(new.last_verified_at)
+            .bind(metadata_text.as_deref().unwrap_or("{}"))
+            .execute(&mut *conn)
+            .await?;
+        }
+    }
     Ok(())
 }
 
@@ -995,5 +1148,181 @@ mod tests {
         assert!(!pretty.contains(secret));
         let option = format!("{:?}", Some(&key));
         assert!(!option.contains(secret));
+    }
+
+    // items.id=714: save_credential is the one writer of extra_metadata.
+
+    fn new_cred<'a>(
+        provider: &'a str,
+        credential: &'a str,
+        meta: Option<&'a serde_json::Value>,
+        verified: Option<&'a str>,
+    ) -> NewCredential<'a> {
+        NewCredential {
+            provider,
+            key_type: TEST_KEY_TYPE,
+            credential,
+            persona_id: None,
+            auth_type: Some("api_key"),
+            expires_at: None,
+            last_verified_at: verified,
+            extra_metadata: meta,
+        }
+    }
+
+    #[tokio::test]
+    async fn save_credential_inserts_with_metadata_and_verification() {
+        let mut conn = seeded_conn().await;
+        let meta = serde_json::json!({"account_id": "abc123"});
+        save_credential_conn(
+            &mut conn,
+            &new_cred("p1", "sk-one", Some(&meta), Some("2026-10-12T10:00:00Z")),
+        )
+        .await
+        .unwrap();
+        let key = get_active_key_conn(&mut conn, "p1", TEST_KEY_TYPE, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(key.credential, "sk-one");
+        assert_eq!(key.auth_type.as_deref(), Some("api_key"));
+        assert_eq!(key.extra_metadata, meta);
+        assert_eq!(
+            key.last_verified_at.as_deref(),
+            Some("2026-10-12T10:00:00Z")
+        );
+    }
+
+    #[tokio::test]
+    async fn save_credential_without_metadata_inserts_an_empty_object() {
+        let mut conn = seeded_conn().await;
+        save_credential_conn(&mut conn, &new_cred("p1", "sk-one", None, None))
+            .await
+            .unwrap();
+        let key = get_active_key_conn(&mut conn, "p1", TEST_KEY_TYPE, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(key.extra_metadata, serde_json::json!({}));
+        assert_eq!(key.last_verified_at, None);
+    }
+
+    #[tokio::test]
+    async fn resaving_without_metadata_keeps_it_and_with_metadata_replaces_it() {
+        let mut conn = seeded_conn().await;
+        let first = serde_json::json!({"account_id": "abc123"});
+        save_credential_conn(&mut conn, &new_cred("p1", "sk-one", Some(&first), None))
+            .await
+            .unwrap();
+        save_credential_conn(&mut conn, &new_cred("p1", "sk-two", None, None))
+            .await
+            .unwrap();
+        let key = get_active_key_conn(&mut conn, "p1", TEST_KEY_TYPE, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(key.credential, "sk-two");
+        assert_eq!(key.extra_metadata, first, "None keeps the stored object");
+
+        let second = serde_json::json!({"account_id": "def456"});
+        save_credential_conn(&mut conn, &new_cred("p1", "sk-three", Some(&second), None))
+            .await
+            .unwrap();
+        let key = get_active_key_conn(&mut conn, "p1", TEST_KEY_TYPE, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            key.extra_metadata, second,
+            "Some replaces, it does not merge"
+        );
+
+        // An empty object clears.
+        let empty = serde_json::json!({});
+        save_credential_conn(&mut conn, &new_cred("p1", "sk-four", Some(&empty), None))
+            .await
+            .unwrap();
+        let key = get_active_key_conn(&mut conn, "p1", TEST_KEY_TYPE, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(key.extra_metadata, empty);
+    }
+
+    #[tokio::test]
+    async fn a_replaced_key_does_not_inherit_the_old_verification() {
+        let mut conn = seeded_conn().await;
+        save_credential_conn(
+            &mut conn,
+            &new_cred("p1", "sk-one", None, Some("2026-10-12T10:00:00Z")),
+        )
+        .await
+        .unwrap();
+        save_credential_conn(&mut conn, &new_cred("p1", "sk-two", None, None))
+            .await
+            .unwrap();
+        let key = get_active_key_conn(&mut conn, "p1", TEST_KEY_TYPE, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(key.last_verified_at, None);
+        let rows: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM integration_keys")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(rows.0, 1, "a re-save replaces, never duplicates");
+    }
+
+    #[tokio::test]
+    async fn save_credential_rejects_bad_metadata_and_an_empty_credential() {
+        let mut conn = seeded_conn().await;
+        let not_object = serde_json::json!(["a"]);
+        let non_string = serde_json::json!({"account_id": 7});
+        let big = serde_json::json!({"account_id": "x".repeat(MAX_EXTRA_METADATA_BYTES)});
+        for bad in [&not_object, &non_string, &big] {
+            let r =
+                save_credential_conn(&mut conn, &new_cred("p1", "sk-one", Some(bad), None)).await;
+            assert!(
+                matches!(r, Err(IntegrationKeysStoreError::Validation(_))),
+                "{bad}"
+            );
+        }
+        let r = save_credential_conn(&mut conn, &new_cred("p1", "   ", None, None)).await;
+        assert!(matches!(r, Err(IntegrationKeysStoreError::Validation(_))));
+        let rows: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM integration_keys")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(rows.0, 0, "a refused save writes nothing");
+    }
+
+    #[tokio::test]
+    async fn save_credential_keeps_global_and_persona_keys_apart() {
+        let mut conn = seeded_conn().await;
+        let global = new_cred("p1", "sk-global", None, None);
+        let mut persona = new_cred("p1", "sk-persona", None, None);
+        persona.persona_id = Some("persona-a");
+        save_credential_conn(&mut conn, &global).await.unwrap();
+        save_credential_conn(&mut conn, &persona).await.unwrap();
+        let g = get_active_key_conn(&mut conn, "p1", TEST_KEY_TYPE, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let p = get_active_key_conn(&mut conn, "p1", TEST_KEY_TYPE, Some("persona-a"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(g.credential, "sk-global");
+        assert_eq!(p.credential, "sk-persona");
+    }
+
+    #[test]
+    fn new_credential_debug_never_contains_the_credential() {
+        let secret = "sk-newcred-must-not-print";
+        let meta = serde_json::json!({"account_id": "acct-not-printed"});
+        let n = new_cred("p1", secret, Some(&meta), None);
+        let shown = format!("{n:?} {n:#?}");
+        assert!(!shown.contains(secret), "{shown}");
+        assert!(!shown.contains("acct-not-printed"), "{shown}");
     }
 }

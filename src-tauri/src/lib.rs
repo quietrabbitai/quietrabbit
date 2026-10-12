@@ -16,6 +16,7 @@ pub mod persona_sync;
 pub mod persona_view_sync;
 pub mod pinned_asset;
 pub mod provider_catalog;
+pub mod provider_credentials;
 pub mod providers;
 pub mod recommendation;
 pub mod spend;

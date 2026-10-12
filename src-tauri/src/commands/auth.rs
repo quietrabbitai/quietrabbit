@@ -571,9 +571,14 @@ pub async fn logout(
     key_registry: State<'_, KeyRegistry>,
     group_key_registry: State<'_, GroupKeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
+    connect_sessions: State<'_, crate::provider_credentials::session::ConnectSessions>,
 ) -> Result<(), String> {
     let user_id = key_registry.with_key(|k| k.user_id.clone()).await;
     key_registry.clear().await;
+    // items.id=714: a connect dialog's session, and any clipboard text it was
+    // holding for a key the user had not yet confirmed, must not outlive the
+    // account that opened it. Cleared whether or not a key was resident.
+    connect_sessions.clear();
 
     if let Some(user_id) = user_id {
         // items.id=469: group keys are per-Persona, not per-account, so
@@ -758,6 +763,7 @@ mod tests {
         let app = tauri::test::mock_app();
         app.manage(KeyRegistry::default());
         app.manage(GroupKeyRegistry::default());
+        app.manage(crate::provider_credentials::session::ConnectSessions::default());
         app.manage(pool);
         app
     }
@@ -1028,9 +1034,14 @@ mod tests {
         .unwrap();
         assert!(registry.is_occupied().await);
 
-        logout(registry.clone(), group_key_registry.clone(), pool.clone())
-            .await
-            .unwrap();
+        logout(
+            registry.clone(),
+            group_key_registry.clone(),
+            pool.clone(),
+            app.state::<crate::provider_credentials::session::ConnectSessions>(),
+        )
+        .await
+        .unwrap();
         assert!(
             !registry.is_occupied().await,
             "registry must be empty after logout"
@@ -1153,9 +1164,14 @@ mod tests {
                 .await
         );
 
-        logout(registry.clone(), group_key_registry.clone(), pool.clone())
-            .await
-            .unwrap();
+        logout(
+            registry.clone(),
+            group_key_registry.clone(),
+            pool.clone(),
+            app.state::<crate::provider_credentials::session::ConnectSessions>(),
+        )
+        .await
+        .unwrap();
 
         assert!(
             !group_key_registry
@@ -1194,9 +1210,14 @@ mod tests {
         )
         .await
         .unwrap();
-        logout(registry.clone(), group_key_registry.clone(), pool.clone())
-            .await
-            .unwrap();
+        logout(
+            registry.clone(),
+            group_key_registry.clone(),
+            pool.clone(),
+            app.state::<crate::provider_credentials::session::ConnectSessions>(),
+        )
+        .await
+        .unwrap();
 
         let mut conn = pool.acquire().await.unwrap();
         // Row must still exist (not deleted) -- audit trail, Jason's
@@ -1221,6 +1242,87 @@ mod tests {
         );
     }
 
+    /// items.id=714: a connect session and the clipboard candidate it holds do
+    /// not survive logout, whether or not a key was resident.
+    #[tokio::test]
+    async fn logout_ends_a_connect_session_and_drops_its_clipboard_candidate() {
+        use crate::provider_credentials::session::{ConnectSessions, SessionError};
+        use std::time::Instant;
+
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let registry = app.state::<KeyRegistry>();
+        let group_key_registry = app.state::<GroupKeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
+        let sessions = app.state::<ConnectSessions>();
+
+        login(
+            "Alice".to_owned(),
+            "password123".to_owned(),
+            registry.clone(),
+            group_key_registry.clone(),
+            pool.clone(),
+        )
+        .await
+        .unwrap();
+        let user_id = registry.with_key(|k| k.user_id.clone()).await.unwrap();
+
+        let now = Instant::now();
+        let id = sessions.begin(&user_id, "some-provider", now).unwrap();
+        sessions
+            .with_session(&id, &user_id, now, |s| {
+                s.set_candidate(zeroize::Zeroizing::new(
+                    "fx_candidate_0123456789".to_owned(),
+                ))
+            })
+            .unwrap();
+        assert_eq!(
+            sessions.with_session(&id, &user_id, now, |s| s.has_candidate()),
+            Ok(true)
+        );
+
+        logout(
+            registry.clone(),
+            group_key_registry.clone(),
+            pool.clone(),
+            sessions.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert!(sessions.is_empty(), "logout must drop the session");
+        assert_eq!(
+            sessions.with_session(&id, &user_id, now, |s| s.has_candidate()),
+            Err(SessionError::NoSession),
+            "the candidate must not be reachable after logout, even for the same user"
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_clears_a_connect_session_even_when_no_key_was_resident() {
+        use crate::provider_credentials::session::ConnectSessions;
+
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let registry = app.state::<KeyRegistry>();
+        let group_key_registry = app.state::<GroupKeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
+        let sessions = app.state::<ConnectSessions>();
+        sessions
+            .begin("someone", "some-provider", std::time::Instant::now())
+            .unwrap();
+
+        logout(
+            registry.clone(),
+            group_key_registry.clone(),
+            pool.clone(),
+            sessions.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(sessions.is_empty());
+    }
+
     #[tokio::test]
     async fn logout_on_empty_registry_is_a_no_op_not_an_error() {
         let _env = setup().await;
@@ -1229,7 +1331,13 @@ mod tests {
         let group_key_registry = app.state::<GroupKeyRegistry>();
         let pool = app.state::<sqlx::SqlitePool>();
 
-        let result = logout(registry.clone(), group_key_registry.clone(), pool.clone()).await;
+        let result = logout(
+            registry.clone(),
+            group_key_registry.clone(),
+            pool.clone(),
+            app.state::<crate::provider_credentials::session::ConnectSessions>(),
+        )
+        .await;
         assert!(result.is_ok(), "logout with no resident key must not error");
     }
 
@@ -1352,9 +1460,14 @@ mod tests {
             .unwrap()
             .is_some());
 
-        logout(registry.clone(), group_key_registry.clone(), pool.clone())
-            .await
-            .unwrap();
+        logout(
+            registry.clone(),
+            group_key_registry.clone(),
+            pool.clone(),
+            app.state::<crate::provider_credentials::session::ConnectSessions>(),
+        )
+        .await
+        .unwrap();
 
         let result = get_session(registry.clone(), pool.clone()).await;
         assert_eq!(result, Ok(None));

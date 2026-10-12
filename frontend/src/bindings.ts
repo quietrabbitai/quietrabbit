@@ -883,6 +883,31 @@ export const commands = {
 	checkCatalogUpdate: () => typedError<CatalogCheckDto, string>(__TAURI_INVOKE("check_catalog_update")),
 	applyCatalogUpdate: (sha256: string) => typedError<CatalogApplyDto, string>(__TAURI_INVOKE("apply_catalog_update", { sha256 })),
 	rollbackCatalog: () => typedError<CatalogApplyDto, string>(__TAURI_INVOKE("rollback_catalog")),
+	/**
+	 *  Open the connect dialog's session for a hosted provider. Writes nothing and
+	 *  contacts nothing.
+	 */
+	beginProviderConnect: (providerId: string) => typedError<ProviderConnectInfo, string>(__TAURI_INVOKE("begin_provider_connect", { providerId })),
+	/**
+	 *  Open the provider's keys page or spend-limit page in the default browser.
+	 *  The URL comes from the provider row and must pass the URL policy.
+	 */
+	openProviderPage: (sessionId: string, page: ProviderPage) => typedError<null, string>(__TAURI_INVOKE("open_provider_page", { sessionId, page })),
+	/**
+	 *  Read the clipboard once, on the user's click, and say whether it holds a
+	 *  key the row's pattern recognises. Returns a state and a length only.
+	 */
+	checkClipboardForKey: (sessionId: string) => typedError<ClipboardOffer, string>(__TAURI_INVOKE("check_clipboard_for_key", { sessionId })),
+	/**
+	 *  Check the key with its provider, then store it for the signed-in user.
+	 *  The key goes in and never comes out.
+	 */
+	saveProviderKey: (request: SaveKeyRequest) => typedError<SaveOutcome, string>(__TAURI_INVOKE("save_provider_key", { request })),
+	/**
+	 *  Close the dialog's session and drop any clipboard text it held. Ending an
+	 *  unknown session is a no-op.
+	 */
+	endProviderConnect: (sessionId: string) => typedError<null, string>(__TAURI_INVOKE("end_provider_connect", { sessionId })),
 };
 
 /* Types */
@@ -1025,6 +1050,35 @@ export type ChatInfo = {
 	created_at: string,
 	last_message_at: string,
 };
+
+/**  What happened to the key check. */
+export type CheckState = 
+/**  The provider accepted the key; `last_verified_at` is set. */
+"Verified" | 
+/**
+ *  The row has no model list to ask, so the key could not be checked. Saved
+ *  unverified; the first real call is its test.
+ */
+"Unavailable" | 
+/**  The check could not be completed and the user chose to save anyway. */
+"Inconclusive";
+
+export type ClipboardOffer = {
+	state: ClipboardState,
+	/**  Characters in the matched text; 0 unless `Matches`. */
+	length: number,
+};
+
+export type ClipboardState = 
+/**
+ *  The clipboard holds one line matching the key pattern. The text is held
+ *  in memory for `save_provider_key`; it is not returned.
+ */
+"Matches" | "NoMatch" | 
+/**  The clipboard is empty, not text, or could not be read. */
+"Unavailable" | 
+/**  The row has no usable key pattern; the clipboard was NOT read. */
+"NoPattern";
 
 /**
  *  Selector-screen-facing provider summary. `lane` matches the frontend's
@@ -1354,6 +1408,15 @@ export type HealthResponse = {
 	 */
 	qr_hosted_configured: boolean,
 };
+
+/**  Where the key to save comes from. Never derives Debug: it can hold a key. */
+export type KeySource = 
+/**  The user typed or pasted it into the dialog. */
+{ Typed: {
+	api_key: string,
+} } | 
+/**  The text `check_clipboard_for_key` matched and the user then confirmed. */
+"ClipboardCandidate";
 
 export type LimitDto = {
 	id: string,
@@ -1714,6 +1777,26 @@ export type PrivacyGuardianDefaultLevel = "low" | "medium" | "high";
  */
 export type PrivacyPreference = "red" | "yellow" | "green";
 
+export type ProviderConnectInfo = {
+	session_id: string,
+	/**
+	 *  `credential_acquisition.method` from the row (`guided_paste`,
+	 *  `oauth_pkce`, ...). Pasting a key works whatever it says.
+	 */
+	method: string | null,
+	/**
+	 *  Names of the per-user variables the row needs (for example
+	 *  `account_id`); the dialog must collect each.
+	 */
+	user_variables: string[],
+	keys_page_available: boolean,
+	spend_limit_available: boolean,
+	/**  The row carries a usable key pattern, so the clipboard can be offered. */
+	clipboard_assist_available: boolean,
+	/**  The row has a model list, so a pasted key can be checked. */
+	key_check_available: boolean,
+};
+
 export type ProviderDisclosure = {
 	provider_id: string,
 	display_name: string,
@@ -1798,6 +1881,13 @@ export type ProviderModelsView = {
 	selection: SelectionInfoDto,
 	models: ProviderModelDto[],
 };
+
+/**  A provider page the dialog can open. */
+export type ProviderPage = 
+/**  Where the provider issues API keys. */
+"Keys" | 
+/**  The provider's own spend-limit page (a local cap cannot stop a leaked key). */
+"Spend";
 
 export type ProviderRecommendation = {
 	/**
@@ -1959,6 +2049,23 @@ export type ResumeRunRequest = {
 	run_id: string,
 	user_id: string,
 	persona_id: string,
+};
+
+export type SaveKeyRequest = {
+	session_id: string,
+	source: KeySource,
+	/**  Values for the row's `user_variables`, by name. */
+	variables: { [key in string]: string },
+	/**
+	 *  Save even if the provider could not be reached to check the key. Never
+	 *  overrides a key the provider rejected.
+	 */
+	save_unverified: boolean,
+};
+
+export type SaveOutcome = {
+	verified: boolean,
+	check: CheckState,
 };
 
 export type ScopeKind = "all" | "provider" | "persona" | "focus";

@@ -198,6 +198,13 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::provider_catalog::check_catalog_update,
         commands::provider_catalog::apply_catalog_update,
         commands::provider_catalog::rollback_catalog,
+        // Group 28 -- Hosted-provider credential acquisition, guided paste
+        // (items.id=714, decisions.id=875 point 7, spec Part 8g)
+        commands::provider_credentials::begin_provider_connect,
+        commands::provider_credentials::open_provider_page,
+        commands::provider_credentials::check_clipboard_for_key,
+        commands::provider_credentials::save_provider_key,
+        commands::provider_credentials::end_provider_connect,
     ])
 }
 

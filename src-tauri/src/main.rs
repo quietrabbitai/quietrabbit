@@ -140,6 +140,9 @@ async fn async_main() {
         // directly (see auth::registry module header). Default::default()
         // starts with an empty slot; login() (a later step) populates it.
         .manage(quietrabbit_lib::auth::registry::KeyRegistry::default())
+        // ConnectSessions (items.id=714): the in-memory "connect dialog is
+        // open" state for credential capture; nothing here is persisted.
+        .manage(quietrabbit_lib::provider_credentials::session::ConnectSessions::default())
         // GroupKeyRegistry: multi-key group registry (items.id=283,
         // Working/GROUP_DB_DESIGN_20260802.md Section 2.1), alongside the
         // single-slot KeyRegistry above, not a replacement for it. Same

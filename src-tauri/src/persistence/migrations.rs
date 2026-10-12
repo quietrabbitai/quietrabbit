@@ -390,6 +390,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/shared_030.sql"),
     },
     SchemaFile {
+        prefix: "shared",
+        version: 31,
+        sql: include_str!("../../schema/shared_031.sql"),
+    },
+    SchemaFile {
         prefix: "tier3_cookies",
         version: 1,
         sql: include_str!("../../schema/tier3_cookies_001.sql"),
@@ -2252,15 +2257,15 @@ mod tests {
             .await
             .expect("shared migration chain must apply cleanly on a fresh db");
         assert_eq!(
-            applied, 30,
-            "expected all thirty shared schema versions to apply"
+            applied, 31,
+            "expected all thirty-one shared schema versions to apply"
         );
 
         let version: (i64,) = sqlx::query_as("SELECT MAX(version) FROM schema_version")
             .fetch_one(&mut conn)
             .await
             .unwrap();
-        assert_eq!(version.0, 30);
+        assert_eq!(version.0, 31);
     }
 
     /// items.id=708 / items.id=703 / items.id=724: shared_026.sql and
@@ -2370,6 +2375,47 @@ mod tests {
             );
             assert!(limits[0] > 0, "{id}: the token limit must be positive");
         }
+    }
+
+    /// items.id=714 (shared_031.sql): the Ollama Cloud row is connected by a
+    /// pasted key, keeps its keys page, and nothing else in its acquisition
+    /// block moved. Data only: the other rows keep their method.
+    #[tokio::test]
+    async fn test_ollama_cloud_row_is_guided_paste_after_shared_031() {
+        let mut conn = make_test_conn().await;
+        run_migrations(&mut conn, "shared", None).await.unwrap();
+        let (method, keys_page, auth_url, key_pattern): (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT json_extract(credential_acquisition, '$.method'), \
+                        json_extract(credential_acquisition, '$.keys_page_url'), \
+                        json_extract(credential_acquisition, '$.auth_url'), \
+                        json_extract(credential_acquisition, '$.key_pattern') \
+                 FROM providers WHERE id = 'ollama_cloud'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(method, "guided_paste");
+        assert_eq!(keys_page, "https://ollama.com/settings/keys");
+        assert_eq!((auth_url, key_pattern), (None, None));
+
+        let others: Vec<(String,)> = sqlx::query_as(
+            "SELECT json_extract(credential_acquisition, '$.method') FROM providers \
+             WHERE id != 'ollama_cloud' AND credential_acquisition IS NOT NULL \
+             ORDER BY id",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        assert!(!others.is_empty());
+        assert!(
+            others.iter().all(|(m,)| m != "local_signin"),
+            "no row names the sidecar sign-in any more"
+        );
     }
 
     /// items.id=724: every seeded hosted (provider, model) pair must build a
@@ -2727,8 +2773,8 @@ mod tests {
             .expect("drift-healing run must succeed");
 
         assert_eq!(
-            applied, 29,
-            "shared v2 through v30 should count as newly applied from a stale v1 database"
+            applied, 30,
+            "shared v2 through v31 should count as newly applied from a stale v1 database"
         );
 
         // items.id=427: shared_013.sql drops tier3_providers (generalized

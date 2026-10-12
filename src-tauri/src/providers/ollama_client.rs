@@ -103,6 +103,49 @@ fn context_hard_limit() -> f64 {
         .unwrap_or(CONTEXT_HARD_LIMIT_DEFAULT)
 }
 
+// ---------------------------------------------------------------------------
+// External-model guard (items.id=714)
+// ---------------------------------------------------------------------------
+
+/// Whether a model tag names a model Ollama serves from a remote service
+/// instead of running on this computer.
+///
+/// QR's sidecar is the "local" route: a step with a local-only ceiling is
+/// allowed to use it precisely because nothing leaves the machine. Ollama can
+/// forward a cloud-suffixed model name to ollama.com when the Ollama instance
+/// is signed in, which would send the prompt off the machine while still
+/// looking local. QR never signs its sidecar in (Chat-PM ruling, items.id=714),
+/// but the sidecar inherits the user's HOME (only OLLAMA_HOST and
+/// OLLAMA_MODELS are set), so this guard refuses such a tag whatever the
+/// sign-in state.
+///
+/// The final `:`-segment (the tag) is `cloud` or ends in `-cloud`,
+/// case-insensitive. VERIFIED from Ollama's cloud docs (read by Chat-PM):
+/// the `:cloud` suffix. ASSUMED, not read from docs: the older `-cloud` tag
+/// form (for example `name:size-cloud`); it is treated as cloud so a mistake
+/// fails closed. A name with no tag is never cloud. This is a name check
+/// only; whether `/api/tags` or `/api/show` report a remote host is
+/// unverified, so a structural check is left to the sidecar sign-in follow-up.
+pub fn is_cloud_model_tag(tag: &str) -> bool {
+    let t = tag.trim().to_ascii_lowercase();
+    match t.rsplit_once(':') {
+        Some((_, seg)) => seg == "cloud" || seg.ends_with("-cloud"),
+        None => false,
+    }
+}
+
+fn cloud_model_refusal(tag: &str) -> ConductorError {
+    log::warn!(
+        "ollama_client: refusing cloud-classified model tag '{tag}' on the local sidecar \
+         (items.id=714)"
+    );
+    ConductorError::OllamaInvalidRequest {
+        plain_language: "That model runs on a remote service, not on this computer, so Quiet \
+            Rabbit will not run it as a local model."
+            .to_owned(),
+    }
+}
+
 /// The sidecar trust gate (see module doc comment, items.id=586). Logs once
 /// per refused call rather than silently returning the unavailable shape --
 /// the refusal itself is the interesting event, distinct from an ordinary
@@ -254,6 +297,9 @@ impl OllamaClient {
         &self,
         request: &GenerateRequest,
     ) -> Result<GenerateResponse, ConductorError> {
+        if is_cloud_model_tag(&request.model_id) {
+            return Err(cloud_model_refusal(&request.model_id));
+        }
         if !sidecar_trusted() {
             return Err(ConductorError::OllamaUnavailable {
                 plain_language: "The local AI isn't responding. \
@@ -387,6 +433,9 @@ impl OllamaClient {
         _task_type: &str,
         options: Option<GenerateOptions>,
     ) -> Result<GenerateResponse, ConductorError> {
+        if is_cloud_model_tag(model) {
+            return Err(cloud_model_refusal(model));
+        }
         if !sidecar_trusted() {
             return Err(ConductorError::OllamaUnavailable {
                 plain_language: "The local AI isn't responding. [Try again] [Get help]".to_owned(),
@@ -627,6 +676,12 @@ impl OllamaClient {
         tag: &str,
     ) -> Result<impl Stream<Item = Result<PullProgressLine, OllamaModelError>>, OllamaModelError>
     {
+        if is_cloud_model_tag(tag) {
+            log::warn!(
+                "ollama_client: refusing to pull cloud-classified model tag '{tag}' (items.id=714)"
+            );
+            return Err(OllamaModelError::CloudModelRefused);
+        }
         if !sidecar_trusted() {
             return Err(OllamaModelError::SidecarUntrusted);
         }
@@ -748,6 +803,10 @@ pub enum OllamaModelError {
     /// was actually attempted.
     #[error("QR's own sidecar is not confirmed running; refusing to contact it")]
     SidecarUntrusted,
+    /// items.id=714: refused before making any HTTP call, because the tag
+    /// names a model served from a remote service (`is_cloud_model_tag`).
+    #[error("that model runs on a remote service; refusing to pull it on the local sidecar")]
+    CloudModelRefused,
 }
 
 /// One decoded line of Ollama's `/api/pull` NDJSON stream.
@@ -1140,5 +1199,133 @@ mod tests {
         assert_eq!(result.status, ContextWindowStatusKind::Warn);
         let msg = result.plain_language.unwrap();
         assert!(msg.contains("getting long"));
+    }
+
+    // -- external-model guard (items.id=714) ----------------------------------
+
+    #[test]
+    fn cloud_tag_classification() {
+        // Documented form (:cloud) and the ASSUMED older form (-cloud suffix).
+        for yes in [
+            "gpt-oss:cloud",
+            "gpt-oss:120b-cloud",
+            "qwen3-coder:480b-cloud",
+            "GPT-OSS:CLOUD",
+            "  model:7b-Cloud  ",
+            "registry.example.test:8080/library/model:cloud",
+        ] {
+            assert!(is_cloud_model_tag(yes), "{yes}");
+        }
+        // Local tags, no tag at all, and "cloud" only inside a name.
+        for no in [
+            "llama3.2:3b",
+            "gpt-oss:20b",
+            "gpt-oss",
+            "cloud",
+            "cloudy-model:7b",
+            "model:cloudy",
+            "model:7b-cloudy",
+            "model:cloud-7b",
+            "model:7b",
+            "registry.example.test:8080/library/model",
+            "",
+            ":",
+        ] {
+            assert!(!is_cloud_model_tag(no), "{no}");
+        }
+    }
+
+    /// A counting loopback listener standing in for the sidecar's port.
+    fn counting_listener() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = count.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stream.is_ok() {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        });
+        (port, count)
+    }
+
+    /// With the sidecar TRUSTED (so the trust gate is not what stops the call),
+    /// a cloud tag must still make zero connections from generate, chat and
+    /// pull_model; a local tag does reach the port.
+    #[tokio::test]
+    async fn cloud_tags_make_zero_sidecar_connections_and_local_tags_do() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        crate::ollama_sidecar::force_trust_for_test(true);
+        let (port, count) = counting_listener();
+        let saved_host = std::env::var("OLLAMA_HOST").ok();
+        let saved_port = std::env::var("OLLAMA_PORT").ok();
+        std::env::set_var("OLLAMA_HOST", "127.0.0.1");
+        std::env::set_var("OLLAMA_PORT", port.to_string());
+
+        let client = OllamaClient::new();
+        let request = |model: &str| GenerateRequest {
+            provider_id: None,
+            model_id: model.to_owned(),
+            prompt: "hi".to_owned(),
+            images: None,
+            task_type: "generic".to_owned(),
+            stream: Some(false),
+            options: None,
+        };
+        let messages = vec![ChatMessage {
+            role: crate::providers::types::ChatRole::User,
+            content: "hi".to_owned(),
+        }];
+
+        for tag in ["gpt-oss:cloud", "gpt-oss:120b-cloud"] {
+            let g = client.generate(&request(tag)).await;
+            assert!(
+                matches!(g, Err(ConductorError::OllamaInvalidRequest { .. })),
+                "generate {tag}"
+            );
+            let c = client.chat(&messages, tag, "generic", None).await;
+            assert!(
+                matches!(c, Err(ConductorError::OllamaInvalidRequest { .. })),
+                "chat {tag}"
+            );
+            let p = client.pull_model(tag).await;
+            assert!(
+                matches!(p, Err(OllamaModelError::CloudModelRefused)),
+                "pull {tag}"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a cloud tag must never reach the sidecar"
+        );
+
+        // A local tag is not refused by the guard: it connects (the listener
+        // never answers, so the call itself fails or times out; only the
+        // connection matters here).
+        let local = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            client.generate(&request("llama3.2:3b")),
+        )
+        .await;
+        let _ = local;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            count.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "a local tag still reaches the sidecar"
+        );
+
+        crate::ollama_sidecar::force_trust_for_test(false);
+        match saved_host {
+            Some(v) => std::env::set_var("OLLAMA_HOST", v),
+            None => std::env::remove_var("OLLAMA_HOST"),
+        }
+        match saved_port {
+            Some(v) => std::env::set_var("OLLAMA_PORT", v),
+            None => std::env::remove_var("OLLAMA_PORT"),
+        }
     }
 }

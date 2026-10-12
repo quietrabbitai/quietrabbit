@@ -365,12 +365,29 @@ fn the_list_request_has_exactly_one_production_caller() {
         .iter()
         .filter(|c| !c.starts_with("hosted_client.rs"))
         .collect();
-    assert_eq!(
-        outside.len(),
-        1,
+    // Two user-clicked commands, nothing else: the refresh (items.id=711) and
+    // the key check inside save_provider_key (items.id=714), which sends the
+    // user's own key to its own provider once, on a click.
+    // (The scan keys on file names; this is provider_credentials/flow.rs.)
+    let allowed = ["provider_models.rs", "flow.rs"];
+    assert!(
+        outside
+            .iter()
+            .all(|c| allowed.iter().any(|a| c.starts_with(a))),
         "unexpected callers of the provider model list: {callers:#?}"
     );
-    assert!(outside[0].starts_with("provider_models.rs"), "{callers:#?}");
+    assert_eq!(
+        outside.len(),
+        2,
+        "expected exactly the refresh and the key check: {callers:#?}"
+    );
+    assert!(
+        outside.iter().any(|c| c.starts_with("provider_models.rs"))
+            && outside
+                .iter()
+                .any(|c| c.starts_with("flow.rs") && c.contains(".check_key(")),
+        "{callers:#?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
