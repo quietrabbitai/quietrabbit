@@ -64,6 +64,7 @@ use serde_json;
 use crate::conductor::concurrency::{ConductorScheduler, PathPriority};
 use crate::conductor::failure::{
     ConductorError, FailureAction, FailureHandler, FailureResult, FailureSeverity, MAX_RETRIES,
+    RETRY_AFTER_METADATA_KEY,
 };
 use crate::conductor::privacy::logger::{DisclosureLogEntry, DisclosureLogger};
 use crate::conductor::privacy::types::{
@@ -73,16 +74,28 @@ use crate::conductor::privacy::PrivacyGateway;
 use crate::conductor::tokens::{ExternalAccess, StepDefinition};
 use crate::conductor::types::{PersonalTrack, SharedStateTrack, TaskStep, TaskTrack};
 use crate::persistence::integration_keys_store::{self, QR_HOSTED_KEY_TYPE};
-use crate::persistence::provider_store::{self, ProviderModel};
+use crate::persistence::provider_store::{self, Provider, ProviderModel};
 use crate::providers::errors::ProviderError;
 use crate::providers::hosted_call::{CallContext, HostedRoute};
 use crate::providers::hosted_client::{HostedClient, HostedRequest};
 use crate::providers::ollama_client::{check_context_window, OllamaClient};
-use crate::providers::types::{ContextWindowStatusKind, GenerateOptions, GenerateRequest};
+use crate::providers::types::{
+    ContextWindowStatusKind, GenerateOptions, GenerateRequest, GenerateResponse,
+};
+use crate::spend::codes::Code;
+use crate::spend::gate::{
+    block_metadata, metered_generate, RunAttendance, SpendBlock, SpendCall, SpendCallError,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
+
+/// The longest Retry-After the retry loop will sit through (items.id=710).
+/// A provider asking for more than this parks the run for the user instead of
+/// holding it asleep; the wait before any one retry is therefore bounded, and
+/// the number of retries by MAX_RETRIES.
+const RETRY_AFTER_CAP_SECS: u64 = 60;
 
 /// Minimum personal field value length considered for word-boundary PII matching.
 /// Avoids false positives from short values like "OR", "CA", "I", "a".
@@ -189,6 +202,9 @@ pub struct StepContext {
     pub user_id: String,
     pub persona_id: String,
     pub key_hex: String,
+    /// items.id=710: whether a user is present. The spend gate lets an
+    /// unattended step spend only within an approved per-run budget.
+    pub attendance: RunAttendance,
     /// items.id=439 (Part 6): the Focus-level external_access ceiling,
     /// excluding this step's own external_access_override (see
     /// FocusRun::_focus_external_access) — used by the Step 3 tighten-only
@@ -324,6 +340,13 @@ impl StepExecutor {
                         return Some(result); // never retried
                     }
                     if result.action == FailureAction::Retry && retry_count < MAX_RETRIES {
+                        // items.id=710: honor a provider's Retry-After. A wait
+                        // longer than the cap parks the run instead of
+                        // sleeping through it. The inference slot was
+                        // released before this point.
+                        if let Some(parked) = honor_retry_after(&result).await {
+                            return Some(parked);
+                        }
                         retry_count += 1;
                         continue;
                     }
@@ -650,43 +673,42 @@ impl StepExecutor {
             ));
         }
 
-        let generate_result: Result<_, ConductorError> = if ctx.effective_access
-            != ExternalAccess::LocalOnly
-        {
-            // Step 4.5 above already guarantees qr_hosted_provider_preference is
-            // Some(...) at this point -- no silent fallback to any default
-            // provider for a None preference (matches select_model()'s
-            // policy). The provider row, model row and the user's stored
-            // key become one CallContext (items.id=709); a provider id with
-            // no row is a real ConductorError, not a panic.
-            match (
-                ctx.qr_hosted_provider_preference.as_deref(),
-                selected_model.hosted_model.as_ref(),
-            ) {
-                (Some(provider_id), Some(model)) => {
-                    let hosted_request = hosted_request_from(&ctx.step.options_override, &request);
-                    let call =
-                        resolve_hosted_inputs(pool, &ctx.user_id, &ctx.key_hex, provider_id, model)
-                            .await
-                            .and_then(|inputs| inputs.build_call());
-                    match call {
-                        Ok(call) => hosted_client()
-                            .generate(&call, &hosted_request)
-                            .await
-                            .map(|outcome| outcome.response)
-                            .map_err(ConductorError::from),
-                        Err(e) => Err(ConductorError::from(e)),
+        let generate_result: Result<_, ConductorError> =
+            if ctx.effective_access != ExternalAccess::LocalOnly {
+                // Step 4.5 above already guarantees qr_hosted_provider_preference is
+                // Some(...) at this point -- no silent fallback to any default
+                // provider for a None preference (matches select_model()'s
+                // policy). The provider row, model row and the user's stored
+                // key become one CallContext (items.id=709); a provider id with
+                // no row is a real ConductorError, not a panic. The spend gate
+                // (items.id=710) runs between building that context and the
+                // network call.
+                match (
+                    ctx.qr_hosted_provider_preference.as_deref(),
+                    selected_model.hosted_model.as_ref(),
+                ) {
+                    (Some(provider_id), Some(model)) => {
+                        hosted_step_call(
+                            hosted_client(),
+                            pool,
+                            ctx,
+                            provider_id,
+                            model,
+                            &request,
+                            &chrono::Local,
+                            HostedInputs::build_call,
+                        )
+                        .await
                     }
-                }
-                _ => unreachable!(
-                    "effective_access != LocalOnly with no qr_hosted_provider_preference \
+                    _ => unreachable!(
+                        "effective_access != LocalOnly with no qr_hosted_provider_preference \
                          or no resolved model -- the Step 4.5 guard and select_model() must \
                          already have short-circuited"
-                ),
-            }
-        } else {
-            ollama_client().generate(&request).await
-        };
+                    ),
+                }
+            } else {
+                ollama_client().generate(&request).await
+            };
 
         // Python oracle: finally block — always release regardless of generate result.
         scheduler.release_inference_slot(&ctx.focus_run_id);
@@ -1166,10 +1188,126 @@ fn hosted_request_from(
     }
 }
 
+/// The Retry-After a Retry result carries, in seconds.
+fn retry_after_of(result: &FailureResult) -> Option<u64> {
+    result
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get(RETRY_AFTER_METADATA_KEY))
+        .and_then(|v| v.as_u64())
+}
+
+/// Wait out a provider's Retry-After before a retry (items.id=710). Returns
+/// `Some(parked)` - the run parks for the user, nothing is slept - when the
+/// provider asked for more than RETRY_AFTER_CAP_SECS; otherwise sleeps for the
+/// requested time (none when the result carries no Retry-After) and returns
+/// `None`, and the caller retries.
+async fn honor_retry_after(result: &FailureResult) -> Option<FailureResult> {
+    let secs = retry_after_of(result)?;
+    if secs > RETRY_AFTER_CAP_SECS {
+        return Some(long_wait_result(result.clone(), secs));
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+    None
+}
+
+/// A rate limit asked for a wait longer than the cap: stop retrying and park
+/// the run for the user (items.id=710). The wait travels as data.
+fn long_wait_result(mut result: FailureResult, secs: u64) -> FailureResult {
+    let mut meta = HashMap::new();
+    meta.insert(
+        "code".to_owned(),
+        serde_json::json!(Code::BlockRateLimitedLongWait.as_str()),
+    );
+    meta.insert(RETRY_AFTER_METADATA_KEY.to_owned(), serde_json::json!(secs));
+    meta.insert(
+        "wait_cap_secs".to_owned(),
+        serde_json::json!(RETRY_AFTER_CAP_SECS),
+    );
+    result.action = FailureAction::AwaitUser;
+    result.severity = FailureSeverity::Require;
+    result.metadata = Some(meta);
+    result
+}
+
+/// A spend block as the error the failure handler understands.
+fn spend_block_error(block: &SpendBlock) -> ConductorError {
+    ConductorError::SpendBlock {
+        plain_language: block.code_str().to_owned(),
+        params: block_metadata(block),
+    }
+}
+
+/// One hosted step call, end to end (items.id=709 dispatch, items.id=710 spend
+/// gate): resolve the rows and the stored key, build the call context, run the
+/// consent / price / cap / limit / unattended pre-flight, make the call,
+/// settle the ledger. Nothing reaches the network unless the pre-flight
+/// clears. The client and the time zone are parameters so the whole path can be
+/// exercised against a loopback server (`build` is `HostedInputs::build_call`
+/// in production, which refuses anything but HTTPS).
+#[allow(clippy::too_many_arguments)]
+async fn hosted_step_call<Tz: chrono::TimeZone>(
+    client: &HostedClient,
+    pool: &sqlx::SqlitePool,
+    ctx: &StepContext,
+    provider_id: &str,
+    model: &ProviderModel,
+    request: &GenerateRequest,
+    tz: &Tz,
+    build: fn(&HostedInputs) -> Result<CallContext, ProviderError>,
+) -> Result<GenerateResponse, ConductorError> {
+    let hosted_request = hosted_request_from(&ctx.step.options_override, request);
+    let inputs = resolve_hosted_inputs(pool, &ctx.user_id, &ctx.key_hex, provider_id, model)
+        .await
+        .map_err(ConductorError::from)?;
+    let call = build(&inputs).map_err(ConductorError::from)?;
+
+    // The hash of the disclosed attributes spans every model of the provider,
+    // and exact price parsing needs the raw pricing text.
+    let all_models = provider_store::list_models_for_provider(pool, provider_id)
+        .await
+        .map_err(|_| spend_block_error(&SpendBlock::new(Code::BlockLedgerUnavailable)))?;
+    let pricing_texts = provider_store::list_model_pricing_text(pool, provider_id)
+        .await
+        .map_err(|_| spend_block_error(&SpendBlock::new(Code::BlockLedgerUnavailable)))?;
+
+    let non_empty = |s: &'_ str| {
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.to_owned())
+        }
+    };
+    let persona_id = non_empty(&ctx.persona_id);
+    let focus_id = non_empty(&ctx.focus_id);
+    let run_id = non_empty(&ctx.focus_run_id);
+    let spend = SpendCall {
+        user_id: &ctx.user_id,
+        key_hex: &ctx.key_hex,
+        provider: &inputs.provider,
+        model,
+        all_models: &all_models,
+        pricing_texts: &pricing_texts,
+        persona_id: persona_id.as_deref(),
+        focus_id: focus_id.as_deref(),
+        run_id: run_id.as_deref(),
+        attendance: ctx.attendance,
+    };
+
+    match metered_generate(client, &call, &hosted_request, &spend, tz).await {
+        Ok(metered) => Ok(metered.outcome.response),
+        Err(SpendCallError::Block(block)) => Err(spend_block_error(&block)),
+        Err(SpendCallError::Provider(e)) => Err(ConductorError::from(e)),
+    }
+}
+
 /// What a hosted call is built from: the two catalog rows (as a plain-data
 /// route) and the user's stored key record.
 struct HostedInputs {
     route: HostedRoute,
+    /// The provider's catalog row (items.id=710: the spend gate reads its
+    /// disclosed attributes).
+    provider: Provider,
     key: integration_keys_store::IntegrationKey,
 }
 
@@ -1240,7 +1378,11 @@ async fn resolve_hosted_inputs(
     })?
     .ok_or_else(missing)?;
 
-    Ok(HostedInputs { route, key })
+    Ok(HostedInputs {
+        route,
+        provider,
+        key,
+    })
 }
 
 /// Context window size for a resolved model selection.
@@ -2615,6 +2757,7 @@ mod tests {
             user_id: "u".to_owned(),
             persona_id: "p".to_owned(),
             key_hex: String::new(),
+            attendance: RunAttendance::Attended,
         };
         let mut projected = HashMap::new();
         projected.insert("name".to_owned(), "Alice (abstracted)".to_owned());
@@ -2674,6 +2817,7 @@ mod tests {
             user_id: "u".to_owned(),
             persona_id: "p".to_owned(),
             key_hex: String::new(),
+            attendance: RunAttendance::Attended,
         };
         assert_eq!(compute_step_sensitivity(&ctx, &pt, &HashMap::new()), 2);
     }
@@ -2719,7 +2863,546 @@ mod tests {
             user_id: "u".to_owned(),
             persona_id: "p".to_owned(),
             key_hex: String::new(),
+            attendance: RunAttendance::Attended,
         };
         assert_eq!(compute_step_sensitivity(&ctx, &pt, &HashMap::new()), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Spend gate in the hosted branch (items.id=710). Neutral fixtures, a
+    // loopback server, no live calls. The invariant under test: nothing
+    // reaches the network unless the pre-flight clears.
+    // -----------------------------------------------------------------------
+
+    use crate::persistence::provider_spend_store as spend_store;
+    use crate::providers::loopback_test_server::{Canned, LoopbackServer};
+    use crate::spend::disclosure::attributes_hash;
+
+    const SPEND_USER: &str = "user-spend";
+    const PRICE_TEXT: &str =
+        r#"{"input_per_mtok":0.50,"output_per_mtok":1.50,"as_of":"2026-10-11","source":"curated"}"#;
+
+    fn hosted_ctx(attendance: RunAttendance, key_hex: &str) -> StepContext {
+        use crate::conductor::tokens::{StepDefinition, StepType};
+        StepContext {
+            step: StepDefinition {
+                step_id: "s1".to_owned(),
+                display_name: "Step 1".to_owned(),
+                guide_id: "g".to_owned(),
+                task_type: "general".to_owned(),
+                routing_tier: ExternalAccess::AnonymousRequired,
+                step_type: StepType::default(),
+                output_var: None,
+                prompt_template: "Hello".to_owned(),
+                field_requirements: HashMap::new(),
+                options_override: HashMap::new(),
+                external_access_override: Some(ExternalAccess::AnonymousRequired),
+                requires_user_handoff: false,
+                revisitable: true,
+                block_stable_id: None,
+                block_customization: None,
+                schedule_trigger: None,
+            },
+            focus_id: "focus-1".to_owned(),
+            focus_run_id: "run-1".to_owned(),
+            user_input: String::new(),
+            persona_context: String::new(),
+            focus_external_access: ExternalAccess::AnonymousRequired,
+            effective_access: ExternalAccess::AnonymousRequired,
+            execution_tier: 2,
+            abstraction_tier: 2,
+            raw_abstraction: 1,
+            floor_consent_preference: None,
+            qr_hosted_provider_preference: Some("fixture-host-a".to_owned()),
+            qr_hosted_ceiling_excluded: None,
+            next_execution_tier: None,
+            retry_count: 0,
+            focus_name: "test".to_owned(),
+            user_id: SPEND_USER.to_owned(),
+            persona_id: "persona-1".to_owned(),
+            key_hex: key_hex.to_owned(),
+            attendance,
+        }
+    }
+
+    /// A callable fixture host priced at `price` (None = unpriced), with a
+    /// stored key, pointed at `server`.
+    async fn spend_rig(
+        pool: &sqlx::SqlitePool,
+        server: &LoopbackServer,
+        price: Option<&str>,
+    ) -> (String, ProviderModel) {
+        seed_fixture_hosted(pool, "fixture-host-a", "fixture-model-a", 4096).await;
+        make_fixture_callable(
+            pool,
+            "fixture-host-a",
+            &format!("{}/v1", server.base()),
+            "[]",
+        )
+        .await;
+        if let Some(p) = price {
+            sqlx::query(
+                "UPDATE provider_models SET pricing = ? WHERE provider_id = 'fixture-host-a'",
+            )
+            .bind(p)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        let key_hex = fixture_key_hex();
+        integration_keys_store::upsert_key(
+            SPEND_USER,
+            &key_hex,
+            "fixture-host-a",
+            QR_HOSTED_KEY_TYPE,
+            "stored-key-value",
+            None,
+            Some("api_key"),
+            None,
+        )
+        .await
+        .unwrap();
+        let model = default_model(pool, "fixture-host-a").await;
+        (key_hex, model)
+    }
+
+    async fn grant_consent(pool: &sqlx::SqlitePool, key_hex: &str, no_cap: bool) {
+        let provider = provider_store::get_provider(pool, "fixture-host-a")
+            .await
+            .unwrap()
+            .unwrap();
+        let models = provider_store::list_models_for_provider(pool, "fixture-host-a")
+            .await
+            .unwrap();
+        let texts = provider_store::list_model_pricing_text(pool, "fixture-host-a")
+            .await
+            .unwrap();
+        let hash = attributes_hash(&provider, &models, &texts);
+        let mut conn = spend_store::open(SPEND_USER, key_hex).await.unwrap();
+        spend_store::insert_consent_conn(
+            &mut conn,
+            "fixture-host-a",
+            &hash,
+            no_cap,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn set_cost_limit(
+        key_hex: &str,
+        period: spend_store::LimitPeriod,
+        value: i64,
+        approves_unattended: bool,
+    ) {
+        let mut conn = spend_store::open(SPEND_USER, key_hex).await.unwrap();
+        spend_store::upsert_limit_conn(
+            &mut conn,
+            &spend_store::LimitSpec {
+                metric: spend_store::LimitMetric::CostUsd,
+                period,
+                scope_kind: spend_store::ScopeKind::All,
+                scope_id: None,
+                limit_value: value,
+                warn_at_pct: 80,
+                approves_unattended,
+            },
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+    }
+
+    fn loopback_build(i: &HostedInputs) -> Result<CallContext, ProviderError> {
+        CallContext::build_for_loopback(&i.route, &i.key.credential, &i.key.extra_metadata)
+    }
+
+    async fn call_hosted(
+        pool: &sqlx::SqlitePool,
+        key_hex: &str,
+        model: &ProviderModel,
+        attendance: RunAttendance,
+    ) -> Result<GenerateResponse, ConductorError> {
+        hosted_step_call(
+            &loopback_client(),
+            pool,
+            &hosted_ctx(attendance, key_hex),
+            "fixture-host-a",
+            model,
+            &generate_request("hello there"),
+            &chrono::Utc,
+            loopback_build,
+        )
+        .await
+    }
+
+    fn block_code(e: &ConductorError) -> String {
+        match e {
+            ConductorError::SpendBlock { params, .. } => {
+                params["code"].as_str().unwrap_or("<no code>").to_owned()
+            }
+            other => panic!("expected a spend block, got {other:?}"),
+        }
+    }
+
+    async fn ledger_count(key_hex: &str) -> i64 {
+        let mut conn = spend_store::open(SPEND_USER, key_hex).await.unwrap();
+        sqlx::query_scalar("SELECT COUNT(*) FROM provider_usage_ledger")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn without_consent_nothing_reaches_the_network() {
+        with_temp_shared_db(|pool| async move {
+            let server = LoopbackServer::start(vec![loopback_chat_ok()]);
+            let (key_hex, model) = spend_rig(&pool, &server, Some(PRICE_TEXT)).await;
+            let err = call_hosted(&pool, &key_hex, &model, RunAttendance::Attended)
+                .await
+                .unwrap_err();
+            assert_eq!(block_code(&err), "spend_block.consent_required");
+            assert_eq!(server.connections(), 0, "no request may be made");
+            assert_eq!(ledger_count(&key_hex).await, 0);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_unpriced_model_never_reaches_the_network() {
+        with_temp_shared_db(|pool| async move {
+            let server = LoopbackServer::start(vec![loopback_chat_ok()]);
+            let (key_hex, model) = spend_rig(&pool, &server, None).await;
+            grant_consent(&pool, &key_hex, true).await;
+            let err = call_hosted(&pool, &key_hex, &model, RunAttendance::Attended)
+                .await
+                .unwrap_err();
+            assert_eq!(block_code(&err), "spend_block.price_unknown");
+            assert_eq!(server.connections(), 0);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_priced_model_without_a_cap_never_reaches_the_network() {
+        with_temp_shared_db(|pool| async move {
+            let server = LoopbackServer::start(vec![loopback_chat_ok()]);
+            let (key_hex, model) = spend_rig(&pool, &server, Some(PRICE_TEXT)).await;
+            grant_consent(&pool, &key_hex, false).await;
+            let err = call_hosted(&pool, &key_hex, &model, RunAttendance::Attended)
+                .await
+                .unwrap_err();
+            assert_eq!(block_code(&err), "spend_block.cap_required");
+            assert_eq!(server.connections(), 0);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_cleared_call_goes_out_and_is_settled_in_the_ledger() {
+        with_temp_shared_db(|pool| async move {
+            let server = LoopbackServer::start(vec![loopback_chat_ok()]);
+            let (key_hex, model) = spend_rig(&pool, &server, Some(PRICE_TEXT)).await;
+            grant_consent(&pool, &key_hex, false).await;
+            set_cost_limit(&key_hex, spend_store::LimitPeriod::Month, 5_000_000, false).await;
+
+            let out = call_hosted(&pool, &key_hex, &model, RunAttendance::Attended)
+                .await
+                .expect("a cleared call succeeds");
+            assert_eq!(out.content, "ok");
+            assert_eq!(server.connections(), 1);
+
+            use sqlx::Row;
+            let mut conn = spend_store::open(SPEND_USER, &key_hex).await.unwrap();
+            let row = sqlx::query("SELECT outcome, usage_source, tokens_in, tokens_out, cost_micros, reserved_micros, run_id, persona_id, focus_id, provider_id, model_id FROM provider_usage_ledger")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+            assert_eq!(row.get::<String, _>("outcome"), "ok");
+            assert_eq!(row.get::<String, _>("usage_source"), "reported");
+            // The loopback reply reports 4 prompt and 2 completion tokens:
+            // ceil(4 x 0.5) + ceil(2 x 1.5) = 2 + 3.
+            assert_eq!(row.get::<i64, _>("tokens_in"), 4);
+            assert_eq!(row.get::<i64, _>("tokens_out"), 2);
+            assert_eq!(row.get::<i64, _>("cost_micros"), 5);
+            assert!(row.get::<i64, _>("reserved_micros") > 5, "the worst case was reserved");
+            assert_eq!(row.get::<String, _>("run_id"), "run-1");
+            assert_eq!(row.get::<String, _>("persona_id"), "persona-1");
+            assert_eq!(row.get::<String, _>("focus_id"), "focus-1");
+            assert_eq!(row.get::<String, _>("provider_id"), "fixture-host-a");
+            assert_eq!(row.get::<String, _>("model_id"), "fixture-model-a");
+        })
+        .await;
+    }
+
+    /// The cap is computed from the limit that is actually sent: the request
+    /// body carries the model row's limit, and the reservation holds that
+    /// many output tokens.
+    #[tokio::test]
+    async fn the_reservation_holds_the_output_limit_that_is_sent() {
+        with_temp_shared_db(|pool| async move {
+            let server = LoopbackServer::start(vec![loopback_chat_ok()]);
+            let (key_hex, model) = spend_rig(&pool, &server, Some(PRICE_TEXT)).await;
+            grant_consent(&pool, &key_hex, true).await;
+            call_hosted(&pool, &key_hex, &model, RunAttendance::Attended)
+                .await
+                .unwrap();
+            assert_eq!(server.captured()[0].json()["max_completion_tokens"], 128);
+            let mut conn = spend_store::open(SPEND_USER, &key_hex).await.unwrap();
+            let reserved: i64 =
+                sqlx::query_scalar("SELECT reserved_micros FROM provider_usage_ledger")
+                    .fetch_one(&mut conn)
+                    .await
+                    .unwrap();
+            // 128 output tokens x 1.5 = 192, plus the input estimate.
+            assert!(reserved >= 192, "reserved {reserved}");
+        })
+        .await;
+    }
+
+    /// The scope item 2 case end to end: a call that burned its whole output
+    /// budget and returned an error is charged for the tokens.
+    #[tokio::test]
+    async fn a_budget_exhausted_call_is_charged_in_the_ledger() {
+        with_temp_shared_db(|pool| async move {
+            let server = LoopbackServer::start(vec![Canned::json(
+                200,
+                r#"{"choices":[{"message":{"content":""},"finish_reason":"length"}],
+                    "usage":{"prompt_tokens":10,"completion_tokens":128,
+                             "completion_tokens_details":{"reasoning_tokens":128}}}"#,
+            )]);
+            let (key_hex, model) = spend_rig(&pool, &server, Some(PRICE_TEXT)).await;
+            grant_consent(&pool, &key_hex, true).await;
+            let err = call_hosted(&pool, &key_hex, &model, RunAttendance::Attended)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ConductorError::Provider { .. }));
+            use sqlx::Row;
+            let mut conn = spend_store::open(SPEND_USER, &key_hex).await.unwrap();
+            let row = sqlx::query("SELECT outcome, tokens_out, reasoning_tokens, cost_micros FROM provider_usage_ledger")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+            assert_eq!(row.get::<String, _>("outcome"), "budget_exhausted");
+            assert_eq!(row.get::<i64, _>("tokens_out"), 128);
+            assert_eq!(row.get::<Option<i64>, _>("reasoning_tokens"), Some(128));
+            // 10 x 0.5 -> 5, 128 x 1.5 -> 192.
+            assert_eq!(row.get::<i64, _>("cost_micros"), 197);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_unattended_step_parks_without_an_approved_budget() {
+        with_temp_shared_db(|pool| async move {
+            let server = LoopbackServer::start(vec![loopback_chat_ok()]);
+            let (key_hex, model) = spend_rig(&pool, &server, Some(PRICE_TEXT)).await;
+            grant_consent(&pool, &key_hex, true).await;
+            let err = call_hosted(&pool, &key_hex, &model, RunAttendance::Unattended)
+                .await
+                .unwrap_err();
+            assert_eq!(block_code(&err), "spend_block.budget_approval_required");
+            assert_eq!(server.connections(), 0, "a parked run sends nothing");
+
+            // The block parks the run (not retried, not failed) and carries
+            // the estimate and what is missing, as data.
+            let handler = FailureHandler::new(ExternalAccess::AnonymousRequired);
+            let r = handler.handle(&err, Some("s1"), Some("focus-1"), 0);
+            assert_eq!(r.action, FailureAction::AwaitUser);
+            let m = r.metadata.unwrap();
+            assert_eq!(m["code"], "spend_block.budget_approval_required");
+            assert_eq!(m["missing_approval"], "per_run_cost_limit");
+            assert!(m["estimate_micros"].as_i64().unwrap() > 0);
+
+            // The same step attended goes out.
+            call_hosted(&pool, &key_hex, &model, RunAttendance::Attended)
+                .await
+                .expect("attended runs are not subject to the run-budget rule");
+            assert_eq!(server.connections(), 1);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_unattended_step_spends_within_an_approved_budget_only() {
+        with_temp_shared_db(|pool| async move {
+            let server = LoopbackServer::start(vec![loopback_chat_ok()]);
+            let (key_hex, model) = spend_rig(&pool, &server, Some(PRICE_TEXT)).await;
+            grant_consent(&pool, &key_hex, true).await;
+            // A budget of 400 micro-USD: the worst case for one call (128
+            // output tokens, about 200 micro) fits once, not twice.
+            set_cost_limit(&key_hex, spend_store::LimitPeriod::Run, 400, true).await;
+            call_hosted(&pool, &key_hex, &model, RunAttendance::Unattended)
+                .await
+                .expect("within the approved budget");
+            // The first call settled at its actual 5 micro, so there is room
+            // for another; exhaust it by reserving past the budget instead.
+            let mut conn = spend_store::open(SPEND_USER, &key_hex).await.unwrap();
+            spend_store::insert_reservation_conn(
+                &mut conn,
+                &spend_store::NewReservation {
+                    provider_id: "fixture-host-a",
+                    model_id: "fixture-model-a",
+                    persona_id: Some("persona-1"),
+                    focus_id: Some("focus-1"),
+                    run_id: Some("run-1"),
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    cost_micros: 300,
+                    price_source: "curated",
+                },
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
+            drop(conn);
+            let before = server.connections();
+            let err = call_hosted(&pool, &key_hex, &model, RunAttendance::Unattended)
+                .await
+                .unwrap_err();
+            assert_eq!(block_code(&err), "spend_block.limit_reached");
+            assert_eq!(
+                server.connections(),
+                before,
+                "an exhausted budget sends nothing"
+            );
+        })
+        .await;
+    }
+
+    /// Each attempt is one request. A 429 then a 200 (what the retry loop
+    /// does: re-run the step) leaves a failed row at no cost and an ok row.
+    #[tokio::test]
+    async fn every_retry_counts_as_a_request_and_a_429_costs_nothing() {
+        with_temp_shared_db(|pool| async move {
+            let server = LoopbackServer::start(vec![
+                Canned::json(429, "{}").with_header("Retry-After", "2"),
+                loopback_chat_ok(),
+            ]);
+            let (key_hex, model) = spend_rig(&pool, &server, Some(PRICE_TEXT)).await;
+            grant_consent(&pool, &key_hex, true).await;
+
+            let err = call_hosted(&pool, &key_hex, &model, RunAttendance::Attended)
+                .await
+                .unwrap_err();
+            // The provider's Retry-After reaches the failure handler as data.
+            let handler = FailureHandler::new(ExternalAccess::AnonymousRequired);
+            let r = handler.handle(&err, Some("s1"), Some("focus-1"), 0);
+            assert_eq!(r.action, FailureAction::Retry);
+            assert_eq!(retry_after_of(&r), Some(2));
+
+            call_hosted(&pool, &key_hex, &model, RunAttendance::Attended)
+                .await
+                .expect("the retry succeeds");
+
+            let mut conn = spend_store::open(SPEND_USER, &key_hex).await.unwrap();
+            let totals = spend_store::usage_totals_conn(
+                &mut conn,
+                &spend_store::UsageFilter {
+                    run_id: Some("run-1"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(totals.requests, 2, "both attempts count as requests");
+            assert_eq!(totals.cost_micros, 5, "only the successful attempt costs");
+            let failed: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM provider_usage_ledger WHERE outcome = 'failed' AND cost_micros = 0",
+            )
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+            assert_eq!(failed, 1);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rate_limit_headers_are_recorded_for_the_usage_summary() {
+        with_temp_shared_db(|pool| async move {
+            let server = LoopbackServer::start(vec![loopback_chat_ok()
+                .with_header("x-ratelimit-remaining-requests", "17")
+                .with_header("x-ratelimit-limit-requests", "50")]);
+            let (key_hex, model) = spend_rig(&pool, &server, Some(PRICE_TEXT)).await;
+            grant_consent(&pool, &key_hex, true).await;
+            call_hosted(&pool, &key_hex, &model, RunAttendance::Attended)
+                .await
+                .unwrap();
+            let mut conn = spend_store::open(SPEND_USER, &key_hex).await.unwrap();
+            let snap = spend_store::get_rate_snapshot_conn(&mut conn, "fixture-host-a")
+                .await
+                .unwrap()
+                .expect("a snapshot");
+            assert_eq!(snap.requests_remaining, Some(17));
+            assert_eq!(snap.requests_limit, Some(50));
+        })
+        .await;
+    }
+
+    // -- Retry-After ------------------------------------------------------
+
+    fn retry_result(secs: Option<u64>) -> FailureResult {
+        let mut metadata = None;
+        if let Some(s) = secs {
+            let mut m = HashMap::new();
+            m.insert(RETRY_AFTER_METADATA_KEY.to_owned(), serde_json::json!(s));
+            metadata = Some(m);
+        }
+        FailureResult {
+            action: FailureAction::Retry,
+            failure_mode: Some("F10".to_owned()),
+            plain_language: "429".to_owned(),
+            is_recoverable: true,
+            severity: FailureSeverity::Suggest,
+            step_id: Some("s1".to_owned()),
+            focus_id: Some("focus-1".to_owned()),
+            metadata,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_after_is_waited_out_before_the_retry() {
+        let start = tokio::time::Instant::now();
+        assert!(honor_retry_after(&retry_result(Some(2))).await.is_none());
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_with_no_retry_after_does_not_wait() {
+        let start = tokio::time::Instant::now();
+        assert!(honor_retry_after(&retry_result(None)).await.is_none());
+        assert_eq!(start.elapsed(), std::time::Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_at_the_cap_is_slept_and_one_past_it_parks() {
+        let start = tokio::time::Instant::now();
+        assert!(honor_retry_after(&retry_result(Some(RETRY_AFTER_CAP_SECS)))
+            .await
+            .is_none());
+        assert_eq!(
+            start.elapsed(),
+            std::time::Duration::from_secs(RETRY_AFTER_CAP_SECS)
+        );
+
+        let start = tokio::time::Instant::now();
+        let parked = honor_retry_after(&retry_result(Some(RETRY_AFTER_CAP_SECS + 1)))
+            .await
+            .expect("a long wait parks the run");
+        assert_eq!(start.elapsed(), std::time::Duration::ZERO, "nothing slept");
+        assert_eq!(parked.action, FailureAction::AwaitUser);
+        assert_eq!(parked.severity, FailureSeverity::Require);
+        let m = parked.metadata.unwrap();
+        assert_eq!(m["code"], "spend_block.rate_limited_long_wait");
+        assert_eq!(m[RETRY_AFTER_METADATA_KEY], RETRY_AFTER_CAP_SECS + 1);
+        assert_eq!(m["wait_cap_secs"], RETRY_AFTER_CAP_SECS);
+    }
+
+    /// The whole wait across a run of retries is bounded by MAX_RETRIES x the cap.
+    #[test]
+    fn the_total_retry_wait_is_bounded() {
+        assert!(u64::from(MAX_RETRIES) * RETRY_AFTER_CAP_SECS <= 300);
     }
 }

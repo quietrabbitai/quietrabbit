@@ -100,6 +100,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/keys_003.sql"),
     },
     SchemaFile {
+        prefix: "keys",
+        version: 4,
+        sql: include_str!("../../schema/keys_004.sql"),
+    },
+    SchemaFile {
         prefix: "messages",
         version: 1,
         sql: include_str!("../../schema/messages_001.sql"),
@@ -3599,7 +3604,9 @@ mod tests {
         // items.id=528 Phase 2: keys_002.sql added a second real version
         // (key_type 'tier2' -> 'qr_hosted' rename). items.id=708: keys_003.sql
         // added a third (hosted-provider consent/limits/ledger tables).
-        assert_eq!(result.expect("migration must apply cleanly"), 3);
+        // items.id=710: keys_004.sql added a fourth (unattended-approval flag,
+        // ledger settlement columns, rate-limit snapshot table).
+        assert_eq!(result.expect("migration must apply cleanly"), 4);
 
         let mut conn = open_verify_conn(&db_path, Some(TEST_KEY_HEX)).await;
         assert!(table_exists(&mut conn, "integration_keys").await);
@@ -3609,6 +3616,7 @@ mod tests {
             "provider_usage_ledger",
             "price_overrides",
             "calibration",
+            "provider_rate_snapshot",
         ] {
             assert!(table_exists(&mut conn, table).await, "{table} must exist");
         }

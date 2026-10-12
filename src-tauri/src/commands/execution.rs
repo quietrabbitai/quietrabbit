@@ -174,6 +174,8 @@ pub(crate) async fn load_and_authorize_run(
         Some(app_handle),
     );
     run.crisis_floor_triggered = crisis_detected;
+    // A user started this run from the app (items.id=710): attended.
+    run.attendance = crate::spend::gate::RunAttendance::Attended;
 
     // Phase 1 LOAD and Phase 2 AUTHORIZE run synchronously before returning,
     // guaranteeing a valid run_id is available to the caller.
@@ -436,6 +438,8 @@ pub async fn resume_run(
             )
             .await
             .map_err(|e| e.to_string())?;
+            // A user pressed resume (items.id=710): attended.
+            run.attendance = crate::spend::gate::RunAttendance::Attended;
 
             // Spawn resume_execution() in the background, matching
             // submit_focus_run's fire-and-forget shape -- progress arrives via
@@ -628,6 +632,8 @@ pub async fn reenter_step(
     )
     .await
     .map_err(|e| e.to_string())?;
+    // A user asked to revisit a step (items.id=710): attended.
+    run.attendance = crate::spend::gate::RunAttendance::Attended;
 
     // This run's resolved step list -- already customization-applied at
     // LOAD time (focus_def.steps), not the Focus type's raw catalog.

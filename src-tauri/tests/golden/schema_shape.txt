@@ -124,6 +124,7 @@ TABLE provider_consent
   attributes_hash TEXT notnull=1 pk=0 default=None
   consented_at TEXT notnull=1 pk=0 default=None
   revoked_at TEXT notnull=0 pk=0 default=None
+  no_cap_confirmed INTEGER notnull=1 pk=0 default=Some("0")
 TABLE provider_limits
   id TEXT notnull=0 pk=1 default=None
   metric TEXT notnull=1 pk=0 default=None
@@ -134,6 +135,17 @@ TABLE provider_limits
   warn_at_pct INTEGER notnull=1 pk=0 default=Some("80")
   created_at TEXT notnull=1 pk=0 default=None
   updated_at TEXT notnull=1 pk=0 default=None
+  approves_unattended INTEGER notnull=1 pk=0 default=Some("0")
+TABLE provider_rate_snapshot
+  provider_id TEXT notnull=0 pk=1 default=None
+  observed_at TEXT notnull=1 pk=0 default=None
+  requests_limit INTEGER notnull=0 pk=0 default=None
+  requests_remaining INTEGER notnull=0 pk=0 default=None
+  tokens_limit INTEGER notnull=0 pk=0 default=None
+  tokens_remaining INTEGER notnull=0 pk=0 default=None
+  requests_reset TEXT notnull=0 pk=0 default=None
+  tokens_reset TEXT notnull=0 pk=0 default=None
+  raw TEXT notnull=1 pk=0 default=Some("'{}'")
 TABLE provider_usage_ledger
   id TEXT notnull=0 pk=1 default=None
   recorded_at TEXT notnull=1 pk=0 default=None
@@ -147,6 +159,10 @@ TABLE provider_usage_ledger
   requests INTEGER notnull=1 pk=0 default=Some("1")
   cost_micros INTEGER notnull=0 pk=0 default=None
   price_source TEXT notnull=1 pk=0 default=Some("'unknown'")
+  reasoning_tokens INTEGER notnull=0 pk=0 default=None
+  outcome TEXT notnull=1 pk=0 default=Some("'ok'")
+  usage_source TEXT notnull=1 pk=0 default=Some("'reported'")
+  reserved_micros INTEGER notnull=0 pk=0 default=None
 TABLE schema_version
   version INTEGER notnull=0 pk=1 default=None
   applied_at TEXT notnull=1 pk=0 default=None

@@ -33,6 +33,10 @@ use crate::conductor::tokens::ExternalAccess;
 /// Python oracle: MAX_RETRIES = 3
 pub const MAX_RETRIES: u32 = 3;
 
+/// `FailureResult.metadata` key carrying a provider's Retry-After, in seconds
+/// (items.id=710). Present only on a Retry result for a rate limit.
+pub const RETRY_AFTER_METADATA_KEY: &str = "retry_after_secs";
+
 // ---------------------------------------------------------------------------
 // ConductorError — full error taxonomy
 // ---------------------------------------------------------------------------
@@ -106,8 +110,13 @@ pub enum ConductorError {
     MissingApiKey { plain_language: String },
     #[error("{plain_language}")]
     InvalidApiKey { plain_language: String },
+    /// `retry_after_secs`: the provider's `Retry-After` in delta-seconds form,
+    /// when it sent one (items.id=710). The executor's retry loop waits for it.
     #[error("{plain_language}")]
-    ProviderRateLimit { plain_language: String },
+    ProviderRateLimit {
+        plain_language: String,
+        retry_after_secs: Option<u64>,
+    },
     #[error("{plain_language}")]
     ProviderTimeout { plain_language: String },
     #[error("{plain_language}")]
@@ -123,6 +132,17 @@ pub enum ConductorError {
     // F10 subtype — no Tier 1.5 (qr_hosted) provider configured (install interview not completed)
     #[error("{plain_language}")]
     MissingQrHostedConfig { plain_language: String },
+
+    // F10 subtype — the spend gate stopped a hosted call before any network
+    // traffic, or parked an unattended run (items.id=710). `plain_language` is
+    // the stable code string, NOT user-facing prose: the copy renders in the
+    // frontend from the code and `params` (decisions.id=875, spec Part 8d).
+    // `params` is a JSON object holding `code` and the block's parameters.
+    #[error("{plain_language}")]
+    SpendBlock {
+        plain_language: String,
+        params: serde_json::Value,
+    },
 
     // F10 subtype — the user's hosted provider is set up, but this Focus's
     // external-access ceiling does not permit it (items.id=692)
@@ -178,7 +198,7 @@ impl ConductorError {
             | Self::LoopDetected { plain_language }
             | Self::MissingApiKey { plain_language }
             | Self::InvalidApiKey { plain_language }
-            | Self::ProviderRateLimit { plain_language }
+            | Self::ProviderRateLimit { plain_language, .. }
             | Self::ProviderTimeout { plain_language }
             | Self::ProviderUnavailable { plain_language }
             | Self::Provider { plain_language }
@@ -188,6 +208,7 @@ impl ConductorError {
             | Self::UnknownProvider { plain_language }
             | Self::VoiceProfileContamination { plain_language }
             | Self::MissingQrHostedConfig { plain_language }
+            | Self::SpendBlock { plain_language, .. }
             | Self::ProviderExcludedByCeiling { plain_language }
             | Self::TierBoundaryViolation { plain_language }
             | Self::InsecureKeychain { plain_language }
@@ -479,8 +500,12 @@ impl FailureHandler {
                 }
             }
 
-            // F10 — Rate limit: retry with suggest severity
-            ConductorError::ProviderRateLimit { .. } => {
+            // F10 — Rate limit: retry with suggest severity. A Retry-After the
+            // provider sent travels in the metadata; the executor's retry loop
+            // waits for it (items.id=710).
+            ConductorError::ProviderRateLimit {
+                retry_after_secs, ..
+            } => {
                 if retry_count >= MAX_RETRIES {
                     return self.escalate_failed_retry("F10", sid, fid);
                 }
@@ -492,9 +517,30 @@ impl FailureHandler {
                     severity: FailureSeverity::Suggest,
                     step_id: sid,
                     focus_id: fid,
-                    metadata: None,
+                    metadata: retry_after_secs.map(|secs| {
+                        let mut m = HashMap::new();
+                        m.insert(RETRY_AFTER_METADATA_KEY.to_owned(), serde_json::json!(secs));
+                        m
+                    }),
                 }
             }
+
+            // F10 — the spend gate stopped the call (items.id=710). Nothing was
+            // sent. Requires the user: consent, a price, a cap, a budget
+            // approval or a raised limit. The code and parameters travel in the
+            // metadata; the run parks (checkpointed, resumable).
+            ConductorError::SpendBlock { params, .. } => FailureResult {
+                action: FailureAction::AwaitUser,
+                failure_mode: Some("F10".to_owned()),
+                plain_language: msg,
+                is_recoverable: true,
+                severity: FailureSeverity::Require,
+                step_id: sid,
+                focus_id: fid,
+                metadata: params
+                    .as_object()
+                    .map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+            },
 
             // F10 — Timeout / unavailable: retry with require severity
             ConductorError::ProviderTimeout { .. } | ConductorError::ProviderUnavailable { .. } => {
@@ -1143,6 +1189,7 @@ mod tests {
         let r = h.handle(
             &err(ConductorError::ProviderRateLimit {
                 plain_language: "429".to_owned(),
+                retry_after_secs: None,
             }),
             None,
             None,
@@ -1150,6 +1197,68 @@ mod tests {
         );
         assert_eq!(r.action, FailureAction::Retry);
         assert_eq!(r.severity, FailureSeverity::Suggest);
+        assert!(r.metadata.is_none(), "no Retry-After means no metadata");
+    }
+
+    /// items.id=710: a provider's Retry-After reaches the retry loop as data.
+    #[test]
+    fn f10_rate_limit_carries_retry_after_in_metadata() {
+        let h = handler(2);
+        let r = h.handle(
+            &err(ConductorError::ProviderRateLimit {
+                plain_language: "429".to_owned(),
+                retry_after_secs: Some(7),
+            }),
+            None,
+            None,
+            0,
+        );
+        assert_eq!(r.action, FailureAction::Retry);
+        let secs = r
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get(RETRY_AFTER_METADATA_KEY))
+            .and_then(|v| v.as_u64());
+        assert_eq!(secs, Some(7));
+    }
+
+    /// items.id=710: a spend-gate block parks the run for the user and
+    /// carries its code and parameters as data, never as prose.
+    #[test]
+    fn f10_spend_block_parks_with_code_and_params() {
+        let h = handler(2);
+        let r = h.handle(
+            &err(ConductorError::SpendBlock {
+                plain_language: "spend_block.limit_reached".to_owned(),
+                params: serde_json::json!({
+                    "code": "spend_block.limit_reached",
+                    "spent": 4_900_000,
+                    "limit": 5_000_000
+                }),
+            }),
+            Some("step-1"),
+            Some("focus-1"),
+            0,
+        );
+        assert_eq!(r.action, FailureAction::AwaitUser);
+        assert_eq!(r.severity, FailureSeverity::Require);
+        assert_eq!(r.failure_mode.as_deref(), Some("F10"));
+        assert!(r.is_recoverable);
+        let m = r.metadata.expect("metadata");
+        assert_eq!(m["code"], "spend_block.limit_reached");
+        assert_eq!(m["spent"], 4_900_000);
+        assert_eq!(m["limit"], 5_000_000);
+        // Never retried, whatever the retry count.
+        let again = h.handle(
+            &err(ConductorError::SpendBlock {
+                plain_language: "spend_block.consent_required".to_owned(),
+                params: serde_json::json!({"code": "spend_block.consent_required"}),
+            }),
+            None,
+            None,
+            MAX_RETRIES,
+        );
+        assert_eq!(again.action, FailureAction::AwaitUser);
     }
 
     #[test]
@@ -1158,6 +1267,7 @@ mod tests {
         let r = h.handle(
             &err(ConductorError::ProviderRateLimit {
                 plain_language: "429".to_owned(),
+                retry_after_secs: Some(1),
             }),
             None,
             None,

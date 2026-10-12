@@ -157,7 +157,7 @@ fn get_integration_keys_db_path(user_id: &str) -> PathBuf {
 /// personal_store.rs::open_personal_db's shape, but delegates PRAGMA
 /// construction to connect_options_encrypted (P4 -- see module header)
 /// rather than building SqliteConnectOptions inline a third time.
-async fn open_integration_keys_db(
+pub(crate) async fn open_integration_keys_db(
     user_id: &str,
     key_hex: &str,
 ) -> Result<SqliteConnection, IntegrationKeysStoreError> {
@@ -800,7 +800,13 @@ mod tests {
                     .await
                     .unwrap();
             }
-            sqlx::query("DELETE FROM schema_version WHERE version = 3")
+            // keys_004 alters these tables and owns provider_rate_snapshot, so
+            // it must be re-applied together with keys_003.
+            sqlx::query("DROP TABLE provider_rate_snapshot")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM schema_version WHERE version IN (3, 4)")
                 .execute(&mut conn)
                 .await
                 .unwrap();
@@ -819,7 +825,7 @@ mod tests {
         let tables: Vec<(String,)> = sqlx::query_as(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN \
              ('provider_consent', 'provider_limits', 'provider_usage_ledger', \
-              'price_overrides', 'calibration')",
+              'price_overrides', 'calibration', 'provider_rate_snapshot')",
         )
         .fetch_all(&mut conn)
         .await
@@ -833,7 +839,7 @@ mod tests {
 
         assert_eq!(
             tables.len(),
-            5,
+            6,
             "opening must re-apply the pending migration"
         );
         let key = found

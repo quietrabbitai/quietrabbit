@@ -1020,6 +1020,55 @@ pub async fn get_model_by_provider_and_model_id(
     }
 }
 
+/// Every catalog model of one provider, in a stable order (model_id). Used by
+/// the consent attributes hash (items.id=710), which must cover every model's
+/// privacy overrides, not only the selected one.
+pub async fn list_models_for_provider(
+    pool: &sqlx::SqlitePool,
+    provider_id: &str,
+) -> Result<Vec<ProviderModel>, ProviderStoreError> {
+    let mut conn = pool.acquire().await?;
+
+    let sql = format!(
+        "SELECT {MODEL_SELECT_COLUMNS} FROM provider_models
+         WHERE provider_id = ? ORDER BY model_id"
+    );
+    let rows = sqlx::query(&sql)
+        .bind(provider_id)
+        .fetch_all(&mut *conn)
+        .await?;
+    rows.iter().map(row_to_provider_model).collect()
+}
+
+/// The RAW `pricing` JSON text of every model of one provider, as
+/// `(model_id, pricing_text)` in model_id order. `ProviderModel.pricing` is
+/// already parsed into a serde_json value, which has turned each price into
+/// a float; the spend code needs the original decimal text to read prices
+/// exactly (spend::price), so it reads the column itself.
+pub async fn list_model_pricing_text(
+    pool: &sqlx::SqlitePool,
+    provider_id: &str,
+) -> Result<Vec<(String, Option<String>)>, ProviderStoreError> {
+    let mut conn = pool.acquire().await?;
+    let rows = sqlx::query(
+        "SELECT model_id, pricing FROM provider_models
+         WHERE provider_id = ? ORDER BY model_id",
+    )
+    .bind(provider_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    rows.iter()
+        .map(|r| {
+            Ok((
+                r.try_get::<String, _>("model_id")
+                    .map_err(ProviderStoreError::Database)?,
+                r.try_get::<Option<String>, _>("pricing")
+                    .map_err(ProviderStoreError::Database)?,
+            ))
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Write operations
 // ---------------------------------------------------------------------------

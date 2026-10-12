@@ -850,6 +850,26 @@ export const commands = {
 	 *  frontend concern, but nothing here requires a shared-storage warning.
 	 */
 	deleteLocalModel: (id: string) => typedError<null, string>(__TAURI_INVOKE("delete_local_model", { id })),
+	getProviderDisclosure: (providerId: string, modelId: string | null, sensitivePersona: boolean) => typedError<ProviderDisclosure, string>(__TAURI_INVOKE("get_provider_disclosure", { providerId, modelId, sensitivePersona })),
+	recordProviderConsent: (request: RecordConsentRequest) => typedError<ConsentResult, string>(__TAURI_INVOKE("record_provider_consent", { request })),
+	setLimit: (request: SetLimitRequest) => typedError<{
+	id: string,
+	metric: LimitMetric,
+	period: LimitPeriod,
+	scope_kind: ScopeKind,
+	scope_id: string | null,
+	/**  Micro-USD for the cost metric, a plain count otherwise. Decimal string. */
+	limit_value: string,
+	warn_at_pct: number,
+	/**
+	 *  The user approves unattended runs spending within this per-run cost
+	 *  limit. Only a per-run cost limit can carry it.
+	 */
+	approves_unattended: boolean,
+} | null, string>(__TAURI_INVOKE("set_limit", { request })),
+	listLimits: () => typedError<LimitDto[], string>(__TAURI_INVOKE("list_limits")),
+	getUsageSummary: (request: UsageSummaryRequest) => typedError<UsageSummary, string>(__TAURI_INVOKE("get_usage_summary", { request })),
+	estimateCost: (request: EstimateCostRequest) => typedError<CostEstimate, string>(__TAURI_INVOKE("estimate_cost", { request })),
 };
 
 /* Types */
@@ -884,6 +904,12 @@ export type AutoResolvedSpan = {
 };
 
 export type CandidateKind = "local_model" | "hosted_api";
+
+export type CapChoice = 
+/**  Set (or replace) the all-providers monthly cost cap. */
+{ kind: "set"; micros: string } | 
+/**  Consent with no cap, explicitly confirmed. */
+{ kind: "no_cap"; confirmed: boolean };
 
 export type CapabilityProfileResponse = {
 	installed_models: string[],
@@ -955,6 +981,43 @@ export type CloudChatProviderSummary = {
 	privacy_commitment_basis: PrivacyCommitmentBasis | null,
 };
 
+export type ConsentAction = "consent" | "revoke";
+
+export type ConsentResult = {
+	/**
+	 *  `consent_state.current` after a consent, `consent_state.revoked` after
+	 *  a revoke.
+	 */
+	consent_state: string,
+	/**  The cap limit this consent created or replaced, if any. */
+	cap_limit_id: string | null,
+};
+
+/**  What using a model costs, as far as the catalog knows. */
+export type CostClass = 
+/**  The price is known and is exactly zero. */
+"free" | 
+/**  The price is known and non-zero. */
+"metered" | 
+/**  No readable price. Treated as metered with an unknowable cost. */
+"unknown";
+
+export type CostEstimate = {
+	/**  `price_state.known | unknown | stale`. */
+	price_state: string,
+	/**  `provider_api`, `curated` or `user`; None when the price is unknown. */
+	price_source: string | null,
+	price_as_of: string | null,
+	price_age_days: number | null,
+	cost_basis: string,
+	input_tokens: string,
+	output_limit_tokens: string,
+	/**  Micro-USD, decimal strings. None when the price is unknown. */
+	input_micros: string | null,
+	worst_case_micros: string | null,
+	expected_micros: string | null,
+};
+
 export type CreatePersonaRequest = {
 	user_id: string,
 	name: string,
@@ -964,6 +1027,44 @@ export type CreatePersonaRequest = {
 
 export type CreatePersonaResponse = {
 	persona_id: string,
+};
+
+export type DisclosedAttributes = {
+	trains_on_data: boolean,
+	retains_data: boolean,
+	/**  None = the provider does not state a retention period. */
+	retention_days: number | null,
+	is_anonymous: boolean,
+	login_required: boolean,
+	jurisdiction: string | null,
+	/**  `contractual` or `policy_only`; None = not assessed. */
+	commitment_basis: string | null,
+	/**  `verified`, `unverified` or `stale`. */
+	verification_status: string,
+	/**  Curated destination risk: 1 low, 2 medium, 3 high. */
+	risk_rating: number,
+	/**  When the posture was verified, from the catalog (date text). */
+	as_of: string | null,
+	/**
+	 *  Catalog free-text notes about per-model differences. Data from the
+	 *  provider row, not text written in code.
+	 */
+	model_overrides: string[],
+	disclosures: string[],
+};
+
+export type EstimateCostRequest = {
+	provider_id: string,
+	model_id: string,
+	/**  Size of the prompt in BYTES (not characters). */
+	input_bytes: number,
+	/**  The output limit to price against; the model row's limit when absent. */
+	max_output_tokens: number | null,
+	/**
+	 *  The caller's expectation of visible output tokens, for the expected
+	 *  figure. There is no default.
+	 */
+	expected_output_tokens: number | null,
 };
 
 /**
@@ -1008,6 +1109,18 @@ export type FocusInfo = {
 	 *  supplied key_hex. NOT the same as updated_at (settings-edit time).
 	 */
 	last_used: string | null,
+};
+
+export type FreeTierDto = {
+	provider_id: string,
+	requests_per_minute: number | null,
+	requests_per_day: number | null,
+	tokens_per_minute: number | null,
+	tokens_per_day: number | null,
+	/**  The published-limits as-of date from the catalog. */
+	as_of: string | null,
+	/**  The latest rate-limit headers seen from the provider, when any. */
+	observed: RateSnapshotDto | null,
 };
 
 /**
@@ -1114,6 +1227,36 @@ export type HealthResponse = {
 	 *  requirement).
 	 */
 	qr_hosted_configured: boolean,
+};
+
+export type LimitDto = {
+	id: string,
+	metric: LimitMetric,
+	period: LimitPeriod,
+	scope_kind: ScopeKind,
+	scope_id: string | null,
+	/**  Micro-USD for the cost metric, a plain count otherwise. Decimal string. */
+	limit_value: string,
+	warn_at_pct: number,
+	/**
+	 *  The user approves unattended runs spending within this per-run cost
+	 *  limit. Only a per-run cost limit can carry it.
+	 */
+	approves_unattended: boolean,
+};
+
+export type LimitMetric = "cost_usd" | "tokens_in" | "tokens_out" | "requests";
+
+export type LimitPeriod = "run" | "day" | "week" | "month";
+
+export type LimitStatusDto = {
+	limit: LimitDto,
+	/**  Used inside the limit's own scope and window (same unit as the limit). */
+	spent: string,
+	/**  Whole percent of the limit used, capped at 100000. */
+	pct: number,
+	/**  `limit_state.ok | warn | reached`. */
+	state: string,
 };
 
 /**
@@ -1291,6 +1434,12 @@ export type PaneRectFraction = {
 };
 
 /**
+ *  A warning parameter value. Parameters are structured values the screen
+ *  formats, never pre-formatted text.
+ */
+export type ParamValue = boolean | number | string;
+
+/**
  *  IPC-safe projection of an entity_facts row pending cross-Persona
  *  confirmation (decisions.id=546, decisions.id=639, items.id=27).
  *  field_value is intentionally absent -- mirrors PersonalFieldInfo's
@@ -1397,6 +1546,32 @@ export type PrivacyGuardianDefaultLevel = "low" | "medium" | "high";
  */
 export type PrivacyPreference = "red" | "yellow" | "green";
 
+export type ProviderDisclosure = {
+	provider_id: string,
+	display_name: string,
+	attributes: DisclosedAttributes,
+	warnings: WarningDto[],
+	overall_tier: WarningTier,
+	/**
+	 *  What a consent must quote back (record_provider_consent refuses any
+	 *  other value, so a screen cannot consent to attributes it did not show).
+	 */
+	attributes_hash: string,
+	/**  `consent_state.none | current | stale | revoked`. */
+	consent_state: string,
+	cost_class: CostClass,
+	/**  Some live model is metered or unpriced. */
+	can_cost_money: boolean,
+	/**  A spend cap (or an explicit no-cap confirmation) is needed to consent. */
+	cap_required: boolean,
+	/**  Micro-USD, as a decimal string. */
+	suggested_cap_micros: string,
+	spend_limit_url: string | null,
+	/**  `price_state.known | unknown | stale` for the selected model. */
+	price_state: string,
+	price_as_of: string | null,
+};
+
 export type ProviderHealth = {
 	provider: string,
 	status: ProviderStatus,
@@ -1419,6 +1594,15 @@ export type ProviderRecommendation = {
 
 export type ProviderStatus = "available" | "degraded" | "unavailable";
 
+export type ProviderUsageDto = {
+	provider_id: string,
+	/**  Micro-USD, decimal string. */
+	cost_micros: string,
+	tokens_in: string,
+	tokens_out: string,
+	requests: string,
+};
+
 /**
  *  Non-secret Tier 1.5 (qr_hosted) configuration state -- never carries the credential
  *  itself. `configured` is true iff an active user-global qr_hosted key exists
@@ -1437,6 +1621,20 @@ export type QrHostedConfig = {
  */
 export type RamClass = "low" | "medium" | "high" | "very_high";
 
+export type RateSnapshotDto = {
+	observed_at: string,
+	requests_limit: string | null,
+	requests_remaining: string | null,
+	tokens_limit: string | null,
+	tokens_remaining: string | null,
+	/**
+	 *  The provider's own reset text, passed through (a duration, a
+	 *  timestamp or a count).
+	 */
+	requests_reset: string | null,
+	tokens_reset: string | null,
+};
+
 export type Recommendation = {
 	provider_id: string,
 	kind: CandidateKind,
@@ -1444,6 +1642,18 @@ export type Recommendation = {
 	needs_install: boolean,
 	needs_api_key: boolean,
 	installed: boolean,
+};
+
+export type RecordConsentRequest = {
+	provider_id: string,
+	action: ConsentAction,
+	/**  Required for `consent`: the `attributes_hash` the screen displayed. */
+	attributes_hash: string | null,
+	/**
+	 *  Required for `consent` when the provider can cost money and no cap
+	 *  applies yet.
+	 */
+	cap: CapChoice | null,
 };
 
 /**
@@ -1488,6 +1698,8 @@ export type ResumeRunRequest = {
 	persona_id: string,
 };
 
+export type ScopeKind = "all" | "provider" | "persona" | "focus";
+
 /**
  *  Bundled to keep send_message's own parameter count under specta's 10-arg
  *  SpectaFn ceiling once confirmed_cross_persona_fact_ids (decisions.id=815,
@@ -1525,6 +1737,19 @@ export type SessionInfo = {
 	display_name: string,
 	role: string,
 	is_primary: boolean,
+};
+
+export type SetLimitRequest = {
+	metric: LimitMetric,
+	period: LimitPeriod,
+	scope_kind: ScopeKind,
+	scope_id: string | null,
+	/**  Micro-USD for cost, a plain count otherwise. Decimal string, > 0. */
+	limit_value: string,
+	warn_at_pct: number,
+	approves_unattended: boolean,
+	/**  Remove the limit with this (metric, period, scope) instead of setting it. */
+	remove: boolean,
 };
 
 export type StoreIngestedDocumentResponse = {
@@ -1658,6 +1883,44 @@ export type UpdateTopicStateRequest = {
 	state: string,
 };
 
+/**
+ *  Usage and limit status.
+ * 
+ *  SETTLEMENT CAN OVERSHOOT A CAP. A call is cleared against its worst-case
+ *  estimate and charged its actual usage afterwards. Actual usage can exceed
+ *  the estimate (a provider counting reasoning past the output limit, a
+ *  dearer prompt-length price tier chosen from the real prompt size, a billed
+ *  call whose usage was only estimated), and a call that may have reached the
+ *  provider with no usage returned is charged at its reserved worst case. The
+ *  overshoot is recorded, not refused, so a figure here can sit above its
+ *  limit. `settlement_may_exceed_limits` is always true and repeats this in
+ *  data for consumers.
+ */
+export type UsageSummary = {
+	period: LimitPeriod,
+	/**  Start of the window (UTC, fixed-width text), calendar in local time. */
+	since: string,
+	settlement_may_exceed_limits: boolean,
+	/**
+	 *  What the cost figures mean: `cost_basis.list_price_estimate` (list
+	 *  price from the catalog or a user override, not a billed amount).
+	 */
+	cost_basis: string,
+	totals: ProviderUsageDto[],
+	/**  Day, week and month limits only (run limits apply per run). */
+	limits: LimitStatusDto[],
+	free_tiers: FreeTierDto[],
+};
+
+export type UsageSummaryRequest = {
+	/**
+	 *  `day`, `week` or `month`. (`run` limits apply per run and are not
+	 *  summarized.)
+	 */
+	period: LimitPeriod,
+	provider_id: string | null,
+};
+
 export type UserPreference = "preferred" | "allowed" | "declined";
 
 export type UserProviderPreference = {
@@ -1703,6 +1966,16 @@ export type VoiceProfileInfo = {
 	formality: string,
 	length_preference: string,
 };
+
+export type WarningDto = {
+	/**  Stable code, for example `warning.unverified_provider`. */
+	code: string,
+	tier: WarningTier,
+	params: { [key in string]: ParamValue | null },
+};
+
+/**  How loudly a warning should be presented. Ordered: None < Notice < Strong. */
+export type WarningTier = "none" | "notice" | "strong";
 
 /**
  *  items.id=364: a pane's own Ctrl+=/Ctrl+-/Ctrl+0 shortcuts, intercepted by

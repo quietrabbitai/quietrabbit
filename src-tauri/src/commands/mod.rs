@@ -67,5 +67,6 @@ pub mod persona;
 pub mod persona_sync;
 pub mod persona_view_sync;
 pub mod personal;
+pub mod provider_spend;
 pub mod qr_hosted;
 pub mod system;

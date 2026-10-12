@@ -178,6 +178,14 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::model_install::enable_local_model,
         commands::model_install::disable_local_model,
         commands::model_install::delete_local_model,
+        // Group 25 -- Hosted-provider consent, limits and spend (items.id=710,
+        // decisions.id=875, spec Part 8d-8e)
+        commands::provider_spend::get_provider_disclosure,
+        commands::provider_spend::record_provider_consent,
+        commands::provider_spend::set_limit,
+        commands::provider_spend::list_limits,
+        commands::provider_spend::get_usage_summary,
+        commands::provider_spend::estimate_cost,
     ])
 }
 

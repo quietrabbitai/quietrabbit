@@ -115,6 +115,11 @@ pub async fn run_periodic_sweep(
             )
             .await;
 
+            // items.id=710: this run has no user present, and rehydrate_focus_run
+            // leaves `attendance` at its fail-closed default, Unattended. The
+            // spend gate therefore lets it spend only within a per-run budget
+            // the user approved (provider_limits.approves_unattended) and
+            // otherwise parks it. Do NOT set Attended here.
             let mut run = match result {
                 Ok(run) => run,
                 Err(e) => {

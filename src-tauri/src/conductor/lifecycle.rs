@@ -1150,6 +1150,17 @@ pub struct FocusRun<L: DisclosureLoggerForRun = SqliteDisclosureLogger> {
     /// (including the six test helpers in this file) are unaffected.
     /// Consumed once, at Phase 5 OUTPUT (see output()); never persisted.
     pub(crate) crisis_floor_triggered: bool,
+
+    /// Whether a user is present for this run (items.id=710, review ruling 1).
+    /// Defaults to `Unattended` in `new` and in `rehydrate_focus_run`: a run
+    /// whose attendance is not stated parks instead of spending beyond an
+    /// approved per-run budget (no-autonomous-action tenet, spec Part 8e).
+    /// The IPC commands that a user triggers (commands::execution) set
+    /// `Attended` after construction, like `crisis_floor_triggered`. The
+    /// scheduled sweep leaves the default: it has no user in the loop. A
+    /// future second unattended path inherits the safe default with no code
+    /// change; a real attended flag is its own follow-up.
+    pub(crate) attendance: crate::spend::gate::RunAttendance,
 }
 
 impl<L: DisclosureLoggerForRun> FocusRun<L> {
@@ -1196,6 +1207,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             _checkpointing_suspended: false,
             _persona_context_rendered: String::new(),
             crisis_floor_triggered: false,
+            attendance: crate::spend::gate::RunAttendance::Unattended,
         }
     }
 
@@ -2279,6 +2291,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             user_id: self.user_id.clone(),
             persona_id: self.persona_id.clone(),
             key_hex: self.key_hex.clone().unwrap_or_default(),
+            attendance: self.attendance,
         };
 
         // Borrow distinct fields of self simultaneously — Rust borrow checker allows
@@ -3948,6 +3961,35 @@ mod tests {
             None,
         );
         assert_eq!(run.output_sensitivity(), "general");
+    }
+
+    /// items.id=710: a run whose attendance nobody states is unattended, so
+    /// the spend gate parks it rather than letting it spend beyond an
+    /// approved per-run budget. Only the IPC commands a user triggers say
+    /// otherwise (commands::execution).
+    #[test]
+    fn a_new_run_is_unattended_until_a_caller_says_otherwise() {
+        let scheduler = Arc::new(ConductorScheduler::new());
+        let mut run: FocusRun = FocusRun::new(
+            "u".to_owned(),
+            "p".to_owned(),
+            "f".to_owned(),
+            dummy_pool(),
+            scheduler,
+            "".to_owned(),
+            false,
+            None,
+            None,
+            false,
+            std::collections::HashSet::new(),
+            None,
+        );
+        assert_eq!(
+            run.attendance,
+            crate::spend::gate::RunAttendance::Unattended
+        );
+        run.attendance = crate::spend::gate::RunAttendance::Attended;
+        assert_eq!(run.attendance, crate::spend::gate::RunAttendance::Attended);
     }
 
     // -------------------------------------------------------------------------

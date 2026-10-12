@@ -88,6 +88,147 @@ pub struct HostedOutcome {
     /// Hidden reasoning tokens when the provider reports them (inside
     /// `completion_tokens`); feeds output_overhead calibration (items.id=711).
     pub reasoning_tokens: Option<u32>,
+    /// The rate-limit headers the response carried (items.id=710): remaining
+    /// free-tier quota for the usage summary.
+    pub rate_limit: RateLimitInfo,
+    /// The answer was cut off by the output token limit (non-empty text with
+    /// the "ran out of tokens" finish reason). The call is billed for the
+    /// whole limit; surfacing the truncation to the user is items.id=696.
+    pub truncated: bool,
+}
+
+/// Token usage a provider reported for one call. Present on any 2xx body that
+/// carried a usage object, INCLUDING a body that then failed to yield an
+/// answer (a budget-exhausted call is billed for the tokens it burned).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostedUsage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub reasoning_tokens: Option<u32>,
+}
+
+/// The rate-limit related response headers of one call, captured generically:
+/// any header whose lower-cased name contains `ratelimit`, plus `retry-after`.
+/// No header name is spelled out here, so no provider is named in code; the
+/// accessors find a quantity by the words in its header name.
+///
+/// Bounded and sanitised: at most `MAX_RATE_HEADERS` entries, values of
+/// visible ASCII at most `MAX_RATE_VALUE_LEN` long. The values are never put
+/// into an error message or a log.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RateLimitInfo {
+    entries: Vec<(String, String)>,
+}
+
+const MAX_RATE_HEADERS: usize = 32;
+const MAX_RATE_VALUE_LEN: usize = 128;
+
+impl RateLimitInfo {
+    pub(crate) fn from_headers(headers: &HeaderMap) -> Self {
+        let mut entries = Vec::new();
+        for (name, value) in headers {
+            let lname = name.as_str().to_ascii_lowercase();
+            if !(lname.contains("ratelimit") || lname == "retry-after") {
+                continue;
+            }
+            // to_str() accepts visible ASCII only.
+            let Ok(v) = value.to_str() else { continue };
+            let v = v.trim();
+            if v.is_empty() || v.len() > MAX_RATE_VALUE_LEN {
+                continue;
+            }
+            entries.push((lname, v.to_owned()));
+            if entries.len() >= MAX_RATE_HEADERS {
+                break;
+            }
+        }
+        entries.sort();
+        Self { entries }
+    }
+
+    /// Test and fixture constructor.
+    #[cfg(test)]
+    pub(crate) fn from_pairs(pairs: &[(&str, &str)]) -> Self {
+        let mut entries: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_ascii_lowercase(), (*v).to_owned()))
+            .collect();
+        entries.sort();
+        Self { entries }
+    }
+
+    pub fn entries(&self) -> &[(String, String)] {
+        &self.entries
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The smallest plain-integer value among headers whose name (with the
+    /// `ratelimit` word removed) contains every word in `must` and none in
+    /// `must_not`. The smallest is the conservative reading when a provider
+    /// reports several windows (for example input and output tokens).
+    fn min_count(&self, must: &[&str], must_not: &[&str]) -> Option<u64> {
+        self.entries
+            .iter()
+            .filter(|(name, _)| {
+                let n = name.replace("ratelimit", "");
+                must.iter().all(|w| n.contains(w)) && !must_not.iter().any(|w| n.contains(w))
+            })
+            .filter_map(|(_, v)| v.parse::<u64>().ok())
+            .min()
+    }
+
+    fn first_text(&self, must: &[&str], must_not: &[&str]) -> Option<String> {
+        self.entries
+            .iter()
+            .find(|(name, _)| {
+                let n = name.replace("ratelimit", "");
+                must.iter().all(|w| n.contains(w)) && !must_not.iter().any(|w| n.contains(w))
+            })
+            .map(|(_, v)| v.clone())
+    }
+
+    pub fn remaining_requests(&self) -> Option<u64> {
+        self.min_count(&["remaining", "request"], &["token"])
+    }
+    pub fn limit_requests(&self) -> Option<u64> {
+        self.min_count(&["limit", "request"], &["token", "remaining", "reset"])
+    }
+    pub fn remaining_tokens(&self) -> Option<u64> {
+        self.min_count(&["remaining", "token"], &["request"])
+    }
+    pub fn limit_tokens(&self) -> Option<u64> {
+        self.min_count(&["limit", "token"], &["request", "remaining", "reset"])
+    }
+    /// The provider's own text for when the request window resets (a duration,
+    /// a timestamp or a count; interpretation is the consumer's).
+    pub fn reset_requests(&self) -> Option<String> {
+        self.first_text(&["reset", "request"], &["token"])
+    }
+    pub fn reset_tokens(&self) -> Option<String> {
+        self.first_text(&["reset", "token"], &["request"])
+    }
+}
+
+/// Everything one metered call produced, success or failure (items.id=710).
+#[derive(Debug)]
+pub struct HostedAttempt {
+    pub result: Result<HostedOutcome, ProviderError>,
+    /// Usage the provider reported, when the response body carried any,
+    /// whether or not the call then produced an answer.
+    pub usage: Option<HostedUsage>,
+    pub rate_limit: RateLimitInfo,
+    /// The HTTP status of the response, when one arrived. `None` when the
+    /// request failed with no response (a read timeout, a reset).
+    pub http_status: Option<u16>,
+    /// True when the request may have reached the provider: a response of any
+    /// status arrived, or the connection failed after the request was sent
+    /// (read timeout, reset). False for failures before sending (a
+    /// misconfigured call, a connection that never opened), which count
+    /// neither as a request nor as spend.
+    pub reached_provider: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -145,48 +286,121 @@ impl HostedClient {
     /// Privacy contract: the prompt contains abstracted values only
     /// (enforced upstream by StepExecutor Step 8). This method performs no
     /// privacy validation and writes no disclosure log.
+    ///
+    /// Callers that account for spend use `generate_metered`, which also
+    /// returns the usage and headers of failed calls.
     pub async fn generate(
         &self,
         ctx: &CallContext,
         req: &HostedRequest,
     ) -> Result<HostedOutcome, ProviderError> {
+        self.generate_metered(ctx, req).await.result
+    }
+
+    /// `generate`, plus what the spend ledger needs from every outcome
+    /// (items.id=710): the usage the provider reported even when the call
+    /// then failed to produce an answer, the rate-limit headers, and whether
+    /// the request may have reached the provider.
+    pub async fn generate_metered(&self, ctx: &CallContext, req: &HostedRequest) -> HostedAttempt {
+        let before_send = |e: ProviderError| HostedAttempt {
+            result: Err(e),
+            usage: None,
+            rate_limit: RateLimitInfo::default(),
+            http_status: None,
+            reached_provider: false,
+        };
+
         // Fail closed before any traffic: payload (token limit) and headers.
-        let payload = build_payload(ctx, req)?;
-        let headers = self.headers(ctx, true)?;
-        let body = serde_json::to_vec(&payload)
-            .map_err(|_| misconfigured_ctx(ctx, "the request could not be built"))?;
+        let payload = match build_payload(ctx, req) {
+            Ok(p) => p,
+            Err(e) => return before_send(e),
+        };
+        let headers = match self.headers(ctx, true) {
+            Ok(h) => h,
+            Err(e) => return before_send(e),
+        };
+        let body = match serde_json::to_vec(&payload) {
+            Ok(b) => b,
+            Err(_) => return before_send(misconfigured_ctx(ctx, "the request could not be built")),
+        };
 
         let start = Instant::now();
-        let response = self
-            .send(
-                ctx,
+        let response = match self
+            .send_raw(
                 Method::POST,
                 &ctx.generate_url(),
                 headers,
                 Some(body),
                 self.generate_timeout,
             )
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                // A connection that never opened, or a request that could not
+                // be built, never reached the provider. Anything else
+                // (read timeout, reset) may have.
+                let reached = !(e.is_connect() || e.is_builder());
+                return HostedAttempt {
+                    result: Err(transport_error(ctx, &e)),
+                    usage: None,
+                    rate_limit: RateLimitInfo::default(),
+                    http_status: None,
+                    reached_provider: reached,
+                };
+            }
+        };
         let status = response.status();
+        let rate_limit = RateLimitInfo::from_headers(response.headers());
         if !status.is_success() {
-            return Err(status_error(
-                ctx,
-                status,
-                response.headers(),
-                Purpose::Generate,
-            ));
+            return HostedAttempt {
+                result: Err(status_error(
+                    ctx,
+                    status,
+                    response.headers(),
+                    Purpose::Generate,
+                )),
+                usage: None,
+                rate_limit,
+                http_status: Some(status.as_u16()),
+                reached_provider: true,
+            };
         }
-        let bytes = self.read_body(ctx, response).await?;
+        let bytes = match self.read_body(ctx, response).await {
+            Ok(b) => b,
+            Err(e) => {
+                return HostedAttempt {
+                    result: Err(e),
+                    usage: None,
+                    rate_limit,
+                    http_status: Some(status.as_u16()),
+                    reached_provider: true,
+                }
+            }
+        };
         let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-        let body: Value =
-            serde_json::from_slice(&bytes).map_err(|_| malformed(ctx, "it was not valid JSON"))?;
-        let parsed = match ctx.dialect {
-            Dialect::OpenaiChat => parse_chat(ctx, &body)?,
-            Dialect::AnthropicMessages => parse_messages(ctx, &body)?,
+        let body: Value = match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(_) => {
+                return HostedAttempt {
+                    result: Err(malformed(ctx, "it was not valid JSON")),
+                    usage: None,
+                    rate_limit,
+                    http_status: Some(status.as_u16()),
+                    reached_provider: true,
+                }
+            }
         };
 
-        Ok(HostedOutcome {
+        // Usage first, so a call that burned tokens and then failed to yield
+        // an answer (budget exhausted, malformed answer) is still charged.
+        let usage = extract_usage(ctx.dialect, &body);
+        let parsed = match ctx.dialect {
+            Dialect::OpenaiChat => parse_chat(ctx, &body, usage),
+            Dialect::AnthropicMessages => parse_messages(ctx, &body, usage),
+        };
+        let result = parsed.map(|parsed| HostedOutcome {
             response: GenerateResponse {
                 content: parsed.content,
                 model: ctx.model_id.clone(),
@@ -197,7 +411,16 @@ impl HostedClient {
             },
             finish_reason: parsed.finish_reason,
             reasoning_tokens: parsed.reasoning_tokens,
-        })
+            rate_limit: rate_limit.clone(),
+            truncated: parsed.truncated,
+        });
+        HostedAttempt {
+            result,
+            usage,
+            rate_limit,
+            http_status: Some(status.as_u16()),
+            reached_provider: true,
+        }
     }
 
     /// GET the provider's model list with the key. `Ok(ids)` means the key
@@ -300,6 +523,27 @@ impl HostedClient {
         Ok(map)
     }
 
+    /// The raw send, keeping the transport error so a caller can tell a
+    /// connection that never opened from one that failed after sending.
+    async fn send_raw(
+        &self,
+        method: Method,
+        url: &str,
+        headers: HeaderMap,
+        body: Option<Vec<u8>>,
+        timeout: Duration,
+    ) -> Result<Response, reqwest::Error> {
+        let mut request = self
+            .http
+            .request(method, url)
+            .headers(headers)
+            .timeout(timeout);
+        if let Some(b) = body {
+            request = request.body(b);
+        }
+        request.send().await
+    }
+
     async fn send(
         &self,
         ctx: &CallContext,
@@ -309,15 +553,9 @@ impl HostedClient {
         body: Option<Vec<u8>>,
         timeout: Duration,
     ) -> Result<Response, ProviderError> {
-        let mut request = self
-            .http
-            .request(method, url)
-            .headers(headers)
-            .timeout(timeout);
-        if let Some(b) = body {
-            request = request.body(b);
-        }
-        request.send().await.map_err(|e| transport_error(ctx, &e))
+        self.send_raw(method, url, headers, body, timeout)
+            .await
+            .map_err(|e| transport_error(ctx, &e))
     }
 
     /// Read the body, refusing anything larger than the cap (declared length
@@ -360,20 +598,29 @@ impl Default for HostedClient {
 // Payload
 // ---------------------------------------------------------------------------
 
-/// Build the JSON body. Fails closed when no output token limit is set.
-fn build_payload(ctx: &CallContext, req: &HostedRequest) -> Result<Value, ProviderError> {
-    let limit = req
-        .max_output_tokens
+/// The output token limit a call will be sent with: the request's own budget
+/// when it set one, else the model row's. `None` means the call has no limit
+/// and `build_payload` fails closed. One function, used by the payload and by
+/// the spend pre-flight, so the cap is computed from exactly what is sent.
+pub(crate) fn effective_output_limit(ctx: &CallContext, req: &HostedRequest) -> Option<u64> {
+    req.max_output_tokens
         .filter(|n| *n > 0)
         .map(u64::from)
         .or_else(|| ctx.row_token_limit().map(|(_, v)| v))
-        .ok_or_else(|| {
-            misconfigured_ctx(
-                ctx,
-                "this model has no output length limit set, and QR won't send a request \
-                 without one",
-            )
-        })?;
+}
+
+/// The error for a call with no output token limit.
+pub(crate) fn missing_limit_error(ctx: &CallContext) -> ProviderError {
+    misconfigured_ctx(
+        ctx,
+        "this model has no output length limit set, and QR won't send a request \
+         without one",
+    )
+}
+
+/// Build the JSON body. Fails closed when no output token limit is set.
+fn build_payload(ctx: &CallContext, req: &HostedRequest) -> Result<Value, ProviderError> {
+    let limit = effective_output_limit(ctx, req).ok_or_else(|| missing_limit_error(ctx))?;
 
     let mut payload = Map::new();
     payload.insert("model".to_owned(), json!(ctx.model_id));
@@ -429,6 +676,7 @@ fn build_payload(ctx: &CallContext, req: &HostedRequest) -> Result<Value, Provid
 struct Parsed {
     content: String,
     finish_reason: Option<String>,
+    truncated: bool,
     prompt_tokens: u32,
     completion_tokens: u32,
     reasoning_tokens: Option<u32>,
@@ -440,7 +688,40 @@ fn token_count(v: &Value) -> u32 {
         .unwrap_or(0)
 }
 
-fn parse_chat(ctx: &CallContext, body: &Value) -> Result<Parsed, ProviderError> {
+/// The usage object of a 2xx body, when it carries one with at least one
+/// token count. Read before the answer is examined (items.id=710).
+fn extract_usage(dialect: Dialect, body: &Value) -> Option<HostedUsage> {
+    let usage = body.get("usage")?;
+    if !usage.is_object() {
+        return None;
+    }
+    let (prompt_key, completion_key) = match dialect {
+        Dialect::OpenaiChat => ("prompt_tokens", "completion_tokens"),
+        Dialect::AnthropicMessages => ("input_tokens", "output_tokens"),
+    };
+    if usage.get(prompt_key).and_then(Value::as_u64).is_none()
+        && usage.get(completion_key).and_then(Value::as_u64).is_none()
+    {
+        return None;
+    }
+    let reasoning_tokens = match dialect {
+        Dialect::OpenaiChat => usage["completion_tokens_details"]["reasoning_tokens"]
+            .as_u64()
+            .map(|n| n.min(u64::from(u32::MAX)) as u32),
+        Dialect::AnthropicMessages => None,
+    };
+    Some(HostedUsage {
+        prompt_tokens: token_count(&usage[prompt_key]),
+        completion_tokens: token_count(&usage[completion_key]),
+        reasoning_tokens,
+    })
+}
+
+fn parse_chat(
+    ctx: &CallContext,
+    body: &Value,
+    usage: Option<HostedUsage>,
+) -> Result<Parsed, ProviderError> {
     let choice = &body["choices"][0];
     if choice.is_null() {
         return Err(malformed(ctx, "it had no answer in it"));
@@ -449,19 +730,22 @@ fn parse_chat(ctx: &CallContext, body: &Value) -> Result<Parsed, ProviderError> 
     let content = choice["message"]["content"].as_str().map(str::to_owned);
     let content = answer_or_error(ctx, content, finish_reason.as_deref(), "length")?;
 
-    let usage = &body["usage"];
+    let truncated = finish_reason.as_deref() == Some("length");
     Ok(Parsed {
         content,
         finish_reason,
-        prompt_tokens: token_count(&usage["prompt_tokens"]),
-        completion_tokens: token_count(&usage["completion_tokens"]),
-        reasoning_tokens: usage["completion_tokens_details"]["reasoning_tokens"]
-            .as_u64()
-            .map(|n| n.min(u64::from(u32::MAX)) as u32),
+        truncated,
+        prompt_tokens: usage.map_or(0, |u| u.prompt_tokens),
+        completion_tokens: usage.map_or(0, |u| u.completion_tokens),
+        reasoning_tokens: usage.and_then(|u| u.reasoning_tokens),
     })
 }
 
-fn parse_messages(ctx: &CallContext, body: &Value) -> Result<Parsed, ProviderError> {
+fn parse_messages(
+    ctx: &CallContext,
+    body: &Value,
+    usage: Option<HostedUsage>,
+) -> Result<Parsed, ProviderError> {
     let blocks = body["content"]
         .as_array()
         .ok_or_else(|| malformed(ctx, "it had no content in it"))?;
@@ -478,12 +762,13 @@ fn parse_messages(ctx: &CallContext, body: &Value) -> Result<Parsed, ProviderErr
         "max_tokens",
     )?;
 
-    let usage = &body["usage"];
+    let truncated = finish_reason.as_deref() == Some("max_tokens");
     Ok(Parsed {
         content,
         finish_reason,
-        prompt_tokens: token_count(&usage["input_tokens"]),
-        completion_tokens: token_count(&usage["output_tokens"]),
+        truncated,
+        prompt_tokens: usage.map_or(0, |u| u.prompt_tokens),
+        completion_tokens: usage.map_or(0, |u| u.completion_tokens),
         reasoning_tokens: None,
     })
 }

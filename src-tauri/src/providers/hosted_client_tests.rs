@@ -1208,3 +1208,373 @@ async fn live_single_call() {
         println!("LIVE {line}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Metering (items.id=710): usage on every outcome, rate-limit headers, and
+// whether a request reached the provider.
+// ---------------------------------------------------------------------------
+
+fn chat_budget_exhausted() -> Canned {
+    Canned::json(
+        200,
+        &json!({
+            "choices": [{"message": {"role": "assistant", "content": ""},
+                         "finish_reason": "length"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 4096,
+                      "completion_tokens_details": {"reasoning_tokens": 4096}}
+        })
+        .to_string(),
+    )
+}
+
+#[tokio::test]
+async fn a_budget_exhausted_call_still_reports_the_tokens_it_burned() {
+    let server = LoopbackServer::start(vec![chat_budget_exhausted()]);
+    let ctx = ctx_for(&chat_route(&server.base()));
+    let a = client().generate_metered(&ctx, &request()).await;
+    assert!(matches!(
+        a.result,
+        Err(ProviderError::OutputBudgetExhausted { .. })
+    ));
+    assert_eq!(
+        a.usage,
+        Some(HostedUsage {
+            prompt_tokens: 10,
+            completion_tokens: 4096,
+            reasoning_tokens: Some(4096)
+        })
+    );
+    assert!(a.reached_provider);
+    assert_eq!(a.http_status, Some(200));
+    // The unmetered entry point is unchanged: still an error, no usage.
+    let server = LoopbackServer::start(vec![chat_budget_exhausted()]);
+    let ctx = ctx_for(&chat_route(&server.base()));
+    let err = client().generate(&ctx, &request()).await.unwrap_err();
+    assert!(matches!(err, ProviderError::OutputBudgetExhausted { .. }));
+}
+
+#[tokio::test]
+async fn the_messages_dialect_reports_usage_on_budget_exhaustion_too() {
+    let server = LoopbackServer::start(vec![Canned::json(
+        200,
+        &json!({
+            "type": "message", "content": [],
+            "stop_reason": "max_tokens",
+            "usage": {"input_tokens": 30, "output_tokens": 256}
+        })
+        .to_string(),
+    )]);
+    let ctx = ctx_for(&messages_route(&server.base()));
+    let a = client().generate_metered(&ctx, &request()).await;
+    assert!(matches!(
+        a.result,
+        Err(ProviderError::OutputBudgetExhausted { .. })
+    ));
+    assert_eq!(
+        a.usage,
+        Some(HostedUsage {
+            prompt_tokens: 30,
+            completion_tokens: 256,
+            reasoning_tokens: None
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_truncated_non_empty_answer_is_flagged_and_still_complete() {
+    let server = LoopbackServer::start(vec![Canned::json(
+        200,
+        &json!({
+            "choices": [{"message": {"content": "cut off mid-sen"}, "finish_reason": "length"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 512}
+        })
+        .to_string(),
+    )]);
+    let ctx = ctx_for(&chat_route(&server.base()));
+    let a = client().generate_metered(&ctx, &request()).await;
+    let out = a.result.expect("a truncated answer is still an answer");
+    assert!(out.truncated);
+    assert_eq!(out.response.output_token_count, 512);
+    assert_eq!(a.usage.unwrap().completion_tokens, 512);
+
+    let server = LoopbackServer::start(vec![chat_ok()]);
+    let ctx = ctx_for(&chat_route(&server.base()));
+    assert!(!client().generate(&ctx, &request()).await.unwrap().truncated);
+
+    let server = LoopbackServer::start(vec![Canned::json(
+        200,
+        &json!({
+            "content": [{"type": "text", "text": "cut"}],
+            "stop_reason": "max_tokens",
+            "usage": {"input_tokens": 1, "output_tokens": 256}
+        })
+        .to_string(),
+    )]);
+    let ctx = ctx_for(&messages_route(&server.base()));
+    assert!(client().generate(&ctx, &request()).await.unwrap().truncated);
+}
+
+#[tokio::test]
+async fn a_malformed_answer_that_carried_usage_still_reports_it() {
+    let server = LoopbackServer::start(vec![Canned::json(
+        200,
+        &json!({"choices": [], "usage": {"prompt_tokens": 12, "completion_tokens": 3}}).to_string(),
+    )]);
+    let ctx = ctx_for(&chat_route(&server.base()));
+    let a = client().generate_metered(&ctx, &request()).await;
+    assert!(matches!(
+        a.result,
+        Err(ProviderError::MalformedResponse { .. })
+    ));
+    assert_eq!(a.usage.unwrap().prompt_tokens, 12);
+    assert!(a.reached_provider);
+}
+
+#[tokio::test]
+async fn a_response_with_no_usage_object_reports_none() {
+    let server = LoopbackServer::start(vec![Canned::json(
+        200,
+        &json!({"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}).to_string(),
+    )]);
+    let ctx = ctx_for(&chat_route(&server.base()));
+    let a = client().generate_metered(&ctx, &request()).await;
+    assert!(a.result.is_ok());
+    assert_eq!(a.usage, None);
+    // An empty usage object is no usage either.
+    let server = LoopbackServer::start(vec![Canned::json(
+        200,
+        &json!({"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}], "usage": {}})
+            .to_string(),
+    )]);
+    let ctx = ctx_for(&chat_route(&server.base()));
+    assert_eq!(
+        client().generate_metered(&ctx, &request()).await.usage,
+        None
+    );
+}
+
+#[tokio::test]
+async fn invalid_json_reached_the_provider_with_no_usage() {
+    let server = LoopbackServer::start(vec![Canned::json(200, "not json at all")]);
+    let ctx = ctx_for(&chat_route(&server.base()));
+    let a = client().generate_metered(&ctx, &request()).await;
+    assert!(matches!(
+        a.result,
+        Err(ProviderError::MalformedResponse { .. })
+    ));
+    assert_eq!(a.usage, None);
+    assert!(a.reached_provider);
+    assert_eq!(a.http_status, Some(200));
+}
+
+#[tokio::test]
+async fn error_statuses_count_as_requests_with_their_headers_and_no_usage() {
+    for status in [429u16, 500, 503, 401, 402, 404] {
+        let server = LoopbackServer::start(vec![Canned::json(status, "{}")
+            .with_header("x-ratelimit-remaining-requests", "0")
+            .with_header("Retry-After", "7")]);
+        let ctx = ctx_for(&chat_route(&server.base()));
+        let a = client().generate_metered(&ctx, &request()).await;
+        assert!(a.result.is_err(), "{status}");
+        assert_eq!(a.usage, None, "{status}");
+        assert!(a.reached_provider, "{status}");
+        assert_eq!(a.http_status, Some(status));
+        assert_eq!(a.rate_limit.remaining_requests(), Some(0), "{status}");
+    }
+}
+
+#[tokio::test]
+async fn a_429_hands_retry_after_to_the_error() {
+    let server =
+        LoopbackServer::start(vec![Canned::json(429, "{}").with_header("Retry-After", "7")]);
+    let ctx = ctx_for(&chat_route(&server.base()));
+    let a = client().generate_metered(&ctx, &request()).await;
+    match a.result {
+        Err(ProviderError::RateLimit {
+            retry_after_secs, ..
+        }) => assert_eq!(retry_after_secs, Some(7)),
+        other => panic!("expected a rate limit, got {other:?}"),
+    }
+    // And it survives the conversion the executor's retry loop sees.
+    let server =
+        LoopbackServer::start(vec![Canned::json(429, "{}").with_header("Retry-After", "7")]);
+    let ctx = ctx_for(&chat_route(&server.base()));
+    let err = client().generate(&ctx, &request()).await.unwrap_err();
+    match crate::conductor::failure::ConductorError::from(err) {
+        crate::conductor::failure::ConductorError::ProviderRateLimit {
+            retry_after_secs, ..
+        } => assert_eq!(retry_after_secs, Some(7)),
+        other => panic!("expected ProviderRateLimit, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_connection_that_never_opened_did_not_reach_the_provider() {
+    // Bind a port and release it, so the connection is refused.
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let ctx = ctx_for(&chat_route(&format!("http://127.0.0.1:{port}")));
+    let a = client().generate_metered(&ctx, &request()).await;
+    assert!(a.result.is_err());
+    assert!(!a.reached_provider, "a refused connection is not a request");
+    assert_eq!(a.http_status, None);
+    assert_eq!(a.usage, None);
+}
+
+#[tokio::test]
+async fn a_read_timeout_after_sending_may_have_reached_the_provider() {
+    let server = LoopbackServer::start(vec![chat_ok().with_delay(Duration::from_millis(1500))]);
+    let ctx = ctx_for(&chat_route(&server.base()));
+    let slow = HostedClient::for_loopback_tests(
+        Duration::from_millis(250),
+        Duration::from_secs(2),
+        1024 * 1024,
+    );
+    let a = slow.generate_metered(&ctx, &request()).await;
+    assert!(matches!(a.result, Err(ProviderError::Timeout { .. })));
+    assert!(
+        a.reached_provider,
+        "the request was sent before it timed out"
+    );
+    assert_eq!(a.http_status, None);
+    assert_eq!(a.usage, None);
+}
+
+#[tokio::test]
+async fn a_misconfigured_call_makes_no_request_and_is_not_counted() {
+    let server = LoopbackServer::start(vec![chat_ok()]);
+    let mut route = chat_route(&server.base());
+    route.request_options = Some(json!({}));
+    let ctx = ctx_for(&route);
+    let a = client().generate_metered(&ctx, &request()).await;
+    assert!(matches!(a.result, Err(ProviderError::Misconfigured { .. })));
+    assert!(!a.reached_provider);
+    assert_eq!(server.connections(), 0);
+}
+
+#[tokio::test]
+async fn the_output_limit_helper_matches_what_is_sent() {
+    let server = LoopbackServer::start(vec![chat_ok(), chat_ok()]);
+    let ctx = ctx_for(&chat_route(&server.base()));
+    // Row limit.
+    assert_eq!(effective_output_limit(&ctx, &request()), Some(512));
+    // A call-supplied budget wins.
+    let mut req = request();
+    req.max_output_tokens = Some(64);
+    assert_eq!(effective_output_limit(&ctx, &req), Some(64));
+    client().generate(&ctx, &req).await.unwrap();
+    assert_eq!(
+        server.captured()[0].json()["max_completion_tokens"],
+        64,
+        "the cap is computed from exactly the limit that is sent"
+    );
+    // Zero is not a limit.
+    req.max_output_tokens = Some(0);
+    assert_eq!(effective_output_limit(&ctx, &req), Some(512));
+    // No limit anywhere.
+    let mut route = chat_route(&server.base());
+    route.request_options = Some(json!({}));
+    assert_eq!(effective_output_limit(&ctx_for(&route), &request()), None);
+}
+
+#[tokio::test]
+async fn a_successful_outcome_carries_the_rate_limit_headers() {
+    let server = LoopbackServer::start(vec![chat_ok()
+        .with_header("x-ratelimit-remaining-requests", "41")
+        .with_header("x-ratelimit-limit-requests", "50")
+        .with_header("x-ratelimit-remaining-tokens", "9000")
+        .with_header("x-ratelimit-limit-tokens", "10000")
+        .with_header("x-ratelimit-reset-tokens", "6s")
+        .with_header("x-unrelated", "ignored")]);
+    let ctx = ctx_for(&chat_route(&server.base()));
+    let out = client().generate(&ctx, &request()).await.unwrap();
+    let r = &out.rate_limit;
+    assert_eq!(r.remaining_requests(), Some(41));
+    assert_eq!(r.limit_requests(), Some(50));
+    assert_eq!(r.remaining_tokens(), Some(9000));
+    assert_eq!(r.limit_tokens(), Some(10_000));
+    assert_eq!(r.reset_tokens().as_deref(), Some("6s"));
+    assert!(r.entries().iter().all(|(k, _)| k != "x-unrelated"));
+}
+
+#[test]
+fn rate_limit_quantities_are_found_by_the_words_in_their_names() {
+    // A differently ordered naming scheme, plus several token windows: the
+    // smallest remaining is the conservative reading.
+    let info = RateLimitInfo::from_pairs(&[
+        ("vendor-ratelimit-requests-remaining", "12"),
+        ("vendor-ratelimit-requests-limit", "60"),
+        ("vendor-ratelimit-requests-reset", "2026-10-11T18:00:00Z"),
+        ("vendor-ratelimit-input-tokens-remaining", "800"),
+        ("vendor-ratelimit-output-tokens-remaining", "300"),
+        ("vendor-ratelimit-tokens-remaining", "1000"),
+        ("vendor-ratelimit-tokens-limit", "5000"),
+        ("retry-after", "3"),
+    ]);
+    assert_eq!(info.remaining_requests(), Some(12));
+    assert_eq!(info.limit_requests(), Some(60));
+    assert_eq!(info.remaining_tokens(), Some(300));
+    assert_eq!(info.limit_tokens(), Some(5000));
+    assert_eq!(
+        info.reset_requests().as_deref(),
+        Some("2026-10-11T18:00:00Z")
+    );
+    assert_eq!(info.reset_tokens(), None);
+    // Retry-After is kept as an entry, not mistaken for a quantity.
+    assert!(info.entries().iter().any(|(k, _)| k == "retry-after"));
+}
+
+#[test]
+fn rate_limit_capture_is_bounded_and_ignores_hostile_values() {
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+    let mut h = HeaderMap::new();
+    // Too long a value is dropped.
+    h.insert(
+        HeaderName::from_static("x-ratelimit-remaining-requests"),
+        HeaderValue::from_str(&"9".repeat(200)).unwrap(),
+    );
+    // A non-numeric value is kept as text but never read as a count.
+    h.insert(
+        HeaderName::from_static("x-ratelimit-remaining-tokens"),
+        HeaderValue::from_static("lots"),
+    );
+    // A value with bytes outside visible ASCII is dropped.
+    h.insert(
+        HeaderName::from_static("x-ratelimit-reset-requests"),
+        HeaderValue::from_bytes(b"ab\xffcd").unwrap(),
+    );
+    // An empty value is dropped.
+    h.insert(
+        HeaderName::from_static("x-ratelimit-limit-requests"),
+        HeaderValue::from_static(""),
+    );
+    let info = RateLimitInfo::from_headers(&h);
+    assert_eq!(info.remaining_requests(), None);
+    assert_eq!(info.remaining_tokens(), None);
+    assert_eq!(info.reset_requests(), None);
+    assert_eq!(info.limit_requests(), None);
+    assert_eq!(info.entries().len(), 1);
+
+    // The number of captured headers is capped.
+    let mut many = HeaderMap::new();
+    for i in 0..100 {
+        many.insert(
+            HeaderName::from_bytes(format!("x-ratelimit-extra-{i}").as_bytes()).unwrap(),
+            HeaderValue::from_static("1"),
+        );
+    }
+    assert_eq!(RateLimitInfo::from_headers(&many).entries().len(), 32);
+}
+
+#[tokio::test]
+async fn rate_limit_values_never_leak_into_error_text() {
+    let server = LoopbackServer::start(vec![Canned::json(429, "{}")
+        .with_header("x-ratelimit-remaining-requests", "SECRET-LOOKING-TEXT")
+        .with_header("Retry-After", "5")]);
+    let ctx = ctx_for(&chat_route(&server.base()));
+    let a = client().generate_metered(&ctx, &request()).await;
+    let text = error_text(&a.result.unwrap_err());
+    assert!(!text.contains("SECRET-LOOKING-TEXT"));
+}

@@ -474,6 +474,18 @@ async fn finish_login(
         ),
     }
 
+    // items.id=710: spend-ledger recovery -- one more sibling call in this
+    // "the moment key material becomes resident" sequence. A hosted call that
+    // was reserved in the ledger but never settled because the process died
+    // is converted to `interrupted` and stays charged at its reserved worst
+    // case, so a crash can never make spend vanish from the caps. Best-effort:
+    // logged inside, never turns an otherwise-successful login into an Err.
+    let _ = crate::persistence::provider_spend_store::recover_interrupted_spend(
+        user_id,
+        &personal_key_hex_for_sync,
+    )
+    .await;
+
     // items.id=290, decisions.id=718: rehydrate GroupKeyRegistry from every
     // one of this account's personas' personal.db group_keys tables --
     // GroupKeyRegistry itself stays deliberately volatile (auth/registry.rs's

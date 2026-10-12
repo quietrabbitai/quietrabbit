@@ -44,7 +44,8 @@ pub enum ProviderError {
 
     /// Provider rate limit hit (HTTP 429). Retryable via executor retry loop.
     /// `retry_after_secs` is the `Retry-After` header in delta-seconds form;
-    /// the retry loop does not honor it yet, it only reaches the message.
+    /// it travels to the executor's retry loop, which waits for it
+    /// (items.id=710). An HTTP-date form is not parsed and yields `None`.
     #[error("provider '{}': rate limit hit (429)", provider)]
     RateLimit {
         provider: String,
@@ -146,9 +147,14 @@ impl From<ProviderError> for ConductorError {
             ProviderError::InvalidApiKey { plain_language, .. } => {
                 ConductorError::InvalidApiKey { plain_language }
             }
-            ProviderError::RateLimit { plain_language, .. } => {
-                ConductorError::ProviderRateLimit { plain_language }
-            }
+            ProviderError::RateLimit {
+                plain_language,
+                retry_after_secs,
+                ..
+            } => ConductorError::ProviderRateLimit {
+                plain_language,
+                retry_after_secs,
+            },
             ProviderError::Timeout { plain_language, .. } => {
                 ConductorError::ProviderTimeout { plain_language }
             }
