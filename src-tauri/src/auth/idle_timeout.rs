@@ -73,6 +73,7 @@ pub async fn run_periodic_check(
     pool: &sqlx::SqlitePool,
     key_registry: &KeyRegistry,
     group_key_registry: &GroupKeyRegistry,
+    connect_sessions: &crate::provider_credentials::session::ConnectSessions,
 ) {
     let Some(user_id) = key_registry.with_key(|k| k.user_id.clone()).await else {
         return;
@@ -128,6 +129,10 @@ pub async fn run_periodic_check(
     }
 
     key_registry.clear().await;
+    // items.id=714: same boundary as commands::auth::logout -- a connect
+    // dialog's session and any clipboard text held for an unconfirmed key end
+    // with the unlocked account.
+    connect_sessions.clear();
     // items.id=469: same gap as commands::auth::logout -- see
     // auth::clear_group_keys_for_user for why this is needed alongside
     // key_registry.clear() and not subsumed by it.
@@ -157,6 +162,7 @@ mod tests {
 
     use crate::auth::registry::GroupKeyRegistry;
     use crate::commands::auth::login;
+    use crate::provider_credentials::session::ConnectSessions;
     use crate::test_support::ENV_MUTEX;
 
     struct TestEnv {
@@ -282,7 +288,13 @@ mod tests {
             .await
             .unwrap();
 
-        run_periodic_check(&pool, &registry, &group_key_registry).await;
+        run_periodic_check(
+            &pool,
+            &registry,
+            &group_key_registry,
+            &ConnectSessions::default(),
+        )
+        .await;
 
         assert!(
             !registry.is_occupied().await,
@@ -299,6 +311,69 @@ mod tests {
         assert_eq!(
             still_live.0, 0,
             "an idle-timeout fire must soft-expire the session too, same as logout()"
+        );
+    }
+
+    /// items.id=714: an idle lock ends a connect session and drops the
+    /// clipboard candidate it held; a session survives a check that finds the
+    /// account still active.
+    #[tokio::test]
+    async fn run_periodic_check_ends_a_connect_session_and_its_candidate_when_idle_timeout_exceeded(
+    ) {
+        use crate::provider_credentials::session::SessionError;
+        use std::time::Instant;
+
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let registry = app.state::<KeyRegistry>();
+        let group_key_registry = app.state::<GroupKeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
+        let sessions = ConnectSessions::default();
+
+        login(
+            "Alice".to_owned(),
+            "correct horse battery staple".to_owned(),
+            registry.clone(),
+            group_key_registry.clone(),
+            pool.clone(),
+        )
+        .await
+        .unwrap();
+        let user_id = registry.with_key(|k| k.user_id.clone()).await.unwrap();
+        let now = Instant::now();
+        let id = sessions.begin(&user_id, "some-provider", now).unwrap();
+        sessions
+            .with_session(&id, &user_id, now, |s| {
+                s.set_candidate(zeroize::Zeroizing::new(
+                    "fx_candidate_0123456789".to_owned(),
+                ))
+            })
+            .unwrap();
+
+        // Still active: nothing is cleared, the candidate stays.
+        run_periodic_check(&pool, &registry, &group_key_registry, &sessions).await;
+        assert!(registry.is_occupied().await);
+        assert_eq!(
+            sessions.with_session(&id, &user_id, now, |s| s.has_candidate()),
+            Ok(true)
+        );
+
+        // Idle past the boundary: the lock ends the session and the candidate.
+        let mut conn = pool.acquire().await.unwrap();
+        let stale = (chrono::Utc::now() - chrono::Duration::minutes(30)).to_rfc3339();
+        sqlx::query("UPDATE auth_sessions SET last_active_at = ?")
+            .bind(&stale)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        run_periodic_check(&pool, &registry, &group_key_registry, &sessions).await;
+
+        assert!(!registry.is_occupied().await);
+        assert!(sessions.is_empty(), "the idle lock must drop the session");
+        assert_eq!(
+            sessions.with_session(&id, &user_id, now, |s| s.has_candidate()),
+            Err(SessionError::NoSession),
+            "the candidate must not be reachable after an idle lock, even for the same user"
         );
     }
 
@@ -329,7 +404,13 @@ mod tests {
             .await
             .unwrap();
 
-        run_periodic_check(&pool, &registry, &group_key_registry).await;
+        run_periodic_check(
+            &pool,
+            &registry,
+            &group_key_registry,
+            &ConnectSessions::default(),
+        )
+        .await;
 
         assert!(
             registry.is_occupied().await,
@@ -387,7 +468,13 @@ mod tests {
         drop(conn);
 
         for _ in 0..25 {
-            run_periodic_check(&pool, &registry, &group_key_registry).await;
+            run_periodic_check(
+                &pool,
+                &registry,
+                &group_key_registry,
+                &ConnectSessions::default(),
+            )
+            .await;
         }
 
         assert!(
@@ -411,7 +498,13 @@ mod tests {
         let pool = app.state::<sqlx::SqlitePool>();
 
         // No login() call at all -- KeyRegistry starts empty.
-        run_periodic_check(&pool, &registry, &group_key_registry).await;
+        run_periodic_check(
+            &pool,
+            &registry,
+            &group_key_registry,
+            &ConnectSessions::default(),
+        )
+        .await;
 
         assert!(!registry.is_occupied().await);
     }
@@ -476,7 +569,13 @@ mod tests {
             .await
             .unwrap();
 
-        run_periodic_check(&pool, &registry, &group_key_registry).await;
+        run_periodic_check(
+            &pool,
+            &registry,
+            &group_key_registry,
+            &ConnectSessions::default(),
+        )
+        .await;
 
         assert!(
             !registry.is_occupied().await,

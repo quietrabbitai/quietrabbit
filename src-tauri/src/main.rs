@@ -557,10 +557,13 @@ async fn async_main() {
                                 idle_handle
                                     .state::<quietrabbit_lib::auth::registry::GroupKeyRegistry>();
                             let pool = idle_handle.state::<sqlx::SqlitePool>();
+                            let connect_sessions = idle_handle
+                                .state::<quietrabbit_lib::provider_credentials::session::ConnectSessions>();
                             quietrabbit_lib::auth::idle_timeout::run_periodic_check(
                                 &pool,
                                 &key_registry,
                                 &group_key_registry,
+                                &connect_sessions,
                             )
                             .await;
                         }
