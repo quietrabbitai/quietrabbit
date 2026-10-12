@@ -908,6 +908,7 @@ export const commands = {
 	 *  unknown session is a no-op.
 	 */
 	endProviderConnect: (sessionId: string) => typedError<null, string>(__TAURI_INVOKE("end_provider_connect", { sessionId })),
+	cancelChatStream: (runId: string) => typedError<null, string>(__TAURI_INVOKE("cancel_chat_stream", { runId })),
 };
 
 /* Types */
@@ -1481,6 +1482,12 @@ export type MessageInfo = {
 	 *  model reply). The UI must not offer it for copy.
 	 */
 	is_error: boolean,
+	/**
+	 *  items.id=715 (decisions.id=883): Gate 2 found a withheld personal
+	 *  value in this reply. The reply is intact; the UI shows a plain,
+	 *  non-blocking notice.
+	 */
+	personal_flagged: boolean,
 };
 
 export type ModelPriceDto = {

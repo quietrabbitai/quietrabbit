@@ -42,6 +42,7 @@
 use chrono::{DateTime, TimeZone, Utc};
 use serde_json::{json, Map, Value};
 use sqlx::SqliteConnection;
+use tokio_util::sync::CancellationToken;
 
 use crate::persistence::provider_spend_store::{
     self as store, ConsentStanding, LedgerOutcome, LimitMetric, LimitPeriod, LimitRow,
@@ -54,6 +55,7 @@ use crate::providers::hosted_client::{
     effective_output_limit, missing_limit_error, HostedAttempt, HostedClient, HostedOutcome,
     HostedRequest,
 };
+use crate::providers::hosted_stream::StreamSink;
 use crate::spend::calibration::{self, applied_from, CallSample};
 use crate::spend::codes::Code;
 use crate::spend::disclosure::attributes_hash;
@@ -632,15 +634,24 @@ pub struct MeteredOutcome {
     pub notices: Vec<LimitNotice>,
 }
 
-/// Pre-flight, call, settle. The ONLY way the executor reaches a hosted
-/// provider.
-pub async fn metered_generate<Tz: TimeZone>(
-    client: &HostedClient,
+/// The shared body of every metered call: output limit, open the store,
+/// pre-flight (consent, price, cap, unattended budget, limits, reservation),
+/// make the call, settle. `call` is the only part that differs between a
+/// whole-body call and a streamed one; it returns the attempt plus whatever
+/// else the caller wants back. Nothing reaches the network unless the
+/// pre-flight clears.
+async fn metered_core<Tz, F, Fut, X>(
     call_ctx: &CallContext,
     req: &HostedRequest,
     spend: &SpendCall<'_>,
     tz: &Tz,
-) -> Result<MeteredOutcome, SpendCallError> {
+    call: F,
+) -> Result<(HostedAttempt, X, Vec<LimitNotice>), SpendCallError>
+where
+    Tz: TimeZone,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = (HostedAttempt, X)>,
+{
     // The cap is computed from exactly the limit the request will carry.
     let output_limit = effective_output_limit(call_ctx, req)
         .ok_or_else(|| SpendCallError::Provider(missing_limit_error(call_ctx)))?;
@@ -660,7 +671,7 @@ pub async fn metered_generate<Tz: TimeZone>(
         .await
         .map_err(SpendCallError::Block)?;
 
-    let attempt = client.generate_metered(call_ctx, req).await;
+    let (attempt, extra) = call().await;
     finish(
         &mut conn,
         &reserved,
@@ -679,13 +690,85 @@ pub async fn metered_generate<Tz: TimeZone>(
             n.scope_kind.as_str()
         );
     }
+    Ok((attempt, extra, reserved.notices))
+}
 
+/// Pre-flight, call, settle. The ONLY way the executor reaches a hosted
+/// provider with a whole-body call.
+pub async fn metered_generate<Tz: TimeZone>(
+    client: &HostedClient,
+    call_ctx: &CallContext,
+    req: &HostedRequest,
+    spend: &SpendCall<'_>,
+    tz: &Tz,
+) -> Result<MeteredOutcome, SpendCallError> {
+    let (attempt, (), notices) = metered_core(call_ctx, req, spend, tz, || async {
+        (client.generate_metered(call_ctx, req).await, ())
+    })
+    .await?;
     match attempt.result {
-        Ok(outcome) => Ok(MeteredOutcome {
-            outcome,
-            notices: reserved.notices,
-        }),
+        Ok(outcome) => Ok(MeteredOutcome { outcome, notices }),
         Err(e) => Err(SpendCallError::Provider(e)),
+    }
+}
+
+/// A streamed metered call's result plus the text the user was shown
+/// (items.id=715), which Gate 2 scans even when the call did not complete.
+pub struct StreamedMetered {
+    pub result: Result<MeteredOutcome, SpendCallError>,
+    /// Empty when the gate blocked the call before any traffic.
+    pub received_text: String,
+    pub cancelled: bool,
+}
+
+// Never prints the reply text (decisions.id=883).
+impl std::fmt::Debug for StreamedMetered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamedMetered")
+            .field("ok", &self.result.is_ok())
+            .field("received_len", &self.received_text.len())
+            .field("cancelled", &self.cancelled)
+            .finish()
+    }
+}
+
+/// `metered_generate` for a streamed call (items.id=715; decisions.id=874,
+/// 883). The same pre-flight, reservation and settlement, with the same
+/// `settlement_for`: a completed stream with a final usage figure is
+/// reported, one without is estimated, and a cancel, a cut or an in-stream
+/// failure after the request was sent keeps the reserved worst case
+/// (Interrupt). The ONLY way the executor reaches a hosted provider with a
+/// streamed call.
+pub async fn metered_generate_streamed<Tz: TimeZone>(
+    client: &HostedClient,
+    call_ctx: &CallContext,
+    req: &HostedRequest,
+    spend: &SpendCall<'_>,
+    tz: &Tz,
+    sink: &dyn StreamSink,
+    cancel: &CancellationToken,
+) -> StreamedMetered {
+    let core = metered_core(call_ctx, req, spend, tz, || async {
+        let s = client
+            .generate_stream_metered(call_ctx, req, sink, cancel)
+            .await;
+        (s.attempt, (s.received_text, s.cancelled))
+    })
+    .await;
+    match core {
+        Err(e) => StreamedMetered {
+            result: Err(e),
+            received_text: String::new(),
+            cancelled: false,
+        },
+        Ok((attempt, (received_text, cancelled), notices)) => StreamedMetered {
+            result: match attempt.result {
+                Ok(outcome) => Ok(MeteredOutcome { outcome, notices }),
+                Err(e) => Err(SpendCallError::Provider(e)),
+            },
+            received_text,
+            cancelled,
+        },
     }
 }
 

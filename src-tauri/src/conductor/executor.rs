@@ -79,13 +79,15 @@ use crate::persistence::provider_store::{self, Provider, ProviderModel};
 use crate::providers::errors::ProviderError;
 use crate::providers::hosted_call::{CallContext, HostedRoute};
 use crate::providers::hosted_client::{HostedClient, HostedRequest};
+use crate::providers::hosted_stream::{NullSink, StreamEnd, StreamOutcome, StreamSink};
 use crate::providers::ollama_client::{check_context_window, OllamaClient};
 use crate::providers::types::{
     ContextWindowStatusKind, GenerateOptions, GenerateRequest, GenerateResponse,
 };
 use crate::spend::codes::Code;
 use crate::spend::gate::{
-    block_metadata, metered_generate, RunAttendance, SpendBlock, SpendCall, SpendCallError,
+    block_metadata, metered_generate, metered_generate_streamed, RunAttendance, SpendBlock,
+    SpendCall, SpendCallError,
 };
 
 // ---------------------------------------------------------------------------
@@ -206,6 +208,10 @@ pub struct StepContext {
     /// items.id=710: whether a user is present. The spend gate lets an
     /// unattended step spend only within an approved per-run budget.
     pub attendance: RunAttendance,
+    /// items.id=715: Some when this run's owner asked its hosted steps to
+    /// stream (API Chat). None (every other run) = whole-body calls, exactly
+    /// as before. Ignored by a local (Ollama) step.
+    pub stream: Option<crate::chat_stream::ChatStream>,
     /// items.id=439 (Part 6): the Focus-level external_access ceiling,
     /// excluding this step's own external_access_override (see
     /// FocusRun::_focus_external_access) — used by the Step 3 tighten-only
@@ -685,42 +691,66 @@ impl StepExecutor {
             ));
         }
 
-        let generate_result: Result<_, ConductorError> =
-            if ctx.effective_access != ExternalAccess::LocalOnly {
-                // Step 4.5 above already guarantees qr_hosted_provider_preference is
-                // Some(...) at this point -- no silent fallback to any default
-                // provider for a None preference (matches select_model()'s
-                // policy). The provider row, model row and the user's stored
-                // key become one CallContext (items.id=709); a provider id with
-                // no row is a real ConductorError, not a panic. The spend gate
-                // (items.id=710) runs between building that context and the
-                // network call.
-                match (
-                    ctx.qr_hosted_provider_preference.as_deref(),
-                    selected_model.hosted_model.as_ref(),
-                ) {
-                    (Some(provider_id), Some(model)) => {
-                        hosted_step_call(
-                            hosted_client(),
-                            pool,
-                            ctx,
-                            provider_id,
-                            model,
-                            &request,
-                            &chrono::Local,
-                            HostedInputs::build_call,
-                        )
-                        .await
-                    }
-                    _ => unreachable!(
-                        "effective_access != LocalOnly with no qr_hosted_provider_preference \
-                         or no resolved model -- the Step 4.5 guard and select_model() must \
-                         already have short-circuited"
-                    ),
+        // items.id=715: a hosted step streams only when the run's owner asked
+        // for it (API Chat). A local step never does.
+        let hosted_step = ctx.effective_access != ExternalAccess::LocalOnly;
+        let stream_sink: Option<Box<dyn StreamSink>> = match (&ctx.stream, step_streams(ctx)) {
+            (Some(_), true) => Some(match app_handle {
+                Some(h) => Box::new(crate::chat_stream::TauriDeltaSink::new(
+                    h.clone(),
+                    ctx.focus_run_id.clone(),
+                    ctx.step.step_id.clone(),
+                )),
+                None => Box::new(NullSink),
+            }),
+            _ => None,
+        };
+        let mut stream_tail = StreamTail::default();
+
+        let generate_result: Result<_, ConductorError> = if hosted_step {
+            // Step 4.5 above already guarantees qr_hosted_provider_preference is
+            // Some(...) at this point -- no silent fallback to any default
+            // provider for a None preference (matches select_model()'s
+            // policy). The provider row, model row and the user's stored
+            // key become one CallContext (items.id=709); a provider id with
+            // no row is a real ConductorError, not a panic. The spend gate
+            // (items.id=710) runs between building that context and the
+            // network call.
+            match (
+                ctx.qr_hosted_provider_preference.as_deref(),
+                selected_model.hosted_model.as_ref(),
+            ) {
+                (Some(provider_id), Some(model)) => {
+                    let parts = match (&ctx.stream, stream_sink.as_deref()) {
+                        (Some(handle), Some(sink)) => Some(StreamParts {
+                            sink,
+                            cancel: handle.token(),
+                            tail: &mut stream_tail,
+                        }),
+                        _ => None,
+                    };
+                    hosted_step_call(
+                        hosted_client(),
+                        pool,
+                        ctx,
+                        provider_id,
+                        model,
+                        &request,
+                        &chrono::Local,
+                        HostedInputs::build_call,
+                        parts,
+                    )
+                    .await
                 }
-            } else {
-                ollama_client().generate(&request).await
-            };
+                _ => unreachable!(
+                    "effective_access != LocalOnly with no qr_hosted_provider_preference \
+                     or no resolved model -- the Step 4.5 guard and select_model() must \
+                     already have short-circuited"
+                ),
+            }
+        } else {
+            ollama_client().generate(&request).await
+        };
 
         // Python oracle: finally block — always release regardless of generate result.
         scheduler.release_inference_slot(&ctx.focus_run_id);
@@ -728,6 +758,34 @@ impl StepExecutor {
         let response = match generate_result {
             Ok(r) => r,
             Err(e) => {
+                // items.id=715: a streamed reply that ended badly or was
+                // cancelled was still SHOWN, so Gate 2 flags what the user
+                // saw (decisions.id=883) and the front end is told how it
+                // ended. A failure before any text was shown is reported
+                // through the ordinary failure path only, because it may be
+                // retried.
+                if let Some(sink) = stream_sink.as_deref() {
+                    if stream_tail.cancelled || !stream_tail.received_text.is_empty() {
+                        let g2 = streamed_gate2(
+                            ctx,
+                            privacy_gateway,
+                            &gate_track,
+                            &stream_tail.received_text,
+                            selected_model.provider_id.clone(),
+                            &g1.fields_shared,
+                        )
+                        .await;
+                        sink.end(&StreamEnd {
+                            outcome: if stream_tail.cancelled {
+                                StreamOutcome::Cancelled
+                            } else {
+                                StreamOutcome::Failed
+                            },
+                            personal_flagged: g2.flagged,
+                            audit_unavailable: g2.audit_unavailable,
+                        });
+                    }
+                }
                 return Ok(Some(failure_handler.handle(
                     &e,
                     Some(&ctx.step.step_id),
@@ -738,35 +796,57 @@ impl StepExecutor {
         };
 
         // -- Step 11 — PG_GATE_2: inbound contamination scan --
-        let g2 = privacy_gateway
-            .gate2(
-                &ctx.step.step_id,
-                &ctx.focus_run_id,
-                &response.content,
+        if let Some(sink) = stream_sink.as_deref() {
+            // items.id=715 (decisions.id=883): a STREAMED external reply has
+            // already been shown, so Gate 2 flags and notifies; it never
+            // holds, discards, edits or retracts it, and the run continues.
+            // (The non-streamed branch below is unchanged; items.id=735 owns
+            // that one.)
+            let g2 = streamed_gate2(
+                ctx,
+                privacy_gateway,
                 &gate_track,
-                execution_tier,
-                ctx.effective_access,
+                &response.content,
                 selected_model.provider_id.clone(),
-                Some(&g1.fields_shared),
+                &g1.fields_shared,
             )
-            .await
-            .map_err(|e| ConductorError::DisclosureLogWrite {
-                plain_language: e.plain_language.clone(),
-            })?;
+            .await;
+            sink.end(&StreamEnd {
+                outcome: StreamOutcome::Complete,
+                personal_flagged: g2.flagged,
+                audit_unavailable: g2.audit_unavailable,
+            });
+        } else {
+            let g2 = privacy_gateway
+                .gate2(
+                    &ctx.step.step_id,
+                    &ctx.focus_run_id,
+                    &response.content,
+                    &gate_track,
+                    execution_tier,
+                    ctx.effective_access,
+                    selected_model.provider_id.clone(),
+                    Some(&g1.fields_shared),
+                )
+                .await
+                .map_err(|e| ConductorError::DisclosureLogWrite {
+                    plain_language: e.plain_language.clone(),
+                })?;
 
-        if g2.flagged {
-            return Ok(Some(
-                failure_handler.handle(
-                    &ConductorError::InboundContamination {
-                        plain_language: "The response may contain personal information. \
+            if g2.flagged {
+                return Ok(Some(
+                    failure_handler.handle(
+                        &ConductorError::InboundContamination {
+                            plain_language: "The response may contain personal information. \
                         [Review and continue] [Discard] [Get help]"
-                            .to_owned(),
-                    },
-                    Some(&ctx.step.step_id),
-                    Some(&ctx.focus_id),
-                    retry_count,
-                ),
-            ));
+                                .to_owned(),
+                        },
+                        Some(&ctx.step.step_id),
+                        Some(&ctx.focus_id),
+                        retry_count,
+                    ),
+                ));
+            }
         }
 
         // -- Step 12 — update TaskTrack --
@@ -1337,6 +1417,7 @@ async fn hosted_step_call<Tz: chrono::TimeZone>(
     request: &GenerateRequest,
     tz: &Tz,
     build: fn(&HostedInputs) -> Result<CallContext, ProviderError>,
+    stream: Option<StreamParts<'_>>,
 ) -> Result<GenerateResponse, ConductorError> {
     let hosted_request = hosted_request_from(&ctx.step.options_override, request);
     let inputs = resolve_hosted_inputs(pool, &ctx.user_id, &ctx.key_hex, provider_id, model)
@@ -1376,11 +1457,135 @@ async fn hosted_step_call<Tz: chrono::TimeZone>(
         attendance: ctx.attendance,
     };
 
-    match metered_generate(client, &call, &hosted_request, &spend, tz).await {
+    let result = match stream {
+        None => metered_generate(client, &call, &hosted_request, &spend, tz).await,
+        Some(parts) => {
+            // items.id=715: the same gate, with the call streamed. The text
+            // the user was shown comes back in the tail even when the call
+            // did not complete, so Gate 2 can scan it.
+            let m = metered_generate_streamed(
+                client,
+                &call,
+                &hosted_request,
+                &spend,
+                tz,
+                parts.sink,
+                parts.cancel,
+            )
+            .await;
+            parts.tail.received_text = m.received_text;
+            parts.tail.cancelled = m.cancelled;
+            m.result
+        }
+    };
+    match result {
         Ok(metered) => Ok(metered.outcome.response),
         Err(SpendCallError::Block(block)) => Err(spend_block_error(&block)),
         Err(SpendCallError::Provider(e)) => Err(ConductorError::from(e)),
     }
+}
+
+/// Whether this step streams its reply (items.id=715): its run's owner asked
+/// for it AND the step goes to a hosted provider. A local step never streams.
+fn step_streams(ctx: &StepContext) -> bool {
+    ctx.stream.is_some() && ctx.effective_access != ExternalAccess::LocalOnly
+}
+
+/// What a streamed step needs from its caller (items.id=715): where the
+/// display-only text goes, the cancel token, and a place to hand back what
+/// was received.
+pub(crate) struct StreamParts<'a> {
+    pub sink: &'a dyn StreamSink,
+    pub cancel: &'a tokio_util::sync::CancellationToken,
+    pub tail: &'a mut StreamTail,
+}
+
+/// What a streamed call leaves behind, for Gate 2 on a call that did not
+/// complete. Never printed: it holds reply text.
+#[derive(Default)]
+pub(crate) struct StreamTail {
+    pub received_text: String,
+    pub cancelled: bool,
+}
+
+/// What Gate 2 found in a streamed reply.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StreamedGate2 {
+    pub flagged: bool,
+    pub audit_unavailable: bool,
+}
+
+/// Gate 2 for a STREAMED external reply (items.id=715, decisions.id=883):
+/// scan the text the user was shown, write gate2's disclosure-log entry on a
+/// hit, mark the reply personal-flagged, and tell the caller to raise the
+/// notice. It never fails the step and never alters or retracts the reply.
+///
+/// If the disclosure-log write fails after display (gate2 returns an error
+/// only when it matched AND external access is live), the reply is kept and
+/// still flagged, the notice says the audit entry is unavailable, and a
+/// content-free error is logged: failing the run would retract text the user
+/// already read, after the money was spent. Chat-PM accepted this
+/// 2026-10-12.
+async fn streamed_gate2<L: DisclosureLogger>(
+    ctx: &StepContext,
+    privacy_gateway: &PrivacyGateway<L>,
+    gate_track: &GateTrack,
+    text: &str,
+    provider: Option<String>,
+    fields_shared: &[String],
+) -> StreamedGate2 {
+    if text.is_empty() {
+        return StreamedGate2::default();
+    }
+    let found = privacy_gateway
+        .gate2(
+            &ctx.step.step_id,
+            &ctx.focus_run_id,
+            text,
+            gate_track,
+            ctx.execution_tier,
+            ctx.effective_access,
+            provider,
+            Some(fields_shared),
+        )
+        .await;
+    let outcome = match found {
+        Ok(g2) if !g2.flagged => return StreamedGate2::default(),
+        Ok(_) => StreamedGate2 {
+            flagged: true,
+            audit_unavailable: false,
+        },
+        Err(_) => {
+            log::error!(
+                "executor: Gate 2 matched a streamed reply but its disclosure-log entry \
+                 could not be written (run {}, step {}); the reply is kept and flagged",
+                ctx.focus_run_id,
+                ctx.step.step_id
+            );
+            StreamedGate2 {
+                flagged: true,
+                audit_unavailable: true,
+            }
+        }
+    };
+    if ctx.key_hex.is_empty() {
+        return outcome;
+    }
+    match crate::persistence::message_store::mark_reply_personal_flagged(
+        &ctx.user_id,
+        &ctx.persona_id,
+        &ctx.key_hex,
+        &ctx.focus_run_id,
+    )
+    .await
+    {
+        Ok(_) => {}
+        Err(e) => log::warn!(
+            "executor: could not mark the streamed reply of run {} personal-flagged: {e}",
+            ctx.focus_run_id
+        ),
+    }
+    outcome
 }
 
 /// What a hosted call is built from: the two catalog rows (as a plain-data
@@ -2854,6 +3059,7 @@ mod tests {
             persona_id: "p".to_owned(),
             key_hex: String::new(),
             attendance: RunAttendance::Attended,
+            stream: None,
         };
         let mut projected = HashMap::new();
         projected.insert("name".to_owned(), "Alice (abstracted)".to_owned());
@@ -2914,6 +3120,7 @@ mod tests {
             persona_id: "p".to_owned(),
             key_hex: String::new(),
             attendance: RunAttendance::Attended,
+            stream: None,
         };
         assert_eq!(compute_step_sensitivity(&ctx, &pt, &HashMap::new()), 2);
     }
@@ -2960,6 +3167,7 @@ mod tests {
             persona_id: "p".to_owned(),
             key_hex: String::new(),
             attendance: RunAttendance::Attended,
+            stream: None,
         };
         assert_eq!(compute_step_sensitivity(&ctx, &pt, &HashMap::new()), 1);
     }
@@ -3018,6 +3226,7 @@ mod tests {
             persona_id: "persona-1".to_owned(),
             key_hex: key_hex.to_owned(),
             attendance,
+            stream: None,
         }
     }
 
@@ -3129,6 +3338,7 @@ mod tests {
             &generate_request("hello there"),
             &chrono::Utc,
             loopback_build,
+            None,
         )
         .await
     }
@@ -3739,5 +3949,558 @@ mod tests {
     #[test]
     fn the_total_retry_wait_is_bounded() {
         assert!(u64::from(MAX_RETRIES) * RETRY_AFTER_CAP_SECS <= 300);
+    }
+
+    // -----------------------------------------------------------------------
+    // items.id=715: streamed hosted steps. Loopback only; the same spend rig.
+    // -----------------------------------------------------------------------
+
+    mod streaming {
+        use super::*;
+        use crate::conductor::privacy::logger::{FailLogger, TestLogger};
+        use crate::providers::loopback_test_server::StreamStep;
+        use std::sync::Mutex;
+        use tokio_util::sync::CancellationToken;
+
+        #[derive(Default)]
+        struct Rec {
+            deltas: Mutex<Vec<String>>,
+            ends: Mutex<Vec<StreamEnd>>,
+        }
+
+        impl StreamSink for Rec {
+            fn delta(&self, _seq: u32, text: &str) {
+                self.deltas.lock().unwrap().push(text.to_owned());
+            }
+            fn end(&self, end: &StreamEnd) {
+                self.ends.lock().unwrap().push(*end);
+            }
+        }
+
+        impl Rec {
+            fn text(&self) -> String {
+                self.deltas.lock().unwrap().concat()
+            }
+        }
+
+        fn frame(v: serde_json::Value) -> Vec<u8> {
+            format!("data: {v}\n\n").into_bytes()
+        }
+        fn delta(t: &str) -> Vec<u8> {
+            frame(serde_json::json!({"choices":[{"delta":{"content":t},"finish_reason":null}]}))
+        }
+        fn finish() -> Vec<u8> {
+            frame(serde_json::json!({"choices":[{"delta":{},"finish_reason":"stop"}]}))
+        }
+        fn usage() -> Vec<u8> {
+            frame(
+                serde_json::json!({"choices":[],"usage":{"prompt_tokens":4,"completion_tokens":2}}),
+            )
+        }
+        fn steps(frames: Vec<Vec<u8>>) -> Vec<StreamStep> {
+            frames.into_iter().map(StreamStep::Chunk).collect()
+        }
+        fn with_usage() -> Canned {
+            Canned::sse(steps(vec![
+                delta("Hel"),
+                delta("lo"),
+                finish(),
+                usage(),
+                b"data: [DONE]\n\n".to_vec(),
+            ]))
+        }
+
+        async fn streamed(
+            pool: &sqlx::SqlitePool,
+            key_hex: &str,
+            model: &ProviderModel,
+            rec: &Rec,
+            token: &CancellationToken,
+            tail: &mut StreamTail,
+        ) -> Result<GenerateResponse, ConductorError> {
+            hosted_step_call(
+                &loopback_client(),
+                pool,
+                &hosted_ctx(RunAttendance::Attended, key_hex),
+                "fixture-host-a",
+                model,
+                &generate_request("hello there"),
+                &chrono::Utc,
+                loopback_build,
+                Some(StreamParts {
+                    sink: rec,
+                    cancel: token,
+                    tail,
+                }),
+            )
+            .await
+        }
+
+        /// outcome, usage_source, tokens_in, tokens_out, cost, reserved
+        async fn only_ledger_row(key_hex: &str) -> (String, String, i64, i64, i64, i64) {
+            use sqlx::Row;
+            let mut conn = spend_store::open(SPEND_USER, key_hex).await.unwrap();
+            let row = sqlx::query(
+                "SELECT outcome, usage_source, tokens_in, tokens_out, cost_micros, \
+                 reserved_micros FROM provider_usage_ledger",
+            )
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+            (
+                row.get("outcome"),
+                row.get("usage_source"),
+                row.get("tokens_in"),
+                row.get("tokens_out"),
+                row.get("cost_micros"),
+                row.get("reserved_micros"),
+            )
+        }
+
+        async fn cleared(
+            pool: &sqlx::SqlitePool,
+            server: &LoopbackServer,
+        ) -> (String, ProviderModel) {
+            let (key_hex, model) = spend_rig(pool, server, Some(PRICE_TEXT)).await;
+            grant_consent(pool, &key_hex, false).await;
+            set_cost_limit(&key_hex, spend_store::LimitPeriod::Month, 5_000_000, false).await;
+            (key_hex, model)
+        }
+
+        #[tokio::test]
+        async fn a_streamed_call_goes_through_the_gate_and_settles_as_reported() {
+            with_temp_shared_db(|pool| async move {
+                let server = LoopbackServer::start(vec![with_usage()]);
+                let (key_hex, model) = cleared(&pool, &server).await;
+                let rec = Rec::default();
+                let mut tail = StreamTail::default();
+                let out = streamed(
+                    &pool,
+                    &key_hex,
+                    &model,
+                    &rec,
+                    &CancellationToken::new(),
+                    &mut tail,
+                )
+                .await
+                .expect("a cleared streamed call succeeds");
+                assert_eq!(out.content, "Hello");
+                assert_eq!(rec.text(), "Hello");
+                assert_eq!(tail.received_text, "Hello");
+                assert!(!tail.cancelled);
+
+                let body = server.captured()[0].json();
+                assert_eq!(body["stream"], true);
+                assert_eq!(body["stream_options"]["include_usage"], true);
+                assert_eq!(body["max_completion_tokens"], 128);
+
+                let (outcome, source, tin, tout, cost, reserved) = only_ledger_row(&key_hex).await;
+                assert_eq!((outcome.as_str(), source.as_str()), ("ok", "reported"));
+                assert_eq!((tin, tout, cost), (4, 2, 5));
+                assert!(reserved > cost, "the worst case was reserved first");
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn a_completed_stream_with_no_usage_is_estimated() {
+            with_temp_shared_db(|pool| async move {
+                let server = LoopbackServer::start(vec![Canned::sse(steps(vec![
+                    delta("Hello world"),
+                    finish(),
+                    b"data: [DONE]\n\n".to_vec(),
+                ]))]);
+                let (key_hex, model) = cleared(&pool, &server).await;
+                let mut tail = StreamTail::default();
+                streamed(
+                    &pool,
+                    &key_hex,
+                    &model,
+                    &Rec::default(),
+                    &CancellationToken::new(),
+                    &mut tail,
+                )
+                .await
+                .unwrap();
+                let (outcome, source, _, tout, _, _) = only_ledger_row(&key_hex).await;
+                assert_eq!((outcome.as_str(), source.as_str()), ("ok", "estimated"));
+                assert_eq!(tout, 3, "ceil(11 bytes / 4)");
+            })
+            .await;
+        }
+
+        async fn assert_interrupted_at_worst_case(canned: Canned) {
+            with_temp_shared_db(|pool| async move {
+                let server = LoopbackServer::start(vec![canned]);
+                let (key_hex, model) = cleared(&pool, &server).await;
+                let mut tail = StreamTail::default();
+                let err = streamed(
+                    &pool,
+                    &key_hex,
+                    &model,
+                    &Rec::default(),
+                    &CancellationToken::new(),
+                    &mut tail,
+                )
+                .await
+                .unwrap_err();
+                assert!(
+                    matches!(
+                        err,
+                        ConductorError::Provider { .. }
+                            | ConductorError::ProviderUnavailable { .. }
+                    ),
+                    "{err:?}"
+                );
+                let (outcome, source, _, _, cost, reserved) = only_ledger_row(&key_hex).await;
+                assert_eq!((outcome.as_str(), source.as_str()), ("interrupted", "none"));
+                assert_eq!(cost, reserved, "charged at the reserved worst case");
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn an_in_stream_error_as_the_first_event_keeps_the_reserved_worst_case() {
+            assert_interrupted_at_worst_case(Canned::sse(steps(vec![frame(serde_json::json!({
+                "error": {"code": "server_error"},
+                "choices":[{"delta":{"content":""},"finish_reason":"error"}]
+            }))])))
+            .await;
+        }
+
+        #[tokio::test]
+        async fn a_cut_after_text_keeps_the_reserved_worst_case() {
+            assert_interrupted_at_worst_case(Canned::sse(vec![
+                StreamStep::Chunk(delta("Hel")),
+                StreamStep::Cut,
+            ]))
+            .await;
+        }
+
+        #[tokio::test]
+        async fn a_failure_after_text_is_terminal_and_never_retried() {
+            with_temp_shared_db(|pool| async move {
+                let server = LoopbackServer::start(vec![Canned::sse(vec![
+                    StreamStep::Chunk(delta("Hel")),
+                    StreamStep::Cut,
+                ])]);
+                let (key_hex, model) = cleared(&pool, &server).await;
+                let mut tail = StreamTail::default();
+                let err = streamed(
+                    &pool,
+                    &key_hex,
+                    &model,
+                    &Rec::default(),
+                    &CancellationToken::new(),
+                    &mut tail,
+                )
+                .await
+                .unwrap_err();
+                // Terminal class: the failure handler parks it instead of
+                // retrying over text the user already read.
+                assert!(matches!(err, ConductorError::Provider { .. }), "{err:?}");
+                assert_eq!(tail.received_text, "Hel");
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn cancel_mid_stream_stops_the_read_settles_as_interrupted_and_returns_the_text() {
+            with_temp_shared_db(|pool| async move {
+                let server = LoopbackServer::start(vec![Canned::sse(vec![
+                    StreamStep::Chunk(delta("Hi")),
+                    StreamStep::Hold(std::time::Duration::from_secs(20)),
+                ])]);
+                let (key_hex, model) = cleared(&pool, &server).await;
+                let token = CancellationToken::new();
+                let t2 = token.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    t2.cancel();
+                });
+                let rec = Rec::default();
+                let mut tail = StreamTail::default();
+                let started = std::time::Instant::now();
+                let err = streamed(&pool, &key_hex, &model, &rec, &token, &mut tail)
+                    .await
+                    .unwrap_err();
+                assert!(started.elapsed() < std::time::Duration::from_secs(5));
+                assert!(matches!(err, ConductorError::Provider { .. }));
+                assert!(tail.cancelled);
+                assert_eq!(tail.received_text, "Hi");
+                let (outcome, _, _, _, cost, reserved) = only_ledger_row(&key_hex).await;
+                assert_eq!(outcome, "interrupted");
+                assert_eq!(cost, reserved);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                while server.client_closed() == 0 && std::time::Instant::now() < deadline {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                assert_eq!(server.client_closed(), 1, "the HTTP read must really stop");
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn cancel_before_the_first_byte_is_interrupted_never_released() {
+            with_temp_shared_db(|pool| async move {
+                let server = LoopbackServer::start(vec![
+                    with_usage().with_delay(std::time::Duration::from_millis(1500))
+                ]);
+                let (key_hex, model) = cleared(&pool, &server).await;
+                let token = CancellationToken::new();
+                let t2 = token.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    t2.cancel();
+                });
+                let mut tail = StreamTail::default();
+                streamed(&pool, &key_hex, &model, &Rec::default(), &token, &mut tail)
+                    .await
+                    .unwrap_err();
+                assert!(tail.cancelled);
+                assert_eq!(ledger_count(&key_hex).await, 1, "the reservation is kept");
+                let (outcome, _, _, _, cost, reserved) = only_ledger_row(&key_hex).await;
+                assert_eq!(outcome, "interrupted");
+                assert_eq!(cost, reserved);
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn cancel_before_dispatch_sends_nothing_and_releases_the_reservation() {
+            with_temp_shared_db(|pool| async move {
+                let server = LoopbackServer::start(vec![with_usage()]);
+                let (key_hex, model) = cleared(&pool, &server).await;
+                let token = CancellationToken::new();
+                token.cancel();
+                let mut tail = StreamTail::default();
+                streamed(&pool, &key_hex, &model, &Rec::default(), &token, &mut tail)
+                    .await
+                    .unwrap_err();
+                assert_eq!(server.connections(), 0);
+                assert_eq!(
+                    ledger_count(&key_hex).await,
+                    0,
+                    "provably never sent: released"
+                );
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn streaming_stays_behind_consent_price_and_cap() {
+            with_temp_shared_db(|pool| async move {
+                // No consent.
+                let server = LoopbackServer::start(vec![with_usage()]);
+                let (key_hex, model) = spend_rig(&pool, &server, Some(PRICE_TEXT)).await;
+                let mut tail = StreamTail::default();
+                let err = streamed(
+                    &pool,
+                    &key_hex,
+                    &model,
+                    &Rec::default(),
+                    &CancellationToken::new(),
+                    &mut tail,
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(block_code(&err), "spend_block.consent_required");
+                assert_eq!(server.connections(), 0);
+                assert!(tail.received_text.is_empty());
+                // Consent but no cap.
+                grant_consent(&pool, &key_hex, false).await;
+                let err = streamed(
+                    &pool,
+                    &key_hex,
+                    &model,
+                    &Rec::default(),
+                    &CancellationToken::new(),
+                    &mut tail,
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(block_code(&err), "spend_block.cap_required");
+                assert_eq!(server.connections(), 0);
+            })
+            .await;
+        }
+
+        #[test]
+        fn only_a_hosted_step_with_the_seam_streams() {
+            let reg = crate::chat_stream::ChatStreamRegistry::default();
+            let handle = reg.register(SPEND_USER, "run-1");
+            let mut ctx = hosted_ctx(RunAttendance::Attended, "");
+            assert!(!step_streams(&ctx), "no seam, no stream");
+            ctx.stream = Some(handle.clone());
+            assert!(step_streams(&ctx));
+            ctx.effective_access = ExternalAccess::LocalOnly;
+            assert!(!step_streams(&ctx), "a local step ignores the seam");
+        }
+
+        #[tokio::test]
+        async fn a_call_without_the_seam_still_sends_stream_false() {
+            with_temp_shared_db(|pool| async move {
+                let server = LoopbackServer::start(vec![loopback_chat_ok()]);
+                let (key_hex, model) = cleared(&pool, &server).await;
+                call_hosted(&pool, &key_hex, &model, RunAttendance::Attended)
+                    .await
+                    .unwrap();
+                let body = server.captured()[0].json();
+                assert_eq!(body["stream"], false);
+                assert!(body.get("stream_options").is_none());
+            })
+            .await;
+        }
+
+        // -- Gate 2 for a streamed reply (decisions.id=883) -------------------
+
+        fn gate_track_with(name: &str, value: &str) -> GateTrack {
+            let mut gt = GateTrack::new();
+            gt.add_field(GateField {
+                field_name: name.to_owned(),
+                field_value: value.to_owned(),
+                sensitivity: Sensitivity::Personal,
+                sensitivity_severity: 2,
+                source_id: "s".to_owned(),
+                abstraction_tier2: AbstractionPolicy::Omit,
+                abstraction_tier3: AbstractionPolicy::Omit,
+            })
+            .unwrap();
+            gt.seal();
+            gt
+        }
+
+        /// A migrated messages.db holding the run's assistant placeholder.
+        async fn seed_reply(key_hex: &str, run_id: &str) {
+            crate::persistence::migrations::migrate_messages_db(SPEND_USER, "persona-1", key_hex)
+                .await
+                .unwrap();
+            crate::persistence::message_store::save_message(
+                SPEND_USER,
+                "persona-1",
+                key_hex,
+                "c1",
+                "assistant",
+                "the reply",
+                Some(run_id),
+            )
+            .await
+            .unwrap();
+        }
+
+        async fn reply_flagged(key_hex: &str) -> bool {
+            crate::persistence::message_store::list_messages(SPEND_USER, "persona-1", key_hex, "c1")
+                .await
+                .unwrap()[0]
+                .personal_flagged
+        }
+
+        #[tokio::test]
+        async fn a_hit_flags_the_reply_logs_and_never_alters_it() {
+            with_temp_shared_db(|_pool| async move {
+                let key_hex = fixture_key_hex();
+                seed_reply(&key_hex, "run-1").await;
+                let ctx = hosted_ctx(RunAttendance::Attended, &key_hex);
+                let gw = PrivacyGateway::new(TestLogger::new());
+                let track = gate_track_with("home_city", "Springfield");
+                let g2 = streamed_gate2(
+                    &ctx,
+                    &gw,
+                    &track,
+                    "You live in Springfield, right?",
+                    Some("fixture-host-a".to_owned()),
+                    &[],
+                )
+                .await;
+                assert_eq!(
+                    g2,
+                    StreamedGate2 {
+                        flagged: true,
+                        audit_unavailable: false
+                    }
+                );
+                assert_eq!(gw.logger.entry_count(), 1);
+                assert_eq!(
+                    gw.logger.entries()[0].event_type,
+                    "gate2_contamination_detected"
+                );
+                assert!(reply_flagged(&key_hex).await);
+                // The content is untouched.
+                let m = crate::persistence::message_store::list_messages(
+                    SPEND_USER,
+                    "persona-1",
+                    &key_hex,
+                    "c1",
+                )
+                .await
+                .unwrap();
+                assert_eq!(m[0].content, "the reply");
+                assert!(!m[0].is_error);
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn no_hit_an_intentionally_shared_value_and_empty_text_flag_nothing() {
+            with_temp_shared_db(|_pool| async move {
+                let key_hex = fixture_key_hex();
+                seed_reply(&key_hex, "run-1").await;
+                let ctx = hosted_ctx(RunAttendance::Attended, &key_hex);
+                let gw = PrivacyGateway::new(TestLogger::new());
+                let track = gate_track_with("home_city", "Springfield");
+                for (text, shared) in [
+                    ("Nothing personal here", vec![]),
+                    ("You live in Springfield", vec!["home_city".to_owned()]),
+                    ("", vec![]),
+                ] {
+                    let g2 = streamed_gate2(&ctx, &gw, &track, text, None, &shared).await;
+                    assert_eq!(g2, StreamedGate2::default(), "{text}");
+                }
+                assert_eq!(gw.logger.entry_count(), 0);
+                assert!(!reply_flagged(&key_hex).await);
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn an_audit_log_failure_after_display_keeps_the_reply_and_still_flags_it() {
+            with_temp_shared_db(|_pool| async move {
+                let key_hex = fixture_key_hex();
+                seed_reply(&key_hex, "run-1").await;
+                let ctx = hosted_ctx(RunAttendance::Attended, &key_hex);
+                let gw = PrivacyGateway::new(FailLogger);
+                let track = gate_track_with("home_city", "Springfield");
+                let g2 =
+                    streamed_gate2(&ctx, &gw, &track, "You live in Springfield", None, &[]).await;
+                // Not a failure of the step: flagged, with the audit entry
+                // reported as unavailable.
+                assert_eq!(
+                    g2,
+                    StreamedGate2 {
+                        flagged: true,
+                        audit_unavailable: true
+                    }
+                );
+                assert!(reply_flagged(&key_hex).await);
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn the_non_streamed_gate_2_branch_is_unchanged() {
+            // Pin the source: the hold for a non-streamed step still exists,
+            // and the streamed branch has no InboundContamination.
+            let src = include_str!("executor.rs");
+            let production = src.split("#[cfg(test)]").next().unwrap();
+            let streamed_branch = production
+                .split("if let Some(sink) = stream_sink.as_deref() {\n            // items.id=715 (decisions.id=883)")
+                .nth(1)
+                .expect("the streamed Gate 2 branch")
+                .split("} else {")
+                .next()
+                .unwrap();
+            assert!(!streamed_branch.contains("InboundContamination"));
+            assert!(production.contains("ConductorError::InboundContamination"));
+        }
     }
 }

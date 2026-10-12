@@ -109,6 +109,8 @@ fn plain_text(e: &ProviderError) -> String {
         | ProviderError::MalformedResponse { plain_language, .. }
         | ProviderError::OutputBudgetExhausted { plain_language, .. }
         | ProviderError::Misconfigured { plain_language, .. }
+        | ProviderError::StreamInterrupted { plain_language, .. }
+        | ProviderError::StreamCancelled { plain_language, .. }
         | ProviderError::ProviderFailure { plain_language, .. }
         | ProviderError::UnknownProvider { plain_language, .. }
         | ProviderError::MissingQrHostedConfig { plain_language } => plain_language.clone(),

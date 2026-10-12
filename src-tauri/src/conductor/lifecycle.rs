@@ -1217,6 +1217,12 @@ pub struct FocusRun<L: DisclosureLoggerForRun = SqliteDisclosureLogger> {
     /// future second unattended path inherits the safe default with no code
     /// change; a real attended flag is its own follow-up.
     pub(crate) attendance: crate::spend::gate::RunAttendance,
+    /// items.id=715 (decisions.id=874, 883): set by the owner of an API Chat
+    /// run so its hosted steps stream their reply (display-only deltas, a
+    /// cancel token, Gate 2 flags instead of holding). `None` - the default,
+    /// and what every other run keeps - sends `stream: false` exactly as
+    /// before. A rehydrated or swept run has none. Local steps ignore it.
+    pub chat_stream: Option<crate::chat_stream::ChatStream>,
 }
 
 impl<L: DisclosureLoggerForRun> FocusRun<L> {
@@ -1264,6 +1270,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             _persona_context_rendered: String::new(),
             crisis_floor_triggered: false,
             attendance: crate::spend::gate::RunAttendance::Unattended,
+            chat_stream: None,
         }
     }
 
@@ -2348,6 +2355,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             persona_id: self.persona_id.clone(),
             key_hex: self.key_hex.clone().unwrap_or_default(),
             attendance: self.attendance,
+            stream: self.chat_stream.clone(),
         };
 
         // Borrow distinct fields of self simultaneously — Rust borrow checker allows
@@ -4287,6 +4295,28 @@ mod tests {
         );
         run.attendance = crate::spend::gate::RunAttendance::Attended;
         assert_eq!(run.attendance, crate::spend::gate::RunAttendance::Attended);
+    }
+
+    /// items.id=715: no run streams unless its owner sets the seam, so every
+    /// existing caller keeps whole-body calls.
+    #[test]
+    fn a_new_run_does_not_stream() {
+        let scheduler = Arc::new(ConductorScheduler::new());
+        let run: FocusRun = FocusRun::new(
+            "u".to_owned(),
+            "p".to_owned(),
+            "f".to_owned(),
+            dummy_pool(),
+            scheduler,
+            "".to_owned(),
+            false,
+            None,
+            None,
+            false,
+            std::collections::HashSet::new(),
+            None,
+        );
+        assert!(run.chat_stream.is_none());
     }
 
     // -------------------------------------------------------------------------

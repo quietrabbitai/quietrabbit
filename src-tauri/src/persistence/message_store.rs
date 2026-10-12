@@ -42,6 +42,10 @@ pub struct MessageRecord {
     /// same way it already skips a still-empty placeholder, so a failure
     /// is never replayed back into the model's own conversation history.
     pub is_error: bool,
+    /// items.id=715 (messages_006.sql, decisions.id=883): Gate 2 found a
+    /// withheld personal value in this streamed reply. The reply is kept and
+    /// shown; this only marks it.
+    pub personal_flagged: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -150,6 +154,7 @@ fn row_to_message_record(r: &sqlx::sqlite::SqliteRow) -> Result<MessageRecord, s
         focus_run_id: r.try_get("focus_run_id")?,
         created_at: r.try_get("created_at")?,
         is_error: r.try_get::<i64, _>("is_error")? != 0,
+        personal_flagged: r.try_get::<i64, _>("personal_flagged")? != 0,
     })
 }
 
@@ -202,6 +207,7 @@ pub async fn save_message(
         focus_run_id: focus_run_id.map(|s| s.to_owned()),
         created_at: timestamp,
         is_error: false,
+        personal_flagged: false,
     })
 }
 
@@ -221,7 +227,7 @@ pub async fn list_messages(
     let mut conn = open_messages_db(user_id, persona_id, key_hex).await?;
 
     let rows = sqlx::query(
-        "SELECT id, context_key, sender, content, focus_run_id, created_at, is_error
+        "SELECT id, context_key, sender, content, focus_run_id, created_at, is_error, personal_flagged
          FROM messages
          WHERE context_key = ?
          ORDER BY created_at ASC",
@@ -251,7 +257,7 @@ pub async fn get_message(
     let mut conn = open_messages_db(user_id, persona_id, key_hex).await?;
 
     let row = sqlx::query(
-        "SELECT id, context_key, sender, content, focus_run_id, created_at, is_error
+        "SELECT id, context_key, sender, content, focus_run_id, created_at, is_error, personal_flagged
          FROM messages
          WHERE id = ?",
     )
@@ -288,7 +294,7 @@ pub async fn find_assistant_message_by_focus_run_id(
     let mut conn = open_messages_db(user_id, persona_id, key_hex).await?;
 
     let row = sqlx::query(
-        "SELECT id, context_key, sender, content, focus_run_id, created_at, is_error
+        "SELECT id, context_key, sender, content, focus_run_id, created_at, is_error, personal_flagged
          FROM messages
          WHERE focus_run_id = ? AND sender = 'assistant'",
     )
@@ -334,6 +340,29 @@ pub async fn update_message_content(
     Ok(())
 }
 
+/// Mark the assistant reply owned by `focus_run_id` as personal-flagged
+/// (items.id=715, decisions.id=883): Gate 2 found a withheld personal value in
+/// a streamed external reply. Only sets the mark; never touches the content.
+/// Returns false when the run owns no assistant message (not a chat send).
+pub async fn mark_reply_personal_flagged(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    focus_run_id: &str,
+) -> Result<bool, MessageStoreError> {
+    let mut conn = open_messages_db(user_id, persona_id, key_hex).await?;
+
+    let done = sqlx::query(
+        "UPDATE messages SET personal_flagged = 1
+         WHERE focus_run_id = ? AND sender = 'assistant'",
+    )
+    .bind(focus_run_id)
+    .execute(&mut conn)
+    .await?;
+
+    Ok(done.rows_affected() > 0)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -357,6 +386,8 @@ mod tests {
     // items.id=501 slice 3: drops gate3_review_status/reviewed_at_risk_rating,
     // which row_to_message_record no longer reads.
     const MESSAGES_SCHEMA_V5: &str = include_str!("../../schema/messages_005.sql");
+    // items.id=715: personal_flagged, read unconditionally by row_to_message_record.
+    const MESSAGES_SCHEMA_V6: &str = include_str!("../../schema/messages_006.sql");
 
     async fn test_db() -> SqliteConnection {
         let mut conn = SqliteConnectOptions::new()
@@ -370,6 +401,7 @@ mod tests {
             .chain(parse_statements(MESSAGES_SCHEMA_V3))
             .chain(parse_statements(MESSAGES_SCHEMA_V4))
             .chain(parse_statements(MESSAGES_SCHEMA_V5))
+            .chain(parse_statements(MESSAGES_SCHEMA_V6))
         {
             sqlx::query(&stmt)
                 .execute(&mut conn)
@@ -427,7 +459,7 @@ mod tests {
         let id = seed_message(&mut conn, "ctx-1", "user", "hello", "2026-08-09T00:00:00Z").await;
 
         let row = sqlx::query(
-            "SELECT id, context_key, sender, content, focus_run_id, created_at, is_error
+            "SELECT id, context_key, sender, content, focus_run_id, created_at, is_error, personal_flagged
              FROM messages WHERE id = ?",
         )
         .bind(&id)
@@ -814,7 +846,7 @@ mod tests {
         }
         assert_eq!(
             messages_applied_versions(&mut conn).await,
-            vec![1, 2, 3, 4, 5]
+            vec![1, 2, 3, 4, 5, 6]
         );
 
         // Every old row loads through the real read path, other columns intact.
@@ -885,7 +917,7 @@ mod tests {
         assert!(!cols.contains(&"reviewed_at_risk_rating".to_owned()));
         assert_eq!(
             messages_applied_versions(&mut conn).await,
-            vec![1, 2, 3, 4, 5]
+            vec![1, 2, 3, 4, 5, 6]
         );
         conn.close().await.expect("close must succeed");
 
@@ -896,7 +928,7 @@ mod tests {
             assert_eq!(messages_columns(&mut conn).await, cols);
             assert_eq!(
                 messages_applied_versions(&mut conn).await,
-                vec![1, 2, 3, 4, 5]
+                vec![1, 2, 3, 4, 5, 6]
             );
             conn.close().await.expect("close must succeed");
         }
@@ -926,6 +958,102 @@ mod tests {
             }
             other => panic!("expected Validation variant, got: {other:?}"),
         }
+    }
+
+    /// items.id=715 (decisions.id=883): the Gate 2 mark sets exactly one
+    /// column on the assistant reply of the run, never touches the content,
+    /// and defaults to unflagged.
+    #[tokio::test]
+    async fn mark_reply_personal_flagged_marks_only_the_run_owned_reply() {
+        let _env = setup().await;
+        save_message(USER_ID, PERSONA_ID, KEY_HEX, "c1", "user", "q", None)
+            .await
+            .unwrap();
+        save_message(
+            USER_ID,
+            PERSONA_ID,
+            KEY_HEX,
+            "c1",
+            "assistant",
+            "the reply",
+            Some("run-1"),
+        )
+        .await
+        .unwrap();
+        save_message(
+            USER_ID,
+            PERSONA_ID,
+            KEY_HEX,
+            "c1",
+            "assistant",
+            "other",
+            Some("run-2"),
+        )
+        .await
+        .unwrap();
+
+        let before = list_messages(USER_ID, PERSONA_ID, KEY_HEX, "c1")
+            .await
+            .unwrap();
+        assert!(
+            before.iter().all(|m| !m.personal_flagged),
+            "default is unflagged"
+        );
+
+        assert!(
+            mark_reply_personal_flagged(USER_ID, PERSONA_ID, KEY_HEX, "run-1")
+                .await
+                .unwrap()
+        );
+        // Idempotent, and a run with no reply is a no-op.
+        assert!(
+            mark_reply_personal_flagged(USER_ID, PERSONA_ID, KEY_HEX, "run-1")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !mark_reply_personal_flagged(USER_ID, PERSONA_ID, KEY_HEX, "no-such-run")
+                .await
+                .unwrap()
+        );
+
+        let after = list_messages(USER_ID, PERSONA_ID, KEY_HEX, "c1")
+            .await
+            .unwrap();
+        for m in &after {
+            assert_eq!(
+                m.personal_flagged,
+                m.content == "the reply",
+                "{}",
+                m.content
+            );
+        }
+        assert_eq!(
+            after
+                .iter()
+                .find(|m| m.content == "the reply")
+                .unwrap()
+                .content,
+            "the reply"
+        );
+        // A later content backfill keeps the mark.
+        let reply = after.iter().find(|m| m.personal_flagged).unwrap();
+        update_message_content(
+            USER_ID,
+            PERSONA_ID,
+            KEY_HEX,
+            &reply.id,
+            "the final reply",
+            false,
+        )
+        .await
+        .unwrap();
+        let again = get_message(USER_ID, PERSONA_ID, KEY_HEX, &reply.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(again.personal_flagged);
+        assert_eq!(again.content, "the final reply");
     }
 
     #[tokio::test]

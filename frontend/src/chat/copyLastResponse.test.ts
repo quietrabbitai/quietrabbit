@@ -18,6 +18,7 @@ function msg(overrides: Partial<MessageInfo>): MessageInfo {
     focus_run_id: null,
     created_at: '2026-10-04T00:00:00Z',
     is_error: false,
+    personal_flagged: false,
     ...overrides,
   }
 }

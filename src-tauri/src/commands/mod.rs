@@ -51,6 +51,7 @@ pub struct NotImplementedPlaceholder {}
 
 pub mod active_board;
 pub mod auth;
+pub mod chat_stream;
 pub mod chats;
 pub mod cloud_chat_pane;
 pub mod consent;

@@ -625,7 +625,19 @@ fn parse_options(
             }
         }
     }
-    merge_required_options(route, dialect, obj)
+    let merged = merge_required_options(route, dialect, obj)?;
+    // items.id=715: `stream_options` is honored only on streamed calls and is
+    // dropped from whole-body calls. A row may replace the default or, with
+    // JSON null, remove it for a provider that rejects it.
+    if merged
+        .get("stream_options")
+        .is_some_and(|v| !(v.is_null() || v.is_object()))
+    {
+        return Err(fail(
+            "this model's stream options are not a JSON object or null",
+        ));
+    }
+    Ok(merged)
 }
 
 /// Apply the provider's `required_request_options` OVER the model's options

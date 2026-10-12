@@ -134,6 +134,10 @@ async fn async_main() {
         // -- lock is only ever held for the brief insert/remove/lookup, not
         // across the pull itself.
         .manage(Mutex::new(PullCancellationRegistry::default()))
+        // ChatStreamRegistry (items.id=715): run id -> CancellationToken for
+        // streamed chat replies in flight, owner-checked; entries are removed
+        // when the run's handle drops.
+        .manage(quietrabbit_lib::chat_stream::ChatStreamRegistry::default())
         // KeyRegistry: single-slot in-memory master-key registry (items.id=
         // 205, Architecture/AUTH_MULTIUSER_ARCHITECTURE.md Section 4.2).
         // Encapsulated type -- its own internal Mutex is not exposed

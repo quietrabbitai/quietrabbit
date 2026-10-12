@@ -35,6 +35,23 @@ impl Captured {
     }
 }
 
+/// One step of a streamed (chunked) response (items.id=715).
+#[derive(Debug, Clone)]
+pub(crate) enum StreamStep {
+    /// Send these bytes as one HTTP chunk, then flush.
+    Chunk(Vec<u8>),
+    /// Wait (the server thread stays responsive to shutdown).
+    Pause(Duration),
+    /// Close the connection here without the terminating chunk: a cut.
+    Cut,
+    /// Announce a chunk longer than what is sent, send part of it, close.
+    CutMidChunk(Vec<u8>),
+    /// Keep the connection open sending SSE keepalive comments until the
+    /// client closes it (or this long passes). A client that closes is
+    /// counted by `LoopbackServer::client_closed`.
+    Hold(Duration),
+}
+
 /// A canned response.
 #[derive(Debug, Clone)]
 pub(crate) struct Canned {
@@ -42,6 +59,10 @@ pub(crate) struct Canned {
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     delay: Duration,
+    /// When set, the response is chunked and these steps are played.
+    stream: Option<Vec<StreamStep>>,
+    /// When set, sent as Content-Length instead of the body's real length.
+    declared_len: Option<usize>,
 }
 
 impl Canned {
@@ -51,7 +72,28 @@ impl Canned {
             headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
             body: body.as_bytes().to_vec(),
             delay: Duration::ZERO,
+            stream: None,
+            declared_len: None,
         }
+    }
+
+    /// A 200 `text/event-stream` response played step by step as chunks.
+    pub fn sse(steps: Vec<StreamStep>) -> Self {
+        Self {
+            status: 200,
+            headers: vec![("Content-Type".to_owned(), "text/event-stream".to_owned())],
+            body: Vec::new(),
+            delay: Duration::ZERO,
+            stream: Some(steps),
+            declared_len: None,
+        }
+    }
+
+    /// Claim `len` bytes of Content-Length but send only the real body: the
+    /// connection then closes short.
+    pub fn with_declared_length(mut self, len: usize) -> Self {
+        self.declared_len = Some(len);
+        self
     }
 
     pub fn bytes(status: u16, body: Vec<u8>) -> Self {
@@ -60,6 +102,8 @@ impl Canned {
             headers: Vec::new(),
             body,
             delay: Duration::ZERO,
+            stream: None,
+            declared_len: None,
         }
     }
 
@@ -79,6 +123,7 @@ pub(crate) struct LoopbackServer {
     captured: Arc<Mutex<Vec<Captured>>>,
     connections: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
+    closed_by_client: Arc<AtomicUsize>,
 }
 
 impl LoopbackServer {
@@ -91,8 +136,10 @@ impl LoopbackServer {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let connections = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(AtomicBool::new(false));
+        let closed_by_client = Arc::new(AtomicUsize::new(0));
 
         let (cap, conns, stop_flag) = (captured.clone(), connections.clone(), stop.clone());
+        let closed = closed_by_client.clone();
         std::thread::spawn(move || {
             let mut index = 0usize;
             for stream in listener.incoming() {
@@ -107,10 +154,14 @@ impl LoopbackServer {
                     cap.lock().unwrap().push(request);
                 }
                 std::thread::sleep(canned.delay);
+                if let Some(steps) = &canned.stream {
+                    play_stream(&mut stream, &canned, steps, &stop_flag, &closed);
+                    continue;
+                }
+                let declared = canned.declared_len.unwrap_or(canned.body.len());
                 let mut head = format!(
                     "HTTP/1.1 {} X\r\nContent-Length: {}\r\nConnection: close\r\n",
-                    canned.status,
-                    canned.body.len()
+                    canned.status, declared
                 );
                 for (n, v) in &canned.headers {
                     head.push_str(&format!("{n}: {v}\r\n"));
@@ -127,6 +178,7 @@ impl LoopbackServer {
             captured,
             connections,
             stop,
+            closed_by_client,
         }
     }
 
@@ -142,6 +194,11 @@ impl LoopbackServer {
     pub fn connections(&self) -> usize {
         self.connections.load(Ordering::SeqCst)
     }
+
+    /// How many `Hold` streams ended because the client closed the connection.
+    pub fn client_closed(&self) -> usize {
+        self.closed_by_client.load(Ordering::SeqCst)
+    }
 }
 
 impl Drop for LoopbackServer {
@@ -150,6 +207,86 @@ impl Drop for LoopbackServer {
         // Wake the accept loop so the thread exits.
         let _ = TcpStream::connect(("127.0.0.1", self.port));
     }
+}
+
+/// Sleep in short slices so shutdown is not held up by a long pause.
+fn nap(total: Duration, stop: &AtomicBool) {
+    let mut left = total;
+    let slice = Duration::from_millis(10);
+    while !left.is_zero() && !stop.load(Ordering::SeqCst) {
+        let d = left.min(slice);
+        std::thread::sleep(d);
+        left -= d;
+    }
+}
+
+fn write_chunk(stream: &mut TcpStream, data: &[u8]) -> bool {
+    if data.is_empty() {
+        // A zero-length chunk would end the body.
+        return true;
+    }
+    let head = format!("{:x}\r\n", data.len());
+    stream.write_all(head.as_bytes()).is_ok()
+        && stream.write_all(data).is_ok()
+        && stream.write_all(b"\r\n").is_ok()
+        && stream.flush().is_ok()
+}
+
+fn play_stream(
+    stream: &mut TcpStream,
+    canned: &Canned,
+    steps: &[StreamStep],
+    stop: &AtomicBool,
+    closed_by_client: &AtomicUsize,
+) {
+    let mut head = format!(
+        "HTTP/1.1 {} X\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n",
+        canned.status
+    );
+    for (n, v) in &canned.headers {
+        head.push_str(&format!("{n}: {v}\r\n"));
+    }
+    head.push_str("\r\n");
+    if stream.write_all(head.as_bytes()).is_err() {
+        return;
+    }
+    let _ = stream.flush();
+    for step in steps {
+        match step {
+            StreamStep::Chunk(data) => {
+                if !write_chunk(stream, data) {
+                    return;
+                }
+            }
+            StreamStep::Pause(d) => nap(*d, stop),
+            StreamStep::Cut => {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+                return;
+            }
+            StreamStep::CutMidChunk(part) => {
+                let head = format!("{:x}\r\n", part.len() + 64);
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(part);
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+                return;
+            }
+            StreamStep::Hold(max) => {
+                let started = std::time::Instant::now();
+                while started.elapsed() < *max && !stop.load(Ordering::SeqCst) {
+                    if !write_chunk(stream, b": ka\n\n") {
+                        closed_by_client.fetch_add(1, Ordering::SeqCst);
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                return;
+            }
+        }
+    }
+    // Normal end: the terminating chunk.
+    let _ = stream.write_all(b"0\r\n\r\n");
+    let _ = stream.flush();
 }
 
 fn read_request(stream: &mut TcpStream) -> Option<Captured> {

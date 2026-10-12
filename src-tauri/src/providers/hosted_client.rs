@@ -29,7 +29,9 @@
 //   - the key is only ever placed in a sensitive header value; it never
 //     appears in a URL, a body, a log line, a Debug or Display, or an error;
 //   - upstream response bodies are never copied into error text;
-//   - `stream` is always false (items.id=715 owns streaming).
+//   - `stream` is false on every whole-body call. A streamed call is a
+//     separate method (`generate_stream_metered`, hosted_stream.rs) chosen
+//     per call, never by a row option (items.id=715).
 //
 // PROXIES: production honors the standard proxy environment variables
 // (HTTP_PROXY, HTTPS_PROXY, NO_PROXY) like any reqwest client; TLS still
@@ -47,6 +49,7 @@ use crate::providers::hosted_call::{
     AuthScheme, CallContext, Dialect, MESSAGES_DIALECT_VERSION_DEFAULT,
     MESSAGES_DIALECT_VERSION_HEADER,
 };
+use crate::providers::hosted_stream::StreamLimits;
 use crate::providers::types::{CompletionStatus, GenerateResponse, ProviderHealth, ProviderStatus};
 use crate::providers::utils::now;
 
@@ -237,10 +240,12 @@ pub struct HostedAttempt {
 
 /// Stateless: holds a connection pool and limits, never a key or a provider.
 pub struct HostedClient {
-    http: Client,
-    generate_timeout: Duration,
+    pub(super) http: Client,
+    pub(super) generate_timeout: Duration,
     health_timeout: Duration,
-    max_response_bytes: usize,
+    pub(super) max_response_bytes: usize,
+    /// Streamed calls (items.id=715, hosted_stream.rs).
+    pub(super) stream_limits: StreamLimits,
 }
 
 impl HostedClient {
@@ -256,6 +261,7 @@ impl HostedClient {
             generate_timeout: GENERATE_TIMEOUT,
             health_timeout: HEALTH_TIMEOUT,
             max_response_bytes: MAX_RESPONSE_BYTES,
+            stream_limits: StreamLimits::default(),
         }
     }
 
@@ -278,7 +284,15 @@ impl HostedClient {
             generate_timeout,
             health_timeout,
             max_response_bytes,
+            stream_limits: StreamLimits::default(),
         }
+    }
+
+    /// Test-only: replace the streamed-call limits.
+    #[cfg(test)]
+    pub(crate) fn with_stream_limits(mut self, limits: StreamLimits) -> Self {
+        self.stream_limits = limits;
+        self
     }
 
     /// Send one generation request.
@@ -311,7 +325,7 @@ impl HostedClient {
         };
 
         // Fail closed before any traffic: payload (token limit) and headers.
-        let payload = match build_payload(ctx, req) {
+        let payload = match build_payload(ctx, req, false) {
             Ok(p) => p,
             Err(e) => return before_send(e),
         };
@@ -498,7 +512,11 @@ impl HostedClient {
     // -- internals ----------------------------------------------------------
 
     /// Compose request headers: auth (sensitive), dialect headers, row extras.
-    fn headers(&self, ctx: &CallContext, with_body: bool) -> Result<HeaderMap, ProviderError> {
+    pub(super) fn headers(
+        &self,
+        ctx: &CallContext,
+        with_body: bool,
+    ) -> Result<HeaderMap, ProviderError> {
         let mut map = HeaderMap::new();
         map.insert(ACCEPT, HeaderValue::from_static("application/json"));
         if with_body {
@@ -540,7 +558,7 @@ impl HostedClient {
 
     /// The raw send, keeping the transport error so a caller can tell a
     /// connection that never opened from one that failed after sending.
-    async fn send_raw(
+    pub(super) async fn send_raw(
         &self,
         method: Method,
         url: &str,
@@ -634,7 +652,17 @@ pub(crate) fn missing_limit_error(ctx: &CallContext) -> ProviderError {
 }
 
 /// Build the JSON body. Fails closed when no output token limit is set.
-fn build_payload(ctx: &CallContext, req: &HostedRequest) -> Result<Value, ProviderError> {
+///
+/// `stream` is the per-call delivery choice (items.id=715): false for a
+/// whole-body call (`"stream": false`, and any `stream_options` removed), true
+/// for a streamed call (`"stream": true`; the OpenAI-compatible dialect also
+/// asks for a final usage frame unless the row sets `stream_options` itself,
+/// where JSON null removes it for a provider that rejects the option).
+pub(super) fn build_payload(
+    ctx: &CallContext,
+    req: &HostedRequest,
+    stream: bool,
+) -> Result<Value, ProviderError> {
     let limit = effective_output_limit(ctx, req).ok_or_else(|| missing_limit_error(ctx))?;
 
     let mut payload = Map::new();
@@ -680,7 +708,14 @@ fn build_payload(ctx: &CallContext, req: &HostedRequest) -> Result<Value, Provid
     // The client owns these regardless of what a row said (build rejects them
     // already; this keeps the guarantee local to the code that sends).
     payload.insert("model".to_owned(), json!(ctx.model_id));
-    payload.insert("stream".to_owned(), Value::Bool(false));
+    payload.insert("stream".to_owned(), Value::Bool(stream));
+    if stream {
+        if ctx.dialect == Dialect::OpenaiChat && !ctx.options.contains_key("stream_options") {
+            payload.insert("stream_options".to_owned(), json!({"include_usage": true}));
+        }
+    } else {
+        payload.remove("stream_options");
+    }
     Ok(Value::Object(payload))
 }
 
@@ -688,16 +723,16 @@ fn build_payload(ctx: &CallContext, req: &HostedRequest) -> Result<Value, Provid
 // Response parsing
 // ---------------------------------------------------------------------------
 
-struct Parsed {
-    content: String,
-    finish_reason: Option<String>,
-    truncated: bool,
-    prompt_tokens: u32,
-    completion_tokens: u32,
-    reasoning_tokens: Option<u32>,
+pub(super) struct Parsed {
+    pub(super) content: String,
+    pub(super) finish_reason: Option<String>,
+    pub(super) truncated: bool,
+    pub(super) prompt_tokens: u32,
+    pub(super) completion_tokens: u32,
+    pub(super) reasoning_tokens: Option<u32>,
 }
 
-fn token_count(v: &Value) -> u32 {
+pub(super) fn token_count(v: &Value) -> u32 {
     v.as_u64()
         .map(|n| n.min(u64::from(u32::MAX)) as u32)
         .unwrap_or(0)
@@ -705,7 +740,7 @@ fn token_count(v: &Value) -> u32 {
 
 /// The usage object of a 2xx body, when it carries one with at least one
 /// token count. Read before the answer is examined (items.id=710).
-fn extract_usage(dialect: Dialect, body: &Value) -> Option<HostedUsage> {
+pub(super) fn extract_usage(dialect: Dialect, body: &Value) -> Option<HostedUsage> {
     let usage = body.get("usage")?;
     if !usage.is_object() {
         return None;
@@ -732,7 +767,7 @@ fn extract_usage(dialect: Dialect, body: &Value) -> Option<HostedUsage> {
     })
 }
 
-fn parse_chat(
+pub(super) fn parse_chat(
     ctx: &CallContext,
     body: &Value,
     usage: Option<HostedUsage>,
@@ -756,7 +791,7 @@ fn parse_chat(
     })
 }
 
-fn parse_messages(
+pub(super) fn parse_messages(
     ctx: &CallContext,
     body: &Value,
     usage: Option<HostedUsage>,
@@ -794,7 +829,7 @@ fn parse_messages(
 /// any other reason is returned as is (unchanged behavior); a missing one is
 /// malformed. Non-empty text cut off by the limit stays a normal answer: its
 /// truncation is tracked under items.id=696 and 716.
-fn answer_or_error(
+pub(super) fn answer_or_error(
     ctx: &CallContext,
     content: Option<String>,
     finish_reason: Option<&str>,
@@ -905,12 +940,12 @@ fn parse_live_models(ctx: &CallContext, body: &Value) -> Result<Vec<LiveModel>, 
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Purpose {
+pub(super) enum Purpose {
     Generate,
     ModelList,
 }
 
-fn misconfigured_ctx(ctx: &CallContext, detail: &str) -> ProviderError {
+pub(super) fn misconfigured_ctx(ctx: &CallContext, detail: &str) -> ProviderError {
     // Same wording as hosted_call::misconfigured, built from a context
     // (which no longer has the route).
     ProviderError::Misconfigured {
@@ -922,7 +957,7 @@ fn misconfigured_ctx(ctx: &CallContext, detail: &str) -> ProviderError {
     }
 }
 
-fn malformed(ctx: &CallContext, what: &str) -> ProviderError {
+pub(super) fn malformed(ctx: &CallContext, what: &str) -> ProviderError {
     ProviderError::MalformedResponse {
         provider: ctx.provider_id.clone(),
         plain_language: format!(
@@ -932,7 +967,7 @@ fn malformed(ctx: &CallContext, what: &str) -> ProviderError {
     }
 }
 
-fn transport_error(ctx: &CallContext, e: &reqwest::Error) -> ProviderError {
+pub(super) fn transport_error(ctx: &CallContext, e: &reqwest::Error) -> ProviderError {
     let name = &ctx.display_name;
     let provider = ctx.provider_id.clone();
     if e.is_timeout() {
@@ -972,7 +1007,7 @@ fn retry_after_secs(headers: &HeaderMap) -> Option<u64> {
         .ok()
 }
 
-fn status_error(
+pub(super) fn status_error(
     ctx: &CallContext,
     status: StatusCode,
     headers: &HeaderMap,

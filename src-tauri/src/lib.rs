@@ -2,6 +2,7 @@
 // Quiet Rabbit -- library root.
 
 pub mod auth;
+pub mod chat_stream;
 pub mod cloud_chat_gpu_pane;
 pub mod commands;
 pub mod conductor;

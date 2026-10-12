@@ -205,6 +205,9 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::provider_credentials::check_clipboard_for_key,
         commands::provider_credentials::save_provider_key,
         commands::provider_credentials::end_provider_connect,
+        // Group 29 -- Streamed chat reply cancellation (items.id=715,
+        // decisions.id=874, 883)
+        commands::chat_stream::cancel_chat_stream,
     ])
 }
 

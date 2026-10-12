@@ -75,6 +75,10 @@ pub struct MessageInfo {
     /// items.id=587/501: a plain-language failure message (never a real
     /// model reply). The UI must not offer it for copy.
     pub is_error: bool,
+    /// items.id=715 (decisions.id=883): Gate 2 found a withheld personal
+    /// value in this reply. The reply is intact; the UI shows a plain,
+    /// non-blocking notice.
+    pub personal_flagged: bool,
 }
 
 /// Push event payload for "message-content-ready" (items.id=320). Emitted
@@ -114,6 +118,7 @@ fn to_message_info(r: message_store::MessageRecord) -> MessageInfo {
         focus_run_id: r.focus_run_id,
         created_at: r.created_at,
         is_error: r.is_error,
+        personal_flagged: r.personal_flagged,
     }
 }
 
@@ -649,6 +654,7 @@ mod tests {
             focus_run_id: None,
             created_at: "2026-08-09T00:00:00Z".to_owned(),
             is_error: false,
+            personal_flagged: false,
         }
     }
 
@@ -1206,8 +1212,10 @@ mod tests {
             focus_run_id: Some("run-1".to_owned()),
             created_at: "2026-08-09T00:00:00Z".to_owned(),
             is_error: false,
+            personal_flagged: true,
         };
         let info = to_message_info(record);
+        assert!(info.personal_flagged);
         assert_eq!(info.id, "id-1");
         assert_eq!(info.focus_run_id.as_deref(), Some("run-1"));
     }

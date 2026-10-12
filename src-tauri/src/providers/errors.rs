@@ -107,6 +107,25 @@ pub enum ProviderError {
         plain_language: String,
     },
 
+    /// A streamed reply ended abnormally AFTER text had already been shown
+    /// (connection cut, idle or total timeout, size cap, an error event, or an
+    /// end of stream with no completion signal). Terminal and not retried:
+    /// a retry would stream a second, different reply over the first
+    /// (items.id=715). A failure BEFORE any text was shown keeps its normal,
+    /// possibly retryable, class.
+    #[error("provider '{}': stream interrupted", provider)]
+    StreamInterrupted {
+        provider: String,
+        plain_language: String,
+    },
+
+    /// The user stopped a streamed reply (items.id=715). Terminal.
+    #[error("provider '{}': stream cancelled", provider)]
+    StreamCancelled {
+        provider: String,
+        plain_language: String,
+    },
+
     /// A provider or model row (or the request) cannot be turned into a
     /// valid call: unsupported wire format, unsafe URL template or variable,
     /// forbidden header or option, missing token limit. Raised before any
@@ -167,6 +186,8 @@ impl From<ProviderError> for ConductorError {
             | ProviderError::MalformedResponse { plain_language, .. }
             | ProviderError::OutputBudgetExhausted { plain_language, .. }
             | ProviderError::Misconfigured { plain_language, .. }
+            | ProviderError::StreamInterrupted { plain_language, .. }
+            | ProviderError::StreamCancelled { plain_language, .. }
             | ProviderError::ProviderFailure { plain_language, .. } => {
                 ConductorError::Provider { plain_language }
             }
@@ -227,6 +248,14 @@ mod tests {
                 plain_language: pl(),
             },
             ProviderError::Misconfigured {
+                provider: "p".into(),
+                plain_language: pl(),
+            },
+            ProviderError::StreamInterrupted {
+                provider: "p".into(),
+                plain_language: pl(),
+            },
+            ProviderError::StreamCancelled {
                 provider: "p".into(),
                 plain_language: pl(),
             },
