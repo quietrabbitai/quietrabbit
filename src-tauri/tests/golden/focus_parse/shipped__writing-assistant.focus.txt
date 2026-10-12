@@ -1,0 +1,89 @@
+OK
+FocusDefinition {
+    focus_id: "writing-assistant",
+    display_name: "Writing Assistant",
+    description: "Craft polished writing for any purpose. Your voice, your context, your words — refined for clarity and impact.\n",
+    version: "1.0",
+    max_routing_tier: AnonymousRequired,
+    steps: [],
+    output_type: "general",
+    suggest_in_focuses: [],
+    multi_source_validation: false,
+    generic_title_template: "Hidden item",
+    high_priority_trigger: None,
+}
+--- step
+StepDefinition {
+    step_id: "voice_analysis",
+    display_name: "Understanding your style...",
+    guide_id: "writing-voice",
+    task_type: "quick_response",
+    routing_tier: LocalOnly,
+    step_type: Generate,
+    output_var: Some(
+        "voice_analysis_output",
+    ),
+    prompt_template: "You are helping prepare a writing request. Analyse the user's request and identify: the purpose, the intended audience, the desired tone, and the key points to cover.\nDo not write the draft yet. Only analyse the request.\nVoice preferences: {voice_profile} Request: {user_input}\n",
+    field_requirements: {},
+    options_override: {},
+    external_access_override: Some(
+        LocalOnly,
+    ),
+    revisitable: true,
+    requires_user_handoff: false,
+    block_stable_id: None,
+    block_customization: None,
+    schedule_trigger: None,
+}
+field_requirements: {"voice_profile": Recommended}
+options_override: {"num_predict":256,"temperature":0.3}
+--- step
+StepDefinition {
+    step_id: "draft_writing",
+    display_name: "Writing your draft...",
+    guide_id: "writing-voice",
+    task_type: "creative_writing",
+    routing_tier: AnonymousRequired,
+    step_type: Generate,
+    output_var: Some(
+        "draft_output",
+    ),
+    prompt_template: "Write a polished draft based on the following request and analysis. Adapt naturally to the user's context without mentioning it directly. Be clear, purposeful, and well-structured.\nRequest: {user_input}\nAnalysis: {voice_analysis_output}\nContext (use naturally if present, ignore if empty):\n  Role: {job_title}\n  Organisation: {employer}\n  Location: {location_city}\n\nVoice preferences: {voice_profile}\n",
+    field_requirements: {},
+    options_override: {},
+    external_access_override: Some(
+        AnonymousRequired,
+    ),
+    revisitable: true,
+    requires_user_handoff: false,
+    block_stable_id: None,
+    block_customization: None,
+    schedule_trigger: None,
+}
+field_requirements: {"employer": Optional, "job_title": Optional, "location_city": Optional}
+options_override: {"num_predict":1024,"temperature":0.5}
+--- step
+StepDefinition {
+    step_id: "voice_transform",
+    display_name: "Refining your voice...",
+    guide_id: "writing-voice",
+    task_type: "quick_response",
+    routing_tier: LocalOnly,
+    step_type: VoiceTransform,
+    output_var: Some(
+        "final_output",
+    ),
+    prompt_template: "Refine the following draft to better match the user's voice and preferences. Preserve all content and meaning. Adjust tone, phrasing, and rhythm only.\nVoice preferences: {voice_profile} Draft: {draft_output}\n",
+    field_requirements: {},
+    options_override: {},
+    external_access_override: Some(
+        LocalOnly,
+    ),
+    revisitable: true,
+    requires_user_handoff: false,
+    block_stable_id: None,
+    block_customization: None,
+    schedule_trigger: None,
+}
+field_requirements: {"voice_profile": Recommended}
+options_override: {"num_predict":1024,"temperature":0.3}

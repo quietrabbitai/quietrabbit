@@ -1,0 +1,106 @@
+OK
+FocusDefinition {
+    focus_id: "fixture-block-scalars",
+    display_name: "Block scalars",
+    description: "First line\n  indented line\nlast line\n",
+    version: "1.0",
+    max_routing_tier: LocalOnly,
+    steps: [],
+    output_type: "general",
+    suggest_in_focuses: [],
+    multi_source_validation: false,
+    generic_title_template: "Hidden item",
+    high_priority_trigger: None,
+}
+--- step
+StepDefinition {
+    step_id: "literal",
+    display_name: "literal",
+    guide_id: "quick-ask-guide",
+    task_type: "generic",
+    routing_tier: LocalOnly,
+    step_type: Generate,
+    output_var: None,
+    prompt_template: "Line one\n  Line two indented\n\nLine four after blank\n",
+    field_requirements: {},
+    options_override: {},
+    external_access_override: Some(
+        LocalOnly,
+    ),
+    revisitable: true,
+    requires_user_handoff: false,
+    block_stable_id: None,
+    block_customization: None,
+    schedule_trigger: None,
+}
+field_requirements: {}
+options_override: {}
+--- step
+StepDefinition {
+    step_id: "folded",
+    display_name: "folded",
+    guide_id: "quick-ask-guide",
+    task_type: "generic",
+    routing_tier: LocalOnly,
+    step_type: Generate,
+    output_var: None,
+    prompt_template: "Folded into one line.\nNew paragraph.\n",
+    field_requirements: {},
+    options_override: {},
+    external_access_override: Some(
+        LocalOnly,
+    ),
+    revisitable: true,
+    requires_user_handoff: false,
+    block_stable_id: None,
+    block_customization: None,
+    schedule_trigger: None,
+}
+field_requirements: {}
+options_override: {}
+--- step
+StepDefinition {
+    step_id: "stripped",
+    display_name: "stripped",
+    guide_id: "quick-ask-guide",
+    task_type: "generic",
+    routing_tier: LocalOnly,
+    step_type: Generate,
+    output_var: None,
+    prompt_template: "No trailing newline",
+    field_requirements: {},
+    options_override: {},
+    external_access_override: Some(
+        LocalOnly,
+    ),
+    revisitable: true,
+    requires_user_handoff: false,
+    block_stable_id: None,
+    block_customization: None,
+    schedule_trigger: None,
+}
+field_requirements: {}
+options_override: {}
+--- step
+StepDefinition {
+    step_id: "kept",
+    display_name: "kept",
+    guide_id: "quick-ask-guide",
+    task_type: "generic",
+    routing_tier: LocalOnly,
+    step_type: Generate,
+    output_var: None,
+    prompt_template: "Keep trailing\n\n",
+    field_requirements: {},
+    options_override: {},
+    external_access_override: Some(
+        LocalOnly,
+    ),
+    revisitable: true,
+    requires_user_handoff: false,
+    block_stable_id: None,
+    block_customization: None,
+    schedule_trigger: None,
+}
+field_requirements: {}
+options_override: {}

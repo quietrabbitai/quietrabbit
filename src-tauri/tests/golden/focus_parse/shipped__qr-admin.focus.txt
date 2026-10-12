@@ -1,0 +1,39 @@
+OK
+FocusDefinition {
+    focus_id: "qr-admin",
+    display_name: "QR Admin",
+    description: "System findings from Quiet Rabbit's nightly review -- quality checks, duplicate detection, and other background maintenance, surfaced here for your review.\n",
+    version: "1.0",
+    max_routing_tier: LocalOnly,
+    steps: [],
+    output_type: "qr_admin_note",
+    suggest_in_focuses: [],
+    multi_source_validation: false,
+    generic_title_template: "Hidden item",
+    high_priority_trigger: None,
+}
+--- step
+StepDefinition {
+    step_id: "acknowledge",
+    display_name: "Reviewing note...",
+    guide_id: "qr-admin-guide",
+    task_type: "summarization",
+    routing_tier: LocalOnly,
+    step_type: Generate,
+    output_var: Some(
+        "admin_output",
+    ),
+    prompt_template: "Summarize the following system note in one or two plain sentences, suitable for display on a review card. Do not add commentary beyond the note's own content.\nNote: {user_input}\n",
+    field_requirements: {},
+    options_override: {},
+    external_access_override: Some(
+        LocalOnly,
+    ),
+    revisitable: true,
+    requires_user_handoff: false,
+    block_stable_id: None,
+    block_customization: None,
+    schedule_trigger: None,
+}
+field_requirements: {}
+options_override: {"num_predict":64,"temperature":0.2}

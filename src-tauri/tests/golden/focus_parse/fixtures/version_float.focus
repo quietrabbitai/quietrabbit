@@ -1,0 +1,12 @@
+# Parity fixture (items.id=733): an unquoted float version must still read as text.
+id: fixture-version-float
+display_name: Version float
+version: 1.0
+max_routing_tier: 1
+steps:
+  one:
+    display_name: One
+    task_type: generic
+    routing_tier: 1
+    step_type: generate
+    prompt_template: Say {user_input}

@@ -1,0 +1,15 @@
+id: fixture-anchors
+guides: &g
+  - shared-guide
+output_types: *g
+steps:
+  one:
+    task_type: generic
+    routing_tier: 1
+    step_type: generate
+    prompt_template: &t "Say {user_input}"
+  two:
+    task_type: generic
+    routing_tier: 1
+    step_type: generate
+    prompt_template: *t

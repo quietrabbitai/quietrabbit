@@ -1,0 +1,37 @@
+OK
+FocusDefinition {
+    focus_id: "fixture-version-float",
+    display_name: "Version float",
+    description: "",
+    version: "1.0",
+    max_routing_tier: LocalOnly,
+    steps: [],
+    output_type: "general",
+    suggest_in_focuses: [],
+    multi_source_validation: false,
+    generic_title_template: "Hidden item",
+    high_priority_trigger: None,
+}
+--- step
+StepDefinition {
+    step_id: "one",
+    display_name: "One",
+    guide_id: "quick-ask-guide",
+    task_type: "generic",
+    routing_tier: LocalOnly,
+    step_type: Generate,
+    output_var: None,
+    prompt_template: "Say {user_input}",
+    field_requirements: {},
+    options_override: {},
+    external_access_override: Some(
+        LocalOnly,
+    ),
+    revisitable: true,
+    requires_user_handoff: false,
+    block_stable_id: None,
+    block_customization: None,
+    schedule_trigger: None,
+}
+field_requirements: {}
+options_override: {}

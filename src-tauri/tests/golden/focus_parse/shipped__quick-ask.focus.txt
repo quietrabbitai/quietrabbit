@@ -1,0 +1,43 @@
+OK
+FocusDefinition {
+    focus_id: "quick-ask",
+    display_name: "Quick Ask",
+    description: "Turn a short idea or prompt into a polished draft, ready to use or refine further.\n",
+    version: "1.0",
+    max_routing_tier: LocalOnly,
+    steps: [],
+    output_type: "quick_ask",
+    suggest_in_focuses: [
+        "writing-assistant",
+        "job-match",
+        "research-and-buy",
+    ],
+    multi_source_validation: false,
+    generic_title_template: "Hidden item",
+    high_priority_trigger: None,
+}
+--- step
+StepDefinition {
+    step_id: "draft",
+    display_name: "Writing draft...",
+    guide_id: "quick-ask-guide",
+    task_type: "creative_writing",
+    routing_tier: LocalOnly,
+    step_type: Generate,
+    output_var: Some(
+        "draft_output",
+    ),
+    prompt_template: "Write a clear, well-structured draft based on the following request. Be direct and useful. Do not add unnecessary preamble.\nRequest: {user_input}\n",
+    field_requirements: {},
+    options_override: {},
+    external_access_override: Some(
+        LocalOnly,
+    ),
+    revisitable: true,
+    requires_user_handoff: false,
+    block_stable_id: None,
+    block_customization: None,
+    schedule_trigger: None,
+}
+field_requirements: {}
+options_override: {"num_predict":512,"temperature":0.4}

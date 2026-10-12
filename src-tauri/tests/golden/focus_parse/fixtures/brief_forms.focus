@@ -1,0 +1,8 @@
+id: fixture-brief
+brief:
+  intent: >
+    A mapping, as the shipped files write it.
+  constraints:
+    - one
+    - two
+steps: {}

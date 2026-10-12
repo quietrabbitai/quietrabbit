@@ -5,7 +5,7 @@
 // RunResult — structured outcome from a completed or interrupted run.
 // demote_interrupted_runs() — standalone async fn for startup recovery.
 //
-// Phase 1 LOAD:       parse .focus file via serde_yaml; validate steps
+// Phase 1 LOAD:       parse .focus file via serde-saphyr; validate steps
 // Phase 2 AUTHORIZE:  focus_settings tier check; create focus_run record (initializing)
 // Phase 3 INITIALIZE: build + seal PersonalTrack; assemble TaskTrack + SharedStateTrack;
 //                     construct PrivacyGateway; assemble persona context (async);
@@ -47,7 +47,7 @@
 //   call site (commands/execution.rs, this file's own test helpers) keeps
 //   compiling unchanged and now gets the concrete logger for free.
 //
-// serde_yaml replaces Python hand-parser:
+// serde-saphyr (items.id=733; was serde_yaml) replaces Python hand-parser:
 //   FocusDefinition populated via intermediate RawFocusFile deserialization.
 //   brief: block deserialized but discarded — never wired to runtime behavior (D6-343).
 //
@@ -115,8 +115,10 @@ pub enum LifecycleError {
     // Phase 1 — LOAD
     #[error("Focus file not found: {0}.focus")]
     FocusNotFound(String),
+    /// Plain-text parser message (no source snippet, so an authored prompt is
+    /// never echoed back in an error).
     #[error("YAML parse error: {0}")]
-    YamlParse(#[from] serde_yaml::Error),
+    YamlParse(String),
     #[error("Focus validation failed: {0}")]
     ValidationFailed(String),
 
@@ -177,7 +179,7 @@ pub enum LifecycleError {
 }
 
 // ---------------------------------------------------------------------------
-// Internal serde_yaml deserialization structs (private)
+// Internal serde-saphyr deserialization structs (private)
 // ---------------------------------------------------------------------------
 // These map 1:1 to the .focus YAML file structure. parse_focus_definition()
 // converts raw -> domain types. brief: block is parsed but discarded (D6-343).
@@ -187,7 +189,7 @@ struct RawFocusFile {
     id: Option<String>,
     display_name: Option<String>,
     description: Option<String>,
-    version: Option<serde_yaml::Value>, // YAML may parse "1.0" as Number; stringify
+    version: Option<serde_json::Value>, // YAML may parse 1.0 as a Number; stringify
     max_routing_tier: Option<u8>,
     output_types: Option<Vec<String>>, // conductor-brief (preferred)
     output_type: Option<String>,       // legacy single value — fallback only
@@ -195,8 +197,10 @@ struct RawFocusFile {
     suggest_in_focuses: Option<Vec<String>>,
     multi_source_validation: Option<bool>,
     steps: Option<IndexMap<String, RawStep>>, // IndexMap preserves YAML dict order
-    #[allow(dead_code)] // D6-343: parsed for forward compat, not wired in Release 1.
-    brief: Option<serde_yaml::Value>,
+    // D6-343: accepted in any shape for forward compat, not wired in Release 1.
+    // IgnoredAny reads and drops it, so a brief can never fail a Focus load.
+    #[allow(dead_code)]
+    brief: Option<serde::de::IgnoredAny>,
     // decisions.id=513 (D6-471), items.id=175. No .focus file in this repo
     // declares this section yet — Option so every existing file keeps
     // parsing unchanged. Only generic_title_template is built now; type
@@ -247,7 +251,7 @@ struct RawStep {
     output_var: Option<String>,
     prompt_template: Option<String>,
     field_requirements: Option<Vec<RawFieldRequirement>>,
-    options_override: Option<serde_yaml::Value>, // YAML map -> HashMap<String, json::Value>
+    options_override: Option<serde_json::Value>, // YAML map -> HashMap<String, json::Value>
 }
 
 #[derive(Deserialize)]
@@ -351,7 +355,7 @@ fn execution_tier_ordinal(access: ExternalAccess) -> u8 {
 /// (load_focus_definition_from_db(), items.id=496). field_requirements and
 /// options_override arrive pre-converted (Vec<{name,scope}> -> HashMap,
 /// source Value -> HashMap<String, serde_json::Value>) because that
-/// conversion is genuinely source-format-specific (serde_yaml::Value vs
+/// conversion is genuinely source-format-specific (a parsed YAML value vs
 /// plain JSON); everything build_step_definition() does with these fields
 /// is not.
 struct NormalizedRawStep {
@@ -424,7 +428,7 @@ fn build_step_definition(
 }
 
 /// Convert RawFocusFile -> FocusDefinition.
-/// Replaces Python's hand-written _parse_focus_definition() with serde_yaml.
+/// Replaces Python's hand-written _parse_focus_definition() with serde-saphyr.
 /// Applies the same shims: guide_id inheritance, output_types->output_type,
 /// field_requirements list -> HashMap.
 fn parse_focus_definition(raw: RawFocusFile) -> Result<FocusDefinition, LifecycleError> {
@@ -452,8 +456,8 @@ fn parse_focus_definition(raw: RawFocusFile) -> Result<FocusDefinition, Lifecycl
 
     // Version: YAML may parse "1.0" as float Number. str(value) in Python.
     let version = match raw.version {
-        Some(serde_yaml::Value::String(s)) => s,
-        Some(serde_yaml::Value::Number(n)) => n.to_string(),
+        Some(serde_json::Value::String(s)) => s,
+        Some(serde_json::Value::Number(n)) => n.to_string(),
         Some(_) | None => "1.0".to_owned(),
     };
 
@@ -508,10 +512,9 @@ fn parse_focus_definition(raw: RawFocusFile) -> Result<FocusDefinition, Lifecycl
                 .collect::<HashMap<_, _>>();
 
             // options_override: YAML map -> HashMap<String, serde_json::Value>.
-            // serde_yaml::Value implements Serialize; round-trip via serde_json is safe.
+            // The field is read straight into a serde_json::Value.
             let options_override = raw_step
                 .options_override
-                .and_then(|v| serde_json::to_value(v).ok())
                 .and_then(|jv| {
                     if let serde_json::Value::Object(map) = jv {
                         Some(map.into_iter().collect::<HashMap<_, _>>())
@@ -580,7 +583,7 @@ fn parse_focus_definition(raw: RawFocusFile) -> Result<FocusDefinition, Lifecycl
 
 /// items.id=496: DB-composition path's per-step JSON shape -- mirrors
 /// RawStep field-for-field except options_override, which is JSON-native
-/// here (no serde_yaml::Value round-trip needed -- the source is already
+/// here (no YAML value conversion needed -- the source is already
 /// JSON, unlike a .focus file). Deserialized from
 /// focus_block_customization.customization when a composition row's
 /// block_stable_id is NULL (see load_focus_definition_from_db(), below).
@@ -804,6 +807,60 @@ fn parse_optional_trigger(
     }))
 }
 
+/// Parse the text of a `.focus` file into a FocusDefinition. The one place
+/// YAML text enters the loader (load_focus_definition and the golden tests
+/// both go through it).
+fn parse_focus_text(text: &str) -> Result<FocusDefinition, LifecycleError> {
+    if text.len() > MAX_FOCUS_FILE_BYTES {
+        return Err(LifecycleError::ValidationFailed(format!(
+            "Focus file is too large (over {MAX_FOCUS_FILE_BYTES} bytes)"
+        )));
+    }
+    let raw: RawFocusFile = serde_saphyr::from_str_with_options(text, focus_yaml_options())
+        .map_err(|e| LifecycleError::YamlParse(e.to_string()))?;
+    parse_focus_definition(raw)
+}
+
+/// Largest .focus file the loader will parse, in bytes. The shipped files are
+/// about 6 KiB at most. serde-saphyr's budget does not cap an in-memory
+/// string's size (only reader input), so the cap is applied here first.
+const MAX_FOCUS_FILE_BYTES: usize = 256 * 1024;
+
+/// Parser options for .focus files (items.id=733, RUSTSEC-2024-0449).
+///
+/// A .focus file is trusted data that ships with the app, but a Focus can also
+/// be user-composed, so the parser runs under explicit limits and any breach
+/// is an Err, never a panic or an unbounded allocation:
+///   max_depth 16 and flow_nesting_limit 16 (shipped files nest about 5 deep),
+///   max_events 50_000 and max_nodes 20_000 (a 256 KiB file cannot reach
+///   either by accident), max_total_scalar_bytes 256 KiB, max_documents 1,
+///   at most 64 aliases and 64 anchors (the shipped files use none),
+///   max_total_comment_bytes 256 KiB.
+/// Behaviour matches the serde_yaml 0.9 parser this replaces: a duplicate key
+/// is an error, `<<` is an ordinary key (no merge expansion), and only
+/// `true` and `false` are booleans, so a word such as `yes` stays a string.
+/// Parse errors carry no source snippet, so an authored prompt is never
+/// echoed back in an error message.
+fn focus_yaml_options() -> serde_saphyr::Options {
+    serde_saphyr::options! {
+        budget: serde_saphyr::budget! {
+            max_depth: 16,
+            flow_nesting_limit: 16,
+            max_events: 50_000,
+            max_nodes: 20_000,
+            max_total_scalar_bytes: 256 * 1024,
+            max_total_comment_bytes: 256 * 1024,
+            max_documents: 1,
+            max_aliases: 64,
+            max_anchors: 64,
+        },
+        duplicate_keys: serde_saphyr::DuplicateKeyPolicy::Error,
+        merge_keys: serde_saphyr::MergeKeyPolicy::AsOrdinary,
+        strict_booleans: true,
+        with_snippet: false,
+    }
+}
+
 /// Parse and validate a Focus definition by focus_id — tries shared.db's
 /// composition tables first (items.id=496), falling back to the .focus
 /// YAML file when no `focuses` row exists (every Focus shipped before this
@@ -836,8 +893,7 @@ pub async fn load_focus_definition(
 
     let focus_file = find_focus_file(focus_id)?;
     let text = tokio::fs::read_to_string(&focus_file).await?;
-    let raw: RawFocusFile = serde_yaml::from_str(&text)?;
-    let focus_def = parse_focus_definition(raw)?;
+    let focus_def = parse_focus_text(&text)?;
 
     let mut all_errors: Vec<String> = Vec::new();
     for step in &focus_def.steps {
@@ -3467,7 +3523,7 @@ mod tests {
             id: Some("quick-ask".to_owned()),
             display_name: Some("Quick Ask".to_owned()),
             description: Some("Fast single-step query".to_owned()),
-            version: Some(serde_yaml::Value::String("1.0".to_owned())),
+            version: Some(serde_json::Value::String("1.0".to_owned())),
             max_routing_tier: Some(1),
             output_types: Some(vec!["quick_ask".to_owned()]),
             output_type: None,
@@ -3827,10 +3883,253 @@ mod tests {
         );
     }
 
+    // -- YAML parser parity (items.id=733) ----------------------------------
+    //
+    // The snapshots in tests/golden/focus_parse/ were generated with serde_yaml
+    // BEFORE the parser was replaced (RUSTSEC-2024-0449). Every shipped .focus
+    // file and every fixture under tests/golden/focus_parse/fixtures/ must
+    // still produce the same FocusDefinition, byte for byte, or the same Err.
+    // Regenerate (only on a deliberate behaviour change):
+    //   cargo test regenerate_focus_parse_snapshots -- --ignored
+
+    fn focus_parse_golden_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/focus_parse")
+    }
+
+    /// (golden file name, .focus text) for every shipped focus file and every
+    /// fixture, in a stable order.
+    fn focus_parse_inputs() -> Vec<(String, String)> {
+        let shipped =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../app/core_artifacts/focuses");
+        let fixtures = focus_parse_golden_dir().join("fixtures");
+        let mut out = Vec::new();
+        for (prefix, dir) in [("shipped", shipped), ("fixture", fixtures)] {
+            let mut names: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap_or_else(|e| panic!("read {dir:?}: {e}"))
+                .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+                .filter(|n| n.ends_with(".focus"))
+                .collect();
+            names.sort();
+            for n in names {
+                let text = std::fs::read_to_string(dir.join(&n)).unwrap();
+                out.push((format!("{prefix}__{n}.txt"), text));
+            }
+        }
+        out
+    }
+
+    /// A deterministic rendering of everything parsing produced. HashMaps are
+    /// sorted; every other field goes through Debug.
+    fn render_focus_snapshot(r: &Result<FocusDefinition, LifecycleError>) -> String {
+        use std::collections::BTreeMap;
+        let def = match r {
+            // The error TEXT belongs to the parser and is not compared.
+            Err(_) => return "ERR\n".to_owned(),
+            Ok(def) => def,
+        };
+        let mut out = String::from("OK\n");
+        let mut shell = def.clone();
+        shell.steps.clear();
+        out += &format!("{shell:#?}\n");
+        for step in &def.steps {
+            let mut s = step.clone();
+            let fr: BTreeMap<_, _> = s.field_requirements.drain().collect();
+            let oo: BTreeMap<_, _> = s.options_override.drain().collect();
+            out += &format!(
+                "--- step\n{s:#?}\nfield_requirements: {fr:?}\noptions_override: {}\n",
+                serde_json::to_string(&oo).unwrap()
+            );
+        }
+        out
+    }
+
+    // -- hostile input (items.id=733) ----------------------------------------
+    //
+    // Every case must come back as Err, never a panic, a hang or a stack
+    // overflow. Each runs on a thread with a 1 MiB stack, half of a Tokio
+    // worker's default 2 MiB, so a parser that recursed per nesting level of a
+    // 100_000-deep input would overflow it. (Measured: a debug build needs more
+    // than 256 KiB even for a legal 16-deep file, and about 512 KiB is enough
+    // for every case here, so 1 MiB leaves headroom without hiding recursion.)
+
+    fn parse_on_small_stack(text: String) -> Result<FocusDefinition, LifecycleError> {
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(move || parse_focus_text(&text))
+            .unwrap()
+            .join()
+            .expect("the parser must not panic or overflow its stack")
+    }
+
+    fn assert_rejected(label: &str, text: String) {
+        let started = std::time::Instant::now();
+        let r = parse_on_small_stack(text);
+        assert!(r.is_err(), "{label}: expected Err");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{label}: rejection must be fast"
+        );
+        // The message is plain text: one line of prose, no source echo.
+        let msg = r.err().unwrap().to_string();
+        assert!(
+            !msg.contains('\u{1b}'),
+            "{label}: no terminal escapes in {msg:?}"
+        );
+    }
+
+    #[test]
+    fn deeply_nested_block_input_is_rejected() {
+        let mut text = String::from("id: deep\nsteps:\n  s:\n    options_override:\n");
+        for i in 0..2000 {
+            text.push_str(&" ".repeat(6 + i * 2));
+            text.push_str(&format!("k{i}:\n"));
+        }
+        text.push_str(&" ".repeat(6 + 2000 * 2));
+        text.push_str("leaf: 1\n");
+        assert_rejected("deep block", text);
+    }
+
+    #[test]
+    fn deeply_nested_flow_input_is_rejected() {
+        assert_rejected(
+            "deep flow seq",
+            format!(
+                "id: x\nsteps: {}{}\n",
+                "[".repeat(100_000),
+                "]".repeat(100_000)
+            ),
+        );
+        assert_rejected(
+            "deep flow map",
+            format!(
+                "id: x\nsteps: {}1{}\n",
+                "{a: ".repeat(50_000),
+                "}".repeat(50_000)
+            ),
+        );
+        // Unbalanced and deep.
+        assert_rejected(
+            "deep unbalanced",
+            format!("id: x\nsteps: {}\n", "[".repeat(100_000)),
+        );
+    }
+
+    #[test]
+    fn nesting_just_over_the_limit_is_rejected_and_just_under_is_accepted() {
+        let nest = |depth: usize| {
+            let mut text = String::from("id: edge\nsteps:\n  s:\n    options_override:\n");
+            for i in 0..depth {
+                text.push_str(&" ".repeat(6 + i * 2));
+                text.push_str(&format!("k{i}:\n"));
+            }
+            text.push_str(&" ".repeat(6 + depth * 2));
+            text.push_str("leaf: 1\n");
+            text
+        };
+        // steps -> s -> options_override are 3 levels; 8 more is still far
+        // under the limit of 16.
+        assert!(parse_on_small_stack(nest(8)).is_ok());
+        assert!(parse_on_small_stack(nest(40)).is_err());
+    }
+
+    #[test]
+    fn over_large_input_is_rejected() {
+        // Over the file-size cap: refused before any parsing.
+        let big = format!(
+            "id: big\ndescription: {}\n",
+            "a".repeat(MAX_FOCUS_FILE_BYTES)
+        );
+        assert_rejected("over the byte cap", big);
+        // Under the cap but over the node budget: 70k one-character items.
+        let many = format!(
+            "id: many\nsuggest_in_focuses:\n{}",
+            "  - a\n".repeat(40_000)
+        );
+        assert!(many.len() < MAX_FOCUS_FILE_BYTES);
+        assert_rejected("over the node budget", many);
+        // Many keys.
+        let keys: String = (0..30_000).map(|i| format!("k{i}: 1\n")).collect();
+        assert_rejected("many keys", format!("id: keys\n{keys}"));
+        // One very long simple key.
+        assert_rejected("long key", format!("id: x\n{}: 1\n", "k".repeat(100_000)));
+    }
+
+    #[test]
+    fn alias_bombs_and_anchor_floods_are_rejected() {
+        // "Billion laughs": each level aliases the previous one many times.
+        let mut bomb = String::from("id: bomb\nl0: &l0 [a, a, a, a, a, a, a, a, a]\n");
+        for i in 1..9 {
+            let prev = format!("*l{}", i - 1);
+            let row = vec![prev; 9].join(", ");
+            bomb.push_str(&format!("l{i}: &l{i} [{row}]\n"));
+        }
+        assert_rejected("alias bomb", bomb);
+        // More aliases than the limit, even if each is cheap.
+        let mut flood = String::from("id: flood\nbase: &b x\nlist:\n");
+        flood.push_str(&"  - *b\n".repeat(500));
+        assert_rejected("alias flood", flood);
+        // More anchors than the limit.
+        let anchors: String = (0..500).map(|i| format!("a{i}: &x{i} v\n")).collect();
+        assert_rejected("anchor flood", format!("id: anchors\n{anchors}"));
+    }
+
+    #[test]
+    fn malformed_and_ambiguous_documents_are_rejected() {
+        for (label, text) in [
+            ("unclosed flow", "id: x\nsteps: [a, b\n"),
+            ("unclosed quote", "id: \"never closed\nsteps: {}\n"),
+            ("bad indentation", "id: x\nsteps:\n  a: 1\n b: 2\n"),
+            ("tab indentation", "id: x\nsteps:\n\ta: 1\n"),
+            ("two documents", "id: a\n---\nid: b\n"),
+            ("duplicate keys", "id: a\nid: b\n"),
+            ("wrong type", "id: x\nmax_routing_tier: [1]\n"),
+            ("number too big for u8", "id: x\nmax_routing_tier: 4000\n"),
+            ("steps is a scalar", "id: x\nsteps: nope\n"),
+            ("undefined alias", "id: x\nguides: *nothing\n"),
+            ("control character", "id: x\u{0}y\n"),
+            ("only a bare dash", "- \n- \n"),
+            ("scalar document", "just text\n"),
+            ("tag bomb", "id: !!python/object/apply:os.system [x]\n"),
+        ] {
+            assert_rejected(label, text.to_owned());
+        }
+    }
+
+    #[test]
+    fn a_rejected_file_never_echoes_its_text() {
+        let secret = "SECRET-PROMPT-TEXT-0123456789";
+        let r = parse_focus_text(&format!(
+            "id: x\nsteps:\n  s:\n    prompt_template: {secret}\n    routing_tier: [oops\n"
+        ));
+        let msg = r.err().expect("malformed").to_string();
+        assert!(!msg.contains(secret), "{msg}");
+    }
+
+    #[test]
+    fn focus_files_parse_to_the_golden_snapshots() {
+        let inputs = focus_parse_inputs();
+        assert!(inputs.len() >= 20, "shipped files and fixtures are present");
+        for (name, text) in inputs {
+            let got = render_focus_snapshot(&parse_focus_text(&text));
+            let want = std::fs::read_to_string(focus_parse_golden_dir().join(&name))
+                .unwrap_or_else(|e| panic!("missing golden {name}: {e}"));
+            assert_eq!(got, want, "parsed result changed for {name}");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn regenerate_focus_parse_snapshots() {
+        for (name, text) in focus_parse_inputs() {
+            let got = render_focus_snapshot(&parse_focus_text(&text));
+            std::fs::write(focus_parse_golden_dir().join(&name), got).unwrap();
+        }
+    }
+
     #[test]
     fn shipped_focus_files_parse_unchanged_after_requires_user_handoff_field_added() {
         // items.id=528 Phase 2: confirms the new Option<bool> RawStep field
-        // is genuinely optional to serde_yaml (missing key -> None) against
+        // is genuinely optional to the YAML parser (missing key -> None) against
         // REAL production YAML, not just hand-constructed RawStep literals --
         // and that every shipped step's derivation is unaffected by this
         // change (none use routing_tier: 3, so requires_user_handoff must be
@@ -3847,9 +4146,7 @@ mod tests {
                 .join(filename);
             let text = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("failed to read {path:?}: {e}"));
-            let raw: RawFocusFile = serde_yaml::from_str(&text)
-                .unwrap_or_else(|e| panic!("failed to parse {filename}: {e}"));
-            let def = parse_focus_definition(raw)
+            let def = parse_focus_text(&text)
                 .unwrap_or_else(|e| panic!("failed to build FocusDefinition for {filename}: {e}"));
             assert!(
                 !def.steps.is_empty(),

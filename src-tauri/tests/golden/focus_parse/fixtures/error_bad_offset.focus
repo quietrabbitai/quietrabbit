@@ -1,0 +1,6 @@
+id: fixture-bad-offset
+display_config:
+  high_priority_trigger:
+    anchor_field: due_at
+    offset: "tomorrow"
+steps: {}

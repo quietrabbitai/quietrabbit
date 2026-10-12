@@ -1,0 +1,7 @@
+id: fixture-display
+display_config:
+  generic_title_template: "Item {n}"
+  high_priority_trigger:
+    anchor_field: due_at
+    offset: "-4h"
+steps: {}

@@ -1,0 +1,11 @@
+id: fixture-unknown
+mystery: [1, 2, {a: b}]
+future_section:
+  anything: goes
+steps:
+  one:
+    task_type: generic
+    routing_tier: 1
+    step_type: generate
+    prompt_template: x
+    not_a_known_step_key: true

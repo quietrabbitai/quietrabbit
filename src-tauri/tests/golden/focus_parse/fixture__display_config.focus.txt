@@ -1,0 +1,22 @@
+OK
+FocusDefinition {
+    focus_id: "fixture-display",
+    display_name: "fixture-display",
+    description: "",
+    version: "1.0",
+    max_routing_tier: LocalOnly,
+    steps: [],
+    output_type: "general",
+    suggest_in_focuses: [],
+    multi_source_validation: false,
+    generic_title_template: "Item {n}",
+    high_priority_trigger: Some(
+        HighPriorityTrigger {
+            anchor_field: "due_at",
+            offset: TimeDelta {
+                secs: -14400,
+                nanos: 0,
+            },
+        },
+    ),
+}

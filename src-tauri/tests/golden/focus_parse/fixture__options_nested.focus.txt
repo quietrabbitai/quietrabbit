@@ -1,0 +1,37 @@
+OK
+FocusDefinition {
+    focus_id: "fixture-options",
+    display_name: "fixture-options",
+    description: "",
+    version: "1.0",
+    max_routing_tier: LocalOnly,
+    steps: [],
+    output_type: "general",
+    suggest_in_focuses: [],
+    multi_source_validation: false,
+    generic_title_template: "Hidden item",
+    high_priority_trigger: None,
+}
+--- step
+StepDefinition {
+    step_id: "one",
+    display_name: "one",
+    guide_id: "quick-ask-guide",
+    task_type: "generic",
+    routing_tier: LocalOnly,
+    step_type: Generate,
+    output_var: None,
+    prompt_template: "x",
+    field_requirements: {},
+    options_override: {},
+    external_access_override: Some(
+        LocalOnly,
+    ),
+    revisitable: true,
+    requires_user_handoff: false,
+    block_stable_id: None,
+    block_customization: None,
+    schedule_trigger: None,
+}
+field_requirements: {"full_name": Recommended, "nickname": Optional}
+options_override: {"big":12345678901,"date_like":"2026-10-12","dotted":3.0,"empty_map":{},"empty_seq":[],"exp":1000.0,"float_big":15000000000.0,"hex":31,"keep":true,"label":"quoted: text","neg":-7,"nested":{"a":1,"b":[1,2,3],"c":{"deep":"x"}},"no_word":"no","nothing":null,"num_ctx":8192,"num_predict":512,"octal":15,"on_word":"on","plain_label":"some text here","seq_of_maps":[{"k":1},{"k":2}],"stream":false,"temperature":0.4,"tilde":null,"top_p":1,"yes_word":"yes"}

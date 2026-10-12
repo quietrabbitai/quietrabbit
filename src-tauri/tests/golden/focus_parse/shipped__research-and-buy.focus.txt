@@ -1,0 +1,89 @@
+OK
+FocusDefinition {
+    focus_id: "research-and-buy",
+    display_name: "Research & Buy",
+    description: "Research a purchase decision from first requirements to final recommendation. Surfaces trade-offs, not just a top pick.\n",
+    version: "1.0",
+    max_routing_tier: AnonymousRequired,
+    steps: [],
+    output_type: "research_summary",
+    suggest_in_focuses: [],
+    multi_source_validation: false,
+    generic_title_template: "Hidden item",
+    high_priority_trigger: None,
+}
+--- step
+StepDefinition {
+    step_id: "requirements_capture",
+    display_name: "Understanding what you need",
+    guide_id: "research-analysis",
+    task_type: "general",
+    routing_tier: LocalOnly,
+    step_type: Generate,
+    output_var: Some(
+        "requirements",
+    ),
+    prompt_template: "{voice_profile} The user wants help researching a purchase. Based on their request, produce a concise requirements summary covering: what they need, key constraints (budget, use case, preferences), and any assumptions made where information was not provided.\nUser request: {user_input} Location: {location_city}\n",
+    field_requirements: {},
+    options_override: {},
+    external_access_override: Some(
+        LocalOnly,
+    ),
+    revisitable: true,
+    requires_user_handoff: false,
+    block_stable_id: None,
+    block_customization: None,
+    schedule_trigger: None,
+}
+field_requirements: {"location_city": Recommended}
+options_override: {"num_predict":512,"temperature":0.3}
+--- step
+StepDefinition {
+    step_id: "research",
+    display_name: "Researching options",
+    guide_id: "research-analysis",
+    task_type: "research",
+    routing_tier: AnonymousRequired,
+    step_type: Generate,
+    output_var: Some(
+        "research_results",
+    ),
+    prompt_template: "{voice_profile} Based on the following requirements, research the available options. For each viable option surface: key strengths, weaknesses, and who it is best suited for. Do not recommend a specific retailer.\nRequirements: {requirements} {persona_context}\n",
+    field_requirements: {},
+    options_override: {},
+    external_access_override: Some(
+        AnonymousRequired,
+    ),
+    revisitable: true,
+    requires_user_handoff: false,
+    block_stable_id: None,
+    block_customization: None,
+    schedule_trigger: None,
+}
+field_requirements: {}
+options_override: {"num_predict":1024,"temperature":0.4}
+--- step
+StepDefinition {
+    step_id: "recommendation",
+    display_name: "Building your recommendation",
+    guide_id: "research-analysis",
+    task_type: "general",
+    routing_tier: AnonymousRequired,
+    step_type: Generate,
+    output_var: Some(
+        "research_summary",
+    ),
+    prompt_template: "{voice_profile} Based on the research below, produce a recommendation that explains the strongest option and the specific reasons it fits the requirements. Then explain the situations where each alternative would be a better choice. Be direct. Do not hedge unnecessarily.\nRequirements: {requirements} Research: {research_results}\n",
+    field_requirements: {},
+    options_override: {},
+    external_access_override: Some(
+        AnonymousRequired,
+    ),
+    revisitable: true,
+    requires_user_handoff: false,
+    block_stable_id: None,
+    block_customization: None,
+    schedule_trigger: None,
+}
+field_requirements: {}
+options_override: {"num_predict":768,"temperature":0.3}

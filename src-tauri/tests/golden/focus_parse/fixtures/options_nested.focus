@@ -1,0 +1,46 @@
+id: fixture-options
+steps:
+  one:
+    task_type: generic
+    routing_tier: 1
+    step_type: generate
+    prompt_template: x
+    field_requirements:
+      - name: full_name
+        scope: recommended
+      - name: nickname
+        scope: optional
+      - name: ignored
+        scope: not_a_scope
+    options_override:
+      temperature: 0.4
+      top_p: 1
+      num_predict: 512
+      num_ctx: 8192
+      stream: false
+      keep: true
+      nothing: null
+      tilde: ~
+      label: "quoted: text"
+      plain_label: some text here
+      yes_word: yes
+      no_word: no
+      on_word: on
+      hex: 0x1F
+      octal: 0o17
+      exp: 1e3
+      neg: -7
+      big: 12345678901
+      float_big: 1.5e10
+      dotted: 3.0
+      date_like: 2026-10-12
+      nested:
+        a: 1
+        b: [1, 2, 3]
+        c:
+          deep: "x"
+      seq_of_maps:
+        - k: 1
+        - k: 2
+      empty_map: {}
+      empty_seq: []

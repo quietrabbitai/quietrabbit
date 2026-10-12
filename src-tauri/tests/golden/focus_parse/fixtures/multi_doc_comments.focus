@@ -1,0 +1,6 @@
+# leading comment
+---
+id: fixture-doc   # trailing comment
+# between keys
+display_name: "Doc"
+steps: {}

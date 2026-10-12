@@ -1,0 +1,9 @@
+id: fixture-version-int
+version: 2
+max_routing_tier: 2
+steps:
+  one:
+    task_type: generic
+    routing_tier: 2
+    step_type: generate
+    prompt_template: x

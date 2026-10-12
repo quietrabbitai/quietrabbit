@@ -1,0 +1,3 @@
+id: fixture-bad-type
+max_routing_tier: high
+steps: {}

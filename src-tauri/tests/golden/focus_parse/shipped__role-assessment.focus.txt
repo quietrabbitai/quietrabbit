@@ -1,0 +1,114 @@
+OK
+FocusDefinition {
+    focus_id: "role-assessment",
+    display_name: "Role Assessment",
+    description: "Evaluate a job description against your professional context and decide whether to apply, reach out, or move on. Surfaces fit gaps, market salary data by role and location, and a clear next-step recommendation.\n",
+    version: "1.0",
+    max_routing_tier: AnonymousRequired,
+    steps: [],
+    output_type: "role_assessment",
+    suggest_in_focuses: [],
+    multi_source_validation: false,
+    generic_title_template: "Hidden item",
+    high_priority_trigger: None,
+}
+--- step
+StepDefinition {
+    step_id: "jd_intake",
+    display_name: "Reading the job description",
+    guide_id: "role-assessment-analyst",
+    task_type: "general",
+    routing_tier: LocalOnly,
+    step_type: Generate,
+    output_var: Some(
+        "jd_summary",
+    ),
+    prompt_template: "{voice_profile} The user wants to evaluate a job opportunity. Extract and summarise the following from the job description they provide: - Role title and level - Company name (if present) - Location or remote status - Core responsibilities (3–5 bullet points) - Required qualifications (must-have) - Preferred qualifications (nice-to-have) - Any notable culture or team signals - Compensation range if stated (or note if absent)\nNote: The user has a resume on file in their Library. Its contents are not available in this session and will not factor into this summary.\nUser's current professional context: Employer: {employer} Industry: {industry} Job title: {job_title}\nJob description: {user_input}\n",
+    field_requirements: {},
+    options_override: {},
+    external_access_override: Some(
+        LocalOnly,
+    ),
+    revisitable: true,
+    requires_user_handoff: false,
+    block_stable_id: None,
+    block_customization: None,
+    schedule_trigger: None,
+}
+field_requirements: {"employer": Recommended, "industry": Recommended, "job_title": Recommended}
+options_override: {"num_predict":512,"temperature":0.2}
+--- step
+StepDefinition {
+    step_id: "fit_analysis",
+    display_name: "Analysing fit",
+    guide_id: "role-assessment-analyst",
+    task_type: "research",
+    routing_tier: AnonymousRequired,
+    step_type: Generate,
+    output_var: Some(
+        "fit_analysis",
+    ),
+    prompt_template: "{voice_profile} Based on the job summary and the user's professional context below, analyse fit. The user's resume is not available in this session — base the analysis on their current role, industry, and any context provided. Structure the output as: 1. Strengths — where the user's professional context aligns well\n   with the role requirements\n2. Gaps — requirements the user may not meet, with a realistic\n   assessment of whether each gap is a dealbreaker, bridgeable,\n   or minor\n3. Signals — anything notable about the role, company, or posting\n   that the user should factor into their decision (positive or\n   cautionary)\n\nJob summary: {jd_summary} {persona_context}\n",
+    field_requirements: {},
+    options_override: {},
+    external_access_override: Some(
+        AnonymousRequired,
+    ),
+    revisitable: true,
+    requires_user_handoff: false,
+    block_stable_id: None,
+    block_customization: None,
+    schedule_trigger: None,
+}
+field_requirements: {}
+options_override: {"num_predict":768,"temperature":0.4}
+--- step
+StepDefinition {
+    step_id: "salary_research",
+    display_name: "Researching salary",
+    guide_id: "role-assessment-analyst",
+    task_type: "research",
+    routing_tier: AnonymousRequired,
+    step_type: Generate,
+    output_var: Some(
+        "salary_context",
+    ),
+    prompt_template: "{voice_profile} Research the market salary range for this role. No salary preference from the user is available — produce general market-rate data only. Base research on: role title, seniority level, industry, and location (if present in the job summary).\nStructure the output as: - Typical market range (low / mid / high) for this role and location - Key factors that push compensation up or down for this role type - Whether the stated compensation range (if any) is competitive,\n  low, high, or undisclosed\n\nJob summary: {jd_summary}\n",
+    field_requirements: {},
+    options_override: {},
+    external_access_override: Some(
+        AnonymousRequired,
+    ),
+    revisitable: true,
+    requires_user_handoff: false,
+    block_stable_id: None,
+    block_customization: None,
+    schedule_trigger: None,
+}
+field_requirements: {}
+options_override: {"num_predict":512,"temperature":0.3}
+--- step
+StepDefinition {
+    step_id: "disposition",
+    display_name: "Your next step",
+    guide_id: "role-assessment-analyst",
+    task_type: "general",
+    routing_tier: AnonymousRequired,
+    step_type: Generate,
+    output_var: Some(
+        "role_assessment",
+    ),
+    prompt_template: "{voice_profile} Based on the fit analysis and salary context, produce a clear disposition with specific reasoning. Choose one of: - Apply — recommend applying directly; explain why the fit is strong\n  enough and the opportunity is worth pursuing\n- Reach out first — recommend a warm contact or informational\n  conversation before applying; explain what information would make\n  the decision clearer\n- Skip — recommend passing; explain the specific reasons the role is\n  not a good fit or the opportunity is not worth the effort\n\nThen provide 2–3 specific next steps the user should take based on the disposition.\nFit analysis: {fit_analysis} Salary context: {salary_context}\n",
+    field_requirements: {},
+    options_override: {},
+    external_access_override: Some(
+        AnonymousRequired,
+    ),
+    revisitable: true,
+    requires_user_handoff: false,
+    block_stable_id: None,
+    block_customization: None,
+    schedule_trigger: None,
+}
+field_requirements: {}
+options_override: {"num_predict":512,"temperature":0.3}

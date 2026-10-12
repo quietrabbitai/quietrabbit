@@ -1,0 +1,14 @@
+OK
+FocusDefinition {
+    focus_id: "fixture-doc",
+    display_name: "Doc",
+    description: "",
+    version: "1.0",
+    max_routing_tier: LocalOnly,
+    steps: [],
+    output_type: "general",
+    suggest_in_focuses: [],
+    multi_source_validation: false,
+    generic_title_template: "Hidden item",
+    high_priority_trigger: None,
+}

@@ -1,0 +1,38 @@
+id: fixture-block-scalars
+display_name: Block scalars
+description: |
+  First line
+    indented line
+  last line
+steps:
+  literal:
+    task_type: generic
+    routing_tier: 1
+    step_type: generate
+    prompt_template: |
+      Line one
+        Line two indented
+
+      Line four after blank
+  folded:
+    task_type: generic
+    routing_tier: 1
+    step_type: generate
+    prompt_template: >
+      Folded into
+      one line.
+
+      New paragraph.
+  stripped:
+    task_type: generic
+    routing_tier: 1
+    step_type: generate
+    prompt_template: >-
+      No trailing newline
+  kept:
+    task_type: generic
+    routing_tier: 1
+    step_type: generate
+    prompt_template: |+
+      Keep trailing
+

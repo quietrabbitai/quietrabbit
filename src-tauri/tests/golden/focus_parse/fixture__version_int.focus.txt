@@ -1,0 +1,37 @@
+OK
+FocusDefinition {
+    focus_id: "fixture-version-int",
+    display_name: "fixture-version-int",
+    description: "",
+    version: "2",
+    max_routing_tier: AnonymousRequired,
+    steps: [],
+    output_type: "general",
+    suggest_in_focuses: [],
+    multi_source_validation: false,
+    generic_title_template: "Hidden item",
+    high_priority_trigger: None,
+}
+--- step
+StepDefinition {
+    step_id: "one",
+    display_name: "one",
+    guide_id: "quick-ask-guide",
+    task_type: "generic",
+    routing_tier: AnonymousRequired,
+    step_type: Generate,
+    output_var: None,
+    prompt_template: "x",
+    field_requirements: {},
+    options_override: {},
+    external_access_override: Some(
+        AnonymousRequired,
+    ),
+    revisitable: true,
+    requires_user_handoff: false,
+    block_stable_id: None,
+    block_customization: None,
+    schedule_trigger: None,
+}
+field_requirements: {}
+options_override: {}
