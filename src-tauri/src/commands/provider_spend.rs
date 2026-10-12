@@ -83,7 +83,7 @@ fn to_params(v: &Value) -> ParamMap {
     out
 }
 
-#[derive(Debug, Clone, Serialize, Type)]
+#[derive(Debug, Clone, PartialEq, Serialize, Type)]
 pub struct WarningDto {
     /// Stable code, for example `warning.unverified_provider`.
     pub code: String,
@@ -91,7 +91,7 @@ pub struct WarningDto {
     pub params: ParamMap,
 }
 
-fn warning_dto(w: &Warning) -> WarningDto {
+pub(crate) fn warning_dto(w: &Warning) -> WarningDto {
     WarningDto {
         code: w.code.clone(),
         tier: w.tier,

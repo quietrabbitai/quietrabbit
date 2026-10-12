@@ -202,6 +202,40 @@ pub async fn get_active_key(
     get_active_key_conn(&mut conn, provider, key_type, persona_id).await
 }
 
+/// Provider ids that have an active user-global key of `key_type`, sorted.
+/// PRESENCE ONLY (items.id=712): selects the `provider` column and nothing
+/// else, so no credential is read into memory. One database open for the
+/// whole set. User-global scope (persona_id IS NULL) matches the lookup the
+/// hosted client uses (`get_active_key` with no persona).
+pub async fn active_key_provider_ids(
+    user_id: &str,
+    key_hex: &str,
+    key_type: &str,
+) -> Result<Vec<String>, IntegrationKeysStoreError> {
+    let mut conn = open_integration_keys_db(user_id, key_hex).await?;
+    active_key_provider_ids_conn(&mut conn, key_type).await
+}
+
+async fn active_key_provider_ids_conn(
+    conn: &mut SqliteConnection,
+    key_type: &str,
+) -> Result<Vec<String>, IntegrationKeysStoreError> {
+    let rows = sqlx::query(
+        "SELECT DISTINCT provider FROM integration_keys
+         WHERE key_type = ? AND is_active = 1 AND persona_id IS NULL
+         ORDER BY provider",
+    )
+    .bind(key_type)
+    .fetch_all(&mut *conn)
+    .await?;
+    rows.iter()
+        .map(|r| {
+            r.try_get::<String, _>("provider")
+                .map_err(IntegrationKeysStoreError::from)
+        })
+        .collect()
+}
+
 async fn get_active_key_conn(
     conn: &mut SqliteConnection,
     provider: &str,
@@ -380,6 +414,49 @@ mod tests {
         .await
         .unwrap();
         conn
+    }
+
+    #[tokio::test]
+    async fn active_key_provider_ids_lists_user_global_active_keys_only() {
+        let mut conn = seeded_conn().await;
+        for (provider, persona) in [
+            ("fixture-host-b", None),
+            ("fixture-host-a", None),
+            ("fixture-host-c", Some("persona-1")),
+        ] {
+            upsert_key_conn(
+                &mut conn,
+                provider,
+                TEST_KEY_TYPE,
+                "fixture-key",
+                persona,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        upsert_key_conn(
+            &mut conn,
+            "fixture-host-d",
+            "other_key_type",
+            "fixture-key",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE integration_keys SET is_active = 0 WHERE provider = 'fixture-host-b'")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+
+        // Sorted; persona-scoped, other-key-type and inactive rows excluded.
+        let ids = active_key_provider_ids_conn(&mut conn, TEST_KEY_TYPE)
+            .await
+            .unwrap();
+        assert_eq!(ids, vec!["fixture-host-a".to_owned()]);
     }
 
     #[tokio::test]

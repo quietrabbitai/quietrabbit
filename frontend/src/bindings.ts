@@ -1582,13 +1582,22 @@ export type ProviderHealth = {
 };
 
 export type ProviderRecommendation = {
-	/**  None only when the catalog is empty. */
+	/**
+	 *  None only when nothing is recommendable: an empty catalog, or only
+	 *  hosted entries that are not recommendable.
+	 */
 	recommended: Recommendation | null,
 	/**
-	 *  0 to 4 entries; fewer than 2 only when the catalog has fewer than 3
-	 *  candidates. Never an error.
+	 *  0 to 4 recommendable entries; fewer than 2 only when the catalog has
+	 *  fewer than 3 candidates. Never an error.
 	 */
 	alternatives: Recommendation[],
+	/**
+	 *  Every hosted entry that is not the recommendation or an alternative:
+	 *  all non-recommendable ones plus any recommendable one past the
+	 *  alternatives cap, in rank order, each with its warning codes.
+	 */
+	other_providers: Recommendation[],
 	weak_hardware: boolean,
 };
 
@@ -1621,6 +1630,21 @@ export type QrHostedConfig = {
  */
 export type RamClass = "low" | "medium" | "high" | "very_high";
 
+/**
+ *  The cost class used to RANK hosted candidates. Deliberately not the
+ *  spend-accounting `spend::disclosure::CostClass`: see the module header for
+ *  how the two differ.
+ */
+export type RankCostClass = 
+/**  Free tier available and the default model is not requires_paid. */
+"free" | 
+/**  The user's plan at this provider includes API use. */
+"plan_included" | 
+/**  A readable price that is not free. */
+"metered" | 
+/**  No readable price. */
+"unknown";
+
 export type RateSnapshotDto = {
 	observed_at: string,
 	requests_limit: string | null,
@@ -1642,6 +1666,17 @@ export type Recommendation = {
 	needs_install: boolean,
 	needs_api_key: boolean,
 	installed: boolean,
+	/**
+	 *  Shares a rank with another entry of the same kind: the UI shows no
+	 *  badge on it (decisions.id=853).
+	 */
+	tied: boolean,
+	/**  Hosted entries only; None for a local model. */
+	cost_class: RankCostClass | null,
+	/**  items.id=710 warning codes (hosted entries; empty for a local model). */
+	warnings: WarningDto[],
+	/**  Hosted entries only: per-user URL variables the provider needs. */
+	user_variables: string[],
 };
 
 export type RecordConsentRequest = {

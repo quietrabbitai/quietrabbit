@@ -21,10 +21,10 @@
 //   (hardware_probe::get_or_detect), matchable against providers.
 //   hardware_requirement (Part 4a). No caller in this app yet -- this
 //   command exists so items.id=437's onboarding UI has something to call.
-// get_provider_recommendation: items.id=607 -- Step 1 engine (see
-//   recommendation.rs). Callable before login: like get_health it only
-//   needs the shared.db pool; without a resident session the hosted
-//   needs_api_key lookup degrades to "no key" instead of failing.
+// get_provider_recommendation: items.id=607, items.id=712 -- Step 1 engine
+//   (see recommendation.rs). Callable before login: like get_health it only
+//   needs the shared.db pool; without a resident session the key-presence
+//   and plan lookups degrade to "none" instead of failing.
 
 use serde::Serialize;
 use specta::Type;
@@ -35,9 +35,10 @@ use crate::hardware_probe::{self, HardwareProfile, RamClass};
 use crate::ollama_sidecar::SidecarStartup;
 use crate::persistence::integration_keys_store::{self, QR_HOSTED_KEY_TYPE};
 use crate::persistence::provider_store;
+use crate::persistence::user_provider_preference_store;
 use crate::providers::ollama_client::OllamaClient;
 use crate::providers::types::{ProviderHealth, ProviderStatus};
-use crate::recommendation::{self, Candidate, CandidateKind, ProviderRecommendation};
+use crate::recommendation::{self, Candidate, CandidateKind, ProviderRecommendation, UserContext};
 
 // ---------------------------------------------------------------------------
 // Response structs
@@ -182,72 +183,125 @@ pub async fn get_hardware_profile(
 /// Decimal megabytes per curated min_vram_gb (probe vram_mb is decimal MB).
 const MB_PER_GB: u32 = 1000;
 
-/// Reduces a providers row to an engine candidate. Local candidates are
-/// is_local rows whose hardware_requirement carries a parsable
-/// min_ram_class; one that does not is skipped with a warning rather than
-/// guessed at. Hosted candidates are qr_recommended cloud_inference_api rows
-/// (the per-type recommendation slot recorded in shared_016.sql).
-fn to_candidate(p: &provider_store::Provider, has_key: bool) -> Option<Candidate> {
-    if p.is_local {
-        let req = p.hardware_requirement.as_ref()?;
-        let min_ram_class = req
-            .get("min_ram_class")
-            .and_then(|v| serde_json::from_value::<RamClass>(v.clone()).ok());
-        let Some(min_ram_class) = min_ram_class else {
-            log::warn!(
-                "provider '{}' hardware_requirement has no usable min_ram_class, skipped",
-                p.id
-            );
-            return None;
-        };
-        let min_vram_mb = req
-            .get("min_vram_gb")
-            .and_then(|v| v.as_u64())
-            .and_then(|gb| u32::try_from(gb).ok())
-            .and_then(|gb| gb.checked_mul(MB_PER_GB));
-        return Some(Candidate {
-            provider_id: p.id.clone(),
-            kind: CandidateKind::LocalModel,
-            rank: p.qr_recommendation_rank,
-            min_ram_class: Some(min_ram_class),
-            min_vram_mb,
-            installed: p.installed,
-            has_key: false,
-        });
-    }
-    if is_hosted_candidate(p) {
-        return Some(Candidate {
-            provider_id: p.id.clone(),
-            kind: CandidateKind::HostedApi,
-            rank: p.qr_recommendation_rank,
-            min_ram_class: None,
-            min_vram_mb: None,
-            installed: false,
-            has_key,
-        });
-    }
-    None
+/// Reduces an is_local providers row to an engine candidate. A local
+/// candidate's hardware_requirement must carry a parsable min_ram_class; one
+/// that does not is skipped with a warning rather than guessed at. Hosted
+/// candidates are reduced by recommendation::hosted_candidate (items.id=712).
+fn local_candidate(p: &provider_store::Provider) -> Option<Candidate> {
+    let req = p.hardware_requirement.as_ref()?;
+    let min_ram_class = req
+        .get("min_ram_class")
+        .and_then(|v| serde_json::from_value::<RamClass>(v.clone()).ok());
+    let Some(min_ram_class) = min_ram_class else {
+        log::warn!(
+            "provider '{}' hardware_requirement has no usable min_ram_class, skipped",
+            p.id
+        );
+        return None;
+    };
+    let min_vram_mb = req
+        .get("min_vram_gb")
+        .and_then(|v| v.as_u64())
+        .and_then(|gb| u32::try_from(gb).ok())
+        .and_then(|gb| gb.checked_mul(MB_PER_GB));
+    Some(Candidate {
+        provider_id: p.id.clone(),
+        kind: CandidateKind::LocalModel,
+        rank: p.qr_recommendation_rank,
+        min_ram_class: Some(min_ram_class),
+        min_vram_mb,
+        installed: p.installed,
+        has_key: false,
+        hosted: None,
+    })
 }
 
-/// Hosted candidate = qr_recommended cloud_inference_api row (the
-/// per-type recommendation slot recorded in shared_016.sql).
-fn is_hosted_candidate(p: &provider_store::Provider) -> bool {
-    !p.is_local && p.qr_recommended && p.provider_type == "cloud_inference_api"
-}
-
-/// A failed key lookup must not fail the recommendation: it degrades to "no
-/// key" (the user is simply asked for one) and is logged.
-fn key_lookup_or_false<T, E: std::fmt::Display>(
-    provider_id: &str,
-    result: Result<Option<T>, E>,
-) -> bool {
+/// A failed lookup must not fail the recommendation: it degrades to the empty
+/// value (no key configured, no plan known -- the user is simply asked) and is
+/// logged.
+fn lookup_or_default<T: Default, E: std::fmt::Display>(what: &str, result: Result<T, E>) -> T {
     match result {
-        Ok(found) => found.is_some(),
+        Ok(found) => found,
         Err(e) => {
-            log::warn!("key lookup for provider '{provider_id}' failed, treating as no key: {e}");
-            false
+            log::warn!("{what} lookup failed, treating as none: {e}");
+            T::default()
         }
     }
+}
+
+/// The per-user ranking facts: which hosted providers have an active key
+/// (presence only, the credential column is never read) and the user's plan
+/// at each provider (account-wide preference rows). Empty with no resident
+/// session.
+async fn load_user_context(
+    pool: &sqlx::SqlitePool,
+    session: Option<&(String, String)>,
+) -> UserContext {
+    let Some((user_id, key_hex_str)) = session else {
+        return UserContext::default();
+    };
+    let configured = lookup_or_default(
+        "hosted key presence",
+        integration_keys_store::active_key_provider_ids(user_id, key_hex_str, QR_HOSTED_KEY_TYPE)
+            .await,
+    );
+    let prefs = lookup_or_default(
+        "plan keys",
+        user_provider_preference_store::list_preferences_for_user(pool, user_id).await,
+    );
+    let plan_keys = prefs
+        .into_iter()
+        .filter(|p| p.persona_id.is_none() && p.focus_id.is_none())
+        .filter_map(|p| p.plan_key.map(|k| (p.provider_id, k)))
+        .collect();
+    UserContext {
+        configured_provider_ids: configured.into_iter().collect(),
+        plan_keys,
+    }
+}
+
+/// The engine catalog: local rows plus the hosted eligible set, with each
+/// hosted row's default model and raw pricing text read for it and nothing
+/// else.
+async fn load_catalog(
+    pool: &sqlx::SqlitePool,
+    ctx: &UserContext,
+    today: chrono::NaiveDate,
+) -> Result<Vec<Candidate>, String> {
+    let providers = provider_store::list_active_providers(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut catalog = Vec::new();
+    for p in &providers {
+        if p.is_local {
+            catalog.extend(local_candidate(p));
+            continue;
+        }
+        if p.provider_type != recommendation::HOSTED_PROVIDER_TYPE {
+            continue;
+        }
+        let model = provider_store::get_default_model(pool, &p.id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let pricing = provider_store::list_model_pricing_text(pool, &p.id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let pricing_text = model.as_ref().and_then(|m| {
+            pricing
+                .iter()
+                .find(|(id, _)| *id == m.model_id)
+                .and_then(|(_, t)| t.as_deref())
+        });
+        catalog.extend(recommendation::hosted_candidate(
+            p,
+            model.as_ref(),
+            pricing_text,
+            ctx,
+            today,
+        ));
+    }
+    Ok(catalog)
 }
 
 #[tauri::command]
@@ -260,32 +314,8 @@ pub async fn get_provider_recommendation(
     let session = key_registry
         .with_key(|k| (k.user_id.clone(), key_hex(&k.master_key)))
         .await;
-    let providers = provider_store::list_active_providers(&pool)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let mut catalog = Vec::new();
-    for p in &providers {
-        // The key lookup is only for hosted candidates; local rows and
-        // non-candidates never touch integration_keys.db.
-        let has_key = match &session {
-            Some((user_id, key_hex_str)) if is_hosted_candidate(p) => key_lookup_or_false(
-                &p.id,
-                integration_keys_store::get_active_key(
-                    user_id,
-                    key_hex_str,
-                    &p.id,
-                    QR_HOSTED_KEY_TYPE,
-                    None,
-                )
-                .await,
-            ),
-            _ => false,
-        };
-        if let Some(c) = to_candidate(p, has_key) {
-            catalog.push(c);
-        }
-    }
+    let ctx = load_user_context(&pool, session.as_ref()).await;
+    let catalog = load_catalog(&pool, &ctx, chrono::Local::now().date_naive()).await?;
     Ok(recommendation::recommend(&profile, &catalog))
 }
 
@@ -302,10 +332,12 @@ mod tests {
     use tauri::Manager;
 
     #[test]
-    fn key_lookup_error_degrades_to_no_key() {
-        assert!(!key_lookup_or_false::<(), _>("p", Err("db unreadable")));
-        assert!(!key_lookup_or_false::<(), &str>("p", Ok(None)));
-        assert!(key_lookup_or_false::<_, &str>("p", Ok(Some(()))));
+    fn lookup_error_degrades_to_none() {
+        assert!(lookup_or_default::<Vec<String>, _>("p", Err("db unreadable")).is_empty());
+        assert_eq!(
+            lookup_or_default::<Vec<String>, &str>("p", Ok(vec!["x".to_owned()])),
+            vec!["x".to_owned()]
+        );
     }
 
     struct TestEnv {
@@ -449,5 +481,162 @@ mod tests {
 
         let result = qr_hosted_is_configured(&pool, &registry).await;
         assert_eq!(result, Ok(true));
+    }
+
+    // items.id=712: the IPC-layer loading, against the real encrypted keys
+    // store and the migrated, seeded shared.db.
+
+    #[tokio::test]
+    async fn user_context_is_empty_with_no_session() {
+        let pool = sqlx::SqlitePool::connect_lazy_with(
+            sqlx::sqlite::SqliteConnectOptions::new().filename(":memory:"),
+        );
+        let ctx = load_user_context(&pool, None).await;
+        assert!(ctx.configured_provider_ids.is_empty());
+        assert!(ctx.plan_keys.is_empty());
+    }
+
+    #[tokio::test]
+    async fn user_context_carries_key_presence_and_account_wide_plan_keys() {
+        let master_key = [0x66u8; crate::auth::kdf::MASTER_KEY_LEN];
+        let _env = setup("user-f", &master_key).await;
+        let ids = hosted_ids(&_env.pool).await;
+        let (keyed, planned, scoped) = (ids[0].clone(), ids[1].clone(), ids[2].clone());
+
+        integration_keys_store::upsert_key(
+            "user-f",
+            &key_hex(&master_key),
+            &keyed,
+            QR_HOSTED_KEY_TYPE,
+            "fixture_secret_value",
+            None,
+            Some("api_key"),
+            None,
+        )
+        .await
+        .expect("upsert_key must succeed in test setup");
+
+        sqlx::query(
+            "INSERT INTO users (id, display_name, role, is_primary, auth_enabled, created_at) \
+             VALUES ('user-f', 'Fixture User', 'user', 1, 1, '2026-01-01T00:00:00Z')",
+        )
+        .execute(&_env.pool)
+        .await
+        .expect("fixture user");
+        sqlx::query(
+            "INSERT INTO personas (id, display_name, persona_type, created_at) \
+             VALUES ('fixture-persona', 'Fixture', 'personal', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&_env.pool)
+        .await
+        .expect("fixture persona");
+        user_provider_preference_store::upsert_preference(
+            &_env.pool,
+            user_provider_preference_store::NewUserProviderPreference {
+                user_id: "user-f",
+                persona_id: None,
+                focus_id: None,
+                provider_id: &planned,
+                login_available: false,
+                user_preference: user_provider_preference_store::UserPreference::Allowed,
+                local_model_version: None,
+                subscription_status: None,
+                plan_key: Some("fixture-plan"),
+                model_id: None,
+            },
+        )
+        .await
+        .expect("account-wide preference row");
+        // A Persona-scoped plan is not the account-wide plan.
+        user_provider_preference_store::upsert_preference(
+            &_env.pool,
+            user_provider_preference_store::NewUserProviderPreference {
+                user_id: "user-f",
+                persona_id: Some("fixture-persona"),
+                focus_id: None,
+                provider_id: &scoped,
+                login_available: false,
+                user_preference: user_provider_preference_store::UserPreference::Allowed,
+                local_model_version: None,
+                subscription_status: None,
+                plan_key: Some("fixture-plan"),
+                model_id: None,
+            },
+        )
+        .await
+        .expect("persona-scoped preference row");
+
+        let session = ("user-f".to_owned(), key_hex(&master_key));
+        let ctx = load_user_context(&_env.pool, Some(&session)).await;
+        assert_eq!(
+            ctx.configured_provider_ids.iter().collect::<Vec<_>>(),
+            vec![&keyed]
+        );
+        assert_eq!(ctx.plan_keys.len(), 1);
+        assert_eq!(
+            ctx.plan_keys.get(&planned).map(String::as_str),
+            Some("fixture-plan")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_seeded_catalog_yields_only_clean_flagged_recommendations() {
+        let master_key = [0x77u8; crate::auth::kdf::MASTER_KEY_LEN];
+        let _env = setup("user-g", &master_key).await;
+        let catalog = load_catalog(
+            &_env.pool,
+            &UserContext::default(),
+            chrono::NaiveDate::from_ymd_opt(2026, 10, 12).unwrap(),
+        )
+        .await
+        .expect("catalog");
+        let hosted: Vec<&Candidate> = catalog
+            .iter()
+            .filter(|c| c.kind == CandidateKind::HostedApi)
+            .collect();
+        assert!(!hosted.is_empty(), "the curated hosted rows are eligible");
+
+        // Weak hardware, so a hosted entry leads if any is recommendable.
+        let profile = HardwareProfile {
+            profile_version: hardware_probe::PROFILE_VERSION,
+            ram_mb: 4_000,
+            ram_class: RamClass::from_mb(4_000),
+            cpu_cores: 4,
+            gpus: Vec::new(),
+            primary_gpu: None,
+        };
+        let r = recommendation::recommend(&profile, &catalog);
+        let providers = provider_store::list_active_providers(&_env.pool)
+            .await
+            .unwrap();
+        let row = |id: &str| providers.iter().find(|p| p.id == id).unwrap();
+
+        for entry in r.recommended.iter().chain(r.alternatives.iter()) {
+            if entry.kind != CandidateKind::HostedApi {
+                continue;
+            }
+            let p = row(&entry.provider_id);
+            assert!(p.qr_recommended, "flag required");
+            assert_eq!(
+                p.verification_status,
+                provider_store::VerificationStatus::Verified
+            );
+            assert!(!p.trains_on_data_by_default && p.risk_rating <= 1);
+        }
+        // Every hosted candidate is accounted for: the recommendation, an
+        // alternative or an other provider. Nothing is dropped.
+        let is_hosted = |e: &&recommendation::Recommendation| e.kind == CandidateKind::HostedApi;
+        let listed = r.recommended.iter().filter(is_hosted).count()
+            + r.alternatives.iter().filter(is_hosted).count()
+            + r.other_providers.len();
+        assert_eq!(listed, hosted.len());
+        assert!(r.other_providers.iter().all(|o| o.cost_class.is_some()));
+        // Curated ranks are unique, so nothing is tied.
+        assert!(r
+            .recommended
+            .iter()
+            .chain(r.alternatives.iter())
+            .chain(r.other_providers.iter())
+            .all(|e| !e.tied));
     }
 }
