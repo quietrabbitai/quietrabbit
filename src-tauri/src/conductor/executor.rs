@@ -82,7 +82,7 @@ use crate::providers::hosted_client::{HostedClient, HostedRequest};
 use crate::providers::hosted_stream::{NullSink, StreamEnd, StreamOutcome, StreamSink};
 use crate::providers::ollama_client::{check_context_window, OllamaClient};
 use crate::providers::types::{
-    ContextWindowStatusKind, GenerateOptions, GenerateRequest, GenerateResponse,
+    CompletionStatus, ContextWindowStatusKind, GenerateOptions, GenerateRequest, GenerateResponse,
 };
 use crate::spend::codes::Code;
 use crate::spend::gate::{
@@ -212,6 +212,12 @@ pub struct StepContext {
     /// stream (API Chat). None (every other run) = whole-body calls, exactly
     /// as before. Ignored by a local (Ollama) step.
     pub stream: Option<crate::chat_stream::ChatStream>,
+    /// items.id=716: Some when this run belongs to an API conversation bound to
+    /// one provider and model. The run then uses exactly that destination (the
+    /// user's preference is not consulted) through the same consent, limits,
+    /// reservation and gate path, and it never falls through to the local
+    /// model. None (every other run) = unchanged.
+    pub bound: Option<crate::api_chat::BoundDestination>,
     /// items.id=439 (Part 6): the Focus-level external_access ceiling,
     /// excluding this step's own external_access_override (see
     /// FocusRun::_focus_external_access) — used by the Step 3 tighten-only
@@ -450,6 +456,27 @@ impl StepExecutor {
 
         // -- Step 4 — cloud_frontier boundary handled by lifecycle; executor never reached --
 
+        // -- Step 4.4 — a bound API Chat run uses exactly its bound provider (items.id=716) --
+        // Before 4.5 on purpose: missing_provider_error() treats a LocalOnly
+        // step as needing no provider, which for a bound run would let it fall
+        // through to the local model below. It never does.
+        if let Some(bound) = &ctx.bound {
+            if let Some(code) = crate::api_chat::bound_run_stop(
+                bound,
+                ctx.effective_access,
+                ctx.qr_hosted_provider_preference.as_deref(),
+            ) {
+                return Ok(Some(failure_handler.handle(
+                    &spend_block_error(
+                        &SpendBlock::new(code).with("provider_id", bound.provider_id.clone()),
+                    ),
+                    Some(&ctx.step.step_id),
+                    Some(&ctx.focus_id),
+                    retry_count,
+                )));
+            }
+        }
+
         // -- Step 4.5 — Tier 1.5 (qr_hosted) provider preference gate (F10) --
         // No prescribed default (architecture: "User choice at install. No
         // prescribed default."). An unset preference is a real gap, not
@@ -471,19 +498,24 @@ impl StepExecutor {
             )));
         }
 
-        let selected_model = select_model(
-            pool,
-            &ctx.step.task_type,
-            ctx.effective_access,
-            ctx.qr_hosted_provider_preference.as_deref(),
-            Some(SelectionLookup {
-                user_id: &ctx.user_id,
-                key_hex: &ctx.key_hex,
-                persona_id: &ctx.persona_id,
-                focus_id: &ctx.focus_id,
-            }),
-        )
-        .await?;
+        let selected_model = match &ctx.bound {
+            Some(bound) => select_bound_model(pool, ctx, bound).await?,
+            None => {
+                select_model(
+                    pool,
+                    &ctx.step.task_type,
+                    ctx.effective_access,
+                    ctx.qr_hosted_provider_preference.as_deref(),
+                    Some(SelectionLookup {
+                        user_id: &ctx.user_id,
+                        key_hex: &ctx.key_hex,
+                        persona_id: &ctx.persona_id,
+                        focus_id: &ctx.focus_id,
+                    }),
+                )
+                .await?
+            }
+        };
 
         // Build gate track for Gate1/Gate2 calls.
         // privacy::types::PersonalTrack (typed enum fields) differs from
@@ -766,6 +798,9 @@ impl StepExecutor {
                 // retried.
                 if let Some(sink) = stream_sink.as_deref() {
                     if stream_tail.cancelled || !stream_tail.received_text.is_empty() {
+                        // items.id=716 (decisions.id=883): what the user saw
+                        // is kept, marked cancelled or cut, never retracted.
+                        keep_partial_reply(ctx, &stream_tail).await;
                         let g2 = reply_gate2(
                             ctx,
                             privacy_gateway,
@@ -816,6 +851,7 @@ impl StepExecutor {
                 audit_unavailable: g2.audit_unavailable,
             });
         }
+        record_completed_reply(ctx, &response).await;
 
         // -- Step 12 — update TaskTrack --
         // D4-040: content = model output ONLY — never prompt-expanded input.
@@ -1272,6 +1308,45 @@ async fn select_model(
     }
 }
 
+/// The model of a bound API Chat run (items.id=716): the model the conversation
+/// was bound to, resolved by id. A retired or missing model stops the step with
+/// its code; the provider's default is never substituted.
+async fn select_bound_model(
+    pool: &sqlx::SqlitePool,
+    ctx: &StepContext,
+    bound: &crate::api_chat::BoundDestination,
+) -> Result<SelectedModel, ConductorError> {
+    match crate::conductor::model_selection::resolve_bound_model(
+        pool,
+        &ctx.user_id,
+        &ctx.key_hex,
+        &bound.provider_id,
+        &bound.model_id,
+    )
+    .await
+    {
+        Ok(resolved) => {
+            if resolved.may_be_retired || resolved.deprecated {
+                log::info!(
+                    "bound model for provider '{}' is {}",
+                    bound.provider_id,
+                    if resolved.deprecated {
+                        "deprecated"
+                    } else {
+                        "missing from the latest model list"
+                    }
+                );
+            }
+            Ok(SelectedModel {
+                provider_id: Some(resolved.model.provider_id.clone()),
+                model_id: resolved.model.model_id.clone(),
+                hosted_model: Some(resolved.model),
+            })
+        }
+        Err(e) => Err(model_error(&e)),
+    }
+}
+
 /// Who is asking, for the stored model selection (items.id=711).
 struct SelectionLookup<'a> {
     user_id: &'a str,
@@ -1583,6 +1658,74 @@ async fn reply_gate2<L: DisclosureLogger>(
         ),
     }
     outcome
+}
+
+/// A streamed reply that was cancelled or cut keeps the text the user was
+/// shown, on the chat reply row of this run, marked `cancelled` or `cut`
+/// (items.id=716; decisions.id=883: displayed text is never retracted). The
+/// run still parks through the ordinary failure path, and finalize_chat_reply
+/// leaves a kept partial reply alone. A run that owns no chat reply row (not a
+/// chat send) is a no-op. A failed write is logged and never changes the run.
+async fn keep_partial_reply(ctx: &StepContext, tail: &StreamTail) {
+    if tail.received_text.is_empty() || ctx.key_hex.is_empty() {
+        return;
+    }
+    let status = if tail.cancelled {
+        crate::persistence::message_store::ReplyStatus::Cancelled
+    } else {
+        crate::persistence::message_store::ReplyStatus::Cut
+    };
+    if let Err(e) = crate::persistence::message_store::set_reply_outcome(
+        &ctx.user_id,
+        &ctx.persona_id,
+        &ctx.key_hex,
+        &ctx.focus_run_id,
+        status,
+        Some(&tail.received_text),
+    )
+    .await
+    {
+        log::warn!(
+            "executor: could not keep the partial reply of run {}: {e}",
+            ctx.focus_run_id
+        );
+    }
+}
+
+/// A reply that completed: mark it `truncated` when the provider stopped at
+/// the output limit (items.id=716, the ruling of items.id=709 that a truncated
+/// hosted answer must be surfaced), and for a streamed or bound run reset the
+/// status to `complete` otherwise, so an earlier attempt that was cut and then
+/// retried does not leave its mark on the finished reply. Not a chat send: a
+/// no-op.
+async fn record_completed_reply(ctx: &StepContext, response: &GenerateResponse) {
+    if ctx.key_hex.is_empty() {
+        return;
+    }
+    let truncated = response.completion_status == CompletionStatus::Truncated;
+    if !truncated && ctx.stream.is_none() && ctx.bound.is_none() {
+        return;
+    }
+    let status = if truncated {
+        crate::persistence::message_store::ReplyStatus::Truncated
+    } else {
+        crate::persistence::message_store::ReplyStatus::Complete
+    };
+    if let Err(e) = crate::persistence::message_store::set_reply_outcome(
+        &ctx.user_id,
+        &ctx.persona_id,
+        &ctx.key_hex,
+        &ctx.focus_run_id,
+        status,
+        None,
+    )
+    .await
+    {
+        log::warn!(
+            "executor: could not record the outcome of run {}'s reply: {e}",
+            ctx.focus_run_id
+        );
+    }
 }
 
 /// Step 12: the TaskStep a completed step records. `content` is the model
@@ -3093,6 +3236,7 @@ mod tests {
             key_hex: String::new(),
             attendance: RunAttendance::Attended,
             stream: None,
+            bound: None,
         };
         let mut projected = HashMap::new();
         projected.insert("name".to_owned(), "Alice (abstracted)".to_owned());
@@ -3154,6 +3298,7 @@ mod tests {
             key_hex: String::new(),
             attendance: RunAttendance::Attended,
             stream: None,
+            bound: None,
         };
         assert_eq!(compute_step_sensitivity(&ctx, &pt, &HashMap::new()), 2);
     }
@@ -3201,6 +3346,7 @@ mod tests {
             key_hex: String::new(),
             attendance: RunAttendance::Attended,
             stream: None,
+            bound: None,
         };
         assert_eq!(compute_step_sensitivity(&ctx, &pt, &HashMap::new()), 1);
     }
@@ -3260,6 +3406,7 @@ mod tests {
             key_hex: key_hex.to_owned(),
             attendance,
             stream: None,
+            bound: None,
         }
     }
 
@@ -3505,6 +3652,306 @@ mod tests {
             assert_eq!(ledger_model, "fixture-model-b");
         })
         .await;
+    }
+
+    // -- items.id=716: a bound API Chat run uses exactly its bound model ---------
+
+    fn bound_to(model_id: &str) -> crate::api_chat::BoundDestination {
+        crate::api_chat::BoundDestination {
+            provider_id: "fixture-host-a".to_owned(),
+            model_id: model_id.to_owned(),
+        }
+    }
+
+    async fn call_bound(
+        pool: &sqlx::SqlitePool,
+        key_hex: &str,
+        bound: &crate::api_chat::BoundDestination,
+    ) -> Result<GenerateResponse, ConductorError> {
+        let mut ctx = hosted_ctx(RunAttendance::Attended, key_hex);
+        ctx.bound = Some(bound.clone());
+        let picked = select_bound_model(pool, &ctx, bound).await?;
+        let model = picked.hosted_model.expect("a hosted row");
+        hosted_step_call(
+            &loopback_client(),
+            pool,
+            &ctx,
+            "fixture-host-a",
+            &model,
+            &generate_request("hello there"),
+            &chrono::Utc,
+            loopback_build,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_bound_run_sends_its_bound_model_not_the_stored_selection() {
+        with_temp_shared_db(|pool| async move {
+            let server = LoopbackServer::start(vec![loopback_chat_ok()]);
+            let (key_hex, _default) = spend_rig(&pool, &server, Some(PRICE_TEXT)).await;
+            seed_user(&pool).await;
+            add_curated_model(
+                &pool,
+                "fixture-model-b",
+                r#"{"max_completion_tokens":64}"#,
+                "active",
+            )
+            .await;
+            add_curated_model(
+                &pool,
+                "fixture-model-c",
+                r#"{"max_completion_tokens":65}"#,
+                "active",
+            )
+            .await;
+            grant_consent(&pool, &key_hex, true).await;
+            // The user's stored selection says model-c; the conversation is
+            // bound to model-b. The binding wins, and the ledger agrees.
+            pick_account_model(&pool, Some("fixture-model-c")).await;
+
+            call_bound(&pool, &key_hex, &bound_to("fixture-model-b"))
+                .await
+                .unwrap();
+            let sent = server.captured()[0].json();
+            assert_eq!(sent["model"], "fixture-model-b");
+            assert_eq!(sent["max_completion_tokens"], 64);
+            let mut conn = spend_store::open(SPEND_USER, &key_hex).await.unwrap();
+            let ledger_model: String =
+                sqlx::query_scalar("SELECT model_id FROM provider_usage_ledger")
+                    .fetch_one(&mut conn)
+                    .await
+                    .unwrap();
+            assert_eq!(ledger_model, "fixture-model-b");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_bound_run_goes_through_the_unchanged_consent_gate() {
+        with_temp_shared_db(|pool| async move {
+            let server = LoopbackServer::start(vec![loopback_chat_ok()]);
+            let (key_hex, _default) = spend_rig(&pool, &server, Some(PRICE_TEXT)).await;
+            seed_user(&pool).await;
+            add_curated_model(
+                &pool,
+                "fixture-model-b",
+                r#"{"max_completion_tokens":64}"#,
+                "active",
+            )
+            .await;
+            // No consent was ever given for this provider.
+            let err = call_bound(&pool, &key_hex, &bound_to("fixture-model-b"))
+                .await
+                .unwrap_err();
+            assert_eq!(block_code(&err), "spend_block.consent_required");
+            assert_eq!(server.connections(), 0, "nothing reached the network");
+            assert_eq!(ledger_count(&key_hex).await, 0);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_bound_model_that_is_retired_or_gone_stops_and_never_uses_the_default() {
+        with_temp_shared_db(|pool| async move {
+            let server = LoopbackServer::start(vec![loopback_chat_ok()]);
+            let (key_hex, _default) = spend_rig(&pool, &server, Some(PRICE_TEXT)).await;
+            seed_user(&pool).await;
+            add_curated_model(
+                &pool,
+                "fixture-model-old",
+                r#"{"max_completion_tokens":64}"#,
+                "retired",
+            )
+            .await;
+            grant_consent(&pool, &key_hex, true).await;
+
+            let err = call_bound(&pool, &key_hex, &bound_to("fixture-model-old"))
+                .await
+                .unwrap_err();
+            assert_eq!(block_code(&err), "spend_block.model_retired");
+            let err = call_bound(&pool, &key_hex, &bound_to("fixture-model-ghost"))
+                .await
+                .unwrap_err();
+            assert_eq!(block_code(&err), "spend_block.model_unavailable");
+            assert_eq!(server.connections(), 0);
+        })
+        .await;
+    }
+
+    // -- items.id=716: what the user saw is kept; a cut-off answer says so ------
+
+    const PARTIAL_KEY: &str = "0606060606060606060606060606060606060606060606060606060606060606";
+
+    async fn placeholder(context_key: &str, run_id: &str) {
+        crate::persistence::message_store::save_message(
+            SPEND_USER,
+            "persona-1",
+            PARTIAL_KEY,
+            context_key,
+            "assistant",
+            "",
+            Some(run_id),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn reply_of(run_id: &str) -> crate::persistence::message_store::MessageRecord {
+        crate::persistence::message_store::find_assistant_message_by_focus_run_id(
+            SPEND_USER,
+            "persona-1",
+            PARTIAL_KEY,
+            run_id,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_or_cut_stream_keeps_the_text_the_user_saw_marked_with_how_it_ended() {
+        use crate::persistence::message_store::ReplyStatus;
+        with_temp_shared_db(|_pool| async move {
+            placeholder("chat-a", "run-cancel").await;
+            placeholder("chat-a", "run-cut").await;
+            placeholder("chat-a", "run-empty").await;
+
+            let mut ctx = hosted_ctx(RunAttendance::Attended, PARTIAL_KEY);
+            ctx.focus_run_id = "run-cancel".to_owned();
+            keep_partial_reply(
+                &ctx,
+                &StreamTail {
+                    received_text: "half an answ".to_owned(),
+                    cancelled: true,
+                },
+            )
+            .await;
+            let r = reply_of("run-cancel").await;
+            assert_eq!(
+                (r.content.as_str(), r.reply_status),
+                ("half an answ", ReplyStatus::Cancelled)
+            );
+
+            ctx.focus_run_id = "run-cut".to_owned();
+            keep_partial_reply(
+                &ctx,
+                &StreamTail {
+                    received_text: "the first part".to_owned(),
+                    cancelled: false,
+                },
+            )
+            .await;
+            let r = reply_of("run-cut").await;
+            assert_eq!(
+                (r.content.as_str(), r.reply_status),
+                ("the first part", ReplyStatus::Cut)
+            );
+
+            // Nothing was shown, nothing is kept.
+            ctx.focus_run_id = "run-empty".to_owned();
+            keep_partial_reply(
+                &ctx,
+                &StreamTail {
+                    received_text: String::new(),
+                    cancelled: true,
+                },
+            )
+            .await;
+            let r = reply_of("run-empty").await;
+            assert_eq!(
+                (r.content.as_str(), r.reply_status),
+                ("", ReplyStatus::Complete)
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_truncated_reply_is_marked_and_a_retried_one_does_not_keep_an_old_cut_mark() {
+        use crate::persistence::message_store::ReplyStatus;
+        with_temp_shared_db(|_pool| async move {
+            placeholder("chat-b", "run-trunc").await;
+            placeholder("chat-b", "run-retry").await;
+            placeholder("chat-b", "run-plain").await;
+            let response = |status| GenerateResponse {
+                content: "text".to_owned(),
+                model: "m".to_owned(),
+                prompt_token_count: 1,
+                output_token_count: 1,
+                latency_ms: 1.0,
+                completion_status: status,
+            };
+
+            // Truncated by the output limit: marked, whatever kind of run.
+            let mut ctx = hosted_ctx(RunAttendance::Attended, PARTIAL_KEY);
+            ctx.focus_run_id = "run-trunc".to_owned();
+            record_completed_reply(&ctx, &response(CompletionStatus::Truncated)).await;
+            assert_eq!(
+                reply_of("run-trunc").await.reply_status,
+                ReplyStatus::Truncated
+            );
+
+            // An earlier attempt was cut, the retry completed: the mark is reset.
+            ctx.focus_run_id = "run-retry".to_owned();
+            ctx.bound = Some(bound_to("fixture-model-a"));
+            crate::persistence::message_store::set_reply_outcome(
+                SPEND_USER,
+                "persona-1",
+                PARTIAL_KEY,
+                "run-retry",
+                ReplyStatus::Cut,
+                Some("old"),
+            )
+            .await
+            .unwrap();
+            record_completed_reply(&ctx, &response(CompletionStatus::Complete)).await;
+            assert_eq!(
+                reply_of("run-retry").await.reply_status,
+                ReplyStatus::Complete
+            );
+
+            // A run that is neither bound, streamed nor truncated is left alone.
+            ctx.focus_run_id = "run-plain".to_owned();
+            ctx.bound = None;
+            crate::persistence::message_store::set_reply_outcome(
+                SPEND_USER,
+                "persona-1",
+                PARTIAL_KEY,
+                "run-plain",
+                ReplyStatus::Cut,
+                Some("x"),
+            )
+            .await
+            .unwrap();
+            record_completed_reply(&ctx, &response(CompletionStatus::Complete)).await;
+            assert_eq!(reply_of("run-plain").await.reply_status, ReplyStatus::Cut);
+        })
+        .await;
+    }
+
+    /// The bound-run guard has to run BEFORE step 4.5: missing_provider_error
+    /// treats a LocalOnly step as needing no provider, which for a bound run
+    /// would let it fall through to the local model. A source scan, because
+    /// execute_once has no unit harness; the guard's rules are tested in
+    /// api_chat::tests.
+    #[test]
+    fn the_bound_guard_runs_before_the_provider_gate_and_before_the_local_branch() {
+        let src = include_str!("executor.rs");
+        // Only the production part of the file.
+        let prod = &src[..src.find("#[cfg(test)]").expect("test module marker")];
+        let guard = prod
+            .find("crate::api_chat::bound_run_stop(")
+            .expect("the bound guard call");
+        let gate = prod
+            .find("if let Some(error) = missing_provider_error(")
+            .expect("the 4.5 gate");
+        let local = prod
+            .find("ollama_client().generate(&request)")
+            .expect("the local branch");
+        assert!(guard < gate, "the guard must precede step 4.5");
+        assert!(gate < local);
     }
 
     #[tokio::test]
@@ -4269,6 +4716,90 @@ mod tests {
                     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 }
                 assert_eq!(server.client_closed(), 1, "the HTTP read must really stop");
+            })
+            .await;
+        }
+
+        /// items.id=716: the real cancel path (`cancel_chat_stream`'s body,
+        /// owner-checked, on the registry handle the bound run holds) stops a
+        /// bound run's HTTP read. A foreign user's cancel trips nothing.
+        #[tokio::test]
+        async fn cancel_chat_stream_stops_a_bound_run() {
+            with_temp_shared_db(|pool| async move {
+                let server = LoopbackServer::start(vec![Canned::sse(vec![
+                    StreamStep::Chunk(delta("Hi")),
+                    StreamStep::Hold(std::time::Duration::from_secs(20)),
+                ])]);
+                let (key_hex, _default) = cleared(&pool, &server).await;
+                let bound = bound_to("fixture-model-a");
+                let mut ctx = hosted_ctx(RunAttendance::Attended, &key_hex);
+                ctx.bound = Some(bound.clone());
+                let model = select_bound_model(&pool, &ctx, &bound)
+                    .await
+                    .unwrap()
+                    .hosted_model
+                    .expect("a hosted row");
+
+                // The same registration send_api_chat_message makes.
+                let registry = crate::chat_stream::ChatStreamRegistry::default();
+                let handle = registry.register(SPEND_USER, &ctx.focus_run_id);
+                let token = handle.token().clone();
+
+                let reg = registry.clone();
+                let run_id = ctx.focus_run_id.clone();
+                let canceller = tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    let foreign = crate::commands::chat_stream::cancel_for_user(
+                        &reg,
+                        "someone-else",
+                        &run_id,
+                    );
+                    let own =
+                        crate::commands::chat_stream::cancel_for_user(&reg, SPEND_USER, &run_id);
+                    (foreign, own)
+                });
+
+                let rec = Rec::default();
+                let mut tail = StreamTail::default();
+                let started = std::time::Instant::now();
+                let err = hosted_step_call(
+                    &loopback_client(),
+                    &pool,
+                    &ctx,
+                    "fixture-host-a",
+                    &model,
+                    &generate_request("hello there"),
+                    &chrono::Utc,
+                    loopback_build,
+                    Some(StreamParts {
+                        sink: &rec,
+                        cancel: &token,
+                        tail: &mut tail,
+                    }),
+                )
+                .await
+                .unwrap_err();
+                let (foreign, own) = canceller.await.unwrap();
+
+                assert_eq!(
+                    foreign,
+                    Err(crate::commands::chat_stream::STREAM_NOT_FOUND.to_owned()),
+                    "another user's cancel is refused and trips nothing"
+                );
+                assert_eq!(own, Ok(()));
+                assert!(started.elapsed() < std::time::Duration::from_secs(5));
+                assert!(matches!(err, ConductorError::Provider { .. }));
+                assert!(tail.cancelled, "it stopped because of the cancel");
+                assert_eq!(tail.received_text, "Hi", "what the user saw is returned");
+                let (outcome, _, _, _, cost, reserved) = only_ledger_row(&key_hex).await;
+                assert_eq!(outcome, "interrupted");
+                assert_eq!(cost, reserved, "charged at the reserved worst case");
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                while server.client_closed() == 0 && std::time::Instant::now() < deadline {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                assert_eq!(server.client_closed(), 1, "the HTTP read must really stop");
+                drop(handle);
             })
             .await;
         }

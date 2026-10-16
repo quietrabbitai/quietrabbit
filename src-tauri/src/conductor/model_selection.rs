@@ -176,45 +176,100 @@ pub async fn resolve_hosted_model(
         return curated(model, ModelOrigin::Default, None);
     };
 
+    resolve_model_id(
+        pool,
+        user_id,
+        key_hex,
+        provider_id,
+        default_model.as_ref(),
+        &selection.model_id,
+        Some(selection.source),
+    )
+    .await
+}
+
+/// The model a conversation is bound to (items.id=716). An API Chat binds a
+/// provider and model at creation, so there is no preference to look up and no
+/// default to fall back to: the model is resolved by id through exactly the
+/// rules a stored selection follows (curated row, else the user's own live
+/// list with a user-chosen output limit). A retired or missing model is an
+/// error code, never a quiet switch to the provider's default, which would
+/// change the cost and the privacy of a conversation the user set up.
+pub async fn resolve_bound_model(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    key_hex: &str,
+    provider_id: &str,
+    model_id: &str,
+) -> Result<ResolvedModel, ModelError> {
+    let default_model = provider_store::get_default_model(pool, provider_id)
+        .await
+        .map_err(|e| {
+            log::warn!("default model lookup failed: {e}");
+            ModelError::Store
+        })?;
+    resolve_model_id(
+        pool,
+        user_id,
+        key_hex,
+        provider_id,
+        default_model.as_ref(),
+        model_id,
+        None,
+    )
+    .await
+}
+
+/// The shared tail of `resolve_hosted_model` and `resolve_bound_model`: a model
+/// id, wherever it came from, to a runnable row.
+async fn resolve_model_id(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    key_hex: &str,
+    provider_id: &str,
+    default_model: Option<&ProviderModel>,
+    model_id: &str,
+    source: Option<SelectionSource>,
+) -> Result<ResolvedModel, ModelError> {
     let curated_row =
-        provider_store::get_model_by_provider_and_model_id(pool, provider_id, &selection.model_id)
+        provider_store::get_model_by_provider_and_model_id(pool, provider_id, model_id)
             .await
             .map_err(|e| {
                 log::warn!("selected model lookup failed: {e}");
                 ModelError::Store
             })?;
     if let Some(model) = curated_row {
-        return curated(model, ModelOrigin::Curated, Some(selection.source));
+        return curated(model, ModelOrigin::Curated, source);
     }
 
     // Not a curated row: it must be in the user's own live list.
     if key_hex.is_empty() {
         return Err(ModelError::Unavailable {
-            model_id: selection.model_id,
+            model_id: model_id.to_owned(),
         });
     }
     let mut conn = spend_store::open(user_id, key_hex).await.map_err(|e| {
         log::warn!("model selection: could not open the per-user store: {e}");
         ModelError::Store
     })?;
-    let live = get_live_model_conn(&mut conn, provider_id, &selection.model_id)
+    let live = get_live_model_conn(&mut conn, provider_id, model_id)
         .await
         .map_err(|e| {
             log::warn!("live model lookup failed: {e}");
             ModelError::Store
         })?
         .ok_or_else(|| ModelError::Unavailable {
-            model_id: selection.model_id.clone(),
+            model_id: model_id.to_owned(),
         })?;
     if live.user_output_limit.is_none() {
         return Err(ModelError::OutputLimitRequired {
-            model_id: selection.model_id,
+            model_id: model_id.to_owned(),
         });
     }
     Ok(ResolvedModel {
-        model: synthesize_live_model(default_model.as_ref(), &live),
+        model: synthesize_live_model(default_model, &live),
         origin: ModelOrigin::Uncurated,
-        source: Some(selection.source),
+        source,
         may_be_retired: !live.present,
         deprecated: false,
     })
@@ -579,6 +634,86 @@ mod tests {
             let r = rig.resolve(None, None).await.unwrap();
             assert!(r.may_be_retired);
             assert_eq!(r.model.model_id, "live-a");
+        })
+        .await;
+    }
+
+    // -- items.id=716: a bound conversation names its model; nothing falls back
+
+    impl Rig {
+        async fn bound(&self, model_id: &str) -> Result<ResolvedModel, ModelError> {
+            resolve_bound_model(&self.pool, USER, KEY, &self.provider, model_id).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bound_model_resolves_by_id_ignoring_any_stored_selection() {
+        with_rig(|rig| async move {
+            rig.add_curated("m-bound", "active").await;
+            rig.add_curated("m-selected", "active").await;
+            rig.select(SelectionScope::Account, Some("m-selected"))
+                .await;
+
+            let r = rig.bound("m-bound").await.unwrap();
+            assert_eq!(r.model.model_id, "m-bound");
+            assert_eq!(r.origin, ModelOrigin::Curated);
+            assert!(r.source.is_none(), "no selection level produced it");
+
+            // The default model is also reachable by its own id.
+            let d = rig.bound(&rig.default_model).await.unwrap();
+            assert_eq!(d.model.model_id, rig.default_model);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_retired_or_unknown_bound_model_stops_and_never_uses_the_default() {
+        with_rig(|rig| async move {
+            rig.add_curated("m-retired", "retired").await;
+            assert_eq!(
+                rig.bound("m-retired").await.unwrap_err(),
+                ModelError::Retired {
+                    model_id: "m-retired".into()
+                }
+            );
+            assert_eq!(
+                rig.bound("ghost").await.unwrap_err(),
+                ModelError::Unavailable {
+                    model_id: "ghost".into()
+                }
+            );
+            // No unlocked session: nothing to look in beyond the catalog.
+            let no_key = resolve_bound_model(&rig.pool, USER, "", &rig.provider, "ghost").await;
+            assert_eq!(
+                no_key.unwrap_err(),
+                ModelError::Unavailable {
+                    model_id: "ghost".into()
+                }
+            );
+            // A deprecated one still runs, with the flag.
+            rig.add_curated("m-deprecated", "deprecated").await;
+            assert!(rig.bound("m-deprecated").await.unwrap().deprecated);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_bound_uncurated_model_needs_the_users_output_limit() {
+        with_rig(|rig| async move {
+            rig.live(&[("live-a", Some(32_000))], true).await;
+            assert_eq!(
+                rig.bound("live-a").await.unwrap_err(),
+                ModelError::OutputLimitRequired {
+                    model_id: "live-a".into()
+                }
+            );
+            let mut conn = spend_store::open(USER, KEY).await.unwrap();
+            set_user_output_limit_conn(&mut conn, &rig.provider, "live-a", Some(300))
+                .await
+                .unwrap();
+            let r = rig.bound("live-a").await.unwrap();
+            assert_eq!(r.origin, ModelOrigin::Uncurated);
+            assert!(r.model.pricing.is_none());
         })
         .await;
     }

@@ -138,6 +138,10 @@ async fn async_main() {
         // streamed chat replies in flight, owner-checked; entries are removed
         // when the run's handle drops.
         .manage(quietrabbit_lib::chat_stream::ChatStreamRegistry::default())
+        // ReviewRegistry (items.id=716): outbound API Chat reviews waiting for
+        // the user's answers. Offsets and a text hash only, never message
+        // text; single use, bound to user, Persona and conversation, expiring.
+        .manage(quietrabbit_lib::api_chat::review::ReviewRegistry::default())
         // KeyRegistry: single-slot in-memory master-key registry (items.id=
         // 205, Architecture/AUTH_MULTIUSER_ARCHITECTURE.md Section 4.2).
         // Encapsulated type -- its own internal Mutex is not exposed

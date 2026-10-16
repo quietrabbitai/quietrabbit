@@ -100,6 +100,18 @@ pub struct HostedOutcome {
     pub truncated: bool,
 }
 
+impl HostedOutcome {
+    /// Carry the truncation into the response, where the executor and the
+    /// transcript can see it (items.id=716, items.id=709's ruling that a
+    /// truncated hosted answer must be surfaced).
+    pub(crate) fn finished(mut self) -> Self {
+        if self.truncated {
+            self.response.completion_status = CompletionStatus::Truncated;
+        }
+        self
+    }
+}
+
 /// Token usage a provider reported for one call. Present on any 2xx body that
 /// carried a usage object, INCLUDING a body that then failed to yield an
 /// answer (a budget-exhausted call is billed for the tokens it burned).
@@ -414,19 +426,22 @@ impl HostedClient {
             Dialect::OpenaiChat => parse_chat(ctx, &body, usage),
             Dialect::AnthropicMessages => parse_messages(ctx, &body, usage),
         };
-        let result = parsed.map(|parsed| HostedOutcome {
-            response: GenerateResponse {
-                content: parsed.content,
-                model: ctx.model_id.clone(),
-                prompt_token_count: parsed.prompt_tokens,
-                output_token_count: parsed.completion_tokens,
-                latency_ms,
-                completion_status: CompletionStatus::Complete,
-            },
-            finish_reason: parsed.finish_reason,
-            reasoning_tokens: parsed.reasoning_tokens,
-            rate_limit: rate_limit.clone(),
-            truncated: parsed.truncated,
+        let result = parsed.map(|parsed| {
+            HostedOutcome {
+                response: GenerateResponse {
+                    content: parsed.content,
+                    model: ctx.model_id.clone(),
+                    prompt_token_count: parsed.prompt_tokens,
+                    output_token_count: parsed.completion_tokens,
+                    latency_ms,
+                    completion_status: CompletionStatus::Complete,
+                },
+                finish_reason: parsed.finish_reason,
+                reasoning_tokens: parsed.reasoning_tokens,
+                rate_limit: rate_limit.clone(),
+                truncated: parsed.truncated,
+            }
+            .finished()
         });
         HostedAttempt {
             result,

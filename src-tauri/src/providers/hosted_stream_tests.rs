@@ -665,6 +665,10 @@ async fn chat_stream_length_with_text_is_truncated_and_without_text_is_budget_ex
     .await;
     let out = a.attempt.result.as_ref().unwrap();
     assert!(out.truncated);
+    assert_eq!(
+        out.response.completion_status,
+        crate::providers::types::CompletionStatus::Truncated
+    );
     assert_eq!(out.response.content, "Hel");
 
     let server = LoopbackServer::start(vec![Canned::sse(chunks(vec![
@@ -1112,7 +1116,12 @@ async fn messages_stream_max_tokens_with_text_is_truncated() {
         &Rec::default(),
     )
     .await;
-    assert!(a.attempt.result.as_ref().unwrap().truncated);
+    let out = a.attempt.result.as_ref().unwrap();
+    assert!(out.truncated);
+    assert_eq!(
+        out.response.completion_status,
+        crate::providers::types::CompletionStatus::Truncated
+    );
 }
 
 #[tokio::test]

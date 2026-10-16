@@ -19,6 +19,9 @@ function msg(overrides: Partial<MessageInfo>): MessageInfo {
     created_at: '2026-10-04T00:00:00Z',
     is_error: false,
     personal_flagged: false,
+    reply_status: 'complete',
+    provider_id: null,
+    model_id: null,
     ...overrides,
   }
 }

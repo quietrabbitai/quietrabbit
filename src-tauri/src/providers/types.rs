@@ -64,6 +64,9 @@ pub enum CompletionStatus {
     /// Only used in Release 2.
     Streaming,
     Cancelled,
+    /// items.id=716: a hosted answer cut off by the output token limit. The
+    /// text is whole as far as it goes and the call is billed for the limit.
+    Truncated,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]

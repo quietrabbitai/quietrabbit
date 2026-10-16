@@ -462,8 +462,9 @@ async fn reasoning_that_eats_the_budget_is_an_explicit_error() {
 }
 
 #[tokio::test]
-async fn truncated_but_non_empty_output_stays_complete() {
-    // items.id=696 / 716 own truncation; this item does not change it.
+async fn truncated_but_non_empty_output_is_still_an_answer_and_says_it_was_cut() {
+    // items.id=716 carries the truncation into the response so the transcript
+    // can surface it (items.id=709's ruling); the answer itself is kept.
     let server = LoopbackServer::start(vec![Canned::json(
         200,
         r#"{"choices":[{"message":{"content":"partial"},"finish_reason":"length"}],
@@ -472,8 +473,14 @@ async fn truncated_but_non_empty_output_stays_complete() {
     let ctx = ctx_for(&chat_route(&server.base()));
     let out = client().generate(&ctx, &request()).await.unwrap();
     assert_eq!(out.response.content, "partial");
-    assert_eq!(out.response.completion_status, CompletionStatus::Complete);
+    assert_eq!(out.response.completion_status, CompletionStatus::Truncated);
     assert_eq!(out.finish_reason.as_deref(), Some("length"));
+
+    // A normal stop is not truncated.
+    let server = LoopbackServer::start(vec![chat_ok()]);
+    let ctx = ctx_for(&chat_route(&server.base()));
+    let whole = client().generate(&ctx, &request()).await.unwrap();
+    assert_eq!(whole.response.completion_status, CompletionStatus::Complete);
 }
 
 // -- transport ---------------------------------------------------------------

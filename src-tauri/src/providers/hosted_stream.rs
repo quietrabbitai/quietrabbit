@@ -826,19 +826,22 @@ impl HostedClient {
                 );
                 return StreamAttempt {
                     attempt: HostedAttempt {
-                        result: answered.map(|content| HostedOutcome {
-                            response: GenerateResponse {
-                                content,
-                                model: ctx.model_id.clone(),
-                                prompt_token_count: usage.map_or(0, |u| u.prompt_tokens),
-                                output_token_count: usage.map_or(0, |u| u.completion_tokens),
-                                latency_ms,
-                                completion_status: CompletionStatus::Complete,
-                            },
-                            finish_reason: reason.clone(),
-                            reasoning_tokens: usage.and_then(|u| u.reasoning_tokens),
-                            rate_limit: rate_limit.clone(),
-                            truncated: reason.as_deref() == Some(length_reason),
+                        result: answered.map(|content| {
+                            HostedOutcome {
+                                response: GenerateResponse {
+                                    content,
+                                    model: ctx.model_id.clone(),
+                                    prompt_token_count: usage.map_or(0, |u| u.prompt_tokens),
+                                    output_token_count: usage.map_or(0, |u| u.completion_tokens),
+                                    latency_ms,
+                                    completion_status: CompletionStatus::Complete,
+                                },
+                                finish_reason: reason.clone(),
+                                reasoning_tokens: usage.and_then(|u| u.reasoning_tokens),
+                                rate_limit: rate_limit.clone(),
+                                truncated: reason.as_deref() == Some(length_reason),
+                            }
+                            .finished()
                         }),
                         usage,
                         rate_limit,
@@ -943,19 +946,22 @@ impl HostedClient {
         }
         StreamAttempt {
             attempt: HostedAttempt {
-                result: parsed.map(|p| HostedOutcome {
-                    response: GenerateResponse {
-                        content: p.content,
-                        model: ctx.model_id.clone(),
-                        prompt_token_count: p.prompt_tokens,
-                        output_token_count: p.completion_tokens,
-                        latency_ms,
-                        completion_status: CompletionStatus::Complete,
-                    },
-                    finish_reason: p.finish_reason,
-                    reasoning_tokens: p.reasoning_tokens,
-                    rate_limit: rate_limit.clone(),
-                    truncated: p.truncated,
+                result: parsed.map(|p| {
+                    HostedOutcome {
+                        response: GenerateResponse {
+                            content: p.content,
+                            model: ctx.model_id.clone(),
+                            prompt_token_count: p.prompt_tokens,
+                            output_token_count: p.completion_tokens,
+                            latency_ms,
+                            completion_status: CompletionStatus::Complete,
+                        },
+                        finish_reason: p.finish_reason,
+                        reasoning_tokens: p.reasoning_tokens,
+                        rate_limit: rate_limit.clone(),
+                        truncated: p.truncated,
+                    }
+                    .finished()
                 }),
                 usage,
                 rate_limit,

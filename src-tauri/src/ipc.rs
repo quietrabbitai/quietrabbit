@@ -212,6 +212,10 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         // Group 29 -- Streamed chat reply cancellation (items.id=715,
         // decisions.id=874, 883)
         commands::chat_stream::cancel_chat_stream,
+        // Group 30 -- API Chat: a conversation bound to one provider and model
+        // (items.id=716, decisions.id=874, 875)
+        commands::api_chat::create_api_chat,
+        commands::api_chat::send_api_chat_message,
     ])
 }
 

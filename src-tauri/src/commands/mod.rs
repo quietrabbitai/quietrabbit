@@ -50,6 +50,7 @@ use specta::Type;
 pub struct NotImplementedPlaceholder {}
 
 pub mod active_board;
+pub mod api_chat;
 pub mod auth;
 pub mod chat_stream;
 pub mod chats;

@@ -1,0 +1,37 @@
+OK
+FocusDefinition {
+    focus_id: "api-chat",
+    display_name: "API Chat",
+    description: "A conversation with a hosted AI provider and model chosen for this chat.\n",
+    version: "1.0",
+    max_routing_tier: Unrestricted,
+    steps: [],
+    output_type: "api_chat",
+    suggest_in_focuses: [],
+    multi_source_validation: false,
+    generic_title_template: "Hidden item",
+    high_priority_trigger: None,
+}
+--- step
+StepDefinition {
+    step_id: "reply",
+    display_name: "Replying...",
+    guide_id: "api-chat-guide",
+    task_type: "general",
+    routing_tier: Unrestricted,
+    step_type: Generate,
+    output_var: Some(
+        "reply",
+    ),
+    prompt_template: "Continue this conversation as the assistant. Reply to the last User message.\n{user_input}\n",
+    field_requirements: {},
+    options_override: {},
+    external_access_override: None,
+    revisitable: true,
+    requires_user_handoff: false,
+    block_stable_id: None,
+    block_customization: None,
+    schedule_trigger: None,
+}
+field_requirements: {}
+options_override: {}

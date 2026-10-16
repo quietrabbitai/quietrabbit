@@ -207,6 +207,12 @@ pub struct Gate3Result {
     /// partition_by_prior_decision (all-auto approved, all-auto blocked, and
     /// the partly-auto pending_consent path); empty otherwise.
     pub auto_resolved: Vec<AutoResolvedSpan>,
+    /// items.id=716: the spans the consent_request event asked the user about
+    /// (the same items the event payload carries), so a caller that has to
+    /// apply the user's answers itself (the API Chat send, where the server is
+    /// what sends) can find each span's offsets. Empty on every path except
+    /// pending_consent. Not part of the IPC projection.
+    pub review_spans: Vec<ConsentSpanItem>,
 }
 
 /// IPC-safe projection of Gate3Result — Gate3Result itself derives neither

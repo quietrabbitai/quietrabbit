@@ -16,6 +16,8 @@
 //   price_state.*  whether and how well a price is known
 //   limit_state.*  where a limit stands
 //   consent_state.* where a provider's consent stands
+//   api_chat.*     an API Chat send was stopped before any network traffic
+//                  for a reason that is not spend (items.id=716)
 
 use serde::{Deserialize, Serialize};
 
@@ -115,6 +117,26 @@ pub enum Code {
     /// client will not send without one (items.id=711).
     BlockModelOutputLimitRequired,
 
+    // -- an API Chat send was stopped before any network traffic (items.id=716) -
+    /// The Persona's ceiling for the api-chat Focus does not permit external
+    /// use. The user raises it through the friction gate. Nothing is sent and
+    /// the local model is never used instead.
+    ApiChatCeilingBlocked,
+    /// The provider this conversation is bound to is no longer an active
+    /// hosted provider. Nothing is sent and no other provider is used.
+    ApiChatProviderUnavailable,
+    /// A run of the api-chat Focus has no readable binding. Fail closed.
+    ApiChatBindingMissing,
+    /// The outbound Privacy Guardian review blocked the message.
+    ApiChatReviewBlocked,
+    /// The conversation is the wrong kind for this command: a QR chat cannot
+    /// send to a provider, and an API chat cannot use the QR send.
+    ApiChatWrongChatKind,
+    /// The Privacy Filter is not available, so an outbound message cannot be
+    /// reviewed. Nothing is sent (decisions.id=864: external use waits for a
+    /// verified Privacy Filter).
+    ApiChatPrivacyFilterUnavailable,
+
     // -- cost basis, price state, limit state, consent state ------------------
     CostBasisListPriceEstimate,
     PriceStateKnown,
@@ -160,6 +182,12 @@ impl Code {
         Code::BlockModelRetired,
         Code::BlockModelUnavailable,
         Code::BlockModelOutputLimitRequired,
+        Code::ApiChatCeilingBlocked,
+        Code::ApiChatProviderUnavailable,
+        Code::ApiChatBindingMissing,
+        Code::ApiChatReviewBlocked,
+        Code::ApiChatWrongChatKind,
+        Code::ApiChatPrivacyFilterUnavailable,
         Code::CostBasisListPriceEstimate,
         Code::PriceStateKnown,
         Code::PriceStateUnknown,
@@ -204,6 +232,12 @@ impl Code {
             Code::BlockModelRetired => "spend_block.model_retired",
             Code::BlockModelUnavailable => "spend_block.model_unavailable",
             Code::BlockModelOutputLimitRequired => "spend_block.model_output_limit_required",
+            Code::ApiChatCeilingBlocked => "api_chat.ceiling_blocked",
+            Code::ApiChatProviderUnavailable => "api_chat.provider_unavailable",
+            Code::ApiChatBindingMissing => "api_chat.binding_missing",
+            Code::ApiChatReviewBlocked => "api_chat.review_blocked",
+            Code::ApiChatWrongChatKind => "api_chat.wrong_chat_kind",
+            Code::ApiChatPrivacyFilterUnavailable => "api_chat.privacy_filter_unavailable",
             Code::CostBasisListPriceEstimate => "cost_basis.list_price_estimate",
             Code::PriceStateKnown => "price_state.known",
             Code::PriceStateUnknown => "price_state.unknown",
@@ -282,6 +316,12 @@ mod tests {
             "spend_block.model_retired",
             "spend_block.model_unavailable",
             "spend_block.model_output_limit_required",
+            "api_chat.ceiling_blocked",
+            "api_chat.provider_unavailable",
+            "api_chat.binding_missing",
+            "api_chat.review_blocked",
+            "api_chat.wrong_chat_kind",
+            "api_chat.privacy_filter_unavailable",
             "cost_basis.list_price_estimate",
             "price_state.known",
             "price_state.unknown",
@@ -309,9 +349,9 @@ mod tests {
     /// this length check keeps the two in step.
     #[test]
     fn all_lists_every_variant() {
-        // 17 warnings + 11 blocks + 1 cost basis + 3 price states
-        // + 3 limit states + 4 consent states.
-        assert_eq!(Code::ALL.len(), 39);
+        // 17 warnings + 11 blocks + 6 API Chat stops + 1 cost basis
+        // + 3 price states + 3 limit states + 4 consent states.
+        assert_eq!(Code::ALL.len(), 45);
     }
 
     #[test]

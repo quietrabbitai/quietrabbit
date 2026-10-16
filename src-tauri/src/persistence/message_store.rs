@@ -46,6 +46,57 @@ pub struct MessageRecord {
     /// withheld personal value in this streamed reply. The reply is kept and
     /// shown; this only marks it.
     pub personal_flagged: bool,
+    /// items.id=716 (messages_007.sql): the provider and model that produced
+    /// this assistant reply. None for a user turn, a QR reply and any row from
+    /// before the migration. The API Chat history builder uses it to keep a
+    /// flagged reply from reaching a different provider (decisions.id=883).
+    pub provider_id: Option<String>,
+    pub model_id: Option<String>,
+    /// items.id=716: how this reply ended. A reply that was shown and then
+    /// cancelled or cut keeps its text (decisions.id=883).
+    pub reply_status: ReplyStatus,
+    /// items.id=716: for an API Chat user turn, the text actually sent to the
+    /// provider after the Privacy Guardian review applied the user's decisions.
+    /// History is rebuilt from it, so a decided span is never sent or asked
+    /// about again. None everywhere else.
+    pub outbound_content: Option<String>,
+}
+
+/// How an assistant reply ended (messages.reply_status). Stored as text with
+/// no CHECK (messages_007.sql), so an unknown stored value is an error here,
+/// never a quiet default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReplyStatus {
+    #[default]
+    Complete,
+    /// The provider stopped at the output token limit; the text is cut off.
+    Truncated,
+    /// The user stopped the stream; the text received so far is kept.
+    Cancelled,
+    /// The stream ended early (connection cut, in-stream error); the text
+    /// received so far is kept.
+    Cut,
+}
+
+impl ReplyStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Truncated => "truncated",
+            Self::Cancelled => "cancelled",
+            Self::Cut => "cut",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "complete" => Some(Self::Complete),
+            "truncated" => Some(Self::Truncated),
+            "cancelled" => Some(Self::Cancelled),
+            "cut" => Some(Self::Cut),
+            _ => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -145,7 +196,16 @@ pub(crate) async fn open_messages_db(
 // Row mapping helper
 // ---------------------------------------------------------------------------
 
+/// The column list every message SELECT reads, so the row mapper and the
+/// queries cannot drift apart.
+const MESSAGE_COLUMNS: &str = "id, context_key, sender, content, focus_run_id, created_at, \
+     is_error, personal_flagged, provider_id, model_id, reply_status, outbound_content";
+
 fn row_to_message_record(r: &sqlx::sqlite::SqliteRow) -> Result<MessageRecord, sqlx::Error> {
+    let status: String = r.try_get("reply_status")?;
+    let reply_status = ReplyStatus::parse(&status).ok_or_else(|| {
+        sqlx::Error::Decode(format!("unknown messages.reply_status '{status}'").into())
+    })?;
     Ok(MessageRecord {
         id: r.try_get("id")?,
         context_key: r.try_get("context_key")?,
@@ -155,6 +215,10 @@ fn row_to_message_record(r: &sqlx::sqlite::SqliteRow) -> Result<MessageRecord, s
         created_at: r.try_get("created_at")?,
         is_error: r.try_get::<i64, _>("is_error")? != 0,
         personal_flagged: r.try_get::<i64, _>("personal_flagged")? != 0,
+        provider_id: r.try_get("provider_id")?,
+        model_id: r.try_get("model_id")?,
+        reply_status,
+        outbound_content: r.try_get("outbound_content")?,
     })
 }
 
@@ -174,6 +238,43 @@ pub async fn save_message(
     content: &str,
     focus_run_id: Option<&str>,
 ) -> Result<MessageRecord, MessageStoreError> {
+    save_message_with_provenance(
+        user_id,
+        persona_id,
+        key_hex,
+        context_key,
+        sender,
+        content,
+        focus_run_id,
+        &MessageProvenance::default(),
+    )
+    .await
+}
+
+/// The API Chat columns of a new message (messages_007.sql). All None for a
+/// QR chat message.
+#[derive(Debug, Clone, Default)]
+pub struct MessageProvenance<'a> {
+    /// The provider and model that produces (or produced) an assistant reply.
+    pub provider_id: Option<&'a str>,
+    pub model_id: Option<&'a str>,
+    /// For a user turn: the text actually sent to the provider.
+    pub outbound_content: Option<&'a str>,
+}
+
+/// `save_message` plus the API Chat columns. A row's producer and outbound
+/// text are written once, here, at insert.
+#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
+pub async fn save_message_with_provenance(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    context_key: &str,
+    sender: &str,
+    content: &str,
+    focus_run_id: Option<&str>,
+    provenance: &MessageProvenance<'_>,
+) -> Result<MessageRecord, MessageStoreError> {
     if !VALID_SENDER.contains(&sender) {
         return Err(MessageStoreError::Validation(format!(
             "Invalid sender '{}'. Must be one of: {}",
@@ -187,8 +288,9 @@ pub async fn save_message(
 
     sqlx::query(
         "INSERT INTO messages
-         (id, context_key, sender, content, focus_run_id, created_at)
-         VALUES (?, ?, ?, ?, ?, ?)",
+         (id, context_key, sender, content, focus_run_id, created_at,
+          provider_id, model_id, outbound_content)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(context_key)
@@ -196,6 +298,9 @@ pub async fn save_message(
     .bind(content)
     .bind(focus_run_id)
     .bind(&timestamp)
+    .bind(provenance.provider_id)
+    .bind(provenance.model_id)
+    .bind(provenance.outbound_content)
     .execute(&mut conn)
     .await?;
 
@@ -208,6 +313,10 @@ pub async fn save_message(
         created_at: timestamp,
         is_error: false,
         personal_flagged: false,
+        provider_id: provenance.provider_id.map(str::to_owned),
+        model_id: provenance.model_id.map(str::to_owned),
+        reply_status: ReplyStatus::Complete,
+        outbound_content: provenance.outbound_content.map(str::to_owned),
     })
 }
 
@@ -226,12 +335,12 @@ pub async fn list_messages(
 ) -> Result<Vec<MessageRecord>, MessageStoreError> {
     let mut conn = open_messages_db(user_id, persona_id, key_hex).await?;
 
-    let rows = sqlx::query(
-        "SELECT id, context_key, sender, content, focus_run_id, created_at, is_error, personal_flagged
+    let rows = sqlx::query(&format!(
+        "SELECT {MESSAGE_COLUMNS}
          FROM messages
          WHERE context_key = ?
-         ORDER BY created_at ASC",
-    )
+         ORDER BY created_at ASC"
+    ))
     .bind(context_key)
     .fetch_all(&mut conn)
     .await?;
@@ -256,11 +365,11 @@ pub async fn get_message(
 ) -> Result<Option<MessageRecord>, MessageStoreError> {
     let mut conn = open_messages_db(user_id, persona_id, key_hex).await?;
 
-    let row = sqlx::query(
-        "SELECT id, context_key, sender, content, focus_run_id, created_at, is_error, personal_flagged
+    let row = sqlx::query(&format!(
+        "SELECT {MESSAGE_COLUMNS}
          FROM messages
-         WHERE id = ?",
-    )
+         WHERE id = ?"
+    ))
     .bind(message_id)
     .fetch_optional(&mut conn)
     .await?;
@@ -293,11 +402,11 @@ pub async fn find_assistant_message_by_focus_run_id(
 ) -> Result<Option<MessageRecord>, MessageStoreError> {
     let mut conn = open_messages_db(user_id, persona_id, key_hex).await?;
 
-    let row = sqlx::query(
-        "SELECT id, context_key, sender, content, focus_run_id, created_at, is_error, personal_flagged
+    let row = sqlx::query(&format!(
+        "SELECT {MESSAGE_COLUMNS}
          FROM messages
-         WHERE focus_run_id = ? AND sender = 'assistant'",
-    )
+         WHERE focus_run_id = ? AND sender = 'assistant'"
+    ))
     .bind(focus_run_id)
     .fetch_optional(&mut conn)
     .await?;
@@ -363,6 +472,50 @@ pub async fn mark_reply_personal_flagged(
     Ok(done.rows_affected() > 0)
 }
 
+/// Record how the assistant reply owned by `focus_run_id` ended, and for a
+/// reply that was shown and then cancelled or cut, keep the text that was
+/// received (items.id=716, decisions.id=883: displayed text is never
+/// retracted). `partial_text` of None leaves the content alone, which is the
+/// truncated case (the reply is whole, it just hit the output limit).
+/// Returns false when the run owns no assistant message. A non-empty
+/// `partial_text` is never written over an `is_error` row.
+pub async fn set_reply_outcome(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    focus_run_id: &str,
+    status: ReplyStatus,
+    partial_text: Option<&str>,
+) -> Result<bool, MessageStoreError> {
+    let mut conn = open_messages_db(user_id, persona_id, key_hex).await?;
+
+    let done = match partial_text {
+        Some(text) => {
+            sqlx::query(
+                "UPDATE messages SET content = ?, reply_status = ?
+                 WHERE focus_run_id = ? AND sender = 'assistant' AND is_error = 0",
+            )
+            .bind(text)
+            .bind(status.as_str())
+            .bind(focus_run_id)
+            .execute(&mut conn)
+            .await?
+        }
+        None => {
+            sqlx::query(
+                "UPDATE messages SET reply_status = ?
+                 WHERE focus_run_id = ? AND sender = 'assistant'",
+            )
+            .bind(status.as_str())
+            .bind(focus_run_id)
+            .execute(&mut conn)
+            .await?
+        }
+    };
+
+    Ok(done.rows_affected() > 0)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -388,6 +541,9 @@ mod tests {
     const MESSAGES_SCHEMA_V5: &str = include_str!("../../schema/messages_005.sql");
     // items.id=715: personal_flagged, read unconditionally by row_to_message_record.
     const MESSAGES_SCHEMA_V6: &str = include_str!("../../schema/messages_006.sql");
+    // items.id=716: provider_id, model_id, reply_status and outbound_content are read
+    // unconditionally by row_to_message_record.
+    const MESSAGES_SCHEMA_V7: &str = include_str!("../../schema/messages_007.sql");
 
     async fn test_db() -> SqliteConnection {
         let mut conn = SqliteConnectOptions::new()
@@ -402,6 +558,7 @@ mod tests {
             .chain(parse_statements(MESSAGES_SCHEMA_V4))
             .chain(parse_statements(MESSAGES_SCHEMA_V5))
             .chain(parse_statements(MESSAGES_SCHEMA_V6))
+            .chain(parse_statements(MESSAGES_SCHEMA_V7))
         {
             sqlx::query(&stmt)
                 .execute(&mut conn)
@@ -458,10 +615,9 @@ mod tests {
         let mut conn = test_db().await;
         let id = seed_message(&mut conn, "ctx-1", "user", "hello", "2026-08-09T00:00:00Z").await;
 
-        let row = sqlx::query(
-            "SELECT id, context_key, sender, content, focus_run_id, created_at, is_error, personal_flagged
-             FROM messages WHERE id = ?",
-        )
+        let row = sqlx::query(&format!(
+            "SELECT {MESSAGE_COLUMNS} FROM messages WHERE id = ?"
+        ))
         .bind(&id)
         .fetch_one(&mut conn)
         .await
@@ -846,7 +1002,7 @@ mod tests {
         }
         assert_eq!(
             messages_applied_versions(&mut conn).await,
-            vec![1, 2, 3, 4, 5, 6]
+            vec![1, 2, 3, 4, 5, 6, 7]
         );
 
         // Every old row loads through the real read path, other columns intact.
@@ -917,7 +1073,7 @@ mod tests {
         assert!(!cols.contains(&"reviewed_at_risk_rating".to_owned()));
         assert_eq!(
             messages_applied_versions(&mut conn).await,
-            vec![1, 2, 3, 4, 5, 6]
+            vec![1, 2, 3, 4, 5, 6, 7]
         );
         conn.close().await.expect("close must succeed");
 
@@ -928,7 +1084,7 @@ mod tests {
             assert_eq!(messages_columns(&mut conn).await, cols);
             assert_eq!(
                 messages_applied_versions(&mut conn).await,
-                vec![1, 2, 3, 4, 5, 6]
+                vec![1, 2, 3, 4, 5, 6, 7]
             );
             conn.close().await.expect("close must succeed");
         }
@@ -958,6 +1114,184 @@ mod tests {
             }
             other => panic!("expected Validation variant, got: {other:?}"),
         }
+    }
+
+    /// items.id=716: the producer and the outbound text are written once at
+    /// insert and read back; a plain save leaves them NULL and the reply
+    /// status complete.
+    #[tokio::test]
+    async fn provenance_columns_round_trip_and_default_to_empty() {
+        let _env = setup().await;
+        save_message(USER_ID, PERSONA_ID, KEY_HEX, "c1", "user", "plain", None)
+            .await
+            .unwrap();
+        save_message_with_provenance(
+            USER_ID,
+            PERSONA_ID,
+            KEY_HEX,
+            "c1",
+            "user",
+            "typed text",
+            None,
+            &MessageProvenance {
+                outbound_content: Some("typed text [removed]"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        save_message_with_provenance(
+            USER_ID,
+            PERSONA_ID,
+            KEY_HEX,
+            "c1",
+            "assistant",
+            "",
+            Some("run-9"),
+            &MessageProvenance {
+                provider_id: Some("prov-x"),
+                model_id: Some("model-1"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let msgs = list_messages(USER_ID, PERSONA_ID, KEY_HEX, "c1")
+            .await
+            .unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].provider_id, None);
+        assert_eq!(msgs[0].outbound_content, None);
+        assert_eq!(msgs[0].reply_status, ReplyStatus::Complete);
+        assert_eq!(
+            msgs[1].outbound_content.as_deref(),
+            Some("typed text [removed]")
+        );
+        assert_eq!(msgs[1].content, "typed text");
+        assert_eq!(msgs[2].provider_id.as_deref(), Some("prov-x"));
+        assert_eq!(msgs[2].model_id.as_deref(), Some("model-1"));
+    }
+
+    /// items.id=716 (decisions.id=883): a cancelled or cut reply keeps the text
+    /// that was received. A truncated reply keeps its own text and only gains
+    /// the status. A run with no reply is a no-op, and an error row is never
+    /// overwritten with partial text.
+    #[tokio::test]
+    async fn set_reply_outcome_keeps_partial_text_and_marks_the_status() {
+        let _env = setup().await;
+        for run in ["run-cut", "run-trunc", "run-err"] {
+            save_message(
+                USER_ID,
+                PERSONA_ID,
+                KEY_HEX,
+                "c1",
+                "assistant",
+                "",
+                Some(run),
+            )
+            .await
+            .unwrap();
+        }
+        let err = find_assistant_message_by_focus_run_id(USER_ID, PERSONA_ID, KEY_HEX, "run-err")
+            .await
+            .unwrap()
+            .unwrap();
+        update_message_content(USER_ID, PERSONA_ID, KEY_HEX, &err.id, "a failure", true)
+            .await
+            .unwrap();
+
+        assert!(set_reply_outcome(
+            USER_ID,
+            PERSONA_ID,
+            KEY_HEX,
+            "run-cut",
+            ReplyStatus::Cut,
+            Some("half an ans")
+        )
+        .await
+        .unwrap());
+        let cut = find_assistant_message_by_focus_run_id(USER_ID, PERSONA_ID, KEY_HEX, "run-cut")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cut.content, "half an ans");
+        assert_eq!(cut.reply_status, ReplyStatus::Cut);
+
+        let whole =
+            find_assistant_message_by_focus_run_id(USER_ID, PERSONA_ID, KEY_HEX, "run-trunc")
+                .await
+                .unwrap()
+                .unwrap();
+        update_message_content(
+            USER_ID,
+            PERSONA_ID,
+            KEY_HEX,
+            &whole.id,
+            "long answer",
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(set_reply_outcome(
+            USER_ID,
+            PERSONA_ID,
+            KEY_HEX,
+            "run-trunc",
+            ReplyStatus::Truncated,
+            None
+        )
+        .await
+        .unwrap());
+        let trunc =
+            find_assistant_message_by_focus_run_id(USER_ID, PERSONA_ID, KEY_HEX, "run-trunc")
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(trunc.content, "long answer", "content untouched");
+        assert_eq!(trunc.reply_status, ReplyStatus::Truncated);
+
+        assert!(!set_reply_outcome(
+            USER_ID,
+            PERSONA_ID,
+            KEY_HEX,
+            "run-err",
+            ReplyStatus::Cancelled,
+            Some("partial")
+        )
+        .await
+        .unwrap());
+        let err = find_assistant_message_by_focus_run_id(USER_ID, PERSONA_ID, KEY_HEX, "run-err")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            err.content, "a failure",
+            "an error row is never overwritten"
+        );
+        assert!(!set_reply_outcome(
+            USER_ID,
+            PERSONA_ID,
+            KEY_HEX,
+            "no-run",
+            ReplyStatus::Cut,
+            Some("x")
+        )
+        .await
+        .unwrap());
+    }
+
+    #[test]
+    fn reply_status_round_trips_and_rejects_unknown_text() {
+        for s in [
+            ReplyStatus::Complete,
+            ReplyStatus::Truncated,
+            ReplyStatus::Cancelled,
+            ReplyStatus::Cut,
+        ] {
+            assert_eq!(ReplyStatus::parse(s.as_str()), Some(s));
+        }
+        assert_eq!(ReplyStatus::parse("whole"), None);
     }
 
     /// items.id=715 (decisions.id=883): the Gate 2 mark sets exactly one

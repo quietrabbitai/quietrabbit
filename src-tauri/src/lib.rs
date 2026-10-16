@@ -1,6 +1,7 @@
 // src-tauri/src/lib.rs
 // Quiet Rabbit -- library root.
 
+pub mod api_chat;
 pub mod auth;
 pub mod chat_stream;
 pub mod cloud_chat_gpu_pane;

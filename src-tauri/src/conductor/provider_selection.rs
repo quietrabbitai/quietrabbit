@@ -103,6 +103,32 @@ pub async fn resolve_external_provider(
     ExternalProviderResolution::NotConfigured
 }
 
+/// The provider an API Chat conversation is bound to (items.id=716). The
+/// binding is the user's explicit choice for this conversation, so no
+/// preference is consulted; the ceiling still decides whether the bound
+/// provider may be used: `ExcludedByCeiling` when it does not permit it,
+/// `NotConfigured` when the bound id is not an active hosted provider (removed,
+/// retired or not a hosted API row). Never substitutes another provider.
+pub async fn resolve_bound_provider(
+    pool: &sqlx::SqlitePool,
+    provider_id: &str,
+    access: ExternalAccess,
+) -> ExternalProviderResolution {
+    let candidates = provider_store::list_providers_by_type(pool, HOSTED_PROVIDER_TYPE)
+        .await
+        .unwrap_or_default();
+    let Some(bound) = candidates.into_iter().find(|p| p.id == provider_id) else {
+        return ExternalProviderResolution::NotConfigured;
+    };
+    let name = bound.display_name.clone();
+    if providers_permitted_by_ceiling(vec![bound], access).is_empty() {
+        return ExternalProviderResolution::ExcludedByCeiling {
+            provider_name: name,
+        };
+    }
+    ExternalProviderResolution::Selected(provider_id.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,6 +448,76 @@ mod tests {
                     .await,
                 ExternalProviderResolution::Selected(second)
             );
+        })
+        .await;
+    }
+
+    // -- items.id=716: a bound conversation resolves its own provider --------
+
+    #[tokio::test]
+    async fn a_bound_provider_is_selected_without_any_preference() {
+        with_db(|pool| async move {
+            let [(first, _), _] = hosted_pair(&pool).await;
+            // No preference row exists at all.
+            assert_eq!(
+                resolve_bound_provider(&pool, &first, ExternalAccess::Unrestricted).await,
+                ExternalProviderResolution::Selected(first.clone())
+            );
+            // A preference for ANOTHER provider changes nothing.
+            let [_, (second, _)] = hosted_pair(&pool).await;
+            prefer(&pool, &second).await;
+            assert_eq!(
+                resolve_bound_provider(&pool, &first, ExternalAccess::Unrestricted).await,
+                ExternalProviderResolution::Selected(first)
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_bound_provider_still_obeys_the_ceiling() {
+        with_db(|pool| async move {
+            for (id, name) in hosted_pair(&pool).await {
+                assert_eq!(
+                    resolve_bound_provider(&pool, &id, ExternalAccess::AnonymousRequired).await,
+                    ExternalProviderResolution::ExcludedByCeiling {
+                        provider_name: name.clone()
+                    },
+                    "{id}"
+                );
+                assert!(
+                    !matches!(
+                        resolve_bound_provider(&pool, &id, ExternalAccess::LocalOnly).await,
+                        ExternalProviderResolution::Selected(_)
+                    ),
+                    "{id}: a local-only ceiling permits no provider"
+                );
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_unknown_or_non_hosted_bound_provider_is_not_configured() {
+        with_db(|pool| async move {
+            assert_eq!(
+                resolve_bound_provider(&pool, "no-such-provider", ExternalAccess::Unrestricted)
+                    .await,
+                ExternalProviderResolution::NotConfigured
+            );
+            let local: Option<String> = sqlx::query_scalar(
+                "SELECT id FROM providers WHERE provider_type <> 'cloud_inference_api' LIMIT 1",
+            )
+            .fetch_optional(&pool)
+            .await
+            .expect("query");
+            if let Some(local) = local {
+                assert_eq!(
+                    resolve_bound_provider(&pool, &local, ExternalAccess::Unrestricted).await,
+                    ExternalProviderResolution::NotConfigured,
+                    "a non-hosted row is never a bound API provider"
+                );
+            }
         })
         .await;
     }

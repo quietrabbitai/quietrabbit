@@ -29,8 +29,8 @@ use tauri::State;
 use crate::auth::registry::{key_hex, KeyRegistry};
 use crate::commands::execution::{self, SubmitFocusRunRequest};
 use crate::conductor::concurrency::ConductorScheduler;
-use crate::conductor::lifecycle::{LifecycleError, RunResult};
-use crate::persistence::{chat_store, message_store, output_store};
+use crate::conductor::lifecycle::{FocusRun, LifecycleError, RunResult};
+use crate::persistence::{chat_binding_store, chat_store, message_store, output_store};
 
 // ---------------------------------------------------------------------------
 // Request DTO
@@ -79,6 +79,13 @@ pub struct MessageInfo {
     /// value in this reply. The reply is intact; the UI shows a plain,
     /// non-blocking notice.
     pub personal_flagged: bool,
+    /// items.id=716: "complete", "truncated", "cancelled" or "cut". A reply
+    /// that was shown and then cancelled or cut keeps its text and says so; a
+    /// truncated one hit the output token limit.
+    pub reply_status: String,
+    /// items.id=716: the provider and model that produced an API Chat reply.
+    pub provider_id: Option<String>,
+    pub model_id: Option<String>,
 }
 
 /// Push event payload for "message-content-ready" (items.id=320). Emitted
@@ -119,6 +126,9 @@ fn to_message_info(r: message_store::MessageRecord) -> MessageInfo {
         created_at: r.created_at,
         is_error: r.is_error,
         personal_flagged: r.personal_flagged,
+        reply_status: r.reply_status.as_str().to_owned(),
+        provider_id: r.provider_id,
+        model_id: r.model_id,
     }
 }
 
@@ -371,8 +381,21 @@ pub(crate) async fn finalize_chat_reply(
         }
     };
 
+    // items.id=716 (decisions.id=883): a reply that was shown and then
+    // cancelled or cut already holds the text the user saw. The failure that
+    // parked the run is not written over it, and the reply counts as a real
+    // reply (it files its chat in History like any other).
+    let kept_partial = matches!(
+        msg.reply_status,
+        message_store::ReplyStatus::Cancelled | message_store::ReplyStatus::Cut
+    ) && !msg.content.is_empty()
+        && !msg.is_error;
+
     let mut is_real_reply = false;
-    let content: Option<String> =
+    let content: Option<String> = if kept_partial {
+        is_real_reply = true;
+        None
+    } else {
         match output_store::get_output_for_run(user_id, persona_id, key_hex, run_id).await {
             Ok(Some(output)) => {
                 // content is only NULL for an ingested-document row
@@ -404,7 +427,8 @@ pub(crate) async fn finalize_chat_reply(
                 log::warn!("finalize_chat_reply: failed to fetch output for run {run_id}: {e}");
                 None
             }
-        };
+        }
+    };
 
     if let Some(c) = &content {
         update_message_content_logged(user_id, persona_id, key_hex, &msg.id, c, !is_real_reply)
@@ -519,6 +543,19 @@ pub async fn send_message(
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
+    // 0. items.id=716: a QR chat is self-contained. A conversation bound to a
+    // provider is an API Chat and sends only through send_api_chat_message,
+    // where the outbound review and the bound destination apply. An unreadable
+    // or unknown binding refuses too: it may be an external conversation.
+    match chat_binding_store::get_binding(&user_id, &persona_id, &key_hex_str, &context_key).await {
+        Ok(None) => {}
+        Ok(Some(_)) | Err(_) => {
+            return Err(crate::spend::codes::Code::ApiChatWrongChatKind
+                .as_str()
+                .to_owned())
+        }
+    }
+
     // 1. Persist the user's turn. items.id=587 (decisions.id=844): the
     // owning chat row is no longer created/bumped here -- that now happens
     // only once a real reply is actually saved, in finalize_chat_reply
@@ -563,15 +600,44 @@ pub async fn send_message(
         topic_id: None,
         confirmed_cross_persona_fact_ids,
     };
-    let mut run = execution::load_and_authorize_run(
+    let run = execution::load_and_authorize_run(
         app_handle,
         scheduler,
         pool,
         key_hex_str.clone(),
         crisis_detected,
+        None,
         request,
     )
     .await?;
+
+    // 4-6. Reserve the placeholder, finish the run in the background, return
+    // the transcript.
+    start_reply(
+        run,
+        &user_id,
+        &persona_id,
+        &key_hex_str,
+        &context_key,
+        &message_store::MessageProvenance::default(),
+    )
+    .await
+}
+
+/// Steps 4 to 6 of a chat send, shared by send_message and
+/// send_api_chat_message (items.id=716) so there is one finalisation path.
+/// Reserves the assistant placeholder row (carrying `provenance`: for an API
+/// chat, the provider and model that will produce the reply), runs the run in
+/// the background and hands off to `finalize_chat_reply`, and returns the
+/// transcript as it stands.
+pub(crate) async fn start_reply(
+    mut run: FocusRun,
+    user_id: &str,
+    persona_id: &str,
+    key_hex_str: &str,
+    context_key: &str,
+    provenance: &message_store::MessageProvenance<'_>,
+) -> Result<Vec<MessageInfo>, String> {
     let run_id = run
         .focus_run_id
         .clone()
@@ -582,14 +648,15 @@ pub async fn send_message(
     // into) while generation is in flight. Its own id isn't needed beyond
     // this point -- finalize_chat_reply (step 5) finds this row again by
     // focus_run_id, not by id.
-    message_store::save_message(
-        &user_id,
-        &persona_id,
-        &key_hex_str,
-        &context_key,
+    message_store::save_message_with_provenance(
+        user_id,
+        persona_id,
+        key_hex_str,
+        context_key,
         "assistant",
         "",
         Some(&run_id),
+        provenance,
     )
     .await
     .map_err(|e| e.to_string())?;
@@ -601,9 +668,9 @@ pub async fn send_message(
     // file/bump the owning chat in History (items.id=587). Mirrors
     // execute_full()'s own "failures logged, not panicking" convention
     // (execution.rs) -- errors here are lost sends, not crashes.
-    let bg_user_id = user_id.clone();
-    let bg_persona_id = persona_id.clone();
-    let bg_key_hex = key_hex_str.clone();
+    let bg_user_id = user_id.to_owned();
+    let bg_persona_id = persona_id.to_owned();
+    let bg_key_hex = key_hex_str.to_owned();
     let bg_run_id = run_id.clone();
     tokio::spawn(async move {
         let result = run.execute_full().await;
@@ -621,10 +688,9 @@ pub async fn send_message(
     // 6. Return the transcript as it stands now (includes the just-reserved,
     // still-empty assistant placeholder — the caller renders staged/final
     // content via the run-status-update listener and a later refetch).
-    let transcript =
-        message_store::list_messages(&user_id, &persona_id, &key_hex_str, &context_key)
-            .await
-            .map_err(|e| e.to_string())?;
+    let transcript = message_store::list_messages(user_id, persona_id, key_hex_str, context_key)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(transcript.into_iter().map(to_message_info).collect())
 }
 
@@ -655,6 +721,10 @@ mod tests {
             created_at: "2026-08-09T00:00:00Z".to_owned(),
             is_error: false,
             personal_flagged: false,
+            provider_id: None,
+            model_id: None,
+            reply_status: message_store::ReplyStatus::Complete,
+            outbound_content: None,
         }
     }
 
@@ -973,6 +1043,101 @@ mod tests {
     // asserting the outcome directly tests the condition that gates it.
     // -----------------------------------------------------------------
 
+    // items.id=716 (decisions.id=883): a reply that was shown and then
+    // cancelled or cut keeps its text. The failure that parks the run is not
+    // written over it, and the chat is filed like any other real reply.
+    #[tokio::test]
+    async fn finalize_chat_reply_keeps_a_cancelled_partial_and_files_the_chat() {
+        let _env = setup().await;
+        let key = key_hex_str();
+        message_store::save_message(
+            USER_ID,
+            PERSONA_ID,
+            &key,
+            "chat-partial",
+            "user",
+            "hi",
+            None,
+        )
+        .await
+        .unwrap();
+        message_store::save_message(
+            USER_ID,
+            PERSONA_ID,
+            &key,
+            "chat-partial",
+            "assistant",
+            "",
+            Some("run-p1"),
+        )
+        .await
+        .unwrap();
+        message_store::set_reply_outcome(
+            USER_ID,
+            PERSONA_ID,
+            &key,
+            "run-p1",
+            message_store::ReplyStatus::Cancelled,
+            Some("the part the user read"),
+        )
+        .await
+        .unwrap();
+
+        // The run parked with a failure (as a cancelled stream does).
+        let result = Ok(run_result_with_failure(
+            "a failure that must not replace it",
+        ));
+        let outcome = finalize_chat_reply(USER_ID, PERSONA_ID, &key, "run-p1", &result, None).await;
+
+        assert_eq!(outcome, ReplyOutcome::ChatFiled);
+        let row = message_store::find_assistant_message_by_focus_run_id(
+            USER_ID, PERSONA_ID, &key, "run-p1",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(row.content, "the part the user read");
+        assert!(!row.is_error);
+        assert_eq!(row.reply_status, message_store::ReplyStatus::Cancelled);
+        assert_eq!(
+            chat_store::list_chats(USER_ID, PERSONA_ID, &key)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    // A placeholder that never received any text is still replaced by the
+    // failure message, whatever its status: only kept text is protected.
+    #[tokio::test]
+    async fn finalize_chat_reply_still_replaces_an_empty_placeholder_with_the_failure() {
+        let _env = setup().await;
+        let key = key_hex_str();
+        message_store::save_message(
+            USER_ID,
+            PERSONA_ID,
+            &key,
+            "chat-empty",
+            "assistant",
+            "",
+            Some("run-e1"),
+        )
+        .await
+        .unwrap();
+        let result = Ok(run_result_with_failure("the failure text"));
+        let outcome = finalize_chat_reply(USER_ID, PERSONA_ID, &key, "run-e1", &result, None).await;
+        assert_eq!(outcome, ReplyOutcome::ErrorShown);
+        let row = message_store::find_assistant_message_by_focus_run_id(
+            USER_ID, PERSONA_ID, &key, "run-e1",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(row.content, "the failure text");
+        assert!(row.is_error);
+    }
+
     #[tokio::test]
     async fn finalize_chat_reply_on_failure_leaves_no_chats_row_and_marks_is_error() {
         let _env = setup().await;
@@ -1213,9 +1378,15 @@ mod tests {
             created_at: "2026-08-09T00:00:00Z".to_owned(),
             is_error: false,
             personal_flagged: true,
+            provider_id: None,
+            model_id: None,
+            reply_status: message_store::ReplyStatus::Complete,
+            outbound_content: None,
         };
         let info = to_message_info(record);
         assert!(info.personal_flagged);
+        assert_eq!(info.reply_status, "complete");
+        assert_eq!(info.provider_id, None);
         assert_eq!(info.id, "id-1");
         assert_eq!(info.focus_run_id.as_deref(), Some("run-1"));
     }

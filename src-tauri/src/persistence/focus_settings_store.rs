@@ -286,6 +286,41 @@ pub async fn create_focus_settings(
     })
 }
 
+/// Create a focus_settings row for `(persona_id, focus_id)` only if none
+/// exists, with the Open-profile defaults every seeded Focus gets (bidirectional,
+/// shared, privacy_tier 2) and the given ceiling. Returns true when it created
+/// the row, false when one was already there. An existing row is NEVER touched:
+/// a ceiling the user raised through the friction gate survives every later
+/// call. Idempotent, so it can run at bind time and again at every send
+/// (items.id=716, the lesson of items.id=318: a Persona with no row hits a hard
+/// AUTHORIZE failure). The Persona row must exist (foreign key).
+pub async fn ensure_focus_settings_default(
+    pool: &sqlx::SqlitePool,
+    persona_id: &str,
+    focus_id: &str,
+    max_permitted_tier: ExternalAccess,
+) -> Result<bool, FocusSettingsStoreError> {
+    let created_at = crate::providers::utils::now();
+    let mut conn = pool.acquire().await?;
+
+    let done = sqlx::query(
+        "INSERT OR IGNORE INTO focus_settings
+         (persona_id, focus_id, context_flow, library_visibility,
+          privacy_tier, max_permitted_tier, focus_profile, voice_override,
+          created_at, updated_at)
+         VALUES (?, ?, 'bidirectional', 'shared', 2, ?, 'open', NULL, ?, ?)",
+    )
+    .bind(persona_id)
+    .bind(focus_id)
+    .bind(max_permitted_tier.as_str())
+    .bind(&created_at)
+    .bind(&created_at)
+    .execute(&mut *conn)
+    .await?;
+
+    Ok(done.rows_affected() > 0)
+}
+
 /// Update one or more fields on an existing focus_settings row.
 /// Only provided (non-None) fields are updated.
 ///

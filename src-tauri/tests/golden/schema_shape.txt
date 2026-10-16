@@ -183,6 +183,16 @@ TABLE schema_version
   applied_at TEXT notnull=1 pk=0 default=None
   description TEXT notnull=1 pk=0 default=None
 === messages ===
+TABLE chat_binding_targets
+  context_key TEXT notnull=1 pk=1 default=None
+  slot INTEGER notnull=1 pk=2 default=Some("0")
+  provider_id TEXT notnull=1 pk=0 default=None
+  model_id TEXT notnull=1 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+TABLE chat_bindings
+  context_key TEXT notnull=0 pk=1 default=None
+  kind TEXT notnull=1 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
 TABLE chats
   id TEXT notnull=0 pk=1 default=None
   persona_id TEXT notnull=1 pk=0 default=None
@@ -201,6 +211,10 @@ TABLE messages
   chat_id TEXT notnull=0 pk=0 default=None
   is_error INTEGER notnull=1 pk=0 default=Some("0")
   personal_flagged INTEGER notnull=1 pk=0 default=Some("0")
+  provider_id TEXT notnull=0 pk=0 default=None
+  model_id TEXT notnull=0 pk=0 default=None
+  reply_status TEXT notnull=1 pk=0 default=Some("'complete'")
+  outbound_content TEXT notnull=0 pk=0 default=None
 TABLE migration_lock
   id INTEGER notnull=0 pk=1 default=None
   locked_at TEXT notnull=0 pk=0 default=None

@@ -517,6 +517,7 @@ async fn gate3_with_pf<L: DisclosureLogger>(
         .map(rank_to_tier)
         .unwrap_or(ReviewTier::High); // reaching here with empty spans is always forced-High
 
+    let review_spans = spans.clone();
     let payload = ConsentRequestPayload {
         focus_run_id: focus_run_id.to_owned(),
         focus_name: focus_name.to_owned(),
@@ -552,6 +553,7 @@ async fn gate3_with_pf<L: DisclosureLogger>(
         // items.id=501 slice 2: the spans NOT in this payload because they
         // were silently resolved -- the caller must apply them too.
         auto_resolved,
+        review_spans,
         ..Gate3Result::default()
     })
 }

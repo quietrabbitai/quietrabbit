@@ -20,6 +20,9 @@ function freshChat(personaId: string): ChatInfo {
     archived_at: null,
     created_at: now,
     last_message_at: now,
+    kind: 'qr',
+    provider_id: null,
+    model_id: null,
   }
 }
 

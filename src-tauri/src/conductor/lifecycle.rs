@@ -1233,6 +1233,13 @@ pub struct FocusRun<L: DisclosureLoggerForRun = SqliteDisclosureLogger> {
     /// and what every other run keeps - sends `stream: false` exactly as
     /// before. A rehydrated or swept run has none. Local steps ignore it.
     pub chat_stream: Option<crate::chat_stream::ChatStream>,
+    /// items.id=716: the provider and model an API Chat run is bound to.
+    /// `None` (the default, and what every other run keeps) resolves the
+    /// provider from the user's preference exactly as before. Must be set
+    /// BEFORE `authorize()`, which builds the failure handler from provider
+    /// resolution. A rehydrated run re-derives it from its conversation's
+    /// binding.
+    pub chat_binding: Option<crate::api_chat::BoundDestination>,
 }
 
 impl<L: DisclosureLoggerForRun> FocusRun<L> {
@@ -1281,6 +1288,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             crisis_floor_triggered: false,
             attendance: crate::spend::gate::RunAttendance::Unattended,
             chat_stream: None,
+            chat_binding: None,
         }
     }
 
@@ -1457,14 +1465,27 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         };
         let escalation_available = self._focus_external_access == ExternalAccess::LocalOnly
             || !matches!(
-                resolve_external_provider(
-                    &self.pool,
-                    &self.user_id,
-                    &self.persona_id,
-                    &self.focus_id,
-                    self._focus_external_access,
-                )
-                .await,
+                match &self.chat_binding {
+                    // items.id=716: a bound run asks about its own provider.
+                    Some(bound) => {
+                        crate::conductor::provider_selection::resolve_bound_provider(
+                            &self.pool,
+                            &bound.provider_id,
+                            self._focus_external_access,
+                        )
+                        .await
+                    }
+                    None => {
+                        resolve_external_provider(
+                            &self.pool,
+                            &self.user_id,
+                            &self.persona_id,
+                            &self.focus_id,
+                            self._focus_external_access,
+                        )
+                        .await
+                    }
+                },
                 ExternalProviderResolution::ExcludedByCeiling { .. }
             );
         FailureHandler::with_escalation(self._focus_external_access, escalation_available)
@@ -2379,15 +2400,30 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             use crate::conductor::provider_selection::{
                 resolve_external_provider, ExternalProviderResolution,
             };
-            match resolve_external_provider(
-                &self.pool,
-                &user_id,
-                &persona_id,
-                &focus_id,
-                effective_access,
-            )
-            .await
-            {
+            let resolution = match &self.chat_binding {
+                // items.id=716: a bound conversation resolves its own
+                // provider; the user's preference is not consulted. The
+                // ceiling still applies.
+                Some(bound) => {
+                    crate::conductor::provider_selection::resolve_bound_provider(
+                        &self.pool,
+                        &bound.provider_id,
+                        effective_access,
+                    )
+                    .await
+                }
+                None => {
+                    resolve_external_provider(
+                        &self.pool,
+                        &user_id,
+                        &persona_id,
+                        &focus_id,
+                        effective_access,
+                    )
+                    .await
+                }
+            };
+            match resolution {
                 ExternalProviderResolution::Selected(id) => (Some(id), None),
                 ExternalProviderResolution::NotConfigured => (None, None),
                 ExternalProviderResolution::ExcludedByCeiling { provider_name } => {
@@ -2424,6 +2460,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             key_hex: self.key_hex.clone().unwrap_or_default(),
             attendance: self.attendance,
             stream: self.chat_stream.clone(),
+            bound: self.chat_binding.clone(),
         };
 
         // Borrow distinct fields of self simultaneously — Rust borrow checker allows
@@ -3463,6 +3500,18 @@ pub async fn rehydrate_focus_run<L: DisclosureLoggerForRun>(
         app_handle,
     );
     run.focus_run_id = Some(focus_run_id);
+
+    // items.id=716: a resumed API Chat run goes back to the destination its
+    // conversation was bound to, never to whatever the user's preference
+    // happens to resolve to now. With no readable binding it does not run.
+    if run.focus_id == crate::api_chat::API_CHAT_FOCUS_ID {
+        let run_id = run.focus_run_id.clone().unwrap_or_default();
+        let bound =
+            crate::api_chat::destination_for_run(&run.user_id, &run.persona_id, key, &run_id)
+                .await
+                .map_err(|code| LifecycleError::ValidationFailed(code.as_str().to_owned()))?;
+        run.chat_binding = Some(bound);
+    }
 
     run.load().await?;
     run.resolve_tier_config().await?;
@@ -5479,6 +5528,185 @@ mod tests {
         }
     }
 
+    // -------------------------------------------------------------------------
+    // items.id=716: a rehydrated api-chat run goes back to its bound destination
+    // -------------------------------------------------------------------------
+
+    /// Seeds a paused api-chat run (focus_runs row in outputs.db) and returns
+    /// its id. The Persona's api-chat settings row is made at the given ceiling.
+    async fn seed_paused_api_chat_run(
+        pool: &sqlx::SqlitePool,
+        user_id: &str,
+        persona_id: &str,
+    ) -> String {
+        crate::persistence::focus_settings_store::ensure_focus_settings_default(
+            pool,
+            persona_id,
+            crate::api_chat::API_CHAT_FOCUS_ID,
+            ExternalAccess::Unrestricted,
+        )
+        .await
+        .expect("api-chat settings row");
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let mut conn = open_outputs_db(user_id, persona_id, RESUME_TEST_KEY_HEX)
+            .await
+            .expect("open_outputs_db");
+        sqlx::query(
+            "INSERT INTO focus_runs
+             (id, focus_id, status, is_fast_lane, is_quick_ask, topic_id, user_input, started_at)
+             VALUES (?, 'api-chat', 'awaiting_user', 0, 0, NULL, 'User: hi', ?)",
+        )
+        .bind(&run_id)
+        .bind(now())
+        .execute(&mut conn)
+        .await
+        .expect("seed focus_runs");
+        run_id
+    }
+
+    async fn rehydrate_api_chat(
+        pool: &sqlx::SqlitePool,
+        user_id: &str,
+        persona_id: &str,
+        run_id: &str,
+    ) -> Result<FocusRun, LifecycleError> {
+        rehydrate_focus_run(
+            user_id.to_owned(),
+            persona_id.to_owned(),
+            run_id.to_owned(),
+            pool.clone(),
+            Arc::new(ConductorScheduler::new()),
+            Some(RESUME_TEST_KEY_HEX.to_owned()),
+            std::collections::HashSet::new(),
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_rehydrated_api_chat_run_re_derives_its_binding_through_the_reply_message() {
+        use crate::persistence::chat_binding_store::{create_binding, ChatKind};
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let (user_id, persona_id) = ("bind-user", "bind-persona");
+        let pool = setup_shared_and_persona_for_resume_test(user_id, persona_id).await;
+        let key = RESUME_TEST_KEY_HEX;
+
+        // 1. A run whose conversation is bound: the destination comes back,
+        // and it is the BINDING, not a preference (none exists here).
+        let run_id = seed_paused_api_chat_run(&pool, user_id, persona_id).await;
+        create_binding(
+            user_id,
+            persona_id,
+            key,
+            "chat-bound",
+            ChatKind::Api,
+            "prov-bound",
+            "model-bound",
+        )
+        .await
+        .unwrap();
+        crate::persistence::message_store::save_message(
+            user_id,
+            persona_id,
+            key,
+            "chat-bound",
+            "assistant",
+            "",
+            Some(&run_id),
+        )
+        .await
+        .unwrap();
+        let run = rehydrate_api_chat(&pool, user_id, persona_id, &run_id)
+            .await
+            .expect("a bound run rehydrates");
+        assert_eq!(
+            run.chat_binding,
+            Some(crate::api_chat::BoundDestination {
+                provider_id: "prov-bound".to_owned(),
+                model_id: "model-bound".to_owned(),
+            })
+        );
+        assert!(
+            run.chat_stream.is_none(),
+            "a resumed run has no stream, as documented"
+        );
+
+        // 2. The reply message exists but its conversation has no binding.
+        let run_id = seed_paused_api_chat_run(&pool, user_id, persona_id).await;
+        crate::persistence::message_store::save_message(
+            user_id,
+            persona_id,
+            key,
+            "chat-unbound",
+            "assistant",
+            "",
+            Some(&run_id),
+        )
+        .await
+        .unwrap();
+        let err = rehydrate_api_chat(&pool, user_id, persona_id, &run_id)
+            .await
+            .err()
+            .expect("no binding means the run does not continue");
+        assert!(
+            err.to_string().contains("api_chat.binding_missing"),
+            "{err}"
+        );
+
+        // 3. The conversation is bound, but as a QR chat: not an API destination.
+        let run_id = seed_paused_api_chat_run(&pool, user_id, persona_id).await;
+        create_binding(
+            user_id,
+            persona_id,
+            key,
+            "chat-qr-kind",
+            ChatKind::Qr,
+            "prov-bound",
+            "model-bound",
+        )
+        .await
+        .unwrap();
+        crate::persistence::message_store::save_message(
+            user_id,
+            persona_id,
+            key,
+            "chat-qr-kind",
+            "assistant",
+            "",
+            Some(&run_id),
+        )
+        .await
+        .unwrap();
+        let err = rehydrate_api_chat(&pool, user_id, persona_id, &run_id)
+            .await
+            .err()
+            .expect("a QR-kind binding is not an API destination");
+        assert!(
+            err.to_string().contains("api_chat.binding_missing"),
+            "{err}"
+        );
+
+        // 4. The run has no reply message at all.
+        let run_id = seed_paused_api_chat_run(&pool, user_id, persona_id).await;
+        let err = rehydrate_api_chat(&pool, user_id, persona_id, &run_id)
+            .await
+            .err()
+            .expect("no reply message means no binding to find");
+        assert!(
+            err.to_string().contains("api_chat.binding_missing"),
+            "{err}"
+        );
+
+        match saved_root {
+            Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+            None => std::env::remove_var("QR_DATA_ROOT"),
+        }
+    }
+
     /// End-to-end (minus the model call) proof that a paused quick-ask run
     /// survives a rehydrate: real shared.db + real quick-ask.focus (the
     /// shipped artifact, one step: "draft") + a real checkpoint written via
@@ -5573,6 +5801,10 @@ mod tests {
         .expect("rehydrate_focus_run must succeed");
 
         assert_eq!(run.focus_id, "quick-ask");
+        assert!(
+            run.chat_binding.is_none(),
+            "only an api-chat run re-derives a binding"
+        );
         assert_eq!(
             run.user_input, "Test user input for resume",
             "user_input must round-trip from focus_runs.user_input (outputs_010.sql)"
@@ -6412,5 +6644,68 @@ mod tests {
         } else {
             std::env::remove_var("QR_DATA_ROOT");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// items.id=716: the shipped api-chat Focus
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod api_chat_focus_tests {
+    use super::*;
+
+    const API_CHAT_FOCUS: &str = include_str!("../../../app/core_artifacts/focuses/api-chat.focus");
+
+    fn parsed() -> FocusDefinition {
+        parse_focus_text(API_CHAT_FOCUS).expect("api-chat.focus must parse")
+    }
+
+    #[test]
+    fn it_is_one_external_step_with_no_handoff_and_no_override() {
+        let def = parsed();
+        assert_eq!(def.focus_id, crate::api_chat::API_CHAT_FOCUS_ID);
+        assert_eq!(def.max_routing_tier, ExternalAccess::Unrestricted);
+        assert_eq!(def.steps.len(), 1);
+        let step = &def.steps[0];
+        assert_eq!(step.routing_tier, ExternalAccess::Unrestricted);
+        assert!(
+            !step.requires_user_handoff,
+            "routing_tier 3 alone would imply a handoff"
+        );
+        assert_eq!(
+            step.external_access_override, None,
+            "an unrestricted step carries no override"
+        );
+        assert!(
+            step.field_requirements.is_empty(),
+            "no personal field reaches the provider"
+        );
+        assert_eq!(def.output_type, "api_chat");
+    }
+
+    #[test]
+    fn the_prompt_carries_only_the_conversation() {
+        let step = &parsed().steps[0];
+        assert!(step.prompt_template.contains("{user_input}"));
+        for token in ["{persona_context}", "{voice_profile}", "{previous_output}"] {
+            assert!(
+                !step.prompt_template.contains(token),
+                "{token} must not ride on an API Chat prompt"
+            );
+        }
+        // No output limit here: the model row's limit governs the hosted call
+        // (the spend gate's worst case depends on it).
+        assert!(!step.options_override.contains_key("num_predict"));
+    }
+
+    #[test]
+    fn it_declares_its_own_guide_and_never_uses_the_retired_default() {
+        let def = parsed();
+        assert!(def.steps.iter().all(|s| s.guide_id == "api-chat-guide"));
+        assert!(
+            !API_CHAT_FOCUS.to_lowercase().contains("quick"),
+            "Quick Ask is a retired concept (decisions.id=804)"
+        );
     }
 }

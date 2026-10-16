@@ -138,15 +138,20 @@ pub struct ReenterStepResponse {
 /// field -- that DTO is deserialized directly from the frontend, and this
 /// safety floor must always be server-computed from the real text, never
 /// trusted from the client.
+///
+/// `bound` (items.id=716) is the provider and model an API Chat run is bound
+/// to. It is set before AUTHORIZE because authorize builds the failure handler
+/// from provider resolution. Every other caller passes None.
 pub(crate) async fn load_and_authorize_run(
     app_handle: tauri::AppHandle,
     scheduler: tauri::State<'_, Arc<ConductorScheduler>>,
     pool: tauri::State<'_, sqlx::SqlitePool>,
     key_hex: String,
     crisis_detected: bool,
+    bound: Option<crate::api_chat::BoundDestination>,
     request: SubmitFocusRunRequest,
 ) -> Result<FocusRun, String> {
-    let is_quick_ask = request.focus_id == "quick-ask";
+    let is_quick_ask = is_quick_ask_focus(&request.focus_id);
     let scheduler = Arc::clone(&*scheduler);
     let confirmed_cross_persona_fact_ids: std::collections::HashSet<String> = request
         .confirmed_cross_persona_fact_ids
@@ -174,6 +179,7 @@ pub(crate) async fn load_and_authorize_run(
         Some(app_handle),
     );
     run.crisis_floor_triggered = crisis_detected;
+    run.chat_binding = bound;
     // A user started this run from the app (items.id=710): attended.
     run.attendance = crate::spend::gate::RunAttendance::Attended;
 
@@ -183,6 +189,13 @@ pub(crate) async fn load_and_authorize_run(
     run.authorize().await.map_err(|e| e.to_string())?;
 
     Ok(run)
+}
+
+/// Whether a run's Focus id is the retired Quick Ask Focus. Pulled out so a
+/// test can pin that an API Chat run (`api-chat`) never counts as one
+/// (items.id=716).
+fn is_quick_ask_focus(focus_id: &str) -> bool {
+    focus_id == "quick-ask"
 }
 
 #[tauri::command]
@@ -210,6 +223,7 @@ pub async fn submit_focus_run(
         pool,
         key_hex_str,
         crisis_detected,
+        None,
         request,
     )
     .await?;
@@ -676,4 +690,19 @@ pub async fn reenter_step(
         discarded_step_ids: plan.discarded_step_ids,
         stale_output_vars: plan.stale_output_vars,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// items.id=716: an API Chat run never counts as Quick Ask (a retired
+    /// concept, decisions.id=804), so `is_quick_ask` is never set for it.
+    #[test]
+    fn only_the_quick_ask_focus_id_is_quick_ask() {
+        assert!(is_quick_ask_focus("quick-ask"));
+        assert!(!is_quick_ask_focus(crate::api_chat::API_CHAT_FOCUS_ID));
+        assert!(!is_quick_ask_focus("writing-assistant"));
+        assert!(!is_quick_ask_focus(""));
+    }
 }

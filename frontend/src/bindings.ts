@@ -931,6 +931,8 @@ export const commands = {
 	 */
 	cancelOauthConnect: (sessionId: string) => typedError<null, string>(__TAURI_INVOKE("cancel_oauth_connect", { sessionId })),
 	cancelChatStream: (runId: string) => typedError<null, string>(__TAURI_INVOKE("cancel_chat_stream", { runId })),
+	createApiChat: (request: CreateApiChatRequest) => typedError<CreateApiChatResponse, string>(__TAURI_INVOKE("create_api_chat", { request })),
+	sendApiChatMessage: (request: SendApiChatRequest) => typedError<SendApiChatOutcome, string>(__TAURI_INVOKE("send_api_chat_message", { request })),
 };
 
 /* Types */
@@ -1072,6 +1074,14 @@ export type ChatInfo = {
 	archived_at: string | null,
 	created_at: string,
 	last_message_at: string,
+	/**
+	 *  items.id=716: "qr" for a QR chat (no binding row) or "api" for an API
+	 *  Chat, so History can keep the two surfaces apart.
+	 */
+	kind: string,
+	/**  The provider and model an API Chat is bound to; None for a QR chat. */
+	provider_id: string | null,
+	model_id: string | null,
 };
 
 /**  What happened to the key check. */
@@ -1212,6 +1222,18 @@ export type CostEstimate = {
 	 *  is applied to the worst case only when it is above 1.0.
 	 */
 	calibration: CalibrationDto,
+};
+
+export type CreateApiChatRequest = {
+	user_id: string,
+	persona_id: string,
+	provider_id: string,
+	model_id: string,
+};
+
+export type CreateApiChatResponse = {
+	/**  The conversation's key ("chat-{uuid}"). Its binding is immutable. */
+	context_key: string,
 };
 
 export type CreatePersonaRequest = {
@@ -1516,6 +1538,15 @@ export type MessageInfo = {
 	 *  non-blocking notice.
 	 */
 	personal_flagged: boolean,
+	/**
+	 *  items.id=716: "complete", "truncated", "cancelled" or "cut". A reply
+	 *  that was shown and then cancelled or cut keeps its text and says so; a
+	 *  truncated one hit the output token limit.
+	 */
+	reply_status: string,
+	/**  items.id=716: the provider and model that produced an API Chat reply. */
+	provider_id: string | null,
+	model_id: string | null,
 };
 
 export type ModelPriceDto = {
@@ -2151,6 +2182,43 @@ export type SelectionScope = { kind: "account" } | { kind: "persona"; persona_id
 
 /**  Which level a resolved selection came from. */
 export type SelectionSource = "focus" | "persona" | "account";
+
+export type SendApiChatOutcome = 
+/**
+ *  The message was sent. `messages` is the transcript with the reserved
+ *  reply row; `message-delta` streams the text and `message-content-ready`
+ *  is the completion signal. The omitted counts are history messages left
+ *  out of what was sent (a flagged reply that must not go to this
+ *  provider, a user turn that was never reviewed), so omission is never
+ *  silent.
+ */
+{ type: "sent"; messages: MessageInfo[]; omitted_flagged: number; omitted_unreviewed: number } | 
+/**
+ *  The Privacy Guardian has a question. A `consent_request` event with
+ *  this key as its `focus_run_id` was emitted. Nothing was saved or sent.
+ *  Record the user's answers under the key, then send again with it.
+ */
+{ type: "review_required"; review_key: string };
+
+export type SendApiChatRequest = {
+	user_id: string,
+	persona_id: string,
+	context_key: string,
+	/**  The user's turn, exactly as typed. */
+	content: string,
+	/**
+	 *  entity_facts.id values the user already confirmed this session
+	 *  (decisions.id=815); same meaning as in send_message.
+	 */
+	confirmed_cross_persona_fact_ids: string[],
+	/**
+	 *  The review key from an earlier `review_required` outcome, sent back
+	 *  once the user has answered the Privacy Guardian modal (their answers
+	 *  are recorded under the key with submit_chat_copy_consent_decision).
+	 *  None starts a new review.
+	 */
+	review_key: string | null,
+};
 
 /**
  *  Bundled to keep send_message's own parameter count under specta's 10-arg

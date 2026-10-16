@@ -1,0 +1,45 @@
+# app/core_artifacts/focuses/api-chat.focus
+# API Chat — one-step Focus behind an API conversation (items.id=716).
+#
+# A conversation bound to a hosted provider and model (chat_bindings) runs
+# this Focus. The step is external (routing_tier 3, ceiling Unrestricted) but
+# is NOT a handoff: the call goes straight to the bound provider through the
+# existing consent, limits, spend reservation and Gate 1/2/3 path.
+# requires_user_handoff is set explicitly because routing_tier 3 would
+# otherwise imply a handoff.
+#
+# No personal fields and no {persona_context} token: only the conversation
+# text reaches the provider. The Persona's focus_settings row for this Focus
+# (created lazily, local_only until the user raises it through the friction
+# gate) stays the hard ceiling.
+#
+# Guide: api-chat-guide is declared so the parser never falls back to its
+# default guide id. No .guide artifact exists for it yet (reported to
+# Chat-PM); the guide id is read only for the run's version manifest.
+
+id: api-chat
+display_name: API Chat
+description: >
+  A conversation with a hosted AI provider and model chosen for this chat.
+version: "1.0"
+max_routing_tier: 3
+guides:
+  - api-chat-guide
+output_types:
+  - api_chat
+suggest_in_focuses: []
+
+steps:
+  reply:
+    display_name: Replying...
+    task_type: general
+    routing_tier: 3
+    requires_user_handoff: false
+    step_type: generate
+    output_var: reply
+    prompt_template: >
+      Continue this conversation as the assistant. Reply to the last User
+      message.
+
+      {user_input}
+    field_requirements: []

@@ -1162,25 +1162,86 @@ pub async fn write_element_consent_decisions(
 pub const COPY_REVIEW_FOCUS_ID: &str = "chat-copy";
 pub const COPY_REVIEW_RUN_ID_PREFIX: &str = "clipboard-copy-chat-";
 
+/// items.id=716: the same kind of synthetic key and stub run, for the Privacy
+/// Guardian review of one outbound API Chat message. One key per send, so a
+/// decision on one message never carries to another (a standing preference,
+/// which the user opts into, is the only thing that does).
+pub const API_SEND_REVIEW_FOCUS_ID: &str = "api-chat-send";
+pub const API_SEND_REVIEW_RUN_ID_PREFIX: &str = "api-chat-send-";
+
 async fn ensure_copy_review_run_conn(
     conn: &mut SqliteConnection,
     run_id: &str,
 ) -> Result<(), OutputStoreError> {
-    if !run_id.starts_with(COPY_REVIEW_RUN_ID_PREFIX) {
+    let focus_id = if run_id.starts_with(COPY_REVIEW_RUN_ID_PREFIX) {
+        COPY_REVIEW_FOCUS_ID
+    } else if run_id.starts_with(API_SEND_REVIEW_RUN_ID_PREFIX) {
+        API_SEND_REVIEW_FOCUS_ID
+    } else {
         return Err(OutputStoreError::Validation(format!(
-            "run_id must start with '{COPY_REVIEW_RUN_ID_PREFIX}', got '{run_id}'"
+            "run_id must start with '{COPY_REVIEW_RUN_ID_PREFIX}' or \
+             '{API_SEND_REVIEW_RUN_ID_PREFIX}', got '{run_id}'"
         )));
-    }
+    };
     sqlx::query(
         "INSERT OR IGNORE INTO focus_runs (id, focus_id, status, started_at)
          VALUES (?, ?, 'complete', ?)",
     )
     .bind(run_id)
-    .bind(COPY_REVIEW_FOCUS_ID)
+    .bind(focus_id)
     .bind(crate::providers::utils::now())
     .execute(conn)
     .await?;
     Ok(())
+}
+
+/// One recorded answer to a Privacy Guardian span, as read back by the API
+/// Chat send (items.id=716) to apply to the outbound text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedSpanDecision {
+    pub span_id: String,
+    /// "generalize" | "keep_private" | "release_original"
+    pub decision: String,
+    pub suggestion_text: Option<String>,
+    pub user_modified_text: Option<String>,
+}
+
+/// The element-consent decisions recorded under `run_id`, latest per span_id.
+/// A span with no row here was not answered.
+pub async fn list_element_decisions_for_run(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    run_id: &str,
+) -> Result<Vec<RecordedSpanDecision>, OutputStoreError> {
+    if key_hex.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
+    let rows = sqlx::query(
+        "SELECT span_id, decision, suggestion_text, user_modified_text
+         FROM consent_decisions
+         WHERE focus_run_id = ? AND decision_type = 'element_consent' AND span_id IS NOT NULL
+         ORDER BY created_at DESC, rowid DESC",
+    )
+    .bind(run_id)
+    .fetch_all(&mut conn)
+    .await?;
+
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for r in &rows {
+        let span_id: String = r.try_get("span_id")?;
+        if seen.insert(span_id.clone()) {
+            out.push(RecordedSpanDecision {
+                span_id,
+                decision: r.try_get("decision")?,
+                suggestion_text: r.try_get("suggestion_text")?,
+                user_modified_text: r.try_get("user_modified_text")?,
+            });
+        }
+    }
+    Ok(out)
 }
 
 /// Record the Privacy Guardian decisions for a copy-time review (items.id=501
