@@ -49,7 +49,7 @@ pub async fn run_periodic_sweep(
     app_handle: Option<tauri::AppHandle<tauri::Wry>>,
 ) {
     let Some((user_id, key_hex_str)) = key_registry
-        .with_key(|k| (k.user_id.clone(), key_hex(&k.master_key)))
+        .with_key(|k| (k.user_id.clone(), key_hex(&k.data_key)))
         .await
     else {
         return; // no account resident -- nothing this tick can check against

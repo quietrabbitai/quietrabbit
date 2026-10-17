@@ -39,6 +39,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use regex::Regex;
+#[cfg(test)]
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::ConnectOptions;
 use sqlx::Row;
@@ -108,6 +109,10 @@ fn phone_pattern() -> &'static Regex {
 
 #[derive(Debug, Error)]
 pub enum PersonalStoreError {
+    /// The account's key epoch changed since this session unlocked
+    /// (auth::epoch_guard, items.id=629).
+    #[error("{0}")]
+    KeyEpoch(#[from] crate::auth::epoch_guard::KeyEpochError),
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("Decryption error: {0}")]
@@ -155,6 +160,7 @@ pub(crate) async fn open_personal_db(
     persona_id: &str,
     key_hex: &str,
 ) -> Result<SqliteConnection, PersonalStoreError> {
+    crate::auth::epoch_guard::ensure_current(user_id).await?;
     let db_path = get_personal_db_path(user_id, persona_id);
 
     // BUG FOUND + FIXED (items.id=389, same class as items.id=384 slice 7's
@@ -177,7 +183,7 @@ pub(crate) async fn open_personal_db(
         .unwrap_or(false);
     let journal_mode = if network_storage { "DELETE" } else { "WAL" };
 
-    let conn = SqliteConnectOptions::new()
+    let conn = crate::providers::utils::quiet_connect_options()
         .filename(&db_path)
         .create_if_missing(false)
         // SQLCipher's PRAGMA key blob-literal syntax requires the x'...'

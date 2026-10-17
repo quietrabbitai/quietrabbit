@@ -28,6 +28,7 @@
 use std::path::{Path, PathBuf};
 
 use sqlx::sqlite::SqliteConnectOptions;
+use sqlx::ConnectOptions;
 
 // ---------------------------------------------------------------------------
 // Timestamp
@@ -134,6 +135,18 @@ pub fn db_path_tier3_cookies(user_id: &str) -> PathBuf {
 // SqliteConnectOptions builders
 // ---------------------------------------------------------------------------
 
+/// SqliteConnectOptions with sqlx's per-statement logging switched off, for
+/// every connection that sends a key. sqlx logs each statement it runs at
+/// debug level (and slow ones at warn), and `PRAGMA key = "x'...'"` /
+/// `PRAGMA rekey` are statements: left on, a debug-level log (RUST_LOG=debug)
+/// carries the data key in plaintext (found by items.id=629's no-key-material
+/// test). Statement logging is the only thing lost on these connections.
+pub fn quiet_connect_options() -> SqliteConnectOptions {
+    SqliteConnectOptions::new()
+        .log_statements(log::LevelFilter::Off)
+        .log_slow_statements(log::LevelFilter::Off, std::time::Duration::from_secs(1))
+}
+
 /// SqliteConnectOptions for UNENCRYPTED databases (shared.db only).
 /// No PRAGMA key. Journal mode applied via .pragma().
 /// Python oracle: open_db() / open_instance_db()
@@ -162,7 +175,7 @@ pub fn connect_options_unencrypted(path: &Path) -> SqliteConnectOptions {
 /// key_hex: hex-encoded key string from InMemoryKeyRegistry.
 /// Python oracle: open_personal_db() / open_outputs_db() / open_integration_keys_db()
 pub fn connect_options_encrypted(path: &Path, key_hex: &str) -> SqliteConnectOptions {
-    SqliteConnectOptions::new()
+    quiet_connect_options()
         .filename(path)
         .create_if_missing(true)
         .pragma("key", format!("\"x'{key_hex}'\"")) // FIRST — SQLCipher requirement

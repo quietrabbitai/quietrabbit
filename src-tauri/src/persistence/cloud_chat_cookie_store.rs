@@ -37,6 +37,10 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum CloudChatCookieStoreError {
+    /// The account's key epoch changed since this session unlocked
+    /// (auth::epoch_guard, items.id=629).
+    #[error("{0}")]
+    KeyEpoch(#[from] crate::auth::epoch_guard::KeyEpochError),
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("Migration error: {0}")]
@@ -101,6 +105,7 @@ async fn open_tier3_cookies_db(
     user_id: &str,
     key_hex: &str,
 ) -> Result<SqliteConnection, CloudChatCookieStoreError> {
+    crate::auth::epoch_guard::ensure_current(user_id).await?;
     let db_path = get_tier3_cookies_db_path(user_id);
 
     if !db_path.exists() {

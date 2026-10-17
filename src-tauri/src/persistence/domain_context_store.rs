@@ -26,7 +26,7 @@
 
 use std::path::PathBuf;
 
-use sqlx::sqlite::{SqliteConnectOptions, SqliteRow};
+use sqlx::sqlite::SqliteRow;
 use sqlx::ConnectOptions;
 use sqlx::Row;
 use sqlx::SqliteConnection;
@@ -38,6 +38,10 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum DomainContextStoreError {
+    /// The account's key epoch changed since this session unlocked
+    /// (auth::epoch_guard, items.id=629).
+    #[error("{0}")]
+    KeyEpoch(#[from] crate::auth::epoch_guard::KeyEpochError),
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("Migration error: {0}")]
@@ -167,6 +171,7 @@ async fn open_domain_context_db(
     focus_id: &str,
     key_hex: &str,
 ) -> Result<SqliteConnection, DomainContextStoreError> {
+    crate::auth::epoch_guard::ensure_current(user_id).await?;
     let db_path = get_domain_context_path(user_id, persona_id, focus_id);
 
     if !db_path.exists() {
@@ -184,7 +189,7 @@ async fn open_domain_context_db(
     // PRAGMA key MUST be registered before journal_mode (D6-346).
     // SqliteConnectOptions.pragma() fires pragmas in insertion order after
     // sqlite3_open_v2 — key is first, journal_mode second.
-    let conn = SqliteConnectOptions::new()
+    let conn = crate::providers::utils::quiet_connect_options()
         .filename(&db_path)
         .create_if_missing(false)
         .pragma("key", format!("\"x'{key_hex}'\""))

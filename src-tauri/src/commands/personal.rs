@@ -72,7 +72,7 @@ pub async fn get_personal_fields(
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<Vec<PersonalFieldInfo>, String> {
     let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
+        .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
@@ -100,7 +100,7 @@ pub async fn update_personal_field(
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<PersonalFieldInfo, String> {
     let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
+        .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
@@ -150,7 +150,7 @@ pub async fn get_voice_profile(
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<VoiceProfileInfo, String> {
     let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
+        .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 

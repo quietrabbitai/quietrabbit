@@ -106,7 +106,7 @@ pub async fn create_group(
 ) -> Result<String, GroupCreationError> {
     // 1. Resolve the caller -- hard requirement, see module header.
     let (current_user_id, personal_key_hex) = key_registry
-        .with_key(|k| (k.user_id.clone(), key_hex(&k.master_key)))
+        .with_key(|k| (k.user_id.clone(), key_hex(&k.data_key)))
         .await
         .ok_or(GroupCreationError::NotLoggedIn)?;
 
@@ -259,7 +259,7 @@ mod tests {
         let user_id = uuid::Uuid::new_v4().to_string();
         let master_key = [master_key_fill; kdf::MASTER_KEY_LEN];
         let (sharing_private_key, sharing_public_key) =
-            sharing_keypair::derive_sharing_keypair(&master_key, &user_id);
+            sharing_keypair::derive_sharing_keypair(&master_key, &user_id, 1);
 
         crate::auth::user_store::create_user(
             pool,
@@ -291,7 +291,8 @@ mod tests {
         key_registry
             .replace(UnlockedKey {
                 user_id: user_id.clone(),
-                master_key,
+                data_key: master_key,
+                key_epoch: 1,
                 sharing_private_key: sharing_private_key.to_bytes(),
                 unlocked_at: crate::providers::utils::now(),
             })
@@ -487,7 +488,7 @@ mod tests {
             make_logged_in_user_with_persona(pool, "Grace", 0x77, &grace_key_registry).await;
         let grace_master_key = [0x77u8; kdf::MASTER_KEY_LEN];
         let (grace_sharing_private_key, _) =
-            sharing_keypair::derive_sharing_keypair(&grace_master_key, &_grace_user_id);
+            sharing_keypair::derive_sharing_keypair(&grace_master_key, &_grace_user_id, 1);
 
         let invitation_id = group_invitations::send_invitation(
             pool,

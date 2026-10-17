@@ -423,13 +423,14 @@ export const commands = {
 	login: (displayName: string, password: string) => typedError<null, string>(__TAURI_INVOKE("login", { displayName, password })),
 	logout: () => typedError<null, string>(__TAURI_INVOKE("logout")),
 	/**
-	 *  Derive and return the current session's recovery mnemonic for one-time
-	 *  display. Section 8.5's Option B: `Mnemonic::from_entropy()` on the raw
-	 *  32-byte master key directly, not a wrapper key -- `Mnemonic::parse()` on
-	 *  the returned phrase later recovers the exact original bytes, no
-	 *  unwrapping step. Requires a resident session (KeyRegistry) the same way
-	 *  qr_hosted::get_qr_hosted_config does; "not logged in" is the same error string
-	 *  for the same reason -- there is no key to derive a mnemonic from yet.
+	 *  Return the new account's 24-word recovery phrase for its ONE-TIME
+	 *  display (items.id=629, decisions.id=893, Architecture 8.5). The phrase is
+	 *  independent 256-bit recovery entropy generated at account creation, not
+	 *  the data key, and it is held only in KeyRegistry's pending slot: this
+	 *  command takes it, so a second call (or a call after logout) finds
+	 *  nothing. QR keeps no copy once this returns. Requires a resident session
+	 *  the same way qr_hosted::get_qr_hosted_config does; "not logged in" is the
+	 *  same error string for the same reason.
 	 */
 	getRecoveryKeyDisplay: () => typedError<RecoveryKeyDisplay, string>(__TAURI_INVOKE("get_recovery_key_display")),
 	/**

@@ -943,6 +943,16 @@ TABLE user_capabilities
   capability TEXT notnull=1 pk=3 default=None
   allowed INTEGER notnull=1 pk=0 default=Some("1")
   created_at TEXT notnull=1 pk=0 default=None
+TABLE user_key_wrappers
+  user_id TEXT notnull=0 pk=1 default=None
+  key_epoch INTEGER notnull=1 pk=0 default=Some("1")
+  format_version INTEGER notnull=1 pk=0 default=None
+  password_wrap_hex TEXT notnull=1 pk=0 default=None
+  recovery_public_key_hex TEXT notnull=1 pk=0 default=None
+  recovery_seal_hex TEXT notnull=1 pk=0 default=None
+  pending_rotation TEXT notnull=0 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+  updated_at TEXT notnull=1 pk=0 default=None
 TABLE user_personas
   user_id TEXT notnull=1 pk=1 default=None
   persona_id TEXT notnull=1 pk=2 default=None

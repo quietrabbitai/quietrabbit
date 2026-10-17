@@ -502,7 +502,7 @@ mod tests {
         let user_id = uuid::Uuid::new_v4().to_string();
         let master_key = [master_key_fill; kdf::MASTER_KEY_LEN];
         let (sharing_private_key, sharing_public_key) =
-            sharing_keypair::derive_sharing_keypair(&master_key, &user_id);
+            sharing_keypair::derive_sharing_keypair(&master_key, &user_id, 1);
 
         crate::auth::user_store::create_user(
             pool,
@@ -759,7 +759,7 @@ mod tests {
         let second_user_id = uuid::Uuid::new_v4().to_string();
         let master_key = [0x99u8; kdf::MASTER_KEY_LEN];
         let (_priv, pub_key) =
-            sharing_keypair::derive_sharing_keypair(&master_key, &second_user_id);
+            sharing_keypair::derive_sharing_keypair(&master_key, &second_user_id, 1);
         crate::auth::user_store::create_user(
             pool,
             &second_user_id,

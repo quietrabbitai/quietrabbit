@@ -17,7 +17,6 @@
 
 use std::path::PathBuf;
 
-use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::ConnectOptions;
 use sqlx::Row;
 use sqlx::SqliteConnection;
@@ -28,6 +27,10 @@ use crate::persistence::entity_store::Entity;
 
 #[derive(Debug, Error)]
 pub enum ViewCacheStoreError {
+    /// The account's key epoch changed since this session unlocked
+    /// (auth::epoch_guard, items.id=629).
+    #[error("{0}")]
+    KeyEpoch(#[from] crate::auth::epoch_guard::KeyEpochError),
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("Migration error: {0}")]
@@ -97,6 +100,7 @@ pub(crate) async fn open_view_cache_db(
     share_id: &str,
     key_hex: &str,
 ) -> Result<SqliteConnection, ViewCacheStoreError> {
+    crate::auth::epoch_guard::ensure_current(user_id).await?;
     let db_path = get_view_cache_db_path(user_id, share_id);
 
     if !db_path.exists() {
@@ -108,7 +112,7 @@ pub(crate) async fn open_view_cache_db(
         .unwrap_or(false);
     let journal_mode = if network_storage { "DELETE" } else { "WAL" };
 
-    let conn = SqliteConnectOptions::new()
+    let conn = crate::providers::utils::quiet_connect_options()
         .filename(&db_path)
         .create_if_missing(false)
         .pragma("key", format!("\"x'{key_hex}'\""))

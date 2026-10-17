@@ -510,7 +510,7 @@ pub async fn list_messages(
     context_key: String,
 ) -> Result<Vec<MessageInfo>, String> {
     let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
+        .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
@@ -539,7 +539,7 @@ pub async fn send_message(
     } = request;
 
     let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
+        .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 

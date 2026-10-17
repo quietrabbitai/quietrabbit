@@ -105,6 +105,10 @@ impl ReplyStatus {
 
 #[derive(Debug, Error)]
 pub enum MessageStoreError {
+    /// The account's key epoch changed since this session unlocked
+    /// (auth::epoch_guard, items.id=629).
+    #[error("{0}")]
+    KeyEpoch(#[from] crate::auth::epoch_guard::KeyEpochError),
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("Validation error: {0}")]
@@ -155,6 +159,7 @@ pub(crate) async fn open_messages_db(
     persona_id: &str,
     key_hex: &str,
 ) -> Result<SqliteConnection, MessageStoreError> {
+    crate::auth::epoch_guard::ensure_current(user_id).await?;
     if key_hex.is_empty() {
         return Err(MessageStoreError::Validation(
             "key_hex required".to_string(),

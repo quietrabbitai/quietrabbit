@@ -634,7 +634,7 @@ pub async fn open_cloud_chat_panes(
     // reason to refuse opening the pane, matching restore_cookies_into_jar's
     // own best-effort framing.
     let session = key_registry
-        .with_key(|k| (k.user_id.clone(), key_hex(&k.master_key)))
+        .with_key(|k| (k.user_id.clone(), key_hex(&k.data_key)))
         .await;
 
     for provider_id in provider_ids {
@@ -706,7 +706,7 @@ pub async fn close_cloud_chat_pane(
     }
 
     let session = key_registry
-        .with_key(|k| (k.user_id.clone(), key_hex(&k.master_key)))
+        .with_key(|k| (k.user_id.clone(), key_hex(&k.data_key)))
         .await;
 
     match (

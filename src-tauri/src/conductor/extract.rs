@@ -45,7 +45,6 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::ConnectOptions;
 use sqlx::Row;
 use sqlx::SqliteConnection;
@@ -133,6 +132,9 @@ async fn open_outputs_db(
     persona_id: &str,
     key_hex: &str,
 ) -> Result<SqliteConnection, sqlx::Error> {
+    crate::auth::epoch_guard::ensure_current(user_id)
+        .await
+        .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
     let db_path = get_outputs_db_path(user_id, persona_id);
 
     if !db_path.exists() {
@@ -150,7 +152,7 @@ async fn open_outputs_db(
         .unwrap_or(false);
     let journal_mode = if network_storage { "DELETE" } else { "WAL" };
 
-    SqliteConnectOptions::new()
+    crate::providers::utils::quiet_connect_options()
         .filename(&db_path)
         .create_if_missing(false)
         .pragma("key", format!("\"x'{key_hex}'\""))

@@ -181,7 +181,7 @@ pub async fn list_outputs(
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<Vec<OutputInfo>, String> {
     let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
+        .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
@@ -236,7 +236,7 @@ pub async fn get_output(
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<OutputInfo, String> {
     let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
+        .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
@@ -269,7 +269,7 @@ pub async fn list_forward_links(
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<Vec<OutputInfo>, String> {
     let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
+        .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
@@ -304,7 +304,7 @@ pub async fn get_predecessor(
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<Option<OutputInfo>, String> {
     let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
+        .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
@@ -342,7 +342,7 @@ pub async fn delete_output(
     deep_purge: Option<bool>,
 ) -> Result<(), String> {
     let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
+        .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
@@ -365,7 +365,7 @@ pub async fn export_output(
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<(), String> {
     let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
+        .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
@@ -390,7 +390,7 @@ pub async fn update_active_document(
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<(), String> {
     let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
+        .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
@@ -515,7 +515,7 @@ pub async fn copy_output_to_clipboard(
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<(), String> {
     let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
+        .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 

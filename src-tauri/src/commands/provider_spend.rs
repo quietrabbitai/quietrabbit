@@ -365,7 +365,7 @@ pub struct CostEstimate {
 
 pub(crate) async fn session(key_registry: &KeyRegistry) -> Result<(String, String), String> {
     key_registry
-        .with_key(|k| (k.user_id.clone(), key_hex(&k.master_key)))
+        .with_key(|k| (k.user_id.clone(), key_hex(&k.data_key)))
         .await
         .ok_or_else(|| "not logged in".to_owned())
 }

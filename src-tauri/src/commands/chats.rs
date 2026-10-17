@@ -85,7 +85,7 @@ pub async fn list_chats(
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<Vec<ChatInfo>, String> {
     let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
+        .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
@@ -117,7 +117,7 @@ pub async fn archive_chat(
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<(), String> {
     let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
+        .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 

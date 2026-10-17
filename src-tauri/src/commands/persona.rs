@@ -290,7 +290,7 @@ pub async fn list_focuses(
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<Vec<FocusInfo>, String> {
     let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
+        .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
@@ -335,7 +335,7 @@ pub async fn get_focus_settings(
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<FocusInfo, String> {
     let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
+        .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
@@ -382,7 +382,7 @@ pub async fn update_focus_settings(
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<FocusInfo, String> {
     let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
+        .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 

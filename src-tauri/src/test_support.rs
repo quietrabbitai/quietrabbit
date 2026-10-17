@@ -74,11 +74,12 @@ pub async fn populate_registry(
     master_key: [u8; crate::auth::kdf::MASTER_KEY_LEN],
 ) {
     let (sharing_private_key, _) =
-        crate::auth::sharing_keypair::derive_sharing_keypair(&master_key, user_id);
+        crate::auth::sharing_keypair::derive_sharing_keypair(&master_key, user_id, 1);
     registry
         .replace(crate::auth::registry::UnlockedKey {
             user_id: user_id.to_owned(),
-            master_key,
+            data_key: master_key,
+            key_epoch: 1,
             sharing_private_key: sharing_private_key.to_bytes(),
             unlocked_at: crate::providers::utils::now(),
         })

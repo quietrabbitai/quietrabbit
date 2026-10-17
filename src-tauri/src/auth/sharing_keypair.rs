@@ -29,7 +29,9 @@
 // already paid on every login.
 //
 // DOMAIN SEPARATION: derive_sharing_keypair's HKDF info string
-// ("QuietRabbit-v1|x25519-sharing-key|{user_id}") is deliberately not just a
+// ("QuietRabbit-v1|x25519-sharing-key|account|{user_id}|epoch:{n}", the
+// AUTH Section 4.0 form; the "account" scope label is a build choice, items.id=
+// 629) is deliberately not just a
 // static label. The version tag supports future crypto-agility. The purpose
 // label is what prevents this derived subkey's namespace from colliding with
 // any OTHER future subkey HKDF-derived from the same master key -- this
@@ -115,16 +117,22 @@ fn hex_decode(user_id: &str, s: &str) -> Result<Vec<u8>, SharingKeypairError> {
 }
 
 /// Derive this account's X25519 sharing keypair deterministically from its
-/// resident master key. Pure function, no I/O -- called both at account
-/// creation (to obtain the public key for the shared.db write) and on every
-/// login (to populate KeyRegistry's resident UnlockedKey.sharing_private_key)
-/// -- see module header on why the private key is never persisted instead.
+/// resident data key (DEK) for one key epoch. Pure function, no I/O -- called
+/// both at account creation (to obtain the public key for the shared.db
+/// write) and on every login (to populate KeyRegistry's resident
+/// UnlockedKey.sharing_private_key) -- see module header on why the private
+/// key is never persisted instead.
+///
+/// `key_epoch` is part of the HKDF info string (decisions.id=893, AUTH
+/// Section 4.0/4.3): every rotation changes the DEK AND the epoch, so the
+/// keypair -- and therefore the published public key -- changes at each one.
 pub fn derive_sharing_keypair(
-    master_key: &[u8; kdf::MASTER_KEY_LEN],
+    data_key: &[u8; kdf::MASTER_KEY_LEN],
     user_id: &str,
+    key_epoch: u64,
 ) -> (StaticSecret, PublicKey) {
-    let hk = Hkdf::<Sha256>::new(None, master_key);
-    let info = format!("QuietRabbit-v1|x25519-sharing-key|{user_id}");
+    let hk = Hkdf::<Sha256>::new(None, data_key);
+    let info = format!("QuietRabbit-v1|x25519-sharing-key|account|{user_id}|epoch:{key_epoch}");
     let mut okm = Zeroizing::new([0u8; PUBLIC_KEY_LEN]);
     hk.expand(info.as_bytes(), okm.as_mut())
         .expect("32 bytes is a valid HKDF-SHA256 output length");
@@ -273,8 +281,8 @@ mod tests {
     #[test]
     fn same_master_key_and_user_id_derive_identical_keypair() {
         let master_key = [0x11u8; kdf::MASTER_KEY_LEN];
-        let (priv1, pub1) = derive_sharing_keypair(&master_key, "user-a");
-        let (priv2, pub2) = derive_sharing_keypair(&master_key, "user-a");
+        let (priv1, pub1) = derive_sharing_keypair(&master_key, "user-a", 1);
+        let (priv2, pub2) = derive_sharing_keypair(&master_key, "user-a", 1);
         assert_eq!(priv1.to_bytes(), priv2.to_bytes());
         assert_eq!(pub1.as_bytes(), pub2.as_bytes());
     }
@@ -284,9 +292,23 @@ mod tests {
         // Proves the info string's user_id component actually participates
         // in domain separation, not just the purpose label.
         let master_key = [0x22u8; kdf::MASTER_KEY_LEN];
-        let (priv_a, _) = derive_sharing_keypair(&master_key, "user-a");
-        let (priv_b, _) = derive_sharing_keypair(&master_key, "user-b");
+        let (priv_a, _) = derive_sharing_keypair(&master_key, "user-a", 1);
+        let (priv_b, _) = derive_sharing_keypair(&master_key, "user-b", 1);
         assert_ne!(priv_a.to_bytes(), priv_b.to_bytes());
+    }
+
+    #[test]
+    fn a_different_key_epoch_derives_a_different_keypair() {
+        // items.id=629: the epoch is in the HKDF info string, so every
+        // rotation publishes a new public key even from the same bytes.
+        let master_key = [0x23u8; kdf::MASTER_KEY_LEN];
+        let (priv_1, pub_1) = derive_sharing_keypair(&master_key, "user-a", 1);
+        let (priv_1b, pub_1b) = derive_sharing_keypair(&master_key, "user-a", 1);
+        let (priv_2, pub_2) = derive_sharing_keypair(&master_key, "user-a", 2);
+        assert_eq!(priv_1.to_bytes(), priv_1b.to_bytes());
+        assert_eq!(pub_1.as_bytes(), pub_1b.as_bytes());
+        assert_ne!(priv_1.to_bytes(), priv_2.to_bytes());
+        assert_ne!(pub_1.as_bytes(), pub_2.as_bytes());
     }
 
     #[test]
@@ -295,14 +317,14 @@ mod tests {
         // avoid: casually treating the master key as a raw X25519 scalar.
         // If this ever fails, the HKDF step has been skipped somewhere.
         let master_key = [0x33u8; kdf::MASTER_KEY_LEN];
-        let (private_key, _) = derive_sharing_keypair(&master_key, "user-a");
+        let (private_key, _) = derive_sharing_keypair(&master_key, "user-a", 1);
         assert_ne!(private_key.to_bytes(), master_key);
     }
 
     #[test]
     fn encrypt_then_decrypt_round_trips() {
         let master_key = [0x44u8; kdf::MASTER_KEY_LEN];
-        let (private_key, public_key) = derive_sharing_keypair(&master_key, "user-a");
+        let (private_key, public_key) = derive_sharing_keypair(&master_key, "user-a", 1);
 
         let plaintext = b"a group's symmetric key, 32 bytes of it right here!";
         let envelope = encrypt_to_public_key(public_key.as_bytes(), plaintext).unwrap();
@@ -313,8 +335,9 @@ mod tests {
 
     #[test]
     fn wrong_private_key_fails_to_decrypt() {
-        let (_, public_key_a) = derive_sharing_keypair(&[0x55u8; kdf::MASTER_KEY_LEN], "user-a");
-        let (private_key_b, _) = derive_sharing_keypair(&[0x66u8; kdf::MASTER_KEY_LEN], "user-b");
+        let (_, public_key_a) = derive_sharing_keypair(&[0x55u8; kdf::MASTER_KEY_LEN], "user-a", 1);
+        let (private_key_b, _) =
+            derive_sharing_keypair(&[0x66u8; kdf::MASTER_KEY_LEN], "user-b", 1);
 
         let envelope = encrypt_to_public_key(public_key_a.as_bytes(), b"secret").unwrap();
         let result = decrypt_own_envelope(&private_key_b, &envelope);
@@ -325,7 +348,7 @@ mod tests {
     #[test]
     fn tampered_ciphertext_fails_authentication_not_silently_wrong_plaintext() {
         let master_key = [0x77u8; kdf::MASTER_KEY_LEN];
-        let (private_key, public_key) = derive_sharing_keypair(&master_key, "user-a");
+        let (private_key, public_key) = derive_sharing_keypair(&master_key, "user-a", 1);
 
         let mut envelope = encrypt_to_public_key(public_key.as_bytes(), b"secret").unwrap();
         let last = envelope.len() - 1;
@@ -341,7 +364,7 @@ mod tests {
     #[test]
     fn truncated_envelope_is_rejected_as_malformed_not_a_panic() {
         let master_key = [0x88u8; kdf::MASTER_KEY_LEN];
-        let (private_key, _) = derive_sharing_keypair(&master_key, "user-a");
+        let (private_key, _) = derive_sharing_keypair(&master_key, "user-a", 1);
 
         let result = decrypt_own_envelope(&private_key, &[0x01, 0x02, 0x03]);
         assert!(matches!(
@@ -353,7 +376,7 @@ mod tests {
     #[test]
     fn unknown_envelope_version_is_rejected() {
         let master_key = [0x99u8; kdf::MASTER_KEY_LEN];
-        let (private_key, public_key) = derive_sharing_keypair(&master_key, "user-a");
+        let (private_key, public_key) = derive_sharing_keypair(&master_key, "user-a", 1);
 
         let mut envelope = encrypt_to_public_key(public_key.as_bytes(), b"secret").unwrap();
         envelope[0] = 0xFF;

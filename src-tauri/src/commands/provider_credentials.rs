@@ -461,7 +461,7 @@ pub async fn save_provider_key(
     sessions: State<'_, ConnectSessions>,
 ) -> Result<SaveOutcome, String> {
     let (user_id, key_hex_str) = key_registry
-        .with_key(|k| (k.user_id.clone(), key_hex(&k.master_key)))
+        .with_key(|k| (k.user_id.clone(), key_hex(&k.data_key)))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
     let provider_id = sessions

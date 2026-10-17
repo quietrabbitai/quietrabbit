@@ -110,6 +110,10 @@ pub struct PromotableRun {
 
 #[derive(Debug, Error)]
 pub enum TopicStoreError {
+    /// The account's key epoch changed since this session unlocked
+    /// (auth::epoch_guard, items.id=629).
+    #[error("{0}")]
+    KeyEpoch(#[from] crate::auth::epoch_guard::KeyEpochError),
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("I/O error: {0}")]
@@ -237,6 +241,7 @@ async fn open_outputs_db(
     persona_id: &str,
     key_hex: &str,
 ) -> Result<SqliteConnection, TopicStoreError> {
+    crate::auth::epoch_guard::ensure_current(user_id).await?;
     let db_path = crate::persistence::migrations::get_data_root()
         .join("users")
         .join(user_id)

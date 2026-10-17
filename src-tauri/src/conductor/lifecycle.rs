@@ -112,6 +112,10 @@ use crate::providers::utils::{connect_options_encrypted, db_path_outputs, now};
 /// Python oracle: multiple exception types raised by phase methods.
 #[derive(Debug, Error)]
 pub enum LifecycleError {
+    /// The account's key epoch changed since this session unlocked
+    /// (auth::epoch_guard, items.id=629).
+    #[error("{0}")]
+    KeyEpoch(#[from] crate::auth::epoch_guard::KeyEpochError),
     // Phase 1 — LOAD
     #[error("Focus file not found: {0}.focus")]
     FocusNotFound(String),
@@ -1099,6 +1103,7 @@ async fn open_outputs_db(
     persona_id: &str,
     key_hex: &str,
 ) -> Result<SqliteConnection, LifecycleError> {
+    crate::auth::epoch_guard::ensure_current(user_id).await?;
     let path = db_path_outputs(user_id, persona_id);
 
     if !path.exists() {

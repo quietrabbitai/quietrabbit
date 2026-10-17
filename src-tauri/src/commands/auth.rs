@@ -4,13 +4,13 @@
 //
 // login/logout wired items.id=205 (2026-08-01) against the auth foundation
 // (auth::kdf, auth::registry, auth::user_store) built earlier this session.
-// get_recovery_key_display wired items.id=229 (2026-08-09) per Architecture/
-// AUTH_MULTIUSER_ARCHITECTURE.md Section 5/8.5 (Option B: the mnemonic IS
-// the master key, not a wrapper around it) -- reads the resident master key
-// out of KeyRegistry and encodes it via BIP39, never persisting it. Only
-// meaningful immediately after a session is established (bootstrap login or
-// a later recovery flow); "not logged in" is a real, expected error path,
-// not an internal-inconsistency case.
+// get_recovery_key_display wired items.id=229 (2026-08-09), rebuilt by
+// items.id=629 (decisions.id=893): the 24-word phrase is now independent
+// recovery entropy generated at account creation, not the key itself
+// (Option B retired). Because it cannot be re-derived from anything stored,
+// the entropy is held in KeyRegistry's one-shot pending slot from creation
+// until this command takes it exactly once; a second call, or a call after
+// logout, finds nothing. "not logged in" is a real, expected error path.
 //
 // SIGNATURE CHANGE, flagged: login() originally took only `password:
 // String`. It now also takes `display_name: String` -- user_store's
@@ -37,25 +37,17 @@
 // disabled; the bookkeeping exists so a future session can flip
 // enforcement on without a schema or data-flow change.
 //
-// KEY VERIFICATION: there is no password_hash column and no separate
-// password-verification step (Section 4.1/4.2: the derived Argon2id key
-// IS the credential). A wrong password derives a different key, which
-// then fails to decrypt integration_keys.db -- SQLCipher's key validation
-// happens at connection-open time (verified against
-// persistence::personal_store.rs::open_personal_db's identical pattern
-// this session), which is what verify_integration_keys_db below
-// detects. integration_keys.db is used for this (not personal.db/
-// outputs.db) because it is USER-scoped, not persona-scoped
-// (providers::utils::db_path_integration_keys(user_id) takes no
-// persona_id) -- it is the only encrypted store guaranteed to exist for
-// an account regardless of whether onboarding/persona-creation has
-// happened yet.
+// PASSWORD CHECK (items.id=629, decisions.id=893): there is no password_hash
+// column. login() derives the Argon2id password key (PK) and unwraps the
+// account's random data key (DEK) from its user_key_wrappers row; the wrap's
+// ChaCha20-Poly1305 tag is the password check, so a wrong password fails
+// there, before any database is opened. The DEK, not the PK, is what the
+// registry holds and what every store opens with.
 //
-// FAILURE CLASSIFICATION: a wrong key and an unrelated I/O error (disk
-// full, permissions, genuine file corruption) are deliberately NOT treated
-// the same (Jason's direction, 2026-08-01) -- only a confirmed wrong-key
-// failure counts toward auth_failures/lockout bookkeeping. See
-// KeyVerification below.
+// FAILURE CLASSIFICATION: a wrong password (wrap tag failure) and an
+// unrelated failure (corrupt row, I/O error) are deliberately NOT treated
+// the same (Jason's direction, 2026-08-01) -- only a confirmed wrong-
+// password failure counts toward auth_failures/lockout bookkeeping.
 //
 // SESSION LIFECYCLE ON LOGOUT: auth_sessions rows are soft-expired
 // (expires_at set to now), never deleted -- Jason's direction, 2026-08-01,
@@ -65,6 +57,8 @@
 
 use tauri::State;
 
+use crate::auth::data_key::{self, DataKeyError};
+use crate::auth::epoch_guard;
 use crate::auth::kdf;
 use crate::auth::registry::{
     key_hex, GroupKeyRegistry, KeyRegistry, UnlockedGroupKey, UnlockedKey,
@@ -96,74 +90,11 @@ pub struct SessionInfo {
     pub is_primary: bool,
 }
 
-// ---------------------------------------------------------------------------
-// Key verification against integration_keys.db
-// ---------------------------------------------------------------------------
-
-enum KeyVerification {
-    /// Confirmed wrong key -- SQLCipher rejected an EXISTING file at
-    /// connection-open time. Counts toward auth_failures/lockout.
-    WrongKey,
-    /// Any other failure (I/O, permissions, genuine corruption unrelated
-    /// to the key). Must NOT count toward auth_failures/lockout.
-    Other(String),
-}
-
-/// Open a user's EXISTING integration_keys.db under the given key, to
-/// verify the key is correct. Does NOT create the file if missing --
-/// unlike migrations::migrate_keys_db (which is create-or-migrate and is
-/// used separately, only on the bootstrap path, to establish the file
-/// under the real key for the first time). A missing file here is
-/// classified as Other, not WrongKey -- an account past bootstrap should
-/// always have this file; its absence is a different, more serious
-/// problem than a wrong password and should not be silently folded into
-/// the failed-attempt count.
-async fn verify_integration_keys_db(user_id: &str, key_hex: &str) -> Result<(), KeyVerification> {
-    use sqlx::sqlite::SqliteConnectOptions;
-    use sqlx::ConnectOptions;
-
-    let db_path = crate::providers::utils::db_path_integration_keys(user_id);
-    if !db_path.exists() {
-        return Err(KeyVerification::Other(
-            "integration_keys.db does not exist for this account".to_owned(),
-        ));
-    }
-
-    let network_storage = std::env::var("QR_NETWORK_STORAGE")
-        .map(|v| v.to_lowercase() == "true")
-        .unwrap_or(false);
-    let journal_mode = if network_storage { "DELETE" } else { "WAL" };
-
-    SqliteConnectOptions::new()
-        .filename(&db_path)
-        .create_if_missing(false)
-        // SQLCipher's PRAGMA key blob-literal syntax requires the x'...'
-        // form itself wrapped in an outer pair of double quotes (verified
-        // this session against SQLCipher's own documentation and by
-        // isolating the exact failure with a standalone diagnostic test --
-        // omitting the outer quotes produces "syntax error near x'...'" on
-        // every SQLite/SQLCipher build tested here, confirmed reproducibly).
-        // persistence::personal_store.rs::open_personal_db has this exact
-        // same bug (format!("x'{key_hex}'") without outer quotes) -- it
-        // was never caught because that module has zero tests (confirmed
-        // this session); flagged in this session's handoff rather than
-        // fixed here, since personal_store.rs is outside items.id=205's
-        // scope.
-        .pragma("key", format!("\"x'{key_hex}'\""))
-        .pragma("cipher_compatibility", "4")
-        .pragma("journal_mode", journal_mode)
-        .connect()
-        .await
-        .map(|_conn| ())
-        .map_err(|e| {
-            let msg = e.to_string().to_lowercase();
-            if msg.contains("not a database") || msg.contains("file is not a database") {
-                KeyVerification::WrongKey
-            } else {
-                KeyVerification::Other(e.to_string())
-            }
-        })
-}
+/// Shown for an account with no key wrapper -- created before the data-key
+/// format. Deliberately neutral: it states what is true of the account and
+/// says nothing about any remedy.
+const LEGACY_ACCOUNT_MESSAGE: &str =
+    "This account was created before the data-key format and can't be opened";
 
 // ---------------------------------------------------------------------------
 // Lockout bookkeeping (mechanism only -- see module header)
@@ -242,28 +173,40 @@ pub async fn login(
         // password directly -- there is no separate account-creation step
         // for login() to defer to (Jason's direction, 2026-08-01).
         let salt = kdf::generate_salt().map_err(|e| e.to_string())?;
-        let master_key = kdf::derive_master_key(
-            password.as_bytes(),
-            &salt,
-            kdf::DEFAULT_ARGON2_MEMORY_KIB,
-            kdf::DEFAULT_ARGON2_ITERATIONS,
-            kdf::DEFAULT_ARGON2_PARALLELISM,
-        )
-        .map_err(|e| e.to_string())?;
-
         let user_id = uuid::Uuid::new_v4().to_string();
 
-        // items.id=289, decisions.id=677: derived once here purely to get
-        // the public key for the shared.db write below (create_user writes
-        // it atomically alongside users/user_salts). finish_login (below)
-        // re-derives the same keypair a second time to populate the
-        // resident KeyRegistry entry -- a deliberate, cheap redundancy (see
-        // that call site's own comment) rather than threading this value
-        // through as extra state.
-        let (_, sharing_public_key) =
-            sharing_keypair::derive_sharing_keypair(&master_key, &user_id);
+        // items.id=629 (decisions.id=893): the Argon2id output is only the
+        // password key. A random DEK and independent recovery entropy are
+        // generated here, the DEK is wrapped under the PK and sealed to the
+        // recovery public key, and the PK is dropped (zeroized) as soon as
+        // the wrap exists.
+        let material = {
+            let password_key = zeroize::Zeroizing::new(
+                kdf::derive_password_key(
+                    password.as_bytes(),
+                    &salt,
+                    kdf::DEFAULT_ARGON2_MEMORY_KIB,
+                    kdf::DEFAULT_ARGON2_ITERATIONS,
+                    kdf::DEFAULT_ARGON2_PARALLELISM,
+                )
+                .map_err(|e| e.to_string())?,
+            );
+            data_key::create_account_key_material(&user_id, &password_key)
+                .map_err(|e| e.to_string())?
+        };
+        let key_epoch = material.wrapper.key_epoch;
 
-        user_store::create_user(
+        // items.id=289, decisions.id=677: derived once here purely to get
+        // the public key for the shared.db write below (create_user_with_wrapper
+        // writes it atomically alongside users/user_salts and the key
+        // wrapper). finish_login (below) re-derives the same keypair a second
+        // time to populate the resident KeyRegistry entry -- a deliberate,
+        // cheap redundancy (see that call site's own comment) rather than
+        // threading this value through as extra state.
+        let (_, sharing_public_key) =
+            sharing_keypair::derive_sharing_keypair(&material.dek, &user_id, key_epoch);
+
+        user_store::create_user_with_wrapper(
             &pool,
             &user_id,
             &display_name,
@@ -274,30 +217,12 @@ pub async fn login(
             kdf::DEFAULT_ARGON2_ITERATIONS,
             kdf::DEFAULT_ARGON2_PARALLELISM,
             sharing_public_key.as_bytes(),
+            &material.wrapper,
         )
         .await
         .map_err(|e| e.to_string())?;
 
-        // Establishes integration_keys.db fresh, under the real key, for
-        // the first time -- this IS creation (migrate_keys_db is
-        // create-or-migrate), not verification, so the generic migrations
-        // helper is correct here, not verify_integration_keys_db above
-        // (which deliberately refuses to create).
-        crate::persistence::migrations::migrate_keys_db(&user_id, &key_hex(&master_key))
-            .await
-            // MigrationError's Display impl (via #[error(...)] on each
-            // variant) already produces a message -- only the Failed
-            // variant carries a plain_language field specifically,
-            // matching it alone would miss Locked/Sqlx/Io. e.to_string()
-            // via Display covers all four correctly.
-            .map_err(|e| e.to_string())?;
-
-        // Establishes cloud_chat_cookies.db fresh, same create-or-migrate call
-        // shape as integration_keys.db just above (items.id=224 resolution,
-        // decisions.id=711) -- see tier3_cookies_001.sql's own header.
-        crate::persistence::migrations::migrate_tier3_cookies_db(&user_id, &key_hex(&master_key))
-            .await
-            .map_err(|e| e.to_string())?;
+        establish_account_dbs(&user_id, &material.dek).await?;
 
         // <<< SEAM: if future onboarding design decides the first-run
         // flow should also create a default persona, that call goes here
@@ -309,9 +234,15 @@ pub async fn login(
         // onboarding runs -- a real, named, deliberate intermediate
         // state, not an oversight. >>>
 
+        // Held only until get_recovery_key_display takes it (one time).
+        key_registry
+            .set_pending_recovery(material.recovery_entropy.clone())
+            .await;
+
         finish_login(
             &user_id,
-            master_key,
+            *material.dek,
+            key_epoch,
             &key_registry,
             &group_key_registry,
             &pool,
@@ -341,24 +272,54 @@ pub async fn login(
                 "internal error: account exists with no salt record".to_owned()
             })?;
 
-        let candidate_key = kdf::derive_master_key(password.as_bytes(), &salt, mem, iter, par)
-            .map_err(|e| e.to_string())?;
+        // An account with no wrapper row predates the data-key format. It
+        // is named as such rather than folded into "invalid credentials":
+        // it is not a wrong password and retrying cannot fix it.
+        let wrapper = user_store::get_key_wrapper(&pool, &user.id)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| LEGACY_ACCOUNT_MESSAGE.to_owned())?;
+        if wrapper.format_version != data_key::WRAP_FORMAT_VERSION {
+            return Err(format!(
+                "couldn't verify credentials: unsupported key wrapper format {}",
+                wrapper.format_version
+            ));
+        }
 
-        match verify_integration_keys_db(&user.id, &key_hex(&candidate_key)).await {
-            Err(KeyVerification::WrongKey) => {
+        let password_key = zeroize::Zeroizing::new(
+            kdf::derive_password_key(password.as_bytes(), &salt, mem, iter, par)
+                .map_err(|e| e.to_string())?,
+        );
+
+        match data_key::unwrap_dek(
+            &password_key,
+            &wrapper.password_wrap,
+            &user.id,
+            wrapper.key_epoch,
+            wrapper.format_version,
+        ) {
+            Err(DataKeyError::WrongPassword) => {
                 record_failed_attempt(&pool, &display_name).await?;
                 Err("invalid credentials".to_owned())
             }
-            Err(KeyVerification::Other(msg)) => {
+            Err(e) => {
                 // Deliberately NOT recorded as a failed attempt (Jason's
-                // direction, 2026-08-01) -- an I/O problem is not evidence
-                // the password was wrong.
-                Err(format!("couldn't verify credentials: {msg}"))
+                // direction, 2026-08-01) -- a malformed wrapper is not
+                // evidence the password was wrong.
+                Err(format!("couldn't verify credentials: {e}"))
             }
-            Ok(()) => {
+            Ok(dek) => {
+                // Idempotent create-or-migrate: a crash between
+                // create_user_with_wrapper() and the file creation in the
+                // bootstrap branch leaves an account whose wrapper is
+                // complete but whose first databases do not exist yet --
+                // this recreates them under the same DEK instead of
+                // leaving the account unusable.
+                establish_account_dbs(&user.id, &dek).await?;
                 finish_login(
                     &user.id,
-                    candidate_key,
+                    *dek,
+                    wrapper.key_epoch,
                     &key_registry,
                     &group_key_registry,
                     &pool,
@@ -367,6 +328,34 @@ pub async fn login(
             }
         }
     }
+}
+
+/// Create-or-migrate the two per-account databases every account has from
+/// its first moment (integration_keys.db, cloud_chat_cookies.db) under the
+/// DEK. Safe to repeat.
+async fn establish_account_dbs(
+    user_id: &str,
+    dek: &[u8; kdf::MASTER_KEY_LEN],
+) -> Result<(), String> {
+    let dek_hex = zeroize::Zeroizing::new(key_hex(dek));
+    // Establishes integration_keys.db under the real key (migrate_keys_db is
+    // create-or-migrate).
+    crate::persistence::migrations::migrate_keys_db(user_id, &dek_hex)
+        .await
+        // MigrationError's Display impl (via #[error(...)] on each
+        // variant) already produces a message -- only the Failed
+        // variant carries a plain_language field specifically,
+        // matching it alone would miss Locked/Sqlx/Io. e.to_string()
+        // via Display covers all four correctly.
+        .map_err(|e| e.to_string())?;
+
+    // Establishes cloud_chat_cookies.db, same create-or-migrate call shape
+    // as integration_keys.db just above (items.id=224 resolution,
+    // decisions.id=711) -- see tier3_cookies_001.sql's own header.
+    crate::persistence::migrations::migrate_tier3_cookies_db(user_id, &dek_hex)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Decode a stored group_key_hex value into raw key bytes, or None if it's
@@ -388,7 +377,8 @@ fn hex_decode_group_key(s: &str) -> Option<[u8; kdf::MASTER_KEY_LEN]> {
 
 async fn finish_login(
     user_id: &str,
-    master_key: [u8; kdf::MASTER_KEY_LEN],
+    data_key: [u8; kdf::MASTER_KEY_LEN],
+    key_epoch: u64,
     key_registry: &State<'_, KeyRegistry>,
     group_key_registry: &State<'_, GroupKeyRegistry>,
     pool: &sqlx::SqlitePool,
@@ -396,19 +386,24 @@ async fn finish_login(
     let now = crate::providers::utils::now();
 
     // items.id=289, decisions.id=677: re-derived here (not persisted -- see
-    // auth::sharing_keypair's module header) so it follows master_key's own
+    // auth::sharing_keypair's module header) so it follows data_key's own
     // single-slot lifecycle exactly -- both installed into the registry
     // together, both evicted together on logout/clear.
-    let (sharing_private_key, _) = sharing_keypair::derive_sharing_keypair(&master_key, user_id);
+    let (sharing_private_key, _) =
+        sharing_keypair::derive_sharing_keypair(&data_key, user_id, key_epoch);
 
     key_registry
         .replace(UnlockedKey {
             user_id: user_id.to_owned(),
-            master_key,
+            data_key,
+            key_epoch,
             sharing_private_key: sharing_private_key.to_bytes(),
             unlocked_at: now.clone(),
         })
         .await;
+    // items.id=629: from here every store open for this account compares
+    // the epoch it unlocked under against the stored one (auth::epoch_guard).
+    epoch_guard::set_resident(user_id, key_epoch);
 
     // items.id=303 (decisions.id=722): persona-share sync's "app-start" pull
     // trigger -- the moment this account's sharing private key becomes
@@ -418,7 +413,7 @@ async fn finish_login(
     // main.rs's periodic timer covers the steady-state case). Best-effort,
     // fire-and-forget inside the fn -- never turns an otherwise-successful
     // login into an Err.
-    let personal_key_hex_for_sync = key_hex(&master_key);
+    let personal_key_hex_for_sync = key_hex(&data_key);
     crate::persona_sync::engine::pull_all_accepted_shares_on_login(
         pool,
         user_id,
@@ -497,7 +492,7 @@ async fn finish_login(
     // corrupted ancillary row would be a lockout bug, not a safety
     // improvement (there would be no way to fix the row without being able
     // to log in in the first place).
-    let personal_key_hex = key_hex(&master_key);
+    let personal_key_hex = key_hex(&data_key);
     match persona_store::list_personas_for_user(pool, user_id).await {
         Ok(personas) => {
             for persona in personas {
@@ -638,28 +633,33 @@ pub async fn record_activity(
     Ok(())
 }
 
-/// Derive and return the current session's recovery mnemonic for one-time
-/// display. Section 8.5's Option B: `Mnemonic::from_entropy()` on the raw
-/// 32-byte master key directly, not a wrapper key -- `Mnemonic::parse()` on
-/// the returned phrase later recovers the exact original bytes, no
-/// unwrapping step. Requires a resident session (KeyRegistry) the same way
-/// qr_hosted::get_qr_hosted_config does; "not logged in" is the same error string
-/// for the same reason -- there is no key to derive a mnemonic from yet.
+/// Return the new account's 24-word recovery phrase for its ONE-TIME
+/// display (items.id=629, decisions.id=893, Architecture 8.5). The phrase is
+/// independent 256-bit recovery entropy generated at account creation, not
+/// the data key, and it is held only in KeyRegistry's pending slot: this
+/// command takes it, so a second call (or a call after logout) finds
+/// nothing. QR keeps no copy once this returns. Requires a resident session
+/// the same way qr_hosted::get_qr_hosted_config does; "not logged in" is the
+/// same error string for the same reason.
 #[tauri::command]
 #[specta::specta]
 pub async fn get_recovery_key_display(
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<RecoveryKeyDisplay, String> {
-    let master_key = key_registry
-        .with_key(|k| k.master_key)
+    if !key_registry.is_occupied().await {
+        return Err("not logged in".to_owned());
+    }
+
+    let entropy = key_registry
+        .take_pending_recovery()
         .await
-        .ok_or_else(|| "not logged in".to_owned())?;
+        .ok_or_else(|| "recovery phrase is not available".to_owned())?;
 
-    let mnemonic = bip39::Mnemonic::from_entropy(&master_key)
-        .map_err(|e| e.to_string())?
-        .to_string();
+    let mnemonic = data_key::mnemonic_from_entropy(&entropy).map_err(|e| e.to_string())?;
 
-    Ok(RecoveryKeyDisplay { mnemonic })
+    Ok(RecoveryKeyDisplay {
+        mnemonic: mnemonic.to_string(),
+    })
 }
 
 /// Read back the current session's identity (items.id=267), if any.
@@ -1341,57 +1341,450 @@ mod tests {
         assert!(result.is_ok(), "logout with no resident key must not error");
     }
 
+    // -----------------------------------------------------------------
+    // Data-key hierarchy (items.id=629, decisions.id=893)
+    // -----------------------------------------------------------------
+
+    /// Captures every `log` record emitted in this test process, so the
+    /// no-key-material test can search them. Installed at most once.
+    struct CaptureLogger;
+    static CAPTURED_LOGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    impl log::Log for CaptureLogger {
+        fn enabled(&self, _: &log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record) {
+            CAPTURED_LOGS
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(format!("{}", record.args()));
+        }
+        fn flush(&self) {}
+    }
+
+    fn hex_of(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    async fn do_login(
+        app: &tauri::App<tauri::test::MockRuntime>,
+        name: &str,
+        password: &str,
+    ) -> Result<(), String> {
+        login(
+            name.to_owned(),
+            password.to_owned(),
+            app.state::<KeyRegistry>(),
+            app.state::<GroupKeyRegistry>(),
+            app.state::<sqlx::SqlitePool>(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn create_then_unlock_round_trip_resolves_the_same_data_key_and_epoch() {
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let registry = app.state::<KeyRegistry>();
+
+        do_login(&app, "Alice", "correct horse battery staple")
+            .await
+            .unwrap();
+        let first = registry
+            .with_key(|k| (k.data_key, k.key_epoch, k.user_id.clone()))
+            .await
+            .unwrap();
+        assert_eq!(first.1, 1, "a new account starts at key epoch 1");
+
+        registry.clear().await;
+        assert!(!registry.is_occupied().await);
+
+        do_login(&app, "Alice", "correct horse battery staple")
+            .await
+            .unwrap();
+        let second = registry
+            .with_key(|k| (k.data_key, k.key_epoch, k.user_id.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            first, second,
+            "unlock must unwrap the same DEK, not derive a new one"
+        );
+
+        // The unwrapped DEK really is the key the account's stores use.
+        crate::persistence::integration_keys_store::open_integration_keys_db(
+            &second.2,
+            &key_hex(&second.0),
+        )
+        .await
+        .expect("integration_keys.db must open under the unwrapped DEK");
+    }
+
+    #[tokio::test]
+    async fn the_dek_is_not_the_password_key() {
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let registry = app.state::<KeyRegistry>();
+        do_login(&app, "Alice", "a password").await.unwrap();
+        let (dek, user_id) = registry
+            .with_key(|k| (k.data_key, k.user_id.clone()))
+            .await
+            .unwrap();
+
+        let (salt, mem, iter, par) = user_store::get_salt_params(&_env.pool, &user_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let pk = kdf::derive_password_key(b"a password", &salt, mem, iter, par).unwrap();
+        assert_ne!(pk, dek, "the Argon2id output is only the password key");
+    }
+
+    #[tokio::test]
+    async fn recovery_phrase_unseals_the_resident_data_key() {
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let registry = app.state::<KeyRegistry>();
+        do_login(&app, "Alice", "pw-for-recovery").await.unwrap();
+        let (dek, user_id) = registry
+            .with_key(|k| (k.data_key, k.user_id.clone()))
+            .await
+            .unwrap();
+
+        let display = get_recovery_key_display(registry.clone()).await.unwrap();
+        assert_eq!(display.mnemonic.split_whitespace().count(), 24);
+
+        let entropy = data_key::entropy_from_mnemonic(&display.mnemonic).unwrap();
+        assert_ne!(
+            *entropy, dek,
+            "Option B is retired: the phrase is not the key"
+        );
+
+        let wrapper = user_store::get_key_wrapper(&_env.pool, &user_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let (secret, public) = data_key::derive_recovery_keypair(&entropy, &user_id);
+        assert_eq!(public.as_bytes(), &wrapper.recovery_public_key);
+
+        let unsealed =
+            data_key::unseal_dek_with_recovery_key(&secret, &wrapper.recovery_seal).unwrap();
+        assert_eq!(
+            *unsealed, dek,
+            "the typed words must recover the resident DEK"
+        );
+    }
+
     #[tokio::test]
     async fn get_recovery_key_display_fails_without_a_resident_session() {
         let _env = setup().await;
         let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
-        let _group_key_registry = app.state::<GroupKeyRegistry>();
-        let _pool = app.state::<sqlx::SqlitePool>();
 
         let result = get_recovery_key_display(registry.clone()).await;
         assert_eq!(result.err(), Some("not logged in".to_owned()));
     }
 
     #[tokio::test]
-    async fn get_recovery_key_display_mnemonic_round_trips_to_the_exact_master_key() {
-        // Section 8.5: "the mnemonic IS the master key" -- Mnemonic::parse()
-        // on the displayed phrase must reconstruct the original 32 bytes
-        // bit-for-bit, no wrapping.
+    async fn get_recovery_key_display_shows_the_phrase_once() {
         let _env = setup().await;
         let app = mock_app_with_registry(_env.pool.clone());
         let registry = app.state::<KeyRegistry>();
-        let group_key_registry = app.state::<GroupKeyRegistry>();
-        let pool = app.state::<sqlx::SqlitePool>();
+        do_login(&app, "Alice", "pw").await.unwrap();
 
-        login(
-            "Alice".to_owned(),
-            "correct horse battery staple".to_owned(),
-            registry.clone(),
-            group_key_registry.clone(),
-            pool.clone(),
+        assert!(get_recovery_key_display(registry.clone()).await.is_ok());
+        assert_eq!(
+            get_recovery_key_display(registry.clone()).await.err(),
+            Some("recovery phrase is not available".to_owned()),
+            "a second call must find nothing"
+        );
+
+        // A later unlock is not account creation: no phrase is available.
+        registry.clear().await;
+        do_login(&app, "Alice", "pw").await.unwrap();
+        assert_eq!(
+            get_recovery_key_display(registry.clone()).await.err(),
+            Some("recovery phrase is not available".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_discards_an_undisplayed_recovery_phrase() {
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let registry = app.state::<KeyRegistry>();
+        do_login(&app, "Alice", "pw").await.unwrap();
+        registry.clear().await;
+        assert!(registry.take_pending_recovery().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn wrong_password_fails_at_the_wrap_tag_before_any_store_is_opened() {
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let registry = app.state::<KeyRegistry>();
+        do_login(&app, "Alice", "right-password").await.unwrap();
+        let user_id = registry.with_key(|k| k.user_id.clone()).await.unwrap();
+        registry.clear().await;
+
+        // Remove every per-account store. The old check opened
+        // integration_keys.db and would have reported an I/O-style failure
+        // here. The wrap tag needs no file.
+        let ik = crate::providers::utils::db_path_integration_keys(&user_id);
+        let ck = crate::providers::utils::db_path_tier3_cookies(&user_id);
+        for p in [&ik, &ck] {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", p.display()));
+            }
+        }
+
+        let result = do_login(&app, "Alice", "wrong-password").await;
+        assert_eq!(result, Err("invalid credentials".to_owned()));
+        assert!(!registry.is_occupied().await);
+        assert!(
+            !ik.exists() && !ck.exists(),
+            "a failed password check must not touch any store"
+        );
+
+        let mut conn = _env.pool.acquire().await.unwrap();
+        let failures: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM auth_failures WHERE display_name = 'Alice'")
+                .fetch_one(&mut *conn)
+                .await
+                .unwrap();
+        assert_eq!(failures.0, 1);
+    }
+
+    #[tokio::test]
+    async fn interrupted_wrapper_write_leaves_no_half_made_account_and_a_retry_works() {
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let registry = app.state::<KeyRegistry>();
+
+        let mut conn = _env.pool.acquire().await.unwrap();
+        sqlx::query(
+            "CREATE TRIGGER fail_wrapper_write BEFORE INSERT ON user_key_wrappers
+             BEGIN SELECT RAISE(ABORT, 'simulated interruption'); END",
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+
+        let result = do_login(&app, "Alice", "pw").await;
+        assert!(
+            result.is_err(),
+            "the failed wrapper write must fail account creation"
+        );
+        assert!(!registry.is_occupied().await);
+        for table in [
+            "users",
+            "user_salts",
+            "user_sharing_keys",
+            "user_key_wrappers",
+        ] {
+            let n: (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(&mut *conn)
+                .await
+                .unwrap();
+            assert_eq!(n.0, 0, "{table} must be rolled back with the wrapper");
+        }
+
+        sqlx::query("DROP TRIGGER fail_wrapper_write")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+
+        do_login(&app, "Alice", "pw")
+            .await
+            .expect("a retry must bootstrap cleanly");
+        assert!(registry.is_occupied().await);
+    }
+
+    #[tokio::test]
+    async fn crash_after_the_account_rows_are_written_still_unlocks_and_recreates_the_stores() {
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let registry = app.state::<KeyRegistry>();
+        do_login(&app, "Alice", "pw").await.unwrap();
+        let user_id = registry.with_key(|k| k.user_id.clone()).await.unwrap();
+        registry.clear().await;
+
+        // The state a crash between create_user_with_wrapper() and the
+        // first database creation leaves behind: complete rows, no files.
+        let ik = crate::providers::utils::db_path_integration_keys(&user_id);
+        let ck = crate::providers::utils::db_path_tier3_cookies(&user_id);
+        for p in [&ik, &ck] {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", p.display()));
+            }
+        }
+
+        do_login(&app, "Alice", "pw")
+            .await
+            .expect("account must still unlock");
+        assert!(
+            ik.exists() && ck.exists(),
+            "unlock must recreate the first databases"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_account_with_no_wrapper_is_refused_neutrally_and_not_counted_as_a_failure() {
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let registry = app.state::<KeyRegistry>();
+
+        user_store::create_user(
+            &_env.pool,
+            "legacy-user",
+            "Legacy",
+            "admin",
+            true,
+            b"salt1234salt1234",
+            1024,
+            1,
+            1,
+            &[0u8; 32],
         )
         .await
         .unwrap();
 
-        let resident_key = registry.with_key(|k| k.master_key).await.unwrap();
-
-        let display = get_recovery_key_display(registry.clone()).await.unwrap();
+        let result = do_login(&app, "Legacy", "anything").await;
         assert_eq!(
-            display.mnemonic.split_whitespace().count(),
-            24,
-            "256 bits of entropy must encode to a 24-word BIP39 phrase"
+            result,
+            Err(
+                "This account was created before the data-key format and can't be opened"
+                    .to_owned()
+            )
         );
-
-        let recovered: [u8; kdf::MASTER_KEY_LEN] = bip39::Mnemonic::parse(&display.mnemonic)
-            .unwrap()
-            .to_entropy()
-            .try_into()
+        assert!(!registry.is_occupied().await);
+        let mut conn = _env.pool.acquire().await.unwrap();
+        let failures: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM auth_failures")
+            .fetch_one(&mut *conn)
+            .await
             .unwrap();
         assert_eq!(
-            recovered, resident_key,
-            "recovered entropy must match the resident master key exactly"
+            failures.0, 0,
+            "a pre-wrapper account is not a wrong password"
         );
+    }
+
+    #[tokio::test]
+    async fn a_changed_key_epoch_refuses_store_opens() {
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let registry = app.state::<KeyRegistry>();
+        do_login(&app, "Alice", "pw").await.unwrap();
+        let (dek, user_id) = registry
+            .with_key(|k| (k.data_key, k.user_id.clone()))
+            .await
+            .unwrap();
+        let hex = key_hex(&dek);
+
+        crate::persistence::integration_keys_store::open_integration_keys_db(&user_id, &hex)
+            .await
+            .expect("opens while the epoch matches");
+
+        // Another OS session rotates: the stored epoch moves on.
+        sqlx::query("UPDATE user_key_wrappers SET key_epoch = 2 WHERE user_id = ?")
+            .bind(&user_id)
+            .execute(&_env.pool)
+            .await
+            .unwrap();
+
+        let err =
+            crate::persistence::integration_keys_store::open_integration_keys_db(&user_id, &hex)
+                .await
+                .err()
+                .expect("a stale epoch must refuse the open");
+        assert!(
+            matches!(
+                err,
+                crate::persistence::integration_keys_store::IntegrationKeysStoreError::KeyEpoch(_)
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_key_material_reaches_logs_or_ipc_responses() {
+        let _ = log::set_logger(&CaptureLogger);
+        log::set_max_level(log::LevelFilter::Trace);
+
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let registry = app.state::<KeyRegistry>();
+        let password = "pw-with-a-distinct-marker-9f3a";
+
+        let create = do_login(&app, "Alice", password).await;
+        let (dek, user_id) = registry
+            .with_key(|k| (k.data_key, k.user_id.clone()))
+            .await
+            .unwrap();
+        let display = get_recovery_key_display(registry.clone()).await.unwrap();
+        let entropy = data_key::entropy_from_mnemonic(&display.mnemonic).unwrap();
+        let (salt, mem, iter, par) = user_store::get_salt_params(&_env.pool, &user_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let pk = kdf::derive_password_key(password.as_bytes(), &salt, mem, iter, par).unwrap();
+        let wrapper = user_store::get_key_wrapper(&_env.pool, &user_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        registry.clear().await;
+        let wrong = do_login(&app, "Alice", "not-the-password").await;
+        let unlock = do_login(&app, "Alice", password).await;
+        let session = get_session(registry.clone(), app.state::<sqlx::SqlitePool>())
+            .await
+            .unwrap();
+
+        let secrets = [
+            ("dek", hex_of(&dek)),
+            ("password key", hex_of(&pk)),
+            ("recovery entropy", hex_of(entropy.as_slice())),
+            ("mnemonic", display.mnemonic.clone()),
+            ("password", password.to_owned()),
+        ];
+
+        // IPC: what login/get_session return, plus the serialized session.
+        let ipc = format!(
+            "{create:?} {wrong:?} {unlock:?} {}",
+            serde_json::to_string(&session).unwrap()
+        );
+        for (name, secret) in &secrets {
+            assert!(
+                !ipc.contains(secret.as_str()),
+                "{name} leaked into an IPC response"
+            );
+        }
+        // The one response that carries the phrase carries nothing else.
+        let display_json = serde_json::to_string(&display).unwrap();
+        for (name, secret) in secrets.iter().filter(|(n, _)| *n != "mnemonic") {
+            assert!(
+                !display_json.contains(secret.as_str()),
+                "{name} leaked into the phrase response"
+            );
+        }
+
+        // Logs and Debug output of every stored/derived type.
+        let logs = CAPTURED_LOGS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .join("\n");
+        let debug = format!("{wrapper:?}");
+        for (name, secret) in &secrets {
+            assert!(
+                !logs.contains(secret.as_str()),
+                "{name} leaked into the logs: {:?}",
+                logs.lines().find(|l| l.contains(secret.as_str()))
+            );
+            assert!(
+                !debug.contains(secret.as_str()),
+                "{name} leaked into Debug output"
+            );
+        }
     }
 
     #[tokio::test]

@@ -63,7 +63,8 @@ fn is_idle_expired(idle_timeout_minutes: i64, last_active_at: &str, now: &str) -
 }
 
 /// Check the currently-resident account's idle time and clear KeyRegistry
-/// if it has exceeded that account's users.idle_timeout_minutes. A no-op if
+/// if it has exceeded that account's users.idle_timeout_minutes, or if the
+/// account's key epoch changed since this session unlocked (items.id=629). A no-op if
 /// nobody is logged in, if the account has no live session row, or on any
 /// DB error -- fail-silent (log::warn!, return), matching every sibling
 /// periodic-sweep function's posture (persona_sync::engine::
@@ -117,14 +118,32 @@ pub async fn run_periodic_check(
         }
     };
 
-    // No live session row for this account -- nothing to check (e.g. the
-    // resident key predates any session row, which shouldn't happen in
-    // practice, but there is nothing to compare against either way).
-    let Some(last_active_at) = last_active_at else {
-        return;
-    };
+    // items.id=629 (decisions.id=893): the account's key was rotated in
+    // another session, so the data key resident here is stale -- lock, the
+    // same way an idle expiry does. Only a confirmed epoch change locks; a
+    // transient read failure is logged and the idle check below proceeds.
+    let epoch_changed =
+        match crate::auth::epoch_guard::ensure_current_with_pool(pool, &user_id).await {
+            Ok(()) => false,
+            Err(crate::auth::epoch_guard::KeyEpochError::Changed { .. }) => {
+                log::warn!("idle_timeout: key epoch changed for user={user_id} -- locking session");
+                true
+            }
+            Err(e) => {
+                log::warn!("idle_timeout: couldn't check key epoch for user={user_id}: {e}");
+                false
+            }
+        };
 
-    if !is_idle_expired(user.idle_timeout_minutes, &last_active_at, &now) {
+    // No live session row for this account -- nothing to check for idle
+    // expiry (e.g. the resident key predates any session row, which
+    // shouldn't happen in practice, but there is nothing to compare
+    // against either way).
+    let idle_expired = last_active_at
+        .as_deref()
+        .is_some_and(|last| is_idle_expired(user.idle_timeout_minutes, last, &now));
+
+    if !epoch_changed && !idle_expired {
         return;
     }
 
@@ -254,6 +273,58 @@ mod tests {
     // ------------------------------------------------------------------
     // Integration tests -- real user + session row via login().
     // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn run_periodic_check_locks_the_session_when_the_key_epoch_changed() {
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let registry = app.state::<KeyRegistry>();
+        let group_key_registry = app.state::<GroupKeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
+
+        login(
+            "Alice".to_owned(),
+            "correct horse battery staple".to_owned(),
+            registry.clone(),
+            group_key_registry.clone(),
+            pool.clone(),
+        )
+        .await
+        .unwrap();
+        let user_id = registry.with_key(|k| k.user_id.clone()).await.unwrap();
+
+        // Fresh activity, matching epoch: nothing to lock.
+        run_periodic_check(
+            &pool,
+            &registry,
+            &group_key_registry,
+            &ConnectSessions::default(),
+        )
+        .await;
+        assert!(
+            registry.is_occupied().await,
+            "an active, current session stays unlocked"
+        );
+
+        // Another OS session rotated the key.
+        sqlx::query("UPDATE user_key_wrappers SET key_epoch = key_epoch + 1 WHERE user_id = ?")
+            .bind(&user_id)
+            .execute(&*pool)
+            .await
+            .unwrap();
+
+        run_periodic_check(
+            &pool,
+            &registry,
+            &group_key_registry,
+            &ConnectSessions::default(),
+        )
+        .await;
+        assert!(
+            !registry.is_occupied().await,
+            "a changed key epoch must lock the session even though it is not idle"
+        );
+    }
 
     #[tokio::test]
     async fn run_periodic_check_clears_registry_and_soft_expires_session_when_idle_timeout_exceeded(

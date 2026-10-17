@@ -131,6 +131,10 @@ pub struct OutputRecord {
 
 #[derive(Debug, Error)]
 pub enum OutputStoreError {
+    /// The account's key epoch changed since this session unlocked
+    /// (auth::epoch_guard, items.id=629).
+    #[error("{0}")]
+    KeyEpoch(#[from] crate::auth::epoch_guard::KeyEpochError),
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("Validation error: {0}")]
@@ -184,6 +188,7 @@ pub(crate) async fn open_outputs_db(
     persona_id: &str,
     key_hex: &str,
 ) -> Result<SqliteConnection, OutputStoreError> {
+    crate::auth::epoch_guard::ensure_current(user_id).await?;
     let db_path = get_outputs_db_path(user_id, persona_id);
 
     // BUG FOUND + FIXED (items.id=412 live verification pass, same class as

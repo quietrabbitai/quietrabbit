@@ -1286,7 +1286,7 @@ pub async fn run_periodic_sweep(pool: &sqlx::SqlitePool, key_registry: &KeyRegis
         .with_key(|k| {
             (
                 k.user_id.clone(),
-                crate::auth::registry::key_hex(&k.master_key),
+                crate::auth::registry::key_hex(&k.data_key),
                 k.sharing_private_key,
             )
         })
@@ -1378,7 +1378,7 @@ mod tests {
         let user_id = uuid::Uuid::new_v4().to_string();
         let master_key = [master_key_fill; kdf::MASTER_KEY_LEN];
         let (sharing_private_key, sharing_public_key) =
-            sk::derive_sharing_keypair(&master_key, &user_id);
+            sk::derive_sharing_keypair(&master_key, &user_id, 1);
         let key_hex: String = master_key.iter().map(|b| format!("{b:02x}")).collect();
 
         crate::auth::user_store::create_user(

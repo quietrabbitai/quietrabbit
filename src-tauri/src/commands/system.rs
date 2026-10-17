@@ -119,7 +119,7 @@ async fn qr_hosted_is_configured(
     key_registry: &KeyRegistry,
 ) -> Result<bool, String> {
     let session = key_registry
-        .with_key(|k| (k.user_id.clone(), key_hex(&k.master_key)))
+        .with_key(|k| (k.user_id.clone(), key_hex(&k.data_key)))
         .await;
     let Some((user_id, key_hex_str)) = session else {
         return Ok(false);
@@ -312,7 +312,7 @@ pub async fn get_provider_recommendation(
 ) -> Result<ProviderRecommendation, String> {
     let profile = hardware_probe::get_or_detect(&pool).await;
     let session = key_registry
-        .with_key(|k| (k.user_id.clone(), key_hex(&k.master_key)))
+        .with_key(|k| (k.user_id.clone(), key_hex(&k.data_key)))
         .await;
     let ctx = load_user_context(&pool, session.as_ref()).await;
     let catalog = load_catalog(&pool, &ctx, chrono::Local::now().date_naive()).await?;

@@ -194,7 +194,7 @@ pub async fn set_group_fact_source_opt_in(
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<(), String> {
     let (user_id, key_hex_str) = key_registry
-        .with_key(|k| (k.user_id.clone(), key_hex(&k.master_key)))
+        .with_key(|k| (k.user_id.clone(), key_hex(&k.data_key)))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
@@ -227,7 +227,7 @@ pub async fn get_group_fact_sources(
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<Vec<String>, String> {
     let (user_id, key_hex_str) = key_registry
-        .with_key(|k| (k.user_id.clone(), key_hex(&k.master_key)))
+        .with_key(|k| (k.user_id.clone(), key_hex(&k.data_key)))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
@@ -252,7 +252,7 @@ pub async fn list_persona_group_ids(
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<Vec<String>, String> {
     let (user_id, key_hex_str) = key_registry
-        .with_key(|k| (k.user_id.clone(), key_hex(&k.master_key)))
+        .with_key(|k| (k.user_id.clone(), key_hex(&k.data_key)))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 

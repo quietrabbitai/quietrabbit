@@ -53,6 +53,10 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum IntegrationKeysStoreError {
+    /// The account's key epoch changed since this session unlocked
+    /// (auth::epoch_guard, items.id=629).
+    #[error("{0}")]
+    KeyEpoch(#[from] crate::auth::epoch_guard::KeyEpochError),
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("Validation error: {0}")]
@@ -161,6 +165,7 @@ pub(crate) async fn open_integration_keys_db(
     user_id: &str,
     key_hex: &str,
 ) -> Result<SqliteConnection, IntegrationKeysStoreError> {
+    crate::auth::epoch_guard::ensure_current(user_id).await?;
     let db_path = get_integration_keys_db_path(user_id);
 
     // Always migrate, not only when the file is missing (items.id=389, the

@@ -15,13 +15,12 @@
 // to this module. Keeping create_user() single-purpose is what makes that
 // addition clean later rather than requiring this module to be reworked.
 //
-// NO PASSWORD VERIFIER STORED HERE, deliberately: this module creates a
-// user + salt row only -- the derived Argon2id master key IS the
-// credential (Section 4.1/4.2). There is no separate password_hash
-// verification step; a wrong password simply derives a different (wrong)
-// key, which then fails to open that user's SQLCipher-encrypted stores.
-// login() (a later step in this same file tree) is responsible for
-// detecting that failure and writing it to auth_failures.
+// NO PASSWORD VERIFIER STORED HERE, deliberately: since items.id=629
+// (decisions.id=893) the password check is the authentication tag of the
+// DEK password wrap (auth::data_key), stored in user_key_wrappers by
+// create_user_with_wrapper() below. There is still no separate
+// password_hash. login() detects a tag failure and writes it to
+// auth_failures.
 //
 // LOGIN IDENTIFIER: display_name is used as the lookup key for a login
 // attempt. This is a SCHEMA-DERIVED inference, not a documented
@@ -36,6 +35,8 @@
 use sqlx::Row;
 use thiserror::Error;
 
+use crate::auth::data_key::KeyWrapper;
+
 #[derive(Debug, Error)]
 pub enum UserStoreError {
     #[error("Database error: {0}")]
@@ -48,6 +49,8 @@ pub enum UserStoreError {
     CorruptKdfParams(String, String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("Stored key wrapper for user '{0}' is malformed")]
+    CorruptWrapper(String),
 }
 
 #[derive(Debug, Clone)]
@@ -175,10 +178,8 @@ pub async fn get_salt_params(
 
 /// Create a new user + their salt row, atomically (SAVEPOINT, mirrors
 /// persona_store::create_persona's pattern -- on failure, ROLLBACK TO
-/// without a subsequent RELEASE, since the connection is dropped
-/// immediately after returning; verified this session against
-/// persona_store.rs's existing, working implementation of the same
-/// pattern rather than assumed).
+/// then RELEASE, so the pooled connection is returned with no transaction
+/// open).
 ///
 /// auth_enabled is hardcoded to 1 here, not exposed as a parameter --
 /// Section 2.1 reframes it as an onboarding-time invariant evaluated once
@@ -198,6 +199,11 @@ pub async fn get_salt_params(
 /// already gets. Not secret (shared.db is unencrypted, instance-wide); the
 /// matching private key is never written anywhere -- see
 /// auth::sharing_keypair's module header.
+///
+/// NO KEY WRAPPER (items.id=629): this variant writes none, so the account
+/// it creates cannot be unlocked by login(). It exists for the many tests
+/// that need a user row without real key material. Production account
+/// creation uses create_user_with_wrapper().
 #[allow(clippy::too_many_arguments)]
 pub async fn create_user(
     pool: &sqlx::SqlitePool,
@@ -210,6 +216,70 @@ pub async fn create_user(
     kdf_iterations: u32,
     kdf_parallelism: u32,
     sharing_public_key: &[u8; 32],
+) -> Result<(), UserStoreError> {
+    create_user_inner(
+        pool,
+        user_id,
+        display_name,
+        role,
+        is_primary,
+        salt,
+        kdf_memory_kib,
+        kdf_iterations,
+        kdf_parallelism,
+        sharing_public_key,
+        None,
+    )
+    .await
+}
+
+/// create_user() plus the account's key wrapper (items.id=629,
+/// decisions.id=893), all in the one SAVEPOINT: users, user_salts,
+/// user_sharing_keys and user_key_wrappers either all exist or none do, so
+/// an interrupted write leaves no half-made account.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_user_with_wrapper(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    display_name: &str,
+    role: &str,
+    is_primary: bool,
+    salt: &[u8],
+    kdf_memory_kib: u32,
+    kdf_iterations: u32,
+    kdf_parallelism: u32,
+    sharing_public_key: &[u8; 32],
+    wrapper: &KeyWrapper,
+) -> Result<(), UserStoreError> {
+    create_user_inner(
+        pool,
+        user_id,
+        display_name,
+        role,
+        is_primary,
+        salt,
+        kdf_memory_kib,
+        kdf_iterations,
+        kdf_parallelism,
+        sharing_public_key,
+        Some(wrapper),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_user_inner(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    display_name: &str,
+    role: &str,
+    is_primary: bool,
+    salt: &[u8],
+    kdf_memory_kib: u32,
+    kdf_iterations: u32,
+    kdf_parallelism: u32,
+    sharing_public_key: &[u8; 32],
+    wrapper: Option<&KeyWrapper>,
 ) -> Result<(), UserStoreError> {
     let created_at = crate::providers::utils::now();
     let mut conn = pool.acquire().await?;
@@ -258,6 +328,26 @@ pub async fn create_user(
         .execute(&mut *conn)
         .await?;
 
+        if let Some(w) = wrapper {
+            sqlx::query(
+                "INSERT INTO user_key_wrappers
+                 (user_id, key_epoch, format_version, password_wrap_hex,
+                  recovery_public_key_hex, recovery_seal_hex,
+                  created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(user_id)
+            .bind(w.key_epoch as i64)
+            .bind(i64::from(w.format_version))
+            .bind(hex_encode(&w.password_wrap))
+            .bind(hex_encode(&w.recovery_public_key))
+            .bind(hex_encode(&w.recovery_seal))
+            .bind(&created_at)
+            .bind(&created_at)
+            .execute(&mut *conn)
+            .await?;
+        }
+
         Ok(())
     }
     .await;
@@ -270,9 +360,15 @@ pub async fn create_user(
             Ok(())
         }
         Err(e) => {
+            // ROLLBACK TO alone undoes the writes but leaves the savepoint --
+            // and the transaction it opened, with its write lock -- open.
+            // The connection goes back to the pool, so without the RELEASE
+            // a failed creation would leave shared.db locked for every
+            // later writer (found by items.id=629's interrupted-write test).
             let _ = sqlx::query("ROLLBACK TO create_user")
                 .execute(&mut *conn)
                 .await;
+            let _ = sqlx::query("RELEASE create_user").execute(&mut *conn).await;
             // Structured constraint detection (DatabaseError::is_unique_violation),
             // not string-matching -- corrected this session per external
             // review; verified sqlx exposes this method directly rather
@@ -285,6 +381,59 @@ pub async fn create_user(
             Err(UserStoreError::Database(e))
         }
     }
+}
+
+/// Read an account's key wrapper (user_key_wrappers). `None` for an account
+/// created before the data-key format: it cannot be unlocked.
+pub async fn get_key_wrapper(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+) -> Result<Option<KeyWrapper>, UserStoreError> {
+    let mut conn = pool.acquire().await?;
+    let row = sqlx::query(
+        "SELECT key_epoch, format_version, password_wrap_hex,
+                recovery_public_key_hex, recovery_seal_hex
+         FROM user_key_wrappers WHERE user_id = ?",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some(row) = row else { return Ok(None) };
+
+    let corrupt = || UserStoreError::CorruptWrapper(user_id.to_owned());
+    let key_epoch = u64::try_from(row.get::<i64, _>("key_epoch")).map_err(|_| corrupt())?;
+    let format_version =
+        u8::try_from(row.get::<i64, _>("format_version")).map_err(|_| corrupt())?;
+    let decode = |col: &str| -> Result<Vec<u8>, UserStoreError> {
+        hex_decode(user_id, &row.get::<String, _>(col)).map_err(|_| corrupt())
+    };
+    let recovery_public_key: [u8; 32] = decode("recovery_public_key_hex")?
+        .try_into()
+        .map_err(|_| corrupt())?;
+
+    Ok(Some(KeyWrapper {
+        key_epoch,
+        format_version,
+        password_wrap: decode("password_wrap_hex")?,
+        recovery_public_key,
+        recovery_seal: decode("recovery_seal_hex")?,
+    }))
+}
+
+/// The account's current key epoch, or None if it has no wrapper row. Read
+/// by auth::epoch_guard on every store open.
+pub async fn get_key_epoch(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+) -> Result<Option<u64>, UserStoreError> {
+    let mut conn = pool.acquire().await?;
+    let row: Option<(i64,)> =
+        sqlx::query_as("SELECT key_epoch FROM user_key_wrappers WHERE user_id = ?")
+            .bind(user_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    row.map(|(e,)| u64::try_from(e).map_err(|_| UserStoreError::CorruptWrapper(user_id.to_owned())))
+        .transpose()
 }
 
 #[cfg(test)]

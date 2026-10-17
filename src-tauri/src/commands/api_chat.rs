@@ -286,7 +286,7 @@ pub async fn create_api_chat(
     request: CreateApiChatRequest,
 ) -> Result<CreateApiChatResponse, String> {
     let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
+        .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
     let context_key = create_api_chat_inner(
@@ -430,7 +430,7 @@ pub async fn send_api_chat_message(
     } = request;
 
     let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
+        .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 

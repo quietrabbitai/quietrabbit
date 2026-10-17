@@ -26,6 +26,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 
+#[cfg(test)]
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::ConnectOptions;
 use sqlx::SqliteConnection;
@@ -410,6 +411,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/shared_032.sql"),
     },
     SchemaFile {
+        prefix: "shared",
+        version: 33,
+        sql: include_str!("../../schema/shared_033.sql"),
+    },
+    SchemaFile {
         prefix: "tier3_cookies",
         version: 1,
         sql: include_str!("../../schema/tier3_cookies_001.sql"),
@@ -729,7 +735,10 @@ fn process_id() -> String {
 /// Open a raw SqliteConnection without key or journal configuration.
 /// Callers apply key and journal_mode via run_migrations().
 async fn open_raw(path: &Path) -> Result<SqliteConnection, MigrationError> {
-    let opts = SqliteConnectOptions::new()
+    // Statement logging off: this connection sends PRAGMA key, which sqlx
+    // would otherwise log with the key in it (providers::utils::
+    // quiet_connect_options, items.id=629).
+    let opts = crate::providers::utils::quiet_connect_options()
         .filename(path)
         .create_if_missing(true)
         // Pinned explicitly rather than left to sqlx's default (items.id=
@@ -2272,15 +2281,15 @@ mod tests {
             .await
             .expect("shared migration chain must apply cleanly on a fresh db");
         assert_eq!(
-            applied, 32,
-            "expected all thirty-two shared schema versions to apply"
+            applied, 33,
+            "expected all thirty-three shared schema versions to apply"
         );
 
         let version: (i64,) = sqlx::query_as("SELECT MAX(version) FROM schema_version")
             .fetch_one(&mut conn)
             .await
             .unwrap();
-        assert_eq!(version.0, 32);
+        assert_eq!(version.0, 33);
     }
 
     /// items.id=708 / items.id=703 / items.id=724: shared_026.sql and
@@ -2848,8 +2857,8 @@ mod tests {
             .expect("drift-healing run must succeed");
 
         assert_eq!(
-            applied, 31,
-            "shared v2 through v32 should count as newly applied from a stale v1 database"
+            applied, 32,
+            "shared v2 through v33 should count as newly applied from a stale v1 database"
         );
 
         // items.id=427: shared_013.sql drops tier3_providers (generalized

@@ -308,7 +308,7 @@ pub async fn remove_member(
         .with_key(|k| {
             (
                 k.user_id.clone(),
-                crate::auth::registry::key_hex(&k.master_key),
+                crate::auth::registry::key_hex(&k.data_key),
             )
         })
         .await
@@ -588,7 +588,7 @@ mod tests {
         let user_id = uuid::Uuid::new_v4().to_string();
         let master_key = [master_key_fill; kdf::MASTER_KEY_LEN];
         let (sharing_private_key, sharing_public_key) =
-            sharing_keypair::derive_sharing_keypair(&master_key, &user_id);
+            sharing_keypair::derive_sharing_keypair(&master_key, &user_id, 1);
 
         crate::auth::user_store::create_user(
             pool,
@@ -885,7 +885,8 @@ mod tests {
         key_registry
             .replace(crate::auth::registry::UnlockedKey {
                 user_id: departing_user.clone(),
-                master_key: departing_master_key,
+                data_key: departing_master_key,
+                key_epoch: 1,
                 sharing_private_key: departing_private_key.to_bytes(),
                 unlocked_at: "2026-01-01T00:00:00Z".to_owned(),
             })
@@ -966,7 +967,8 @@ mod tests {
         key_registry
             .replace(crate::auth::registry::UnlockedKey {
                 user_id: initiator_user,
-                master_key: initiator_master_key,
+                data_key: initiator_master_key,
+                key_epoch: 1,
                 sharing_private_key: initiator_private_key.to_bytes(),
                 unlocked_at: "2026-01-01T00:00:00Z".to_owned(),
             })

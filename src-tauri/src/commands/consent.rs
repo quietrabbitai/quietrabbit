@@ -202,7 +202,7 @@ pub async fn submit_consent_decision(
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<(), String> {
     let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
+        .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
@@ -224,7 +224,7 @@ pub async fn submit_floor_consent_decision(
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<(), String> {
     let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
+        .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
@@ -259,7 +259,7 @@ pub async fn submit_element_consent_decision(
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<(), String> {
     let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
+        .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
@@ -428,7 +428,7 @@ pub async fn submit_extract_confirm(
     use tauri::Emitter;
 
     let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
+        .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
@@ -635,7 +635,7 @@ pub async fn get_pending_cross_persona_confirmations(
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<Vec<PendingCrossPersonaFact>, String> {
     let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
+        .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
@@ -730,7 +730,7 @@ pub async fn request_chat_copy_gate3_review(
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<Gate3ReviewResult, String> {
     let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
+        .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
@@ -808,7 +808,7 @@ pub async fn submit_chat_copy_consent_decision(
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<(), String> {
     let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
+        .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 

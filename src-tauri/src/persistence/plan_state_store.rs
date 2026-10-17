@@ -43,7 +43,6 @@
 
 use std::path::PathBuf;
 
-use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::ConnectOptions;
 use sqlx::Row;
 use sqlx::SqliteConnection;
@@ -160,6 +159,10 @@ pub struct StateCeilingStatus {
 
 #[derive(Debug, Error)]
 pub enum PlanStateStoreError {
+    /// The account's key epoch changed since this session unlocked
+    /// (auth::epoch_guard, items.id=629).
+    #[error("{0}")]
+    KeyEpoch(#[from] crate::auth::epoch_guard::KeyEpochError),
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("I/O error: {0}")]
@@ -187,6 +190,7 @@ async fn open_plan_state_db(
     topic_id: &str,
     key_hex: &str,
 ) -> Result<SqliteConnection, PlanStateStoreError> {
+    crate::auth::epoch_guard::ensure_current(user_id).await?;
     let db_path = get_plan_state_db_path(user_id, persona_id, focus_id, topic_id);
 
     if !db_path.exists() {
@@ -202,7 +206,7 @@ async fn open_plan_state_db(
         .unwrap_or(false);
     let journal_mode = if network_storage { "DELETE" } else { "WAL" };
 
-    let conn = SqliteConnectOptions::new()
+    let conn = crate::providers::utils::quiet_connect_options()
         .filename(&db_path)
         .create_if_missing(false)
         .pragma("key", format!("\"x'{key_hex}'\""))

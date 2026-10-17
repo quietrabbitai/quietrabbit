@@ -208,7 +208,7 @@ pub async fn submit_focus_run(
     request: SubmitFocusRunRequest,
 ) -> Result<SubmitFocusRunResponse, String> {
     let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
+        .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
@@ -251,7 +251,7 @@ pub async fn get_run_output(
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<GetRunOutputResponse, String> {
     let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
+        .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
@@ -298,7 +298,7 @@ pub async fn get_run_status(
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<Option<String>, String> {
     let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
+        .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
@@ -316,7 +316,7 @@ pub async fn cancel_run(
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<(), String> {
     let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
+        .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
@@ -383,7 +383,7 @@ pub async fn resume_run(
     use tauri::Emitter;
 
     let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
+        .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
@@ -607,7 +607,7 @@ pub async fn reenter_step(
     use crate::persistence::output_store::get_focus_run_status;
 
     let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
+        .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 

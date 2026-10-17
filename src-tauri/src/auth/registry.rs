@@ -6,11 +6,11 @@
 // memory at any instant, for the process's entire lifetime.
 //
 // ARCHITECTURAL DEVIATION FROM SECTION 4.2's LITERAL STRUCT: the doc gives
-// master_key: Vec<u8>. This module uses [u8; kdf::MASTER_KEY_LEN] (32
+// master_key: Vec<u8> (now the data key, field `data_key`). This module uses [u8; kdf::MASTER_KEY_LEN] (32
 // bytes) instead. A fixed-size array enforces the invariant stated
 // elsewhere in the document (Section 4.1: master key is always "raw 32
 // bytes") while eliminating heap allocation and reallocation exposure that
-// Vec<u8> carries -- kdf::derive_master_key() already returns this exact
+// Vec<u8> carries -- kdf::derive_password_key() already returns this exact
 // array type, so no conversion is needed either way.
 //
 // SECURITY RATIONALE -- ZEROIZE-ON-DROP: derive(Zeroize, ZeroizeOnDrop) is
@@ -39,7 +39,7 @@
 // IMPLEMENTATION NOTE -- TRANSIENT COPIES NOT COVERED HERE: the
 // replace-not-mutate invariant above protects the long-lived copy once a
 // key is resident in this registry. It does NOT cover transient copies
-// created before that point -- kdf::derive_master_key()'s stack buffer,
+// created before that point -- kdf::derive_password_key()'s stack buffer,
 // or a freshly-constructed UnlockedKey's fields before it's moved into
 // replace(). Whoever writes login() (a later step) needs to verify that
 // path separately; this module's guarantee starts once a key is inside it.
@@ -60,7 +60,9 @@ pub(crate) fn key_hex(key: &[u8; kdf::MASTER_KEY_LEN]) -> String {
     key.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// One account's resident, unlocked master key. Never persisted -- exists
+/// One account's resident, unlocked data key (DEK, decisions.id=893 --
+/// formerly "master key"; the field was renamed `data_key` in items.id=629)
+/// plus the key epoch it was unlocked under. Never persisted -- exists
 /// only as Tauri managed state for this process's lifetime. Fields are
 /// pub(crate): constructed only by login() (a later step, same crate);
 /// not part of the IPC surface, so no external caller can reach these
@@ -68,10 +70,10 @@ pub(crate) fn key_hex(key: &[u8; kdf::MASTER_KEY_LEN]) -> String {
 /// defending against a real access path.
 ///
 /// sharing_private_key (items.id=289, decisions.id=677): the account's
-/// X25519 sharing keypair's private half, HKDF-derived from master_key (see
-/// auth::sharing_keypair::derive_sharing_keypair). Follows master_key's own
+/// X25519 sharing keypair's private half, HKDF-derived from data_key (see
+/// auth::sharing_keypair::derive_sharing_keypair). Follows data_key's own
 /// single-slot lifecycle deliberately -- not a second standing secret, it's
-/// re-derived alongside master_key on every login and evicted alongside it
+/// re-derived alongside data_key on every login and evicted alongside it
 /// on clear().
 ///
 /// Stored as raw [u8; 32] rather than x25519_dalek::StaticSecret directly --
@@ -80,7 +82,7 @@ pub(crate) fn key_hex(key: &[u8; kdf::MASTER_KEY_LEN]) -> String {
 /// the callable Zeroize trait #[derive(Zeroize)] requires of every
 /// non-skipped field (confirmed via a real compile error this session:
 /// "StaticSecret: DefaultIsZeroes ... required by StaticSecret: Zeroize").
-/// Raw bytes get the exact same #[derive(Zeroize)] treatment master_key
+/// Raw bytes get the exact same #[derive(Zeroize)] treatment data_key
 /// already has here, and StaticSecret::from(bytes) reconstructs an
 /// equivalent key on demand wherever one is actually needed (e.g.
 /// auth::sharing_keypair::decrypt_own_envelope).
@@ -88,7 +90,9 @@ pub(crate) fn key_hex(key: &[u8; kdf::MASTER_KEY_LEN]) -> String {
 pub struct UnlockedKey {
     #[zeroize(skip)]
     pub(crate) user_id: String,
-    pub(crate) master_key: [u8; kdf::MASTER_KEY_LEN],
+    pub(crate) data_key: [u8; kdf::MASTER_KEY_LEN],
+    /// The key epoch this session unlocked under (user_key_wrappers.key_epoch).
+    pub(crate) key_epoch: u64,
     pub(crate) sharing_private_key: [u8; 32],
     #[zeroize(skip)]
     pub(crate) unlocked_at: String,
@@ -99,6 +103,14 @@ pub struct UnlockedKey {
 #[derive(Default)]
 pub struct KeyRegistry {
     slot: tokio::sync::Mutex<Option<UnlockedKey>>,
+    /// Recovery entropy of a just-created account, held ONLY until the
+    /// one-time display (commands::auth::get_recovery_key_display) takes it
+    /// or the session ends (items.id=629). Never persisted. The phrase
+    /// cannot be re-derived from the DEK (it is independent entropy), so
+    /// this is the only place it exists between account creation and
+    /// display. A crash before display loses it for good: the account then
+    /// needs a new recovery phrase (items.id=630).
+    pending_recovery: tokio::sync::Mutex<Option<zeroize::Zeroizing<[u8; kdf::MASTER_KEY_LEN]>>>,
 }
 
 impl KeyRegistry {
@@ -130,7 +142,27 @@ impl KeyRegistry {
     /// fires clear() correctly on that basis alone.
     pub async fn clear(&self) {
         let mut guard = self.slot.lock().await;
+        if let Some(outgoing) = guard.as_ref() {
+            crate::auth::epoch_guard::clear_resident_for(&outgoing.user_id);
+        }
         *guard = None;
+        *self.pending_recovery.lock().await = None;
+    }
+
+    /// Hold a new account's recovery entropy for its one-time display.
+    pub async fn set_pending_recovery(
+        &self,
+        entropy: zeroize::Zeroizing<[u8; kdf::MASTER_KEY_LEN]>,
+    ) {
+        *self.pending_recovery.lock().await = Some(entropy);
+    }
+
+    /// Take the pending recovery entropy, leaving nothing behind: a second
+    /// call returns None.
+    pub async fn take_pending_recovery(
+        &self,
+    ) -> Option<zeroize::Zeroizing<[u8; kdf::MASTER_KEY_LEN]>> {
+        self.pending_recovery.lock().await.take()
     }
 
     /// Whether any account's key is currently resident. Used by callers
@@ -170,7 +202,7 @@ impl KeyRegistry {
         self.with_key(|k| k.sharing_private_key).await
     }
 
-    /// Resolve the resident account's master key as key_hex, or None if no
+    /// Resolve the resident account's data key as key_hex, or None if no
     /// account is currently unlocked. Same convenience-for-outside-crate
     /// reasoning as sharing_private_key above -- key_hex() itself is
     /// pub(crate), not reachable from the main.rs binary crate. items.id=290
@@ -179,7 +211,7 @@ impl KeyRegistry {
     /// auth::group_membership::apply_pending_rotations' own personal.db
     /// durable-write step (group_key_store::save_group_key).
     pub async fn personal_key_hex(&self) -> Option<String> {
-        self.with_key(|k| key_hex(&k.master_key)).await
+        self.with_key(|k| key_hex(&k.data_key)).await
     }
 }
 
@@ -195,7 +227,7 @@ impl KeyRegistry {
 // share group-key state, and one Persona can hold keys for more than one
 // group at once.
 //
-// KEY SIZE: [u8; kdf::MASTER_KEY_LEN], same as UnlockedKey.master_key.
+// KEY SIZE: [u8; kdf::MASTER_KEY_LEN], same as UnlockedKey.data_key.
 // group.db is encrypted the same way personal.db is (design doc Section
 // 2.1), and migrate_group_db's key_hex feeds the same SQLCipher PRAGMA key
 // mechanism migrate_personal_db does -- no basis found for a different
@@ -333,10 +365,11 @@ mod tests {
     fn make_key(user_id: &str, byte_fill: u8) -> UnlockedKey {
         let master_key = [byte_fill; kdf::MASTER_KEY_LEN];
         let (sharing_private_key, _) =
-            crate::auth::sharing_keypair::derive_sharing_keypair(&master_key, user_id);
+            crate::auth::sharing_keypair::derive_sharing_keypair(&master_key, user_id, 1);
         UnlockedKey {
             user_id: user_id.to_owned(),
-            master_key,
+            data_key: master_key,
+            key_epoch: 1,
             sharing_private_key: sharing_private_key.to_bytes(),
             unlocked_at: "2026-01-01T00:00:00Z".to_owned(),
         }
@@ -397,7 +430,7 @@ mod tests {
         let registry = KeyRegistry::default();
         registry.replace(make_key("user-a", 0x42)).await;
 
-        let master_key = registry.with_key(|k| k.master_key).await;
+        let master_key = registry.with_key(|k| k.data_key).await;
         assert_eq!(master_key, Some([0x42u8; kdf::MASTER_KEY_LEN]));
     }
 

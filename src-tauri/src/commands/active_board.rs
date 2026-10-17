@@ -124,7 +124,7 @@ pub async fn get_active_board(
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<ActiveBoardResponse, String> {
     let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
+        .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
@@ -174,7 +174,7 @@ pub async fn get_topic_list(
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<Vec<TopicInfo>, String> {
     let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
+        .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
@@ -203,7 +203,7 @@ pub async fn update_topic_state(
     }
 
     let key_hex_str = key_registry
-        .with_key(|k| key_hex(&k.master_key))
+        .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 

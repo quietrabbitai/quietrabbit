@@ -78,7 +78,7 @@ pub async fn get_qr_hosted_config(
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<QrHostedConfig, String> {
     let session = key_registry
-        .with_key(|k| (k.user_id.clone(), key_hex(&k.master_key)))
+        .with_key(|k| (k.user_id.clone(), key_hex(&k.data_key)))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
     let (user_id, key_hex_str) = session;
@@ -116,7 +116,7 @@ pub async fn set_qr_hosted_provider(
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<(), String> {
     let session = key_registry
-        .with_key(|k| (k.user_id.clone(), key_hex(&k.master_key)))
+        .with_key(|k| (k.user_id.clone(), key_hex(&k.data_key)))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
     let (user_id, key_hex_str) = session;

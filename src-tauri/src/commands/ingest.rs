@@ -255,7 +255,7 @@ pub async fn store_ingested_document(
     }
 
     let (master_key, key_hex_str) = key_registry
-        .with_key(|k| (k.master_key, key_hex(&k.master_key)))
+        .with_key(|k| (k.data_key, key_hex(&k.data_key)))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
@@ -389,7 +389,7 @@ pub async fn get_ingested_document_bytes(
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<Vec<u8>, String> {
     let (master_key, key_hex_str) = key_registry
-        .with_key(|k| (k.master_key, key_hex(&k.master_key)))
+        .with_key(|k| (k.data_key, key_hex(&k.data_key)))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
