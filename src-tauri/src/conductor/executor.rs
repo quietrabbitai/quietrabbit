@@ -4446,11 +4446,15 @@ mod tests {
         struct Rec {
             deltas: Mutex<Vec<String>>,
             ends: Mutex<Vec<StreamEnd>>,
+            first_delta: tokio::sync::Notify,
         }
 
         impl StreamSink for Rec {
             fn delta(&self, _seq: u32, text: &str) {
                 self.deltas.lock().unwrap().push(text.to_owned());
+                // notify_one keeps a permit, so a delta that lands before
+                // anyone waits is not lost.
+                self.first_delta.notify_one();
             }
             fn end(&self, end: &StreamEnd) {
                 self.ends.lock().unwrap().push(*end);
@@ -4461,7 +4465,18 @@ mod tests {
             fn text(&self) -> String {
                 self.deltas.lock().unwrap().concat()
             }
+
+            /// Wait until the sink has been handed its first delta, at most
+            /// `CANCEL_WAIT`. On a timeout this returns anyway: the caller
+            /// cancels and the test's own assertions then fail, so a missing
+            /// delta shows up as a failure and never as a hang (items.id=767).
+            async fn wait_first_delta(&self) {
+                let _ = tokio::time::timeout(CANCEL_WAIT, self.first_delta.notified()).await;
+            }
         }
+
+        /// How long a canceller waits for the event it cancels after.
+        const CANCEL_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
         fn frame(v: serde_json::Value) -> Vec<u8> {
             format!("data: {v}\n\n").into_bytes()
@@ -4694,11 +4709,12 @@ mod tests {
                 let (key_hex, model) = cleared(&pool, &server).await;
                 let token = CancellationToken::new();
                 let t2 = token.clone();
+                let rec = std::sync::Arc::new(Rec::default());
+                let seen = rec.clone();
                 tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    seen.wait_first_delta().await;
                     t2.cancel();
                 });
-                let rec = Rec::default();
                 let mut tail = StreamTail::default();
                 let started = std::time::Instant::now();
                 let err = streamed(&pool, &key_hex, &model, &rec, &token, &mut tail)
@@ -4745,10 +4761,12 @@ mod tests {
                 let handle = registry.register(SPEND_USER, &ctx.focus_run_id);
                 let token = handle.token().clone();
 
+                let rec = std::sync::Arc::new(Rec::default());
+                let seen = rec.clone();
                 let reg = registry.clone();
                 let run_id = ctx.focus_run_id.clone();
                 let canceller = tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    seen.wait_first_delta().await;
                     let foreign = crate::commands::chat_stream::cancel_for_user(
                         &reg,
                         "someone-else",
@@ -4759,7 +4777,6 @@ mod tests {
                     (foreign, own)
                 });
 
-                let rec = Rec::default();
                 let mut tail = StreamTail::default();
                 let started = std::time::Instant::now();
                 let err = hosted_step_call(
@@ -4772,7 +4789,7 @@ mod tests {
                     &chrono::Utc,
                     loopback_build,
                     Some(StreamParts {
-                        sink: &rec,
+                        sink: &*rec,
                         cancel: &token,
                         tail: &mut tail,
                     }),
@@ -4807,20 +4824,26 @@ mod tests {
         #[tokio::test]
         async fn cancel_before_the_first_byte_is_interrupted_never_released() {
             with_temp_shared_db(|pool| async move {
+                // The server holds its reply well past the cancel, so the
+                // cancel lands before the first byte however slow the client
+                // is (items.id=767).
                 let server = LoopbackServer::start(vec![
-                    with_usage().with_delay(std::time::Duration::from_millis(1500))
+                    with_usage().with_delay(std::time::Duration::from_secs(5))
                 ]);
                 let (key_hex, model) = cleared(&pool, &server).await;
                 let token = CancellationToken::new();
-                let t2 = token.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                    t2.cancel();
-                });
                 let mut tail = StreamTail::default();
-                streamed(&pool, &key_hex, &model, &Rec::default(), &token, &mut tail)
-                    .await
-                    .unwrap_err();
+                let rec = Rec::default();
+                // Cancel once the server has the request: after dispatch, so
+                // the reservation is kept, and before any reply byte.
+                let (streamed_result, ()) = tokio::join!(
+                    streamed(&pool, &key_hex, &model, &rec, &token, &mut tail),
+                    async {
+                        server.wait_for_request(CANCEL_WAIT).await;
+                        token.cancel();
+                    }
+                );
+                streamed_result.unwrap_err();
                 assert!(tail.cancelled);
                 assert_eq!(ledger_count(&key_hex).await, 1, "the reservation is kept");
                 let (outcome, _, _, _, cost, reserved) = only_ledger_row(&key_hex).await;

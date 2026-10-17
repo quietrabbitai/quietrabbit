@@ -124,6 +124,7 @@ pub(crate) struct LoopbackServer {
     connections: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     closed_by_client: Arc<AtomicUsize>,
+    request_seen: Arc<tokio::sync::Notify>,
 }
 
 impl LoopbackServer {
@@ -140,6 +141,8 @@ impl LoopbackServer {
 
         let (cap, conns, stop_flag) = (captured.clone(), connections.clone(), stop.clone());
         let closed = closed_by_client.clone();
+        let request_seen = Arc::new(tokio::sync::Notify::new());
+        let seen = request_seen.clone();
         std::thread::spawn(move || {
             let mut index = 0usize;
             for stream in listener.incoming() {
@@ -152,6 +155,7 @@ impl LoopbackServer {
                 index += 1;
                 if let Some(request) = read_request(&mut stream) {
                     cap.lock().unwrap().push(request);
+                    seen.notify_one();
                 }
                 std::thread::sleep(canned.delay);
                 if let Some(steps) = &canned.stream {
@@ -179,7 +183,18 @@ impl LoopbackServer {
             connections,
             stop,
             closed_by_client,
+            request_seen,
         }
+    }
+
+    /// Wait until a request has been read in full, at most `within`; returns
+    /// whether one arrived. A request that landed before the call is not
+    /// missed (the notification keeps a permit). For tests that must act
+    /// after the client has really dispatched, never after a fixed sleep.
+    pub async fn wait_for_request(&self, within: Duration) -> bool {
+        tokio::time::timeout(within, self.request_seen.notified())
+            .await
+            .is_ok()
     }
 
     /// `http://127.0.0.1:<port>`
