@@ -364,6 +364,12 @@ impl PinnedFetcher {
                 }
                 hasher.update(&chunk);
                 file.write_all(&chunk).await.map_err(io_err)?;
+                // tokio::fs::File::write_all returns before the write(2) has run
+                // on the blocking pool. Without this flush, a network error or
+                // cancel on the next iteration returns while the chunk is still
+                // queued, so the .part file is shorter than `have` and a prompt
+                // retry resumes from the wrong offset (items.id=766).
+                file.flush().await.map_err(io_err)?;
                 have = got;
                 progress(have, expect.size);
             }
