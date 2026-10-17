@@ -492,6 +492,20 @@ mod tests {
         assert_eq!(text.as_deref(), Some("Hello World"));
     }
 
+    // Built outside docx-rust (Python zipfile, Word-style part layout), so
+    // this exercises the parse path on a file docx-rust's own writer did not
+    // produce -- the round-trip test above cannot catch a reader/writer pair
+    // that agree with each other but not with real files.
+    #[test]
+    fn extracts_text_from_a_word_style_docx_fixture() {
+        let bytes = include_bytes!("../../tests/fixtures/word_style.docx");
+        let text = extract_document_text(Path::new("upload.docx"), bytes);
+        assert_eq!(
+            text.as_deref(),
+            Some("Quiet Rabbit\r\nSplit across two runs.")
+        );
+    }
+
     #[test]
     fn garbage_pdf_bytes_degrade_to_none_without_panicking() {
         let garbage = b"this is not a pdf, just some bytes".to_vec();

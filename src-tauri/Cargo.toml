@@ -307,3 +307,18 @@ strsim = "0.11"
 # [dependencies] -- this feature and its mock app machinery must never
 # compile into a production build.
 tauri = { version = "2", features = ["test"] }
+
+# items.id=763 (revisit trigger: items.id=765): docx-rust 0.1.11 is the
+# newest release and pins zip = "4"; RUSTSEC-2026-0367/0368/0369 are patched
+# only in zip >= 9.0.0, so no `cargo update` or docx-rust bump can clear
+# them. vendor/docx-rust is the published 0.1.11 source with exactly two
+# changes (see vendor/docx-rust/PATCHES.md): zip = "9", and
+# zip.file_names() handled as an iterator of Result. Parsing code is
+# untouched, so .docx text extraction is identical. (The advisories are in
+# ZipArchive::extract(), which docx-rust never calls; this clears
+# `cargo deny check` rather than a reachable bug.)
+#
+# Revisit (items.id=765): drop this patch and vendor/docx-rust/ once
+# cstkingkey/docx-rs publishes a docx-rust release that depends on zip >= 9.
+[patch.crates-io]
+docx-rust = { path = "vendor/docx-rust" }
