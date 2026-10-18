@@ -7,13 +7,13 @@
 //
 // login() itself returns null on success (CLAUDE.md: master key/session
 // state never cross IPC), so a successful submit immediately follows up
-// with commands.getSession() to learn the resulting user_id, then hands it
-// to navShellConfig.ts's setCurrentUserId() before calling onLoggedIn().
+// with finishSignIn() (commands.getSession() plus navShellConfig.ts's
+// setCurrentUserId()) before calling onLoggedIn().
 
 import { useState, type FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { commands } from '../bindings'
-import { setCurrentUserId } from '../navShell/navShellConfig'
+import { finishSignIn } from './finishSignIn'
 
 export interface LoginFormProps {
   onLoggedIn: () => void
@@ -37,13 +37,13 @@ export function LoginForm({ onLoggedIn }: LoginFormProps) {
       return
     }
 
-    const sessionResult = await commands.getSession()
-    if (sessionResult.status !== 'ok') {
-      setError(sessionResult.error)
+    const finished = await finishSignIn()
+    if (finished.status === 'error') {
+      setError(finished.message)
       setSubmitting(false)
       return
     }
-    if (sessionResult.data === null) {
+    if (finished.status === 'sessionMissing') {
       // Should be impossible immediately after a successful login() --
       // surfaced distinctly rather than silently retried, same discipline
       // commands/auth.rs uses for its own "should be impossible" cases.
@@ -52,7 +52,6 @@ export function LoginForm({ onLoggedIn }: LoginFormProps) {
       return
     }
 
-    setCurrentUserId(sessionResult.data.user_id)
     onLoggedIn()
   }
 

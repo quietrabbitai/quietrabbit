@@ -23,6 +23,25 @@
   color: var(--text-muted);
 }
 
+/* items.id=769: Account security corner button. Fixed to the bottom-right
+ * corner so it never shifts the dock's layout. NOTE: a native Cloud Chat pane
+ * is composited above the webview, so where it overlaps this corner the button
+ * is covered until the pane steps aside. */
+.nav-shell__account-button {
+  position: fixed;
+  right: 12px;
+  bottom: 12px;
+  z-index: 900;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text-muted);
+  font: inherit;
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
 .nav-shell__content {
   display: flex;
   flex: 1;

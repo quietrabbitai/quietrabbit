@@ -113,3 +113,11 @@ export function allRotationErrorSuffixes(): string[] {
   }
   return [...out].sort()
 }
+
+/** What the login screen shows after the app signed the user out because of an
+ *  error (needs_resume, epoch_changed, ...): the same coded error and screen
+ *  wording the form would have shown, carried across the sign-out. */
+export interface SignOutNotice {
+  error: KeyRotationError
+  context: RotationErrorContext
+}

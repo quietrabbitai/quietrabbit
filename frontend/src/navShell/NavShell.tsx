@@ -27,6 +27,8 @@ import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import './NavShell.css'
 import { commands, type PersonaInfo } from '../bindings'
+import { AccountSecurityScreen } from '../auth/AccountSecurityScreen'
+import type { SignOutNotice } from '../auth/rotationErrors'
 import { WorkspaceShell } from './WorkspaceShell'
 import {
   DEFAULT_NAV_STATE,
@@ -41,8 +43,15 @@ import {
   type NavState,
 } from './navShellConfig'
 
-export function NavShell() {
+export interface NavShellProps {
+  /** Sign out of the session, optionally leaving a message on the login screen.
+   *  Owned by App (items.id=769); the Account security panel calls it. */
+  onSignOut: (notice?: SignOutNotice) => void
+}
+
+export function NavShell({ onSignOut }: NavShellProps) {
   const { t } = useTranslation()
+  const [accountSecurityOpen, setAccountSecurityOpen] = useState(false)
   const [navState, setNavState] = useState<NavState>(DEFAULT_NAV_STATE)
   const [personas, setPersonas] = useState<PersonaInfo[]>([])
   const [personaError, setPersonaError] = useState<string | null>(null)
@@ -102,6 +111,21 @@ export function NavShell() {
           onUpdatePair={handleUpdatePair}
         />
       </div>
+      {/* items.id=769: Account security entry point -- a corner button, not a
+          fifth dock rail (decisions in the item's approved plan, Q1). */}
+      <button
+        type="button"
+        className="nav-shell__account-button"
+        onClick={() => setAccountSecurityOpen(true)}
+      >
+        {t('auth.accountSecurity.openButton')}
+      </button>
+      {accountSecurityOpen && (
+        <AccountSecurityScreen
+          onClose={() => setAccountSecurityOpen(false)}
+          onSignOut={onSignOut}
+        />
+      )}
     </main>
   )
 }

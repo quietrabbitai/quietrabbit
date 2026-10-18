@@ -1,0 +1,67 @@
+/* Account security panel (items.id=769). Functional layout only. z-index sits
+ * above the dock and the Privacy Guardian modal (1000) but below the
+ * key-rotation overlay (2000), which must stay on top while a change runs. */
+
+.account-security {
+  position: fixed;
+  inset: 0;
+  z-index: 1500;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+}
+
+.account-security__panel {
+  /* A <dialog open> brings UA positioning and borders; this is a flex child. */
+  position: static;
+  margin: 0;
+  border: 0;
+  width: 460px;
+  max-width: calc(100vw - 32px);
+  max-height: calc(100vh - 32px);
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 20px;
+  overflow-y: auto;
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--shadow);
+  font-family: var(--font-sans);
+  text-align: left;
+}
+
+.account-security__panel:focus {
+  outline: none;
+}
+
+.account-security__title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: var(--heading);
+  font-weight: 400;
+}
+
+.account-security__section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.account-security__heading {
+  margin: 0;
+  font-size: var(--text-lg);
+  font-weight: 500;
+}
+
+.account-security__footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-subtle);
+}

@@ -4,11 +4,13 @@
 // process; this still runs the real check rather than assuming that, since
 // it's the same call NavShell's own tree relies on being accurate.
 
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { commands } from './bindings'
 import { LoginForm } from './auth/LoginForm'
+import { RotationErrorText } from './auth/RotationErrorText'
 import { RotationProgress } from './auth/RotationProgress'
+import type { SignOutNotice } from './auth/rotationErrors'
 import { NavShell } from './navShell/NavShell'
 import { setCurrentUserId } from './navShell/navShellConfig'
 
@@ -20,6 +22,21 @@ function App() {
   const [sessionCheckError, setSessionCheckError] = useState<string | null>(
     null,
   )
+
+  // items.id=769: why the user was just signed out, shown on the login screen.
+  const [signOutNotice, setSignOutNotice] = useState<SignOutNotice | null>(null)
+
+  // Sign out (explicit, or forced by a credential-change error). logout() clears
+  // the resident key; the cached user id goes with it. A failed logout() still
+  // returns to the login screen -- showing the error there -- because the
+  // alternative is a signed-in-looking app the user asked to leave.
+  const signOut = useCallback(async (notice?: SignOutNotice) => {
+    const result = await commands.logout()
+    setCurrentUserId(null)
+    setSignOutNotice(notice ?? null)
+    setSessionCheckError(result.status === 'ok' ? null : result.error)
+    setBootState('loginRequired')
+  }, [])
 
   useEffect(() => {
     commands.getSession().then((result) => {
@@ -111,11 +128,19 @@ function App() {
             {t('auth.loginError', { message: sessionCheckError })}
           </p>
         )}
-        <LoginForm onLoggedIn={() => setBootState('loggedIn')} />
+        {signOutNotice && (
+          <RotationErrorText error={signOutNotice.error} context={signOutNotice.context} />
+        )}
+        <LoginForm
+          onLoggedIn={() => {
+            setSignOutNotice(null)
+            setBootState('loggedIn')
+          }}
+        />
       </>
     )
   } else {
-    screen = <NavShell />
+    screen = <NavShell onSignOut={(notice) => void signOut(notice)} />
   }
 
   return (

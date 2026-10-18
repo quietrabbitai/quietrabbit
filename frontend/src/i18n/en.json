@@ -6,6 +6,23 @@
     "submitButton": "Log in",
     "loginError": "Could not log in: {{message}}",
     "sessionMissingAfterLogin": "Logged in, but no session was returned. Try again.",
+    "accountSecurity": {
+      "openButton": "Account security",
+      "title": "Account security",
+      "signOut": "Sign out",
+      "close": "Close",
+      "changePassword": {
+        "heading": "Change password",
+        "intro": "Changing your password re-locks all of your data under a new key, so the old password stops opening it from then on. This can take a while for a large account. Copies or backups made before the change can still be opened with your old password, and nothing can change that.",
+        "currentLabel": "Current password",
+        "newLabel": "New password",
+        "confirmLabel": "Confirm new password",
+        "submit": "Change password",
+        "submitting": "Changing password…",
+        "mismatch": "The new password and its confirmation don't match.",
+        "success": "Your password was changed. Your data is protected under the new password from now on. Copies or backups made before the change can still be opened with your old password."
+      }
+    },
     "rotation": {
       "title": {
         "generic": "Re-locking your data",
