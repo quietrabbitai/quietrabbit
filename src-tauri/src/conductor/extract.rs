@@ -152,10 +152,18 @@ async fn open_outputs_db(
         .unwrap_or(false);
     let journal_mode = if network_storage { "DELETE" } else { "WAL" };
 
+    let db_key = crate::auth::subkeys::db_key_hex(
+        user_id,
+        key_hex,
+        crate::auth::subkeys::DbPurpose::Outputs,
+        persona_id,
+    )
+    .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
+
     crate::providers::utils::quiet_connect_options()
         .filename(&db_path)
         .create_if_missing(false)
-        .pragma("key", format!("\"x'{key_hex}'\""))
+        .pragma("key", format!("\"x'{}'\"", db_key.as_str()))
         .pragma("cipher_compatibility", "4")
         .pragma("journal_mode", journal_mode)
         .pragma("busy_timeout", "5000")

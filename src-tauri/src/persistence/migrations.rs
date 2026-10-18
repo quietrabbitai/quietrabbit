@@ -16,6 +16,13 @@
 // The PRAGMA is constructed here as: PRAGMA key = "x'{key_hex}'"
 // Callers must NOT wrap the value in x'...' themselves.
 //
+// SUBKEYS (items.id=630): the typed migrate_*_db helpers below take the DATA
+// KEY (DEK) hex and derive the per-database subkey (auth::subkeys) before
+// calling migrate_db_file, which receives the already-derived key. The group
+// helper (migrate_group_db) is the exception: group.db is keyed by the group
+// key itself. run_migrations / run_migrations_at / schema_version_exists
+// below take whatever key they are handed, derived or not.
+//
 // SCHEMA AUTHORING RULE: no semicolons inside string literals in .sql files.
 // parse_statements() is not a general-purpose SQL parser.
 //
@@ -31,6 +38,8 @@ use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::ConnectOptions;
 use sqlx::SqliteConnection;
 use thiserror::Error;
+
+use crate::auth::subkeys::{self, DbPurpose};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -52,6 +61,10 @@ pub enum MigrationError {
     Sqlx(#[from] sqlx::Error),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// A database key could not be derived from the data key
+    /// (auth::subkeys, items.id=630).
+    #[error("{0}")]
+    Subkey(#[from] crate::auth::subkeys::SubkeyError),
 }
 
 // ---------------------------------------------------------------------------
@@ -1590,7 +1603,8 @@ pub async fn migrate_personal_db(
         .join("personas")
         .join(persona_id)
         .join("personal.db");
-    migrate_db_file(&db_path, "personal", Some(key_hex)).await
+    let key = subkeys::db_key_hex(user_id, key_hex, DbPurpose::Personal, persona_id)?;
+    migrate_db_file(&db_path, "personal", Some(&key)).await
 }
 
 /// Migrate a group's group.db (encrypted). key_hex: bare hex bytes only.
@@ -1628,7 +1642,8 @@ pub async fn migrate_outputs_db(
         .join("personas")
         .join(persona_id)
         .join("outputs.db");
-    migrate_db_file(&db_path, "outputs", Some(key_hex)).await
+    let key = subkeys::db_key_hex(user_id, key_hex, DbPurpose::Outputs, persona_id)?;
+    migrate_db_file(&db_path, "outputs", Some(&key)).await
 }
 
 /// Migrate a user's messages.db (encrypted). key_hex: bare hex bytes only.
@@ -1643,7 +1658,8 @@ pub async fn migrate_messages_db(
         .join("personas")
         .join(persona_id)
         .join("messages.db");
-    migrate_db_file(&db_path, "messages", Some(key_hex)).await
+    let key = subkeys::db_key_hex(user_id, key_hex, DbPurpose::Messages, persona_id)?;
+    migrate_db_file(&db_path, "messages", Some(&key)).await
 }
 
 /// Migrate a VIEW-ONLY persona share's recipient-side read-only cache
@@ -1670,7 +1686,8 @@ pub async fn migrate_view_cache_db(
         .join("persona_view_shares")
         .join(share_id)
         .join("view_cache.db");
-    migrate_db_file(&db_path, "view_cache", Some(key_hex)).await
+    let key = subkeys::db_key_hex(user_id, key_hex, DbPurpose::ViewCache, share_id)?;
+    migrate_db_file(&db_path, "view_cache", Some(&key)).await
 }
 
 /// Migrate a user's integration_keys.db (encrypted). key_hex: bare hex bytes only.
@@ -1679,7 +1696,13 @@ pub async fn migrate_keys_db(user_id: &str, key_hex: &str) -> Result<u32, Migrat
         .join("users")
         .join(user_id)
         .join("integration_keys.db");
-    migrate_db_file(&db_path, "keys", Some(key_hex)).await
+    let key = subkeys::db_key_hex(
+        user_id,
+        key_hex,
+        DbPurpose::IntegrationKeys,
+        subkeys::ACCOUNT_SCOPE,
+    )?;
+    migrate_db_file(&db_path, "keys", Some(&key)).await
 }
 
 /// Guards a one-time atomic same-directory rename of a legacy on-disk file
@@ -1738,7 +1761,13 @@ pub async fn migrate_tier3_cookies_db(user_id: &str, key_hex: &str) -> Result<u3
     let old_path = dir.join("tier3_cookies.db");
     let db_path = dir.join("cloud_chat_cookies.db");
     rename_legacy_db_file_if_safe(&old_path, &db_path);
-    migrate_db_file(&db_path, "tier3_cookies", Some(key_hex)).await
+    let key = subkeys::db_key_hex(
+        user_id,
+        key_hex,
+        DbPurpose::CloudCookies,
+        subkeys::ACCOUNT_SCOPE,
+    )?;
+    migrate_db_file(&db_path, "tier3_cookies", Some(&key)).await
 }
 
 /// Migrate models/scores.db (unencrypted).
@@ -1759,7 +1788,13 @@ pub async fn migrate_domain_context_db(
     let db_path = crate::persistence::domain_context_store::get_domain_context_path(
         user_id, persona_id, focus_id,
     );
-    migrate_db_file(&db_path, "domain_context", Some(key_hex)).await
+    let key = subkeys::db_key_hex(
+        user_id,
+        key_hex,
+        DbPurpose::DomainContext,
+        &subkeys::scope(&[persona_id, focus_id])?,
+    )?;
+    migrate_db_file(&db_path, "domain_context", Some(&key)).await
 }
 
 /// Migrate a topic's plan_state.db (encrypted). key_hex: bare hex bytes only.
@@ -1774,7 +1809,13 @@ pub async fn migrate_plan_state_db(
     let db_path = crate::persistence::topic_store::get_plan_state_path(
         user_id, persona_id, focus_id, topic_id,
     );
-    migrate_db_file(&db_path, "plan_state", Some(key_hex)).await
+    let key = subkeys::db_key_hex(
+        user_id,
+        key_hex,
+        DbPurpose::PlanState,
+        &subkeys::scope(&[persona_id, focus_id, topic_id])?,
+    )?;
+    migrate_db_file(&db_path, "plan_state", Some(&key)).await
 }
 
 /// Migrate both focus-level databases in one call.
@@ -3397,8 +3438,13 @@ mod tests {
     // plan_state_store.rs's tests (real migration call, not a hand-
     // bootstrapped dummy table).
 
-    const TEST_KEY_HEX: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
-    const WRONG_KEY_HEX: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddee";
+    const TEST_KEY_HEX: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
+    const WRONG_KEY_HEX: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    /// The subkey the typed migrate_*_db helpers apply for TEST_KEY_HEX.
+    fn dk(user_id: &str, purpose: DbPurpose, scope: &str) -> String {
+        subkeys::test_key_hex(user_id, TEST_KEY_HEX, purpose, scope)
+    }
 
     /// Opens a verification connection to an already-migrated real file,
     /// applying the key with the same builder shape run_migrations itself
@@ -3466,7 +3512,11 @@ mod tests {
             "personal_001 + personal_002 + personal_003 + personal_004 + personal_005 + personal_006 + personal_007 + personal_008 must all apply in one pass"
         );
 
-        let mut conn = open_verify_conn(&db_path, Some(TEST_KEY_HEX)).await;
+        let mut conn = open_verify_conn(
+            &db_path,
+            Some(&dk(user_id, DbPurpose::Personal, persona_id)),
+        )
+        .await;
         for table in [
             "entities",
             "entity_facts",
@@ -3666,7 +3716,13 @@ mod tests {
             std::env::remove_var("QR_DATA_ROOT");
         }
 
-        assert!(schema_version_exists(&db_path, Some(TEST_KEY_HEX)).await);
+        assert!(
+            schema_version_exists(
+                &db_path,
+                Some(&dk(user_id, DbPurpose::Personal, persona_id))
+            )
+            .await
+        );
     }
 
     #[tokio::test]
@@ -3735,7 +3791,8 @@ mod tests {
              outputs_011 must all apply in one pass"
         );
 
-        let mut conn = open_verify_conn(&db_path, Some(TEST_KEY_HEX)).await;
+        let mut conn =
+            open_verify_conn(&db_path, Some(&dk(user_id, DbPurpose::Outputs, persona_id))).await;
         for table in [
             "outputs",
             "focus_runs",
@@ -3829,7 +3886,15 @@ mod tests {
         // tables and the calibration output sample count).
         assert_eq!(result.expect("migration must apply cleanly"), 5);
 
-        let mut conn = open_verify_conn(&db_path, Some(TEST_KEY_HEX)).await;
+        let mut conn = open_verify_conn(
+            &db_path,
+            Some(&dk(
+                user_id,
+                DbPurpose::IntegrationKeys,
+                subkeys::ACCOUNT_SCOPE,
+            )),
+        )
+        .await;
         assert!(table_exists(&mut conn, "integration_keys").await);
         for table in [
             "provider_consent",
@@ -3927,7 +3992,15 @@ mod tests {
 
         assert_eq!(result.expect("migration must apply cleanly"), 1);
 
-        let mut conn = open_verify_conn(&db_path, Some(TEST_KEY_HEX)).await;
+        let mut conn = open_verify_conn(
+            &db_path,
+            Some(&dk(
+                user_id,
+                DbPurpose::DomainContext,
+                &subkeys::scope(&[persona_id, focus_id]).unwrap(),
+            )),
+        )
+        .await;
         for table in [
             "domain_context_blocks",
             "standing_summary",
@@ -3994,10 +4067,26 @@ mod tests {
             "plan_state.db must exist as its own real file"
         );
 
-        let mut dc_conn = open_verify_conn(&dc_path, Some(TEST_KEY_HEX)).await;
+        let mut dc_conn = open_verify_conn(
+            &dc_path,
+            Some(&dk(
+                user_id,
+                DbPurpose::DomainContext,
+                &subkeys::scope(&[persona_id, focus_id]).unwrap(),
+            )),
+        )
+        .await;
         assert!(table_exists(&mut dc_conn, "domain_context_blocks").await);
 
-        let mut ps_conn = open_verify_conn(&ps_path, Some(TEST_KEY_HEX)).await;
+        let mut ps_conn = open_verify_conn(
+            &ps_path,
+            Some(&dk(
+                user_id,
+                DbPurpose::PlanState,
+                &subkeys::scope(&[persona_id, focus_id, topic_id]).unwrap(),
+            )),
+        )
+        .await;
         assert!(table_exists(&mut ps_conn, "topic_header").await);
         assert!(table_exists(&mut ps_conn, "handoff_tokens").await);
     }

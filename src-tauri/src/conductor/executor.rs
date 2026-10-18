@@ -2825,7 +2825,12 @@ mod tests {
             // Nothing writes extra_metadata yet (items.id=714): set it directly.
             let mut conn = crate::providers::utils::connect_options_encrypted(
                 &crate::providers::utils::db_path_integration_keys("user-y"),
-                &key_hex,
+                &crate::auth::subkeys::test_key_hex(
+                    "user-y",
+                    &key_hex,
+                    crate::auth::subkeys::DbPurpose::IntegrationKeys,
+                    crate::auth::subkeys::ACCOUNT_SCOPE,
+                ),
             )
             .create_if_missing(false)
             .connect()

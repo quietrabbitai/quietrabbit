@@ -1486,7 +1486,7 @@ mod tests {
 
         let persona_id = "unchecked-none-persona";
         let group_id = "unchecked-none-group";
-        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
 
         let verify = async {
             let result = get_document_unchecked(persona_id, group_id, key_hex, "no-such-doc")
@@ -1513,7 +1513,7 @@ mod tests {
         let owner_persona_id = "unchecked-owner";
         let stranger_persona_id = "unchecked-stranger";
         let group_id = "unchecked-group";
-        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
 
         let verify = async {
             // Seed the document into the STRANGER's own local group.db copy
@@ -1731,7 +1731,7 @@ mod tests {
 
         let persona_id = "real-path-persona";
         let group_id = "real-path-group";
-        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
 
         let verify = async {
             let doc_id = create_document(
@@ -1773,8 +1773,8 @@ mod tests {
 
         let persona_id = "rekey-persona";
         let group_id = "rekey-group";
-        let old_key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
-        let new_key_hex = "11223344556677889900aabbccddeeff00112233445566778899aabbccddee";
+        let old_key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
+        let new_key_hex = "11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff";
 
         let verify = async {
             let doc_id = create_document(
@@ -1827,7 +1827,7 @@ mod tests {
 
         let persona_id = "self-heal-persona";
         let group_id = "self-heal-group";
-        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
 
         let db_path = get_group_db_path(persona_id, group_id);
         assert!(

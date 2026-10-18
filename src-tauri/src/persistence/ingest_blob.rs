@@ -16,16 +16,14 @@
 // envelope to a third party -- no ephemeral keypair/DH step needed, so the
 // wire format is just [format][nonce][ciphertext], not a full envelope.
 //
-// KEY DERIVATION: the blob key is HKDF-derived from the account's resident
-// data key with a fixed purpose label plus persona_id, matching
-// derive_sharing_keypair's domain-separation reasoning exactly -- the
+// KEY DERIVATION (items.id=630): the blob key is the AUTH Section 4.0
+// per-purpose subkey, auth::subkeys::derive_db_key with purpose IngestBlob,
+// scope persona_id, the account's user id and the key epoch -- i.e. the info
+// string QuietRabbit-v1|ingest-blob|<persona_id>|<user_id>|epoch:<n>. The
 // version tag supports future crypto-agility, the purpose label prevents
-// collision with any other subkey ever HKDF-derived from the same
-// data key (sharing_keypair.rs's own header already documents one such
-// sibling consumer), and persona_id is defense-in-depth binding so a future
-// mismatched-argument bug is domain-separated rather than silently reusing
-// key material across personas. The raw data key is NEVER used directly
-// as AEAD key material -- always through this HKDF step first.
+// collision with any other subkey derived from the same data key, and the
+// user id and epoch mean a rotation (new data key, new epoch) changes every
+// blob key. The raw data key is NEVER used directly as AEAD key material.
 //
 // NO PERSISTED KEY: like every other key in this app, the blob key is never
 // written to disk -- it is re-derived on demand from the resident
@@ -69,13 +67,12 @@ use std::path::{Path, PathBuf};
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
-use hkdf::Hkdf;
-use sha2::Sha256;
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use zeroize::Zeroizing;
 
 use crate::auth::kdf;
+use crate::auth::subkeys;
 
 const FORMAT_V1: u8 = 0x01;
 const FORMAT_LEN: usize = 1;
@@ -98,6 +95,13 @@ pub enum IngestBlobError {
     UnsupportedFormat(u8),
     #[error("Blob decryption failed (authentication tag mismatch)")]
     DecryptionFailed,
+    /// The account's key epoch changed since this session unlocked
+    /// (auth::epoch_guard).
+    #[error("{0}")]
+    KeyEpoch(#[from] crate::auth::epoch_guard::KeyEpochError),
+    /// The blob key could not be derived (auth::subkeys).
+    #[error("{0}")]
+    Subkey(#[from] crate::auth::subkeys::SubkeyError),
 }
 
 /// Path to a specific version of an ingested document's encrypted blob.
@@ -114,20 +118,22 @@ pub fn ingest_blob_path(user_id: &str, persona_id: &str, output_id: &str, versio
         .join(format!("v{version}.enc"))
 }
 
-/// HKDF-derive this persona's ingest-blob AEAD key from the account's
-/// resident data key. Pure function, no I/O. See module header for the
-/// domain-separation reasoning (mirrors auth::sharing_keypair::
-/// derive_sharing_keypair).
-fn derive_ingest_blob_key(
+/// Derive this persona's ingest-blob AEAD key from the data key for an
+/// explicit key epoch. Pure function, no I/O (the rotation engine calls it
+/// for both the old and the new epoch). See the module header.
+pub(crate) fn derive_ingest_blob_key(
     data_key: &[u8; kdf::MASTER_KEY_LEN],
+    user_id: &str,
     persona_id: &str,
-) -> Zeroizing<[u8; KEY_LEN]> {
-    let hk = Hkdf::<Sha256>::new(None, data_key);
-    let info = format!("QuietRabbit-v1|ingest-blob-key|{persona_id}");
-    let mut okm = Zeroizing::new([0u8; KEY_LEN]);
-    hk.expand(info.as_bytes(), okm.as_mut())
-        .expect("32 bytes is a valid HKDF-SHA256 output length");
-    okm
+    epoch: u64,
+) -> Result<Zeroizing<[u8; KEY_LEN]>, IngestBlobError> {
+    Ok(subkeys::derive_db_key(
+        data_key,
+        subkeys::DbPurpose::IngestBlob,
+        persona_id,
+        user_id,
+        epoch,
+    )?)
 }
 
 /// Associated data binding a ciphertext to its (persona, output, version)
@@ -236,12 +242,19 @@ pub async fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), IngestBl
 pub async fn write_encrypted_blob(
     path: &Path,
     data_key: &[u8; kdf::MASTER_KEY_LEN],
+    user_id: &str,
     persona_id: &str,
     output_id: &str,
     version: i32,
     plaintext: &[u8],
 ) -> Result<(), IngestBlobError> {
-    let aead_key = derive_ingest_blob_key(data_key, persona_id);
+    crate::auth::epoch_guard::ensure_current(user_id).await?;
+    let aead_key = derive_ingest_blob_key(
+        data_key,
+        user_id,
+        persona_id,
+        subkeys::resident_or_initial_epoch(user_id),
+    )?;
 
     let mut nonce_bytes = [0u8; NONCE_LEN];
     getrandom::fill(&mut nonce_bytes).map_err(|e| IngestBlobError::RandomSource(e.to_string()))?;
@@ -273,10 +286,12 @@ pub async fn write_encrypted_blob(
 pub async fn read_encrypted_blob(
     path: &Path,
     data_key: &[u8; kdf::MASTER_KEY_LEN],
+    user_id: &str,
     persona_id: &str,
     output_id: &str,
     version: i32,
 ) -> Result<Vec<u8>, IngestBlobError> {
+    crate::auth::epoch_guard::ensure_current(user_id).await?;
     let file_bytes = tokio::fs::read(path).await?;
 
     if file_bytes.len() < MIN_FILE_LEN {
@@ -292,7 +307,12 @@ pub async fn read_encrypted_blob(
     let ciphertext = &file_bytes[FORMAT_LEN + NONCE_LEN..];
 
     let aad = blob_aad(persona_id, output_id, version);
-    let aead_key = derive_ingest_blob_key(data_key, persona_id);
+    let aead_key = derive_ingest_blob_key(
+        data_key,
+        user_id,
+        persona_id,
+        subkeys::resident_or_initial_epoch(user_id),
+    )?;
     let cipher = ChaCha20Poly1305::new(&Key::from(*aead_key));
     cipher
         .decrypt(
@@ -317,23 +337,33 @@ mod tests {
         // the master key directly as AEAD key material instead of through
         // the HKDF step.
         let master_key = [0x11u8; kdf::MASTER_KEY_LEN];
-        let key = derive_ingest_blob_key(&master_key, "persona-a");
+        let key = derive_ingest_blob_key(&master_key, "user-a", "persona-a", 1).unwrap();
         assert_ne!(key.as_slice(), &master_key[..KEY_LEN]);
     }
 
     #[test]
     fn different_persona_id_derives_a_different_key() {
         let master_key = [0x22u8; kdf::MASTER_KEY_LEN];
-        let key_a = derive_ingest_blob_key(&master_key, "persona-a");
-        let key_b = derive_ingest_blob_key(&master_key, "persona-b");
+        let key_a = derive_ingest_blob_key(&master_key, "user-a", "persona-a", 1).unwrap();
+        let key_b = derive_ingest_blob_key(&master_key, "user-a", "persona-b", 1).unwrap();
         assert_ne!(*key_a, *key_b);
+    }
+
+    #[test]
+    fn user_and_epoch_participate_in_the_blob_key() {
+        let master_key = [0x28u8; kdf::MASTER_KEY_LEN];
+        let base = derive_ingest_blob_key(&master_key, "user-a", "persona-a", 1).unwrap();
+        let other_user = derive_ingest_blob_key(&master_key, "user-b", "persona-a", 1).unwrap();
+        let next_epoch = derive_ingest_blob_key(&master_key, "user-a", "persona-a", 2).unwrap();
+        assert_ne!(*base, *other_user);
+        assert_ne!(*base, *next_epoch);
     }
 
     #[test]
     fn same_master_key_and_persona_id_derive_identical_key() {
         let master_key = [0x33u8; kdf::MASTER_KEY_LEN];
-        let key1 = derive_ingest_blob_key(&master_key, "persona-a");
-        let key2 = derive_ingest_blob_key(&master_key, "persona-a");
+        let key1 = derive_ingest_blob_key(&master_key, "user-a", "persona-a", 1).unwrap();
+        let key2 = derive_ingest_blob_key(&master_key, "user-a", "persona-a", 1).unwrap();
         assert_eq!(*key1, *key2);
     }
 
@@ -357,11 +387,11 @@ mod tests {
         let path = tempdir.path().join("nested").join("deeper").join("v1.enc");
         let plaintext = b"a real uploaded document's bytes, right here";
 
-        write_encrypted_blob(&path, &KEY, "persona-a", "out-1", 1, plaintext)
+        write_encrypted_blob(&path, &KEY, "user-a", "persona-a", "out-1", 1, plaintext)
             .await
             .expect("write must succeed, including creating parent dirs");
 
-        let decrypted = read_encrypted_blob(&path, &KEY, "persona-a", "out-1", 1)
+        let decrypted = read_encrypted_blob(&path, &KEY, "user-a", "persona-a", "out-1", 1)
             .await
             .expect("read must succeed");
 
@@ -372,7 +402,7 @@ mod tests {
     async fn file_starts_with_the_format_byte() {
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         let path = tempdir.path().join("v1.enc");
-        write_encrypted_blob(&path, &KEY, "persona-a", "out-1", 1, b"x")
+        write_encrypted_blob(&path, &KEY, "user-a", "persona-a", "out-1", 1, b"x")
             .await
             .unwrap();
 
@@ -387,11 +417,20 @@ mod tests {
         let path = tempdir.path().join("v1.enc");
         let master_key = [0x55u8; kdf::MASTER_KEY_LEN];
 
-        write_encrypted_blob(&path, &master_key, "persona-a", "out-1", 1, b"secret")
-            .await
-            .unwrap();
+        write_encrypted_blob(
+            &path,
+            &master_key,
+            "user-a",
+            "persona-a",
+            "out-1",
+            1,
+            b"secret",
+        )
+        .await
+        .unwrap();
 
-        let result = read_encrypted_blob(&path, &master_key, "persona-b", "out-1", 1).await;
+        let result =
+            read_encrypted_blob(&path, &master_key, "user-a", "persona-b", "out-1", 1).await;
         assert!(matches!(result, Err(IngestBlobError::DecryptionFailed)));
     }
 
@@ -403,6 +442,7 @@ mod tests {
         write_encrypted_blob(
             &path,
             &[0x66u8; kdf::MASTER_KEY_LEN],
+            "user-a",
             "persona-a",
             "out-1",
             1,
@@ -414,6 +454,7 @@ mod tests {
         let result = read_encrypted_blob(
             &path,
             &[0x77u8; kdf::MASTER_KEY_LEN],
+            "user-a",
             "persona-a",
             "out-1",
             1,
@@ -428,15 +469,23 @@ mod tests {
         let path_a = tempdir.path().join("out-a").join("v1.enc");
         let path_b = tempdir.path().join("out-b").join("v1.enc");
 
-        write_encrypted_blob(&path_a, &KEY, "persona-a", "out-a", 1, b"document A")
-            .await
-            .unwrap();
+        write_encrypted_blob(
+            &path_a,
+            &KEY,
+            "user-a",
+            "persona-a",
+            "out-a",
+            1,
+            b"document A",
+        )
+        .await
+        .unwrap();
         tokio::fs::create_dir_all(path_b.parent().unwrap())
             .await
             .unwrap();
         tokio::fs::copy(&path_a, &path_b).await.unwrap();
 
-        let swapped = read_encrypted_blob(&path_b, &KEY, "persona-a", "out-b", 1).await;
+        let swapped = read_encrypted_blob(&path_b, &KEY, "user-a", "persona-a", "out-b", 1).await;
         assert!(
             matches!(swapped, Err(IngestBlobError::DecryptionFailed)),
             "a blob copied under another output id must not decrypt as that output"
@@ -444,7 +493,7 @@ mod tests {
 
         // The binding is to the ids, not the path: the same bytes still
         // open under their own output id wherever they sit.
-        let own = read_encrypted_blob(&path_b, &KEY, "persona-a", "out-a", 1)
+        let own = read_encrypted_blob(&path_b, &KEY, "user-a", "persona-a", "out-a", 1)
             .await
             .unwrap();
         assert_eq!(own, b"document A");
@@ -456,18 +505,18 @@ mod tests {
         let v1 = tempdir.path().join("v1.enc");
         let v2 = tempdir.path().join("v2.enc");
 
-        write_encrypted_blob(&v1, &KEY, "persona-a", "out-1", 1, b"version one")
+        write_encrypted_blob(&v1, &KEY, "user-a", "persona-a", "out-1", 1, b"version one")
             .await
             .unwrap();
         tokio::fs::copy(&v1, &v2).await.unwrap();
 
-        let swapped = read_encrypted_blob(&v2, &KEY, "persona-a", "out-1", 2).await;
+        let swapped = read_encrypted_blob(&v2, &KEY, "user-a", "persona-a", "out-1", 2).await;
         assert!(
             matches!(swapped, Err(IngestBlobError::DecryptionFailed)),
             "v1 bytes placed at the v2 path must not decrypt as version 2"
         );
 
-        let own = read_encrypted_blob(&v1, &KEY, "persona-a", "out-1", 1)
+        let own = read_encrypted_blob(&v1, &KEY, "user-a", "persona-a", "out-1", 1)
             .await
             .unwrap();
         assert_eq!(own, b"version one");
@@ -479,16 +528,25 @@ mod tests {
         let path = tempdir.path().join("v1.enc");
         let master_key = [0x88u8; kdf::MASTER_KEY_LEN];
 
-        write_encrypted_blob(&path, &master_key, "persona-a", "out-1", 1, b"secret")
-            .await
-            .unwrap();
+        write_encrypted_blob(
+            &path,
+            &master_key,
+            "user-a",
+            "persona-a",
+            "out-1",
+            1,
+            b"secret",
+        )
+        .await
+        .unwrap();
 
         let mut file_bytes = tokio::fs::read(&path).await.unwrap();
         let last = file_bytes.len() - 1;
         file_bytes[last] ^= 0xFF; // flip a bit inside the AEAD tag
         tokio::fs::write(&path, file_bytes).await.unwrap();
 
-        let result = read_encrypted_blob(&path, &master_key, "persona-a", "out-1", 1).await;
+        let result =
+            read_encrypted_blob(&path, &master_key, "user-a", "persona-a", "out-1", 1).await;
         assert!(
             matches!(result, Err(IngestBlobError::DecryptionFailed)),
             "a tampered blob must fail AEAD verification, not decrypt to garbage"
@@ -502,7 +560,8 @@ mod tests {
         tokio::fs::write(&path, [0x01, 0x02, 0x03]).await.unwrap();
 
         let master_key = [0x99u8; kdf::MASTER_KEY_LEN];
-        let result = read_encrypted_blob(&path, &master_key, "persona-a", "out-1", 1).await;
+        let result =
+            read_encrypted_blob(&path, &master_key, "user-a", "persona-a", "out-1", 1).await;
         assert!(matches!(result, Err(IngestBlobError::MalformedBlob)));
     }
 
@@ -510,7 +569,7 @@ mod tests {
     async fn unknown_format_byte_is_rejected_as_unsupported() {
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         let path = tempdir.path().join("v1.enc");
-        write_encrypted_blob(&path, &KEY, "persona-a", "out-1", 1, b"secret")
+        write_encrypted_blob(&path, &KEY, "user-a", "persona-a", "out-1", 1, b"secret")
             .await
             .unwrap();
 
@@ -518,7 +577,7 @@ mod tests {
         file_bytes[0] = 0x02;
         tokio::fs::write(&path, file_bytes).await.unwrap();
 
-        let result = read_encrypted_blob(&path, &KEY, "persona-a", "out-1", 1).await;
+        let result = read_encrypted_blob(&path, &KEY, "user-a", "persona-a", "out-1", 1).await;
         assert!(matches!(
             result,
             Err(IngestBlobError::UnsupportedFormat(0x02))
@@ -530,7 +589,7 @@ mod tests {
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         let path = tempdir.path().join("out-1").join("v1.enc");
 
-        write_encrypted_blob(&path, &KEY, "persona-a", "out-1", 1, b"secret")
+        write_encrypted_blob(&path, &KEY, "user-a", "persona-a", "out-1", 1, b"secret")
             .await
             .unwrap();
 
@@ -547,14 +606,14 @@ mod tests {
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         let path = tempdir.path().join("v1.enc");
 
-        write_encrypted_blob(&path, &KEY, "persona-a", "out-1", 1, b"first")
+        write_encrypted_blob(&path, &KEY, "user-a", "persona-a", "out-1", 1, b"first")
             .await
             .unwrap();
-        write_encrypted_blob(&path, &KEY, "persona-a", "out-1", 1, b"second")
+        write_encrypted_blob(&path, &KEY, "user-a", "persona-a", "out-1", 1, b"second")
             .await
             .unwrap();
 
-        let decrypted = read_encrypted_blob(&path, &KEY, "persona-a", "out-1", 1)
+        let decrypted = read_encrypted_blob(&path, &KEY, "user-a", "persona-a", "out-1", 1)
             .await
             .unwrap();
         assert_eq!(decrypted, b"second");
@@ -568,22 +627,22 @@ mod tests {
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         let path = tempdir.path().join("v1.enc");
 
-        write_encrypted_blob(&path, &KEY, "persona-a", "out-1", 1, b"old")
+        write_encrypted_blob(&path, &KEY, "user-a", "persona-a", "out-1", 1, b"old")
             .await
             .unwrap();
         tokio::fs::write(tmp_path(&path), [0x01, 0xAA, 0xBB])
             .await
             .unwrap();
 
-        let still_old = read_encrypted_blob(&path, &KEY, "persona-a", "out-1", 1)
+        let still_old = read_encrypted_blob(&path, &KEY, "user-a", "persona-a", "out-1", 1)
             .await
             .unwrap();
         assert_eq!(still_old, b"old", "readers must never see the .tmp");
 
-        write_encrypted_blob(&path, &KEY, "persona-a", "out-1", 1, b"new")
+        write_encrypted_blob(&path, &KEY, "user-a", "persona-a", "out-1", 1, b"new")
             .await
             .expect("a stale .tmp must not block the next write");
-        let now_new = read_encrypted_blob(&path, &KEY, "persona-a", "out-1", 1)
+        let now_new = read_encrypted_blob(&path, &KEY, "user-a", "persona-a", "out-1", 1)
             .await
             .unwrap();
         assert_eq!(now_new, b"new");
@@ -599,7 +658,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = read_encrypted_blob(&path, &KEY, "persona-a", "out-1", 1).await;
+        let result = read_encrypted_blob(&path, &KEY, "user-a", "persona-a", "out-1", 1).await;
         match result {
             Err(IngestBlobError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
             other => panic!("expected Io(NotFound), got {other:?}"),

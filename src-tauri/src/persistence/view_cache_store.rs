@@ -31,6 +31,10 @@ pub enum ViewCacheStoreError {
     /// (auth::epoch_guard, items.id=629).
     #[error("{0}")]
     KeyEpoch(#[from] crate::auth::epoch_guard::KeyEpochError),
+    /// A database key could not be derived from the data key
+    /// (auth::subkeys, items.id=630).
+    #[error("{0}")]
+    Subkey(#[from] crate::auth::subkeys::SubkeyError),
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("Migration error: {0}")]
@@ -106,6 +110,12 @@ pub(crate) async fn open_view_cache_db(
     if !db_path.exists() {
         crate::persistence::migrations::migrate_view_cache_db(user_id, share_id, key_hex).await?;
     }
+    let db_key = crate::auth::subkeys::db_key_hex(
+        user_id,
+        key_hex,
+        crate::auth::subkeys::DbPurpose::ViewCache,
+        share_id,
+    )?;
 
     let network_storage = std::env::var("QR_NETWORK_STORAGE")
         .map(|v| v.to_lowercase() == "true")
@@ -115,7 +125,7 @@ pub(crate) async fn open_view_cache_db(
     let conn = crate::providers::utils::quiet_connect_options()
         .filename(&db_path)
         .create_if_missing(false)
-        .pragma("key", format!("\"x'{key_hex}'\""))
+        .pragma("key", format!("\"x'{}'\"", db_key.as_str()))
         .pragma("cipher_compatibility", "4")
         .pragma("journal_mode", journal_mode)
         .connect()

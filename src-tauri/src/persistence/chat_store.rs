@@ -221,7 +221,7 @@ mod tests {
     const USER_ID: &str = "user-chat-test";
     const PERSONA_ID: &str = "persona-chat-test";
     const OTHER_PERSONA_ID: &str = "persona-chat-test-other";
-    const KEY_HEX: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+    const KEY_HEX: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
 
     struct TestEnv {
         _tempdir: tempfile::TempDir,

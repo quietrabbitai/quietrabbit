@@ -112,7 +112,7 @@ mod tests {
         }
     }
 
-    const TEST_KEY_HEX: &str = "aabbccddeeff00112233445566778899aabbccddeeff0011223344556677aa";
+    const TEST_KEY_HEX: &str = "aabbccddeeff00112233445566778899aabbccddeeff0011223344556677aabb";
 
     async fn insert_group_fact(
         persona_id: &str,

@@ -133,7 +133,8 @@ pub async fn list_group_keys(
 mod tests {
     use super::*;
 
-    const PERSONAL_KEY_HEX: &str = "aabbccddeeff00112233445566778899aabbccddeeff0011223344556677aa";
+    const PERSONAL_KEY_HEX: &str =
+        "aabbccddeeff00112233445566778899aabbccddeeff0011223344556677aabb";
 
     struct TestEnv {
         _tempdir: tempfile::TempDir,

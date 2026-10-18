@@ -120,8 +120,9 @@ mod tests {
     use super::*;
     use sqlx::Row;
 
-    const GROUP_KEY_HEX: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
-    const PERSONAL_KEY_HEX: &str = "aabbccddeeff00112233445566778899aabbccddeeff0011223344556677aa";
+    const GROUP_KEY_HEX: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
+    const PERSONAL_KEY_HEX: &str =
+        "aabbccddeeff00112233445566778899aabbccddeeff0011223344556677aabb";
 
     struct ForkRow {
         title: String,

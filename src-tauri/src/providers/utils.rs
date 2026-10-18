@@ -328,7 +328,7 @@ mod tests {
 
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         let db_path = tempdir.path().join("test.db");
-        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
 
         // Bootstrap: create the file under the key via
         // connect_options_encrypted itself (create_if_missing(true)),

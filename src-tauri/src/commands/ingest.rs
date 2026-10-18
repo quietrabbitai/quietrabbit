@@ -308,6 +308,7 @@ pub async fn store_ingested_document(
     ingest_blob::write_encrypted_blob(
         &storage_path,
         &master_key,
+        &user_id,
         &persona_id,
         &output_id,
         version,
@@ -425,6 +426,7 @@ pub async fn get_ingested_document_bytes(
     ingest_blob::read_encrypted_blob(
         Path::new(&storage_path),
         &master_key,
+        &user_id,
         &persona_id,
         &output_id,
         record.storage_version,

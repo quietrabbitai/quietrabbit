@@ -222,7 +222,14 @@ pub async fn login(
         .await
         .map_err(|e| e.to_string())?;
 
-        establish_account_dbs(&user_id, &material.dek).await?;
+        // items.id=630: every database key is derived for the epoch this
+        // process unlocked under (auth::subkeys), so the epoch is registered
+        // before any database is opened or created.
+        epoch_guard::set_resident(&user_id, key_epoch);
+        if let Err(e) = establish_account_dbs(&user_id, &material.dek).await {
+            epoch_guard::clear_resident_for(&user_id);
+            return Err(e);
+        }
 
         // <<< SEAM: if future onboarding design decides the first-run
         // flow should also create a default persona, that call goes here
@@ -315,7 +322,13 @@ pub async fn login(
                 // complete but whose first databases do not exist yet --
                 // this recreates them under the same DEK instead of
                 // leaving the account unusable.
-                establish_account_dbs(&user.id, &dek).await?;
+                // items.id=630: register the epoch BEFORE any database is
+                // opened, so its subkey is derived for the right epoch.
+                epoch_guard::set_resident(&user.id, wrapper.key_epoch);
+                if let Err(e) = establish_account_dbs(&user.id, &dek).await {
+                    epoch_guard::clear_resident_for(&user.id);
+                    return Err(e);
+                }
                 finish_login(
                     &user.id,
                     *dek,
@@ -2081,8 +2094,14 @@ mod tests {
         let db_path = crate::providers::utils::db_path_outputs(&user.id, &persona_id);
         let run_id = uuid::Uuid::new_v4().to_string();
         {
+            let outputs_key = crate::auth::subkeys::test_key_hex(
+                &user.id,
+                &personal_key_hex,
+                crate::auth::subkeys::DbPurpose::Outputs,
+                &persona_id,
+            );
             let mut conn =
-                crate::providers::utils::connect_options_encrypted(&db_path, &personal_key_hex)
+                crate::providers::utils::connect_options_encrypted(&db_path, &outputs_key)
                     .create_if_missing(false)
                     .connect()
                     .await
@@ -2114,12 +2133,19 @@ mod tests {
         .await
         .expect("second login must succeed");
 
-        let mut conn =
-            crate::providers::utils::connect_options_encrypted(&db_path, &personal_key_hex)
-                .create_if_missing(false)
-                .connect()
-                .await
-                .expect("must reopen outputs.db under its key");
+        let mut conn = crate::providers::utils::connect_options_encrypted(
+            &db_path,
+            &crate::auth::subkeys::test_key_hex(
+                &user.id,
+                &personal_key_hex,
+                crate::auth::subkeys::DbPurpose::Outputs,
+                &persona_id,
+            ),
+        )
+        .create_if_missing(false)
+        .connect()
+        .await
+        .expect("must reopen outputs.db under its key");
         let status: String = sqlx::query_scalar("SELECT status FROM focus_runs WHERE id = ?")
             .bind(&run_id)
             .fetch_one(&mut conn)

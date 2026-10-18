@@ -42,6 +42,10 @@ pub enum DomainContextStoreError {
     /// (auth::epoch_guard, items.id=629).
     #[error("{0}")]
     KeyEpoch(#[from] crate::auth::epoch_guard::KeyEpochError),
+    /// A database key could not be derived from the data key
+    /// (auth::subkeys, items.id=630).
+    #[error("{0}")]
+    Subkey(#[from] crate::auth::subkeys::SubkeyError),
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("Migration error: {0}")]
@@ -180,6 +184,12 @@ async fn open_domain_context_db(
         )
         .await?;
     }
+    let db_key = crate::auth::subkeys::db_key_hex(
+        user_id,
+        key_hex,
+        crate::auth::subkeys::DbPurpose::DomainContext,
+        &crate::auth::subkeys::scope(&[persona_id, focus_id])?,
+    )?;
 
     let network_storage = std::env::var("QR_NETWORK_STORAGE")
         .map(|v| v.to_lowercase() == "true")
@@ -192,7 +202,7 @@ async fn open_domain_context_db(
     let conn = crate::providers::utils::quiet_connect_options()
         .filename(&db_path)
         .create_if_missing(false)
-        .pragma("key", format!("\"x'{key_hex}'\""))
+        .pragma("key", format!("\"x'{}'\"", db_key.as_str()))
         .pragma("cipher_compatibility", "4")
         .pragma("journal_mode", journal_mode)
         .connect()

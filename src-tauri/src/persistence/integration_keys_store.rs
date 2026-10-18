@@ -57,6 +57,10 @@ pub enum IntegrationKeysStoreError {
     /// (auth::epoch_guard, items.id=629).
     #[error("{0}")]
     KeyEpoch(#[from] crate::auth::epoch_guard::KeyEpochError),
+    /// A database key could not be derived from the data key
+    /// (auth::subkeys, items.id=630).
+    #[error("{0}")]
+    Subkey(#[from] crate::auth::subkeys::SubkeyError),
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("Validation error: {0}")]
@@ -175,8 +179,14 @@ pub(crate) async fn open_integration_keys_db(
     // it was created at. run_migrations is schema_version-tracked and only
     // applies what is pending.
     crate::persistence::migrations::migrate_keys_db(user_id, key_hex).await?;
+    let db_key = crate::auth::subkeys::db_key_hex(
+        user_id,
+        key_hex,
+        crate::auth::subkeys::DbPurpose::IntegrationKeys,
+        crate::auth::subkeys::ACCOUNT_SCOPE,
+    )?;
 
-    let conn = crate::providers::utils::connect_options_encrypted(&db_path, key_hex)
+    let conn = crate::providers::utils::connect_options_encrypted(&db_path, &db_key)
         .create_if_missing(false)
         .connect()
         .await?;
@@ -787,8 +797,8 @@ mod tests {
     // re-verify every scoping branch already covered above in-memory; they
     // focus on the one dimension those tests structurally cannot reach.
 
-    const TEST_KEY_HEX: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
-    const WRONG_KEY_HEX: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddee";
+    const TEST_KEY_HEX: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
+    const WRONG_KEY_HEX: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
     #[tokio::test]
     async fn get_active_key_and_upsert_key_round_trip_against_real_migrated_db() {
@@ -1017,7 +1027,12 @@ mod tests {
         {
             let mut conn = crate::providers::utils::connect_options_encrypted(
                 &get_integration_keys_db_path(user_id),
-                TEST_KEY_HEX,
+                &crate::auth::subkeys::test_key_hex(
+                    user_id,
+                    TEST_KEY_HEX,
+                    crate::auth::subkeys::DbPurpose::IntegrationKeys,
+                    crate::auth::subkeys::ACCOUNT_SCOPE,
+                ),
             )
             .create_if_missing(false)
             .connect()
@@ -1059,7 +1074,12 @@ mod tests {
 
         let mut conn = crate::providers::utils::connect_options_encrypted(
             &get_integration_keys_db_path(user_id),
-            TEST_KEY_HEX,
+            &crate::auth::subkeys::test_key_hex(
+                user_id,
+                TEST_KEY_HEX,
+                crate::auth::subkeys::DbPurpose::IntegrationKeys,
+                crate::auth::subkeys::ACCOUNT_SCOPE,
+            ),
         )
         .create_if_missing(false)
         .connect()

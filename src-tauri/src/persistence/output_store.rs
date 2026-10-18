@@ -135,6 +135,10 @@ pub enum OutputStoreError {
     /// (auth::epoch_guard, items.id=629).
     #[error("{0}")]
     KeyEpoch(#[from] crate::auth::epoch_guard::KeyEpochError),
+    /// A database key could not be derived from the data key
+    /// (auth::subkeys, items.id=630).
+    #[error("{0}")]
+    Subkey(#[from] crate::auth::subkeys::SubkeyError),
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("Validation error: {0}")]
@@ -207,8 +211,14 @@ pub(crate) async fn open_outputs_db(
     // idempotent/pending-only behavior (schema_version-tracked) rather than
     // a file-existence guess about whether anything is pending.
     crate::persistence::migrations::migrate_outputs_db(user_id, persona_id, key_hex).await?;
+    let db_key = crate::auth::subkeys::db_key_hex(
+        user_id,
+        key_hex,
+        crate::auth::subkeys::DbPurpose::Outputs,
+        persona_id,
+    )?;
 
-    let conn = crate::providers::utils::connect_options_encrypted(&db_path, key_hex)
+    let conn = crate::providers::utils::connect_options_encrypted(&db_path, &db_key)
         .create_if_missing(false)
         .pragma("busy_timeout", "5000")
         .connect()
@@ -2433,7 +2443,7 @@ mod tests {
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
         let user_id = "self-heal-user";
         let persona_id = "self-heal-persona";
-        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
 
         let db_path = get_outputs_db_path(user_id, persona_id);
         assert!(
@@ -2488,7 +2498,7 @@ mod tests {
 
         let user_id = "stale-pre-source-user";
         let persona_id = "stale-pre-source-persona";
-        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
         let db_path = get_outputs_db_path(user_id, persona_id);
         std::fs::create_dir_all(db_path.parent().unwrap())
             .expect("failed to create parent dirs for test db");
@@ -2497,7 +2507,18 @@ mod tests {
             let mut conn = SqliteConnectOptions::new()
                 .filename(&db_path)
                 .create_if_missing(true)
-                .pragma("key", format!("\"x'{key_hex}'\""))
+                .pragma(
+                    "key",
+                    format!(
+                        "\"x'{}'\"",
+                        crate::auth::subkeys::test_key_hex(
+                            user_id,
+                            key_hex,
+                            crate::auth::subkeys::DbPurpose::Outputs,
+                            persona_id,
+                        )
+                    ),
+                )
                 .connect()
                 .await
                 .expect("stale fixture connect failed");
@@ -2545,7 +2566,7 @@ mod tests {
 
     // -- Ingestion (items.id=383, decisions.id=486) -------------------------
 
-    const INGEST_KEY_HEX: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+    const INGEST_KEY_HEX: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
 
     /// Real on-disk outputs.db via the actual migration path (matches
     /// open_outputs_db_self_heals_a_never_created_file's own real-file
@@ -3248,7 +3269,7 @@ mod tests {
 
         let user_id = "fact-cascade-user";
         let persona_id = "fact-cascade-persona";
-        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
         let focus_run_id = "run-fact-cascade-1";
 
         test_seed_focus_run(user_id, persona_id, key_hex, focus_run_id, "quick-ask")
@@ -3343,7 +3364,7 @@ mod tests {
 
         let user_id = "fact-scope-user";
         let persona_id = "fact-scope-persona";
-        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
 
         test_seed_focus_run(user_id, persona_id, key_hex, "run-a", "quick-ask")
             .await

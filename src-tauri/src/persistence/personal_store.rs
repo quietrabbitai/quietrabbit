@@ -113,6 +113,10 @@ pub enum PersonalStoreError {
     /// (auth::epoch_guard, items.id=629).
     #[error("{0}")]
     KeyEpoch(#[from] crate::auth::epoch_guard::KeyEpochError),
+    /// A database key could not be derived from the data key
+    /// (auth::subkeys, items.id=630).
+    #[error("{0}")]
+    Subkey(#[from] crate::auth::subkeys::SubkeyError),
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("Decryption error: {0}")]
@@ -177,6 +181,12 @@ pub(crate) async fn open_personal_db(
     // exercised by migrate_personal_db_is_idempotent_on_real_file) rather
     // than a file-existence guess about whether anything is pending.
     crate::persistence::migrations::migrate_personal_db(user_id, persona_id, key_hex).await?;
+    let db_key = crate::auth::subkeys::db_key_hex(
+        user_id,
+        key_hex,
+        crate::auth::subkeys::DbPurpose::Personal,
+        persona_id,
+    )?;
 
     let network_storage = std::env::var("QR_NETWORK_STORAGE")
         .map(|v| v.to_lowercase() == "true")
@@ -191,7 +201,7 @@ pub(crate) async fn open_personal_db(
         // commands/auth.rs::verify_integration_keys_db, which isolated
         // this exact failure via a standalone diagnostic test
         // (items.id=206, 2026-08-02).
-        .pragma("key", format!("\"x'{key_hex}'\""))
+        .pragma("key", format!("\"x'{}'\"", db_key.as_str()))
         .pragma("cipher_compatibility", "4")
         .pragma("journal_mode", journal_mode)
         .connect()
@@ -1498,6 +1508,17 @@ pub async fn get_disclosure_log_for_run(
 mod tests {
     use super::*;
 
+    /// The subkey open_personal_db applies for `key_hex` (test fixtures that
+    /// create the file themselves must use it, items.id=630).
+    fn personal_db_key(user_id: &str, key_hex: &str, persona_id: &str) -> String {
+        crate::auth::subkeys::test_key_hex(
+            user_id,
+            key_hex,
+            crate::auth::subkeys::DbPurpose::Personal,
+            persona_id,
+        )
+    }
+
     /// Regression test for items.id=206: open_personal_db's PRAGMA key
     /// blob-literal form was missing the outer double quotes SQLCipher
     /// requires, causing every real (non-mocked) connection attempt to
@@ -1520,7 +1541,7 @@ mod tests {
         let db_path = get_personal_db_path(user_id, persona_id);
         std::fs::create_dir_all(db_path.parent().unwrap())
             .expect("failed to create parent dirs for test db");
-        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
 
         // Bootstrap: create the file under the key using the same
         // corrected PRAGMA form, matching how a real first-write would
@@ -1529,7 +1550,10 @@ mod tests {
             let mut conn = SqliteConnectOptions::new()
                 .filename(&db_path)
                 .create_if_missing(true)
-                .pragma("key", format!("\"x'{key_hex}'\""))
+                .pragma(
+                    "key",
+                    format!("\"x'{}'\"", personal_db_key(user_id, key_hex, persona_id)),
+                )
                 .connect()
                 .await
                 .expect("bootstrap connect with corrected PRAGMA form must succeed");
@@ -1556,6 +1580,62 @@ mod tests {
         );
     }
 
+    /// items.id=630: the file open_personal_db creates is keyed by the
+    /// per-database SUBKEY, never by the data key it was handed, and a
+    /// different persona's subkey does not open it.
+    #[tokio::test]
+    async fn open_personal_db_is_keyed_by_a_subkey_not_the_data_key() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+        let user_id = "subkey-user";
+        let persona_id = "subkey-persona";
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
+
+        let created = open_personal_db(user_id, persona_id, key_hex)
+            .await
+            .map(drop);
+        let db_path = get_personal_db_path(user_id, persona_id);
+
+        async fn readable(path: &std::path::Path, key: &str) -> bool {
+            let Ok(mut conn) = SqliteConnectOptions::new()
+                .filename(path)
+                .create_if_missing(false)
+                .pragma("key", format!("\"x'{key}'\""))
+                .connect()
+                .await
+            else {
+                return false;
+            };
+            sqlx::query("SELECT count(*) FROM sqlite_master")
+                .execute(&mut conn)
+                .await
+                .is_ok()
+        }
+        let under_subkey = readable(&db_path, &personal_db_key(user_id, key_hex, persona_id)).await;
+        let under_dek = readable(&db_path, key_hex).await;
+        let under_other_persona = readable(
+            &db_path,
+            &personal_db_key(user_id, key_hex, "other-persona"),
+        )
+        .await;
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+
+        created.expect("open_personal_db must create the file");
+        assert!(under_subkey, "the file must open under its own subkey");
+        assert!(!under_dek, "the data key itself must not open the file");
+        assert!(
+            !under_other_persona,
+            "another persona's subkey must not open the file"
+        );
+    }
+
     /// Regression test for items.id=278: open_personal_db must self-heal a
     /// never-yet-created personal.db by running migrate_personal_db()
     /// itself, rather than hard-failing with SQLITE_CANTOPEN -- the same
@@ -1575,7 +1655,7 @@ mod tests {
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
         let user_id = "self-heal-user";
         let persona_id = "self-heal-persona";
-        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
 
         let db_path = get_personal_db_path(user_id, persona_id);
         assert!(
@@ -1634,7 +1714,7 @@ mod tests {
 
         let user_id = "stale-v1-user";
         let persona_id = "stale-v1-persona";
-        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
         let db_path = get_personal_db_path(user_id, persona_id);
         std::fs::create_dir_all(db_path.parent().unwrap())
             .expect("failed to create parent dirs for test db");
@@ -1643,7 +1723,10 @@ mod tests {
             let mut conn = SqliteConnectOptions::new()
                 .filename(&db_path)
                 .create_if_missing(true)
-                .pragma("key", format!("\"x'{key_hex}'\""))
+                .pragma(
+                    "key",
+                    format!("\"x'{}'\"", personal_db_key(user_id, key_hex, persona_id)),
+                )
                 .connect()
                 .await
                 .expect("stale fixture connect failed");
@@ -1777,7 +1860,7 @@ mod tests {
 
         let user_id = "vp-test-user";
         let persona_id = "vp-test-persona";
-        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
 
         let entry_id = save_voice_profile_entry(
             user_id,
@@ -1815,7 +1898,7 @@ mod tests {
 
         let user_id = "vp-test-user";
         let persona_id = "vp-test-persona";
-        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
 
         let entry_id = save_voice_profile_entry(
             user_id,
@@ -1881,7 +1964,7 @@ mod tests {
 
         let user_id = "vp-test-user";
         let persona_id = "vp-test-persona";
-        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
 
         let entry_id = save_voice_profile_entry(
             user_id,
@@ -1938,7 +2021,7 @@ mod tests {
 
         let user_id = "standing-pref-user";
         let persona_id = "standing-pref-persona";
-        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
 
         let none_yet = find_standing_preference(user_id, persona_id, key_hex, "hash-abc")
             .await
@@ -1986,7 +2069,7 @@ mod tests {
 
         let user_id = "standing-pref-user-2";
         let persona_id = "standing-pref-persona-2";
-        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
 
         write_standing_preference(
             user_id,

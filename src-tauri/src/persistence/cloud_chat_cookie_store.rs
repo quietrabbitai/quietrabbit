@@ -41,6 +41,10 @@ pub enum CloudChatCookieStoreError {
     /// (auth::epoch_guard, items.id=629).
     #[error("{0}")]
     KeyEpoch(#[from] crate::auth::epoch_guard::KeyEpochError),
+    /// A database key could not be derived from the data key
+    /// (auth::subkeys, items.id=630).
+    #[error("{0}")]
+    Subkey(#[from] crate::auth::subkeys::SubkeyError),
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("Migration error: {0}")]
@@ -111,8 +115,14 @@ async fn open_tier3_cookies_db(
     if !db_path.exists() {
         crate::persistence::migrations::migrate_tier3_cookies_db(user_id, key_hex).await?;
     }
+    let db_key = crate::auth::subkeys::db_key_hex(
+        user_id,
+        key_hex,
+        crate::auth::subkeys::DbPurpose::CloudCookies,
+        crate::auth::subkeys::ACCOUNT_SCOPE,
+    )?;
 
-    let conn = crate::providers::utils::connect_options_encrypted(&db_path, key_hex)
+    let conn = crate::providers::utils::connect_options_encrypted(&db_path, &db_key)
         .create_if_missing(false)
         .connect()
         .await?;

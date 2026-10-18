@@ -17,6 +17,7 @@ pub mod kdf;
 pub mod persona_sharing;
 pub mod registry;
 pub mod sharing_keypair;
+pub mod subkeys;
 pub mod user_store;
 
 use crate::auth::registry::GroupKeyRegistry;

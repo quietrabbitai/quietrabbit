@@ -914,7 +914,7 @@ fn same_grant_set(a: &[PermissionGrant], b: &[PermissionGrant]) -> bool {
 mod tests {
     use super::*;
 
-    const KEY_HEX: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+    const KEY_HEX: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
 
     struct TestEnv {
         _tempdir: tempfile::TempDir,

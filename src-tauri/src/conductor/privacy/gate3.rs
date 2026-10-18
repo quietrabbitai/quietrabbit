@@ -1181,7 +1181,7 @@ mod tests {
 
     use crate::conductor::privacy::logger::TestLogger;
 
-    const TEST_KEY_HEX: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+    const TEST_KEY_HEX: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
 
     fn entity_with(label: &str, span_text: &str) -> PfEntityDecoded {
         PfEntityDecoded {

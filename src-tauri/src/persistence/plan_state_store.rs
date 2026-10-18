@@ -163,6 +163,10 @@ pub enum PlanStateStoreError {
     /// (auth::epoch_guard, items.id=629).
     #[error("{0}")]
     KeyEpoch(#[from] crate::auth::epoch_guard::KeyEpochError),
+    /// A database key could not be derived from the data key
+    /// (auth::subkeys, items.id=630).
+    #[error("{0}")]
+    Subkey(#[from] crate::auth::subkeys::SubkeyError),
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("I/O error: {0}")]
@@ -200,6 +204,12 @@ async fn open_plan_state_db(
         .await
         .map_err(|e| PlanStateStoreError::Migration(e.to_string()))?;
     }
+    let db_key = crate::auth::subkeys::db_key_hex(
+        user_id,
+        key_hex,
+        crate::auth::subkeys::DbPurpose::PlanState,
+        &crate::auth::subkeys::scope(&[persona_id, focus_id, topic_id])?,
+    )?;
 
     let network_storage = std::env::var("QR_NETWORK_STORAGE")
         .map(|v| v.to_lowercase() == "true")
@@ -209,7 +219,7 @@ async fn open_plan_state_db(
     let conn = crate::providers::utils::quiet_connect_options()
         .filename(&db_path)
         .create_if_missing(false)
-        .pragma("key", format!("\"x'{key_hex}'\""))
+        .pragma("key", format!("\"x'{}'\"", db_key.as_str()))
         .pragma("cipher_compatibility", "4")
         .pragma("journal_mode", journal_mode)
         .pragma("busy_timeout", "5000")
@@ -906,7 +916,7 @@ pub async fn record_ceiling_user_response(
 mod tests {
     use super::*;
 
-    const TEST_KEY_HEX: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+    const TEST_KEY_HEX: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
 
     /// Regression test for items.id=773: consume_handoff_token previously
     /// only checked expired_at IS NULL, not whether expiry_at had actually

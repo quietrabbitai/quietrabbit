@@ -116,6 +116,10 @@ pub enum LifecycleError {
     /// (auth::epoch_guard, items.id=629).
     #[error("{0}")]
     KeyEpoch(#[from] crate::auth::epoch_guard::KeyEpochError),
+    /// A database key could not be derived from the data key
+    /// (auth::subkeys, items.id=630).
+    #[error("{0}")]
+    Subkey(#[from] crate::auth::subkeys::SubkeyError),
     // Phase 1 — LOAD
     #[error("Focus file not found: {0}.focus")]
     FocusNotFound(String),
@@ -1112,7 +1116,13 @@ async fn open_outputs_db(
             .map_err(|e| LifecycleError::DatabaseMigration(e.to_string()))?;
     }
 
-    let conn = connect_options_encrypted(&path, key_hex)
+    let db_key = crate::auth::subkeys::db_key_hex(
+        user_id,
+        key_hex,
+        crate::auth::subkeys::DbPurpose::Outputs,
+        persona_id,
+    )?;
+    let conn = connect_options_encrypted(&path, &db_key)
         .create_if_missing(false)
         .pragma("busy_timeout", "5000")
         .connect()

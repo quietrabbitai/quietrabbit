@@ -257,7 +257,7 @@ mod tests {
 
     const USER_ID: &str = "user-bind-test";
     const PERSONA_ID: &str = "persona-bind-test";
-    const KEY_HEX: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+    const KEY_HEX: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
 
     struct TestEnv {
         _tempdir: tempfile::TempDir,

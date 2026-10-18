@@ -109,6 +109,10 @@ pub enum MessageStoreError {
     /// (auth::epoch_guard, items.id=629).
     #[error("{0}")]
     KeyEpoch(#[from] crate::auth::epoch_guard::KeyEpochError),
+    /// A database key could not be derived from the data key
+    /// (auth::subkeys, items.id=630).
+    #[error("{0}")]
+    Subkey(#[from] crate::auth::subkeys::SubkeyError),
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("Validation error: {0}")]
@@ -187,8 +191,14 @@ pub(crate) async fn open_messages_db(
     // personal_store.rs's open_personal_db -- fixed separately as
     // items.id=389, same pattern applied there.
     crate::persistence::migrations::migrate_messages_db(user_id, persona_id, key_hex).await?;
+    let db_key = crate::auth::subkeys::db_key_hex(
+        user_id,
+        key_hex,
+        crate::auth::subkeys::DbPurpose::Messages,
+        persona_id,
+    )?;
 
-    let conn = crate::providers::utils::connect_options_encrypted(&db_path, key_hex)
+    let conn = crate::providers::utils::connect_options_encrypted(&db_path, &db_key)
         .create_if_missing(false)
         .pragma("busy_timeout", "5000")
         .connect()
@@ -654,7 +664,7 @@ mod tests {
 
     const USER_ID: &str = "user-msg-test";
     const PERSONA_ID: &str = "persona-msg-test";
-    const KEY_HEX: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aa";
+    const KEY_HEX: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
 
     struct TestEnv {
         _tempdir: tempfile::TempDir,
@@ -852,11 +862,19 @@ mod tests {
         std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
 
         {
-            let mut conn = crate::providers::utils::connect_options_encrypted(&db_path, KEY_HEX)
-                .create_if_missing(true)
-                .connect()
-                .await
-                .expect("stale fixture connect failed");
+            let mut conn = crate::providers::utils::connect_options_encrypted(
+                &db_path,
+                &crate::auth::subkeys::test_key_hex(
+                    user_id,
+                    KEY_HEX,
+                    crate::auth::subkeys::DbPurpose::Messages,
+                    persona_id,
+                ),
+            )
+            .create_if_missing(true)
+            .connect()
+            .await
+            .expect("stale fixture connect failed");
             for stmt in parse_statements(MESSAGES_SCHEMA) {
                 sqlx::query(&stmt)
                     .execute(&mut conn)
@@ -940,11 +958,19 @@ mod tests {
             ("m-withheld", Some("withheld"), Some(1)),
         ];
         {
-            let mut conn = crate::providers::utils::connect_options_encrypted(&db_path, KEY_HEX)
-                .create_if_missing(true)
-                .connect()
-                .await
-                .expect("v4 fixture connect failed");
+            let mut conn = crate::providers::utils::connect_options_encrypted(
+                &db_path,
+                &crate::auth::subkeys::test_key_hex(
+                    user_id,
+                    KEY_HEX,
+                    crate::auth::subkeys::DbPurpose::Messages,
+                    persona_id,
+                ),
+            )
+            .create_if_missing(true)
+            .connect()
+            .await
+            .expect("v4 fixture connect failed");
             for schema in [
                 MESSAGES_SCHEMA,
                 MESSAGES_SCHEMA_V2,
