@@ -1,0 +1,24 @@
+.new-phrase-flow {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.new-phrase-flow__text {
+  margin: 0;
+  font-size: var(--text-base);
+  line-height: var(--leading-body);
+  color: var(--text-muted);
+}
+
+.new-phrase-flow__field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.new-phrase-flow__buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}

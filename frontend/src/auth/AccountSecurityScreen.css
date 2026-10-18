@@ -58,6 +58,13 @@
   font-weight: 500;
 }
 
+.account-security__text {
+  margin: 0;
+  font-size: var(--text-base);
+  line-height: var(--leading-body);
+  color: var(--text-muted);
+}
+
 .account-security__footer {
   display: flex;
   justify-content: flex-end;

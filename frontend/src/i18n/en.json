@@ -11,6 +11,11 @@
       "title": "Account security",
       "signOut": "Sign out",
       "close": "Close",
+      "recoveryPhrase": {
+        "heading": "Recovery phrase",
+        "intro": "Your 24-word recovery phrase opens your data if you forget your password. If someone else may have seen it, create a new one: the old words then stop opening your current data.",
+        "open": "Create a new recovery phrase"
+      },
       "changePassword": {
         "heading": "Change password",
         "intro": "Changing your password re-locks all of your data under a new key, so the old password stops opening it from then on. This can take a while for a large account. Copies or backups made before the change can still be opened with your old password, and nothing can change that.",
@@ -22,6 +27,28 @@
         "mismatch": "The new password and its confirmation don't match.",
         "success": "Your password was changed. Your data is protected under the new password from now on. Copies or backups made before the change can still be opened with your old password."
       }
+    },
+    "newPhrase": {
+      "intro": "A new recovery phrase replaces your current one. You will be shown 24 new words once, asked to re-enter a few of them, and then your data is re-locked under a new key. After that the old words no longer open your current data. Nothing changes until you confirm the new words, and until then your old phrase keeps working. Copies or backups made before the change can still be opened with your old password and your old words, and nothing can change that.",
+      "passwordLabel": "Current password",
+      "start": "Show my new phrase",
+      "cancel": "Cancel",
+      "confirmPasswordLabel": "Current password, to confirm",
+      "confirmSubmit": "Confirm and replace my recovery phrase",
+      "startOver": "Start over",
+      "success": "Your new recovery phrase is active. The old words no longer open your current data. Keep the new words safe and offline. Copies or backups made before this change can still be opened with your old password and your old words.",
+      "done": "Done"
+    },
+    "recoveryPhrase": {
+      "showHeading": "Your new recovery phrase",
+      "showIntro": "Write these 24 words down in order and keep them somewhere safe and offline. They are shown only once.",
+      "wordsLabel": "Recovery phrase words",
+      "showWarning": "Anyone who has these words can unlock your data, and QuietRabbit cannot show them again. There is no copy button on purpose.",
+      "writtenDown": "I've written them down",
+      "confirmHeading": "Check your recovery phrase",
+      "confirmIntro": "The words are hidden now. To check that you have them, enter the words at these positions.",
+      "wordLabel": "Word {{position}}",
+      "cancel": "Cancel"
     },
     "rotation": {
       "title": {

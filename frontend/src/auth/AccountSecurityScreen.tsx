@@ -12,6 +12,7 @@ import { useTranslation } from 'react-i18next'
 import { commands } from '../bindings'
 import { acquireBlockingOverlay } from './blockingOverlay'
 import { ChangePasswordForm } from './ChangePasswordForm'
+import { NewRecoveryPhraseFlow } from './NewRecoveryPhraseFlow'
 import type { SignOutNotice } from './rotationErrors'
 import { useDialogFocus } from './useDialogFocus'
 
@@ -26,6 +27,7 @@ export function AccountSecurityScreen({ onClose, onSignOut }: AccountSecurityScr
   const panelRef = useRef<HTMLDialogElement>(null)
   const [busy, setBusy] = useState(false)
   const [displayName, setDisplayName] = useState('')
+  const [newPhraseOpen, setNewPhraseOpen] = useState(false)
 
   useEffect(() => acquireBlockingOverlay(), [])
 
@@ -65,6 +67,24 @@ export function AccountSecurityScreen({ onClose, onSignOut }: AccountSecurityScr
         <section className="account-security__section">
           <h3 className="account-security__heading">{t('auth.accountSecurity.changePassword.heading')}</h3>
           <ChangePasswordForm displayName={displayName} onBusyChange={setBusy} onSignOut={onSignOut} />
+        </section>
+
+        <section className="account-security__section">
+          <h3 className="account-security__heading">{t('auth.accountSecurity.recoveryPhrase.heading')}</h3>
+          {newPhraseOpen ? (
+            <NewRecoveryPhraseFlow
+              onClose={() => setNewPhraseOpen(false)}
+              onBusyChange={setBusy}
+              onSignOut={onSignOut}
+            />
+          ) : (
+            <>
+              <p className="account-security__text">{t('auth.accountSecurity.recoveryPhrase.intro')}</p>
+              <button type="button" onClick={() => setNewPhraseOpen(true)} disabled={busy}>
+                {t('auth.accountSecurity.recoveryPhrase.open')}
+              </button>
+            </>
+          )}
         </section>
 
         <div className="account-security__footer">

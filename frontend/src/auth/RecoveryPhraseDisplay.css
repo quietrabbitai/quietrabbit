@@ -1,0 +1,59 @@
+.recovery-phrase {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.recovery-phrase__heading {
+  margin: 0;
+  font-size: var(--text-md);
+  font-weight: 500;
+}
+
+.recovery-phrase__text {
+  margin: 0;
+  font-size: var(--text-base);
+  line-height: var(--leading-body);
+  color: var(--text-muted);
+}
+
+/* Row-major numbered grid. Not selectable: the phrase is meant to be written
+ * down, not copied (there is no copy button either). */
+.recovery-phrase__words {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px 10px;
+  margin: 0;
+  padding: 10px;
+  list-style: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-sunken);
+  font-family: var(--mono);
+  font-size: var(--text-base);
+  user-select: none;
+}
+
+.recovery-phrase__word {
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+}
+
+.recovery-phrase__index {
+  min-width: 1.6em;
+  text-align: right;
+  color: var(--text-label);
+}
+
+.recovery-phrase__answer {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.recovery-phrase__buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
