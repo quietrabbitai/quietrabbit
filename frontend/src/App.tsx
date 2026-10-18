@@ -8,6 +8,7 @@ import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { commands } from './bindings'
 import { LoginForm } from './auth/LoginForm'
+import { RotationProgress } from './auth/RotationProgress'
 import { NavShell } from './navShell/NavShell'
 import { setCurrentUserId } from './navShell/navShellConfig'
 
@@ -95,12 +96,15 @@ function App() {
     return () => window.removeEventListener('contextmenu', handleContextMenu)
   }, [])
 
+  // items.id=769: the key-rotation progress overlay is mounted here, beside
+  // every boot state, not inside NavShell -- login() and the recovery-phrase
+  // restore both run rotations with no session, and a webview that reloads
+  // mid-rotation must find the overlay before it finds anything else.
+  let screen
   if (bootState === 'checking') {
-    return <p>{t('auth.checkingSession')}</p>
-  }
-
-  if (bootState === 'loginRequired') {
-    return (
+    screen = <p>{t('auth.checkingSession')}</p>
+  } else if (bootState === 'loginRequired') {
+    screen = (
       <>
         {sessionCheckError && (
           <p role="alert">
@@ -110,9 +114,16 @@ function App() {
         <LoginForm onLoggedIn={() => setBootState('loggedIn')} />
       </>
     )
+  } else {
+    screen = <NavShell />
   }
 
-  return <NavShell />
+  return (
+    <>
+      {screen}
+      <RotationProgress />
+    </>
+  )
 }
 
 export default App

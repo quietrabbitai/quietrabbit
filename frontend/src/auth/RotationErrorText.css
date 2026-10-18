@@ -1,0 +1,6 @@
+.rotation-error-text {
+  margin: 0;
+  font-size: var(--text-base);
+  line-height: var(--leading-body);
+  color: var(--danger);
+}

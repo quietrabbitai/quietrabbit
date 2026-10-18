@@ -36,13 +36,14 @@
 // Chat bar is always clickable and enters Cloud Chat directly; the only
 // Privacy Guardian review in chat is the copy-time one, owned by ChatPane.
 
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { useTranslation } from 'react-i18next'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { commands, type ChatInfo, type PaneRectFraction, type PersonaInfo } from '../bindings'
 import { ChatPane } from '../chat/ChatPane'
 import { ChatHistoryList } from '../chat/ChatHistoryList'
 import { PersonaBox } from './persona/PersonaBox'
+import { isBlockingOverlayActive, subscribeBlockingOverlay } from '../auth/blockingOverlay'
 import { requireCurrentUserId, type DominancePairState } from './navShellConfig'
 import { CloudChatCollapsedStrip } from './CloudChatCollapsedStrip'
 import { useDominancePair } from './useDominancePair'
@@ -209,6 +210,14 @@ export function CloudChatAccessPane({
   // Guardian modal is open. A native provider pane draws above the webview,
   // so syncPaneLayout pushes an empty layout while this is set.
   const [copyModalOpen, setCopyModalOpen] = useState(false)
+  // items.id=769: same hide, for DOM layers that are not this pane's own
+  // children (the key-rotation overlay, the Account security panel). They
+  // register in auth/blockingOverlay; any holder hides the panes.
+  const blockingOverlayActive = useSyncExternalStore(
+    subscribeBlockingOverlay,
+    isBlockingOverlayActive,
+  )
+  const panesHidden = copyModalOpen || blockingOverlayActive
 
   // items.id=404: the three internal actions that mean "make Cloud Chat/Chat
   // the outer dock's dominant rail" -- see this component's own
@@ -252,7 +261,7 @@ export function CloudChatAccessPane({
 
   const syncPaneLayout = useCallback(() => {
     const body = contentBodyRef.current
-    if (!body || copyModalOpen) {
+    if (!body || panesHidden) {
       // items.id=501 slice 2: copyModalOpen also lands here -- see its
       // declaration. items.id=391: reachable via the ResizeObserver effect's own
       // requestAnimationFrame callback (below) if .content-body unmounts
@@ -274,7 +283,7 @@ export function CloudChatAccessPane({
         setOpenError(result.error)
       }
     })
-  }, [activeProviderId, setOpenError, copyModalOpen])
+  }, [activeProviderId, setOpenError, panesHidden])
 
   useEffect(() => {
     const body = contentBodyRef.current

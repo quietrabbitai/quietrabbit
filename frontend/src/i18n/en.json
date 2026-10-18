@@ -5,7 +5,63 @@
     "passwordLabel": "Password",
     "submitButton": "Log in",
     "loginError": "Could not log in: {{message}}",
-    "sessionMissingAfterLogin": "Logged in, but no session was returned. Try again."
+    "sessionMissingAfterLogin": "Logged in, but no session was returned. Try again.",
+    "rotation": {
+      "title": {
+        "generic": "Re-locking your data",
+        "passwordChange": "Changing your password",
+        "restore": "Restoring your access",
+        "newPhrase": "Creating your new recovery phrase"
+      },
+      "phase": {
+        "preparing": "Preparing",
+        "rekeying": "Re-locking your data under the new key",
+        "verifying": "Checking that everything opens correctly",
+        "finishing": "Finishing up",
+        "resuming": "Finishing an interrupted change",
+        "rollingBack": "Undoing the change",
+        "working": "Working"
+      },
+      "progressLabel": "Progress",
+      "percent": "{{percent}}%",
+      "keepOpen": "This can take a while for a large account. Please keep QuietRabbit open until it finishes.",
+      "crashSafe": "If QuietRabbit closes or stops part-way, nothing is lost. The change finishes the next time you sign in: use the password you just set, or your recovery phrase.",
+      "outcome": {
+        "complete": "The change is finished. Your data is protected under the new key from now on. Copies or backups made before the change can still be opened with the credentials you used before it.",
+        "rolledBack": "Nothing was changed. Your old password still works.",
+        "failed": "The change did not finish, and nothing is lost. It will finish the next time you sign in: use the password you just set, or your recovery phrase."
+      },
+      "close": "Close"
+    },
+    "rotationErrors": {
+      "notLoggedIn": "You're not signed in. Sign in again to continue.",
+      "invalidCredentials": "That didn't match. Check it and try again.",
+      "accountLocked": "Too many failed attempts. This account is locked for now.",
+      "newPasswordEmpty": "Enter a new password.",
+      "phraseInvalid": "That isn't a valid 24-word recovery phrase. Check the words and try again.",
+      "rotationInProgress": "A password or recovery change is already running or waiting to finish. Let it finish, then try again.",
+      "activeRuns_one": "{{count}} task is still running. Wait for it to finish or cancel it, then try again. Nothing was changed.",
+      "activeRuns_other": "{{count}} tasks are still running. Wait for them to finish or cancel them, then try again. Nothing was changed.",
+      "busy": "QuietRabbit is busy with something else right now, for example a chat reply that is still being written. Wait for it to finish, then try again. Nothing was changed.",
+      "insufficientSpace": "There isn't enough free disk space. This change needs about {{needed}} MB free and {{available}} MB is available. Free up some space and try again. Nothing was changed.",
+      "freeSpaceUnknown": "QuietRabbit couldn't check how much disk space is free, so the change didn't start. Nothing was changed.",
+      "unrecognisedFiles": "Your account's data folder contains files QuietRabbit doesn't recognise, so the change didn't start. Nothing was changed. If you added files there yourself, move them elsewhere and try again.",
+      "databaseUnreadable": "Part of your data couldn't be opened, so the change didn't start. Nothing was changed.",
+      "epochChanged": "Your account was changed from another window or session. Sign in again to continue.",
+      "rotationAlreadyComplete": "That change had already finished, so it can't be cancelled. Sign in with the new password or your recovery phrase to complete it.",
+      "rolledBack": "Nothing was changed. Your old password still works.",
+      "needsResume": "The change didn't finish, and nothing is lost. It will finish the next time you sign in with the password you just set, or with your recovery phrase.",
+      "noPendingPhrase": "That recovery phrase is no longer waiting to be confirmed. Start again to get a new one.",
+      "confirmationFailed": "Those words don't match your new recovery phrase. Check the word numbers and try again. After several wrong tries the phrase is discarded and you start again.",
+      "internal": "Something went wrong. Try again, and if it keeps happening, restart QuietRabbit.",
+      "currentPasswordWrong": "That isn't your current password.",
+      "rolledBackNewPhrase": "Nothing was changed. Your old password and recovery phrase still work.",
+      "needsResumeNewPhrase": "The change didn't finish, and nothing is lost. It will finish the next time you sign in with your password or your new recovery phrase. Keep the new phrase safe: the old one may stop working.",
+      "restoreInvalidCredentials": "Those words don't match this account. Check the display name and the words, then try again.",
+      "rolledBackRestore": "Nothing was changed. Your recovery phrase still works.",
+      "needsResumeRestore": "Your access wasn't fully restored, and nothing is lost. It will finish the next time you sign in with the password you just set, or with your recovery phrase.",
+      "cancelInvalidCredentials": "That isn't the new password or the recovery phrase for the pending change."
+    }
   },
   "navShell": {
     "personaLoadError": "Could not load personas: {{message}}",
