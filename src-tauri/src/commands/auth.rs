@@ -1479,8 +1479,14 @@ mod tests {
         let (secret, public) = data_key::derive_recovery_keypair(&entropy, &user_id);
         assert_eq!(public.as_bytes(), &wrapper.recovery_public_key);
 
-        let unsealed =
-            data_key::unseal_dek_with_recovery_key(&secret, &wrapper.recovery_seal).unwrap();
+        let unsealed = data_key::unseal_dek_with_recovery_key(
+            &secret,
+            &wrapper.recovery_seal,
+            &user_id,
+            wrapper.key_epoch,
+            wrapper.format_version,
+        )
+        .unwrap();
         assert_eq!(
             *unsealed, dek,
             "the typed words must recover the resident DEK"

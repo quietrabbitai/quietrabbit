@@ -14,6 +14,7 @@ pub mod group_invitations;
 pub mod group_membership;
 pub mod idle_timeout;
 pub mod kdf;
+pub mod key_rotation_io;
 pub mod persona_sharing;
 pub mod registry;
 pub mod sharing_keypair;

@@ -174,6 +174,10 @@ mod tests {
             "commands/auth.rs",
             "key applied only inside #[cfg(test)] code",
         ),
+        (
+            "auth/key_rotation_io.rs",
+            "rotation primitives: the engine owns the account and checks the epoch itself",
+        ),
     ];
 
     fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {

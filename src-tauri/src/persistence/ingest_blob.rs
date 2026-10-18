@@ -234,6 +234,64 @@ pub async fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), IngestBl
     Ok(())
 }
 
+/// Encrypt `plaintext` under `key` with `aad` into the file layout
+/// (format byte, nonce, ciphertext+tag). Pure.
+fn seal_blob_bytes(
+    key: &[u8; KEY_LEN],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, IngestBlobError> {
+    let mut nonce_bytes = [0u8; NONCE_LEN];
+    getrandom::fill(&mut nonce_bytes).map_err(|e| IngestBlobError::RandomSource(e.to_string()))?;
+
+    let cipher = ChaCha20Poly1305::new(&Key::from(*key));
+    let ciphertext = cipher
+        .encrypt(
+            &Nonce::from(nonce_bytes),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .map_err(|e| IngestBlobError::EncryptionFailed(e.to_string()))?;
+
+    let mut file_bytes = Vec::with_capacity(FORMAT_LEN + NONCE_LEN + ciphertext.len());
+    file_bytes.push(FORMAT_V1);
+    file_bytes.extend_from_slice(&nonce_bytes);
+    file_bytes.extend_from_slice(&ciphertext);
+    Ok(file_bytes)
+}
+
+/// Decrypt a blob file's bytes under `key` with `aad`. Pure.
+fn open_blob_bytes(
+    key: &[u8; KEY_LEN],
+    aad: &[u8],
+    file_bytes: &[u8],
+) -> Result<Vec<u8>, IngestBlobError> {
+    if file_bytes.len() < MIN_FILE_LEN {
+        return Err(IngestBlobError::MalformedBlob);
+    }
+    if file_bytes[0] != FORMAT_V1 {
+        return Err(IngestBlobError::UnsupportedFormat(file_bytes[0]));
+    }
+
+    let nonce_bytes: [u8; NONCE_LEN] = file_bytes[FORMAT_LEN..FORMAT_LEN + NONCE_LEN]
+        .try_into()
+        .expect("slice length checked above");
+    let ciphertext = &file_bytes[FORMAT_LEN + NONCE_LEN..];
+
+    let cipher = ChaCha20Poly1305::new(&Key::from(*key));
+    cipher
+        .decrypt(
+            &Nonce::from(nonce_bytes),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
+        .map_err(|_| IngestBlobError::DecryptionFailed)
+}
+
 /// Encrypt `plaintext`, bound to (persona_id, output_id, version), and write
 /// it to `path` via write_file_atomic, creating parent directories as
 /// needed. Overwrites any existing file at `path` -- callers write each
@@ -255,27 +313,8 @@ pub async fn write_encrypted_blob(
         persona_id,
         subkeys::resident_or_initial_epoch(user_id),
     )?;
-
-    let mut nonce_bytes = [0u8; NONCE_LEN];
-    getrandom::fill(&mut nonce_bytes).map_err(|e| IngestBlobError::RandomSource(e.to_string()))?;
-
     let aad = blob_aad(persona_id, output_id, version);
-    let cipher = ChaCha20Poly1305::new(&Key::from(*aead_key));
-    let ciphertext = cipher
-        .encrypt(
-            &Nonce::from(nonce_bytes),
-            Payload {
-                msg: plaintext,
-                aad: &aad,
-            },
-        )
-        .map_err(|e| IngestBlobError::EncryptionFailed(e.to_string()))?;
-
-    let mut file_bytes = Vec::with_capacity(FORMAT_LEN + NONCE_LEN + ciphertext.len());
-    file_bytes.push(FORMAT_V1);
-    file_bytes.extend_from_slice(&nonce_bytes);
-    file_bytes.extend_from_slice(&ciphertext);
-
+    let file_bytes = seal_blob_bytes(&aead_key, &aad, plaintext)?;
     write_file_atomic(path, &file_bytes).await
 }
 
@@ -293,19 +332,6 @@ pub async fn read_encrypted_blob(
 ) -> Result<Vec<u8>, IngestBlobError> {
     crate::auth::epoch_guard::ensure_current(user_id).await?;
     let file_bytes = tokio::fs::read(path).await?;
-
-    if file_bytes.len() < MIN_FILE_LEN {
-        return Err(IngestBlobError::MalformedBlob);
-    }
-    if file_bytes[0] != FORMAT_V1 {
-        return Err(IngestBlobError::UnsupportedFormat(file_bytes[0]));
-    }
-
-    let nonce_bytes: [u8; NONCE_LEN] = file_bytes[FORMAT_LEN..FORMAT_LEN + NONCE_LEN]
-        .try_into()
-        .expect("slice length checked above");
-    let ciphertext = &file_bytes[FORMAT_LEN + NONCE_LEN..];
-
     let aad = blob_aad(persona_id, output_id, version);
     let aead_key = derive_ingest_blob_key(
         data_key,
@@ -313,16 +339,87 @@ pub async fn read_encrypted_blob(
         persona_id,
         subkeys::resident_or_initial_epoch(user_id),
     )?;
-    let cipher = ChaCha20Poly1305::new(&Key::from(*aead_key));
-    cipher
-        .decrypt(
-            &Nonce::from(nonce_bytes),
-            Payload {
-                msg: ciphertext,
-                aad: &aad,
+    open_blob_bytes(&aead_key, &aad, &file_bytes)
+}
+
+/// Where a blob stood when the rotation looked at it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobRekey {
+    /// Decrypted under the old key and rewritten under the new one.
+    Rewritten,
+    /// Already opens under the new key: an earlier, interrupted pass got here.
+    AlreadyOnNewKey,
+}
+
+/// Re-encrypt one blob from the old data key and epoch to the new ones, in
+/// place (items.id=630). Uses explicit keys and epochs, never the resident
+/// ones, and does not consult the epoch guard: the rotation engine owns the
+/// account while it runs. The old and new keys are tried against the file
+/// itself, so a blob left either way by a crash is recognised. The CPU work
+/// runs off the async executor; the replacement goes through
+/// write_file_atomic, so a crash leaves the complete old file or the complete
+/// new one. Fails (and writes nothing) if neither key opens it.
+#[allow(clippy::too_many_arguments)]
+pub async fn reencrypt_blob(
+    path: &Path,
+    user_id: &str,
+    persona_id: &str,
+    output_id: &str,
+    version: i32,
+    old_dek: &[u8; kdf::MASTER_KEY_LEN],
+    old_epoch: u64,
+    new_dek: &[u8; kdf::MASTER_KEY_LEN],
+    new_epoch: u64,
+) -> Result<BlobRekey, IngestBlobError> {
+    let file_bytes = tokio::fs::read(path).await?;
+    let old_key = derive_ingest_blob_key(old_dek, user_id, persona_id, old_epoch)?;
+    let new_key = derive_ingest_blob_key(new_dek, user_id, persona_id, new_epoch)?;
+    let aad = blob_aad(persona_id, output_id, version);
+
+    let outcome =
+        tokio::task::spawn_blocking(move || match open_blob_bytes(&old_key, &aad, &file_bytes) {
+            Ok(plaintext) => {
+                let plaintext = Zeroizing::new(plaintext);
+                seal_blob_bytes(&new_key, &aad, &plaintext).map(Some)
+            }
+            Err(old_err) => match open_blob_bytes(&new_key, &aad, &file_bytes) {
+                Ok(_) => Ok(None),
+                Err(_) => Err(old_err),
             },
-        )
-        .map_err(|_| IngestBlobError::DecryptionFailed)
+        })
+        .await
+        .map_err(|e| IngestBlobError::EncryptionFailed(format!("blob task failed: {e}")))??;
+
+    match outcome {
+        Some(new_bytes) => {
+            write_file_atomic(path, &new_bytes).await?;
+            Ok(BlobRekey::Rewritten)
+        }
+        None => Ok(BlobRekey::AlreadyOnNewKey),
+    }
+}
+
+/// Whether the blob at `path` opens under `dek` at `epoch` (no epoch guard,
+/// explicit key). Used by the rotation's verification.
+pub async fn blob_opens_under(
+    path: &Path,
+    user_id: &str,
+    persona_id: &str,
+    output_id: &str,
+    version: i32,
+    dek: &[u8; kdf::MASTER_KEY_LEN],
+    epoch: u64,
+) -> Result<bool, IngestBlobError> {
+    let file_bytes = tokio::fs::read(path).await?;
+    let key = derive_ingest_blob_key(dek, user_id, persona_id, epoch)?;
+    let aad = blob_aad(persona_id, output_id, version);
+    Ok(open_blob_bytes(&key, &aad, &file_bytes).is_ok())
+}
+
+/// `<path>.tmp` left by an interrupted write_file_atomic (re-exported for the
+/// rotation, which deletes stale ones: they hold old-key ciphertext).
+pub fn stale_tmp_path(path: &Path) -> PathBuf {
+    tmp_path(path)
 }
 
 #[cfg(test)]
@@ -706,5 +803,96 @@ mod tests {
         } else {
             std::env::remove_var("QR_DATA_ROOT");
         }
+    }
+
+    // -- rotation re-encryption (items.id=630) ------------------------------
+
+    const OLD: [u8; 32] = [0x71u8; 32];
+    const NEW: [u8; 32] = [0x72u8; 32];
+
+    async fn write_with(path: &Path, dek: &[u8; 32], epoch: u64, version: i32, pt: &[u8]) {
+        let key = derive_ingest_blob_key(dek, "user-a", "persona-a", epoch).unwrap();
+        let bytes = seal_blob_bytes(&key, &blob_aad("persona-a", "out-1", version), pt).unwrap();
+        write_file_atomic(path, &bytes).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reencrypt_moves_a_blob_to_the_new_key_and_the_old_key_stops_opening_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1.enc");
+        write_with(&path, &OLD, 1, 1, b"the document").await;
+
+        let out = reencrypt_blob(&path, "user-a", "persona-a", "out-1", 1, &OLD, 1, &NEW, 2)
+            .await
+            .unwrap();
+        assert_eq!(out, BlobRekey::Rewritten);
+        assert!(
+            blob_opens_under(&path, "user-a", "persona-a", "out-1", 1, &NEW, 2)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !blob_opens_under(&path, "user-a", "persona-a", "out-1", 1, &OLD, 1)
+                .await
+                .unwrap()
+        );
+        assert!(!stale_tmp_path(&path).exists());
+    }
+
+    #[tokio::test]
+    async fn reencrypt_recognises_a_blob_an_earlier_pass_already_moved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1.enc");
+        write_with(&path, &NEW, 2, 1, b"doc").await;
+        let before = tokio::fs::read(&path).await.unwrap();
+
+        let out = reencrypt_blob(&path, "user-a", "persona-a", "out-1", 1, &OLD, 1, &NEW, 2)
+            .await
+            .unwrap();
+        assert_eq!(out, BlobRekey::AlreadyOnNewKey);
+        assert_eq!(
+            tokio::fs::read(&path).await.unwrap(),
+            before,
+            "not rewritten"
+        );
+    }
+
+    #[tokio::test]
+    async fn reencrypt_with_neither_key_fails_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1.enc");
+        write_with(&path, &[0x99u8; 32], 1, 1, b"doc").await;
+        let before = tokio::fs::read(&path).await.unwrap();
+
+        let err = reencrypt_blob(&path, "user-a", "persona-a", "out-1", 1, &OLD, 1, &NEW, 2)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, IngestBlobError::DecryptionFailed));
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn reencrypt_keeps_the_context_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v2.enc");
+        write_with(&path, &OLD, 1, 2, b"version two").await;
+        // Claiming it is version 1 must not open it, rotated or not.
+        let err = reencrypt_blob(&path, "user-a", "persona-a", "out-1", 1, &OLD, 1, &NEW, 2)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, IngestBlobError::DecryptionFailed));
+        reencrypt_blob(&path, "user-a", "persona-a", "out-1", 2, &OLD, 1, &NEW, 2)
+            .await
+            .unwrap();
+        assert!(
+            blob_opens_under(&path, "user-a", "persona-a", "out-1", 2, &NEW, 2)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !blob_opens_under(&path, "user-a", "persona-a", "out-1", 1, &NEW, 2)
+                .await
+                .unwrap()
+        );
     }
 }

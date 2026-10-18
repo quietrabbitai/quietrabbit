@@ -31,9 +31,22 @@
 //                      info = b"QuietRabbit-v1|x25519-recovery-key|<user_id>")
 //                    -- NOT epoch-bound, so the same 24 words stay valid
 //                    across rotations.
-//   recovery seal  = auth::sharing_keypair envelope (version 0x01 ||
+//   recovery seal  = AAD-bound auth::sharing_keypair envelope (version 0x02 ||
 //                    ephemeral pubkey || nonce || ciphertext+tag) of the
-//                    32-byte DEK addressed to the recovery public key.
+//                    32-byte DEK addressed to the recovery public key,
+//                    authenticated data =
+//                      b"QuietRabbit-v1|dek-seal|"
+//                      || u16-BE length of user_id || user_id (UTF-8)
+//                      || key_epoch as u64-BE || format_version as u8
+//                      || the 32-byte recovery public key.
+//                    Format version 1 (items.id=629) used a plain 0x01
+//                    envelope with no authenticated data. The AAD stops a
+//                    genuine seal being replayed into another user's row or
+//                    another epoch (items.id=630). It does not stop forgery
+//                    by someone who can write the row: an envelope to a
+//                    public key can be built by anyone who knows it. The
+//                    restore path therefore also proves the unsealed DEK by
+//                    opening a database with it (auth::key_rotation).
 //
 // NONCE STRATEGY: a fresh random 12-byte nonce per wrap. The PK is derived
 // from a per-account salt and a wrap is written once per (PK, epoch), so
@@ -51,7 +64,9 @@ use crate::auth::kdf;
 use crate::auth::sharing_keypair;
 
 /// Wrapper format version written by this build.
-pub const WRAP_FORMAT_VERSION: u8 = 1;
+/// Version 2 (items.id=630) binds the recovery seal to user, epoch and
+/// format version. No shipped users, so there is no version-1 read path.
+pub const WRAP_FORMAT_VERSION: u8 = 2;
 
 /// Key epoch of a freshly created account. Increases at every rotation
 /// (items.id=630).
@@ -223,24 +238,51 @@ pub fn derive_recovery_keypair(
     (secret, public)
 }
 
-/// Seal the DEK to the stored recovery public key (the same envelope
-/// construction as auth::sharing_keypair). Needs no secret beyond the DEK
-/// itself, which is what lets a later rotation re-seal without the words.
+fn seal_aad(
+    user_id: &str,
+    key_epoch: u64,
+    format_version: u8,
+    recovery_public_key: &[u8; sharing_keypair::PUBLIC_KEY_LEN],
+) -> Vec<u8> {
+    let uid = user_id.as_bytes();
+    let mut aad = Vec::with_capacity(24 + 2 + uid.len() + 8 + 1 + recovery_public_key.len());
+    aad.extend_from_slice(b"QuietRabbit-v1|dek-seal|");
+    aad.extend_from_slice(&(uid.len() as u16).to_be_bytes());
+    aad.extend_from_slice(uid);
+    aad.extend_from_slice(&key_epoch.to_be_bytes());
+    aad.push(format_version);
+    aad.extend_from_slice(recovery_public_key);
+    aad
+}
+
+/// Seal the DEK to the stored recovery public key, bound to user, epoch and
+/// format version (module header). Needs no secret beyond the DEK itself,
+/// which is what lets a later rotation re-seal without the words.
 pub fn seal_dek_to_recovery_key(
     recovery_public_key: &[u8; sharing_keypair::PUBLIC_KEY_LEN],
     dek: &[u8; kdf::MASTER_KEY_LEN],
+    user_id: &str,
+    key_epoch: u64,
+    format_version: u8,
 ) -> Result<Vec<u8>, DataKeyError> {
-    sharing_keypair::encrypt_to_public_key(recovery_public_key, dek)
+    let aad = seal_aad(user_id, key_epoch, format_version, recovery_public_key);
+    sharing_keypair::encrypt_to_public_key_with_aad(recovery_public_key, dek, &aad)
         .map_err(|e| DataKeyError::Crypto(e.to_string()))
 }
 
-/// Open a recovery seal with the recovery private key.
+/// Open a recovery seal with the recovery private key. `user_id`,
+/// `key_epoch` and `format_version` must be the ones the seal was made for.
 pub fn unseal_dek_with_recovery_key(
     recovery_secret: &StaticSecret,
     recovery_seal: &[u8],
+    user_id: &str,
+    key_epoch: u64,
+    format_version: u8,
 ) -> Result<SecretBytes, DataKeyError> {
+    let public = PublicKey::from(recovery_secret);
+    let aad = seal_aad(user_id, key_epoch, format_version, public.as_bytes());
     let plaintext = Zeroizing::new(
-        sharing_keypair::decrypt_own_envelope(recovery_secret, recovery_seal)
+        sharing_keypair::decrypt_own_envelope_with_aad(recovery_secret, recovery_seal, &aad)
             .map_err(|_| DataKeyError::RecoveryUnsealFailed)?,
     );
     let mut dek = Zeroizing::new([0u8; kdf::MASTER_KEY_LEN]);
@@ -272,6 +314,109 @@ pub fn entropy_from_mnemonic(phrase: &str) -> Result<SecretBytes, DataKeyError> 
     Ok(entropy)
 }
 
+fn rotation_aad(user_id: &str, from_epoch: u64, to_epoch: u64, rotation_id: &str) -> Vec<u8> {
+    let uid = user_id.as_bytes();
+    let rid = rotation_id.as_bytes();
+    let mut aad = Vec::with_capacity(28 + 2 + uid.len() + 16 + 2 + rid.len());
+    aad.extend_from_slice(b"QuietRabbit-v1|rotation-wrap|");
+    aad.extend_from_slice(&(uid.len() as u16).to_be_bytes());
+    aad.extend_from_slice(uid);
+    aad.extend_from_slice(&from_epoch.to_be_bytes());
+    aad.extend_from_slice(&to_epoch.to_be_bytes());
+    aad.extend_from_slice(&(rid.len() as u16).to_be_bytes());
+    aad.extend_from_slice(rid);
+    aad
+}
+
+/// Encrypt the OLD data key under the NEW data key for the pending-rotation
+/// row (items.id=630). Whoever can reach the new key (through the staged
+/// password wrap or the staged recovery seal) can recover the old one to
+/// finish or undo a rotation that was interrupted. Layout: nonce (12) ||
+/// ChaCha20-Poly1305 ciphertext+tag, authenticated data binds user, both
+/// epochs and the rotation id.
+pub fn wrap_old_dek_under_new(
+    new_dek: &[u8; kdf::MASTER_KEY_LEN],
+    old_dek: &[u8; kdf::MASTER_KEY_LEN],
+    user_id: &str,
+    from_epoch: u64,
+    to_epoch: u64,
+    rotation_id: &str,
+) -> Result<Vec<u8>, DataKeyError> {
+    let mut nonce = [0u8; NONCE_LEN];
+    getrandom::fill(&mut nonce).map_err(|e| DataKeyError::RandomSource(e.to_string()))?;
+    let aad = rotation_aad(user_id, from_epoch, to_epoch, rotation_id);
+    let cipher = ChaCha20Poly1305::new(&Key::from(*new_dek));
+    let ciphertext = cipher
+        .encrypt(
+            &Nonce::from(nonce),
+            Payload {
+                msg: old_dek.as_slice(),
+                aad: &aad,
+            },
+        )
+        .map_err(|e| DataKeyError::Crypto(e.to_string()))?;
+    let mut out = Vec::with_capacity(NONCE_LEN + ciphertext.len());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
+}
+
+/// Recover the old data key from the pending-rotation row with the new one.
+pub fn unwrap_old_dek_with_new(
+    new_dek: &[u8; kdf::MASTER_KEY_LEN],
+    wrapped: &[u8],
+    user_id: &str,
+    from_epoch: u64,
+    to_epoch: u64,
+    rotation_id: &str,
+) -> Result<SecretBytes, DataKeyError> {
+    if wrapped.len() != NONCE_LEN + kdf::MASTER_KEY_LEN + TAG_LEN {
+        return Err(DataKeyError::MalformedWrapper);
+    }
+    let (nonce, ciphertext) = wrapped.split_at(NONCE_LEN);
+    let nonce: [u8; NONCE_LEN] = nonce.try_into().expect("split at NONCE_LEN");
+    let aad = rotation_aad(user_id, from_epoch, to_epoch, rotation_id);
+    let cipher = ChaCha20Poly1305::new(&Key::from(*new_dek));
+    let plaintext = Zeroizing::new(
+        cipher
+            .decrypt(
+                &Nonce::from(nonce),
+                Payload {
+                    msg: ciphertext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| DataKeyError::MalformedWrapper)?,
+    );
+    let mut dek = Zeroizing::new([0u8; kdf::MASTER_KEY_LEN]);
+    if plaintext.len() != dek.len() {
+        return Err(DataKeyError::MalformedWrapper);
+    }
+    dek.copy_from_slice(&plaintext);
+    Ok(dek)
+}
+
+/// The two stored values that make a new DEK recoverable: the password wrap
+/// under `password_key` and the recovery seal to `recovery_public_key`, both
+/// for `key_epoch` and the current format version. Used to stage a rotation.
+pub fn build_wrapper_parts(
+    user_id: &str,
+    dek: &[u8; kdf::MASTER_KEY_LEN],
+    password_key: &[u8; kdf::MASTER_KEY_LEN],
+    recovery_public_key: &[u8; sharing_keypair::PUBLIC_KEY_LEN],
+    key_epoch: u64,
+) -> Result<(Vec<u8>, Vec<u8>), DataKeyError> {
+    let password_wrap = wrap_dek(password_key, dek, user_id, key_epoch, WRAP_FORMAT_VERSION)?;
+    let recovery_seal = seal_dek_to_recovery_key(
+        recovery_public_key,
+        dek,
+        user_id,
+        key_epoch,
+        WRAP_FORMAT_VERSION,
+    )?;
+    Ok((password_wrap, recovery_seal))
+}
+
 /// Build all key material for a new account: a random DEK, independent
 /// recovery entropy, and the wrapper (password wrap under `password_key`,
 /// recovery public key, recovery seal) at the initial epoch.
@@ -290,7 +435,13 @@ pub fn create_account_key_material(
         INITIAL_KEY_EPOCH,
         WRAP_FORMAT_VERSION,
     )?;
-    let recovery_seal = seal_dek_to_recovery_key(recovery_public.as_bytes(), &dek)?;
+    let recovery_seal = seal_dek_to_recovery_key(
+        recovery_public.as_bytes(),
+        &dek,
+        user_id,
+        INITIAL_KEY_EPOCH,
+        WRAP_FORMAT_VERSION,
+    )?;
 
     Ok(NewAccountKeyMaterial {
         dek,
@@ -328,7 +479,13 @@ mod tests {
     #[test]
     fn wrong_password_key_fails_at_the_wrap_tag() {
         let m = create_account_key_material("user-a", &PK).unwrap();
-        let result = unwrap_dek(&[0x5bu8; 32], &m.wrapper.password_wrap, "user-a", 1, 1);
+        let result = unwrap_dek(
+            &[0x5bu8; 32],
+            &m.wrapper.password_wrap,
+            "user-a",
+            1,
+            WRAP_FORMAT_VERSION,
+        );
         assert!(matches!(result, Err(DataKeyError::WrongPassword)));
     }
 
@@ -337,15 +494,15 @@ mod tests {
         let m = create_account_key_material("user-a", &PK).unwrap();
         let w = &m.wrapper.password_wrap;
         assert!(matches!(
-            unwrap_dek(&PK, w, "user-b", 1, 1),
+            unwrap_dek(&PK, w, "user-b", 1, WRAP_FORMAT_VERSION),
             Err(DataKeyError::WrongPassword)
         ));
         assert!(matches!(
-            unwrap_dek(&PK, w, "user-a", 2, 1),
+            unwrap_dek(&PK, w, "user-a", 2, WRAP_FORMAT_VERSION),
             Err(DataKeyError::WrongPassword)
         ));
         assert!(matches!(
-            unwrap_dek(&PK, w, "user-a", 1, 2),
+            unwrap_dek(&PK, w, "user-a", 1, WRAP_FORMAT_VERSION + 1),
             Err(DataKeyError::WrongPassword)
         ));
     }
@@ -357,11 +514,11 @@ mod tests {
         let last = w.len() - 1;
         w[last] ^= 0xff;
         assert!(matches!(
-            unwrap_dek(&PK, &w, "user-a", 1, 1),
+            unwrap_dek(&PK, &w, "user-a", 1, WRAP_FORMAT_VERSION),
             Err(DataKeyError::WrongPassword)
         ));
         assert!(matches!(
-            unwrap_dek(&PK, &w[..10], "user-a", 1, 1),
+            unwrap_dek(&PK, &w[..10], "user-a", 1, WRAP_FORMAT_VERSION),
             Err(DataKeyError::MalformedWrapper)
         ));
     }
@@ -377,7 +534,8 @@ mod tests {
         let (secret, public) = derive_recovery_keypair(&entropy, "user-a");
         assert_eq!(public.as_bytes(), &m.wrapper.recovery_public_key);
 
-        let dek = unseal_dek_with_recovery_key(&secret, &m.wrapper.recovery_seal).unwrap();
+        let dek = unseal_dek_with_recovery_key(&secret, &m.wrapper.recovery_seal, "user-a", 1, 2)
+            .unwrap();
         assert_eq!(*dek, *m.dek);
     }
 
@@ -393,7 +551,8 @@ mod tests {
         let m = create_account_key_material("user-a", &PK).unwrap();
         let other = generate_recovery_entropy().unwrap();
         let (secret, _) = derive_recovery_keypair(&other, "user-a");
-        let result = unseal_dek_with_recovery_key(&secret, &m.wrapper.recovery_seal);
+        let result =
+            unseal_dek_with_recovery_key(&secret, &m.wrapper.recovery_seal, "user-a", 1, 2);
         assert!(matches!(result, Err(DataKeyError::RecoveryUnsealFailed)));
     }
 
@@ -421,10 +580,98 @@ mod tests {
         // NEW dek to the stored public key, then the old phrase opens it.
         let m = create_account_key_material("user-a", &PK).unwrap();
         let new_dek = generate_dek().unwrap();
-        let seal = seal_dek_to_recovery_key(&m.wrapper.recovery_public_key, &new_dek).unwrap();
+        let seal =
+            seal_dek_to_recovery_key(&m.wrapper.recovery_public_key, &new_dek, "user-a", 2, 2)
+                .unwrap();
         let (secret, _) = derive_recovery_keypair(&m.recovery_entropy, "user-a");
-        let opened = unseal_dek_with_recovery_key(&secret, &seal).unwrap();
+        let opened = unseal_dek_with_recovery_key(&secret, &seal, "user-a", 2, 2).unwrap();
         assert_eq!(*opened, *new_dek);
+    }
+
+    #[test]
+    fn the_seal_is_bound_to_user_epoch_and_format_version() {
+        let m = create_account_key_material("user-a", &PK).unwrap();
+        let (secret, _) = derive_recovery_keypair(&m.recovery_entropy, "user-a");
+        let seal = &m.wrapper.recovery_seal;
+        let ok = |u: &str, e: u64, v: u8| unseal_dek_with_recovery_key(&secret, seal, u, e, v);
+        assert!(ok("user-a", INITIAL_KEY_EPOCH, WRAP_FORMAT_VERSION).is_ok());
+        assert!(matches!(
+            ok("user-b", INITIAL_KEY_EPOCH, WRAP_FORMAT_VERSION),
+            Err(DataKeyError::RecoveryUnsealFailed)
+        ));
+        assert!(matches!(
+            ok("user-a", INITIAL_KEY_EPOCH + 1, WRAP_FORMAT_VERSION),
+            Err(DataKeyError::RecoveryUnsealFailed)
+        ));
+        assert!(matches!(
+            ok("user-a", INITIAL_KEY_EPOCH, WRAP_FORMAT_VERSION + 1),
+            Err(DataKeyError::RecoveryUnsealFailed)
+        ));
+    }
+
+    #[test]
+    fn a_plain_sharing_envelope_is_not_accepted_as_a_seal_and_vice_versa() {
+        let m = create_account_key_material("user-a", &PK).unwrap();
+        let (secret, public) = derive_recovery_keypair(&m.recovery_entropy, "user-a");
+        // A version-1 envelope made the way sharing makes them.
+        let plain = sharing_keypair::encrypt_to_public_key(public.as_bytes(), &[7u8; 32]).unwrap();
+        assert!(matches!(
+            unseal_dek_with_recovery_key(
+                &secret,
+                &plain,
+                "user-a",
+                INITIAL_KEY_EPOCH,
+                WRAP_FORMAT_VERSION
+            ),
+            Err(DataKeyError::RecoveryUnsealFailed)
+        ));
+        // The sharing decrypt must never open a seal.
+        assert!(sharing_keypair::decrypt_own_envelope(&secret, &m.wrapper.recovery_seal).is_err());
+    }
+
+    #[test]
+    fn old_dek_wrapped_under_new_round_trips_and_is_bound() {
+        let old = generate_dek().unwrap();
+        let new = generate_dek().unwrap();
+        let wrapped = wrap_old_dek_under_new(&new, &old, "user-a", 1, 2, "rot-1").unwrap();
+        let back = unwrap_old_dek_with_new(&new, &wrapped, "user-a", 1, 2, "rot-1").unwrap();
+        assert_eq!(*back, *old);
+        for (u, f, t, r) in [
+            ("user-b", 1, 2, "rot-1"),
+            ("user-a", 2, 2, "rot-1"),
+            ("user-a", 1, 3, "rot-1"),
+            ("user-a", 1, 2, "rot-2"),
+        ] {
+            assert!(matches!(
+                unwrap_old_dek_with_new(&new, &wrapped, u, f, t, r),
+                Err(DataKeyError::MalformedWrapper)
+            ));
+        }
+        let other = generate_dek().unwrap();
+        assert!(unwrap_old_dek_with_new(&other, &wrapped, "user-a", 1, 2, "rot-1").is_err());
+        assert!(unwrap_old_dek_with_new(&new, &wrapped[..10], "user-a", 1, 2, "rot-1").is_err());
+    }
+
+    #[test]
+    fn build_wrapper_parts_opens_by_password_and_by_the_stored_phrase() {
+        let m = create_account_key_material("user-a", &PK).unwrap();
+        let new_dek = generate_dek().unwrap();
+        let new_pk = [0x6cu8; 32];
+        let (wrap, seal) = build_wrapper_parts(
+            "user-a",
+            &new_dek,
+            &new_pk,
+            &m.wrapper.recovery_public_key,
+            2,
+        )
+        .unwrap();
+        let by_password = unwrap_dek(&new_pk, &wrap, "user-a", 2, WRAP_FORMAT_VERSION).unwrap();
+        assert_eq!(*by_password, *new_dek);
+        // The SAME 24 words open the new seal: password change keeps them valid.
+        let (secret, _) = derive_recovery_keypair(&m.recovery_entropy, "user-a");
+        let by_phrase =
+            unseal_dek_with_recovery_key(&secret, &seal, "user-a", 2, WRAP_FORMAT_VERSION).unwrap();
+        assert_eq!(*by_phrase, *new_dek);
     }
 
     #[test]

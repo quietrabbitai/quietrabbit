@@ -943,6 +943,34 @@ TABLE user_capabilities
   capability TEXT notnull=1 pk=3 default=None
   allowed INTEGER notnull=1 pk=0 default=Some("1")
   created_at TEXT notnull=1 pk=0 default=None
+TABLE user_key_rotation_items
+  rotation_id TEXT notnull=1 pk=1 default=None
+  rel_path TEXT notnull=1 pk=2 default=None
+  kind TEXT notnull=1 pk=0 default=None
+  state TEXT notnull=1 pk=0 default=Some("'pending'")
+  bytes INTEGER notnull=1 pk=0 default=Some("0")
+  error TEXT notnull=0 pk=0 default=None
+TABLE user_key_rotations
+  rotation_id TEXT notnull=0 pk=1 default=None
+  user_id TEXT notnull=1 pk=0 default=None
+  kind TEXT notnull=1 pk=0 default=None
+  direction TEXT notnull=1 pk=0 default=Some("'forward'")
+  state TEXT notnull=1 pk=0 default=Some("'pending'")
+  from_epoch INTEGER notnull=1 pk=0 default=None
+  to_epoch INTEGER notnull=1 pk=0 default=None
+  started_at TEXT notnull=1 pk=0 default=None
+  finished_at TEXT notnull=0 pk=0 default=None
+  last_error TEXT notnull=0 pk=0 default=None
+  old_dek_under_new_hex TEXT notnull=0 pk=0 default=None
+  staged_salt_hex TEXT notnull=0 pk=0 default=None
+  staged_kdf_memory_kib INTEGER notnull=0 pk=0 default=None
+  staged_kdf_iterations INTEGER notnull=0 pk=0 default=None
+  staged_kdf_parallelism INTEGER notnull=0 pk=0 default=None
+  staged_format_version INTEGER notnull=0 pk=0 default=None
+  staged_password_wrap_hex TEXT notnull=0 pk=0 default=None
+  staged_recovery_public_key_hex TEXT notnull=0 pk=0 default=None
+  staged_recovery_seal_hex TEXT notnull=0 pk=0 default=None
+  staged_sharing_public_key_hex TEXT notnull=0 pk=0 default=None
 TABLE user_key_wrappers
   user_id TEXT notnull=0 pk=1 default=None
   key_epoch INTEGER notnull=1 pk=0 default=Some("1")
@@ -986,6 +1014,8 @@ TABLE user_sharing_keys
   user_id TEXT notnull=0 pk=1 default=None
   public_key_hex TEXT notnull=1 pk=0 default=None
   created_at TEXT notnull=1 pk=0 default=None
+  key_epoch INTEGER notnull=1 pk=0 default=Some("1")
+  rotated_at TEXT notnull=0 pk=0 default=None
 TABLE users
   id TEXT notnull=0 pk=1 default=None
   display_name TEXT notnull=1 pk=0 default=None

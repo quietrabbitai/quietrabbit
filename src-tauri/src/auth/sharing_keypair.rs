@@ -68,7 +68,7 @@
 // (shared_003.sql) references a Persona. Whatever maps persona -> owning
 // user_id to look up the right public key is item 284's problem.
 
-use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use hkdf::Hkdf;
 use sha2::Sha256;
@@ -86,6 +86,14 @@ const NONCE_LEN: usize = 12;
 const AEAD_TAG_LEN: usize = 16;
 const ENVELOPE_HEADER_LEN: usize = 1 + PUBLIC_KEY_LEN + NONCE_LEN;
 const ENVELOPE_VERSION: u8 = 1;
+/// Wire version of the AAD-bound envelope (items.id=630): identical layout to
+/// version 1, but the AEAD also authenticates caller-supplied associated data.
+/// Used by the recovery seal.
+///
+/// A distinct version byte means a plain (version 1) envelope can never be
+/// accepted as a bound one, and the version 1 decrypt rejects every bound
+/// envelope.
+const ENVELOPE_VERSION_BOUND: u8 = 2;
 
 #[derive(Debug, Error)]
 pub enum SharingKeypairError {
@@ -174,6 +182,29 @@ pub fn encrypt_to_public_key(
     recipient_public_key: &[u8; PUBLIC_KEY_LEN],
     plaintext: &[u8],
 ) -> Result<Vec<u8>, SharingKeypairError> {
+    seal_envelope(ENVELOPE_VERSION, recipient_public_key, plaintext, &[])
+}
+
+/// Like encrypt_to_public_key, but the AEAD authenticates `aad` and the
+/// envelope carries version byte 2 (items.id=630). Not for sharing: the
+/// recovery seal (auth::data_key) binds user, epoch and format version this
+/// way. Anyone who knows the public key can still build such an envelope, so
+/// this defends against substitution and replay of a genuine envelope, not
+/// against forgery.
+pub fn encrypt_to_public_key_with_aad(
+    recipient_public_key: &[u8; PUBLIC_KEY_LEN],
+    plaintext: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>, SharingKeypairError> {
+    seal_envelope(ENVELOPE_VERSION_BOUND, recipient_public_key, plaintext, aad)
+}
+
+fn seal_envelope(
+    version: u8,
+    recipient_public_key: &[u8; PUBLIC_KEY_LEN],
+    plaintext: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>, SharingKeypairError> {
     let recipient_public_key = PublicKey::from(*recipient_public_key);
 
     // Fresh ephemeral keypair per call -- see module header on why this
@@ -197,11 +228,17 @@ pub fn encrypt_to_public_key(
 
     let cipher = ChaCha20Poly1305::new(&Key::from(*aead_key));
     let ciphertext = cipher
-        .encrypt(&Nonce::from(nonce_bytes), plaintext)
+        .encrypt(
+            &Nonce::from(nonce_bytes),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|e| SharingKeypairError::EncryptionFailed(e.to_string()))?;
 
     let mut envelope = Vec::with_capacity(ENVELOPE_HEADER_LEN + ciphertext.len());
-    envelope.push(ENVELOPE_VERSION);
+    envelope.push(version);
     envelope.extend_from_slice(ephemeral_public.as_bytes());
     envelope.extend_from_slice(&nonce_bytes);
     envelope.extend_from_slice(&ciphertext);
@@ -218,10 +255,29 @@ pub fn decrypt_own_envelope(
     private_key: &StaticSecret,
     envelope: &[u8],
 ) -> Result<Vec<u8>, SharingKeypairError> {
+    open_envelope(ENVELOPE_VERSION, private_key, envelope, &[])
+}
+
+/// Open an envelope made by encrypt_to_public_key_with_aad. Fails unless the
+/// envelope is version 2 AND `aad` is exactly what it was sealed with.
+pub fn decrypt_own_envelope_with_aad(
+    private_key: &StaticSecret,
+    envelope: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>, SharingKeypairError> {
+    open_envelope(ENVELOPE_VERSION_BOUND, private_key, envelope, aad)
+}
+
+fn open_envelope(
+    version: u8,
+    private_key: &StaticSecret,
+    envelope: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>, SharingKeypairError> {
     if envelope.len() < ENVELOPE_HEADER_LEN + AEAD_TAG_LEN {
         return Err(SharingKeypairError::MalformedEnvelope);
     }
-    if envelope[0] != ENVELOPE_VERSION {
+    if envelope[0] != version {
         return Err(SharingKeypairError::MalformedEnvelope);
     }
 
@@ -245,7 +301,13 @@ pub fn decrypt_own_envelope(
 
     let cipher = ChaCha20Poly1305::new(&Key::from(*aead_key));
     cipher
-        .decrypt(&Nonce::from(nonce_bytes), ciphertext)
+        .decrypt(
+            &Nonce::from(nonce_bytes),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
         .map_err(|_| SharingKeypairError::DecryptionFailed)
 }
 
@@ -386,5 +448,51 @@ mod tests {
             result,
             Err(SharingKeypairError::MalformedEnvelope)
         ));
+    }
+
+    // -- AAD-bound envelope (items.id=630) ----------------------------------
+
+    fn keypair() -> (StaticSecret, [u8; PUBLIC_KEY_LEN]) {
+        let (secret, public) = derive_sharing_keypair(&[0x31u8; kdf::MASTER_KEY_LEN], "user-a", 1);
+        (secret, *public.as_bytes())
+    }
+
+    #[test]
+    fn bound_envelope_round_trips_only_with_the_same_aad() {
+        let (secret, public) = keypair();
+        let env = encrypt_to_public_key_with_aad(&public, b"payload", b"context-1").unwrap();
+        assert_eq!(env[0], 2);
+        assert_eq!(
+            decrypt_own_envelope_with_aad(&secret, &env, b"context-1").unwrap(),
+            b"payload"
+        );
+        assert!(matches!(
+            decrypt_own_envelope_with_aad(&secret, &env, b"context-2"),
+            Err(SharingKeypairError::DecryptionFailed)
+        ));
+        assert!(matches!(
+            decrypt_own_envelope_with_aad(&secret, &env, b""),
+            Err(SharingKeypairError::DecryptionFailed)
+        ));
+    }
+
+    #[test]
+    fn plain_and_bound_envelopes_are_not_interchangeable() {
+        let (secret, public) = keypair();
+        let plain = encrypt_to_public_key(&public, b"payload").unwrap();
+        let bound = encrypt_to_public_key_with_aad(&public, b"payload", b"").unwrap();
+        assert_eq!(plain[0], 1);
+        assert!(decrypt_own_envelope(&secret, &bound).is_err());
+        assert!(decrypt_own_envelope_with_aad(&secret, &plain, b"").is_err());
+    }
+
+    #[test]
+    fn the_plain_envelope_format_is_unchanged() {
+        // Layout [version 1][ephemeral pk 32][nonce 12][ciphertext + 16 tag].
+        let (secret, public) = keypair();
+        let env = encrypt_to_public_key(&public, b"abc").unwrap();
+        assert_eq!(env.len(), 1 + 32 + 12 + 3 + 16);
+        assert_eq!(env[0], 1);
+        assert_eq!(decrypt_own_envelope(&secret, &env).unwrap(), b"abc");
     }
 }

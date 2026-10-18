@@ -96,9 +96,64 @@ pub fn derive_password_key(
     Ok(output)
 }
 
+/// derive_password_key on the blocking thread pool (items.id=630). Argon2id at
+/// the default cost holds a core for a noticeable time and allocates 64 MiB;
+/// called inline from an async fn it stalls every other task on that runtime
+/// worker. The password is copied into a zeroizing buffer for the hop and the
+/// returned key zeroizes on drop.
+pub async fn derive_password_key_blocking(
+    password: &[u8],
+    salt: &[u8],
+    memory_kib: u32,
+    iterations: u32,
+    parallelism: u32,
+) -> Result<zeroize::Zeroizing<[u8; MASTER_KEY_LEN]>, AuthError> {
+    let password = zeroize::Zeroizing::new(password.to_vec());
+    let salt = salt.to_vec();
+    tokio::task::spawn_blocking(move || {
+        derive_password_key(&password, &salt, memory_kib, iterations, parallelism)
+            .map(zeroize::Zeroizing::new)
+    })
+    .await
+    .map_err(|e| AuthError::Derivation(format!("key derivation task failed: {e}")))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// On a single-threaded runtime an inline Argon2id call would starve every
+    /// other task until it returned. A ticker task must keep running while the
+    /// blocking helper derives.
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_derivation_does_not_stall_the_runtime() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let t = ticks.clone();
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                t.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let salt = generate_salt().unwrap();
+        // Heavy enough (64 MiB, 3 passes) to take tens of milliseconds.
+        let key = derive_password_key_blocking(b"pw", &salt, 65536, 3, 4)
+            .await
+            .unwrap();
+        let during = ticks.load(Ordering::SeqCst);
+        ticker.abort();
+        assert!(
+            during >= 1,
+            "the runtime made no progress during derivation"
+        );
+        assert_eq!(
+            *key,
+            derive_password_key(b"pw", &salt, 65536, 3, 4).unwrap(),
+            "same result as the inline derivation"
+        );
+    }
 
     #[test]
     fn same_password_and_salt_yield_identical_key() {
