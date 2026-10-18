@@ -146,7 +146,7 @@ function App() {
   return (
     <>
       {screen}
-      <RotationProgress />
+      <RotationProgress onFailedAcknowledged={() => void signOut()} />
     </>
   )
 }

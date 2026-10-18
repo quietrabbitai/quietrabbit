@@ -28,7 +28,14 @@ import {
   titleSuffix,
 } from './rotationProgress'
 
-export function RotationProgress() {
+export interface RotationProgressProps {
+  /** The person acknowledged a rotation that did not finish and that this
+   *  webview did not start (typically after a reload). The session may now
+   *  hold a key that no longer matches the account's, so the app signs out. */
+  onFailedAcknowledged?: () => void
+}
+
+export function RotationProgress({ onFailedAcknowledged }: RotationProgressProps) {
   const { t } = useTranslation()
   const [state, dispatch] = useReducer(reduceOverlay, INITIAL_OVERLAY_STATE)
   const registeredKind = useSyncExternalStore(subscribeRotationTask, getRotationTask)
@@ -119,7 +126,7 @@ export function RotationProgress() {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape' && hasOutcome) {
         event.preventDefault()
-        dispatch({ type: 'dismiss' })
+        dialog.querySelector<HTMLElement>('button')?.click()
         return
       }
       if (event.key !== 'Tab') return
@@ -186,7 +193,10 @@ export function RotationProgress() {
             <button
               type="button"
               className="rotation-overlay__close"
-              onClick={() => dispatch({ type: 'dismiss' })}
+              onClick={() => {
+                dispatch({ type: 'dismiss' })
+                if (state.outcome === 'failed') onFailedAcknowledged?.()
+              }}
             >
               {t('auth.rotation.close')}
             </button>

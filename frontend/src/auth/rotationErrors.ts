@@ -69,8 +69,8 @@ const OVERRIDES: Record<RotationErrorContext, Partial<Record<RotationErrorCode, 
     rolled_back: 'rolledBackRestore',
     needs_resume: 'needsResumeRestore',
   },
-  // Login reports plain strings, not KeyRotationError (see classifyLoginError,
-  // added with the login screen); nothing differs from the base wording.
+  // Login reports plain strings, not KeyRotationError (see classifyLoginError
+  // below); nothing differs from the base wording.
   login: {},
   cancel: { invalid_credentials: 'cancelInvalidCredentials' },
 }
@@ -120,4 +120,73 @@ export function allRotationErrorSuffixes(): string[] {
 export interface SignOutNotice {
   error: KeyRotationError
   context: RotationErrorContext
+}
+
+// ---------------------------------------------------------------------------
+// login() reports plain strings, not KeyRotationError
+// ---------------------------------------------------------------------------
+
+/** What a login() error string means to the login screen. */
+export type LoginProblem =
+  /** The OLD password was typed while a change is pending: ask for the new
+   *  password or the phrase, or offer to cancel the change. */
+  | 'interrupted'
+  | 'rolledBack'
+  | 'resumeFailed'
+  | 'locked'
+  | 'invalidCredentials'
+  | 'legacyAccount'
+  /** Anything else keeps today's wording: auth.loginError with the message. */
+  | 'other'
+
+// The strings below are the backend's, from commands/auth.rs: the three
+// LOGIN_ROTATION_* constants, the unwrap failure, the lockout answer and
+// LEGACY_ACCOUNT_MESSAGE. Matched exactly; a changed backend string falls into
+// 'other' and is shown as-is, never mis-classified.
+const LOGIN_STRINGS: Record<string, LoginProblem> = {
+  rotation_interrupted: 'interrupted',
+  rotation_rolled_back: 'rolledBack',
+  rotation_resume_failed: 'resumeFailed',
+  'account locked, try again later': 'locked',
+  'invalid credentials': 'invalidCredentials',
+  "This account was created before the data-key format and can't be opened": 'legacyAccount',
+}
+
+export function classifyLoginError(message: string): LoginProblem {
+  return Object.hasOwn(LOGIN_STRINGS, message) ? LOGIN_STRINGS[message] : 'other'
+}
+
+/** Leaf under `auth.loginErrors.` for a classified problem, or null when the
+ *  problem has no standalone message ('interrupted' opens its own screen and
+ *  'other' shows the raw message). */
+export function loginErrorSuffix(problem: LoginProblem): string | null {
+  switch (problem) {
+    case 'rolledBack':
+      return 'rolledBack'
+    case 'resumeFailed':
+      return 'resumeFailed'
+    case 'locked':
+      return 'accountLocked'
+    case 'invalidCredentials':
+      return 'invalidCredentials'
+    case 'legacyAccount':
+      return 'legacyAccount'
+    case 'interrupted':
+    case 'other':
+      return null
+  }
+}
+
+/** Every login suffix, for the test that checks en.json has each. */
+export function allLoginErrorSuffixes(): string[] {
+  const problems: LoginProblem[] = [
+    'interrupted',
+    'rolledBack',
+    'resumeFailed',
+    'locked',
+    'invalidCredentials',
+    'legacyAccount',
+    'other',
+  ]
+  return problems.map(loginErrorSuffix).filter((s): s is string => s !== null)
 }

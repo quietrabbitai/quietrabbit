@@ -14,16 +14,20 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
+  allLoginErrorSuffixes,
   allRotationErrorSuffixes,
+  classifyLoginError,
+  loginErrorSuffix,
   requiresSignOut,
   rotationErrorMessage,
 } from './rotationErrors.ts'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const en = JSON.parse(fs.readFileSync(path.join(here, '..', 'i18n', 'en.json'), 'utf8')) as {
-  auth: { rotationErrors: Record<string, string> }
+  auth: { rotationErrors: Record<string, string>; loginErrors: Record<string, string> }
 }
 const copy = en.auth.rotationErrors
+const loginCopy = en.auth.loginErrors
 
 // Every suffix has a string (plural keys count as present via _one/_other).
 for (const suffix of allRotationErrorSuffixes()) {
@@ -89,5 +93,33 @@ assert.equal(requiresSignOut('epoch_changed'), true)
 assert.equal(requiresSignOut('not_logged_in'), true)
 assert.equal(requiresSignOut('rolled_back'), false)
 assert.equal(requiresSignOut('invalid_credentials'), false)
+
+// --- login() strings ----------------------------------------------------------
+assert.equal(classifyLoginError('rotation_interrupted'), 'interrupted')
+assert.equal(classifyLoginError('rotation_rolled_back'), 'rolledBack')
+assert.equal(classifyLoginError('rotation_resume_failed'), 'resumeFailed')
+assert.equal(classifyLoginError('account locked, try again later'), 'locked')
+assert.equal(classifyLoginError('invalid credentials'), 'invalidCredentials')
+assert.equal(
+  classifyLoginError("This account was created before the data-key format and can't be opened"),
+  'legacyAccount',
+)
+assert.equal(classifyLoginError("couldn't verify credentials: unsupported key wrapper format 1"), 'other')
+assert.equal(classifyLoginError('internal error: account exists with no salt record'), 'other')
+assert.equal(classifyLoginError(''), 'other')
+assert.equal(classifyLoginError('Rotation_Interrupted'), 'other', 'exact match only')
+assert.equal(classifyLoginError('toString'), 'other', 'inherited object keys are not codes')
+assert.equal(classifyLoginError('__proto__'), 'other')
+
+assert.equal(loginErrorSuffix('interrupted'), null, 'opens its own screen')
+assert.equal(loginErrorSuffix('other'), null, 'shows the raw message')
+for (const suffix of allLoginErrorSuffixes()) {
+  assert.equal(typeof loginCopy[suffix], 'string', `en.json auth.loginErrors.${suffix} is missing`)
+}
+for (const key of Object.keys(loginCopy)) {
+  assert.ok(allLoginErrorSuffixes().includes(key), `en.json auth.loginErrors.${key} is not returned by rotationErrors.ts`)
+}
+assert.equal(loginCopy.rolledBack, 'Nothing was changed. Your old password still works.')
+assert.ok(!/\d|minute|hour|second|day/i.test(loginCopy.accountLocked ?? ''), 'no duration promised')
 
 console.log('rotationErrors.test.ts: all assertions passed')

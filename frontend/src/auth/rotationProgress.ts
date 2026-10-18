@@ -40,7 +40,10 @@ export interface TaskProgressPayload {
 }
 
 export type RotationOutcome = 'complete' | 'rolled_back' | 'failed'
-export type RotationKind = 'password_change' | 'restore' | 'new_phrase'
+/** What a form in this webview registered as the starter of a rotation:
+ *  the three credential changes, a cancel of an interrupted change, and the
+ *  forward resume that login() runs when the new password is typed. */
+export type RotationKind = 'password_change' | 'restore' | 'new_phrase' | 'cancel' | 'resume'
 
 const FINAL_PHASES: readonly string[] = ['complete', 'rolled_back', 'failed']
 
@@ -104,7 +107,7 @@ export function phaseLabelSuffix(phase: string | null): PhaseLabelSuffix {
 
 /** Suffix of an `auth.rotation.title.*` i18n key. The kind is known only when
  *  a form in this webview started the rotation (after a reload it is not). */
-export type TitleSuffix = 'generic' | 'passwordChange' | 'restore' | 'newPhrase'
+export type TitleSuffix = 'generic' | 'passwordChange' | 'restore' | 'newPhrase' | 'cancel' | 'resume'
 
 export function titleSuffix(kind: RotationKind | null): TitleSuffix {
   switch (kind) {
@@ -114,6 +117,10 @@ export function titleSuffix(kind: RotationKind | null): TitleSuffix {
       return 'restore'
     case 'new_phrase':
       return 'newPhrase'
+    case 'cancel':
+      return 'cancel'
+    case 'resume':
+      return 'resume'
     default:
       return 'generic'
   }

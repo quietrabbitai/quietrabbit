@@ -9,31 +9,70 @@
 // state never cross IPC), so a successful submit immediately follows up
 // with finishSignIn() (commands.getSession() plus navShellConfig.ts's
 // setCurrentUserId()) before calling onLoggedIn().
+//
+// items.id=769 stage 4: this screen also hosts the two credential-recovery
+// views. "Forgot your password?" switches to RestoreAccessForm (recovery
+// phrase + a new password), and the login() answer "rotation_interrupted" (the
+// OLD password typed while a change is pending) switches to
+// InterruptedChangeScreen. login() answers are plain strings; classifyLoginError
+// (rotationErrors.ts) recognises the few that have their own wording and
+// everything else keeps the original "Could not log in: ..." message. The
+// password field is cleared on every submit. login() registers as the
+// rotation's starter (rotationTask) because typing the new password resumes an
+// interrupted rotation inside it: the form reports the outcome, and the
+// progress overlay (mounted above this screen) shows the progress.
 
 import { useState, type FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { commands } from '../bindings'
 import { finishSignIn } from './finishSignIn'
+import { InterruptedChangeScreen } from './InterruptedChangeScreen'
+import { RestoreAccessForm } from './RestoreAccessForm'
+import { classifyLoginError, loginErrorSuffix, type LoginProblem } from './rotationErrors'
+import { beginRotationTask } from './rotationTask'
 
 export interface LoginFormProps {
   onLoggedIn: () => void
 }
 
+type Mode = 'login' | 'restore' | 'interrupted'
+
+interface LoginFailure {
+  problem: LoginProblem
+  message: string
+}
+
 export function LoginForm({ onLoggedIn }: LoginFormProps) {
   const { t } = useTranslation()
+  const [mode, setMode] = useState<Mode>('login')
   const [displayName, setDisplayName] = useState('')
   const [password, setPassword] = useState('')
+  const [failure, setFailure] = useState<LoginFailure | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
 
   const performLogin = async (name: string, pass: string) => {
     setError(null)
+    setFailure(null)
     setSubmitting(true)
 
-    const loginResult = await commands.login(name, pass)
+    const release = beginRotationTask('resume')
+    let loginResult: Awaited<ReturnType<typeof commands.login>>
+    try {
+      loginResult = await commands.login(name, pass)
+    } catch {
+      loginResult = { status: 'error', error: 'internal error' }
+    } finally {
+      release()
+    }
     if (loginResult.status !== 'ok') {
-      setError(loginResult.error)
+      const problem = classifyLoginError(loginResult.error)
       setSubmitting(false)
+      if (problem === 'interrupted') {
+        setMode('interrupted')
+        return
+      }
+      setFailure({ problem, message: loginResult.error })
       return
     }
 
@@ -57,7 +96,9 @@ export function LoginForm({ onLoggedIn }: LoginFormProps) {
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
-    await performLogin(displayName, password)
+    const submitted = password
+    setPassword('')
+    await performLogin(displayName, submitted)
   }
 
   // DIAG_329 (items.id=329): dev-only test scaffolding -- logs straight into
@@ -71,6 +112,34 @@ export function LoginForm({ onLoggedIn }: LoginFormProps) {
   // fast iteration.
   const handleDevLogin = () => {
     void performLogin('jason', 'jason')
+  }
+
+  if (mode === 'restore') {
+    return (
+      <RestoreAccessForm
+        initialDisplayName={displayName}
+        onLoggedIn={onLoggedIn}
+        onBack={() => setMode('login')}
+      />
+    )
+  }
+
+  if (mode === 'interrupted') {
+    return (
+      <InterruptedChangeScreen
+        displayName={displayName}
+        onSignInWithNewPassword={() => setMode('login')}
+        onUseRecoveryPhrase={() => setMode('restore')}
+        onBack={() => setMode('login')}
+      />
+    )
+  }
+
+  // Member access keeps the t() key below statically checkable by
+  // styleAndI18nConsistency.test.ts.
+  const failureView = failure && {
+    suffix: loginErrorSuffix(failure.problem),
+    message: failure.message,
   }
 
   return (
@@ -105,6 +174,10 @@ export function LoginForm({ onLoggedIn }: LoginFormProps) {
         {t('auth.submitButton')}
       </button>
 
+      <button type="button" onClick={() => setMode('restore')} disabled={submitting}>
+        {t('auth.forgotPassword')}
+      </button>
+
       {/* DIAG_329 (items.id=329): dev-only, see handleDevLogin's own comment. */}
       {import.meta.env.DEV && (
         <button type="button" onClick={handleDevLogin} disabled={submitting}>
@@ -112,6 +185,12 @@ export function LoginForm({ onLoggedIn }: LoginFormProps) {
         </button>
       )}
 
+      {failureView &&
+        (failureView.suffix !== null ? (
+          <p role="alert">{t(`auth.loginErrors.${failureView.suffix}`)}</p>
+        ) : (
+          <p role="alert">{t('auth.loginError', { message: failureView.message })}</p>
+        ))}
       {error && <p role="alert">{t('auth.loginError', { message: error })}</p>}
     </form>
   )

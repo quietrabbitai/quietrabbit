@@ -1,0 +1,41 @@
+.restore-access-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.restore-access-form__heading {
+  margin: 0;
+  font-size: var(--text-lg);
+  font-weight: 500;
+}
+
+.restore-access-form__text {
+  margin: 0;
+  font-size: var(--text-base);
+  line-height: var(--leading-body);
+  color: var(--text-muted);
+}
+
+.restore-access-form__field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.restore-access-form__count {
+  font-size: var(--text-sm);
+  color: var(--text-label);
+}
+
+.restore-access-form__buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.restore-access-form__error {
+  margin: 0;
+  font-size: var(--text-base);
+  color: var(--danger);
+}

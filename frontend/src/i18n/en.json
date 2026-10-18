@@ -6,6 +6,43 @@
     "submitButton": "Log in",
     "loginError": "Could not log in: {{message}}",
     "sessionMissingAfterLogin": "Logged in, but no session was returned. Try again.",
+    "forgotPassword": "Forgot your password?",
+    "loginErrors": {
+      "accountLocked": "Too many failed attempts. This account is locked for now.",
+      "invalidCredentials": "That display name and password didn't match.",
+      "legacyAccount": "This account was created before the data-key format and can't be opened.",
+      "rolledBack": "Nothing was changed. Your old password still works.",
+      "resumeFailed": "The unfinished change couldn't be completed right now, and nothing is lost. Try again, use your recovery phrase, or restart QuietRabbit if it keeps failing."
+    },
+    "restore": {
+      "heading": "Restore access with your recovery phrase",
+      "intro": "Enter your 24-word recovery phrase and choose a new password. Your data is re-locked under a new key and the new password, so the old password stops opening it from then on. This can take a while for a large account. Copies or backups made before the change can still be opened with your old password. Your recovery phrase stays the same.",
+      "phraseLabel": "Recovery phrase (24 words)",
+      "wordCount": "{{count}} of {{total}} words",
+      "newPasswordLabel": "New password",
+      "confirmLabel": "Confirm new password",
+      "submit": "Restore access",
+      "submitting": "Restoring…",
+      "back": "Back to sign in",
+      "mismatch": "The new password and its confirmation don't match."
+    },
+    "interrupted": {
+      "heading": "A change to this account was interrupted",
+      "intro": "A password change for {{name}} was interrupted before it finished, and the password you typed is the old one. Your data is safe. To finish the change, sign in with the NEW password, or use your recovery phrase. Or cancel the change and keep using your old password.",
+      "signInNew": "Sign in with the new password",
+      "useRecovery": "Use my recovery phrase",
+      "cancelHeading": "Cancel the change",
+      "cancelIntro": "Cancelling puts everything back as it was, and you then sign in with your old password. To prove it's you, enter the new password or your recovery phrase. A change that has already been completed can't be cancelled; finish it instead.",
+      "cancelWithPassword": "Cancel using the new password",
+      "cancelWithPhrase": "Cancel using my recovery phrase",
+      "newPasswordLabel": "New password",
+      "phraseLabel": "Recovery phrase (24 words)",
+      "cancelSubmit": "Cancel the change",
+      "cancelling": "Cancelling…",
+      "cancelBack": "Back",
+      "cancelled": "The change was cancelled. Nothing was changed. Sign in with your old password.",
+      "backToSignIn": "Back to sign in"
+    },
     "accountSecurity": {
       "openButton": "Account security",
       "title": "Account security",
@@ -55,7 +92,9 @@
         "generic": "Re-locking your data",
         "passwordChange": "Changing your password",
         "restore": "Restoring your access",
-        "newPhrase": "Creating your new recovery phrase"
+        "newPhrase": "Creating your new recovery phrase",
+        "cancel": "Undoing the interrupted change",
+        "resume": "Finishing your interrupted change"
       },
       "phase": {
         "preparing": "Preparing",

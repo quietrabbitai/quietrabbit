@@ -67,6 +67,8 @@ assert.equal(phaseLabelSuffix('something_new'), 'working', 'open vocabulary fall
 assert.equal(phaseLabelSuffix(null), 'working')
 assert.equal(titleSuffix('new_phrase'), 'newPhrase')
 assert.equal(titleSuffix('password_change'), 'passwordChange')
+assert.equal(titleSuffix('cancel'), 'cancel')
+assert.equal(titleSuffix('resume'), 'resume')
 assert.equal(titleSuffix(null), 'generic')
 assert.equal(outcomeSuffix('rolled_back'), 'rolledBack')
 assert.equal(outcomeSuffix('failed'), 'failed')
