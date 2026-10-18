@@ -383,6 +383,10 @@ pub enum RotationError {
     ReadBackFailed(String),
     #[error("the pending rotation cannot be resumed: {0}")]
     CannotResume(String),
+    /// An explicit cancel of a rotation whose new wraps are already live: the
+    /// data is on the new key and the rotation can only be finished.
+    #[error("the change is already complete on disk and can only be finished")]
+    AlreadyPromoted,
     #[error("the recovery phrase does not belong to this rotation")]
     WrongPhrase,
     /// An error before promotion; every file is back on the old key and the
@@ -1327,6 +1331,100 @@ pub fn new_dek_from_staged_phrase(
     )?)
 }
 
+/// What the user typed to reach the staged new key of an interrupted rotation.
+pub enum StagedCredential<'a> {
+    /// The new password, tried against the staged wrap with the STAGED salt
+    /// and cost parameters.
+    Password(&'a [u8]),
+    /// The recovery phrase's entropy, tried against the staged recovery seal.
+    Phrase(&'a [u8; kdf::MASTER_KEY_LEN]),
+}
+
+/// The new DEK of an interrupted rotation, plus the key that proves the
+/// read-back unlock when the rotation is resumed.
+pub struct StagedUnlock {
+    pub new_dek: SecretBytes,
+    readback_key: Zeroizing<[u8; kdf::MASTER_KEY_LEN]>,
+    via_phrase: bool,
+}
+
+impl StagedUnlock {
+    /// The credential `resume_rotation` reads the live wrapper back with.
+    pub fn credential(&self) -> Credential<'_> {
+        if self.via_phrase {
+            Credential::Phrase(&self.readback_key)
+        } else {
+            Credential::Password(&self.readback_key)
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum StagedUnlockError {
+    /// The staged salt or cost parameters are gone, so a password cannot be
+    /// tried at all.
+    #[error("the staged key derivation parameters are gone")]
+    Unusable,
+    #[error(transparent)]
+    Kdf(kdf::AuthError),
+    /// The credential does not open the staged new key.
+    #[error("the credential does not open the staged key")]
+    WrongCredential,
+    /// Anything else (the staged material is malformed or missing).
+    #[error(transparent)]
+    Failed(RotationError),
+}
+
+/// Turn what the user typed into the staged new DEK. Shared by login (new
+/// password), restore (phrase) and cancel. A wrong credential is reported as
+/// `WrongCredential`: for a password only an authentication failure counts as
+/// wrong, for a phrase a wrong phrase or any failed unseal does.
+pub async fn unlock_staged(
+    pending: &PendingRotation,
+    user_id: &str,
+    credential: StagedCredential<'_>,
+) -> Result<StagedUnlock, StagedUnlockError> {
+    match credential {
+        StagedCredential::Password(password) => {
+            let (Some(salt), Some(mem), Some(iter), Some(par)) = (
+                pending.salt.as_ref(),
+                pending.kdf_memory_kib,
+                pending.kdf_iterations,
+                pending.kdf_parallelism,
+            ) else {
+                return Err(StagedUnlockError::Unusable);
+            };
+            let staged_pk = kdf::derive_password_key_blocking(password, salt, mem, iter, par)
+                .await
+                .map_err(StagedUnlockError::Kdf)?;
+            match new_dek_from_staged_password(pending, user_id, &staged_pk) {
+                Ok(new_dek) => Ok(StagedUnlock {
+                    new_dek,
+                    readback_key: staged_pk,
+                    via_phrase: false,
+                }),
+                Err(RotationError::Crypto(DataKeyError::WrongPassword)) => {
+                    Err(StagedUnlockError::WrongCredential)
+                }
+                Err(e) => Err(StagedUnlockError::Failed(e)),
+            }
+        }
+        StagedCredential::Phrase(entropy) => {
+            match new_dek_from_staged_phrase(pending, user_id, entropy) {
+                Ok(new_dek) => Ok(StagedUnlock {
+                    new_dek,
+                    readback_key: Zeroizing::new(*entropy),
+                    via_phrase: true,
+                }),
+                Err(RotationError::WrongPhrase) | Err(RotationError::Crypto(_)) => {
+                    Err(StagedUnlockError::WrongCredential)
+                }
+                Err(e) => Err(StagedUnlockError::Failed(e)),
+            }
+        }
+    }
+}
+
 async fn load_run<'a>(
     env: &'a RotationEnv<'a>,
     pending: &PendingRotation,
@@ -1463,9 +1561,7 @@ pub async fn cancel_rotation(
     new_dek: SecretBytes,
 ) -> Result<ResumeOutcome, RotationError> {
     if pending.state == RotationState::Verifying {
-        return Err(RotationError::CannotResume(
-            "the change is already complete on disk and can only be finished".into(),
-        ));
+        return Err(RotationError::AlreadyPromoted);
     }
     let _guard =
         epoch_guard::begin_rotation(env.user_id).map_err(|_| RotationError::RotationInProgress)?;

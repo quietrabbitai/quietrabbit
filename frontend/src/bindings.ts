@@ -492,8 +492,22 @@ export const commands = {
 	 */
 	restoreWithRecoveryPhrase: (displayName: string, phrase: string, newPassword: string) => typedError<null, KeyRotationError>(__TAURI_INVOKE("restore_with_recovery_phrase", { displayName, phrase, newPassword })),
 	/**
+	 *  Cancel an interrupted password change, restore or new-phrase rotation by
+	 *  typing the NEW password (for a new-phrase rotation, the account password).
+	 *  On success the account is back on its old key with nothing pending; this does
+	 *  not sign in, the user signs in with the OLD password. Refused with
+	 *  `rotation_already_complete` once the change is promoted.
+	 */
+	cancelInterruptedRotationWithPassword: (displayName: string, newPassword: string) => typedError<null, KeyRotationError>(__TAURI_INVOKE("cancel_interrupted_rotation_with_password", { displayName, newPassword })),
+	/**
+	 *  Cancel an interrupted rotation by typing the 24 recovery words (for a
+	 *  new-phrase rotation, the NEW words). Same outcome as the password form.
+	 */
+	cancelInterruptedRotationWithPhrase: (displayName: string, phrase: string) => typedError<null, KeyRotationError>(__TAURI_INVOKE("cancel_interrupted_rotation_with_phrase", { displayName, phrase })),
+	/**
 	 *  Where a rotation stands. Safe to poll; reads no secret. Without a session
-	 *  there is nothing to report beyond whether this process is rotating.
+	 *  there is nothing to report beyond whether this process is rotating and how
+	 *  the last rotation it ran ended.
 	 */
 	getRotationStatus: () => typedError<RotationStatus, KeyRotationError>(__TAURI_INVOKE("get_rotation_status")),
 	getHealth: () => typedError<HealthResponse, string>(__TAURI_INVOKE("get_health")),
@@ -1519,6 +1533,12 @@ export type KeyRotationError =
 { code: "database_unreadable" } | 
 /**  The account's key was changed in another session. */
 { code: "epoch_changed" } | 
+/**
+ *  Cancel refused: the change is already complete on disk (the new wraps
+ *  are live) and can only be finished, with the new password or the
+ *  recovery phrase.
+ */
+{ code: "rotation_already_complete" } | 
 /**  The change was started and then undone. Nothing changed for the user. */
 { code: "rolled_back" } | 
 /**
@@ -1547,6 +1567,19 @@ export type KeySource =
  *  key. Reads the same slot as `ClipboardCandidate`.
  */
 "SessionCandidate";
+
+/**  How the last rotation this process ran ended. */
+export type LastRotationOutcome = 
+/**
+ *  None ran in this process, one is running, or the last one stopped
+ *  without a final report (an interruption).
+ */
+"none" | "complete" | "rolled_back" | 
+/**
+ *  It did not finish and waits for the next unlock with the new password
+ *  or the recovery phrase (or a cancel, if it was not yet promoted).
+ */
+"failed";
 
 export type LimitDto = {
 	id: string,
@@ -2253,6 +2286,8 @@ export type RotationStatus = {
 	interrupted: boolean,
 	/**  `password_change`, `restore` or `new_phrase` while one is pending. */
 	pending_kind: string | null,
+	/**  How the last rotation this process ran ended. `none` while one runs. */
+	last_outcome: LastRotationOutcome,
 };
 
 export type SaveKeyRequest = {

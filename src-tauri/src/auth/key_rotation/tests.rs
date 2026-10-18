@@ -1268,8 +1268,77 @@ async fn a_promoted_rotation_cannot_be_cancelled() {
     let new_dek = new_dek_from_staged_password(&pending, USER, &pk).unwrap();
     assert!(matches!(
         cancel_rotation(&fx.env(), &pending, new_dek).await,
-        Err(RotationError::CannotResume(_))
+        Err(RotationError::AlreadyPromoted)
     ));
+}
+
+#[tokio::test]
+async fn unlock_staged_reaches_the_new_key_with_the_new_password_or_the_phrase() {
+    let fx = Fixture::new().await;
+    fx.rotate_with_fault(FaultPoint::AfterStage, Fixture::change_password())
+        .await
+        .unwrap_err();
+    let pending = user_store::get_pending_rotation(&fx.pool, USER)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Wrong password, wrong phrase and the OLD password are all just wrong.
+    for wrong in [&b"not it"[..], PASSWORD] {
+        assert!(matches!(
+            unlock_staged(&pending, USER, StagedCredential::Password(wrong)).await,
+            Err(StagedUnlockError::WrongCredential)
+        ));
+    }
+    let stranger = data_key::generate_recovery_entropy().unwrap();
+    assert!(matches!(
+        unlock_staged(&pending, USER, StagedCredential::Phrase(&stranger)).await,
+        Err(StagedUnlockError::WrongCredential)
+    ));
+
+    // Staged cost parameters gone: a password cannot even be tried.
+    let mut no_kdf = pending.clone();
+    no_kdf.kdf_memory_kib = None;
+    assert!(matches!(
+        unlock_staged(&no_kdf, USER, StagedCredential::Password(NEW_PASSWORD)).await,
+        Err(StagedUnlockError::Unusable)
+    ));
+    // Staged wrap gone: not a wrong credential either.
+    let mut no_wrap = pending.clone();
+    no_wrap.password_wrap = None;
+    assert!(matches!(
+        unlock_staged(&no_wrap, USER, StagedCredential::Password(NEW_PASSWORD)).await,
+        Err(StagedUnlockError::Failed(RotationError::CannotResume(_)))
+    ));
+
+    // Both right credentials reach the same new key, and each supplies the
+    // read-back credential its own resume needs.
+    let by_password = unlock_staged(&pending, USER, StagedCredential::Password(NEW_PASSWORD))
+        .await
+        .unwrap();
+    let by_phrase = unlock_staged(
+        &pending,
+        USER,
+        StagedCredential::Phrase(&fx.recovery_entropy),
+    )
+    .await
+    .unwrap();
+    assert_eq!(*by_password.new_dek, *by_phrase.new_dek);
+    assert!(matches!(by_password.credential(), Credential::Password(_)));
+    assert!(matches!(by_phrase.credential(), Credential::Phrase(_)));
+
+    let resumed = resume_rotation(
+        &fx.env(),
+        &pending,
+        by_phrase.new_dek.clone(),
+        by_phrase.credential(),
+    )
+    .await
+    .unwrap();
+    let ResumeOutcome::Completed(outcome) = resumed else {
+        panic!("expected the rotation to complete");
+    };
+    assert_completed(&fx, &outcome.new_dek).await;
 }
 
 #[tokio::test]

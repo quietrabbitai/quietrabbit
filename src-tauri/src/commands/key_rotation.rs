@@ -11,6 +11,9 @@
 //   cancel_new_recovery_phrase()
 //   restore_with_recovery_phrase(name, words, new password)
 //                                              -- no session (forgot password)
+//   cancel_interrupted_rotation_with_password(name, new password)
+//   cancel_interrupted_rotation_with_phrase(name, words)
+//                                              -- no session (resume screen)
 //   get_rotation_status()
 //
 // ERRORS ARE CODED AND CARRY NOTHING TO IDENTIFY ANYTHING. Every command here
@@ -24,6 +27,17 @@
 // auth_failures exactly as login records one (record_failed_attempt), behind
 // the same is_locked_out check, and nothing is cleared on success. Whether
 // recovery-phrase failures should share the password counter is for items.id=632.
+//
+// CANCEL (items.id=771, decisions.id=895 point 5): an interrupted rotation that
+// is not yet promoted can be undone from the login screen with the NEW password
+// or the recovery phrase (the credentials that reach the staged new key). Unknown
+// account, an account with nothing pending, and a wrong credential all answer
+// InvalidCredentials; the last two each record one failed attempt. A promoted
+// rotation (state verifying) answers RotationAlreadyComplete, and only after the
+// credential proved right. Cancel never signs in: the account is back on the OLD
+// key and the user signs in with the old password. The old password typed here is
+// simply wrong (login's uncounted "old password" answer would make cancel an
+// oracle for it). Equal timing across these cases is items.id=639's.
 //
 // NEW-PHRASE ORDER (decided with the plan, differs from AUTH 4.0's listing):
 // the new words are generated and SHOWN first (begin), the user re-enters
@@ -50,8 +64,8 @@ use crate::auth::data_key::{self, DataKeyError};
 use crate::auth::epoch_guard;
 use crate::auth::kdf;
 use crate::auth::key_rotation::{
-    self, Credential, ProgressEvent, ProgressSink, ResumeOutcome, RotationEnv, RotationError,
-    RotationRequest,
+    self, ProgressEvent, ProgressSink, ResumeOutcome, RotationEnv, RotationError, RotationRequest,
+    StagedCredential, StagedUnlockError,
 };
 use crate::auth::registry::{GroupKeyRegistry, KeyRegistry, NewPhraseSlot};
 use crate::auth::user_store;
@@ -96,6 +110,10 @@ pub enum KeyRotationError {
     DatabaseUnreadable,
     /// The account's key was changed in another session.
     EpochChanged,
+    /// Cancel refused: the change is already complete on disk (the new wraps
+    /// are live) and can only be finished, with the new password or the
+    /// recovery phrase.
+    RotationAlreadyComplete,
     /// The change was started and then undone. Nothing changed for the user.
     RolledBack,
     /// The change did not finish and will be completed the next time the
@@ -124,6 +142,20 @@ pub struct WordAnswer {
     pub word: String,
 }
 
+/// How the last rotation this process ran ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum LastRotationOutcome {
+    /// None ran in this process, one is running, or the last one stopped
+    /// without a final report (an interruption).
+    None,
+    Complete,
+    RolledBack,
+    /// It did not finish and waits for the next unlock with the new password
+    /// or the recovery phrase (or a cancel, if it was not yet promoted).
+    Failed,
+}
+
 /// Where a rotation stands, for a webview that reloaded or mounted late.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct RotationStatus {
@@ -138,6 +170,8 @@ pub struct RotationStatus {
     pub interrupted: bool,
     /// `password_change`, `restore` or `new_phrase` while one is pending.
     pub pending_kind: Option<String>,
+    /// How the last rotation this process ran ended. `none` while one runs.
+    pub last_outcome: LastRotationOutcome,
 }
 
 // ---------------------------------------------------------------------------
@@ -211,7 +245,18 @@ fn code_for(e: &RotationError) -> KeyRotationError {
         RotationError::RolledBack { .. } => KeyRotationError::RolledBack,
         RotationError::NeedsResume { .. } => KeyRotationError::NeedsResume,
         RotationError::WrongPhrase => KeyRotationError::InvalidCredentials,
+        RotationError::AlreadyPromoted => KeyRotationError::RotationAlreadyComplete,
         _ => KeyRotationError::Internal,
+    }
+}
+
+/// Translate a failure to reach the staged new key. A wrong credential is the
+/// caller's to count, so it maps to the same code as everywhere else.
+fn code_for_unlock(e: &StagedUnlockError) -> KeyRotationError {
+    match e {
+        StagedUnlockError::WrongCredential => KeyRotationError::InvalidCredentials,
+        StagedUnlockError::Failed(e) => code_for(e),
+        other => internal("staged unlock", other),
     }
 }
 
@@ -571,19 +616,23 @@ pub async fn restore_with_recovery_phrase(
             .await
             .map_err(|e| internal("pending rotation", e))?
             .ok_or_else(|| internal("pending rotation", "flag without a row"))?;
-        let new_dek = match key_rotation::new_dek_from_staged_phrase(&pending, &user.id, &entropy) {
-            Ok(d) => d,
-            Err(RotationError::WrongPhrase) | Err(RotationError::Crypto(_)) => {
-                return wrong().await.map(|_| ());
-            }
-            Err(e) => return Err(code_for(&e)),
+        let unlock = match key_rotation::unlock_staged(
+            &pending,
+            &user.id,
+            StagedCredential::Phrase(&entropy),
+        )
+        .await
+        {
+            Ok(u) => u,
+            Err(StagedUnlockError::WrongCredential) => return wrong().await.map(|_| ()),
+            Err(e) => return Err(code_for_unlock(&e)),
         };
         let env = env_for(&pool, &user.id, None, None);
         let finished = match key_rotation::resume_rotation(
             &env,
             &pending,
-            new_dek,
-            Credential::Phrase(&entropy),
+            unlock.new_dek.clone(),
+            unlock.credential(),
         )
         .await
         {
@@ -675,11 +724,128 @@ pub async fn restore_with_recovery_phrase(
 }
 
 // ---------------------------------------------------------------------------
+// Cancel an interrupted rotation
+// ---------------------------------------------------------------------------
+
+/// What the user typed to prove they may cancel.
+enum CancelWith<'a> {
+    Password(&'a str),
+    Phrase(&'a [u8; kdf::MASTER_KEY_LEN]),
+}
+
+/// Undo an interrupted, not yet promoted rotation. No session exists: the
+/// account is identified by `display_name` and the credential is the one that
+/// reaches the staged NEW key. See the module header for the answers.
+async fn cancel_pending(
+    pool: &sqlx::SqlitePool,
+    display_name: &str,
+    with: CancelWith<'_>,
+) -> Result<(), KeyRotationError> {
+    // Unknown account and wrong credential must look the same.
+    let user = user_store::find_user_by_display_name(pool, display_name)
+        .await
+        .map_err(|e| internal("user", e))?
+        .ok_or(KeyRotationError::InvalidCredentials)?;
+    if is_locked_out(pool, display_name)
+        .await
+        .map_err(|e| internal("lockout check", e))?
+    {
+        return Err(KeyRotationError::AccountLocked);
+    }
+    let state = user_store::get_key_wrapper_state(pool, &user.id)
+        .await
+        .map_err(|e| internal("wrapper", e))?
+        .ok_or_else(|| internal("wrapper", "missing"))?;
+
+    let wrong = || async {
+        record_failed_attempt(pool, display_name)
+            .await
+            .map_err(|e| internal("failure bookkeeping", e))?;
+        Err::<(), _>(KeyRotationError::InvalidCredentials)
+    };
+
+    // Nothing to cancel is answered as a wrong credential, and counted as one.
+    if state.pending_rotation.is_none() {
+        return wrong().await;
+    }
+    let pending = user_store::get_pending_rotation(pool, &user.id)
+        .await
+        .map_err(|e| internal("pending rotation", e))?
+        .ok_or_else(|| internal("pending rotation", "flag without a row"))?;
+
+    let credential = match &with {
+        CancelWith::Password(password) => StagedCredential::Password(password.as_bytes()),
+        CancelWith::Phrase(entropy) => StagedCredential::Phrase(entropy),
+    };
+    let unlock = match key_rotation::unlock_staged(&pending, &user.id, credential).await {
+        Ok(u) => u,
+        Err(StagedUnlockError::WrongCredential) => return wrong().await,
+        Err(e) => return Err(code_for_unlock(&e)),
+    };
+
+    // No session, no scheduler: nothing here can be running Focus work.
+    let env = env_for(pool, &user.id, None, None);
+    match key_rotation::cancel_rotation(&env, &pending, unlock.new_dek.clone()).await {
+        Ok(ResumeOutcome::RolledBack) => Ok(()),
+        Ok(ResumeOutcome::Completed(_)) => Err(internal("cancel", "reported a completed rotation")),
+        Err(e) => Err(code_for(&e)),
+    }
+}
+
+/// Cancel an interrupted password change, restore or new-phrase rotation by
+/// typing the NEW password (for a new-phrase rotation, the account password).
+/// On success the account is back on its old key with nothing pending; this does
+/// not sign in, the user signs in with the OLD password. Refused with
+/// `rotation_already_complete` once the change is promoted.
+#[tauri::command]
+#[specta::specta]
+pub async fn cancel_interrupted_rotation_with_password(
+    display_name: String,
+    new_password: String,
+    pool: State<'_, sqlx::SqlitePool>,
+) -> Result<(), KeyRotationError> {
+    let new_password = Zeroizing::new(new_password);
+    cancel_pending(&pool, &display_name, CancelWith::Password(&new_password)).await
+}
+
+/// Cancel an interrupted rotation by typing the 24 recovery words (for a
+/// new-phrase rotation, the NEW words). Same outcome as the password form.
+#[tauri::command]
+#[specta::specta]
+pub async fn cancel_interrupted_rotation_with_phrase(
+    display_name: String,
+    phrase: String,
+    pool: State<'_, sqlx::SqlitePool>,
+) -> Result<(), KeyRotationError> {
+    // The words' shape is checked first and says nothing about any account.
+    let entropy = data_key::entropy_from_mnemonic(&normalise_phrase(&phrase))
+        .map_err(|_| KeyRotationError::PhraseInvalid)?;
+    cancel_pending(&pool, &display_name, CancelWith::Phrase(&entropy)).await
+}
+
+// ---------------------------------------------------------------------------
 // Status
 // ---------------------------------------------------------------------------
 
+/// Map the last remembered progress event to how the last rotation ended. Only
+/// a final report counts: anything else (a crash left `rekeying`, a refused
+/// resume left `resuming`) is `none`, and so is any moment a rotation runs,
+/// because the remembered event may belong to the previous one.
+fn last_outcome_of(running: bool, last: Option<&ProgressEvent>) -> LastRotationOutcome {
+    if running {
+        return LastRotationOutcome::None;
+    }
+    match last.map(|e| e.phase) {
+        Some(key_rotation::Phase::Complete) => LastRotationOutcome::Complete,
+        Some(key_rotation::Phase::RolledBack) => LastRotationOutcome::RolledBack,
+        Some(key_rotation::Phase::Failed) => LastRotationOutcome::Failed,
+        _ => LastRotationOutcome::None,
+    }
+}
+
 /// Where a rotation stands. Safe to poll; reads no secret. Without a session
-/// there is nothing to report beyond whether this process is rotating.
+/// there is nothing to report beyond whether this process is rotating and how
+/// the last rotation it ran ended.
 #[tauri::command]
 #[specta::specta]
 pub async fn get_rotation_status(
@@ -687,7 +853,8 @@ pub async fn get_rotation_status(
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<RotationStatus, KeyRotationError> {
     let running = epoch_guard::is_rotating();
-    let (phase, percent) = match key_rotation::last_progress().filter(|_| running) {
+    let last = key_rotation::last_progress();
+    let (phase, percent) = match last.as_ref().filter(|_| running) {
         Some(e) => {
             let pct = e
                 .current
@@ -712,6 +879,7 @@ pub async fn get_rotation_status(
         percent,
         interrupted: pending.is_some(),
         pending_kind: pending.map(|p| p.kind.as_str().to_owned()),
+        last_outcome: last_outcome_of(running, last.as_ref()),
     })
 }
 
@@ -867,6 +1035,39 @@ mod tests {
         /// Leave an interrupted rotation behind, as a crash would, and lock
         /// the process (a restart).
         async fn crash_a_password_change(&self, fault: FaultPoint) {
+            self.crash_with(vec![fault]).await;
+        }
+
+        /// Run a password change that dies at the last of `faults`.
+        async fn crash_with(&self, faults: Vec<FaultPoint>) {
+            let err = self
+                .run_password_change_with(faults, NEW_PASSWORD)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RotationError::SimulatedCrash), "{err:?}");
+        }
+
+        /// Run a password change from the resident session with faults armed,
+        /// returning whatever the engine returned.
+        async fn run_password_change_with(
+            &self,
+            faults: Vec<FaultPoint>,
+            new_password: &str,
+        ) -> Result<key_rotation::RotationOutcome, RotationError> {
+            self.run_with(
+                faults,
+                RotationRequest::PasswordChange {
+                    new_password: Zeroizing::new(new_password.as_bytes().to_vec()),
+                },
+            )
+            .await
+        }
+
+        async fn run_with(
+            &self,
+            faults: Vec<FaultPoint>,
+            request: RotationRequest,
+        ) -> Result<key_rotation::RotationOutcome, RotationError> {
             let (user_id, dek, epoch) = self
                 .registry()
                 .with_key(|k| (k.user_id.clone(), k.data_key, k.key_epoch))
@@ -874,18 +1075,40 @@ mod tests {
                 .unwrap();
             let pool = self.pool();
             let mut env = RotationEnv::new(&pool, &user_id, user_dir(&user_id));
-            env.faults = vec![fault];
-            let err = key_rotation::run_rotation(
-                &env,
-                &dek,
-                epoch,
-                RotationRequest::PasswordChange {
-                    new_password: Zeroizing::new(NEW_PASSWORD.as_bytes().to_vec()),
-                },
+            env.faults = faults;
+            key_rotation::run_rotation(&env, &dek, epoch, request).await
+        }
+
+        async fn cancel_password(
+            &self,
+            display_name: &str,
+            password: &str,
+        ) -> Result<(), KeyRotationError> {
+            cancel_interrupted_rotation_with_password(
+                display_name.to_owned(),
+                password.to_owned(),
+                self.pool(),
             )
             .await
-            .unwrap_err();
-            assert!(matches!(err, RotationError::SimulatedCrash), "{err:?}");
+        }
+
+        async fn cancel_phrase(
+            &self,
+            display_name: &str,
+            words: &str,
+        ) -> Result<(), KeyRotationError> {
+            cancel_interrupted_rotation_with_phrase(
+                display_name.to_owned(),
+                words.to_owned(),
+                self.pool(),
+            )
+            .await
+        }
+
+        async fn status(&self) -> RotationStatus {
+            get_rotation_status(self.registry(), self.pool())
+                .await
+                .unwrap()
         }
 
         async fn restart(&self) {
@@ -1437,7 +1660,8 @@ mod tests {
                 phase: None,
                 percent: 0,
                 interrupted: false,
-                pending_kind: None
+                pending_kind: None,
+                last_outcome: LastRotationOutcome::None
             }
         );
 
@@ -1482,6 +1706,480 @@ mod tests {
         );
     }
 
+    // -- cancel an interrupted rotation ------------------------------------
+
+    #[derive(Clone, Copy)]
+    enum Interrupted {
+        Pending,
+        InProgress,
+        Failed,
+        RollbackDirection,
+    }
+
+    struct Crashed {
+        words: String,
+        user_id: String,
+        old_dek: [u8; kdf::MASTER_KEY_LEN],
+        rotation_id: String,
+    }
+
+    /// An account whose password change was interrupted in `case`, after a
+    /// restart (locked, nothing resident).
+    async fn interrupted_account(h: &Harness, case: Interrupted) -> Crashed {
+        let words = h.account().await;
+        let user_id = h.user_id().await;
+        let old_dek = h.registry().with_key(|k| k.data_key).await.unwrap();
+        match case {
+            Interrupted::Pending => h.crash_with(vec![FaultPoint::AfterStage]).await,
+            Interrupted::InProgress => h.crash_with(vec![FaultPoint::AfterItemCommitted(0)]).await,
+            Interrupted::Failed => {
+                h.crash_with(vec![FaultPoint::AfterItemCommitted(0)]).await;
+                let id = pending_of(h, &user_id).await.rotation_id;
+                user_store::abort_rotation(
+                    &h.pool(),
+                    &id,
+                    user_store::RotationState::Failed,
+                    Some("test"),
+                )
+                .await
+                .unwrap();
+            }
+            Interrupted::RollbackDirection => {
+                h.crash_with(vec![
+                    FaultPoint::FailAfterItemCommitted(0),
+                    FaultPoint::RollbackAfterItem(1),
+                ])
+                .await
+            }
+        }
+        let pending = pending_of(h, &user_id).await;
+        match case {
+            Interrupted::Pending => {
+                assert_eq!(pending.state, user_store::RotationState::Pending)
+            }
+            Interrupted::InProgress => {
+                assert_eq!(pending.state, user_store::RotationState::InProgress)
+            }
+            Interrupted::Failed => assert_eq!(pending.state, user_store::RotationState::Failed),
+            Interrupted::RollbackDirection => {
+                assert_eq!(pending.direction, user_store::RotationDirection::Rollback)
+            }
+        }
+        h.restart().await;
+        Crashed {
+            words,
+            user_id,
+            old_dek,
+            rotation_id: pending.rotation_id,
+        }
+    }
+
+    async fn pending_of(h: &Harness, user_id: &str) -> user_store::PendingRotation {
+        user_store::get_pending_rotation(&h.pool(), user_id)
+            .await
+            .unwrap()
+            .expect("a rotation must be pending")
+    }
+
+    /// The account is back on its old key with nothing pending, no failed
+    /// attempt was recorded, no session was opened, and the OLD password opens
+    /// the OLD data.
+    async fn assert_back_on_the_old_key(h: &Harness, c: &Crashed) {
+        let state = user_store::get_key_wrapper_state(&h.pool(), &c.user_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.pending_rotation, None);
+        assert_eq!(state.wrapper.key_epoch, 1);
+        assert!(user_store::get_pending_rotation(&h.pool(), &c.user_id)
+            .await
+            .unwrap()
+            .is_none());
+        let row = user_store::get_rotation(&h.pool(), &c.rotation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, user_store::RotationState::RolledBack);
+        assert!(!h.registry().is_occupied().await, "cancel signs nothing in");
+        assert_eq!(h.failures().await, 0);
+
+        assert_eq!(
+            h.login(NEW_PASSWORD).await.unwrap_err(),
+            "invalid credentials",
+            "the new password is dead after a cancel"
+        );
+        h.login(PASSWORD).await.unwrap();
+        let (dek, epoch) = h
+            .registry()
+            .with_key(|k| (k.data_key, k.key_epoch))
+            .await
+            .unwrap();
+        assert_eq!(dek, c.old_dek);
+        assert_eq!(epoch, 1);
+        assert!(
+            personal_store::open_personal_db(
+                &c.user_id,
+                "persona-1",
+                &crate::auth::registry::key_hex(&dek)
+            )
+            .await
+            .is_ok(),
+            "the old data opens under the old key"
+        );
+        // And a fresh change can start: nothing is left pending.
+        h.change_password(PASSWORD, NEW_PASSWORD).await.unwrap();
+    }
+
+    async fn cancel_with_new_password_at(case: Interrupted) {
+        let h = Harness::new().await;
+        let c = interrupted_account(&h, case).await;
+        h.cancel_password("Alice", NEW_PASSWORD).await.unwrap();
+        assert_back_on_the_old_key(&h, &c).await;
+    }
+
+    #[tokio::test]
+    async fn cancel_undoes_a_pending_rotation() {
+        cancel_with_new_password_at(Interrupted::Pending).await;
+    }
+
+    #[tokio::test]
+    async fn cancel_undoes_an_in_progress_rotation() {
+        cancel_with_new_password_at(Interrupted::InProgress).await;
+    }
+
+    #[tokio::test]
+    async fn cancel_undoes_a_failed_rotation() {
+        cancel_with_new_password_at(Interrupted::Failed).await;
+    }
+
+    #[tokio::test]
+    async fn cancel_finishes_a_rollback_that_was_already_under_way() {
+        cancel_with_new_password_at(Interrupted::RollbackDirection).await;
+    }
+
+    #[tokio::test]
+    async fn cancel_works_with_the_recovery_phrase() {
+        let h = Harness::new().await;
+        let c = interrupted_account(&h, Interrupted::InProgress).await;
+        // Messy typing is forgiven, as at restore.
+        let messy = format!("  {}  ", c.words.to_uppercase().replace(' ', "   "));
+        h.cancel_phrase("Alice", &messy).await.unwrap();
+        assert_back_on_the_old_key(&h, &c).await;
+    }
+
+    #[tokio::test]
+    async fn a_promoted_rotation_cannot_be_cancelled_and_can_still_be_finished() {
+        let h = Harness::new().await;
+        let words = h.account().await;
+        let user_id = h.user_id().await;
+        h.crash_a_password_change(FaultPoint::AfterPromote).await;
+        let pending = pending_of(&h, &user_id).await;
+        assert_eq!(pending.state, user_store::RotationState::Verifying);
+        h.restart().await;
+
+        // A wrong credential learns nothing about the state.
+        assert_eq!(
+            h.cancel_password("Alice", "not it").await.unwrap_err(),
+            KeyRotationError::InvalidCredentials
+        );
+        assert_eq!(h.failures().await, 1);
+
+        // The right ones are told it is already complete, and it is not counted.
+        assert_eq!(
+            h.cancel_password("Alice", NEW_PASSWORD).await.unwrap_err(),
+            KeyRotationError::RotationAlreadyComplete
+        );
+        assert_eq!(
+            h.cancel_phrase("Alice", &words).await.unwrap_err(),
+            KeyRotationError::RotationAlreadyComplete
+        );
+        assert_eq!(h.failures().await, 1);
+        assert!(user_store::get_pending_rotation(&h.pool(), &user_id)
+            .await
+            .unwrap()
+            .is_some());
+
+        // It can only be finished, and the data is on the new key.
+        h.login(NEW_PASSWORD).await.unwrap();
+        assert_eq!(h.registry().with_key(|k| k.key_epoch).await, Some(2));
+    }
+
+    #[tokio::test]
+    async fn a_wrong_credential_counts_exactly_one_failed_attempt_and_changes_nothing() {
+        let h = Harness::new().await;
+        let c = interrupted_account(&h, Interrupted::InProgress).await;
+        let stranger =
+            data_key::mnemonic_from_entropy(&data_key::generate_recovery_entropy().unwrap())
+                .unwrap();
+
+        let mut expected = 0;
+        for attempt in ["not it", PASSWORD] {
+            // The OLD password is just wrong here: login's uncounted
+            // "interrupted" answer would make cancel an oracle for it.
+            assert_eq!(
+                h.cancel_password("Alice", attempt).await.unwrap_err(),
+                KeyRotationError::InvalidCredentials
+            );
+            expected += 1;
+            assert_eq!(h.failures().await, expected);
+        }
+        assert_eq!(
+            h.cancel_phrase("Alice", &stranger).await.unwrap_err(),
+            KeyRotationError::InvalidCredentials
+        );
+        expected += 1;
+        assert_eq!(h.failures().await, expected);
+
+        // Still pending, still cancellable with the right credential, and the
+        // successful cancel clears nothing it should not.
+        assert!(user_store::get_pending_rotation(&h.pool(), &c.user_id)
+            .await
+            .unwrap()
+            .is_some());
+        h.cancel_password("Alice", NEW_PASSWORD).await.unwrap();
+        assert_eq!(h.failures().await, expected);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_new_phrase_rotation_needs_the_new_words_or_the_password() {
+        let h = Harness::new().await;
+        let old_words = h.account().await;
+        let user_id = h.user_id().await;
+        let new_entropy = data_key::generate_recovery_entropy().unwrap();
+        let new_words = data_key::mnemonic_from_entropy(&new_entropy)
+            .unwrap()
+            .to_string();
+        let err = h
+            .run_with(
+                vec![FaultPoint::AfterItemCommitted(0)],
+                RotationRequest::NewPhrase {
+                    password: Zeroizing::new(PASSWORD.as_bytes().to_vec()),
+                    recovery_entropy: new_entropy,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RotationError::SimulatedCrash), "{err:?}");
+        h.restart().await;
+
+        // The OLD words open nothing of the staged key.
+        assert_eq!(
+            h.cancel_phrase("Alice", &old_words).await.unwrap_err(),
+            KeyRotationError::InvalidCredentials
+        );
+        assert_eq!(h.failures().await, 1);
+        h.cancel_phrase("Alice", &new_words).await.unwrap();
+        assert!(user_store::get_pending_rotation(&h.pool(), &user_id)
+            .await
+            .unwrap()
+            .is_none());
+        // The old words still work: nothing was revoked.
+        h.restore(&old_words, NEW_PASSWORD).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unknown_account_nothing_pending_and_wrong_credential_look_the_same() {
+        let h = Harness::new().await;
+        let words = h.account().await;
+        let user_id = h.user_id().await;
+
+        // Nothing pending: answered as a wrong credential and counted as one.
+        assert_eq!(
+            h.cancel_password("Alice", NEW_PASSWORD).await.unwrap_err(),
+            KeyRotationError::InvalidCredentials
+        );
+        assert_eq!(h.failures().await, 1);
+        assert_eq!(
+            h.cancel_phrase("Alice", &words).await.unwrap_err(),
+            KeyRotationError::InvalidCredentials
+        );
+        assert_eq!(h.failures().await, 2);
+
+        // Unknown account: the same answer, no account to count against.
+        assert_eq!(
+            h.cancel_password("Nobody", NEW_PASSWORD).await.unwrap_err(),
+            KeyRotationError::InvalidCredentials
+        );
+        assert_eq!(
+            h.cancel_phrase("Nobody", &words).await.unwrap_err(),
+            KeyRotationError::InvalidCredentials
+        );
+        assert_eq!(h.failures().await, 2);
+
+        // And the same answer an account WITH a pending rotation gives a wrong
+        // credential.
+        h.crash_a_password_change(FaultPoint::AfterItemCommitted(0))
+            .await;
+        h.restart().await;
+        assert_eq!(
+            h.cancel_password("Alice", "not it").await.unwrap_err(),
+            KeyRotationError::InvalidCredentials
+        );
+        assert_eq!(h.failures().await, 3);
+
+        // Words that are not a phrase say so and say nothing about any account.
+        for name in ["Alice", "Nobody"] {
+            assert_eq!(
+                h.cancel_phrase(name, "one two three").await.unwrap_err(),
+                KeyRotationError::PhraseInvalid
+            );
+        }
+        assert_eq!(h.failures().await, 3);
+        assert!(user_store::get_pending_rotation(&h.pool(), &user_id)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn cancel_refuses_while_a_rotation_is_running_and_touches_nothing() {
+        let h = Harness::new().await;
+        let c = interrupted_account(&h, Interrupted::InProgress).await;
+        {
+            let _flag = epoch_guard::begin_rotation(&c.user_id).unwrap();
+            assert_eq!(
+                h.cancel_password("Alice", NEW_PASSWORD).await.unwrap_err(),
+                KeyRotationError::RotationInProgress
+            );
+        }
+        assert_eq!(h.failures().await, 0);
+        assert!(user_store::get_pending_rotation(&h.pool(), &c.user_id)
+            .await
+            .unwrap()
+            .is_some());
+        h.cancel_password("Alice", NEW_PASSWORD).await.unwrap();
+        assert_back_on_the_old_key(&h, &c).await;
+    }
+
+    // -- last outcome -------------------------------------------------------
+
+    fn event(phase: key_rotation::Phase) -> ProgressEvent {
+        ProgressEvent {
+            rotation_id: "r".to_owned(),
+            phase,
+            current: 1,
+            total: 2,
+            message: None,
+        }
+    }
+
+    #[test]
+    fn only_a_final_report_is_an_outcome_and_never_while_running() {
+        use key_rotation::Phase;
+        assert_eq!(last_outcome_of(false, None), LastRotationOutcome::None);
+        for (phase, want) in [
+            (Phase::Complete, LastRotationOutcome::Complete),
+            (Phase::RolledBack, LastRotationOutcome::RolledBack),
+            (Phase::Failed, LastRotationOutcome::Failed),
+        ] {
+            assert_eq!(last_outcome_of(false, Some(&event(phase))), want);
+            assert_eq!(
+                last_outcome_of(true, Some(&event(phase))),
+                LastRotationOutcome::None,
+                "the event may belong to the previous rotation"
+            );
+        }
+        for phase in [
+            Phase::Preparing,
+            Phase::Rekeying,
+            Phase::Verifying,
+            Phase::Finishing,
+            Phase::Resuming,
+            Phase::RollingBack,
+        ] {
+            assert_eq!(
+                last_outcome_of(false, Some(&event(phase))),
+                LastRotationOutcome::None
+            );
+        }
+        assert_eq!(
+            serde_json::to_string(&LastRotationOutcome::RolledBack).unwrap(),
+            "\"rolled_back\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LastRotationOutcome::None).unwrap(),
+            "\"none\""
+        );
+    }
+
+    #[tokio::test]
+    async fn last_outcome_is_none_in_a_process_that_ran_no_rotation() {
+        let h = Harness::new().await;
+        key_rotation::clear_last_progress();
+        h.account().await;
+        assert_eq!(h.status().await.last_outcome, LastRotationOutcome::None);
+    }
+
+    #[tokio::test]
+    async fn last_outcome_complete_is_not_sticky_into_the_next_rotation() {
+        let h = Harness::new().await;
+        h.account().await;
+        key_rotation::clear_last_progress();
+
+        h.change_password(PASSWORD, NEW_PASSWORD).await.unwrap();
+        assert_eq!(h.status().await.last_outcome, LastRotationOutcome::Complete);
+
+        // While a rotation holds the flag the previous outcome is not reported.
+        let user_id = h.user_id().await;
+        {
+            let _flag = epoch_guard::begin_rotation(&user_id).unwrap();
+            let s = h.status().await;
+            assert!(s.running);
+            assert_eq!(s.last_outcome, LastRotationOutcome::None);
+        }
+
+        // A new rotation that starts and is interrupted replaces it with
+        // nothing: a crash is not an outcome.
+        h.crash_with(vec![FaultPoint::AfterItemCommitted(0)]).await;
+        let s = h.status().await;
+        assert!(!s.running && s.interrupted);
+        assert_eq!(s.last_outcome, LastRotationOutcome::None);
+    }
+
+    #[tokio::test]
+    async fn last_outcome_rolled_back_after_an_automatic_rollback_and_after_a_cancel() {
+        let h = Harness::new().await;
+        h.account().await;
+        key_rotation::clear_last_progress();
+
+        let err = h
+            .run_password_change_with(vec![FaultPoint::FailAfterItemCommitted(0)], NEW_PASSWORD)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RotationError::RolledBack { .. }), "{err:?}");
+        assert_eq!(
+            h.status().await.last_outcome,
+            LastRotationOutcome::RolledBack
+        );
+
+        // A cancel reports the same way.
+        key_rotation::clear_last_progress();
+        h.crash_with(vec![FaultPoint::AfterItemCommitted(0)]).await;
+        h.restart().await;
+        assert_eq!(h.status().await.last_outcome, LastRotationOutcome::None);
+        h.cancel_password("Alice", NEW_PASSWORD).await.unwrap();
+        assert_eq!(
+            h.status().await.last_outcome,
+            LastRotationOutcome::RolledBack
+        );
+    }
+
+    #[tokio::test]
+    async fn last_outcome_failed_when_a_promoted_rotation_could_not_finish() {
+        let h = Harness::new().await;
+        h.account().await;
+        key_rotation::clear_last_progress();
+
+        let err = h
+            .run_password_change_with(vec![FaultPoint::FailAfterPromote], NEW_PASSWORD)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RotationError::NeedsResume { .. }), "{err:?}");
+        let s = h.status().await;
+        assert_eq!(s.last_outcome, LastRotationOutcome::Failed);
+        assert!(s.interrupted);
+    }
+
     // -- errors carry nothing identifying -----------------------------------
 
     #[test]
@@ -1513,6 +2211,7 @@ mod tests {
             RotationError::ReadBackFailed(identifying.into()),
             RotationError::CannotResume(identifying.into()),
             RotationError::WrongPhrase,
+            RotationError::AlreadyPromoted,
             RotationError::RolledBack {
                 cause: identifying.into(),
             },
@@ -1542,12 +2241,21 @@ mod tests {
                 available_mb: 3
             }
         );
+        assert_eq!(
+            code_for(&RotationError::AlreadyPromoted),
+            KeyRotationError::RotationAlreadyComplete
+        );
+        assert_eq!(
+            serde_json::to_string(&KeyRotationError::RotationAlreadyComplete).unwrap(),
+            "{\"code\":\"rotation_already_complete\"}"
+        );
         // A recovery phrase never appears in any serialized code either.
         let all = serde_json::to_string(&[
             KeyRotationError::NotLoggedIn,
             KeyRotationError::PhraseInvalid,
             KeyRotationError::ConfirmationFailed,
             KeyRotationError::NoPendingPhrase,
+            KeyRotationError::RotationAlreadyComplete,
         ])
         .unwrap();
         assert!(!all.contains("mnemonic"));

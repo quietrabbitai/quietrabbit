@@ -395,26 +395,23 @@ async fn login_with_pending_rotation(
     group_key_registry: &State<'_, GroupKeyRegistry>,
     pool: &sqlx::SqlitePool,
 ) -> Result<(), String> {
-    use crate::auth::key_rotation::{self, Credential, ResumeOutcome, RotationEnv, RotationError};
+    use crate::auth::key_rotation::{
+        self, ResumeOutcome, RotationEnv, StagedCredential, StagedUnlockError,
+    };
 
     let pending = user_store::get_pending_rotation(pool, &user.id)
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "internal error: a rotation is flagged but missing".to_owned())?;
-    let (Some(salt), Some(mem), Some(iter), Some(par)) = (
-        pending.salt.as_ref(),
-        pending.kdf_memory_kib,
-        pending.kdf_iterations,
-        pending.kdf_parallelism,
-    ) else {
-        return Err(LOGIN_ROTATION_RESUME_FAILED.to_owned());
-    };
 
-    let staged_pk = kdf::derive_password_key_blocking(password.as_bytes(), salt, mem, iter, par)
-        .await
-        .map_err(|e| e.to_string())?;
-    match key_rotation::new_dek_from_staged_password(&pending, &user.id, &staged_pk) {
-        Ok(new_dek) => {
+    match key_rotation::unlock_staged(
+        &pending,
+        &user.id,
+        StagedCredential::Password(password.as_bytes()),
+    )
+    .await
+    {
+        Ok(unlock) => {
             let env = RotationEnv::new(
                 pool,
                 &user.id,
@@ -425,8 +422,8 @@ async fn login_with_pending_rotation(
             match key_rotation::resume_rotation(
                 &env,
                 &pending,
-                new_dek,
-                Credential::Password(&staged_pk),
+                unlock.new_dek.clone(),
+                unlock.credential(),
             )
             .await
             {
@@ -448,7 +445,9 @@ async fn login_with_pending_rotation(
                 }
             }
         }
-        Err(RotationError::Crypto(DataKeyError::WrongPassword)) => {
+        Err(StagedUnlockError::Unusable) => Err(LOGIN_ROTATION_RESUME_FAILED.to_owned()),
+        Err(StagedUnlockError::Kdf(e)) => Err(e.to_string()),
+        Err(StagedUnlockError::WrongCredential) => {
             // Not the new password. Is it the old one?
             let state = user_store::get_key_wrapper_state(pool, &user.id)
                 .await
@@ -477,7 +476,7 @@ async fn login_with_pending_rotation(
                 Err(e) => Err(format!("couldn't verify credentials: {e}")),
             }
         }
-        Err(e) => Err(format!("couldn't verify credentials: {e}")),
+        Err(StagedUnlockError::Failed(e)) => Err(format!("couldn't verify credentials: {e}")),
     }
 }
 

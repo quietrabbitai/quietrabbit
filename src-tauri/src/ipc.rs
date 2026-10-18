@@ -121,6 +121,8 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::key_rotation::cancel_new_recovery_phrase,
         commands::key_rotation::confirm_new_recovery_phrase,
         commands::key_rotation::restore_with_recovery_phrase,
+        commands::key_rotation::cancel_interrupted_rotation_with_password,
+        commands::key_rotation::cancel_interrupted_rotation_with_phrase,
         commands::key_rotation::get_rotation_status,
         // Group 12 -- System
         commands::system::get_health,
