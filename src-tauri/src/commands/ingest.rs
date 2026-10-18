@@ -300,11 +300,21 @@ pub async fn store_ingested_document(
     };
 
     let output_id = uuid::Uuid::new_v4().to_string();
-    let storage_path = ingest_blob::ingest_blob_path(&user_id, &persona_id, &output_id, 1);
+    // A new document's first blob; matches the storage_version=1 that
+    // save_ingested_output inserts below.
+    let version = 1;
+    let storage_path = ingest_blob::ingest_blob_path(&user_id, &persona_id, &output_id, version);
 
-    ingest_blob::write_encrypted_blob(&storage_path, &master_key, &persona_id, &bytes)
-        .await
-        .map_err(|e| e.to_string())?;
+    ingest_blob::write_encrypted_blob(
+        &storage_path,
+        &master_key,
+        &persona_id,
+        &output_id,
+        version,
+        &bytes,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
     let focus_run_id = output_store::create_ingest_focus_run(&user_id, &persona_id, &key_hex_str)
         .await
@@ -412,9 +422,15 @@ pub async fn get_ingested_document_bytes(
         .storage_path
         .ok_or_else(|| "this document has no stored original file".to_string())?;
 
-    ingest_blob::read_encrypted_blob(Path::new(&storage_path), &master_key, &persona_id)
-        .await
-        .map_err(|e| e.to_string())
+    ingest_blob::read_encrypted_blob(
+        Path::new(&storage_path),
+        &master_key,
+        &persona_id,
+        &output_id,
+        record.storage_version,
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

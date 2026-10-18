@@ -1662,9 +1662,17 @@ pub async fn backfill_ingested_content(
 
 /// Record an edited version of an ingested document: bumps storage_version
 /// and repoints storage_path at the new file. Prior version files are NOT
-/// deleted here -- the caller (commands/ingest.rs) writes the new encrypted
-/// blob to its own v{n}.enc path before calling this; old version files
-/// stay on disk as history. Returns the new storage_version.
+/// deleted here -- the caller writes the new encrypted blob to its own
+/// v{n}.enc path before calling this; old version files stay on disk as
+/// history. Returns the new storage_version. (No production caller exists
+/// yet; commands/ingest.rs only writes version 1.)
+///
+/// Contract for that caller (items.id=640): the blob is encrypted with
+/// ingest_blob::write_encrypted_blob at version (current storage_version
+/// plus one), which must equal the value this returns. The version is bound into
+/// the blob's AAD and get_ingested_document_bytes reads with the row's
+/// storage_version, so a mismatch fails decryption rather than serving the
+/// wrong bytes.
 pub async fn bump_ingested_document_version(
     user_id: &str,
     persona_id: &str,
