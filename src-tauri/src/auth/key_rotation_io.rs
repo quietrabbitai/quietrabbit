@@ -215,6 +215,42 @@ fn classify(parts: &[&str]) -> Classified {
     }
 }
 
+/// The target for a stored `rel_path` (as inventory() produced it), so a
+/// resumed rotation can rebuild an item's keys from its row alone.
+pub fn target_for_rel_path(rel_path: &str) -> Option<ItemTarget> {
+    let parts: Vec<&str> = rel_path.split('/').collect();
+    match classify(&parts) {
+        Classified::Item(t) => Some(t),
+        _ => None,
+    }
+}
+
+/// Delete any `-wal`, `-shm` and `-journal` beside `path`; returns how many
+/// existed. Only correct once the database has been opened and closed under
+/// its right key (which consumes a genuine WAL or hot journal): what is left
+/// then belongs to no live state. Never call it on a database that has not
+/// been through that, or committed data in a real WAL would be discarded.
+pub fn remove_leftover_sidecars(path: &Path) -> std::io::Result<usize> {
+    let mut removed = 0;
+    for sidecar in sidecar_paths(path) {
+        match std::fs::remove_file(&sidecar) {
+            Ok(()) => removed += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(removed)
+}
+
+/// Delete a file if it exists; returns whether it did.
+pub fn remove_if_exists(path: &Path) -> std::io::Result<bool> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// Re-key order: account databases, then per persona the three core
 /// databases, then focus and topic databases, view caches, and blobs last.
 fn order_rank(t: &ItemTarget) -> u8 {
@@ -334,13 +370,50 @@ pub enum RekeyError {
     LeftoverSidecar(String),
     #[error("verification failed: {0}")]
     Verification(String),
+    /// The file could not be opened for a reason other than the key.
+    #[error("the database could not be opened: {0}")]
+    Unreadable(String),
 }
+
+/// The SQLite primary result code of a database error (the extended code
+/// masked to its low byte).
+fn primary_code(e: &sqlx::Error) -> Option<i32> {
+    e.as_database_error()
+        .and_then(|d| d.code())
+        .and_then(|c| c.parse::<i32>().ok())
+        .map(|c| c & 0xff)
+}
+
+const SQLITE_BUSY: i32 = 5;
+const SQLITE_LOCKED: i32 = 6;
+const SQLITE_NOTADB: i32 = 26;
 
 /// SQLITE_BUSY / SQLITE_LOCKED: another connection holds the file.
 fn is_busy(e: &sqlx::Error) -> bool {
-    e.as_database_error()
-        .and_then(|d| d.code())
-        .is_some_and(|c| c == "5" || c == "6")
+    matches!(primary_code(e), Some(SQLITE_BUSY | SQLITE_LOCKED))
+}
+
+/// What opening a file under one key came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenProbe {
+    Opens,
+    /// SQLITE_NOTADB (26): the key is wrong, or the file is damaged, or a
+    /// stale sidecar is being replayed over it. The ONLY failure that says
+    /// anything about the key.
+    NotADatabase,
+    /// SQLITE_BUSY / SQLITE_LOCKED: someone else holds the file. Says nothing
+    /// about the key and must never lead to a file being moved or deleted.
+    Busy,
+    /// Anything else (missing file, I/O error, ...), described.
+    Failed(String),
+}
+
+fn probe_from_error(e: &sqlx::Error) -> OpenProbe {
+    match primary_code(e) {
+        Some(SQLITE_NOTADB) => OpenProbe::NotADatabase,
+        Some(SQLITE_BUSY | SQLITE_LOCKED) => OpenProbe::Busy,
+        _ => OpenProbe::Failed(e.to_string()),
+    }
 }
 
 fn busy_or(e: sqlx::Error) -> RekeyError {
@@ -351,13 +424,23 @@ fn busy_or(e: sqlx::Error) -> RekeyError {
     }
 }
 
-fn keyed_options(path: &Path, key_hex: &str) -> sqlx::sqlite::SqliteConnectOptions {
+fn keyed_options_with(
+    path: &Path,
+    key_hex: &str,
+    busy_timeout_ms: u32,
+) -> sqlx::sqlite::SqliteConnectOptions {
     crate::providers::utils::quiet_connect_options()
         .filename(path)
         .create_if_missing(false)
         .pragma("key", format!("\"x'{key_hex}'\""))
         .pragma("cipher_compatibility", "4")
-        .pragma("busy_timeout", "5000")
+        .pragma("busy_timeout", busy_timeout_ms.to_string())
+}
+
+fn keyed_options(path: &Path, key_hex: &str) -> sqlx::sqlite::SqliteConnectOptions {
+    // Waiting for a lock a long time is only worth it in production.
+    let wait = if cfg!(test) { 250 } else { 5000 };
+    keyed_options_with(path, key_hex, wait)
 }
 
 fn sidecar_paths(path: &Path) -> [PathBuf; 3] {
@@ -368,16 +451,30 @@ fn sidecar_paths(path: &Path) -> [PathBuf; 3] {
     })
 }
 
-/// Whether the file opens under `key_hex`. Read-only in effect; safe to call
-/// with the wrong key on a database left by a crash.
-pub async fn db_opens_under(path: &Path, key_hex: &str) -> bool {
-    let Ok(mut conn) = keyed_options(path, key_hex).connect().await else {
-        return false;
+/// Open under `key_hex` and say what happened, keeping "wrong key" apart from
+/// "someone else has the file". Probes wait only briefly for a lock.
+pub async fn probe_open(path: &Path, key_hex: &str) -> OpenProbe {
+    let mut conn = match keyed_options_with(path, key_hex, 250).connect().await {
+        Ok(c) => c,
+        Err(e) => return probe_from_error(&e),
     };
-    sqlx::query("SELECT count(*) FROM sqlite_master")
+    let result = sqlx::query("SELECT count(*) FROM sqlite_master")
         .execute(&mut conn)
-        .await
-        .is_ok()
+        .await;
+    // Closed, not dropped: the file (and any WAL) must be released before the
+    // caller does anything else with it.
+    let _ = conn.close().await;
+    match result {
+        Ok(_) => OpenProbe::Opens,
+        Err(e) => probe_from_error(&e),
+    }
+}
+
+/// Whether the file opens under `key_hex`. Read-only in effect; safe to call
+/// with the wrong key on a database left by a crash. Any failure is false;
+/// use probe_open when the reason matters.
+pub async fn db_opens_under(path: &Path, key_hex: &str) -> bool {
+    probe_open(path, key_hex).await == OpenProbe::Opens
 }
 
 /// Which key a database file is on, found by probing the file itself (a
@@ -386,17 +483,110 @@ pub async fn db_opens_under(path: &Path, key_hex: &str) -> bool {
 pub enum DbKeyState {
     New,
     Old,
+    /// Both keys failed with "not a database" (26), and nothing else.
     Neither,
 }
 
-/// Probe NEW first, then OLD.
-pub async fn db_key_state(path: &Path, old_key_hex: &str, new_key_hex: &str) -> DbKeyState {
-    if db_opens_under(path, new_key_hex).await {
-        DbKeyState::New
-    } else if db_opens_under(path, old_key_hex).await {
-        DbKeyState::Old
+fn probe_error(probe: OpenProbe) -> RekeyError {
+    match probe {
+        OpenProbe::Busy => RekeyError::Busy,
+        OpenProbe::Failed(detail) => RekeyError::Unreadable(detail),
+        OpenProbe::Opens | OpenProbe::NotADatabase => {
+            unreachable!("not an error probe")
+        }
+    }
+}
+
+/// Probe NEW first, then OLD. A busy or locked file, or any failure other
+/// than "not a database", is an ERROR (Busy / Unreadable), never `Neither`:
+/// only a clean "not a database" from BOTH keys means the file is on neither.
+pub async fn db_key_state(
+    path: &Path,
+    old_key_hex: &str,
+    new_key_hex: &str,
+) -> Result<DbKeyState, RekeyError> {
+    match probe_open(path, new_key_hex).await {
+        OpenProbe::Opens => return Ok(DbKeyState::New),
+        OpenProbe::NotADatabase => {}
+        other => return Err(probe_error(other)),
+    }
+    match probe_open(path, old_key_hex).await {
+        OpenProbe::Opens => Ok(DbKeyState::Old),
+        OpenProbe::NotADatabase => Ok(DbKeyState::Neither),
+        other => Err(probe_error(other)),
+    }
+}
+
+/// A database that does not open under any key, with sidecar files beside it,
+/// may be failing BECAUSE of them: SQLite replays any non-empty `-wal` (and
+/// rolls back any `-journal`) it finds, so one left over from an earlier life
+/// of the file makes it unreadable.
+///
+/// This acts ONLY on the "not a database" failure (SQLITE_NOTADB, 26): it
+/// first probes the file under every key and goes on only if each says 26. A
+/// busy or locked file (someone else is using it, and the sidecars may be
+/// theirs and live) or any other failure returns Busy / Unreadable with
+/// nothing moved. Past that gate it moves the sidecars aside, probes again,
+/// and if the file then opens deletes them (they were stale) and returns true;
+/// if it still does not open they are put back untouched and false is
+/// returned. A genuine WAL or hot journal is never lost: with the right key the
+/// file opens on the first, unmoved, attempt and this is never called.
+pub async fn settle_stale_sidecars(path: &Path, key_hexes: &[&str]) -> Result<bool, RekeyError> {
+    let present: Vec<PathBuf> = sidecar_paths(path)
+        .into_iter()
+        .filter(|p| p.exists())
+        .collect();
+    if present.is_empty() {
+        return Ok(false);
+    }
+    // The gate: every key must fail with "not a database", nothing else.
+    for key in key_hexes {
+        match probe_open(path, key).await {
+            OpenProbe::NotADatabase => {}
+            OpenProbe::Opens => return Ok(false),
+            other => return Err(probe_error(other)),
+        }
+    }
+    // The probes above may have consumed the sidecars themselves.
+    let present: Vec<PathBuf> = present.into_iter().filter(|p| p.exists()).collect();
+    if present.is_empty() {
+        return Ok(false);
+    }
+    let mut moved = Vec::new();
+    for original in &present {
+        let mut aside = original.as_os_str().to_owned();
+        aside.push(".quarantined");
+        let aside = PathBuf::from(aside);
+        std::fs::rename(original, &aside)?;
+        moved.push((original.clone(), aside));
+    }
+    let mut opened = false;
+    let mut blocked: Option<RekeyError> = None;
+    for key in key_hexes {
+        match probe_open(path, key).await {
+            OpenProbe::Opens => {
+                opened = true;
+                break;
+            }
+            OpenProbe::NotADatabase => {}
+            other => {
+                blocked = Some(probe_error(other));
+                break;
+            }
+        }
+    }
+    if opened {
+        for (_, aside) in &moved {
+            let _ = std::fs::remove_file(aside);
+        }
     } else {
-        DbKeyState::Neither
+        for (original, aside) in &moved {
+            std::fs::rename(aside, original)?;
+        }
+    }
+    match blocked {
+        Some(e) => Err(e),
+        None => Ok(opened),
     }
 }
 
@@ -450,7 +640,10 @@ pub async fn verify_db_key(path: &Path, key_hex: &str) -> Result<i64, RekeyError
 /// opens (and is sound) under the new key. Sequence from the step-0 evidence
 /// (module header): open under the old key, checkpoint the WAL to nothing,
 /// switch to journal_mode=DELETE, PRAGMA rekey, close, reopen under the new
-/// key and verify, and check no sidecar remains. Not idempotent by itself: to
+/// key and verify, and check no sidecar remains. Stale `-wal`, `-shm` and
+/// `-journal` files are deleted twice: once right after the switch to
+/// rollback-journal mode (the file is then provably ours alone) and once after
+/// the verification. Not idempotent by itself: to
 /// resume, call db_key_state first and only re-key a file that is still Old.
 pub async fn rekey_db_file(
     path: &Path,
@@ -459,12 +652,15 @@ pub async fn rekey_db_file(
 ) -> Result<(), RekeyError> {
     let mut conn = keyed_options(path, old_key_hex).connect().await?;
     let step = async {
-        if sqlx::query("SELECT count(*) FROM sqlite_master")
+        if let Err(e) = sqlx::query("SELECT count(*) FROM sqlite_master")
             .execute(&mut conn)
             .await
-            .is_err()
         {
-            return Err(RekeyError::WrongOldKey);
+            // Only "not a database" says the key is wrong. Busy is busy.
+            return Err(match primary_code(&e) {
+                Some(SQLITE_NOTADB) => RekeyError::WrongOldKey,
+                _ => busy_or(e),
+            });
         }
         let before = user_version(&mut conn).await?;
 
@@ -488,6 +684,12 @@ pub async fn rekey_db_file(
         if !mode.eq_ignore_ascii_case("delete") {
             return Err(RekeyError::JournalMode(mode));
         }
+        // Leaving WAL mode succeeded, which proves this connection has the
+        // file to itself. Anything still beside it now belongs to no live
+        // state (a genuine WAL or hot journal was consumed by the reads
+        // above and the checkpoint), and a stale -wal would otherwise be
+        // replayed over the database the next time it is opened in WAL mode.
+        remove_leftover_sidecars(path)?;
 
         sqlx::query(&format!("PRAGMA rekey = \"x'{new_key_hex}'\""))
             .execute(&mut conn)
@@ -507,15 +709,13 @@ pub async fn rekey_db_file(
         )));
     }
     for sidecar in sidecar_paths(path) {
-        match std::fs::metadata(&sidecar) {
-            Ok(m) if m.len() > 0 => {
-                return Err(RekeyError::LeftoverSidecar(
-                    sidecar.to_string_lossy().into_owned(),
-                ))
-            }
-            _ => {}
+        if std::fs::metadata(&sidecar).is_ok_and(|m| m.len() > 0) {
+            return Err(RekeyError::LeftoverSidecar(
+                sidecar.to_string_lossy().into_owned(),
+            ));
         }
     }
+    remove_leftover_sidecars(path)?;
     Ok(())
 }
 
@@ -762,7 +962,7 @@ mod tests {
 
         assert_eq!(row_count(&path, K2).await, 300);
         assert!(!db_opens_under(&path, K1).await, "old key must not open it");
-        assert_eq!(db_key_state(&path, K1, K2).await, DbKeyState::New);
+        assert_eq!(db_key_state(&path, K1, K2).await.unwrap(), DbKeyState::New);
         for sidecar in sidecar_paths(&path) {
             assert!(
                 std::fs::metadata(&sidecar).map(|m| m.len()).unwrap_or(0) == 0,
@@ -819,7 +1019,7 @@ mod tests {
         make_db(&path, K1, false).await;
         rekey_db_file(&path, K1, K2).await.unwrap();
         assert_eq!(row_count(&path, K2).await, 300);
-        assert_eq!(db_key_state(&path, K1, K2).await, DbKeyState::New);
+        assert_eq!(db_key_state(&path, K1, K2).await.unwrap(), DbKeyState::New);
         // A second rekey of the same file is refused: it is no longer old.
         assert!(matches!(
             rekey_db_file(&path, K1, K2).await,
@@ -832,11 +1032,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.db");
         make_db(&path, K1, false).await;
-        assert_eq!(db_key_state(&path, K1, K2).await, DbKeyState::Old);
+        assert_eq!(db_key_state(&path, K1, K2).await.unwrap(), DbKeyState::Old);
         // Probing with the wrong key first left it intact.
         assert_eq!(row_count(&path, K1).await, 300);
         let other = "4444444444444444444444444444444444444444444444444444444444444444";
-        assert_eq!(db_key_state(&path, other, K2).await, DbKeyState::Neither);
+        assert_eq!(
+            db_key_state(&path, other, K2).await.unwrap(),
+            DbKeyState::Neither
+        );
         assert!(!db_opens_under(&dir.path().join("missing.db"), K1).await);
     }
 
@@ -875,5 +1078,167 @@ mod tests {
         let free = available_space(dir.path());
         assert!(free.is_some_and(|n| n > 0), "{free:?}");
         assert_eq!(available_space(&dir.path().join("nope")), None);
+    }
+
+    #[test]
+    fn rel_paths_round_trip_to_their_targets() {
+        for rel in [
+            "integration_keys.db",
+            "personas/p1/personal.db",
+            "personas/p1/focuses/f1/topics/t1/plan_state.db",
+            "persona_view_shares/s1/view_cache.db",
+            "personas/p1/ingested_documents/o1/v3.enc",
+        ] {
+            assert!(target_for_rel_path(rel).is_some(), "{rel}");
+        }
+        assert!(target_for_rel_path("personas/p1/personal.db-wal").is_none());
+        assert!(target_for_rel_path("readme.txt").is_none());
+    }
+
+    #[test]
+    fn leftover_sidecar_and_tmp_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("a.db");
+        std::fs::write(&db, b"x").unwrap();
+        assert_eq!(remove_leftover_sidecars(&db).unwrap(), 0);
+        for p in sidecar_paths(&db) {
+            std::fs::write(p, b"junk").unwrap();
+        }
+        assert_eq!(remove_leftover_sidecars(&db).unwrap(), 3);
+        assert!(db.exists(), "the database itself is never touched");
+        let tmp = dir.path().join("v1.enc.tmp");
+        std::fs::write(&tmp, b"x").unwrap();
+        assert!(remove_if_exists(&tmp).unwrap());
+        assert!(!remove_if_exists(&tmp).unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_stale_wal_that_blocks_opening_is_settled_then_the_rekey_is_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.db");
+        let stale = dir.path().join("stale-wal");
+
+        let live = make_db(&path, K1, true).await.unwrap();
+        std::fs::copy(&sidecar_paths(&path)[0], &stale).unwrap();
+        live.close().await.unwrap();
+        for p in sidecar_paths(&path) {
+            let _ = std::fs::remove_file(p);
+        }
+        std::fs::remove_file(&path).unwrap();
+
+        // A rollback-journal database with a stale old-key -wal beside it.
+        make_db(&path, K1, false).await;
+        std::fs::copy(&stale, &sidecar_paths(&path)[0]).unwrap();
+        assert!(
+            matches!(
+                rekey_db_file(&path, K1, K2).await,
+                Err(RekeyError::WrongOldKey)
+            ),
+            "the stale -wal makes a good database unreadable"
+        );
+
+        // The failed open did not delete the stale file on every platform and
+        // SQLite version, so settle (a no-op when nothing is left) and probe
+        // again: the database is then plainly on its old key.
+        let _ = settle_stale_sidecars(&path, &[K1, K2]).await.unwrap();
+        assert!(!sidecar_paths(&path)[0].exists());
+        assert_eq!(db_key_state(&path, K1, K2).await.unwrap(), DbKeyState::Old);
+        rekey_db_file(&path, K1, K2).await.unwrap();
+
+        // The next ordinary open (WAL mode, as the stores do) is clean.
+        let mut conn = keyed_options(&path, K2).connect().await.unwrap();
+        sqlx::query("PRAGMA journal_mode=WAL")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+        assert_eq!(verify_db_key(&path, K2).await.unwrap(), 7);
+        assert_eq!(row_count(&path, K2).await, 300);
+    }
+
+    #[tokio::test]
+    async fn settling_puts_the_sidecars_back_when_they_were_not_the_problem() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.db");
+        make_db(&path, "5".repeat(64).as_str(), false).await;
+        // -shm: SQLite does not delete one beside a rollback-journal database,
+        // so it survives the gate's own probes and reaches the quarantine.
+        let shm = sidecar_paths(&path)[1].clone();
+        std::fs::write(&shm, b"shared memory bytes").unwrap();
+        // Neither probed key opens the file: the sidecar was not the problem.
+        assert!(!settle_stale_sidecars(&path, &[K1, K2]).await.unwrap());
+        assert_eq!(std::fs::read(&shm).unwrap(), b"shared memory bytes");
+        let mut aside = shm.as_os_str().to_owned();
+        aside.push(".quarantined");
+        assert!(!PathBuf::from(aside).exists(), "nothing left in quarantine");
+        // And with nothing beside it there is nothing to settle.
+        std::fs::remove_file(&shm).unwrap();
+        assert!(!settle_stale_sidecars(&path, &[K1, K2]).await.unwrap());
+    }
+
+    /// A rollback-journal database held under an EXCLUSIVE lock by another
+    /// connection, which the returned connection keeps.
+    async fn lock_exclusively(path: &Path, key: &str) -> SqliteConnection {
+        let mut conn = keyed_options(path, key).connect().await.unwrap();
+        sqlx::query("BEGIN EXCLUSIVE")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        conn
+    }
+
+    #[tokio::test]
+    async fn a_busy_database_is_reported_busy_never_neither_and_its_sidecars_stay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.db");
+        make_db(&path, K1, false).await;
+        let holder = lock_exclusively(&path, K1).await;
+
+        // Probing says Busy, with the right key AND the wrong one.
+        assert_eq!(probe_open(&path, K1).await, OpenProbe::Busy);
+        assert!(matches!(
+            db_key_state(&path, K1, K2).await,
+            Err(RekeyError::Busy)
+        ));
+
+        // A sidecar beside it (which may be the holder's live one) is not
+        // touched: settle refuses on anything but "not a database".
+        let wal = sidecar_paths(&path)[0].clone();
+        std::fs::write(&wal, b"somebody else's live wal").unwrap();
+        assert!(matches!(
+            settle_stale_sidecars(&path, &[K1, K2]).await,
+            Err(RekeyError::Busy)
+        ));
+        assert_eq!(std::fs::read(&wal).unwrap(), b"somebody else's live wal");
+        assert!(!wal.with_extension("db-wal.quarantined").exists());
+        let mut quarantined = wal.as_os_str().to_owned();
+        quarantined.push(".quarantined");
+        assert!(!PathBuf::from(quarantined).exists());
+
+        // And a rekey attempt reports Busy without changing the file.
+        assert!(matches!(
+            rekey_db_file(&path, K1, K2).await,
+            Err(RekeyError::Busy)
+        ));
+        holder.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn only_not_a_database_counts_as_the_wrong_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.db");
+        make_db(&path, K1, false).await;
+        assert_eq!(probe_open(&path, K2).await, OpenProbe::NotADatabase);
+        assert_eq!(probe_open(&path, K1).await, OpenProbe::Opens);
+        // A missing file is Failed, not NotADatabase, and is not a key state.
+        let missing = dir.path().join("missing.db");
+        assert!(matches!(
+            probe_open(&missing, K1).await,
+            OpenProbe::Failed(_)
+        ));
+        assert!(matches!(
+            db_key_state(&missing, K1, K2).await,
+            Err(RekeyError::Unreadable(_))
+        ));
     }
 }

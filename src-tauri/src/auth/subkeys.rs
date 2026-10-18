@@ -21,11 +21,15 @@
 // WHICH EPOCH: the openers all call epoch_guard::ensure_current first, which
 // compares the epoch THIS process unlocked under with shared.db. The same
 // registered epoch (epoch_guard::resident_epoch) is the epoch a store opened
-// by this process must derive under. With nothing registered (unit tests that
-// install a key without a real login) the initial epoch is used. login() must
-// register the epoch BEFORE it opens or creates any database (see
-// commands::auth). The rotation engine never relies on the registered epoch:
-// it calls derive_db_key with both epochs explicitly.
+// by this process must derive under. login() registers it BEFORE it opens or
+// creates any database (see commands::auth). In a non-test build, deriving
+// for a user with NO registered epoch is an error (NoResidentEpoch): guessing
+// the initial epoch would silently key a rotated account's database with the
+// wrong key. Only the lib's own unit tests (cfg(test)), which install a key
+// without a real login, fall back to the initial epoch; integration tests
+// and everything else must register an epoch. The rotation engine never
+// relies on the registered epoch: it calls derive_db_key with both epochs
+// explicitly.
 //
 // FORMAT RULE: the info string is delimiter-based, so no scope component or
 // user id may contain '|' (or, for multi-part scopes, '/'), and none may be
@@ -36,6 +40,7 @@ use sha2::Sha256;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+#[cfg(test)]
 use crate::auth::data_key::INITIAL_KEY_EPOCH;
 use crate::auth::epoch_guard;
 use crate::auth::kdf;
@@ -95,6 +100,10 @@ pub enum SubkeyError {
     /// A scope or user id was empty or contained a reserved delimiter.
     #[error("key scope component is empty or contains a reserved character: {0}")]
     InvalidComponent(String),
+    /// No key epoch is registered for this user in this process, so the epoch
+    /// to derive under is unknown. A store was opened without a login.
+    #[error("no key epoch is registered for user '{0}'")]
+    NoResidentEpoch(String),
 }
 
 fn check_component(c: &str, forbid_slash: bool) -> Result<(), SubkeyError> {
@@ -171,10 +180,17 @@ pub fn derive_db_key_hex(
 }
 
 /// The epoch a store opened by this process derives under: the one this
-/// process unlocked under, or the initial epoch when none is registered (unit
-/// tests only; see the module header).
-pub fn resident_or_initial_epoch(user_id: &str) -> u64 {
-    epoch_guard::resident_epoch(user_id).unwrap_or(INITIAL_KEY_EPOCH)
+/// process unlocked under. With none registered this is an error in a
+/// non-test build, and the initial epoch only under cfg(test) (see the module
+/// header).
+pub fn resident_or_initial_epoch(user_id: &str) -> Result<u64, SubkeyError> {
+    match epoch_guard::resident_epoch(user_id) {
+        Some(epoch) => Ok(epoch),
+        #[cfg(test)]
+        None => Ok(INITIAL_KEY_EPOCH),
+        #[cfg(not(test))]
+        None => Err(SubkeyError::NoResidentEpoch(user_id.to_owned())),
+    }
 }
 
 /// What every opener and migrate_* helper calls: the subkey (hex) for this
@@ -190,7 +206,7 @@ pub fn db_key_hex(
         purpose,
         scope,
         user_id,
-        resident_or_initial_epoch(user_id),
+        resident_or_initial_epoch(user_id)?,
     )
 }
 
@@ -310,9 +326,11 @@ mod tests {
 
     #[test]
     fn unregistered_epoch_falls_back_to_the_initial_epoch() {
+        // cfg(test) only: the non-test build errors, see
+        // tests/subkeys_resident_epoch.rs.
         assert_eq!(
             resident_or_initial_epoch("subkeys-never-registered"),
-            INITIAL_KEY_EPOCH
+            Ok(INITIAL_KEY_EPOCH)
         );
     }
 

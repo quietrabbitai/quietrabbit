@@ -311,7 +311,7 @@ pub async fn write_encrypted_blob(
         data_key,
         user_id,
         persona_id,
-        subkeys::resident_or_initial_epoch(user_id),
+        subkeys::resident_or_initial_epoch(user_id)?,
     )?;
     let aad = blob_aad(persona_id, output_id, version);
     let file_bytes = seal_blob_bytes(&aead_key, &aad, plaintext)?;
@@ -337,7 +337,7 @@ pub async fn read_encrypted_blob(
         data_key,
         user_id,
         persona_id,
-        subkeys::resident_or_initial_epoch(user_id),
+        subkeys::resident_or_initial_epoch(user_id)?,
     )?;
     open_blob_bytes(&aead_key, &aad, &file_bytes)
 }

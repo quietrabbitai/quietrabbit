@@ -407,6 +407,11 @@ async fn async_main() {
                         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
                         loop {
                             ticker.tick().await;
+                            // items.id=630: no scheduled or background work
+                            // while a data-key rotation is running.
+                            if quietrabbit_lib::auth::epoch_guard::is_rotating() {
+                                continue;
+                            }
                             let registry = pull_handle
                                 .state::<quietrabbit_lib::auth::registry::GroupKeyRegistry>(
                             );

@@ -36,9 +36,64 @@ pub enum KeyEpochError {
     Changed { held: u64, current: Option<u64> },
     #[error("could not check the account key epoch: {0}")]
     Unreadable(String),
+    /// The account's data key is being rotated by this process
+    /// (auth::key_rotation). Stores refuse to open until it finishes.
+    #[error("the account's data key is being changed, try again in a moment")]
+    Rotating,
 }
 
 static RESIDENT: Mutex<Option<(String, u64)>> = Mutex::new(None);
+
+/// The user whose data key this process is rotating right now, if any
+/// (items.id=630). While set, every store open for that user is refused and
+/// the periodic sweeps stand down, so nothing touches a file the rotation is
+/// re-keying and no scheduled work runs mid-rotation (decisions.id=847).
+static ROTATING: Mutex<Option<String>> = Mutex::new(None);
+
+fn rotating_lock() -> std::sync::MutexGuard<'static, Option<String>> {
+    ROTATING.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Held for the duration of a rotation. Dropping it (including on a panic or
+/// an early return) clears the flag.
+#[must_use = "the rotating flag is cleared when this guard is dropped"]
+#[derive(Debug)]
+pub struct RotationGuard {
+    user_id: String,
+}
+
+impl Drop for RotationGuard {
+    fn drop(&mut self) {
+        let mut flag = rotating_lock();
+        if flag.as_deref() == Some(self.user_id.as_str()) {
+            *flag = None;
+        }
+    }
+}
+
+/// Mark `user_id` as being rotated. Only one rotation runs per process: a
+/// second call while one is active returns `Rotating`.
+pub fn begin_rotation(user_id: &str) -> Result<RotationGuard, KeyEpochError> {
+    let mut flag = rotating_lock();
+    if flag.is_some() {
+        return Err(KeyEpochError::Rotating);
+    }
+    *flag = Some(user_id.to_owned());
+    Ok(RotationGuard {
+        user_id: user_id.to_owned(),
+    })
+}
+
+/// Whether this process is rotating any account's key right now. The
+/// periodic sweeps check this and skip the tick.
+pub fn is_rotating() -> bool {
+    rotating_lock().is_some()
+}
+
+/// Whether this process is rotating THIS user's key right now.
+pub fn is_rotating_for(user_id: &str) -> bool {
+    rotating_lock().as_deref() == Some(user_id)
+}
 
 fn lock() -> std::sync::MutexGuard<'static, Option<(String, u64)>> {
     RESIDENT.lock().unwrap_or_else(|p| p.into_inner())
@@ -79,6 +134,9 @@ pub async fn ensure_current_with_pool(
     pool: &sqlx::SqlitePool,
     user_id: &str,
 ) -> Result<(), KeyEpochError> {
+    if is_rotating_for(user_id) {
+        return Err(KeyEpochError::Rotating);
+    }
     let Some(held) = resident_epoch(user_id) else {
         return Ok(());
     };
@@ -91,6 +149,9 @@ pub async fn ensure_current_with_pool(
 /// Check against shared.db on a short read-only connection. Call first in
 /// every store opener that takes a `user_id`.
 pub async fn ensure_current(user_id: &str) -> Result<(), KeyEpochError> {
+    if is_rotating_for(user_id) {
+        return Err(KeyEpochError::Rotating);
+    }
     let Some(held) = resident_epoch(user_id) else {
         return Ok(());
     };
@@ -124,6 +185,38 @@ mod tests {
         assert_eq!(resident_epoch("guard-user-a"), Some(3));
         clear_resident_for("guard-user-a");
         assert_eq!(resident_epoch("guard-user-a"), None);
+    }
+
+    // These two touch the process-global rotating flag, which the rotation
+    // engine's tests also use: serialize them on the shared test mutex.
+    #[tokio::test]
+    async fn the_rotating_flag_is_per_process_exclusive_and_clears_on_drop() {
+        let _serial = crate::test_support::ENV_MUTEX.lock().await;
+        let guard = begin_rotation("rot-flag-a").unwrap();
+        assert!(is_rotating() && is_rotating_for("rot-flag-a"));
+        assert!(!is_rotating_for("rot-flag-b"));
+        assert!(matches!(
+            begin_rotation("rot-flag-b"),
+            Err(KeyEpochError::Rotating)
+        ));
+        drop(guard);
+        assert!(!is_rotating());
+        // Free again.
+        drop(begin_rotation("rot-flag-b").unwrap());
+        assert!(!is_rotating());
+    }
+
+    #[tokio::test]
+    async fn a_rotating_user_is_refused_before_anything_is_read() {
+        let _serial = crate::test_support::ENV_MUTEX.lock().await;
+        // No shared.db exists for these paths: the answer must not need one.
+        let _guard = begin_rotation("rot-flag-refused").unwrap();
+        assert!(matches!(
+            ensure_current("rot-flag-refused").await,
+            Err(KeyEpochError::Rotating)
+        ));
+        // Other users are unaffected.
+        assert!(ensure_current("rot-flag-other").await.is_ok());
     }
 
     #[test]

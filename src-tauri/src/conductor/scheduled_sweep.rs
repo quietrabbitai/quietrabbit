@@ -48,6 +48,11 @@ pub async fn run_periodic_sweep(
     scheduler: &Arc<ConductorScheduler>,
     app_handle: Option<tauri::AppHandle<tauri::Wry>>,
 ) {
+    // items.id=630: no scheduled or background work while this process is
+    // rotating the account's data key (decisions.id=847).
+    if crate::auth::epoch_guard::is_rotating() {
+        return;
+    }
     let Some((user_id, key_hex_str)) = key_registry
         .with_key(|k| (k.user_id.clone(), key_hex(&k.data_key)))
         .await

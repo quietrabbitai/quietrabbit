@@ -1282,6 +1282,11 @@ async fn apply_synced_fact(
 /// logged in. Called from main.rs's existing periodic timer, alongside
 /// group_sync's own pull sweep -- same interval, no second timer.
 pub async fn run_periodic_sweep(pool: &sqlx::SqlitePool, key_registry: &KeyRegistry) {
+    // items.id=630: no scheduled or background work while this process is
+    // rotating the account's data key (decisions.id=847).
+    if crate::auth::epoch_guard::is_rotating() {
+        return;
+    }
     let Some((user_id, personal_key_hex, sharing_private_key_bytes)) = key_registry
         .with_key(|k| {
             (

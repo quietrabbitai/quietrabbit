@@ -76,6 +76,12 @@ pub async fn run_periodic_check(
     group_key_registry: &GroupKeyRegistry,
     connect_sessions: &crate::provider_credentials::session::ConnectSessions,
 ) {
+    // items.id=630: during a data-key rotation this process holds the account
+    // and swaps its own session at the end. An idle expiry or an epoch check
+    // now would lock the session out of its own rotation.
+    if crate::auth::epoch_guard::is_rotating() {
+        return;
+    }
     let Some(user_id) = key_registry.with_key(|k| k.user_id.clone()).await else {
         return;
     };
