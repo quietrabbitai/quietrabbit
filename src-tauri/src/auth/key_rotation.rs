@@ -64,6 +64,7 @@
 // (re-keyed with it) and group.db is keyed by the group key itself.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
 use x25519_dalek::StaticSecret;
@@ -134,6 +135,62 @@ pub struct NoProgress;
 
 impl ProgressSink for NoProgress {
     fn emit(&self, _event: &ProgressEvent) {}
+}
+
+/// The process-wide sink every rotation reports to unless its environment
+/// names another. main.rs installs the Tauri event emitter at startup
+/// (commands::key_rotation::TauriRotationSink); without one (tests) events
+/// are dropped. It also remembers the LAST event so a webview that reloads or
+/// mounts late can ask where a rotation stands (get_rotation_status).
+pub struct GlobalProgress {
+    sink: Mutex<Option<Arc<dyn ProgressSink>>>,
+    last: Mutex<Option<ProgressEvent>>,
+}
+
+impl GlobalProgress {
+    const fn new() -> Self {
+        Self {
+            sink: Mutex::new(None),
+            last: Mutex::new(None),
+        }
+    }
+}
+
+impl ProgressSink for GlobalProgress {
+    fn emit(&self, event: &ProgressEvent) {
+        *self.last.lock().unwrap_or_else(|p| p.into_inner()) = Some(event.clone());
+        let sink = self.sink.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if let Some(sink) = sink {
+            sink.emit(event);
+        }
+    }
+}
+
+static GLOBAL_PROGRESS: GlobalProgress = GlobalProgress::new();
+
+/// Install (or remove) the process-wide progress sink.
+pub fn set_global_progress_sink(sink: Option<Arc<dyn ProgressSink>>) {
+    *GLOBAL_PROGRESS
+        .sink
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = sink;
+}
+
+/// The most recent progress event of any rotation in this process.
+pub fn last_progress() -> Option<ProgressEvent> {
+    GLOBAL_PROGRESS
+        .last
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+}
+
+/// Forget the remembered event (a new session or a finished report).
+pub fn clear_last_progress() {
+    *GLOBAL_PROGRESS
+        .last
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = None;
 }
 
 // ---------------------------------------------------------------------------
@@ -240,7 +297,7 @@ impl<'a> RotationEnv<'a> {
             user_dir,
             scheduler: None,
             registry: None,
-            progress: &NoProgress,
+            progress: &GLOBAL_PROGRESS,
             kdf: KdfParams::default(),
             free_space: io::available_space,
             #[cfg(test)]

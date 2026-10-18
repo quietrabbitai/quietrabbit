@@ -115,6 +115,13 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::auth::get_recovery_key_display,
         commands::auth::get_session,
         commands::auth::record_activity,
+        // items.id=630 -- the three credential changes (data-key rotations)
+        commands::key_rotation::change_password,
+        commands::key_rotation::begin_new_recovery_phrase,
+        commands::key_rotation::cancel_new_recovery_phrase,
+        commands::key_rotation::confirm_new_recovery_phrase,
+        commands::key_rotation::restore_with_recovery_phrase,
+        commands::key_rotation::get_rotation_status,
         // Group 12 -- System
         commands::system::get_health,
         commands::system::get_capability_profile,

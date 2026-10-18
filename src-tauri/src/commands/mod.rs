@@ -60,6 +60,7 @@ pub mod execution;
 pub mod focus_builder;
 pub mod group;
 pub mod ingest;
+pub mod key_rotation;
 pub mod library;
 pub mod messages;
 pub mod model_install;

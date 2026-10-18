@@ -159,6 +159,9 @@ async fn async_main() {
         // / group-unlock path populates entries.
         .manage(quietrabbit_lib::auth::registry::GroupKeyRegistry::default())
         .setup(|app| {
+            // items.id=630: data-key rotation progress goes to the webview on
+            // the shared task-progress event (kind key_rotation).
+            quietrabbit_lib::commands::key_rotation::install_progress_sink(app.handle().clone());
             // Must run synchronously here, before any command handler could
             // touch persistence::migrations::get_data_root() -- every prior
             // caller of that function was test code, which points

@@ -458,6 +458,44 @@ export const commands = {
 	 *  a stray ping racing a logout is expected, not exceptional.
 	 */
 	recordActivity: () => typedError<null, string>(__TAURI_INVOKE("record_activity")),
+	/**
+	 *  Change the account password. Re-verifies `old_password`, then rotates the
+	 *  data key: everything is re-locked under a new key and the new password.
+	 *  The recovery phrase is unchanged and stays valid. Returns when the change is
+	 *  complete (or has failed); progress arrives as `task-progress` events.
+	 */
+	changePassword: (oldPassword: string, newPassword: string) => typedError<null, KeyRotationError>(__TAURI_INVOKE("change_password", { oldPassword, newPassword })),
+	/**
+	 *  Start creating a new recovery phrase: re-verifies the password, generates
+	 *  fresh recovery entropy, keeps it in memory only, and returns the 24 words
+	 *  to show ONCE together with the positions to confirm. Nothing is rotated
+	 *  yet, and the old words still work.
+	 */
+	beginNewRecoveryPhrase: (password: string) => typedError<NewRecoveryPhrase, KeyRotationError>(__TAURI_INVOKE("begin_new_recovery_phrase", { password })),
+	/**
+	 *  Abandon a new phrase that was shown but not confirmed. A no-op when there
+	 *  is none.
+	 */
+	cancelNewRecoveryPhrase: () => typedError<null, KeyRotationError>(__TAURI_INVOKE("cancel_new_recovery_phrase")),
+	/**
+	 *  Confirm the new phrase by re-entering the asked-for words, then rotate: the
+	 *  data key changes, the password stays, and the old words stop working. Asks
+	 *  for the password again (it is not held in memory in between).
+	 */
+	confirmNewRecoveryPhrase: (password: string, answers: WordAnswer[]) => typedError<null, KeyRotationError>(__TAURI_INVOKE("confirm_new_recovery_phrase", { password, answers })),
+	/**
+	 *  Forgot the password: sign in with the 24 recovery words and set a new
+	 *  password. The words unseal the data key, the data key is rotated exactly as
+	 *  for a password change, and the account is unlocked. The words themselves do
+	 *  not change. If a change was interrupted earlier, this is also the way to
+	 *  finish it with the words.
+	 */
+	restoreWithRecoveryPhrase: (displayName: string, phrase: string, newPassword: string) => typedError<null, KeyRotationError>(__TAURI_INVOKE("restore_with_recovery_phrase", { displayName, phrase, newPassword })),
+	/**
+	 *  Where a rotation stands. Safe to poll; reads no secret. Without a session
+	 *  there is nothing to report beyond whether this process is rotating.
+	 */
+	getRotationStatus: () => typedError<RotationStatus, KeyRotationError>(__TAURI_INVOKE("get_rotation_status")),
 	getHealth: () => typedError<HealthResponse, string>(__TAURI_INVOKE("get_health")),
 	getCapabilityProfile: () => typedError<CapabilityProfileResponse, string>(__TAURI_INVOKE("get_capability_profile")),
 	getHardwareProfile: () => typedError<HardwareProfile, string>(__TAURI_INVOKE("get_hardware_profile")),
@@ -1455,6 +1493,46 @@ export type HealthResponse = {
 	qr_hosted_configured: boolean,
 };
 
+/**
+ *  Why a credential change did not happen (or did not finish). Frontend-safe:
+ *  no path, id or secret in any variant.
+ */
+export type KeyRotationError = 
+/**  No account is unlocked in this process. */
+{ code: "not_logged_in" } | 
+/**
+ *  Wrong old password, wrong recovery phrase, or an unknown account. One
+ *  code for all three.
+ */
+{ code: "invalid_credentials" } | { code: "account_locked" } | { code: "new_password_empty" } | 
+/**  The typed words are not a valid 24-word recovery phrase. */
+{ code: "phrase_invalid" } | 
+/**  A rotation is already running, or one is pending that must finish first. */
+{ code: "rotation_in_progress" } | 
+/**  Tasks are still running; wait for them or cancel them. */
+{ code: "active_runs"; count: number } | 
+/**  Another part of the app (or another window) is using the data right now. */
+{ code: "busy" } | { code: "insufficient_space"; needed_mb: number; available_mb: number } | { code: "free_space_unknown" } | 
+/**  A file this app does not recognise is in the account's data. */
+{ code: "unrecognised_files" } | 
+/**  A database could not be opened with the current key. */
+{ code: "database_unreadable" } | 
+/**  The account's key was changed in another session. */
+{ code: "epoch_changed" } | 
+/**  The change was started and then undone. Nothing changed for the user. */
+{ code: "rolled_back" } | 
+/**
+ *  The change did not finish and will be completed the next time the
+ *  account is unlocked with the new password or the recovery phrase.
+ */
+{ code: "needs_resume" } | 
+/**  confirm_new_recovery_phrase without a phrase to confirm. */
+{ code: "no_pending_phrase" } | 
+/**  The re-entered words were not the ones asked for. */
+{ code: "confirmation_failed" } | 
+/**  Anything else. The detail is in the log, not here. */
+{ code: "internal" };
+
 /**  Where the key to save comes from. Never derives Debug: it can hold a key. */
 export type KeySource = 
 /**  The user typed or pasted it into the dialog. */
@@ -1567,6 +1645,15 @@ export type ModelPriceDto = {
 	is_free: boolean,
 	/**  The user's own price is in force. */
 	overridden: boolean,
+};
+
+/**
+ *  The new recovery phrase, shown once, and which word positions (1-based)
+ *  the user must re-enter to confirm it.
+ */
+export type NewRecoveryPhrase = {
+	mnemonic: string,
+	confirm_positions: number[],
 };
 
 /**
@@ -2151,6 +2238,23 @@ export type ResumeRunRequest = {
 	persona_id: string,
 };
 
+/**  Where a rotation stands, for a webview that reloaded or mounted late. */
+export type RotationStatus = {
+	/**  A rotation is running in this process right now. */
+	running: boolean,
+	/**  The last reported phase while running (`rekeying`, `verifying`, ...). */
+	phase: string | null,
+	/**  0 to 100, by bytes, while running. */
+	percent: number,
+	/**
+	 *  A rotation was interrupted and waits for the next unlock with the new
+	 *  password or the recovery phrase.
+	 */
+	interrupted: boolean,
+	/**  `password_change`, `restore` or `new_phrase` while one is pending. */
+	pending_kind: string | null,
+};
+
 export type SaveKeyRequest = {
 	session_id: string,
 	source: KeySource,
@@ -2526,6 +2630,12 @@ export type WarningDto = {
 
 /**  How loudly a warning should be presented. Ordered: None < Notice < Strong. */
 export type WarningTier = "none" | "notice" | "strong";
+
+/**  One re-entered word. */
+export type WordAnswer = {
+	position: number,
+	word: string,
+};
 
 /**
  *  items.id=364: a pane's own Ctrl+=/Ctrl+-/Ctrl+0 shortcuts, intercepted by

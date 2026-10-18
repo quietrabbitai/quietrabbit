@@ -111,6 +111,19 @@ pub struct KeyRegistry {
     /// display. A crash before display loses it for good: the account then
     /// needs a new recovery phrase (items.id=630).
     pending_recovery: tokio::sync::Mutex<Option<zeroize::Zeroizing<[u8; kdf::MASTER_KEY_LEN]>>>,
+    /// A NEW recovery phrase the user has been shown and must confirm before
+    /// the rotation that adopts it runs (items.id=630). Memory only, never
+    /// persisted; cleared by clear(), by cancel, and after too many wrong
+    /// confirmations.
+    pending_new_phrase: tokio::sync::Mutex<Option<NewPhraseSlot>>,
+}
+
+/// The shown-but-unconfirmed new recovery phrase.
+pub struct NewPhraseSlot {
+    pub entropy: zeroize::Zeroizing<[u8; kdf::MASTER_KEY_LEN]>,
+    /// 1-based word positions the user must re-enter to confirm.
+    pub confirm_positions: Vec<u32>,
+    pub failed_confirmations: u8,
 }
 
 impl KeyRegistry {
@@ -147,6 +160,25 @@ impl KeyRegistry {
         }
         *guard = None;
         *self.pending_recovery.lock().await = None;
+        *self.pending_new_phrase.lock().await = None;
+    }
+
+    /// Hold a new recovery phrase for confirmation, replacing any earlier one.
+    pub async fn set_pending_new_phrase(&self, slot: NewPhraseSlot) {
+        *self.pending_new_phrase.lock().await = Some(slot);
+    }
+
+    /// Run a closure on the pending new phrase, if any (it stays in place).
+    pub async fn with_pending_new_phrase<F, R>(&self, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut NewPhraseSlot) -> R,
+    {
+        self.pending_new_phrase.lock().await.as_mut().map(f)
+    }
+
+    /// Take the pending new phrase out, leaving nothing behind.
+    pub async fn take_pending_new_phrase(&self) -> Option<NewPhraseSlot> {
+        self.pending_new_phrase.lock().await.take()
     }
 
     /// Hold a new account's recovery entropy for its one-time display.

@@ -104,7 +104,10 @@ const LEGACY_ACCOUNT_MESSAGE: &str =
 /// (its current, unchanged default -- this session builds bookkeeping,
 /// not enforcement). Queries the flag rather than hardcoding false, so
 /// flipping enforcement on later is a data change, not a code change.
-async fn is_locked_out(pool: &sqlx::SqlitePool, display_name: &str) -> Result<bool, String> {
+pub(crate) async fn is_locked_out(
+    pool: &sqlx::SqlitePool,
+    display_name: &str,
+) -> Result<bool, String> {
     let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
     let enabled: Option<(String,)> =
         sqlx::query_as("SELECT value FROM instance_config WHERE key = 'auth_lockout_enabled'")
@@ -134,7 +137,10 @@ async fn is_locked_out(pool: &sqlx::SqlitePool, display_name: &str) -> Result<bo
 /// Record a failed attempt in auth_failures. Lockout THRESHOLD/DURATION
 /// logic is deliberately not built here (policy, not mechanism -- see
 /// module header) -- this only appends the bookkeeping row.
-async fn record_failed_attempt(pool: &sqlx::SqlitePool, display_name: &str) -> Result<(), String> {
+pub(crate) async fn record_failed_attempt(
+    pool: &sqlx::SqlitePool,
+    display_name: &str,
+) -> Result<(), String> {
     let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
     sqlx::query(
         "INSERT INTO auth_failures (id, display_name, attempted_at)
@@ -282,15 +288,31 @@ pub async fn login(
         // An account with no wrapper row predates the data-key format. It
         // is named as such rather than folded into "invalid credentials":
         // it is not a wrong password and retrying cannot fix it.
-        let wrapper = user_store::get_key_wrapper(&pool, &user.id)
+        let wrapper_state = user_store::get_key_wrapper_state(&pool, &user.id)
             .await
             .map_err(|e| e.to_string())?
             .ok_or_else(|| LEGACY_ACCOUNT_MESSAGE.to_owned())?;
+        let wrapper = wrapper_state.wrapper;
         if wrapper.format_version != data_key::WRAP_FORMAT_VERSION {
             return Err(format!(
                 "couldn't verify credentials: unsupported key wrapper format {}",
                 wrapper.format_version
             ));
+        }
+
+        // items.id=630: a data-key rotation was interrupted. The databases are
+        // split between two keys, so there is no ordinary unlock; this
+        // finishes the rotation (new password) or reports it (old password).
+        if wrapper_state.pending_rotation.is_some() {
+            return login_with_pending_rotation(
+                &user,
+                &display_name,
+                &password,
+                &key_registry,
+                &group_key_registry,
+                &pool,
+            )
+            .await;
         }
 
         let password_key = zeroize::Zeroizing::new(
@@ -343,6 +365,122 @@ pub async fn login(
     }
 }
 
+/// `login` error codes for an interrupted data-key rotation (items.id=630).
+/// Stable strings the frontend matches on; they carry no ids or paths.
+///
+/// The account's password change (or restore, or new phrase) was interrupted
+/// and the password typed is the OLD one, which can no longer open the data.
+/// Sign in with the new password, or use the recovery phrase, to finish it.
+pub const LOGIN_ROTATION_INTERRUPTED: &str = "rotation_interrupted";
+/// The interrupted change was undone while resuming; sign in with the old
+/// password.
+pub const LOGIN_ROTATION_ROLLED_BACK: &str = "rotation_rolled_back";
+/// The interrupted change could not be finished right now and stays pending.
+pub const LOGIN_ROTATION_RESUME_FAILED: &str = "rotation_resume_failed";
+
+/// Unlock an account whose data-key rotation is pending (items.id=630).
+///
+/// The typed password is tried against the STAGED new wrap first (that is the
+/// only way to reach the new data key from a password; the old data key comes
+/// out of the pending row). On success the rotation is finished and the
+/// account is signed in. If the staged wrap does not open but the LIVE wrap
+/// does, the user typed the old password: that is not a failed attempt and
+/// not a session, it is the interrupted-change result. Anything else is a
+/// wrong password.
+async fn login_with_pending_rotation(
+    user: &user_store::UserRecord,
+    display_name: &str,
+    password: &str,
+    key_registry: &State<'_, KeyRegistry>,
+    group_key_registry: &State<'_, GroupKeyRegistry>,
+    pool: &sqlx::SqlitePool,
+) -> Result<(), String> {
+    use crate::auth::key_rotation::{self, Credential, ResumeOutcome, RotationEnv, RotationError};
+
+    let pending = user_store::get_pending_rotation(pool, &user.id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "internal error: a rotation is flagged but missing".to_owned())?;
+    let (Some(salt), Some(mem), Some(iter), Some(par)) = (
+        pending.salt.as_ref(),
+        pending.kdf_memory_kib,
+        pending.kdf_iterations,
+        pending.kdf_parallelism,
+    ) else {
+        return Err(LOGIN_ROTATION_RESUME_FAILED.to_owned());
+    };
+
+    let staged_pk = kdf::derive_password_key_blocking(password.as_bytes(), salt, mem, iter, par)
+        .await
+        .map_err(|e| e.to_string())?;
+    match key_rotation::new_dek_from_staged_password(&pending, &user.id, &staged_pk) {
+        Ok(new_dek) => {
+            let env = RotationEnv::new(
+                pool,
+                &user.id,
+                crate::persistence::migrations::get_data_root()
+                    .join("users")
+                    .join(&user.id),
+            );
+            match key_rotation::resume_rotation(
+                &env,
+                &pending,
+                new_dek,
+                Credential::Password(&staged_pk),
+            )
+            .await
+            {
+                Ok(ResumeOutcome::Completed(outcome)) => {
+                    finish_login(
+                        &user.id,
+                        *outcome.new_dek,
+                        outcome.to_epoch,
+                        key_registry,
+                        group_key_registry,
+                        pool,
+                    )
+                    .await
+                }
+                Ok(ResumeOutcome::RolledBack) => Err(LOGIN_ROTATION_ROLLED_BACK.to_owned()),
+                Err(e) => {
+                    log::warn!("login: couldn't finish the interrupted rotation: {e}");
+                    Err(LOGIN_ROTATION_RESUME_FAILED.to_owned())
+                }
+            }
+        }
+        Err(RotationError::Crypto(DataKeyError::WrongPassword)) => {
+            // Not the new password. Is it the old one?
+            let state = user_store::get_key_wrapper_state(pool, &user.id)
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| LEGACY_ACCOUNT_MESSAGE.to_owned())?;
+            let (live_salt, lm, li, lp) = user_store::get_salt_params(pool, &user.id)
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "internal error: account exists with no salt record".to_owned())?;
+            let live_pk =
+                kdf::derive_password_key_blocking(password.as_bytes(), &live_salt, lm, li, lp)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            match data_key::unwrap_dek(
+                &live_pk,
+                &state.wrapper.password_wrap,
+                &user.id,
+                state.wrapper.key_epoch,
+                state.wrapper.format_version,
+            ) {
+                Ok(_) => Err(LOGIN_ROTATION_INTERRUPTED.to_owned()),
+                Err(DataKeyError::WrongPassword) => {
+                    record_failed_attempt(pool, display_name).await?;
+                    Err("invalid credentials".to_owned())
+                }
+                Err(e) => Err(format!("couldn't verify credentials: {e}")),
+            }
+        }
+        Err(e) => Err(format!("couldn't verify credentials: {e}")),
+    }
+}
+
 /// Create-or-migrate the two per-account databases every account has from
 /// its first moment (integration_keys.db, cloud_chat_cookies.db) under the
 /// DEK. Safe to repeat.
@@ -388,7 +526,7 @@ fn hex_decode_group_key(s: &str) -> Option<[u8; kdf::MASTER_KEY_LEN]> {
     bytes?.try_into().ok()
 }
 
-async fn finish_login(
+pub(crate) async fn finish_login(
     user_id: &str,
     data_key: [u8; kdf::MASTER_KEY_LEN],
     key_epoch: u64,
