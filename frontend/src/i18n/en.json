@@ -25,7 +25,7 @@
     },
     "restore": {
       "heading": "Restore access with your recovery phrase",
-      "intro": "Enter your 24-word recovery phrase and choose a new password. Your data is re-locked under a new key and the new password, so the old password stops opening it from then on. This can take a while for a large account. Copies or backups made before the change can still be opened with your old password. Your recovery phrase stays the same.",
+      "intro": "Enter your 24-word recovery phrase and choose a new password. Your data is re-locked under a new key and the new password, so the old password stops opening it from then on. This can take a while for a large account. Copies or backups made before the change can still be opened with your old password. If you keep copies, make fresh ones after the change and delete the old ones. Your recovery phrase stays the same.",
       "phraseLabel": "Recovery phrase (24 words)",
       "wordCount": "{{count}} of {{total}} words",
       "newPasswordLabel": "New password",
@@ -64,7 +64,7 @@
       },
       "changePassword": {
         "heading": "Change password",
-        "intro": "Changing your password re-locks all of your data under a new key, so the old password stops opening it from then on. This can take a while for a large account. Copies or backups made before the change can still be opened with your old password, and nothing can change that.",
+        "intro": "Changing your password re-locks all of your data under a new key, so the old password stops opening it from then on. This can take a while for a large account. Copies or backups made before the change can still be opened with your old password, and nothing can change that. If you keep copies, make fresh ones after the change and delete the old ones.",
         "currentLabel": "Current password",
         "newLabel": "New password",
         "confirmLabel": "Confirm new password",
@@ -74,7 +74,7 @@
       }
     },
     "newPhrase": {
-      "intro": "A new recovery phrase replaces your current one. You will be shown 24 new words once, asked to re-enter a few of them, and then your data is re-locked under a new key. After that the old words no longer open your current data. Nothing changes until you confirm the new words, and until then your old phrase keeps working. Copies or backups made before the change can still be opened with your old password and your old words, and nothing can change that.",
+      "intro": "A new recovery phrase replaces your current one. You will be shown 24 new words once, asked to re-enter a few of them, and then your data is re-locked under a new key. After that the old words no longer open your current data. Nothing changes until you confirm the new words, and until then your old phrase keeps working. Copies or backups made before the change can still be opened with your old password and your old words, and nothing can change that. If you keep copies, make fresh ones after the change and delete the old ones.",
       "passwordLabel": "Current password",
       "start": "Show my new phrase",
       "cancel": "Cancel",
@@ -129,7 +129,7 @@
       "generic": "You were signed out. Sign in again to continue.",
       "passwordChanged": "Your password was changed. Sign in with your new password.",
       "recoveryPhraseChanged": "Your recovery phrase was changed. Sign in again with your password.",
-      "changeUnfinished": "Your change did not finish. Sign in with your new password to finish it. If you were creating a new recovery phrase, sign in with your current password."
+      "changeUnfinished": "Your change did not finish. Sign in to finish it: use your new password, or your current password if you were creating a new recovery phrase."
     },
     "rotationErrors": {
       "notLoggedIn": "You're not signed in. Sign in again to continue.",
@@ -178,7 +178,7 @@
         "finishFirst": "Finish first",
         "finishFirstHint": "Wait for it to finish, then make the change. Nothing is lost.",
         "stopAndSave": "Stop and save",
-        "stopAndSaveHint": "Stop it now. Your message and any text already written are kept. A reply that hasn't started writing leaves nothing. A task that is stopped is marked cancelled; you can start it again.",
+        "stopAndSaveHint": "Stop it now. Your message and any text already written are kept. If it hasn't started writing yet, nothing is saved from it. A task that is stopped is marked cancelled; you can start it again.",
         "cancel": "Cancel, don't make the change"
       },
       "waiting": {
@@ -213,8 +213,8 @@
       "generic": "Something you wrote or received couldn't be saved.",
       "dismiss": "Dismiss",
       "replyStatus": "A reply was saved, but its status wasn't. A reply that was cut short may look finished.",
-      "personalFlag": "This reply may contain personal details you chose to keep private, but it couldn't be marked that way. Treat it as sensitive and don't copy or share it.",
-      "ocrText": "A document was saved, but the text read from its image wasn't, so it won't show up in search. You can add the document again."
+      "personalFlag": "This reply may include your private information but wasn't marked private.",
+      "ocrText": "A document was saved, but the text read from its image wasn't. You can add the document again."
     }
   },
   "navShell": {
