@@ -46,6 +46,12 @@ const BASE: Record<RotationErrorCode, string> = {
   phrase_invalid: 'phraseInvalid',
   rotation_in_progress: 'rotationInProgress',
   active_runs: 'activeRuns',
+  // The four writer codes (items.id=778) are answered by the finish-or-stop
+  // prompt (rotationWriters.ts); these are the fallback wording.
+  writers_active: 'writersActive',
+  writers_still_running: 'writersStillRunning',
+  writer_not_stopping: 'writerNotStopping',
+  drain_cancelled: 'drainCancelled',
   busy: 'busy',
   insufficient_space: 'insufficientSpace',
   free_space_unknown: 'freeSpaceUnknown',

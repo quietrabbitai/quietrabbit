@@ -2113,6 +2113,11 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             let i = start + offset;
             self.current_step = i;
 
+            // items.id=778: the user chose 'Stop and save' for a key rotation.
+            if self.stop_requested() {
+                return Ok(Some(self.stopped_result()));
+            }
+
             // Clone step to release focus_def borrow before &mut self calls below.
             let step = self.focus_def.as_ref().unwrap().steps[i].clone();
 
@@ -2231,6 +2236,12 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
 
             let step_failure = self.execute_step(&step, i).await?;
 
+            // items.id=778: a step that failed because it was stopped is not a
+            // failure to park or retry; the run is cancelled.
+            if step_failure.is_some() && self.stop_requested() {
+                return Ok(Some(self.stopped_result()));
+            }
+
             if let Some(failure) = step_failure {
                 if failure.action == FailureAction::Degrade {
                     // F8: suspend checkpointing and continue with next step.
@@ -2263,6 +2274,30 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         }
 
         Ok(None) // All steps completed — proceed to Phase 5 OUTPUT
+    }
+
+    /// Whether the user chose to stop this run for a key rotation
+    /// (items.id=778): its lease's stop token has been tripped.
+    pub(crate) fn stop_requested(&self) -> bool {
+        self.lease
+            .as_ref()
+            .is_some_and(|l| l.stop_token().is_cancelled())
+    }
+
+    /// The result of a run stopped for a key rotation: `cancelled`, with no
+    /// failure to show. `execute_and_finish` hands this status to `cleanup`,
+    /// which writes `cancelled` to focus_runs and purges the snapshots. A
+    /// streamed reply's partial text was already kept by the executor.
+    fn stopped_result(&self) -> RunResult {
+        self.emit_status("cancelled", None);
+        RunResult {
+            focus_run_id: self.focus_run_id.clone().unwrap_or_default(),
+            status: "cancelled".to_owned(),
+            output_id: None,
+            output_content: None,
+            failure: None,
+            crisis_resource_block: None,
+        }
     }
 
     /// Compute tier values (ADR-012 Amendment 3); construct StepContext;
@@ -2482,6 +2517,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             key_hex: self.key_hex.clone().unwrap_or_default(),
             attendance: self.attendance,
             stream: self.chat_stream.clone(),
+            stop: self.lease.as_ref().map(|l| l.stop_token().clone()),
             bound: self.chat_binding.clone(),
         };
 
@@ -6016,6 +6052,83 @@ mod tests {
                 .expect("focus_runs row must exist after resume_execution");
             let status: String = row.try_get("status").unwrap();
             assert_eq!(status, "complete");
+        })
+        .await;
+    }
+
+    /// items.id=778: a run whose lease was told to stop ends `cancelled` at the
+    /// next step boundary without running another step, and writes
+    /// `cancelled` to focus_runs. No step executes, so this needs no model.
+    #[tokio::test]
+    async fn a_run_stopped_for_a_key_rotation_ends_cancelled_without_running_a_step() {
+        with_temp_data_root(async {
+            let scheduler = Arc::new(ConductorScheduler::new());
+            let mut run: FocusRun<crate::conductor::privacy::logger::TestLogger> = FocusRun::new(
+                "u-stop".to_owned(),
+                "p".to_owned(),
+                "f".to_owned(),
+                dummy_pool(),
+                scheduler,
+                "".to_owned(),
+                false,
+                Some(CRISIS_TEST_KEY_HEX.to_owned()),
+                None,
+                false,
+                std::collections::HashSet::new(),
+                None,
+            );
+            run.focus_run_id = Some(uuid::Uuid::new_v4().to_string());
+            let mut def = parse_focus_definition(minimal_raw()).unwrap();
+            def.steps.push(crate::conductor::tokens::StepDefinition {
+                step_id: "s1".to_owned(),
+                display_name: "Step 1".to_owned(),
+                guide_id: "g".to_owned(),
+                task_type: "general".to_owned(),
+                routing_tier: ExternalAccess::LocalOnly,
+                step_type: Default::default(),
+                output_var: None,
+                prompt_template: "never rendered".to_owned(),
+                field_requirements: std::collections::HashMap::new(),
+                options_override: std::collections::HashMap::new(),
+                external_access_override: None,
+                requires_user_handoff: false,
+                revisitable: true,
+                block_stable_id: None,
+                block_customization: None,
+                schedule_trigger: None,
+            });
+            run.focus_def = Some(def);
+            let mut personal_track = PersonalTrack::new();
+            personal_track.seal();
+            run.personal_track = Some(personal_track);
+            run.task_track = Some(TaskTrack::new());
+            run.shared_state = Some(SharedStateTrack::new());
+            run.failure_handler = Some(FailureHandler::new(ExternalAccess::LocalOnly));
+            run.privacy_gateway = Some(PrivacyGateway::new(
+                crate::conductor::privacy::logger::TestLogger::for_run("u-stop", "p", ""),
+            ));
+
+            // Not stopped: no stop is requested without a lease.
+            assert!(!run.stop_requested());
+            let lease = crate::auth::writer_gate::acquire(
+                "u-stop",
+                crate::auth::writer_gate::Kind::FocusRun,
+            )
+            .unwrap();
+            let stop = lease.stop_token().clone();
+            run.lease = Some(lease);
+            assert!(!run.stop_requested());
+            stop.cancel();
+            assert!(run.stop_requested());
+
+            let early = run
+                .execute()
+                .await
+                .expect("execute must succeed")
+                .expect("a stopped run returns early");
+            assert_eq!(early.status, "cancelled");
+            assert!(early.failure.is_none());
+            assert!(run.task_track.as_ref().unwrap().steps().is_empty());
         })
         .await;
     }

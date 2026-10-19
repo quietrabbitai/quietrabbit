@@ -4,6 +4,11 @@
 // registers as the rotation's starter (rotationTask) so it, not the overlay,
 // reports how the change ended.
 //
+// Before the rotation starts, the backend drains any running chat reply or
+// Focus run (items.id=778): useWritersFlow shows the finish-or-stop prompt and
+// repeats the call with the answer. What was typed is held by the flow only
+// while the prompt is up and is dropped on cancel, on error and on completion.
+//
 // Every field is cleared as soon as it is submitted. On needs_resume or
 // epoch_changed the session may no longer match the account's key, so the app
 // signs the user out and the login screen carries the same message.
@@ -19,6 +24,8 @@ import { validateNewPassword } from './passwordRules'
 import { RotationErrorText } from './RotationErrorText'
 import { requiresSignOut, type SignOutNotice } from './rotationErrors'
 import { beginRotationTask } from './rotationTask'
+import { useWritersFlow } from './useWritersFlow'
+import { WritersPrompt } from './WritersPrompt'
 
 export interface ChangePasswordFormProps {
   /** The signed-in display name, for the hidden username field that lets a
@@ -38,6 +45,21 @@ export function ChangePasswordForm({ displayName, onBusyChange, onSignOut }: Cha
   const [error, setError] = useState<KeyRotationError | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const [done, setDone] = useState(false)
+
+  const flow = useWritersFlow(({ result }) => {
+    setSubmitting(false)
+    onBusyChange(false)
+    if (result === null) return // cancelled: nothing was changed
+    if (result.status === 'ok') {
+      setDone(true)
+      return
+    }
+    if (requiresSignOut(result.error.code)) {
+      onSignOut({ error: result.error, context: 'changePassword' })
+      return
+    }
+    setError(result.error)
+  })
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -65,33 +87,25 @@ export function ChangePasswordForm({ displayName, onBusyChange, onSignOut }: Cha
 
     setSubmitting(true)
     onBusyChange(true)
-    const release = beginRotationTask('password_change')
-    let result: Awaited<ReturnType<typeof commands.changePassword>>
-    try {
-      result = await commands.changePassword(submittedCurrent, submittedNext)
-    } catch {
-      // The IPC call itself threw (the bridge, not a coded error): report the
-      // generic error rather than leave the form stuck busy.
-      result = { status: 'error', error: { code: 'internal' } }
-    } finally {
-      release()
-      setSubmitting(false)
-      onBusyChange(false)
-    }
-
-    if (result.status === 'ok') {
-      setDone(true)
-      return
-    }
-    if (requiresSignOut(result.error.code)) {
-      onSignOut({ error: result.error, context: 'changePassword' })
-      return
-    }
-    setError(result.error)
+    flow.begin(
+      (writers) => commands.changePassword(submittedCurrent, submittedNext, writers),
+      beginRotationTask('password_change'),
+    )
   }
 
   if (done) {
     return <p className="change-password-form__success">{t('auth.accountSecurity.changePassword.success')}</p>
+  }
+
+  if (flow.state.kind !== 'idle') {
+    return (
+      <WritersPrompt
+        state={flow.state}
+        onChoose={flow.choose}
+        onCancel={flow.cancel}
+        onDismiss={flow.dismiss}
+      />
+    )
   }
 
   return (

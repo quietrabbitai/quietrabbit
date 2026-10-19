@@ -23,6 +23,8 @@ import { RecoveryPhraseDisplay } from './RecoveryPhraseDisplay'
 import { RotationErrorText } from './RotationErrorText'
 import { requiresSignOut, type SignOutNotice } from './rotationErrors'
 import { beginRotationTask } from './rotationTask'
+import { useWritersFlow } from './useWritersFlow'
+import { WritersPrompt } from './WritersPrompt'
 
 type Step = 'password' | 'phrase' | 'done'
 
@@ -55,6 +57,31 @@ export function NewRecoveryPhraseFlow({ onClose, onBusyChange, onSignOut }: NewR
     setBusy(working)
     onBusyChange(working)
   }
+
+  // Before the rotation starts the backend drains any running chat reply or
+  // Focus run (items.id=778); the flow shows the finish-or-stop prompt and
+  // holds the confirm call's password and answers only while it is up.
+  const flow = useWritersFlow(({ result }) => {
+    setWorking(false)
+    if (result === null) return // cancelled: nothing was changed
+    if (result.status === 'ok') {
+      serverHoldsPhrase.current = false
+      setPending(null)
+      setStep('done')
+      return
+    }
+    if (requiresSignOut(result.error.code)) {
+      onSignOut({ error: result.error, context: 'newPhrase' })
+      return
+    }
+    if (result.error.code === 'no_pending_phrase') {
+      // Discarded server-side (too many wrong confirmations, or a lock): the
+      // shown phrase is gone and a new one must be generated.
+      serverHoldsPhrase.current = false
+      setPhraseGone(true)
+    }
+    setError(result.error)
+  })
 
   // Leaving with a phrase shown but not adopted: tell the server to drop it.
   useEffect(
@@ -105,38 +132,26 @@ export function NewRecoveryPhraseFlow({ onClose, onBusyChange, onSignOut }: NewR
     setError(result.error)
   }
 
-  const handleConfirm = async (answers: WordAnswer[]) => {
+  const handleConfirm = (answers: WordAnswer[]) => {
     const submitted = confirmPassword
     setConfirmPassword('')
     setError(null)
     setWorking(true)
-    const release = beginRotationTask('new_phrase')
-    let result: Awaited<ReturnType<typeof commands.confirmNewRecoveryPhrase>>
-    try {
-      result = await commands.confirmNewRecoveryPhrase(submitted, answers)
-    } catch {
-      result = { status: 'error', error: { code: 'internal' } }
-    } finally {
-      release()
-      setWorking(false)
-    }
-    if (result.status === 'ok') {
-      serverHoldsPhrase.current = false
-      setPending(null)
-      setStep('done')
-      return
-    }
-    if (requiresSignOut(result.error.code)) {
-      onSignOut({ error: result.error, context: 'newPhrase' })
-      return
-    }
-    if (result.error.code === 'no_pending_phrase') {
-      // Discarded server-side (too many wrong confirmations, or a lock): the
-      // shown phrase is gone and a new one must be generated.
-      serverHoldsPhrase.current = false
-      setPhraseGone(true)
-    }
-    setError(result.error)
+    flow.begin(
+      (writers) => commands.confirmNewRecoveryPhrase(submitted, answers, writers),
+      beginRotationTask('new_phrase'),
+    )
+  }
+
+  if (flow.state.kind !== 'idle') {
+    return (
+      <WritersPrompt
+        state={flow.state}
+        onChoose={flow.choose}
+        onCancel={flow.cancel}
+        onDismiss={flow.dismiss}
+      />
+    )
   }
 
   if (step === 'done') {
@@ -178,7 +193,7 @@ export function NewRecoveryPhraseFlow({ onClose, onBusyChange, onSignOut }: NewR
         mnemonic={pending.mnemonic ?? ''}
         confirmPositions={pending.positions}
         onWordsHidden={() => setPending((prev) => (prev ? { ...prev, mnemonic: null } : prev))}
-        onConfirm={(answers) => void handleConfirm(answers)}
+        onConfirm={(answers) => handleConfirm(answers)}
         onCancel={() => {
           cancelPhrase()
           onClose()

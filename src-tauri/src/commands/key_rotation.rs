@@ -85,7 +85,7 @@ use crate::auth::key_rotation::{
 use crate::auth::password_policy::{self, PasswordPolicyError};
 use crate::auth::registry::{GroupKeyRegistry, KeyRegistry, NewPhraseSlot};
 use crate::auth::user_store;
-use crate::auth::writer_gate::{self, DrainGuard, GateError};
+use crate::auth::writer_gate::{self, DrainError, DrainGuard, GateError};
 use crate::commands::auth::{finish_login, is_locked_out, record_failed_attempt};
 use crate::task_progress::{emit_progress, TaskProgressPayload};
 
@@ -117,10 +117,30 @@ pub enum KeyRotationError {
     PhraseInvalid,
     /// A rotation is already running, or one is pending that must finish first.
     RotationInProgress,
-    /// Tasks are still running; wait for them or cancel them.
+    /// Tasks are still running; wait for them or cancel them. The engine's own
+    /// last-moment check; the drain normally answers with the codes below.
     ActiveRuns {
         count: u32,
     },
+    /// A chat reply or Focus run is running and no choice was made yet
+    /// (items.id=778). Nothing was changed. The caller asks the user whether
+    /// to finish first or stop and save, and calls again with the answer.
+    WritersActive {
+        replies: u32,
+        focus_runs: u32,
+    },
+    /// The wait for running work reached its ceiling (10 minutes for 'finish
+    /// first', 30 seconds for short operations). Nothing was changed. The
+    /// counts say what is still running.
+    WritersStillRunning {
+        replies: u32,
+        focus_runs: u32,
+    },
+    /// 'Stop and save' was chosen and the work had not stopped after 60
+    /// seconds. Nothing was changed and nothing was killed.
+    WriterNotStopping,
+    /// The user cancelled the wait. Nothing was changed.
+    DrainCancelled,
     /// Another part of the app (or another window) is using the data right now.
     Busy,
     InsufficientSpace {
@@ -157,6 +177,27 @@ pub enum KeyRotationError {
 pub struct NewRecoveryPhrase {
     pub mnemonic: String,
     pub confirm_positions: Vec<u32>,
+}
+
+/// What the user chose when a chat reply or Focus run was running
+/// (items.id=778, decisions.id=896). `ask` is the first call: it changes
+/// nothing and reports what is running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum WritersChoice {
+    Ask,
+    FinishFirst,
+    StopAndSave,
+}
+
+impl From<WritersChoice> for writer_gate::Choice {
+    fn from(c: WritersChoice) -> Self {
+        match c {
+            WritersChoice::Ask => writer_gate::Choice::Ask,
+            WritersChoice::FinishFirst => writer_gate::Choice::FinishFirst,
+            WritersChoice::StopAndSave => writer_gate::Choice::StopAndSave,
+        }
+    }
 }
 
 /// One re-entered word.
@@ -400,36 +441,67 @@ fn env_for<'a>(
 }
 
 /// Drain every writer of `user_id` and close the writer gate before a rotation
-/// starts (items.id=778, decisions.id=896). The returned guard keeps the gate
-/// closed for the whole rotation; dropping it, on success, error or panic,
-/// reopens it. Nothing is changed when this refuses.
-///
-/// Stage 1 refuses while a chat reply or Focus run is running (the
-/// `active_runs` answer, now backed by the real leases); the finish-or-stop
-/// choice and the ceilings arrive with the drain prompt.
-async fn drain_writers(user_id: &str) -> Result<DrainGuard, KeyRotationError> {
-    let drain = writer_gate::begin_drain(user_id).map_err(|e| match e {
-        GateError::NotLoggedIn => KeyRotationError::NotLoggedIn,
-        GateError::DrainInProgress | GateError::Rotating => KeyRotationError::RotationInProgress,
-        other => internal("drain", other),
-    })?;
-    let visible = drain.counts().visible();
-    if visible > 0 {
-        return Err(KeyRotationError::ActiveRuns {
-            count: u32::try_from(visible).unwrap_or(u32::MAX),
-        });
-    }
-    drain
-        .close(writer_gate::COMMAND_DRAIN_CEILING)
+/// starts (items.id=778, decisions.id=896), following the user's choice. The
+/// returned guard keeps the gate closed for the whole rotation; dropping it, on
+/// success, error or panic, reopens it. Nothing is changed when this refuses.
+async fn drain_writers(
+    user_id: &str,
+    choice: WritersChoice,
+) -> Result<DrainGuard, KeyRotationError> {
+    drain_writers_with(user_id, choice, writer_gate::DrainPolicy::default()).await
+}
+
+/// `drain_writers` with the waits spelled out (tests shorten them).
+async fn drain_writers_with(
+    user_id: &str,
+    choice: WritersChoice,
+    policy: writer_gate::DrainPolicy,
+) -> Result<DrainGuard, KeyRotationError> {
+    let to_u32 = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+    writer_gate::drain_for_rotation(user_id, choice.into(), policy)
         .await
         .map_err(|e| match e {
-            GateError::VisibleWork(n) => KeyRotationError::ActiveRuns {
-                count: u32::try_from(n).unwrap_or(u32::MAX),
+            DrainError::Gate(GateError::NotLoggedIn) => KeyRotationError::NotLoggedIn,
+            DrainError::Gate(GateError::DrainInProgress | GateError::Rotating) => {
+                KeyRotationError::RotationInProgress
+            }
+            DrainError::Gate(other) => internal("drain", other),
+            DrainError::WritersActive {
+                replies,
+                focus_runs,
+            } => KeyRotationError::WritersActive {
+                replies: to_u32(replies),
+                focus_runs: to_u32(focus_runs),
             },
-            GateError::StillBusy(_) => KeyRotationError::Busy,
-            other => internal("drain close", other),
-        })?;
-    Ok(drain)
+            DrainError::StillRunning {
+                replies,
+                focus_runs,
+            } => KeyRotationError::WritersStillRunning {
+                replies: to_u32(replies),
+                focus_runs: to_u32(focus_runs),
+            },
+            DrainError::NotStopping => KeyRotationError::WriterNotStopping,
+            DrainError::Cancelled => KeyRotationError::DrainCancelled,
+        })
+}
+
+/// Cancel the wait of a rotation that is waiting for running work (the Cancel
+/// button on the waiting screen). Nothing is changed: the waiting call returns
+/// `drain_cancelled`, the gate reopens and the running work carries on. A
+/// no-op when no wait is under way. Exempt from the drain (it never takes a
+/// lease), so a closed gate cannot block it.
+///
+/// SESSIONLESS: the restore screen waits with nobody signed in, so this needs
+/// no session. It cancels the signed-in account's wait if there is one, and
+/// otherwise the wait that is running. It carries no data and reveals nothing.
+#[tauri::command]
+#[specta::specta]
+pub async fn cancel_writer_wait(
+    key_registry: State<'_, KeyRegistry>,
+) -> Result<(), KeyRotationError> {
+    let user = key_registry.user_id().await;
+    writer_gate::cancel_any_wait(user.as_deref());
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -445,6 +517,7 @@ async fn drain_writers(user_id: &str) -> Result<DrainGuard, KeyRotationError> {
 pub async fn change_password(
     old_password: String,
     new_password: String,
+    writers: WritersChoice,
     key_registry: State<'_, KeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<(), KeyRotationError> {
@@ -458,7 +531,7 @@ pub async fn change_password(
         return Err(KeyRotationError::NewPasswordSameAsCurrent);
     }
 
-    let _drain = drain_writers(&resident.user_id).await?;
+    let _drain = drain_writers(&resident.user_id, writers).await?;
     let env = env_for(&pool, &resident.user_id, true, Some(&key_registry));
     key_rotation::run_rotation(
         &env,
@@ -553,6 +626,7 @@ fn normalise_word(w: &str) -> String {
 pub async fn confirm_new_recovery_phrase(
     password: String,
     answers: Vec<WordAnswer>,
+    writers: WritersChoice,
     key_registry: State<'_, KeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<(), KeyRotationError> {
@@ -593,7 +667,7 @@ pub async fn confirm_new_recovery_phrase(
         .await
         .ok_or(KeyRotationError::NoPendingPhrase)?;
 
-    let _drain = drain_writers(&resident.user_id).await?;
+    let _drain = drain_writers(&resident.user_id, writers).await?;
     let env = env_for(&pool, &resident.user_id, true, Some(&key_registry));
     key_rotation::run_rotation(
         &env,
@@ -638,6 +712,7 @@ pub async fn restore_with_recovery_phrase(
     display_name: String,
     phrase: String,
     new_password: String,
+    writers: WritersChoice,
     key_registry: State<'_, KeyRegistry>,
     group_key_registry: State<'_, GroupKeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
@@ -688,7 +763,7 @@ pub async fn restore_with_recovery_phrase(
             Err(StagedUnlockError::WrongCredential) => return wrong().await.map(|_| ()),
             Err(e) => return Err(code_for_unlock(&e)),
         };
-        let drain = drain_writers(&user.id).await?;
+        let drain = drain_writers(&user.id, writers).await?;
         let env = env_for(&pool, &user.id, true, None);
         let finished = match key_rotation::resume_rotation(
             &env,
@@ -749,7 +824,7 @@ pub async fn restore_with_recovery_phrase(
         Err(_) => return wrong().await.map(|_| ()),
     };
 
-    let drain = drain_writers(&user.id).await?;
+    let drain = drain_writers(&user.id, writers).await?;
     let env = env_for(&pool, &user.id, true, None);
     let outcome = match key_rotation::run_rotation(
         &env,
@@ -960,7 +1035,7 @@ mod tests {
     use crate::commands::auth::{
         get_recovery_key_display, login, logout_core, LOGIN_ROTATION_INTERRUPTED,
     };
-    use crate::persistence::personal_store;
+    use crate::persistence::{message_store, personal_store};
     use crate::test_support::ENV_MUTEX;
 
     const PASSWORD: &str = "password123";
@@ -1074,7 +1149,32 @@ mod tests {
         }
 
         async fn change_password(&self, old: &str, new: &str) -> Result<(), KeyRotationError> {
-            change_password(old.to_owned(), new.to_owned(), self.registry(), self.pool()).await
+            self.change_password_choosing(old, new, WritersChoice::Ask)
+                .await
+        }
+
+        async fn change_password_choosing(
+            &self,
+            old: &str,
+            new: &str,
+            writers: WritersChoice,
+        ) -> Result<(), KeyRotationError> {
+            change_password(
+                old.to_owned(),
+                new.to_owned(),
+                writers,
+                self.registry(),
+                self.pool(),
+            )
+            .await
+        }
+
+        /// The account's data key in hex, as a store opener wants it.
+        async fn key_hex(&self) -> String {
+            self.registry()
+                .with_key(|k| crate::auth::registry::key_hex(&k.data_key))
+                .await
+                .unwrap()
         }
 
         async fn restore(&self, words: &str, new: &str) -> Result<(), KeyRotationError> {
@@ -1082,6 +1182,7 @@ mod tests {
                 "Alice".to_owned(),
                 words.to_owned(),
                 new.to_owned(),
+                WritersChoice::Ask,
                 self.registry(),
                 self.groups(),
                 self.pool(),
@@ -1241,22 +1342,189 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_running_reply_blocks_change_password_with_a_count() {
+    async fn a_running_reply_is_reported_first_and_nothing_is_changed() {
         let h = Harness::new().await;
         h.account().await;
         let user_id = h.user_id().await;
-        // A chat reply in flight holds a lease (items.id=778): the rotation
-        // is refused, nothing is changed, and the gate is left open again.
+        // A chat reply in flight holds a lease (items.id=778): the first call
+        // reports it, changes nothing and leaves the gate open.
         let reply = writer_gate::acquire(&user_id, writer_gate::Kind::Reply).unwrap();
         assert_eq!(
             h.change_password(PASSWORD, NEW_PASSWORD).await.unwrap_err(),
-            KeyRotationError::ActiveRuns { count: 1 }
+            KeyRotationError::WritersActive {
+                replies: 1,
+                focus_runs: 0
+            }
         );
         assert_eq!(writer_gate::phase(&user_id), writer_gate::Phase::Open);
         assert_eq!(h.registry().with_key(|k| k.key_epoch).await, Some(1));
+        assert!(!reply.stop_token().is_cancelled(), "nothing was stopped");
         drop(reply);
         h.change_password(PASSWORD, NEW_PASSWORD).await.unwrap();
         assert!(writer_gate::is_idle(&user_id));
+    }
+
+    /// Wait (bounded) until the gate of `user_id` reaches `want`: the rotation
+    /// command verifies the password first, which takes seconds, before it
+    /// drains.
+    async fn wait_for_phase(user_id: &str, want: writer_gate::Phase) {
+        for _ in 0..600 {
+            if writer_gate::phase(user_id) == want {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("the gate never reached {want:?}");
+    }
+
+    /// Sign in again with `password` after a rotation (the session may or may
+    /// not have ended) and return the data key in hex.
+    async fn sign_in_again(h: &Harness, password: &str) -> String {
+        h.registry().clear().await;
+        epoch_guard::clear_resident_for(&h.user_id().await);
+        h.login(password).await.unwrap();
+        h.key_hex().await
+    }
+
+    #[tokio::test]
+    async fn finish_first_holds_the_rotation_until_the_reply_ends() {
+        let h = Harness::new().await;
+        h.account().await;
+        let user_id = h.user_id().await;
+        let old_key = h.key_hex().await;
+        let reply = writer_gate::acquire(&user_id, writer_gate::Kind::Reply).unwrap();
+
+        let rotate = h.change_password_choosing(PASSWORD, NEW_PASSWORD, WritersChoice::FinishFirst);
+        let writer = async {
+            wait_for_phase(&user_id, writer_gate::Phase::Draining).await;
+            // Held: the rotation has not started, the key is still the old
+            // one, the gate refuses new replies, and the reply can still save.
+            assert_eq!(writer_gate::phase(&user_id), writer_gate::Phase::Draining);
+            assert_eq!(h.registry().with_key(|k| k.key_epoch).await, Some(1));
+            assert!(writer_gate::acquire(&user_id, writer_gate::Kind::Reply).is_err());
+            message_store::save_message(
+                &user_id,
+                "persona-1",
+                &old_key,
+                "ctx-held",
+                "assistant",
+                "the whole reply",
+                None,
+            )
+            .await
+            .unwrap();
+            drop(reply);
+        };
+        let (rotated, ()) = tokio::join!(rotate, writer);
+        rotated.unwrap();
+
+        // The reply written while the rotation waited is under the new key.
+        let new_key = sign_in_again(&h, NEW_PASSWORD).await;
+        let saved = message_store::list_messages(&user_id, "persona-1", &new_key, "ctx-held")
+            .await
+            .unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].content, "the whole reply");
+    }
+
+    #[tokio::test]
+    async fn stop_and_save_stops_the_reply_then_rotates() {
+        let h = Harness::new().await;
+        h.account().await;
+        let user_id = h.user_id().await;
+        let old_key = h.key_hex().await;
+        let reply = writer_gate::acquire(&user_id, writer_gate::Kind::Reply).unwrap();
+        let stop = reply.stop_token().clone();
+
+        let rotate = h.change_password_choosing(PASSWORD, NEW_PASSWORD, WritersChoice::StopAndSave);
+        // A cooperative writer: told to stop, it saves what it has and ends.
+        let writer = async {
+            stop.cancelled().await;
+            message_store::save_message(
+                &user_id,
+                "persona-1",
+                &old_key,
+                "ctx-stopped",
+                "assistant",
+                "half an answ",
+                None,
+            )
+            .await
+            .unwrap();
+            drop(reply);
+        };
+        let (rotated, ()) = tokio::join!(rotate, writer);
+        rotated.unwrap();
+
+        let new_key = sign_in_again(&h, NEW_PASSWORD).await;
+        let saved = message_store::list_messages(&user_id, "persona-1", &new_key, "ctx-stopped")
+            .await
+            .unwrap();
+        assert_eq!(saved[0].content, "half an answ");
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_never_stops_is_reported_and_nothing_is_changed() {
+        let h = Harness::new().await;
+        h.account().await;
+        let user_id = h.user_id().await;
+        let reply = writer_gate::acquire(&user_id, writer_gate::Kind::FocusRun).unwrap();
+        // The grace is the real 60 s constant; a paused clock would need the
+        // whole harness on a paused runtime, so the policy itself is tested
+        // with paused time in auth::writer_gate and this checks the mapping.
+        let err = super::drain_writers_with(
+            &user_id,
+            WritersChoice::StopAndSave,
+            writer_gate::DrainPolicy {
+                finish_first: std::time::Duration::from_millis(50),
+                stop_grace: std::time::Duration::from_millis(50),
+                commands: std::time::Duration::from_millis(50),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, KeyRotationError::WriterNotStopping);
+        assert!(reply.stop_token().is_cancelled());
+        assert_eq!(h.registry().with_key(|k| k.key_epoch).await, Some(1));
+        assert_eq!(writer_gate::phase(&user_id), writer_gate::Phase::Open);
+        // Cancel mapping and the still-running message.
+        let err = super::drain_writers_with(
+            &user_id,
+            WritersChoice::FinishFirst,
+            writer_gate::DrainPolicy {
+                finish_first: std::time::Duration::from_millis(50),
+                stop_grace: std::time::Duration::from_millis(50),
+                commands: std::time::Duration::from_millis(50),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err,
+            KeyRotationError::WritersStillRunning {
+                replies: 0,
+                focus_runs: 1
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_writer_wait_ends_a_waiting_rotation_and_changes_nothing() {
+        let h = Harness::new().await;
+        h.account().await;
+        let user_id = h.user_id().await;
+        let reply = writer_gate::acquire(&user_id, writer_gate::Kind::Reply).unwrap();
+        let rotate = h.change_password_choosing(PASSWORD, NEW_PASSWORD, WritersChoice::FinishFirst);
+        let cancel = async {
+            wait_for_phase(&user_id, writer_gate::Phase::Draining).await;
+            cancel_writer_wait(h.registry()).await.unwrap();
+        };
+        let (rotated, ()) = tokio::join!(rotate, cancel);
+        assert_eq!(rotated.unwrap_err(), KeyRotationError::DrainCancelled);
+        assert_eq!(writer_gate::phase(&user_id), writer_gate::Phase::Open);
+        assert_eq!(h.registry().with_key(|k| k.key_epoch).await, Some(1));
+        assert!(!reply.stop_token().is_cancelled(), "the reply carries on");
+        drop(reply);
     }
 
     // -- new-password policy (items.id=777, decisions.id=858) -----------
@@ -1518,6 +1786,46 @@ mod tests {
     // -- restore --------------------------------------------------------
 
     #[tokio::test]
+    async fn cancel_ends_a_waiting_restore_with_nobody_signed_in_and_changes_nothing() {
+        // Cancelling with no session cancels whichever wait is running, so
+        // keep the gate's own drain tests from overlapping this one.
+        let _serial = writer_gate::DRAIN_SERIAL.lock().await;
+        let h = Harness::new().await;
+        let words = h.account().await;
+        let user_id = h.user_id().await;
+        // A reply from the earlier session is still running after the lock.
+        let reply = writer_gate::acquire(&user_id, writer_gate::Kind::Reply).unwrap();
+        logout_core(h.registry(), h.groups(), h.pool(), h.app.state())
+            .await
+            .unwrap();
+        epoch_guard::clear_resident_for(&user_id);
+        assert!(h.registry().user_id().await.is_none(), "no session");
+
+        let restore = restore_with_recovery_phrase(
+            "Alice".to_owned(),
+            words.clone(),
+            NEW_PASSWORD.to_owned(),
+            WritersChoice::FinishFirst,
+            h.registry(),
+            h.groups(),
+            h.pool(),
+        );
+        let cancel = async {
+            wait_for_phase(&user_id, writer_gate::Phase::Draining).await;
+            cancel_writer_wait(h.registry()).await.unwrap();
+        };
+        let (restored, ()) = tokio::join!(restore, cancel);
+        assert_eq!(restored.unwrap_err(), KeyRotationError::DrainCancelled);
+        assert_eq!(writer_gate::phase(&user_id), writer_gate::Phase::Open);
+        assert!(!reply.stop_token().is_cancelled(), "the reply carries on");
+        drop(reply);
+
+        // Nothing changed: the old password still signs in, at the old epoch.
+        h.login(PASSWORD).await.unwrap();
+        assert_eq!(h.registry().with_key(|k| k.key_epoch).await, Some(1));
+    }
+
+    #[tokio::test]
     async fn restore_with_the_words_sets_a_new_password_and_signs_in() {
         let h = Harness::new().await;
         let words = h.account().await;
@@ -1579,6 +1887,7 @@ mod tests {
                 "Nobody".to_owned(),
                 words.clone(),
                 NEW_PASSWORD.to_owned(),
+                WritersChoice::Ask,
                 h.registry(),
                 h.groups(),
                 h.pool(),
@@ -1720,16 +2029,28 @@ mod tests {
             wrong[0].word = "abandon".to_owned();
         }
         assert_eq!(
-            confirm_new_recovery_phrase(PASSWORD.to_owned(), wrong, h.registry(), h.pool(),)
-                .await
-                .unwrap_err(),
+            confirm_new_recovery_phrase(
+                PASSWORD.to_owned(),
+                wrong,
+                WritersChoice::Ask,
+                h.registry(),
+                h.pool(),
+            )
+            .await
+            .unwrap_err(),
             KeyRotationError::ConfirmationFailed
         );
         // An incomplete answer is wrong too.
         assert_eq!(
-            confirm_new_recovery_phrase(PASSWORD.to_owned(), vec![], h.registry(), h.pool(),)
-                .await
-                .unwrap_err(),
+            confirm_new_recovery_phrase(
+                PASSWORD.to_owned(),
+                vec![],
+                WritersChoice::Ask,
+                h.registry(),
+                h.pool(),
+            )
+            .await
+            .unwrap_err(),
             KeyRotationError::ConfirmationFailed
         );
         assert_eq!(h.registry().with_key(|k| k.key_epoch).await, Some(1));
@@ -1737,6 +2058,7 @@ mod tests {
         confirm_new_recovery_phrase(
             PASSWORD.to_owned(),
             answers_for(&shown.mnemonic.to_uppercase(), &shown.confirm_positions),
+            WritersChoice::Ask,
             h.registry(),
             h.pool(),
         )
@@ -1756,9 +2078,15 @@ mod tests {
         h.restore(&shown.mnemonic, NEW_PASSWORD).await.unwrap();
         // The slot was emptied by the adoption.
         assert_eq!(
-            confirm_new_recovery_phrase(PASSWORD.to_owned(), vec![], h.registry(), h.pool(),)
-                .await
-                .unwrap_err(),
+            confirm_new_recovery_phrase(
+                PASSWORD.to_owned(),
+                vec![],
+                WritersChoice::Ask,
+                h.registry(),
+                h.pool(),
+            )
+            .await
+            .unwrap_err(),
             KeyRotationError::NoPendingPhrase
         );
     }
@@ -1784,6 +2112,7 @@ mod tests {
             confirm_new_recovery_phrase(
                 "wrong".to_owned(),
                 answers_for(&shown.mnemonic, &shown.confirm_positions),
+                WritersChoice::Ask,
                 h.registry(),
                 h.pool(),
             )
@@ -1814,16 +2143,28 @@ mod tests {
             .unwrap();
         for _ in 0..MAX_FAILED_CONFIRMATIONS {
             assert_eq!(
-                confirm_new_recovery_phrase(PASSWORD.to_owned(), vec![], h.registry(), h.pool(),)
-                    .await
-                    .unwrap_err(),
+                confirm_new_recovery_phrase(
+                    PASSWORD.to_owned(),
+                    vec![],
+                    WritersChoice::Ask,
+                    h.registry(),
+                    h.pool(),
+                )
+                .await
+                .unwrap_err(),
                 KeyRotationError::ConfirmationFailed
             );
         }
         assert_eq!(
-            confirm_new_recovery_phrase(PASSWORD.to_owned(), vec![], h.registry(), h.pool(),)
-                .await
-                .unwrap_err(),
+            confirm_new_recovery_phrase(
+                PASSWORD.to_owned(),
+                vec![],
+                WritersChoice::Ask,
+                h.registry(),
+                h.pool(),
+            )
+            .await
+            .unwrap_err(),
             KeyRotationError::NoPendingPhrase
         );
     }

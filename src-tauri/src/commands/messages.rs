@@ -391,8 +391,31 @@ pub(crate) async fn finalize_chat_reply(
     ) && !msg.content.is_empty()
         && !msg.is_error;
 
+    // items.id=778: the run was stopped for a key rotation ('Stop and save').
+    // A streamed reply's shown text was kept above; with no text the reply row
+    // is only marked stopped, so the chat can say it did not finish.
+    let stopped = matches!(result, Ok(r) if r.status == "cancelled");
+    if stopped && !kept_partial {
+        if let Err(e) = message_store::set_reply_outcome(
+            user_id,
+            persona_id,
+            key_hex,
+            run_id,
+            message_store::ReplyStatus::Cancelled,
+            None,
+        )
+        .await
+        {
+            log::warn!(
+                "finalize_chat_reply: could not mark the stopped reply of run {run_id}: {e}"
+            );
+        }
+    }
+
     let mut is_real_reply = false;
-    let content: Option<String> = if kept_partial {
+    let content: Option<String> = if kept_partial || stopped {
+        // A stopped reply with no text still files its chat in History, so the
+        // user's own message stays reachable.
         is_real_reply = true;
         None
     } else {
@@ -1121,6 +1144,53 @@ mod tests {
 
     // A placeholder that never received any text is still replaced by the
     // failure message, whatever its status: only kept text is protected.
+    // items.id=778: 'Stop and save' on a reply that had produced no text (a
+    // local reply). The run ends `cancelled`; the reply row is only marked
+    // stopped, keeps no invented text, and the chat is filed so the user's own
+    // message stays reachable.
+    #[tokio::test]
+    async fn finalize_chat_reply_marks_a_stopped_reply_and_files_the_chat() {
+        let _env = setup().await;
+        let key = key_hex_str();
+        message_store::save_message(
+            USER_ID,
+            PERSONA_ID,
+            &key,
+            "chat-stopped",
+            "user",
+            "hello",
+            None,
+        )
+        .await
+        .unwrap();
+        message_store::save_message(
+            USER_ID,
+            PERSONA_ID,
+            &key,
+            "chat-stopped",
+            "assistant",
+            "",
+            Some("run-s1"),
+        )
+        .await
+        .unwrap();
+        let mut stopped = run_result(None);
+        stopped.status = "cancelled".to_owned();
+        let outcome =
+            finalize_chat_reply(USER_ID, PERSONA_ID, &key, "run-s1", &Ok(stopped), None).await;
+
+        assert_eq!(outcome, ReplyOutcome::ChatFiled);
+        let row = message_store::find_assistant_message_by_focus_run_id(
+            USER_ID, PERSONA_ID, &key, "run-s1",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(row.reply_status, message_store::ReplyStatus::Cancelled);
+        assert_eq!(row.content, "");
+        assert!(!row.is_error);
+    }
+
     #[tokio::test]
     async fn finalize_chat_reply_still_replaces_an_empty_placeholder_with_the_failure() {
         let _env = setup().await;

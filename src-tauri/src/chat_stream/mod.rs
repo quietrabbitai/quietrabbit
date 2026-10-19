@@ -271,7 +271,27 @@ impl ChatStreamRegistry {
     /// Register a streaming run for `user_id` and return the handle the run
     /// carries.
     pub fn register(&self, user_id: &str, run_id: &str) -> ChatStream {
-        let token = CancellationToken::new();
+        self.register_with_token(user_id, run_id, CancellationToken::new())
+    }
+
+    /// `register`, with the stream's token a CHILD of `parent`: tripping the
+    /// parent (a run's writer-lease stop token, items.id=778) cancels the
+    /// stream through the same path the Stop button uses.
+    pub fn register_child_of(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        parent: &CancellationToken,
+    ) -> ChatStream {
+        self.register_with_token(user_id, run_id, parent.child_token())
+    }
+
+    fn register_with_token(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        token: CancellationToken,
+    ) -> ChatStream {
         let mut inner = self.lock();
         inner.next_generation += 1;
         let generation = inner.next_generation;
@@ -320,6 +340,24 @@ impl ChatStreamRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stream_registered_under_a_parent_is_cancelled_with_it() {
+        // items.id=778: a run's writer-lease stop token cancels its stream the
+        // way the Stop button does, and the Stop button leaves the parent alone.
+        let reg = ChatStreamRegistry::default();
+        let parent = CancellationToken::new();
+        let stream = reg.register_child_of("u", "r1", &parent);
+        assert!(!stream.token().is_cancelled());
+        parent.cancel();
+        assert!(stream.token().is_cancelled());
+
+        let parent2 = CancellationToken::new();
+        let stream2 = reg.register_child_of("u", "r2", &parent2);
+        reg.cancel("u", "r2").unwrap();
+        assert!(stream2.token().is_cancelled());
+        assert!(!parent2.is_cancelled());
+    }
 
     #[test]
     fn cancel_trips_the_owners_token_and_is_idempotent() {

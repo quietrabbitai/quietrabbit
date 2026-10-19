@@ -161,7 +161,50 @@
       "restoreInvalidCredentials": "Those words don't match this account. Check the display name and the words, then try again.",
       "rolledBackRestore": "Nothing was changed. Your recovery phrase still works.",
       "needsResumeRestore": "Your access wasn't fully restored, and nothing is lost. It will finish the next time you sign in with the password you just set, or with your recovery phrase.",
-      "cancelInvalidCredentials": "That isn't the new password or the recovery phrase for the pending change."
+      "cancelInvalidCredentials": "That isn't the new password or the recovery phrase for the pending change.",
+      "writersActive": "A reply or task is still running. Choose whether to finish it first or stop it, then try again. Nothing was changed.",
+      "writersStillRunning": "Something is still running. Nothing was changed. Try again, or wait for it to finish.",
+      "writerNotStopping": "It didn't stop in time. Nothing was changed. Close QuietRabbit, open it again, and then make the change again.",
+      "drainCancelled": "Cancelled. Nothing was changed."
+    },
+    "rotationWriters": {
+      "ask": {
+        "title": {
+          "replies": "QuietRabbit is still writing a reply.",
+          "tasks": "A task is still running.",
+          "both": "A reply and a task are still running."
+        },
+        "body": "This change re-encrypts all your data, so it can't happen while this is running. New replies and tasks are paused until you choose.",
+        "finishFirst": "Finish first",
+        "finishFirstHint": "Wait for it to finish, then make the change. Nothing is lost.",
+        "stopAndSave": "Stop and save",
+        "stopAndSaveHint": "Stop it now. Your message and any text already written are kept. A reply that hasn't started writing leaves nothing. A task that is stopped is marked cancelled; you can start it again.",
+        "cancel": "Cancel, don't make the change"
+      },
+      "waiting": {
+        "finish": "Waiting for it to finish…",
+        "stop": "Stopping and saving…",
+        "paused": "New replies and tasks are paused until this is done.",
+        "blocker": {
+          "replies": "Still running: a chat reply.",
+          "tasks": "Still running: a task.",
+          "both": "Still running: a chat reply and a task."
+        },
+        "cancel": "Cancel, don't make the change"
+      },
+      "ceiling": {
+        "title": "This is taking a long time.",
+        "bodyWork": "It is still running after 10 minutes. Nothing has been changed.",
+        "bodyOther": "Something else is still saving. Nothing has been changed.",
+        "keepWaiting": "Keep waiting",
+        "stopAndSave": "Stop and save",
+        "cancel": "Cancel, don't make the change"
+      },
+      "notStopping": {
+        "title": "It didn't stop.",
+        "body": "Nothing was changed. Close QuietRabbit, open it again, and then make the change again.",
+        "ok": "OK"
+      }
     }
   },
   "navShell": {

@@ -464,7 +464,7 @@ export const commands = {
 	 *  The recovery phrase is unchanged and stays valid. Returns when the change is
 	 *  complete (or has failed); progress arrives as `task-progress` events.
 	 */
-	changePassword: (oldPassword: string, newPassword: string) => typedError<null, KeyRotationError>(__TAURI_INVOKE("change_password", { oldPassword, newPassword })),
+	changePassword: (oldPassword: string, newPassword: string, writers: WritersChoice) => typedError<null, KeyRotationError>(__TAURI_INVOKE("change_password", { oldPassword, newPassword, writers })),
 	/**
 	 *  Start creating a new recovery phrase: re-verifies the password, generates
 	 *  fresh recovery entropy, keeps it in memory only, and returns the 24 words
@@ -482,7 +482,7 @@ export const commands = {
 	 *  data key changes, the password stays, and the old words stop working. Asks
 	 *  for the password again (it is not held in memory in between).
 	 */
-	confirmNewRecoveryPhrase: (password: string, answers: WordAnswer[]) => typedError<null, KeyRotationError>(__TAURI_INVOKE("confirm_new_recovery_phrase", { password, answers })),
+	confirmNewRecoveryPhrase: (password: string, answers: WordAnswer[], writers: WritersChoice) => typedError<null, KeyRotationError>(__TAURI_INVOKE("confirm_new_recovery_phrase", { password, answers, writers })),
 	/**
 	 *  Forgot the password: sign in with the 24 recovery words and set a new
 	 *  password. The words unseal the data key, the data key is rotated exactly as
@@ -490,7 +490,7 @@ export const commands = {
 	 *  not change. If a change was interrupted earlier, this is also the way to
 	 *  finish it with the words.
 	 */
-	restoreWithRecoveryPhrase: (displayName: string, phrase: string, newPassword: string) => typedError<null, KeyRotationError>(__TAURI_INVOKE("restore_with_recovery_phrase", { displayName, phrase, newPassword })),
+	restoreWithRecoveryPhrase: (displayName: string, phrase: string, newPassword: string, writers: WritersChoice) => typedError<null, KeyRotationError>(__TAURI_INVOKE("restore_with_recovery_phrase", { displayName, phrase, newPassword, writers })),
 	/**
 	 *  Cancel an interrupted password change, restore or new-phrase rotation by
 	 *  typing the NEW password (for a new-phrase rotation, the account password).
@@ -504,6 +504,18 @@ export const commands = {
 	 *  new-phrase rotation, the NEW words). Same outcome as the password form.
 	 */
 	cancelInterruptedRotationWithPhrase: (displayName: string, phrase: string) => typedError<null, KeyRotationError>(__TAURI_INVOKE("cancel_interrupted_rotation_with_phrase", { displayName, phrase })),
+	/**
+	 *  Cancel the wait of a rotation that is waiting for running work (the Cancel
+	 *  button on the waiting screen). Nothing is changed: the waiting call returns
+	 *  `drain_cancelled`, the gate reopens and the running work carries on. A
+	 *  no-op when no wait is under way. Exempt from the drain (it never takes a
+	 *  lease), so a closed gate cannot block it.
+	 * 
+	 *  SESSIONLESS: the restore screen waits with nobody signed in, so this needs
+	 *  no session. It cancels the signed-in account's wait if there is one, and
+	 *  otherwise the wait that is running. It carries no data and reveals nothing.
+	 */
+	cancelWriterWait: () => typedError<null, KeyRotationError>(__TAURI_INVOKE("cancel_writer_wait")),
 	/**
 	 *  Where a rotation stands. Safe to poll; reads no secret. Without a session
 	 *  there is nothing to report beyond whether this process is rotating and how
@@ -1535,8 +1547,30 @@ export type KeyRotationError =
 { code: "phrase_invalid" } | 
 /**  A rotation is already running, or one is pending that must finish first. */
 { code: "rotation_in_progress" } | 
-/**  Tasks are still running; wait for them or cancel them. */
+/**
+ *  Tasks are still running; wait for them or cancel them. The engine's own
+ *  last-moment check; the drain normally answers with the codes below.
+ */
 { code: "active_runs"; count: number } | 
+/**
+ *  A chat reply or Focus run is running and no choice was made yet
+ *  (items.id=778). Nothing was changed. The caller asks the user whether
+ *  to finish first or stop and save, and calls again with the answer.
+ */
+{ code: "writers_active"; replies: number; focus_runs: number } | 
+/**
+ *  The wait for running work reached its ceiling (10 minutes for 'finish
+ *  first', 30 seconds for short operations). Nothing was changed. The
+ *  counts say what is still running.
+ */
+{ code: "writers_still_running"; replies: number; focus_runs: number } | 
+/**
+ *  'Stop and save' was chosen and the work had not stopped after 60
+ *  seconds. Nothing was changed and nothing was killed.
+ */
+{ code: "writer_not_stopping" } | 
+/**  The user cancelled the wait. Nothing was changed. */
+{ code: "drain_cancelled" } | 
 /**  Another part of the app (or another window) is using the data right now. */
 { code: "busy" } | { code: "insufficient_space"; needed_mb: number; available_mb: number } | { code: "free_space_unknown" } | 
 /**  A file this app does not recognise is in the account's data. */
@@ -2683,6 +2717,13 @@ export type WordAnswer = {
 	position: number,
 	word: string,
 };
+
+/**
+ *  What the user chose when a chat reply or Focus run was running
+ *  (items.id=778, decisions.id=896). `ask` is the first call: it changes
+ *  nothing and reports what is running.
+ */
+export type WritersChoice = "ask" | "finish_first" | "stop_and_save";
 
 /**
  *  items.id=364: a pane's own Ctrl+=/Ctrl+-/Ctrl+0 shortcuts, intercepted by

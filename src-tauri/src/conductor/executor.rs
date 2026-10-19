@@ -212,6 +212,12 @@ pub struct StepContext {
     /// stream (API Chat). None (every other run) = whole-body calls, exactly
     /// as before. Ignored by a local (Ollama) step.
     pub stream: Option<crate::chat_stream::ChatStream>,
+    /// items.id=778: tripped when the user chose 'Stop and save' for a key
+    /// rotation. A whole-body model call (local, or hosted without streaming)
+    /// is raced against it and ends the step; a streamed call stops through
+    /// `stream`, whose token is a child of this one. None = never stopped
+    /// (tests, runs without a lease).
+    pub stop: Option<tokio_util::sync::CancellationToken>,
     /// items.id=716: Some when this run belongs to an API conversation bound to
     /// one provider and model. The run then uses exactly that destination (the
     /// user's preference is not consulted) through the same consent, limits,
@@ -739,50 +745,64 @@ impl StepExecutor {
         };
         let mut stream_tail = StreamTail::default();
 
-        let generate_result: Result<_, ConductorError> = if hosted_step {
-            // Step 4.5 above already guarantees qr_hosted_provider_preference is
-            // Some(...) at this point -- no silent fallback to any default
-            // provider for a None preference (matches select_model()'s
-            // policy). The provider row, model row and the user's stored
-            // key become one CallContext (items.id=709); a provider id with
-            // no row is a real ConductorError, not a panic. The spend gate
-            // (items.id=710) runs between building that context and the
-            // network call.
-            match (
-                ctx.qr_hosted_provider_preference.as_deref(),
-                selected_model.hosted_model.as_ref(),
-            ) {
-                (Some(provider_id), Some(model)) => {
-                    let parts = match (&ctx.stream, stream_sink.as_deref()) {
-                        (Some(handle), Some(sink)) => Some(StreamParts {
-                            sink,
-                            cancel: handle.token(),
-                            tail: &mut stream_tail,
-                        }),
-                        _ => None,
-                    };
-                    hosted_step_call(
-                        hosted_client(),
-                        pool,
-                        ctx,
-                        provider_id,
-                        model,
-                        &request,
-                        &chrono::Local,
-                        HostedInputs::build_call,
-                        parts,
-                    )
-                    .await
-                }
-                _ => unreachable!(
-                    "effective_access != LocalOnly with no qr_hosted_provider_preference \
+        // items.id=778: a whole-body call has no partial text to keep, so a
+        // stop simply ends the step. A streamed call is stopped through its
+        // own token (a child of ctx.stop) and keeps what was shown.
+        let race_stop = ctx.stop.clone().filter(|_| !step_streams(ctx));
+        let generate_future = async {
+            if hosted_step {
+                // Step 4.5 above already guarantees qr_hosted_provider_preference is
+                // Some(...) at this point -- no silent fallback to any default
+                // provider for a None preference (matches select_model()'s
+                // policy). The provider row, model row and the user's stored
+                // key become one CallContext (items.id=709); a provider id with
+                // no row is a real ConductorError, not a panic. The spend gate
+                // (items.id=710) runs between building that context and the
+                // network call.
+                match (
+                    ctx.qr_hosted_provider_preference.as_deref(),
+                    selected_model.hosted_model.as_ref(),
+                ) {
+                    (Some(provider_id), Some(model)) => {
+                        let parts = match (&ctx.stream, stream_sink.as_deref()) {
+                            (Some(handle), Some(sink)) => Some(StreamParts {
+                                sink,
+                                cancel: handle.token(),
+                                tail: &mut stream_tail,
+                            }),
+                            _ => None,
+                        };
+                        hosted_step_call(
+                            hosted_client(),
+                            pool,
+                            ctx,
+                            provider_id,
+                            model,
+                            &request,
+                            &chrono::Local,
+                            HostedInputs::build_call,
+                            parts,
+                        )
+                        .await
+                    }
+                    _ => unreachable!(
+                        "effective_access != LocalOnly with no qr_hosted_provider_preference \
                      or no resolved model -- the Step 4.5 guard and select_model() must \
                      already have short-circuited"
-                ),
+                    ),
+                }
+            } else {
+                ollama_client().generate(&request).await
             }
-        } else {
-            ollama_client().generate(&request).await
         };
+        let Some(generate_result) = until_stopped(race_stop.as_ref(), generate_future).await else {
+            // Release the inference slot, then end the step. The run's owner
+            // (lifecycle) sees the stop and cancels the run; this failure is
+            // never shown or retried.
+            scheduler.release_inference_slot(&ctx.focus_run_id);
+            return Ok(Some(stopped_failure(ctx)));
+        };
+        let generate_result: Result<_, ConductorError> = generate_result;
 
         // Python oracle: finally block — always release regardless of generate result.
         scheduler.release_inference_slot(&ctx.focus_run_id);
@@ -1658,6 +1678,40 @@ async fn reply_gate2<L: DisclosureLogger>(
         ),
     }
     outcome
+}
+
+/// Run `fut` unless `stop` is tripped first: `None` means it was stopped (the
+/// future is dropped, which abandons the HTTP request; nothing it had not
+/// already returned is kept). With no token it simply awaits (items.id=778).
+async fn until_stopped<T>(
+    stop: Option<&tokio_util::sync::CancellationToken>,
+    fut: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    match stop {
+        Some(stop) => {
+            tokio::select! {
+                result = fut => Some(result),
+                () = stop.cancelled() => None,
+            }
+        }
+        None => Some(fut.await),
+    }
+}
+
+/// The failure a step returns when the user chose 'Stop and save' for a key
+/// rotation (items.id=778). It is never shown, retried or parked: the run's
+/// lifecycle sees the stop token and cancels the run itself.
+fn stopped_failure(ctx: &StepContext) -> FailureResult {
+    FailureResult {
+        action: FailureAction::Stop,
+        failure_mode: Some("USER_STOP".to_owned()),
+        plain_language: "This was stopped because the account's keys are being changed.".to_owned(),
+        is_recoverable: false,
+        severity: FailureSeverity::Stop,
+        step_id: Some(ctx.step.step_id.clone()),
+        focus_id: Some(ctx.focus_id.clone()),
+        metadata: None,
+    }
 }
 
 /// A streamed reply that was cancelled or cut keeps the text the user was
@@ -3203,6 +3257,7 @@ mod tests {
         .unwrap();
         pt.seal();
         let ctx = StepContext {
+            stop: None,
             step: StepDefinition {
                 step_id: "s1".to_owned(),
                 display_name: "Step 1".to_owned(),
@@ -3265,6 +3320,7 @@ mod tests {
         .unwrap();
         pt.seal();
         let ctx = StepContext {
+            stop: None,
             step: StepDefinition {
                 step_id: "s1".to_owned(),
                 display_name: "Step 1".to_owned(),
@@ -3313,6 +3369,7 @@ mod tests {
         use crate::conductor::tokens::{StepDefinition, StepType};
         let pt = PersonalTrack::new();
         let ctx = StepContext {
+            stop: None,
             step: StepDefinition {
                 step_id: "s1".to_owned(),
                 display_name: "Step 1".to_owned(),
@@ -3373,6 +3430,7 @@ mod tests {
     fn hosted_ctx(attendance: RunAttendance, key_hex: &str) -> StepContext {
         use crate::conductor::tokens::{StepDefinition, StepType};
         StepContext {
+            stop: None,
             step: StepDefinition {
                 step_id: "s1".to_owned(),
                 display_name: "Step 1".to_owned(),
@@ -5308,5 +5366,30 @@ mod tests {
             assert!(helper.contains(".gate2("));
             assert!(production.contains("let g2 = reply_gate2("));
         }
+    }
+
+    // -- items.id=778: Stop and save ----------------------------------------
+
+    #[tokio::test]
+    async fn a_call_is_dropped_when_the_stop_is_tripped() {
+        let stop = tokio_util::sync::CancellationToken::new();
+        let waiting = until_stopped(Some(&stop), std::future::pending::<u8>());
+        stop.cancel();
+        assert_eq!(waiting.await, None);
+    }
+
+    #[tokio::test]
+    async fn a_call_that_finishes_first_keeps_its_result_and_no_token_just_awaits() {
+        let stop = tokio_util::sync::CancellationToken::new();
+        assert_eq!(until_stopped(Some(&stop), async { 7u8 }).await, Some(7));
+        assert_eq!(until_stopped(None, async { 9u8 }).await, Some(9));
+    }
+
+    #[test]
+    fn a_stopped_step_fails_with_a_stop_the_lifecycle_turns_into_a_cancel() {
+        let f = stopped_failure(&hosted_ctx(RunAttendance::Attended, "k"));
+        assert_eq!(f.action, FailureAction::Stop);
+        assert_eq!(f.failure_mode.as_deref(), Some("USER_STOP"));
+        assert!(!f.is_recoverable);
     }
 }

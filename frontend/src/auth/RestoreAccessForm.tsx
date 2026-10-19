@@ -6,6 +6,11 @@
 // finishSignIn. If a change was interrupted earlier, the same call finishes it
 // with the words and the account ends on the password typed here.
 //
+// Before the rotation starts, the backend drains any running chat reply or
+// Focus run (items.id=778): useWritersFlow shows the finish-or-stop prompt and
+// repeats the call with the answer, holding what was typed only while the
+// prompt is up (dropped on cancel, on error and on completion).
+//
 // The typed phrase and both passwords are cleared as soon as the form is
 // submitted, and are never stored or logged.
 
@@ -20,6 +25,8 @@ import { validateNewPassword } from './passwordRules'
 import { joinWords, looksLikePhrase, PHRASE_WORD_COUNT, splitWords } from './recoveryWords'
 import { RotationErrorText } from './RotationErrorText'
 import { beginRotationTask } from './rotationTask'
+import { useWritersFlow } from './useWritersFlow'
+import { WritersPrompt } from './WritersPrompt'
 
 export interface RestoreAccessFormProps {
   initialDisplayName: string
@@ -39,6 +46,25 @@ export function RestoreAccessForm({ initialDisplayName, onLoggedIn, onBack }: Re
   const [submitting, setSubmitting] = useState(false)
 
   const wordCount = splitWords(phrase).length
+
+  const flow = useWritersFlow(({ result }) => {
+    setSubmitting(false)
+    if (result === null) return // cancelled: nothing was changed
+    if (result.status !== 'ok') {
+      setError(result.error)
+      return
+    }
+    void (async () => {
+      const finished = await finishSignIn()
+      if (finished.status === 'ok') {
+        onLoggedIn()
+      } else if (finished.status === 'sessionMissing') {
+        setSessionProblem(t('auth.sessionMissingAfterLogin'))
+      } else {
+        setSessionProblem(finished.message)
+      }
+    })()
+  })
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -70,32 +96,22 @@ export function RestoreAccessForm({ initialDisplayName, onLoggedIn, onBack }: Re
     }
 
     setSubmitting(true)
-    const release = beginRotationTask('restore')
-    let result: Awaited<ReturnType<typeof commands.restoreWithRecoveryPhrase>>
-    try {
-      result = await commands.restoreWithRecoveryPhrase(
-        displayName,
-        joinWords(submittedPhrase),
-        submittedNext,
-      )
-    } catch {
-      result = { status: 'error', error: { code: 'internal' } }
-    } finally {
-      release()
-      setSubmitting(false)
-    }
-    if (result.status !== 'ok') {
-      setError(result.error)
-      return
-    }
-    const finished = await finishSignIn()
-    if (finished.status === 'ok') {
-      onLoggedIn()
-    } else if (finished.status === 'sessionMissing') {
-      setSessionProblem(t('auth.sessionMissingAfterLogin'))
-    } else {
-      setSessionProblem(finished.message)
-    }
+    flow.begin(
+      (writers) =>
+        commands.restoreWithRecoveryPhrase(displayName, joinWords(submittedPhrase), submittedNext, writers),
+      beginRotationTask('restore'),
+    )
+  }
+
+  if (flow.state.kind !== 'idle') {
+    return (
+      <WritersPrompt
+        state={flow.state}
+        onChoose={flow.choose}
+        onCancel={flow.cancel}
+        onDismiss={flow.dismiss}
+      />
+    )
   }
 
   return (

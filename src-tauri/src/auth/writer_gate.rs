@@ -61,6 +61,16 @@ use crate::auth::registry::KeyRegistry;
 /// turns the give-up into the Cancel / Keep waiting choice).
 pub const COMMAND_DRAIN_CEILING: Duration = Duration::from_secs(30);
 
+/// How long 'Finish first' waits for a chat reply or Focus run before the wait
+/// ends with a message offering 'Stop and save' or 'Keep waiting' (Jason's
+/// ruling, items.id=778). 'Keep waiting' starts the ceiling again.
+pub const FINISH_FIRST_CEILING: Duration = Duration::from_secs(10 * 60);
+
+/// How long 'Stop and save' waits for the stopped work to actually end before
+/// it tells the user nothing was changed. Stopping is cooperative; nothing is
+/// ever force-killed.
+pub const STOP_GRACE: Duration = Duration::from_secs(60);
+
 /// What a lease is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Kind {
@@ -407,6 +417,213 @@ impl Drop for DrainGuard {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The drain a rotation runs before it starts
+// ---------------------------------------------------------------------------
+
+/// What the user chose when a rotation found a chat reply or Focus run
+/// running. Nothing is cancelled without this choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Choice {
+    /// No choice made yet: report what is running and change nothing.
+    Ask,
+    /// Wait for the work to end, then rotate.
+    FinishFirst,
+    /// Stop the work cooperatively (a reply is saved as stopped, a Focus run
+    /// is marked cancelled), then rotate.
+    StopAndSave,
+}
+
+/// The waits of a drain. `Default` is the ruled constants; tests shorten them.
+#[derive(Debug, Clone, Copy)]
+pub struct DrainPolicy {
+    pub finish_first: Duration,
+    pub stop_grace: Duration,
+    pub commands: Duration,
+}
+
+impl Default for DrainPolicy {
+    fn default() -> Self {
+        Self {
+            finish_first: FINISH_FIRST_CEILING,
+            stop_grace: STOP_GRACE,
+            commands: COMMAND_DRAIN_CEILING,
+        }
+    }
+}
+
+/// Why a drain did not produce a closed gate. In every case nothing was
+/// changed and the gate is open again.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum DrainError {
+    #[error(transparent)]
+    Gate(#[from] GateError),
+    /// Visible work is running and the user has not chosen yet.
+    #[error("{replies} reply(ies) and {focus_runs} Focus run(s) are running")]
+    WritersActive { replies: usize, focus_runs: usize },
+    /// The wait reached its ceiling. The counts are what was still running.
+    #[error("{replies} reply(ies) and {focus_runs} Focus run(s) are still running")]
+    StillRunning { replies: usize, focus_runs: usize },
+    /// 'Stop and save' was asked and the work had not stopped after the grace.
+    #[error("the running work did not stop in time")]
+    NotStopping,
+    /// The user pressed Cancel during the wait.
+    #[error("the wait was cancelled")]
+    Cancelled,
+}
+
+static WAITS: Mutex<BTreeMap<String, (u64, CancellationToken)>> = Mutex::new(BTreeMap::new());
+static WAIT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn waits() -> MutexGuard<'static, BTreeMap<String, (u64, CancellationToken)>> {
+    WAITS.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Registers a drain's Cancel token for its user; removes it on drop.
+struct WaitRegistration {
+    user_id: String,
+    generation: u64,
+    token: CancellationToken,
+}
+
+impl WaitRegistration {
+    fn new(user_id: &str) -> Self {
+        let generation = WAIT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let token = CancellationToken::new();
+        waits().insert(user_id.to_owned(), (generation, token.clone()));
+        Self {
+            user_id: user_id.to_owned(),
+            generation,
+            token,
+        }
+    }
+}
+
+impl Drop for WaitRegistration {
+    fn drop(&mut self) {
+        let mut w = waits();
+        // Only our own entry: a newer drain for the same user keeps its token.
+        if w.get(&self.user_id)
+            .is_some_and(|(g, _)| *g == self.generation)
+        {
+            w.remove(&self.user_id);
+        }
+    }
+}
+
+/// Cancel the wait of the drain running for `user_id`, if any. The waiting
+/// call returns `DrainError::Cancelled`, the gate reopens and nothing changes.
+pub fn cancel_wait(user_id: &str) -> bool {
+    match waits().get(user_id) {
+        Some((_, token)) => {
+            token.cancel();
+            true
+        }
+        None => false,
+    }
+}
+
+/// Cancel the wait that is under way, whichever account it belongs to. For the
+/// restore screen, where nobody is signed in so there is no session to name
+/// the account: cancel the wait of `resident_user` if it has one, otherwise
+/// every registered wait (at most one is ever running; a drain is per
+/// account but only one rotation runs per process). Returns whether any wait
+/// was cancelled.
+pub fn cancel_any_wait(resident_user: Option<&str>) -> bool {
+    if let Some(user) = resident_user {
+        if cancel_wait(user) {
+            return true;
+        }
+    }
+    let waits = waits();
+    for (_, token) in waits.values() {
+        token.cancel();
+    }
+    !waits.is_empty()
+}
+
+enum WaitEnd {
+    Done,
+    Timeout,
+    Cancelled,
+}
+
+async fn visible_idle_or(
+    guard: &DrainGuard,
+    cancel: &CancellationToken,
+    limit: Duration,
+) -> WaitEnd {
+    tokio::select! {
+        () = guard.wait_visible_idle() => WaitEnd::Done,
+        () = tokio::time::sleep(limit) => WaitEnd::Timeout,
+        () = cancel.cancelled() => WaitEnd::Cancelled,
+    }
+}
+
+/// Drain `user_id`'s writers and close the gate, following the user's choice
+/// (decisions.id=896 points 2 and 3). On `Ok` the returned guard keeps the
+/// gate closed; dropping it reopens. On `Err` nothing was changed.
+pub async fn drain_for_rotation(
+    user_id: &str,
+    choice: Choice,
+    policy: DrainPolicy,
+) -> Result<DrainGuard, DrainError> {
+    let drain = begin_drain(user_id)?;
+    let registration = WaitRegistration::new(user_id);
+    let cancel = &registration.token;
+
+    let running = drain.counts();
+    if running.visible() > 0 {
+        match choice {
+            Choice::Ask => {
+                return Err(DrainError::WritersActive {
+                    replies: running.replies,
+                    focus_runs: running.focus_runs,
+                })
+            }
+            Choice::FinishFirst => {
+                match visible_idle_or(&drain, cancel, policy.finish_first).await {
+                    WaitEnd::Done => {}
+                    WaitEnd::Cancelled => return Err(DrainError::Cancelled),
+                    WaitEnd::Timeout => {
+                        let now = drain.counts();
+                        return Err(DrainError::StillRunning {
+                            replies: now.replies,
+                            focus_runs: now.focus_runs,
+                        });
+                    }
+                }
+            }
+            Choice::StopAndSave => {
+                drain.request_stop();
+                match visible_idle_or(&drain, cancel, policy.stop_grace).await {
+                    WaitEnd::Done => {}
+                    WaitEnd::Cancelled => return Err(DrainError::Cancelled),
+                    WaitEnd::Timeout => return Err(DrainError::NotStopping),
+                }
+            }
+        }
+    }
+
+    // Visible work is gone; close the gate and wait for short work.
+    let closing = drain.close(policy.commands);
+    tokio::select! {
+        closed = closing => match closed {
+            Ok(()) => {}
+            Err(GateError::VisibleWork(_)) | Err(GateError::StillBusy(_)) => {
+                let now = drain.counts();
+                return Err(DrainError::StillRunning {
+                    replies: now.replies,
+                    focus_runs: now.focus_runs,
+                });
+            }
+            Err(other) => return Err(DrainError::Gate(other)),
+        },
+        () = cancel.cancelled() => return Err(DrainError::Cancelled),
+    }
+    Ok(drain)
+}
+
 /// Re-check `cond` on every gate change. Registers for the wake-up BEFORE
 /// checking, so a release between the check and the await is not missed.
 async fn wait_until(mut cond: impl FnMut() -> bool) {
@@ -420,6 +637,11 @@ async fn wait_until(mut cond: impl FnMut() -> bool) {
         notified.await;
     }
 }
+
+/// The wait registry is process-global and `cancel_any_wait` cancels every
+/// wait, so tests that drain or cancel a wait run one at a time.
+#[cfg(test)]
+pub(crate) static DRAIN_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
 mod tests {
@@ -670,6 +892,10 @@ mod tests {
         (
             "key_rotation::get_rotation_status",
             "the status read must never be blocked by the drain it reports on (items.id=778 ruling)",
+        ),
+        (
+            "key_rotation::cancel_writer_wait",
+            "cancels a drain's wait; it must work while the gate is closed (items.id=778 ruling)",
         ),
         (
             "chat_stream::cancel_chat_stream",
@@ -989,6 +1215,195 @@ mod tests {
             bad.is_empty(),
             "a pool is built over an encrypted database: {bad:?}"
         );
+    }
+
+    // -- the drain policy (Jason's stuck-writer ruling, items.id=778) ------
+
+    fn quick() -> DrainPolicy {
+        DrainPolicy::default()
+    }
+
+    #[tokio::test]
+    async fn ask_reports_what_runs_and_changes_nothing() {
+        let _serial = DRAIN_SERIAL.lock().await;
+        let u = "drain-ask";
+        let _reply = acquire(u, Kind::Reply).unwrap();
+        let _run = acquire(u, Kind::FocusRun).unwrap();
+        let err = drain_for_rotation(u, Choice::Ask, quick())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            DrainError::WritersActive {
+                replies: 1,
+                focus_runs: 1
+            }
+        );
+        assert_eq!(phase(u), Phase::Open, "the gate is open again");
+        assert!(!_reply.stop_token().is_cancelled(), "nothing was stopped");
+    }
+
+    #[tokio::test]
+    async fn with_nothing_running_the_gate_closes_whatever_the_choice() {
+        let _serial = DRAIN_SERIAL.lock().await;
+        for (i, choice) in [Choice::Ask, Choice::FinishFirst, Choice::StopAndSave]
+            .into_iter()
+            .enumerate()
+        {
+            let u = format!("drain-idle-{i}");
+            let guard = drain_for_rotation(&u, choice, quick()).await.unwrap();
+            assert_eq!(phase(&u), Phase::Closed);
+            drop(guard);
+            assert_eq!(phase(&u), Phase::Open);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn finish_first_waits_for_the_reply_and_refuses_new_work_meanwhile() {
+        let _serial = DRAIN_SERIAL.lock().await;
+        let u = "drain-finish";
+        let reply = acquire(u, Kind::Reply).unwrap();
+        let waiting = tokio::spawn(async move {
+            drain_for_rotation(u, Choice::FinishFirst, DrainPolicy::default()).await
+        });
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(!waiting.is_finished());
+        // While the gate waits no new reply may start.
+        assert_eq!(acquire(u, Kind::Reply).unwrap_err(), GateError::Rotating);
+        drop(reply);
+        let guard = waiting.await.unwrap().unwrap();
+        assert_eq!(phase(u), Phase::Closed);
+        drop(guard);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn finish_first_ends_at_the_ceiling_and_keep_waiting_starts_it_again() {
+        let _serial = DRAIN_SERIAL.lock().await;
+        let u = "drain-ceiling";
+        let reply = acquire(u, Kind::Reply).unwrap();
+        let err = drain_for_rotation(u, Choice::FinishFirst, DrainPolicy::default())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            DrainError::StillRunning {
+                replies: 1,
+                focus_runs: 0
+            }
+        );
+        assert_eq!(
+            phase(u),
+            Phase::Open,
+            "nothing changed and the gate is open"
+        );
+        // 'Keep waiting' is the same call again, with a fresh ceiling.
+        let again = tokio::spawn(async move {
+            drain_for_rotation(u, Choice::FinishFirst, DrainPolicy::default()).await
+        });
+        tokio::time::sleep(FINISH_FIRST_CEILING - Duration::from_secs(1)).await;
+        assert!(!again.is_finished(), "the ceiling restarted");
+        drop(reply);
+        again.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_during_the_wait_changes_nothing_and_reopens_the_gate() {
+        let _serial = DRAIN_SERIAL.lock().await;
+        let u = "drain-cancel";
+        let reply = acquire(u, Kind::FocusRun).unwrap();
+        let waiting = tokio::spawn(async move {
+            drain_for_rotation(u, Choice::FinishFirst, DrainPolicy::default()).await
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(phase(u), Phase::Draining);
+        assert!(cancel_wait(u));
+        assert_eq!(waiting.await.unwrap().unwrap_err(), DrainError::Cancelled);
+        assert_eq!(phase(u), Phase::Open);
+        assert!(
+            !reply.stop_token().is_cancelled(),
+            "the work was not stopped"
+        );
+        assert!(!cancel_wait(u), "no wait is left to cancel");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_and_save_trips_the_stop_and_proceeds_when_the_work_ends() {
+        let _serial = DRAIN_SERIAL.lock().await;
+        let u = "drain-stop";
+        let reply = acquire(u, Kind::Reply).unwrap();
+        let stop = reply.stop_token().clone();
+        // A cooperative writer: ends when told to stop.
+        let writer = tokio::spawn(async move {
+            stop.cancelled().await;
+            drop(reply);
+        });
+        let guard = drain_for_rotation(u, Choice::StopAndSave, DrainPolicy::default())
+            .await
+            .unwrap();
+        writer.await.unwrap();
+        assert_eq!(phase(u), Phase::Closed);
+        drop(guard);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_and_save_reports_work_that_will_not_stop_and_never_force_kills() {
+        let _serial = DRAIN_SERIAL.lock().await;
+        let u = "drain-not-stopping";
+        let reply = acquire(u, Kind::Reply).unwrap();
+        let err = drain_for_rotation(u, Choice::StopAndSave, DrainPolicy::default())
+            .await
+            .unwrap_err();
+        assert_eq!(err, DrainError::NotStopping);
+        assert_eq!(phase(u), Phase::Open);
+        assert!(reply.stop_token().is_cancelled(), "it was asked to stop");
+        // Still held: nothing killed it.
+        assert_eq!(counts(u).replies, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_command_ends_the_wait_with_a_message_after_the_command_ceiling() {
+        let _serial = DRAIN_SERIAL.lock().await;
+        let u = "drain-straggler";
+        let _cmd = acquire(u, Kind::Command).unwrap();
+        let err = drain_for_rotation(u, Choice::FinishFirst, DrainPolicy::default())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            DrainError::StillRunning {
+                replies: 0,
+                focus_runs: 0
+            }
+        );
+        assert_eq!(phase(u), Phase::Open);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_any_wait_needs_no_session() {
+        let _serial = DRAIN_SERIAL.lock().await;
+        let u = "drain-sessionless";
+        let _reply = acquire(u, Kind::Reply).unwrap();
+        let waiting = tokio::spawn(async move {
+            drain_for_rotation(u, Choice::FinishFirst, DrainPolicy::default()).await
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Nobody signed in: no user to name, the running wait is cancelled.
+        assert!(cancel_any_wait(None));
+        assert_eq!(waiting.await.unwrap().unwrap_err(), DrainError::Cancelled);
+        assert!(!cancel_any_wait(None), "nothing left to cancel");
+    }
+
+    #[tokio::test]
+    async fn a_closed_gate_never_blocks_the_exempt_operations() {
+        let _serial = DRAIN_SERIAL.lock().await;
+        // The exempt commands never take a lease, so a Closed gate cannot
+        // refuse them: cancel_wait and the status read only look at the gate.
+        let u = "drain-exempt";
+        let guard = drain_for_rotation(u, Choice::Ask, quick()).await.unwrap();
+        assert_eq!(phase(u), Phase::Closed);
+        assert!(!cancel_wait(u));
+        assert_eq!(counts(u).total(), 0);
+        drop(guard);
     }
 
     #[tokio::test]

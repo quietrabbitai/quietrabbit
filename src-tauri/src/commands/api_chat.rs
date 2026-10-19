@@ -569,7 +569,12 @@ pub async fn send_api_chat_message(
         .ok_or_else(|| "run_id not set after authorize".to_string())?;
     // Streamed, with a cancel token the caller reaches through
     // cancel_chat_stream (items.id=715).
-    run.chat_stream = Some(chat_registry.register(&user_id, &run_id));
+    // A 'Stop and save' for a key rotation (items.id=778) trips the lease's
+    // token, which cancels the stream like the Stop button does.
+    run.chat_stream = Some(match run.lease.as_ref() {
+        Some(lease) => chat_registry.register_child_of(&user_id, &run_id, lease.stop_token()),
+        None => chat_registry.register(&user_id, &run_id),
+    });
 
     let messages = start_reply(
         run,
