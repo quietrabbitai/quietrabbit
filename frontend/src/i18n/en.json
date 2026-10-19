@@ -176,7 +176,7 @@
         },
         "body": "This change re-encrypts all your data, so it can't happen while this is running. New replies and tasks are paused until you choose.",
         "finishFirst": "Finish first",
-        "finishFirstHint": "Wait for it to finish, then make the change. Nothing is lost.",
+        "finishFirstHint": "Wait for it to finish, then make the change. Nothing is stopped.",
         "stopAndSave": "Stop and save",
         "stopAndSaveHint": "Stop it now. Your message and any text already written are kept. If it hasn't started writing yet, nothing is saved from it. A task that is stopped is marked cancelled; you can start it again.",
         "cancel": "Cancel, don't make the change"
