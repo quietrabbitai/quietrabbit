@@ -48,16 +48,19 @@ pub async fn run_periodic_sweep(
     scheduler: &Arc<ConductorScheduler>,
     app_handle: Option<tauri::AppHandle<tauri::Wry>>,
 ) {
-    // items.id=630: no scheduled or background work while this process is
-    // rotating the account's data key (decisions.id=847).
-    if crate::auth::epoch_guard::is_rotating() {
-        return;
-    }
     let Some((user_id, key_hex_str)) = key_registry
         .with_key(|k| (k.user_id.clone(), key_hex(&k.data_key)))
         .await
     else {
         return; // no account resident -- nothing this tick can check against
+    };
+    // items.id=630, items.id=778: no scheduled or background work while this
+    // process is rotating the account's data key (decisions.id=847). The tick
+    // holds a sweep lease; a rotation under way or being prepared refuses it.
+    let Ok(_sweep_lease) =
+        crate::auth::writer_gate::acquire(&user_id, crate::auth::writer_gate::Kind::Sweep)
+    else {
+        return;
     };
 
     let personas = match list_personas_for_user(pool, &user_id).await {
@@ -104,6 +107,15 @@ pub async fn run_periodic_sweep(
         };
 
         for focus_run_id in due {
+            // items.id=778: each resumed run is a Focus run of its own, so a
+            // rotation can count it, wait for it, or stop it. Refused means a
+            // rotation is being prepared: leave the rest for the next tick.
+            let Ok(run_lease) = crate::auth::writer_gate::acquire(
+                &user_id,
+                crate::auth::writer_gate::Kind::FocusRun,
+            ) else {
+                return;
+            };
             let result: Result<FocusRun, _> = rehydrate_focus_run(
                 user_id.clone(),
                 persona.id.clone(),
@@ -135,6 +147,7 @@ pub async fn run_periodic_sweep(
                 }
             };
 
+            run.lease = Some(run_lease);
             let result = run.resume_execution().await;
             if let Err(e) = &result {
                 log::warn!(

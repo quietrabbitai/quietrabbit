@@ -487,6 +487,7 @@ pub async fn list_provider_models(
     key_registry: State<'_, KeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<ProviderModelsView, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let (user_id, key_hex_str) = session(&key_registry).await?;
     let cat = load_catalog(&pool, &provider_id).await?;
     let stored = prefs::resolve_model_selection(
@@ -583,6 +584,7 @@ pub async fn refresh_available_models(
     key_registry: State<'_, KeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<RefreshResultDto, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let (user_id, key_hex_str) = session(&key_registry).await?;
     let cat = load_catalog(&pool, &provider_id).await?;
     let key = integration_keys_store::get_active_key(
@@ -689,6 +691,7 @@ pub async fn set_model_selection(
     key_registry: State<'_, KeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<(), String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let (user_id, key_hex_str) = session(&key_registry).await?;
     let cat = load_catalog(&pool, &request.provider_id).await?;
     let mut conn = store::open(&user_id, &key_hex_str)
@@ -830,6 +833,7 @@ pub async fn set_price_override(
     key_registry: State<'_, KeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<ModelPriceDto, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let (user_id, key_hex_str) = session(&key_registry).await?;
     let cat = load_catalog(&pool, &request.provider_id).await?;
     let mut conn = store::open(&user_id, &key_hex_str)

@@ -629,6 +629,14 @@ pub async fn open_cloud_chat_panes(
     app_handle: tauri::AppHandle,
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<(), String> {
+    // items.id=778: the cookie restore reads the account's cookie store, so
+    // it holds a lease. Not logged in is not an error here (see below); a
+    // rotation under way is.
+    let _lease = match crate::auth::writer_gate::command(&key_registry).await {
+        Ok(lease) => Some(lease),
+        Err(crate::auth::writer_gate::GateError::NotLoggedIn) => None,
+        Err(e) => return Err(e.into()),
+    };
     // Not logged in => no per-provider cookie store to restore from at all
     // -- treated the same as "no stored cookies" (log + proceed), not a
     // reason to refuse opening the pane, matching restore_cookies_into_jar's
@@ -705,9 +713,23 @@ pub async fn close_cloud_chat_pane(
             .map_err(|e| e.to_string())?;
     }
 
-    let session = key_registry
-        .with_key(|k| (k.user_id.clone(), key_hex(&k.data_key)))
-        .await;
+    // items.id=778: closing the pane itself never waits for a rotation; the
+    // cookie save does. When the gate refuses (a rotation under way) the
+    // cookies are not saved this time and the pane closes regardless.
+    let lease = match crate::auth::writer_gate::command(&key_registry).await {
+        Ok(lease) => Some(lease),
+        Err(e) => {
+            log::warn!("cloud_chat_pane: cookies not saved on close, {e}");
+            None
+        }
+    };
+    let session = if lease.is_some() {
+        key_registry
+            .with_key(|k| (k.user_id.clone(), key_hex(&k.data_key)))
+            .await
+    } else {
+        None
+    };
 
     match (
         session,

@@ -94,6 +94,7 @@ pub async fn get_health(
     key_registry: tauri::State<'_, KeyRegistry>,
     pool: tauri::State<'_, sqlx::SqlitePool>,
 ) -> Result<HealthResponse, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let ollama = client.check_health().await;
     let startup = sidecar_startup.read().await.clone();
     let qr_hosted_configured = qr_hosted_is_configured(&pool, &key_registry).await?;
@@ -310,6 +311,7 @@ pub async fn get_provider_recommendation(
     pool: tauri::State<'_, sqlx::SqlitePool>,
     key_registry: tauri::State<'_, KeyRegistry>,
 ) -> Result<ProviderRecommendation, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let profile = hardware_probe::get_or_detect(&pool).await;
     let session = key_registry
         .with_key(|k| (k.user_id.clone(), key_hex(&k.data_key)))

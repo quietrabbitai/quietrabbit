@@ -123,6 +123,7 @@ pub async fn get_active_board(
     key_registry: State<'_, KeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<ActiveBoardResponse, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.data_key))
         .await
@@ -173,6 +174,7 @@ pub async fn get_topic_list(
     persona_id: String,
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<Vec<TopicInfo>, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.data_key))
         .await
@@ -193,6 +195,7 @@ pub async fn update_topic_state(
     key_registry: State<'_, KeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<(), String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     const VALID_STATES: &[&str] = &["Active", "Paused", "Waiting on you", "Complete", "Closed"];
     if !VALID_STATES.contains(&request.state.as_str()) {
         return Err(format!(

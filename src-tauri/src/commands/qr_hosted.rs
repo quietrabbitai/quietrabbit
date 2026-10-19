@@ -77,6 +77,7 @@ pub async fn get_qr_hosted_config(
     provider: String,
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<QrHostedConfig, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let session = key_registry
         .with_key(|k| (k.user_id.clone(), key_hex(&k.data_key)))
         .await
@@ -115,6 +116,7 @@ pub async fn set_qr_hosted_provider(
     api_key: String,
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<(), String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let session = key_registry
         .with_key(|k| (k.user_id.clone(), key_hex(&k.data_key)))
         .await
@@ -156,6 +158,7 @@ pub async fn set_qr_hosted_provider_preference(
     key_registry: State<'_, KeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<(), String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let user_id = key_registry
         .with_key(|k| k.user_id.clone())
         .await
@@ -250,6 +253,7 @@ pub async fn get_qr_hosted_provider_preferences(
     key_registry: State<'_, KeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<Vec<UserProviderPreference>, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let user_id = key_registry
         .with_key(|k| k.user_id.clone())
         .await

@@ -1255,6 +1255,12 @@ pub struct FocusRun<L: DisclosureLoggerForRun = SqliteDisclosureLogger> {
     /// resolution. A rehydrated run re-derives it from its conversation's
     /// binding.
     pub chat_binding: Option<crate::api_chat::BoundDestination>,
+    /// items.id=778 (decisions.id=896): this run's writer lease. Taken by the
+    /// caller that starts or resumes the run, BEFORE the run can touch a
+    /// database, and held until the run is dropped, which for a spawned run is
+    /// after `finalize_chat_reply`: a key rotation waits for it, or stops the
+    /// run at the user's choice. `None` only for runs built by tests.
+    pub(crate) lease: Option<crate::auth::writer_gate::WriterLease>,
 }
 
 impl<L: DisclosureLoggerForRun> FocusRun<L> {
@@ -1304,6 +1310,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             attendance: crate::spend::gate::RunAttendance::Unattended,
             chat_stream: None,
             chat_binding: None,
+            lease: None,
         }
     }
 

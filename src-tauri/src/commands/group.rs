@@ -118,6 +118,7 @@ pub async fn remove_group_member(
     key_registry: State<'_, KeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<(), String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let reason: DepartureReason = reason
         .parse()
         .map_err(|e: group_membership::GroupMembershipError| e.to_string())?;
@@ -153,6 +154,7 @@ pub async fn create_group(
     key_registry: State<'_, KeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<String, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     group_creation::create_group(
         &pool,
         &creator_persona_id,
@@ -193,6 +195,7 @@ pub async fn set_group_fact_source_opt_in(
     opted_in: bool,
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<(), String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let (user_id, key_hex_str) = key_registry
         .with_key(|k| (k.user_id.clone(), key_hex(&k.data_key)))
         .await
@@ -226,6 +229,7 @@ pub async fn get_group_fact_sources(
     persona_id: String,
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<Vec<String>, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let (user_id, key_hex_str) = key_registry
         .with_key(|k| (k.user_id.clone(), key_hex(&k.data_key)))
         .await
@@ -251,6 +255,7 @@ pub async fn list_persona_group_ids(
     persona_id: String,
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<Vec<String>, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let (user_id, key_hex_str) = key_registry
         .with_key(|k| (k.user_id.clone(), key_hex(&k.data_key)))
         .await

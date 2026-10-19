@@ -254,6 +254,7 @@ pub async fn get_catalog_status(
     key_registry: State<'_, KeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<CatalogStatusDto, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     session_user(&key_registry).await?;
     status_impl(&pool, TRUSTED_PUBLIC_KEYS).await
 }
@@ -307,6 +308,7 @@ pub async fn check_catalog_update(
     key_registry: State<'_, KeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<CatalogCheckDto, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     session_user(&key_registry).await?;
     check_impl(
         &pool,
@@ -346,6 +348,7 @@ pub async fn apply_catalog_update(
     key_registry: State<'_, KeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<CatalogApplyDto, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let user_id = session_user(&key_registry).await?;
     require_admin(&pool, &user_id).await?;
     let dir = stage_dir();
@@ -388,6 +391,7 @@ pub async fn rollback_catalog(
     key_registry: State<'_, KeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<CatalogApplyDto, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let user_id = session_user(&key_registry).await?;
     require_admin(&pool, &user_id).await?;
     rollback_impl(&pool, Utc::now()).await

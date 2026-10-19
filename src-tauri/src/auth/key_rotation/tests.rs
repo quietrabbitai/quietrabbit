@@ -12,7 +12,6 @@ use super::*;
 use crate::auth::epoch_guard;
 use crate::auth::registry::{key_hex, GroupKeyRegistry};
 use crate::auth::subkeys::encode_hex;
-use crate::conductor::concurrency::PathPriority;
 use crate::persistence::{migrations, personal_store};
 use crate::provider_credentials::session::ConnectSessions;
 use crate::test_support::ENV_MUTEX;
@@ -674,6 +673,26 @@ async fn background_checks_stand_down_while_a_rotation_runs() {
     assert!(!session.is_occupied().await);
 }
 
+#[tokio::test]
+async fn the_idle_check_stands_down_while_the_writer_gate_drains() {
+    // items.id=778: a drain can wait minutes for a reply to finish; the
+    // periodic check must not lock the session out from under it.
+    let fx = Fixture::new().await;
+    let session = KeyRegistry::default();
+    populate_registry(&session, USER, *fx.dek, 1).await;
+    fx.rotate(Fixture::change_password()).await.unwrap();
+
+    let drain = crate::auth::writer_gate::begin_drain(USER).unwrap();
+    idle_timeout_check(&fx, &session).await;
+    assert!(
+        session.is_occupied().await,
+        "no lock decision is taken while the gate drains"
+    );
+    drop(drain);
+    idle_timeout_check(&fx, &session).await;
+    assert!(!session.is_occupied().await);
+}
+
 // ---------------------------------------------------------------------------
 // Progress and the rotating flag
 // ---------------------------------------------------------------------------
@@ -776,26 +795,44 @@ async fn an_unrecognised_encrypted_file_stops_the_rotation_before_anything_chang
 }
 
 #[tokio::test]
-async fn a_running_task_blocks_the_rotation() {
+async fn a_rotation_that_requires_a_closed_gate_waits_for_the_writers() {
+    use crate::auth::writer_gate::{self, Kind};
     let fx = Fixture::new().await;
-    let scheduler = ConductorScheduler::new();
-    assert!(
-        scheduler
-            .acquire_run_slot("run-1", PathPriority::Interactive)
-            .await
-    );
     let mut env = fx.env();
-    env.scheduler = Some(&scheduler);
+    env.require_closed_gate = true;
+
+    // The caller forgot to drain: refused, nothing changed.
+    let err = run_rotation(&env, &fx.dek, 1, Fixture::change_password())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, RotationError::GateNotClosed), "{err:?}");
+    assert_untouched(&fx).await;
+
+    // Drained and closed, but a writer still holds a lease: refused with the
+    // count, nothing changed.
+    let lease = writer_gate::acquire(USER, Kind::Command).unwrap();
+    let drain = writer_gate::begin_drain(USER).unwrap();
+    assert!(drain
+        .close(std::time::Duration::from_millis(20))
+        .await
+        .is_err());
     let err = run_rotation(&env, &fx.dek, 1, Fixture::change_password())
         .await
         .unwrap_err();
     assert!(matches!(err, RotationError::ActiveRuns(1)), "{err:?}");
     assert_untouched(&fx).await;
 
-    scheduler.release_run_slot("run-1");
+    // Writer done, gate closed and empty: the rotation runs.
+    drop(lease);
+    drain
+        .close(std::time::Duration::from_millis(20))
+        .await
+        .unwrap();
     run_rotation(&env, &fx.dek, 1, Fixture::change_password())
         .await
         .unwrap();
+    drop(drain);
+    assert!(writer_gate::is_idle(USER));
 }
 
 #[tokio::test]

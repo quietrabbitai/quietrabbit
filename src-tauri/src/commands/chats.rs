@@ -84,6 +84,7 @@ pub async fn list_chats(
     persona_id: String,
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<Vec<ChatInfo>, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.data_key))
         .await
@@ -116,6 +117,7 @@ pub async fn archive_chat(
     chat_id: String,
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<(), String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.data_key))
         .await

@@ -254,6 +254,13 @@ pub async fn store_ingested_document(
         return Err("exactly one of content or file_path is required".to_owned());
     }
 
+    // items.id=778: an import is three writes (blob, run row, output row); the
+    // lease keeps a key rotation from landing between them.
+    let _lease = crate::auth::writer_gate::lease_for_session(
+        &key_registry,
+        crate::auth::writer_gate::Kind::Ingest,
+    )
+    .await?;
     let (master_key, key_hex_str) = key_registry
         .with_key(|k| (k.data_key, key_hex(&k.data_key)))
         .await
@@ -347,7 +354,23 @@ pub async fn store_ingested_document(
         let bg_key_hex = key_hex_str.clone();
         let bg_output_id = output_id.clone();
         let bg_bytes = bytes.clone();
+        // items.id=778: the OCR backfill writes after this command returns, so
+        // it holds a lease of its own. If a rotation is under way the document
+        // is already stored; only the searchable text is skipped, and said so.
+        let bg_lease = match crate::auth::writer_gate::acquire(
+            &user_id,
+            crate::auth::writer_gate::Kind::Ingest,
+        ) {
+            Ok(lease) => Some(lease),
+            Err(e) => {
+                log::warn!("store_ingested_document: OCR text for {output_id} skipped, {e}");
+                None
+            }
+        };
         tokio::spawn(async move {
+            let Some(_bg_lease) = bg_lease else {
+                return;
+            };
             let client = app_handle.state::<OllamaClient>();
             if let Some(text) = ocr_image_text(&client, &bg_bytes).await {
                 if let Err(e) = output_store::backfill_ingested_content(
@@ -399,6 +422,7 @@ pub async fn get_ingested_document_bytes(
     key_registry: State<'_, KeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<Vec<u8>, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let (master_key, key_hex_str) = key_registry
         .with_key(|k| (k.data_key, key_hex(&k.data_key)))
         .await

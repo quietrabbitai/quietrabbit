@@ -285,6 +285,7 @@ pub async fn create_api_chat(
     key_registry: State<'_, KeyRegistry>,
     request: CreateApiChatRequest,
 ) -> Result<CreateApiChatResponse, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.data_key))
         .await
@@ -429,6 +430,14 @@ pub async fn send_api_chat_message(
         review_key,
     } = request;
 
+    // items.id=778: the reply's writer lease, held by the run until it ends
+    // (see commands::messages::send_message). Dropped here if the send returns
+    // early (a pending review, a refusal).
+    let lease = crate::auth::writer_gate::lease_for_session(
+        &key_registry,
+        crate::auth::writer_gate::Kind::Reply,
+    )
+    .await?;
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.data_key))
         .await
@@ -553,6 +562,7 @@ pub async fn send_api_chat_message(
         run_request,
     )
     .await?;
+    run.lease = Some(lease);
     let run_id = run
         .focus_run_id
         .clone()

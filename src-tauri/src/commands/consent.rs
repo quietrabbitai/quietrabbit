@@ -201,6 +201,7 @@ pub async fn submit_consent_decision(
     request: SubmitConsentDecisionRequest,
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<(), String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.data_key))
         .await
@@ -223,6 +224,7 @@ pub async fn submit_floor_consent_decision(
     request: SubmitFloorConsentDecisionRequest,
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<(), String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.data_key))
         .await
@@ -258,6 +260,7 @@ pub async fn submit_element_consent_decision(
     request: SubmitElementConsentDecisionRequest,
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<(), String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.data_key))
         .await
@@ -425,6 +428,7 @@ pub async fn submit_extract_confirm(
     request: SubmitExtractConfirmRequest,
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<(), String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     use tauri::Emitter;
 
     let key_hex_str = key_registry
@@ -634,6 +638,7 @@ pub async fn get_pending_cross_persona_confirmations(
     request: GetPendingCrossPersonaConfirmationsRequest,
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<Vec<PendingCrossPersonaFact>, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.data_key))
         .await
@@ -729,6 +734,7 @@ pub async fn request_chat_copy_gate3_review(
     key_registry: State<'_, KeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<Gate3ReviewResult, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.data_key))
         .await
@@ -807,6 +813,7 @@ pub async fn submit_chat_copy_consent_decision(
     request: SubmitElementConsentDecisionRequest,
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<(), String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.data_key))
         .await

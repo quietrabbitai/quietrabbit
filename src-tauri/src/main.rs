@@ -410,11 +410,28 @@ async fn async_main() {
                         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
                         loop {
                             ticker.tick().await;
-                            // items.id=630: no scheduled or background work
-                            // while a data-key rotation is running.
-                            if quietrabbit_lib::auth::epoch_guard::is_rotating() {
-                                continue;
-                            }
+                            // items.id=630, items.id=778: no scheduled or
+                            // background work while a data-key rotation is
+                            // running or being prepared. The tick holds a sweep
+                            // lease for the account that is unlocked (the
+                            // persona-share sweeps below take their own).
+                            // Nobody unlocked: nothing below has a key to use.
+                            let sweep_user = pull_handle
+                                .state::<quietrabbit_lib::auth::registry::KeyRegistry>()
+                                .user_id()
+                                .await;
+                            let _group_sweep_lease = match sweep_user.as_deref() {
+                                Some(user_id) => {
+                                    match quietrabbit_lib::auth::writer_gate::acquire(
+                                        user_id,
+                                        quietrabbit_lib::auth::writer_gate::Kind::Sweep,
+                                    ) {
+                                        Ok(lease) => Some(lease),
+                                        Err(_) => continue,
+                                    }
+                                }
+                                None => None,
+                            };
                             let registry = pull_handle
                                 .state::<quietrabbit_lib::auth::registry::GroupKeyRegistry>(
                             );

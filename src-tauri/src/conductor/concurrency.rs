@@ -305,6 +305,10 @@ impl ConductorScheduler {
     // -- Diagnostics ---------------------------------------------------------
 
     /// Current number of active focus runs.
+    ///
+    /// Diagnostic only. Nothing in the real app registers a run here, so a key
+    /// rotation does NOT use this count (it did until items.id=778 and so
+    /// never saw a running reply); it drains `auth::writer_gate` instead.
     pub fn active_run_count(&self) -> usize {
         self.state.lock().unwrap().active_runs.len()
     }

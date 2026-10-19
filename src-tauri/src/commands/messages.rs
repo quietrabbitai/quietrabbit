@@ -509,6 +509,7 @@ pub async fn list_messages(
     key_registry: State<'_, KeyRegistry>,
     context_key: String,
 ) -> Result<Vec<MessageInfo>, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.data_key))
         .await
@@ -538,6 +539,15 @@ pub async fn send_message(
         confirmed_cross_persona_fact_ids,
     } = request;
 
+    // items.id=778 (decisions.id=896): the reply's writer lease, taken before
+    // the user's turn is saved, so a key rotation either waits for the whole
+    // reply or is not under way yet. It moves into the run and is released
+    // when the background task ends, after finalize_chat_reply.
+    let lease = crate::auth::writer_gate::lease_for_session(
+        &key_registry,
+        crate::auth::writer_gate::Kind::Reply,
+    )
+    .await?;
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.data_key))
         .await
@@ -600,7 +610,7 @@ pub async fn send_message(
         topic_id: None,
         confirmed_cross_persona_fact_ids,
     };
-    let run = execution::load_and_authorize_run(
+    let mut run = execution::load_and_authorize_run(
         app_handle,
         scheduler,
         pool,
@@ -610,6 +620,7 @@ pub async fn send_message(
         request,
     )
     .await?;
+    run.lease = Some(lease);
 
     // 4-6. Reserve the placeholder, finish the run in the background, return
     // the transcript.

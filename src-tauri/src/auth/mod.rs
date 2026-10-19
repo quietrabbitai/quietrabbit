@@ -22,6 +22,7 @@ pub mod registry;
 pub mod sharing_keypair;
 pub mod subkeys;
 pub mod user_store;
+pub mod writer_gate;
 
 use crate::auth::registry::GroupKeyRegistry;
 use crate::persistence::persona_store;

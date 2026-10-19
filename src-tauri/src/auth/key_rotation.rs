@@ -10,8 +10,9 @@
 //   1. Preflight, changing nothing: the account is at the epoch the caller
 //      thinks, no rotation is pending, the process-wide rotating flag is taken
 //      (epoch_guard::begin_rotation: every store open for the account is now
-//      refused and the periodic sweeps stand down), no Focus run is active,
-//      the account directory is inventoried (an encrypted file this code does
+//      refused and the periodic sweeps stand down), the writer gate is closed
+//      and empty (auth::writer_gate: the caller drained every writer first,
+//      items.id=778), the account directory is inventoried (an encrypted file this code does
 //      not recognise stops the rotation), every database opens under the OLD
 //      key and passes cipher_integrity_check, and there is room for the
 //      largest file.
@@ -80,7 +81,7 @@ use crate::auth::user_store::{
     self, PendingRotation, RotationDirection, RotationItem, RotationKind, RotationState,
     StagedRotation, UserStoreError,
 };
-use crate::conductor::concurrency::ConductorScheduler;
+use crate::auth::writer_gate::{self, GateCheckError};
 use crate::persistence::ingest_blob::{self, BlobRekey};
 
 // ---------------------------------------------------------------------------
@@ -276,8 +277,11 @@ pub struct RotationEnv<'a> {
     pub user_id: &'a str,
     /// `<data root>/users/<user_id>`.
     pub user_dir: PathBuf,
-    /// Refuses to start while any Focus run is active.
-    pub scheduler: Option<&'a ConductorScheduler>,
+    /// Require the writer gate to be closed and empty before anything starts
+    /// (items.id=778). The commands that start a rotation drain and close the
+    /// gate first and set this; tests and the unlock-time resume and cancel
+    /// paths, which have no writers to drain, leave it off.
+    pub require_closed_gate: bool,
     /// The session to swap to the new key at the end. `None` for a rotation
     /// performed on behalf of another process (and in tests).
     pub registry: Option<&'a KeyRegistry>,
@@ -295,7 +299,7 @@ impl<'a> RotationEnv<'a> {
             pool,
             user_id,
             user_dir,
-            scheduler: None,
+            require_closed_gate: false,
             registry: None,
             progress: &GLOBAL_PROGRESS,
             kdf: KdfParams::default(),
@@ -363,6 +367,10 @@ pub enum RotationError {
     EpochChanged,
     #[error("{0} task(s) are still running, wait for them or cancel them")]
     ActiveRuns(usize),
+    /// A start path asked for a closed writer gate and the caller had not
+    /// drained and closed it. A programming error, never a user condition.
+    #[error("the writer gate was not closed before the rotation started")]
+    GateNotClosed,
     #[error("unrecognised encrypted file in the account directory: {0}")]
     UnknownEncryptedFile(String),
     #[error("the account has no integration_keys.db to prove the recovered key against")]
@@ -993,11 +1001,11 @@ async fn preflight(
         return Err(RotationError::EpochChanged);
     }
 
-    if let Some(scheduler) = env.scheduler {
-        let active = scheduler.active_run_count();
-        if active > 0 {
-            return Err(RotationError::ActiveRuns(active));
-        }
+    if env.require_closed_gate {
+        writer_gate::ensure_closed_and_empty(env.user_id).map_err(|e| match e {
+            GateCheckError::Busy(n) => RotationError::ActiveRuns(n),
+            GateCheckError::NotClosed => RotationError::GateNotClosed,
+        })?;
     }
 
     let inv = io::inventory(&env.user_dir).await?;
@@ -1478,13 +1486,6 @@ pub async fn resume_rotation(
     if pending.direction == RotationDirection::Rollback {
         return finish_rollback(&run, pending.last_error.as_deref().unwrap_or("cancelled")).await;
     }
-    if let Some(scheduler) = env.scheduler {
-        let active = scheduler.active_run_count();
-        if active > 0 {
-            return Err(RotationError::ActiveRuns(active));
-        }
-    }
-
     let result = if pending.state == RotationState::Verifying {
         run.check_still_ours(true).await?;
         run.emit(Phase::Finishing, run.total_bytes, None);

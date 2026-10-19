@@ -289,6 +289,7 @@ pub async fn list_focuses(
     key_registry: State<'_, KeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<Vec<FocusInfo>, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.data_key))
         .await
@@ -334,6 +335,7 @@ pub async fn get_focus_settings(
     focus_id: String,
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<FocusInfo, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.data_key))
         .await
@@ -381,6 +383,7 @@ pub async fn update_focus_settings(
     request: UpdateFocusSettingsRequest,
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<FocusInfo, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.data_key))
         .await

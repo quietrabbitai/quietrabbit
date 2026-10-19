@@ -71,6 +71,7 @@ pub async fn get_personal_fields(
     user_id: String,
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<Vec<PersonalFieldInfo>, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.data_key))
         .await
@@ -99,6 +100,7 @@ pub async fn update_personal_field(
     request: UpdatePersonalFieldRequest,
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<PersonalFieldInfo, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.data_key))
         .await
@@ -149,6 +151,7 @@ pub async fn get_voice_profile(
     user_id: String,
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<VoiceProfileInfo, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.data_key))
         .await

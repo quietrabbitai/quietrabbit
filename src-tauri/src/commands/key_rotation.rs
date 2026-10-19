@@ -58,6 +58,12 @@
 // disk and never in an error. The password is asked for again at confirm
 // rather than held in memory between the two calls.
 //
+// WRITERS (items.id=778, decisions.id=896): the three commands that start a
+// rotation first drain the account's writers through auth::writer_gate
+// (drain_writers below): no new reply, Focus run, import or sweep starts, and
+// the rotation runs only once every lease has ended. They hold no lease
+// themselves and are listed as exempt in the gate's source scan.
+//
 // PROGRESS: events on the existing `task-progress` channel with kind
 // `key_rotation` (TauriRotationSink, installed in main.rs), plus
 // get_rotation_status for a webview that reloads mid-rotation.
@@ -79,8 +85,8 @@ use crate::auth::key_rotation::{
 use crate::auth::password_policy::{self, PasswordPolicyError};
 use crate::auth::registry::{GroupKeyRegistry, KeyRegistry, NewPhraseSlot};
 use crate::auth::user_store;
+use crate::auth::writer_gate::{self, DrainGuard, GateError};
 use crate::commands::auth::{finish_login, is_locked_out, record_failed_attempt};
-use crate::conductor::concurrency::ConductorScheduler;
 use crate::task_progress::{emit_progress, TaskProgressPayload};
 
 // ---------------------------------------------------------------------------
@@ -384,13 +390,46 @@ async fn authorise_session_change(
 fn env_for<'a>(
     pool: &'a sqlx::SqlitePool,
     user_id: &'a str,
-    scheduler: Option<&'a ConductorScheduler>,
+    require_closed_gate: bool,
     registry: Option<&'a KeyRegistry>,
 ) -> RotationEnv<'a> {
     let mut env = RotationEnv::new(pool, user_id, user_dir(user_id));
-    env.scheduler = scheduler;
+    env.require_closed_gate = require_closed_gate;
     env.registry = registry;
     env
+}
+
+/// Drain every writer of `user_id` and close the writer gate before a rotation
+/// starts (items.id=778, decisions.id=896). The returned guard keeps the gate
+/// closed for the whole rotation; dropping it, on success, error or panic,
+/// reopens it. Nothing is changed when this refuses.
+///
+/// Stage 1 refuses while a chat reply or Focus run is running (the
+/// `active_runs` answer, now backed by the real leases); the finish-or-stop
+/// choice and the ceilings arrive with the drain prompt.
+async fn drain_writers(user_id: &str) -> Result<DrainGuard, KeyRotationError> {
+    let drain = writer_gate::begin_drain(user_id).map_err(|e| match e {
+        GateError::NotLoggedIn => KeyRotationError::NotLoggedIn,
+        GateError::DrainInProgress | GateError::Rotating => KeyRotationError::RotationInProgress,
+        other => internal("drain", other),
+    })?;
+    let visible = drain.counts().visible();
+    if visible > 0 {
+        return Err(KeyRotationError::ActiveRuns {
+            count: u32::try_from(visible).unwrap_or(u32::MAX),
+        });
+    }
+    drain
+        .close(writer_gate::COMMAND_DRAIN_CEILING)
+        .await
+        .map_err(|e| match e {
+            GateError::VisibleWork(n) => KeyRotationError::ActiveRuns {
+                count: u32::try_from(n).unwrap_or(u32::MAX),
+            },
+            GateError::StillBusy(_) => KeyRotationError::Busy,
+            other => internal("drain close", other),
+        })?;
+    Ok(drain)
 }
 
 // ---------------------------------------------------------------------------
@@ -408,7 +447,6 @@ pub async fn change_password(
     new_password: String,
     key_registry: State<'_, KeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
-    scheduler: State<'_, Arc<ConductorScheduler>>,
 ) -> Result<(), KeyRotationError> {
     let old_password = Zeroizing::new(old_password);
     let new_password = Zeroizing::new(new_password);
@@ -420,12 +458,8 @@ pub async fn change_password(
         return Err(KeyRotationError::NewPasswordSameAsCurrent);
     }
 
-    let env = env_for(
-        &pool,
-        &resident.user_id,
-        Some(&scheduler),
-        Some(&key_registry),
-    );
+    let _drain = drain_writers(&resident.user_id).await?;
+    let env = env_for(&pool, &resident.user_id, true, Some(&key_registry));
     key_rotation::run_rotation(
         &env,
         &resident.data_key,
@@ -521,7 +555,6 @@ pub async fn confirm_new_recovery_phrase(
     answers: Vec<WordAnswer>,
     key_registry: State<'_, KeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
-    scheduler: State<'_, Arc<ConductorScheduler>>,
 ) -> Result<(), KeyRotationError> {
     let password = Zeroizing::new(password);
     let resident = resident(&key_registry).await?;
@@ -560,12 +593,8 @@ pub async fn confirm_new_recovery_phrase(
         .await
         .ok_or(KeyRotationError::NoPendingPhrase)?;
 
-    let env = env_for(
-        &pool,
-        &resident.user_id,
-        Some(&scheduler),
-        Some(&key_registry),
-    );
+    let _drain = drain_writers(&resident.user_id).await?;
+    let env = env_for(&pool, &resident.user_id, true, Some(&key_registry));
     key_rotation::run_rotation(
         &env,
         &resident.data_key,
@@ -659,7 +688,8 @@ pub async fn restore_with_recovery_phrase(
             Err(StagedUnlockError::WrongCredential) => return wrong().await.map(|_| ()),
             Err(e) => return Err(code_for_unlock(&e)),
         };
-        let env = env_for(&pool, &user.id, None, None);
+        let drain = drain_writers(&user.id).await?;
+        let env = env_for(&pool, &user.id, true, None);
         let finished = match key_rotation::resume_rotation(
             &env,
             &pending,
@@ -687,6 +717,9 @@ pub async fn restore_with_recovery_phrase(
         )
         .await
         .map_err(|e| code_for(&e))?;
+        // The writers are drained and the rotation is over: reopen the gate
+        // before signing in (finish_login takes its own lease).
+        drop(drain);
         return finish_login(
             &user.id,
             *outcome.new_dek,
@@ -716,7 +749,8 @@ pub async fn restore_with_recovery_phrase(
         Err(_) => return wrong().await.map(|_| ()),
     };
 
-    let env = env_for(&pool, &user.id, None, None);
+    let drain = drain_writers(&user.id).await?;
+    let env = env_for(&pool, &user.id, true, None);
     let outcome = match key_rotation::run_rotation(
         &env,
         &old_dek,
@@ -743,6 +777,7 @@ pub async fn restore_with_recovery_phrase(
         }
         Err(e) => return Err(code_for(&e)),
     };
+    drop(drain);
     finish_login(
         &user.id,
         *outcome.new_dek,
@@ -815,8 +850,9 @@ async fn cancel_pending(
         Err(e) => return Err(code_for_unlock(&e)),
     };
 
-    // No session, no scheduler: nothing here can be running Focus work.
-    let env = env_for(pool, &user.id, None, None);
+    // No session and no drain: cancel is an unlock-time path with no writers
+    // (items.id=778 leaves it alone).
+    let env = env_for(pool, &user.id, false, None);
     match key_rotation::cancel_rotation(&env, &pending, unlock.new_dek.clone()).await {
         Ok(ResumeOutcome::RolledBack) => Ok(()),
         Ok(ResumeOutcome::Completed(_)) => Err(internal("cancel", "reported a completed rotation")),
@@ -968,7 +1004,6 @@ mod tests {
             app.manage(KeyRegistry::default());
             app.manage(GroupKeyRegistry::default());
             app.manage(crate::provider_credentials::session::ConnectSessions::default());
-            app.manage(Arc::new(ConductorScheduler::new()));
             app.manage(pool);
             Harness {
                 _lock: lock,
@@ -986,9 +1021,6 @@ mod tests {
         }
         fn pool(&self) -> State<'_, sqlx::SqlitePool> {
             self.app.state::<sqlx::SqlitePool>()
-        }
-        fn scheduler(&self) -> State<'_, Arc<ConductorScheduler>> {
-            self.app.state::<Arc<ConductorScheduler>>()
         }
 
         async fn login(&self, password: &str) -> Result<(), String> {
@@ -1042,14 +1074,7 @@ mod tests {
         }
 
         async fn change_password(&self, old: &str, new: &str) -> Result<(), KeyRotationError> {
-            change_password(
-                old.to_owned(),
-                new.to_owned(),
-                self.registry(),
-                self.pool(),
-                self.scheduler(),
-            )
-            .await
+            change_password(old.to_owned(), new.to_owned(), self.registry(), self.pool()).await
         }
 
         async fn restore(&self, words: &str, new: &str) -> Result<(), KeyRotationError> {
@@ -1216,23 +1241,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_running_task_blocks_change_password_with_a_count() {
+    async fn a_running_reply_blocks_change_password_with_a_count() {
         let h = Harness::new().await;
         h.account().await;
-        assert!(
-            h.scheduler()
-                .acquire_run_slot(
-                    "run-1",
-                    crate::conductor::concurrency::PathPriority::Interactive
-                )
-                .await
-        );
+        let user_id = h.user_id().await;
+        // A chat reply in flight holds a lease (items.id=778): the rotation
+        // is refused, nothing is changed, and the gate is left open again.
+        let reply = writer_gate::acquire(&user_id, writer_gate::Kind::Reply).unwrap();
         assert_eq!(
             h.change_password(PASSWORD, NEW_PASSWORD).await.unwrap_err(),
             KeyRotationError::ActiveRuns { count: 1 }
         );
-        h.scheduler().release_run_slot("run-1");
+        assert_eq!(writer_gate::phase(&user_id), writer_gate::Phase::Open);
+        assert_eq!(h.registry().with_key(|k| k.key_epoch).await, Some(1));
+        drop(reply);
         h.change_password(PASSWORD, NEW_PASSWORD).await.unwrap();
+        assert!(writer_gate::is_idle(&user_id));
     }
 
     // -- new-password policy (items.id=777, decisions.id=858) -----------
@@ -1696,28 +1720,16 @@ mod tests {
             wrong[0].word = "abandon".to_owned();
         }
         assert_eq!(
-            confirm_new_recovery_phrase(
-                PASSWORD.to_owned(),
-                wrong,
-                h.registry(),
-                h.pool(),
-                h.scheduler()
-            )
-            .await
-            .unwrap_err(),
+            confirm_new_recovery_phrase(PASSWORD.to_owned(), wrong, h.registry(), h.pool(),)
+                .await
+                .unwrap_err(),
             KeyRotationError::ConfirmationFailed
         );
         // An incomplete answer is wrong too.
         assert_eq!(
-            confirm_new_recovery_phrase(
-                PASSWORD.to_owned(),
-                vec![],
-                h.registry(),
-                h.pool(),
-                h.scheduler()
-            )
-            .await
-            .unwrap_err(),
+            confirm_new_recovery_phrase(PASSWORD.to_owned(), vec![], h.registry(), h.pool(),)
+                .await
+                .unwrap_err(),
             KeyRotationError::ConfirmationFailed
         );
         assert_eq!(h.registry().with_key(|k| k.key_epoch).await, Some(1));
@@ -1727,7 +1739,6 @@ mod tests {
             answers_for(&shown.mnemonic.to_uppercase(), &shown.confirm_positions),
             h.registry(),
             h.pool(),
-            h.scheduler(),
         )
         .await
         .unwrap();
@@ -1745,15 +1756,9 @@ mod tests {
         h.restore(&shown.mnemonic, NEW_PASSWORD).await.unwrap();
         // The slot was emptied by the adoption.
         assert_eq!(
-            confirm_new_recovery_phrase(
-                PASSWORD.to_owned(),
-                vec![],
-                h.registry(),
-                h.pool(),
-                h.scheduler()
-            )
-            .await
-            .unwrap_err(),
+            confirm_new_recovery_phrase(PASSWORD.to_owned(), vec![], h.registry(), h.pool(),)
+                .await
+                .unwrap_err(),
             KeyRotationError::NoPendingPhrase
         );
     }
@@ -1781,7 +1786,6 @@ mod tests {
                 answers_for(&shown.mnemonic, &shown.confirm_positions),
                 h.registry(),
                 h.pool(),
-                h.scheduler()
             )
             .await
             .unwrap_err(),
@@ -1810,28 +1814,16 @@ mod tests {
             .unwrap();
         for _ in 0..MAX_FAILED_CONFIRMATIONS {
             assert_eq!(
-                confirm_new_recovery_phrase(
-                    PASSWORD.to_owned(),
-                    vec![],
-                    h.registry(),
-                    h.pool(),
-                    h.scheduler()
-                )
-                .await
-                .unwrap_err(),
+                confirm_new_recovery_phrase(PASSWORD.to_owned(), vec![], h.registry(), h.pool(),)
+                    .await
+                    .unwrap_err(),
                 KeyRotationError::ConfirmationFailed
             );
         }
         assert_eq!(
-            confirm_new_recovery_phrase(
-                PASSWORD.to_owned(),
-                vec![],
-                h.registry(),
-                h.pool(),
-                h.scheduler()
-            )
-            .await
-            .unwrap_err(),
+            confirm_new_recovery_phrase(PASSWORD.to_owned(), vec![], h.registry(), h.pool(),)
+                .await
+                .unwrap_err(),
             KeyRotationError::NoPendingPhrase
         );
     }

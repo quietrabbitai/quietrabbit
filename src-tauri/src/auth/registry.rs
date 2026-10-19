@@ -245,6 +245,13 @@ impl KeyRegistry {
     pub async fn personal_key_hex(&self) -> Option<String> {
         self.with_key(|k| key_hex(&k.data_key)).await
     }
+
+    /// The id of the account that is unlocked, or None. The same
+    /// outside-crate convenience for main.rs's sweep loop, which takes its
+    /// writer lease (auth::writer_gate, items.id=778) for this account.
+    pub async fn user_id(&self) -> Option<String> {
+        self.with_key(|k| k.user_id.clone()).await
+    }
 }
 
 // ---------------------------------------------------------------------------

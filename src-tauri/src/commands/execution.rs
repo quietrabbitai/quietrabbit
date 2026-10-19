@@ -142,6 +142,11 @@ pub struct ReenterStepResponse {
 /// `bound` (items.id=716) is the provider and model an API Chat run is bound
 /// to. It is set before AUTHORIZE because authorize builds the failure handler
 /// from provider resolution. Every other caller passes None.
+///
+/// items.id=778: the caller holds the run's writer lease (taken before anything
+/// was written) across this call and moves it into `run.lease` afterwards, so
+/// the run keeps it until it is dropped. If LOAD or AUTHORIZE fails the lease
+/// is dropped with the error.
 pub(crate) async fn load_and_authorize_run(
     app_handle: tauri::AppHandle,
     scheduler: tauri::State<'_, Arc<ConductorScheduler>>,
@@ -211,6 +216,12 @@ pub async fn submit_focus_run(
         .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
+    // items.id=778: the run's lease, held by the run until it ends.
+    let lease = crate::auth::writer_gate::lease_for_session(
+        &key_registry,
+        crate::auth::writer_gate::Kind::FocusRun,
+    )
+    .await?;
 
     // R1 crisis-handling floor (decisions.id=607, items.id=265): local,
     // deterministic check on the actual fresh input for this run -- not
@@ -227,6 +238,7 @@ pub async fn submit_focus_run(
         request,
     )
     .await?;
+    run.lease = Some(lease);
 
     let run_id = run
         .focus_run_id
@@ -250,6 +262,7 @@ pub async fn get_run_output(
     persona_id: String,
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<GetRunOutputResponse, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.data_key))
         .await
@@ -297,6 +310,7 @@ pub async fn get_run_status(
     persona_id: String,
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<Option<String>, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.data_key))
         .await
@@ -315,6 +329,7 @@ pub async fn cancel_run(
     persona_id: String,
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<(), String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.data_key))
         .await
@@ -382,6 +397,9 @@ pub async fn resume_run(
     use crate::persistence::output_store::get_focus_run_status;
     use tauri::Emitter;
 
+    // items.id=778: this command's own lease; the resumed run takes its own
+    // below, which outlives the command (it moves into the spawned task).
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.data_key))
         .await
@@ -439,6 +457,11 @@ pub async fn resume_run(
         // already treats it like awaiting_user (both checkpoint the step
         // BEFORE it runs), so no new branch is needed here either.
         "awaiting_user" | "awaiting_schedule" | "paused" | "running" | "initializing" => {
+            let run_lease = crate::auth::writer_gate::lease_for_session(
+                &key_registry,
+                crate::auth::writer_gate::Kind::FocusRun,
+            )
+            .await?;
             let scheduler = Arc::clone(&*scheduler);
             let mut run: FocusRun = rehydrate_focus_run(
                 request.user_id.clone(),
@@ -454,6 +477,7 @@ pub async fn resume_run(
             .map_err(|e| e.to_string())?;
             // A user pressed resume (items.id=710): attended.
             run.attendance = crate::spend::gate::RunAttendance::Attended;
+            run.lease = Some(run_lease);
 
             // Spawn resume_execution() in the background, matching
             // submit_focus_run's fire-and-forget shape -- progress arrives via
@@ -604,6 +628,7 @@ pub async fn reenter_step(
     key_registry: State<'_, KeyRegistry>,
     request: ReenterStepRequest,
 ) -> Result<ReenterStepResponse, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     use crate::persistence::output_store::get_focus_run_status;
 
     let key_hex_str = key_registry

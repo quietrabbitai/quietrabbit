@@ -533,6 +533,18 @@ pub(crate) async fn finish_login(
     group_key_registry: &State<'_, GroupKeyRegistry>,
     pool: &sqlx::SqlitePool,
 ) -> Result<(), String> {
+    // items.id=778: everything below touches the account's data (interrupted-run
+    // recovery, share pulls, group-key rehydration), so it holds a lease. A
+    // rotation of this account under way refuses the sign-in; the callers'
+    // epoch registration is dropped, as for any failure here.
+    let _lease =
+        match crate::auth::writer_gate::acquire(user_id, crate::auth::writer_gate::Kind::Command) {
+            Ok(lease) => lease,
+            Err(e) => {
+                epoch_guard::clear_resident_for(user_id);
+                return Err(e.to_string());
+            }
+        };
     let now = crate::providers::utils::now();
 
     // items.id=621: the session row is written BEFORE the key becomes

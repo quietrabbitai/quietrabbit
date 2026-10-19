@@ -621,6 +621,7 @@ pub async fn get_provider_disclosure(
     key_registry: State<'_, KeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<ProviderDisclosure, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let (user_id, key_hex_str) = session(&key_registry).await?;
     let cat = load_catalog(&pool, &provider_id).await?;
     let mut conn = store::open(&user_id, &key_hex_str)
@@ -742,6 +743,7 @@ pub async fn record_provider_consent(
     key_registry: State<'_, KeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<ConsentResult, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let (user_id, key_hex_str) = session(&key_registry).await?;
     let cat = load_catalog(&pool, &request.provider_id).await?;
     let mut conn = store::open(&user_id, &key_hex_str)
@@ -791,6 +793,7 @@ pub async fn set_limit(
     request: SetLimitRequest,
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<Option<LimitDto>, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let (user_id, key_hex_str) = session(&key_registry).await?;
     let mut conn = store::open(&user_id, &key_hex_str)
         .await
@@ -801,6 +804,7 @@ pub async fn set_limit(
 #[tauri::command]
 #[specta::specta]
 pub async fn list_limits(key_registry: State<'_, KeyRegistry>) -> Result<Vec<LimitDto>, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let (user_id, key_hex_str) = session(&key_registry).await?;
     let mut conn = store::open(&user_id, &key_hex_str)
         .await
@@ -965,6 +969,7 @@ pub async fn get_usage_summary(
     key_registry: State<'_, KeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<UsageSummary, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let (user_id, key_hex_str) = session(&key_registry).await?;
     let providers = provider_store::list_all_providers(&pool)
         .await
@@ -1127,6 +1132,7 @@ pub async fn estimate_cost(
     key_registry: State<'_, KeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<CostEstimate, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let (user_id, key_hex_str) = session(&key_registry).await?;
     let cat = load_catalog(&pool, &request.provider_id).await?;
     let mut request = request;

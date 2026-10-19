@@ -229,6 +229,7 @@ pub async fn begin_provider_connect(
     pool: State<'_, sqlx::SqlitePool>,
     sessions: State<'_, ConnectSessions>,
 ) -> Result<ProviderConnectInfo, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let user_id = signed_in_user(&key_registry).await?;
     let provider = load_provider(&pool, &provider_id).await?;
     begin_impl(&sessions, &provider, &user_id, Instant::now())
@@ -279,6 +280,7 @@ pub async fn open_provider_page(
     pool: State<'_, sqlx::SqlitePool>,
     sessions: State<'_, ConnectSessions>,
 ) -> Result<(), String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let user_id = signed_in_user(&key_registry).await?;
     let provider_id = sessions
         .with_session(&session_id, &user_id, Instant::now(), |s| {
@@ -356,6 +358,7 @@ pub async fn check_clipboard_for_key(
     pool: State<'_, sqlx::SqlitePool>,
     sessions: State<'_, ConnectSessions>,
 ) -> Result<ClipboardOffer, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let user_id = signed_in_user(&key_registry).await?;
     let provider_id = sessions
         .with_session(&session_id, &user_id, Instant::now(), |s| {
@@ -460,6 +463,7 @@ pub async fn save_provider_key(
     pool: State<'_, sqlx::SqlitePool>,
     sessions: State<'_, ConnectSessions>,
 ) -> Result<SaveOutcome, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let (user_id, key_hex_str) = key_registry
         .with_key(|k| (k.user_id.clone(), key_hex(&k.data_key)))
         .await
@@ -504,6 +508,7 @@ pub async fn end_provider_connect(
     key_registry: State<'_, KeyRegistry>,
     sessions: State<'_, ConnectSessions>,
 ) -> Result<(), String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let user_id = signed_in_user(&key_registry).await?;
     sessions.end(&session_id, &user_id);
     Ok(())
@@ -558,6 +563,7 @@ pub async fn start_oauth_connect(
     pool: State<'_, sqlx::SqlitePool>,
     sessions: State<'_, ConnectSessions>,
 ) -> Result<OauthStarted, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let (user_id, provider) =
         session_provider(&key_registry, &pool, &sessions, &session_id).await?;
     let used = oauth_flow::start(
@@ -581,6 +587,7 @@ pub async fn submit_oauth_code(
     key_registry: State<'_, KeyRegistry>,
     sessions: State<'_, ConnectSessions>,
 ) -> Result<OauthStatus, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let code = Zeroizing::new(code);
     let user_id = signed_in_user(&key_registry).await?;
     oauth_flow::submit_code(&oauth_env(&sessions), &session_id, &user_id, code).await
@@ -595,6 +602,7 @@ pub async fn get_oauth_connect_status(
     key_registry: State<'_, KeyRegistry>,
     sessions: State<'_, ConnectSessions>,
 ) -> Result<OauthStatus, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let user_id = signed_in_user(&key_registry).await?;
     oauth_flow::status(&oauth_env(&sessions), &session_id, &user_id)
 }
@@ -608,6 +616,7 @@ pub async fn cancel_oauth_connect(
     key_registry: State<'_, KeyRegistry>,
     sessions: State<'_, ConnectSessions>,
 ) -> Result<(), String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let user_id = signed_in_user(&key_registry).await?;
     oauth_flow::cancel(&oauth_env(&sessions), &session_id, &user_id)
 }

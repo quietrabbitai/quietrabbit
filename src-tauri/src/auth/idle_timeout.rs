@@ -248,6 +248,12 @@ pub async fn run_periodic_check(
         return None;
     }
     let user_id = key_registry.with_key(|k| k.user_id.clone()).await?;
+    // items.id=778: the same while a rotation is being prepared. The writer
+    // gate drains for as long as the user lets an in-flight reply finish, and
+    // a lock then would clear the key the rotation is about to use.
+    if crate::auth::writer_gate::phase(&user_id) != crate::auth::writer_gate::Phase::Open {
+        return None;
+    }
 
     let lock = |reason| {
         lock_for_check(
