@@ -33,7 +33,49 @@
 // bytes and returns them, owns no long-lived state, and holds no secret
 // material after derive_password_key() returns.
 
+// UNICODE NORMALISATION (items.id=777 stage 0, decisions.id=858): the password
+// is normalised to NFKC INSIDE derive_password_key, the single choke point for
+// every sign-in, change, restore, resume and cancel path, so no caller can
+// forget it and the same typing always derives the same key whichever form the
+// keyboard, IME or operating system produced (NFC vs NFD, full-width, ligature).
+// ASCII is already NFKC, so it reaches Argon2 byte for byte as before. Input
+// that is not valid UTF-8 cannot be normalised and passes through unchanged.
+// This is a one-way compatibility fold (full-width "A" becomes "A"), which is
+// what NFKC means: an account keyed from a raw, not-NFKC-stable password before
+// this change no longer opens with that typing and is reached through the
+// recovery phrase (restore does not use the old password).
 use argon2::{Algorithm, Argon2, Params, Version};
+use unicode_normalization::{is_nfkc, UnicodeNormalization};
+use zeroize::Zeroizing;
+
+/// A password as it is fed to the KDF: the caller's own bytes when they are
+/// already normal (or not UTF-8), otherwise a zeroizing normalised copy.
+pub enum NormalisedPassword<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Zeroizing<Vec<u8>>),
+}
+
+impl NormalisedPassword<'_> {
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            NormalisedPassword::Borrowed(b) => b,
+            NormalisedPassword::Owned(v) => v,
+        }
+    }
+}
+
+/// NFKC-normalise `password` if it is valid UTF-8 and not already NFKC.
+pub fn normalise_password(password: &[u8]) -> NormalisedPassword<'_> {
+    let Ok(text) = std::str::from_utf8(password) else {
+        return NormalisedPassword::Borrowed(password);
+    };
+    if is_nfkc(text) {
+        return NormalisedPassword::Borrowed(password);
+    }
+    let mut out = Zeroizing::new(String::with_capacity(text.len()));
+    out.extend(text.nfkc());
+    NormalisedPassword::Owned(Zeroizing::new(out.as_bytes().to_vec()))
+}
 
 /// Key length in bytes for the PK, the DEK and group keys (all raw 32 bytes,
 /// 256 bits). Name kept from before decisions.id=893 -- it is shared with
@@ -73,7 +115,8 @@ pub fn generate_salt() -> Result<[u8; SALT_LEN], AuthError> {
 /// from that account's own user_salts row -- see module header on
 /// parameter ownership).
 ///
-/// password: raw bytes, not required to be valid UTF-8.
+/// password: raw bytes, not required to be valid UTF-8. Valid UTF-8 is
+///   NFKC-normalised first (see the module note on unicode normalisation).
 /// salt: any length argon2::Params/Argon2 itself accepts; SALT_LEN (16) is
 ///   this module's own generation length but is not enforced here, since a
 ///   caller reading an existing account's stored salt should not have this
@@ -89,9 +132,10 @@ pub fn derive_password_key(
         .map_err(|e| AuthError::Derivation(e.to_string()))?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
+    let password = normalise_password(password);
     let mut output = [0u8; MASTER_KEY_LEN];
     argon2
-        .hash_password_into(password, salt, &mut output)
+        .hash_password_into(password.as_bytes(), salt, &mut output)
         .map_err(|e| AuthError::Derivation(e.to_string()))?;
     Ok(output)
 }
@@ -239,6 +283,145 @@ mod tests {
         assert!(
             key.is_ok(),
             "production Argon2id parameters must derive successfully"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Unicode normalisation (items.id=777 stage 0)
+    // -----------------------------------------------------------------------
+
+    fn hex(key: &[u8]) -> String {
+        key.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn fixed_salt() -> Vec<u8> {
+        (0u8..16).collect()
+    }
+
+    /// GOLDEN VECTORS captured from the derivation BEFORE normalisation was
+    /// added (fixed salt 00..0f). ASCII, and non-ASCII text that is already
+    /// NFKC, must keep deriving these exact keys, byte for byte, or every
+    /// existing account would stop opening.
+    #[test]
+    fn keys_for_existing_passwords_are_unchanged() {
+        let cases: [(&[u8], u32, u32, u32, &str); 7] = [
+            (
+                b"password123",
+                1024,
+                1,
+                1,
+                "4be78b7adf3077390f9593e33e6b719f96b2b3c111b97796b94eaa78e4651cba",
+            ),
+            (
+                b"correct horse battery staple",
+                1024,
+                1,
+                1,
+                "f0d1525842159cef972608e2f8bc1cb2c8230f81eea76f124789f6beb42403b2",
+            ),
+            (
+                b"  leading and trailing  ",
+                1024,
+                1,
+                1,
+                "0770f4702590af17a65c29f56df2eefee9ee813f97ca03a38802cacaceee750c",
+            ),
+            (
+                b"",
+                1024,
+                1,
+                1,
+                "0a6f2a8fdc5ec4bf35827f17b098cb15026d0d990623f7232eea9b2d63a974d4",
+            ),
+            (
+                b"P@ss w0rd! #1 ~ \"quoted\"",
+                8192,
+                2,
+                2,
+                "6c748172c9bb8ecdeb823835a33d714ba1b57fb6244ee88cc5c091d94ac8fa20",
+            ),
+            // Non-ASCII but already NFKC (composed e-acute and i-diaeresis, a
+            // check mark, CJK): must not change either.
+            (
+                "na\u{ef}ve caf\u{e9} \u{2713} \u{65e5}\u{672c}\u{8a9e}".as_bytes(),
+                1024,
+                1,
+                1,
+                "11c07a1c52ba3851db260be5f8ccb3950a039d000e314fdb523c99a82ec1803c",
+            ),
+            (
+                b"a real-shaped password",
+                65536,
+                3,
+                4,
+                "1d2b5f827d0802fe500ddb475d1c2768b2e62fff77d978cd9d16d0bb7b9fcd9a",
+            ),
+        ];
+        for (pw, m, i, p, want) in cases {
+            let got = derive_password_key(pw, &fixed_salt(), m, i, p).unwrap();
+            assert_eq!(
+                hex(&got),
+                want,
+                "key changed for {:?}",
+                String::from_utf8_lossy(pw)
+            );
+        }
+    }
+
+    #[test]
+    fn ascii_and_already_normal_text_is_not_copied() {
+        assert!(matches!(
+            normalise_password(b"plain ascii"),
+            NormalisedPassword::Borrowed(_)
+        ));
+        assert!(matches!(
+            normalise_password("caf\u{e9}".as_bytes()),
+            NormalisedPassword::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn full_width_and_ligature_derive_the_key_of_their_nfkc_form() {
+        let salt = fixed_salt();
+        let derive = |pw: &str| derive_password_key(pw.as_bytes(), &salt, 1024, 1, 1).unwrap();
+        // Full-width letters and digits fold to ASCII.
+        assert_eq!(
+            derive("\u{ff50}\u{ff41}\u{ff53}\u{ff53}\u{ff11}\u{ff12}\u{ff13}"),
+            derive("pass123")
+        );
+        // The "fi" ligature folds to the two letters.
+        assert_eq!(derive("\u{fb01}nd the \u{fb01}sh"), derive("find the fish"));
+        // Superscript two folds to a plain digit.
+        assert_eq!(derive("x\u{b2}"), derive("x2"));
+    }
+
+    #[test]
+    fn nfc_and_nfd_of_the_same_text_derive_the_same_key() {
+        let salt = fixed_salt();
+        let nfc = "caf\u{e9} cr\u{e8}me br\u{fb}l\u{e9}e \u{f1}";
+        let nfd = "cafe\u{301} cre\u{300}me bru\u{302}le\u{301}e n\u{303}";
+        assert_ne!(
+            nfc.as_bytes(),
+            nfd.as_bytes(),
+            "the test needs two different encodings"
+        );
+        assert_eq!(
+            derive_password_key(nfc.as_bytes(), &salt, 1024, 1, 1).unwrap(),
+            derive_password_key(nfd.as_bytes(), &salt, 1024, 1, 1).unwrap()
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_passes_through_unchanged() {
+        // 0xff 0xfe is never valid UTF-8.
+        let raw: &[u8] = &[b'p', 0xff, 0xfe, b'w'];
+        assert!(std::str::from_utf8(raw).is_err());
+        assert!(matches!(normalise_password(raw), NormalisedPassword::Borrowed(b) if b == raw));
+        // Borrowed means the bytes reach Argon2 exactly as given.
+        let salt = fixed_salt();
+        assert_eq!(
+            derive_password_key(raw, &salt, 1024, 1, 1).unwrap(),
+            derive_password_key(raw, &salt, 1024, 1, 1).unwrap()
         );
     }
 }

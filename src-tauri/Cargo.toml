@@ -288,9 +288,16 @@ anno = { version = "=0.11.0", default-features = false }
 # annotate-snippets and encoding_rs_io.
 serde-saphyr = { version = "1.3.0", default-features = false, features = ["deserialize"] }
 
+# items.id=777 stage 0: NFKC-normalises the password inside
+# auth::kdf::derive_password_key (decisions.id=858). Was a dev-dependency only.
+# Pinned EXACTLY (0.1.25, the version already in Cargo.lock) on purpose: this
+# crate's Unicode tables decide which key a password derives, so a table change
+# from a silent bump could lock accounts out. Bump only deliberately, with the
+# kdf golden-vector tests re-run. MIT OR Apache-2.0.
+unicode-normalization = "=0.1.25"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
-unicode-normalization = "0.1"
 tempfile = "3"
 # Character Error Rate (Levenshtein) for the OCR accuracy eval
 # (providers/ocr_eval.rs, items.id=150 Part 3) -- already resolved
