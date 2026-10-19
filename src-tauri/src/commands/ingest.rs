@@ -363,7 +363,13 @@ pub async fn store_ingested_document(
         ) {
             Ok(lease) => Some(lease),
             Err(e) => {
-                log::warn!("store_ingested_document: OCR text for {output_id} skipped, {e}");
+                // The document is stored, but its image text will not be read:
+                // tell the user (items.id=778) rather than skip silently.
+                crate::write_failure::report(
+                    Some(&app_handle),
+                    crate::write_failure::Lost::OcrText,
+                    &format!("store_ingested_document: OCR text for {output_id} skipped, {e}"),
+                );
                 None
             }
         };
@@ -373,17 +379,28 @@ pub async fn store_ingested_document(
             };
             let client = app_handle.state::<OllamaClient>();
             if let Some(text) = ocr_image_text(&client, &bg_bytes).await {
-                if let Err(e) = output_store::backfill_ingested_content(
-                    &bg_user_id,
-                    &bg_persona_id,
-                    &bg_key_hex,
-                    &bg_output_id,
-                    &text,
-                )
-                .await
-                {
-                    log::warn!(
-                        "store_ingested_document: OCR backfill failed for {bg_output_id} (non-fatal): {e}"
+                // The searchable text read from the image is user content: a
+                // failed save is retried and then reported (items.id=778), not
+                // logged and dropped. The document itself is already stored.
+                let saved = crate::write_failure::retry_transient(|| async {
+                    output_store::backfill_ingested_content(
+                        &bg_user_id,
+                        &bg_persona_id,
+                        &bg_key_hex,
+                        &bg_output_id,
+                        &text,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())
+                })
+                .await;
+                if let Err(e) = saved {
+                    crate::write_failure::report(
+                        Some(&app_handle),
+                        crate::write_failure::Lost::OcrText,
+                        &format!(
+                            "store_ingested_document: OCR backfill failed for {bg_output_id}: {e}"
+                        ),
                     );
                 }
             }

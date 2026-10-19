@@ -12,6 +12,8 @@ import { LoginForm } from './auth/LoginForm'
 import { RotationErrorText } from './auth/RotationErrorText'
 import { RotationProgress } from './auth/RotationProgress'
 import { SessionLockText } from './auth/SessionLockText'
+import { WriteFailedNotice } from './auth/WriteFailedNotice'
+import { addFailure, parseWriteFailed, WRITE_FAILED_EVENT } from './auth/writeFailed'
 import type { SignOutNotice } from './auth/rotationErrors'
 import {
   isSessionLockNotice,
@@ -43,6 +45,29 @@ function App() {
 
   // items.id=769: why the user was just signed out, shown on the login screen.
   const [signOutNotice, setSignOutNotice] = useState<SignOutNotice | null>(null)
+
+  // items.id=778: a write of the user's own content failed after its retries
+  // (a reply, a run's final status, a History entry). Shown until dismissed.
+  const [writeFailures, setWriteFailures] = useState<string[]>([])
+  useEffect(() => {
+    let cancelled = false
+    let unlisten: UnlistenFn | undefined
+    listen<unknown>(WRITE_FAILED_EVENT, (event) => {
+      const kind = parseWriteFailed(event.payload)
+      if (kind !== null) setWriteFailures((current) => addFailure(current, kind))
+    })
+      .then((fn) => {
+        if (cancelled) fn()
+        else unlisten = fn
+      })
+      .catch(() => {
+        // No Tauri bridge (plain browser): nothing emits.
+      })
+    return () => {
+      cancelled = true
+      unlisten?.()
+    }
+  }, [])
 
   // Sign out (explicit, or forced by a credential-change error). logout() clears
   // the resident key; the cached user id goes with it. A failed logout() still
@@ -220,6 +245,7 @@ function App() {
     <>
       {screen}
       <RotationProgress onFailedAcknowledged={() => void signOut()} />
+      <WriteFailedNotice kinds={writeFailures} onDismiss={() => setWriteFailures([])} />
     </>
   )
 }

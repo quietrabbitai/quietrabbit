@@ -820,7 +820,7 @@ impl StepExecutor {
                     if stream_tail.cancelled || !stream_tail.received_text.is_empty() {
                         // items.id=716 (decisions.id=883): what the user saw
                         // is kept, marked cancelled or cut, never retracted.
-                        keep_partial_reply(ctx, &stream_tail).await;
+                        keep_partial_reply(ctx, &stream_tail, app_handle).await;
                         let g2 = reply_gate2(
                             ctx,
                             privacy_gateway,
@@ -828,6 +828,7 @@ impl StepExecutor {
                             &stream_tail.received_text,
                             selected_model.provider_id.clone(),
                             &g1.fields_shared,
+                            app_handle,
                         )
                         .await;
                         sink.end(&StreamEnd {
@@ -862,6 +863,7 @@ impl StepExecutor {
             &response.content,
             selected_model.provider_id.clone(),
             &g1.fields_shared,
+            app_handle,
         )
         .await;
         if let Some(sink) = stream_sink.as_deref() {
@@ -871,7 +873,7 @@ impl StepExecutor {
                 audit_unavailable: g2.audit_unavailable,
             });
         }
-        record_completed_reply(ctx, &response).await;
+        record_completed_reply(ctx, &response, app_handle).await;
 
         // -- Step 12 — update TaskTrack --
         // D4-040: content = model output ONLY — never prompt-expanded input.
@@ -1612,6 +1614,7 @@ async fn reply_gate2<L: DisclosureLogger>(
     text: &str,
     provider: Option<String>,
     fields_shared: &[String],
+    app_handle: Option<&tauri::AppHandle<tauri::Wry>>,
 ) -> ReplyGate2 {
     if text.is_empty() {
         return ReplyGate2::default();
@@ -1663,19 +1666,28 @@ async fn reply_gate2<L: DisclosureLogger>(
     if ctx.key_hex.is_empty() {
         return outcome;
     }
-    match crate::persistence::message_store::mark_reply_personal_flagged(
-        &ctx.user_id,
-        &ctx.persona_id,
-        &ctx.key_hex,
-        &ctx.focus_run_id,
-    )
-    .await
-    {
-        Ok(_) => {}
-        Err(e) => log::warn!(
-            "executor: could not mark the reply of run {} personal-flagged: {e}",
-            ctx.focus_run_id
-        ),
+    // The personal-data flag is privacy-relevant: if it cannot be saved the
+    // user is told (items.id=778) and shown what to do, not just logged.
+    let marked = crate::write_failure::retry_transient(|| async {
+        crate::persistence::message_store::mark_reply_personal_flagged(
+            &ctx.user_id,
+            &ctx.persona_id,
+            &ctx.key_hex,
+            &ctx.focus_run_id,
+        )
+        .await
+        .map_err(|e| e.to_string())
+    })
+    .await;
+    if let Err(e) = marked {
+        crate::write_failure::report(
+            app_handle,
+            crate::write_failure::Lost::PersonalFlag,
+            &format!(
+                "executor: could not mark the reply of run {} personal-flagged: {e}",
+                ctx.focus_run_id
+            ),
+        );
     }
     outcome
 }
@@ -1720,7 +1732,11 @@ fn stopped_failure(ctx: &StepContext) -> FailureResult {
 /// run still parks through the ordinary failure path, and finalize_chat_reply
 /// leaves a kept partial reply alone. A run that owns no chat reply row (not a
 /// chat send) is a no-op. A failed write is logged and never changes the run.
-async fn keep_partial_reply(ctx: &StepContext, tail: &StreamTail) {
+async fn keep_partial_reply(
+    ctx: &StepContext,
+    tail: &StreamTail,
+    app_handle: Option<&tauri::AppHandle<tauri::Wry>>,
+) {
     if tail.received_text.is_empty() || ctx.key_hex.is_empty() {
         return;
     }
@@ -1729,19 +1745,29 @@ async fn keep_partial_reply(ctx: &StepContext, tail: &StreamTail) {
     } else {
         crate::persistence::message_store::ReplyStatus::Cut
     };
-    if let Err(e) = crate::persistence::message_store::set_reply_outcome(
-        &ctx.user_id,
-        &ctx.persona_id,
-        &ctx.key_hex,
-        &ctx.focus_run_id,
-        status,
-        Some(&tail.received_text),
-    )
-    .await
-    {
-        log::warn!(
-            "executor: could not keep the partial reply of run {}: {e}",
-            ctx.focus_run_id
+    let kept = crate::write_failure::retry_transient(|| async {
+        crate::persistence::message_store::set_reply_outcome(
+            &ctx.user_id,
+            &ctx.persona_id,
+            &ctx.key_hex,
+            &ctx.focus_run_id,
+            status,
+            Some(&tail.received_text),
+        )
+        .await
+        .map_err(|e| e.to_string())
+    })
+    .await;
+    // The text the user was shown is user content: if it cannot be kept, say
+    // so (items.id=778) instead of logging and moving on.
+    if let Err(e) = kept {
+        crate::write_failure::report(
+            app_handle,
+            crate::write_failure::Lost::Reply,
+            &format!(
+                "executor: could not keep the partial reply of run {}: {e}",
+                ctx.focus_run_id
+            ),
         );
     }
 }
@@ -1752,7 +1778,11 @@ async fn keep_partial_reply(ctx: &StepContext, tail: &StreamTail) {
 /// status to `complete` otherwise, so an earlier attempt that was cut and then
 /// retried does not leave its mark on the finished reply. Not a chat send: a
 /// no-op.
-async fn record_completed_reply(ctx: &StepContext, response: &GenerateResponse) {
+async fn record_completed_reply(
+    ctx: &StepContext,
+    response: &GenerateResponse,
+    app_handle: Option<&tauri::AppHandle<tauri::Wry>>,
+) {
     if ctx.key_hex.is_empty() {
         return;
     }
@@ -1765,19 +1795,29 @@ async fn record_completed_reply(ctx: &StepContext, response: &GenerateResponse) 
     } else {
         crate::persistence::message_store::ReplyStatus::Complete
     };
-    if let Err(e) = crate::persistence::message_store::set_reply_outcome(
-        &ctx.user_id,
-        &ctx.persona_id,
-        &ctx.key_hex,
-        &ctx.focus_run_id,
-        status,
-        None,
-    )
-    .await
-    {
-        log::warn!(
-            "executor: could not record the outcome of run {}'s reply: {e}",
-            ctx.focus_run_id
+    let recorded = crate::write_failure::retry_transient(|| async {
+        crate::persistence::message_store::set_reply_outcome(
+            &ctx.user_id,
+            &ctx.persona_id,
+            &ctx.key_hex,
+            &ctx.focus_run_id,
+            status,
+            None,
+        )
+        .await
+        .map_err(|e| e.to_string())
+    })
+    .await;
+    // The marker says whether a reply was cut off at the output limit
+    // (items.id=716): if it cannot be saved the user is told (items.id=778).
+    if let Err(e) = recorded {
+        crate::write_failure::report(
+            app_handle,
+            crate::write_failure::Lost::ReplyStatus,
+            &format!(
+                "executor: could not record the outcome of run {}'s reply: {e}",
+                ctx.focus_run_id
+            ),
         );
     }
 }
@@ -3889,6 +3929,7 @@ mod tests {
                     received_text: "half an answ".to_owned(),
                     cancelled: true,
                 },
+                None,
             )
             .await;
             let r = reply_of("run-cancel").await;
@@ -3904,6 +3945,7 @@ mod tests {
                     received_text: "the first part".to_owned(),
                     cancelled: false,
                 },
+                None,
             )
             .await;
             let r = reply_of("run-cut").await;
@@ -3920,6 +3962,7 @@ mod tests {
                     received_text: String::new(),
                     cancelled: true,
                 },
+                None,
             )
             .await;
             let r = reply_of("run-empty").await;
@@ -3950,7 +3993,7 @@ mod tests {
             // Truncated by the output limit: marked, whatever kind of run.
             let mut ctx = hosted_ctx(RunAttendance::Attended, PARTIAL_KEY);
             ctx.focus_run_id = "run-trunc".to_owned();
-            record_completed_reply(&ctx, &response(CompletionStatus::Truncated)).await;
+            record_completed_reply(&ctx, &response(CompletionStatus::Truncated), None).await;
             assert_eq!(
                 reply_of("run-trunc").await.reply_status,
                 ReplyStatus::Truncated
@@ -3969,7 +4012,7 @@ mod tests {
             )
             .await
             .unwrap();
-            record_completed_reply(&ctx, &response(CompletionStatus::Complete)).await;
+            record_completed_reply(&ctx, &response(CompletionStatus::Complete), None).await;
             assert_eq!(
                 reply_of("run-retry").await.reply_status,
                 ReplyStatus::Complete
@@ -3988,7 +4031,7 @@ mod tests {
             )
             .await
             .unwrap();
-            record_completed_reply(&ctx, &response(CompletionStatus::Complete)).await;
+            record_completed_reply(&ctx, &response(CompletionStatus::Complete), None).await;
             assert_eq!(reply_of("run-plain").await.reply_status, ReplyStatus::Cut);
         })
         .await;
@@ -5074,6 +5117,7 @@ mod tests {
                     "You live in Springfield, right?",
                     Some("fixture-host-a".to_owned()),
                     &[],
+                    None,
                 )
                 .await;
                 assert_eq!(
@@ -5118,7 +5162,7 @@ mod tests {
                     ("You live in Springfield", vec!["home_city".to_owned()]),
                     ("", vec![]),
                 ] {
-                    let g2 = reply_gate2(&ctx, &gw, &track, text, None, &shared).await;
+                    let g2 = reply_gate2(&ctx, &gw, &track, text, None, &shared, None).await;
                     assert_eq!(g2, ReplyGate2::default(), "{text}");
                 }
                 assert_eq!(gw.logger.entry_count(), 0);
@@ -5135,7 +5179,8 @@ mod tests {
                 let ctx = hosted_ctx(RunAttendance::Attended, &key_hex);
                 let gw = PrivacyGateway::new(FailLogger);
                 let track = track_of(&[("diagnosis", "Hypertension", 3)]);
-                let g2 = reply_gate2(&ctx, &gw, &track, "You have hypertension", None, &[]).await;
+                let g2 =
+                    reply_gate2(&ctx, &gw, &track, "You have hypertension", None, &[], None).await;
                 // Not a failure of the step: flagged, with the audit entry
                 // reported as unavailable, and the severity recovered.
                 assert_eq!(
@@ -5174,6 +5219,7 @@ mod tests {
                         text,
                         None,
                         &[],
+                        None,
                     )
                     .await;
                     let b = reply_gate2(
@@ -5183,6 +5229,7 @@ mod tests {
                         text,
                         None,
                         &[],
+                        None,
                     )
                     .await;
                     assert_eq!(a, b, "{text}");
@@ -5221,6 +5268,7 @@ mod tests {
                 "Springfield and Acme Credit",
                 None,
                 &g1.fields_shared,
+                None,
             )
             .await;
             assert_eq!(g2, ReplyGate2::default());
@@ -5251,6 +5299,7 @@ mod tests {
                 "Springfield and Acme Credit",
                 None,
                 &g1_ext.fields_shared,
+                None,
             )
             .await;
             assert!(g2_ext.flagged);

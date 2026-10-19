@@ -237,33 +237,59 @@ impl Drop for WriterLease {
 }
 
 /// Take a lease for `user_id`.
+///
+/// ORDERING WITH A ROTATION (items.id=778, the acquire/begin_rotation gap): the
+/// rotating flag (epoch_guard::begin_rotation) and this gate are two locks.
+/// The two sides use opposite orders so one of them always sees the other:
+///   - here: register the lease FIRST, then look at the flag. If a rotation set
+///     the flag in the meantime, the lease is undone and refused.
+///   - the engine: set the flag FIRST, then count the leases (run_rotation,
+///     resume_rotation, cancel_rotation: `check_no_writers`), refusing if any.
+///
+/// A lease can therefore never be admitted unseen while a rotation starts. The
+/// three start commands go further and close the gate first.
 pub fn acquire(user_id: &str, kind: Kind) -> Result<WriterLease, GateError> {
     if crate::auth::epoch_guard::is_rotating_for(user_id) {
         return Err(GateError::Rotating);
     }
-    let mut g = gate();
-    g.next_id += 1;
-    let id = g.next_id;
-    let u = g.users.entry(user_id.to_owned()).or_default();
-    let admitted = match (u.phase(), kind) {
-        (Phase::Open, _) => true,
-        (Phase::Draining, Kind::Command) => true,
-        (Phase::Draining, _) | (Phase::Closed, _) => false,
+    let lease = {
+        let mut g = gate();
+        g.next_id += 1;
+        let id = g.next_id;
+        let u = g.users.entry(user_id.to_owned()).or_default();
+        let admitted = match (u.phase(), kind) {
+            (Phase::Open, _) => true,
+            (Phase::Draining, Kind::Command) => true,
+            (Phase::Draining, _) | (Phase::Closed, _) => false,
+        };
+        if !admitted {
+            return Err(GateError::Rotating);
+        }
+        *u.counts.slot(kind) += 1;
+        let stop = CancellationToken::new();
+        if kind.is_visible_work() {
+            u.stops.insert(id, stop.clone());
+        }
+        WriterLease {
+            id,
+            user_id: user_id.to_owned(),
+            kind,
+            stop,
+        }
     };
-    if !admitted {
+    // Registered; now look at the flag again (see above). Dropping `lease`
+    // undoes the registration.
+    if crate::auth::epoch_guard::is_rotating_for(user_id) {
         return Err(GateError::Rotating);
     }
-    *u.counts.slot(kind) += 1;
-    let stop = CancellationToken::new();
-    if kind.is_visible_work() {
-        u.stops.insert(id, stop.clone());
-    }
-    Ok(WriterLease {
-        id,
-        user_id: user_id.to_owned(),
-        kind,
-        stop,
-    })
+    Ok(lease)
+}
+
+/// The engine's half of the ordering: with the rotating flag already set, no
+/// lease may be live (a rotation that did not drain first, such as the
+/// unlock-time resume and cancel). Returns how many are.
+pub fn live_leases(user_id: &str) -> usize {
+    counts(user_id).total()
 }
 
 /// A lease for the account unlocked in this process. Commands call this first.
@@ -824,6 +850,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_lease_registered_just_before_the_flag_is_seen_by_the_engine() {
+        // The other order of the race: the lease won, then the flag was set.
+        // The engine, checking after it set the flag, must see the lease.
+        let _serial = crate::test_support::ENV_MUTEX.lock().await;
+        let u = "gate-race";
+        let lease = acquire(u, Kind::Command).unwrap();
+        let guard = crate::auth::epoch_guard::begin_rotation(u).unwrap();
+        assert_eq!(live_leases(u), 1);
+        drop(guard);
+        drop(lease);
+        assert_eq!(live_leases(u), 0);
+    }
+
+    #[tokio::test]
     async fn a_rotation_held_by_this_process_refuses_every_lease() {
         let _serial = crate::test_support::ENV_MUTEX.lock().await;
         let u = "gate-rotating";
@@ -1117,6 +1157,29 @@ mod tests {
         );
     }
 
+    /// Spawn sites that sit in a function with no lease in sight, each with why
+    /// the work they start is safe. Keyed `file::function`.
+    const SPAWN_SITE_EXEMPT: &[(&str, &str)] = &[];
+
+    /// The function a byte offset sits in: from the nearest `fn` line at or
+    /// before it to the next `fn` line, with that function's name.
+    fn enclosing_fn(code: &str, at: usize) -> (String, &str) {
+        let fn_re =
+            regex::Regex::new(r"(?m)^[ \t]*(?:pub(?:\([a-z]+\))?\s+)?(?:async\s+)?fn\s+(\w+)")
+                .unwrap();
+        let starts: Vec<(usize, String)> = fn_re
+            .captures_iter(code)
+            .map(|c| (c.get(0).unwrap().start(), c[1].to_owned()))
+            .collect();
+        let idx = starts.iter().rposition(|(s, _)| *s <= at).unwrap_or(0);
+        let (start, name) = starts
+            .get(idx)
+            .cloned()
+            .unwrap_or((0, "<module>".to_owned()));
+        let end = starts.get(idx + 1).map_or(code.len(), |(s, _)| *s);
+        (name, &code[start..end])
+    }
+
     #[test]
     fn every_spawn_site_takes_a_lease_or_is_listed() {
         let spawn_re = regex::Regex::new(
@@ -1127,40 +1190,66 @@ mod tests {
         rs_files(&src_dir(), &mut files);
         let mut unleased = Vec::new();
         let mut seen_exempt = std::collections::BTreeSet::new();
+        let mut seen_site_exempt = std::collections::BTreeSet::new();
         for path in files {
             let rel = path
                 .strip_prefix(src_dir())
                 .unwrap()
                 .to_string_lossy()
                 .replace('\\', "/");
-            if is_test_file(&rel) || rel == "auth/writer_gate.rs" {
-                continue;
+            if is_test_file(&rel) || rel == "auth/writer_gate.rs" || rel == "main.rs" {
+                continue; // main.rs: pinned task by task (MAIN_TASKS)
             }
             let text = std::fs::read_to_string(&path).unwrap();
             let prod = production_text(&text);
+            // Comments out, byte offsets kept (blank lines keep the layout).
             let code: String = prod
                 .lines()
-                .filter(|l| !l.trim_start().starts_with("//"))
+                .map(|l| {
+                    if l.trim_start().starts_with("//") {
+                        ""
+                    } else {
+                        l
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
-            if !spawn_re.is_match(&code) {
+            let sites: Vec<usize> = spawn_re.find_iter(&code).map(|m| m.start()).collect();
+            if sites.is_empty() {
                 continue;
             }
             if let Some((f, _)) = SPAWN_EXEMPT.iter().find(|(f, _)| *f == rel) {
                 seen_exempt.insert(*f);
-            } else if !code.contains("writer_gate::") {
-                unleased.push(rel);
+                continue;
+            }
+            // Per SITE: the function that spawns must take a lease or hand one
+            // to the task (a `lease` it moves in), or be listed.
+            for at in sites {
+                let (name, window) = enclosing_fn(&code, at);
+                let key = format!("{rel}::{name}");
+                if SPAWN_SITE_EXEMPT.iter().any(|(k, _)| *k == key) {
+                    seen_site_exempt.insert(key);
+                } else if !(window.contains("writer_gate::") || window.contains("lease")) {
+                    unleased.push(key);
+                }
             }
         }
         assert!(
             unleased.is_empty(),
-            "these files spawn work but never take a writer lease and are not listed in \
-             SPAWN_EXEMPT with a reason: {unleased:?}"
+            "these functions spawn work but neither take a writer lease nor pass one into the \
+             task, and are not listed in SPAWN_SITE_EXEMPT (or their file in SPAWN_EXEMPT) \
+             with a reason: {unleased:?}"
         );
         for (f, _) in SPAWN_EXEMPT {
             assert!(
                 seen_exempt.contains(f),
-                "SPAWN_EXEMPT lists {f}, which no longer spawns (or now takes a lease): remove it"
+                "SPAWN_EXEMPT lists {f}, which no longer spawns: remove it"
+            );
+        }
+        for (k, _) in SPAWN_SITE_EXEMPT {
+            assert!(
+                seen_site_exempt.contains(*k),
+                "SPAWN_SITE_EXEMPT lists {k}, which no longer spawns: remove it"
             );
         }
     }

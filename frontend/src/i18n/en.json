@@ -205,6 +205,16 @@
         "body": "Nothing was changed. Close QuietRabbit, open it again, and then make the change again.",
         "ok": "OK"
       }
+    },
+    "writeFailed": {
+      "reply": "A reply couldn't be saved to this chat. If you can still see it on screen, copy it now.",
+      "run": "A task finished but its final status couldn't be saved. Check it in your Library before you rely on it.",
+      "history": "A chat's entry in History couldn't be saved. Your messages are saved, but the chat may be missing from the list.",
+      "generic": "Something you wrote or received couldn't be saved.",
+      "dismiss": "Dismiss",
+      "replyStatus": "A reply was saved, but its status wasn't. A reply that was cut short may look finished.",
+      "personalFlag": "This reply may contain personal details you chose to keep private, but it couldn't be marked that way. Treat it as sensitive and don't copy or share it.",
+      "ocrText": "A document was saved, but the text read from its image wasn't, so it won't show up in search. You can add the document again."
     }
   },
   "navShell": {

@@ -38,6 +38,14 @@
 //      be stale. The hook takes its keys from the RotationOutcome, never from
 //      the registry, which still holds the OLD key while it runs.
 //
+// RETRY (items.id=778, decisions.id=896 point 7): a TRANSIENT failure of one
+// file (a busy database, a leftover sidecar that cannot be removed yet) is
+// retried inside the rotation, REKEY_ATTEMPTS times in all with REKEY_BACKOFF
+// between them, before it counts as a failure. Each retry first re-checks that
+// the rotation is still ours, and move_item is idempotent (it probes which key
+// the file is under), so a retry can never double-apply. Hard errors are not
+// retried. The rollback and the resume paths use the same bounded retry.
+//
 // FAILURE: an error while the process is alive, before promotion, rolls the
 // rotation back automatically (every file back to the old key, state
 // `rolled_back`, nothing changed for the user). After promotion nothing is
@@ -87,6 +95,16 @@ use crate::auth::user_store::{
 };
 use crate::auth::writer_gate::{self, GateCheckError};
 use crate::persistence::ingest_blob::{self, BlobRekey};
+
+/// Attempts per file for a transient failure (the first try included).
+pub const REKEY_ATTEMPTS: usize = 5;
+/// Sleep before attempts 2 to 5: about 3.75 s of waiting per file at worst.
+pub const REKEY_BACKOFF: [std::time::Duration; REKEY_ATTEMPTS - 1] = [
+    std::time::Duration::from_millis(250),
+    std::time::Duration::from_millis(500),
+    std::time::Duration::from_millis(1000),
+    std::time::Duration::from_millis(2000),
+];
 
 // ---------------------------------------------------------------------------
 // Progress
@@ -293,8 +311,13 @@ pub struct RotationEnv<'a> {
     pub kdf: KdfParams,
     /// Free bytes on the filesystem holding a path. Injectable.
     pub free_space: fn(&Path) -> Option<u64>,
+    /// Sleeps between the attempts at a transiently failing file. Injectable.
+    pub retry_backoff: [std::time::Duration; REKEY_ATTEMPTS - 1],
     #[cfg(test)]
     pub faults: Vec<FaultPoint>,
+    /// Test only: make item `.0` fail transiently `.1` more times.
+    #[cfg(test)]
+    pub transient_failures: Option<(usize, std::sync::atomic::AtomicUsize)>,
 }
 
 impl<'a> RotationEnv<'a> {
@@ -308,8 +331,11 @@ impl<'a> RotationEnv<'a> {
             progress: &GLOBAL_PROGRESS,
             kdf: KdfParams::default(),
             free_space: io::available_space,
+            retry_backoff: REKEY_BACKOFF,
             #[cfg(test)]
             faults: Vec::new(),
+            #[cfg(test)]
+            transient_failures: None,
         }
     }
 
@@ -391,6 +417,9 @@ pub enum RotationError {
     Busy { rel_path: String },
     #[error("re-keying {rel_path} failed: {detail}")]
     Item { rel_path: String, detail: String },
+    /// A journal or WAL file is still beside the database; transient, retried.
+    #[error("a leftover journal or WAL file could not be cleared beside {rel_path}")]
+    LeftoverSidecar { rel_path: String },
     #[error("the new wrapper did not verify after it was written: {0}")]
     ReadBackFailed(String),
     #[error("the pending rotation cannot be resumed: {0}")]
@@ -428,6 +457,20 @@ pub enum RotationError {
 }
 
 impl RotationError {
+    /// Whether a bounded retry can help: another connection still holds the
+    /// file, or a leftover sidecar could not be cleared yet. Never a key or a
+    /// data problem.
+    pub fn is_transient(&self) -> bool {
+        use std::io::ErrorKind::{Interrupted, ResourceBusy, TimedOut, WouldBlock};
+        match self {
+            RotationError::Busy { .. } | RotationError::LeftoverSidecar { .. } => true,
+            RotationError::Io(e) => {
+                matches!(e.kind(), Interrupted | ResourceBusy | TimedOut | WouldBlock)
+            }
+            _ => false,
+        }
+    }
+
     fn is_crash(&self) -> bool {
         #[cfg(test)]
         {
@@ -516,6 +559,9 @@ impl Run<'_> {
 fn file_err(rel_path: &str, e: io::RekeyError) -> RotationError {
     match e {
         io::RekeyError::Busy => RotationError::Busy {
+            rel_path: rel_path.to_owned(),
+        },
+        io::RekeyError::LeftoverSidecar(_) => RotationError::LeftoverSidecar {
             rel_path: rel_path.to_owned(),
         },
         other => RotationError::Item {
@@ -645,6 +691,61 @@ fn label_of(item: &RotationItem) -> &'static str {
         .unwrap_or("Files")
 }
 
+/// `move_item` with the bounded retry for transient failures (see the module
+/// header). Between attempts the rotation must still be ours; a hard error, or
+/// the last transient one, is returned.
+async fn move_item_with_retry(
+    run: &Run<'_>,
+    n: usize,
+    item: &RotationItem,
+    src: (&[u8; kdf::MASTER_KEY_LEN], u64),
+    dst: (&[u8; kdf::MASTER_KEY_LEN], u64),
+    promoted: bool,
+) -> Result<(), RotationError> {
+    let mut attempt = 0;
+    loop {
+        #[cfg(test)]
+        let injected = match &run.env.transient_failures {
+            Some((at, left))
+                if *at == n
+                    && left
+                        .fetch_update(
+                            std::sync::atomic::Ordering::SeqCst,
+                            std::sync::atomic::Ordering::SeqCst,
+                            |v| v.checked_sub(1),
+                        )
+                        .is_ok() =>
+            {
+                Err(RotationError::Busy {
+                    rel_path: item.rel_path.clone(),
+                })
+            }
+            _ => Ok(()),
+        };
+        #[cfg(not(test))]
+        let injected: Result<(), RotationError> = {
+            let _ = n;
+            Ok(())
+        };
+        let result = match injected {
+            Ok(()) => move_item(run, item, src, dst).await,
+            Err(e) => Err(e),
+        };
+        match result {
+            Err(e) if e.is_transient() && attempt + 1 < REKEY_ATTEMPTS => {
+                log::warn!(
+                    "key_rotation: transient failure on attempt {} of {REKEY_ATTEMPTS}, retrying: {e}",
+                    attempt + 1
+                );
+                tokio::time::sleep(run.env.retry_backoff[attempt]).await;
+                run.check_still_ours(promoted).await?;
+                attempt += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Re-key every item not yet committed, in order, recording each.
 async fn drive_forward(run: &Run<'_>) -> Result<(), RotationError> {
     let pool = run.env.pool;
@@ -678,11 +779,13 @@ async fn drive_forward(run: &Run<'_>) -> Result<(), RotationError> {
         )
         .await?;
 
-        let moved = move_item(
+        let moved = move_item_with_retry(
             run,
+            n,
             item,
             (&run.old_dek, run.from_epoch),
             (&run.new_dek, run.to_epoch),
+            false,
         )
         .await;
         if let Err(e) = moved {
@@ -771,11 +874,13 @@ async fn roll_back(run: &Run<'_>, cause: &str) -> Result<(), RotationError> {
     // Newest first: the reverse of the order they were moved.
     for (n, item) in run.items.iter().enumerate().rev() {
         run.emit(Phase::RollingBack, done, Some(label_of(item)));
-        let moved = move_item(
+        let moved = move_item_with_retry(
             run,
+            n,
             item,
             (&run.new_dek, run.to_epoch),
             (&run.old_dek, run.from_epoch),
+            false,
         )
         .await;
         match moved {
@@ -1024,7 +1129,17 @@ async fn preflight(
                 rel_path: item.rel_path.clone(),
                 detail,
             };
-            match io::probe_open(&item.abs_path, &key).await {
+            // A busy file is retried a bounded number of times before the
+            // rotation refuses to start (nothing has changed yet).
+            let mut probe = io::probe_open(&item.abs_path, &key).await;
+            for pause in env.retry_backoff {
+                if !matches!(probe, io::OpenProbe::Busy) {
+                    break;
+                }
+                tokio::time::sleep(pause).await;
+                probe = io::probe_open(&item.abs_path, &key).await;
+            }
+            match probe {
                 io::OpenProbe::Opens => {}
                 io::OpenProbe::Busy => {
                     return Err(RotationError::Busy {
@@ -1062,6 +1177,21 @@ async fn preflight(
     Ok((state, inv))
 }
 
+/// The engine's half of the acquire/begin_rotation ordering (items.id=778; see
+/// writer_gate::acquire): with the rotating flag set, count the live leases. A
+/// start path that drained and closed the gate first has none. The unlock-time
+/// resume and cancel do not drain, so a lease that slipped in just before the
+/// flag is found here and the rotation refuses instead of running under a writer.
+fn check_no_writers(env: &RotationEnv<'_>) -> Result<(), RotationError> {
+    if env.require_closed_gate {
+        return Ok(()); // preflight asserts a closed, empty gate
+    }
+    match writer_gate::live_leases(env.user_id) {
+        0 => Ok(()),
+        n => Err(RotationError::ActiveRuns(n)),
+    }
+}
+
 /// Rotate the account's data key. `old_dek` is the resident (or recovered)
 /// key at `from_epoch`; the caller has authenticated for `request`. See the
 /// module header for the order of work and the failure policy.
@@ -1081,6 +1211,7 @@ pub async fn run_rotation(
     }
     let _guard =
         epoch_guard::begin_rotation(env.user_id).map_err(|_| RotationError::RotationInProgress)?;
+    check_no_writers(env)?;
 
     let user = env.user_id;
     let kind = request.kind();
@@ -1484,6 +1615,7 @@ pub async fn resume_rotation(
 ) -> Result<ResumeOutcome, RotationError> {
     let _guard =
         epoch_guard::begin_rotation(env.user_id).map_err(|_| RotationError::RotationInProgress)?;
+    check_no_writers(env)?;
     let run = load_run(env, pending, new_dek).await?;
     run.emit(Phase::Resuming, 0, None);
 
@@ -1570,6 +1702,7 @@ pub async fn cancel_rotation(
     }
     let _guard =
         epoch_guard::begin_rotation(env.user_id).map_err(|_| RotationError::RotationInProgress)?;
+    check_no_writers(env)?;
     let run = load_run(env, pending, new_dek).await?;
     finish_rollback(&run, "cancelled").await
 }

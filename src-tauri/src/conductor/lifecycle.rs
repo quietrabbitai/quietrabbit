@@ -1644,27 +1644,34 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         Ok(())
     }
 
-    /// Bounded, logged wrapper around write_focus_run_record() for the failure/
+    /// Bounded wrapper around write_focus_run_record() for the failure/
     /// terminal-status call sites. A stalled DB write (lock contention or raw
     /// disk I/O latency, e.g. under concurrent backup I/O) must never hang the
     /// run indefinitely -- 10s is chosen to sit above the 5s busy_timeout so a
-    /// legitimate lock wait can still complete normally.
+    /// legitimate lock wait can still complete normally. A transient failure is
+    /// retried; a failure that remains is NOT silent (items.id=778): the run's
+    /// final status would otherwise stay `running`, so it is reported to the
+    /// user (`data-write-failed`, kind `run`) as well as logged.
     async fn write_focus_run_record_logged(&self, status: &str) {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            self.write_focus_run_record(status),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                log::warn!("lifecycle: write_focus_run_record({status}) failed (non-fatal): {e}");
+        let saved = crate::write_failure::retry_transient(|| async {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                self.write_focus_run_record(status),
+            )
+            .await
+            {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(_) => Err("timed out after 10s".to_owned()),
             }
-            Err(_) => {
-                log::warn!(
-                    "lifecycle: write_focus_run_record({status}) timed out after 10s (non-fatal)"
-                );
-            }
+        })
+        .await;
+        if let Err(e) = saved {
+            crate::write_failure::report(
+                self.app_handle.as_ref(),
+                crate::write_failure::Lost::Run,
+                &format!("lifecycle: write_focus_run_record({status}) failed: {e}"),
+            );
         }
     }
 

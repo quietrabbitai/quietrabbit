@@ -984,6 +984,92 @@ async fn a_database_held_by_something_else_stops_the_rotation_untouched() {
     assert_completed(&fx, &outcome.new_dek).await;
 }
 
+// ---------------------------------------------------------------------------
+// Bounded retry of transient failures (items.id=778, decisions.id=896 point 7)
+// ---------------------------------------------------------------------------
+
+fn no_wait() -> [std::time::Duration; REKEY_ATTEMPTS - 1] {
+    [std::time::Duration::ZERO; REKEY_ATTEMPTS - 1]
+}
+
+#[test]
+fn only_a_busy_file_or_a_stuck_sidecar_is_transient() {
+    assert!(RotationError::Busy {
+        rel_path: "x".into()
+    }
+    .is_transient());
+    assert!(RotationError::LeftoverSidecar {
+        rel_path: "x".into()
+    }
+    .is_transient());
+    assert!(RotationError::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock)).is_transient());
+    assert!(!RotationError::Io(std::io::Error::from(std::io::ErrorKind::NotFound)).is_transient());
+    for hard in [
+        RotationError::EpochChanged,
+        RotationError::Item {
+            rel_path: "x".into(),
+            detail: "y".into(),
+        },
+        RotationError::DatabaseUnreadable {
+            rel_path: "x".into(),
+            detail: "y".into(),
+        },
+        RotationError::ActiveRuns(1),
+    ] {
+        assert!(!hard.is_transient(), "{hard:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_transient_failure_is_retried_and_the_rotation_completes() {
+    let fx = Fixture::new().await;
+    let mut env = fx.env();
+    env.retry_backoff = no_wait();
+    // Item 1 is busy on its first four attempts and fine on the fifth.
+    env.transient_failures = Some((1, std::sync::atomic::AtomicUsize::new(REKEY_ATTEMPTS - 1)));
+    let outcome = run_rotation(&env, &fx.dek, 1, Fixture::change_password())
+        .await
+        .unwrap();
+    assert_completed(&fx, &outcome.new_dek).await;
+}
+
+#[tokio::test]
+async fn a_failure_that_outlasts_the_retries_rolls_back_and_changes_nothing() {
+    let fx = Fixture::new().await;
+    let mut env = fx.env();
+    env.retry_backoff = no_wait();
+    // Busy on every attempt: five tries, then the ordinary rollback.
+    env.transient_failures = Some((1, std::sync::atomic::AtomicUsize::new(REKEY_ATTEMPTS)));
+    let err = run_rotation(&env, &fx.dek, 1, Fixture::change_password())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, RotationError::RolledBack { .. }), "{err:?}");
+    // The failed attempt used exactly the budget, no more.
+    let (_, left) = env.transient_failures.as_ref().unwrap();
+    assert_eq!(left.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_rolled_back(&fx).await;
+}
+
+#[tokio::test]
+async fn a_retry_stops_when_the_rotation_is_no_longer_ours() {
+    // Between attempts the engine re-checks the wrapper; a changed epoch ends
+    // the retries with the epoch error, not another attempt.
+    let fx = Fixture::new().await;
+    let mut env = fx.env();
+    env.retry_backoff = no_wait();
+    env.transient_failures = Some((1, std::sync::atomic::AtomicUsize::new(REKEY_ATTEMPTS)));
+    // Another process changes the account's epoch right after staging.
+    sqlx::query("UPDATE user_key_wrappers SET key_epoch = key_epoch + 1 WHERE user_id = ?")
+        .bind(USER)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+    let err = run_rotation(&env, &fx.dek, 1, Fixture::change_password())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, RotationError::EpochChanged), "{err:?}");
+}
+
 #[tokio::test]
 async fn a_file_that_appears_during_the_rotation_fails_into_the_rollback_path() {
     let fx = Fixture::new().await;

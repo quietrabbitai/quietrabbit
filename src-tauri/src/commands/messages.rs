@@ -158,12 +158,13 @@ const HISTORY_WINDOW: usize = 10;
 /// generation hasn't finished/backfilled yet (see send_message) has nothing
 /// useful to thread into context, and an empty "Assistant: \n" line would
 /// just be noise.
-/// Bounded, logged wrapper around message_store::update_message_content --
-/// same rationale as lifecycle.rs's write_focus_run_record_logged (f615f8b),
-/// applied to the one backfill write it doesn't cover: a stalled encrypted-DB
-/// write here would otherwise silently block the "message-content-ready"
-/// emit below forever. Non-fatal: logs and returns on both failure and
-/// timeout, same as its lifecycle.rs sibling.
+/// Bounded wrapper around message_store::update_message_content -- same
+/// rationale as lifecycle.rs's write_focus_run_record_logged (f615f8b), applied
+/// to the one backfill write it doesn't cover: a stalled encrypted-DB write
+/// here would otherwise silently block the "message-content-ready" emit below
+/// forever. Each attempt is bounded at 10 s, and a transient failure is retried
+/// (write_failure::retry_transient). Returns whether the reply text was saved:
+/// a false is NOT silent (items.id=778) -- the caller reports it.
 async fn update_message_content_logged(
     user_id: &str,
     persona_id: &str,
@@ -171,19 +172,27 @@ async fn update_message_content_logged(
     message_id: &str,
     content: &str,
     is_error: bool,
-) {
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        message_store::update_message_content(
-            user_id, persona_id, key_hex, message_id, content, is_error,
-        ),
-    )
-    .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => log::warn!("send_message: update_message_content failed (non-fatal): {e}"),
-        Err(_) => {
-            log::warn!("send_message: update_message_content timed out after 10s (non-fatal)")
+) -> bool {
+    let saved = crate::write_failure::retry_transient(|| async {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            message_store::update_message_content(
+                user_id, persona_id, key_hex, message_id, content, is_error,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err("timed out after 10s".to_owned()),
+        }
+    })
+    .await;
+    match saved {
+        Ok(()) => true,
+        Err(e) => {
+            log::warn!("send_message: update_message_content failed: {e}");
+            false
         }
     }
 }
@@ -336,6 +345,10 @@ pub(crate) enum ReplyOutcome {
     /// (e.g. a hypothetical "cancelled" with no failure attached). The
     /// placeholder stays empty, same as before this item.
     NothingToBackfill,
+    /// A write of the user's reply failed after its retries, or the reply row
+    /// could not even be looked up (items.id=778): the loss was reported to the
+    /// user (`data-write-failed`), never swallowed.
+    WriteFailed,
     /// `run_id` has no owning assistant message row at all -- a
     /// submit_focus_run/Board-originated run, not a chat send. Safe no-op;
     /// this is what makes it safe to call this function from resume_run and
@@ -374,10 +387,14 @@ pub(crate) async fn finalize_chat_reply(
         Ok(Some(m)) => m,
         Ok(None) => return ReplyOutcome::NotAChatMessage,
         Err(e) => {
-            log::warn!(
-                "finalize_chat_reply: find_assistant_message_by_focus_run_id failed for run {run_id}: {e}"
+            // items.id=778: not "not a chat message": we could not even look.
+            // A reply may be waiting to be saved; tell the user.
+            crate::write_failure::report(
+                app_handle,
+                crate::write_failure::Lost::Reply,
+                &format!("finalize_chat_reply: could not find the reply row of run {run_id}: {e}"),
             );
-            return ReplyOutcome::NotAChatMessage;
+            return ReplyOutcome::WriteFailed;
         }
     };
 
@@ -454,8 +471,16 @@ pub(crate) async fn finalize_chat_reply(
     };
 
     if let Some(c) = &content {
-        update_message_content_logged(user_id, persona_id, key_hex, &msg.id, c, !is_real_reply)
-            .await;
+        if !update_message_content_logged(user_id, persona_id, key_hex, &msg.id, c, !is_real_reply)
+            .await
+        {
+            crate::write_failure::report(
+                app_handle,
+                crate::write_failure::Lost::Reply,
+                &format!("finalize_chat_reply: the reply of run {run_id} was not saved"),
+            );
+            return ReplyOutcome::WriteFailed;
+        }
     }
 
     let outcome = if is_real_reply {
@@ -486,8 +511,12 @@ pub(crate) async fn finalize_chat_reply(
             Ok(true) => ReplyOutcome::ChatFiled,
             Ok(false) => ReplyOutcome::RealReplyNoChat,
             Err(e) => {
-                log::warn!(
-                    "finalize_chat_reply: ensure_chat_and_bump_activity failed (non-fatal): {e}"
+                // The reply is saved but its History entry is not: the chat
+                // would not be findable (items.id=778).
+                crate::write_failure::report(
+                    app_handle,
+                    crate::write_failure::Lost::History,
+                    &format!("finalize_chat_reply: ensure_chat_and_bump_activity failed: {e}"),
                 );
                 ReplyOutcome::RealReplyNoChat
             }
@@ -672,6 +701,13 @@ pub(crate) async fn start_reply(
     context_key: &str,
     provenance: &message_store::MessageProvenance<'_>,
 ) -> Result<Vec<MessageInfo>, String> {
+    // items.id=778: the spawned task below owns `run`, and with it the run's
+    // writer lease, until finalize_chat_reply has finished. A run without one
+    // would write under no lease, so it is refused here (both callers take the
+    // lease at command entry and move it into `run.lease`).
+    if run.lease.is_none() {
+        return Err("internal: a reply run must hold a writer lease".to_owned());
+    }
     let run_id = run
         .focus_run_id
         .clone()
@@ -1189,6 +1225,44 @@ mod tests {
         assert_eq!(row.reply_status, message_store::ReplyStatus::Cancelled);
         assert_eq!(row.content, "");
         assert!(!row.is_error);
+    }
+
+    // items.id=778 (no silent loss): a reply that cannot be saved because the
+    // key is refused is reported, not dropped. The outcome says so, and the
+    // reply row is left as it was (it was never overwritten with garbage).
+    #[tokio::test]
+    async fn a_reply_that_cannot_be_saved_against_a_refused_key_is_reported() {
+        let _env = setup().await;
+        let key = key_hex_str();
+        message_store::save_message(USER_ID, PERSONA_ID, &key, "chat-lost", "user", "hi", None)
+            .await
+            .unwrap();
+        message_store::save_message(
+            USER_ID,
+            PERSONA_ID,
+            &key,
+            "chat-lost",
+            "assistant",
+            "",
+            Some("run-lost"),
+        )
+        .await
+        .unwrap();
+        // The account's key is being changed: every store open is refused.
+        let flag = crate::auth::epoch_guard::begin_rotation(USER_ID).unwrap();
+        let result = Ok(run_result(None));
+        let outcome =
+            finalize_chat_reply(USER_ID, PERSONA_ID, &key, "run-lost", &result, None).await;
+        assert_eq!(outcome, ReplyOutcome::WriteFailed);
+        drop(flag);
+        // Nothing was written over the placeholder.
+        let row = message_store::find_assistant_message_by_focus_run_id(
+            USER_ID, PERSONA_ID, &key, "run-lost",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(row.content, "");
     }
 
     #[tokio::test]

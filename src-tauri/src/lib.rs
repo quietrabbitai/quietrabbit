@@ -26,3 +26,4 @@ pub mod task_progress;
 pub mod task_supervision;
 #[cfg(test)]
 pub mod test_support;
+pub mod write_failure;
