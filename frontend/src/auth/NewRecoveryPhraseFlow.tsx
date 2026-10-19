@@ -18,6 +18,7 @@ import './NewRecoveryPhraseFlow.css'
 import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { commands, type KeyRotationError, type WordAnswer } from '../bindings'
+import { PasswordField } from './PasswordField'
 import { RecoveryPhraseDisplay } from './RecoveryPhraseDisplay'
 import { RotationErrorText } from './RotationErrorText'
 import { requiresSignOut, type SignOutNotice } from './rotationErrors'
@@ -188,9 +189,8 @@ export function NewRecoveryPhraseFlow({ onClose, onBusyChange, onSignOut }: NewR
         confirmExtra={
           <div className="new-phrase-flow__field">
             <label htmlFor="new-phrase-confirm-password">{t('auth.newPhrase.confirmPasswordLabel')}</label>
-            <input
+            <PasswordField
               id="new-phrase-confirm-password"
-              type="password"
               value={confirmPassword}
               onChange={(event) => setConfirmPassword(event.target.value)}
               autoComplete="current-password"
@@ -208,9 +208,8 @@ export function NewRecoveryPhraseFlow({ onClose, onBusyChange, onSignOut }: NewR
       <p className="new-phrase-flow__text">{t('auth.newPhrase.intro')}</p>
       <div className="new-phrase-flow__field">
         <label htmlFor="new-phrase-password">{t('auth.newPhrase.passwordLabel')}</label>
-        <input
+        <PasswordField
           id="new-phrase-password"
-          type="password"
           value={password}
           onChange={(event) => setPassword(event.target.value)}
           autoComplete="current-password"

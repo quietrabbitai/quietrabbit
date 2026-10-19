@@ -14,7 +14,9 @@ import { useState, type FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { commands, type KeyRotationError } from '../bindings'
 import { finishSignIn } from './finishSignIn'
-import { newPasswordProblem } from './passwordForm'
+import { NewPasswordHint } from './NewPasswordHint'
+import { PasswordField } from './PasswordField'
+import { validateNewPassword } from './passwordRules'
 import { joinWords, looksLikePhrase, PHRASE_WORD_COUNT, splitWords } from './recoveryWords'
 import { RotationErrorText } from './RotationErrorText'
 import { beginRotationTask } from './rotationTask'
@@ -42,7 +44,7 @@ export function RestoreAccessForm({ initialDisplayName, onLoggedIn, onBack }: Re
     event.preventDefault()
     const submittedPhrase = phrase
     const submittedNext = next
-    const problem = newPasswordProblem(next, confirm)
+    const problem = validateNewPassword(next, confirm)
     // Cleared on every submit, valid or not.
     setPhrase('')
     setNext('')
@@ -56,6 +58,10 @@ export function RestoreAccessForm({ initialDisplayName, onLoggedIn, onBack }: Re
     }
     if (problem === 'empty') {
       setError({ code: 'new_password_empty' })
+      return
+    }
+    if (problem === 'too_short') {
+      setError({ code: 'new_password_too_short' })
       return
     }
     if (problem === 'mismatch') {
@@ -131,22 +137,22 @@ export function RestoreAccessForm({ initialDisplayName, onLoggedIn, onBack }: Re
 
       <div className="restore-access-form__field">
         <label htmlFor="restore-new-password">{t('auth.restore.newPasswordLabel')}</label>
-        <input
+        <PasswordField
           id="restore-new-password"
-          type="password"
           value={next}
           onChange={(event) => setNext(event.target.value)}
           autoComplete="new-password"
+          aria-describedby="restore-new-password-hint"
           disabled={submitting}
           required
         />
+        <NewPasswordHint id="restore-new-password-hint" password={next} />
       </div>
 
       <div className="restore-access-form__field">
         <label htmlFor="restore-confirm-password">{t('auth.restore.confirmLabel')}</label>
-        <input
+        <PasswordField
           id="restore-confirm-password"
-          type="password"
           value={confirm}
           onChange={(event) => setConfirm(event.target.value)}
           autoComplete="new-password"

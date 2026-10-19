@@ -1519,6 +1519,18 @@ export type KeyRotationError =
  *  code for all three.
  */
 { code: "invalid_credentials" } | { code: "account_locked" } | { code: "new_password_empty" } | 
+/**
+ *  Fewer than 15 characters (decisions.id=858; counted in Unicode code
+ *  points after NFKC, see auth::password_policy).
+ */
+{ code: "new_password_too_short" } | 
+/**  On the common / breached password list. */
+{ code: "new_password_blocked" } | 
+/**
+ *  change_password only: the new password is the current one, which would
+ *  start a data-key rotation that changes nothing for the user.
+ */
+{ code: "new_password_same_as_current" } | 
 /**  The typed words are not a valid 24-word recovery phrase. */
 { code: "phrase_invalid" } | 
 /**  A rotation is already running, or one is pending that must finish first. */

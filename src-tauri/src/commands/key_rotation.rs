@@ -16,6 +16,15 @@
 //                                              -- no session (resume screen)
 //   get_rotation_status()
 //
+// NEW-PASSWORD POLICY (items.id=777, decisions.id=858 and 900): a password
+// being CHOSEN (change_password, restore_with_recovery_phrase) is checked by
+// auth::password_policy before any credential is verified or any work starts:
+// empty, shorter than 15 characters, or on the common/breached list each have
+// their own code. change_password also refuses a new password equal to the
+// current one, but only after the old password is verified (earlier it would
+// be an oracle). Cancelling an interrupted change and signing in never apply
+// the policy: they type a password that already exists, which may predate it.
+//
 // ERRORS ARE CODED AND CARRY NOTHING TO IDENTIFY ANYTHING. Every command here
 // returns KeyRotationError: a small closed set of codes, a few with a count or
 // a size in megabytes. No file name, path, user id, persona id or rotation id
@@ -67,6 +76,7 @@ use crate::auth::key_rotation::{
     self, ProgressEvent, ProgressSink, ResumeOutcome, RotationEnv, RotationError, RotationRequest,
     StagedCredential, StagedUnlockError,
 };
+use crate::auth::password_policy::{self, PasswordPolicyError};
 use crate::auth::registry::{GroupKeyRegistry, KeyRegistry, NewPhraseSlot};
 use crate::auth::user_store;
 use crate::commands::auth::{finish_login, is_locked_out, record_failed_attempt};
@@ -89,6 +99,14 @@ pub enum KeyRotationError {
     InvalidCredentials,
     AccountLocked,
     NewPasswordEmpty,
+    /// Fewer than 15 characters (decisions.id=858; counted in Unicode code
+    /// points after NFKC, see auth::password_policy).
+    NewPasswordTooShort,
+    /// On the common / breached password list.
+    NewPasswordBlocked,
+    /// change_password only: the new password is the current one, which would
+    /// start a data-key rotation that changes nothing for the user.
+    NewPasswordSameAsCurrent,
     /// The typed words are not a valid 24-word recovery phrase.
     PhraseInvalid,
     /// A rotation is already running, or one is pending that must finish first.
@@ -282,6 +300,19 @@ fn internal(context: &str, e: impl std::fmt::Display) -> KeyRotationError {
     KeyRotationError::Internal
 }
 
+/// decisions.id=858: judge a password that is about to be chosen, BEFORE any
+/// credential is checked or any work is done. The verdict depends only on what
+/// the caller typed, so it says nothing about any account and is not a failed
+/// attempt. Never used for a password that already exists (sign-in, resume,
+/// cancel).
+fn check_new_password(password: &str) -> Result<(), KeyRotationError> {
+    password_policy::validate_new_password(password).map_err(|e| match e {
+        PasswordPolicyError::Empty => KeyRotationError::NewPasswordEmpty,
+        PasswordPolicyError::TooShort => KeyRotationError::NewPasswordTooShort,
+        PasswordPolicyError::Blocked => KeyRotationError::NewPasswordBlocked,
+    })
+}
+
 /// Re-verify a password against the account's LIVE wrapper and return the
 /// DEK it opens, recording a wrong password as a failed attempt. A resident
 /// session alone is not enough authority to rotate.
@@ -381,10 +412,13 @@ pub async fn change_password(
 ) -> Result<(), KeyRotationError> {
     let old_password = Zeroizing::new(old_password);
     let new_password = Zeroizing::new(new_password);
-    if new_password.is_empty() {
-        return Err(KeyRotationError::NewPasswordEmpty);
-    }
+    check_new_password(&new_password)?;
     let (resident, _) = authorise_session_change(&key_registry, &pool, &old_password).await?;
+    // Only now, with the old password proven right, is "same as the current
+    // password" a safe thing to say (before that it would be an oracle).
+    if password_policy::same_password(&old_password, &new_password) {
+        return Err(KeyRotationError::NewPasswordSameAsCurrent);
+    }
 
     let env = env_for(
         &pool,
@@ -580,9 +614,7 @@ pub async fn restore_with_recovery_phrase(
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<(), KeyRotationError> {
     let new_password = Zeroizing::new(new_password);
-    if new_password.is_empty() {
-        return Err(KeyRotationError::NewPasswordEmpty);
-    }
+    check_new_password(&new_password)?;
     // The words' shape is checked first and says nothing about any account,
     // so an unknown account cannot be told apart by it.
     let entropy = data_key::entropy_from_mnemonic(&normalise_phrase(&phrase))
@@ -1201,6 +1233,174 @@ mod tests {
         );
         h.scheduler().release_run_slot("run-1");
         h.change_password(PASSWORD, NEW_PASSWORD).await.unwrap();
+    }
+
+    // -- new-password policy (items.id=777, decisions.id=858) -----------
+
+    const FIFTEEN: &str = "fifteen chars!!"; // exactly 15, not listed
+    const FOURTEEN: &str = "fourteen chars"; // one short of the minimum
+    const LISTED_LONG: &str = "123456789daniel"; // on the pinned blocklist
+
+    #[tokio::test]
+    async fn change_password_enforces_the_policy_with_distinct_codes() {
+        let h = Harness::new().await;
+        h.account().await;
+        assert_eq!(FIFTEEN.chars().count(), 15);
+        assert_eq!(FOURTEEN.chars().count(), 14);
+
+        assert_eq!(
+            h.change_password(PASSWORD, FOURTEEN).await.unwrap_err(),
+            KeyRotationError::NewPasswordTooShort
+        );
+        assert_eq!(
+            h.change_password(PASSWORD, LISTED_LONG).await.unwrap_err(),
+            KeyRotationError::NewPasswordBlocked
+        );
+        assert_eq!(
+            h.change_password(PASSWORD, &LISTED_LONG.to_uppercase())
+                .await
+                .unwrap_err(),
+            KeyRotationError::NewPasswordBlocked
+        );
+        // A verdict on the NEW password says nothing about the old one: it is
+        // given before the old password is checked and is not a failed attempt.
+        assert_eq!(
+            h.change_password("not the password", "short")
+                .await
+                .unwrap_err(),
+            KeyRotationError::NewPasswordTooShort
+        );
+        assert_eq!(h.failures().await, 0);
+        // Nothing started: no pending change, the old password still opens.
+        assert!(!h.status().await.interrupted);
+        h.registry().clear().await;
+        epoch_guard::clear_resident_for(&h.user_id().await);
+        h.login(PASSWORD).await.unwrap();
+
+        // Exactly 15 is accepted.
+        h.change_password(PASSWORD, FIFTEEN).await.unwrap();
+        h.registry().clear().await;
+        epoch_guard::clear_resident_for(&h.user_id().await);
+        h.login(FIFTEEN).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn change_password_length_is_counted_in_characters_after_normalisation() {
+        let h = Harness::new().await;
+        h.account().await;
+        // 8 CJK characters are 24 bytes but 8 characters.
+        let cjk = "\u{65e5}\u{672c}\u{8a9e}\u{6f22}\u{5b57}\u{4eba}\u{6c11}\u{6c34}";
+        assert!(cjk.len() >= 15);
+        assert_eq!(
+            h.change_password(PASSWORD, cjk).await.unwrap_err(),
+            KeyRotationError::NewPasswordTooShort
+        );
+        // 14 decomposed accented letters are 14 characters (28 bytes).
+        assert_eq!(
+            h.change_password(PASSWORD, &"e\u{301}".repeat(14))
+                .await
+                .unwrap_err(),
+            KeyRotationError::NewPasswordTooShort
+        );
+        // 15 emoji are 15 characters.
+        h.change_password(PASSWORD, &"\u{1f600}".repeat(15))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn change_password_refuses_the_current_password_only_after_verifying_it() {
+        let h = Harness::new().await;
+        h.account().await;
+        // Move to a non-ASCII password so the test covers normalisation too.
+        let current = "Cr\u{e8}me br\u{fb}l\u{e9}e is fifteen+";
+        h.change_password(PASSWORD, current).await.unwrap();
+
+        assert_eq!(
+            h.change_password(current, current).await.unwrap_err(),
+            KeyRotationError::NewPasswordSameAsCurrent
+        );
+        // The same text typed in decomposed form is the same password (same
+        // key), so it is refused too.
+        let decomposed = "Cre\u{300}me bru\u{302}le\u{301}e is fifteen+";
+        assert_ne!(current, decomposed);
+        assert_eq!(
+            h.change_password(current, decomposed).await.unwrap_err(),
+            KeyRotationError::NewPasswordSameAsCurrent
+        );
+        assert_eq!(h.failures().await, 0);
+        assert!(!h.status().await.interrupted);
+
+        // A WRONG old password that happens to equal the new one must not be
+        // told apart from any other wrong password: no "same as current".
+        let wrong = "this is not the password";
+        assert_eq!(
+            h.change_password(wrong, wrong).await.unwrap_err(),
+            KeyRotationError::InvalidCredentials
+        );
+        assert_eq!(h.failures().await, 1);
+
+        // And no password history is kept: the previous password is allowed
+        // again.
+        h.change_password(current, NEW_PASSWORD).await.unwrap();
+        h.change_password(NEW_PASSWORD, current).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restore_enforces_the_policy_before_touching_the_account() {
+        let h = Harness::new().await;
+        let words = h.account().await;
+        h.registry().clear().await;
+        epoch_guard::clear_resident_for(&h.user_id().await);
+
+        assert_eq!(
+            h.restore(&words, "short").await.unwrap_err(),
+            KeyRotationError::NewPasswordTooShort
+        );
+        assert_eq!(
+            h.restore(&words, LISTED_LONG).await.unwrap_err(),
+            KeyRotationError::NewPasswordBlocked
+        );
+        // Judged before the words: wrong words with a bad password still get
+        // the password verdict, and nothing is counted or changed.
+        assert_eq!(
+            h.restore("one two three", "short").await.unwrap_err(),
+            KeyRotationError::NewPasswordTooShort
+        );
+        assert_eq!(h.failures().await, 0);
+        h.login(PASSWORD).await.unwrap();
+        h.registry().clear().await;
+        epoch_guard::clear_resident_for(&h.user_id().await);
+
+        h.restore(&words, FIFTEEN).await.unwrap();
+        h.registry().clear().await;
+        epoch_guard::clear_resident_for(&h.user_id().await);
+        h.login(FIFTEEN).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_and_resuming_never_apply_the_policy() {
+        // A change interrupted with a password that predates the policy (here a
+        // 4-character one, started below the command layer) must still be
+        // cancellable with that password, and a sign-in with it must still
+        // finish the change.
+        for resume in [false, true] {
+            let h = Harness::new().await;
+            h.account().await;
+            let err = h
+                .run_password_change_with(vec![FaultPoint::AfterItemCommitted(0)], "weak")
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RotationError::SimulatedCrash), "{err:?}");
+            h.restart().await;
+
+            if resume {
+                h.login("weak").await.unwrap();
+            } else {
+                h.cancel_password("Alice", "weak").await.unwrap();
+                h.login(PASSWORD).await.unwrap();
+            }
+        }
     }
 
     // -- interrupted change, through login ------------------------------

@@ -414,7 +414,8 @@ mod tests {
     #[test]
     fn invalid_utf8_passes_through_unchanged() {
         // 0xff 0xfe is never valid UTF-8.
-        let raw: &[u8] = &[b'p', 0xff, 0xfe, b'w'];
+        let raw_bytes: Vec<u8> = vec![b'p', 0xff, 0xfe, b'w'];
+        let raw: &[u8] = &raw_bytes;
         assert!(std::str::from_utf8(raw).is_err());
         assert!(matches!(normalise_password(raw), NormalisedPassword::Borrowed(b) if b == raw));
         // Borrowed means the bytes reach Argon2 exactly as given.

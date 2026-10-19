@@ -16,6 +16,7 @@ pub mod idle_timeout;
 pub mod kdf;
 pub mod key_rotation;
 pub mod key_rotation_io;
+pub mod password_policy;
 pub mod persona_sharing;
 pub mod registry;
 pub mod sharing_keypair;

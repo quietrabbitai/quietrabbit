@@ -27,6 +27,7 @@ import { useTranslation } from 'react-i18next'
 import { commands } from '../bindings'
 import { finishSignIn } from './finishSignIn'
 import { InterruptedChangeScreen } from './InterruptedChangeScreen'
+import { PasswordField } from './PasswordField'
 import { RestoreAccessForm } from './RestoreAccessForm'
 import { classifyLoginError, loginErrorSuffix, type LoginProblem } from './rotationErrors'
 import { beginRotationTask } from './rotationTask'
@@ -160,9 +161,8 @@ export function LoginForm({ onLoggedIn }: LoginFormProps) {
 
       <div>
         <label htmlFor="login-password">{t('auth.passwordLabel')}</label>
-        <input
+        <PasswordField
           id="login-password"
-          type="password"
           value={password}
           onChange={(event) => setPassword(event.target.value)}
           autoComplete="current-password"

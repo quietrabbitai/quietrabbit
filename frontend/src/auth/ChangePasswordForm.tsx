@@ -12,7 +12,10 @@ import './ChangePasswordForm.css'
 import { useState, type FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { commands, type KeyRotationError } from '../bindings'
-import { canSubmitPasswordChange, newPasswordProblem } from './passwordForm'
+import { NewPasswordHint } from './NewPasswordHint'
+import { PasswordField } from './PasswordField'
+import { canSubmitPasswordChange } from './passwordForm'
+import { validateNewPassword } from './passwordRules'
 import { RotationErrorText } from './RotationErrorText'
 import { requiresSignOut, type SignOutNotice } from './rotationErrors'
 import { beginRotationTask } from './rotationTask'
@@ -40,7 +43,7 @@ export function ChangePasswordForm({ displayName, onBusyChange, onSignOut }: Cha
     event.preventDefault()
     const submittedCurrent = current
     const submittedNext = next
-    const problem = newPasswordProblem(next, confirm)
+    const problem = validateNewPassword(next, confirm)
     // Cleared on every submit, valid or not: nothing typed lingers in state.
     setCurrent('')
     setNext('')
@@ -49,6 +52,10 @@ export function ChangePasswordForm({ displayName, onBusyChange, onSignOut }: Cha
     setMismatch(false)
     if (problem === 'empty') {
       setError({ code: 'new_password_empty' })
+      return
+    }
+    if (problem === 'too_short') {
+      setError({ code: 'new_password_too_short' })
       return
     }
     if (problem === 'mismatch') {
@@ -105,9 +112,8 @@ export function ChangePasswordForm({ displayName, onBusyChange, onSignOut }: Cha
 
       <div>
         <label htmlFor="change-password-current">{t('auth.accountSecurity.changePassword.currentLabel')}</label>
-        <input
+        <PasswordField
           id="change-password-current"
-          type="password"
           value={current}
           onChange={(event) => setCurrent(event.target.value)}
           autoComplete="current-password"
@@ -118,22 +124,22 @@ export function ChangePasswordForm({ displayName, onBusyChange, onSignOut }: Cha
 
       <div>
         <label htmlFor="change-password-new">{t('auth.accountSecurity.changePassword.newLabel')}</label>
-        <input
+        <PasswordField
           id="change-password-new"
-          type="password"
           value={next}
           onChange={(event) => setNext(event.target.value)}
           autoComplete="new-password"
+          aria-describedby="change-password-new-hint"
           disabled={submitting}
           required
         />
+        <NewPasswordHint id="change-password-new-hint" password={next} />
       </div>
 
       <div>
         <label htmlFor="change-password-confirm">{t('auth.accountSecurity.changePassword.confirmLabel')}</label>
-        <input
+        <PasswordField
           id="change-password-confirm"
-          type="password"
           value={confirm}
           onChange={(event) => setConfirm(event.target.value)}
           autoComplete="new-password"

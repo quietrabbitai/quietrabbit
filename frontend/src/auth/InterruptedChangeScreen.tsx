@@ -19,6 +19,7 @@ import './InterruptedChangeScreen.css'
 import { useState, type FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { commands, type KeyRotationError } from '../bindings'
+import { PasswordField } from './PasswordField'
 import { joinWords, looksLikePhrase, splitWords, PHRASE_WORD_COUNT } from './recoveryWords'
 import { RotationErrorText } from './RotationErrorText'
 import { beginRotationTask } from './rotationTask'
@@ -129,9 +130,8 @@ export function InterruptedChangeScreen({
           {method === 'password' ? (
             <div className="interrupted-change__field">
               <label htmlFor="interrupted-new-password">{t('auth.interrupted.newPasswordLabel')}</label>
-              <input
+              <PasswordField
                 id="interrupted-new-password"
-                type="password"
                 value={password}
                 onChange={(event) => setPassword(event.target.value)}
                 autoComplete="new-password"

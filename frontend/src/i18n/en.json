@@ -14,6 +14,15 @@
       "rolledBack": "Nothing was changed. Your old password still works.",
       "resumeFailed": "The unfinished change couldn't be completed right now, and nothing is lost. Try again, use your recovery phrase, or restart QuietRabbit if it keeps failing."
     },
+    "passwordField": {
+      "show": "Show password"
+    },
+    "passwordRules": {
+      "rule": "At least {{min}} characters. A phrase of a few words works well.",
+      "count": "{{count}} of {{min}} characters",
+      "countOk": "{{count}} characters: OK",
+      "reachedMinimum": "Long enough: at least {{min}} characters."
+    },
     "restore": {
       "heading": "Restore access with your recovery phrase",
       "intro": "Enter your 24-word recovery phrase and choose a new password. Your data is re-locked under a new key and the new password, so the old password stops opening it from then on. This can take a while for a large account. Copies or backups made before the change can still be opened with your old password. Your recovery phrase stays the same.",
@@ -127,6 +136,9 @@
       "invalidCredentials": "That didn't match. Check it and try again.",
       "accountLocked": "Too many failed attempts. This account is locked for now.",
       "newPasswordEmpty": "Enter a new password.",
+      "newPasswordTooShort": "That password is too short. Use at least 15 characters; a phrase of a few words works well.",
+      "newPasswordBlocked": "That password is on a list of passwords that are too common or have appeared in data breaches. Choose a different one; a phrase of a few words works well.",
+      "newPasswordSameAsCurrent": "That is already your current password. Choose a different one.",
       "phraseInvalid": "That isn't a valid 24-word recovery phrase. Check the words and try again.",
       "rotationInProgress": "A password or recovery change is already running or waiting to finish. Let it finish, then try again.",
       "activeRuns_one": "{{count}} task is still running. Wait for it to finish or cancel it, then try again. Nothing was changed.",
