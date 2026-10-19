@@ -41,6 +41,43 @@ use sqlx::Row;
 
 use crate::auth::registry::{GroupKeyRegistry, KeyRegistry};
 use crate::auth::user_store;
+use crate::provider_credentials::session::ConnectSessions;
+
+/// Why a session ended (items.id=621, items.id=775). The wire string from
+/// `as_str` is what the frontend's `session-locked` listener receives, and it
+/// is also what the backend logs, so a lock is always attributable. To add a
+/// reason: add a variant and an `as_str` arm here, then give the frontend's
+/// `sessionLock.ts` a copy key for it (an unknown string already falls back to
+/// generic copy there and still returns to the login screen).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockReason {
+    /// `users.idle_timeout_minutes` elapsed with no activity.
+    Idle,
+    /// The 30-day absolute session ceiling (Architecture 3.1) was reached.
+    SessionExpired,
+    /// The account's key was rotated in another process (items.id=629).
+    KeyEpochChanged,
+    /// The resident account has no `users` row or no session row to check
+    /// against, so the session cannot be shown to be live.
+    NoSession,
+    /// A lookup, pool or query error made the session unverifiable.
+    CheckFailed,
+    /// The user (or the app on their behalf) signed out.
+    LoggedOut,
+}
+
+impl LockReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LockReason::Idle => "idle",
+            LockReason::SessionExpired => "session_expired",
+            LockReason::KeyEpochChanged => "key_epoch_changed",
+            LockReason::NoSession => "no_session",
+            LockReason::CheckFailed => "check_failed",
+            LockReason::LoggedOut => "logged_out",
+        }
+    }
+}
 
 /// Pure boundary check, no DB access -- unit-testable in isolation. Fails
 /// closed (treats an unparsable timestamp as expired) since this guards a
@@ -62,122 +99,200 @@ fn is_idle_expired(idle_timeout_minutes: i64, last_active_at: &str, now: &str) -
     now.signed_duration_since(last).num_seconds() >= idle_timeout_minutes * 60
 }
 
-/// Check the currently-resident account's idle time and clear KeyRegistry
-/// if it has exceeded that account's users.idle_timeout_minutes, or if the
-/// account's key epoch changed since this session unlocked (items.id=629). A no-op if
-/// nobody is logged in, if the account has no live session row, or on any
-/// DB error -- fail-silent (log::warn!, return), matching every sibling
-/// periodic-sweep function's posture (persona_sync::engine::
-/// run_periodic_sweep and persona_view_sync's own). Must never panic: this
-/// drives its own always-on timer in main.rs.
+/// Pure check of the absolute session ceiling (items.id=621): the newest
+/// session row's `expires_at` is at or before `now`. Fails closed on an
+/// unparsable timestamp, same as `is_idle_expired`.
+fn is_past_ceiling(expires_at: &str, now: &str) -> bool {
+    let (Ok(expires), Ok(now)) = (
+        chrono::DateTime::parse_from_rfc3339(expires_at),
+        chrono::DateTime::parse_from_rfc3339(now),
+    ) else {
+        log::error!(
+            "idle_timeout: unparsable timestamp (expires_at={expires_at:?}, now={now:?}) -- \
+             failing closed, treating the session as past its ceiling"
+        );
+        return true;
+    };
+    expires <= now
+}
+
+/// End the resident session: the one clear path every lock goes through
+/// (idle expiry, the 30-day ceiling, a key-epoch change, an unverifiable
+/// session, logout). Everything that holds key material is cleared first and
+/// unconditionally; the soft-expire of the session rows is last and is the
+/// only step that can report an error, so a DB failure can never leave a key
+/// resident. `user_id` is `None` when nothing was resident (a stray logout):
+/// then only the registry's pending slots and the connect sessions are cleared.
+pub async fn lock_session(
+    pool: &sqlx::SqlitePool,
+    key_registry: &KeyRegistry,
+    group_key_registry: &GroupKeyRegistry,
+    connect_sessions: &ConnectSessions,
+    user_id: Option<&str>,
+    reason: LockReason,
+) -> Result<(), String> {
+    log::info!(
+        "lock_session: locking user={user_id:?} reason={}",
+        reason.as_str()
+    );
+    key_registry.clear().await;
+    // items.id=714: same boundary as commands::auth::logout -- a connect
+    // dialog's session and any clipboard text held for an unconfirmed key end
+    // with the unlocked account.
+    connect_sessions.clear();
+
+    let Some(user_id) = user_id else {
+        return Ok(());
+    };
+    // items.id=469: group keys are per-Persona, not per-account -- see
+    // auth::clear_group_keys_for_user for why this is needed alongside
+    // key_registry.clear() and not subsumed by it.
+    crate::auth::clear_group_keys_for_user(pool, group_key_registry, user_id).await;
+
+    // Soft-expire (Jason's direction, 2026-08-01): update expires_at rather
+    // than DELETE, to preserve an audit trail of when sessions existed and
+    // ended.
+    let now = crate::providers::utils::now();
+    sqlx::query(
+        "UPDATE auth_sessions SET expires_at = ?
+         WHERE user_id = ? AND expires_at > ?",
+    )
+    .bind(&now)
+    .bind(user_id)
+    .bind(&now)
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+/// `lock_session` for the periodic check: a failed soft-expire is logged (the
+/// key is already gone) and the reason is returned for the caller to report.
+async fn lock_for_check(
+    pool: &sqlx::SqlitePool,
+    key_registry: &KeyRegistry,
+    group_key_registry: &GroupKeyRegistry,
+    connect_sessions: &ConnectSessions,
+    user_id: &str,
+    reason: LockReason,
+) -> Option<LockReason> {
+    if let Err(e) = lock_session(
+        pool,
+        key_registry,
+        group_key_registry,
+        connect_sessions,
+        Some(user_id),
+        reason,
+    )
+    .await
+    {
+        log::warn!(
+            "idle_timeout: couldn't soft-expire sessions for user={user_id} after locking \
+             ({}): {e}",
+            reason.as_str()
+        );
+    }
+    Some(reason)
+}
+
+/// Check the currently-resident account's session and lock it (clear
+/// KeyRegistry and the rest, via `lock_session`) when it can no longer be
+/// shown to be live. Returns the reason when it locked, `None` otherwise.
+///
+/// FAILS CLOSED (items.id=621): a missing `users` row, a lookup, pool or query
+/// error, a missing session row, a session past its 30-day ceiling and an idle
+/// expiry all lock, each with its own reason. The one deliberate exception is
+/// a failed key-epoch read: only a confirmed epoch change locks (items.id=629,
+/// decisions.id=893), a transient read failure is logged and the checks below
+/// still run. A no-op (`None`) if nobody is logged in or a key rotation is in
+/// progress. Must never panic: this drives its own always-on timer in main.rs.
 pub async fn run_periodic_check(
     pool: &sqlx::SqlitePool,
     key_registry: &KeyRegistry,
     group_key_registry: &GroupKeyRegistry,
-    connect_sessions: &crate::provider_credentials::session::ConnectSessions,
-) {
+    connect_sessions: &ConnectSessions,
+) -> Option<LockReason> {
     // items.id=630: during a data-key rotation this process holds the account
     // and swaps its own session at the end. An idle expiry or an epoch check
     // now would lock the session out of its own rotation.
     if crate::auth::epoch_guard::is_rotating() {
-        return;
+        return None;
     }
-    let Some(user_id) = key_registry.with_key(|k| k.user_id.clone()).await else {
-        return;
+    let user_id = key_registry.with_key(|k| k.user_id.clone()).await?;
+
+    let lock = |reason| {
+        lock_for_check(
+            pool,
+            key_registry,
+            group_key_registry,
+            connect_sessions,
+            &user_id,
+            reason,
+        )
     };
 
     let user = match user_store::find_user_by_id(pool, &user_id).await {
         Ok(Some(u)) => u,
         Ok(None) => {
             log::warn!("idle_timeout: resident user_id={user_id} has no matching users row");
-            return;
+            return lock(LockReason::NoSession).await;
         }
         Err(e) => {
             log::warn!("idle_timeout: couldn't look up user={user_id}: {e}");
-            return;
-        }
-    };
-
-    let mut conn = match pool.acquire().await {
-        Ok(c) => c,
-        Err(e) => {
-            log::warn!("idle_timeout: couldn't acquire shared.db connection: {e}");
-            return;
+            return lock(LockReason::CheckFailed).await;
         }
     };
 
     let now = crate::providers::utils::now();
 
-    let last_active_at: Option<String> = match sqlx::query(
-        "SELECT MAX(last_active_at) AS last_active_at
-         FROM auth_sessions WHERE user_id = ? AND expires_at > ?",
+    // The newest session row carries the max of both columns. No
+    // `expires_at > now` filter: an expired session must be observable here
+    // (the filter used to turn it into a NULL and so into "still active").
+    let (last_active_at, expires_at): (Option<String>, Option<String>) = match sqlx::query(
+        "SELECT MAX(last_active_at) AS last_active_at, MAX(expires_at) AS expires_at
+         FROM auth_sessions WHERE user_id = ?",
     )
     .bind(&user_id)
-    .bind(&now)
-    .fetch_one(&mut *conn)
+    .fetch_one(pool)
     .await
     {
-        Ok(row) => row.get("last_active_at"),
+        Ok(row) => (row.get("last_active_at"), row.get("expires_at")),
         Err(e) => {
             log::warn!("idle_timeout: couldn't read auth_sessions for user={user_id}: {e}");
-            return;
+            return lock(LockReason::CheckFailed).await;
         }
     };
 
     // items.id=629 (decisions.id=893): the account's key was rotated in
     // another session, so the data key resident here is stale -- lock, the
     // same way an idle expiry does. Only a confirmed epoch change locks; a
-    // transient read failure is logged and the idle check below proceeds.
-    let epoch_changed =
-        match crate::auth::epoch_guard::ensure_current_with_pool(pool, &user_id).await {
-            Ok(()) => false,
-            Err(crate::auth::epoch_guard::KeyEpochError::Changed { .. }) => {
-                log::warn!("idle_timeout: key epoch changed for user={user_id} -- locking session");
-                true
-            }
-            Err(e) => {
-                log::warn!("idle_timeout: couldn't check key epoch for user={user_id}: {e}");
-                false
-            }
-        };
-
-    // No live session row for this account -- nothing to check for idle
-    // expiry (e.g. the resident key predates any session row, which
-    // shouldn't happen in practice, but there is nothing to compare
-    // against either way).
-    let idle_expired = last_active_at
-        .as_deref()
-        .is_some_and(|last| is_idle_expired(user.idle_timeout_minutes, last, &now));
-
-    if !epoch_changed && !idle_expired {
-        return;
+    // transient read failure is logged and the checks below proceed.
+    match crate::auth::epoch_guard::ensure_current_with_pool(pool, &user_id).await {
+        Ok(()) => {}
+        Err(crate::auth::epoch_guard::KeyEpochError::Changed { .. }) => {
+            log::warn!("idle_timeout: key epoch changed for user={user_id} -- locking session");
+            return lock(LockReason::KeyEpochChanged).await;
+        }
+        Err(e) => {
+            log::warn!("idle_timeout: couldn't check key epoch for user={user_id}: {e}");
+        }
     }
 
-    key_registry.clear().await;
-    // items.id=714: same boundary as commands::auth::logout -- a connect
-    // dialog's session and any clipboard text held for an unconfirmed key end
-    // with the unlocked account.
-    connect_sessions.clear();
-    // items.id=469: same gap as commands::auth::logout -- see
-    // auth::clear_group_keys_for_user for why this is needed alongside
-    // key_registry.clear() and not subsumed by it.
-    crate::auth::clear_group_keys_for_user(pool, group_key_registry, &user_id).await;
+    // A resident key with no session row to compare against cannot be shown
+    // to be live.
+    let (Some(last_active_at), Some(expires_at)) = (last_active_at, expires_at) else {
+        log::warn!("idle_timeout: resident user_id={user_id} has no auth_sessions row");
+        return lock(LockReason::NoSession).await;
+    };
 
-    // Soft-expire, same pattern commands::auth::logout already uses --
-    // update expires_at rather than DELETE, to preserve an audit trail of
-    // when sessions existed and ended.
-    if let Err(e) = sqlx::query(
-        "UPDATE auth_sessions SET expires_at = ?
-         WHERE user_id = ? AND expires_at > ?",
-    )
-    .bind(&now)
-    .bind(&user_id)
-    .bind(&now)
-    .execute(&mut *conn)
-    .await
-    {
-        log::warn!("idle_timeout: couldn't soft-expire sessions for user={user_id}: {e}");
+    if is_past_ceiling(&expires_at, &now) {
+        log::warn!("idle_timeout: session for user={user_id} reached its absolute ceiling");
+        return lock(LockReason::SessionExpired).await;
     }
+    if is_idle_expired(user.idle_timeout_minutes, &last_active_at, &now) {
+        return lock(LockReason::Idle).await;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -276,6 +391,36 @@ mod tests {
         assert!(is_idle_expired(15, "not a timestamp", "also not one"));
     }
 
+    #[test]
+    fn a_session_at_or_past_its_ceiling_is_expired() {
+        let now = "2026-09-20T12:00:00+00:00";
+        assert!(is_past_ceiling("2026-09-20T12:00:00+00:00", now)); // exactly at
+        assert!(is_past_ceiling("2026-09-19T12:00:00+00:00", now));
+    }
+
+    #[test]
+    fn a_session_before_its_ceiling_is_not_expired() {
+        let now = "2026-09-20T12:00:00+00:00";
+        assert!(!is_past_ceiling("2026-09-20T12:00:01+00:00", now));
+    }
+
+    #[test]
+    fn an_unparsable_ceiling_fails_closed() {
+        assert!(is_past_ceiling("not a timestamp", "also not one"));
+    }
+
+    #[test]
+    fn lock_reason_wire_strings_are_stable() {
+        // These strings cross to the frontend (session-locked) and are matched
+        // there; changing one is a breaking change.
+        assert_eq!(LockReason::Idle.as_str(), "idle");
+        assert_eq!(LockReason::SessionExpired.as_str(), "session_expired");
+        assert_eq!(LockReason::KeyEpochChanged.as_str(), "key_epoch_changed");
+        assert_eq!(LockReason::NoSession.as_str(), "no_session");
+        assert_eq!(LockReason::CheckFailed.as_str(), "check_failed");
+        assert_eq!(LockReason::LoggedOut.as_str(), "logged_out");
+    }
+
     // ------------------------------------------------------------------
     // Integration tests -- real user + session row via login().
     // ------------------------------------------------------------------
@@ -319,13 +464,14 @@ mod tests {
             .await
             .unwrap();
 
-        run_periodic_check(
+        let reason = run_periodic_check(
             &pool,
             &registry,
             &group_key_registry,
             &ConnectSessions::default(),
         )
         .await;
+        assert_eq!(reason, Some(LockReason::KeyEpochChanged));
         assert!(
             !registry.is_occupied().await,
             "a changed key epoch must lock the session even though it is not idle"
@@ -663,5 +809,235 @@ mod tests {
             "an idle-timeout fire must evict this persona's group keys too, not just the \
              account master key"
         );
+    }
+
+    // -- fail-closed (items.id=621) -------------------------------------
+
+    async fn login_alice(
+        app: &tauri::App<tauri::test::MockRuntime>,
+    ) -> (String, tauri::State<'_, KeyRegistry>) {
+        let registry = app.state::<KeyRegistry>();
+        login(
+            "Alice".to_owned(),
+            "correct horse battery staple".to_owned(),
+            registry.clone(),
+            app.state::<GroupKeyRegistry>(),
+            app.state::<sqlx::SqlitePool>(),
+        )
+        .await
+        .unwrap();
+        let user_id = registry.with_key(|k| k.user_id.clone()).await.unwrap();
+        (user_id, registry)
+    }
+
+    #[tokio::test]
+    async fn run_periodic_check_returns_the_reason_for_an_idle_lock_and_none_when_healthy() {
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let (_user_id, registry) = login_alice(&app).await;
+        let group_key_registry = app.state::<GroupKeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
+        let sessions = ConnectSessions::default();
+
+        assert_eq!(
+            run_periodic_check(&pool, &registry, &group_key_registry, &sessions).await,
+            None
+        );
+        assert!(registry.is_occupied().await);
+
+        let stale = (chrono::Utc::now() - chrono::Duration::minutes(30)).to_rfc3339();
+        sqlx::query("UPDATE auth_sessions SET last_active_at = ?")
+            .bind(&stale)
+            .execute(&*pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            run_periodic_check(&pool, &registry, &group_key_registry, &sessions).await,
+            Some(LockReason::Idle)
+        );
+        assert!(!registry.is_occupied().await);
+    }
+
+    #[tokio::test]
+    async fn a_null_last_active_at_locks_instead_of_counting_as_active() {
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let (_user_id, registry) = login_alice(&app).await;
+        let group_key_registry = app.state::<GroupKeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
+
+        // No session row at all: MAX(last_active_at) is NULL.
+        sqlx::query("DELETE FROM auth_sessions")
+            .execute(&*pool)
+            .await
+            .unwrap();
+
+        let reason = run_periodic_check(
+            &pool,
+            &registry,
+            &group_key_registry,
+            &ConnectSessions::default(),
+        )
+        .await;
+        assert_eq!(reason, Some(LockReason::NoSession));
+        assert!(
+            !registry.is_occupied().await,
+            "a NULL last_active_at fails closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_users_row_locks() {
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let (user_id, registry) = login_alice(&app).await;
+        let group_key_registry = app.state::<GroupKeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
+
+        // Foreign keys off on the connection that deletes, so the users row
+        // goes without cascading into the other tables the check reads.
+        let mut conn = pool.acquire().await.unwrap();
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM users WHERE id = ?")
+            .bind(&user_id)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+
+        let reason = run_periodic_check(
+            &pool,
+            &registry,
+            &group_key_registry,
+            &ConnectSessions::default(),
+        )
+        .await;
+        assert_eq!(reason, Some(LockReason::NoSession));
+        assert!(!registry.is_occupied().await);
+    }
+
+    #[tokio::test]
+    async fn a_session_past_the_thirty_day_ceiling_locks_even_when_recently_active() {
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let (_user_id, registry) = login_alice(&app).await;
+        let group_key_registry = app.state::<GroupKeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
+
+        // last_active_at is fresh (login just wrote it); only the ceiling is up.
+        let past = (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        sqlx::query("UPDATE auth_sessions SET expires_at = ?")
+            .bind(&past)
+            .execute(&*pool)
+            .await
+            .unwrap();
+
+        let reason = run_periodic_check(
+            &pool,
+            &registry,
+            &group_key_registry,
+            &ConnectSessions::default(),
+        )
+        .await;
+        assert_eq!(reason, Some(LockReason::SessionExpired));
+        assert!(
+            !registry.is_occupied().await,
+            "an expired session used to yield NULL and be treated as still active"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_database_error_locks_and_still_evicts_group_keys() {
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let (_user_id, registry) = login_alice(&app).await;
+        let group_key_registry = app.state::<GroupKeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
+
+        group_key_registry
+            .replace(
+                "persona-x",
+                "group-1",
+                crate::auth::registry::UnlockedGroupKey {
+                    group_id: "group-1".to_owned(),
+                    group_key: [0xAAu8; crate::auth::kdf::MASTER_KEY_LEN],
+                    unlocked_at: crate::providers::utils::now(),
+                },
+            )
+            .await;
+
+        // Every shared.db query now fails, including the persona listing the
+        // group-key eviction normally relies on.
+        pool.close().await;
+
+        let reason = run_periodic_check(
+            &pool,
+            &registry,
+            &group_key_registry,
+            &ConnectSessions::default(),
+        )
+        .await;
+        assert_eq!(reason, Some(LockReason::CheckFailed));
+        assert!(
+            !registry.is_occupied().await,
+            "an error must not leave the key resident"
+        );
+        assert!(
+            !group_key_registry.is_occupied("persona-x", "group-1").await,
+            "with the persona list unreadable, every group key is cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rotation_in_progress_is_never_locked() {
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let (user_id, registry) = login_alice(&app).await;
+        let group_key_registry = app.state::<GroupKeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
+
+        sqlx::query("DELETE FROM auth_sessions")
+            .execute(&*pool)
+            .await
+            .unwrap();
+        let _guard = crate::auth::epoch_guard::begin_rotation(&user_id).unwrap();
+
+        let reason = run_periodic_check(
+            &pool,
+            &registry,
+            &group_key_registry,
+            &ConnectSessions::default(),
+        )
+        .await;
+        assert_eq!(reason, None);
+        assert!(registry.is_occupied().await);
+    }
+
+    #[tokio::test]
+    async fn lock_session_with_nobody_resident_still_clears_connect_sessions() {
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let registry = app.state::<KeyRegistry>();
+        let group_key_registry = app.state::<GroupKeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
+        let sessions = ConnectSessions::default();
+        sessions
+            .begin("some-user", "some-provider", std::time::Instant::now())
+            .unwrap();
+
+        lock_session(
+            &pool,
+            &registry,
+            &group_key_registry,
+            &sessions,
+            None,
+            LockReason::LoggedOut,
+        )
+        .await
+        .unwrap();
+        assert!(sessions.is_empty());
     }
 }

@@ -44,11 +44,10 @@ use crate::persistence::persona_store;
 /// process at a time, so there is never a second, still-logged-in account
 /// whose Personas this could accidentally clear.
 ///
-/// Best-effort, matching finish_login's own posture on this identical
-/// query: a lookup failure is logged and treated as nothing-to-clear rather
-/// than propagated -- failing a logout or idle-timeout clear over an
-/// ancillary lookup would be worse than leaving one account's group keys
-/// resident an extra cycle.
+/// Never fails the caller: a lookup failure is logged and falls back to
+/// clearing every resident group key (items.id=621) rather than propagating --
+/// failing a logout or idle-timeout clear over an ancillary lookup would be
+/// worse, and leaving keys resident would be worse still.
 pub async fn clear_group_keys_for_user(
     pool: &sqlx::SqlitePool,
     group_key_registry: &GroupKeyRegistry,
@@ -61,11 +60,15 @@ pub async fn clear_group_keys_for_user(
             }
         }
         Err(e) => {
+            // Fail closed (items.id=621): without the Persona list the keys
+            // cannot be evicted one Persona at a time, and this runs only at
+            // a session boundary, where the single-slot KeyRegistry means
+            // every resident group key belongs to the account that just ended.
             log::warn!(
                 "clear_group_keys_for_user: couldn't list personas for user={user_id}: {e} -- \
-                 this account's group keys may remain resident until the next successful call \
-                 or process exit"
+                 clearing every resident group key instead"
             );
+            group_key_registry.clear_all().await;
         }
     }
 }

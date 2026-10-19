@@ -535,6 +535,79 @@ pub(crate) async fn finish_login(
 ) -> Result<(), String> {
     let now = crate::providers::utils::now();
 
+    // items.id=621: the session row is written BEFORE the key becomes
+    // resident. It is the only step here that can fail, and run in this order
+    // a failed INSERT leaves nothing unlocked (it used to return Err with the
+    // key already installed and no session row for the idle check to find).
+    // The callers registered this account's key epoch (items.id=630) before
+    // calling in, so a failure here also drops that registration. A pending
+    // recovery phrase, set by the bootstrap branch, is left for the retry.
+    let mut conn = match pool.acquire().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            epoch_guard::clear_resident_for(user_id);
+            return Err(e.to_string());
+        }
+    };
+    // Section 3.1: absolute session lifetime, "hard ceiling... currently
+    // 30 days... stays out of the settings surface entirely" -- a
+    // constant, not a per-row/per-user configurable field (unlike
+    // idle_timeout_minutes on users, which is per-user and adjustable).
+    let expires_at = (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339();
+    if let Err(e) = sqlx::query(
+        "INSERT INTO auth_sessions
+         (session_id, user_id, created_at, last_active_at, expires_at, is_remember_me)
+         VALUES (?, ?, ?, ?, ?, 0)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(user_id)
+    .bind(&now)
+    .bind(&now)
+    .bind(&expires_at)
+    .execute(&mut *conn)
+    .await
+    {
+        epoch_guard::clear_resident_for(user_id);
+        return Err(e.to_string());
+    }
+    // Return the connection before the best-effort work below, which uses the pool.
+    drop(conn);
+
+    // From here the key is resident, so a failure must not leave it there.
+    // Every step in install_session is best-effort today and returns Ok; this
+    // clears both registries should one ever return Err.
+    if let Err(e) = install_session(
+        user_id,
+        data_key,
+        key_epoch,
+        &now,
+        key_registry,
+        group_key_registry,
+        pool,
+    )
+    .await
+    {
+        key_registry.clear().await;
+        crate::auth::clear_group_keys_for_user(pool, group_key_registry, user_id).await;
+        return Err(e);
+    }
+
+    Ok(())
+}
+
+/// Everything `finish_login` does once the session row exists: install the key,
+/// register its epoch, then the best-effort work that needs the key resident
+/// (share pulls, interrupted-run recovery, spend recovery, group-key
+/// rehydration).
+async fn install_session(
+    user_id: &str,
+    data_key: [u8; kdf::MASTER_KEY_LEN],
+    key_epoch: u64,
+    now: &str,
+    key_registry: &State<'_, KeyRegistry>,
+    group_key_registry: &State<'_, GroupKeyRegistry>,
+    pool: &sqlx::SqlitePool,
+) -> Result<(), String> {
     // items.id=289, decisions.id=677: re-derived here (not persisted -- see
     // auth::sharing_keypair's module header) so it follows data_key's own
     // single-slot lifecycle exactly -- both installed into the registry
@@ -548,7 +621,7 @@ pub(crate) async fn finish_login(
             data_key,
             key_epoch,
             sharing_private_key: sharing_private_key.to_bytes(),
-            unlocked_at: now.clone(),
+            unlocked_at: now.to_owned(),
         })
         .await;
     // items.id=629: from here every store open for this account compares
@@ -667,7 +740,7 @@ pub(crate) async fn finish_login(
                                     UnlockedGroupKey {
                                         group_id: row.group_id.clone(),
                                         group_key,
-                                        unlocked_at: now.clone(),
+                                        unlocked_at: now.to_owned(),
                                     },
                                 )
                                 .await;
@@ -687,26 +760,6 @@ pub(crate) async fn finish_login(
         ),
     }
 
-    let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
-    // Section 3.1: absolute session lifetime, "hard ceiling... currently
-    // 30 days... stays out of the settings surface entirely" -- a
-    // constant, not a per-row/per-user configurable field (unlike
-    // idle_timeout_minutes on users, which is per-user and adjustable).
-    let expires_at = (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339();
-    sqlx::query(
-        "INSERT INTO auth_sessions
-         (session_id, user_id, created_at, last_active_at, expires_at, is_remember_me)
-         VALUES (?, ?, ?, ?, ?, 0)",
-    )
-    .bind(uuid::Uuid::new_v4().to_string())
-    .bind(user_id)
-    .bind(&now)
-    .bind(&now)
-    .bind(&expires_at)
-    .execute(&mut *conn)
-    .await
-    .map_err(|e| e.to_string())?;
-
     Ok(())
 }
 
@@ -719,37 +772,20 @@ pub async fn logout(
     connect_sessions: State<'_, crate::provider_credentials::session::ConnectSessions>,
 ) -> Result<(), String> {
     let user_id = key_registry.with_key(|k| k.user_id.clone()).await;
-    key_registry.clear().await;
-    // items.id=714: a connect dialog's session, and any clipboard text it was
-    // holding for a key the user had not yet confirmed, must not outlive the
-    // account that opened it. Cleared whether or not a key was resident.
-    connect_sessions.clear();
-
-    if let Some(user_id) = user_id {
-        // items.id=469: group keys are per-Persona, not per-account, so
-        // clearing KeyRegistry alone left every Persona's group key
-        // resident until process exit. See auth::clear_group_keys_for_user
-        // for the enumerate-and-clear logic shared with idle-timeout.
-        crate::auth::clear_group_keys_for_user(&pool, &group_key_registry, &user_id).await;
-
-        let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
-        let now = crate::providers::utils::now();
-        // Soft-expire (Jason's direction, 2026-08-01): update expires_at
-        // rather than DELETE, to preserve an audit trail of when sessions
-        // existed and ended.
-        sqlx::query(
-            "UPDATE auth_sessions SET expires_at = ?
-             WHERE user_id = ? AND expires_at > ?",
-        )
-        .bind(&now)
-        .bind(&user_id)
-        .bind(&now)
-        .execute(&mut *conn)
-        .await
-        .map_err(|e| e.to_string())?;
-    }
-
-    Ok(())
+    // items.id=621: the same clear path an idle or ceiling lock uses. It clears
+    // everything holding key material first, whether or not a key was
+    // resident (items.id=714: a connect dialog's session and any clipboard
+    // text it held for an unconfirmed key must not outlive the account), and
+    // reports a failed session-row soft-expire last.
+    crate::auth::idle_timeout::lock_session(
+        &pool,
+        &key_registry,
+        &group_key_registry,
+        &connect_sessions,
+        user_id.as_deref(),
+        crate::auth::idle_timeout::LockReason::LoggedOut,
+    )
+    .await
 }
 
 /// Record activity on the resident account's live session(s) (items.id=311).
@@ -2297,6 +2333,64 @@ mod tests {
         assert_eq!(
             status, "paused",
             "finish_login must demote a stale running focus_run to paused"
+        );
+    }
+
+    /// items.id=621: finish_login used to install the key before it wrote the
+    /// session row, so a failed INSERT returned Err with the key resident.
+    #[tokio::test]
+    async fn a_failed_session_insert_leaves_no_key_resident() {
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let registry = app.state::<KeyRegistry>();
+        let group_key_registry = app.state::<GroupKeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
+
+        login(
+            "Alice".to_owned(),
+            "password123".to_owned(),
+            registry.clone(),
+            group_key_registry.clone(),
+            pool.clone(),
+        )
+        .await
+        .unwrap();
+        let user_id = registry.with_key(|k| k.user_id.clone()).await.unwrap();
+        logout(
+            registry.clone(),
+            group_key_registry.clone(),
+            pool.clone(),
+            app.state::<crate::provider_credentials::session::ConnectSessions>(),
+        )
+        .await
+        .unwrap();
+
+        // The INSERT now fails: no such table.
+        sqlx::query("ALTER TABLE auth_sessions RENAME TO auth_sessions_gone")
+            .execute(&*pool)
+            .await
+            .unwrap();
+
+        let result = login(
+            "Alice".to_owned(),
+            "password123".to_owned(),
+            registry.clone(),
+            group_key_registry.clone(),
+            pool.clone(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "login must fail when the session row cannot be written"
+        );
+        assert!(
+            !registry.is_occupied().await,
+            "a failed login must not leave the key resident"
+        );
+        assert_eq!(
+            epoch_guard::resident_epoch(&user_id),
+            None,
+            "nor a registered key epoch"
         );
     }
 }

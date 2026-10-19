@@ -340,6 +340,15 @@ impl GroupKeyRegistry {
         guard.retain(|(pid, _), _| pid != persona_id);
     }
 
+    /// Evict every resident group key, for every Persona. Only valid at a
+    /// session boundary: KeyRegistry is single-slot, so at most one account's
+    /// group keys are ever resident, and ending that account's session ends
+    /// them all. The fallback for when the Persona list cannot be read
+    /// (auth::clear_group_keys_for_user).
+    pub async fn clear_all(&self) {
+        self.keys.lock().await.clear();
+    }
+
     /// Whether a key is currently resident for this (persona_id, group_id)
     /// pair. Used by callers that need to check residency without needing
     /// the key itself (e.g. deciding whether to prompt for group unlock).
