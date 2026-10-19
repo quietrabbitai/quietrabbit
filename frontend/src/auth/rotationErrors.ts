@@ -106,11 +106,13 @@ export function rotationErrorMessage(
 
 /** Codes after which the in-memory session may no longer match the account's
  *  key (or there is no session), so the screen should sign the user out
- *  rather than leave them in an app whose stores will fail. needs_resume: the
- *  change is unfinished and resumes at the next sign-in. epoch_changed: another
- *  session rotated the key. */
+ *  rather than leave them in an app whose stores will fail. epoch_changed:
+ *  another session rotated the key. needs_resume is NOT here (items.id=778):
+ *  the backend ends the session itself after a change that did not finish and
+ *  announces it with `session-locked` (reason change_unfinished), so the login
+ *  screen carries one message, not two. */
 export function requiresSignOut(code: RotationErrorCode): boolean {
-  return code === 'needs_resume' || code === 'epoch_changed' || code === 'not_logged_in'
+  return code === 'epoch_changed' || code === 'not_logged_in'
 }
 
 /** Every suffix this file can return, for the test that checks en.json has each. */

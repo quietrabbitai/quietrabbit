@@ -2,9 +2,11 @@
 // choose a new password (items.id=769 stage 4). The backend unseals the data
 // key with the words, proves it against the account's data, re-locks
 // everything under a new key and the new password, and signs the person in
-// (restoreWithRecoveryPhrase) -- so success follows LoginForm's path through
-// finishSignIn. If a change was interrupted earlier, the same call finishes it
-// with the words and the account ends on the password typed here.
+// (restoreWithRecoveryPhrase). It opens no session (items.id=778): the backend
+// announces `session-locked` and the user signs in with the new password, so
+// success returns to the login screen. If a change was interrupted earlier, the
+// same call finishes it with the words and the account ends on the password
+// typed here.
 //
 // Before the rotation starts, the backend drains any running chat reply or
 // Focus run (items.id=778): useWritersFlow shows the finish-or-stop prompt and
@@ -18,7 +20,6 @@ import './RestoreAccessForm.css'
 import { useState, type FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { commands, type KeyRotationError } from '../bindings'
-import { finishSignIn } from './finishSignIn'
 import { NewPasswordHint } from './NewPasswordHint'
 import { PasswordField } from './PasswordField'
 import { validateNewPassword } from './passwordRules'
@@ -30,11 +31,10 @@ import { WritersPrompt } from './WritersPrompt'
 
 export interface RestoreAccessFormProps {
   initialDisplayName: string
-  onLoggedIn: () => void
   onBack: () => void
 }
 
-export function RestoreAccessForm({ initialDisplayName, onLoggedIn, onBack }: RestoreAccessFormProps) {
+export function RestoreAccessForm({ initialDisplayName, onBack }: RestoreAccessFormProps) {
   const { t } = useTranslation()
   const [displayName, setDisplayName] = useState(initialDisplayName)
   const [phrase, setPhrase] = useState('')
@@ -42,7 +42,6 @@ export function RestoreAccessForm({ initialDisplayName, onLoggedIn, onBack }: Re
   const [confirm, setConfirm] = useState('')
   const [mismatch, setMismatch] = useState(false)
   const [error, setError] = useState<KeyRotationError | null>(null)
-  const [sessionProblem, setSessionProblem] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
 
   const wordCount = splitWords(phrase).length
@@ -54,16 +53,9 @@ export function RestoreAccessForm({ initialDisplayName, onLoggedIn, onBack }: Re
       setError(result.error)
       return
     }
-    void (async () => {
-      const finished = await finishSignIn()
-      if (finished.status === 'ok') {
-        onLoggedIn()
-      } else if (finished.status === 'sessionMissing') {
-        setSessionProblem(t('auth.sessionMissingAfterLogin'))
-      } else {
-        setSessionProblem(finished.message)
-      }
-    })()
+    // Done: back to the login screen, where the session-locked notice says the
+    // password was changed.
+    onBack()
   })
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
@@ -77,7 +69,6 @@ export function RestoreAccessForm({ initialDisplayName, onLoggedIn, onBack }: Re
     setConfirm('')
     setError(null)
     setMismatch(false)
-    setSessionProblem(null)
     if (!looksLikePhrase(submittedPhrase)) {
       setError({ code: 'phrase_invalid' })
       return
@@ -189,11 +180,6 @@ export function RestoreAccessForm({ initialDisplayName, onLoggedIn, onBack }: Re
       {mismatch && (
         <p role="alert" className="restore-access-form__error">
           {t('auth.restore.mismatch')}
-        </p>
-      )}
-      {sessionProblem && (
-        <p role="alert" className="restore-access-form__error">
-          {t('auth.loginError', { message: sessionProblem })}
         </p>
       )}
       <RotationErrorText error={error} context="restore" />

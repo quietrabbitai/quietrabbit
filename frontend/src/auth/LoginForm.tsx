@@ -119,7 +119,6 @@ export function LoginForm({ onLoggedIn }: LoginFormProps) {
     return (
       <RestoreAccessForm
         initialDisplayName={displayName}
-        onLoggedIn={onLoggedIn}
         onBack={() => setMode('login')}
       />
     )

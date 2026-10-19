@@ -462,7 +462,9 @@ export const commands = {
 	 *  Change the account password. Re-verifies `old_password`, then rotates the
 	 *  data key: everything is re-locked under a new key and the new password.
 	 *  The recovery phrase is unchanged and stays valid. Returns when the change is
-	 *  complete (or has failed); progress arrives as `task-progress` events.
+	 *  complete (or has failed); progress arrives as `task-progress` events. A
+	 *  completed change ENDS THE SESSION (`session-locked`, reason
+	 *  `password_changed`): the user signs in again with the new password.
 	 */
 	changePassword: (oldPassword: string, newPassword: string, writers: WritersChoice) => typedError<null, KeyRotationError>(__TAURI_INVOKE("change_password", { oldPassword, newPassword, writers })),
 	/**
@@ -480,15 +482,18 @@ export const commands = {
 	/**
 	 *  Confirm the new phrase by re-entering the asked-for words, then rotate: the
 	 *  data key changes, the password stays, and the old words stop working. Asks
-	 *  for the password again (it is not held in memory in between).
+	 *  for the password again (it is not held in memory in between). A completed
+	 *  change ENDS THE SESSION (`session-locked`, reason `recovery_phrase_changed`):
+	 *  the user signs in again with the same password.
 	 */
 	confirmNewRecoveryPhrase: (password: string, answers: WordAnswer[], writers: WritersChoice) => typedError<null, KeyRotationError>(__TAURI_INVOKE("confirm_new_recovery_phrase", { password, answers, writers })),
 	/**
-	 *  Forgot the password: sign in with the 24 recovery words and set a new
-	 *  password. The words unseal the data key, the data key is rotated exactly as
-	 *  for a password change, and the account is unlocked. The words themselves do
-	 *  not change. If a change was interrupted earlier, this is also the way to
-	 *  finish it with the words.
+	 *  Forgot the password: set a new password with the 24 recovery words. The
+	 *  words unseal the data key, the data key is rotated exactly as for a password
+	 *  change, and the user then signs in with the new password: no session is
+	 *  opened here (items.id=778; decisions.id=896 ends every rotation at the login
+	 *  screen). The words themselves do not change. If a change was interrupted
+	 *  earlier, this is also the way to finish it with the words.
 	 */
 	restoreWithRecoveryPhrase: (displayName: string, phrase: string, newPassword: string, writers: WritersChoice) => typedError<null, KeyRotationError>(__TAURI_INVOKE("restore_with_recovery_phrase", { displayName, phrase, newPassword, writers })),
 	/**

@@ -31,8 +31,12 @@
 //      new credential and must give the new DEK.
 //   6. Promotion step 2 (user_store::finish_rotation): staging and the wrapped
 //      old DEK are cleared, `committed`.
-//   7. The caller's session is swapped to the new key, then the sharing hook
-//      runs (after_sharing_key_rotation).
+//   7. The sharing hook runs (after_sharing_key_rotation), THEN the caller's
+//      key registry is cleared completely while the rotating flag is still
+//      held (items.id=778, decisions.id=896): the session ends and the user
+//      signs in again, because the data key changed and any cached key would
+//      be stale. The hook takes its keys from the RotationOutcome, never from
+//      the registry, which still holds the OLD key while it runs.
 //
 // FAILURE: an error while the process is alive, before promotion, rolls the
 // rotation back automatically (every file back to the old key, state
@@ -75,7 +79,7 @@ use crate::auth::data_key::{self, DataKeyError, SecretBytes};
 use crate::auth::epoch_guard;
 use crate::auth::kdf;
 use crate::auth::key_rotation_io::{self as io, DbKeyState, InventoryItem, ItemTarget};
-use crate::auth::registry::{KeyRegistry, UnlockedKey};
+use crate::auth::registry::KeyRegistry;
 use crate::auth::sharing_keypair;
 use crate::auth::user_store::{
     self, PendingRotation, RotationDirection, RotationItem, RotationKind, RotationState,
@@ -896,25 +900,17 @@ async fn scrub_shared_db(pool: &sqlx::SqlitePool) {
     }
 }
 
-/// Swap the caller's session to the new key and register the new epoch. Done
-/// while the rotating flag is still held, so no sweep sees the epoch change
-/// before the registry has caught up.
-async fn install_session(env: &RotationEnv<'_>, outcome: &RotationOutcome) {
-    let Some(registry) = env.registry else {
-        return;
-    };
-    let (sharing_private, _) =
-        sharing_keypair::derive_sharing_keypair(&outcome.new_dek, env.user_id, outcome.to_epoch);
-    registry
-        .replace(UnlockedKey {
-            user_id: env.user_id.to_owned(),
-            data_key: *outcome.new_dek,
-            key_epoch: outcome.to_epoch,
-            sharing_private_key: sharing_private.to_bytes(),
-            unlocked_at: crate::providers::utils::now(),
-        })
-        .await;
-    epoch_guard::set_resident(env.user_id, outcome.to_epoch);
+/// Clear the caller's key registry completely (key, resident epoch, pending
+/// phrase and recovery slots) after a rotation (items.id=778). Done while the
+/// rotating flag is still held, so no sweep or idle check sees the epoch change
+/// while the old key is still resident. The command layer then ends the rest of
+/// the session (group keys, connect sessions, session rows) and tells the
+/// webview. A rotation run on behalf of another process has no registry.
+async fn end_session(env: &RotationEnv<'_>) {
+    if let Some(registry) = env.registry {
+        // Also clears the process-wide resident epoch of the account.
+        registry.clear().await;
+    }
 }
 
 /// The sharing-key hook (items.id=630, for items.id=659). Called once per
@@ -1230,6 +1226,9 @@ async fn handle_failure(run: &Run<'_>, e: RotationError) -> RotationError {
         Ok(Some(r)) if r.state == RotationState::Verifying
     );
     if promoted {
+        // The data is on the new key; the registry's key is stale. End the
+        // session now, while the flag is still held (items.id=778).
+        end_session(run.env).await;
         run.emit(Phase::Failed, run.total_bytes, None);
         return RotationError::NeedsResume { cause };
     }
@@ -1247,6 +1246,9 @@ async fn handle_failure(run: &Run<'_>, e: RotationError) -> RotationError {
                 Some(&format!("{cause}; rollback failed: {rb}")),
             )
             .await;
+            // Files may be on either key and the unlock now needs the staged
+            // credential: the resident key cannot be trusted (items.id=778).
+            end_session(run.env).await;
             run.emit(Phase::Failed, 0, None);
             RotationError::NeedsResume {
                 cause: format!("{cause}; rollback failed: {rb}"),
@@ -1255,8 +1257,8 @@ async fn handle_failure(run: &Run<'_>, e: RotationError) -> RotationError {
     }
 }
 
-/// The last steps of a successful rotation: install the new session, run the
-/// sharing hook, report completion.
+/// The last steps of a successful rotation: run the sharing hook, end the
+/// session (clear the registry), report completion.
 async fn complete(
     run: &Run<'_>,
     old_sharing_public: Option<[u8; 32]>,
@@ -1271,7 +1273,8 @@ async fn complete(
         old_sharing_public_key: old_sharing_public,
         new_sharing_public_key: new_sharing_public,
     };
-    install_session(run.env, &outcome).await;
+    #[cfg(test)]
+    record_hook_call(run.env).await;
     after_sharing_key_rotation(
         run.env.pool,
         run.env.user_id,
@@ -1281,6 +1284,7 @@ async fn complete(
         outcome.new_sharing_public_key,
     )
     .await;
+    end_session(run.env).await;
     run.emit(Phase::Complete, run.total_bytes, None);
     outcome
 }
@@ -1568,6 +1572,30 @@ pub async fn cancel_rotation(
         epoch_guard::begin_rotation(env.user_id).map_err(|_| RotationError::RotationInProgress)?;
     let run = load_run(env, pending, new_dek).await?;
     finish_rollback(&run, "cancelled").await
+}
+
+/// Test seam: what the sharing hook's call site saw (items.id=778: the hook
+/// runs while the rotating flag is held and BEFORE the registry is cleared).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HookObservation {
+    pub rotating: bool,
+    pub registry_occupied: bool,
+}
+
+#[cfg(test)]
+pub(crate) static HOOK_OBSERVATION: Mutex<Option<HookObservation>> = Mutex::new(None);
+
+#[cfg(test)]
+async fn record_hook_call(env: &RotationEnv<'_>) {
+    let registry_occupied = match env.registry {
+        Some(r) => r.is_occupied().await,
+        None => false,
+    };
+    *HOOK_OBSERVATION.lock().unwrap() = Some(HookObservation {
+        rotating: epoch_guard::is_rotating_for(env.user_id),
+        registry_occupied,
+    });
 }
 
 #[cfg(test)]

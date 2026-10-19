@@ -10,7 +10,7 @@ use sqlx::{ConnectOptions, Connection};
 
 use super::*;
 use crate::auth::epoch_guard;
-use crate::auth::registry::{key_hex, GroupKeyRegistry};
+use crate::auth::registry::{key_hex, GroupKeyRegistry, UnlockedKey};
 use crate::auth::subkeys::encode_hex;
 use crate::persistence::{migrations, personal_store};
 use crate::provider_credentials::session::ConnectSessions;
@@ -587,27 +587,89 @@ async fn a_forged_recovered_key_cannot_start_a_restore() {
 }
 
 #[tokio::test]
-async fn the_session_is_swapped_to_the_new_key_before_the_flag_clears() {
+async fn a_completed_rotation_ends_the_session_and_clears_the_registry() {
+    // items.id=778: after a rotation nothing is resident. The registry's key,
+    // the resident epoch and the pending slots are gone, and the gate is idle.
+    let fx = Fixture::new().await;
+    let registry = KeyRegistry::default();
+    populate_registry(&registry, USER, *fx.dek, 1).await;
+    registry
+        .set_pending_new_phrase(crate::auth::registry::NewPhraseSlot {
+            entropy: data_key::generate_recovery_entropy().unwrap(),
+            confirm_positions: vec![1, 2, 3],
+            failed_confirmations: 0,
+        })
+        .await;
+    let mut env = fx.env();
+    env.registry = Some(&registry);
+    run_rotation(&env, &fx.dek, 1, Fixture::change_password())
+        .await
+        .unwrap();
+
+    assert!(!registry.is_occupied().await);
+    assert!(registry.with_key(|k| k.key_epoch).await.is_none());
+    assert!(registry.with_pending_new_phrase(|_| ()).await.is_none());
+    assert_eq!(epoch_guard::resident_epoch(USER), None);
+    assert!(crate::auth::writer_gate::is_idle(USER));
+    assert!(!epoch_guard::is_rotating_for(USER), "the flag is released");
+}
+
+#[tokio::test]
+async fn the_sharing_hook_runs_while_the_flag_is_held_and_before_the_registry_is_cleared() {
+    let fx = Fixture::new().await;
+    let registry = KeyRegistry::default();
+    populate_registry(&registry, USER, *fx.dek, 1).await;
+    *HOOK_OBSERVATION.lock().unwrap() = None;
+    let mut env = fx.env();
+    env.registry = Some(&registry);
+    run_rotation(&env, &fx.dek, 1, Fixture::change_password())
+        .await
+        .unwrap();
+    assert_eq!(
+        *HOOK_OBSERVATION.lock().unwrap(),
+        Some(HookObservation {
+            rotating: true,
+            registry_occupied: true
+        }),
+        "the hook sees the rotating flag and the (old) key still resident"
+    );
+    assert!(
+        !registry.is_occupied().await,
+        "and the clear comes after it"
+    );
+}
+
+#[tokio::test]
+async fn a_failure_after_promotion_ends_the_session() {
+    // After promotion the data is on the new key: the resident (old) key is
+    // stale, so the session ends (items.id=778 amendment).
     let fx = Fixture::new().await;
     let registry = KeyRegistry::default();
     populate_registry(&registry, USER, *fx.dek, 1).await;
     let mut env = fx.env();
     env.registry = Some(&registry);
-    let outcome = run_rotation(&env, &fx.dek, 1, Fixture::change_password())
+    env.faults = vec![FaultPoint::FailAfterPromote];
+    let err = run_rotation(&env, &fx.dek, 1, Fixture::change_password())
         .await
-        .unwrap();
+        .unwrap_err();
+    assert!(matches!(err, RotationError::NeedsResume { .. }), "{err:?}");
+    assert!(!registry.is_occupied().await);
+}
 
-    assert_eq!(
-        registry.with_key(|k| (k.data_key, k.key_epoch)).await,
-        Some((*outcome.new_dek, 2))
-    );
-    assert_eq!(epoch_guard::resident_epoch(USER), Some(2));
-    assert!(epoch_guard::ensure_current(USER).await.is_ok());
-    let (private, _) = sharing_keypair::derive_sharing_keypair(&outcome.new_dek, USER, 2);
-    assert_eq!(
-        registry.sharing_private_key().await,
-        Some(private.to_bytes())
-    );
+#[tokio::test]
+async fn a_rollback_before_promotion_keeps_the_session() {
+    let fx = Fixture::new().await;
+    let registry = KeyRegistry::default();
+    populate_registry(&registry, USER, *fx.dek, 1).await;
+    let mut env = fx.env();
+    env.registry = Some(&registry);
+    env.faults = vec![FaultPoint::FailAfterItemCommitted(0)];
+    let err = run_rotation(&env, &fx.dek, 1, Fixture::change_password())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, RotationError::RolledBack { .. }), "{err:?}");
+    assert!(registry.is_occupied().await, "a rollback changes nothing");
+    assert_eq!(registry.with_key(|k| k.key_epoch).await, Some(1));
 }
 
 // ---------------------------------------------------------------------------
@@ -1019,6 +1081,129 @@ async fn crash_then_resume_forward(fault: FaultPoint) {
         panic!("{fault:?}: expected the rotation to complete");
     };
     assert_completed(&fx, &outcome.new_dek).await;
+}
+
+// ---------------------------------------------------------------------------
+// The kill matrix with a concurrent writer (items.id=778, decisions.id=896
+// point 9): a reply is writing while the user asks for a rotation, the
+// rotation waits for it (finished or stopped), then dies at each fault point
+// and resumes forward. What the writer saved must survive under the new key.
+// ---------------------------------------------------------------------------
+
+async fn read_markers(path: &Path, key: &str) -> Vec<String> {
+    let mut conn = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false)
+        .pragma("key", format!("\"x'{key}'\""))
+        .pragma("cipher_compatibility", "4")
+        .connect()
+        .await
+        .unwrap();
+    let rows = sqlx::query_scalar("SELECT v FROM qr_marker")
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+    conn.close().await.unwrap();
+    rows
+}
+
+/// Which way the concurrent writer ends.
+#[derive(Clone, Copy, Debug)]
+enum WriterEnds {
+    /// 'Finish first': it finishes on its own.
+    Finishes,
+    /// 'Stop and save': it is told to stop, saves what it has, then ends.
+    IsStopped,
+}
+
+async fn crash_with_a_concurrent_writer_then_resume(fault: FaultPoint, ends: WriterEnds) {
+    use crate::auth::writer_gate::{self, Choice, DrainPolicy, Kind};
+
+    let fx = Fixture::new().await;
+    let inv = io::inventory(&fx.user_dir).await.unwrap();
+    let personal = inv
+        .items
+        .iter()
+        .find(|i| i.rel_path.ends_with("personal.db"))
+        .unwrap();
+    let ItemTarget::Db(target) = &personal.target else {
+        panic!("personal.db is a database")
+    };
+    let old_key = io::db_key_for(target, &fx.dek, USER, 1).unwrap();
+
+    let reply = writer_gate::acquire(USER, Kind::Reply).unwrap();
+    let stop = reply.stop_token().clone();
+    let choice = match ends {
+        WriterEnds::Finishes => Choice::FinishFirst,
+        WriterEnds::IsStopped => Choice::StopAndSave,
+    };
+    let writer = async {
+        // The drain has begun: no new reply may start, this one is still ours.
+        while writer_gate::phase(USER) != writer_gate::Phase::Draining {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(writer_gate::acquire(USER, Kind::Reply).is_err());
+        if matches!(ends, WriterEnds::IsStopped) {
+            stop.cancelled().await;
+        }
+        // Written under the OLD key, before the rotation may start.
+        mark_db(&personal.abs_path, &old_key, "writer:what the reply saved").await;
+        drop(reply);
+    };
+    let (guard, ()) = tokio::join!(
+        async {
+            writer_gate::drain_for_rotation(USER, choice, DrainPolicy::default())
+                .await
+                .unwrap()
+        },
+        writer
+    );
+
+    // The rotation starts only now, with the gate closed and empty, and dies.
+    let mut env = fx.env();
+    env.require_closed_gate = true;
+    env.faults = vec![fault];
+    let err = run_rotation(&env, &fx.dek, 1, Fixture::change_password())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, RotationError::SimulatedCrash),
+        "{fault:?}/{ends:?}: {err:?}"
+    );
+    drop(env);
+    drop(guard);
+
+    // The next unlock resumes forward and completes.
+    let resumed = fx.resume_with_new_password().await.unwrap();
+    let ResumeOutcome::Completed(outcome) = resumed else {
+        panic!("{fault:?}/{ends:?}: expected the rotation to complete");
+    };
+    assert_completed(&fx, &outcome.new_dek).await;
+    let new_key = io::db_key_for(target, &outcome.new_dek, USER, 2).unwrap();
+    let markers = read_markers(&personal.abs_path, &new_key).await;
+    assert!(
+        markers.iter().any(|m| m == "writer:what the reply saved"),
+        "{fault:?}/{ends:?}: the writer's data is lost: {markers:?}"
+    );
+    assert!(writer_gate::is_idle(USER));
+}
+
+#[tokio::test]
+async fn the_kill_matrix_with_a_concurrent_writer() {
+    // One fixture per case; run in sequence (each holds the process lock).
+    for ends in [WriterEnds::Finishes, WriterEnds::IsStopped] {
+        for fault in [
+            FaultPoint::AfterStage,
+            FaultPoint::AfterItemRekeyBeforeRow(0),
+            FaultPoint::AfterItemCommitted(0),
+            FaultPoint::AfterAllItems,
+            FaultPoint::AfterPromote,
+        ] {
+            // (A crash after the rotation finished leaves a normal account:
+            // crash_after_the_rotation_finished_leaves_a_normal_account.)
+            crash_with_a_concurrent_writer_then_resume(fault, ends).await;
+        }
+    }
 }
 
 #[tokio::test]

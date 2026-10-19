@@ -27,7 +27,16 @@ const en = JSON.parse(fs.readFileSync(path.join(here, '..', 'i18n', 'en.json'), 
 // -- nextBootState: a lock always lands on the login screen ---------------
 const states: BootState[] = ['checking', 'loginRequired', 'loggedIn']
 for (const state of states) {
-  for (const reason of ['idle', 'session_expired', 'key_epoch_changed', 'logged_out', 'brand_new']) {
+  for (const reason of [
+    'idle',
+    'session_expired',
+    'key_epoch_changed',
+    'logged_out',
+    'password_changed',
+    'recovery_phrase_changed',
+    'change_unfinished',
+    'brand_new',
+  ]) {
     assert.equal(
       nextBootState(state, { type: 'session-locked', reason }),
       'loginRequired',
@@ -74,6 +83,18 @@ assert.equal(isSessionLockNotice(rotationNotice), false)
 assert.equal(lockNoticeSuffix('idle'), 'idle')
 assert.equal(lockNoticeSuffix('session_expired'), 'expired')
 assert.equal(lockNoticeSuffix('key_epoch_changed'), 'keyEpochChanged')
+// items.id=778: every rotation ends the session with its own line.
+assert.equal(lockNoticeSuffix('password_changed'), 'passwordChanged')
+assert.equal(lockNoticeSuffix('recovery_phrase_changed'), 'recoveryPhraseChanged')
+assert.equal(lockNoticeSuffix('change_unfinished'), 'changeUnfinished')
+assert.equal(
+  en.auth.sessionLocked.passwordChanged,
+  'Your password was changed. Sign in with your new password.',
+)
+assert.equal(
+  en.auth.sessionLocked.recoveryPhraseChanged,
+  'Your recovery phrase was changed. Sign in again with your password.',
+)
 for (const reason of ['no_session', 'check_failed', 'something_new', 'toString', '__proto__']) {
   assert.equal(lockNoticeSuffix(reason), 'generic', reason)
 }

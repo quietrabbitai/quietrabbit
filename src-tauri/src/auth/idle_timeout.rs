@@ -64,6 +64,16 @@ pub enum LockReason {
     CheckFailed,
     /// The user (or the app on their behalf) signed out.
     LoggedOut,
+    /// A password change or a restore finished (items.id=778): the data key
+    /// changed, so the session ends and the user signs in with the new password.
+    PasswordChanged,
+    /// A new recovery phrase was created (items.id=778): the data key changed,
+    /// the password did not.
+    RecoveryPhraseChanged,
+    /// A change that was started did not finish after its new wraps went live
+    /// (items.id=778): the data is on the new key and the next sign-in with the
+    /// new credential finishes it.
+    ChangeUnfinished,
 }
 
 impl LockReason {
@@ -75,6 +85,9 @@ impl LockReason {
             LockReason::NoSession => "no_session",
             LockReason::CheckFailed => "check_failed",
             LockReason::LoggedOut => "logged_out",
+            LockReason::PasswordChanged => "password_changed",
+            LockReason::RecoveryPhraseChanged => "recovery_phrase_changed",
+            LockReason::ChangeUnfinished => "change_unfinished",
         }
     }
 }

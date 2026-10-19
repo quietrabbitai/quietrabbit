@@ -77,6 +77,7 @@ use zeroize::Zeroizing;
 
 use crate::auth::data_key::{self, DataKeyError};
 use crate::auth::epoch_guard;
+use crate::auth::idle_timeout::{emit_session_locked, lock_session, LockReason};
 use crate::auth::kdf;
 use crate::auth::key_rotation::{
     self, ProgressEvent, ProgressSink, ResumeOutcome, RotationEnv, RotationError, RotationRequest,
@@ -86,7 +87,8 @@ use crate::auth::password_policy::{self, PasswordPolicyError};
 use crate::auth::registry::{GroupKeyRegistry, KeyRegistry, NewPhraseSlot};
 use crate::auth::user_store;
 use crate::auth::writer_gate::{self, DrainError, DrainGuard, GateError};
-use crate::commands::auth::{finish_login, is_locked_out, record_failed_attempt};
+use crate::commands::auth::{is_locked_out, record_failed_attempt};
+use crate::provider_credentials::session::ConnectSessions;
 use crate::task_progress::{emit_progress, TaskProgressPayload};
 
 // ---------------------------------------------------------------------------
@@ -485,6 +487,67 @@ async fn drain_writers_with(
         })
 }
 
+/// What a rotation command found out about the session while it ran: whether
+/// the session must end, for whom and why (items.id=778, decisions.id=896).
+/// Every COMPLETED rotation ends the session, and so does one that failed
+/// after its new wraps were live (`NeedsResume`); a rollback or a refusal does
+/// not. The engine has already cleared the key registry; the command then
+/// finishes the lock (group keys, connect sessions, session rows) and tells
+/// the webview.
+#[derive(Default)]
+struct SessionEnd {
+    pending: Option<(String, LockReason)>,
+}
+
+impl SessionEnd {
+    /// Record the end implied by `outcome`: `ok_reason` when it completed,
+    /// `ChangeUnfinished` when it needs resuming, nothing otherwise.
+    fn note<T>(
+        &mut self,
+        user_id: &str,
+        outcome: &Result<T, RotationError>,
+        ok_reason: LockReason,
+    ) {
+        match outcome {
+            Ok(_) => self.pending = Some((user_id.to_owned(), ok_reason)),
+            Err(e) => self.note_error(user_id, e),
+        }
+    }
+
+    /// `note` for a failure: only `NeedsResume` ends the session.
+    fn note_error(&mut self, user_id: &str, error: &RotationError) {
+        if matches!(error, RotationError::NeedsResume { .. }) {
+            self.pending = Some((user_id.to_owned(), LockReason::ChangeUnfinished));
+        }
+    }
+
+    /// End the session if one was recorded: `lock_session` is the one clear
+    /// path every lock goes through. Returns the reason to announce.
+    async fn finish(
+        self,
+        pool: &sqlx::SqlitePool,
+        key_registry: &KeyRegistry,
+        group_key_registry: &GroupKeyRegistry,
+        connect_sessions: &ConnectSessions,
+    ) -> Option<LockReason> {
+        let (user_id, reason) = self.pending?;
+        if let Err(e) = lock_session(
+            pool,
+            key_registry,
+            group_key_registry,
+            connect_sessions,
+            Some(&user_id),
+            reason,
+        )
+        .await
+        {
+            // The key is already gone; only the session-row soft-expire failed.
+            log::warn!("key_rotation: could not soft-expire the sessions after the change: {e}");
+        }
+        Some(reason)
+    }
+}
+
 /// Cancel the wait of a rotation that is waiting for running work (the Cancel
 /// button on the waiting screen). Nothing is changed: the waiting call returns
 /// `drain_cancelled`, the gate reopens and the running work carries on. A
@@ -511,20 +574,79 @@ pub async fn cancel_writer_wait(
 /// Change the account password. Re-verifies `old_password`, then rotates the
 /// data key: everything is re-locked under a new key and the new password.
 /// The recovery phrase is unchanged and stays valid. Returns when the change is
-/// complete (or has failed); progress arrives as `task-progress` events.
+/// complete (or has failed); progress arrives as `task-progress` events. A
+/// completed change ENDS THE SESSION (`session-locked`, reason
+/// `password_changed`): the user signs in again with the new password.
 #[tauri::command]
 #[specta::specta]
+#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
 pub async fn change_password(
+    app_handle: tauri::AppHandle,
     old_password: String,
     new_password: String,
     writers: WritersChoice,
     key_registry: State<'_, KeyRegistry>,
+    group_key_registry: State<'_, GroupKeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
+    connect_sessions: State<'_, ConnectSessions>,
+) -> Result<(), KeyRotationError> {
+    let (result, lock) = change_password_core(
+        old_password,
+        new_password,
+        writers,
+        key_registry,
+        group_key_registry,
+        pool,
+        connect_sessions,
+    )
+    .await;
+    if let Some(reason) = lock {
+        emit_session_locked(&app_handle, reason);
+    }
+    result
+}
+
+/// The body of `change_password`, split out so tests can call it without an
+/// `AppHandle` (same split as `logout`/`logout_core`). Returns the result and
+/// the reason the session ended, if it did.
+#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
+pub(crate) async fn change_password_core(
+    old_password: String,
+    new_password: String,
+    writers: WritersChoice,
+    key_registry: State<'_, KeyRegistry>,
+    group_key_registry: State<'_, GroupKeyRegistry>,
+    pool: State<'_, sqlx::SqlitePool>,
+    connect_sessions: State<'_, ConnectSessions>,
+) -> (Result<(), KeyRotationError>, Option<LockReason>) {
+    let mut end = SessionEnd::default();
+    let result = change_password_inner(
+        old_password,
+        new_password,
+        writers,
+        &key_registry,
+        &pool,
+        &mut end,
+    )
+    .await;
+    let lock = end
+        .finish(&pool, &key_registry, &group_key_registry, &connect_sessions)
+        .await;
+    (result, lock)
+}
+
+async fn change_password_inner(
+    old_password: String,
+    new_password: String,
+    writers: WritersChoice,
+    key_registry: &KeyRegistry,
+    pool: &sqlx::SqlitePool,
+    end: &mut SessionEnd,
 ) -> Result<(), KeyRotationError> {
     let old_password = Zeroizing::new(old_password);
     let new_password = Zeroizing::new(new_password);
     check_new_password(&new_password)?;
-    let (resident, _) = authorise_session_change(&key_registry, &pool, &old_password).await?;
+    let (resident, _) = authorise_session_change(key_registry, pool, &old_password).await?;
     // Only now, with the old password proven right, is "same as the current
     // password" a safe thing to say (before that it would be an oracle).
     if password_policy::same_password(&old_password, &new_password) {
@@ -532,8 +654,8 @@ pub async fn change_password(
     }
 
     let _drain = drain_writers(&resident.user_id, writers).await?;
-    let env = env_for(&pool, &resident.user_id, true, Some(&key_registry));
-    key_rotation::run_rotation(
+    let env = env_for(pool, &resident.user_id, true, Some(key_registry));
+    let outcome = key_rotation::run_rotation(
         &env,
         &resident.data_key,
         resident.key_epoch,
@@ -541,9 +663,9 @@ pub async fn change_password(
             new_password: Zeroizing::new(new_password.as_bytes().to_vec()),
         },
     )
-    .await
-    .map(drop)
-    .map_err(|e| code_for(&e))
+    .await;
+    end.note(&resident.user_id, &outcome, LockReason::PasswordChanged);
+    outcome.map(drop).map_err(|e| code_for(&e))
 }
 
 // ---------------------------------------------------------------------------
@@ -620,18 +742,75 @@ fn normalise_word(w: &str) -> String {
 
 /// Confirm the new phrase by re-entering the asked-for words, then rotate: the
 /// data key changes, the password stays, and the old words stop working. Asks
-/// for the password again (it is not held in memory in between).
+/// for the password again (it is not held in memory in between). A completed
+/// change ENDS THE SESSION (`session-locked`, reason `recovery_phrase_changed`):
+/// the user signs in again with the same password.
 #[tauri::command]
 #[specta::specta]
+#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
 pub async fn confirm_new_recovery_phrase(
+    app_handle: tauri::AppHandle,
     password: String,
     answers: Vec<WordAnswer>,
     writers: WritersChoice,
     key_registry: State<'_, KeyRegistry>,
+    group_key_registry: State<'_, GroupKeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
+    connect_sessions: State<'_, ConnectSessions>,
+) -> Result<(), KeyRotationError> {
+    let (result, lock) = confirm_new_recovery_phrase_core(
+        password,
+        answers,
+        writers,
+        key_registry,
+        group_key_registry,
+        pool,
+        connect_sessions,
+    )
+    .await;
+    if let Some(reason) = lock {
+        emit_session_locked(&app_handle, reason);
+    }
+    result
+}
+
+/// The body of `confirm_new_recovery_phrase`, split out for tests (no `AppHandle`).
+#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
+pub(crate) async fn confirm_new_recovery_phrase_core(
+    password: String,
+    answers: Vec<WordAnswer>,
+    writers: WritersChoice,
+    key_registry: State<'_, KeyRegistry>,
+    group_key_registry: State<'_, GroupKeyRegistry>,
+    pool: State<'_, sqlx::SqlitePool>,
+    connect_sessions: State<'_, ConnectSessions>,
+) -> (Result<(), KeyRotationError>, Option<LockReason>) {
+    let mut end = SessionEnd::default();
+    let result = confirm_new_recovery_phrase_inner(
+        password,
+        answers,
+        writers,
+        &key_registry,
+        &pool,
+        &mut end,
+    )
+    .await;
+    let lock = end
+        .finish(&pool, &key_registry, &group_key_registry, &connect_sessions)
+        .await;
+    (result, lock)
+}
+
+async fn confirm_new_recovery_phrase_inner(
+    password: String,
+    answers: Vec<WordAnswer>,
+    writers: WritersChoice,
+    key_registry: &KeyRegistry,
+    pool: &sqlx::SqlitePool,
+    end: &mut SessionEnd,
 ) -> Result<(), KeyRotationError> {
     let password = Zeroizing::new(password);
-    let resident = resident(&key_registry).await?;
+    let resident = resident(key_registry).await?;
 
     // Check the words before anything else is spent.
     let verdict = key_registry
@@ -661,15 +840,15 @@ pub async fn confirm_new_recovery_phrase(
         Some((true, _)) => {}
     }
 
-    authorise_session_change(&key_registry, &pool, &password).await?;
+    authorise_session_change(key_registry, pool, &password).await?;
     let entropy = key_registry
         .with_pending_new_phrase(|slot| slot.entropy.clone())
         .await
         .ok_or(KeyRotationError::NoPendingPhrase)?;
 
     let _drain = drain_writers(&resident.user_id, writers).await?;
-    let env = env_for(&pool, &resident.user_id, true, Some(&key_registry));
-    key_rotation::run_rotation(
+    let env = env_for(pool, &resident.user_id, true, Some(key_registry));
+    let outcome = key_rotation::run_rotation(
         &env,
         &resident.data_key,
         resident.key_epoch,
@@ -678,9 +857,15 @@ pub async fn confirm_new_recovery_phrase(
             recovery_entropy: entropy,
         },
     )
-    .await
-    .map_err(|e| code_for(&e))?;
-    // Adopted: the held words have done their job.
+    .await;
+    end.note(
+        &resident.user_id,
+        &outcome,
+        LockReason::RecoveryPhraseChanged,
+    );
+    outcome.map_err(|e| code_for(&e))?;
+    // Adopted: the held words have done their job (the engine has already
+    // cleared the registry, pending slots included).
     drop(key_registry.take_pending_new_phrase().await);
     Ok(())
 }
@@ -701,14 +886,17 @@ fn normalise_phrase(phrase: &str) -> Zeroizing<String> {
     )
 }
 
-/// Forgot the password: sign in with the 24 recovery words and set a new
-/// password. The words unseal the data key, the data key is rotated exactly as
-/// for a password change, and the account is unlocked. The words themselves do
-/// not change. If a change was interrupted earlier, this is also the way to
-/// finish it with the words.
+/// Forgot the password: set a new password with the 24 recovery words. The
+/// words unseal the data key, the data key is rotated exactly as for a password
+/// change, and the user then signs in with the new password: no session is
+/// opened here (items.id=778; decisions.id=896 ends every rotation at the login
+/// screen). The words themselves do not change. If a change was interrupted
+/// earlier, this is also the way to finish it with the words.
 #[tauri::command]
 #[specta::specta]
+#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
 pub async fn restore_with_recovery_phrase(
+    app_handle: tauri::AppHandle,
     display_name: String,
     phrase: String,
     new_password: String,
@@ -716,6 +904,52 @@ pub async fn restore_with_recovery_phrase(
     key_registry: State<'_, KeyRegistry>,
     group_key_registry: State<'_, GroupKeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
+    connect_sessions: State<'_, ConnectSessions>,
+) -> Result<(), KeyRotationError> {
+    let (result, lock) = restore_with_recovery_phrase_core(
+        display_name,
+        phrase,
+        new_password,
+        writers,
+        key_registry,
+        group_key_registry,
+        pool,
+        connect_sessions,
+    )
+    .await;
+    if let Some(reason) = lock {
+        emit_session_locked(&app_handle, reason);
+    }
+    result
+}
+
+/// The body of `restore_with_recovery_phrase`, split out for tests (no `AppHandle`).
+#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
+pub(crate) async fn restore_with_recovery_phrase_core(
+    display_name: String,
+    phrase: String,
+    new_password: String,
+    writers: WritersChoice,
+    key_registry: State<'_, KeyRegistry>,
+    group_key_registry: State<'_, GroupKeyRegistry>,
+    pool: State<'_, sqlx::SqlitePool>,
+    connect_sessions: State<'_, ConnectSessions>,
+) -> (Result<(), KeyRotationError>, Option<LockReason>) {
+    let mut end = SessionEnd::default();
+    let result = restore_inner(display_name, phrase, new_password, writers, &pool, &mut end).await;
+    let lock = end
+        .finish(&pool, &key_registry, &group_key_registry, &connect_sessions)
+        .await;
+    (result, lock)
+}
+
+async fn restore_inner(
+    display_name: String,
+    phrase: String,
+    new_password: String,
+    writers: WritersChoice,
+    pool: &sqlx::SqlitePool,
+    end: &mut SessionEnd,
 ) -> Result<(), KeyRotationError> {
     let new_password = Zeroizing::new(new_password);
     check_new_password(&new_password)?;
@@ -724,23 +958,23 @@ pub async fn restore_with_recovery_phrase(
     let entropy = data_key::entropy_from_mnemonic(&normalise_phrase(&phrase))
         .map_err(|_| KeyRotationError::PhraseInvalid)?;
     // Unknown account and wrong words must look the same.
-    let user = user_store::find_user_by_display_name(&pool, &display_name)
+    let user = user_store::find_user_by_display_name(pool, &display_name)
         .await
         .map_err(|e| internal("user", e))?
         .ok_or(KeyRotationError::InvalidCredentials)?;
-    if is_locked_out(&pool, &display_name)
+    if is_locked_out(pool, &display_name)
         .await
         .map_err(|e| internal("lockout check", e))?
     {
         return Err(KeyRotationError::AccountLocked);
     }
-    let state = user_store::get_key_wrapper_state(&pool, &user.id)
+    let state = user_store::get_key_wrapper_state(pool, &user.id)
         .await
         .map_err(|e| internal("wrapper", e))?
         .ok_or_else(|| internal("wrapper", "missing"))?;
 
     let wrong = || async {
-        record_failed_attempt(&pool, &display_name)
+        record_failed_attempt(pool, &display_name)
             .await
             .map_err(|e| internal("failure bookkeeping", e))?;
         Err::<(), _>(KeyRotationError::InvalidCredentials)
@@ -748,7 +982,7 @@ pub async fn restore_with_recovery_phrase(
 
     // An interrupted change: finish it with the words.
     if state.pending_rotation.is_some() {
-        let pending = user_store::get_pending_rotation(&pool, &user.id)
+        let pending = user_store::get_pending_rotation(pool, &user.id)
             .await
             .map_err(|e| internal("pending rotation", e))?
             .ok_or_else(|| internal("pending rotation", "flag without a row"))?;
@@ -763,8 +997,8 @@ pub async fn restore_with_recovery_phrase(
             Err(StagedUnlockError::WrongCredential) => return wrong().await.map(|_| ()),
             Err(e) => return Err(code_for_unlock(&e)),
         };
-        let drain = drain_writers(&user.id, writers).await?;
-        let env = env_for(&pool, &user.id, true, None);
+        let _drain = drain_writers(&user.id, writers).await?;
+        let env = env_for(pool, &user.id, true, None);
         let finished = match key_rotation::resume_rotation(
             &env,
             &pending,
@@ -775,13 +1009,17 @@ pub async fn restore_with_recovery_phrase(
         {
             Ok(ResumeOutcome::Completed(outcome)) => outcome,
             Ok(ResumeOutcome::RolledBack) => return Err(KeyRotationError::RolledBack),
-            Err(e) => return Err(code_for(&e)),
+            Err(e) => {
+                end.note_error(&user.id, &e);
+                return Err(code_for(&e));
+            }
         };
         // The interrupted change is done, on whatever password it had chosen.
         // The person here forgot their password and typed a new one: run the
         // restore on top so the account ENDS on the typed password. (If this
         // second step fails the account stays on the finished change's
-        // password and the failure is reported; no session is opened.)
+        // password and the failure is reported.) No session is opened: the
+        // user signs in with the new password (items.id=778).
         let outcome = key_rotation::run_rotation(
             &env,
             &finished.new_dek,
@@ -790,21 +1028,9 @@ pub async fn restore_with_recovery_phrase(
                 new_password: Zeroizing::new(new_password.as_bytes().to_vec()),
             },
         )
-        .await
-        .map_err(|e| code_for(&e))?;
-        // The writers are drained and the rotation is over: reopen the gate
-        // before signing in (finish_login takes its own lease).
-        drop(drain);
-        return finish_login(
-            &user.id,
-            *outcome.new_dek,
-            outcome.to_epoch,
-            &key_registry,
-            &group_key_registry,
-            &pool,
-        )
-        .await
-        .map_err(|e| internal("session", e));
+        .await;
+        end.note(&user.id, &outcome, LockReason::PasswordChanged);
+        return outcome.map(drop).map_err(|e| code_for(&e));
     }
 
     // The ordinary case: the words must derive the stored recovery key, then
@@ -824,9 +1050,9 @@ pub async fn restore_with_recovery_phrase(
         Err(_) => return wrong().await.map(|_| ()),
     };
 
-    let drain = drain_writers(&user.id, writers).await?;
-    let env = env_for(&pool, &user.id, true, None);
-    let outcome = match key_rotation::run_rotation(
+    let _drain = drain_writers(&user.id, writers).await?;
+    let env = env_for(pool, &user.id, true, None);
+    let outcome = key_rotation::run_rotation(
         &env,
         &old_dek,
         state.wrapper.key_epoch,
@@ -834,9 +1060,10 @@ pub async fn restore_with_recovery_phrase(
             new_password: Zeroizing::new(new_password.as_bytes().to_vec()),
         },
     )
-    .await
-    {
-        Ok(o) => o,
+    .await;
+    end.note(&user.id, &outcome, LockReason::PasswordChanged);
+    match outcome {
+        Ok(_) => Ok(()),
         // A forged seal unseals to a key that opens nothing real. ONLY a
         // failure to open integration_keys.db (the database every account has
         // and the first one tried) says the recovered key is not the account's:
@@ -848,21 +1075,10 @@ pub async fn restore_with_recovery_phrase(
             if rel_path == "integration_keys.db" =>
         {
             log::warn!("key_rotation: the recovered key does not open the account's keys database");
-            return wrong().await.map(|_| ());
+            wrong().await.map(|_| ())
         }
-        Err(e) => return Err(code_for(&e)),
-    };
-    drop(drain);
-    finish_login(
-        &user.id,
-        *outcome.new_dek,
-        outcome.to_epoch,
-        &key_registry,
-        &group_key_registry,
-        &pool,
-    )
-    .await
-    .map_err(|e| internal("session", e))
+        Err(e) => Err(code_for(&e)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1046,6 +1262,8 @@ mod tests {
         _tempdir: tempfile::TempDir,
         saved_root: Option<String>,
         app: tauri::App<tauri::test::MockRuntime>,
+        /// The reasons the session ended with, in order (items.id=778).
+        locks: std::sync::Mutex<Vec<LockReason>>,
     }
 
     impl Drop for Harness {
@@ -1085,6 +1303,7 @@ mod tests {
                 _tempdir: tempdir,
                 saved_root,
                 app,
+                locks: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -1159,14 +1378,23 @@ mod tests {
             new: &str,
             writers: WritersChoice,
         ) -> Result<(), KeyRotationError> {
-            change_password(
+            let (result, lock) = change_password_core(
                 old.to_owned(),
                 new.to_owned(),
                 writers,
                 self.registry(),
+                self.groups(),
                 self.pool(),
+                self.app.state(),
             )
-            .await
+            .await;
+            self.locks.lock().unwrap().extend(lock);
+            result
+        }
+
+        /// The reason the session last ended with, if it ended.
+        fn last_lock(&self) -> Option<LockReason> {
+            self.locks.lock().unwrap().last().copied()
         }
 
         /// The account's data key in hex, as a store opener wants it.
@@ -1178,7 +1406,7 @@ mod tests {
         }
 
         async fn restore(&self, words: &str, new: &str) -> Result<(), KeyRotationError> {
-            restore_with_recovery_phrase(
+            let (result, lock) = restore_with_recovery_phrase_core(
                 "Alice".to_owned(),
                 words.to_owned(),
                 new.to_owned(),
@@ -1186,8 +1414,33 @@ mod tests {
                 self.registry(),
                 self.groups(),
                 self.pool(),
+                self.app.state(),
             )
-            .await
+            .await;
+            self.locks.lock().unwrap().extend(lock);
+            result
+        }
+
+        /// Assert that nothing is resident and nothing is open: the registry,
+        /// the resident epoch, the pending slots and the gate are all empty,
+        /// and the OLD data key opens no database (items.id=778).
+        async fn assert_nothing_resident(&self, user_id: &str, old_key: &str) {
+            assert!(self.registry().user_id().await.is_none(), "registry key");
+            assert!(
+                self.registry()
+                    .with_pending_new_phrase(|_| ())
+                    .await
+                    .is_none(),
+                "pending phrase slot"
+            );
+            assert_eq!(epoch_guard::resident_epoch(user_id), None, "resident epoch");
+            assert!(writer_gate::is_idle(user_id), "gate idle, zero leases");
+            assert!(
+                personal_store::open_personal_db(user_id, "persona-1", old_key)
+                    .await
+                    .is_err(),
+                "the old key opens no store"
+            );
         }
 
         /// Leave an interrupted rotation behind, as a crash would, and lock
@@ -1279,38 +1532,36 @@ mod tests {
     // -- change_password ----------------------------------------------------
 
     #[tokio::test]
-    async fn change_password_rotates_and_keeps_the_session_working() {
+    async fn change_password_rotates_and_ends_the_session() {
         let h = Harness::new().await;
         h.account().await;
         let user_id = h.user_id().await;
-        let before = h
-            .registry()
-            .with_key(|k| (k.data_key, k.key_epoch))
-            .await
-            .unwrap();
+        let old_key = h.key_hex().await;
 
         h.change_password(PASSWORD, NEW_PASSWORD).await.unwrap();
 
-        // The session now holds a different key at the next epoch, and works.
-        let after = h
-            .registry()
-            .with_key(|k| (k.data_key, k.key_epoch))
-            .await
-            .unwrap();
-        assert_ne!(after.0, before.0);
-        assert_eq!(after.1, before.1 + 1);
-        let new_hex = crate::auth::registry::key_hex(&after.0);
+        // The session ended: nothing is resident, nothing is open, the webview
+        // is told why (items.id=778).
+        assert_eq!(h.last_lock(), Some(LockReason::PasswordChanged));
+        h.assert_nothing_resident(&user_id, &old_key).await;
+        assert_eq!(
+            h.change_password(NEW_PASSWORD, "another valid password")
+                .await
+                .unwrap_err(),
+            KeyRotationError::NotLoggedIn
+        );
+
+        // Old password is dead, new password signs in at the next epoch.
+        assert_eq!(h.login(PASSWORD).await.unwrap_err(), "invalid credentials");
+        h.login(NEW_PASSWORD).await.unwrap();
+        assert_eq!(h.registry().with_key(|k| k.key_epoch).await, Some(2));
+        let new_key = h.key_hex().await;
+        assert_ne!(new_key, old_key);
         assert!(
-            personal_store::open_personal_db(&user_id, "persona-1", &new_hex)
+            personal_store::open_personal_db(&user_id, "persona-1", &new_key)
                 .await
                 .is_ok()
         );
-
-        // Old password is dead, new password signs in.
-        h.registry().clear().await;
-        epoch_guard::clear_resident_for(&user_id);
-        assert_eq!(h.login(PASSWORD).await.unwrap_err(), "invalid credentials");
-        h.login(NEW_PASSWORD).await.unwrap();
     }
 
     #[tokio::test]
@@ -1339,6 +1590,58 @@ mod tests {
         h.registry().clear().await;
         epoch_guard::clear_resident_for(&h.user_id().await);
         h.login(PASSWORD).await.unwrap();
+    }
+
+    #[test]
+    fn only_a_completed_or_unfinished_rotation_ends_the_session() {
+        // items.id=778: complete ends it with the kind's reason, a failure after
+        // promotion ends it as unfinished, a rollback or refusal does not.
+        let ok: Result<(), RotationError> = Ok(());
+        let needs: Result<(), RotationError> =
+            Err(RotationError::NeedsResume { cause: "x".into() });
+        let rolled: Result<(), RotationError> =
+            Err(RotationError::RolledBack { cause: "x".into() });
+        let busy: Result<(), RotationError> = Err(RotationError::ActiveRuns(1));
+
+        let mut end = SessionEnd::default();
+        end.note("u", &ok, LockReason::RecoveryPhraseChanged);
+        assert_eq!(
+            end.pending,
+            Some(("u".into(), LockReason::RecoveryPhraseChanged))
+        );
+
+        let mut end = SessionEnd::default();
+        end.note("u", &needs, LockReason::PasswordChanged);
+        assert_eq!(
+            end.pending,
+            Some(("u".into(), LockReason::ChangeUnfinished))
+        );
+
+        for no in [&rolled, &busy] {
+            let mut end = SessionEnd::default();
+            end.note("u", no, LockReason::PasswordChanged);
+            assert_eq!(end.pending, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn finishing_a_session_end_clears_everything_and_reports_the_reason() {
+        let h = Harness::new().await;
+        h.account().await;
+        let user_id = h.user_id().await;
+        let mut end = SessionEnd::default();
+        end.note::<()>(&user_id, &Ok(()), LockReason::PasswordChanged);
+        let reason = end
+            .finish(&h.pool(), &h.registry(), &h.groups(), &h.app.state())
+            .await;
+        assert_eq!(reason, Some(LockReason::PasswordChanged));
+        assert!(h.registry().user_id().await.is_none());
+        assert_eq!(epoch_guard::resident_epoch(&user_id), None);
+        // Nothing recorded, nothing ended.
+        let none = SessionEnd::default()
+            .finish(&h.pool(), &h.registry(), &h.groups(), &h.app.state())
+            .await;
+        assert_eq!(none, None);
     }
 
     #[tokio::test]
@@ -1607,6 +1910,7 @@ mod tests {
         // Move to a non-ASCII password so the test covers normalisation too.
         let current = "Cr\u{e8}me br\u{fb}l\u{e9}e is fifteen+";
         h.change_password(PASSWORD, current).await.unwrap();
+        h.login(current).await.unwrap();
 
         assert_eq!(
             h.change_password(current, current).await.unwrap_err(),
@@ -1635,6 +1939,7 @@ mod tests {
         // And no password history is kept: the previous password is allowed
         // again.
         h.change_password(current, NEW_PASSWORD).await.unwrap();
+        h.login(NEW_PASSWORD).await.unwrap();
         h.change_password(NEW_PASSWORD, current).await.unwrap();
     }
 
@@ -1764,16 +2069,15 @@ mod tests {
         h.restart().await;
 
         h.restore(&words, "the one typed at restore").await.unwrap();
-        assert!(h.registry().is_occupied().await);
+        // No session is opened by a restore: the user signs in (items.id=778).
+        assert!(!h.registry().is_occupied().await);
+        assert_eq!(h.last_lock(), Some(LockReason::PasswordChanged));
         assert!(user_store::get_pending_rotation(&h.pool(), &user_id)
             .await
             .unwrap()
             .is_none());
         // Two rotations ran: the interrupted change (epoch 2) and then the
         // restore on top (epoch 3), so the account ENDS on the typed password.
-        assert_eq!(h.registry().with_key(|k| k.key_epoch).await, Some(3));
-        h.registry().clear().await;
-        epoch_guard::clear_resident_for(&user_id);
         assert_eq!(h.login(PASSWORD).await.unwrap_err(), "invalid credentials");
         assert_eq!(
             h.login(NEW_PASSWORD).await.unwrap_err(),
@@ -1781,6 +2085,7 @@ mod tests {
             "the interrupted change's password was superseded"
         );
         h.login("the one typed at restore").await.unwrap();
+        assert_eq!(h.registry().with_key(|k| k.key_epoch).await, Some(3));
     }
 
     // -- restore --------------------------------------------------------
@@ -1801,7 +2106,7 @@ mod tests {
         epoch_guard::clear_resident_for(&user_id);
         assert!(h.registry().user_id().await.is_none(), "no session");
 
-        let restore = restore_with_recovery_phrase(
+        let restore = restore_with_recovery_phrase_core(
             "Alice".to_owned(),
             words.clone(),
             NEW_PASSWORD.to_owned(),
@@ -1809,13 +2114,18 @@ mod tests {
             h.registry(),
             h.groups(),
             h.pool(),
+            h.app.state(),
         );
         let cancel = async {
             wait_for_phase(&user_id, writer_gate::Phase::Draining).await;
             cancel_writer_wait(h.registry()).await.unwrap();
         };
         let (restored, ()) = tokio::join!(restore, cancel);
-        assert_eq!(restored.unwrap_err(), KeyRotationError::DrainCancelled);
+        assert_eq!(restored.0.unwrap_err(), KeyRotationError::DrainCancelled);
+        assert_eq!(
+            restored.1, None,
+            "a cancelled change does not end the session"
+        );
         assert_eq!(writer_gate::phase(&user_id), writer_gate::Phase::Open);
         assert!(!reply.stop_token().is_cancelled(), "the reply carries on");
         drop(reply);
@@ -1826,16 +2136,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restore_with_the_words_sets_a_new_password_and_signs_in() {
+    async fn restore_with_the_words_sets_a_new_password_and_ends_at_login() {
         let h = Harness::new().await;
         let words = h.account().await;
         let user_id = h.user_id().await;
+        let old_key = h.key_hex().await;
         logout_core(h.registry(), h.groups(), h.pool(), h.app.state())
             .await
             .unwrap();
         epoch_guard::clear_resident_for(&user_id);
 
         h.restore(&words, NEW_PASSWORD).await.unwrap();
+        // No session is opened: the user signs in with the new password.
+        assert_eq!(h.last_lock(), Some(LockReason::PasswordChanged));
+        h.assert_nothing_resident(&user_id, &old_key).await;
+        h.login(NEW_PASSWORD).await.unwrap();
         let (key, epoch) = h
             .registry()
             .with_key(|k| (crate::auth::registry::key_hex(&k.data_key), k.key_epoch))
@@ -1883,7 +2198,7 @@ mod tests {
 
         // The right words for a name that does not exist.
         assert_eq!(
-            restore_with_recovery_phrase(
+            restore_with_recovery_phrase_core(
                 "Nobody".to_owned(),
                 words.clone(),
                 NEW_PASSWORD.to_owned(),
@@ -1891,8 +2206,10 @@ mod tests {
                 h.registry(),
                 h.groups(),
                 h.pool(),
+                h.app.state(),
             )
             .await
+            .0
             .unwrap_err(),
             KeyRotationError::InvalidCredentials
         );
@@ -2006,6 +2323,7 @@ mod tests {
         let h = Harness::new().await;
         let old_words = h.account().await;
         let user_id = h.user_id().await;
+        let old_key = h.key_hex().await;
 
         let shown = begin_new_recovery_phrase(PASSWORD.to_owned(), h.registry(), h.pool())
             .await
@@ -2029,41 +2347,53 @@ mod tests {
             wrong[0].word = "abandon".to_owned();
         }
         assert_eq!(
-            confirm_new_recovery_phrase(
+            confirm_new_recovery_phrase_core(
                 PASSWORD.to_owned(),
                 wrong,
                 WritersChoice::Ask,
                 h.registry(),
+                h.groups(),
                 h.pool(),
+                h.app.state(),
             )
             .await
+            .0
             .unwrap_err(),
             KeyRotationError::ConfirmationFailed
         );
         // An incomplete answer is wrong too.
         assert_eq!(
-            confirm_new_recovery_phrase(
+            confirm_new_recovery_phrase_core(
                 PASSWORD.to_owned(),
                 vec![],
                 WritersChoice::Ask,
                 h.registry(),
+                h.groups(),
                 h.pool(),
+                h.app.state(),
             )
             .await
+            .0
             .unwrap_err(),
             KeyRotationError::ConfirmationFailed
         );
         assert_eq!(h.registry().with_key(|k| k.key_epoch).await, Some(1));
 
-        confirm_new_recovery_phrase(
+        let (done, lock) = confirm_new_recovery_phrase_core(
             PASSWORD.to_owned(),
             answers_for(&shown.mnemonic.to_uppercase(), &shown.confirm_positions),
             WritersChoice::Ask,
             h.registry(),
+            h.groups(),
             h.pool(),
+            h.app.state(),
         )
-        .await
-        .unwrap();
+        .await;
+        done.unwrap();
+        assert_eq!(lock, Some(LockReason::RecoveryPhraseChanged));
+        // The session ended with the change; the password is the same.
+        h.assert_nothing_resident(&user_id, &old_key).await;
+        h.login(PASSWORD).await.unwrap();
         assert_eq!(h.registry().with_key(|k| k.key_epoch).await, Some(2));
 
         // The password did not change; the old words are dead; the new ones work.
@@ -2076,16 +2406,20 @@ mod tests {
             KeyRotationError::InvalidCredentials
         );
         h.restore(&shown.mnemonic, NEW_PASSWORD).await.unwrap();
+        h.login(NEW_PASSWORD).await.unwrap();
         // The slot was emptied by the adoption.
         assert_eq!(
-            confirm_new_recovery_phrase(
+            confirm_new_recovery_phrase_core(
                 PASSWORD.to_owned(),
                 vec![],
                 WritersChoice::Ask,
                 h.registry(),
+                h.groups(),
                 h.pool(),
+                h.app.state(),
             )
             .await
+            .0
             .unwrap_err(),
             KeyRotationError::NoPendingPhrase
         );
@@ -2109,14 +2443,17 @@ mod tests {
         // The right words but the wrong password at confirm: refused, and the
         // old words and key are untouched.
         assert_eq!(
-            confirm_new_recovery_phrase(
+            confirm_new_recovery_phrase_core(
                 "wrong".to_owned(),
                 answers_for(&shown.mnemonic, &shown.confirm_positions),
                 WritersChoice::Ask,
                 h.registry(),
+                h.groups(),
                 h.pool(),
+                h.app.state(),
             )
             .await
+            .0
             .unwrap_err(),
             KeyRotationError::InvalidCredentials
         );
@@ -2143,27 +2480,33 @@ mod tests {
             .unwrap();
         for _ in 0..MAX_FAILED_CONFIRMATIONS {
             assert_eq!(
-                confirm_new_recovery_phrase(
+                confirm_new_recovery_phrase_core(
                     PASSWORD.to_owned(),
                     vec![],
                     WritersChoice::Ask,
                     h.registry(),
+                    h.groups(),
                     h.pool(),
+                    h.app.state(),
                 )
                 .await
+                .0
                 .unwrap_err(),
                 KeyRotationError::ConfirmationFailed
             );
         }
         assert_eq!(
-            confirm_new_recovery_phrase(
+            confirm_new_recovery_phrase_core(
                 PASSWORD.to_owned(),
                 vec![],
                 WritersChoice::Ask,
                 h.registry(),
+                h.groups(),
                 h.pool(),
+                h.app.state(),
             )
             .await
+            .0
             .unwrap_err(),
             KeyRotationError::NoPendingPhrase
         );
@@ -2651,6 +2994,8 @@ mod tests {
 
         h.change_password(PASSWORD, NEW_PASSWORD).await.unwrap();
         assert_eq!(h.status().await.last_outcome, LastRotationOutcome::Complete);
+        // The change ended the session; sign in again for the next rotation.
+        h.login(NEW_PASSWORD).await.unwrap();
 
         // While a rotation holds the flag the previous outcome is not reported.
         let user_id = h.user_id().await;

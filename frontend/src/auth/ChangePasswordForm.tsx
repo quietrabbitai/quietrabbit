@@ -9,9 +9,14 @@
 // repeats the call with the answer. What was typed is held by the flow only
 // while the prompt is up and is dropped on cancel, on error and on completion.
 //
-// Every field is cleared as soon as it is submitted. On needs_resume or
-// epoch_changed the session may no longer match the account's key, so the app
-// signs the user out and the login screen carries the same message.
+// A completed change shows nothing here: the backend ends the session and the
+// app returns to the login screen with the reason (items.id=778, session-locked,
+// sessionLock.ts). The same holds for a change that did not finish
+// (needs_resume).
+//
+// Every field is cleared as soon as it is submitted. On epoch_changed the
+// session no longer matches the account's key, so the app signs the user out
+// and the login screen carries the same message.
 
 import './ChangePasswordForm.css'
 import { useState, type FormEvent } from 'react'
@@ -44,16 +49,14 @@ export function ChangePasswordForm({ displayName, onBusyChange, onSignOut }: Cha
   const [mismatch, setMismatch] = useState(false)
   const [error, setError] = useState<KeyRotationError | null>(null)
   const [submitting, setSubmitting] = useState(false)
-  const [done, setDone] = useState(false)
 
   const flow = useWritersFlow(({ result }) => {
     setSubmitting(false)
     onBusyChange(false)
     if (result === null) return // cancelled: nothing was changed
-    if (result.status === 'ok') {
-      setDone(true)
-      return
-    }
+    // ok: the backend has ended the session; session-locked returns the app to
+    // the login screen with the message.
+    if (result.status === 'ok') return
     if (requiresSignOut(result.error.code)) {
       onSignOut({ error: result.error, context: 'changePassword' })
       return
@@ -91,10 +94,6 @@ export function ChangePasswordForm({ displayName, onBusyChange, onSignOut }: Cha
       (writers) => commands.changePassword(submittedCurrent, submittedNext, writers),
       beginRotationTask('password_change'),
     )
-  }
-
-  if (done) {
-    return <p className="change-password-form__success">{t('auth.accountSecurity.changePassword.success')}</p>
   }
 
   if (flow.state.kind !== 'idle') {

@@ -88,7 +88,7 @@ assert.match(copy.unrecognisedFiles ?? '', /recognise/)
 assert.match(copy.rotationAlreadyComplete ?? '', /new password or your recovery phrase/)
 
 // Which codes mean "leave the session".
-assert.equal(requiresSignOut('needs_resume'), true)
+assert.equal(requiresSignOut('needs_resume'), false, 'the backend ends that session itself')
 assert.equal(requiresSignOut('epoch_changed'), true)
 assert.equal(requiresSignOut('not_logged_in'), true)
 assert.equal(requiresSignOut('rolled_back'), false)

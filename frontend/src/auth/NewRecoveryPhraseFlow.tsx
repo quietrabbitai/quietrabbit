@@ -26,7 +26,7 @@ import { beginRotationTask } from './rotationTask'
 import { useWritersFlow } from './useWritersFlow'
 import { WritersPrompt } from './WritersPrompt'
 
-type Step = 'password' | 'phrase' | 'done'
+type Step = 'password' | 'phrase'
 
 interface PendingPhrase {
   /** null once the words have been hidden. */
@@ -65,9 +65,11 @@ export function NewRecoveryPhraseFlow({ onClose, onBusyChange, onSignOut }: NewR
     setWorking(false)
     if (result === null) return // cancelled: nothing was changed
     if (result.status === 'ok') {
+      // The backend has ended the session (items.id=778): session-locked returns
+      // the app to the login screen with the message. Drop the shown words.
       serverHoldsPhrase.current = false
       setPending(null)
-      setStep('done')
+      setStep('password')
       return
     }
     if (requiresSignOut(result.error.code)) {
@@ -151,19 +153,6 @@ export function NewRecoveryPhraseFlow({ onClose, onBusyChange, onSignOut }: NewR
         onCancel={flow.cancel}
         onDismiss={flow.dismiss}
       />
-    )
-  }
-
-  if (step === 'done') {
-    return (
-      <div className="new-phrase-flow">
-        <p className="new-phrase-flow__text">{t('auth.newPhrase.success')}</p>
-        <div className="new-phrase-flow__buttons">
-          <button type="button" onClick={onClose}>
-            {t('auth.newPhrase.done')}
-          </button>
-        </div>
-      </div>
     )
   }
 

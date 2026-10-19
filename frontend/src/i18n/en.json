@@ -70,8 +70,7 @@
         "confirmLabel": "Confirm new password",
         "submit": "Change password",
         "submitting": "Changing password…",
-        "mismatch": "The new password and its confirmation don't match.",
-        "success": "Your password was changed. Your data is protected under the new password from now on. Copies or backups made before the change can still be opened with your old password."
+        "mismatch": "The new password and its confirmation don't match."
       }
     },
     "newPhrase": {
@@ -81,9 +80,7 @@
       "cancel": "Cancel",
       "confirmPasswordLabel": "Current password, to confirm",
       "confirmSubmit": "Confirm and replace my recovery phrase",
-      "startOver": "Start over",
-      "success": "Your new recovery phrase is active. The old words no longer open your current data. Keep the new words safe and offline. Copies or backups made before this change can still be opened with your old password and your old words.",
-      "done": "Done"
+      "startOver": "Start over"
     },
     "recoveryPhrase": {
       "showHeading": "Your new recovery phrase",
@@ -129,7 +126,10 @@
       "idle": "You were signed out because QuietRabbit was idle for too long. Sign in again to continue.",
       "expired": "Your session reached its time limit. Sign in again to continue.",
       "keyEpochChanged": "Your account was changed from another window or session. Sign in again to continue.",
-      "generic": "You were signed out. Sign in again to continue."
+      "generic": "You were signed out. Sign in again to continue.",
+      "passwordChanged": "Your password was changed. Sign in with your new password.",
+      "recoveryPhraseChanged": "Your recovery phrase was changed. Sign in again with your password.",
+      "changeUnfinished": "Your change did not finish. Sign in with your new password to finish it. If you were creating a new recovery phrase, sign in with your current password."
     },
     "rotationErrors": {
       "notLoggedIn": "You're not signed in. Sign in again to continue.",

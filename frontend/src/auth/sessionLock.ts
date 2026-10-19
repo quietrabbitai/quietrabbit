@@ -2,7 +2,9 @@
 //
 // The backend emits `session-locked` with `{ reason }` from every lock path:
 // idle expiry, the 30-day ceiling, a key-epoch change, an unverifiable
-// session, and logout (src-tauri/src/auth/idle_timeout.rs, LockReason). Jason's
+// session, logout, and (items.id=778) every key rotation: a completed password
+// change, restore or new recovery phrase, and a change that did not finish
+// after its new wraps went live (src-tauri/src/auth/idle_timeout.rs, LockReason). Jason's
 // ruling: when the backend session ends the app always shows the login
 // screen; it never stays signed-in-looking over a locked backend.
 //
@@ -81,6 +83,10 @@ const COPY_SUFFIX: Record<string, string> = {
   idle: 'idle',
   session_expired: 'expired',
   key_epoch_changed: 'keyEpochChanged',
+  // items.id=778: every rotation ends the session; these say why.
+  password_changed: 'passwordChanged',
+  recovery_phrase_changed: 'recoveryPhraseChanged',
+  change_unfinished: 'changeUnfinished',
 }
 const GENERIC_SUFFIX = 'generic'
 
