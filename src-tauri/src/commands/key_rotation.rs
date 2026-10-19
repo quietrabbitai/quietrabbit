@@ -890,7 +890,7 @@ mod tests {
 
     use crate::auth::key_rotation::{FaultPoint, Phase};
     use crate::commands::auth::{
-        get_recovery_key_display, login, logout, LOGIN_ROTATION_INTERRUPTED,
+        get_recovery_key_display, login, logout_core, LOGIN_ROTATION_INTERRUPTED,
     };
     use crate::persistence::personal_store;
     use crate::test_support::ENV_MUTEX;
@@ -1298,7 +1298,7 @@ mod tests {
         let h = Harness::new().await;
         let words = h.account().await;
         let user_id = h.user_id().await;
-        logout(h.registry(), h.groups(), h.pool(), h.app.state())
+        logout_core(h.registry(), h.groups(), h.pool(), h.app.state())
             .await
             .unwrap();
         epoch_guard::clear_resident_for(&user_id);
@@ -1322,7 +1322,7 @@ mod tests {
         h.login(NEW_PASSWORD).await.unwrap();
 
         // The SAME words still work after the restore.
-        logout(h.registry(), h.groups(), h.pool(), h.app.state())
+        logout_core(h.registry(), h.groups(), h.pool(), h.app.state())
             .await
             .unwrap();
         epoch_guard::clear_resident_for(&user_id);
@@ -1334,7 +1334,7 @@ mod tests {
         let h = Harness::new().await;
         let words = h.account().await;
         let user_id = h.user_id().await;
-        logout(h.registry(), h.groups(), h.pool(), h.app.state())
+        logout_core(h.registry(), h.groups(), h.pool(), h.app.state())
             .await
             .unwrap();
         epoch_guard::clear_resident_for(&user_id);
@@ -1389,7 +1389,7 @@ mod tests {
         let h = Harness::new().await;
         let words = h.account().await;
         let user_id = h.user_id().await;
-        logout(h.registry(), h.groups(), h.pool(), h.app.state())
+        logout_core(h.registry(), h.groups(), h.pool(), h.app.state())
             .await
             .unwrap();
         epoch_guard::clear_resident_for(&user_id);
@@ -1433,7 +1433,7 @@ mod tests {
         let h = Harness::new().await;
         let words = h.account().await;
         let user_id = h.user_id().await;
-        logout(h.registry(), h.groups(), h.pool(), h.app.state())
+        logout_core(h.registry(), h.groups(), h.pool(), h.app.state())
             .await
             .unwrap();
         epoch_guard::clear_resident_for(&user_id);
@@ -1534,7 +1534,7 @@ mod tests {
         assert_eq!(h.registry().with_key(|k| k.key_epoch).await, Some(2));
 
         // The password did not change; the old words are dead; the new ones work.
-        logout(h.registry(), h.groups(), h.pool(), h.app.state())
+        logout_core(h.registry(), h.groups(), h.pool(), h.app.state())
             .await
             .unwrap();
         epoch_guard::clear_resident_for(&user_id);

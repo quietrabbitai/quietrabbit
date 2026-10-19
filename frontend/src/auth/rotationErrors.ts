@@ -16,6 +16,7 @@
 // backend message.
 
 import type { KeyRotationError } from '../bindings.ts'
+import type { SessionLockNotice } from './sessionLock.ts'
 
 export type RotationErrorCode = KeyRotationError['code']
 
@@ -117,10 +118,14 @@ export function allRotationErrorSuffixes(): string[] {
 /** What the login screen shows after the app signed the user out because of an
  *  error (needs_resume, epoch_changed, ...): the same coded error and screen
  *  wording the form would have shown, carried across the sign-out. */
-export interface SignOutNotice {
+export interface RotationSignOutNotice {
   error: KeyRotationError
   context: RotationErrorContext
 }
+
+/** Either a coded rotation error, or the backend ending the session
+ *  (items.id=775; see sessionLock.ts). */
+export type SignOutNotice = RotationSignOutNotice | SessionLockNotice
 
 // ---------------------------------------------------------------------------
 // login() reports plain strings, not KeyRotationError

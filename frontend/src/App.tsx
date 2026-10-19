@@ -4,21 +4,39 @@
 // process; this still runs the real check rather than assuming that, since
 // it's the same call NavShell's own tree relies on being accurate.
 
-import { useCallback, useEffect, useState } from 'react'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { commands } from './bindings'
 import { LoginForm } from './auth/LoginForm'
 import { RotationErrorText } from './auth/RotationErrorText'
 import { RotationProgress } from './auth/RotationProgress'
+import { SessionLockText } from './auth/SessionLockText'
 import type { SignOutNotice } from './auth/rotationErrors'
+import {
+  isSessionLockNotice,
+  nextBootState,
+  noticeAfterLock,
+  parseSessionLocked,
+  recheckAfterListen,
+  SESSION_LOCKED_EVENT,
+  type BootEvent,
+  type BootState,
+} from './auth/sessionLock'
 import { NavShell } from './navShell/NavShell'
 import { setCurrentUserId } from './navShell/navShellConfig'
-
-type BootState = 'checking' | 'loginRequired' | 'loggedIn'
 
 function App() {
   const { t } = useTranslation()
   const [bootState, setBootState] = useState<BootState>('checking')
+  // Read by the listener's post-attach re-check, which runs outside render.
+  const bootStateRef = useRef<BootState>(bootState)
+  useEffect(() => {
+    bootStateRef.current = bootState
+  }, [bootState])
+  const dispatchBoot = useCallback((event: BootEvent) => {
+    setBootState((state) => nextBootState(state, event))
+  }, [])
   const [sessionCheckError, setSessionCheckError] = useState<string | null>(
     null,
   )
@@ -35,14 +53,66 @@ function App() {
     setCurrentUserId(null)
     setSignOutNotice(notice ?? null)
     setSessionCheckError(result.status === 'ok' ? null : result.error)
-    setBootState('loginRequired')
-  }, [])
+    dispatchBoot({ type: 'signed-out' })
+  }, [dispatchBoot])
+
+  // items.id=775: the backend ended the session (idle, the 30-day ceiling, a
+  // key-epoch change, logout). Jason's ruling: always return to the login
+  // screen, with the reason, rather than stay signed-in-looking over a locked
+  // backend. A logout this webview asked for keeps the notice signOut() sets.
+  const applyLock = useCallback(
+    (reason: string) => {
+      setCurrentUserId(null)
+      setSignOutNotice((current) => noticeAfterLock(current, reason))
+      if (reason !== 'logged_out') {
+        setSessionCheckError(null)
+      }
+      dispatchBoot({ type: 'session-locked', reason })
+    },
+    [dispatchBoot],
+  )
+
+  // One listener for the life of the app. The cancelled flag covers React
+  // StrictMode's mount-unmount-mount: listen() resolves asynchronously, so a
+  // cleanup that runs first must detach the listener the moment it arrives.
+  // Once attached, getSession() is asked again: a lock that fired between the
+  // boot answer and this point emitted to nobody.
+  useEffect(() => {
+    let cancelled = false
+    let unlisten: UnlistenFn | undefined
+    listen<unknown>(SESSION_LOCKED_EVENT, (event) => {
+      const reason = parseSessionLocked(event.payload)
+      if (reason !== null) applyLock(reason)
+    })
+      .then((fn) => {
+        if (cancelled) {
+          fn()
+          return
+        }
+        unlisten = fn
+        return commands.getSession().then((result) => {
+          if (cancelled || result.status !== 'ok') return
+          const recheck = recheckAfterListen(
+            bootStateRef.current,
+            result.data === null ? 'absent' : 'present',
+          )
+          if (recheck?.type === 'session-locked') applyLock(recheck.reason)
+        })
+      })
+      .catch(() => {
+        // No Tauri bridge (plain browser): nothing emits, nothing to do.
+      })
+    return () => {
+      cancelled = true
+      unlisten?.()
+    }
+  }, [applyLock])
 
   useEffect(() => {
     commands.getSession().then((result) => {
       if (result.status === 'ok' && result.data !== null) {
         setCurrentUserId(result.data.user_id)
-        setBootState('loggedIn')
+        dispatchBoot({ type: 'boot-session', present: true })
         return
       }
       if (result.status !== 'ok') {
@@ -52,9 +122,9 @@ function App() {
         // swallowed, for debuggability.
         setSessionCheckError(result.error)
       }
-      setBootState('loginRequired')
+      dispatchBoot({ type: 'boot-session', present: false })
     })
-  }, [])
+  }, [dispatchBoot])
 
   // items.id=311: idle-timeout activity signal. Frontend-driven rather than
   // bumped on every IPC command -- see auth::idle_timeout's own module
@@ -128,13 +198,16 @@ function App() {
             {t('auth.loginError', { message: sessionCheckError })}
           </p>
         )}
-        {signOutNotice && (
-          <RotationErrorText error={signOutNotice.error} context={signOutNotice.context} />
-        )}
+        {signOutNotice &&
+          (isSessionLockNotice(signOutNotice) ? (
+            <SessionLockText reason={signOutNotice.lockReason} />
+          ) : (
+            <RotationErrorText error={signOutNotice.error} context={signOutNotice.context} />
+          ))}
         <LoginForm
           onLoggedIn={() => {
             setSignOutNotice(null)
-            setBootState('loggedIn')
+            dispatchBoot({ type: 'login-succeeded' })
           }}
         />
       </>

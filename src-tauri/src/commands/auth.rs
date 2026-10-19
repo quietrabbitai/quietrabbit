@@ -766,6 +766,26 @@ async fn install_session(
 #[tauri::command]
 #[specta::specta]
 pub async fn logout(
+    app_handle: tauri::AppHandle,
+    key_registry: State<'_, KeyRegistry>,
+    group_key_registry: State<'_, GroupKeyRegistry>,
+    pool: State<'_, sqlx::SqlitePool>,
+    connect_sessions: State<'_, crate::provider_credentials::session::ConnectSessions>,
+) -> Result<(), String> {
+    let result = logout_core(key_registry, group_key_registry, pool, connect_sessions).await;
+    // items.id=775: tell the webview, whatever the soft-expire's outcome --
+    // the key is gone either way. A webview that initiated this ignores it.
+    crate::auth::idle_timeout::emit_session_locked(
+        &app_handle,
+        crate::auth::idle_timeout::LockReason::LoggedOut,
+    );
+    result
+}
+
+/// The body of `logout`, split out so tests can call it without an
+/// `AppHandle` (a concrete `tauri::AppHandle` cannot be built from the mock
+/// runtime -- same split commands::consent uses).
+pub(crate) async fn logout_core(
     key_registry: State<'_, KeyRegistry>,
     group_key_registry: State<'_, GroupKeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
@@ -944,7 +964,7 @@ mod tests {
     /// builds a real App<MockRuntime> without needing a webview or config
     /// file (verified against tauri 2.11.x docs this session). Commands
     /// are called directly as functions, not through the IPC layer -- this
-    /// tests login()/logout()'s own logic, not Tauri's invoke plumbing.
+    /// tests login()/logout_core()'s own logic, not Tauri's invoke plumbing.
     fn mock_app_with_registry(pool: sqlx::SqlitePool) -> tauri::App<tauri::test::MockRuntime> {
         let app = tauri::test::mock_app();
         app.manage(KeyRegistry::default());
@@ -1220,7 +1240,7 @@ mod tests {
         .unwrap();
         assert!(registry.is_occupied().await);
 
-        logout(
+        logout_core(
             registry.clone(),
             group_key_registry.clone(),
             pool.clone(),
@@ -1236,7 +1256,7 @@ mod tests {
 
     #[tokio::test]
     async fn logout_clears_group_keys_for_every_persona_under_the_account_but_not_others() {
-        // items.id=469: logout() previously called only key_registry.clear()
+        // items.id=469: logout_core() previously called only key_registry.clear()
         // -- group keys resident for the logged-out account's Personas
         // outlived the session. This exercises the multi-Persona case
         // (one account can have more than one Persona) and confirms the
@@ -1350,7 +1370,7 @@ mod tests {
                 .await
         );
 
-        logout(
+        logout_core(
             registry.clone(),
             group_key_registry.clone(),
             pool.clone(),
@@ -1396,7 +1416,7 @@ mod tests {
         )
         .await
         .unwrap();
-        logout(
+        logout_core(
             registry.clone(),
             group_key_registry.clone(),
             pool.clone(),
@@ -1467,7 +1487,7 @@ mod tests {
             Ok(true)
         );
 
-        logout(
+        logout_core(
             registry.clone(),
             group_key_registry.clone(),
             pool.clone(),
@@ -1498,7 +1518,7 @@ mod tests {
             .begin("someone", "some-provider", std::time::Instant::now())
             .unwrap();
 
-        logout(
+        logout_core(
             registry.clone(),
             group_key_registry.clone(),
             pool.clone(),
@@ -1517,7 +1537,7 @@ mod tests {
         let group_key_registry = app.state::<GroupKeyRegistry>();
         let pool = app.state::<sqlx::SqlitePool>();
 
-        let result = logout(
+        let result = logout_core(
             registry.clone(),
             group_key_registry.clone(),
             pool.clone(),
@@ -2045,7 +2065,7 @@ mod tests {
             .unwrap()
             .is_some());
 
-        logout(
+        logout_core(
             registry.clone(),
             group_key_registry.clone(),
             pool.clone(),
@@ -2356,7 +2376,7 @@ mod tests {
         .await
         .unwrap();
         let user_id = registry.with_key(|k| k.user_id.clone()).await.unwrap();
-        logout(
+        logout_core(
             registry.clone(),
             group_key_registry.clone(),
             pool.clone(),

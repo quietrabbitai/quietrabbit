@@ -116,6 +116,12 @@
       },
       "close": "Close"
     },
+    "sessionLocked": {
+      "idle": "You were signed out because QuietRabbit was idle for too long. Sign in again to continue.",
+      "expired": "Your session reached its time limit. Sign in again to continue.",
+      "keyEpochChanged": "Your account was changed from another window or session. Sign in again to continue.",
+      "generic": "You were signed out. Sign in again to continue."
+    },
     "rotationErrors": {
       "notLoggedIn": "You're not signed in. Sign in again to continue.",
       "invalidCredentials": "That didn't match. Check it and try again.",

@@ -79,6 +79,35 @@ impl LockReason {
     }
 }
 
+/// The Tauri event the webview listens on to return to the login screen
+/// (items.id=775). Payload: `{ "reason": <LockReason::as_str> }`. Hand-typed
+/// on the frontend (src/auth/sessionLock.ts), like `task-progress`.
+pub const SESSION_LOCKED_EVENT: &str = "session-locked";
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct SessionLockedPayload {
+    reason: &'static str,
+}
+
+/// Tell the webview the session ended. Call it after `lock_session` at every
+/// lock site. Errors are logged and swallowed, the same idiom as every other
+/// emit in this codebase (task_progress::emit_progress): the lock itself has
+/// already happened, and a webview that missed the event finds out at its
+/// next `getSession` re-check.
+pub fn emit_session_locked<R: tauri::Runtime>(handle: &impl tauri::Emitter<R>, reason: LockReason) {
+    if let Err(e) = handle.emit(
+        SESSION_LOCKED_EVENT,
+        SessionLockedPayload {
+            reason: reason.as_str(),
+        },
+    ) {
+        log::warn!(
+            "idle_timeout: couldn't emit {SESSION_LOCKED_EVENT} ({}): {e}",
+            reason.as_str()
+        );
+    }
+}
+
 /// Pure boundary check, no DB access -- unit-testable in isolation. Fails
 /// closed (treats an unparsable timestamp as expired) since this guards a
 /// resident master key: the safer default when data is unexpectedly
@@ -1039,5 +1068,25 @@ mod tests {
         .await
         .unwrap();
         assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn emit_session_locked_sends_the_reason_payload() {
+        use std::sync::{Arc, Mutex};
+        use tauri::Listener;
+
+        let app = tauri::test::mock_app();
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = seen.clone();
+        app.handle().listen(SESSION_LOCKED_EVENT, move |event| {
+            sink.lock().unwrap().push(event.payload().to_owned());
+        });
+
+        emit_session_locked(app.handle(), LockReason::Idle);
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![r#"{"reason":"idle"}"#.to_owned()]
+        );
     }
 }

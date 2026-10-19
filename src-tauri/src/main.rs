@@ -575,13 +575,22 @@ async fn async_main() {
                             let pool = idle_handle.state::<sqlx::SqlitePool>();
                             let connect_sessions = idle_handle
                                 .state::<quietrabbit_lib::provider_credentials::session::ConnectSessions>();
-                            quietrabbit_lib::auth::idle_timeout::run_periodic_check(
-                                &pool,
-                                &key_registry,
-                                &group_key_registry,
-                                &connect_sessions,
-                            )
-                            .await;
+                            // items.id=775: a lock tells the webview, which
+                            // returns to the login screen with the reason.
+                            if let Some(reason) =
+                                quietrabbit_lib::auth::idle_timeout::run_periodic_check(
+                                    &pool,
+                                    &key_registry,
+                                    &group_key_registry,
+                                    &connect_sessions,
+                                )
+                                .await
+                            {
+                                quietrabbit_lib::auth::idle_timeout::emit_session_locked(
+                                    &idle_handle,
+                                    reason,
+                                );
+                            }
                         }
                     }
                 },
