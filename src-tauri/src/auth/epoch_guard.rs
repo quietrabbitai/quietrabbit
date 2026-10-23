@@ -121,6 +121,16 @@ pub fn resident_epoch(user_id: &str) -> Option<u64> {
         .map(|(_, e)| *e)
 }
 
+/// The epoch a store opened by this process must derive and check under: the
+/// resident epoch while a session is unlocked, else the epoch a live writer
+/// lease started under (items.id=781). Work that outlives its session (a chat
+/// reply or a Focus run after a sign-out or an idle lock) keeps its own data
+/// key and, through its lease, its own epoch, so it saves under the key it
+/// started with instead of failing. None when neither exists.
+pub fn effective_epoch(user_id: &str) -> Option<u64> {
+    resident_epoch(user_id).or_else(|| crate::auth::writer_gate::pinned_epoch(user_id))
+}
+
 fn compare(held: u64, current: Option<u64>) -> Result<(), KeyEpochError> {
     if current == Some(held) {
         Ok(())
@@ -137,7 +147,7 @@ pub async fn ensure_current_with_pool(
     if is_rotating_for(user_id) {
         return Err(KeyEpochError::Rotating);
     }
-    let Some(held) = resident_epoch(user_id) else {
+    let Some(held) = effective_epoch(user_id) else {
         return Ok(());
     };
     let current = crate::auth::user_store::get_key_epoch(pool, user_id)
@@ -152,7 +162,7 @@ pub async fn ensure_current(user_id: &str) -> Result<(), KeyEpochError> {
     if is_rotating_for(user_id) {
         return Err(KeyEpochError::Rotating);
     }
-    let Some(held) = resident_epoch(user_id) else {
+    let Some(held) = effective_epoch(user_id) else {
         return Ok(());
     };
     let mut conn = SqliteConnectOptions::new()
@@ -185,6 +195,57 @@ mod tests {
         assert_eq!(resident_epoch("guard-user-a"), Some(3));
         clear_resident_for("guard-user-a");
         assert_eq!(resident_epoch("guard-user-a"), None);
+    }
+
+    async fn pool_with_epoch(user: &str, epoch: i64) -> sqlx::SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(":memory:"))
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE user_key_wrappers (user_id TEXT PRIMARY KEY, key_epoch INTEGER NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO user_key_wrappers (user_id, key_epoch) VALUES (?, ?)")
+            .bind(user)
+            .bind(epoch)
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool
+    }
+
+    // items.id=781: once the session has ended, work still running under a
+    // writer lease is checked against shared.db with the epoch it started under.
+    #[tokio::test]
+    async fn a_pinned_epoch_is_checked_after_the_session_clears() {
+        use crate::auth::writer_gate::{acquire, Kind};
+
+        let user = "guard-pinned-ok";
+        set_resident(user, 3);
+        let lease = acquire(user, Kind::Reply).unwrap();
+        clear_resident_for(user);
+        assert_eq!(effective_epoch(user), Some(3));
+
+        let same = pool_with_epoch(user, 3).await;
+        assert!(ensure_current_with_pool(&same, user).await.is_ok());
+
+        // Another session rotated the key meanwhile: refused, not written over.
+        let rotated = pool_with_epoch(user, 4).await;
+        assert!(matches!(
+            ensure_current_with_pool(&rotated, user).await,
+            Err(KeyEpochError::Changed {
+                held: 3,
+                current: Some(4)
+            })
+        ));
+
+        drop(lease);
+        assert_eq!(effective_epoch(user), None);
+        assert!(ensure_current_with_pool(&rotated, user).await.is_ok());
     }
 
     // These two touch the process-global rotating flag, which the rotation

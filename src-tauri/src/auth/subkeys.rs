@@ -180,11 +180,12 @@ pub fn derive_db_key_hex(
 }
 
 /// The epoch a store opened by this process derives under: the one this
-/// process unlocked under. With none registered this is an error in a
-/// non-test build, and the initial epoch only under cfg(test) (see the module
-/// header).
+/// process unlocked under, or, once that session has ended, the one a live
+/// writer lease started under (epoch_guard::effective_epoch, items.id=781).
+/// With neither this is an error in a non-test build, and the initial epoch
+/// only under cfg(test) (see the module header).
 pub fn resident_or_initial_epoch(user_id: &str) -> Result<u64, SubkeyError> {
-    match epoch_guard::resident_epoch(user_id) {
+    match epoch_guard::effective_epoch(user_id) {
         Some(epoch) => Ok(epoch),
         #[cfg(test)]
         None => Ok(INITIAL_KEY_EPOCH),

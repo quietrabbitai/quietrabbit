@@ -1227,6 +1227,102 @@ mod tests {
         assert!(!row.is_error);
     }
 
+    // items.id=781: the reply of a session that has ended (sign-out, idle lock)
+    // is still saved, under the key epoch it started with. The registry's clear
+    // forgets the resident epoch; the reply's writer lease pins it.
+    #[tokio::test]
+    async fn a_reply_that_outlives_its_session_is_saved_under_its_own_epoch() {
+        use crate::auth::epoch_guard;
+        use crate::auth::writer_gate::{self, Kind};
+
+        let _lock = ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+        let user = "user-msgcmd-outlives";
+        let key = key_hex_str();
+
+        // A shared.db that says the account is at epoch 3, as after a rotation.
+        let shared = crate::providers::utils::db_path_shared();
+        std::fs::create_dir_all(shared.parent().unwrap()).unwrap();
+        {
+            use sqlx::ConnectOptions;
+            let mut conn = sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&shared)
+                .create_if_missing(true)
+                .connect()
+                .await
+                .unwrap();
+            sqlx::query("CREATE TABLE user_key_wrappers (user_id TEXT PRIMARY KEY, key_epoch INTEGER NOT NULL)")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO user_key_wrappers (user_id, key_epoch) VALUES (?, 3)")
+                .bind(user)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+
+        // Signed in at epoch 3: the stores are keyed under it.
+        epoch_guard::set_resident(user, 3);
+        crate::persistence::migrations::migrate_messages_db(user, PERSONA_ID, &key)
+            .await
+            .expect("messages.db migration must succeed");
+        message_store::save_message(user, PERSONA_ID, &key, "chat-outlives", "user", "hi", None)
+            .await
+            .unwrap();
+        message_store::save_message(
+            user,
+            PERSONA_ID,
+            &key,
+            "chat-outlives",
+            "assistant",
+            "",
+            Some("run-outlives"),
+        )
+        .await
+        .unwrap();
+        let lease = writer_gate::acquire(user, Kind::Reply).unwrap();
+
+        // The session ends while the reply is still running.
+        epoch_guard::clear_resident_for(user);
+
+        let result = Ok(run_result_awaiting_user(Some(
+            "the reply that finished late",
+        )));
+        let outcome =
+            finalize_chat_reply(user, PERSONA_ID, &key, "run-outlives", &result, None).await;
+        drop(lease);
+
+        assert_eq!(outcome, ReplyOutcome::ChatFiled);
+
+        // Signed in again, the reply is there and its chat is filed.
+        epoch_guard::set_resident(user, 3);
+        let row = message_store::find_assistant_message_by_focus_run_id(
+            user,
+            PERSONA_ID,
+            &key,
+            "run-outlives",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(row.content, "the reply that finished late");
+        assert_eq!(
+            chat_store::list_chats(user, PERSONA_ID, &key)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        epoch_guard::clear_resident_for(user);
+        match saved_root {
+            Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+            None => std::env::remove_var("QR_DATA_ROOT"),
+        }
+    }
+
     // items.id=778 (no silent loss): a reply that cannot be saved because the
     // key is refused is reported, not dropped. The outcome says so, and the
     // reply row is left as it was (it was never overwritten with garbage).

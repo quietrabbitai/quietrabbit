@@ -37,6 +37,15 @@
 // every lease for its user, whatever the phase: the resume and cancel paths do
 // not drain, but nothing may start under them either.
 //
+// THE LEASE PINS THE KEY EPOCH (items.id=781). A store key derives from the
+// data key AND the key epoch, and the epoch is resident only while a session is
+// unlocked (epoch_guard, cleared by KeyRegistry::clear at sign-out and at every
+// lock). A reply or run that outlives its session keeps its own copy of the
+// data key but not the epoch, so without a pin every store open after the lock
+// failed and the work was lost. `acquire` records the resident epoch on the
+// lease; `pinned_epoch` hands it to epoch_guard::effective_epoch while the
+// lease is live, and it ends with the lease.
+//
 // RELEASE: WriterLease and DrainGuard are RAII. Dropping releases, so a normal
 // end, an early `?` return, a panic unwind and an aborted task all release. A
 // DrainGuard dropped for any reason reopens the gate.
@@ -165,6 +174,9 @@ struct UserState {
     counts: Counts,
     /// Stop tokens of the visible leases, by lease id.
     stops: BTreeMap<u64, CancellationToken>,
+    /// The key epoch each live lease started under, by lease id (items.id=781).
+    /// Only leases taken while an epoch was resident appear here.
+    epochs: BTreeMap<u64, u64>,
 }
 
 impl UserState {
@@ -227,6 +239,7 @@ impl Drop for WriterLease {
                 let slot = u.counts.slot(self.kind);
                 *slot = slot.saturating_sub(1);
                 u.stops.remove(&self.id);
+                u.epochs.remove(&self.id);
                 if u.is_idle() {
                     g.users.remove(&self.user_id);
                 }
@@ -252,6 +265,8 @@ pub fn acquire(user_id: &str, kind: Kind) -> Result<WriterLease, GateError> {
     if crate::auth::epoch_guard::is_rotating_for(user_id) {
         return Err(GateError::Rotating);
     }
+    // Read before the gate lock is taken: the two locks are never nested here.
+    let epoch = crate::auth::epoch_guard::resident_epoch(user_id);
     let lease = {
         let mut g = gate();
         g.next_id += 1;
@@ -269,6 +284,9 @@ pub fn acquire(user_id: &str, kind: Kind) -> Result<WriterLease, GateError> {
         let stop = CancellationToken::new();
         if kind.is_visible_work() {
             u.stops.insert(id, stop.clone());
+        }
+        if let Some(epoch) = epoch {
+            u.epochs.insert(id, epoch);
         }
         WriterLease {
             id,
@@ -304,6 +322,16 @@ pub async fn lease_for_session(
 /// `lease_for_session(.., Kind::Command)`: the one line a command adds.
 pub async fn command(key_registry: &KeyRegistry) -> Result<WriterLease, GateError> {
     lease_for_session(key_registry, Kind::Command).await
+}
+
+/// The key epoch `user_id`'s live work started under, if any live lease was
+/// taken while an epoch was resident (items.id=781). The newest lease wins; they
+/// agree in practice, because a rotation waits for every lease to end.
+pub fn pinned_epoch(user_id: &str) -> Option<u64> {
+    gate()
+        .users
+        .get(user_id)
+        .and_then(|u| u.epochs.values().next_back().copied())
 }
 
 /// The live leases of `user_id`.
@@ -871,6 +899,26 @@ mod tests {
         assert_eq!(acquire(u, Kind::Command).unwrap_err(), GateError::Rotating);
         drop(guard);
         assert!(acquire(u, Kind::Command).is_ok());
+    }
+
+    #[test]
+    fn a_lease_pins_the_resident_epoch_until_it_drops() {
+        let u = "gate-pin";
+        // Taken with no session: nothing to pin.
+        let none = acquire(u, Kind::Command).unwrap();
+        assert_eq!(pinned_epoch(u), None);
+        drop(none);
+
+        crate::auth::epoch_guard::set_resident(u, 7);
+        let a = acquire(u, Kind::Reply).unwrap();
+        let b = acquire(u, Kind::Command).unwrap();
+        crate::auth::epoch_guard::clear_resident_for(u);
+        assert_eq!(pinned_epoch(u), Some(7));
+        drop(a);
+        assert_eq!(pinned_epoch(u), Some(7), "the other lease still pins it");
+        drop(b);
+        assert_eq!(pinned_epoch(u), None);
+        assert!(is_idle(u));
     }
 
     #[test]

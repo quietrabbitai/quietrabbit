@@ -67,13 +67,14 @@ pub const WRITE_BACKOFF: [Duration; WRITE_ATTEMPTS - 1] =
     [Duration::from_millis(200), Duration::from_millis(400)];
 
 /// Whether an error text says the account's key was refused or has changed (a
-/// retry cannot help): a rotation under way, another session's key change, or
-/// a file that no longer opens under this key.
+/// retry cannot help): a rotation under way, another session's key change, no
+/// key epoch to derive under, or a file that no longer opens under this key.
 pub fn is_key_refusal(message: &str) -> bool {
     let m = message.to_lowercase();
     m.contains("data key is being changed")
         || m.contains("changed in another session")
         || m.contains("could not check the account key epoch")
+        || m.contains("no key epoch is registered")
         || m.contains("file is not a database")
         || m.contains("hmac")
 }
@@ -146,6 +147,9 @@ mod tests {
             "this account's key was changed in another session, unlock again"
         ));
         assert!(is_key_refusal("file is not a database (code 26)"));
+        assert!(is_key_refusal(
+            "Migration error: no key epoch is registered for user 'u'"
+        ));
         assert!(!is_key_refusal("database is locked"));
         assert!(!is_key_refusal("disk I/O error"));
     }
