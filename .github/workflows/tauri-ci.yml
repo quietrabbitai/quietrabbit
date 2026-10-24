@@ -18,11 +18,20 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      core_dump_selftest:
+        description: "Deliberately crash a tiny binary after the tests to prove core/backtrace capture works (items.id=800). The run goes red on purpose."
+        type: boolean
+        default: false
 
 jobs:
   check:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    # Least privilege for this job (items.id=800). The repo default is already
+    # read-only; this makes it explicit. The rest of items.id=645 is separate.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -111,9 +120,52 @@ jobs:
         with:
           manifest-path: src-tauri/Cargo.toml
 
+      # items.id=800 / items.id=566: a SIGSEGV at test-binary exit has hit CI 5
+      # times with no stack. Capture a core to /tmp/cores so the failure-only
+      # "Core-dump backtrace" step below can print a symbolized backtrace into
+      # the log. No core is ever uploaded: the repo is public and a raw core is
+      # the whole process memory. Every command here is guarded so a diagnostic
+      # can never fail the green path.
+      - name: Enable core dumps
+        run: .github/scripts/ci-core-dump.sh enable
+
       - name: Test
         working-directory: src-tauri
-        run: cargo test
+        run: |
+          ulimit -c 2097152 || echo "::warning::could not raise the core size limit"
+          cargo test
+
+      # workflow_dispatch only, never on push/PR. Proves the capture path end to
+      # end: a second thread idles while main crashes inside an atexit handler,
+      # like the real crash at exit. Fails the job on purpose; the failure-only
+      # step below must then print both thread stacks. Also lists env var NAMES
+      # (never values) to show what a run: step's processes inherit.
+      - name: Core-dump self-test (deliberate crash)
+        if: github.event_name == 'workflow_dispatch' && inputs.core_dump_selftest
+        run: |
+          echo "env var names visible to this step:"
+          env | cut -d= -f1 | sort
+          cat > /tmp/selftest.c <<'EOF'
+          #include <pthread.h>
+          #include <stdlib.h>
+          #include <unistd.h>
+          static void *selftest_idle_thread(void *a) { (void)a; for (;;) sleep(1); return 0; }
+          static void selftest_crash_at_exit(void) { *(volatile int *)0 = 1; }
+          int main(void) {
+            pthread_t t;
+            pthread_create(&t, 0, selftest_idle_thread, 0);
+            atexit(selftest_crash_at_exit);
+            return 0;
+          }
+          EOF
+          gcc -g -O0 -pthread -o /tmp/selftest /tmp/selftest.c
+          ulimit -c 2097152 || echo "::warning::could not raise the core size limit"
+          /tmp/selftest
+
+      - name: Core-dump backtrace
+        if: failure()
+        timeout-minutes: 10
+        run: .github/scripts/ci-core-dump.sh report
 
  # Frontend gate (items.id=588): runs in parallel with `check`, no Rust
   # toolchain needed. The npm test script uses `node --experimental-strip-types`
