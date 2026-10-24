@@ -805,6 +805,9 @@ struct RecoverySummary {
     /// Personas not attempted because the loop stopped early (session no
     /// longer resident, or the writer gate left Open).
     personas_skipped: usize,
+    /// Personas whose demote was deferred because a reply or Focus run was
+    /// alive (items.id=794). They are demoted at the next login, not before.
+    personas_deferred: usize,
 }
 
 /// Why `recover_interrupted_runs` stops before the next persona, if it does.
@@ -851,10 +854,11 @@ async fn recover_interrupted_runs(
         match crate::conductor::lifecycle::demote_interrupted_runs(user_id, persona_id, key_hex)
             .await
         {
-            Ok(n) => {
+            Ok(Some(n)) => {
                 summary.personas_done += 1;
                 summary.runs_demoted += n;
             }
+            Ok(None) => summary.personas_deferred += 1,
             Err(e) => {
                 summary.personas_failed += 1;
                 log::warn!(
@@ -903,9 +907,10 @@ fn spawn_interrupted_run_recovery(
         let summary = recover_interrupted_runs(&user_id, &key_hex, key_epoch, &persona_ids).await;
         log::info!(
             "finish_login: interrupted-run recovery for user={user_id} took {} ms: {} personas \
-             done, {} failed, {} skipped, {} runs paused",
+             done, {} deferred, {} failed, {} skipped, {} runs paused",
             started.elapsed().as_millis(),
             summary.personas_done,
+            summary.personas_deferred,
             summary.personas_failed,
             summary.personas_skipped,
             summary.runs_demoted
@@ -2761,6 +2766,86 @@ mod tests {
             run_status(&user_id, &persona_id, &run_id, &key_hex).await,
             "running",
             "the recovery was skipped; it runs again at the next login"
+        );
+    }
+
+    /// items.id=794: with a reply or Focus run alive, every persona's demote is
+    /// deferred and the rows stay `running`; once the lease is gone the same
+    /// call demotes them.
+    #[tokio::test]
+    async fn interrupted_run_recovery_defers_every_persona_while_a_reply_is_alive() {
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let (user_id, key_hex, epoch) = first_login(&app).await;
+        let mut seeded = Vec::new();
+        for _ in 0..3 {
+            seeded.push(seed_persona_with_stale_run(&_env.pool, &user_id, &key_hex, None).await);
+        }
+        let ids: Vec<String> = seeded.iter().map(|(p, _)| p.clone()).collect();
+
+        let reply =
+            crate::auth::writer_gate::acquire(&user_id, crate::auth::writer_gate::Kind::Reply)
+                .unwrap();
+        let summary = recover_interrupted_runs(&user_id, &key_hex, epoch, &ids).await;
+        assert_eq!(
+            summary,
+            RecoverySummary {
+                personas_deferred: 3,
+                ..Default::default()
+            }
+        );
+        for (persona_id, run_id) in &seeded {
+            assert_eq!(
+                run_status(&user_id, persona_id, run_id, &key_hex).await,
+                "running"
+            );
+        }
+
+        drop(reply);
+        let summary = recover_interrupted_runs(&user_id, &key_hex, epoch, &ids).await;
+        assert_eq!(summary.personas_done, 3);
+        assert_eq!(summary.personas_deferred, 0);
+        assert_eq!(summary.runs_demoted, 3);
+        for (persona_id, run_id) in &seeded {
+            assert_eq!(
+                run_status(&user_id, persona_id, run_id, &key_hex).await,
+                "paused"
+            );
+        }
+    }
+
+    /// items.id=794, end to end through login: a reply that outlived its
+    /// session (lease still held) keeps its stale-looking `running` row across
+    /// a lock and a re-login; the next login after it ended demotes the row.
+    #[tokio::test]
+    async fn relogin_leaves_a_live_run_running_and_the_next_login_demotes_it() {
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let registry = app.state::<KeyRegistry>();
+        let (user_id, key_hex, _) = first_login(&app).await;
+        let (persona_id, run_id) =
+            seed_persona_with_stale_run(&_env.pool, &user_id, &key_hex, None).await;
+
+        let reply =
+            crate::auth::writer_gate::acquire(&user_id, crate::auth::writer_gate::Kind::Reply)
+                .unwrap();
+        registry.clear().await;
+        do_login(&app, "Alice", "password123").await.unwrap();
+        wait_for_recovery(&user_id).await;
+        assert_eq!(
+            run_status(&user_id, &persona_id, &run_id, &key_hex).await,
+            "running",
+            "a live reply's run must not be demoted by a re-login"
+        );
+
+        drop(reply);
+        registry.clear().await;
+        do_login(&app, "Alice", "password123").await.unwrap();
+        wait_for_recovery(&user_id).await;
+        assert_eq!(
+            run_status(&user_id, &persona_id, &run_id, &key_hex).await,
+            "paused",
+            "the next login with no live work demotes it"
         );
     }
 

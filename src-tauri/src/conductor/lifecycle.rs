@@ -3413,13 +3413,26 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
 
 /// Update stale in-progress focus_runs to 'paused' status.
 /// Called at startup to recover from sessions interrupted by crash or restart.
-/// Returns the number of rows updated.
+/// Returns `Some(rows updated)`, or `None` when the demote was deferred
+/// because the user has a chat reply or Focus run alive (items.id=794).
+///
+/// items.id=794 (decisions.id=902): since items.id=781 a reply or Focus run
+/// can outlive its session and finish saving under its own writer lease, so a
+/// `running` row older than the threshold may belong to a run that is alive in
+/// this process. A fresh process after a crash has no leases, so a run left
+/// behind by a crash is still demoted. The lease is keyed by user and kind, not
+/// by run or persona, so any live visible lease for the user defers the whole
+/// persona; the next login with no visible work demotes it (idempotent). There
+/// is no recheck in between. The check sits right before the UPDATE, after the
+/// database is open, to keep the window short in which a run resumed in the
+/// meantime could still be demoted (residual, accepted: the run overwrites the
+/// status when it ends).
 /// Python oracle: demote_interrupted_runs() standalone function.
 pub async fn demote_interrupted_runs(
     user_id: &str,
     persona_id: &str,
     key_hex: &str,
-) -> Result<u64, LifecycleError> {
+) -> Result<Option<u64>, LifecycleError> {
     let threshold_minutes: i64 = std::env::var("QR_INTERRUPT_THRESHOLD_MINUTES")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -3442,6 +3455,17 @@ pub async fn demote_interrupted_runs(
     // QR_INTERRUPT_THRESHOLD_MINUTES=0. unixepoch() normalizes both sides
     // to integer seconds regardless of which ISO8601-family format they
     // started in, sidestepping the format mismatch entirely.
+    //
+    // items.id=794: only chat replies and Focus runs count (`visible()`); the
+    // login's own Command lease and the recovery's own Sweep lease do not.
+    let live_visible = crate::auth::writer_gate::counts(user_id).visible();
+    if live_visible > 0 {
+        log::info!(
+            "demote_interrupted_runs: deferring for user={user_id} persona={persona_id}: \
+             {live_visible} reply/Focus run lease(s) live"
+        );
+        return Ok(None);
+    }
     let result = sqlx::query(
         "UPDATE focus_runs SET status = 'paused'
          WHERE status IN ('running', 'initializing')
@@ -3451,7 +3475,7 @@ pub async fn demote_interrupted_runs(
     .execute(&mut conn)
     .await?;
 
-    Ok(result.rows_affected())
+    Ok(Some(result.rows_affected()))
 }
 
 // ---------------------------------------------------------------------------
@@ -5959,7 +5983,8 @@ mod tests {
             .await
             .expect("demote_interrupted_runs must succeed");
         assert_eq!(
-            demoted, 1,
+            demoted,
+            Some(1),
             "exactly the stale run must be demoted, not the fresh one"
         );
 
@@ -5988,6 +6013,96 @@ mod tests {
         } else {
             std::env::remove_var("QR_DATA_ROOT");
         }
+    }
+
+    /// items.id=794: a stale `running` row is left alone while the user has a
+    /// reply or Focus run alive (a lease in the writer gate), and demoted once
+    /// there is none. No lease at all is the fresh-process-after-a-crash case.
+    /// Own user ids: the writer gate is a process-wide static.
+    #[tokio::test]
+    async fn demote_interrupted_runs_defers_while_a_reply_or_focus_run_is_alive() {
+        use crate::auth::writer_gate::{acquire, Kind};
+
+        with_temp_data_root(async {
+            let user_id = "demote-lease-user";
+            let other_user_id = "demote-lease-other-user";
+            let persona_id = "demote-lease-persona";
+            setup_shared_and_persona_for_resume_test(user_id, persona_id).await;
+
+            let run_id = uuid::Uuid::new_v4().to_string();
+            {
+                let mut conn = open_outputs_db(user_id, persona_id, RESUME_TEST_KEY_HEX)
+                    .await
+                    .expect("open_outputs_db must succeed");
+                sqlx::query(
+                    "INSERT INTO focus_runs (id, focus_id, status, started_at)
+                     VALUES (?, 'quick-ask', 'running', ?)",
+                )
+                .bind(&run_id)
+                .bind((Utc::now() - Duration::minutes(10)).to_rfc3339())
+                .execute(&mut conn)
+                .await
+                .expect("seeding the stale focus_runs row must succeed");
+            }
+            let status = || async {
+                let mut conn = open_outputs_db(user_id, persona_id, RESUME_TEST_KEY_HEX)
+                    .await
+                    .expect("open_outputs_db must succeed for the read");
+                sqlx::query_scalar::<_, String>("SELECT status FROM focus_runs WHERE id = ?")
+                    .bind(&run_id)
+                    .fetch_one(&mut conn)
+                    .await
+                    .expect("the row must still exist")
+            };
+            let demote = || async {
+                demote_interrupted_runs(user_id, persona_id, RESUME_TEST_KEY_HEX)
+                    .await
+                    .expect("demote_interrupted_runs must succeed")
+            };
+
+            // A live reply, then a live Focus run: deferred, row untouched.
+            let reply = acquire(user_id, Kind::Reply).unwrap();
+            assert_eq!(demote().await, None);
+            assert_eq!(status().await, "running");
+            drop(reply);
+            let focus_run = acquire(user_id, Kind::FocusRun).unwrap();
+            assert_eq!(demote().await, None);
+            assert_eq!(status().await, "running");
+            drop(focus_run);
+
+            // Another user's visible work does not block this user.
+            let others = acquire(other_user_id, Kind::Reply).unwrap();
+            // Short work of this user's own (the login's Command lease, the
+            // recovery's Sweep lease, an ingest) is not visible work.
+            let short = [
+                acquire(user_id, Kind::Command).unwrap(),
+                acquire(user_id, Kind::Sweep).unwrap(),
+                acquire(user_id, Kind::Ingest).unwrap(),
+            ];
+            assert_eq!(demote().await, Some(1));
+            assert_eq!(status().await, "paused");
+            drop((others, short));
+
+            // The same row, running again: with the lease gone (and in a fresh
+            // process there never was one), the next call demotes it.
+            {
+                let mut conn = open_outputs_db(user_id, persona_id, RESUME_TEST_KEY_HEX)
+                    .await
+                    .expect("open_outputs_db must succeed");
+                sqlx::query("UPDATE focus_runs SET status = 'running' WHERE id = ?")
+                    .bind(&run_id)
+                    .execute(&mut conn)
+                    .await
+                    .unwrap();
+            }
+            let reply = acquire(user_id, Kind::Reply).unwrap();
+            assert_eq!(demote().await, None);
+            assert_eq!(status().await, "running");
+            drop(reply);
+            assert_eq!(demote().await, Some(1));
+            assert_eq!(status().await, "paused");
+        })
+        .await;
     }
 
     /// resume_execution() itself: promotes to 'running', then drives a run
