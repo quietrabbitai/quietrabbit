@@ -329,3 +329,20 @@ tauri = { version = "2", features = ["test"] }
 # cstkingkey/docx-rs publishes a docx-rust release that depends on zip >= 9.
 [patch.crates-io]
 docx-rust = { path = "vendor/docx-rust" }
+
+# items.id=783: build argon2 optimized in the dev and test profiles. The test
+# profile inherits dev, where dependencies are otherwise opt-level 0, and one
+# production-parameter Argon2id derivation (auth/kdf.rs DEFAULT_ARGON2_*) took
+# 1.6 s there -- about 7 per commands::key_rotation harness test, 11.4 s each,
+# all of it serialized behind test_support::ENV_MUTEX. At opt-level 3 the same
+# derivation takes 0.06 s and the lib suite 76 s instead of 448 s locally.
+# This changes how fast the code runs, not what it computes: the KDF
+# parameters are untouched, the tests still run the real ones, and the release
+# profile (opt-level 3 already) is unaffected.
+#
+# If argon2 is ever swapped for another KDF crate this override silently stops
+# applying and the slow tests come back. To check, time
+# `cargo test --lib kdf::tests::real_default_parameters_derive_successfully`:
+# about 0.06 s with the override, about 1.6 s without.
+[profile.dev.package.argon2]
+opt-level = 3
