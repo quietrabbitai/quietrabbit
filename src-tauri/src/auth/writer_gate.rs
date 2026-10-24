@@ -908,6 +908,9 @@ mod tests {
 
     #[test]
     fn a_lease_pins_the_resident_epoch_until_it_drops() {
+        // items.id=796: the resident slot is one process-wide value that the
+        // ENV_MUTEX tests (login, key rotation, messages) also write.
+        let _serial = crate::test_support::ENV_MUTEX.blocking_lock();
         let u = "gate-pin";
         // Taken with no session: nothing to pin.
         let none = acquire(u, Kind::Command).unwrap();

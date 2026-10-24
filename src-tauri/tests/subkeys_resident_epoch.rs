@@ -9,6 +9,19 @@ use quietrabbit_lib::auth::subkeys::{self, DbPurpose, SubkeyError};
 
 const DEK_HEX: &str = "4242424242424242424242424242424242424242424242424242424242424242";
 
+// items.id=796: epoch_guard keeps ONE process-wide resident slot (one unlocked
+// session per process), and cargo runs these tests in parallel threads of one
+// process. A test that registers a user and then reads it back would see the
+// slot overwritten by another test's set_resident in between. Every test that
+// calls set_resident holds this for its whole body. Poison is tolerated so one
+// failed test does not turn the rest into spurious failures. (writer_gate's
+// DRAIN_SERIAL is pub(crate) and async, so an integration test defines its own.)
+static RESIDENT_SLOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn hold_resident_slot() -> std::sync::MutexGuard<'static, ()> {
+    RESIDENT_SLOT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[test]
 fn deriving_without_a_registered_epoch_is_an_error() {
     let user = "resident-epoch-test-unregistered";
@@ -25,6 +38,7 @@ fn deriving_without_a_registered_epoch_is_an_error() {
 
 #[test]
 fn deriving_with_a_registered_epoch_uses_that_epoch() {
+    let _slot = hold_resident_slot();
     let user = "resident-epoch-test-registered";
     epoch_guard::set_resident(user, 3);
     let derived = subkeys::db_key_hex(user, DEK_HEX, DbPurpose::Personal, "persona-1").unwrap();
@@ -45,6 +59,7 @@ fn deriving_with_a_registered_epoch_uses_that_epoch() {
 // started under, so the work saves under its own key and not under a guess.
 #[test]
 fn a_live_writer_lease_keeps_the_epoch_after_the_session_clears() {
+    let _slot = hold_resident_slot();
     use quietrabbit_lib::auth::writer_gate::{self, Kind};
 
     let user = "resident-epoch-test-lease-pin";
@@ -71,6 +86,7 @@ fn a_live_writer_lease_keeps_the_epoch_after_the_session_clears() {
 
 #[test]
 fn a_lease_pin_is_per_user() {
+    let _slot = hold_resident_slot();
     use quietrabbit_lib::auth::writer_gate::{self, Kind};
 
     let (a, b) = ("resident-epoch-test-pin-a", "resident-epoch-test-pin-b");
@@ -88,6 +104,7 @@ fn a_lease_pin_is_per_user() {
 
 #[test]
 fn a_resident_epoch_wins_over_a_lease_pin() {
+    let _slot = hold_resident_slot();
     use quietrabbit_lib::auth::writer_gate::{self, Kind};
 
     // Signed out and back in under a newer epoch while work from the older

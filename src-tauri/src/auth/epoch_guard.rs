@@ -188,6 +188,9 @@ mod tests {
 
     #[test]
     fn registration_is_per_user_and_clears_only_for_that_user() {
+        // items.id=796: the resident slot is one process-wide value that the
+        // ENV_MUTEX tests (login, key rotation, messages) also write.
+        let _serial = crate::test_support::ENV_MUTEX.blocking_lock();
         set_resident("guard-user-a", 3);
         assert_eq!(resident_epoch("guard-user-a"), Some(3));
         assert_eq!(resident_epoch("guard-user-b"), None);
@@ -224,6 +227,9 @@ mod tests {
     async fn a_pinned_epoch_is_checked_after_the_session_clears() {
         use crate::auth::writer_gate::{acquire, Kind};
 
+        // items.id=796: the resident slot is one process-wide value that the
+        // ENV_MUTEX tests (login, key rotation, messages) also write.
+        let _serial = crate::test_support::ENV_MUTEX.lock().await;
         let user = "guard-pinned-ok";
         set_resident(user, 3);
         let lease = acquire(user, Kind::Reply).unwrap();
