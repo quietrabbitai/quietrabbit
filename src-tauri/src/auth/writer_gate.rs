@@ -1079,9 +1079,12 @@ mod tests {
     /// module. Test files themselves are skipped by the callers.
     fn production_text(text: &str) -> &str {
         // Cut at the test MODULE, not at the first #[cfg(test)] attribute: a
-        // test-only item can sit mid-file, with production code after it.
-        let re = regex::Regex::new(r"(?m)^#\[cfg\(test\)\]\s*\n\s*(?:pub\(crate\)\s+)?mod\s+\w+")
-            .unwrap();
+        // test-only item can sit mid-file, with production code after it. An
+        // inline module only (`{`): an out-of-line `mod tests;` is a one-line
+        // declaration, and the production code after it must stay visible.
+        let re =
+            regex::Regex::new(r"(?m)^#\[cfg\(test\)\]\s*\n\s*(?:pub\(crate\)\s+)?mod\s+\w+\s*\{")
+                .unwrap();
         re.find(text).map_or(text, |m| &text[..m.start()])
     }
 
@@ -1359,6 +1362,445 @@ mod tests {
         assert!(
             bad.is_empty(),
             "a pool is built over an encrypted database: {bad:?}"
+        );
+    }
+
+    // -- the resident-epoch slot (items.id=797) -----------------------------
+    //
+    // epoch_guard keeps ONE process-wide (user, epoch) slot, and cargo runs the
+    // tests of one binary in parallel threads of one process, so two tests that
+    // write it race (items.id=796). A lib test serializes on the shared
+    // test_support::ENV_MUTEX; an integration test (tests/*.rs, its own
+    // process) on a file-local mutex. This scan fails a test that writes the
+    // slot without holding one. It reads TEST code, where the spawn scan above
+    // reads production code.
+
+    /// Test helpers that take the slot guard and hand it to the test that
+    /// calls them: (file, fn, call, why). `file` is relative to src/ (or
+    /// `tests/...` for an integration test); `call` is how a test names the
+    /// helper. The scan checks every row: the fn exists in that file, locks,
+    /// returns a value (a guard has to be handed out) and is still called.
+    const SLOT_GUARD_HELPERS: &[(&str, &str, &str, &str)] = &[
+        (
+            "auth/idle_timeout.rs",
+            "setup",
+            "setup",
+            "the TestEnv it returns holds ENV_MUTEX for the whole test",
+        ),
+        (
+            "commands/auth.rs",
+            "setup",
+            "setup",
+            "the TestEnv it returns holds ENV_MUTEX for the whole test",
+        ),
+        (
+            "auth/key_rotation/tests.rs",
+            "new",
+            "Fixture::new",
+            "the Fixture it returns holds ENV_MUTEX for the whole test",
+        ),
+        (
+            "commands/key_rotation.rs",
+            "new",
+            "Harness::new",
+            "the Harness it returns holds ENV_MUTEX for the whole test",
+        ),
+        (
+            "tests/subkeys_resident_epoch.rs",
+            "hold_resident_slot",
+            "hold_resident_slot",
+            "a process-local mutex: the integration binary is its own process",
+        ),
+    ];
+
+    fn tests_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests")
+    }
+
+    /// Full-line comments blanked, line layout kept.
+    fn blank_comments(text: &str) -> String {
+        text.lines()
+            .map(|l| {
+                if l.trim_start().starts_with("//") {
+                    ""
+                } else {
+                    l
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Every fn in `code` as (name, start offset, text up to the next fn).
+    fn fn_windows(code: &str) -> Vec<(String, usize, &str)> {
+        let fn_re =
+            regex::Regex::new(r"(?m)^[ \t]*(?:pub(?:\([a-z]+\))?\s+)?(?:async\s+)?fn\s+(\w+)")
+                .unwrap();
+        let starts: Vec<(usize, String)> = fn_re
+            .captures_iter(code)
+            .map(|c| (c.get(0).unwrap().start(), c[1].to_owned()))
+            .collect();
+        starts
+            .iter()
+            .enumerate()
+            .map(|(i, (s, name))| {
+                let end = starts.get(i + 1).map_or(code.len(), |(e, _)| *e);
+                (name.clone(), *s, &code[*s..end])
+            })
+            .collect()
+    }
+
+    /// Whether the fn starting at `fn_start` carries `#[test]` or
+    /// `#[tokio::test..]`, looking up past blank lines and other attributes.
+    fn has_test_attr(code: &str, fn_start: usize) -> bool {
+        static ATTR: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let attr = ATTR.get_or_init(|| regex::Regex::new(r"^#\[(?:tokio::)?test\b").unwrap());
+        for line in code[..fn_start].lines().rev() {
+            let t = line.trim();
+            if attr.is_match(t) {
+                return true;
+            }
+            if !(t.is_empty() || t.starts_with("#[")) {
+                return false;
+            }
+        }
+        false
+    }
+
+    /// Offset of the first call to each name in `window` (`name(`, not a
+    /// `fn name(` definition). Built once per fn: the scan asks about many
+    /// names, and a pattern scan per name took ten seconds.
+    fn call_index(window: &str) -> std::collections::HashMap<&str, usize> {
+        static CALL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let re = CALL.get_or_init(|| regex::Regex::new(r"\b(\w+)\s*\(").unwrap());
+        let mut index = std::collections::HashMap::new();
+        for m in re.captures_iter(window).filter_map(|c| c.get(1)) {
+            if !window[..m.start()].ends_with("fn ") {
+                index.entry(m.as_str()).or_insert(m.start());
+            }
+        }
+        index
+    }
+
+    /// Offset of the first `let <name> = ENV_MUTEX.lock()` (or
+    /// `blocking_lock()`): a guard bound to a real name. A bare `_` drops it
+    /// on that line, so it protects nothing.
+    fn env_mutex_guard_pos(window: &str) -> Option<usize> {
+        static GUARD: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let re = GUARD.get_or_init(|| {
+            regex::Regex::new(
+                r"let\s+(?:mut\s+)?(\w+)\s*=\s*(?:crate::test_support::)?ENV_MUTEX\s*\.\s*(?:blocking_lock|lock)\s*\(\s*\)",
+            )
+            .unwrap()
+        });
+        first_named_bind_at(re, window, |_| true)
+    }
+
+    /// Offset of the first `let <name> = <call>(` with a real name (see above).
+    fn helper_guard_pos(window: &str, call: &str) -> Option<usize> {
+        static BIND: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let re = BIND.get_or_init(|| {
+            regex::Regex::new(r"let\s+(?:mut\s+)?(\w+)\s*=\s*([\w:]+)\s*\(").unwrap()
+        });
+        first_named_bind_at(re, window, |c| &c[2] == call)
+    }
+
+    /// Offset of the first match of `re` whose capture 1 (the binding) is not
+    /// a bare `_`.
+    fn first_named_bind_at(
+        re: &regex::Regex,
+        window: &str,
+        keep: impl Fn(&regex::Captures) -> bool,
+    ) -> Option<usize> {
+        re.captures_iter(window)
+            .find(|c| &c[1] != "_" && keep(c))
+            .map(|c| c.get(0).unwrap().start())
+    }
+
+    struct SlotSources {
+        /// (path relative to src/, production code, comments blanked)
+        prod: Vec<(String, String)>,
+        /// Test code: src/ test files and test modules, and tests/**/*.rs as
+        /// `tests/...`.
+        test: Vec<(String, String)>,
+    }
+
+    fn slot_sources() -> SlotSources {
+        let mut files = Vec::new();
+        rs_files(&src_dir(), &mut files);
+        files.sort();
+        let all: Vec<(String, String)> = files
+            .iter()
+            .map(|p| {
+                let rel = p
+                    .strip_prefix(src_dir())
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                (rel, std::fs::read_to_string(p).unwrap())
+            })
+            .collect();
+        // Files that exist only for tests: `#[cfg(test)] mod x;` declares
+        // d/x.rs or d/x/mod.rs (below d/<file stem>/ unless the declaring file
+        // is a mod.rs, lib.rs or main.rs). is_test_file knows only the names.
+        let decl_re = regex::Regex::new(
+            r"(?m)^#\[cfg\(test\)\]\s*\n\s*(?:pub(?:\([a-z]+\))?\s+)?mod\s+(\w+)\s*;",
+        )
+        .unwrap();
+        let mut declared = std::collections::BTreeSet::new();
+        for (rel, text) in &all {
+            let p = std::path::Path::new(rel);
+            let dir = p.parent().unwrap_or(std::path::Path::new(""));
+            let stem = p.file_stem().unwrap().to_string_lossy().into_owned();
+            let base = if matches!(stem.as_str(), "mod" | "lib" | "main") {
+                dir.to_path_buf()
+            } else {
+                dir.join(&stem)
+            };
+            for c in decl_re.captures_iter(text) {
+                for cand in [
+                    base.join(format!("{}.rs", &c[1])),
+                    base.join(&c[1]).join("mod.rs"),
+                ] {
+                    declared.insert(cand.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        let mut out = SlotSources {
+            prod: Vec::new(),
+            test: Vec::new(),
+        };
+        for (rel, text) in all {
+            if is_test_file(&rel) || declared.contains(&rel) {
+                out.test.push((rel, blank_comments(&text)));
+                continue;
+            }
+            // From an inline test module to the end of the file is test code
+            // (clippy's items_after_test_module keeps production out of it).
+            let prod = production_text(&text);
+            out.test
+                .push((rel.clone(), blank_comments(&text[prod.len()..])));
+            out.prod.push((rel, blank_comments(prod)));
+        }
+        let mut files = Vec::new();
+        rs_files(&tests_dir(), &mut files);
+        files.sort();
+        for p in files {
+            let rel = p
+                .strip_prefix(tests_dir())
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.test.push((
+                format!("tests/{rel}"),
+                blank_comments(&std::fs::read_to_string(&p).unwrap()),
+            ));
+        }
+        out
+    }
+
+    /// Production fns that write the slot: those that call set_resident, and,
+    /// to a fixed point by name, every production fn that calls one of them
+    /// (login -> finish_login -> install_session today). Returns (direct
+    /// callers, all).
+    fn production_slot_writers(
+        prod: &[(String, String)],
+    ) -> (
+        std::collections::BTreeSet<String>,
+        std::collections::BTreeSet<String>,
+    ) {
+        let calls: Vec<(String, std::collections::HashMap<&str, usize>)> = prod
+            .iter()
+            .flat_map(|(_, code)| fn_windows(code))
+            .map(|(name, _, w)| (name, call_index(w)))
+            .collect();
+        let mut direct = std::collections::BTreeSet::new();
+        for (name, index) in &calls {
+            if index.contains_key("set_resident") {
+                direct.insert(name.clone());
+            }
+        }
+        let mut all = direct.clone();
+        loop {
+            let mut grew = false;
+            for (name, index) in &calls {
+                if !all.contains(name) && all.iter().any(|n| index.contains_key(n.as_str())) {
+                    all.insert(name.clone());
+                    grew = true;
+                }
+            }
+            if !grew {
+                return (direct, all);
+            }
+        }
+    }
+
+    #[test]
+    fn every_resident_slot_writer_test_holds_the_slot_guard() {
+        let src = slot_sources();
+        let (direct, writers) = production_slot_writers(&src.prod);
+        assert!(
+            !direct.is_empty(),
+            "found no production fn that calls set_resident: the derivation is broken, so this \
+             scan would pass for the wrong reason"
+        );
+
+        let mut violations = Vec::new();
+        let mut guarded_lib = 0;
+        let mut guarded_integration = 0;
+        for (rel, code) in &src.test {
+            let rows: Vec<_> = SLOT_GUARD_HELPERS
+                .iter()
+                .filter(|(file, ..)| file == rel)
+                .collect();
+            let fns: Vec<_> = fn_windows(code)
+                .into_iter()
+                .map(|(name, start, w)| (name, start, w, call_index(w)))
+                .collect();
+            // The guard has to be taken before the first write.
+            let guard_pos = |w: &str| {
+                env_mutex_guard_pos(w)
+                    .into_iter()
+                    .chain(
+                        rows.iter()
+                            .filter_map(|(_, _, call, _)| helper_guard_pos(w, call)),
+                    )
+                    .min()
+            };
+            // Every slot write in `w`, in order: set_resident itself, and a
+            // call to a writer (derived from production, or a test-side one).
+            let writes = |index: &std::collections::HashMap<&str, usize>,
+                          side: &std::collections::BTreeSet<String>| {
+                let mut v: Vec<(usize, String)> = index
+                    .get("set_resident")
+                    .map(|at| (*at, "set_resident".to_owned()))
+                    .into_iter()
+                    .collect();
+                for n in writers.iter().chain(side.iter()) {
+                    if let Some(at) = index.get(n.as_str()) {
+                        v.push((*at, n.clone()));
+                    }
+                }
+                v.sort();
+                v
+            };
+            // Test-side writers: a non-test fn that writes the slot without
+            // taking the guard first (login_alice style) writes it for
+            // whoever calls it. A fn that takes the guard itself, then writes,
+            // is serialized for the whole of its body and is not one.
+            let mut side = std::collections::BTreeSet::new();
+            loop {
+                let mut grew = false;
+                for (name, start, w, index) in &fns {
+                    if side.contains(name) || has_test_attr(code, *start) {
+                        continue;
+                    }
+                    let Some((first, _)) = writes(index, &side).into_iter().next() else {
+                        continue;
+                    };
+                    if !guard_pos(w).is_some_and(|g| g <= first) {
+                        side.insert(name.clone());
+                        grew = true;
+                    }
+                }
+                if !grew {
+                    break;
+                }
+            }
+            for (name, start, w, index) in &fns {
+                let is_test = has_test_attr(code, *start);
+                // A test also writes through a writer it calls; any other fn
+                // only counts when it calls set_resident itself.
+                let mut calls = writes(index, &side);
+                calls.retain(|(_, n)| is_test || n == "set_resident");
+                let Some((first, via)) = calls.into_iter().next() else {
+                    continue;
+                };
+                if guard_pos(w).is_some_and(|g| g <= first) {
+                    if rel.starts_with("tests/") {
+                        guarded_integration += 1;
+                    } else {
+                        guarded_lib += 1;
+                    }
+                    continue;
+                }
+                let how = if via == "set_resident" {
+                    "directly, through set_resident".to_owned()
+                } else {
+                    format!("through {via}")
+                };
+                violations.push(format!("{rel}::{name} ({how})"));
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "these tests write the process-wide resident-epoch slot without holding a guard \
+             taken before the write, so they race every other test that does: {violations:#?}\n\
+             Fix: in a lib test bind the shared mutex for the whole test, \
+             `let _lock = crate::test_support::ENV_MUTEX.lock().await;` (`.blocking_lock()` in a \
+             sync test), under a real name: `let _ =` drops it on that line. In an integration \
+             test (tests/*.rs, its own process) copy hold_resident_slot() from \
+             tests/subkeys_resident_epoch.rs and bind it. A test that goes through a helper \
+             needs a row in SLOT_GUARD_HELPERS (the scan checks the helper's body). Writers \
+             derived from production code: {writers:?}. See items.id=796 and items.id=797."
+        );
+
+        // The scan must have seen guarded tests of both kinds, or its
+        // detection is broken and it passes vacuously.
+        assert!(guarded_lib > 0, "saw no guarded lib test writing the slot");
+        assert!(
+            guarded_integration > 0,
+            "saw no guarded integration test writing the slot"
+        );
+
+        // Every helper row must really be a guard helper, and still be used.
+        let mut bad_rows = Vec::new();
+        for (file, fn_name, call, _why) in SLOT_GUARD_HELPERS {
+            let Some((_, code)) = src.test.iter().find(|(rel, _)| rel == file) else {
+                bad_rows.push(format!("{file}: no such test source"));
+                continue;
+            };
+            let fns = fn_windows(code);
+            let locks = fns.iter().any(|(n, _, w)| {
+                let signature = w.split('{').next().unwrap_or("");
+                n == fn_name
+                    && signature.contains("->")
+                    && if file.starts_with("tests/") {
+                        w.contains(".lock(")
+                    } else {
+                        env_mutex_guard_pos(w).is_some()
+                    }
+            });
+            if !locks {
+                bad_rows.push(format!(
+                    "{file}::{fn_name}: not found, takes no lock, or returns nothing"
+                ));
+            }
+            if !fns
+                .iter()
+                .any(|(n, _, w)| n != fn_name && helper_guard_pos(w, call).is_some())
+            {
+                bad_rows.push(format!("{file}::{fn_name}: no test calls it any more"));
+            }
+        }
+        assert!(
+            bad_rows.is_empty(),
+            "SLOT_GUARD_HELPERS rows that are not live guard helpers: {bad_rows:?}"
+        );
+
+        // One shared ENV_MUTEX. A second definition would make the name match
+        // above lie: that was the three-copies bug of items.id=205.
+        let dup_re = regex::Regex::new(r"\bstatic\s+(?:mut\s+)?ENV_MUTEX\b").unwrap();
+        let dups: Vec<&String> = src
+            .prod
+            .iter()
+            .chain(src.test.iter())
+            .filter(|(rel, code)| rel != "test_support.rs" && dup_re.is_match(code))
+            .map(|(rel, _)| rel)
+            .collect();
+        assert!(
+            dups.is_empty(),
+            "ENV_MUTEX is defined outside test_support.rs in {dups:?}: import the shared one"
         );
     }
 
