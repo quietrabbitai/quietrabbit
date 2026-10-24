@@ -1211,7 +1211,16 @@ async fn preflight(
     let largest = inv.required_free_space();
     if largest > 0 {
         let needed = largest + largest / 10 + 1024 * 1024;
-        let available = (env.free_space)(&env.user_dir).ok_or(RotationError::FreeSpaceUnknown)?;
+        // Blocking pool, like inventory(): a statvfs stuck on an unreachable
+        // hard mount then ties up one blocking thread, not an async worker. A
+        // join failure is "unknown" like any other failure to measure.
+        let free_space = env.free_space;
+        let user_dir = env.user_dir.clone();
+        let available = tokio::task::spawn_blocking(move || free_space(&user_dir))
+            .await
+            .ok()
+            .flatten()
+            .ok_or(RotationError::FreeSpaceUnknown)?;
         if available < needed {
             return Err(RotationError::InsufficientSpace { needed, available });
         }

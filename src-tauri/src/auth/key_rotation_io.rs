@@ -336,7 +336,79 @@ pub fn db_key_for(
 /// Free bytes on the filesystem holding `path`, or None if it cannot be
 /// determined (the caller must then decide; the engine treats None as "not
 /// enough information" and says so rather than guessing).
+///
+/// On unix this asks the kernel about the path itself (statvfs), so it is
+/// the path's own filesystem that answers -- tmpfs, a network home, a bind
+/// mount, whatever it is. It never consults a mount list and never falls back
+/// to a nearby mount's figure: any failure is None (items.id=791; the old
+/// sysinfo longest-prefix match skipped tmpfs and NFS/CIFS mounts and so
+/// reported the parent filesystem's free space for a data dir on one).
 pub fn available_space(path: &Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        statvfs_available(path)
+    }
+    #[cfg(not(unix))]
+    {
+        sysinfo_available_space(path)
+    }
+}
+
+/// How many times an EINTR from statvfs is retried before giving up (None).
+#[cfg(unix)]
+const STATVFS_EINTR_RETRIES: usize = 5;
+
+/// `f_bavail` (blocks available to an unprivileged user, as sysinfo reports)
+/// times the fragment size, from one statvfs on `path`.
+#[cfg(unix)]
+fn statvfs_available(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    for _ in 0..STATVFS_EINTR_RETRIES {
+        // SAFETY: `c_path` is a valid NUL-terminated C string that outlives
+        // the call, and `stat.as_mut_ptr()` is a valid, writable pointer to a
+        // `libc::statvfs`.
+        let rc = unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) };
+        if rc == 0 {
+            // SAFETY: statvfs returned 0, so it fully initialised `stat`.
+            let stat = unsafe { stat.assume_init() };
+            // The field widths differ by target (u32 blocks on macOS), so
+            // widen before multiplying.
+            #[allow(clippy::unnecessary_cast)]
+            return bytes_available(
+                stat.f_bavail as u64,
+                stat.f_frsize as u64,
+                stat.f_bsize as u64,
+            );
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return None;
+        }
+    }
+    None
+}
+
+/// Free bytes from a statvfs result: available blocks times the fragment
+/// size (`f_frsize`, falling back to `f_bsize` when a filesystem reports 0).
+/// None when no usable block size is known or the product overflows -- numbers
+/// that cannot be right are "unknown", never "plenty".
+#[cfg(any(unix, test))]
+fn bytes_available(bavail: u64, frsize: u64, bsize: u64) -> Option<u64> {
+    let block = if frsize != 0 { frsize } else { bsize };
+    if block == 0 {
+        return None;
+    }
+    bavail.checked_mul(block)
+}
+
+/// Non-unix targets: the longest-prefix sysinfo match this function used
+/// everywhere before items.id=791. It can pick a parent volume when sysinfo
+/// omits the path's own, and is not fixed here (no Windows build exists to
+/// test a replacement on).
+#[cfg(not(unix))]
+fn sysinfo_available_space(path: &Path) -> Option<u64> {
     let path = std::fs::canonicalize(path).ok()?;
     let disks = sysinfo::Disks::new_with_refreshed_list();
     disks
@@ -1078,6 +1150,53 @@ mod tests {
         let free = available_space(dir.path());
         assert!(free.is_some_and(|n| n > 0), "{free:?}");
         assert_eq!(available_space(&dir.path().join("nope")), None);
+    }
+
+    /// items.id=791: a data dir on a tmpfs (which sysinfo omits) must be
+    /// measured on that tmpfs, not on the parent mount. The oracle is
+    /// independent of the code under test: writing 8 MiB into the tmpfs must
+    /// lower the reported free space by about 8 MiB, which the parent
+    /// filesystem's figure would not do.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn available_space_measures_a_tmpfs_not_its_parent_mount() {
+        let shm = Path::new("/dev/shm");
+        let is_tmpfs = std::fs::read_to_string("/proc/mounts").is_ok_and(|mounts| {
+            mounts.lines().any(|l| {
+                let mut f = l.split_whitespace();
+                let (_, mount_point, fs_type) = (f.next(), f.next(), f.next());
+                mount_point == Some("/dev/shm") && fs_type == Some("tmpfs")
+            })
+        });
+        let dir = match tempfile::tempdir_in(shm) {
+            Ok(dir) if is_tmpfs => dir,
+            _ => {
+                eprintln!("skipped: /dev/shm is missing, not writable or not a tmpfs here");
+                return;
+            }
+        };
+        const WRITTEN: u64 = 8 * 1024 * 1024;
+        const SLACK: u64 = 2 * 1024 * 1024;
+        let before = available_space(dir.path()).expect("free space on /dev/shm");
+        std::fs::write(dir.path().join("fill"), vec![0xA5u8; WRITTEN as usize]).unwrap();
+        let after = available_space(dir.path()).expect("free space on /dev/shm");
+        let drop = before.saturating_sub(after);
+        assert!(
+            drop.abs_diff(WRITTEN) <= SLACK,
+            "free space fell by {drop} bytes after writing {WRITTEN} into the tmpfs \
+             (before {before}, after {after}): the parent filesystem is being measured"
+        );
+    }
+
+    #[test]
+    fn bytes_available_uses_the_fragment_size_and_refuses_nonsense() {
+        assert_eq!(bytes_available(10, 4096, 512), Some(40_960));
+        // A filesystem that reports no fragment size falls back to the block size.
+        assert_eq!(bytes_available(10, 0, 512), Some(5_120));
+        assert_eq!(bytes_available(0, 4096, 4096), Some(0));
+        // No usable block size, or an overflowing product, is "unknown".
+        assert_eq!(bytes_available(10, 0, 0), None);
+        assert_eq!(bytes_available(u64::MAX, 2, 2), None);
     }
 
     #[test]
