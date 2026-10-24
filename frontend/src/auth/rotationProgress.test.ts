@@ -10,6 +10,8 @@ import {
   INITIAL_OVERLAY_STATE,
   isFinalPhase,
   isKeyRotationProgress,
+  isNotStartedPhase,
+  isWaitingOnLargeStep,
   outcomeSuffix,
   overlayVisible,
   percentOf,
@@ -28,10 +30,15 @@ import { beginRotationTask, getRotationTask, subscribeRotationTask } from './rot
 
 const event = (phase: string, current: number | null = null, total: number | null = null) =>
   ({ type: 'event', payload: { task_id: 'r1', kind: 'key_rotation', phase, current, total } }) as const
-const status = (running: boolean, last: 'none' | 'complete' | 'rolled_back' | 'failed', percent = 0) =>
+const status = (
+  running: boolean,
+  last: 'none' | 'complete' | 'rolled_back' | 'failed',
+  percent: number | null = 0,
+  phase = 'rekeying',
+) =>
   ({
     type: 'status',
-    status: { running, phase: running ? 'rekeying' : null, percent, last_outcome: last },
+    status: { running, phase: running ? phase : null, percent, last_outcome: last },
   }) as const
 
 // --- payload guard ----------------------------------------------------------
@@ -111,6 +118,58 @@ s = reduceOverlay(s, event('rekeying', 1, 100))
 assert.equal(s.outcome, null, 'a new rotation clears the old outcome')
 s = reduceOverlay(s, event('failed', 0, 0))
 assert.equal(s.outcome, 'failed')
+
+// items.id=780: the overlay is up while preparing, with no number to show.
+s = reduceOverlay(INITIAL_OVERLAY_STATE, event('preparing', null, null))
+assert.equal(overlayVisible(s), true, 'visible from the first report, before any bytes exist')
+assert.equal(s.percent, null)
+assert.equal(isWaitingOnLargeStep(s), false, 'preparing has its own phase line')
+// A status read taken while preparing says the same (percent null, not 0).
+s = reduceOverlay(s, status(true, 'none', null, 'preparing'))
+assert.equal(s.phase, 'preparing')
+assert.equal(s.percent, null, 'a poll must not turn "unknown" into 0%')
+assert.equal(overlayVisible(s), true)
+
+// Honest progress across the large database item: determinate, then
+// indeterminate for the one opaque step, then determinate again.
+s = reduceOverlay(s, event('rekeying', 10, 100))
+assert.equal(s.percent, 10)
+assert.equal(isWaitingOnLargeStep(s), false)
+s = reduceOverlay(s, event('rekeying', null, null))
+assert.equal(s.running, true)
+assert.equal(s.phase, 'rekeying')
+assert.equal(s.percent, null, 'no percentage across a single step with no progress inside it')
+assert.equal(isWaitingOnLargeStep(s), true)
+s = reduceOverlay(s, status(true, 'none', null))
+assert.equal(s.percent, null, 'the status poll keeps the step indeterminate')
+assert.equal(isWaitingOnLargeStep(s), true)
+s = reduceOverlay(s, event('rekeying', 56, 100))
+assert.equal(s.percent, 56)
+assert.equal(isWaitingOnLargeStep(s), false, 'determinate again at the next item')
+assert.equal(isWaitingOnLargeStep(reduceOverlay(s, event('complete', 100, 100))), false)
+assert.equal(isWaitingOnLargeStep(INITIAL_OVERLAY_STATE), false)
+// A real percent from the status read is still taken as it is.
+assert.equal(reduceOverlay(INITIAL_OVERLAY_STATE, status(true, 'none', 0)).percent, 0)
+
+// A refusal after preparing ends the run without announcing anything, owned
+// or not, and a later rotation starts clean.
+assert.equal(isNotStartedPhase('not_started'), true)
+assert.equal(isNotStartedPhase('failed'), false)
+assert.equal(isFinalPhase('not_started'), false, 'not an outcome')
+s = reduceOverlay(reduceOverlay(INITIAL_OVERLAY_STATE, event('preparing')), event('not_started'))
+assert.equal(s.running, false)
+assert.equal(s.outcome, null, 'nothing to announce')
+assert.equal(overlayVisible(s), false, 'the overlay closes at once')
+s = reduceOverlay(
+  reduceOverlay(reduceOverlay(INITIAL_OVERLAY_STATE, { type: 'owner', kind: 'restore' }), event('preparing')),
+  event('not_started'),
+)
+assert.equal(overlayVisible(s), false)
+assert.equal(s.owned, true, 'ownership is the form\'s to release')
+// A poll that lands after the run has already ended changes nothing.
+assert.equal(reduceOverlay(s, status(false, 'complete')).outcome, null)
+s = reduceOverlay(s, event('preparing'))
+assert.equal(overlayVisible(s), true, 'the next attempt shows again')
 
 // A starter form owns the outcome: progress shows, the overlay stays quiet.
 let owned = reduceOverlay(INITIAL_OVERLAY_STATE, { type: 'owner', kind: 'password_change' })

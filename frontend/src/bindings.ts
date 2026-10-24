@@ -2328,8 +2328,12 @@ export type RotationStatus = {
 	running: boolean,
 	/**  The last reported phase while running (`rekeying`, `verifying`, ...). */
 	phase: string | null,
-	/**  0 to 100, by bytes, while running. */
-	percent: number,
+	/**
+	 *  0 to 100, by bytes, while running. `None` when no byte count exists
+	 *  (nothing inventoried yet, or one large database being re-keyed, a
+	 *  single step with no progress inside it; items.id=780) and when idle.
+	 */
+	percent: number | null,
 	/**
 	 *  A rotation was interrupted and waits for the next unlock with the new
 	 *  password or the recovery phrase.

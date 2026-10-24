@@ -794,14 +794,20 @@ async fn progress_is_reported_in_order_in_bytes_with_no_paths_and_the_flag_held(
     assert!(verifying < finishing);
     assert!(phases[..verifying].iter().all(|p| *p != Phase::Complete));
 
-    let total = events[0].0.total;
+    // Preparing comes before the account is inventoried, so it has no counts
+    // (items.id=780); every later event counts bytes against the same total.
+    assert_eq!((events[0].0.current, events[0].0.total), (None, None));
+    let total = events[1].0.total.unwrap();
     assert!(total > 0);
     let mut last = 0;
+    for (e, _) in events.iter().skip(1) {
+        assert_eq!(e.total, Some(total));
+        let current = e.current.unwrap();
+        assert!(current >= last && current <= total);
+        last = current;
+    }
     for (e, rotating) in events.iter() {
         assert_eq!(e.rotation_id, outcome.rotation_id);
-        assert_eq!(e.total, total);
-        assert!(e.current >= last && e.current <= total);
-        last = e.current;
         assert!(*rotating, "every event is emitted with the flag held");
         if let Some(m) = &e.message {
             assert!(
@@ -810,7 +816,61 @@ async fn progress_is_reported_in_order_in_bytes_with_no_paths_and_the_flag_held(
             );
         }
     }
-    assert_eq!(events.last().unwrap().0.current, total);
+    assert_eq!(events.last().unwrap().0.current, Some(total));
+}
+
+#[tokio::test]
+async fn preparing_is_reported_before_preflight_and_a_refusal_closes_it() {
+    // items.id=780: the overlay must be up for the whole of preflight, so
+    // Preparing is emitted before it. Proof: a refusal that preflight alone
+    // produces (no room for the largest file) still leaves a Preparing event
+    // ahead of it, and NotStarted closes the report with nothing staged.
+    let fx = Fixture::new().await;
+    let recorder = Recorder::default();
+    let mut env = fx.env();
+    env.progress = &recorder;
+    env.free_space = |_| Some(10);
+    let err = run_rotation(&env, &fx.dek, 1, Fixture::change_password())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, RotationError::InsufficientSpace { .. }),
+        "{err:?}"
+    );
+
+    let events = recorder.events.lock().unwrap();
+    let phases: Vec<Phase> = events.iter().map(|(e, _)| e.phase).collect();
+    assert_eq!(phases, vec![Phase::Preparing, Phase::NotStarted]);
+    for (e, rotating) in events.iter() {
+        assert_eq!((e.current, e.total), (None, None));
+        assert!(*rotating, "both are emitted with the flag held");
+        assert_eq!(e.rotation_id, events[0].0.rotation_id);
+    }
+    drop(events);
+    assert!(
+        user_store::get_key_wrapper_state(&fx.pool, USER)
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_rotation
+            .is_none(),
+        "nothing was staged"
+    );
+    fx.assert_all_under(&fx.dek, 1).await;
+}
+
+#[test]
+fn only_a_large_database_is_an_opaque_step() {
+    let item = |is_blob: bool, bytes: u64| RotationItem {
+        rel_path: "x".to_owned(),
+        is_blob,
+        state: RotationState::Pending,
+        bytes,
+        error: None,
+    };
+    assert!(is_opaque_step(&item(false, OPAQUE_STEP_MIN_BYTES)));
+    assert!(!is_opaque_step(&item(false, OPAQUE_STEP_MIN_BYTES - 1)));
+    assert!(!is_opaque_step(&item(true, OPAQUE_STEP_MIN_BYTES * 8)));
 }
 
 #[tokio::test]

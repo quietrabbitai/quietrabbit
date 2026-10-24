@@ -75,6 +75,35 @@
   background: var(--accent);
 }
 
+/* No value (preparing, or one large database being re-keyed; items.id=780).
+ * appearance: none removes the native indeterminate animation, so draw one: a
+ * soft band sweeping across the track. */
+.rotation-overlay__bar:indeterminate {
+  background: var(--surface-sunken) linear-gradient(90deg, transparent, var(--accent), transparent) no-repeat;
+  background-size: 40% 100%;
+  animation: rotation-overlay-sweep 1.4s ease-in-out infinite;
+}
+
+.rotation-overlay__bar:indeterminate::-webkit-progress-bar {
+  background: transparent;
+}
+
+@keyframes rotation-overlay-sweep {
+  from {
+    background-position: -40% 0;
+  }
+  to {
+    background-position: 140% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rotation-overlay__bar:indeterminate {
+    animation: none;
+    background: repeating-linear-gradient(90deg, var(--accent) 0 8px, var(--surface-sunken) 8px 16px);
+  }
+}
+
 .rotation-overlay__close {
   align-self: flex-end;
   padding: 6px 16px;

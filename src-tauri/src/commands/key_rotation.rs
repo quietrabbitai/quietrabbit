@@ -230,8 +230,10 @@ pub struct RotationStatus {
     pub running: bool,
     /// The last reported phase while running (`rekeying`, `verifying`, ...).
     pub phase: Option<String>,
-    /// 0 to 100, by bytes, while running.
-    pub percent: u8,
+    /// 0 to 100, by bytes, while running. `None` when no byte count exists
+    /// (nothing inventoried yet, or one large database being re-keyed, a
+    /// single step with no progress inside it; items.id=780) and when idle.
+    pub percent: Option<u8>,
     /// A rotation was interrupted and waits for the next unlock with the new
     /// password or the recovery phrase.
     pub interrupted: bool,
@@ -260,8 +262,8 @@ impl ProgressSink for TauriRotationSink {
                 task_id: e.rotation_id.clone(),
                 kind: "key_rotation".to_owned(),
                 phase: e.phase.as_str().to_owned(),
-                current: Some(e.current),
-                total: Some(e.total),
+                current: e.current,
+                total: e.total,
                 message: e.message.clone(),
             },
         );
@@ -1215,15 +1217,19 @@ pub async fn get_rotation_status(
     let last = key_rotation::last_progress();
     let (phase, percent) = match last.as_ref().filter(|_| running) {
         Some(e) => {
-            let pct = e
-                .current
-                .saturating_mul(100)
-                .checked_div(e.total)
-                .unwrap_or(0)
-                .min(100) as u8;
+            let pct = match (e.current, e.total) {
+                (Some(current), Some(total)) => Some(
+                    current
+                        .saturating_mul(100)
+                        .checked_div(total)
+                        .unwrap_or(0)
+                        .min(100) as u8,
+                ),
+                _ => None,
+            };
             (Some(e.phase.as_str().to_owned()), pct)
         }
-        None => (None, 0),
+        None => (None, None),
     };
     let user_id = key_registry.with_key(|k| k.user_id.clone()).await;
     let pending = match (&user_id, running) {
@@ -2534,7 +2540,7 @@ mod tests {
             RotationStatus {
                 running: false,
                 phase: None,
-                percent: 0,
+                percent: None,
                 interrupted: false,
                 pending_kind: None,
                 last_outcome: LastRotationOutcome::None
@@ -2933,8 +2939,8 @@ mod tests {
         ProgressEvent {
             rotation_id: "r".to_owned(),
             phase,
-            current: 1,
-            total: 2,
+            current: Some(1),
+            total: Some(2),
             message: None,
         }
     }

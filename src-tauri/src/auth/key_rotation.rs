@@ -121,6 +121,11 @@ pub enum Phase {
     Complete,
     RolledBack,
     Failed,
+    /// The rotation was refused or failed before anything was staged, after
+    /// `Preparing` had been reported. Nothing changed and there is nothing to
+    /// announce: the caller's own error says why. It only closes the report
+    /// that `Preparing` opened (items.id=780).
+    NotStarted,
 }
 
 impl Phase {
@@ -135,18 +140,22 @@ impl Phase {
             Phase::Complete => "complete",
             Phase::RolledBack => "rolled_back",
             Phase::Failed => "failed",
+            Phase::NotStarted => "not_started",
         }
     }
 }
 
 /// One progress report. `current` and `total` are BYTES of items done and to
-/// do. `message` is a display label, never a path or an id.
+/// do, or `None` when no honest byte count exists (before the account has been
+/// inventoried, and during a single opaque step such as one large database's
+/// `PRAGMA rekey`; items.id=780). `message` is a display label, never a path
+/// or an id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProgressEvent {
     pub rotation_id: String,
     pub phase: Phase,
-    pub current: u64,
-    pub total: u64,
+    pub current: Option<u64>,
+    pub total: Option<u64>,
     pub message: Option<String>,
 }
 
@@ -524,10 +533,30 @@ impl Run<'_> {
         self.env.progress.emit(&ProgressEvent {
             rotation_id: self.rotation_id.clone(),
             phase,
-            current,
-            total: self.total_bytes,
+            current: Some(current),
+            total: Some(self.total_bytes),
             message: message.map(str::to_owned),
         });
+    }
+
+    /// Report that `item` is about to be re-keyed, `done` bytes of items being
+    /// finished. An item that is one opaque step (see `is_opaque_step`) is
+    /// reported WITHOUT byte counts: any percentage shown across it would be a
+    /// guess, because the step has no progress hook and its speed depends on
+    /// the machine.
+    fn emit_item(&self, phase: Phase, done: u64, item: &RotationItem) {
+        let label = Some(label_of(item));
+        if is_opaque_step(item) {
+            self.env.progress.emit(&ProgressEvent {
+                rotation_id: self.rotation_id.clone(),
+                phase,
+                current: None,
+                total: None,
+                message: label.map(str::to_owned),
+            });
+        } else {
+            self.emit(phase, done, label);
+        }
     }
 
     /// The engine's own epoch check: the wrapper must still be at the epoch
@@ -685,6 +714,19 @@ async fn move_item(
     Ok(())
 }
 
+/// Databases at least this big are re-keyed by one `PRAGMA rekey`, which
+/// reports no progress while it runs, so the bar goes indeterminate for them
+/// (items.id=780, decisions.id=899). A size cut-off, not a speed estimate:
+/// smaller databases finish quickly enough that switching the bar's mode for
+/// each of them would only flicker.
+pub const OPAQUE_STEP_MIN_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Whether re-keying `item` is one step with no progress inside it. Blobs are
+/// whole files that each report on their own, so only a large database counts.
+fn is_opaque_step(item: &RotationItem) -> bool {
+    !item.is_blob && item.bytes >= OPAQUE_STEP_MIN_BYTES
+}
+
 fn label_of(item: &RotationItem) -> &'static str {
     io::target_for_rel_path(&item.rel_path)
         .map(|t| display_label(&t))
@@ -769,7 +811,7 @@ async fn drive_forward(run: &Run<'_>) -> Result<(), RotationError> {
             continue;
         }
         run.check_still_ours(false).await?;
-        run.emit(Phase::Rekeying, done, Some(label_of(item)));
+        run.emit_item(Phase::Rekeying, done, item);
         user_store::set_rotation_item_state(
             pool,
             &run.rotation_id,
@@ -873,7 +915,7 @@ async fn roll_back(run: &Run<'_>, cause: &str) -> Result<(), RotationError> {
     let mut done: u64 = 0;
     // Newest first: the reverse of the order they were moved.
     for (n, item) in run.items.iter().enumerate().rev() {
-        run.emit(Phase::RollingBack, done, Some(label_of(item)));
+        run.emit_item(Phase::RollingBack, done, item);
         let moved = move_item_with_retry(
             run,
             n,
@@ -1192,33 +1234,32 @@ fn check_no_writers(env: &RotationEnv<'_>) -> Result<(), RotationError> {
     }
 }
 
-/// Rotate the account's data key. `old_dek` is the resident (or recovered)
-/// key at `from_epoch`; the caller has authenticated for `request`. See the
-/// module header for the order of work and the failure policy.
-pub async fn run_rotation(
+/// What the work before the first item leaves behind for the run.
+struct Prepared {
+    to_epoch: u64,
+    new_dek: SecretBytes,
+    password_key: Zeroizing<[u8; kdf::MASTER_KEY_LEN]>,
+    items: Vec<RotationItem>,
+    total_bytes: u64,
+    old_sharing_public: Option<[u8; 32]>,
+    new_sharing_public: [u8; 32],
+}
+
+/// Preflight and staging: everything from "nothing has changed" to "the
+/// rotation is staged and resumable". Split out so `run_rotation` can close
+/// the `Preparing` report when this refuses (items.id=780).
+async fn prepare_rotation(
     env: &RotationEnv<'_>,
     old_dek: &[u8; kdf::MASTER_KEY_LEN],
     from_epoch: u64,
-    request: RotationRequest,
-) -> Result<RotationOutcome, RotationError> {
-    // The engine's own epoch check, before taking the flag (the flag makes
-    // the guard refuse everyone, this process included).
-    match epoch_guard::ensure_current_with_pool(env.pool, env.user_id).await {
-        Ok(()) => {}
-        Err(epoch_guard::KeyEpochError::Changed { .. }) => return Err(RotationError::EpochChanged),
-        Err(epoch_guard::KeyEpochError::Rotating) => return Err(RotationError::RotationInProgress),
-        Err(e) => return Err(RotationError::Epoch(e.to_string())),
-    }
-    let _guard =
-        epoch_guard::begin_rotation(env.user_id).map_err(|_| RotationError::RotationInProgress)?;
-    check_no_writers(env)?;
-
+    request: &RotationRequest,
+    rotation_id: &str,
+) -> Result<Prepared, RotationError> {
     let user = env.user_id;
     let kind = request.kind();
     let (state, inv) = preflight(env, old_dek, from_epoch, kind).await?;
 
     // Stage.
-    let rotation_id = uuid::Uuid::new_v4().to_string();
     let to_epoch = from_epoch + 1;
     let new_dek = data_key::generate_dek()?;
     let salt = kdf::generate_salt()?;
@@ -1285,7 +1326,7 @@ pub async fn run_rotation(
     let total_bytes = inv.total_bytes();
 
     let staged = StagedRotation {
-        rotation_id: rotation_id.clone(),
+        rotation_id: rotation_id.to_owned(),
         user_id: user.to_owned(),
         kind,
         from_epoch,
@@ -1296,7 +1337,7 @@ pub async fn run_rotation(
             user,
             from_epoch,
             to_epoch,
-            &rotation_id,
+            rotation_id,
         )?,
         salt: salt.to_vec(),
         kdf_memory_kib: env.kdf.memory_kib,
@@ -1316,6 +1357,77 @@ pub async fn run_rotation(
             UserStoreError::EpochChanged => RotationError::EpochChanged,
             other => other.into(),
         })?;
+    Ok(Prepared {
+        to_epoch,
+        new_dek,
+        password_key,
+        items,
+        total_bytes,
+        old_sharing_public,
+        new_sharing_public: *new_sharing_public.as_bytes(),
+    })
+}
+
+/// Rotate the account's data key. `old_dek` is the resident (or recovered)
+/// key at `from_epoch`; the caller has authenticated for `request`. See the
+/// module header for the order of work and the failure policy.
+pub async fn run_rotation(
+    env: &RotationEnv<'_>,
+    old_dek: &[u8; kdf::MASTER_KEY_LEN],
+    from_epoch: u64,
+    request: RotationRequest,
+) -> Result<RotationOutcome, RotationError> {
+    // The engine's own epoch check, before taking the flag (the flag makes
+    // the guard refuse everyone, this process included).
+    match epoch_guard::ensure_current_with_pool(env.pool, env.user_id).await {
+        Ok(()) => {}
+        Err(epoch_guard::KeyEpochError::Changed { .. }) => return Err(RotationError::EpochChanged),
+        Err(epoch_guard::KeyEpochError::Rotating) => return Err(RotationError::RotationInProgress),
+        Err(e) => return Err(RotationError::Epoch(e.to_string())),
+    }
+    let _guard =
+        epoch_guard::begin_rotation(env.user_id).map_err(|_| RotationError::RotationInProgress)?;
+    check_no_writers(env)?;
+
+    let kind = request.kind();
+    // Reported before any work, with no byte counts (there is no inventory
+    // yet), so the overlay is up for the whole of preflight and staging
+    // (items.id=780). The flag is already held, so a status read agrees that a
+    // rotation is running.
+    let rotation_id = uuid::Uuid::new_v4().to_string();
+    env.progress.emit(&ProgressEvent {
+        rotation_id: rotation_id.clone(),
+        phase: Phase::Preparing,
+        current: None,
+        total: None,
+        message: None,
+    });
+    let prepared = match prepare_rotation(env, old_dek, from_epoch, &request, &rotation_id).await {
+        Ok(p) => p,
+        Err(e) => {
+            // Nothing was staged. A simulated crash reports nothing, like the
+            // process death it stands for.
+            if !e.is_crash() {
+                env.progress.emit(&ProgressEvent {
+                    rotation_id,
+                    phase: Phase::NotStarted,
+                    current: None,
+                    total: None,
+                    message: None,
+                });
+            }
+            return Err(e);
+        }
+    };
+    let Prepared {
+        to_epoch,
+        new_dek,
+        password_key,
+        items,
+        total_bytes,
+        old_sharing_public,
+        new_sharing_public,
+    } = prepared;
     #[cfg(test)]
     env.fault(FaultPoint::AfterStage)?;
 
@@ -1330,7 +1442,6 @@ pub async fn run_rotation(
         items,
         total_bytes,
     };
-    run.emit(Phase::Preparing, 0, None);
 
     let result = match drive_forward(&run).await {
         Ok(()) => promote_and_finish(&run, Credential::Password(&password_key)).await,
@@ -1342,7 +1453,7 @@ pub async fn run_rotation(
 
     #[cfg(test)]
     env.fault(FaultPoint::AfterFinishBeforeInstall)?;
-    Ok(complete(&run, old_sharing_public, *new_sharing_public.as_bytes()).await)
+    Ok(complete(&run, old_sharing_public, new_sharing_public).await)
 }
 
 /// Decide what a failure means. Before promotion it is rolled back; after it,

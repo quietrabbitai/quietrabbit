@@ -15,6 +15,12 @@
 //      process-wide and derived from the last final event, so on a cold mount
 //      it describes some earlier rotation and must never be shown.
 // `message` on the payload is a backend display label and is never rendered.
+//
+// NULL BYTE COUNTS MEAN "NO HONEST NUMBER" (items.id=780, decisions.id=899):
+// the backend sends them while it prepares (nothing inventoried yet) and while
+// it re-keys one large database (a single statement with no progress inside it).
+// The bar is then indeterminate. The same rule holds on the status read, whose
+// `percent` is null in those moments, so a poll never turns "unknown" into 0%.
 
 import type { LastRotationOutcome, RotationStatus } from '../bindings.ts'
 
@@ -46,9 +52,17 @@ export type RotationOutcome = 'complete' | 'rolled_back' | 'failed'
 export type RotationKind = 'password_change' | 'restore' | 'new_phrase' | 'cancel' | 'resume'
 
 const FINAL_PHASES: readonly string[] = ['complete', 'rolled_back', 'failed']
+/** The rotation was refused before anything was staged, after `preparing` had
+ *  been reported. It ends the run but is not an outcome: the form that started
+ *  it shows its own coded error, and a reloaded webview has nothing to say. */
+export const NOT_STARTED_PHASE = 'not_started'
 
 export function isFinalPhase(phase: string): phase is RotationOutcome {
   return FINAL_PHASES.includes(phase)
+}
+
+export function isNotStartedPhase(phase: string): boolean {
+  return phase === NOT_STARTED_PHASE
 }
 
 /** Narrowing guard for the untyped event payload. */
@@ -181,6 +195,9 @@ export function reduceOverlay(state: OverlayState, action: OverlayAction): Overl
           outcome: state.owned ? null : payload.phase,
         }
       }
+      if (isNotStartedPhase(payload.phase)) {
+        return { ...state, running: false, phase: null, percent: null, outcome: null }
+      }
       return {
         ...state,
         running: true,
@@ -215,6 +232,14 @@ export function reduceOverlay(state: OverlayState, action: OverlayAction): Overl
     case 'dismiss':
       return { ...state, outcome: null }
   }
+}
+
+/** Re-locking is under way but no percentage exists: one large database is
+ *  being re-keyed in a single step. The overlay says so instead of showing a
+ *  number it cannot back. (During `preparing` there is no percentage either,
+ *  but the phase line already says why.) */
+export function isWaitingOnLargeStep(state: OverlayState): boolean {
+  return state.running && state.phase === 'rekeying' && state.percent === null
 }
 
 /** Whether the overlay should be on screen (and hold the blocking layer). */

@@ -22,6 +22,7 @@ import {
   TASK_PROGRESS_EVENT,
   isKeyRotationProgress,
   outcomeSuffix,
+  isWaitingOnLargeStep,
   overlayVisible,
   phaseLabelSuffix,
   reduceOverlay,
@@ -181,6 +182,9 @@ export function RotationProgress({ onFailedAcknowledged }: RotationProgressProps
               <p className="rotation-overlay__percent">
                 {t('auth.rotation.percent', { percent: state.percent })}
               </p>
+            )}
+            {isWaitingOnLargeStep(state) && (
+              <p className="rotation-overlay__note">{t('auth.rotation.largeStepHint')}</p>
             )}
             <p className="rotation-overlay__note">{t('auth.rotation.keepOpen')}</p>
             <p className="rotation-overlay__note">{t('auth.rotation.crashSafe')}</p>

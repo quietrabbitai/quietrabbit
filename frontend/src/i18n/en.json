@@ -113,6 +113,7 @@
       },
       "progressLabel": "Progress",
       "percent": "{{percent}}%",
+      "largeStepHint": "The largest step shows no percentage while it runs. It is still working.",
       "keepOpen": "This can take a while for a large account. Please keep QuietRabbit open until it finishes.",
       "crashSafe": "If QuietRabbit closes or stops part-way, nothing is lost. The change finishes the next time you sign in: use the password you just set, or your recovery phrase.",
       "outcome": {
