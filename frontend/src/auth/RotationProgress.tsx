@@ -178,14 +178,18 @@ export function RotationProgress({ onFailedAcknowledged }: RotationProgressProps
               max={100}
               value={state.percent ?? undefined}
             />
-            {state.percent !== null && (
-              <p className="rotation-overlay__percent">
-                {t('auth.rotation.percent', { percent: state.percent })}
+            {/* Percent and hint share one grid cell, both always rendered: the
+                cell is as tall as the taller of the two, so neither appearing
+                nor going away moves the panel. The inactive one is
+                visibility:hidden (also out of the accessibility tree). */}
+            <div className="rotation-overlay__detail">
+              <p className="rotation-overlay__percent" data-active={state.percent !== null}>
+                {t('auth.rotation.percent', { percent: state.percent ?? 0 })}
               </p>
-            )}
-            {isWaitingOnLargeStep(state) && (
-              <p className="rotation-overlay__note">{t('auth.rotation.largeStepHint')}</p>
-            )}
+              <p className="rotation-overlay__note" data-active={isWaitingOnLargeStep(state)}>
+                {t('auth.rotation.largeStepHint')}
+              </p>
+            </div>
             <p className="rotation-overlay__note">{t('auth.rotation.keepOpen')}</p>
             <p className="rotation-overlay__note">{t('auth.rotation.crashSafe')}</p>
           </>

@@ -52,6 +52,20 @@
   color: var(--text-muted);
 }
 
+/* Percent line and large-step hint stacked in one cell: the cell is as tall as
+ * the taller child, so toggling which one shows never resizes the panel. */
+.rotation-overlay__detail {
+  display: grid;
+}
+
+.rotation-overlay__detail > * {
+  grid-area: 1 / 1;
+}
+
+.rotation-overlay__detail > [data-active='false'] {
+  visibility: hidden;
+}
+
 .rotation-overlay__bar {
   width: 100%;
   height: 8px;
@@ -97,10 +111,23 @@
   }
 }
 
+/* Reduced motion: no sweep. A static cue must not read as progress, so no fill
+ * edge and no blocky stripes: thin diagonal hatching over the whole track, the
+ * usual "busy, length unknown" texture. Lines stay full --accent so they keep
+ * 3:1 against the track (a faded accent would not). The determinate bar's
+ * width transition is motion too, so it snaps instead. */
 @media (prefers-reduced-motion: reduce) {
   .rotation-overlay__bar:indeterminate {
     animation: none;
-    background: repeating-linear-gradient(90deg, var(--accent) 0 8px, var(--surface-sunken) 8px 16px);
+    background: repeating-linear-gradient(
+      45deg,
+      var(--accent) 0 2px,
+      var(--surface-sunken) 2px 6px
+    );
+  }
+
+  .rotation-overlay__bar::-webkit-progress-value {
+    transition: none;
   }
 }
 

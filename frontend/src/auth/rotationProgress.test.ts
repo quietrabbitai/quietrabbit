@@ -148,6 +148,37 @@ assert.equal(s.percent, 56)
 assert.equal(isWaitingOnLargeStep(s), false, 'determinate again at the next item')
 assert.equal(isWaitingOnLargeStep(reduceOverlay(s, event('complete', 100, 100))), false)
 assert.equal(isWaitingOnLargeStep(INITIAL_OVERLAY_STATE), false)
+// items.id=792: rolling back a large database is the same opaque step as
+// re-keying it, so it gets the same hint (and only without a percentage).
+s = reduceOverlay(INITIAL_OVERLAY_STATE, event('rekeying', null, null))
+assert.equal(isWaitingOnLargeStep(s), true)
+s = reduceOverlay(s, event('rolling_back', null, null))
+assert.equal(s.phase, 'rolling_back')
+assert.equal(s.percent, null)
+assert.equal(isWaitingOnLargeStep(s), true, 'rollback of a large database has the hint')
+s = reduceOverlay(s, status(true, 'none', null, 'rolling_back'))
+assert.equal(isWaitingOnLargeStep(s), true, 'the status poll keeps it')
+s = reduceOverlay(s, event('rolling_back', 40, 100))
+assert.equal(s.percent, 40)
+assert.equal(isWaitingOnLargeStep(s), false, 'a rollback item with counts has a percentage, no hint')
+s = reduceOverlay(s, event('rolling_back', null, null))
+assert.equal(isWaitingOnLargeStep(s), true)
+s = reduceOverlay(s, event('rolled_back', 0, 0))
+assert.equal(isWaitingOnLargeStep(s), false, 'ended')
+assert.equal(
+  isWaitingOnLargeStep(reduceOverlay(INITIAL_OVERLAY_STATE, event('rolling_back', null, null))),
+  true,
+  'a webview that joins mid-rollback shows it too',
+)
+for (const phase of ['preparing', 'verifying', 'finishing', 'resuming', 'working']) {
+  assert.equal(
+    isWaitingOnLargeStep(reduceOverlay(INITIAL_OVERLAY_STATE, event(phase, null, null))),
+    false,
+    `${phase} never shows the large-step hint`,
+  )
+}
+// Not running (stale phase left on the state) never shows it.
+assert.equal(isWaitingOnLargeStep({ ...INITIAL_OVERLAY_STATE, phase: 'rolling_back' }), false)
 // A real percent from the status read is still taken as it is.
 assert.equal(reduceOverlay(INITIAL_OVERLAY_STATE, status(true, 'none', 0)).percent, 0)
 

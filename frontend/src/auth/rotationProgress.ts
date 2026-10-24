@@ -234,12 +234,22 @@ export function reduceOverlay(state: OverlayState, action: OverlayAction): Overl
   }
 }
 
-/** Re-locking is under way but no percentage exists: one large database is
- *  being re-keyed in a single step. The overlay says so instead of showing a
- *  number it cannot back. (During `preparing` there is no percentage either,
- *  but the phase line already says why.) */
+/** Phases whose per-item report drops its byte counts for one large database
+ *  (src-tauri key_rotation.rs emit_item): the forward re-key and the rollback,
+ *  which undoes the same database in the same single step. */
+const OPAQUE_STEP_PHASES: readonly string[] = ['rekeying', 'rolling_back']
+
+/** Re-locking (or undoing) is under way but no percentage exists: one large
+ *  database is being re-keyed in a single step. The overlay says so instead of
+ *  showing a number it cannot back. (During `preparing` there is no percentage
+ *  either, but the phase line already says why.) */
 export function isWaitingOnLargeStep(state: OverlayState): boolean {
-  return state.running && state.phase === 'rekeying' && state.percent === null
+  return (
+    state.running &&
+    state.percent === null &&
+    state.phase !== null &&
+    OPAQUE_STEP_PHASES.includes(state.phase)
+  )
 }
 
 /** Whether the overlay should be on screen (and hold the blocking layer). */
