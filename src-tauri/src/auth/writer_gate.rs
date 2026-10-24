@@ -738,11 +738,16 @@ mod tests {
     #[tokio::test]
     async fn a_lease_is_released_when_its_task_is_aborted() {
         let u = "gate-abort";
+        // CHANGED is notified on release and phase changes, never on acquire, so
+        // wait_until cannot see the lease being taken: the task reports it.
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             let _lease = acquire(u, Kind::Reply).unwrap();
+            held_tx.send(()).unwrap();
             std::future::pending::<()>().await;
         });
-        wait_until(|| counts(u).replies == 1).await;
+        held_rx.await.unwrap();
+        assert_eq!(counts(u).replies, 1);
         task.abort();
         let _ = task.await;
         assert!(is_idle(u));
