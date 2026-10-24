@@ -202,6 +202,21 @@ assert.equal(reduceOverlay(s, status(false, 'complete')).outcome, null)
 s = reduceOverlay(s, event('preparing'))
 assert.equal(overlayVisible(s), true, 'the next attempt shows again')
 
+// items.id=790: a resume or cancel reports from the start with no counts (the
+// items are not read yet), and a refusal after that closes it the same way.
+for (const first of ['resuming', 'rolling_back']) {
+  s = reduceOverlay(INITIAL_OVERLAY_STATE, event(first, null, null))
+  assert.equal(s.running, true, `${first} opens the overlay`)
+  assert.equal(s.percent, null, `${first} without counts is indeterminate, not 0%`)
+  assert.equal(overlayVisible(s), true)
+  s = reduceOverlay(s, event('not_started'))
+  assert.equal(overlayVisible(s), false, `a refusal after ${first} closes at once`)
+  assert.equal(s.outcome, null, 'and announces nothing')
+}
+// The second resuming report carries counts and takes the bar to a number.
+s = reduceOverlay(reduceOverlay(INITIAL_OVERLAY_STATE, event('resuming', null, null)), event('resuming', 0, 100))
+assert.equal(s.percent, 0)
+
 // A starter form owns the outcome: progress shows, the overlay stays quiet.
 let owned = reduceOverlay(INITIAL_OVERLAY_STATE, { type: 'owner', kind: 'password_change' })
 assert.equal(owned.owned, true)

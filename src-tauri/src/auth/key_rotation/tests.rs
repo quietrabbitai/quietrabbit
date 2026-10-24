@@ -1729,6 +1729,302 @@ async fn the_wrong_new_key_cannot_drive_a_resume() {
 }
 
 // ---------------------------------------------------------------------------
+// Resume and cancel report from the start (items.id=790)
+// ---------------------------------------------------------------------------
+
+/// The pending rotation, the new key the NEW password reaches, and the
+/// read-back key, the way an unlock with the new password would produce them.
+async fn pending_with_new_key(fx: &Fixture) -> (PendingRotation, SecretBytes, [u8; 32]) {
+    let pending = user_store::get_pending_rotation(&fx.pool, USER)
+        .await
+        .unwrap()
+        .expect("a rotation must be pending");
+    let pk = kdf::derive_password_key(
+        NEW_PASSWORD,
+        pending.salt.as_ref().unwrap(),
+        pending.kdf_memory_kib.unwrap(),
+        pending.kdf_iterations.unwrap(),
+        pending.kdf_parallelism.unwrap(),
+    )
+    .unwrap();
+    let new_dek = new_dek_from_staged_password(&pending, USER, &pk).unwrap();
+    (pending, new_dek, pk)
+}
+
+fn recorded_phases(recorder: &Recorder) -> Vec<Phase> {
+    recorder
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(e, _)| e.phase)
+        .collect()
+}
+
+/// Every event carries the pending rotation's id and is emitted with the flag
+/// held (so a status read agrees a rotation is running).
+fn assert_events_belong_to(recorder: &Recorder, pending: &PendingRotation) {
+    for (e, rotating) in recorder.events.lock().unwrap().iter() {
+        assert_eq!(e.rotation_id, pending.rotation_id);
+        assert!(*rotating, "every event is emitted with the flag held");
+    }
+}
+
+#[tokio::test]
+async fn resume_reports_before_it_loads_the_run_and_without_counts() {
+    let fx = Fixture::new().await;
+    fx.rotate_with_fault(FaultPoint::AfterStage, Fixture::change_password())
+        .await
+        .unwrap_err();
+    let (pending, new_dek, pk) = pending_with_new_key(&fx).await;
+
+    let recorder = Recorder::default();
+    let mut env = fx.env();
+    env.progress = &recorder;
+    let resumed = resume_rotation(&env, &pending, new_dek, Credential::Password(&pk))
+        .await
+        .unwrap();
+    assert!(matches!(resumed, ResumeOutcome::Completed(_)));
+
+    let events = recorder.events.lock().unwrap();
+    // First: no inventory yet, so no counts. Second: the items are loaded, so
+    // the report now counts bytes against the total.
+    assert_eq!(events[0].0.phase, Phase::Resuming);
+    assert_eq!((events[0].0.current, events[0].0.total), (None, None));
+    assert_eq!(events[1].0.phase, Phase::Resuming);
+    assert_eq!(events[1].0.current, Some(0));
+    assert!(events[1].0.total.unwrap() > 0);
+    assert_eq!(events.last().unwrap().0.phase, Phase::Complete);
+    drop(events);
+    assert_events_belong_to(&recorder, &pending);
+}
+
+#[tokio::test]
+async fn resume_refused_by_load_run_closes_the_report_and_changes_nothing() {
+    let fx = Fixture::new().await;
+    fx.rotate_with_fault(FaultPoint::AfterStage, Fixture::change_password())
+        .await
+        .unwrap_err();
+    let (pending, _, pk) = pending_with_new_key(&fx).await;
+    let stranger = data_key::generate_dek().unwrap();
+
+    let recorder = Recorder::default();
+    let mut env = fx.env();
+    env.progress = &recorder;
+    let err = resume_rotation(&env, &pending, stranger, Credential::Password(&pk))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, RotationError::CannotResume(_)), "{err:?}");
+
+    assert_eq!(
+        recorded_phases(&recorder),
+        vec![Phase::Resuming, Phase::NotStarted]
+    );
+    for (e, _) in recorder.events.lock().unwrap().iter() {
+        assert_eq!((e.current, e.total), (None, None));
+    }
+    assert_events_belong_to(&recorder, &pending);
+    assert!(!epoch_guard::is_rotating());
+    assert!(
+        user_store::get_pending_rotation(&fx.pool, USER)
+            .await
+            .unwrap()
+            .is_some(),
+        "the refusal left the rotation pending and resumable"
+    );
+}
+
+#[tokio::test]
+async fn cancel_reports_rolling_back_before_it_loads_the_run() {
+    let fx = Fixture::new().await;
+    fx.rotate_with_fault(
+        FaultPoint::AfterItemCommitted(4),
+        Fixture::change_password(),
+    )
+    .await
+    .unwrap_err();
+    let (pending, new_dek, _) = pending_with_new_key(&fx).await;
+
+    let recorder = Recorder::default();
+    let mut env = fx.env();
+    env.progress = &recorder;
+    let out = cancel_rotation(&env, &pending, new_dek).await.unwrap();
+    assert!(matches!(out, ResumeOutcome::RolledBack));
+
+    let phases = recorded_phases(&recorder);
+    assert_eq!(phases.first(), Some(&Phase::RollingBack));
+    assert_eq!(phases.last(), Some(&Phase::RolledBack));
+    assert!(phases[..phases.len() - 1]
+        .iter()
+        .all(|p| *p == Phase::RollingBack));
+    {
+        let events = recorder.events.lock().unwrap();
+        assert_eq!((events[0].0.current, events[0].0.total), (None, None));
+    }
+    assert!(phases.len() > 2, "the items are reported after the first");
+    assert_events_belong_to(&recorder, &pending);
+    assert_rolled_back(&fx).await;
+}
+
+#[tokio::test]
+async fn cancel_refused_by_load_run_closes_the_report_and_changes_nothing() {
+    let fx = Fixture::new().await;
+    fx.rotate_with_fault(FaultPoint::AfterStage, Fixture::change_password())
+        .await
+        .unwrap_err();
+    let (pending, _, _) = pending_with_new_key(&fx).await;
+    let stranger = data_key::generate_dek().unwrap();
+
+    let recorder = Recorder::default();
+    let mut env = fx.env();
+    env.progress = &recorder;
+    let err = cancel_rotation(&env, &pending, stranger).await.unwrap_err();
+    assert!(matches!(err, RotationError::CannotResume(_)), "{err:?}");
+
+    assert_eq!(
+        recorded_phases(&recorder),
+        vec![Phase::RollingBack, Phase::NotStarted]
+    );
+    assert_events_belong_to(&recorder, &pending);
+    assert!(!epoch_guard::is_rotating());
+    assert!(user_store::get_pending_rotation(&fx.pool, USER)
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn resume_and_cancel_refused_before_the_first_report_emit_nothing() {
+    use crate::auth::writer_gate::{self, Kind};
+
+    let fx = Fixture::new().await;
+    fx.rotate_with_fault(FaultPoint::AfterStage, Fixture::change_password())
+        .await
+        .unwrap_err();
+    let (pending, new_dek, pk) = pending_with_new_key(&fx).await;
+    let recorder = Recorder::default();
+    let mut env = fx.env();
+    env.progress = &recorder;
+
+    // A live writer lease: refused with the count, after the flag, before any
+    // report (instant, so nothing needs closing).
+    {
+        let _lease = writer_gate::acquire(USER, Kind::Command).unwrap();
+        let err = resume_rotation(&env, &pending, new_dek.clone(), Credential::Password(&pk))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RotationError::ActiveRuns(1)), "{err:?}");
+        let err = cancel_rotation(&env, &pending, new_dek.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RotationError::ActiveRuns(1)), "{err:?}");
+    }
+
+    // Another rotation holds the flag: this one must not report at all, or its
+    // NotStarted would close the OTHER rotation's overlay.
+    {
+        let _other = epoch_guard::begin_rotation("someone-else").unwrap();
+        let err = resume_rotation(&env, &pending, new_dek.clone(), Credential::Password(&pk))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RotationError::RotationInProgress), "{err:?}");
+        let err = cancel_rotation(&env, &pending, new_dek.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RotationError::RotationInProgress), "{err:?}");
+    }
+    assert!(recorded_phases(&recorder).is_empty());
+}
+
+#[tokio::test]
+async fn cancelling_a_promoted_rotation_emits_nothing() {
+    let fx = Fixture::new().await;
+    fx.rotate_with_fault(FaultPoint::AfterPromote, Fixture::change_password())
+        .await
+        .unwrap_err();
+    let (pending, new_dek, _) = pending_with_new_key(&fx).await;
+
+    let recorder = Recorder::default();
+    let mut env = fx.env();
+    env.progress = &recorder;
+    assert!(matches!(
+        cancel_rotation(&env, &pending, new_dek).await,
+        Err(RotationError::AlreadyPromoted)
+    ));
+    assert!(recorded_phases(&recorder).is_empty());
+}
+
+#[tokio::test]
+async fn a_promoted_resume_that_fails_its_read_back_closes_silently_and_stays_resumable() {
+    let fx = Fixture::new().await;
+    fx.rotate_with_fault(FaultPoint::AfterPromote, Fixture::change_password())
+        .await
+        .unwrap_err();
+    let (pending, new_dek, _) = pending_with_new_key(&fx).await;
+    assert_eq!(pending.state, RotationState::Verifying);
+
+    // A credential that does not open the live wrapper: the read-back fails.
+    let wrong_pk = [7u8; 32];
+    let recorder = Recorder::default();
+    let mut env = fx.env();
+    env.progress = &recorder;
+    resume_rotation(&env, &pending, new_dek, Credential::Password(&wrong_pk))
+        .await
+        .unwrap_err();
+
+    let phases = recorded_phases(&recorder);
+    assert_eq!(
+        phases,
+        vec![
+            Phase::Resuming,
+            Phase::Resuming,
+            Phase::Finishing,
+            Phase::NotStarted
+        ]
+    );
+    assert!(
+        !phases.contains(&Phase::Failed),
+        "no outcome is announced (decisions.id=904)"
+    );
+    assert_events_belong_to(&recorder, &pending);
+    assert!(!epoch_guard::is_rotating());
+    let after = user_store::get_pending_rotation(&fx.pool, USER)
+        .await
+        .unwrap()
+        .expect("still pending");
+    assert_eq!(
+        after.state,
+        RotationState::Verifying,
+        "not marked failed: cancel must keep refusing a promoted rotation"
+    );
+}
+
+#[tokio::test]
+async fn a_crash_after_the_first_resume_report_closes_nothing() {
+    let fx = Fixture::new().await;
+    fx.rotate_with_fault(FaultPoint::AfterStage, Fixture::change_password())
+        .await
+        .unwrap_err();
+    let (pending, new_dek, pk) = pending_with_new_key(&fx).await;
+
+    let recorder = Recorder::default();
+    let mut env = fx.env();
+    env.progress = &recorder;
+    env.faults = vec![FaultPoint::AfterItemCommitted(2)];
+    let err = resume_rotation(&env, &pending, new_dek, Credential::Password(&pk))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, RotationError::SimulatedCrash), "{err:?}");
+
+    let phases = recorded_phases(&recorder);
+    assert_eq!(phases.first(), Some(&Phase::Resuming));
+    assert!(
+        !phases.contains(&Phase::NotStarted) && !phases.contains(&Phase::Failed),
+        "a process death reports nothing: {phases:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Retained blob versions and stale files
 // ---------------------------------------------------------------------------
 

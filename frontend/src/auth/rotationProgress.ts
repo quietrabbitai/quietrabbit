@@ -52,9 +52,10 @@ export type RotationOutcome = 'complete' | 'rolled_back' | 'failed'
 export type RotationKind = 'password_change' | 'restore' | 'new_phrase' | 'cancel' | 'resume'
 
 const FINAL_PHASES: readonly string[] = ['complete', 'rolled_back', 'failed']
-/** The rotation was refused before anything was staged, after `preparing` had
- *  been reported. It ends the run but is not an outcome: the form that started
- *  it shows its own coded error, and a reloaded webview has nothing to say. */
+/** The rotation was refused after its first report (`preparing`, `resuming` or
+ *  `rolling_back`) without reaching an outcome. It ends the run but is not an
+ *  outcome: the form that started it shows its own coded error, and a reloaded
+ *  webview has nothing to say. */
 export const NOT_STARTED_PHASE = 'not_started'
 
 export function isFinalPhase(phase: string): phase is RotationOutcome {

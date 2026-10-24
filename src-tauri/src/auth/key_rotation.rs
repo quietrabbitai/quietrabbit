@@ -121,10 +121,12 @@ pub enum Phase {
     Complete,
     RolledBack,
     Failed,
-    /// The rotation was refused or failed before anything was staged, after
-    /// `Preparing` had been reported. Nothing changed and there is nothing to
-    /// announce: the caller's own error says why. It only closes the report
-    /// that `Preparing` opened (items.id=780).
+    /// The rotation was refused or failed after its first report (`Preparing`,
+    /// `Resuming` or `RollingBack`) without reaching an outcome: before
+    /// anything was staged, or, for a resume or cancel, before any item moved
+    /// (or, for a promoted rotation, with its state left as it was). There is
+    /// nothing to announce: the caller's own error says why. It only closes the
+    /// report that the first event opened (items.id=780, items.id=790).
     NotStarted,
 }
 
@@ -1243,6 +1245,19 @@ fn check_no_writers(env: &RotationEnv<'_>) -> Result<(), RotationError> {
     }
 }
 
+/// Report `phase` with no byte counts, for the moments before the account's
+/// items are known (items.id=780, items.id=790). Needs no `Run`: the resume and
+/// cancel paths call it before `load_run` has produced one.
+fn emit_uncounted(env: &RotationEnv<'_>, rotation_id: &str, phase: Phase) {
+    env.progress.emit(&ProgressEvent {
+        rotation_id: rotation_id.to_owned(),
+        phase,
+        current: None,
+        total: None,
+        message: None,
+    });
+}
+
 /// What the work before the first item leaves behind for the run.
 struct Prepared {
     to_epoch: u64,
@@ -1404,26 +1419,14 @@ pub async fn run_rotation(
     // (items.id=780). The flag is already held, so a status read agrees that a
     // rotation is running.
     let rotation_id = uuid::Uuid::new_v4().to_string();
-    env.progress.emit(&ProgressEvent {
-        rotation_id: rotation_id.clone(),
-        phase: Phase::Preparing,
-        current: None,
-        total: None,
-        message: None,
-    });
+    emit_uncounted(env, &rotation_id, Phase::Preparing);
     let prepared = match prepare_rotation(env, old_dek, from_epoch, &request, &rotation_id).await {
         Ok(p) => p,
         Err(e) => {
             // Nothing was staged. A simulated crash reports nothing, like the
             // process death it stands for.
             if !e.is_crash() {
-                env.progress.emit(&ProgressEvent {
-                    rotation_id,
-                    phase: Phase::NotStarted,
-                    current: None,
-                    total: None,
-                    message: None,
-                });
+                emit_uncounted(env, &rotation_id, Phase::NotStarted);
             }
             return Err(e);
         }
@@ -1722,11 +1725,52 @@ async fn load_run<'a>(
     })
 }
 
+/// `load_run`, preceded by the first report and followed, on a refusal, by the
+/// silent closing one (items.id=790; the resume and cancel counterpart of
+/// `run_rotation`'s `Preparing` / `NotStarted`). Called with the rotating flag
+/// held, so a status read agrees a rotation is running. No byte counts: the
+/// items are not read yet. A refusal before this point (flag taken, writers
+/// present) emits nothing: it is instant, and a `NotStarted` for a flag some
+/// other rotation holds would close ITS report. A simulated crash reports
+/// nothing, like the process death it stands for.
+async fn load_run_reported<'a>(
+    env: &'a RotationEnv<'a>,
+    pending: &PendingRotation,
+    new_dek: SecretBytes,
+    first: Phase,
+) -> Result<Run<'a>, RotationError> {
+    emit_uncounted(env, &pending.rotation_id, first);
+    match load_run(env, pending, new_dek).await {
+        Ok(run) => Ok(run),
+        Err(e) => {
+            if !e.is_crash() {
+                emit_uncounted(env, &pending.rotation_id, Phase::NotStarted);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// The tail of resuming a PROMOTED rotation: confirm it is still ours, read the
+/// live wrapper back with the credential, finish.
+async fn finish_promoted(run: &Run<'_>, credential: &Credential<'_>) -> Result<(), RotationError> {
+    run.check_still_ours(true).await?;
+    run.emit(Phase::Finishing, run.total_bytes, None);
+    read_back(run, run.env.user_id, credential).await?;
+    user_store::finish_rotation(run.env.pool, &run.rotation_id)
+        .await
+        .map_err(RotationError::from)?;
+    scrub_shared_db(run.env.pool).await;
+    Ok(())
+}
+
 /// Finish an interrupted rotation FORWARD. `new_dek` comes from
 /// new_dek_from_staged_password or new_dek_from_staged_phrase; `credential`
 /// is what proves the read-back (the staged/new password key, or the phrase's
 /// entropy). A failure marks the rotation `failed` and keeps it resumable; it
-/// does not roll back by itself (cancel_rotation does that on request).
+/// does not roll back by itself (cancel_rotation does that on request). A
+/// PROMOTED rotation is the exception: it is not marked failed, so it stays
+/// `Verifying` and cancel keeps refusing it (items.id=790).
 pub async fn resume_rotation(
     env: &RotationEnv<'_>,
     pending: &PendingRotation,
@@ -1736,20 +1780,22 @@ pub async fn resume_rotation(
     let _guard =
         epoch_guard::begin_rotation(env.user_id).map_err(|_| RotationError::RotationInProgress)?;
     check_no_writers(env)?;
-    let run = load_run(env, pending, new_dek).await?;
+    let run = load_run_reported(env, pending, new_dek, Phase::Resuming).await?;
     run.emit(Phase::Resuming, 0, None);
 
     if pending.direction == RotationDirection::Rollback {
         return finish_rollback(&run, pending.last_error.as_deref().unwrap_or("cancelled")).await;
     }
     let result = if pending.state == RotationState::Verifying {
-        run.check_still_ours(true).await?;
-        run.emit(Phase::Finishing, run.total_bytes, None);
-        read_back(&run, env.user_id, &credential).await?;
-        user_store::finish_rotation(env.pool, &run.rotation_id)
-            .await
-            .map_err(RotationError::from)?;
-        scrub_shared_db(env.pool).await;
+        // Promoted: the rotation's state must stay `Verifying` (cancel refuses
+        // on it), so a failure here is NOT marked failed. It closes the report
+        // without an outcome and leaves the rotation resumable (items.id=790).
+        if let Err(e) = finish_promoted(&run, &credential).await {
+            if !e.is_crash() {
+                emit_uncounted(env, &run.rotation_id, Phase::NotStarted);
+            }
+            return Err(e);
+        }
         Ok(())
     } else {
         match drive_forward(&run).await {
@@ -1823,7 +1869,7 @@ pub async fn cancel_rotation(
     let _guard =
         epoch_guard::begin_rotation(env.user_id).map_err(|_| RotationError::RotationInProgress)?;
     check_no_writers(env)?;
-    let run = load_run(env, pending, new_dek).await?;
+    let run = load_run_reported(env, pending, new_dek, Phase::RollingBack).await?;
     finish_rollback(&run, "cancelled").await
 }
 
