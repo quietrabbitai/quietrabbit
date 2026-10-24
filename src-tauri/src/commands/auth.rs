@@ -648,6 +648,8 @@ async fn install_session(
     // main.rs's periodic timer covers the steady-state case). Best-effort,
     // fire-and-forget inside the fn -- never turns an otherwise-successful
     // login into an Err.
+    let install_started = std::time::Instant::now();
+    let phase_started = std::time::Instant::now();
     let personal_key_hex_for_sync = key_hex(&data_key);
     crate::persona_sync::engine::pull_all_accepted_shares_on_login(
         pool,
@@ -669,40 +671,54 @@ async fn install_session(
     )
     .await;
 
+    log::info!(
+        "finish_login: share pulls took {} ms for user={user_id}",
+        phase_started.elapsed().as_millis()
+    );
+
+    // items.id=779: the persona list is read ONCE (after the share pulls, which
+    // may materialise a persona) and shared by the interrupted-run recovery and
+    // the group-key rehydrate below -- each used to list it separately.
+    let phase_started = std::time::Instant::now();
+    let personas = match persona_store::list_personas_for_user(pool, user_id).await {
+        Ok(personas) => Some(personas),
+        Err(e) => {
+            log::warn!(
+                "finish_login: couldn't list personas for user={user_id}: {e} -- \
+                 skipping interrupted-run recovery and group-key rehydration entirely"
+            );
+            None
+        }
+    };
+    log::info!(
+        "finish_login: listing personas took {} ms ({} personas) for user={user_id}",
+        phase_started.elapsed().as_millis(),
+        personas.as_ref().map_or(0, Vec::len)
+    );
+
     // items.id=252: crash-interrupted focus_runs recovery -- a third
     // sibling call in this same "the moment key material becomes resident"
-    // sequence as the two pull calls immediately above. There is no
-    // per-persona "unlock" event in this codebase (key_hex is derived once
-    // per-user here; persona_id is just a routing parameter passed
-    // alongside it) so this is the correct, and only, call site --
-    // demote_interrupted_runs() (conductor::lifecycle) is otherwise never
-    // invoked, leaving crash-interrupted runs stuck at running/initializing
-    // forever. Best-effort per persona, same posture as the two calls
-    // above: logged and skipped, never turns an otherwise-successful login
-    // into an Err.
-    match persona_store::list_personas_for_user(pool, user_id).await {
-        Ok(personas) => {
-            for persona in personas {
-                if let Err(e) = crate::conductor::lifecycle::demote_interrupted_runs(
-                    user_id,
-                    &persona.id,
-                    &personal_key_hex_for_sync,
-                )
-                .await
-                {
-                    log::warn!(
-                        "finish_login: couldn't demote interrupted focus_runs for \
-                         persona={}: {e} -- skipping this persona",
-                        persona.id
-                    );
-                }
-            }
-        }
-        Err(e) => log::warn!(
-            "finish_login: couldn't list personas for user={user_id}: {e} -- \
-             skipping interrupted-run recovery entirely"
-        ),
+    // sequence as the two pull calls above. There is no per-persona "unlock"
+    // event in this codebase (key_hex is derived once per-user here;
+    // persona_id is just a routing parameter passed alongside it) so this is
+    // the correct, and only, call site -- demote_interrupted_runs()
+    // (conductor::lifecycle) is otherwise never invoked, leaving
+    // crash-interrupted runs stuck at running/initializing forever.
+    // Best-effort per persona: logged and skipped, never turns an
+    // otherwise-successful login into an Err.
+    //
+    // items.id=779: it runs in a background task (nothing the session needs
+    // waits on it), spawned here so it overlaps the spend recovery and the
+    // rehydrate below.
+    if let Some(personas) = &personas {
+        spawn_interrupted_run_recovery(
+            user_id,
+            zeroize::Zeroizing::new(personal_key_hex_for_sync.clone()),
+            key_epoch,
+            personas.iter().map(|p| p.id.clone()).collect(),
+        );
     }
+    let phase_started = std::time::Instant::now();
 
     // items.id=710: spend-ledger recovery -- one more sibling call in this
     // "the moment key material becomes resident" sequence. A hosted call that
@@ -715,6 +731,10 @@ async fn install_session(
         &personal_key_hex_for_sync,
     )
     .await;
+    log::info!(
+        "finish_login: spend recovery took {} ms for user={user_id}",
+        phase_started.elapsed().as_millis()
+    );
 
     // items.id=290, decisions.id=718: rehydrate GroupKeyRegistry from every
     // one of this account's personas' personal.db group_keys tables --
@@ -727,52 +747,170 @@ async fn install_session(
     // corrupted ancillary row would be a lockout bug, not a safety
     // improvement (there would be no way to fix the row without being able
     // to log in in the first place).
+    let phase_started = std::time::Instant::now();
     let personal_key_hex = key_hex(&data_key);
-    match persona_store::list_personas_for_user(pool, user_id).await {
-        Ok(personas) => {
-            for persona in personas {
-                match group_key_store::list_group_keys(user_id, &persona.id, &personal_key_hex)
-                    .await
-                {
-                    Ok(rows) => {
-                        for row in rows {
-                            let Some(group_key) = hex_decode_group_key(&row.group_key_hex) else {
-                                log::warn!(
-                                    "finish_login: malformed group_key_hex for persona={} \
-                                     group={} -- skipping this row",
-                                    persona.id,
-                                    row.group_id
-                                );
-                                continue;
-                            };
-                            group_key_registry
-                                .replace(
-                                    &persona.id,
-                                    &row.group_id,
-                                    UnlockedGroupKey {
-                                        group_id: row.group_id.clone(),
-                                        group_key,
-                                        unlocked_at: now.to_owned(),
-                                    },
-                                )
-                                .await;
-                        }
+    if let Some(personas) = &personas {
+        for persona in personas {
+            match group_key_store::list_group_keys(user_id, &persona.id, &personal_key_hex).await {
+                Ok(rows) => {
+                    for row in rows {
+                        let Some(group_key) = hex_decode_group_key(&row.group_key_hex) else {
+                            log::warn!(
+                                "finish_login: malformed group_key_hex for persona={} \
+                                 group={} -- skipping this row",
+                                persona.id,
+                                row.group_id
+                            );
+                            continue;
+                        };
+                        group_key_registry
+                            .replace(
+                                &persona.id,
+                                &row.group_id,
+                                UnlockedGroupKey {
+                                    group_id: row.group_id.clone(),
+                                    group_key,
+                                    unlocked_at: now.to_owned(),
+                                },
+                            )
+                            .await;
                     }
-                    Err(e) => log::warn!(
-                        "finish_login: couldn't read group_keys for persona={}: {e} -- \
-                         skipping this persona",
-                        persona.id
-                    ),
                 }
+                Err(e) => log::warn!(
+                    "finish_login: couldn't read group_keys for persona={}: {e} -- \
+                     skipping this persona",
+                    persona.id
+                ),
             }
         }
-        Err(e) => log::warn!(
-            "finish_login: couldn't list personas for user={user_id}: {e} -- \
-             skipping group-key rehydration entirely"
-        ),
     }
+    log::info!(
+        "finish_login: group-key rehydrate took {} ms; session usable after {} ms for user={user_id}",
+        phase_started.elapsed().as_millis(),
+        install_started.elapsed().as_millis()
+    );
 
     Ok(())
+}
+
+/// What one run of the background interrupted-run recovery did (items.id=779).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RecoverySummary {
+    /// Personas whose demote ran to completion.
+    personas_done: usize,
+    /// Personas whose demote returned an error (logged, skipped).
+    personas_failed: usize,
+    /// Focus runs moved to paused across all personas.
+    runs_demoted: u64,
+    /// Personas not attempted because the loop stopped early (session no
+    /// longer resident, or the writer gate left Open).
+    personas_skipped: usize,
+}
+
+/// Why `recover_interrupted_runs` stops before the next persona, if it does.
+///
+/// The recovery owns a copy of the data key, so unlike a reply that outlives
+/// its session (items.id=781) it must NOT keep using it once the session ends:
+/// its Sweep lease pins the key epoch, so the epoch guard alone would let it
+/// carry on after a logout, an idle lock or the 30-day ceiling. Checked before
+/// EVERY persona. The persona already open when a lock lands finishes (one open
+/// and one UPDATE), then the loop stops and the key copy is dropped.
+///   - the session is no longer resident under the epoch the task started with
+///     (lock, logout, another account, a re-login under a new epoch);
+///   - the writer gate left Open (a rotation is draining or closing): a
+///     rotation must never wait behind this best-effort work (items.id=778).
+fn recovery_stop_reason(user_id: &str, key_epoch: u64) -> Option<&'static str> {
+    if epoch_guard::resident_epoch(user_id) != Some(key_epoch) {
+        return Some("the session is no longer resident");
+    }
+    if crate::auth::writer_gate::phase(user_id) != crate::auth::writer_gate::Phase::Open {
+        return Some("a key rotation is draining the writer gate");
+    }
+    None
+}
+
+/// The body of the background recovery, split from the spawn so tests can
+/// await it.
+async fn recover_interrupted_runs(
+    user_id: &str,
+    key_hex: &str,
+    key_epoch: u64,
+    persona_ids: &[String],
+) -> RecoverySummary {
+    let mut summary = RecoverySummary::default();
+    for (i, persona_id) in persona_ids.iter().enumerate() {
+        if let Some(reason) = recovery_stop_reason(user_id, key_epoch) {
+            summary.personas_skipped = persona_ids.len() - i;
+            log::info!(
+                "finish_login: interrupted-run recovery stopping for user={user_id} with {} \
+                 personas left: {reason}",
+                summary.personas_skipped
+            );
+            break;
+        }
+        match crate::conductor::lifecycle::demote_interrupted_runs(user_id, persona_id, key_hex)
+            .await
+        {
+            Ok(n) => {
+                summary.personas_done += 1;
+                summary.runs_demoted += n;
+            }
+            Err(e) => {
+                summary.personas_failed += 1;
+                log::warn!(
+                    "finish_login: couldn't demote interrupted focus_runs for \
+                     persona={persona_id}: {e} -- skipping this persona"
+                );
+            }
+        }
+    }
+    summary
+}
+
+/// Run the interrupted-run recovery for `persona_ids` in a background task
+/// (items.id=779) so login returns as soon as the session is usable.
+///
+/// The Sweep lease is taken HERE, before the spawn, and moved into the task:
+/// there is no gap in which a rotation could start unseen, a rotation that
+/// begins afterwards waits for this short task (and `recovery_stop_reason`
+/// ends it early), and a gate that is already draining, closed or rotating
+/// refuses the lease, so the recovery is skipped. Skipping is safe: the demote
+/// is idempotent and runs again at the next login. Decisions.id=847: this work
+/// only ever runs while a key is resident.
+fn spawn_interrupted_run_recovery(
+    user_id: &str,
+    key_hex: zeroize::Zeroizing<String>,
+    key_epoch: u64,
+    persona_ids: Vec<String>,
+) {
+    if persona_ids.is_empty() {
+        return;
+    }
+    let lease =
+        match crate::auth::writer_gate::acquire(user_id, crate::auth::writer_gate::Kind::Sweep) {
+            Ok(lease) => lease,
+            Err(e) => {
+                log::info!(
+                    "finish_login: skipping interrupted-run recovery for user={user_id}: {e}"
+                );
+                return;
+            }
+        };
+    let user_id = user_id.to_owned();
+    tokio::spawn(async move {
+        let _lease = lease;
+        let started = std::time::Instant::now();
+        let summary = recover_interrupted_runs(&user_id, &key_hex, key_epoch, &persona_ids).await;
+        log::info!(
+            "finish_login: interrupted-run recovery for user={user_id} took {} ms: {} personas \
+             done, {} failed, {} skipped, {} runs paused",
+            started.elapsed().as_millis(),
+            summary.personas_done,
+            summary.personas_failed,
+            summary.personas_skipped,
+            summary.runs_demoted
+        );
+    });
 }
 
 #[tauri::command]
@@ -2344,6 +2482,9 @@ mod tests {
         .await
         .expect("second login must succeed");
 
+        // items.id=779: the demote runs in a background task after login returns.
+        wait_for_recovery(&user.id).await;
+
         let mut conn = crate::providers::utils::connect_options_encrypted(
             &db_path,
             &crate::auth::subkeys::test_key_hex(
@@ -2365,6 +2506,261 @@ mod tests {
         assert_eq!(
             status, "paused",
             "finish_login must demote a stale running focus_run to paused"
+        );
+    }
+
+    /// Wait until the background interrupted-run recovery (items.id=779) has
+    /// released its Sweep lease for `user_id`. The lease is taken before login
+    /// returns, so a count of zero means the task is finished (or never started).
+    async fn wait_for_recovery(user_id: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while crate::auth::writer_gate::counts(user_id).sweeps > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the background recovery must finish within 10 s");
+    }
+
+    /// A persona with an outputs.db holding one stale `running` focus_run and,
+    /// optionally, one durable group key. Returns (persona_id, run_id).
+    async fn seed_persona_with_stale_run(
+        pool: &sqlx::SqlitePool,
+        user_id: &str,
+        personal_key_hex: &str,
+        group: Option<(&str, &str)>,
+    ) -> (String, String) {
+        let persona_id = uuid::Uuid::new_v4().to_string();
+        persona_store::create_persona(pool, &persona_id, "Seeded", "personal", user_id, None)
+            .await
+            .expect("create_persona must succeed");
+        if let Some((group_id, group_key_hex)) = group {
+            group_key_store::save_group_key(
+                user_id,
+                &persona_id,
+                personal_key_hex,
+                group_id,
+                group_key_hex,
+                &crate::providers::utils::now(),
+            )
+            .await
+            .expect("save_group_key must succeed");
+        }
+        crate::persistence::migrations::migrate_outputs_db(user_id, &persona_id, personal_key_hex)
+            .await
+            .expect("outputs.db migration must succeed");
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let mut conn = outputs_conn(user_id, &persona_id, personal_key_hex).await;
+        sqlx::query(
+            "INSERT INTO focus_runs (id, focus_id, status, started_at)
+             VALUES (?, 'test-focus', 'running', '2020-01-01T00:00:00Z')",
+        )
+        .bind(&run_id)
+        .execute(&mut conn)
+        .await
+        .expect("seeding a stale focus_runs row must succeed");
+        drop(conn);
+        (persona_id, run_id)
+    }
+
+    async fn outputs_conn(
+        user_id: &str,
+        persona_id: &str,
+        personal_key_hex: &str,
+    ) -> sqlx::SqliteConnection {
+        use sqlx::ConnectOptions;
+
+        crate::providers::utils::connect_options_encrypted(
+            &crate::providers::utils::db_path_outputs(user_id, persona_id),
+            &crate::auth::subkeys::test_key_hex(
+                user_id,
+                personal_key_hex,
+                crate::auth::subkeys::DbPurpose::Outputs,
+                persona_id,
+            ),
+        )
+        .create_if_missing(false)
+        .connect()
+        .await
+        .expect("must reopen outputs.db under its key")
+    }
+
+    async fn run_status(
+        user_id: &str,
+        persona_id: &str,
+        run_id: &str,
+        personal_key_hex: &str,
+    ) -> String {
+        let mut conn = outputs_conn(user_id, persona_id, personal_key_hex).await;
+        sqlx::query_scalar("SELECT status FROM focus_runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap()
+    }
+
+    async fn first_login(app: &tauri::App<tauri::test::MockRuntime>) -> (String, String, u64) {
+        do_login(app, "Alice", "password123").await.unwrap();
+        let registry = app.state::<KeyRegistry>();
+        let (user_id, epoch) = registry
+            .with_key(|k| (k.user_id.clone(), k.key_epoch))
+            .await
+            .unwrap();
+        (user_id, registry.personal_key_hex().await.unwrap(), epoch)
+    }
+
+    /// items.id=779: several personas -- every group key is rehydrated before
+    /// login returns, and every interrupted run is demoted by the background task.
+    #[tokio::test]
+    async fn login_with_several_personas_rehydrates_every_group_key_and_demotes_every_run() {
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let registry = app.state::<KeyRegistry>();
+        let group_key_registry = app.state::<GroupKeyRegistry>();
+        let (user_id, key_hex, _) = first_login(&app).await;
+
+        let mut seeded = Vec::new();
+        for i in 0..4u8 {
+            let group_id = format!("group-many-{i}");
+            let group_key_hex = format!("{:02x}", i + 1).repeat(kdf::MASTER_KEY_LEN);
+            let (persona_id, run_id) = seed_persona_with_stale_run(
+                &_env.pool,
+                &user_id,
+                &key_hex,
+                Some((&group_id, &group_key_hex)),
+            )
+            .await;
+            seeded.push((persona_id, run_id, group_id, group_key_hex));
+        }
+        registry.clear().await;
+
+        do_login(&app, "Alice", "password123").await.unwrap();
+
+        for (persona_id, _, group_id, group_key_hex) in &seeded {
+            assert_eq!(
+                group_key_registry
+                    .key_hex_for(persona_id, group_id)
+                    .await
+                    .as_deref(),
+                Some(group_key_hex.as_str()),
+                "every group key is rehydrated inline, before login returns"
+            );
+        }
+        wait_for_recovery(&user_id).await;
+        for (persona_id, run_id, _, _) in &seeded {
+            assert_eq!(
+                run_status(&user_id, persona_id, run_id, &key_hex).await,
+                "paused",
+                "every persona's interrupted run is demoted"
+            );
+        }
+    }
+
+    /// items.id=779: login returns while the demote is still running. One
+    /// persona's outputs.db is write-locked by the test, so its demote blocks on
+    /// the busy timeout; login still returns, the lease is still held, and the
+    /// run is demoted once the lock is released.
+    #[tokio::test]
+    async fn login_returns_before_the_interrupted_run_demote_finishes() {
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let registry = app.state::<KeyRegistry>();
+        let (user_id, key_hex, _) = first_login(&app).await;
+        let (persona_id, run_id) =
+            seed_persona_with_stale_run(&_env.pool, &user_id, &key_hex, None).await;
+        registry.clear().await;
+
+        let mut blocker = outputs_conn(&user_id, &persona_id, &key_hex).await;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut blocker)
+            .await
+            .unwrap();
+
+        do_login(&app, "Alice", "password123").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            crate::auth::writer_gate::counts(&user_id).sweeps,
+            1,
+            "login returned while the recovery task still holds its Sweep lease"
+        );
+
+        sqlx::query("ROLLBACK").execute(&mut blocker).await.unwrap();
+        wait_for_recovery(&user_id).await;
+        assert_eq!(
+            run_status(&user_id, &persona_id, &run_id, &key_hex).await,
+            "paused"
+        );
+    }
+
+    /// items.id=779 (b): the recovery stops once the session is no longer
+    /// resident under the epoch it started with, and once the writer gate leaves Open.
+    #[tokio::test]
+    async fn interrupted_run_recovery_stops_when_the_session_or_gate_changes() {
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let registry = app.state::<KeyRegistry>();
+        let (user_id, key_hex, epoch) = first_login(&app).await;
+        let (persona_id, run_id) =
+            seed_persona_with_stale_run(&_env.pool, &user_id, &key_hex, None).await;
+        let ids = vec![persona_id.clone()];
+
+        // A different epoch than the resident one: nothing is attempted.
+        let summary = recover_interrupted_runs(&user_id, &key_hex, epoch + 1, &ids).await;
+        assert_eq!(
+            summary,
+            RecoverySummary {
+                personas_skipped: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            run_status(&user_id, &persona_id, &run_id, &key_hex).await,
+            "running"
+        );
+
+        // The gate is draining for a rotation: nothing is attempted.
+        {
+            let _drain = crate::auth::writer_gate::begin_drain(&user_id).unwrap();
+            let summary = recover_interrupted_runs(&user_id, &key_hex, epoch, &ids).await;
+            assert_eq!(summary.personas_skipped, 1);
+            assert_eq!(summary.runs_demoted, 0);
+        }
+
+        // Control: resident under the same epoch and the gate open, it runs.
+        let summary = recover_interrupted_runs(&user_id, &key_hex, epoch, &ids).await;
+        assert_eq!(summary.personas_done, 1);
+        assert_eq!(summary.runs_demoted, 1);
+        assert_eq!(
+            run_status(&user_id, &persona_id, &run_id, &key_hex).await,
+            "paused"
+        );
+
+        // A locked session (key cleared): nothing is attempted either.
+        registry.clear().await;
+        let summary = recover_interrupted_runs(&user_id, &key_hex, epoch, &ids).await;
+        assert_eq!(summary.personas_skipped, 1);
+    }
+
+    /// items.id=779 (a): a login while the gate is draining still succeeds and
+    /// rehydrates, but takes no Sweep lease and skips the recovery.
+    #[tokio::test]
+    async fn login_during_a_drain_skips_the_recovery_but_still_logs_in() {
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let registry = app.state::<KeyRegistry>();
+        let (user_id, key_hex, _) = first_login(&app).await;
+        let (persona_id, run_id) =
+            seed_persona_with_stale_run(&_env.pool, &user_id, &key_hex, None).await;
+        registry.clear().await;
+
+        let _drain = crate::auth::writer_gate::begin_drain(&user_id).unwrap();
+        do_login(&app, "Alice", "password123").await.unwrap();
+        assert!(registry.is_occupied().await);
+        assert_eq!(crate::auth::writer_gate::counts(&user_id).sweeps, 0);
+        assert_eq!(
+            run_status(&user_id, &persona_id, &run_id, &key_hex).await,
+            "running",
+            "the recovery was skipped; it runs again at the next login"
         );
     }
 
