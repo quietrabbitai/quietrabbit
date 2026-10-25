@@ -14,10 +14,18 @@
 
 use quietrabbit_lib::persistence::migrations::run_migrations;
 use sqlx::sqlite::SqliteConnectOptions;
-use sqlx::ConnectOptions;
+use sqlx::{ConnectOptions, Connection};
 use tempfile::NamedTempFile;
 
 const KEY_HEX: &str = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+// items.id=566: every connection here is closed with `close().await`, never
+// just dropped. A dropped sqlx-sqlite connection runs sqlite3_close later, on
+// its worker thread, so after the last test returns libtest's exit() can run
+// SQLCipher's atexit shutdown (frees the crypto provider and private heap)
+// while a worker is still inside sqlite3_close, and the process dies with
+// SIGSEGV/SIGABRT after "test result: ok". close().await returns only once
+// the worker has finished sqlite3_close.
 
 #[tokio::test]
 async fn test_migration_pipeline_applies_on_real_encrypted_file() {
@@ -43,6 +51,9 @@ async fn test_migration_pipeline_applies_on_real_encrypted_file() {
             first_pass_applied > 0,
             "expected at least one shared schema version to apply on a fresh file"
         );
+        conn.close()
+            .await
+            .expect("first-pass connection must close");
     }
 
     // Second pass: reopen the same file with the correct key. Confirms the
@@ -74,6 +85,9 @@ async fn test_migration_pipeline_applies_on_real_encrypted_file() {
             second_pass_applied, 0,
             "re-running migrations against already-migrated on-disk state must be a no-op"
         );
+        conn.close()
+            .await
+            .expect("second-pass connection must close");
     }
 }
 
@@ -93,6 +107,7 @@ async fn test_migration_pipeline_wrong_key_cannot_read_migrated_file() {
         run_migrations(&mut conn, "shared", Some(KEY_HEX))
             .await
             .expect("migration pipeline must apply cleanly");
+        conn.close().await.expect("migration connection must close");
     }
 
     // Wrong key must not be able to read the migrated schema -- proves the
@@ -114,6 +129,7 @@ async fn test_migration_pipeline_wrong_key_cannot_read_migrated_file() {
                 sqlx::query_as("SELECT MAX(version) FROM schema_version")
                     .fetch_one(&mut conn)
                     .await;
+            conn.close().await.expect("wrong-key connection must close");
             result.is_err()
         }
     };

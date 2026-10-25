@@ -6,8 +6,16 @@
 //! but allow unencrypted reads, which would fail the wrong-key/no-key assertions.
 
 use sqlx::sqlite::SqliteConnectOptions;
-use sqlx::ConnectOptions;
+use sqlx::{ConnectOptions, Connection};
 use tempfile::NamedTempFile;
+
+// items.id=566: every connection in this file is closed with `close().await`,
+// never just dropped. A dropped sqlx-sqlite connection runs sqlite3_close
+// later, on its worker thread, so once the last test returns, exit() can run
+// SQLCipher's atexit shutdown (frees the crypto provider and private heap)
+// while a worker is still inside sqlite3_close, and the process dies with
+// SIGSEGV/SIGABRT after "test result: ok". close().await returns only once
+// the worker has finished sqlite3_close.
 
 const KEY_HEX: &str = "x'deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef'";
 const WRONG_KEY_HEX: &str = "x'0000000000000000000000000000000000000000000000000000000000000000'";
@@ -15,9 +23,18 @@ const WRONG_KEY_HEX: &str = "x'0000000000000000000000000000000000000000000000000
 /// Open an encrypted connection using the options builder (avoids URI
 /// character-escaping pitfalls). PRAGMA key fires before journal_mode in
 /// the pragma batch that executes after sqlite3_open_v2.
+///
+/// `wal = false` sends no journal_mode pragma (sqlx sends none by default).
+/// The wrong-key and no-key opens use it: `PRAGMA journal_mode = WAL` reads
+/// page 1, so on a bad key sqlx's connect() fails *after* it has built the
+/// connection and drops it without waiting for its worker to run
+/// sqlite3_close, and the test can neither close nor await it. Without the
+/// pragma connect() succeeds and the rejection shows at the first query, on a
+/// connection the test can close (items.id=566).
 async fn open_connection(
     path: &std::path::Path,
     key: Option<&str>,
+    wal: bool,
 ) -> Result<sqlx::SqliteConnection, sqlx::Error> {
     let mut opts = SqliteConnectOptions::new()
         .filename(path)
@@ -27,7 +44,11 @@ async fn open_connection(
         opts = opts.pragma("key", format!("\"{k}\""));
     }
 
-    opts.pragma("journal_mode", "WAL").connect().await
+    if wal {
+        opts = opts.pragma("journal_mode", "WAL");
+    }
+
+    opts.connect().await
 }
 
 /// Assert that a DatabaseError is an authentic encryption rejection.
@@ -71,7 +92,7 @@ async fn test_sqlcipher_write_and_read() {
 
     // Write encrypted data.
     {
-        let mut conn = open_connection(&temp_path, Some(KEY_HEX))
+        let mut conn = open_connection(&temp_path, Some(KEY_HEX), true)
             .await
             .expect("SQLCipher connection (write) failed");
         sqlx::query("CREATE TABLE t (v TEXT)")
@@ -82,17 +103,19 @@ async fn test_sqlcipher_write_and_read() {
             .execute(&mut conn)
             .await
             .expect("INSERT failed");
+        conn.close().await.expect("write connection must close");
     }
 
     // Reopen with correct key — data must be readable.
     {
-        let mut conn = open_connection(&temp_path, Some(KEY_HEX))
+        let mut conn = open_connection(&temp_path, Some(KEY_HEX), true)
             .await
             .expect("SQLCipher connection (correct key) failed");
         let row: (String,) = sqlx::query_as("SELECT v FROM t")
             .fetch_one(&mut conn)
             .await
             .expect("SELECT failed with correct key");
+        conn.close().await.expect("read connection must close");
         assert_eq!(row.0, "sentinel");
     }
 }
@@ -104,7 +127,7 @@ async fn test_sqlcipher_wrong_key_cannot_read() {
     drop(file_handle);
 
     {
-        let mut conn = open_connection(&temp_path, Some(KEY_HEX))
+        let mut conn = open_connection(&temp_path, Some(KEY_HEX), true)
             .await
             .expect("SQLCipher connection (write) failed");
         sqlx::query("CREATE TABLE t (v TEXT)")
@@ -115,17 +138,21 @@ async fn test_sqlcipher_wrong_key_cannot_read() {
             .execute(&mut conn)
             .await
             .expect("INSERT failed");
+        conn.close().await.expect("write connection must close");
     }
 
-    // SQLCipher 3.51.3 rejects invalid keys at connect time (WAL init triggers
-    // an immediate page read). Some builds defer to query time — both are valid.
-    match open_connection(&temp_path, Some(WRONG_KEY_HEX)).await {
+    // Opened without the WAL pragma (see open_connection), so the bad key is
+    // rejected at the first query. A connect-time rejection would also be a
+    // valid encryption proof, so that arm is kept, but it leaves a dropped
+    // connection the test cannot close.
+    match open_connection(&temp_path, Some(WRONG_KEY_HEX), false).await {
         Err(sqlx::Error::Database(db_err)) => {
             assert_encryption_db_error(db_err.as_ref());
         }
         Ok(mut conn) => {
             let result: Result<(String,), _> =
                 sqlx::query_as("SELECT v FROM t").fetch_one(&mut conn).await;
+            conn.close().await.expect("wrong-key connection must close");
             assert!(
                 result.is_err(),
                 "Wrong key must not be able to read encrypted data"
@@ -143,7 +170,7 @@ async fn test_sqlcipher_no_key_cannot_read() {
     drop(file_handle);
 
     {
-        let mut conn = open_connection(&temp_path, Some(KEY_HEX))
+        let mut conn = open_connection(&temp_path, Some(KEY_HEX), true)
             .await
             .expect("SQLCipher connection (write) failed");
         sqlx::query("CREATE TABLE t (v TEXT)")
@@ -154,17 +181,19 @@ async fn test_sqlcipher_no_key_cannot_read() {
             .execute(&mut conn)
             .await
             .expect("INSERT failed");
+        conn.close().await.expect("write connection must close");
     }
 
     // No key supplied. Plain SQLite would read this without error —
     // SQLCipher must reject it, proving encryption is active.
-    match open_connection(&temp_path, None).await {
+    match open_connection(&temp_path, None, false).await {
         Err(sqlx::Error::Database(db_err)) => {
             assert_encryption_db_error(db_err.as_ref());
         }
         Ok(mut conn) => {
             let result: Result<(String,), _> =
                 sqlx::query_as("SELECT v FROM t").fetch_one(&mut conn).await;
+            conn.close().await.expect("unkeyed connection must close");
             assert!(
                 result.is_err(),
                 "Unkeyed access must not read encrypted data"
@@ -181,7 +210,7 @@ async fn test_sqlcipher_wal_mode_active() {
     let (file_handle, temp_path) = temp_file.into_parts();
     drop(file_handle);
 
-    let mut conn = open_connection(&temp_path, Some(KEY_HEX))
+    let mut conn = open_connection(&temp_path, Some(KEY_HEX), true)
         .await
         .expect("SQLCipher connection failed");
 
@@ -197,5 +226,6 @@ async fn test_sqlcipher_wal_mode_active() {
         .fetch_one(&mut conn)
         .await
         .expect("PRAGMA journal_mode query failed");
+    conn.close().await.expect("connection must close");
     assert_eq!(row.0, "wal");
 }
