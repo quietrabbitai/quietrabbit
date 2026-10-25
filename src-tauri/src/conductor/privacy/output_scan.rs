@@ -49,6 +49,10 @@
 // export), Light intensity never blocks. This is the same two-path
 // discipline gate3.rs already established (PF path / legacy sensitivity
 // fallback) -- not a new invented behavior.
+//
+// PF FAILURE (items.id=613): when PF IS available but the call fails (timeout,
+// classifier error, panic), the content was not scanned. Full blocks
+// (event types output_scan_timeout / output_scan_pf_error); Light never blocks.
 
 use std::time::Duration;
 
@@ -57,7 +61,7 @@ use indexmap::IndexMap;
 use super::{
     errors::DisclosureLogWriteError,
     logger::{DisclosureLogEntry, DisclosureLogger},
-    privacy_filter::{self, PfEntityDecoded},
+    privacy_filter::{self, classify_outcome, PfEntityDecoded, PfOutcome},
     PF_TIMEOUT_SECS,
 };
 
@@ -103,6 +107,10 @@ pub struct OutputScanResult {
     /// as fail-closed (blocked=true) -- mirrors gate3.rs's own timeout
     /// handling, which also fails closed (blocked=true) on PF timeout.
     pub timed_out: bool,
+    /// PF classifier error or panic (not a timeout). Full intensity treats
+    /// it as fail-closed (blocked=true), like a timeout (items.id=613).
+    /// Not persisted: output_store stores blocked + timed_out only.
+    pub pf_error: bool,
     pub findings: Vec<OutputScanFinding>,
     pub plain_language: Option<String>,
 }
@@ -193,6 +201,7 @@ async fn scan_with_pf<L: DisclosureLogger>(
             return Ok(OutputScanResult {
                 blocked,
                 timed_out: true,
+                pf_error: false,
                 findings: vec![],
                 plain_language: if blocked {
                     Some(
@@ -205,15 +214,22 @@ async fn scan_with_pf<L: DisclosureLogger>(
                 },
             });
         }
-        Ok(Ok(Ok(entities))) => entities,
-        Ok(Ok(Err(e))) => {
-            log::warn!("output_scan: Privacy Filter classify error: {e}");
-            vec![]
-        }
-        Ok(Err(join_err)) => {
-            log::warn!("output_scan: Privacy Filter task panicked: {join_err}");
-            vec![]
-        }
+        // Classifier error and panic are one case (items.id=613): the content
+        // was not scanned, so a Full scan must not pass it.
+        Ok(joined) => match classify_outcome(joined) {
+            PfOutcome::Entities(entities) => entities,
+            PfOutcome::Failed { reason } => {
+                return pf_error_result(
+                    logger,
+                    step_id,
+                    focus_run_id,
+                    execution_tier,
+                    intensity,
+                    &reason,
+                )
+                .await;
+            }
+        },
     };
 
     let findings: Vec<OutputScanFinding> = entities
@@ -268,8 +284,57 @@ async fn scan_with_pf<L: DisclosureLogger>(
     Ok(OutputScanResult {
         blocked,
         timed_out: false,
+        pf_error: false,
         findings,
         plain_language,
+    })
+}
+
+/// The classifier failed (error or panic), so the content was not scanned.
+/// Full blocks; Light never blocks. Logs a distinct event type, as the
+/// timeout arm does. `reason` is offsets / return codes / library error text
+/// only, never the scanned text.
+async fn pf_error_result<L: DisclosureLogger>(
+    logger: &L,
+    step_id: &str,
+    focus_run_id: &str,
+    execution_tier: u8,
+    intensity: ScanIntensity,
+    reason: &str,
+) -> Result<OutputScanResult, DisclosureLogWriteError> {
+    log::warn!("output_scan: Privacy Filter failed, content not scanned: {reason}");
+    let blocked = intensity == ScanIntensity::Full;
+    logger
+        .write(DisclosureLogEntry {
+            step_id: step_id.to_string(),
+            focus_run_id: focus_run_id.to_string(),
+            execution_tier,
+            abstraction_tier: None,
+            provider: None,
+            fields_shared: vec![],
+            fields_abstracted: IndexMap::new(),
+            fields_withheld: vec![],
+            override_declined: blocked,
+            event_type: "output_scan_pf_error".to_string(),
+            category: None,
+            fact_key: None,
+        })
+        .await?;
+
+    Ok(OutputScanResult {
+        blocked,
+        timed_out: false,
+        pf_error: true,
+        findings: vec![],
+        plain_language: if blocked {
+            Some(
+                "The privacy check could not complete, so this export was \
+                 blocked as a precaution. [Try again] [Get help]"
+                    .to_string(),
+            )
+        } else {
+            None
+        },
     })
 }
 
@@ -319,6 +384,7 @@ async fn scan_legacy_fallback<L: DisclosureLogger>(
     Ok(OutputScanResult {
         blocked,
         timed_out: false,
+        pf_error: false,
         findings: vec![],
         plain_language,
     })
@@ -404,6 +470,94 @@ mod tests {
             .await
             .unwrap();
         assert!(result.findings.is_empty());
+    }
+
+    // -- PF classifier error fails closed (items.id=613) ---------------------
+    //
+    // scan_with_pf is called directly. In a build without Privacy Filter
+    // compiled in, run_classify_blocking returns the stub's classifier Err,
+    // so this drives the real classifier-error arm end to end. With PF
+    // compiled in the classifier would succeed, hence the cfg gate.
+
+    #[cfg(not(privacy_filter_available))]
+    #[tokio::test]
+    async fn pf_classifier_error_blocks_full_scan() {
+        let logger = TestLogger::new();
+        let result = scan_with_pf(
+            &logger,
+            "step-1",
+            "run-1",
+            "some text",
+            1,
+            ScanIntensity::Full,
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.blocked,
+            "a Full scan must not pass unscanned content"
+        );
+        assert!(result.pf_error);
+        assert!(!result.timed_out);
+        assert!(result.findings.is_empty());
+        assert!(result.plain_language.is_some());
+        assert_eq!(logger.entry_count(), 1);
+        let entry = &logger.entries()[0];
+        assert_eq!(entry.event_type, "output_scan_pf_error");
+        assert!(entry.override_declined);
+    }
+
+    #[cfg(not(privacy_filter_available))]
+    #[tokio::test]
+    async fn pf_classifier_error_never_blocks_light_scan() {
+        let logger = TestLogger::new();
+        let result = scan_with_pf(
+            &logger,
+            "step-1",
+            "run-1",
+            "some text",
+            1,
+            ScanIntensity::Light,
+        )
+        .await
+        .unwrap();
+        assert!(!result.blocked);
+        assert!(result.pf_error);
+        assert!(result.plain_language.is_none());
+        assert_eq!(logger.entry_count(), 1);
+        let entry = &logger.entries()[0];
+        assert_eq!(entry.event_type, "output_scan_pf_error");
+        assert!(!entry.override_declined);
+    }
+
+    #[tokio::test]
+    async fn pf_error_result_full_blocks_and_light_does_not() {
+        let logger = TestLogger::new();
+        let full = pf_error_result(&logger, "s", "r", 1, ScanIntensity::Full, "rc=-1")
+            .await
+            .unwrap();
+        assert!(full.blocked && full.pf_error && !full.timed_out);
+        let light = pf_error_result(&logger, "s", "r", 1, ScanIntensity::Light, "rc=-1")
+            .await
+            .unwrap();
+        assert!(!light.blocked && light.pf_error);
+        assert_eq!(logger.entry_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn pf_error_result_propagates_log_write_failure() {
+        use crate::conductor::privacy::logger::FailLogger;
+        let result = pf_error_result(&FailLogger, "s", "r", 1, ScanIntensity::Full, "rc=-1").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn only_pf_error_results_set_pf_error() {
+        let logger = TestLogger::new();
+        let legacy = scan_legacy_fallback(&logger, "s", "r", 1, 4, ScanIntensity::Full)
+            .await
+            .unwrap();
+        assert!(!legacy.pf_error);
     }
 
     #[tokio::test]

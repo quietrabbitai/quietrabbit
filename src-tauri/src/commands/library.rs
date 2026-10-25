@@ -997,6 +997,7 @@ mod tests {
         let cached_scan = OutputScanResult {
             blocked: true,
             timed_out: false,
+            pf_error: false,
             findings: vec![],
             plain_language: Some("cached block".to_string()),
         };

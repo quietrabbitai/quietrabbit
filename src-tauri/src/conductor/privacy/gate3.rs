@@ -19,7 +19,8 @@
 //       - spawn_blocking FFI call with 10s timeout (non-negotiable)
 //       - Timeout           → gate_timeout disclosure event + blocked result
 //       - spawn_blocking panic → same as timeout (conservative)
-//       - PF error          → fall back to legacy sensitivity block
+//       - PF error          → gate3_pf_error_block disclosure event + blocked result
+//                             (fail closed, items.id=613; not a timeout, no gate_timeout)
 //       - Zero spans, severity < 3 AND target_tier < 3 → gate3_pf_no_spans + approved (no modal)
 //       - Zero spans, severity >= 3 OR target_tier >= 3 → still routed to the
 //         consent gate (High tier, empty spans list) — see D6-362/decisions.id=405
@@ -59,7 +60,7 @@ use super::{
     errors::DisclosureLogWriteError,
     fact_identity,
     logger::{DisclosureLogEntry, DisclosureLogger},
-    privacy_filter::{self, PfEntityDecoded},
+    privacy_filter::{self, classify_outcome, PfEntityDecoded, PfOutcome},
     types::{AutoResolvedSpan, ConsentRequestPayload, ConsentSpanItem, Gate3Result, ReviewTier},
     PF_TIMEOUT_SECS,
 };
@@ -273,6 +274,42 @@ pub async fn gate3<L: DisclosureLogger>(
 // Privacy Filter path
 // ---------------------------------------------------------------------------
 
+/// The classifier failed (not a timeout, not a panic): the content was not
+/// reviewed, so it does not pass. `reason` is offsets / return codes /
+/// library error text only, never the classified text. Takes no AppHandle and
+/// emits nothing: this is not a gate_timeout.
+async fn pf_error_block<L: DisclosureLogger>(
+    logger: &L,
+    step_id: &str,
+    focus_run_id: &str,
+    execution_tier: u8,
+    content_key: &str,
+    reason: &str,
+) -> Result<Gate3Result, DisclosureLogWriteError> {
+    log::error!("gate3: Privacy Filter error, content blocked (fail closed): {reason}");
+    logger
+        .write(DisclosureLogEntry {
+            step_id: step_id.to_string(),
+            focus_run_id: focus_run_id.to_string(),
+            execution_tier,
+            abstraction_tier: None,
+            provider: None,
+            fields_shared: vec![],
+            fields_abstracted: IndexMap::new(),
+            fields_withheld: vec![content_key.to_string()],
+            override_declined: true,
+            event_type: "gate3_pf_error_block".to_string(),
+            category: None,
+            fact_key: None,
+        })
+        .await?;
+    Ok(Gate3Result {
+        blocked: true,
+        plain_language: Some("Privacy review failed. Content blocked. [Try again]".to_string()),
+        ..Gate3Result::default()
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn gate3_with_pf<L: DisclosureLogger>(
     logger: &L,
@@ -371,65 +408,24 @@ async fn gate3_with_pf<L: DisclosureLogger>(
             });
         }
 
-        // PF returned an error (model unavailable, bad GGUF, etc.): fall back to
-        // sensitivity block. Logs at warn — does not treat as F_SYSTEM.
-        Ok(Ok(Err(pf_err))) => {
-            log::warn!(
-                "gate3: Privacy Filter returned error — falling back to sensitivity block: \
-                 {pf_err}"
-            );
-            if content_sensitivity_severity >= 3 && target_tier >= 2 {
-                logger
-                    .write(DisclosureLogEntry {
-                        step_id: step_id.to_string(),
-                        focus_run_id: focus_run_id.to_string(),
-                        execution_tier,
-                        abstraction_tier: None,
-                        provider: None,
-                        fields_shared: vec![],
-                        fields_abstracted: IndexMap::new(),
-                        fields_withheld: vec![content_key.to_string()],
-                        override_declined: true,
-                        event_type: "gate3_sensitivity_block".to_string(),
-                        category: None,
-                        fact_key: None,
-                    })
-                    .await?;
-                return Ok(Gate3Result {
-                    blocked: true,
-                    plain_language: Some(
-                        "This content contains medical or financial information \
-                         and can't be shared with external services. \
-                         [Use local only] [Get help]"
-                            .to_string(),
-                    ),
-                    ..Gate3Result::default()
-                });
-            }
-            logger
-                .write(DisclosureLogEntry {
-                    step_id: step_id.to_string(),
-                    focus_run_id: focus_run_id.to_string(),
+        // PF returned an error (model unavailable, bad GGUF, poisoned mutex,
+        // bad span, rc != 0): fail closed (items.id=613). The panic arm above
+        // is matched first, so the mapper only sees a non-panic result here.
+        // Not a timeout: no gate_timeout event, timeout stays false.
+        Ok(joined) => match classify_outcome(joined) {
+            PfOutcome::Entities(entities) => entities,
+            PfOutcome::Failed { reason } => {
+                return pf_error_block(
+                    logger,
+                    step_id,
+                    focus_run_id,
                     execution_tier,
-                    abstraction_tier: None,
-                    provider: None,
-                    fields_shared: vec![content_key.to_string()],
-                    fields_abstracted: IndexMap::new(),
-                    fields_withheld: vec![],
-                    override_declined: false,
-                    event_type: "gate3_promotion_approved".to_string(),
-                    category: None,
-                    fact_key: None,
-                })
-                .await?;
-            return Ok(Gate3Result {
-                approved: true,
-                ..Gate3Result::default()
-            });
-        }
-
-        // PF succeeded: process the entity list.
-        Ok(Ok(Ok(entities))) => entities,
+                    content_key,
+                    &reason,
+                )
+                .await;
+            }
+        },
     };
 
     // items.id=406 (decisions.id=756/757): partition entities into those
@@ -995,6 +991,74 @@ mod tests {
             label: label.to_owned(),
             span_text: "test".to_owned(),
         }
+    }
+
+    // -- PF classifier error fails closed (items.id=613) ----------------------
+    // gate3_with_pf needs a tauri::AppHandle, so the arm is tested through the
+    // mapper and the handle-free helper it dispatches to.
+
+    #[tokio::test]
+    async fn classifier_error_goes_through_the_mapper_to_a_fail_closed_block() {
+        use crate::conductor::privacy::logger::TestLogger;
+
+        // The shapes run_classify_blocking_sync returns on failure.
+        for msg in [
+            "Privacy Filter unavailable",
+            "Privacy Filter mutex poisoned: poisoned lock",
+            "pf_classify failed (rc=-1): bad model",
+            "span end 4 is before start 5",
+        ] {
+            let PfOutcome::Failed { reason } = classify_outcome(Ok(Err(msg.to_owned()))) else {
+                panic!("classifier error must map to Failed: {msg}");
+            };
+
+            let logger = TestLogger::new();
+            let result = pf_error_block(&logger, "step-1", "run-1", 2, "msg-1", &reason)
+                .await
+                .unwrap();
+
+            assert!(result.blocked);
+            assert!(!result.approved);
+            assert!(!result.pending_consent);
+            assert!(!result.timeout, "a classifier error is not a timeout");
+            assert_eq!(
+                result.plain_language.as_deref(),
+                Some("Privacy review failed. Content blocked. [Try again]")
+            );
+
+            let entries = logger.entries();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].event_type, "gate3_pf_error_block");
+            assert_eq!(entries[0].fields_withheld, vec!["msg-1".to_string()]);
+            assert!(entries[0].fields_shared.is_empty());
+            assert!(entries[0].override_declined);
+            assert!(
+                entries
+                    .iter()
+                    .all(|e| e.event_type != "gate3_promotion_approved"
+                        && e.event_type != "gate_timeout"),
+                "the old fail-open approval and the timeout event must not be written"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pf_error_block_does_not_depend_on_severity_or_tier() {
+        // The old arm approved below severity 3 / target tier 2; the helper
+        // takes neither, so no input can reach an approval.
+        use crate::conductor::privacy::logger::TestLogger;
+        let logger = TestLogger::new();
+        let result = pf_error_block(&logger, "s", "r", 1, "k", "rc=-1")
+            .await
+            .unwrap();
+        assert!(result.blocked && !result.approved);
+    }
+
+    #[tokio::test]
+    async fn pf_error_block_propagates_log_write_failure() {
+        use crate::conductor::privacy::logger::FailLogger;
+        let result = pf_error_block(&FailLogger, "s", "r", 2, "k", "rc=-1").await;
+        assert!(result.is_err());
     }
 
     // -- zero_spans_safe_to_auto_approve -------------------------------------

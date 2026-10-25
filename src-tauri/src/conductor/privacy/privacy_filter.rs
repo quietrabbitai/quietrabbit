@@ -24,6 +24,8 @@
 //   export PRIVACY_FILTER_LIB_DIR=<path>/build/release-portable
 //                                          ^^^^ build root, not lib/
 
+use std::borrow::Cow;
+
 // ---------------------------------------------------------------------------
 // Shared types (always compiled — stub and live paths share the same API)
 // ---------------------------------------------------------------------------
@@ -46,10 +48,86 @@ pub struct PfEntityDecoded {
     /// Empty string if the label pointer was null (defensive; should not occur).
     pub label: String,
     /// Extracted from the original text using byte offsets returned by the
-    /// privacy-filter.cpp library. Offsets are clamped to valid byte range
-    /// before slicing; assumes the library returns valid UTF-8 boundaries
+    /// privacy-filter.cpp library. Offsets are checked by validate_span
+    /// before slicing (a span with a negative offset, end < start or start
+    /// past the text fails the whole classify call; an end past the text is
+    /// clamped); assumes the library returns valid UTF-8 boundaries
     /// (from_utf8_lossy replaces any invalid bytes rather than panicking).
     pub span_text: String,
+}
+
+// ---------------------------------------------------------------------------
+// Fail-closed helpers (always compiled, pure — items.id=613)
+// ---------------------------------------------------------------------------
+
+/// Result of a Privacy Filter classify call once the timeout has been handled.
+/// Anything that is not a successful classification is `Failed`; callers must
+/// fail closed on it.
+#[derive(Debug)]
+pub(crate) enum PfOutcome {
+    Entities(Vec<PfEntityDecoded>),
+    /// `reason` is for logs only: offsets, return codes and library error
+    /// text, never the classified text.
+    Failed {
+        reason: String,
+    },
+}
+
+/// The one mapping from `run_classify_blocking`'s nested result. A classifier
+/// Err (poisoned mutex, NUL, rc != 0, bad span, unavailable) and a JoinError
+/// (panic) are both `Failed`. The timeout is the outer `tokio::time::timeout`
+/// Err, not part of this result, and stays a separate arm in each caller.
+pub(crate) fn classify_outcome(
+    result: Result<Result<Vec<PfEntityDecoded>, String>, tokio::task::JoinError>,
+) -> PfOutcome {
+    match result {
+        Ok(Ok(entities)) => PfOutcome::Entities(entities),
+        Ok(Err(reason)) => PfOutcome::Failed { reason },
+        // JoinError's Display can carry a panic message; say only which kind.
+        Err(join_err) if join_err.is_panic() => PfOutcome::Failed {
+            reason: "Privacy Filter task panicked".to_owned(),
+        },
+        Err(_) => PfOutcome::Failed {
+            reason: "Privacy Filter task was cancelled".to_owned(),
+        },
+    }
+}
+
+/// Replace each NUL with a space. NUL and space are one byte each, so byte
+/// length and every char boundary are unchanged and span offsets stay valid.
+#[cfg_attr(not(privacy_filter_available), allow(dead_code))]
+pub(crate) fn sanitize_for_pf(text: &str) -> Cow<'_, str> {
+    if text.contains('\0') {
+        Cow::Owned(text.replace('\0', " "))
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
+/// Validate one classifier span against the text length. A span the
+/// classifier flagged is never dropped (a dropped span is a missed finding):
+/// anything unusable is an Err, which makes the whole classify call fail.
+/// `end` past `len` clamps to `len`, so the span still covers the tail.
+#[cfg_attr(not(privacy_filter_available), allow(dead_code))]
+pub(crate) fn validate_span(start: i32, end: i32, len: usize) -> Result<(usize, usize), String> {
+    if start < 0 || end < 0 {
+        return Err(format!(
+            "span has a negative offset (start={start}, end={end})"
+        ));
+    }
+    // Both non-negative i32: the casts are lossless.
+    let (start, end) = (start as usize, end as usize);
+    if end < start {
+        return Err(format!("span end {end} is before start {start}"));
+    }
+    if start > len {
+        return Err(format!("span start {start} is past text length {len}"));
+    }
+    if end > len {
+        log::warn!("privacy_filter: span end {end} past text length {len}, clamped");
+        return Ok((start, len));
+    }
+    Ok((start, end))
 }
 
 // ---------------------------------------------------------------------------
@@ -319,10 +397,14 @@ mod inner {
 
         // pf_classify does not require null termination (takes explicit len),
         // but CString is still used to satisfy *const c_char type. The byte
-        // slice length is passed separately.
-        let c_text =
-            CString::new(text).map_err(|e| format!("text contains interior null byte: {e}"))?;
-        let text_len = text.len();
+        // slice length is passed separately. NULs are swapped for spaces
+        // first (same byte length, so span offsets into `text` stay valid);
+        // CString::new cannot fail after that, but stays an Err, not an
+        // unwrap, so it could only ever fail closed.
+        let sanitized = super::sanitize_for_pf(text);
+        let c_text = CString::new(sanitized.as_ref())
+            .map_err(|e| format!("text contains interior null byte: {e}"))?;
+        let text_len = sanitized.len();
 
         let mut out_ptr: *mut PfEntity = std::ptr::null_mut();
         let mut n: libc::size_t = 0;
@@ -356,17 +438,32 @@ mod inner {
 
         // Decode all spans into owned Rust values before freeing the C buffer.
         // label pointers inside PfEntity are ctx-owned strings — copy them now.
-        let entities: Vec<PfEntityDecoded> = if out_ptr.is_null() || n == 0 {
-            Vec::new()
+        //
+        // A span validate_span rejects makes the WHOLE call an Err (never a
+        // skipped span: a flagged-and-dropped span is a missed finding). The
+        // Result is held, not returned, until the C buffer is freed below.
+        let decoded: Result<Vec<PfEntityDecoded>, String> = if out_ptr.is_null() {
+            if n == 0 {
+                Ok(Vec::new())
+            } else {
+                Err(format!("pf_classify returned a null array with n={n}"))
+            }
+        } else if n == 0 {
+            Ok(Vec::new())
         } else {
             // Safety: out_ptr is a valid array of n PfEntity values allocated
             // by pf_classify. Read before pf_entities_free.
             let slice = unsafe { std::slice::from_raw_parts(out_ptr, n) };
+            // span_text is cut from the ORIGINAL text, not the sanitised copy:
+            // offsets are identical, and span_text is documented (and consumed
+            // downstream) as the user's original text.
             let text_bytes = text.as_bytes();
 
             slice
                 .iter()
-                .map(|e| {
+                .map(|e| -> Result<PfEntityDecoded, String> {
+                    let (start, end) = super::validate_span(e.start, e.end, text_bytes.len())?;
+
                     let label = unsafe {
                         if e.label.is_null() {
                             String::new()
@@ -375,32 +472,29 @@ mod inner {
                         }
                     };
 
-                    // i32 offsets — clamp to valid byte range before slicing.
-                    let start = (e.start.max(0) as usize).min(text_bytes.len());
-                    let end = (e.end.max(0) as usize).min(text_bytes.len());
-
                     let span_text = String::from_utf8_lossy(&text_bytes[start..end]).into_owned();
 
-                    PfEntityDecoded {
-                        start_byte: e.start as usize,
-                        end_byte: e.end as usize,
+                    Ok(PfEntityDecoded {
+                        start_byte: start,
+                        end_byte: end,
                         score: e.score,
                         label,
                         span_text,
-                    }
+                    })
                 })
                 .collect()
         };
 
-        // Free the C-allocated array. pf_entities_free requires both pointer
-        // and count (matches pf.h signature).
+        // Free the C-allocated array on every path, including a rejected
+        // span. pf_entities_free requires both pointer and count (matches
+        // pf.h signature).
         if !out_ptr.is_null() {
             unsafe {
                 pf_entities_free(out_ptr, n);
             }
         }
 
-        Ok(entities)
+        decoded
     }
 } // end mod inner
 
@@ -487,6 +581,148 @@ mod tests {
         assert!(classify_result.is_err());
         let msg = classify_result.unwrap_err();
         assert!(msg.contains("not compiled in"), "unexpected error: {msg}");
+    }
+
+    fn ent() -> PfEntityDecoded {
+        PfEntityDecoded {
+            start_byte: 0,
+            end_byte: 1,
+            score: 0.9,
+            label: "private_person".to_owned(),
+            span_text: "A".to_owned(),
+        }
+    }
+
+    // -- sanitize_for_pf (items.id=613) --------------------------------------
+
+    #[test]
+    fn sanitize_for_pf_replaces_nul_and_preserves_length() {
+        let text = "a\0b\0";
+        let out = sanitize_for_pf(text);
+        assert_eq!(out, "a b ");
+        assert_eq!(out.len(), text.len());
+    }
+
+    #[test]
+    fn sanitize_for_pf_keeps_char_boundaries_with_multibyte_text() {
+        let text = "é\0日\0x";
+        let out = sanitize_for_pf(text);
+        assert_eq!(out.len(), text.len());
+        for i in 0..=text.len() {
+            assert_eq!(out.is_char_boundary(i), text.is_char_boundary(i), "at {i}");
+        }
+        assert!(!out.contains('\0'));
+    }
+
+    #[test]
+    fn sanitize_for_pf_borrows_when_there_is_no_nul() {
+        assert!(matches!(sanitize_for_pf("clean"), Cow::Borrowed("clean")));
+    }
+
+    // -- validate_span (items.id=613) ----------------------------------------
+
+    #[test]
+    fn validate_span_normal() {
+        assert_eq!(validate_span(2, 5, 10), Ok((2, 5)));
+        assert_eq!(validate_span(0, 10, 10), Ok((0, 10)));
+    }
+
+    #[test]
+    fn validate_span_empty_and_at_end_are_valid() {
+        assert_eq!(validate_span(4, 4, 10), Ok((4, 4)));
+        assert_eq!(validate_span(10, 10, 10), Ok((10, 10)));
+    }
+
+    #[test]
+    fn validate_span_negative_offsets_are_errors() {
+        assert!(validate_span(-1, 5, 10).is_err());
+        assert!(validate_span(2, -1, 10).is_err());
+        assert!(validate_span(i32::MIN, i32::MIN, 10).is_err());
+    }
+
+    #[test]
+    fn validate_span_end_before_start_is_an_error() {
+        assert!(validate_span(5, 4, 10).is_err());
+    }
+
+    #[test]
+    fn validate_span_start_past_text_is_an_error() {
+        assert!(validate_span(11, 12, 10).is_err());
+        assert!(validate_span(1, 5, 0).is_err() && validate_span(1, 1, 0).is_err());
+    }
+
+    #[test]
+    fn validate_span_end_past_text_clamps_to_len() {
+        assert_eq!(validate_span(7, 99, 10), Ok((7, 10)));
+        assert_eq!(validate_span(10, 99, 10), Ok((10, 10)));
+    }
+
+    #[test]
+    fn validate_span_error_text_carries_offsets_only() {
+        let msg = validate_span(5, 4, 10).unwrap_err();
+        assert!(msg.contains('5') && msg.contains('4'));
+    }
+
+    // -- classify_outcome (items.id=613) -------------------------------------
+
+    #[test]
+    fn classify_outcome_success_is_entities_not_failed() {
+        assert!(matches!(
+            classify_outcome(Ok(Ok(vec![]))),
+            PfOutcome::Entities(v) if v.is_empty()
+        ));
+        assert!(matches!(
+            classify_outcome(Ok(Ok(vec![ent()]))),
+            PfOutcome::Entities(v) if v.len() == 1
+        ));
+    }
+
+    #[test]
+    fn classify_outcome_classifier_error_is_failed() {
+        let out = classify_outcome(Ok(Err("Privacy Filter unavailable".to_owned())));
+        assert!(
+            matches!(out, PfOutcome::Failed { ref reason } if reason == "Privacy Filter unavailable")
+        );
+    }
+
+    #[test]
+    fn classify_outcome_poisoned_mutex_message_is_failed() {
+        let out = classify_outcome(Ok(Err(
+            "Privacy Filter mutex poisoned: poisoned lock: another task failed inside".to_owned(),
+        )));
+        assert!(matches!(out, PfOutcome::Failed { .. }));
+    }
+
+    #[test]
+    fn classify_outcome_nonzero_rc_message_is_failed() {
+        let out = classify_outcome(Ok(Err("pf_classify failed (rc=-1): bad model".to_owned())));
+        assert!(matches!(out, PfOutcome::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn classify_outcome_join_error_from_a_panicking_task_is_failed() {
+        let joined = tokio::task::spawn_blocking(|| -> Result<Vec<PfEntityDecoded>, String> {
+            panic!("simulated Privacy Filter panic")
+        })
+        .await;
+        assert!(joined.is_err(), "the task must really have panicked");
+        match classify_outcome(joined) {
+            PfOutcome::Failed { reason } => {
+                // The panic message itself is not carried into the reason.
+                assert!(!reason.contains("simulated"), "reason leaked: {reason}");
+            }
+            PfOutcome::Entities(_) => panic!("a panic must map to Failed"),
+        }
+    }
+
+    #[tokio::test]
+    async fn classify_outcome_cancelled_task_is_failed() {
+        let handle =
+            tokio::task::spawn(std::future::pending::<Result<Vec<PfEntityDecoded>, String>>());
+        handle.abort();
+        let joined = handle.await;
+        assert!(joined.is_err());
+        assert!(matches!(classify_outcome(joined), PfOutcome::Failed { .. }));
     }
 
     #[test]
