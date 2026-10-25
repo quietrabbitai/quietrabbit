@@ -4543,7 +4543,6 @@ mod tests {
 
     mod streaming {
         use super::*;
-        use crate::conductor::privacy::logger::{FailLogger, TestLogger};
         use crate::providers::loopback_test_server::StreamStep;
         use std::sync::Mutex;
         use tokio_util::sync::CancellationToken;

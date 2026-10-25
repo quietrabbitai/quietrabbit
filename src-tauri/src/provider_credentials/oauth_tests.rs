@@ -217,7 +217,7 @@ fn an_unsafe_or_unanchored_oauth_address_is_refused() {
     let host = o.trim_start_matches("https://").to_owned();
     let bad = [
         format!("http://{host}/api/v1/auth/keys"),
-        format!("https://other.example.test/api/v1/auth/keys"),
+        "https://other.example.test/api/v1/auth/keys".to_owned(),
         format!("https://{host}.evil.test/api/v1/auth/keys"),
         format!("https://user@{host}/api/v1/auth/keys"),
         format!("https://{host}:8443/api/v1/auth/keys"),

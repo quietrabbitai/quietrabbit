@@ -201,7 +201,7 @@ async fn run(
 }
 
 fn err_of(a: &crate::providers::hosted_stream::StreamAttempt) -> &ProviderError {
-    a.attempt.result.as_ref().err().expect("expected an error")
+    a.attempt.result.as_ref().expect_err("expected an error")
 }
 
 // ---------------------------------------------------------------------------

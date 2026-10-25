@@ -2194,8 +2194,7 @@ mod tests {
         let err =
             crate::persistence::integration_keys_store::open_integration_keys_db(&user_id, &hex)
                 .await
-                .err()
-                .expect("a stale epoch must refuse the open");
+                .expect_err("a stale epoch must refuse the open");
         assert!(
             matches!(
                 err,

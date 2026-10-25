@@ -97,7 +97,7 @@ fn error_text(e: &ProviderError) -> String {
 }
 
 fn plain_text(e: &ProviderError) -> String {
-    let plain = match e {
+    match e {
         ProviderError::MissingApiKey { plain_language, .. }
         | ProviderError::InvalidApiKey { plain_language, .. }
         | ProviderError::RateLimit { plain_language, .. }
@@ -114,8 +114,7 @@ fn plain_text(e: &ProviderError) -> String {
         | ProviderError::ProviderFailure { plain_language, .. }
         | ProviderError::UnknownProvider { plain_language, .. }
         | ProviderError::MissingQrHostedConfig { plain_language } => plain_language.clone(),
-    };
-    plain
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -319,7 +318,8 @@ async fn row_options_cannot_override_model_messages_or_stream() {
 
 #[tokio::test]
 async fn chat_status_codes_map_to_typed_errors_naming_the_row() {
-    let cases: Vec<(u16, fn(&ProviderError) -> bool)> = vec![
+    type Case = (u16, fn(&ProviderError) -> bool);
+    let cases: Vec<Case> = vec![
         (401, |e| matches!(e, ProviderError::InvalidApiKey { .. })),
         (403, |e| matches!(e, ProviderError::InvalidApiKey { .. })),
         (402, |e| matches!(e, ProviderError::PaymentRequired { .. })),

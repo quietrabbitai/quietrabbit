@@ -838,15 +838,16 @@ async fn preparing_is_reported_before_preflight_and_a_refusal_closes_it() {
         "{err:?}"
     );
 
-    let events = recorder.events.lock().unwrap();
-    let phases: Vec<Phase> = events.iter().map(|(e, _)| e.phase).collect();
-    assert_eq!(phases, vec![Phase::Preparing, Phase::NotStarted]);
-    for (e, rotating) in events.iter() {
-        assert_eq!((e.current, e.total), (None, None));
-        assert!(*rotating, "both are emitted with the flag held");
-        assert_eq!(e.rotation_id, events[0].0.rotation_id);
+    {
+        let events = recorder.events.lock().unwrap();
+        let phases: Vec<Phase> = events.iter().map(|(e, _)| e.phase).collect();
+        assert_eq!(phases, vec![Phase::Preparing, Phase::NotStarted]);
+        for (e, rotating) in events.iter() {
+            assert_eq!((e.current, e.total), (None, None));
+            assert!(*rotating, "both are emitted with the flag held");
+            assert_eq!(e.rotation_id, events[0].0.rotation_id);
+        }
     }
-    drop(events);
     assert!(
         user_store::get_key_wrapper_state(&fx.pool, USER)
             .await

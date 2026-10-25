@@ -4316,7 +4316,7 @@ mod tests {
         let r = parse_focus_text(&format!(
             "id: x\nsteps:\n  s:\n    prompt_template: {secret}\n    routing_tier: [oops\n"
         ));
-        let msg = r.err().expect("malformed").to_string();
+        let msg = r.expect_err("malformed").to_string();
         assert!(!msg.contains(secret), "{msg}");
     }
 

@@ -905,8 +905,8 @@ async fn write_floor_consent_preference(
 mod tests {
     use super::*;
     use crate::conductor::tokens::ExternalAccess;
-    use crate::persistence::{focus_settings_store, message_store};
-    use crate::test_support::{mock_app_with_registry, populate_registry, ENV_MUTEX};
+    use crate::persistence::focus_settings_store;
+    use crate::test_support::{mock_app_with_registry, ENV_MUTEX};
     use tauri::Manager;
 
     const USER_ID: &str = "user-consent-test";

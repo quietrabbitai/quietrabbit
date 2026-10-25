@@ -2496,14 +2496,15 @@ mod tests {
     async fn test_oauth_row_gains_exchange_url_and_key_check_path_after_shared_032() {
         let mut conn = make_test_conn().await;
         run_migrations(&mut conn, "shared", None).await.unwrap();
-        let rows: Vec<(
+        type Row = (
             String,
             Option<String>,
             Option<String>,
             Option<String>,
             Option<String>,
             Option<String>,
-        )> = sqlx::query_as(
+        );
+        let rows: Vec<Row> = sqlx::query_as(
             "SELECT id, json_extract(credential_acquisition, '$.method'), \
                         json_extract(credential_acquisition, '$.auth_url'), \
                         json_extract(credential_acquisition, '$.keys_page_url'), \

@@ -1890,7 +1890,7 @@ mod tests {
         tokio::time::sleep(FINISH_FIRST_CEILING - Duration::from_secs(1)).await;
         assert!(!again.is_finished(), "the ceiling restarted");
         drop(reply);
-        again.await.unwrap().unwrap();
+        let _guard = again.await.unwrap().unwrap();
     }
 
     #[tokio::test(start_paused = true)]

@@ -478,7 +478,7 @@ mod tests {
                 Reject::NotFound,
             ),
             (get(&format!("/Callback?{good_q}"), &host), Reject::NotFound),
-            (get(&format!("/favicon.ico"), &host), Reject::NotFound),
+            (get("/favicon.ico", &host), Reject::NotFound),
             // Host (DNS rebinding and wrong port)
             (
                 get(&format!("/callback?{good_q}"), "evil.example"),
