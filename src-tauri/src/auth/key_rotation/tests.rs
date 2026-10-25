@@ -2024,6 +2024,120 @@ async fn a_crash_after_the_first_resume_report_closes_nothing() {
     );
 }
 
+/// The counted `Resuming` report (the second one) of a resume, with the events
+/// that followed it.
+fn counted_resuming(recorder: &Recorder) -> (ProgressEvent, Vec<ProgressEvent>) {
+    let events: Vec<ProgressEvent> = recorder
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(e, _)| e.clone())
+        .collect();
+    assert_eq!(events[0].phase, Phase::Resuming);
+    assert_eq!(events[0].current, None, "the first report has no counts");
+    assert_eq!(events[1].phase, Phase::Resuming);
+    (events[1].clone(), events[2..].to_vec())
+}
+
+#[tokio::test]
+async fn a_partly_done_resume_reports_the_committed_bytes_not_zero() {
+    let fx = Fixture::new().await;
+    fx.rotate_with_fault(
+        FaultPoint::AfterItemCommitted(4),
+        Fixture::change_password(),
+    )
+    .await
+    .unwrap_err();
+    let (pending, new_dek, pk) = pending_with_new_key(&fx).await;
+    let items = user_store::list_rotation_items(&fx.pool, &pending.rotation_id)
+        .await
+        .unwrap();
+    let committed: u64 = items
+        .iter()
+        .filter(|i| i.state == RotationState::Committed)
+        .map(|i| i.bytes)
+        .sum();
+    let total: u64 = items.iter().map(|i| i.bytes).sum();
+    assert!(committed > 0 && committed < total, "setup: a partial run");
+
+    let recorder = Recorder::default();
+    let mut env = fx.env();
+    env.progress = &recorder;
+    resume_rotation(&env, &pending, new_dek, Credential::Password(&pk))
+        .await
+        .unwrap();
+
+    let (resuming, after) = counted_resuming(&recorder);
+    assert_eq!(resuming.current, Some(committed));
+    assert_eq!(resuming.total, Some(total));
+    // Continuous with the first item the resume re-keys: no step back or jump.
+    let first_rekeying = after
+        .iter()
+        .find(|e| e.phase == Phase::Rekeying)
+        .expect("the resume re-keys the remaining items");
+    assert_eq!(first_rekeying.current, Some(committed));
+    assert_eq!(
+        recorder.events.lock().unwrap().last().unwrap().0.phase,
+        Phase::Complete
+    );
+}
+
+#[tokio::test]
+async fn a_promoted_resume_reports_everything_done() {
+    let fx = Fixture::new().await;
+    fx.rotate_with_fault(FaultPoint::AfterPromote, Fixture::change_password())
+        .await
+        .unwrap_err();
+    let (pending, new_dek, pk) = pending_with_new_key(&fx).await;
+    assert_eq!(pending.state, RotationState::Verifying);
+
+    let recorder = Recorder::default();
+    let mut env = fx.env();
+    env.progress = &recorder;
+    resume_rotation(&env, &pending, new_dek, Credential::Password(&pk))
+        .await
+        .unwrap();
+
+    let (resuming, after) = counted_resuming(&recorder);
+    let total = resuming.total.expect("counted");
+    assert!(total > 0);
+    assert_eq!(resuming.current, Some(total));
+    let finishing = after.iter().find(|e| e.phase == Phase::Finishing).unwrap();
+    assert_eq!(finishing.current, resuming.current);
+}
+
+#[tokio::test]
+async fn a_resumed_rollback_reports_from_zero_like_the_rollback_it_runs() {
+    let fx = Fixture::new().await;
+    let mut env = fx.env();
+    env.faults = vec![
+        FaultPoint::FailAfterItemCommitted(6),
+        FaultPoint::RollbackAfterItem(8),
+    ];
+    run_rotation(&env, &fx.dek, 1, Fixture::change_password())
+        .await
+        .unwrap_err();
+    let (pending, new_dek, pk) = pending_with_new_key(&fx).await;
+    assert_eq!(pending.direction, RotationDirection::Rollback);
+
+    let recorder = Recorder::default();
+    let mut env = fx.env();
+    env.progress = &recorder;
+    let out = resume_rotation(&env, &pending, new_dek, Credential::Password(&pk))
+        .await
+        .unwrap();
+    assert!(matches!(out, ResumeOutcome::RolledBack));
+
+    let (resuming, after) = counted_resuming(&recorder);
+    assert_eq!(resuming.current, Some(0));
+    let first_rolling = after
+        .iter()
+        .find(|e| e.phase == Phase::RollingBack)
+        .expect("the rollback is reported");
+    assert_eq!(first_rolling.current, Some(0));
+}
+
 // ---------------------------------------------------------------------------
 // Retained blob versions and stale files
 // ---------------------------------------------------------------------------

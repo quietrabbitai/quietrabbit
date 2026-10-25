@@ -541,6 +541,16 @@ impl Run<'_> {
         });
     }
 
+    /// Bytes of the items already committed: what a forward run has done before
+    /// it starts, whether it is a fresh run or a resume.
+    fn committed_bytes(&self) -> u64 {
+        self.items
+            .iter()
+            .filter(|i| i.state == RotationState::Committed)
+            .map(|i| i.bytes)
+            .sum()
+    }
+
     /// Report that `item` is about to be re-keyed, `done` bytes of items being
     /// finished. An item that is one opaque step (see `is_opaque_step`) is
     /// reported WITHOUT byte counts: any percentage shown across it would be a
@@ -802,12 +812,7 @@ async fn drive_forward(run: &Run<'_>) -> Result<(), RotationError> {
     )
     .await?;
 
-    let mut done: u64 = run
-        .items
-        .iter()
-        .filter(|i| i.state == RotationState::Committed)
-        .map(|i| i.bytes)
-        .sum();
+    let mut done = run.committed_bytes();
     for (n, item) in run.items.iter().enumerate() {
         if item.state == RotationState::Committed {
             continue;
@@ -1781,7 +1786,15 @@ pub async fn resume_rotation(
         epoch_guard::begin_rotation(env.user_id).map_err(|_| RotationError::RotationInProgress)?;
     check_no_writers(env)?;
     let run = load_run_reported(env, pending, new_dek, Phase::Resuming).await?;
-    run.emit(Phase::Resuming, 0, None);
+    // A forward resume (a promoted one included: every item is committed) starts
+    // where drive_forward will, so the bar does not show 0% and then jump. A
+    // rollback walks every item again from 0, so 0 is what follows it.
+    let resumed_done = if pending.direction == RotationDirection::Rollback {
+        0
+    } else {
+        run.committed_bytes()
+    };
+    run.emit(Phase::Resuming, resumed_done, None);
 
     if pending.direction == RotationDirection::Rollback {
         return finish_rollback(&run, pending.last_error.as_deref().unwrap_or("cancelled")).await;

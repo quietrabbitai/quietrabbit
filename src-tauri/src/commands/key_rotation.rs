@@ -1022,6 +1022,11 @@ async fn restore_inner(
         // second step fails the account stays on the finished change's
         // password and the failure is reported.) No session is opened: the
         // user signs in with the new password (items.id=778).
+        // The overlay closes on the first rotation's Complete and reopens on
+        // the second's Preparing, a gap of one DB read (items.id=799). That is
+        // accepted: suppressing the Complete would leave the overlay up for
+        // good whenever the second step is refused before its first report
+        // (epoch changed, rotating flag taken, writers present).
         let outcome = key_rotation::run_rotation(
             &env,
             &finished.new_dek,
