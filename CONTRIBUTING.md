@@ -36,7 +36,7 @@ cd ../src-tauri && cargo tauri dev
 ```
 
 Before opening a pull request, all of these must pass from `src-tauri/`:
-`cargo build`, `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo deny check`, and `cargo test` (plain, not `--lib`).
+`cargo build`, `cargo fmt --check`, `cargo clippy --tests -- -D warnings`, `cargo deny check`, and `cargo test` (plain, not `--lib`).
 Frontend changes also need, from `frontend/`: `npm ci`, `npx tsc -b`, `npm test` and `npm run lint`.
 
 ## Terminology

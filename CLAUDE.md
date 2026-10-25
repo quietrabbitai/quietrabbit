@@ -92,7 +92,7 @@ but keep it in mind if you add other CWD-relative paths in this codebase.
 Key commands:
   cargo build                                          — compile check
   cargo fmt --check                                    — formatting (CI gate; fix with plain `cargo fmt` over the whole crate, never scoped to one file)
-  cargo clippy -- -D warnings                          — lint (CI gate)
+  cargo clippy --tests -- -D warnings                  — lint (CI gate)
   cargo deny check                                     — advisories/licenses/bans/sources (CI gate)
   cargo test 2>&1 | grep -E "^error|test result"      — test summary (PLAIN, never --lib: --lib skips the src-tauri/tests/ targets)
   git branch --show-current                            — verify branch (must show main)
