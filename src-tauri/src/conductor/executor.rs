@@ -100,6 +100,24 @@ use crate::spend::gate::{
 /// the number of retries by MAX_RETRIES.
 const RETRY_AFTER_CAP_SECS: u64 = 60;
 
+/// Backoff before a hosted retry that carries no Retry-After, or a shorter
+/// one (items.id=727): full jitter, a random wait in [0, min(cap, base x
+/// 2^attempt)], attempt counted from 0. With MAX_RETRIES = 3 the ceilings are
+/// 1 s, 2 s and 4 s, so the cap is not reached today; it keeps the bound
+/// stated if MAX_RETRIES is ever raised.
+const BACKOFF_BASE_MS: u64 = 1_000;
+
+/// The longest computed backoff before one hosted retry (items.id=727). A
+/// Retry-After is the floor of the wait (the wait is the larger of the two,
+/// never their sum), so one retry waits at most the larger of this and
+/// RETRY_AFTER_CAP_SECS, and a run of retries at most MAX_RETRIES times that.
+const BACKOFF_CAP_SECS: u64 = 30;
+
+/// The failure_mode of the hosted-provider class (failure.rs F10). A Retry
+/// result with this mode is a hosted call that failed; F1 (local Ollama) and
+/// F2 (quality) retries are not, and wait for nothing.
+const HOSTED_FAILURE_MODE: &str = "F10";
+
 /// Minimum personal field value length considered for word-boundary PII matching.
 /// Avoids false positives from short values like "OR", "CA", "I", "a".
 /// Python oracle: _VP_MIN_FIELD_LENGTH = 8
@@ -307,6 +325,8 @@ impl StepExecutor {
     /// Err(ConductorError) from execute_once() and are caught here, mapped to
     /// FailureResult via failure_handler.handle().
     /// await_floor_consent exits immediately — never retried.
+    /// The retry policy (stop check, hosted backoff, Retry-After) lives in
+    /// `retry_loop`.
     ///
     /// Python oracle: StepExecutor.execute()
     #[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
@@ -322,57 +342,19 @@ impl StepExecutor {
         app_handle: Option<&tauri::AppHandle<tauri::Wry>>,
         pool: &sqlx::SqlitePool,
     ) -> Option<FailureResult> {
-        let mut retry_count = 0u32;
-
-        loop {
-            match self
-                .execute_once(
-                    &ctx,
-                    retry_count,
-                    personal_track,
-                    task_track,
-                    shared_state,
-                    failure_handler,
-                    privacy_gateway,
-                    scheduler,
-                    app_handle,
-                    pool,
-                )
-                .await
-            {
-                // DisclosureLogWrite (F_SYSTEM) and VoiceProfileContamination (F4 subtype)
-                // propagate out of execute_once as Err(). Convert to FailureResult.
-                // Python oracle: except (DisclosureLogWriteError, VoiceProfileContaminationError)
-                Err(e) => {
-                    return Some(failure_handler.handle(
-                        &e,
-                        Some(&ctx.step.step_id),
-                        Some(&ctx.focus_id),
-                        retry_count,
-                    ));
-                }
-
-                Ok(None) => return None, // step succeeded
-
-                Ok(Some(result)) => {
-                    if result.action == FailureAction::AwaitFloorConsent {
-                        return Some(result); // never retried
-                    }
-                    if result.action == FailureAction::Retry && retry_count < MAX_RETRIES {
-                        // items.id=710: honor a provider's Retry-After. A wait
-                        // longer than the cap parks the run instead of
-                        // sleeping through it. The inference slot was
-                        // released before this point.
-                        if let Some(parked) = honor_retry_after(&result).await {
-                            return Some(parked);
-                        }
-                        retry_count += 1;
-                        continue;
-                    }
-                    return Some(result);
-                }
-            }
-        }
+        let mut attempt = RealAttempt {
+            executor: self,
+            ctx: &ctx,
+            personal_track,
+            task_track,
+            shared_state,
+            failure_handler,
+            privacy_gateway,
+            scheduler,
+            app_handle,
+            pool,
+        };
+        retry_loop(&mut attempt, &ctx, failure_handler, random_ms).await
     }
 
     // =========================================================================
@@ -1420,18 +1402,230 @@ fn retry_after_of(result: &FailureResult) -> Option<u64> {
         .and_then(|v| v.as_u64())
 }
 
+/// Sleep for `d` unless `stop` is tripped first (items.id=727). `true` = the
+/// whole wait passed; `false` = the run was stopped, before or during it. The
+/// select is biased so a token that is already tripped wins even for a zero
+/// delay. With no token it simply sleeps.
+async fn sleep_or_stop(
+    d: std::time::Duration,
+    stop: Option<&tokio_util::sync::CancellationToken>,
+) -> bool {
+    match stop {
+        Some(stop) => {
+            tokio::select! {
+                biased;
+                () = stop.cancelled() => false,
+                () = tokio::time::sleep(d) => true,
+            }
+        }
+        None => {
+            if !d.is_zero() {
+                tokio::time::sleep(d).await;
+            }
+            true
+        }
+    }
+}
+
 /// Wait out a provider's Retry-After before a retry (items.id=710). Returns
-/// `Some(parked)` - the run parks for the user, nothing is slept - when the
-/// provider asked for more than RETRY_AFTER_CAP_SECS; otherwise sleeps for the
-/// requested time (none when the result carries no Retry-After) and returns
-/// `None`, and the caller retries.
-async fn honor_retry_after(result: &FailureResult) -> Option<FailureResult> {
+/// `Some(result)` - do not retry, return this - when the provider asked for
+/// more than RETRY_AFTER_CAP_SECS (the run parks for the user, nothing is
+/// slept) or when `stop` was tripped during the wait (items.id=727; the last
+/// result is returned unchanged and the run's owner sees the stop and cancels
+/// the run). Otherwise sleeps for the requested time (none when the result
+/// carries no Retry-After) and returns `None`, and the caller retries.
+async fn honor_retry_after(
+    result: &FailureResult,
+    stop: Option<&tokio_util::sync::CancellationToken>,
+) -> Option<FailureResult> {
     let secs = retry_after_of(result)?;
     if secs > RETRY_AFTER_CAP_SECS {
         return Some(long_wait_result(result.clone(), secs));
     }
-    tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+    if !sleep_or_stop(std::time::Duration::from_secs(secs), stop).await {
+        return Some(result.clone());
+    }
     None
+}
+
+/// The ceiling of the jittered backoff before retry number `retry_count`
+/// (0-based): min(BACKOFF_CAP_SECS, BACKOFF_BASE_MS x 2^retry_count).
+fn backoff_ceiling(retry_count: u32) -> std::time::Duration {
+    let cap_ms = BACKOFF_CAP_SECS * 1_000;
+    let factor = 1u64.checked_shl(retry_count).unwrap_or(u64::MAX);
+    std::time::Duration::from_millis(BACKOFF_BASE_MS.saturating_mul(factor).min(cap_ms))
+}
+
+/// Full jitter: a wait in [0, ceiling]. `sample(max_ms)` returns a value in
+/// [0, max_ms] and is the only source of randomness, so tests can pin it; the
+/// result is clamped to the ceiling, so no sampler can exceed the cap.
+fn jittered(ceiling: std::time::Duration, sample: impl Fn(u64) -> u64) -> std::time::Duration {
+    let max_ms = u64::try_from(ceiling.as_millis()).unwrap_or(u64::MAX);
+    std::time::Duration::from_millis(sample(max_ms).min(max_ms))
+}
+
+/// The production jitter sampler: uniform in [0, max_ms] from the OS random
+/// source (the modulo bias is negligible at the <= 30 000 this is called
+/// with). If the source fails it returns `max_ms`, the deterministic ceiling,
+/// so a broken RNG delays a retry at most the cap and never skips or fails it.
+fn random_ms(max_ms: u64) -> u64 {
+    let mut bytes = [0u8; 8];
+    if let Err(e) = getrandom::fill(&mut bytes) {
+        log::warn!("executor: retry jitter source failed, using the ceiling: {e}");
+        return max_ms;
+    }
+    u64::from_le_bytes(bytes) % max_ms.saturating_add(1)
+}
+
+/// Whether a result is a hosted-provider call that failed and may be retried
+/// (the F10 class). Decided by the failure class, not by the step's external
+/// access ceiling: a step allowed to go external can still have run, and
+/// failed, on local Ollama.
+fn is_hosted_retry(result: &FailureResult) -> bool {
+    result.action == FailureAction::Retry
+        && result.failure_mode.as_deref() == Some(HOSTED_FAILURE_MODE)
+}
+
+/// The wait before retry number `retry_count` (0-based) of a failed step
+/// (items.id=727). Returns `Some(result)` - do not retry, return this - when
+/// the provider's Retry-After parks the run or the run was stopped during the
+/// wait; `None` = the wait is over, retry.
+///
+/// Only a hosted (F10) retry waits: the larger of a provider's Retry-After
+/// (the floor, itself bounded by RETRY_AFTER_CAP_SECS) and a jittered
+/// exponential backoff (bounded by BACKOFF_CAP_SECS). A local (F1/F2) retry
+/// waits for nothing, exactly as before. The caller holds no inference slot:
+/// execute_once released it before returning the failure.
+///
+/// Spend: the retry that follows re-runs the whole step, including the spend
+/// pre-flight, and counts as one more request (items.id=710). Nothing here
+/// changes that.
+async fn wait_before_retry(
+    result: &FailureResult,
+    retry_count: u32,
+    stop: Option<&tokio_util::sync::CancellationToken>,
+    sample: impl Fn(u64) -> u64,
+) -> Option<FailureResult> {
+    if !is_hosted_retry(result) {
+        return None;
+    }
+    if let Some(done) = honor_retry_after(result, stop).await {
+        return Some(done);
+    }
+    // The Retry-After (if any) has been slept; top the wait up to the backoff
+    // when that is longer, so the total is the larger of the two.
+    let slept = std::time::Duration::from_secs(retry_after_of(result).unwrap_or(0));
+    let backoff = jittered(backoff_ceiling(retry_count), sample);
+    if !sleep_or_stop(backoff.saturating_sub(slept), stop).await {
+        return Some(result.clone());
+    }
+    None
+}
+
+/// One attempt at a step, as the retry loop sees it. The real implementation
+/// runs `StepExecutor::execute_once`; a test supplies a scripted one so the
+/// loop's rules can be exercised without the 15-step sequence (items.id=727).
+/// The returned future must be Send: `StepExecutor::execute` is spawned.
+trait StepAttempt {
+    fn once(
+        &mut self,
+        retry_count: u32,
+    ) -> impl std::future::Future<Output = Result<Option<FailureResult>, ConductorError>> + Send;
+}
+
+/// The real attempt: the borrowed arguments of `StepExecutor::execute`.
+struct RealAttempt<'a, L: DisclosureLogger> {
+    executor: &'a StepExecutor,
+    ctx: &'a StepContext,
+    personal_track: &'a PersonalTrack,
+    task_track: &'a mut TaskTrack,
+    shared_state: &'a mut SharedStateTrack,
+    failure_handler: &'a FailureHandler,
+    privacy_gateway: &'a PrivacyGateway<L>,
+    scheduler: &'a Arc<ConductorScheduler>,
+    app_handle: Option<&'a tauri::AppHandle<tauri::Wry>>,
+    pool: &'a sqlx::SqlitePool,
+}
+
+impl<L: DisclosureLogger> StepAttempt for RealAttempt<'_, L> {
+    fn once(
+        &mut self,
+        retry_count: u32,
+    ) -> impl std::future::Future<Output = Result<Option<FailureResult>, ConductorError>> + Send
+    {
+        self.executor.execute_once(
+            self.ctx,
+            retry_count,
+            self.personal_track,
+            self.task_track,
+            self.shared_state,
+            self.failure_handler,
+            self.privacy_gateway,
+            self.scheduler,
+            self.app_handle,
+            self.pool,
+        )
+    }
+}
+
+/// The retry loop of `StepExecutor::execute`: run an attempt, and retry a
+/// Retry result up to MAX_RETRIES times.
+///
+/// Stop (items.id=727): if `ctx.stop` is tripped, a Retry result is returned
+/// as it is instead of calling the attempt again, for every failure class, and
+/// a hosted wait that the stop interrupts does the same. The run's owner
+/// (lifecycle) checks the token before it looks at any failure and cancels the
+/// run, so the model is never called after a cancel.
+async fn retry_loop<A: StepAttempt>(
+    attempt: &mut A,
+    ctx: &StepContext,
+    failure_handler: &FailureHandler,
+    sample: impl Fn(u64) -> u64,
+) -> Option<FailureResult> {
+    let mut retry_count = 0u32;
+
+    loop {
+        match attempt.once(retry_count).await {
+            // DisclosureLogWrite (F_SYSTEM) and VoiceProfileContamination (F4 subtype)
+            // propagate out of execute_once as Err(). Convert to FailureResult.
+            // Python oracle: except (DisclosureLogWriteError, VoiceProfileContaminationError)
+            Err(e) => {
+                return Some(failure_handler.handle(
+                    &e,
+                    Some(&ctx.step.step_id),
+                    Some(&ctx.focus_id),
+                    retry_count,
+                ));
+            }
+
+            Ok(None) => return None, // step succeeded
+
+            Ok(Some(result)) => {
+                if result.action == FailureAction::AwaitFloorConsent {
+                    return Some(result); // never retried
+                }
+                if result.action == FailureAction::Retry && retry_count < MAX_RETRIES {
+                    // items.id=727: a stopped run is not retried.
+                    if ctx.stop.as_ref().is_some_and(|s| s.is_cancelled()) {
+                        return Some(result);
+                    }
+                    // items.id=710/727: a hosted retry waits (Retry-After and
+                    // jittered backoff); a Retry-After over the cap parks the
+                    // run, and a stop during the wait ends it. The inference
+                    // slot was released before this point. Each retry re-runs
+                    // the spend pre-flight and counts as a request (items.id=710).
+                    if let Some(done) =
+                        wait_before_retry(&result, retry_count, ctx.stop.as_ref(), &sample).await
+                    {
+                        return Some(done);
+                    }
+                    retry_count += 1;
+                    continue;
+                }
+                return Some(result);
+            }
+        }
+    }
 }
 
 /// A rate limit asked for a wait longer than the cap: stop retrying and park
@@ -4496,30 +4690,34 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn retry_after_is_waited_out_before_the_retry() {
         let start = tokio::time::Instant::now();
-        assert!(honor_retry_after(&retry_result(Some(2))).await.is_none());
+        assert!(honor_retry_after(&retry_result(Some(2)), None)
+            .await
+            .is_none());
         assert_eq!(start.elapsed(), std::time::Duration::from_secs(2));
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_retry_with_no_retry_after_does_not_wait() {
         let start = tokio::time::Instant::now();
-        assert!(honor_retry_after(&retry_result(None)).await.is_none());
+        assert!(honor_retry_after(&retry_result(None), None).await.is_none());
         assert_eq!(start.elapsed(), std::time::Duration::ZERO);
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_wait_at_the_cap_is_slept_and_one_past_it_parks() {
         let start = tokio::time::Instant::now();
-        assert!(honor_retry_after(&retry_result(Some(RETRY_AFTER_CAP_SECS)))
-            .await
-            .is_none());
+        assert!(
+            honor_retry_after(&retry_result(Some(RETRY_AFTER_CAP_SECS)), None)
+                .await
+                .is_none()
+        );
         assert_eq!(
             start.elapsed(),
             std::time::Duration::from_secs(RETRY_AFTER_CAP_SECS)
         );
 
         let start = tokio::time::Instant::now();
-        let parked = honor_retry_after(&retry_result(Some(RETRY_AFTER_CAP_SECS + 1)))
+        let parked = honor_retry_after(&retry_result(Some(RETRY_AFTER_CAP_SECS + 1)), None)
             .await
             .expect("a long wait parks the run");
         assert_eq!(start.elapsed(), std::time::Duration::ZERO, "nothing slept");
@@ -4535,6 +4733,439 @@ mod tests {
     #[test]
     fn the_total_retry_wait_is_bounded() {
         assert!(u64::from(MAX_RETRIES) * RETRY_AFTER_CAP_SECS <= 300);
+    }
+
+    // -- Hosted backoff and cancellation (items.id=727) --------------------
+
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    fn with_mode(mut r: FailureResult, mode: &str) -> FailureResult {
+        r.failure_mode = Some(mode.to_owned());
+        r
+    }
+
+    /// A hosted (F10) Retry result carrying `secs` as its Retry-After, if any.
+    fn hosted_retry(secs: Option<u64>) -> FailureResult {
+        with_mode(retry_result(secs), "F10")
+    }
+
+    /// A local-Ollama (F1) Retry result: no metadata.
+    fn local_retry() -> FailureResult {
+        with_mode(retry_result(None), "F1")
+    }
+
+    /// The backoff total is bounded too: the wait before one retry is the
+    /// larger of the two caps (a Retry-After floor and a computed backoff are
+    /// never added), a run of retries at most MAX_RETRIES times that.
+    #[test]
+    fn the_total_backoff_wait_is_bounded() {
+        assert!(u64::from(MAX_RETRIES) * BACKOFF_CAP_SECS <= 300);
+        let per_retry = RETRY_AFTER_CAP_SECS.max(BACKOFF_CAP_SECS);
+        assert!(u64::from(MAX_RETRIES) * per_retry <= 300);
+        // And the computed ceilings really are under the cap, whatever the attempt.
+        for n in 0..200 {
+            assert!(backoff_ceiling(n) <= Duration::from_secs(BACKOFF_CAP_SECS));
+        }
+    }
+
+    #[test]
+    fn the_backoff_ceiling_doubles_per_attempt_and_stops_at_the_cap() {
+        let ms = |n| backoff_ceiling(n).as_millis();
+        assert_eq!(
+            [ms(0), ms(1), ms(2), ms(3), ms(4)],
+            [1_000, 2_000, 4_000, 8_000, 16_000]
+        );
+        assert_eq!(ms(5), 30_000, "32 s is clamped to the cap");
+        assert_eq!(ms(6), 30_000);
+        assert_eq!(ms(63), 30_000, "the largest shift does not overflow");
+        assert_eq!(ms(64), 30_000, "a shift past the width does not overflow");
+        assert_eq!(ms(u32::MAX), 30_000);
+    }
+
+    #[test]
+    fn jitter_stays_inside_zero_and_the_ceiling() {
+        let c = Duration::from_millis(4_000);
+        assert_eq!(jittered(c, |_| 0), Duration::ZERO);
+        assert_eq!(jittered(c, |m| m), c);
+        assert_eq!(jittered(c, |m| m / 2), Duration::from_millis(2_000));
+        // The sampler is told the ceiling in ms ...
+        assert_eq!(
+            jittered(c, |m| if m == 4_000 { 7 } else { 9_999 }),
+            Duration::from_millis(7)
+        );
+        // ... and a misbehaving one cannot exceed it.
+        assert_eq!(jittered(c, |_| u64::MAX), c);
+    }
+
+    #[test]
+    fn the_production_sampler_stays_inside_its_bound() {
+        for max in [0u64, 1, 999, 30_000] {
+            for _ in 0..200 {
+                assert!(random_ms(max) <= max);
+            }
+        }
+        assert_eq!(random_ms(0), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hosted_retry_with_no_retry_after_waits_a_jittered_backoff_that_grows() {
+        let mut waits = Vec::new();
+        for attempt in 0..MAX_RETRIES {
+            let start = tokio::time::Instant::now();
+            let r = wait_before_retry(&hosted_retry(None), attempt, None, |m| m / 2).await;
+            assert!(r.is_none(), "a plain backoff ends in a retry");
+            waits.push(start.elapsed());
+        }
+        assert_eq!(
+            waits,
+            [
+                Duration::from_millis(500),
+                Duration::from_millis(1_000),
+                Duration::from_millis(2_000)
+            ]
+        );
+        // Jitter off the bottom of the range: no wait at all.
+        let start = tokio::time::Instant::now();
+        assert!(wait_before_retry(&hosted_retry(None), 2, None, |_| 0)
+            .await
+            .is_none());
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hosted_timeout_and_a_429_without_retry_after_both_back_off() {
+        // Same F10 Retry shape either way (failure.rs gives both metadata None).
+        for secs in [None, None] {
+            let start = tokio::time::Instant::now();
+            assert!(wait_before_retry(&hosted_retry(secs), 1, None, |m| m)
+                .await
+                .is_none());
+            assert_eq!(start.elapsed(), Duration::from_secs(2));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_after_is_the_floor_of_the_wait() {
+        // Retry-After longer than the backoff: exactly the Retry-After.
+        let start = tokio::time::Instant::now();
+        assert!(wait_before_retry(&hosted_retry(Some(5)), 0, None, |m| m)
+            .await
+            .is_none());
+        assert_eq!(start.elapsed(), Duration::from_secs(5));
+
+        // Backoff longer than the Retry-After: the backoff, not the sum.
+        let start = tokio::time::Instant::now();
+        assert!(wait_before_retry(&hosted_retry(Some(1)), 2, None, |m| m)
+            .await
+            .is_none());
+        assert_eq!(start.elapsed(), Duration::from_secs(4));
+
+        // Jitter at zero: the Retry-After alone.
+        let start = tokio::time::Instant::now();
+        assert!(wait_before_retry(&hosted_retry(Some(3)), 2, None, |_| 0)
+            .await
+            .is_none());
+        assert_eq!(start.elapsed(), Duration::from_secs(3));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_after_over_the_cap_still_parks_and_waits_for_nothing() {
+        let start = tokio::time::Instant::now();
+        let parked = wait_before_retry(
+            &hosted_retry(Some(RETRY_AFTER_CAP_SECS + 1)),
+            0,
+            None,
+            |m| m,
+        )
+        .await
+        .expect("parks");
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        assert_eq!(parked.action, FailureAction::AwaitUser);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_local_retry_waits_for_nothing_and_ignores_the_stop() {
+        let stop = CancellationToken::new();
+        stop.cancel();
+        for mode in ["F1", "F2"] {
+            let start = tokio::time::Instant::now();
+            let r = with_mode(local_retry(), mode);
+            assert!(wait_before_retry(&r, 2, Some(&stop), |m| m).await.is_none());
+            assert_eq!(start.elapsed(), Duration::ZERO);
+        }
+        // Unchanged: a non-Retry result is not a hosted retry either.
+        let mut r = hosted_retry(None);
+        r.action = FailureAction::AwaitUser;
+        assert!(!is_hosted_retry(&r));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_during_a_backoff_wait_ends_it_at_once_without_a_retry() {
+        let stop = CancellationToken::new();
+        let start = tokio::time::Instant::now();
+        let last = hosted_retry(None);
+        let (r, ()) = tokio::join!(
+            wait_before_retry(&last, 2, Some(&stop), |m| m), // would wait 4 s
+            async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                stop.cancel();
+            }
+        );
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_millis(100),
+            "ended promptly"
+        );
+        let r = r.expect("a stopped wait is not a retry");
+        assert_eq!(r.action, FailureAction::Retry, "the last result, unchanged");
+        assert_eq!(r.failure_mode, last.failure_mode);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_during_a_retry_after_wait_ends_it_at_once_without_a_retry() {
+        let stop = CancellationToken::new();
+        let start = tokio::time::Instant::now();
+        let last = hosted_retry(Some(30));
+        let (r, ()) = tokio::join!(wait_before_retry(&last, 0, Some(&stop), |m| m), async {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            stop.cancel();
+        });
+        assert_eq!(start.elapsed(), Duration::from_millis(250));
+        assert_eq!(r.expect("stopped").action, FailureAction::Retry);
+
+        // honor_retry_after on its own does the same.
+        let stop = CancellationToken::new();
+        let start = tokio::time::Instant::now();
+        let (r, ()) = tokio::join!(honor_retry_after(&last, Some(&stop)), async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            stop.cancel();
+        });
+        assert_eq!(start.elapsed(), Duration::from_millis(10));
+        assert!(r.is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_already_stopped_run_does_not_wait_even_for_a_zero_delay() {
+        let stop = CancellationToken::new();
+        stop.cancel();
+        let start = tokio::time::Instant::now();
+        // Backoff sampled to zero, no Retry-After: nothing to sleep, still stops.
+        assert!(
+            wait_before_retry(&hosted_retry(None), 0, Some(&stop), |_| 0)
+                .await
+                .is_some()
+        );
+        assert!(
+            wait_before_retry(&hosted_retry(Some(0)), 0, Some(&stop), |_| 0)
+                .await
+                .is_some()
+        );
+        assert!(!sleep_or_stop(Duration::ZERO, Some(&stop)).await);
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    // -- The retry loop, against a scripted attempt ------------------------
+
+    /// Plays a script of attempt outcomes and records the retry_count of each
+    /// call. With a scheduler it also takes and gives back the inference slot
+    /// inside each attempt, the way execute_once does.
+    struct Scripted {
+        script: std::collections::VecDeque<Result<Option<FailureResult>, ConductorError>>,
+        seen: Vec<u32>,
+        scheduler: Option<Arc<ConductorScheduler>>,
+    }
+
+    impl Scripted {
+        fn new(script: Vec<Result<Option<FailureResult>, ConductorError>>) -> Self {
+            Self {
+                script: script.into(),
+                seen: Vec::new(),
+                scheduler: None,
+            }
+        }
+    }
+
+    impl StepAttempt for Scripted {
+        fn once(
+            &mut self,
+            retry_count: u32,
+        ) -> impl std::future::Future<Output = Result<Option<FailureResult>, ConductorError>> + Send
+        {
+            self.seen.push(retry_count);
+            let next = self.script.pop_front().expect("the script ran out");
+            let scheduler = self.scheduler.clone();
+            async move {
+                if let Some(s) = scheduler {
+                    assert!(
+                        s.acquire_inference_slot("run-1", PathPriority::Interactive)
+                            .await,
+                        "the slot must be free at the start of every attempt"
+                    );
+                    s.release_inference_slot("run-1");
+                }
+                next
+            }
+        }
+    }
+
+    fn loop_ctx(stop: Option<CancellationToken>) -> StepContext {
+        StepContext {
+            stop,
+            ..hosted_ctx(RunAttendance::Attended, "00")
+        }
+    }
+
+    fn handler() -> FailureHandler {
+        FailureHandler::new(ExternalAccess::AnonymousRequired)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_loop_retries_with_a_growing_backoff_up_to_max_retries_then_returns_the_last() {
+        let mut a = Scripted::new(
+            (0..=MAX_RETRIES)
+                .map(|_| Ok(Some(hosted_retry(None))))
+                .collect(),
+        );
+        let start = tokio::time::Instant::now();
+        let r = retry_loop(&mut a, &loop_ctx(None), &handler(), |m| m).await;
+        assert_eq!(a.seen, [0, 1, 2, 3], "one attempt plus MAX_RETRIES retries");
+        assert_eq!(r.expect("exhausted").action, FailureAction::Retry);
+        // Ceilings 1 s + 2 s + 4 s with the sampler at its maximum.
+        assert_eq!(start.elapsed(), Duration::from_secs(7));
+        assert!(start.elapsed() <= Duration::from_secs(u64::from(MAX_RETRIES) * 60));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_loop_returns_success_after_a_retry() {
+        let mut a = Scripted::new(vec![Ok(Some(hosted_retry(Some(2)))), Ok(None)]);
+        let start = tokio::time::Instant::now();
+        let r = retry_loop(&mut a, &loop_ctx(None), &handler(), |_| 0).await;
+        assert!(r.is_none());
+        assert_eq!(a.seen, [0, 1]);
+        assert_eq!(start.elapsed(), Duration::from_secs(2), "the Retry-After");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_local_retry_in_the_loop_is_immediate_as_before() {
+        let mut a = Scripted::new(vec![Ok(Some(local_retry())), Ok(None)]);
+        let start = tokio::time::Instant::now();
+        assert!(retry_loop(&mut a, &loop_ctx(None), &handler(), |m| m)
+            .await
+            .is_none());
+        assert_eq!(a.seen, [0, 1]);
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_during_a_hosted_wait_means_no_further_attempt() {
+        let stop = CancellationToken::new();
+        let mut a = Scripted::new(vec![Ok(Some(hosted_retry(None))), Ok(None)]);
+        let ctx = loop_ctx(Some(stop.clone()));
+        let h = handler();
+        let start = tokio::time::Instant::now();
+        let (r, ()) = tokio::join!(retry_loop(&mut a, &ctx, &h, |m| m), async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            stop.cancel();
+        });
+        assert_eq!(a.seen, [0], "the model is not called again after the stop");
+        assert_eq!(r.expect("the last result").action, FailureAction::Retry);
+        assert_eq!(start.elapsed(), Duration::from_millis(300));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_during_a_retry_after_wait_means_no_further_attempt() {
+        let stop = CancellationToken::new();
+        let mut a = Scripted::new(vec![Ok(Some(hosted_retry(Some(45)))), Ok(None)]);
+        let ctx = loop_ctx(Some(stop.clone()));
+        let h = handler();
+        let start = tokio::time::Instant::now();
+        let (r, ()) = tokio::join!(retry_loop(&mut a, &ctx, &h, |m| m), async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            stop.cancel();
+        });
+        assert_eq!(a.seen, [0]);
+        assert!(r.is_some());
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+    }
+
+    /// Every class: a tripped token stops a retry before any call or wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_tripped_stop_prevents_any_retry_of_any_class() {
+        for first in [local_retry(), hosted_retry(None), hosted_retry(Some(5))] {
+            let stop = CancellationToken::new();
+            stop.cancel();
+            let mut a = Scripted::new(vec![Ok(Some(first.clone())), Ok(None)]);
+            let start = tokio::time::Instant::now();
+            let r = retry_loop(&mut a, &loop_ctx(Some(stop)), &handler(), |m| m).await;
+            assert_eq!(a.seen, [0]);
+            let r = r.expect("the last result");
+            assert_eq!(r.action, first.action);
+            assert_eq!(r.failure_mode, first.failure_mode);
+            assert_eq!(start.elapsed(), Duration::ZERO);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_floor_consent_wait_and_a_non_retry_failure_are_returned_untouched() {
+        for action in [FailureAction::AwaitFloorConsent, FailureAction::AwaitUser] {
+            let mut r = hosted_retry(None);
+            r.action = action.clone();
+            let mut a = Scripted::new(vec![Ok(Some(r))]);
+            let out = retry_loop(&mut a, &loop_ctx(None), &handler(), |m| m).await;
+            assert_eq!(out.expect("returned").action, action);
+            assert_eq!(a.seen, [0]);
+        }
+    }
+
+    /// The wait runs between attempts, outside the inference slot. The scripted
+    /// attempt takes and gives back the real scheduler's slot as execute_once
+    /// does; while the loop sits in its backoff, another run must be able to
+    /// take the slot at once.
+    #[tokio::test(start_paused = true)]
+    async fn the_inference_slot_is_free_during_the_wait() {
+        let scheduler = Arc::new(ConductorScheduler::new());
+        let mut a = Scripted::new(vec![Ok(Some(hosted_retry(Some(3)))), Ok(None)]);
+        a.scheduler = Some(scheduler.clone());
+        let ctx = loop_ctx(None);
+        let h = handler();
+        let probe_sched = scheduler.clone();
+        let (r, probed) = tokio::join!(retry_loop(&mut a, &ctx, &h, |m| m), async move {
+            tokio::time::sleep(Duration::from_secs(1)).await; // inside the 3 s wait
+            let got = tokio::time::timeout(
+                Duration::from_millis(1),
+                probe_sched.acquire_inference_slot("other", PathPriority::Interactive),
+            )
+            .await;
+            probe_sched.release_inference_slot("other");
+            got
+        });
+        assert!(r.is_none());
+        assert_eq!(probed, Ok(true), "another run takes the slot mid-wait");
+        assert_eq!(a.seen, [0, 1], "and the retry's own acquire succeeded");
+    }
+
+    /// execute_once has no unit harness, so the placement of the wait is also
+    /// pinned by a source scan: the loop never touches the slot, and the wait
+    /// comes after the attempt returns; the one acquire is in execute_once and
+    /// is released on the stop path and the normal path.
+    #[test]
+    fn the_wait_sits_between_attempts_and_never_takes_the_slot() {
+        let src = include_str!("executor.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("test module marker")];
+        let start = prod.find("async fn retry_loop<").expect("retry_loop");
+        let body = &prod[start..start + prod[start..].find("\n}\n").expect("end")];
+        assert!(
+            !body.contains("inference_slot"),
+            "the loop never holds the slot"
+        );
+        let attempt = body.find("attempt.once(").expect("the attempt call");
+        let wait = body.find("wait_before_retry(").expect("the wait call");
+        assert!(attempt < wait, "the wait follows the attempt");
+        assert_eq!(prod.matches("acquire_inference_slot(").count(), 1);
+        assert_eq!(prod.matches("release_inference_slot(").count(), 2);
+        let acquire = prod.find("acquire_inference_slot(").unwrap();
+        assert!(acquire > prod.find("async fn execute_once").unwrap());
     }
 
     // -----------------------------------------------------------------------
