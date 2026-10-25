@@ -128,6 +128,8 @@ pub fn derive_password_key(
     iterations: u32,
     parallelism: u32,
 ) -> Result<[u8; MASTER_KEY_LEN], AuthError> {
+    #[cfg(test)]
+    derive_threads::record();
     let params = Params::new(memory_kib, iterations, parallelism, Some(MASTER_KEY_LEN))
         .map_err(|e| AuthError::Derivation(e.to_string()))?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
@@ -160,6 +162,28 @@ pub async fn derive_password_key_blocking(
     })
     .await
     .map_err(|e| AuthError::Derivation(format!("key derivation task failed: {e}")))?
+}
+
+/// Test probe (items.id=639): the threads derive_password_key has run on. A
+/// current_thread test that drives a command to completion asserts its own
+/// thread is absent, which holds only if every derivation hopped to the
+/// blocking pool. Thread ids are unique, so parallel tests cannot disturb it.
+/// Kept below the production code: writer_gate's spawn-site scan reads a file
+/// only up to its first inline test module.
+#[cfg(test)]
+pub(crate) mod derive_threads {
+    use std::sync::Mutex;
+    use std::thread::{current, ThreadId};
+
+    static SEEN: Mutex<Vec<ThreadId>> = Mutex::new(Vec::new());
+
+    pub(super) fn record() {
+        SEEN.lock().unwrap().push(current().id());
+    }
+
+    pub(crate) fn ran_on_current_thread() -> bool {
+        SEEN.lock().unwrap().contains(&current().id())
+    }
 }
 
 #[cfg(test)]

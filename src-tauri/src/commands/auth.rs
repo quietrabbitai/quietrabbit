@@ -55,6 +55,8 @@
 // how auth_failures is treated as data worth keeping rather than
 // discarding.
 
+use std::sync::OnceLock;
+
 use tauri::State;
 
 use crate::auth::data_key::{self, DataKeyError};
@@ -156,6 +158,67 @@ pub(crate) async fn record_failed_attempt(
 }
 
 // ---------------------------------------------------------------------------
+// Password-key derivation for login (items.id=639)
+// ---------------------------------------------------------------------------
+
+/// Argon2id cost parameters, as stored per account in user_salts.
+#[derive(Clone, Copy)]
+struct KdfCost {
+    memory_kib: u32,
+    iterations: u32,
+    parallelism: u32,
+}
+
+impl KdfCost {
+    /// What a new account is written with, and what the unknown-name dummy
+    /// derivation costs.
+    const DEFAULT: KdfCost = KdfCost {
+        memory_kib: kdf::DEFAULT_ARGON2_MEMORY_KIB,
+        iterations: kdf::DEFAULT_ARGON2_ITERATIONS,
+        parallelism: kdf::DEFAULT_ARGON2_PARALLELISM,
+    };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// derive_candidate calls made on this thread. Per-thread so parallel
+    /// tests cannot disturb each other's count.
+    static DERIVE_CANDIDATE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The one place login derives a password key: the bootstrap, the known-account
+/// and the unknown-name paths all come through here, so each costs exactly one
+/// Argon2 derivation by construction, and always on the blocking pool.
+async fn derive_candidate(
+    password: &str,
+    salt: &[u8],
+    cost: KdfCost,
+) -> Result<zeroize::Zeroizing<[u8; kdf::MASTER_KEY_LEN]>, String> {
+    #[cfg(test)]
+    DERIVE_CANDIDATE_CALLS.with(|c| c.set(c.get() + 1));
+    kdf::derive_password_key_blocking(
+        password.as_bytes(),
+        salt,
+        cost.memory_kib,
+        cost.iterations,
+        cost.parallelism,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// A random salt for the unknown-name derivation, generated on first use and
+/// kept for the life of the process. Never stored.
+fn dummy_salt() -> Result<&'static [u8; kdf::SALT_LEN], String> {
+    static DUMMY_SALT: OnceLock<[u8; kdf::SALT_LEN]> = OnceLock::new();
+    if let Some(salt) = DUMMY_SALT.get() {
+        return Ok(salt);
+    }
+    let fresh = kdf::generate_salt().map_err(|e| e.to_string())?;
+    Ok(DUMMY_SALT.get_or_init(|| fresh))
+}
+
+// ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
 
@@ -187,16 +250,7 @@ pub async fn login(
         // recovery public key, and the PK is dropped (zeroized) as soon as
         // the wrap exists.
         let material = {
-            let password_key = zeroize::Zeroizing::new(
-                kdf::derive_password_key(
-                    password.as_bytes(),
-                    &salt,
-                    kdf::DEFAULT_ARGON2_MEMORY_KIB,
-                    kdf::DEFAULT_ARGON2_ITERATIONS,
-                    kdf::DEFAULT_ARGON2_PARALLELISM,
-                )
-                .map_err(|e| e.to_string())?,
-            );
+            let password_key = derive_candidate(&password, &salt, KdfCost::DEFAULT).await?;
             data_key::create_account_key_material(&user_id, &password_key)
                 .map_err(|e| e.to_string())?
         };
@@ -262,12 +316,23 @@ pub async fn login(
         )
         .await
     } else {
-        let user = user_store::find_user_by_display_name(&pool, &display_name)
+        let Some(user) = user_store::find_user_by_display_name(&pool, &display_name)
             .await
             .map_err(|e| e.to_string())?
-            // Same error message as a wrong password below -- do not
-            // reveal whether the display_name itself exists.
-            .ok_or_else(|| "invalid credentials".to_owned())?;
+        else {
+            // Same error message AND the same Argon2 work as a wrong password
+            // below -- neither the message nor the timing reveals whether the
+            // display_name exists (items.id=639). The key is discarded.
+            //
+            // <<< SEAM (items.id=632): lockout for names with no account goes
+            // here, after the derivation and before the return -- the
+            // is_locked_out check, then record_failed_attempt, so an unknown
+            // name is counted and locked exactly like a known one. >>>
+            derive_candidate(&password, dummy_salt()?, KdfCost::DEFAULT)
+                .await
+                .ok();
+            return Err("invalid credentials".to_owned());
+        };
 
         if is_locked_out(&pool, &display_name).await? {
             return Err("account locked, try again later".to_owned());
@@ -315,10 +380,16 @@ pub async fn login(
             .await;
         }
 
-        let password_key = zeroize::Zeroizing::new(
-            kdf::derive_password_key(password.as_bytes(), &salt, mem, iter, par)
-                .map_err(|e| e.to_string())?,
-        );
+        let password_key = derive_candidate(
+            &password,
+            &salt,
+            KdfCost {
+                memory_kib: mem,
+                iterations: iter,
+                parallelism: par,
+            },
+        )
+        .await?;
 
         match data_key::unwrap_dek(
             &password_key,
@@ -1374,6 +1445,67 @@ mod tests {
         )
         .await;
         assert_eq!(result, Err("invalid credentials".to_owned()));
+    }
+
+    fn derive_candidate_calls() -> usize {
+        DERIVE_CANDIDATE_CALLS.with(|c| c.get())
+    }
+
+    /// items.id=639: an unknown display name and a wrong password each cost
+    /// exactly one derivation. Counts calls, not time (timing is flaky in CI).
+    #[tokio::test]
+    async fn unknown_name_and_wrong_password_each_derive_exactly_once() {
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+
+        let before = derive_candidate_calls();
+        do_login(&app, "Alice", "correct-password").await.unwrap();
+        assert_eq!(
+            derive_candidate_calls() - before,
+            1,
+            "bootstrap derives once"
+        );
+        app.state::<KeyRegistry>().clear().await;
+
+        let before = derive_candidate_calls();
+        let unknown = do_login(&app, "Nobody", "whatever").await;
+        assert_eq!(unknown, Err("invalid credentials".to_owned()));
+        assert_eq!(
+            derive_candidate_calls() - before,
+            1,
+            "an unknown name derives exactly once"
+        );
+
+        let before = derive_candidate_calls();
+        let wrong = do_login(&app, "Alice", "wrong-password").await;
+        assert_eq!(
+            wrong, unknown,
+            "same error for an unknown name and a wrong password"
+        );
+        assert_eq!(
+            derive_candidate_calls() - before,
+            1,
+            "a wrong password derives exactly once"
+        );
+    }
+
+    /// items.id=639: on a current_thread runtime the test's own thread is the
+    /// one running the login future, so an inline derivation would record that
+    /// thread. None of bootstrap, known and unknown logins may.
+    #[tokio::test(flavor = "current_thread")]
+    async fn login_derives_off_the_runtime_thread() {
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+
+        do_login(&app, "Alice", "correct-password").await.unwrap();
+        app.state::<KeyRegistry>().clear().await;
+        let _ = do_login(&app, "Alice", "wrong-password").await;
+        let _ = do_login(&app, "Nobody", "whatever").await;
+
+        assert!(
+            !kdf::derive_threads::ran_on_current_thread(),
+            "a login derivation ran inline on the runtime thread"
+        );
     }
 
     #[tokio::test]
