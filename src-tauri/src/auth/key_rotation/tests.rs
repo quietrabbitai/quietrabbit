@@ -2107,9 +2107,10 @@ async fn a_promoted_resume_reports_everything_done() {
     assert_eq!(finishing.current, resuming.current);
 }
 
-#[tokio::test]
-async fn a_resumed_rollback_reports_from_zero_like_the_rollback_it_runs() {
-    let fx = Fixture::new().await;
+/// An automatic rollback that dies after undoing item 8 (and every later one):
+/// the pending rotation is left in the rollback direction, with those items in
+/// state `RolledBack`.
+async fn crash_a_rollback_part_way(fx: &Fixture) {
     let mut env = fx.env();
     env.faults = vec![
         FaultPoint::FailAfterItemCommitted(6),
@@ -2118,8 +2119,102 @@ async fn a_resumed_rollback_reports_from_zero_like_the_rollback_it_runs() {
     run_rotation(&env, &fx.dek, 1, Fixture::change_password())
         .await
         .unwrap_err();
+}
+
+/// The `RollingBack` events that followed the counted `Resuming` report, as
+/// their byte counts.
+fn rolling_back_counts(after: &[ProgressEvent]) -> Vec<u64> {
+    after
+        .iter()
+        .filter(|e| e.phase == Phase::RollingBack)
+        .map(|e| e.current.expect("counted"))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_resumed_rollback_starts_at_the_rolled_back_bytes_and_reaches_the_total() {
+    let fx = Fixture::new().await;
+    crash_a_rollback_part_way(&fx).await;
     let (pending, new_dek, pk) = pending_with_new_key(&fx).await;
     assert_eq!(pending.direction, RotationDirection::Rollback);
+    let items = user_store::list_rotation_items(&fx.pool, &pending.rotation_id)
+        .await
+        .unwrap();
+    let rolled_back: u64 = items
+        .iter()
+        .filter(|i| i.state == RotationState::RolledBack)
+        .map(|i| i.bytes)
+        .sum();
+    let total: u64 = items.iter().map(|i| i.bytes).sum();
+    let left = items
+        .iter()
+        .filter(|i| i.state != RotationState::RolledBack)
+        .count();
+    assert!(
+        rolled_back > 0 && rolled_back < total,
+        "setup: a partial rollback"
+    );
+
+    let recorder = Recorder::default();
+    let mut env = fx.env();
+    env.progress = &recorder;
+    let out = resume_rotation(&env, &pending, new_dek, Credential::Password(&pk))
+        .await
+        .unwrap();
+    assert!(matches!(out, ResumeOutcome::RolledBack));
+
+    let (resuming, after) = counted_resuming(&recorder);
+    assert_eq!(resuming.current, Some(rolled_back));
+    assert_eq!(resuming.total, Some(total));
+    let counts = rolling_back_counts(&after);
+    assert_eq!(
+        counts.len(),
+        left,
+        "only the items not yet undone are walked"
+    );
+    assert_eq!(
+        counts.first(),
+        resuming.current.as_ref(),
+        "continuous with the report before it"
+    );
+    assert!(counts.windows(2).all(|w| w[0] <= w[1]), "{counts:?}");
+    // The walk goes newest first, so the last item it reports is the lowest
+    // one not yet undone; undoing it fills the bar.
+    let last_bytes = items
+        .iter()
+        .find(|i| i.state != RotationState::RolledBack)
+        .unwrap()
+        .bytes;
+    assert_eq!(counts.last().unwrap() + last_bytes, total);
+    assert_eq!(
+        recorder.events.lock().unwrap().last().unwrap().0.phase,
+        Phase::RolledBack
+    );
+    assert_rolled_back(&fx).await;
+}
+
+#[tokio::test]
+async fn a_resumed_rollback_with_nothing_rolled_back_starts_at_zero() {
+    let fx = Fixture::new().await;
+    crash_a_rollback_part_way(&fx).await;
+    let (pending, new_dek, pk) = pending_with_new_key(&fx).await;
+    // The rollback direction is recorded but no item is marked undone yet. The
+    // files that were undone stay on the old key, which the walk tolerates.
+    let items = user_store::list_rotation_items(&fx.pool, &pending.rotation_id)
+        .await
+        .unwrap();
+    for item in &items {
+        user_store::set_rotation_item_state(
+            &fx.pool,
+            &pending.rotation_id,
+            &item.rel_path,
+            RotationState::Committed,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    let total: u64 = items.iter().map(|i| i.bytes).sum();
 
     let recorder = Recorder::default();
     let mut env = fx.env();
@@ -2131,11 +2226,62 @@ async fn a_resumed_rollback_reports_from_zero_like_the_rollback_it_runs() {
 
     let (resuming, after) = counted_resuming(&recorder);
     assert_eq!(resuming.current, Some(0));
-    let first_rolling = after
+    let counts = rolling_back_counts(&after);
+    assert_eq!(counts.len(), items.len(), "every item is walked");
+    assert_eq!(counts.first(), Some(&0));
+    assert_eq!(counts.last().unwrap() + items[0].bytes, total);
+    assert_rolled_back(&fx).await;
+}
+
+#[tokio::test]
+async fn a_resumed_rollback_walks_a_failed_item_though_others_are_rolled_back() {
+    let fx = Fixture::new().await;
+    crash_a_rollback_part_way(&fx).await;
+    let (pending, new_dek, pk) = pending_with_new_key(&fx).await;
+    let items = user_store::list_rotation_items(&fx.pool, &pending.rotation_id)
+        .await
+        .unwrap();
+    let rolled_back = items
         .iter()
-        .find(|e| e.phase == Phase::RollingBack)
-        .expect("the rollback is reported");
-    assert_eq!(first_rolling.current, Some(0));
+        .filter(|i| i.state == RotationState::RolledBack)
+        .count();
+    let failed = items
+        .iter()
+        .rev()
+        .find(|i| i.state == RotationState::RolledBack)
+        .expect("setup: some items are rolled back");
+    user_store::set_rotation_item_state(
+        &fx.pool,
+        &pending.rotation_id,
+        &failed.rel_path,
+        RotationState::Failed,
+        Some("boom"),
+    )
+    .await
+    .unwrap();
+
+    let recorder = Recorder::default();
+    let mut env = fx.env();
+    env.progress = &recorder;
+    let out = resume_rotation(&env, &pending, new_dek, Credential::Password(&pk))
+        .await
+        .unwrap();
+    assert!(matches!(out, ResumeOutcome::RolledBack));
+
+    let (resuming, after) = counted_resuming(&recorder);
+    let counts = rolling_back_counts(&after);
+    assert_eq!(
+        counts.len(),
+        items.len() - (rolled_back - 1),
+        "the failed item is walked with the ones never undone"
+    );
+    let skipped: u64 = items
+        .iter()
+        .filter(|i| i.state == RotationState::RolledBack && i.rel_path != failed.rel_path)
+        .map(|i| i.bytes)
+        .sum();
+    assert_eq!(resuming.current, Some(skipped));
+    assert_rolled_back(&fx).await;
 }
 
 // ---------------------------------------------------------------------------

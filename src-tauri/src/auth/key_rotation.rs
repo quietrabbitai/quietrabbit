@@ -541,12 +541,13 @@ impl Run<'_> {
         });
     }
 
-    /// Bytes of the items already committed: what a forward run has done before
-    /// it starts, whether it is a fresh run or a resume.
-    fn committed_bytes(&self) -> u64 {
+    /// Bytes of the items in `state`: what a run has done before it starts,
+    /// whether it is a fresh run or a resume (`Committed` for a forward run,
+    /// `RolledBack` for a rollback).
+    fn bytes_in_state(&self, state: RotationState) -> u64 {
         self.items
             .iter()
-            .filter(|i| i.state == RotationState::Committed)
+            .filter(|i| i.state == state)
             .map(|i| i.bytes)
             .sum()
     }
@@ -812,7 +813,7 @@ async fn drive_forward(run: &Run<'_>) -> Result<(), RotationError> {
     )
     .await?;
 
-    let mut done = run.committed_bytes();
+    let mut done = run.bytes_in_state(RotationState::Committed);
     for (n, item) in run.items.iter().enumerate() {
         if item.state == RotationState::Committed {
             continue;
@@ -919,9 +920,16 @@ async fn roll_back(run: &Run<'_>, cause: &str) -> Result<(), RotationError> {
     )
     .await?;
 
-    let mut done: u64 = 0;
+    // Items a previous (interrupted) rollback already undid are skipped and
+    // counted as done up front, so a resumed bar starts where that one stopped.
+    // `RolledBack` is only written after the move succeeded; any other state,
+    // `Failed` included, is walked again.
+    let mut done = run.bytes_in_state(RotationState::RolledBack);
     // Newest first: the reverse of the order they were moved.
     for (n, item) in run.items.iter().enumerate().rev() {
+        if item.state == RotationState::RolledBack {
+            continue;
+        }
         run.emit_item(Phase::RollingBack, done, item);
         let moved = move_item_with_retry(
             run,
@@ -1786,13 +1794,13 @@ pub async fn resume_rotation(
         epoch_guard::begin_rotation(env.user_id).map_err(|_| RotationError::RotationInProgress)?;
     check_no_writers(env)?;
     let run = load_run_reported(env, pending, new_dek, Phase::Resuming).await?;
-    // A forward resume (a promoted one included: every item is committed) starts
-    // where drive_forward will, so the bar does not show 0% and then jump. A
-    // rollback walks every item again from 0, so 0 is what follows it.
+    // A resume starts where the run it continues will (a promoted forward one
+    // included: every item is committed), so the bar does not show 0% and then
+    // jump. A rollback starts at the bytes it already undid.
     let resumed_done = if pending.direction == RotationDirection::Rollback {
-        0
+        run.bytes_in_state(RotationState::RolledBack)
     } else {
-        run.committed_bytes()
+        run.bytes_in_state(RotationState::Committed)
     };
     run.emit(Phase::Resuming, resumed_done, None);
 
