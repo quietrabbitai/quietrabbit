@@ -46,7 +46,16 @@
 // credential proved right. Cancel never signs in: the account is back on the OLD
 // key and the user signs in with the old password. The old password typed here is
 // simply wrong (login's uncounted "old password" answer would make cancel an
-// oracle for it). Equal timing across these cases is items.id=639's.
+// oracle for it).
+//
+// TIMING (items.id=807): login's unknown-name path does one Argon2 derivation
+// like a wrong password (items.id=639). Here no Argon2 is involved for either
+// phrase credential (HKDF + X25519 only), so unknown name and wrong words differ
+// by a few SQLite reads and one failure INSERT, milliseconds. For cancel with a
+// PASSWORD the only derivation is a known account WITH a pending rotation
+// (unlock_staged); an unknown name and a known account with nothing pending are
+// both fast and look the same. That one slow case is deliberately left (the
+// call site in cancel_pending says why).
 //
 // NEW-PHRASE ORDER (decided with the plan, differs from AUTH 4.0's listing):
 // the new words are generated and SHOWN first (begin), the user re-enters
@@ -959,7 +968,12 @@ async fn restore_inner(
     // so an unknown account cannot be told apart by it.
     let entropy = data_key::entropy_from_mnemonic(&normalise_phrase(&phrase))
         .map_err(|_| KeyRotationError::PhraseInvalid)?;
-    // Unknown account and wrong words must look the same.
+    // Unknown account and wrong words must look the same. No Argon2 on either
+    // side here, so the gap is milliseconds (items.id=807).
+    //
+    // <<< SEAM (items.id=632): lockout for names with no account goes here,
+    // before the return -- is_locked_out, then record_failed_attempt, so an
+    // unknown name is counted and locked exactly like a known one. >>>
     let user = user_store::find_user_by_display_name(pool, &display_name)
         .await
         .map_err(|e| internal("user", e))?
@@ -1107,6 +1121,17 @@ async fn cancel_pending(
     with: CancelWith<'_>,
 ) -> Result<(), KeyRotationError> {
     // Unknown account and wrong credential must look the same.
+    //
+    // No derivation for an unknown name, on purpose (items.id=807). The only
+    // Argon2 in cancel is unlock_staged's Password arm, reached only by a known
+    // account with a pending rotation; a known account with nothing pending
+    // (below) is as fast as an unknown name, so an unknown name matches the
+    // common known case. Deriving here would not hide the slow case anyway:
+    // login's pending-rotation path shows the same "mid-rotation" state.
+    //
+    // <<< SEAM (items.id=632): lockout for names with no account goes here,
+    // before the return -- is_locked_out, then record_failed_attempt, so an
+    // unknown name is counted and locked exactly like a known one. >>>
     let user = user_store::find_user_by_display_name(pool, display_name)
         .await
         .map_err(|e| internal("user", e))?
