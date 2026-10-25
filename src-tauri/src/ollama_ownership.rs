@@ -397,6 +397,30 @@ mod tests {
         cmd.spawn().expect("failed to spawn test `sh` process")
     }
 
+    /// A stand-in process that stays alive until it is killed (or the
+    /// returned `Child`'s stdin is closed): one `sh` blocked in the `read`
+    /// builtin on a stdin pipe the `Child` keeps open. Joins process group
+    /// `group` (`0` starts a new group, a positive pgid joins that one).
+    /// Not `sleep N`: a fixed lifetime lets the process exit on its own when
+    /// a run on a contended core outlasts it, and then it reads as killed.
+    /// And not `exec <program>`: `spawn()` returns only after the child has
+    /// exec'd the `sh` image (std waits on the exec pipe), `process_group`
+    /// is applied before that exec, and the `read` builtin never execs
+    /// again, so the pid is a group member with its final image the moment
+    /// this returns -- nothing for a test to wait for.
+    fn spawn_blocked_sh(group: libc::pid_t, extra_env: &[(&str, &str)]) -> Child {
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("read _").stdin(Stdio::piped());
+        cmd.process_group(group);
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        cmd.spawn().expect("failed to spawn test `sh` process")
+    }
+
     /// `kill_process_group`'s job ends at signaling -- reaping is the
     /// actual parent's responsibility, which in production is never this
     /// process for a genuine orphan (whatever adopted it, e.g. systemd,
@@ -554,40 +578,25 @@ mod tests {
     /// that whole group; only the individually-proven-QR member(s).
     #[tokio::test]
     async fn group_kill_spares_an_unrelated_process_sharing_the_group() {
-        use std::os::unix::process::CommandExt;
-
         let models_dir = Path::new("/tmp/quietrabbit-ownership-test-mixed-group");
 
-        // `exec sleep 20`, not a bare `sleep 20`: on some shells/platforms
-        // (confirmed live on the CI runner, not reproduced locally) `sh -c
-        // "sleep 20"` does NOT tail-exec-optimize away the `sh` process --
-        // `sleep` runs as `sh`'s child instead, so each spawn below would
-        // silently become two group members instead of one and the
-        // precondition assertion undercounted the real group. `exec`
-        // forces the replacement explicitly, portably, so each spawn here
-        // is provably exactly one process.
+        // Each stand-in is exactly one process (`spawn_blocked_sh` -- a lone
+        // `sh -c "sleep 20"` is two on shells that don't tail-exec, which
+        // undercounted the group on the CI runner) and lives until killed.
         //
         // The group LEADER is the "shell" -- unrelated, no OLLAMA_MODELS --
         // matching the real pre-fix shape where the launching shell/
         // cargo-tauri was the leader and `ollama serve` just a member.
-        let mut leader = Command::new("sh");
-        leader.arg("-c").arg("exec sleep 20");
-        leader.process_group(0);
-        let mut leader = leader.spawn().expect("failed to spawn test leader");
+        let mut leader = spawn_blocked_sh(0, &[]);
         let leader_pid = leader.id();
         let pgid = current_pgid(Pid::from_u32(leader_pid)).expect("leader must have a pgid");
 
         // The "orphan" -- provably QR's own -- joins that same group
-        // directly (`process_group(pgid)` with a positive value means
-        // "join this existing group", not "start a new one").
-        let mut orphan = Command::new("sh");
-        orphan.arg("-c").arg("exec sleep 20");
-        orphan.env("OLLAMA_MODELS", models_dir);
-        orphan.process_group(pgid);
-        let mut orphan = orphan.spawn().expect("failed to spawn test orphan");
+        // directly (a positive group means "join this existing group", not
+        // "start a new one").
+        let mut orphan = spawn_blocked_sh(pgid, &[("OLLAMA_MODELS", models_dir.to_str().unwrap())]);
         let orphan_pid = orphan.id();
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
         let sys = fresh_sys();
         // Membership, not an exact count: robust against any other
         // incidental member the shell/OS happens to add, while still
@@ -789,8 +798,6 @@ mod tests {
     /// tauri`), and a provably-QR, orphaned member shares that same group.
     #[tokio::test]
     async fn reclaim_through_mixed_group_spares_the_unrelated_leader() {
-        use std::os::unix::process::CommandExt;
-
         // ENV_MUTEX + an isolated QR_DATA_ROOT -- see
         // reclaim_leaves_a_live_qr_sibling_untouched's own comment above.
         let _lock = crate::test_support::ENV_MUTEX.lock().await;
@@ -800,21 +807,12 @@ mod tests {
 
         let models_dir = Path::new("/tmp/quietrabbit-ownership-test-reclaim-mixed-group");
 
-        let mut leader = Command::new("sh");
-        leader.arg("-c").arg("sleep 20");
-        leader.process_group(0);
-        let mut leader = leader.spawn().expect("failed to spawn test leader");
+        let mut leader = spawn_blocked_sh(0, &[]);
         let leader_pid = leader.id();
         let pgid = current_pgid(Pid::from_u32(leader_pid)).expect("leader must have a pgid");
 
-        let mut orphan = Command::new("sh");
-        orphan.arg("-c").arg("sleep 20");
-        orphan.env("OLLAMA_MODELS", models_dir);
-        orphan.process_group(pgid);
-        let mut orphan = orphan.spawn().expect("failed to spawn test orphan");
+        let mut orphan = spawn_blocked_sh(pgid, &[("OLLAMA_MODELS", models_dir.to_str().unwrap())]);
         let orphan_pid = orphan.id();
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
 
         // Not QR's own exe -- this test process is the orphan's real
         // parent, so is_orphaned is true via the "not qr_exe_path" branch;
