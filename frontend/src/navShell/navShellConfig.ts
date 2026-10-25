@@ -26,7 +26,9 @@
 // renamed 'history' rail (displayed as "Library" now; the DockRailId value
 // itself stays 'history', see HistoryScreen.tsx's own header comment for
 // why the internal identifier wasn't renamed too). Current shape: 4 peer
-// rails (Board/Chat+Cloud Chat/Library[='history']).
+// rails (DockRailId: board/chat/cloudChat/history, Library = 'history'); chat
+// and cloudChat share one dock region, so three regions render
+// (Board/Chat+Cloud Chat/Library).
 //
 // What got deleted, not just left unwired, and why: FixedButtonId,
 // FIXED_BUTTON_ORDER, TopLevel, TemporaryCrumb, chain,

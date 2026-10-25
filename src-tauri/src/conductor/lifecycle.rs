@@ -6811,9 +6811,9 @@ mod tests {
         }
     }
 
-    /// Full completion proof, requiring a real local Ollama instance
-    /// (127.0.0.1:11434 or the Garuda dev address -- see CLAUDE.md) to
-    /// actually answer the "quick_response" model call once the gate lets
+    /// Full completion proof, requiring a real Ollama instance at
+    /// OllamaClient's default address (127.0.0.1:21434, QR's own sidecar
+    /// port) to actually answer the "quick_response" model call once the gate lets
     /// step_a through. #[ignore]d for the same reason providers::
     /// ocr_eval's live eval tests are: plain `cargo test` (the CI gate)
     /// must not depend on an external service. Run manually with

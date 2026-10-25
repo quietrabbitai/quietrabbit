@@ -8,6 +8,9 @@
 
 Phase 1 is in active development. The installer is not yet available.
 
+Quiet Rabbit works on Linux only for now. Windows and macOS are planned for the first
+release but do not work yet.
+
 This guide will be updated with full installation instructions when Phase 1 is ready.
 Watch this repo or check https://quietrabbit.ai for updates.
 
@@ -30,31 +33,31 @@ Quiet Rabbit will:
 - Run fully on your own hardware — no data leaves your machine by default
 
 **Requirements (coming Phase 1):**
-- Windows, macOS, or Linux (x86_64)
+- Linux (x86_64) for now; Windows and macOS are planned for the first release but do not work yet
 - 8GB RAM minimum (16GB recommended)
-- GPU optional — NVIDIA and AMD supported, CPU fallback always available
+- GPU optional — NVIDIA and AMD GPUs are detected and used only where Ollama itself supports
+  the card (some AMD cards are not); otherwise Quiet Rabbit runs on the CPU
 - ~10GB disk space for models and data
 
 ---
 
 ## Privacy Model
 
-Quiet Rabbit uses a tiered routing system:
+Quiet Rabbit routes work by how far it leaves your device, and you choose at every step:
 
 - **Tier 1 — Local Ollama:** runs on your hardware, fully private; set a Focus's ceiling to "Local only" to keep it here
-- **Tier 1.5 — Faster hosted inference (opt-in):** same open-source model class as Tier 1, run on
-  faster hosted hardware (e.g. Groq) when your own hardware is the bottleneck. Requires an
-  account, so it's not anonymous — never automatic, never default, always your explicit choice
-  per task.
-- **Tier 2 — Private cloud review (split-screen):** an anonymous, no-retention alternative to
-  Tier 3. Quiet Rabbit prepares your context; you paste it into a provider that doesn't require
-  sign-in (e.g. Duck.ai) and paste the response back. Stronger models than Tier 1.5,
-  no account needed.
-- **Tier 3 — Full cloud service:** Claude, ChatGPT, or Gemini for final validation. Quiet Rabbit
-  generates a chat starter from your history, and you paste it in through a split-screen view —
-  always optional, always explicit. A direct in-app API round-trip (skipping the copy/paste step)
-  was evaluated and found technically workable, but doesn't yet have a clear case for this
-  release — it's parked as a possible future paid option, not part of Phase 1.
+- **Tier 1.5 — Faster hosted inference (opt-in):** the same class of open-weight model as
+  Tier 1, run on a hosted provider's faster hardware when your own is the bottleneck. You pick
+  the provider from a curated list that discloses what each one keeps and trains on. Requires an
+  account, so it's not anonymous — never automatic, never default, always your explicit choice.
+- **Cloud Chat, anonymous (split-screen):** an alternative that needs no sign-in (Duck.ai
+  today). Quiet Rabbit prepares your context; you paste it in and paste the response back.
+  Stronger models than Tier 1.5, no account needed.
+- **Cloud Chat, with your own account (split-screen):** Claude, ChatGPT, or Gemini for final
+  validation. Quiet Rabbit generates a chat starter from your history, and you paste it in
+  through a split-screen view — always optional, always explicit. A direct in-app connection to
+  a hosted provider you choose (API Chat) is planned for the first release and will also be
+  opt-in.
 
 For a sensitive Focus, set its ceiling (Maximum permitted tier) to "Local only" and Quiet Rabbit runs its AI steps for it on your machine.
 Every external service interaction asks before acting.

@@ -6,7 +6,8 @@ Quiet Rabbit is a self-hosted personal AI platform that keeps every part of your
 exactly where it belongs — organized into separate Personas, each with its own Focuses,
 memory, privacy settings, and team of AI Guides. Each Persona stays completely separate.
 
-It runs on your own hardware. Installs with one command. Gets smarter the more you use it.
+It runs on your own hardware and will install like any other desktop app, with no Docker
+and no server setup. Gets smarter the more you use it.
 And it never needs you to become an AI expert to get value from it.
 
 ---
@@ -46,8 +47,10 @@ Guide knows your voice.
 injected automatically so you never have to repeat yourself. Stays on your device. Never
 shared across Personas. Never exported without your permission.
 
-**Quick Ask** is an ephemeral single-session interaction — no memory, no tracking, just an
-answer. Start a Quick Ask, or create a Topic to track it.
+**Chat** is where you talk to Quiet Rabbit. Each chat belongs to one Persona and is filed
+into History once its first reply is saved; starting a new chat never deletes the old one.
+**Cloud Chat** is a split-screen view for taking a question to an outside service such as
+Duck.ai, Claude, ChatGPT or Gemini; Quiet Rabbit asks before anything leaves your device.
 
 ---
 
@@ -63,11 +66,14 @@ are not shared.
 *The installer is not yet available. Phase 1 is in active development — watch
 this repo or https://quietrabbit.ai for updates.*
 
+Quiet Rabbit works on Linux only for now. Windows and macOS are planned for the first
+release but do not work yet.
+
 ---
 
 ## Built-in Focuses
 
-Quiet Rabbit ships with a set of built-in Focuses covering everyday pursuits — writing, research, cooking, travel, reading, and more. Each one runs structured, context-aware workflows that improve the more you use them.
+Quiet Rabbit is designed to ship with a small core set of Focuses, writing first, with more you can switch on. Each one runs structured, context-aware workflows that improve the more you use them.
 
 The full Focus list will be published when the first release is ready.
 
@@ -76,9 +82,9 @@ The full Focus list will be published when the first release is ready.
 ## Privacy Model
 
 - **Local inference by default** — Ollama runs on your hardware, bundled in the install
-- **Tiered routing, your choice at every step** — local Ollama is the default; faster hosted
-  inference and private split-screen cloud review are opt-in, never automatic; full cloud
-  service is always optional and explicit
+- **Your choice at every step** — on-device processing is the default; faster hosted
+  inference and Cloud Chat (a split-screen view for outside services) are opt-in, never
+  automatic
 - **You set the ceiling for each Focus** — set a Focus to "Local only" and Quiet Rabbit runs its AI steps on your own hardware
 - **No telemetry** — Quiet Rabbit never sends usage data anywhere
 - **Transparent always** — every action that touches external services asks first
@@ -109,7 +115,7 @@ See LICENSE for full terms.
 ## Status
 
 Phase 1 in active development — desktop app (Tauri/Rust), native Ollama integration,
-full Focus library.
+Focus library.
 
 Not ready for public use yet. Watch this repo for updates.
 

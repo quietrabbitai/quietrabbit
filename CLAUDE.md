@@ -1,8 +1,8 @@
 # Quiet Rabbit — Claude Code Context
-# Last updated: September 23, 2026 (Chat-PM staleness sweep -- Naming
-# Architecture term map corrected: Plan->Topic and Task->Action rows added,
-# "all migrations applied" framing fixed (Task->Action never propagated to
-# code -- see below). Sections not touched this pass were not re-verified.)
+# Last updated: October 25, 2026 (items.id=653 docs pass -- Ollama and Dev
+# Environment per decisions.id=840 and 863, version, R1 Focuses, tier
+# vocabulary, key-hierarchy wording, Rust names for Python-era rules, cites.
+# Sections not touched this pass were not re-verified.)
 
 ## Session Discipline
 - Respond with code only. No preamble, no recap, no explanation unless asked.
@@ -15,7 +15,7 @@
 - One task at a time. Draft → Jason approves → write file. Never skip approval.
 
 ## Project
-Self-hosted privacy-first AI platform. Engine: Conductor. Version: 0.2.
+Self-hosted privacy-first AI platform. Engine: Conductor. Version: 0.1.0 (src-tauri/tauri.conf.json and Cargo.toml).
 Tagline: "Your personal AI. Built to grow, always yours."
 
 ## Architecture Reference
@@ -42,14 +42,22 @@ resolve, rather than guessing or inventing.
   Linked via libsqlite3-sys feature flag. PRAGMA key fires before journal_mode
   via SqliteConnectOptions::pragma() insertion order — enforced in every opener.
   Never use sqlx::query!() macros — no static DATABASE_URL in many-small-encrypted-DB topology.
-- Master key never persisted: keys live only in Rust AppState/KeyRegistry for the
-  duration of the session. Never written to disk, never in IPC responses.
-- Tier 1.5 = user choice among the curated hosted providers, which are rows in the providers table (decisions.id=872, 875) --
-  fast hosted inference, same capability class as local Tier 1, non-anonymous.
-  Honest trade-off framing. No prescribed default. (decisions.id=665/727 --
-  both providers moved off "Tier 2" once that label was clarified as
-  split-screen-only; Tier 2 itself is Duck.ai/Brave Leo, anonymous,
-  no-retention, not yet shipped.)
+- Data key: never written in the clear to the app's databases or files, and never
+  in IPC responses. It lives in Rust AppState/KeyRegistry for the duration of the
+  session. At rest it exists only as the password wrap and the recovery seal in
+  shared.db (decisions.id=893, AUTH_MULTIUSER_ARCHITECTURE.md Section 4.0); if the
+  optional OS-keychain convenience entry is ever enabled, Section 2.2 governs it
+  and it is replaced at every rotation.
+- Tier vocabulary (decisions.id=811, 818): code and decisions say qr_local,
+  qr_hosted (the old Tier 1.5), cloud_anonymous (old Tier 2) and cloud_frontier
+  (old Tier 3); users see "Cloud Chat". qr_hosted = user opt-in to a hosted
+  provider running the same class of model as qr_local, for speed;
+  non-anonymous. Hosted providers are curated rows in the providers table with
+  disclosed attributes (training, retention, anonymity, jurisdiction, cost);
+  warn and allow, never block; no provider or model is named in code and none
+  is a default or silently routed to (decisions.id=872, 875). cloud_anonymous:
+  Duck.ai is the only entry (items.id=194; Brave Leo has no standalone launch
+  URL, so it is not currently possible -- src-tauri/schema/shared_001.sql).
 - Silent operator: personal context informs output, never narrated.
   Never "Since you mentioned..." or "Based on your preference..."
 - Human in the loop: all auto-improvements require explicit approval.
@@ -59,11 +67,15 @@ resolve, rather than guessing or inventing.
 Repo root:
   /home/kulaga/QuietRabbit/06_GitRepos/quietrabbit-core/
 
-NAS path (Garuda only — Proxmox/LXC retired):
+NAS path (Garuda only; the share is served by the Proxmox host over NFS and
+mounted at /mnt/NAS -- the LXC and Docker stack are retired):
   /mnt/NAS/QuietRabbitMirror/
 
 Services:
-  Ollama API:  http://192.168.88.238:11434  (Garuda, ethernet)
+  Ollama: QR starts its own sidecar on 127.0.0.1:21434 (see "Ollama" below).
+  Never point QR at another Ollama. Use localhost, never a LAN address
+  (DHCP-assigned, changes). Manual experiments against some other Ollama are
+  run by hand and are never configured into QR.
 
 Rust dev runs locally on Garuda via cargo.
 Docker and the LXC container are retired — do not reference them.
@@ -99,19 +111,45 @@ The Rust toolchain is pinned (rust-toolchain.toml at repo root, version
 matched in the CI workflow's Install Rust step) rather than left on
 `stable` -- an unpinned `dtolnay/rust-toolchain@stable` install can pick
 up a newer clippy than the one a local gate run just passed against and
-fail CI on lints that never fired locally (items.id=587, 2026-10-03: a
+fail CI on lints that never fired locally (commit dbae287, 2026-10-03,
+closed under items.id=586: a
 `double_must_use` lint against `#[async_trait]`-generated methods, new
 or tightened on a newer stable, failed CI on pre-existing code the same
 day a local `cargo clippy -- -D warnings` run passed clean). Bump the
 version in both places together, deliberately, and re-run the full local
 gate above (including clippy -D warnings) before pushing a bump.
 
-## Ollama (D6-353)
-QR checks for a running Ollama instance at 127.0.0.1:11434 on startup.
-If found, uses it. If not, starts the bundled Ollama sidecar.
-No duplicate model downloads. No contention between instances.
-Dev: Ollama runs on Garuda at http://192.168.88.238:11434 — already running, always detected.
-127.0.0.1:11434 also works locally (system Ollama, always detected first).
+Dev-only paths must be flagged in a comment where added and tracked for
+removal before release: find_focus_file's compile-time CARGO_MANIFEST_DIR path
+(items.id=617), the privacy-filter model at
+~/.local/share/quietrabbit/models/privacy-filter-q8.gguf (items.id=678, the
+first-login download), and the debug-only PATH lookup of `ollama`
+(items.id=583).
+
+## Ollama (decisions.id=840, 863)
+QR always runs its own bundled Ollama sidecar and never uses a user-installed
+Ollama (decisions.id=840). No detect-and-reuse: a user's own Ollama is invisible
+to QR's model registry, Focus eligibility and Cloud Chat, and the sidecar uses
+its own models directory (QR_DATA_ROOT/ollama_models). Port 11434 is probed
+only to log a GPU/RAM contention warning; it never gates or redirects the
+sidecar.
+
+Built today (ollama_sidecar.rs): the sidecar binds 127.0.0.1:21434
+(QR_OLLAMA_PORT), fixed, no fallback. Startup reclaims leftover QR orphans
+(items.id=586), identified by environment variable and command-line match under
+ollama_models.
+
+Decided in decisions.id=863, NOT built yet -- do not assume any of it in code:
+- single instance: a second launch focuses the first window and exits
+  (items.id=667, ready);
+- the sidecar binary is named qr-ollama and QR signals only processes it can
+  prove are its own (recorded process group, not command-line match)
+  (items.id=668, ready, depends on items.id=616);
+- port preferred 21434, fallback through 21435-21443, failing only if all ten
+  are busy; no manual port setting in R1 (items.id=668).
+Related and still open: OllamaClient::base_url() still honours OLLAMA_HOST and
+OLLAMA_PORT (items.id=616, ready); the bundled binary is a stub (items.id=583,
+ready).
 
 ## Naming Architecture — term map
 
@@ -129,7 +167,7 @@ column, don't assume every row here is fully propagated to code.
 | user_lives           | user_personas       | Join table in shared.db                      |
 | lives/ (path)        | personas/ (path)    | Filesystem segment                           |
 | life_affinity        | (removed)           | Dropped from FocusDefinition (D6-300)        |
-| life_context         | persona_context     | SYSTEM_TOKENS in tokens.py                   |
+| life_context         | persona_context     | SYSTEM_TOKENS in tokens.rs                   |
 | life_store.py        | persona_store.py    | Migration complete                           |
 | Path                 | Focus               | File extension: .focus                       |
 | path_id              | focus_id            | Column and parameter name                    |
@@ -160,8 +198,13 @@ column, don't assume every row here is fully propagated to code.
 |                      |                     | Action/action_id only in ADR-013/design docs.|
 
 ## R1 Focuses
-Canonical R1 Focus list: FOCUS_ROADMAP.md → § R1 Confirmed scope
-13 Focuses across 4 R1 Personas (Personal, Work, Student, Medical).
+R1 core (ships installed) is Writing Assistant and Tech Support only; every
+other Focus is available from the gallery, default off (decisions.id=600, a
+Phase-1 output that Phase 5 re-applies, items.id=130). FOCUS_ROADMAP.md is
+superseded (tracked_files.id=43, tracker items.id=130): do not read its
+13-Focus R1 list as current.
+Built (app/core_artifacts/focuses/): writing-assistant, quick-ask,
+research-and-buy, role-assessment, qr-admin, api-chat. Tech Support is not built.
 Wellness is post-R1 (wearable API required).
 Finance is deferred (bank API required).
 Do not build any Focus until Chat-PM directs the build session.
@@ -179,10 +222,13 @@ Design sessions must all complete before shared infrastructure build begins.
 - Tier 3 is a terminal boundary — execution loop breaks, status=awaiting_user.
 - auth_enabled=1 ONLY if ALL databases migrate successfully. Partial = rollback.
 - focus_run created as status=initializing, promoted to running after Phase 3 only.
-- Recovery key: BIP39 mnemonic of full 32 bytes. Exact reconstruction, no wrapping.
+- Recovery key: BIP39 mnemonic of 256-bit recovery entropy, independent of the data key. The app stores only the derived recovery public key and the data key sealed to it; every password change, restore and new recovery phrase rotates the data key. See AUTH_MULTIUSER_ARCHITECTURE.md Sections 4.0 and 5.1.
 - Release 1/Release 2 = product roadmap. Phase 1-7 = Conductor lifecycle phases.
-- SYSTEM_TOKENS frozenset defined in conductor/tokens.py.
-- ContextCompactor makes direct local model call. No Librarian, no routing.
+- SYSTEM_TOKENS is a const array in conductor/tokens.rs (5 reserved names:
+  user_input, persona_context, voice_profile, previous_output, focus_context).
+- ContextCompactor is not built: no such type exists in source. decisions.id=87
+  stays active. Chat history is bounded by message count only
+  (HISTORY_WINDOW = 10, commands/messages.rs).
 - is_fast_lane boolean on focus_runs — Phase 1 capture only.
 - Hierarchical fact model: scope tree (depth tiers) + knowledge graph (D6-459).
   Two distinct layers — do not conflate. Scope tree governs inheritance and access
@@ -228,15 +274,19 @@ Classify every finding: Accepted / Rejected / Deferred / Requires empirical vali
 
 ## Critical Bug Patterns (do not repeat)
 - PRAGMA key must be set BEFORE journal_mode in encrypted openers.
-- Never use executescript() in migrations — implicit COMMIT breaks SAVEPOINT atomicity.
-- _bootstrap_lock_table() before acquire_lock() in run_migrations().
+- Migrations (migrations.rs) run one SAVEPOINT per schema version on an
+  autocommit connection, executing parse_statements() output one statement at
+  a time. No BEGIN/COMMIT wrappers: a SAVEPOINT outside a BEGIN is the
+  outermost transaction and RELEASE commits it, so an explicit COMMIT breaks
+  atomicity.
+- bootstrap_lock_table() before acquire_lock() in run_migrations() (migrations.rs).
 - Voice profile VALUES must be validated at write time — reject + warn if PII detected.
 - Floor consent preference must be scoped: abstraction_tier + consent_timestamp.
 - not_permitted enforces at Tier 2+ only. Raw values permitted at Tier 1.
 
 ## Schema Authoring Rule
 Do not use semicolons inside string literals in .sql files.
-_parse_statements() is not a general-purpose SQL parser.
+parse_statements() (migrations.rs) is not a general-purpose SQL parser.
 A migration that drops a table another table still references via FOREIGN
 KEY must be listed in FK_OFF_MIGRATIONS (migrations.rs) -- DROP TABLE
 triggers ON DELETE CASCADE the same as an explicit DELETE would, not just
@@ -244,7 +294,8 @@ the latter; the every_drop_table_is_fk_off_or_audited test enforces this
 (items.id=585/586).
 
 ## Prompt Authoring Rule
-_render_prompt() uses str.replace() for {token} substitution. Templates must
+render_template() (conductor/executor.rs) substitutes {token} with
+String::replace and strips unresolved {token} patterns. Templates must
 not use {token_name} syntax for any string not intended as a Conductor token.
 
 ## Rust/Tauri Architecture
@@ -286,7 +337,7 @@ encrypted connections doesn't apply here. The real reason not to pool is
 security-boundary lifetime: a pooled connection stays unlocked past
 KeyRegistry's clear() at logout/idle-timeout, silently extending decrypted
 access beyond the window that boundary exists to enforce. shared.db is the
-one exception — genuinely unencrypted, pooled via items.id=481.
+one exception — genuinely unencrypted, pooled via items.id=483.
 SQLCipher linkage: libsqlite3-sys sqlcipher feature (D6-346).
 
 ### Tauri IPC command conventions

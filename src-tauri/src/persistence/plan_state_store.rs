@@ -31,7 +31,7 @@
 //   per migrations.py and the schema header. Rust port uses the encrypted
 //   opener with key_hex, which is architecturally correct.
 //
-// Handoff token expiry (items.id=773 fix):
+// Handoff token expiry (items.id=96 fix):
 //   consume_handoff_token checks expired_at IS NULL AND expiry_at >= now() at
 //   the query layer, so a token past its expiry_at but not yet swept by Boot
 //   Check cannot be consumed. Complementary to expire_overdue_handoff_tokens'
@@ -918,7 +918,7 @@ mod tests {
 
     const TEST_KEY_HEX: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
 
-    /// Regression test for items.id=773: consume_handoff_token previously
+    /// Regression test for items.id=96: consume_handoff_token previously
     /// only checked expired_at IS NULL, not whether expiry_at had actually
     /// passed. A token past its expiry_at but not yet swept by Boot Check
     /// (expired_at still NULL) was consumable when it shouldn't be. Sets up

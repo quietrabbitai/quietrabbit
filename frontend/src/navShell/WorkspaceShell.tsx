@@ -9,7 +9,9 @@
 // History rail instead, renamed "Library" for the user (the DockRailId
 // value/region below is still 'history' internally; see HistoryScreen.tsx's
 // own header comment for why that identifier wasn't renamed too). Current
-// shape: 4 rails (Board / Chat+Cloud Chat / Library[='history']).
+// shape: 4 rails (DockRailId: board / chat / cloudChat / history, Library =
+// 'history'); chat and cloudChat share one dock region, so three regions
+// render (Board / Chat+Cloud Chat / Library).
 //
 // The fixed vertical order (Board / Chat+Cloud Chat / Library, top to
 // bottom) mirrors the old file's Board/Chat/Cloud Chat order, with Library

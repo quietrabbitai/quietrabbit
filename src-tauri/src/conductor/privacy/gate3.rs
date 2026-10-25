@@ -124,7 +124,8 @@ pub async fn gate3<L: DisclosureLogger>(
     // always means High" assumption for callers that DO know their actual
     // destination set; the OR-condition structure itself is unchanged.
     destination_risk_rating: Option<u8>,
-    // items.id=458 (corrected scope of the earlier items.id=799): true for
+    // items.id=458 (corrected scope of the earlier decisions.id=799, per
+    // decisions.id=804): true for
     // every caller with a real content_sensitivity_severity to consult --
     // false only for callers with no PersonalTrack (request_chat_copy_gate3_review
     // in commands/consent.rs) that hardcode content_sensitivity_severity=1 as a placeholder. When false, a live
@@ -881,7 +882,8 @@ fn build_consent_spans(
 /// commands/consent.rs). For those
 /// callers, a live destination_risk alone must not force the High-tier
 /// consent gate on zero PF spans -- that produced an empty, uninformative
-/// interrupt (items.id=458, corrected scope of the earlier items.id=799).
+/// interrupt (items.id=458, corrected scope of the earlier decisions.id=799,
+/// per decisions.id=804).
 /// The severity check stays live regardless of this flag, as a defensive
 /// floor. The main Focus-execution path (executor.rs, real per-field
 /// severity from compute_step_sensitivity) always passes true and is
