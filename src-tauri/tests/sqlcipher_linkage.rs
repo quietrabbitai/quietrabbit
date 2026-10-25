@@ -5,6 +5,8 @@
 //! silently ignores PRAGMA key — these tests would pass the connect step
 //! but allow unencrypted reads, which would fail the wrong-key/no-key assertions.
 
+mod common;
+
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{ConnectOptions, Connection};
 use tempfile::NamedTempFile;
@@ -36,6 +38,9 @@ async fn open_connection(
     key: Option<&str>,
     wal: bool,
 ) -> Result<sqlx::SqliteConnection, sqlx::Error> {
+    // items.id=802: every test's first open goes through here.
+    common::init_sqlcipher();
+
     let mut opts = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(true);

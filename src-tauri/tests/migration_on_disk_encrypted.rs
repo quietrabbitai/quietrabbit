@@ -12,6 +12,8 @@
 // rerun) rather than schema-content-level, so this stays stable as the
 // "shared" prefix gains future migration versions.
 
+mod common;
+
 use quietrabbit_lib::persistence::migrations::run_migrations;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{ConnectOptions, Connection};
@@ -29,6 +31,7 @@ const KEY_HEX: &str = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefd
 
 #[tokio::test]
 async fn test_migration_pipeline_applies_on_real_encrypted_file() {
+    common::init_sqlcipher(); // items.id=802
     let temp_file = NamedTempFile::new().unwrap();
     let (file_handle, temp_path) = temp_file.into_parts();
     drop(file_handle);
@@ -93,6 +96,7 @@ async fn test_migration_pipeline_applies_on_real_encrypted_file() {
 
 #[tokio::test]
 async fn test_migration_pipeline_wrong_key_cannot_read_migrated_file() {
+    common::init_sqlcipher(); // items.id=802
     let temp_file = NamedTempFile::new().unwrap();
     let (file_handle, temp_path) = temp_file.into_parts();
     drop(file_handle);
