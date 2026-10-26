@@ -91,7 +91,7 @@ but keep it in mind if you add other CWD-relative paths in this codebase.
 
 Key commands:
   cargo build                                          — compile check
-  cargo fmt --check                                    — formatting (CI gate; fix with plain `cargo fmt` over the whole crate, never scoped to one file)
+  cargo fmt --check                                    — formatting (CI gate; `cargo fmt` reformats the whole crate and cannot be scoped to a file; to fix one file run `rustfmt` on that path; after any `cargo fmt` run `git status` and stage by explicit path (project guide entry cargo_fmt_does_not_scope_to_files))
   cargo clippy --tests -- -D warnings                  — lint (CI gate)
   cargo deny check                                     — advisories/licenses/bans/sources (CI gate)
   cargo test 2>&1 | grep -E "^error|test result"      — test summary (PLAIN, never --lib: --lib skips the src-tauri/tests/ targets)
