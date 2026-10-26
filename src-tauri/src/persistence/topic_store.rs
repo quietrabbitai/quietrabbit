@@ -32,6 +32,7 @@
 // PRAGMA key applied via SqliteConnectOptions (D6-346).
 // Caller supplies bare hex; store wraps it in SQLCipher x'...' syntax.
 
+use crate::persistence::savepoint::rollback_to_and_release;
 use std::path::PathBuf;
 
 use chrono::{Duration, Utc};
@@ -305,7 +306,7 @@ pub async fn create_topic(
 
     // SAVEPOINT: topics INSERT and topic_storage_locations INSERT are a logical unit.
     // If the storage location INSERT fails, the topic row must not persist orphaned.
-    // ROLLBACK TO used to match the SAVEPOINT pattern in migrations.rs.
+    // Failures go through savepoint::rollback_to_and_release, as in migrations.rs.
     sqlx::query("SAVEPOINT create_topic_sp")
         .execute(&mut conn)
         .await?;
@@ -328,9 +329,7 @@ pub async fn create_topic(
     .await;
 
     if let Err(e) = topic_result {
-        let _ = sqlx::query("ROLLBACK TO create_topic_sp")
-            .execute(&mut conn)
-            .await;
+        rollback_to_and_release(&mut conn, "create_topic_sp").await;
         return Err(TopicStoreError::Database(e));
     }
 
@@ -345,9 +344,7 @@ pub async fn create_topic(
     .await;
 
     if let Err(e) = storage_result {
-        let _ = sqlx::query("ROLLBACK TO create_topic_sp")
-            .execute(&mut conn)
-            .await;
+        rollback_to_and_release(&mut conn, "create_topic_sp").await;
         return Err(TopicStoreError::Database(e));
     }
 

@@ -41,6 +41,7 @@
 // PRAGMA key applied via SqliteConnectOptions (D6-346).
 // Caller supplies bare hex; store wraps it in SQLCipher x'...' syntax.
 
+use crate::persistence::savepoint::rollback_to_and_release;
 use std::path::PathBuf;
 
 use sqlx::ConnectOptions;
@@ -621,7 +622,8 @@ pub async fn write_block(
 
     // SAVEPOINT: INSERT and token counter UPDATE are a logical unit.
     // If UPDATE fails after INSERT, token estimate diverges from actual block count.
-    // ROLLBACK TO used (not conn.begin()) to match the SAVEPOINT pattern in migrations.rs.
+    // A SAVEPOINT (not conn.begin()) with savepoint::rollback_to_and_release on
+    // failure, matching migrations.rs.
     sqlx::query("SAVEPOINT write_block_sp")
         .execute(&mut conn)
         .await?;
@@ -652,9 +654,7 @@ pub async fn write_block(
     if let Err(e) = insert_result {
         // Rollback failure means the connection is already broken;
         // the upstream ? on the next operation will surface it.
-        let _ = sqlx::query("ROLLBACK TO write_block_sp")
-            .execute(&mut conn)
-            .await;
+        rollback_to_and_release(&mut conn, "write_block_sp").await;
         return Err(PlanStateStoreError::Database(e));
     }
 
@@ -667,9 +667,7 @@ pub async fn write_block(
     .await;
 
     if let Err(e) = update_result {
-        let _ = sqlx::query("ROLLBACK TO write_block_sp")
-            .execute(&mut conn)
-            .await;
+        rollback_to_and_release(&mut conn, "write_block_sp").await;
         return Err(PlanStateStoreError::Database(e));
     }
 

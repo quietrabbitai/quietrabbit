@@ -39,6 +39,7 @@
 //
 // QUERY STYLE: runtime sqlx::query() only — no query!() macros.
 
+use crate::persistence::savepoint::rollback_to_and_release;
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
@@ -841,15 +842,7 @@ pub(crate) async fn resolve_candidate_conn(
             Ok(())
         }
         Err(e) => {
-            if let Err(rollback_err) = sqlx::query("ROLLBACK TO resolve_candidate")
-                .execute(&mut *conn)
-                .await
-            {
-                log::error!("Savepoint rollback failed in resolve_candidate: {rollback_err}");
-            }
-            let _ = sqlx::query("RELEASE resolve_candidate")
-                .execute(&mut *conn)
-                .await;
+            rollback_to_and_release(&mut *conn, "resolve_candidate").await;
             Err(e)
         }
     }

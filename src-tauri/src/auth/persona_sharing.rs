@@ -61,6 +61,7 @@
 // QUERY STYLE: runtime sqlx::query() / sqlx::QueryBuilder only -- no
 // query!() macros, matching the rest of this codebase.
 
+use crate::persistence::savepoint::rollback_to_and_release;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use sqlx::SqliteConnection;
@@ -613,16 +614,7 @@ pub async fn accept_persona_share(
                 .await?;
         }
         Err(e) => {
-            if let Err(rollback_err) = sqlx::query("ROLLBACK TO accept_persona_share")
-                .execute(&mut personal_conn)
-                .await
-            {
-                log::error!(
-                    "Savepoint rollback failed in accept_persona_share content write \
-                     (persona_id='{persona_id}'): {rollback_err} -- original error still \
-                     being propagated: {e}"
-                );
-            }
+            rollback_to_and_release(&mut personal_conn, "accept_persona_share").await;
             return Err(PersonaSharingError::Database(e));
         }
     }
@@ -684,16 +676,7 @@ pub async fn accept_persona_share(
                 .await?;
         }
         Err(e) => {
-            if let Err(rollback_err) = sqlx::query("ROLLBACK TO accept_persona_share")
-                .execute(&mut *shared_conn)
-                .await
-            {
-                log::error!(
-                    "Savepoint rollback failed in accept_persona_share registration \
-                     (persona_id='{persona_id}'): {rollback_err} -- original error still \
-                     being propagated: {e}"
-                );
-            }
+            rollback_to_and_release(&mut shared_conn, "accept_persona_share").await;
             return Err(PersonaSharingError::Database(e));
         }
     }

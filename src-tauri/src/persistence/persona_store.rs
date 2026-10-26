@@ -20,6 +20,7 @@
 // a &sqlx::SqlitePool in; every fn here does pool.acquire() rather than
 // opening its own connection.
 
+use crate::persistence::savepoint::rollback_to_and_release;
 use sqlx::Row;
 use thiserror::Error;
 
@@ -318,15 +319,7 @@ pub async fn create_persona(
                 .await?;
         }
         Err(e) => {
-            if let Err(rollback_err) = sqlx::query("ROLLBACK TO create_persona")
-                .execute(&mut *conn)
-                .await
-            {
-                log::error!(
-                    "Savepoint rollback failed in create_persona (persona_id='{persona_id}'): \
-                     {rollback_err} -- original error still being propagated: {e}"
-                );
-            }
+            rollback_to_and_release(&mut conn, "create_persona").await;
             return Err(classify_constraint_error(persona_id, e));
         }
     }
@@ -427,4 +420,105 @@ pub async fn is_user_in_persona(
         .await?;
 
     Ok(row.is_some())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::ENV_MUTEX;
+    use sqlx::sqlite::SqlitePoolOptions;
+    use sqlx::ConnectOptions;
+
+    /// Points QR_DATA_ROOT at a temp dir and restores it on drop, including
+    /// when an assertion panics.
+    struct RootGuard(Option<String>);
+
+    impl RootGuard {
+        fn set(path: &std::path::Path) -> Self {
+            let saved = std::env::var("QR_DATA_ROOT").ok();
+            std::env::set_var("QR_DATA_ROOT", path);
+            RootGuard(saved)
+        }
+    }
+
+    impl Drop for RootGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+                None => std::env::remove_var("QR_DATA_ROOT"),
+            }
+        }
+    }
+
+    /// items.id=615: a failed create_persona must hand its pooled connection
+    /// back outside any transaction. The pool has ONE connection so the
+    /// failed call's connection is the one the next call reuses; a second,
+    /// independent connection proves the later write really committed.
+    #[tokio::test]
+    async fn a_failed_create_persona_leaves_the_pooled_connection_reusable() {
+        let _lock = ENV_MUTEX.lock().await;
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        let _root = RootGuard::set(tempdir.path());
+
+        {
+            crate::persistence::migrations::migrate_shared_db()
+                .await
+                .expect("shared.db migration must succeed in test setup");
+            let opts = crate::providers::utils::connect_options_unencrypted(
+                &crate::providers::utils::db_path_shared(),
+            );
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(opts.clone())
+                .await
+                .expect("single-connection shared.db pool must connect");
+
+            // The personas INSERT succeeds, then user_personas fails its
+            // foreign key (no such user): a real mid-savepoint failure.
+            let failed =
+                create_persona(&pool, "p-fail", "Fails", "personal", "no-such-user", None).await;
+            assert!(
+                matches!(failed, Err(PersonaStoreError::Database(_))),
+                "{failed:?}"
+            );
+            assert!(get_persona(&pool, "p-fail").await.unwrap().is_none());
+
+            crate::auth::user_store::create_user(
+                &pool,
+                "u1",
+                "Alice",
+                "admin",
+                true,
+                b"salt1234",
+                1024,
+                1,
+                1,
+                &[0u8; 32],
+            )
+            .await
+            .expect("create_user should succeed");
+            create_persona(&pool, "p-ok", "Works", "personal", "u1", None)
+                .await
+                .expect("a second create_persona on the same pool must succeed");
+
+            // A fresh connection sees it. Were the first connection still
+            // inside the failed savepoint's transaction, the second
+            // persona would be uncommitted and invisible here.
+            let mut fresh = opts.connect().await.expect("fresh connection must open");
+            let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM personas WHERE id = 'p-ok'")
+                .fetch_one(&mut fresh)
+                .await
+                .unwrap();
+            assert_eq!(n, 1, "the second persona must be committed");
+            drop(fresh);
+
+            // And the pooled connection can open a write transaction.
+            sqlx::query("BEGIN IMMEDIATE").execute(&pool).await.unwrap();
+            sqlx::query("ROLLBACK").execute(&pool).await.unwrap();
+        }
+    }
 }

@@ -94,6 +94,7 @@
 // (many-small-encrypted-DB topology, no static DATABASE_URL). shared.db
 // access is pooled (items.id=483) -- callers pass a &sqlx::SqlitePool in.
 
+use crate::persistence::savepoint::rollback_to_and_release;
 use sqlx::SqliteConnection;
 use thiserror::Error;
 use x25519_dalek::StaticSecret;
@@ -286,9 +287,7 @@ pub async fn remove_member(
                 .await?;
         }
         Err(_) => {
-            let _ = sqlx::query("ROLLBACK TO remove_member")
-                .execute(&mut *conn)
-                .await;
+            rollback_to_and_release(&mut conn, "remove_member").await;
         }
     }
 

@@ -35,6 +35,7 @@
 // proven against commands/auth.rs::verify_integration_keys_db, which
 // isolated the exact failure via a standalone diagnostic test).
 
+use crate::persistence::savepoint::rollback_to_and_release;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -576,15 +577,7 @@ pub async fn save_personal_field(
             Ok(id)
         }
         Err(e) => {
-            if let Err(rollback_err) = sqlx::query("ROLLBACK TO save_personal_field")
-                .execute(&mut conn)
-                .await
-            {
-                log::error!("Savepoint rollback failed in save_personal_field: {rollback_err}");
-            }
-            let _ = sqlx::query("RELEASE save_personal_field")
-                .execute(&mut conn)
-                .await;
+            rollback_to_and_release(&mut conn, "save_personal_field").await;
             Err(PersonalStoreError::Database(e))
         }
     }
@@ -756,18 +749,7 @@ pub async fn create_entity_fact_with_provenance(
             Ok(id)
         }
         Err(e) => {
-            if let Err(rollback_err) =
-                sqlx::query("ROLLBACK TO create_entity_fact_with_provenance_outer")
-                    .execute(&mut conn)
-                    .await
-            {
-                log::error!(
-                    "Savepoint rollback failed in create_entity_fact_with_provenance: {rollback_err}"
-                );
-            }
-            let _ = sqlx::query("RELEASE create_entity_fact_with_provenance_outer")
-                .execute(&mut conn)
-                .await;
+            rollback_to_and_release(&mut conn, "create_entity_fact_with_provenance_outer").await;
             Err(e)
         }
     }
@@ -883,17 +865,7 @@ pub(crate) async fn create_entity_fact_with_provenance_conn(
             Ok(id)
         }
         Err(e) => {
-            if let Err(rollback_err) = sqlx::query("ROLLBACK TO create_entity_fact_with_provenance")
-                .execute(&mut *conn)
-                .await
-            {
-                log::error!(
-                    "Savepoint rollback failed in create_entity_fact_with_provenance: {rollback_err}"
-                );
-            }
-            let _ = sqlx::query("RELEASE create_entity_fact_with_provenance")
-                .execute(&mut *conn)
-                .await;
+            rollback_to_and_release(&mut *conn, "create_entity_fact_with_provenance").await;
             Err(PersonalStoreError::Database(e))
         }
     }
@@ -1375,17 +1347,7 @@ pub async fn save_voice_profile_entry(
             Ok(id)
         }
         Err(e) => {
-            if let Err(rollback_err) = sqlx::query("ROLLBACK TO save_voice_profile_entry")
-                .execute(&mut conn)
-                .await
-            {
-                log::error!(
-                    "Savepoint rollback failed in save_voice_profile_entry: {rollback_err}"
-                );
-            }
-            let _ = sqlx::query("RELEASE save_voice_profile_entry")
-                .execute(&mut conn)
-                .await;
+            rollback_to_and_release(&mut conn, "save_voice_profile_entry").await;
             Err(e)
         }
     }

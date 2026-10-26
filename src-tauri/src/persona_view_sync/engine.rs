@@ -58,6 +58,7 @@
 // remote wipe exists in this architecture (decisions.id=723's own accepted
 // limitation, mirroring group.db's trust-based framing, items.id=210).
 
+use crate::persistence::savepoint::rollback_to_and_release;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use thiserror::Error;
@@ -307,17 +308,7 @@ pub async fn accept_persona_view_share(
                 .await?;
         }
         Err(e) => {
-            if let Err(rollback_err) = sqlx::query("ROLLBACK TO accept_persona_view_share")
-                .execute(&mut cache_conn)
-                .await
-            {
-                log::error!(
-                    "Savepoint rollback failed in accept_persona_view_share: {rollback_err}"
-                );
-            }
-            let _ = sqlx::query("RELEASE accept_persona_view_share")
-                .execute(&mut cache_conn)
-                .await;
+            rollback_to_and_release(&mut cache_conn, "accept_persona_view_share").await;
             return Err(e);
         }
     }
@@ -731,17 +722,7 @@ async fn pull_if_newer_view(
                 .await?;
         }
         Err(e) => {
-            if let Err(rollback_err) = sqlx::query("ROLLBACK TO persona_view_sync_apply_update")
-                .execute(&mut cache_conn)
-                .await
-            {
-                log::error!(
-                    "Savepoint rollback failed in persona_view_sync apply_update: {rollback_err}"
-                );
-            }
-            let _ = sqlx::query("RELEASE persona_view_sync_apply_update")
-                .execute(&mut cache_conn)
-                .await;
+            rollback_to_and_release(&mut cache_conn, "persona_view_sync_apply_update").await;
             return Err(e);
         }
     }

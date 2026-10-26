@@ -39,6 +39,7 @@
 //
 // QUERY STYLE: runtime sqlx::query() only — no query!() macros.
 
+use crate::persistence::savepoint::rollback_to_and_release;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use sqlx::SqliteConnection;
@@ -520,15 +521,7 @@ pub(crate) async fn import_record_conn(
             Ok(id)
         }
         Err(e) => {
-            if let Err(rollback_err) = sqlx::query("ROLLBACK TO import_record")
-                .execute(&mut *conn)
-                .await
-            {
-                log::error!("Savepoint rollback failed in import_record: {rollback_err}");
-            }
-            let _ = sqlx::query("RELEASE import_record")
-                .execute(&mut *conn)
-                .await;
+            rollback_to_and_release(&mut *conn, "import_record").await;
             Err(e)
         }
     }

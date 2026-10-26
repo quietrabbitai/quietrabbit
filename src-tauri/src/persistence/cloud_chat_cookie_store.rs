@@ -26,6 +26,7 @@
 // itself expired/cleared it) must not resurrect on the next load -- a
 // per-cookie upsert would leave stale rows behind; a full replace can't.
 
+use crate::persistence::savepoint::rollback_to_and_release;
 use sqlx::ConnectOptions;
 use sqlx::Row;
 use sqlx::SqliteConnection;
@@ -242,15 +243,7 @@ pub(crate) async fn upsert_cookies_conn(
             Ok(())
         }
         Err(e) => {
-            if let Err(rollback_err) = sqlx::query("ROLLBACK TO upsert_tier3_cookies")
-                .execute(&mut *conn)
-                .await
-            {
-                log::error!("Savepoint rollback failed in upsert_cookies: {rollback_err}");
-            }
-            let _ = sqlx::query("RELEASE upsert_tier3_cookies")
-                .execute(&mut *conn)
-                .await;
+            rollback_to_and_release(&mut *conn, "upsert_tier3_cookies").await;
             Err(CloudChatCookieStoreError::Database(e))
         }
     }

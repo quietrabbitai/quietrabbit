@@ -90,6 +90,7 @@
 //     regenerating it), no dedup_store fuzzy matching.
 //   - application-layer share-stopping (items.id=299 point 4) is untouched.
 
+use crate::persistence::savepoint::rollback_to_and_release;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use sqlx::SqliteConnection;
@@ -341,17 +342,7 @@ pub async fn provision_sync_relationship(
             Ok(id)
         }
         Err(e) => {
-            if let Err(rollback_err) = sqlx::query("ROLLBACK TO provision_sync_relationship")
-                .execute(&mut conn)
-                .await
-            {
-                log::error!(
-                    "Savepoint rollback failed in provision_sync_relationship: {rollback_err}"
-                );
-            }
-            let _ = sqlx::query("RELEASE provision_sync_relationship")
-                .execute(&mut conn)
-                .await;
+            rollback_to_and_release(&mut conn, "provision_sync_relationship").await;
             Err(e)
         }
     }
@@ -1169,17 +1160,7 @@ async fn apply_update(
             Ok(())
         }
         Err(e) => {
-            if let Err(rollback_err) = sqlx::query("ROLLBACK TO persona_sync_apply_update")
-                .execute(&mut conn)
-                .await
-            {
-                log::error!(
-                    "Savepoint rollback failed in persona_sync apply_update: {rollback_err}"
-                );
-            }
-            let _ = sqlx::query("RELEASE persona_sync_apply_update")
-                .execute(&mut conn)
-                .await;
+            rollback_to_and_release(&mut conn, "persona_sync_apply_update").await;
             Err(e)
         }
     }

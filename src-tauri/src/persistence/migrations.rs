@@ -29,6 +29,7 @@
 // LOCK IDENTITY: hostname:pid:uuid (uuid generated once per process startup
 // via OnceLock). The UUID component eliminates PID-reuse false ownership.
 
+use crate::persistence::savepoint::rollback_to_and_release;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
@@ -802,9 +803,7 @@ async fn bootstrap_lock_table(conn: &mut SqliteConnection) -> Result<(), Migrati
                 .await?;
         }
         Err(e) => {
-            let _ = sqlx::query("ROLLBACK TO bootstrap_lock")
-                .execute(&mut *conn)
-                .await;
+            rollback_to_and_release(&mut *conn, "bootstrap_lock").await;
             return Err(MigrationError::Sqlx(e));
         }
     }
@@ -1406,20 +1405,14 @@ async fn run_pending(
                 "migrations: {prefix} v{version} failed (statement {statement_index} of {}): {e}",
                 statements.len()
             );
-            // ROLLBACK TO undoes the work but leaves the SAVEPOINT (the
-            // outermost transaction) open. RELEASE closes it so the
-            // connection is back in autocommit; without it release_lock's
-            // UPDATE would be discarded when the connection drops and the
-            // lock would leak (items.id=585 D2). Either can legitimately
-            // fail if the SAVEPOINT statement itself never ran.
-            for cleanup in [
-                format!("ROLLBACK TO {savepoint}"),
-                format!("RELEASE {savepoint}"),
-            ] {
-                if let Err(ce) = sqlx::query(&cleanup).execute(&mut *conn).await {
-                    log::debug!("migrations: {prefix} v{version} cleanup `{cleanup}`: {ce}");
-                }
-            }
+            // The rollback undoes the work but leaves the SAVEPOINT (the
+            // outermost transaction) open. The helper's RELEASE closes it
+            // so the connection is back in autocommit; without it
+            // release_lock's UPDATE would be discarded when the connection
+            // drops and the lock would leak (items.id=585 D2). Either
+            // statement can legitimately fail if the SAVEPOINT statement
+            // itself never ran; the helper logs that and carries on.
+            rollback_to_and_release(conn, &savepoint).await;
         }
 
         // Restore enforcement whatever happened above, and only after the

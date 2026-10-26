@@ -51,6 +51,7 @@
 // QUERY STYLE: runtime sqlx::query() only — no query!() macros, matching
 // every other store in this module.
 
+use crate::persistence::savepoint::rollback_to_and_release;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use sqlx::SqliteConnection;
@@ -573,15 +574,7 @@ pub async fn update_entity(
             Ok(())
         }
         Err(e) => {
-            if let Err(rollback_err) = sqlx::query("ROLLBACK TO update_entity")
-                .execute(&mut conn)
-                .await
-            {
-                log::error!("Savepoint rollback failed in update_entity: {rollback_err}");
-            }
-            let _ = sqlx::query("RELEASE update_entity")
-                .execute(&mut conn)
-                .await;
+            rollback_to_and_release(&mut conn, "update_entity").await;
             Err(e)
         }
     }

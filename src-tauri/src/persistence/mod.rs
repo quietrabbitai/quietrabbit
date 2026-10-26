@@ -27,6 +27,7 @@ pub mod provider_catalog_store;
 pub mod provider_models_store;
 pub mod provider_spend_store;
 pub mod provider_store;
+pub mod savepoint;
 pub mod source_registry_store;
 pub mod topic_store;
 pub mod user_provider_preference_store;

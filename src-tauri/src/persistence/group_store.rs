@@ -55,6 +55,7 @@
 // QUERY STYLE: runtime sqlx::query() only -- no query!() macros (many-small-
 // encrypted-DB topology, no static DATABASE_URL).
 
+use crate::persistence::savepoint::rollback_to_and_release;
 use std::path::PathBuf;
 
 use sqlx::ConnectOptions;
@@ -694,10 +695,10 @@ async fn apply_synced_permissions_conn(
     // unit -- a delete that succeeds followed by an insert that fails would
     // leave this persona's local grant set for `document_id` truncated
     // relative to both the pulled manifest AND whatever was there before.
-    // ROLLBACK TO (not conn.begin()) to match the SAVEPOINT pattern already
-    // established in this codebase for the same reason (plan_state_store.rs
-    // write_block, itself following migrations.rs's own SAVEPOINT
-    // convention).
+    // A SAVEPOINT with savepoint::rollback_to_and_release on failure (not
+    // conn.begin()), matching the pattern already established in this
+    // codebase for the same reason (plan_state_store.rs write_block, itself
+    // following migrations.rs's own SAVEPOINT convention).
     sqlx::query("SAVEPOINT apply_synced_permissions_sp")
         .execute(&mut *conn)
         .await?;
@@ -723,9 +724,7 @@ async fn apply_synced_permissions_conn(
         // Rollback failure means the connection is already broken; the
         // upstream ? on the next operation will surface it (same pattern
         // plan_state_store.rs's write_block uses).
-        let _ = sqlx::query("ROLLBACK TO apply_synced_permissions_sp")
-            .execute(&mut *conn)
-            .await;
+        rollback_to_and_release(&mut *conn, "apply_synced_permissions_sp").await;
         return Err(GroupStoreError::Database(e));
     }
 
@@ -744,9 +743,7 @@ async fn apply_synced_permissions_conn(
         .await;
 
         if let Err(e) = insert_result {
-            let _ = sqlx::query("ROLLBACK TO apply_synced_permissions_sp")
-                .execute(&mut *conn)
-                .await;
+            rollback_to_and_release(&mut *conn, "apply_synced_permissions_sp").await;
             return Err(GroupStoreError::Database(e));
         }
     }

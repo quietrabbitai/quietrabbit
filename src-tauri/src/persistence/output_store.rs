@@ -28,6 +28,7 @@
 // PRAGMA key applied via SqliteConnectOptions (D6-346).
 // Caller supplies bare hex; store wraps it in SQLCipher x'...' syntax.
 
+use crate::persistence::savepoint::rollback_to_and_release;
 use std::path::PathBuf;
 
 use sqlx::ConnectOptions;
@@ -1347,9 +1348,7 @@ async fn write_element_consent_decisions_conn(
         .await;
 
         if let Err(e) = result {
-            let _ = sqlx::query("ROLLBACK TO write_element_consent_sp")
-                .execute(&mut *conn)
-                .await;
+            rollback_to_and_release(&mut *conn, "write_element_consent_sp").await;
             return Err(OutputStoreError::Database(e));
         }
     }
@@ -1774,9 +1773,7 @@ pub async fn update_active_document(
     .await?;
 
     if new_row.is_none() {
-        let _ = sqlx::query("ROLLBACK TO update_active_document_sp")
-            .execute(&mut conn)
-            .await;
+        rollback_to_and_release(&mut conn, "update_active_document_sp").await;
         return Err(OutputStoreError::Validation(format!(
             "no such output: '{new_output_id}'"
         )));
@@ -1793,9 +1790,7 @@ pub async fn update_active_document(
     .await?;
 
     if prev_row.is_none() {
-        let _ = sqlx::query("ROLLBACK TO update_active_document_sp")
-            .execute(&mut conn)
-            .await;
+        rollback_to_and_release(&mut conn, "update_active_document_sp").await;
         return Err(OutputStoreError::Validation(format!(
             "no such output: '{previous_output_id}'"
         )));

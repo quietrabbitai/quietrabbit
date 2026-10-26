@@ -32,6 +32,7 @@
 // candidate today. If onboarding design later introduces a separate
 // login-identifier concept, this is the function to revisit.
 
+use crate::persistence::savepoint::rollback_to_and_release;
 use sqlx::Row;
 use thiserror::Error;
 
@@ -197,9 +198,9 @@ pub async fn get_salt_params(
 }
 
 /// Create a new user + their salt row, atomically (SAVEPOINT, mirrors
-/// persona_store::create_persona's pattern -- on failure, ROLLBACK TO
-/// then RELEASE, so the pooled connection is returned with no transaction
-/// open).
+/// persona_store::create_persona's pattern -- on failure,
+/// savepoint::rollback_to_and_release, so the pooled connection is returned
+/// with no transaction open).
 ///
 /// auth_enabled is hardcoded to 1 here, not exposed as a parameter --
 /// Section 2.1 reframes it as an onboarding-time invariant evaluated once
@@ -380,15 +381,12 @@ async fn create_user_inner(
             Ok(())
         }
         Err(e) => {
-            // ROLLBACK TO alone undoes the writes but leaves the savepoint --
-            // and the transaction it opened, with its write lock -- open.
+            // Undoing the savepoint without releasing it leaves it -- and the
+            // transaction it opened, with its write lock -- open.
             // The connection goes back to the pool, so without the RELEASE
             // a failed creation would leave shared.db locked for every
             // later writer (found by items.id=629's interrupted-write test).
-            let _ = sqlx::query("ROLLBACK TO create_user")
-                .execute(&mut *conn)
-                .await;
-            let _ = sqlx::query("RELEASE create_user").execute(&mut *conn).await;
+            rollback_to_and_release(&mut conn, "create_user").await;
             // Structured constraint detection (DatabaseError::is_unique_violation),
             // not string-matching -- corrected this session per external
             // review; verified sqlx exposes this method directly rather
@@ -461,9 +459,10 @@ pub async fn get_key_epoch(
 // ---------------------------------------------------------------------------
 //
 // Every write below is one SQLite transaction on a pooled connection, run
-// inside a SAVEPOINT. A failed step does ROLLBACK TO and then ALWAYS RELEASE,
-// so the connection goes back to the pool outside any transaction (ROLLBACK
-// TO alone leaves the savepoint, and the write lock, open).
+// inside a SAVEPOINT. A failed step goes through savepoint::rollback_to_and_release,
+// which ALWAYS releases, so the connection goes back to the pool outside any
+// transaction (a rollback alone leaves the savepoint, and the write lock,
+// open).
 
 /// What a rotation is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -682,15 +681,7 @@ pub async fn get_key_wrapper_state(
 /// Undo a savepoint and prove the connection is outside any transaction.
 /// Returns false if it could not be made clean.
 async fn undo_savepoint(conn: &mut sqlx::SqliteConnection, name: &str) -> bool {
-    let rolled = sqlx::query(&format!("ROLLBACK TO {name}"))
-        .execute(&mut *conn)
-        .await
-        .is_ok();
-    let released = sqlx::query(&format!("RELEASE {name}"))
-        .execute(&mut *conn)
-        .await
-        .is_ok();
-    if !(rolled && released) {
+    if !rollback_to_and_release(conn, name).await {
         return false;
     }
     // Authoritative probe: BEGIN fails inside a transaction.
@@ -700,11 +691,11 @@ async fn undo_savepoint(conn: &mut sqlx::SqliteConnection, name: &str) -> bool {
     sqlx::query("ROLLBACK").execute(&mut *conn).await.is_ok()
 }
 
-/// Finish a SAVEPOINT: RELEASE on success, ROLLBACK TO then RELEASE on error.
+/// Finish a SAVEPOINT: RELEASE on success, rollback_to_and_release on error.
 /// Takes the pooled connection by value because a connection that cannot be
 /// proven to be outside a transaction must never go back to the pool: a
 /// failed RELEASE (for example a deferred constraint failing at commit) is
-/// undone with ROLLBACK TO and RELEASE, and if THAT fails too the connection
+/// undone with rollback_to_and_release, and if THAT fails too the connection
 /// is detached from the pool and dropped (closing it, which ends whatever
 /// transaction it held).
 async fn end_savepoint<T>(
@@ -2159,7 +2150,7 @@ mod tests {
         let single = single_connection_pool().await;
         let mut conn = single.acquire().await.unwrap();
         // Open a real transaction that the savepoint name below does not
-        // belong to, so ROLLBACK TO fails and the connection stays dirty.
+        // belong to, so the rollback fails and the connection stays dirty.
         sqlx::query("BEGIN").execute(&mut *conn).await.unwrap();
         assert_eq!(single.size(), 1);
 

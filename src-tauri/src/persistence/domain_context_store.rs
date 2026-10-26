@@ -24,6 +24,7 @@
 // The many-small-encrypted-DBs topology has no static DATABASE_URL, so compile-time
 // query verification is unavailable. Row extraction uses sqlx::Row::try_get().
 
+use crate::persistence::savepoint::rollback_to_and_release;
 use std::path::PathBuf;
 
 use sqlx::sqlite::SqliteRow;
@@ -587,16 +588,7 @@ pub async fn write_approved_extraction(
                 .await?;
         }
         Err(e) => {
-            if let Err(rollback_err) = sqlx::query("ROLLBACK TO write_approved")
-                .execute(&mut conn)
-                .await
-            {
-                log::error!(
-                    "Savepoint rollback failed in write_approved_extraction \
-                     (pending_id='{pending_id}', block_id='{block_id}'): {rollback_err} \
-                     -- original error still being propagated: {e}"
-                );
-            }
+            rollback_to_and_release(&mut conn, "write_approved").await;
             return Err(DomainContextStoreError::Database(e));
         }
     }
