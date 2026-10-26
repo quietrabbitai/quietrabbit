@@ -1480,11 +1480,12 @@ async fn run_pending(
 // Data root helper
 // ---------------------------------------------------------------------------
 
-/// Returns the QR data root path from QR_DATA_ROOT env var.
-/// Mirrors Python get_data_root() from providers/utils.py — panics if unset,
-/// matching the Python behavior (raises RuntimeError if missing).
+/// Returns the QR data root path. Delegates to
+/// `providers::utils::get_data_root`, the one resolver (items.id=663): panics
+/// if the root was never set, matching the Python behavior (raises
+/// RuntimeError if missing).
 pub fn get_data_root() -> PathBuf {
-    PathBuf::from(std::env::var("QR_DATA_ROOT").expect("QR_DATA_ROOT environment variable not set"))
+    crate::providers::utils::get_data_root()
 }
 
 // ---------------------------------------------------------------------------

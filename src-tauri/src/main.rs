@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use tauri::Manager;
+use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 use tokio::sync::{Mutex, RwLock};
 
 use quietrabbit_lib::commands::model_install::PullCancellationRegistry;
@@ -35,6 +36,39 @@ fn rename_legacy_cef_cache_dir_if_safe(old_path: &std::path::Path, new_path: &st
             log::warn!("main: failed to rename CEF cache dir {old_path:?} -> {new_path:?}: {e}")
         }
     }
+}
+
+/// Stops startup visibly when the data directory cannot be set up
+/// (items.id=663). Returning `Err` from `setup()` would only make Tauri panic
+/// inside the event loop with a generic message, which a desktop-launched
+/// (and, on Windows, console-less) user never sees. Instead: log it, hide the
+/// window so the frontend cannot be driven against a missing data root, show
+/// a native error dialog, and exit nonzero when it is dismissed.
+///
+/// Non-blocking `show`: `setup()` runs on the main thread, where the dialog
+/// plugin's `blocking_show` would freeze the app. The caller returns `Ok(())`
+/// right after this so the event loop can draw the dialog. `_exit` rather than
+/// `process::exit` for the reason given at the `RunEvent::Exit` handler below
+/// (items.id=315: the atexit chain segfaults once CEF is initialized).
+fn abort_startup(app: &tauri::AppHandle, message: &str) {
+    log::error!("main: {message} -- aborting startup");
+    eprintln!("quietrabbit: {message} -- aborting startup");
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.hide();
+    }
+    app.dialog()
+        .message(format!(
+            "{message}\n\nQuiet Rabbit cannot start without a data directory it can write to."
+        ))
+        .title("Quiet Rabbit could not start")
+        .kind(MessageDialogKind::Error)
+        .show(|_| {
+            // SAFETY: _exit only terminates the process; nothing here depends
+            // on destructors or atexit handlers running.
+            unsafe {
+                libc::_exit(1);
+            }
+        });
 }
 
 /// Plain, synchronous entry point -- NOT `#[tokio::main]`.
@@ -163,27 +197,32 @@ async fn async_main() {
             // the shared task-progress event (kind key_rotation).
             quietrabbit_lib::commands::key_rotation::install_progress_sink(app.handle().clone());
             // Must run synchronously here, before any command handler could
-            // touch persistence::migrations::get_data_root() -- every prior
+            // touch persistence::migrations::get_data_root(). Every prior
             // caller of that function was test code, which points
-            // QR_DATA_ROOT at a tempdir itself (see test_support.rs);
-            // nothing in the real app ever set it, so any real IPC call
-            // that touched the DB layer (get_health, listActiveProviders,
-            // ...) panicked on a tokio worker thread with "QR_DATA_ROOT
-            // environment variable not set" the first time this app was
-            // actually driven end-to-end through a live window (found via
+            // QR_DATA_ROOT at a tempdir itself (see test_support.rs); nothing
+            // in the real app ever set it, so any real IPC call that touched
+            // the DB layer (get_health, listActiveProviders, ...) panicked on
+            // a tokio worker thread the first time this app was actually
+            // driven end-to-end through a live window (found via
             // WAYLAND_DEBUG repro session, 2026-08-08 -- see items.id=227
             // investigation). Derived from the same app_data_dir() Tauri
             // already resolves for the CEF root_cache_path below, so both
             // land under the same per-install data directory.
+            //
+            // items.id=663: recorded with set_data_root(), not an environment
+            // variable (std::env::set_var here raced concurrent env reads from
+            // the runtime's threads). If the directory cannot be resolved or
+            // created, startup stops visibly -- see abort_startup().
             match app.path().app_data_dir() {
                 Ok(dir) => {
                     if let Err(e) = std::fs::create_dir_all(&dir) {
-                        log::error!(
-                            "main: could not create app_data_dir {dir:?} for \
-                             QR_DATA_ROOT: {e} — persistence commands will panic"
+                        abort_startup(
+                            app.handle(),
+                            &format!("Could not create the data directory {dir:?}: {e}"),
                         );
+                        return Ok(());
                     } else {
-                        std::env::set_var("QR_DATA_ROOT", &dir);
+                        quietrabbit_lib::providers::utils::set_data_root(dir);
 
                         // items.id=275: instance/shared.db is never created
                         // outside test code -- every prior caller of
@@ -288,10 +327,13 @@ async fn async_main() {
                         }
                     }
                 }
-                Err(e) => log::error!(
-                    "main: could not resolve app_data_dir for QR_DATA_ROOT: {e} \
-                     — persistence commands will panic until this is set"
-                ),
+                Err(e) => {
+                    abort_startup(
+                        app.handle(),
+                        &format!("Could not resolve the data directory: {e}"),
+                    );
+                    return Ok(());
+                }
             }
 
             // Must run synchronously here, before any command handler could

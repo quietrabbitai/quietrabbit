@@ -685,6 +685,11 @@ mod tests {
     #[tokio::test]
     async fn liveness_tick_flips_trust_false_when_child_exits() {
         let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        // items.id=663: a child that exited reaches stop()'s get_data_root(),
+        // which no longer falls back to a relative path.
+        let tmp = tempfile::tempdir().unwrap();
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        std::env::set_var("QR_DATA_ROOT", tmp.path());
         let spawned = crate::ollama_spawn_thread::spawn_with_pdeathsig(
             "/bin/sh",
             vec!["-c".into(), "sleep 0.3".into()],
@@ -710,6 +715,10 @@ mod tests {
         );
         assert!(sidecar.child.is_none());
         assert!(!is_trusted());
+        match saved_root {
+            Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+            None => std::env::remove_var("QR_DATA_ROOT"),
+        }
     }
 
     #[tokio::test]

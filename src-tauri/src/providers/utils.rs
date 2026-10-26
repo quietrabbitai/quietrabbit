@@ -26,6 +26,7 @@
 // (commit 7b7ad89). Stores call sqlx::migrate!() directly on pool open.
 
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::ConnectOptions;
@@ -46,12 +47,45 @@ pub fn now() -> String {
 // Data root
 // ---------------------------------------------------------------------------
 
-/// Returns QR_DATA_ROOT as a PathBuf.
-/// Falls back to ./quietrabbit-data for Topology A (zero-config).
-/// Python oracle: get_data_root()
+/// The data root, set once at startup (items.id=663). A process-wide static
+/// rather than an environment variable: `std::env::set_var` after the runtime's
+/// threads exist races concurrent environment reads. RwLock rather than
+/// OnceLock so a test can set and clear it.
+static DATA_ROOT: RwLock<Option<PathBuf>> = RwLock::new(None);
+
+/// Records the data root every `get_data_root()` call resolves to. Called once,
+/// by `main.rs` setup, before any persistence or sidecar call; a second call
+/// replaces the value.
+pub fn set_data_root(root: PathBuf) {
+    *DATA_ROOT.write().unwrap_or_else(|e| e.into_inner()) = Some(root);
+}
+
+/// Returns the data root set by `set_data_root`.
+///
+/// The one resolver for the whole crate (`persistence::migrations::get_data_root`
+/// delegates here). Under `cfg(test)` only, falls back to the `QR_DATA_ROOT`
+/// environment variable, which the tests that take `test_support::ENV_MUTEX`
+/// point at a tempdir. Otherwise panics: a missing root is a startup bug, and
+/// a relative fallback would write user data under the current directory.
 pub fn get_data_root() -> PathBuf {
-    let root = std::env::var("QR_DATA_ROOT").unwrap_or_else(|_| "./quietrabbit-data".to_owned());
-    PathBuf::from(root)
+    if let Some(root) = DATA_ROOT.read().unwrap_or_else(|e| e.into_inner()).clone() {
+        return root;
+    }
+    #[cfg(test)]
+    if let Ok(root) = std::env::var("QR_DATA_ROOT") {
+        return PathBuf::from(root);
+    }
+    panic!(
+        "data root not set: providers::utils::set_data_root() must run during \
+         startup before any persistence call"
+    );
+}
+
+/// Test-only: forgets the value `set_data_root` recorded, so the environment
+/// fallback applies again.
+#[cfg(test)]
+pub(crate) fn clear_data_root() {
+    *DATA_ROOT.write().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 // ---------------------------------------------------------------------------
@@ -211,37 +245,95 @@ mod tests {
         assert!(ts.contains('T'));
     }
 
+    // items.id=663: leaves the set root cleared and QR_DATA_ROOT as it was,
+    // even when the test body panics. Take ENV_MUTEX first.
+    struct RootGuard(Option<String>);
+
+    impl RootGuard {
+        fn new() -> Self {
+            let saved = std::env::var("QR_DATA_ROOT").ok();
+            clear_data_root();
+            Self(saved)
+        }
+    }
+
+    impl Drop for RootGuard {
+        fn drop(&mut self) {
+            clear_data_root();
+            match self.0.take() {
+                Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+                None => std::env::remove_var("QR_DATA_ROOT"),
+            }
+        }
+    }
+
     #[test]
     fn get_data_root_default() {
         let _lock = ENV_MUTEX.blocking_lock();
-        let saved = std::env::var("QR_DATA_ROOT").ok();
+        let _guard = RootGuard::new();
         std::env::remove_var("QR_DATA_ROOT");
 
-        let root = get_data_root();
-        assert_eq!(root, PathBuf::from("./quietrabbit-data"));
-
-        if let Some(v) = saved {
-            std::env::set_var("QR_DATA_ROOT", v);
-        }
+        // Nothing set and no environment variable: fails loudly, never a
+        // relative path.
+        let err = std::panic::catch_unwind(get_data_root).expect_err("must panic");
+        let msg = err
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| err.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(msg.contains("set_data_root"), "unexpected message: {msg}");
     }
 
     #[test]
     fn get_data_root_env_override() {
         let _lock = ENV_MUTEX.blocking_lock();
-        let saved = std::env::var("QR_DATA_ROOT").ok();
+        let _guard = RootGuard::new();
 
         std::env::set_var("QR_DATA_ROOT", "/tmp/qr-test-root");
         let root = get_data_root();
         assert_eq!(root, PathBuf::from("/tmp/qr-test-root"));
+    }
 
-        std::env::remove_var("QR_DATA_ROOT");
-        if let Some(v) = saved {
-            std::env::set_var("QR_DATA_ROOT", v);
-        }
+    #[test]
+    fn set_data_root_takes_precedence_over_env() {
+        let _lock = ENV_MUTEX.blocking_lock();
+        let _guard = RootGuard::new();
+
+        std::env::set_var("QR_DATA_ROOT", "/tmp/qr-env-root");
+        set_data_root(PathBuf::from("/tmp/qr-set-root"));
+        assert_eq!(get_data_root(), PathBuf::from("/tmp/qr-set-root"));
+
+        // Clearing the set value hands resolution back to the environment.
+        clear_data_root();
+        assert_eq!(get_data_root(), PathBuf::from("/tmp/qr-env-root"));
+    }
+
+    #[test]
+    fn migrations_and_utils_resolve_the_same_root() {
+        let _lock = ENV_MUTEX.blocking_lock();
+        let _guard = RootGuard::new();
+
+        set_data_root(PathBuf::from("/tmp/qr-set-root"));
+        assert_eq!(
+            crate::persistence::migrations::get_data_root(),
+            get_data_root()
+        );
+        assert_eq!(get_data_root(), PathBuf::from("/tmp/qr-set-root"));
+
+        clear_data_root();
+        std::env::set_var("QR_DATA_ROOT", "/tmp/qr-env-root");
+        assert_eq!(
+            crate::persistence::migrations::get_data_root(),
+            get_data_root()
+        );
+        assert_eq!(get_data_root(), PathBuf::from("/tmp/qr-env-root"));
     }
 
     #[test]
     fn db_path_shared_contains_instance() {
+        let _lock = ENV_MUTEX.blocking_lock();
+        let _guard = RootGuard::new();
+        std::env::set_var("QR_DATA_ROOT", "/tmp/qr-test-root");
         let path = db_path_shared();
         let s = path.to_string_lossy();
         assert!(s.contains("instance"));
