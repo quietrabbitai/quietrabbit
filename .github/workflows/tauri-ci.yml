@@ -57,11 +57,29 @@ jobs:
           workspaces: src-tauri -> target
 
       - name: Install Linux dependencies
+        timeout-minutes: 20
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev \
-            build-essential curl wget file libssl-dev libgtk-3-dev \
-            libayatana-appindicator3-dev librsvg2-dev
+          pkgs=(libwebkit2gtk-4.1-dev
+            build-essential curl wget file libssl-dev libgtk-3-dev
+            libayatana-appindicator3-dev librsvg2-dev)
+          # items.id=813: a slow mirror once stretched this step to 21 min.
+          # Bound the network part (update + download only) to 300 s per attempt,
+          # 3 attempts, 15 s apart. Completed .debs stay in /var/cache/apt/archives
+          # and partial ones resume, so a retry only fetches what is missing.
+          for attempt in 1 2 3; do
+            if sudo timeout --kill-after=10 300 sh -c \
+                'apt-get update && apt-get install -y --download-only "$@"' sh "${pkgs[@]}"; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::apt download failed or timed out 3 times"
+              exit 1
+            fi
+            echo "::warning::apt attempt $attempt failed or timed out, retrying in 15 s"
+            sleep 15
+          done
+          # Offline from the cache: nothing here waits on the network.
+          sudo apt-get install -y "${pkgs[@]}"
 
       # Ubuntu 24.04's apt libsqlcipher-dev (4.5.6-1build2) is not compiled with
       # SQLITE_ENABLE_FTS5, which outputs_001.sql's outputs_fts virtual table
