@@ -562,7 +562,7 @@ pub async fn send_api_chat_message(
         run_request,
     )
     .await?;
-    run.lease = Some(lease);
+    run.attach_lease(lease).map_err(|e| e.to_string())?;
     let run_id = run
         .focus_run_id
         .clone()

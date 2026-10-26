@@ -147,7 +147,12 @@ pub async fn run_periodic_sweep(
                 }
             };
 
-            run.lease = Some(run_lease);
+            if let Err(e) = run.attach_lease(run_lease) {
+                log::warn!(
+                    "scheduled_sweep: could not attach the lease to run '{focus_run_id}': {e}"
+                );
+                continue;
+            }
             let result = run.resume_execution().await;
             if let Err(e) = &result {
                 log::warn!(

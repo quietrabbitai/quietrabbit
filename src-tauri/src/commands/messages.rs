@@ -672,7 +672,7 @@ pub async fn send_message(
         request,
     )
     .await?;
-    run.lease = Some(lease);
+    run.attach_lease(lease).map_err(|e| e.to_string())?;
 
     // 4-6. Reserve the placeholder, finish the run in the background, return
     // the transcript.

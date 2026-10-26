@@ -9,8 +9,13 @@
 //   Failures inside execute_full() are logged and surfaced as push events there.
 // get_run_output: polls output_store for a completed run's output.
 //   Returns "not_found" if the run has not yet produced output.
-// cancel_run: writes status='cancelled' to focus_runs via cancel_focus_run()
-//   (D6-352). No-op if already terminal. Returns RunNotFound if run unknown.
+// cancel_run: stops a run that is live in this process (trips its lease's
+//   stop token, so it ends cancelled with no further model call, items.id=816),
+//   then writes status='cancelled' to focus_runs and deletes the run's
+//   snapshots via cancel_focus_run() (D6-352). The owner is the signed-in
+//   session user, never the client-supplied user_id; a foreign and an unknown
+//   run give the same RunNotFound error and stop nothing. No-op if already
+//   terminal. A run not live here (parked awaiting_user) is only marked.
 // resume_run: routes by focus_run status. For awaiting_extract_confirm:
 //   crash-recovery replay, then re-emit if pending > 0, or not_implemented
 //   if pending == 0 (output() is owned by submit_extract_confirm, not here).
@@ -238,7 +243,7 @@ pub async fn submit_focus_run(
         request,
     )
     .await?;
-    run.lease = Some(lease);
+    run.attach_lease(lease).map_err(|e| e.to_string())?;
 
     let run_id = run
         .focus_run_id
@@ -329,13 +334,50 @@ pub async fn cancel_run(
     persona_id: String,
     key_registry: State<'_, KeyRegistry>,
 ) -> Result<(), String> {
-    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
+    let lease = crate::auth::writer_gate::command(&key_registry).await?;
     let key_hex_str = key_registry
         .with_key(|k| key_hex(&k.data_key))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
-    output_store::cancel_focus_run(&user_id, &persona_id, &key_hex_str, &run_id)
+    // The lease was taken for the signed-in session, so its user is the
+    // session's (items.id=816).
+    cancel_run_for_session(
+        lease.user_id(),
+        &user_id,
+        &persona_id,
+        &key_hex_str,
+        &run_id,
+    )
+    .await
+}
+
+/// The body of `cancel_run` (items.id=816), apart from the Tauri state so it can
+/// be tested. `session_user` is the signed-in user; `user_id` is what the client
+/// sent and must match it.
+///
+/// 1. A client `user_id` that is not the session's gets the same error as an
+///    unknown run, before anything is touched: no existence leak, and no open
+///    of another account's database.
+/// 2. A run live in this process is stopped FIRST by tripping its lease's stop
+///    token, so it takes no further step or model call while the row is written
+///    (it ends `cancelled` through the same path as a rotation's 'Stop and
+///    save'). Only the session user's own runs can match.
+/// 3. The row is marked cancelled and its snapshots deleted. A run not live
+///    here (parked awaiting_user) gets just this; a finished or already
+///    cancelled run is a no-op; an unknown run is RunNotFound.
+async fn cancel_run_for_session(
+    session_user: &str,
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    run_id: &str,
+) -> Result<(), String> {
+    if user_id != session_user {
+        return Err(output_store::OutputStoreError::RunNotFound(run_id.to_owned()).to_string());
+    }
+    crate::auth::writer_gate::request_stop_for_run(session_user, run_id);
+    output_store::cancel_focus_run(session_user, persona_id, key_hex, run_id)
         .await
         .map_err(|e| e.to_string())
 }
@@ -477,7 +519,7 @@ pub async fn resume_run(
             .map_err(|e| e.to_string())?;
             // A user pressed resume (items.id=710): attended.
             run.attendance = crate::spend::gate::RunAttendance::Attended;
-            run.lease = Some(run_lease);
+            run.attach_lease(run_lease).map_err(|e| e.to_string())?;
 
             // Spawn resume_execution() in the background, matching
             // submit_focus_run's fire-and-forget shape -- progress arrives via
@@ -729,5 +771,181 @@ mod tests {
         assert!(!is_quick_ask_focus(crate::api_chat::API_CHAT_FOCUS_ID));
         assert!(!is_quick_ask_focus("writing-assistant"));
         assert!(!is_quick_ask_focus(""));
+    }
+
+    // -- items.id=816: cancel_run ----------------------------------------------
+    //
+    // `cancel_run` itself takes Tauri State, which has no construction path in a
+    // plain #[tokio::test] (see commands/api_chat.rs); everything it decides is
+    // in `cancel_run_for_session`, tested here against a real SQLCipher
+    // outputs.db. Not tested: the command wrapper (the Command lease and the
+    // session lookup) and a real in-flight model call being dropped.
+
+    use crate::auth::writer_gate::{self, Kind};
+    use crate::persistence::output_store::open_outputs_db;
+    use sqlx::Row;
+
+    const KEY: &str = "0606060606060606060606060606060606060606060606060606060606060606";
+    const PERSONA: &str = "cancel-persona";
+
+    /// Points QR_DATA_ROOT at a fresh directory for one test and restores it.
+    struct DataRoot {
+        _lock: tokio::sync::MutexGuard<'static, ()>,
+        saved: Option<String>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl DataRoot {
+        async fn new() -> Self {
+            let lock = crate::test_support::ENV_MUTEX.lock().await;
+            let saved = std::env::var("QR_DATA_ROOT").ok();
+            let dir = tempfile::tempdir().unwrap();
+            std::env::set_var("QR_DATA_ROOT", dir.path());
+            Self {
+                _lock: lock,
+                saved,
+                _dir: dir,
+            }
+        }
+    }
+
+    impl Drop for DataRoot {
+        fn drop(&mut self) {
+            match &self.saved {
+                Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+                None => std::env::remove_var("QR_DATA_ROOT"),
+            }
+        }
+    }
+
+    async fn seed_run(user: &str, run_id: &str, status: &str, snapshots: usize) {
+        let mut conn = open_outputs_db(user, PERSONA, KEY).await.unwrap();
+        sqlx::query(
+            "INSERT INTO focus_runs (id, focus_id, status, started_at)
+             VALUES (?, 'writing-assistant', ?, '2026-10-26T00:00:00Z')",
+        )
+        .bind(run_id)
+        .bind(status)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        for i in 0..snapshots {
+            sqlx::query(
+                "INSERT INTO focus_run_snapshots
+                 (id, focus_run_id, step_id, phase, checkpoint_hash, created_at)
+                 VALUES (?, ?, 's1', 4, 'h', '2026-10-26T00:00:00Z')",
+            )
+            .bind(format!("{run_id}-snap-{i}"))
+            .bind(run_id)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn status_of(user: &str, run_id: &str) -> String {
+        let mut conn = open_outputs_db(user, PERSONA, KEY).await.unwrap();
+        sqlx::query("SELECT status FROM focus_runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap()
+            .get("status")
+    }
+
+    async fn snapshots_of(user: &str, run_id: &str) -> i64 {
+        let mut conn = open_outputs_db(user, PERSONA, KEY).await.unwrap();
+        sqlx::query("SELECT COUNT(*) AS n FROM focus_run_snapshots WHERE focus_run_id = ?")
+            .bind(run_id)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap()
+            .get("n")
+    }
+
+    #[tokio::test]
+    async fn a_parked_run_that_is_not_live_is_marked_cancelled_and_loses_its_snapshots() {
+        let _root = DataRoot::new().await;
+        let user = "cancel-parked";
+        seed_run(user, "run-1", "awaiting_user", 2).await;
+        assert_eq!(snapshots_of(user, "run-1").await, 2);
+
+        cancel_run_for_session(user, user, PERSONA, KEY, "run-1")
+            .await
+            .unwrap();
+        assert_eq!(status_of(user, "run-1").await, "cancelled");
+        assert_eq!(snapshots_of(user, "run-1").await, 0);
+
+        // Idempotent: a second cancel is Ok and changes nothing.
+        cancel_run_for_session(user, user, PERSONA, KEY, "run-1")
+            .await
+            .unwrap();
+        assert_eq!(status_of(user, "run-1").await, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn a_finished_run_is_a_no_op_and_keeps_its_status() {
+        let _root = DataRoot::new().await;
+        let user = "cancel-finished";
+        for (id, status) in [("c", "complete"), ("f", "failed")] {
+            seed_run(user, id, status, 1).await;
+            cancel_run_for_session(user, user, PERSONA, KEY, id)
+                .await
+                .unwrap();
+            assert_eq!(status_of(user, id).await, status);
+            // Nothing was changed, so nothing was purged.
+            assert_eq!(snapshots_of(user, id).await, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_live_run_is_stopped_and_its_row_reads_cancelled() {
+        let _root = DataRoot::new().await;
+        let user = "cancel-live";
+        seed_run(user, "run-1", "running", 1).await;
+        let lease = writer_gate::acquire(user, Kind::FocusRun).unwrap();
+        lease.bind_run("run-1");
+        let other = writer_gate::acquire(user, Kind::FocusRun).unwrap();
+        other.bind_run("run-2");
+
+        cancel_run_for_session(user, user, PERSONA, KEY, "run-1")
+            .await
+            .unwrap();
+        assert!(lease.stop_token().is_cancelled(), "the run is told to stop");
+        assert!(!other.stop_token().is_cancelled(), "another run is not");
+        assert_eq!(status_of(user, "run-1").await, "cancelled");
+        assert_eq!(snapshots_of(user, "run-1").await, 0);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_run_and_a_foreign_user_get_the_same_error_and_stop_nothing() {
+        let _root = DataRoot::new().await;
+        let owner = "cancel-owner";
+        seed_run(owner, "run-1", "running", 0).await;
+        let lease = writer_gate::acquire(owner, Kind::FocusRun).unwrap();
+        lease.bind_run("run-1");
+
+        let unknown = cancel_run_for_session(owner, owner, PERSONA, KEY, "no-such-run")
+            .await
+            .unwrap_err();
+        assert_eq!(unknown, "Run not found: no-such-run");
+
+        // Another account's session, naming the owner's run: it opens its own
+        // (empty) database, finds no such run, and the owner's lease is not tripped.
+        let foreign =
+            cancel_run_for_session("cancel-intruder", "cancel-intruder", PERSONA, KEY, "run-1")
+                .await
+                .unwrap_err();
+        assert_eq!(foreign, "Run not found: run-1");
+        assert!(!lease.stop_token().is_cancelled());
+
+        // A client that names the owner while signed in as someone else: the
+        // same error, before any database is opened, and nothing is stopped.
+        let spoofed = cancel_run_for_session("cancel-intruder", owner, PERSONA, KEY, "run-1")
+            .await
+            .unwrap_err();
+        assert_eq!(spoofed, "Run not found: run-1");
+        assert!(!lease.stop_token().is_cancelled());
+        assert_eq!(status_of(owner, "run-1").await, "running");
     }
 }

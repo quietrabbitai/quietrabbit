@@ -81,7 +81,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::conductor::concurrency::ConductorScheduler;
-use crate::conductor::executor::{StepContext, StepExecutor};
+use crate::conductor::executor::{is_user_stop, StepContext, StepExecutor};
 use crate::conductor::failure::{
     ConductorError, FailureAction, FailureHandler, FailureResult, FailureSeverity,
 };
@@ -1259,7 +1259,9 @@ pub struct FocusRun<L: DisclosureLoggerForRun = SqliteDisclosureLogger> {
     /// caller that starts or resumes the run, BEFORE the run can touch a
     /// database, and held until the run is dropped, which for a spawned run is
     /// after `finalize_chat_reply`: a key rotation waits for it, or stops the
-    /// run at the user's choice. `None` only for runs built by tests.
+    /// run at the user's choice. `None` only for runs built by tests. Set only
+    /// through `attach_lease` (a source-scan test in auth/writer_gate.rs
+    /// enforces it), which also binds the lease to this run's id.
     pub(crate) lease: Option<crate::auth::writer_gate::WriterLease>,
 }
 
@@ -2244,8 +2246,13 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             let step_failure = self.execute_step(&step, i).await?;
 
             // items.id=778: a step that failed because it was stopped is not a
-            // failure to park or retry; the run is cancelled.
-            if step_failure.is_some() && self.stop_requested() {
+            // failure to park or retry; the run is cancelled. items.id=816: a
+            // user's Cancel and an API Chat Stop during a retry wait end here
+            // too.
+            if step_failure
+                .as_ref()
+                .is_some_and(|f| self.failure_ends_run(f))
+            {
                 return Ok(Some(self.stopped_result()));
             }
 
@@ -2283,12 +2290,42 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         Ok(None) // All steps completed — proceed to Phase 5 OUTPUT
     }
 
+    /// Give this run its writer lease and bind the lease to the run's id, so a
+    /// user's cancel can find the run (items.id=816, `cancel_run`). The id must
+    /// already be set (by `authorize` or `rehydrate_focus_run`, which every
+    /// caller has run): without it nothing could be bound, so this fails and
+    /// attaches nothing, and the lease is released as it drops, rather than
+    /// leave a run that Cancel cannot reach.
+    pub(crate) fn attach_lease(
+        &mut self,
+        lease: crate::auth::writer_gate::WriterLease,
+    ) -> Result<(), LifecycleError> {
+        let Some(run_id) = self.focus_run_id.as_deref() else {
+            return Err(LifecycleError::ValidationFailed(
+                "a run's id must be set before its writer lease is attached".to_owned(),
+            ));
+        };
+        lease.bind_run(run_id);
+        self.lease = Some(lease);
+        Ok(())
+    }
+
     /// Whether the user chose to stop this run for a key rotation
-    /// (items.id=778): its lease's stop token has been tripped.
+    /// (items.id=778) or cancelled it (items.id=816): its lease's stop token
+    /// has been tripped.
     pub(crate) fn stop_requested(&self) -> bool {
         self.lease
             .as_ref()
             .is_some_and(|l| l.stop_token().is_cancelled())
+    }
+
+    /// Whether a failed step ends this run as cancelled (items.id=778, 816):
+    /// the lease's stop token is tripped, or the step itself reports a user
+    /// Stop (an API Chat Stop during a retry wait trips only the stream's
+    /// child token, so the lease token is not tripped). `USER_STOP` is built
+    /// only by `stopped_failure` in executor.rs.
+    fn failure_ends_run(&self, failure: &FailureResult) -> bool {
+        self.stop_requested() || is_user_stop(failure)
     }
 
     /// The result of a run stopped for a key rotation: `cancelled`, with no
@@ -6238,7 +6275,7 @@ mod tests {
             )
             .unwrap();
             let stop = lease.stop_token().clone();
-            run.lease = Some(lease);
+            run.attach_lease(lease).unwrap();
             assert!(!run.stop_requested());
             stop.cancel();
             assert!(run.stop_requested());
@@ -6251,6 +6288,200 @@ mod tests {
             assert_eq!(early.status, "cancelled");
             assert!(early.failure.is_none());
             assert!(run.task_track.as_ref().unwrap().steps().is_empty());
+        })
+        .await;
+    }
+
+    /// A run with one local step and the minimal tracks `execute()` asserts on,
+    /// as in the test above, for the items.id=816 cancel tests. No step can run
+    /// without a model, so these only exercise the stop checks.
+    fn one_step_run(user: &str) -> FocusRun<crate::conductor::privacy::logger::TestLogger> {
+        let scheduler = Arc::new(ConductorScheduler::new());
+        let mut run: FocusRun<crate::conductor::privacy::logger::TestLogger> = FocusRun::new(
+            user.to_owned(),
+            "p".to_owned(),
+            "f".to_owned(),
+            dummy_pool(),
+            scheduler,
+            "".to_owned(),
+            false,
+            Some(CRISIS_TEST_KEY_HEX.to_owned()),
+            None,
+            false,
+            std::collections::HashSet::new(),
+            None,
+        );
+        run.focus_run_id = Some(uuid::Uuid::new_v4().to_string());
+        let mut def = parse_focus_definition(minimal_raw()).unwrap();
+        def.steps.push(crate::conductor::tokens::StepDefinition {
+            step_id: "s1".to_owned(),
+            display_name: "Step 1".to_owned(),
+            guide_id: "g".to_owned(),
+            task_type: "general".to_owned(),
+            routing_tier: ExternalAccess::LocalOnly,
+            step_type: Default::default(),
+            output_var: None,
+            prompt_template: "never rendered".to_owned(),
+            field_requirements: std::collections::HashMap::new(),
+            options_override: std::collections::HashMap::new(),
+            external_access_override: None,
+            requires_user_handoff: false,
+            revisitable: true,
+            block_stable_id: None,
+            block_customization: None,
+            schedule_trigger: None,
+        });
+        run.focus_def = Some(def);
+        let mut personal_track = PersonalTrack::new();
+        personal_track.seal();
+        run.personal_track = Some(personal_track);
+        run.task_track = Some(TaskTrack::new());
+        run.shared_state = Some(SharedStateTrack::new());
+        run.failure_handler = Some(FailureHandler::new(ExternalAccess::LocalOnly));
+        run.privacy_gateway = Some(PrivacyGateway::new(
+            crate::conductor::privacy::logger::TestLogger::for_run(user, "p", ""),
+        ));
+        run
+    }
+
+    /// items.id=816: a user's cancel, by run id, stops a run the way a rotation's
+    /// stop does: it ends `cancelled` with no failure and runs no step.
+    #[tokio::test]
+    async fn a_run_cancelled_by_its_id_ends_cancelled_without_running_a_step() {
+        with_temp_data_root(async {
+            let mut run = one_step_run("u-cancel-run");
+            let run_id = run.focus_run_id.clone().unwrap();
+            run.attach_lease(
+                crate::auth::writer_gate::acquire(
+                    "u-cancel-run",
+                    crate::auth::writer_gate::Kind::FocusRun,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert!(!run.stop_requested());
+
+            assert_eq!(
+                crate::auth::writer_gate::request_stop_for_run("u-cancel-run", &run_id),
+                1
+            );
+            assert!(run.stop_requested());
+            let early = run
+                .execute()
+                .await
+                .expect("execute must succeed")
+                .expect("a cancelled run returns early");
+            assert_eq!(early.status, "cancelled");
+            assert!(early.failure.is_none());
+            assert!(run.task_track.as_ref().unwrap().steps().is_empty());
+        })
+        .await;
+    }
+
+    /// Another user's cancel, or a cancel naming another run, leaves the run
+    /// going.
+    #[tokio::test]
+    async fn a_cancel_for_another_user_or_run_does_not_stop_the_run() {
+        with_temp_data_root(async {
+            let mut run = one_step_run("u-cancel-other");
+            let run_id = run.focus_run_id.clone().unwrap();
+            run.attach_lease(
+                crate::auth::writer_gate::acquire(
+                    "u-cancel-other",
+                    crate::auth::writer_gate::Kind::Reply,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                crate::auth::writer_gate::request_stop_for_run("someone-else", &run_id),
+                0
+            );
+            assert_eq!(
+                crate::auth::writer_gate::request_stop_for_run("u-cancel-other", "another-run"),
+                0
+            );
+            assert!(!run.stop_requested());
+        })
+        .await;
+    }
+
+    /// The lease is released, and the cancel finds nothing, once the run is
+    /// dropped (a crashed or finished run leaves no entry).
+    #[tokio::test]
+    async fn a_dropped_run_leaves_nothing_to_cancel() {
+        with_temp_data_root(async {
+            let mut run = one_step_run("u-cancel-drop");
+            let run_id = run.focus_run_id.clone().unwrap();
+            run.attach_lease(
+                crate::auth::writer_gate::acquire(
+                    "u-cancel-drop",
+                    crate::auth::writer_gate::Kind::FocusRun,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            drop(run);
+            assert_eq!(
+                crate::auth::writer_gate::request_stop_for_run("u-cancel-drop", &run_id),
+                0
+            );
+            assert!(crate::auth::writer_gate::is_idle("u-cancel-drop"));
+        })
+        .await;
+    }
+
+    /// A lease is never attached without a run id to bind it to: it fails, the
+    /// run holds no lease, and the lease is released.
+    #[tokio::test]
+    async fn attach_lease_without_a_run_id_fails_and_attaches_nothing() {
+        with_temp_data_root(async {
+            let mut run = one_step_run("u-cancel-noid");
+            run.focus_run_id = None;
+            let lease = crate::auth::writer_gate::acquire(
+                "u-cancel-noid",
+                crate::auth::writer_gate::Kind::FocusRun,
+            )
+            .unwrap();
+            let err = run.attach_lease(lease).unwrap_err();
+            assert!(matches!(err, LifecycleError::ValidationFailed(_)));
+            assert!(run.lease.is_none());
+            assert!(crate::auth::writer_gate::is_idle("u-cancel-noid"));
+        })
+        .await;
+    }
+
+    /// An API Chat Stop during a retry wait reaches the lifecycle as a USER_STOP
+    /// failure with the lease token untripped: that ends the run; an ordinary
+    /// failure does not (items.id=816).
+    #[tokio::test]
+    async fn a_user_stop_failure_ends_the_run_and_an_ordinary_failure_does_not() {
+        with_temp_data_root(async {
+            let run = one_step_run("u-cancel-failure");
+            let user_stop = FailureResult {
+                action: FailureAction::Stop,
+                failure_mode: Some(crate::conductor::executor::USER_STOP_MODE.to_owned()),
+                plain_language: "This was stopped.".to_owned(),
+                is_recoverable: false,
+                severity: FailureSeverity::Stop,
+                step_id: Some("s1".to_owned()),
+                focus_id: Some("f".to_owned()),
+                metadata: None,
+            };
+            assert!(run.failure_ends_run(&user_stop));
+            let ordinary = FailureResult {
+                action: FailureAction::AwaitUser,
+                failure_mode: Some("F10".to_owned()),
+                is_recoverable: true,
+                ..user_stop.clone()
+            };
+            assert!(!run.failure_ends_run(&ordinary));
+            // A Stop failure of another mode (a real failure) does not end it either.
+            let failed = FailureResult {
+                failure_mode: Some("F4".to_owned()),
+                ..user_stop
+            };
+            assert!(!run.failure_ends_run(&failed));
         })
         .await;
     }

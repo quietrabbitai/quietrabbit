@@ -46,6 +46,13 @@
 // lease; `pinned_epoch` hands it to epoch_guard::effective_epoch while the
 // lease is live, and it ends with the lease.
 //
+// A USER'S CANCEL REACHES A RUN BY ITS ID (items.id=816). A run binds its lease
+// to its Focus run id (FocusRun::attach_lease -> WriterLease::bind_run), and
+// `request_stop_for_run(user, run_id)` trips that lease's stop token: the same
+// token a rotation's 'Stop and save' trips, so the run ends through the same
+// `stopped_result` path. The binding is removed with the lease, so it lives
+// exactly as long as the run.
+//
 // RELEASE: WriterLease and DrainGuard are RAII. Dropping releases, so a normal
 // end, an early `?` return, a panic unwind and an aborted task all release. A
 // DrainGuard dropped for any reason reopens the gate.
@@ -177,6 +184,9 @@ struct UserState {
     /// The key epoch each live lease started under, by lease id (items.id=781).
     /// Only leases taken while an epoch was resident appear here.
     epochs: BTreeMap<u64, u64>,
+    /// The Focus run each visible lease carries, by lease id (items.id=816).
+    /// Bound by `WriterLease::bind_run`, removed with the lease.
+    runs: BTreeMap<u64, String>,
 }
 
 impl UserState {
@@ -229,6 +239,20 @@ impl WriterLease {
     pub fn stop_token(&self) -> &CancellationToken {
         &self.stop
     }
+
+    /// Record that this lease carries Focus run `run_id`, so a user cancel can
+    /// reach its stop token by run id (`request_stop_for_run`, items.id=816).
+    /// Only visible leases (Reply, FocusRun) are ever bound: the token of a
+    /// Command, Ingest or Sweep lease is not a run's, and nothing watches it.
+    /// The binding ends with the lease.
+    pub fn bind_run(&self, run_id: &str) {
+        if !self.kind.is_visible_work() {
+            return;
+        }
+        if let Some(u) = gate().users.get_mut(&self.user_id) {
+            u.runs.insert(self.id, run_id.to_owned());
+        }
+    }
 }
 
 impl Drop for WriterLease {
@@ -240,6 +264,7 @@ impl Drop for WriterLease {
                 *slot = slot.saturating_sub(1);
                 u.stops.remove(&self.id);
                 u.epochs.remove(&self.id);
+                u.runs.remove(&self.id);
                 if u.is_idle() {
                     g.users.remove(&self.user_id);
                 }
@@ -301,6 +326,32 @@ pub fn acquire(user_id: &str, kind: Kind) -> Result<WriterLease, GateError> {
         return Err(GateError::Rotating);
     }
     Ok(lease)
+}
+
+/// Trip the stop token of every live run lease of `user_id` that carries
+/// `run_id` (a user's Cancel, items.id=816). Returns how many tokens it tripped:
+/// 0 for an unknown run, another user's run, or a run that has ended, and the
+/// three are indistinguishable. Tripping again is harmless. More than one lease
+/// can carry a run id (`resume_run` accepts a run that is still `running`), and
+/// all of them are stopped. The run notices through `FocusRun::stop_requested`
+/// and the executor's waits and model calls, exactly as for a rotation's 'Stop
+/// and save'.
+pub fn request_stop_for_run(user_id: &str, run_id: &str) -> usize {
+    let g = gate();
+    let Some(u) = g.users.get(user_id) else {
+        return 0;
+    };
+    let mut tripped = 0;
+    for (lease_id, bound) in &u.runs {
+        if bound != run_id {
+            continue;
+        }
+        if let Some(token) = u.stops.get(lease_id) {
+            token.cancel();
+            tripped += 1;
+        }
+    }
+    tripped
 }
 
 /// The engine's half of the ordering: with the rotating flag already set, no
@@ -702,6 +753,95 @@ mod tests {
     use super::*;
 
     // The gate is process-global: every test uses its own user id.
+
+    // -- items.id=816: a user's cancel reaches a run by its id ---------------
+
+    #[test]
+    fn a_cancel_trips_the_token_of_the_lease_bound_to_the_run() {
+        let u = "gate-cancel-run";
+        let lease = acquire(u, Kind::FocusRun).unwrap();
+        lease.bind_run("run-1");
+        assert!(!lease.stop_token().is_cancelled());
+        assert_eq!(request_stop_for_run(u, "run-1"), 1);
+        assert!(lease.stop_token().is_cancelled());
+        // Idempotent: a second cancel is a harmless repeat.
+        assert_eq!(request_stop_for_run(u, "run-1"), 1);
+        assert!(lease.stop_token().is_cancelled());
+    }
+
+    #[test]
+    fn another_users_run_and_an_unknown_run_trip_nothing_and_look_alike() {
+        let owner = "gate-cancel-owner";
+        let lease = acquire(owner, Kind::Reply).unwrap();
+        lease.bind_run("run-1");
+        assert_eq!(request_stop_for_run("gate-cancel-other", "run-1"), 0);
+        assert_eq!(request_stop_for_run(owner, "no-such-run"), 0);
+        assert_eq!(request_stop_for_run("gate-cancel-nobody", "no-such-run"), 0);
+        assert!(!lease.stop_token().is_cancelled());
+    }
+
+    #[test]
+    fn another_run_of_the_same_user_is_left_running() {
+        let u = "gate-cancel-two-runs";
+        let a = acquire(u, Kind::FocusRun).unwrap();
+        let b = acquire(u, Kind::Reply).unwrap();
+        a.bind_run("run-a");
+        b.bind_run("run-b");
+        assert_eq!(request_stop_for_run(u, "run-a"), 1);
+        assert!(a.stop_token().is_cancelled());
+        assert!(!b.stop_token().is_cancelled());
+    }
+
+    #[test]
+    fn the_binding_ends_with_the_lease() {
+        let u = "gate-cancel-ended";
+        let lease = acquire(u, Kind::FocusRun).unwrap();
+        lease.bind_run("run-1");
+        drop(lease);
+        assert_eq!(request_stop_for_run(u, "run-1"), 0);
+        // Nothing is left behind: the user's state is gone with the lease.
+        assert!(is_idle(u));
+        assert!(!gate().users.contains_key(u));
+    }
+
+    #[test]
+    fn a_lease_of_a_kind_that_is_not_visible_work_is_never_bound() {
+        let u = "gate-cancel-kinds";
+        let leases: Vec<WriterLease> = [Kind::Command, Kind::Ingest, Kind::Sweep]
+            .into_iter()
+            .map(|k| acquire(u, k).unwrap())
+            .collect();
+        for l in &leases {
+            l.bind_run("run-1");
+        }
+        assert_eq!(request_stop_for_run(u, "run-1"), 0);
+        assert!(leases.iter().all(|l| !l.stop_token().is_cancelled()));
+    }
+
+    #[test]
+    fn two_leases_on_one_run_id_are_both_stopped() {
+        // resume_run accepts a run that is still 'running'.
+        let u = "gate-cancel-double";
+        let a = acquire(u, Kind::FocusRun).unwrap();
+        let b = acquire(u, Kind::FocusRun).unwrap();
+        a.bind_run("run-1");
+        b.bind_run("run-1");
+        assert_eq!(request_stop_for_run(u, "run-1"), 2);
+        assert!(a.stop_token().is_cancelled() && b.stop_token().is_cancelled());
+    }
+
+    #[test]
+    fn a_user_cancel_does_not_change_the_phase_or_the_counts() {
+        let u = "gate-cancel-counts";
+        let lease = acquire(u, Kind::FocusRun).unwrap();
+        lease.bind_run("run-1");
+        let before = counts(u);
+        request_stop_for_run(u, "run-1");
+        assert_eq!(counts(u), before);
+        assert_eq!(phase(u), Phase::Open);
+        // A tripped lease is still held until its run drops it.
+        assert!(!is_idle(u));
+    }
 
     #[test]
     fn a_lease_is_released_on_drop() {
@@ -1311,6 +1451,89 @@ mod tests {
                 "SPAWN_SITE_EXEMPT lists {k}, which no longer spawns: remove it"
             );
         }
+    }
+
+    /// The production code of every non-test source file, comment lines
+    /// blanked, as `(relative path, text)`.
+    fn production_sources() -> Vec<(String, String)> {
+        let mut files = Vec::new();
+        rs_files(&src_dir(), &mut files);
+        let mut out = Vec::new();
+        for path in files {
+            let rel = path
+                .strip_prefix(src_dir())
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            if is_test_file(&rel) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let code = production_text(&text)
+                .lines()
+                .map(|l| {
+                    if l.trim_start().starts_with("//") {
+                        ""
+                    } else {
+                        l
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            out.push((rel, code));
+        }
+        out
+    }
+
+    #[test]
+    fn a_run_gets_its_lease_only_through_attach_lease() {
+        // items.id=816: attach_lease binds the lease to the run id, which is
+        // how a user's cancel finds the run. A direct assignment would leave a
+        // run that Cancel cannot reach.
+        let assign = regex::Regex::new(r"\.lease\s*=\s*Some\(").unwrap();
+        let offenders: Vec<String> = production_sources()
+            .into_iter()
+            .filter(|(rel, code)| rel != "conductor/lifecycle.rs" && assign.is_match(code))
+            .map(|(rel, _)| rel)
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "these files assign FocusRun::lease directly instead of calling attach_lease: \
+             {offenders:?}"
+        );
+    }
+
+    #[test]
+    fn user_stop_has_exactly_one_producer() {
+        // items.id=816: the lifecycle now ends a run as cancelled on a step
+        // failure whose mode is USER_STOP, so only executor.rs's
+        // `stopped_failure` may build one.
+        let literal = regex::Regex::new(r#""USER_STOP""#).unwrap();
+        let producer =
+            regex::Regex::new(r"failure_mode\s*:\s*Some\(\s*(?:\w+::)*USER_STOP_MODE").unwrap();
+        let mut literals = Vec::new();
+        let mut producers = Vec::new();
+        for (rel, code) in production_sources() {
+            for _ in literal.find_iter(&code) {
+                literals.push(rel.clone());
+            }
+            for m in producer.find_iter(&code) {
+                producers.push((rel.clone(), enclosing_fn(&code, m.start()).0));
+            }
+        }
+        assert_eq!(
+            literals,
+            vec!["conductor/executor.rs".to_owned()],
+            "the \"USER_STOP\" literal belongs once, in executor.rs's USER_STOP_MODE constant"
+        );
+        assert_eq!(
+            producers,
+            vec![(
+                "conductor/executor.rs".to_owned(),
+                "stopped_failure".to_owned()
+            )],
+            "a USER_STOP failure may be built only by executor.rs stopped_failure"
+        );
     }
 
     #[test]

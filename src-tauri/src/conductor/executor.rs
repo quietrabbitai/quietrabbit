@@ -1605,18 +1605,25 @@ async fn retry_loop<A: StepAttempt>(
                     return Some(result); // never retried
                 }
                 if result.action == FailureAction::Retry && retry_count < MAX_RETRIES {
-                    // items.id=727: a stopped run is not retried.
-                    if ctx.stop.as_ref().is_some_and(|s| s.is_cancelled()) {
-                        return Some(result);
+                    // items.id=727: a stopped run is not retried. items.id=816:
+                    // a user's Stop of a streamed reply counts too.
+                    let stop = effective_stop(ctx);
+                    if stop.is_some_and(|s| s.is_cancelled()) {
+                        return Some(on_stop(ctx, result));
                     }
                     // items.id=710/727: a hosted retry waits (Retry-After and
                     // jittered backoff); a Retry-After over the cap parks the
                     // run, and a stop during the wait ends it. The inference
                     // slot was released before this point. Each retry re-runs
                     // the spend pre-flight and counts as a request (items.id=710).
-                    if let Some(done) =
-                        wait_before_retry(&result, retry_count, ctx.stop.as_ref(), &sample).await
+                    if let Some(done) = wait_before_retry(&result, retry_count, stop, &sample).await
                     {
+                        // A wait that a stop interrupted ends as a stop; one
+                        // that ended for another reason (a Retry-After over the
+                        // cap parks the run) is returned as it is.
+                        if stop.is_some_and(|s| s.is_cancelled()) {
+                            return Some(on_stop(ctx, done));
+                        }
                         return Some(done);
                     }
                     retry_count += 1;
@@ -1744,6 +1751,32 @@ async fn hosted_step_call<Tz: chrono::TimeZone>(
 /// for it AND the step goes to a hosted provider. A local step never streams.
 fn step_streams(ctx: &StepContext) -> bool {
     ctx.stream.is_some() && ctx.effective_access != ExternalAccess::LocalOnly
+}
+
+/// The one token the retry machinery watches (items.id=816). When the step
+/// streams it is the stream's token, a child of `ctx.stop` for API Chat, so it
+/// is tripped both by the user's Stop (`cancel_chat_stream` trips only the
+/// child) and by a parent trip (a rotation's 'Stop and save', `cancel_run`).
+/// Otherwise it is `ctx.stop`. A run with no stream sees exactly `ctx.stop`.
+fn effective_stop(ctx: &StepContext) -> Option<&tokio_util::sync::CancellationToken> {
+    if step_streams(ctx) {
+        ctx.stream.as_ref().map(|s| s.token())
+    } else {
+        ctx.stop.as_ref()
+    }
+}
+
+/// What the retry loop returns once the effective stop is tripped, in place of
+/// `last` (the result it would have retried). A parent trip (`ctx.stop`) leaves
+/// `last` as it is: the lifecycle sees the lease token and cancels the run. A
+/// trip of the stream's token alone is a user's Stop, which the lifecycle can
+/// only learn from the failure, so it becomes `stopped_failure`.
+fn on_stop(ctx: &StepContext, last: FailureResult) -> FailureResult {
+    if ctx.stop.as_ref().is_some_and(|s| s.is_cancelled()) {
+        last
+    } else {
+        stopped_failure(ctx)
+    }
 }
 
 /// What a streamed step needs from its caller (items.id=715): where the
@@ -1904,14 +1937,25 @@ async fn until_stopped<T>(
     }
 }
 
-/// The failure a step returns when the user chose 'Stop and save' for a key
-/// rotation (items.id=778). It is never shown, retried or parked: the run's
-/// lifecycle sees the stop token and cancels the run itself.
+/// The failure mode of a step that was stopped (items.id=778, 816). Built only
+/// by `stopped_failure`; the lifecycle ends a run as cancelled on it (a
+/// source-scan test in auth/writer_gate.rs pins the single producer).
+pub(crate) const USER_STOP_MODE: &str = "USER_STOP";
+
+/// Whether `failure` is the stop `stopped_failure` builds.
+pub(crate) fn is_user_stop(failure: &FailureResult) -> bool {
+    failure.action == FailureAction::Stop && failure.failure_mode.as_deref() == Some(USER_STOP_MODE)
+}
+
+/// The failure a step returns when it was stopped: by 'Stop and save' for a key
+/// rotation (items.id=778), by a user's Cancel (items.id=816), or by an API Chat
+/// Stop during a retry wait (items.id=816). It is never shown, retried or
+/// parked: the run's lifecycle ends the run as cancelled.
 fn stopped_failure(ctx: &StepContext) -> FailureResult {
     FailureResult {
         action: FailureAction::Stop,
-        failure_mode: Some("USER_STOP".to_owned()),
-        plain_language: "This was stopped because the account's keys are being changed.".to_owned(),
+        failure_mode: Some(USER_STOP_MODE.to_owned()),
+        plain_language: "This was stopped.".to_owned(),
         is_recoverable: false,
         severity: FailureSeverity::Stop,
         step_id: Some(ctx.step.step_id.clone()),
@@ -5106,6 +5150,150 @@ mod tests {
         }
     }
 
+    // -- items.id=816: an API Chat Stop ends a retry wait ---------------------
+
+    /// An API Chat step: a streaming hosted step whose stream token is a CHILD
+    /// of the lease token (api_chat.rs), as `register_child_of` builds it.
+    fn api_chat_ctx(
+        parent: &CancellationToken,
+        reg: &crate::chat_stream::ChatStreamRegistry,
+    ) -> StepContext {
+        StepContext {
+            stream: Some(reg.register_child_of("u1", "run-1", parent)),
+            ..loop_ctx(Some(parent.clone()))
+        }
+    }
+
+    /// The real Stop of `cancel_chat_stream`.
+    fn user_stop(reg: &crate::chat_stream::ChatStreamRegistry) {
+        crate::commands::chat_stream::cancel_for_user(reg, "u1", "run-1").unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_during_a_retry_after_wait_of_an_api_chat_run_ends_it_with_no_further_attempt() {
+        let parent = CancellationToken::new();
+        let reg = crate::chat_stream::ChatStreamRegistry::default();
+        let ctx = api_chat_ctx(&parent, &reg);
+        assert!(step_streams(&ctx));
+        let mut a = Scripted::new(vec![Ok(Some(hosted_retry(Some(45)))), Ok(None)]);
+        let h = handler();
+        let start = tokio::time::Instant::now();
+        let (r, ()) = tokio::join!(retry_loop(&mut a, &ctx, &h, |m| m), async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            user_stop(&reg);
+        });
+        assert_eq!(a.seen, [0], "no further attempt, so no spend pre-flight");
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_secs(1),
+            "the wait ended at the Stop"
+        );
+        assert!(is_user_stop(&r.expect("a stop result")));
+        assert!(
+            !parent.is_cancelled(),
+            "the Stop leaves the lease token alone"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_during_a_backoff_wait_of_an_api_chat_run_ends_it_with_no_further_attempt() {
+        let parent = CancellationToken::new();
+        let reg = crate::chat_stream::ChatStreamRegistry::default();
+        let ctx = api_chat_ctx(&parent, &reg);
+        let mut a = Scripted::new(vec![Ok(Some(hosted_retry(None))), Ok(None)]);
+        let h = handler();
+        let start = tokio::time::Instant::now();
+        // The sampler at its maximum: a 1 s backoff before the first retry.
+        let (r, ()) = tokio::join!(retry_loop(&mut a, &ctx, &h, |m| m), async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            user_stop(&reg);
+        });
+        assert_eq!(a.seen, [0]);
+        assert_eq!(start.elapsed(), Duration::from_millis(300));
+        assert!(is_user_stop(&r.expect("a stop result")));
+        assert!(!parent.is_cancelled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_before_the_retry_is_considered_means_no_wait_and_no_attempt() {
+        let parent = CancellationToken::new();
+        let reg = crate::chat_stream::ChatStreamRegistry::default();
+        let ctx = api_chat_ctx(&parent, &reg);
+        user_stop(&reg);
+        let mut a = Scripted::new(vec![Ok(Some(hosted_retry(Some(45)))), Ok(None)]);
+        let start = tokio::time::Instant::now();
+        let r = retry_loop(&mut a, &ctx, &handler(), |m| m).await;
+        assert_eq!(a.seen, [0]);
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        assert!(is_user_stop(&r.expect("a stop result")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_parent_trip_of_an_api_chat_run_ends_the_wait_and_returns_the_retry_unchanged() {
+        // A rotation's 'Stop and save' or cancel_run on an API Chat run: the
+        // child is tripped with the parent, the wait ends, and the lifecycle
+        // sees the lease token (so the result is the existing 727 one).
+        let parent = CancellationToken::new();
+        let reg = crate::chat_stream::ChatStreamRegistry::default();
+        let ctx = api_chat_ctx(&parent, &reg);
+        let mut a = Scripted::new(vec![Ok(Some(hosted_retry(Some(45)))), Ok(None)]);
+        let h = handler();
+        let start = tokio::time::Instant::now();
+        let (r, ()) = tokio::join!(retry_loop(&mut a, &ctx, &h, |m| m), async {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            parent.cancel();
+        });
+        assert_eq!(a.seen, [0]);
+        assert_eq!(start.elapsed(), Duration::from_secs(2));
+        assert_eq!(r.expect("the last result").action, FailureAction::Retry);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_with_no_wait_in_progress_changes_nothing_in_the_loop() {
+        // What a normal Stop looks like to the loop: the attempt itself ends
+        // (a cancelled stream is F10 AwaitUser, or a step that finished), and
+        // the loop returns that untouched.
+        let parent = CancellationToken::new();
+        let reg = crate::chat_stream::ChatStreamRegistry::default();
+        let ctx = api_chat_ctx(&parent, &reg);
+        user_stop(&reg);
+        let mut awaiting = hosted_retry(None);
+        awaiting.action = FailureAction::AwaitUser;
+        let mut a = Scripted::new(vec![Ok(Some(awaiting.clone()))]);
+        let r = retry_loop(&mut a, &ctx, &handler(), |m| m).await;
+        assert_eq!(a.seen, [0]);
+        let r = r.expect("the attempt's own failure");
+        assert_eq!(r.action, FailureAction::AwaitUser);
+        assert!(!is_user_stop(&r));
+
+        let mut a = Scripted::new(vec![Ok(None)]);
+        assert!(retry_loop(&mut a, &ctx, &handler(), |m| m).await.is_none());
+    }
+
+    #[test]
+    fn the_retry_machinery_watches_the_stream_token_only_when_the_step_streams() {
+        let parent = CancellationToken::new();
+        let reg = crate::chat_stream::ChatStreamRegistry::default();
+        let streaming = api_chat_ctx(&parent, &reg);
+        assert!(effective_stop(&streaming).is_some());
+        user_stop(&reg);
+        assert!(effective_stop(&streaming).unwrap().is_cancelled());
+        assert!(!parent.is_cancelled());
+
+        // No stream: exactly ctx.stop, as before this item.
+        let plain = loop_ctx(Some(parent.clone()));
+        assert!(!effective_stop(&plain).unwrap().is_cancelled());
+        parent.cancel();
+        assert!(effective_stop(&plain).unwrap().is_cancelled());
+        assert!(effective_stop(&loop_ctx(None)).is_none());
+
+        // A stream on a LOCAL step is not streamed: ctx.stop is what counts.
+        let mut local = api_chat_ctx(&CancellationToken::new(), &reg);
+        local.effective_access = ExternalAccess::LocalOnly;
+        assert!(!step_streams(&local));
+        assert!(!effective_stop(&local).unwrap().is_cancelled());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_floor_consent_wait_and_a_non_retry_failure_are_returned_untouched() {
         for action in [FailureAction::AwaitFloorConsent, FailureAction::AwaitUser] {
@@ -6069,6 +6257,9 @@ mod tests {
         let f = stopped_failure(&hosted_ctx(RunAttendance::Attended, "k"));
         assert_eq!(f.action, FailureAction::Stop);
         assert_eq!(f.failure_mode.as_deref(), Some("USER_STOP"));
+        assert_eq!(f.failure_mode.as_deref(), Some(USER_STOP_MODE));
+        assert!(is_user_stop(&f));
+        assert_eq!(f.plain_language, "This was stopped.");
         assert!(!f.is_recoverable);
     }
 }

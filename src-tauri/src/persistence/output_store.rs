@@ -981,7 +981,8 @@ pub async fn delete_output(
 // Consent decisions (D6-352)
 // ---------------------------------------------------------------------------
 
-/// Mark a focus run as cancelled.
+/// Mark a focus run as cancelled and delete its snapshots (decisions.id=865:
+/// cancelled purges at once).
 /// No-op if the run is already in a terminal state (complete/cancelled/failed).
 /// Returns RunNotFound if run_id does not exist in this outputs.db.
 pub async fn cancel_focus_run(
@@ -1004,13 +1005,25 @@ pub async fn cancel_focus_run(
     }
 
     // Update only if not already terminal — no-op on complete/cancelled/failed.
-    sqlx::query(
+    let changed = sqlx::query(
         "UPDATE focus_runs SET status = 'cancelled'
          WHERE id = ? AND status NOT IN ('complete','cancelled','failed')",
     )
     .bind(run_id)
     .execute(&mut conn)
-    .await?;
+    .await?
+    .rows_affected();
+
+    // items.id=816 (decisions.id=865): a cancelled run keeps no snapshot. A
+    // live run's own cleanup purges them too; a run parked in awaiting_user or
+    // awaiting_schedule has no run to do it. Only when this call changed the
+    // row, so a repeat or a finished run touches nothing.
+    if changed > 0 {
+        sqlx::query("DELETE FROM focus_run_snapshots WHERE focus_run_id = ?")
+            .bind(run_id)
+            .execute(&mut conn)
+            .await?;
+    }
 
     Ok(())
 }

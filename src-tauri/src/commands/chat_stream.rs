@@ -7,8 +7,9 @@
 // user, read from the KeyRegistry - never an id the front end supplies - so a
 // caller can only ever stop its own stream. An unknown run and another user's
 // run give the same error and trip nothing; cancelling twice, or a stream
-// that just finished, is Ok. `cancel_run` is untouched (it only writes a
-// status and does not stop an in-flight generation; reported separately).
+// that just finished, is Ok. This is a Stop of the reply's stream; it does not
+// cancel the run. `cancel_run` (commands/execution.rs, items.id=816) is the
+// cancel of the whole run: it trips the run's lease stop token.
 
 use tauri::State;
 
