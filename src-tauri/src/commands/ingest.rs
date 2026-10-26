@@ -46,17 +46,149 @@
 // frontend.
 
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
 use base64::Engine as _;
 use serde::Serialize;
 use specta::Type;
 use tauri::{Manager, State};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::auth::registry::{key_hex, KeyRegistry};
 use crate::persistence::ingest_blob;
 use crate::persistence::output_store;
 use crate::providers::ollama_client::OllamaClient;
 use crate::providers::types::{GenerateOptions, GenerateRequest};
+
+/// Largest document, in bytes, that ingest accepts (items.id=664): applies to a
+/// picked file and to pasted content alike. 100 MiB; Chat-PM's choice, change
+/// it here only (the user-facing strings below say "100 MB"). Peak memory at
+/// the cap is about 3x this for a text file (the shared bytes, plus the
+/// ciphertext and assembled file bytes of ingest_blob's seal step), plus
+/// whatever the PDF/DOCX parsers expand it to, which nothing here bounds
+/// (items.id=665).
+const MAX_INGEST_BYTES: u64 = 100 * 1024 * 1024;
+
+/// How long the command waits for PDF/DOCX text extraction before it stores the
+/// document without a text mirror (items.id=664). Under writer_gate's
+/// COMMAND_DRAIN_CEILING (30 s) because the ingest lease is held across the
+/// wait. This stops the WAIT, not the blocking thread: a hung parser keeps its
+/// thread and its Arc of the bytes until it returns. Real isolation is
+/// items.id=665.
+const EXTRACTION_TIMEOUT: Duration = Duration::from_secs(20);
+
+// User-facing text: LibraryPane renders the command's error string verbatim, so
+// none of these carries a path, an id or an OS error (those go to the log).
+const ERR_NOT_REGULAR_FILE: &str = "This isn't a regular file, so it can't be imported.";
+const ERR_FILE_TOO_LARGE: &str = "This file is larger than the 100 MB import limit.";
+const ERR_PASTE_TOO_LARGE: &str = "The pasted text is larger than the 100 MB import limit.";
+const ERR_FILE_UNREADABLE: &str = "That file could not be read.";
+
+fn read_failed(e: std::io::Error) -> String {
+    log::warn!("store_ingested_document: reading the file failed: {e}");
+    ERR_FILE_UNREADABLE.to_owned()
+}
+
+/// Rejects anything that is not a regular file or is over `cap`. Run on the
+/// path's metadata first (cheap, and a stat never blocks on a FIFO) and again
+/// on the opened handle's, so a path swapped for a FIFO or a larger file in
+/// between is still caught.
+fn check_regular_and_size(meta: &std::fs::Metadata, cap: u64) -> Result<(), String> {
+    if !meta.is_file() {
+        return Err(ERR_NOT_REGULAR_FILE.to_owned());
+    }
+    if meta.len() > cap {
+        return Err(ERR_FILE_TOO_LARGE.to_owned());
+    }
+    Ok(())
+}
+
+/// The cap for pasted content, by its UTF-8 byte length. (The IPC layer has
+/// already deserialized the whole string by now; this bounds the copies, the
+/// blob and the mirror that follow.)
+fn check_paste_size(len: usize, cap: u64) -> Result<(), String> {
+    if len as u64 > cap {
+        return Err(ERR_PASTE_TOO_LARGE.to_owned());
+    }
+    Ok(())
+}
+
+/// Reads at most `cap` bytes from `reader`. `take(cap + 1)` bounds the read
+/// even when the source grows past the size it reported; one byte over `cap`
+/// is the rejection.
+async fn read_capped<R: AsyncRead + Unpin>(
+    reader: R,
+    size_hint: u64,
+    cap: u64,
+) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::with_capacity(size_hint.min(cap).saturating_add(1) as usize);
+    reader
+        .take(cap + 1)
+        .read_to_end(&mut buf)
+        .await
+        .map_err(read_failed)?;
+    if buf.len() as u64 > cap {
+        return Err(ERR_FILE_TOO_LARGE.to_owned());
+    }
+    Ok(buf)
+}
+
+/// Reads a picked file for ingest: regular files only, at most `cap` bytes.
+/// `tokio::fs::metadata` follows symlinks, so a symlink to a FIFO or device is
+/// rejected like the FIFO itself. On unix the open is O_NONBLOCK, so a path
+/// that became a FIFO after the stat does not block the open; the opened
+/// handle is then checked again.
+async fn read_ingest_file(path: &Path, cap: u64) -> Result<Vec<u8>, String> {
+    let meta = tokio::fs::metadata(path).await.map_err(read_failed)?;
+    check_regular_and_size(&meta, cap)?;
+    let (file, len) = open_regular_file(path, cap).await?;
+    read_capped(file, len, cap).await
+}
+
+/// Opens `path` and checks the OPENED handle (see read_ingest_file). Returns
+/// the file and its size.
+async fn open_regular_file(path: &Path, cap: u64) -> Result<(tokio::fs::File, u64), String> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK);
+    let file = options.open(path).await.map_err(read_failed)?;
+    let meta = file.metadata().await.map_err(read_failed)?;
+    check_regular_and_size(&meta, cap)?;
+    Ok((file, meta.len()))
+}
+
+/// Waits for a blocking task for at most `limit`. None on timeout or when the
+/// task failed. A timeout drops the handle, which detaches the task: it keeps
+/// running (see EXTRACTION_TIMEOUT).
+async fn await_bounded<T>(handle: tokio::task::JoinHandle<T>, limit: Duration) -> Option<T> {
+    match tokio::time::timeout(limit, handle).await {
+        Ok(joined) => joined.ok(),
+        Err(_) => {
+            log::warn!("store_ingested_document: text extraction timed out after {limit:?}");
+            None
+        }
+    }
+}
+
+/// Where an ingested document's searchable text mirror comes from. The UTF-8
+/// case borrows the shared bytes instead of copying them.
+enum Mirror {
+    Absent,
+    Utf8,
+    Extracted(String),
+}
+
+impl Mirror {
+    fn view<'a>(&'a self, bytes: &'a [u8]) -> Option<&'a str> {
+        match self {
+            Mirror::Absent => None,
+            Mirror::Utf8 => std::str::from_utf8(bytes).ok(),
+            Mirror::Extracted(text) => Some(text),
+        }
+    }
+}
 
 /// Extensions this build will mirror into outputs.content as plain text for
 /// FTS5 search. Anything else is still stored via ingest_blob -- just not
@@ -219,6 +351,81 @@ pub struct StoreIngestedDocumentResponse {
     pub output_id: String,
 }
 
+/// The three writes of an import: the encrypted blob, the ingest-only
+/// focus_run row, the outputs row. If any of them fails the output's blob
+/// directory is removed (items.id=664) and the ORIGINAL error is returned, so
+/// a failed save leaves nothing on disk. Safe because `output_id` is new in
+/// this import and no row references it yet; the caller holds the writer lease
+/// across the writes and this cleanup, so a key rotation cannot interleave.
+/// (A focus_run row written before a failing output insert stays, as before.)
+#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
+async fn persist_ingested_document(
+    user_id: &str,
+    persona_id: &str,
+    master_key: &[u8; crate::auth::kdf::MASTER_KEY_LEN],
+    key_hex_str: &str,
+    output_id: &str,
+    focus_slug: &str,
+    project_entity_id: Option<&str>,
+    sensitivity: &str,
+    original_filename: &str,
+    bytes: &[u8],
+    mirrored_content: Option<&str>,
+) -> Result<(), String> {
+    // A new document's first blob; matches the storage_version=1 that
+    // save_ingested_output inserts below.
+    let version = 1;
+    let storage_path = ingest_blob::ingest_blob_path(user_id, persona_id, output_id, version);
+
+    let saved = async {
+        ingest_blob::write_encrypted_blob(
+            &storage_path,
+            master_key,
+            user_id,
+            persona_id,
+            output_id,
+            version,
+            bytes,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+        let focus_run_id = output_store::create_ingest_focus_run(user_id, persona_id, key_hex_str)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        output_store::save_ingested_output(
+            user_id,
+            persona_id,
+            key_hex_str,
+            output_id,
+            &focus_run_id,
+            "ingested_document",
+            sensitivity,
+            focus_slug,
+            project_entity_id,
+            &storage_path.to_string_lossy(),
+            original_filename,
+            mirrored_content,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    .await;
+
+    if saved.is_err() {
+        // write_encrypted_blob can fail after its rename (the directory
+        // fsync), so the cleanup runs for a failed blob write too.
+        if let Err(e) = ingest_blob::remove_output_blobs(user_id, persona_id, output_id).await {
+            log::warn!(
+                "store_ingested_document: removing the blob after a failed save failed: {e}"
+            );
+        }
+    }
+    saved
+}
+
 /// Store an uploaded/ingested document: writes its bytes to an encrypted
 /// blob on disk (ingest_blob), creates a lightweight ingest-only focus_run,
 /// and writes the outputs.db row (source='external_ingested').
@@ -266,84 +473,69 @@ pub async fn store_ingested_document(
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
-    let (bytes, mirrored_content, original_filename, ocr_eligible): (
-        Vec<u8>,
-        Option<String>,
-        String,
-        bool,
-    ) = match (content, file_path) {
-        (Some(text), None) => {
-            let bytes = text.clone().into_bytes();
-            (bytes, Some(text), "pasted-content.txt".to_owned(), false)
-        }
-        (None, Some(path_str)) => {
-            let path = Path::new(&path_str);
-            let bytes = tokio::fs::read(path)
-                .await
-                .map_err(|e| format!("could not read file at '{path_str}': {e}"))?;
-            let original_filename = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path_str.clone());
-            let ocr_eligible = is_ocr_extension(path);
-            let mirrored = if is_text_mirror_extension(path) {
-                // Explicit error would be the wrong call here -- an
-                // extension in the mirror allowlist that fails to
-                // decode as UTF-8 is still a legitimate file to store,
-                // it just doesn't get a searchable text mirror.
-                String::from_utf8(bytes.clone()).ok()
-            } else {
-                let path_owned = path.to_path_buf();
-                let bytes_for_extract = bytes.clone();
-                tokio::task::spawn_blocking(move || {
-                    extract_document_text(&path_owned, &bytes_for_extract)
-                })
-                .await
-                .unwrap_or(None)
-            };
-            (bytes, mirrored, original_filename, ocr_eligible)
-        }
-        _ => unreachable!("validated exactly one of content/file_path above"),
-    };
+    // items.id=664: one copy of the document's bytes, shared by the text
+    // mirror, the extraction and the background OCR task (Arc, not clones).
+    let (bytes, mirror, original_filename, ocr_eligible): (Arc<Vec<u8>>, Mirror, String, bool) =
+        match (content, file_path) {
+            (Some(text), None) => {
+                check_paste_size(text.len(), MAX_INGEST_BYTES)?;
+                (
+                    Arc::new(text.into_bytes()),
+                    Mirror::Utf8,
+                    "pasted-content.txt".to_owned(),
+                    false,
+                )
+            }
+            (None, Some(path_str)) => {
+                let path = Path::new(&path_str);
+                let bytes = Arc::new(read_ingest_file(path, MAX_INGEST_BYTES).await?);
+                let original_filename = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path_str.clone());
+                let ocr_eligible = is_ocr_extension(path);
+                let mirror = if is_text_mirror_extension(path) {
+                    // Explicit error would be the wrong call here -- an
+                    // extension in the mirror allowlist that fails to
+                    // decode as UTF-8 is still a legitimate file to store,
+                    // it just doesn't get a searchable text mirror.
+                    Mirror::Utf8
+                } else {
+                    let path_owned = path.to_path_buf();
+                    let bytes_for_extract = Arc::clone(&bytes);
+                    let extraction = tokio::task::spawn_blocking(move || {
+                        extract_document_text(&path_owned, &bytes_for_extract)
+                    });
+                    // A timeout degrades to no text mirror, like a parse
+                    // failure: the document is still stored.
+                    match await_bounded(extraction, EXTRACTION_TIMEOUT)
+                        .await
+                        .flatten()
+                    {
+                        Some(text) => Mirror::Extracted(text),
+                        None => Mirror::Absent,
+                    }
+                };
+                (bytes, mirror, original_filename, ocr_eligible)
+            }
+            _ => unreachable!("validated exactly one of content/file_path above"),
+        };
 
     let output_id = uuid::Uuid::new_v4().to_string();
-    // A new document's first blob; matches the storage_version=1 that
-    // save_ingested_output inserts below.
-    let version = 1;
-    let storage_path = ingest_blob::ingest_blob_path(&user_id, &persona_id, &output_id, version);
-
-    ingest_blob::write_encrypted_blob(
-        &storage_path,
+    persist_ingested_document(
+        &user_id,
+        &persona_id,
         &master_key,
-        &user_id,
-        &persona_id,
-        &output_id,
-        version,
-        &bytes,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let focus_run_id = output_store::create_ingest_focus_run(&user_id, &persona_id, &key_hex_str)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    output_store::save_ingested_output(
-        &user_id,
-        &persona_id,
         &key_hex_str,
         &output_id,
-        &focus_run_id,
-        "ingested_document",
-        &sensitivity,
         &focus_slug,
         project_entity_id.as_deref(),
-        &storage_path.to_string_lossy(),
+        &sensitivity,
         &original_filename,
-        mirrored_content.as_deref(),
+        &bytes,
+        mirror.view(&bytes),
     )
-    .await
-    .map_err(|e| e.to_string())?;
+    .await?;
 
     // items.id=150 Part 2: OCR runs detached in the background -- it must
     // never delay this command's IPC response (see OCR_EXTENSIONS's doc
@@ -353,7 +545,7 @@ pub async fn store_ingested_document(
         let bg_persona_id = persona_id.clone();
         let bg_key_hex = key_hex_str.clone();
         let bg_output_id = output_id.clone();
-        let bg_bytes = bytes.clone();
+        let bg_bytes = Arc::clone(&bytes);
         // items.id=778: the OCR backfill writes after this command returns, so
         // it holds a lease of its own. If a rotation is under way the document
         // is already stored; only the searchable text is skipped, and said so.
@@ -604,5 +796,319 @@ mod tests {
     fn rejects_tiff_extensions() {
         assert!(!is_ocr_extension(Path::new("scan.tiff")));
         assert!(!is_ocr_extension(Path::new("scan.tif")));
+    }
+
+    // -- bounded reads (items.id=664) ----------------------------------------
+
+    #[test]
+    fn the_cap_is_100_mib_and_the_strings_say_so() {
+        assert_eq!(MAX_INGEST_BYTES, 100 * 1024 * 1024);
+        assert!(ERR_FILE_TOO_LARGE.contains("100 MB"));
+        assert!(ERR_PASTE_TOO_LARGE.contains("100 MB"));
+    }
+
+    #[tokio::test]
+    async fn a_file_at_the_cap_is_read_and_one_byte_over_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let at_cap = dir.path().join("at_cap.bin");
+        let over = dir.path().join("over.bin");
+        std::fs::write(&at_cap, vec![7u8; 64]).unwrap();
+        std::fs::write(&over, vec![7u8; 65]).unwrap();
+
+        assert_eq!(read_ingest_file(&at_cap, 64).await.unwrap(), vec![7u8; 64]);
+        assert_eq!(
+            read_ingest_file(&over, 64).await.unwrap_err(),
+            ERR_FILE_TOO_LARGE
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_file_is_read_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty.txt");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(read_ingest_file(&empty, 64).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_file_over_the_real_cap_is_rejected_without_being_read() {
+        // Sparse: no disk or memory is used, and the metadata check rejects it
+        // before any byte is read.
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("big.bin");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_INGEST_BYTES + 1)
+            .unwrap();
+        assert_eq!(
+            read_ingest_file(&big, MAX_INGEST_BYTES).await.unwrap_err(),
+            ERR_FILE_TOO_LARGE
+        );
+    }
+
+    #[tokio::test]
+    async fn a_source_that_outgrows_its_reported_size_is_still_bounded() {
+        // An endless reader stands in for a file that grows during the read.
+        let err = read_capped(tokio::io::repeat(0u8), 0, 1024)
+            .await
+            .unwrap_err();
+        assert_eq!(err, ERR_FILE_TOO_LARGE);
+
+        let exact = read_capped(&b"abcd"[..], 4, 4).await.unwrap();
+        assert_eq!(exact, b"abcd");
+    }
+
+    #[tokio::test]
+    async fn a_directory_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            read_ingest_file(dir.path(), 64).await.unwrap_err(),
+            ERR_NOT_REGULAR_FILE
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_file_gives_the_generic_message_without_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("secret-name.pdf");
+        let err = read_ingest_file(&missing, 64).await.unwrap_err();
+        assert_eq!(err, ERR_FILE_UNREADABLE);
+        assert!(!err.contains("secret-name"));
+    }
+
+    #[cfg(unix)]
+    fn make_fifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated path that outlives the call.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fifo_is_rejected_and_does_not_hang() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        make_fifo(&fifo);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), read_ingest_file(&fifo, 64))
+            .await
+            .expect("a FIFO must be rejected, not waited on");
+        assert_eq!(result.unwrap_err(), ERR_NOT_REGULAR_FILE);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_to_a_fifo_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        let link = dir.path().join("link");
+        make_fifo(&fifo);
+        std::os::unix::fs::symlink(&fifo, &link).unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), read_ingest_file(&link, 64))
+            .await
+            .expect("a symlink to a FIFO must be rejected, not waited on");
+        assert_eq!(result.unwrap_err(), ERR_NOT_REGULAR_FILE);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn opening_a_fifo_directly_is_non_blocking_and_checked_on_the_handle() {
+        // The stat in read_ingest_file normally rejects a FIFO first. This is
+        // the path swapped for a FIFO between that stat and the open: the open
+        // must not block (O_NONBLOCK) and the handle check must reject it.
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        make_fifo(&fifo);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), open_regular_file(&fifo, 64))
+            .await
+            .expect("opening a FIFO must not block");
+        assert_eq!(result.err().unwrap(), ERR_NOT_REGULAR_FILE);
+    }
+
+    #[test]
+    fn pasted_content_is_capped_by_utf8_length() {
+        assert!(check_paste_size(64, 64).is_ok());
+        assert_eq!(check_paste_size(65, 64).unwrap_err(), ERR_PASTE_TOO_LARGE);
+        // 'é' is two bytes: 33 characters are 66 bytes.
+        let multibyte = "é".repeat(33);
+        assert_eq!(multibyte.chars().count(), 33);
+        assert_eq!(
+            check_paste_size(multibyte.len(), 64).unwrap_err(),
+            ERR_PASTE_TOO_LARGE
+        );
+    }
+
+    // -- bounded wait on extraction (items.id=664) ---------------------------
+
+    #[tokio::test]
+    async fn a_hung_blocking_task_stops_being_waited_on() {
+        let started = std::time::Instant::now();
+        let handle = tokio::task::spawn_blocking(|| {
+            std::thread::sleep(Duration::from_secs(2));
+            Some("late".to_owned())
+        });
+        let got = await_bounded(handle, Duration::from_millis(50)).await;
+        assert_eq!(got, None);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the wait must end at the limit, not when the task does"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_task_that_finishes_in_time_returns_its_value() {
+        let handle = tokio::task::spawn_blocking(|| 41 + 1);
+        assert_eq!(
+            await_bounded(handle, Duration::from_secs(5)).await,
+            Some(42)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_panicking_blocking_task_is_none_not_a_panic() {
+        let handle = tokio::task::spawn_blocking(|| -> u8 { panic!("parser blew up") });
+        assert_eq!(await_bounded(handle, Duration::from_secs(5)).await, None);
+    }
+
+    #[test]
+    fn the_mirror_borrows_utf8_bytes_and_drops_invalid_ones() {
+        let valid = "héllo".as_bytes();
+        assert_eq!(Mirror::Utf8.view(valid), Some("héllo"));
+        assert_eq!(Mirror::Utf8.view(&[0xff, 0xfe]), None);
+        assert_eq!(Mirror::Absent.view(valid), None);
+        assert_eq!(
+            Mirror::Extracted("text".to_owned()).view(&[0xff]),
+            Some("text")
+        );
+    }
+
+    // -- no blob survives a failed save (items.id=664) -----------------------
+
+    const TEST_USER: &str = "ingest-664-user";
+    const TEST_PERSONA: &str = "ingest-664-persona";
+    const TEST_DATA_KEY: [u8; crate::auth::kdf::MASTER_KEY_LEN] =
+        [0x5au8; crate::auth::kdf::MASTER_KEY_LEN];
+
+    /// Points QR_DATA_ROOT at a fresh tempdir for one test and restores it.
+    struct DataRoot {
+        _lock: tokio::sync::MutexGuard<'static, ()>,
+        saved: Option<String>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl DataRoot {
+        async fn new() -> Self {
+            let lock = crate::test_support::ENV_MUTEX.lock().await;
+            let saved = std::env::var("QR_DATA_ROOT").ok();
+            let dir = tempfile::tempdir().expect("failed to create tempdir");
+            std::env::set_var("QR_DATA_ROOT", dir.path());
+            DataRoot {
+                _lock: lock,
+                saved,
+                _dir: dir,
+            }
+        }
+    }
+
+    impl Drop for DataRoot {
+        fn drop(&mut self) {
+            match self.saved.take() {
+                Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+                None => std::env::remove_var("QR_DATA_ROOT"),
+            }
+        }
+    }
+
+    fn blob_dir(output_id: &str) -> std::path::PathBuf {
+        ingest_blob::ingest_blob_path(TEST_USER, TEST_PERSONA, output_id, 1)
+            .parent()
+            .unwrap()
+            .to_path_buf()
+    }
+
+    async fn persist(output_id: &str, key_hex_str: &str, sensitivity: &str) -> Result<(), String> {
+        persist_ingested_document(
+            TEST_USER,
+            TEST_PERSONA,
+            &TEST_DATA_KEY,
+            key_hex_str,
+            output_id,
+            "writing-assistant",
+            None,
+            sensitivity,
+            "doc.txt",
+            b"the document",
+            Some("the document"),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_successful_save_keeps_the_blob_and_the_row() {
+        let _root = DataRoot::new().await;
+        let key = key_hex(&TEST_DATA_KEY);
+
+        persist("out-ok", &key, "general").await.expect("must save");
+
+        let path = ingest_blob::ingest_blob_path(TEST_USER, TEST_PERSONA, "out-ok", 1);
+        let plain = ingest_blob::read_encrypted_blob(
+            &path,
+            &TEST_DATA_KEY,
+            TEST_USER,
+            TEST_PERSONA,
+            "out-ok",
+            1,
+        )
+        .await
+        .expect("the blob must be readable");
+        assert_eq!(plain, b"the document");
+        let record = output_store::get_output(TEST_USER, TEST_PERSONA, &key, "out-ok")
+            .await
+            .unwrap();
+        assert!(record.is_some(), "the outputs row must exist");
+    }
+
+    #[tokio::test]
+    async fn a_failed_output_insert_leaves_no_blob() {
+        let _root = DataRoot::new().await;
+        let key = key_hex(&TEST_DATA_KEY);
+
+        // The sensitivity check fails save_ingested_output after the blob and
+        // the focus_run row have been written.
+        let err = persist("out-bad-sensitivity", &key, "not-a-sensitivity")
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("Invalid sensitivity"), "original error: {err}");
+        assert!(
+            !blob_dir("out-bad-sensitivity").exists(),
+            "the blob directory must be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_run_row_insert_leaves_no_blob() {
+        let _root = DataRoot::new().await;
+        let key = key_hex(&TEST_DATA_KEY);
+        // outputs.db now exists under `key`; opening it under another key
+        // fails create_ingest_focus_run after the blob was written.
+        persist("out-first", &key, "general").await.unwrap();
+        let wrong_key = key_hex(&[0x6bu8; crate::auth::kdf::MASTER_KEY_LEN]);
+
+        let result = persist("out-wrong-key", &wrong_key, "general").await;
+
+        assert!(result.is_err(), "a wrong database key must fail the save");
+        assert!(
+            !blob_dir("out-wrong-key").exists(),
+            "the blob directory must be removed"
+        );
+        assert!(
+            blob_dir("out-first").exists(),
+            "an earlier, saved document's blob must be untouched"
+        );
     }
 }

@@ -422,6 +422,29 @@ pub fn stale_tmp_path(path: &Path) -> PathBuf {
     tmp_path(path)
 }
 
+/// Remove every blob file of one output: the whole
+/// `ingested_documents/<output_id>` directory (all `v{n}.enc` and any leftover
+/// `.tmp`). A directory that is already gone is Ok. Idempotent.
+///
+/// items.id=664: the failed-save cleanup of commands/ingest.rs, which calls it
+/// for an `output_id` it generated itself a moment earlier, so nothing else
+/// writes under that directory. Never call it for an output whose row exists
+/// without deciding that its bytes should leave the disk.
+pub async fn remove_output_blobs(
+    user_id: &str,
+    persona_id: &str,
+    output_id: &str,
+) -> std::io::Result<()> {
+    let path = ingest_blob_path(user_id, persona_id, output_id, 1);
+    let Some(dir) = path.parent() else {
+        return Ok(());
+    };
+    match tokio::fs::remove_dir_all(dir).await {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -803,6 +826,42 @@ mod tests {
         } else {
             std::env::remove_var("QR_DATA_ROOT");
         }
+    }
+
+    // -- failed-save cleanup (items.id=664) ----------------------------------
+
+    #[tokio::test]
+    async fn remove_output_blobs_removes_every_version_and_a_stale_tmp() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let v1 = ingest_blob_path("user-a", "persona-a", "out-1", 1);
+        let v2 = ingest_blob_path("user-a", "persona-a", "out-1", 2);
+        let other = ingest_blob_path("user-a", "persona-a", "out-2", 1);
+        for p in [&v1, &v2, &other] {
+            write_encrypted_blob(p, &KEY, "user-a", "persona-a", "out-1", 1, b"doc")
+                .await
+                .unwrap();
+        }
+        tokio::fs::write(tmp_path(&v1), b"stale").await.unwrap();
+
+        let result = remove_output_blobs("user-a", "persona-a", "out-1").await;
+        let gone = !v1.parent().unwrap().exists();
+        let sibling_kept = other.exists();
+        let again = remove_output_blobs("user-a", "persona-a", "out-1").await;
+        let never_existed = remove_output_blobs("user-a", "persona-a", "out-9").await;
+
+        match saved_root {
+            Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+            None => std::env::remove_var("QR_DATA_ROOT"),
+        }
+        result.expect("removal must succeed");
+        assert!(gone, "the whole output directory must be gone");
+        assert!(sibling_kept, "another output's blob must be untouched");
+        again.expect("a second removal is a no-op, not an error");
+        never_existed.expect("a missing directory is Ok");
     }
 
     // -- rotation re-encryption (items.id=630) ------------------------------
