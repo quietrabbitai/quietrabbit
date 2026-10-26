@@ -56,19 +56,39 @@ jobs:
         with:
           workspaces: src-tauri -> target
 
+      # items.id=821: the Linux dependency .debs come from an actions/cache entry
+      # when it holds them, so a slow mirror only matters for what the cache
+      # lacks. restore-keys returns the newest entry; the entry is saved (by the
+      # Save step below) only when the needed .deb set changed.
+      - name: Restore apt .deb cache
+        id: apt-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/apt-debs
+          key: apt-debs-v1-restore-${{ github.run_id }}
+          restore-keys: apt-debs-v1-
+
       - name: Install Linux dependencies
+        id: apt-install
         timeout-minutes: 20
+        env:
+          MATCHED_KEY: ${{ steps.apt-cache.outputs.cache-matched-key }}
         run: |
           pkgs=(libwebkit2gtk-4.1-dev
             build-essential curl wget file libssl-dev libgtk-3-dev
             libayatana-appindicator3-dev librsvg2-dev)
+          debs="$HOME/apt-debs"
           # items.id=813: a slow mirror once stretched this step to 21 min.
           # Bound the network part (update + download only) to 300 s per attempt,
           # 3 attempts, 15 s apart. Completed .debs stay in /var/cache/apt/archives
           # and partial ones resume, so a retry only fetches what is missing.
+          # items.id=821: after the update, .debs from the cache that match the
+          # signed index (size and SHA-256, see ci-apt-cache.sh) are put in
+          # place first, so the download below only fetches what is missing.
           for attempt in 1 2 3; do
             if sudo timeout --kill-after=10 300 sh -c \
-                'apt-get update && apt-get install -y --download-only "$@"' sh "${pkgs[@]}"; then
+                'apt-get update && .github/scripts/ci-apt-cache.sh seed "$0" "$@" && apt-get install -y --download-only "$@"' \
+                "$debs" "${pkgs[@]}"; then
               break
             fi
             if [ "$attempt" -eq 3 ]; then
@@ -80,6 +100,15 @@ jobs:
           done
           # Offline from the cache: nothing here waits on the network.
           sudo apt-get install -y "${pkgs[@]}"
+          # Success only: stage the verified set; sets apt_key when it changed.
+          sudo .github/scripts/ci-apt-cache.sh stage "$debs" "$GITHUB_OUTPUT" "$MATCHED_KEY"
+
+      - name: Save apt .deb cache
+        if: steps.apt-install.outputs.apt_key != ''
+        uses: actions/cache/save@v4
+        with:
+          path: ~/apt-debs
+          key: ${{ steps.apt-install.outputs.apt_key }}
 
       # Ubuntu 24.04's apt libsqlcipher-dev (4.5.6-1build2) is not compiled with
       # SQLITE_ENABLE_FTS5, which outputs_001.sql's outputs_fts virtual table
