@@ -79,6 +79,71 @@
   padding: 4px 10px;
 }
 
+/* items.id=817: the "waiting to retry" row. Replaces the live step label while
+ * a hosted retry waits. Neutral tokens only (rule 17, palette v3): no amber, no
+ * new colour. */
+.chat-pane__retry-wait {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 4px 10px;
+  font-size: 14px;
+  color: var(--text-muted);
+}
+
+.chat-pane__retry-wait p {
+  margin: 0;
+}
+
+.chat-pane__retry-wait-why {
+  color: var(--text);
+}
+
+.chat-pane__retry-wait-where {
+  font-size: 13px;
+}
+
+/* Digits keep their width so the countdown does not jiggle. */
+.chat-pane__retry-wait-when {
+  font-variant-numeric: tabular-nums;
+}
+
+.chat-pane__retry-wait-cancel {
+  margin-top: 6px;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.chat-pane__retry-wait-cancel:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: var(--focus-ring-offset);
+}
+
+.chat-pane__retry-wait-cancel:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Text for screen readers only (the one announcement per wait). */
+.chat-pane__sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .chat-pane__not-sent-notice,
 .chat-pane__send-error {
   font-size: 14px;

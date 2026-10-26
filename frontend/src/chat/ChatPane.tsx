@@ -14,7 +14,13 @@ import {
   type PendingCrossPersonaFact,
 } from '../bindings'
 import { CrossPersonaConfirmModal, type CrossPersonaFactDecision } from './CrossPersonaConfirmModal'
-import { classifyRunStatus, findInFlightAssistantMessage } from './lateReplyRecovery'
+import {
+  classifyRunStatus,
+  emptyReplyNotice,
+  findInFlightAssistantMessage,
+} from './lateReplyRecovery'
+import { cancelRetryWait } from './retryWait'
+import { useRetryWait } from './useRetryWait'
 import { findLastCopyableReply } from './copyLastResponse'
 import { applyAllCopyDecisions, COPY_REVIEW_RUN_ID_PREFIX } from './copyDecisions'
 import { devSimulatedCopyFlag } from './devSimulatedCopyFlag'
@@ -227,6 +233,15 @@ export function ChatPane({
     string | null
   >(null)
   const [liveContent, setLiveContent] = useState('')
+  /** items.id=817: the "waiting to retry" row of the active run, if a hosted
+   *  retry is waiting. Replaces the live step label while it shows. */
+  const { row: retryRow, providerName: retryProviderName } = useRetryWait(activeRunId)
+  /** The run whose Cancel was clicked (the button then reads "Cancelling…"). */
+  const [cancellingRunId, setCancellingRunId] = useState<string | null>(null)
+  const [retryCancelError, setRetryCancelError] = useState<{
+    runId: string
+    message: string
+  } | null>(null)
   const [elapsedSeconds, setElapsedSeconds] = useState(0)
   /** items.id=320: set once the CONTENT_POLL_TIMEOUT_MS fallback elapses
    *  with the placeholder row still empty -- surfaces a visible notice
@@ -1149,6 +1164,79 @@ export function ChatPane({
           ? t('navShell.chat.copyLastFailed')
           : t('navShell.chat.copyLastButton')
 
+  // items.id=817: the words of the "waiting to retry" row. The provider name is
+  // the provider row's display name (data); until it is known the row says
+  // 'The provider'. Keys are written out in full so the i18n consistency test
+  // can see every one.
+  const retryProvider = retryProviderName ?? t('navShell.chat.retryWait.providerFallback')
+  const retryWhy = !retryRow
+    ? ''
+    : retryRow.reason === 'busy'
+      ? t('navShell.chat.retryWait.reasonBusy', { provider: retryProvider })
+      : retryRow.reason === 'slow'
+        ? t('navShell.chat.retryWait.reasonSlow', { provider: retryProvider })
+        : t('navShell.chat.retryWait.reasonUnavailable', { provider: retryProvider })
+  const retryWhere = !retryRow
+    ? ''
+    : retryRow.focusName
+      ? t('navShell.chat.retryWait.where', {
+          focus: retryRow.focusName,
+          step: retryRow.stepDisplayName,
+          provider: retryProvider,
+          model: retryRow.modelId,
+        })
+      : t('navShell.chat.retryWait.whereNoFocus', {
+          step: retryRow.stepDisplayName,
+          provider: retryProvider,
+          model: retryRow.modelId,
+        })
+  const retryWhen = !retryRow
+    ? ''
+    : retryRow.mode === 'countdown'
+      ? // Written out as two keys rather than i18next plurals, which the
+        // key-consistency test cannot follow.
+        retryRow.secondsLeft === 1
+        ? t('navShell.chat.retryWait.countdownOne', {
+            count: retryRow.secondsLeft,
+            attempt: retryRow.attempt,
+            max: retryRow.maxAttempts,
+          })
+        : t('navShell.chat.retryWait.countdownOther', {
+            count: retryRow.secondsLeft,
+            attempt: retryRow.attempt,
+            max: retryRow.maxAttempts,
+          })
+      : t('navShell.chat.retryWait.again', {
+          attempt: retryRow.attempt,
+          max: retryRow.maxAttempts,
+        })
+  // No seconds in it: it must not change with every tick.
+  const retryAnnouncement = retryRow
+    ? t('navShell.chat.retryWait.announce', {
+        why: retryWhy,
+        attempt: retryRow.attempt,
+        max: retryRow.maxAttempts,
+      })
+    : ''
+
+  // Cancel of the row: cancel_run really stops the run (items.id=816). The run
+  // then ends cancelled through the normal path (message-content-ready ->
+  // finalize), which clears activeRunId and with it the row.
+  const handleCancelRetryWait = (runId: string) => {
+    setCancellingRunId(runId)
+    cancelRetryWait(commands.cancelRun, runId, userId, personaId)
+      .then((error) => {
+        if (error !== null) {
+          setCancellingRunId(null)
+          setRetryCancelError({ runId, message: error })
+        }
+      })
+      .catch((e: unknown) => {
+        setCancellingRunId(null)
+        setRetryCancelError({ runId, message: String(e) })
+      })
+  }
+
   return (
     <div className="chat-pane" data-collapsed={collapsed ? '' : undefined}>
       {collapsed ? (
@@ -1198,9 +1286,11 @@ export function ChatPane({
                   <span className="chat-pane__message-content">
                     {m.id === liveMessageId && liveContent
                       ? liveContent
-                      : m.content === '' && m.focus_run_id && deadRunIds.has(m.focus_run_id)
-                        ? t('navShell.chat.replyDidNotFinish')
-                        : m.content}
+                      : emptyReplyNotice(m, deadRunIds) === 'stopped'
+                        ? t('navShell.chat.replyStopped')
+                        : emptyReplyNotice(m, deadRunIds) === 'didNotFinish'
+                          ? t('navShell.chat.replyDidNotFinish')
+                          : m.content}
                   </span>
                 </li>
               )
@@ -1232,14 +1322,43 @@ export function ChatPane({
               {t('navShell.chat.copyFailed')}
             </p>
           )}
-          {isGenerating && (
-            <p className="chat-pane__generating" aria-live="polite">
-              {liveStepDisplayName
-                ? t('navShell.chat.generatingWithStep', {
-                    step: liveStepDisplayName,
-                    elapsed: elapsedSeconds,
-                  })
-                : t('navShell.chat.generating', { elapsed: elapsedSeconds })}
+          {/* items.id=817: one polite announcement per wait. The text changes only
+              when a new wait starts (never per tick), and the region stays mounted
+              so a screen reader treats the change as an update. */}
+          <output className="chat-pane__sr-only">{retryRow ? retryAnnouncement : ''}</output>
+          {isGenerating && retryRow ? (
+            <div className="chat-pane__retry-wait">
+              <p className="chat-pane__retry-wait-why">{retryWhy}</p>
+              <p className="chat-pane__retry-wait-where">{retryWhere}</p>
+              <p className="chat-pane__retry-wait-when" aria-hidden="true">
+                {retryWhen}
+              </p>
+              <button
+                type="button"
+                className="chat-pane__retry-wait-cancel"
+                disabled={cancellingRunId === retryRow.runId}
+                onClick={() => handleCancelRetryWait(retryRow.runId)}
+              >
+                {cancellingRunId === retryRow.runId
+                  ? t('navShell.chat.retryWait.cancelling')
+                  : t('navShell.chat.retryWait.cancel')}
+              </button>
+            </div>
+          ) : (
+            isGenerating && (
+              <p className="chat-pane__generating" aria-live="polite">
+                {liveStepDisplayName
+                  ? t('navShell.chat.generatingWithStep', {
+                      step: liveStepDisplayName,
+                      elapsed: elapsedSeconds,
+                    })
+                  : t('navShell.chat.generating', { elapsed: elapsedSeconds })}
+              </p>
+            )
+          )}
+          {retryCancelError && retryCancelError.runId === activeRunId && (
+            <p role="alert" className="chat-pane__send-error">
+              {t('navShell.chat.retryWait.cancelError', { message: retryCancelError.message })}
             </p>
           )}
           {sendError && (

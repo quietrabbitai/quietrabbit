@@ -21,6 +21,7 @@ pub mod provider_catalog;
 pub mod provider_credentials;
 pub mod providers;
 pub mod recommendation;
+pub mod retry_wait;
 pub mod spend;
 pub mod task_progress;
 pub mod task_supervision;

@@ -8,6 +8,7 @@
 import assert from 'node:assert/strict'
 import {
   classifyRunStatus,
+  emptyReplyNotice,
   findInFlightAssistantMessage,
 } from './lateReplyRecovery.ts'
 import type { MessageInfo } from '../bindings.ts'
@@ -92,5 +93,49 @@ assert.equal(classifyRunStatus('awaiting_extract_confirm'), 'inactive')
 assert.equal(classifyRunStatus('awaiting_schedule'), 'inactive')
 assert.equal(classifyRunStatus('complete'), 'inactive', 'should not normally coexist with empty content, but is not "dead" copy')
 assert.equal(classifyRunStatus(null), 'inactive', 'an unknown run_id (Ok(None) from get_run_status) is treated conservatively, not as dead')
+
+// -- emptyReplyNotice (items.id=817) ------------------------------------------
+// What the transcript shows for the empty reply row a user's cancel of a run
+// waiting to retry leaves behind (finalize_chat_reply marks it cancelled, with
+// no text, and files the chat), so the bubble does not linger blank.
+
+{
+  const none = new Set<string>()
+  const stopped = msg({
+    sender: 'assistant',
+    content: '',
+    focus_run_id: 'run-c',
+    reply_status: 'cancelled',
+  })
+  assert.equal(emptyReplyNotice(stopped, none), 'stopped', 'a cancelled empty reply says it was stopped')
+  assert.equal(
+    emptyReplyNotice(stopped, new Set(['run-c'])),
+    'stopped',
+    'stopped wins over didNotFinish: the user cancelled it, it did not fail',
+  )
+  assert.equal(
+    emptyReplyNotice(msg({ sender: 'assistant', content: '', focus_run_id: 'run-d' }), new Set(['run-d'])),
+    'didNotFinish',
+    'a run confirmed dead with an empty reply keeps the existing notice',
+  )
+  assert.equal(
+    emptyReplyNotice(msg({ sender: 'assistant', content: '', focus_run_id: 'run-live' }), none),
+    null,
+    'an in-flight placeholder (complete, empty) shows nothing special',
+  )
+  assert.equal(
+    emptyReplyNotice(
+      msg({ sender: 'assistant', content: 'partial text', reply_status: 'cancelled', focus_run_id: 'run-p' }),
+      none,
+    ),
+    null,
+    'a cancelled reply that kept its text shows that text',
+  )
+  assert.equal(
+    emptyReplyNotice(msg({ sender: 'user', content: '', reply_status: 'cancelled' }), none),
+    null,
+    'only assistant replies',
+  )
+}
 
 console.log('lateReplyRecovery.test.ts: all assertions passed')

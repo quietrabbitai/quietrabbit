@@ -45,3 +45,24 @@ export function classifyRunStatus(status: string | null): RunStatusClass {
   if (status === 'failed' || status === 'cancelled') return 'dead'
   return 'inactive'
 }
+
+/** Which plain notice stands in for an assistant reply with no text (items.id=817).
+ *  - 'stopped': the reply was cancelled before any text arrived -- a user's
+ *    cancel of a run waiting to retry (the run ends cancelled, the empty
+ *    reply row is marked cancelled and its chat is filed in History), or a
+ *    rotation's 'Stop and save'. Read from the saved row, so it also holds
+ *    after the transcript is re-fetched or reopened from History.
+ *  - 'didNotFinish': the run was confirmed dead (failed or cancelled) while
+ *    this pane tracked it (deadRunIds), with the placeholder still empty.
+ *  - null: show the message as it is (it has text, or it is still in flight). */
+export type EmptyReplyNotice = 'stopped' | 'didNotFinish'
+
+export function emptyReplyNotice(
+  m: MessageInfo,
+  deadRunIds: ReadonlySet<string>,
+): EmptyReplyNotice | null {
+  if (m.sender !== 'assistant' || m.content !== '') return null
+  if (m.reply_status === 'cancelled') return 'stopped'
+  if (m.focus_run_id && deadRunIds.has(m.focus_run_id)) return 'didNotFinish'
+  return null
+}
