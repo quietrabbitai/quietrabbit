@@ -256,40 +256,11 @@ pub async fn login(
         };
         let key_epoch = material.wrapper.key_epoch;
 
-        // items.id=289, decisions.id=677: derived once here purely to get
-        // the public key for the shared.db write below (create_user_with_wrapper
-        // writes it atomically alongside users/user_salts and the key
-        // wrapper). finish_login (below) re-derives the same keypair a second
-        // time to populate the resident KeyRegistry entry -- a deliberate,
-        // cheap redundancy (see that call site's own comment) rather than
-        // threading this value through as extra state.
-        let (_, sharing_public_key) =
-            sharing_keypair::derive_sharing_keypair(&material.dek, &user_id, key_epoch);
-
-        user_store::create_user_with_wrapper(
-            &pool,
-            &user_id,
-            &display_name,
-            "admin",
-            true,
-            &salt,
-            kdf::DEFAULT_ARGON2_MEMORY_KIB,
-            kdf::DEFAULT_ARGON2_ITERATIONS,
-            kdf::DEFAULT_ARGON2_PARALLELISM,
-            sharing_public_key.as_bytes(),
-            &material.wrapper,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-
-        // items.id=630: every database key is derived for the epoch this
-        // process unlocked under (auth::subkeys), so the epoch is registered
-        // before any database is opened or created.
-        epoch_guard::set_resident(&user_id, key_epoch);
-        if let Err(e) = establish_account_dbs(&user_id, &material.dek).await {
-            epoch_guard::clear_resident_for(&user_id);
-            return Err(e);
-        }
+        // items.id=614: the first databases are created BEFORE the account
+        // rows, so no row exists unless its databases do; any failure here
+        // leaves nothing behind (no rows, no users/<user_id>/, no resident
+        // epoch) and the recovery phrase below is not yet pending.
+        create_account_atomically(&pool, &user_id, &display_name, &salt, &material).await?;
 
         // <<< SEAM: if future onboarding design decides the first-run
         // flow should also create a default persona, that call goes here
@@ -548,6 +519,80 @@ async fn login_with_pending_rotation(
             }
         }
         Err(StagedUnlockError::Failed(e)) => Err(format!("couldn't verify credentials: {e}")),
+    }
+}
+
+/// The bootstrap's account-creation sequence (items.id=614): register the key
+/// epoch, create the account's first databases under the new DEK, and write the
+/// account rows LAST. On any failure the half-built state is undone -- the
+/// registered epoch is cleared and users/<user_id>/ is removed -- and the
+/// original error is returned. On success the epoch stays registered for
+/// finish_login.
+async fn create_account_atomically(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    display_name: &str,
+    salt: &[u8],
+    material: &data_key::NewAccountKeyMaterial,
+) -> Result<(), String> {
+    let key_epoch = material.wrapper.key_epoch;
+
+    // items.id=630: every database key is derived for the epoch this process
+    // unlocked under (auth::subkeys), so the epoch is registered before any
+    // database is opened or created. It needs no users row.
+    epoch_guard::set_resident(user_id, key_epoch);
+
+    let result = async {
+        establish_account_dbs(user_id, &material.dek).await?;
+
+        // items.id=289, decisions.id=677: derived once here purely to get
+        // the public key for the shared.db write below (create_user_with_wrapper
+        // writes it atomically alongside users/user_salts and the key
+        // wrapper). finish_login re-derives the same keypair a second time to
+        // populate the resident KeyRegistry entry -- a deliberate, cheap
+        // redundancy (see that call site's own comment) rather than
+        // threading this value through as extra state.
+        let (_, sharing_public_key) =
+            sharing_keypair::derive_sharing_keypair(&material.dek, user_id, key_epoch);
+
+        user_store::create_user_with_wrapper(
+            pool,
+            user_id,
+            display_name,
+            "admin",
+            true,
+            salt,
+            kdf::DEFAULT_ARGON2_MEMORY_KIB,
+            kdf::DEFAULT_ARGON2_ITERATIONS,
+            kdf::DEFAULT_ARGON2_PARALLELISM,
+            sharing_public_key.as_bytes(),
+            &material.wrapper,
+        )
+        .await
+        .map_err(|e| e.to_string())
+    }
+    .await;
+
+    if result.is_err() {
+        epoch_guard::clear_resident_for(user_id);
+        discard_half_built_account(user_id).await;
+    }
+    result
+}
+
+/// Best-effort removal of users/<user_id>/ after a failed bootstrap. Only ever
+/// called with the UUID the failed bootstrap itself generated, so it cannot
+/// touch another account's files. A failure to remove is logged and never
+/// replaces the original error: an orphan directory is unreferenced by any row
+/// and the next bootstrap uses a fresh id.
+async fn discard_half_built_account(user_id: &str) {
+    let dir = crate::persistence::migrations::get_data_root()
+        .join("users")
+        .join(user_id);
+    match tokio::fs::remove_dir_all(&dir).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => log::warn!("bootstrap cleanup: could not remove {dir:?}: {e}"),
     }
 }
 
@@ -2125,6 +2170,200 @@ mod tests {
             ik.exists() && ck.exists(),
             "unlock must recreate the first databases"
         );
+    }
+
+    // ---- items.id=614: a failed bootstrap leaves no half-built account ----
+
+    /// Key material for a known user id, with a fixed password key (no Argon2).
+    fn test_material(user_id: &str) -> data_key::NewAccountKeyMaterial {
+        data_key::create_account_key_material(user_id, &[7u8; kdf::MASTER_KEY_LEN]).unwrap()
+    }
+
+    fn user_dir(user_id: &str) -> std::path::PathBuf {
+        crate::persistence::migrations::get_data_root()
+            .join("users")
+            .join(user_id)
+    }
+
+    /// Nothing anywhere points at, or remains of, the account `user_id`.
+    async fn assert_no_account_left(pool: &sqlx::SqlitePool, user_id: &str) {
+        assert!(!user_store::has_any_users(pool).await.unwrap());
+        for table in [
+            "users",
+            "user_salts",
+            "user_sharing_keys",
+            "user_key_wrappers",
+        ] {
+            let n: (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            assert_eq!(n.0, 0, "{table} must be empty");
+        }
+        assert!(
+            !user_dir(user_id).exists(),
+            "users/<user_id>/ must be removed"
+        );
+        assert_eq!(
+            epoch_guard::resident_epoch(user_id),
+            None,
+            "the registered key epoch must be cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_cookies_database_leaves_no_account_and_no_directory() {
+        let _env = setup().await;
+        let user_id = uuid::Uuid::new_v4().to_string();
+        let material = test_material(&user_id);
+
+        // A directory where the cookies database file belongs: opening it
+        // as a database fails, after integration_keys.db has been created.
+        std::fs::create_dir_all(crate::providers::utils::db_path_tier3_cookies(&user_id)).unwrap();
+
+        let result =
+            create_account_atomically(&_env.pool, &user_id, "Alice", &[1u8; 16], &material).await;
+        assert!(result.is_err(), "a cookies database failure must surface");
+        assert_no_account_left(&_env.pool, &user_id).await;
+    }
+
+    #[tokio::test]
+    async fn a_failing_integration_keys_database_leaves_no_account_and_no_directory() {
+        let _env = setup().await;
+        let user_id = uuid::Uuid::new_v4().to_string();
+        let material = test_material(&user_id);
+
+        std::fs::create_dir_all(crate::providers::utils::db_path_integration_keys(&user_id))
+            .unwrap();
+
+        let result =
+            create_account_atomically(&_env.pool, &user_id, "Alice", &[1u8; 16], &material).await;
+        assert!(result.is_err(), "an integration keys failure must surface");
+        assert_no_account_left(&_env.pool, &user_id).await;
+    }
+
+    #[tokio::test]
+    async fn a_failing_row_write_after_the_databases_exist_removes_the_directory() {
+        let _env = setup().await;
+        let user_id = uuid::Uuid::new_v4().to_string();
+        let material = test_material(&user_id);
+
+        sqlx::query(
+            "CREATE TRIGGER fail_wrapper_write BEFORE INSERT ON user_key_wrappers
+             BEGIN SELECT RAISE(ABORT, 'simulated interruption'); END",
+        )
+        .execute(&_env.pool)
+        .await
+        .unwrap();
+
+        // Both files are created before the row write is attempted, so this
+        // is the case where the cleanup has real files to remove.
+        let result =
+            create_account_atomically(&_env.pool, &user_id, "Alice", &[1u8; 16], &material).await;
+        assert!(result.is_err(), "the failed row write must surface");
+        assert_no_account_left(&_env.pool, &user_id).await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_bootstrap_login_leaves_no_account_and_no_pending_recovery() {
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let registry = app.state::<KeyRegistry>();
+
+        // `users` is a regular file, so no per-account directory can be made.
+        std::fs::write(
+            crate::persistence::migrations::get_data_root().join("users"),
+            b"not a directory",
+        )
+        .unwrap();
+
+        let result = do_login(&app, "Alice", "pw").await;
+        assert!(result.is_err(), "the bootstrap must fail");
+        assert!(!user_store::has_any_users(&_env.pool).await.unwrap());
+        assert!(!registry.is_occupied().await);
+        assert!(registry.take_pending_recovery().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failed_row_write_in_login_leaves_no_directory_and_a_retry_shows_the_phrase() {
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let registry = app.state::<KeyRegistry>();
+
+        sqlx::query(
+            "CREATE TRIGGER fail_wrapper_write BEFORE INSERT ON user_key_wrappers
+             BEGIN SELECT RAISE(ABORT, 'simulated interruption'); END",
+        )
+        .execute(&_env.pool)
+        .await
+        .unwrap();
+
+        assert!(do_login(&app, "Alice", "pw").await.is_err());
+        assert!(!user_store::has_any_users(&_env.pool).await.unwrap());
+        assert!(!registry.is_occupied().await);
+        assert!(registry.take_pending_recovery().await.is_none());
+        let users_dir = crate::persistence::migrations::get_data_root().join("users");
+        assert_eq!(
+            std::fs::read_dir(&users_dir).unwrap().count(),
+            0,
+            "no per-account directory may remain"
+        );
+
+        sqlx::query("DROP TRIGGER fail_wrapper_write")
+            .execute(&_env.pool)
+            .await
+            .unwrap();
+        do_login(&app, "Alice", "pw")
+            .await
+            .expect("a retry must bootstrap cleanly");
+        assert!(
+            get_recovery_key_display(registry.clone()).await.is_ok(),
+            "the retry shows the first-run recovery phrase"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_bootstrap_writes_rows_files_and_the_recovery_display() {
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let registry = app.state::<KeyRegistry>();
+
+        do_login(&app, "Alice", "pw").await.unwrap();
+        let user_id = registry.with_key(|k| k.user_id.clone()).await.unwrap();
+
+        assert!(user_store::has_any_users(&_env.pool).await.unwrap());
+        assert!(crate::providers::utils::db_path_integration_keys(&user_id).exists());
+        assert!(crate::providers::utils::db_path_tier3_cookies(&user_id).exists());
+        assert!(user_store::get_key_wrapper_state(&_env.pool, &user_id)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(get_recovery_key_display(registry.clone()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_missing_integration_keys_db_is_recreated_only_for_the_right_password() {
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let registry = app.state::<KeyRegistry>();
+        do_login(&app, "Alice", "right-password").await.unwrap();
+        let user_id = registry.with_key(|k| k.user_id.clone()).await.unwrap();
+        registry.clear().await;
+
+        let ik = crate::providers::utils::db_path_integration_keys(&user_id);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", ik.display()));
+        }
+
+        let wrong = do_login(&app, "Alice", "wrong-password").await;
+        assert_eq!(wrong, Err("invalid credentials".to_owned()));
+        assert!(!ik.exists(), "a wrong password must not recreate the file");
+        assert!(!registry.is_occupied().await);
+
+        do_login(&app, "Alice", "right-password")
+            .await
+            .expect("the right password must unlock and heal");
+        assert!(ik.exists(), "the right password recreates the file");
     }
 
     #[tokio::test]

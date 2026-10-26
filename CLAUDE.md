@@ -220,7 +220,7 @@ Design sessions must all complete before shared infrastructure build begins.
   Step 8: reads from step_disclosure_buffer for Tier 2+ (NEVER from PersonalTrack)
   Raw personal values never appear in external prompt strings.
 - Tier 3 is a terminal boundary — execution loop breaks, status=awaiting_user.
-- auth_enabled=1 ONLY if ALL databases migrate successfully. Partial = rollback.
+- Account creation order (items.id=614, 630): an account row is written only after its first per-account databases (integration_keys.db, cloud_chat_cookies.db) exist, and a failed first-run bootstrap removes users/<user_id>/ and leaves no row. A later login recreates a missing first database under the same data key.
 - focus_run created as status=initializing, promoted to running after Phase 3 only.
 - Recovery key: BIP39 mnemonic of 256-bit recovery entropy, independent of the data key. The app stores only the derived recovery public key and the data key sealed to it; every password change, restore and new recovery phrase rotates the data key. See AUTH_MULTIUSER_ARCHITECTURE.md Sections 4.0 and 5.1.
 - Release 1/Release 2 = product roadmap. Phase 1-7 = Conductor lifecycle phases.
