@@ -118,9 +118,13 @@ pub(crate) async fn arm_release_failure(conn: &mut SqliteConnection, table: &str
          REFERENCES arm_parent(id) DEFERRABLE INITIALLY DEFERRED)"
             .to_string(),
         "DROP TRIGGER IF EXISTS temp.arm_release_failure".to_string(),
+        // The body names arm_child unqualified: older SQLite builds (CI's
+        // SQLCipher; 3.45/3.46 reproduce it) reject a qualified table name on
+        // INSERT/UPDATE/DELETE inside any trigger body. A TEMP trigger resolves
+        // the bare name to the TEMP table first, so this reaches temp.arm_child.
         format!(
             "CREATE TEMP TRIGGER arm_release_failure AFTER INSERT ON main.{table} \
-             BEGIN INSERT INTO temp.arm_child VALUES ('missing'); END"
+             BEGIN INSERT INTO arm_child VALUES ('missing'); END"
         ),
     ] {
         sqlx::query(&stmt)
