@@ -219,7 +219,19 @@ pub fn last_progress() -> Option<ProgressEvent> {
         .clone()
 }
 
-/// Forget the remembered event (a new session or a finished report).
+/// Forget the remembered event. Only tests call this: no non-test code clears
+/// it, on purpose.
+///
+/// The event is process-wide, not scoped to a session or an account, and
+/// `RotationStatus.last_outcome` (derived from it) is likewise deliberately
+/// neither. Every completed rotation locks the session at once, so after the
+/// lock `last_outcome` is the only record of the rotation that just ended, and
+/// a webview that did not start the rotation still has to be able to announce
+/// it. Clearing at lock or sign-out would break that.
+///
+/// Reader rule: show `last_outcome` only for a rotation the reader watched run
+/// (see `rotationProgress.ts`), never on a cold mount, where it describes some
+/// earlier rotation.
 pub fn clear_last_progress() {
     *GLOBAL_PROGRESS
         .last

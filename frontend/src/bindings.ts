@@ -2341,7 +2341,13 @@ export type RotationStatus = {
 	interrupted: boolean,
 	/**  `password_change`, `restore` or `new_phrase` while one is pending. */
 	pending_kind: string | null,
-	/**  How the last rotation this process ran ended. `none` while one runs. */
+	/**
+	 *  How the last rotation this process ran ended. `none` while one runs.
+	 *  Process-wide, not scoped to a session or an account, and never cleared
+	 *  outside tests (see `key_rotation::clear_last_progress`). A reader must
+	 *  show it only for a rotation it watched run, as `rotationProgress.ts`
+	 *  does, never on a cold mount, where it describes an earlier rotation.
+	 */
 	last_outcome: LastRotationOutcome,
 };
 

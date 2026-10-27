@@ -249,6 +249,10 @@ pub struct RotationStatus {
     /// `password_change`, `restore` or `new_phrase` while one is pending.
     pub pending_kind: Option<String>,
     /// How the last rotation this process ran ended. `none` while one runs.
+    /// Process-wide, not scoped to a session or an account, and never cleared
+    /// outside tests (see `key_rotation::clear_last_progress`). A reader must
+    /// show it only for a rotation it watched run, as `rotationProgress.ts`
+    /// does, never on a cold mount, where it describes an earlier rotation.
     pub last_outcome: LastRotationOutcome,
 }
 
