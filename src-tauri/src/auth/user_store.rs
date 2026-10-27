@@ -32,7 +32,7 @@
 // candidate today. If onboarding design later introduces a separate
 // login-identifier concept, this is the function to revisit.
 
-use crate::persistence::savepoint::rollback_to_and_release;
+use crate::persistence::savepoint::end_savepoint;
 use sqlx::Row;
 use thiserror::Error;
 
@@ -198,9 +198,9 @@ pub async fn get_salt_params(
 }
 
 /// Create a new user + their salt row, atomically (SAVEPOINT, mirrors
-/// persona_store::create_persona's pattern -- on failure,
-/// savepoint::rollback_to_and_release, so the pooled connection is returned
-/// with no transaction open).
+/// persona_store::create_persona's pattern -- finished through
+/// savepoint::end_savepoint, so the pooled connection is returned with no
+/// transaction open).
 ///
 /// auth_enabled is hardcoded to 1 here, not exposed as a parameter --
 /// Section 2.1 reframes it as an onboarding-time invariant evaluated once
@@ -373,32 +373,23 @@ async fn create_user_inner(
     }
     .await;
 
-    match step {
-        Ok(()) => {
-            sqlx::query("RELEASE create_user")
-                .execute(&mut *conn)
-                .await?;
-            Ok(())
-        }
-        Err(e) => {
-            // Undoing the savepoint without releasing it leaves it -- and the
-            // transaction it opened, with its write lock -- open.
-            // The connection goes back to the pool, so without the RELEASE
-            // a failed creation would leave shared.db locked for every
-            // later writer (found by items.id=629's interrupted-write test).
-            rollback_to_and_release(&mut conn, "create_user").await;
-            // Structured constraint detection (DatabaseError::is_unique_violation),
-            // not string-matching -- corrected this session per external
-            // review; verified sqlx exposes this method directly rather
-            // than assumed.
-            if let sqlx::Error::Database(ref db_err) = e {
-                if db_err.is_unique_violation() {
-                    return Err(UserStoreError::AlreadyExists(display_name.to_owned()));
-                }
+    // Structured constraint detection (DatabaseError::is_unique_violation),
+    // not string-matching -- corrected this session per external
+    // review; verified sqlx exposes this method directly rather
+    // than assumed.
+    let step = step.map_err(|e| {
+        if let sqlx::Error::Database(ref db_err) = e {
+            if db_err.is_unique_violation() {
+                return UserStoreError::AlreadyExists(display_name.to_owned());
             }
-            Err(UserStoreError::Database(e))
         }
-    }
+        UserStoreError::Database(e)
+    });
+    // The connection goes back to the pool: end_savepoint RELEASEs on
+    // success and otherwise undoes the savepoint, so a failed creation (or a
+    // failed RELEASE) cannot leave shared.db locked for every later writer
+    // (found by items.id=629's interrupted-write test; items.id=822).
+    end_savepoint(conn, "create_user", step).await
 }
 
 /// Read an account's key wrapper (user_key_wrappers). `None` for an account
@@ -459,10 +450,10 @@ pub async fn get_key_epoch(
 // ---------------------------------------------------------------------------
 //
 // Every write below is one SQLite transaction on a pooled connection, run
-// inside a SAVEPOINT. A failed step goes through savepoint::rollback_to_and_release,
-// which ALWAYS releases, so the connection goes back to the pool outside any
-// transaction (a rollback alone leaves the savepoint, and the write lock,
-// open).
+// inside a SAVEPOINT. Each finishes through savepoint::end_savepoint, which
+// ALWAYS releases (also after a failed RELEASE), so the connection goes back
+// to the pool outside any transaction (a rollback alone leaves the savepoint,
+// and the write lock, open).
 
 /// What a rotation is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -676,47 +667,6 @@ pub async fn get_key_wrapper_state(
         },
         pending_rotation: row.get("pending_rotation"),
     }))
-}
-
-/// Undo a savepoint and prove the connection is outside any transaction.
-/// Returns false if it could not be made clean.
-async fn undo_savepoint(conn: &mut sqlx::SqliteConnection, name: &str) -> bool {
-    if !rollback_to_and_release(conn, name).await {
-        return false;
-    }
-    // Authoritative probe: BEGIN fails inside a transaction.
-    if sqlx::query("BEGIN").execute(&mut *conn).await.is_err() {
-        return false;
-    }
-    sqlx::query("ROLLBACK").execute(&mut *conn).await.is_ok()
-}
-
-/// Finish a SAVEPOINT: RELEASE on success, rollback_to_and_release on error.
-/// Takes the pooled connection by value because a connection that cannot be
-/// proven to be outside a transaction must never go back to the pool: a
-/// failed RELEASE (for example a deferred constraint failing at commit) is
-/// undone with rollback_to_and_release, and if THAT fails too the connection
-/// is detached from the pool and dropped (closing it, which ends whatever
-/// transaction it held).
-async fn end_savepoint<T>(
-    mut conn: sqlx::pool::PoolConnection<sqlx::Sqlite>,
-    name: &str,
-    step: Result<T, UserStoreError>,
-) -> Result<T, UserStoreError> {
-    let outcome = match step {
-        Ok(v) => match sqlx::query(&format!("RELEASE {name}"))
-            .execute(&mut *conn)
-            .await
-        {
-            Ok(_) => return Ok(v),
-            Err(e) => UserStoreError::Database(e),
-        },
-        Err(e) => e,
-    };
-    if !undo_savepoint(&mut conn, name).await {
-        drop(conn.detach());
-    }
-    Err(outcome)
 }
 
 /// Stage a rotation: the rotation row, its items and the account's
@@ -2140,6 +2090,50 @@ mod tests {
         .fetch_one(&single)
         .await
         .unwrap();
+        assert_eq!(n, 0);
+        drop(env);
+    }
+
+    /// items.id=822: create_user_inner's RELEASE failing must be undone and
+    /// leave the pooled connection outside any transaction.
+    #[tokio::test]
+    async fn a_failed_release_in_create_user_leaves_the_pooled_connection_clean() {
+        let env = setup().await;
+        let single = single_connection_pool().await;
+        {
+            let mut conn = single.acquire().await.unwrap();
+            crate::persistence::savepoint::arm_release_failure(&mut conn, "users").await;
+        }
+
+        let result = create_user_inner(
+            &single,
+            "u-rel",
+            "Rel",
+            "user",
+            false,
+            b"salt1234",
+            1024,
+            1,
+            1,
+            &[0u8; 32],
+            None,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(UserStoreError::Database(_))),
+            "{result:?}"
+        );
+
+        // Same (only) connection: outside a transaction, the user not written.
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&single)
+            .await
+            .unwrap();
+        sqlx::query("ROLLBACK").execute(&single).await.unwrap();
+        let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM users WHERE id = 'u-rel'")
+            .fetch_one(&single)
+            .await
+            .unwrap();
         assert_eq!(n, 0);
         drop(env);
     }

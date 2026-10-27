@@ -20,7 +20,7 @@
 // a &sqlx::SqlitePool in; every fn here does pool.acquire() rather than
 // opening its own connection.
 
-use crate::persistence::savepoint::rollback_to_and_release;
+use crate::persistence::savepoint::end_savepoint;
 use sqlx::Row;
 use thiserror::Error;
 
@@ -312,17 +312,11 @@ pub async fn create_persona(
     }
     .await;
 
-    match step {
-        Ok(()) => {
-            sqlx::query("RELEASE create_persona")
-                .execute(&mut *conn)
-                .await?;
-        }
-        Err(e) => {
-            rollback_to_and_release(&mut conn, "create_persona").await;
-            return Err(classify_constraint_error(persona_id, e));
-        }
-    }
+    // end_savepoint RELEASEs on success and otherwise undoes the savepoint
+    // (also after a failed RELEASE), so the pooled connection goes back to
+    // the pool outside any transaction.
+    let step = step.map_err(|e| classify_constraint_error(persona_id, e));
+    end_savepoint(conn, "create_persona", step).await?;
 
     Ok(Persona {
         id: persona_id.to_owned(),
@@ -520,5 +514,55 @@ mod tests {
             sqlx::query("BEGIN IMMEDIATE").execute(&pool).await.unwrap();
             sqlx::query("ROLLBACK").execute(&pool).await.unwrap();
         }
+    }
+
+    /// items.id=822: when the RELEASE itself fails (a deferred foreign key
+    /// failing at commit), create_persona must undo the savepoint and hand
+    /// its pooled connection back outside any transaction.
+    #[tokio::test]
+    async fn a_failed_release_in_create_persona_leaves_the_pooled_connection_reusable() {
+        let _lock = ENV_MUTEX.lock().await;
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        let _root = RootGuard::set(tempdir.path());
+
+        crate::persistence::migrations::migrate_shared_db()
+            .await
+            .expect("shared.db migration must succeed in test setup");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(crate::providers::utils::connect_options_unencrypted(
+                &crate::providers::utils::db_path_shared(),
+            ))
+            .await
+            .expect("single-connection shared.db pool must connect");
+        crate::auth::user_store::create_user(
+            &pool,
+            "u1",
+            "Alice",
+            "admin",
+            true,
+            b"salt1234",
+            1024,
+            1,
+            1,
+            &[0u8; 32],
+        )
+        .await
+        .expect("create_user should succeed");
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            crate::persistence::savepoint::arm_release_failure(&mut conn, "personas").await;
+        }
+
+        let failed = create_persona(&pool, "p-rel", "Rel", "personal", "u1", None).await;
+        assert!(
+            matches!(failed, Err(PersonaStoreError::Database(_))),
+            "{failed:?}"
+        );
+
+        // Same (only) connection: outside a transaction, the write undone.
+        sqlx::query("BEGIN IMMEDIATE").execute(&pool).await.unwrap();
+        sqlx::query("ROLLBACK").execute(&pool).await.unwrap();
+        assert!(get_persona(&pool, "p-rel").await.unwrap().is_none());
     }
 }

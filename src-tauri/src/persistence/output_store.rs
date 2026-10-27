@@ -1757,49 +1757,71 @@ pub async fn update_active_document(
     }
 
     let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
+    update_active_document_conn(&mut conn, new_output_id, previous_output_id).await
+}
+
+/// The savepoint body of `update_active_document`, on a caller-supplied
+/// connection (its only production caller passes the one-shot outputs.db
+/// connection) so a test can see what state the connection is left in.
+async fn update_active_document_conn(
+    conn: &mut SqliteConnection,
+    new_output_id: &str,
+    previous_output_id: &str,
+) -> Result<(), OutputStoreError> {
     let timestamp = crate::providers::utils::now();
 
     sqlx::query("SAVEPOINT update_active_document_sp")
-        .execute(&mut conn)
+        .execute(&mut *conn)
         .await?;
 
-    let new_row = sqlx::query(
-        "UPDATE outputs SET document_relationship = 'update', updated_at = ?
-         WHERE id = ? RETURNING id",
-    )
-    .bind(&timestamp)
-    .bind(new_output_id)
-    .fetch_optional(&mut conn)
-    .await?;
-
-    if new_row.is_none() {
-        rollback_to_and_release(&mut conn, "update_active_document_sp").await;
-        return Err(OutputStoreError::Validation(format!(
-            "no such output: '{new_output_id}'"
-        )));
-    }
-
-    let prev_row = sqlx::query(
-        "UPDATE outputs SET superseded_by = ?, updated_at = ?
-         WHERE id = ? RETURNING id",
-    )
-    .bind(new_output_id)
-    .bind(&timestamp)
-    .bind(previous_output_id)
-    .fetch_optional(&mut conn)
-    .await?;
-
-    if prev_row.is_none() {
-        rollback_to_and_release(&mut conn, "update_active_document_sp").await;
-        return Err(OutputStoreError::Validation(format!(
-            "no such output: '{previous_output_id}'"
-        )));
-    }
-
-    sqlx::query("RELEASE update_active_document_sp")
-        .execute(&mut conn)
+    // Everything after the SAVEPOINT, RELEASE included, runs in one block so
+    // that an error from any statement (not only the validation returns)
+    // reaches the rollback below instead of leaving the savepoint open
+    // (items.id=822).
+    let step: Result<(), OutputStoreError> = async {
+        let new_row = sqlx::query(
+            "UPDATE outputs SET document_relationship = 'update', updated_at = ?
+             WHERE id = ? RETURNING id",
+        )
+        .bind(&timestamp)
+        .bind(new_output_id)
+        .fetch_optional(&mut *conn)
         .await?;
 
+        if new_row.is_none() {
+            return Err(OutputStoreError::Validation(format!(
+                "no such output: '{new_output_id}'"
+            )));
+        }
+
+        let prev_row = sqlx::query(
+            "UPDATE outputs SET superseded_by = ?, updated_at = ?
+             WHERE id = ? RETURNING id",
+        )
+        .bind(new_output_id)
+        .bind(&timestamp)
+        .bind(previous_output_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+
+        if prev_row.is_none() {
+            return Err(OutputStoreError::Validation(format!(
+                "no such output: '{previous_output_id}'"
+            )));
+        }
+
+        sqlx::query("RELEASE update_active_document_sp")
+            .execute(&mut *conn)
+            .await?;
+
+        Ok(())
+    }
+    .await;
+
+    if let Err(e) = step {
+        rollback_to_and_release(&mut *conn, "update_active_document_sp").await;
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -2179,6 +2201,35 @@ mod tests {
             Some(deleted_at_ts),
             "pre-existing 'deleted' row's deleted_at must be backfilled from its updated_at"
         );
+    }
+
+    /// items.id=822: an error from the first UPDATE must not leave the
+    /// connection inside the savepoint's transaction.
+    #[tokio::test]
+    async fn a_failed_update_active_document_leaves_the_connection_outside_a_transaction() {
+        let mut conn = test_db().await;
+        let old_id = seed_output(&mut conn, "old").await;
+        let new_id = seed_output(&mut conn, "new").await;
+        sqlx::query(
+            "CREATE TRIGGER fail_first_update BEFORE UPDATE ON outputs
+             BEGIN SELECT RAISE(ABORT, 'injected'); END",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        let result = update_active_document_conn(&mut conn, &new_id, &old_id).await;
+        assert!(
+            matches!(result, Err(OutputStoreError::Database(_))),
+            "{result:?}"
+        );
+
+        // BEGIN fails inside a transaction, so this proves none is open.
+        sqlx::query("BEGIN")
+            .execute(&mut conn)
+            .await
+            .expect("the connection must be outside any transaction");
+        sqlx::query("ROLLBACK").execute(&mut conn).await.unwrap();
     }
 
     const ONE_DECISION: &str = r#"[

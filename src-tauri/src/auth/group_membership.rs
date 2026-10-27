@@ -94,7 +94,7 @@
 // (many-small-encrypted-DB topology, no static DATABASE_URL). shared.db
 // access is pooled (items.id=483) -- callers pass a &sqlx::SqlitePool in.
 
-use crate::persistence::savepoint::rollback_to_and_release;
+use crate::persistence::savepoint::end_savepoint;
 use sqlx::SqliteConnection;
 use thiserror::Error;
 use x25519_dalek::StaticSecret;
@@ -280,18 +280,11 @@ pub async fn remove_member(
     )
     .await;
 
-    match &result {
-        Ok(()) => {
-            sqlx::query("RELEASE remove_member")
-                .execute(&mut *conn)
-                .await?;
-        }
-        Err(_) => {
-            rollback_to_and_release(&mut conn, "remove_member").await;
-        }
-    }
-
-    result?;
+    // The connection is pooled: end_savepoint RELEASEs on success and
+    // otherwise undoes the savepoint (also after a failed RELEASE), so it
+    // goes back to the pool outside any transaction (items.id=822). It takes
+    // the connection by value, so the owner lookup below acquires its own.
+    end_savepoint(conn, "remove_member", result).await?;
 
     // Outside the SAVEPOINT deliberately -- see this fn's own doc comment
     // (ATOMICITY) on why shared.db and GroupKeyRegistry can't be made
@@ -312,8 +305,24 @@ pub async fn remove_member(
         })
         .await
     {
-        match group_invitations::resolve_persona_owner(departing_persona_id, &mut conn).await {
-            Ok(owner_user_id) if owner_user_id == current_user_id => {
+        // end_savepoint consumed the savepoint's connection, so take a fresh
+        // one for this read. A lookup or acquire failure means "nothing
+        // local to clean up", as a failed lookup always has.
+        let owner = match pool.acquire().await {
+            Ok(mut owner_conn) => {
+                group_invitations::resolve_persona_owner(departing_persona_id, &mut owner_conn)
+                    .await
+                    .ok()
+            }
+            Err(e) => {
+                log::warn!(
+                    "remove_member: no pooled connection to resolve the owner of persona={departing_persona_id}: {e}"
+                );
+                None
+            }
+        };
+        match owner {
+            Some(owner_user_id) if owner_user_id == current_user_id => {
                 if let Err(e) = group_key_store::delete_group_key(
                     &current_user_id,
                     departing_persona_id,
@@ -825,6 +834,93 @@ mod tests {
             "rotated key must be freshly generated, not the original group key resent"
         );
         assert_eq!(decrypted.len(), kdf::MASTER_KEY_LEN);
+    }
+
+    /// items.id=822: when remove_member's RELEASE fails (a deferred foreign
+    /// key failing at commit), the savepoint must be undone and the pooled
+    /// connection handed back outside any transaction. Two connections
+    /// because remove_member_inner takes a second one for the sharing-key
+    /// lookup; both are armed so whichever the call uses fails at RELEASE.
+    #[tokio::test]
+    async fn a_failed_release_in_remove_member_leaves_the_pooled_connections_clean() {
+        let _env = setup().await;
+        let pool = &_env.pool;
+        let (_sender_user, sender_persona, _) = make_user_with_persona(pool, "Sender", 0xa1).await;
+        let (_b_user, b_persona, b_private_key) = make_user_with_persona(pool, "Bob", 0xa2).await;
+        let (_c_user, c_persona, c_private_key) = make_user_with_persona(pool, "Carol", 0xa3).await;
+
+        let group_id = "group-release-fail-1";
+        let group_key = [0xa4u8; kdf::MASTER_KEY_LEN];
+        let registry = GroupKeyRegistry::default();
+        for (persona, private_key) in [(&b_persona, &b_private_key), (&c_persona, &c_private_key)] {
+            let invitation = group_invitations::send_invitation(
+                pool,
+                persona,
+                group_id,
+                "Test Group",
+                &sender_persona,
+                &group_key,
+            )
+            .await
+            .unwrap();
+            group_invitations::accept_invitation(
+                pool,
+                &invitation,
+                persona,
+                private_key,
+                &registry,
+                PERSONAL_KEY_HEX,
+            )
+            .await
+            .unwrap();
+        }
+
+        let two = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(crate::providers::utils::connect_options_unencrypted(
+                &crate::providers::utils::db_path_shared(),
+            ))
+            .await
+            .unwrap();
+        {
+            let mut a = two.acquire().await.unwrap();
+            let mut b = two.acquire().await.unwrap();
+            crate::persistence::savepoint::arm_release_failure(&mut a, "group_departures").await;
+            crate::persistence::savepoint::arm_release_failure(&mut b, "group_departures").await;
+        }
+
+        let result = remove_member(
+            &two,
+            group_id,
+            &b_persona,
+            DepartureReason::Removed,
+            &sender_persona,
+            &registry,
+            &KeyRegistry::default(),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(GroupMembershipError::Database(_))),
+            "{result:?}"
+        );
+
+        // Every pooled connection is outside a transaction, the write undone.
+        let mut a = two.acquire().await.unwrap();
+        let mut b = two.acquire().await.unwrap();
+        for conn in [&mut a, &mut b] {
+            sqlx::query("BEGIN IMMEDIATE")
+                .execute(&mut **conn)
+                .await
+                .expect("a pooled connection was left inside a transaction");
+            sqlx::query("ROLLBACK").execute(&mut **conn).await.unwrap();
+        }
+        let (n,): (i64,) =
+            sqlx::query_as("SELECT count(*) FROM group_departures WHERE group_id = ?")
+                .bind(group_id)
+                .fetch_one(&mut *a)
+                .await
+                .unwrap();
+        assert_eq!(n, 0, "the departure must have been rolled back");
     }
 
     #[tokio::test]

@@ -61,7 +61,7 @@
 // QUERY STYLE: runtime sqlx::query() / sqlx::QueryBuilder only -- no
 // query!() macros, matching the rest of this codebase.
 
-use crate::persistence::savepoint::rollback_to_and_release;
+use crate::persistence::savepoint::{end_savepoint, rollback_to_and_release};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use sqlx::SqliteConnection;
@@ -669,17 +669,11 @@ pub async fn accept_persona_share(
     }
     .await;
 
-    match registration_step {
-        Ok(()) => {
-            sqlx::query("RELEASE accept_persona_share")
-                .execute(&mut *shared_conn)
-                .await?;
-        }
-        Err(e) => {
-            rollback_to_and_release(&mut shared_conn, "accept_persona_share").await;
-            return Err(PersonaSharingError::Database(e));
-        }
-    }
+    // The shared.db connection is pooled: end_savepoint RELEASEs on success
+    // and otherwise undoes the savepoint (also after a failed RELEASE), so
+    // it goes back to the pool outside any transaction (items.id=822).
+    let registration_step = registration_step.map_err(PersonaSharingError::Database);
+    end_savepoint(shared_conn, "accept_persona_share", registration_step).await?;
 
     Ok(persona_id)
 }
@@ -1245,6 +1239,78 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(share_status, "accepted");
+    }
+
+    /// items.id=822: when the shared.db half's RELEASE fails (a deferred
+    /// foreign key failing at commit), the savepoint must be undone and the
+    /// pooled connection handed back outside any transaction. The personal.db
+    /// half has already committed to its own file; only shared.db is asserted.
+    #[tokio::test]
+    async fn a_failed_release_in_accept_persona_share_leaves_the_pooled_connections_clean() {
+        let _env = setup().await;
+        let pool = &_env.pool;
+        let (owner_id, owner_persona, owner_key_hex, _) =
+            make_user_with_persona(pool, "Alice", 0x41).await;
+        let (recipient_id, _, recipient_key_hex, recipient_private_key) =
+            make_user_with_persona(pool, "Bob", 0x42).await;
+        let (share_id, _entity_id) = send_share_with_content(
+            pool,
+            &owner_id,
+            &owner_persona,
+            &owner_key_hex,
+            &recipient_id,
+        )
+        .await;
+
+        let two = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(crate::providers::utils::connect_options_unencrypted(
+                &crate::providers::utils::db_path_shared(),
+            ))
+            .await
+            .unwrap();
+        {
+            let mut a = two.acquire().await.unwrap();
+            let mut b = two.acquire().await.unwrap();
+            crate::persistence::savepoint::arm_release_failure(&mut a, "personas").await;
+            crate::persistence::savepoint::arm_release_failure(&mut b, "personas").await;
+        }
+
+        let result = accept_persona_share(
+            &two,
+            &share_id,
+            &recipient_id,
+            &recipient_key_hex,
+            &recipient_private_key,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(PersonaSharingError::Database(_))),
+            "{result:?}"
+        );
+
+        // Every pooled connection is outside a transaction, the write undone.
+        let mut a = two.acquire().await.unwrap();
+        let mut b = two.acquire().await.unwrap();
+        for conn in [&mut a, &mut b] {
+            sqlx::query("BEGIN IMMEDIATE")
+                .execute(&mut **conn)
+                .await
+                .expect("a pooled connection was left inside a transaction");
+            sqlx::query("ROLLBACK").execute(&mut **conn).await.unwrap();
+        }
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM pending_persona_shares WHERE id = ?")
+                .bind(&share_id)
+                .fetch_one(&mut *a)
+                .await
+                .unwrap();
+        assert_eq!(status, "pending", "the share must still be pending");
+        let (personas,): (i64,) = sqlx::query_as("SELECT count(*) FROM personas")
+            .fetch_one(&mut *a)
+            .await
+            .unwrap();
+        assert_eq!(personas, 2, "only the two fixture personas may exist");
     }
 
     #[tokio::test]
