@@ -109,6 +109,7 @@ async fn read_marker(path: &Path, key: &str) -> Option<String> {
 impl Fixture {
     async fn new() -> Fixture {
         let lock = ENV_MUTEX.lock().await;
+        clear_last_progress();
         let saved_root = std::env::var("QR_DATA_ROOT").ok();
         let tempdir = tempfile::tempdir().unwrap();
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
@@ -817,6 +818,20 @@ async fn progress_is_reported_in_order_in_bytes_with_no_paths_and_the_flag_held(
         }
     }
     assert_eq!(events.last().unwrap().0.current, Some(total));
+}
+
+#[tokio::test]
+async fn a_fresh_fixture_starts_with_no_remembered_progress() {
+    // items.id=824: a rotation on the default sink leaves its last event in a
+    // process-wide static, so the next test to take ENV_MUTEX would read it
+    // (get_rotation_status reports it as last_outcome). A new fixture clears it.
+    {
+        let fx = Fixture::new().await;
+        fx.rotate(Fixture::change_password()).await.unwrap();
+        assert_eq!(last_progress().map(|e| e.phase), Some(Phase::Complete));
+    }
+    let _fx = Fixture::new().await;
+    assert!(last_progress().is_none());
 }
 
 #[tokio::test]

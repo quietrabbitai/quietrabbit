@@ -1316,6 +1316,7 @@ mod tests {
     impl Harness {
         async fn new() -> Harness {
             let lock = ENV_MUTEX.lock().await;
+            key_rotation::clear_last_progress();
             let saved_root = std::env::var("QR_DATA_ROOT").ok();
             let tempdir = tempfile::tempdir().unwrap();
             std::env::set_var("QR_DATA_ROOT", tempdir.path());
