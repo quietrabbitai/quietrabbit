@@ -70,7 +70,7 @@ impl RetryWaitReason {
         }
     }
 
-    fn parse(s: &str) -> Option<Self> {
+    pub(crate) fn parse(s: &str) -> Option<Self> {
         match s {
             "busy" => Some(Self::Busy),
             "slow" => Some(Self::Slow),

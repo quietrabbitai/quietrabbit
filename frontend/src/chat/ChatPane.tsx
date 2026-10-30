@@ -21,6 +21,14 @@ import {
 } from './lateReplyRecovery'
 import { cancelRetryWait } from './retryWait'
 import { useRetryWait } from './useRetryWait'
+import {
+  finalFailureStore,
+  isFreshReply,
+  noticeFor,
+  type ResumeBaseline,
+} from './finalFailure'
+import { useFinalFailures } from './useFinalFailure'
+import { FinalFailureNotice } from './FinalFailureNotice'
 import { findLastCopyableReply } from './copyLastResponse'
 import { applyAllCopyDecisions, COPY_REVIEW_RUN_ID_PREFIX } from './copyDecisions'
 import { devSimulatedCopyFlag } from './devSimulatedCopyFlag'
@@ -236,6 +244,18 @@ export function ChatPane({
   /** items.id=817: the "waiting to retry" row of the active run, if a hosted
    *  retry is waiting. Replaces the live step label while it shows. */
   const { row: retryRow, providerName: retryProviderName } = useRetryWait(activeRunId)
+  /** items.id=831: which failed replies are a final failure (the backend says
+   *  so with a `final-failure` event). The notice offers Try again on them. */
+  const finalFailureOf = useFinalFailures()
+  /** items.id=831: set by Try again, from the click until the resumed run ends.
+   *  The failure sentence still in the reply row is hidden meanwhile, and the
+   *  content polls below must not take it for the new reply. A ref as well as
+   *  state: the effect below that polls reads it without re-subscribing. */
+  const [resuming, setResuming] = useState<ResumeBaseline | null>(null)
+  const resumingRef = useRef<ResumeBaseline | null>(null)
+  const [tryAgainError, setTryAgainError] = useState<{ runId: string; message: string } | null>(
+    null,
+  )
   /** The run whose Cancel was clicked (the button then reads "Cancelling…"). */
   const [cancellingRunId, setCancellingRunId] = useState<string | null>(null)
   const [retryCancelError, setRetryCancelError] = useState<{
@@ -295,6 +315,10 @@ export function ChatPane({
   const [crossPersonaCheckError, setCrossPersonaCheckError] = useState<string | null>(null)
 
   const isGenerating = activeRunId !== null
+  // items.id=831: Try again's bookkeeping counts only while its run is the
+  // active one; once the run has ended (a reply, or a new failure, is in the
+  // reply row) nothing is being replaced any more.
+  const resumingNow = resuming !== null && resuming.runId === activeRunId ? resuming : null
 
   useEffect(() => {
     onGenerating?.(isGenerating)
@@ -598,7 +622,7 @@ export function ChatPane({
                   .reverse()
                   .find((m) => m.sender === 'assistant' && m.focus_run_id === activeRunId)
               : undefined
-          if (liveRow?.content) {
+          if (liveRow && isFreshReply(liveRow.content, activeRunId, resumingRef.current)) {
             finalize(result)
             return
           }
@@ -620,7 +644,7 @@ export function ChatPane({
                 .reverse()
                 .find((m) => m.sender === 'assistant' && m.focus_run_id === activeRunId)
             : undefined
-        if (liveRow?.content) {
+        if (liveRow && isFreshReply(liveRow.content, activeRunId, resumingRef.current)) {
           finalize(result)
           return
         }
@@ -637,7 +661,7 @@ export function ChatPane({
                 .reverse()
                 .find((m) => m.sender === 'assistant' && m.focus_run_id === activeRunId)
             : undefined
-        if (liveRow?.content) {
+        if (liveRow && isFreshReply(liveRow.content, activeRunId, resumingRef.current)) {
           // Content arrived in the same tick the timeout fired -- resolve
           // normally, same as the interval poll below would have.
           finalize(result)
@@ -1219,6 +1243,45 @@ export function ChatPane({
       })
     : ''
 
+  // The newest final failure's sentence, for the one polite announcement.
+  const finalFailureAnnouncement =
+    [...messages].reverse().find((m) => noticeFor(m, { get: finalFailureOf }) !== undefined)
+      ?.content ?? ''
+
+  // Try again on a final failure: resume the parked run. The run was
+  // checkpointed at the step that failed, so it runs that step again from a
+  // fresh retry loop (a full set of retries), and its result is written into
+  // this same reply row. The pane goes back to "generating" at once, before the
+  // command answers, so the run's message-content-ready cannot be missed.
+  const handleTryAgain = (m: MessageInfo) => {
+    const runId = m.focus_run_id
+    if (!runId || activeRunId !== null) return
+    const baseline: ResumeBaseline = { runId, staleContent: m.content }
+    // The failure is taken up by this attempt: only a NEW final failure of the
+    // run (another event) brings the button back, so a different kind of
+    // failure the resumed run ends with is shown as plain text. Put back if the
+    // run cannot be resumed at all.
+    const taken = finalFailureOf(runId)
+    finalFailureStore.clear(runId)
+    resumingRef.current = baseline
+    setResuming(baseline)
+    setTryAgainError(null)
+    setActiveRunId(runId)
+    const undo = (message: string) => {
+      resumingRef.current = null
+      setResuming(null)
+      setActiveRunId(null)
+      if (taken) finalFailureStore.apply(taken)
+      setTryAgainError({ runId, message })
+    }
+    commands
+      .resumeRun({ run_id: runId, user_id: userId, persona_id: personaId })
+      .then((result) => {
+        if (result.status !== 'ok') undo(result.error)
+      })
+      .catch((e: unknown) => undo(e instanceof Error ? e.message : String(e)))
+  }
+
   // Cancel of the row: cancel_run really stops the run (items.id=816). The run
   // then ends cancelled through the normal path (message-content-ready ->
   // finalize), which clears activeRunId and with it the row.
@@ -1283,15 +1346,25 @@ export function ChatPane({
                   className={`chat-pane__message chat-pane__message--${m.sender}`}
                   data-message-id={m.id}
                 >
-                  <span className="chat-pane__message-content">
-                    {m.id === liveMessageId && liveContent
-                      ? liveContent
-                      : emptyReplyNotice(m, deadRunIds) === 'stopped'
-                        ? t('navShell.chat.replyStopped')
-                        : emptyReplyNotice(m, deadRunIds) === 'didNotFinish'
-                          ? t('navShell.chat.replyDidNotFinish')
-                          : m.content}
-                  </span>
+                  {noticeFor(m, { get: finalFailureOf }) && resumingNow?.runId !== m.focus_run_id ? (
+                    <FinalFailureNotice
+                      sentence={m.content}
+                      busy={isGenerating}
+                      onTryAgain={() => handleTryAgain(m)}
+                    />
+                  ) : (
+                    <span className="chat-pane__message-content">
+                      {resumingNow?.runId === m.focus_run_id && m.is_error
+                        ? ''
+                        : m.id === liveMessageId && liveContent
+                          ? liveContent
+                          : emptyReplyNotice(m, deadRunIds) === 'stopped'
+                            ? t('navShell.chat.replyStopped')
+                            : emptyReplyNotice(m, deadRunIds) === 'didNotFinish'
+                              ? t('navShell.chat.replyDidNotFinish')
+                              : m.content}
+                    </span>
+                  )}
                 </li>
               )
             })}
@@ -1326,6 +1399,9 @@ export function ChatPane({
               when a new wait starts (never per tick), and the region stays mounted
               so a screen reader treats the change as an update. */}
           <output className="chat-pane__sr-only">{retryRow ? retryAnnouncement : ''}</output>
+          {/* items.id=831: one polite announcement when a reply becomes a final
+              failure. Stays mounted, so the change is read as an update. */}
+          <output className="chat-pane__sr-only">{finalFailureAnnouncement}</output>
           {isGenerating && retryRow ? (
             <div className="chat-pane__retry-wait">
               <p className="chat-pane__retry-wait-why">{retryWhy}</p>
@@ -1355,6 +1431,11 @@ export function ChatPane({
                   : t('navShell.chat.generating', { elapsed: elapsedSeconds })}
               </p>
             )
+          )}
+          {tryAgainError && (
+            <p role="alert" className="chat-pane__send-error">
+              {t('navShell.chat.finalFailure.tryAgainError', { message: tryAgainError.message })}
+            </p>
           )}
           {retryCancelError && retryCancelError.runId === activeRunId && (
             <p role="alert" className="chat-pane__send-error">

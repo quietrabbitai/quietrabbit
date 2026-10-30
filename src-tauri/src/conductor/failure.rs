@@ -351,7 +351,7 @@ impl FailureHandler {
             // F1 — Timeout / generation failure: retry up to MAX_RETRIES
             ConductorError::OllamaTimeout { .. } | ConductorError::OllamaGeneration { .. } => {
                 if retry_count >= MAX_RETRIES {
-                    return self.escalate_failed_retry("F1", sid, fid);
+                    return self.escalate_failed_retry("F1", sid, fid, false);
                 }
                 FailureResult {
                     action: FailureAction::Retry,
@@ -491,7 +491,7 @@ impl FailureHandler {
                 retry_after_secs, ..
             } => {
                 if retry_count >= MAX_RETRIES {
-                    return self.escalate_failed_retry("F10", sid, fid);
+                    return self.escalate_failed_retry("F10", sid, fid, true);
                 }
                 FailureResult {
                     action: FailureAction::Retry,
@@ -529,7 +529,7 @@ impl FailureHandler {
             // F10 — Timeout / unavailable: retry with require severity
             ConductorError::ProviderTimeout { .. } | ConductorError::ProviderUnavailable { .. } => {
                 if retry_count >= MAX_RETRIES {
-                    return self.escalate_failed_retry("F10", sid, fid);
+                    return self.escalate_failed_retry("F10", sid, fid, true);
                 }
                 FailureResult {
                     action: FailureAction::Retry,
@@ -771,12 +771,32 @@ impl FailureHandler {
         }
     }
 
+    /// `hosted`: the call that kept failing was a hosted provider's (F10).
+    /// items.id=831 (decisions.id=925): that provider is already external, so
+    /// "Switch to an external service" is never offered for it, whatever the
+    /// ceiling; the run parks for the user (Try again, or a different provider
+    /// where the surface has one). The executor replaces this fallback text
+    /// with the final-failure message (final_failure.rs) once it knows the
+    /// provider. A local failure (F1) still offers the external service.
     fn escalate_failed_retry(
         &self,
         mode: &str,
         step_id: Option<String>,
         focus_id: Option<String>,
+        hosted: bool,
     ) -> FailureResult {
+        if hosted {
+            return FailureResult {
+                action: FailureAction::AwaitUser,
+                failure_mode: Some(mode.to_owned()),
+                plain_language: "This step failed repeatedly and has been paused.".to_owned(),
+                is_recoverable: true,
+                severity: FailureSeverity::Stop,
+                step_id,
+                focus_id,
+                metadata: None,
+            };
+        }
         if self.offers_escalation() {
             return FailureResult {
                 action: FailureAction::OfferTier2,
@@ -1242,7 +1262,36 @@ mod tests {
             None,
             MAX_RETRIES,
         );
-        assert_eq!(r.action, FailureAction::OfferTier2);
+        // items.id=831: the failed provider is already external, so the
+        // exhausted result never offers "Switch to an external service".
+        assert_eq!(r.action, FailureAction::AwaitUser);
+        assert_eq!(r.failure_mode.as_deref(), Some("F10"));
+        assert!(r.is_recoverable);
+        assert!(!r.plain_language.contains('['), "{}", r.plain_language);
+    }
+
+    #[test]
+    fn a_hosted_exhaustion_never_offers_an_external_service_at_any_ceiling() {
+        for tier in [1, 2, 3] {
+            let h = handler(tier);
+            for e in [
+                ConductorError::ProviderRateLimit {
+                    plain_language: "429".to_owned(),
+                    retry_after_secs: None,
+                },
+                ConductorError::ProviderTimeout {
+                    plain_language: "t".to_owned(),
+                },
+                ConductorError::ProviderUnavailable {
+                    plain_language: "u".to_owned(),
+                },
+            ] {
+                let r = h.handle(&e, Some("s"), Some("f"), MAX_RETRIES);
+                assert_eq!(r.action, FailureAction::AwaitUser, "tier {tier}");
+                assert_eq!(r.step_id.as_deref(), Some("s"));
+                assert_eq!(r.focus_id.as_deref(), Some("f"));
+            }
+        }
     }
 
     #[test]

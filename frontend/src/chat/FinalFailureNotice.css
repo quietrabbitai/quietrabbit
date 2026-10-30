@@ -1,0 +1,58 @@
+/* The final-failure notice (items.id=831). Neutral tokens only (rule 17, palette
+ * v3): the clock is --slate-blue, the button is the secondary style (ink
+ * outline). No amber, no ember, no new colour. The numbers behind these pairs
+ * are asserted by finalFailureContrast.test.ts. */
+
+.final-failure {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.final-failure__message {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.final-failure__icon {
+  flex: none;
+  margin-top: 2px;
+  color: var(--slate-blue);
+}
+
+.final-failure__text {
+  margin: 0;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.final-failure__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+/* A real button, at least 44 px tall (touch target). */
+.final-failure__try-again {
+  min-height: 44px;
+  padding: 0 18px;
+  border: 1.5px solid var(--ink);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.final-failure__try-again:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: var(--focus-ring-offset);
+}
+
+.final-failure__try-again:disabled {
+  opacity: 0.5;
+  cursor: default;
+}

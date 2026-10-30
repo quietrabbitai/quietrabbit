@@ -74,6 +74,7 @@ use crate::conductor::privacy::types::{
 use crate::conductor::privacy::PrivacyGateway;
 use crate::conductor::tokens::{ExternalAccess, StepDefinition};
 use crate::conductor::types::{PersonalTrack, SharedStateTrack, TaskStep, TaskTrack};
+use crate::final_failure;
 use crate::persistence::integration_keys_store::{self, QR_HOSTED_KEY_TYPE};
 use crate::persistence::provider_store::{self, Provider, ProviderModel};
 use crate::providers::errors::ProviderError;
@@ -838,12 +839,27 @@ impl StepExecutor {
                     Some(&ctx.focus_id),
                     retry_count,
                 );
-                return Ok(Some(with_wait_context(
+                let handled = with_wait_context(
                     handled,
                     &e,
                     selected_model.provider_id.as_deref(),
                     &selected_model.model_id,
-                )));
+                );
+                // items.id=831: the last retry failed too. The result becomes
+                // the final-failure message, which names the provider from its
+                // row and carries the ids the chat surface needs.
+                return Ok(Some(
+                    with_final_failure(
+                        handled,
+                        &e,
+                        retry_count,
+                        ctx,
+                        selected_model.provider_id.as_deref(),
+                        &selected_model.model_id,
+                        pool,
+                    )
+                    .await,
+                ));
             }
         };
 
@@ -1495,6 +1511,51 @@ fn with_wait_context(
     ) {
         retry_wait::attach_context(&mut result, reason, provider_id, model_id);
     }
+    result
+}
+
+/// items.id=831 (decisions.id=925): the exhausted result of a hosted call
+/// becomes the final-failure message. Anything that is not the exhaustion of a
+/// provider-error class, or has no provider chosen, is returned unchanged.
+/// The provider is named from its row (data, never code); if the row cannot be
+/// read the message names nothing rather than guess.
+async fn with_final_failure(
+    mut result: FailureResult,
+    error: &ConductorError,
+    retry_count: u32,
+    ctx: &StepContext,
+    provider_id: Option<&str>,
+    model_id: &str,
+    pool: &sqlx::SqlitePool,
+) -> FailureResult {
+    let (Some(reason), Some(provider_id)) = (RetryWaitReason::of_error(error), provider_id) else {
+        return result;
+    };
+    if !final_failure::is_hosted_exhaustion(&result, retry_count) {
+        return result;
+    }
+    let display_name = match provider_store::get_provider(pool, provider_id).await {
+        Ok(Some(p)) => Some(p.display_name),
+        _ => None,
+    };
+    let who = match display_name.as_deref() {
+        Some(provider) => final_failure::Who::Named {
+            provider,
+            model: model_id,
+        },
+        None => final_failure::Who::Unknown,
+    };
+    // API Chat shows the sentence alone; QR Chat and a Focus run put the step
+    // and Focus first, as their wait row does.
+    let scope = if ctx.bound.is_some() {
+        final_failure::Scope::Bare
+    } else {
+        final_failure::Scope::Focus {
+            focus: &ctx.focus_name,
+            step: &ctx.step.display_name,
+        }
+    };
+    final_failure::apply(&mut result, reason, provider_id, model_id, who, scope);
     result
 }
 
@@ -5166,6 +5227,36 @@ mod tests {
         assert!(start.elapsed() <= Duration::from_secs(u64::from(MAX_RETRIES) * 60));
     }
 
+    /// items.id=831: Try again resumes a parked run, which runs the step
+    /// through a fresh retry loop. The retry count is a local of that loop, so
+    /// a resumed run starts at 0 and gets the full MAX_RETRIES again; nothing of
+    /// the failed run's count is carried over.
+    #[tokio::test(start_paused = true)]
+    async fn a_resumed_run_starts_its_retry_loop_at_zero() {
+        let mut first = Scripted::new(
+            (0..=MAX_RETRIES)
+                .map(|_| Ok(Some(hosted_retry(None))))
+                .collect(),
+        );
+        let r = retry_loop(&mut first, &loop_ctx(None), &handler(), |m| m).await;
+        assert!(r.is_some());
+        assert_eq!(first.seen, [0, 1, 2, 3]);
+
+        // The resume: a new attempt object and a new loop for the same step.
+        let mut resumed = Scripted::new(vec![
+            Ok(Some(hosted_retry(None))),
+            Ok(Some(hosted_retry(None))),
+            Ok(None),
+        ]);
+        let r = retry_loop(&mut resumed, &loop_ctx(None), &handler(), |m| m).await;
+        assert!(r.is_none());
+        assert_eq!(
+            resumed.seen,
+            [0, 1, 2],
+            "starts at 0, not at the failed run's MAX_RETRIES"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn the_loop_returns_success_after_a_retry() {
         let mut a = Scripted::new(vec![Ok(Some(hosted_retry(Some(2)))), Ok(None)]);
@@ -5513,6 +5604,110 @@ mod tests {
         assert!(r
             .metadata
             .is_none_or(|m| !m.contains_key(retry_wait::RETRY_REASON_KEY)));
+    }
+
+    // -- items.id=831: the final-failure message --------------------------
+
+    fn lazy_pool() -> sqlx::SqlitePool {
+        sqlx::SqlitePool::connect_lazy_with(
+            sqlx::sqlite::SqliteConnectOptions::new().filename(":memory:"),
+        )
+    }
+
+    #[tokio::test]
+    async fn only_the_exhaustion_of_a_hosted_provider_error_becomes_the_final_failure() {
+        let ctx = hosted_ctx(RunAttendance::Attended, "00");
+        let busy = ConductorError::ProviderRateLimit {
+            plain_language: "429".to_owned(),
+            retry_after_secs: None,
+        };
+        let pool = lazy_pool();
+        let exhausted = || {
+            FailureHandler::new(ExternalAccess::Unrestricted).handle(&busy, None, None, MAX_RETRIES)
+        };
+
+        // Exhausted, a provider chosen: marked, with the Focus wording first
+        // (this ctx is not bound) and the ids; the unreadable row names nothing.
+        let r = with_final_failure(
+            exhausted(),
+            &busy,
+            MAX_RETRIES,
+            &ctx,
+            Some("prov-1"),
+            "model-1",
+            &pool,
+        )
+        .await;
+        assert_eq!(r.action, FailureAction::AwaitUser);
+        assert!(
+            r.plain_language.contains("is paused."),
+            "{}",
+            r.plain_language
+        );
+        assert!(
+            r.plain_language.contains("too busy"),
+            "{}",
+            r.plain_language
+        );
+        let m = r.metadata.expect("context attached");
+        assert_eq!(m[final_failure::FINAL_FAILURE_KEY], true);
+        assert_eq!(m[retry_wait::RETRY_PROVIDER_KEY], "prov-1");
+
+        // No provider chosen, a non-provider error, or retries not used up:
+        // unchanged.
+        let unchanged = |r: &FailureResult| {
+            r.plain_language == exhausted().plain_language && r.metadata.is_none()
+        };
+        assert!(unchanged(
+            &with_final_failure(exhausted(), &busy, MAX_RETRIES, &ctx, None, "m", &pool).await
+        ));
+        let key = ConductorError::MissingApiKey {
+            plain_language: "x".to_owned(),
+        };
+        assert!(unchanged(
+            &with_final_failure(exhausted(), &key, MAX_RETRIES, &ctx, Some("p"), "m", &pool).await
+        ));
+        assert!(unchanged(
+            &with_final_failure(
+                exhausted(),
+                &busy,
+                MAX_RETRIES - 1,
+                &ctx,
+                Some("p"),
+                "m",
+                &pool
+            )
+            .await
+        ));
+
+        // An API Chat run (bound) shows the sentence alone.
+        let bound = StepContext {
+            bound: Some(crate::api_chat::BoundDestination {
+                provider_id: "prov-1".to_owned(),
+                model_id: "model-1".to_owned(),
+            }),
+            ..hosted_ctx(RunAttendance::Attended, "00")
+        };
+        let r = with_final_failure(
+            exhausted(),
+            &busy,
+            MAX_RETRIES,
+            &bound,
+            Some("prov-1"),
+            "model-1",
+            &pool,
+        )
+        .await;
+        assert!(
+            !r.plain_language.contains("is paused."),
+            "{}",
+            r.plain_language
+        );
+        assert!(
+            r.plain_language.contains("too busy"),
+            "{}",
+            r.plain_language
+        );
     }
 
     // -- items.id=816: an API Chat Stop ends a retry wait ---------------------

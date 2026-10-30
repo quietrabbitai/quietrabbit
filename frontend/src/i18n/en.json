@@ -240,6 +240,10 @@
       "contentTimeout": "This is taking longer than expected. Still working -- the reply will appear here as soon as it's ready.",
       "replyDidNotFinish": "That reply didn't finish.",
       "replyStopped": "This reply was stopped.",
+      "finalFailure": {
+        "tryAgain": "Try again",
+        "tryAgainError": "Could not try again: {{message}}"
+      },
       "retryWait": {
         "providerFallback": "The provider",
         "reasonBusy": "{{provider}} is busy.",

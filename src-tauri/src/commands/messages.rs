@@ -537,6 +537,22 @@ pub(crate) async fn finalize_chat_reply(
                 log::warn!("finalize_chat_reply: emit chat-activity-updated failed: {e}");
             }
         }
+        // items.id=831: tell the chat which reply is a final failure, so it
+        // can offer Try again. Before message-content-ready, so the pane that
+        // reloads on that event already knows. Only when the failure text was
+        // what got written (a real reply never carries one).
+        if outcome == ReplyOutcome::ErrorShown {
+            let final_failure = result
+                .as_ref()
+                .ok()
+                .and_then(|r| r.failure.as_ref())
+                .and_then(|f| crate::final_failure::payload_for(f, run_id, &msg.id));
+            if let Some(payload) = final_failure {
+                if let Err(e) = handle.emit(crate::final_failure::FINAL_FAILURE_EVENT, &payload) {
+                    log::warn!("finalize_chat_reply: emit final-failure failed: {e}");
+                }
+            }
+        }
         let payload = MessageContentReadyPayload {
             focus_run_id: run_id.to_owned(),
             message_id: msg.id.clone(),
@@ -1448,6 +1464,94 @@ mod tests {
             placeholder.is_error,
             "the backfilled error text must be flagged is_error"
         );
+    }
+
+    // items.id=831: Try again resumes the parked run, and its result lands in
+    // the SAME reply row the final-failure message was written to (found by
+    // focus_run_id), not in a new message. The failure is a real final-failure
+    // result as the executor builds it; the retry then succeeds.
+    #[tokio::test]
+    async fn try_again_updates_the_same_message_the_final_failure_was_written_to() {
+        use crate::final_failure::{self, Scope, Who};
+        use crate::retry_wait::RetryWaitReason;
+
+        let _env = setup().await;
+        let key = key_hex_str();
+        let chat = "chat-try-again";
+        message_store::save_message(USER_ID, PERSONA_ID, &key, chat, "user", "hi", None)
+            .await
+            .unwrap();
+        message_store::save_message(
+            USER_ID,
+            PERSONA_ID,
+            &key,
+            chat,
+            "assistant",
+            "",
+            Some("run-ta"),
+        )
+        .await
+        .unwrap();
+
+        let mut failed = run_result_with_failure("fallback");
+        {
+            let f = failed.failure.as_mut().unwrap();
+            f.action = crate::conductor::failure::FailureAction::AwaitUser;
+            f.failure_mode = Some("F10".to_owned());
+            f.is_recoverable = true;
+            final_failure::apply(
+                f,
+                RetryWaitReason::Busy,
+                "prov-1",
+                "model-1",
+                Who::Named {
+                    provider: "Provider A",
+                    model: "model-1",
+                },
+                Scope::Bare,
+            );
+        }
+        let sentence = failed.failure.as_ref().unwrap().plain_language.clone();
+        let payload = final_failure::payload_for(failed.failure.as_ref().unwrap(), "run-ta", "x")
+            .expect("a final failure announces itself");
+        assert_eq!(payload.focus_run_id, "run-ta");
+
+        let outcome =
+            finalize_chat_reply(USER_ID, PERSONA_ID, &key, "run-ta", &Ok(failed), None).await;
+        assert_eq!(outcome, ReplyOutcome::ErrorShown);
+        let before = message_store::find_assistant_message_by_focus_run_id(
+            USER_ID, PERSONA_ID, &key, "run-ta",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(before.content, sentence);
+        assert!(before.is_error);
+
+        // Try again: the same run id resumes and finishes with a reply.
+        let outcome = finalize_chat_reply(
+            USER_ID,
+            PERSONA_ID,
+            &key,
+            "run-ta",
+            &Ok(run_result_awaiting_user(Some("the real reply"))),
+            None,
+        )
+        .await;
+        assert_eq!(outcome, ReplyOutcome::ChatFiled);
+        let after = message_store::find_assistant_message_by_focus_run_id(
+            USER_ID, PERSONA_ID, &key, "run-ta",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(after.id, before.id, "the same message row");
+        assert_eq!(after.content, "the real reply");
+        assert!(!after.is_error);
+        let rows = message_store::list_messages(USER_ID, PERSONA_ID, &key, chat)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2, "no new message was added: {rows:?}");
     }
 
     #[tokio::test]
