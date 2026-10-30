@@ -40,6 +40,8 @@ pub enum Lost {
     PersonalFlag,
     /// The text read from an imported image.
     OcrText,
+    /// The searchable text of an imported PDF or Word document (items.id=837).
+    ExtractedText,
 }
 
 impl Lost {
@@ -51,6 +53,7 @@ impl Lost {
             Lost::ReplyStatus => "reply_status",
             Lost::PersonalFlag => "personal_flag",
             Lost::OcrText => "ocr_text",
+            Lost::ExtractedText => "extracted_text",
         }
     }
 }
@@ -220,6 +223,7 @@ mod tests {
             Lost::ReplyStatus,
             Lost::PersonalFlag,
             Lost::OcrText,
+            Lost::ExtractedText,
         ];
         let names: std::collections::BTreeSet<&str> = kinds.iter().map(|k| k.as_str()).collect();
         assert_eq!(names.len(), kinds.len(), "no two kinds share a name");
@@ -246,6 +250,7 @@ mod tests {
             ("reply_gate2", &exec, "Lost::PersonalFlag"),
             ("keep_partial_reply", &exec, "Lost::Reply"),
             ("store_ingested_document", &ingest, "Lost::OcrText"),
+            ("store_ingested_document", &ingest, "Lost::ExtractedText"),
             ("finalize_chat_reply", &messages, "Lost::History"),
             ("write_focus_run_record_logged", &lifecycle, "Lost::Run"),
         ] {

@@ -7,6 +7,7 @@ pub mod chat_stream;
 pub mod cloud_chat_gpu_pane;
 pub mod commands;
 pub mod conductor;
+pub mod doc_parse;
 pub mod final_failure;
 pub mod group_sync;
 pub mod hardware_probe;

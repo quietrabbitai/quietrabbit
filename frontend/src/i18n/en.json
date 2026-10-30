@@ -215,7 +215,8 @@
       "dismiss": "Dismiss",
       "replyStatus": "A reply was saved, but its status wasn't. A reply that was cut short may look finished.",
       "personalFlag": "This reply may include your private information but wasn't marked private.",
-      "ocrText": "A document was saved, but the text read from its image wasn't. You can add the document again."
+      "ocrText": "A document was saved, but the text read from its image wasn't. You can add the document again.",
+      "extractedText": "A document was saved, but its text couldn't be read, so it won't appear in searches. You can still open the original."
     }
   },
   "navShell": {

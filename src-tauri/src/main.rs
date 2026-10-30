@@ -88,6 +88,13 @@ fn abort_startup(app: &tauri::AppHandle, message: &str) {
 /// after CEF subprocess dispatch has confirmed this is the real
 /// browser-process invocation.
 fn main() {
+    // items.id=837: the document-text parser child (the parent re-invokes this
+    // binary with doc_parse::PARSE_ARG). Must stay the first statement: before
+    // logging, CEF, Tokio, Tauri, the key registry or any database, and before
+    // any single-instance check (items.id=667). Returns at once unless this
+    // process was started in parse mode, in which case it never returns.
+    quietrabbit_lib::doc_parse::dispatch_parse_mode();
+
     // Diagnostic-only for Phase A verification -- pre-existing log:: calls
     // in this codebase (e.g. ollama_sidecar.rs) had no registered backend
     // before this, confirmed by an empty log file during the first Phase A

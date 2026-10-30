@@ -4227,6 +4227,7 @@ dependencies = [
  "chrono",
  "docx-rust",
  "env_logger",
+ "flate2",
  "futures-util",
  "gethostname 0.4.3",
  "getrandom 0.4.2",

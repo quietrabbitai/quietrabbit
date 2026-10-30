@@ -72,14 +72,16 @@ zeroize = { version = "1.8", features = ["derive"] }
 # input (jrmuizel/pdf-extract#141 "Security hardening: ~50 panic/crash
 # fixes for untrusted PDF input", and others, all confirmed open) -- exactly
 # this crate's threat model, since PDFs here are arbitrary user uploads.
-# Never call extract_text*() unwrapped; the ingest.rs call site wraps it in
-# std::panic::catch_unwind and degrades to content: None on any failure.
+# Never call extract_text*() outside doc_parse.rs: parse_document_text wraps it
+# in std::panic::catch_unwind, and on Linux the call runs in a child process
+# under a memory cap and a wall-clock kill (items.id=837), degrading to
+# content: None on any failure.
 pdf-extract = "0.12"
 # docx-rust: MIT, fork of docx-rs (cstkingkey), ~2.25M downloads, last
 # release Jan 2026. No documented panic-hardening effort the way
 # pdf-extract has one, but it parses the same class of untrusted
-# zip+XML input -- same catch_unwind treatment applies defensively at the
-# call site.
+# zip+XML input -- same catch_unwind treatment and the same child process
+# apply (doc_parse.rs). It can need hundreds of times the XML size in memory.
 docx-rust = "0.1"
 
 # Base64-encodes image bytes for GenerateRequest.images (items.id=150 Part 2,
@@ -299,6 +301,9 @@ unicode-normalization = "=0.1.25"
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
+# Hostile-fixture generation in tests/doc_parse_child.rs (items.id=837); already
+# in the tree via lopdf and docx-rust.
+flate2 = "1"
 # Character Error Rate (Levenshtein) for the OCR accuracy eval
 # (providers/ocr_eval.rs, items.id=150 Part 3) -- already resolved
 # transitively via clap_builder/darling_core at this same version, so this
@@ -345,4 +350,33 @@ docx-rust = { path = "vendor/docx-rust" }
 # `cargo test --lib kdf::tests::real_default_parameters_derive_successfully`:
 # about 0.06 s with the override, about 1.6 s without.
 [profile.dev.package.argon2]
+opt-level = 3
+
+# The document parsers run in a child process under a memory cap (items.id=837,
+# src/doc_parse.rs). Unoptimized, a decompression or nesting bomb needs 4-9 s to
+# reach the cap in the debug binary that `cargo test` spawns (0.2-0.8 s in
+# release), and a 100 MB legitimate PDF takes 17 s against the 20 s extraction
+# timeout. Optimized, the tests hit the cap and not the clock, and `cargo tauri
+# dev` imports behave like release. Measured: items.id=837 step 2.
+[profile.dev.package.pdf-extract]
+opt-level = 3
+[profile.dev.package.lopdf]
+opt-level = 3
+[profile.dev.package.nom]
+opt-level = 3
+[profile.dev.package.flate2]
+opt-level = 3
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+[profile.dev.package.zlib-rs]
+opt-level = 3
+[profile.dev.package.crc32fast]
+opt-level = 3
+[profile.dev.package.docx-rust]
+opt-level = 3
+[profile.dev.package.hard-xml]
+opt-level = 3
+[profile.dev.package.xmlparser]
+opt-level = 3
+[profile.dev.package.zip]
 opt-level = 3

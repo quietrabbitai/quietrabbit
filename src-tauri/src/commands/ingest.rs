@@ -26,14 +26,17 @@
 // content column (for FTS5 search) two ways. A small allowlist of trivially
 // UTF-8-decodable formats (.txt/.md/.markdown/.html/.htm) is mirrored
 // verbatim -- see is_text_mirror_extension(). PDF and .docx (items.id=386)
-// go through real parsing instead -- see extract_document_text() -- via
+// go through real parsing instead -- see extract_mirror() -- via
 // pdf-extract and docx-rust (both pure Rust, Cargo.toml). Either path can
 // fail (corrupt file, encrypted/password-protected, a scanned/image-only
-// PDF with no text layer, or a panic inside the parsing crate on malformed
-// input -- both crates parse untrusted input and pdf-extract's own tracker
-// documents open panic reports on exactly that, see extract_document_text's
-// doc comment) and always degrades to content: None for that file, never a
-// failed upload. Every other format (images, anything not in either path)
+// PDF with no text layer, or a panic, abort or runaway allocation inside the
+// parsing crate on malformed input -- both crates parse untrusted input and
+// pdf-extract's own tracker documents open panic reports on exactly that, see
+// doc_parse.rs) and always degrades to content: None for that file, never a
+// failed upload. On Linux the parsing runs in a child process under a memory
+// cap and a wall-clock kill (items.id=837, decisions.id=927), so a hostile file
+// can only cost the child; a failure tells the user (Lost::ExtractedText).
+// Every other format (images, anything not in either path)
 // is still stored losslessly via ingest_blob regardless of whether its
 // content could be mirrored/extracted -- decisions.id=486's own rationale
 // for retaining the document at all ("the document is the audit trail...
@@ -56,6 +59,7 @@ use tauri::{Manager, State};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::auth::registry::{key_hex, KeyRegistry};
+use crate::doc_parse::{self, DocumentKind};
 use crate::persistence::ingest_blob;
 use crate::persistence::output_store;
 use crate::providers::ollama_client::OllamaClient;
@@ -65,18 +69,24 @@ use crate::providers::types::{GenerateOptions, GenerateRequest};
 /// picked file and to pasted content alike. 100 MiB; Chat-PM's choice, change
 /// it here only (the user-facing strings below say "100 MB"). Peak memory at
 /// the cap is about 3x this for a text file (the shared bytes, plus the
-/// ciphertext and assembled file bytes of ingest_blob's seal step), plus
-/// whatever the PDF/DOCX parsers expand it to, which nothing here bounds
-/// (items.id=665).
+/// ciphertext and assembled file bytes of ingest_blob's seal step). What the
+/// PDF/DOCX parsers expand it to is not counted here: on Linux that happens in
+/// a child process under a memory cap (doc_parse.rs, items.id=837), which is
+/// still unbounded on other targets until items.id=838.
 const MAX_INGEST_BYTES: u64 = 100 * 1024 * 1024;
 
 /// How long the command waits for PDF/DOCX text extraction before it stores the
 /// document without a text mirror (items.id=664). Under writer_gate's
 /// COMMAND_DRAIN_CEILING (30 s) because the ingest lease is held across the
-/// wait. This stops the WAIT, not the blocking thread: a hung parser keeps its
-/// thread and its Arc of the bytes until it returns. Real isolation is
-/// items.id=665.
+/// wait. On Linux this is the child's wall clock (items.id=837): at the limit
+/// the child's whole process group is killed and reaped, so a hung parser
+/// holds neither a thread nor memory afterwards. Other targets still only stop
+/// the WAIT and leave the blocking thread running (items.id=838).
 const EXTRACTION_TIMEOUT: Duration = Duration::from_secs(20);
+const _: () = assert!(
+    EXTRACTION_TIMEOUT.as_secs() < crate::auth::writer_gate::COMMAND_DRAIN_CEILING.as_secs(),
+    "the ingest lease is held across the extraction wait"
+);
 
 // User-facing text: LibraryPane renders the command's error string verbatim, so
 // none of these carries a path, an id or an OS error (those go to the log).
@@ -161,7 +171,10 @@ async fn open_regular_file(path: &Path, cap: u64) -> Result<(tokio::fs::File, u6
 
 /// Waits for a blocking task for at most `limit`. None on timeout or when the
 /// task failed. A timeout drops the handle, which detaches the task: it keeps
-/// running (see EXTRACTION_TIMEOUT).
+/// running (see EXTRACTION_TIMEOUT). Only the in-process fallback of targets
+/// without child limits uses it (items.id=838); on Linux extraction is a child
+/// process that is killed instead.
+#[cfg(not(target_os = "linux"))]
 async fn await_bounded<T>(handle: tokio::task::JoinHandle<T>, limit: Duration) -> Option<T> {
     match tokio::time::timeout(limit, handle).await {
         Ok(joined) => joined.ok(),
@@ -304,45 +317,77 @@ pub struct IngestedDocumentContentReadyPayload {
     pub output_id: String,
 }
 
-/// Best-effort text extraction for PDF/.docx, run synchronously -- caller is
-/// expected to run this via spawn_blocking (CPU-bound parsing). Returns None
-/// on any failure: wrong/missing extension, corrupt or encrypted file, a
-/// scanned/image-only PDF with no text layer, or a panic inside the parsing
-/// crate itself. The catch_unwind is load-bearing, not defensive-programming
-/// filler: both pdf-extract and docx-rust parse arbitrary user-uploaded
-/// bytes, and pdf-extract's own tracker documents open panics on exactly
-/// that (jrmuizel/pdf-extract#141 "Security hardening: ~50 panic/crash
-/// fixes for untrusted PDF input", plus #147/#134/#133/#132/#129 -- all
-/// confirmed open this session). Without catching it, a single bad upload
-/// would take down the whole async task instead of just losing its search
-/// mirror.
-fn extract_document_text(path: &Path, bytes: &[u8]) -> Option<String> {
-    let ext = path
+/// Which parser an ingested file's extension selects, if any. Every other
+/// extension is stored without extraction and without a notice.
+fn document_kind(path: &Path) -> Option<DocumentKind> {
+    match path
         .extension()
         .and_then(|e| e.to_str())
-        .map(|e| e.to_lowercase());
+        .map(|e| e.to_lowercase())
+        .as_deref()
+    {
+        Some("pdf") => Some(DocumentKind::Pdf),
+        Some("docx") => Some(DocumentKind::Docx),
+        _ => None,
+    }
+}
 
-    let result = match ext.as_deref() {
-        Some("pdf") => std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(bytes).ok()),
-        Some("docx") => std::panic::catch_unwind(|| {
-            docx_rust::DocxFile::from_reader(std::io::Cursor::new(bytes))
-                .ok()?
-                .parse()
-                .ok()
-                .map(|docx| docx.document.body.text())
-        }),
-        _ => return None,
+/// A PDF/.docx's text mirror and, when it could not be read, why (for the log:
+/// never shown to the user, and content-free either way).
+struct Extraction {
+    mirror: Mirror,
+    failure: Option<String>,
+}
+
+/// Best-effort text extraction for PDF/.docx (items.id=386, items.id=837). It
+/// never fails the upload: any failure (a corrupt or encrypted file, a crash,
+/// the memory cap, the timeout, text over the size cap) gives `Mirror::Absent`
+/// plus the reason, and the caller tells the user once the document is stored.
+/// A scanned PDF that parses to empty text is a success, not a failure.
+async fn extract_mirror(path: &Path, bytes: &Arc<Vec<u8>>) -> Extraction {
+    let Some(kind) = document_kind(path) else {
+        return Extraction {
+            mirror: Mirror::Absent,
+            failure: None,
+        };
     };
+    match extract_text(kind, bytes).await {
+        Ok(text) => Extraction {
+            mirror: Mirror::Extracted(text),
+            failure: None,
+        },
+        Err(reason) => Extraction {
+            mirror: Mirror::Absent,
+            failure: Some(reason),
+        },
+    }
+}
 
-    match result {
-        Ok(text) => text,
-        Err(_) => {
-            log::warn!(
-                "extract_document_text: parser panicked on '{}', storing without a text mirror",
-                path.display()
-            );
-            None
-        }
+/// Linux: the parser runs in a child process of this binary under a memory cap,
+/// a CPU limit and a wall-clock kill (doc_parse.rs, items.id=837).
+#[cfg(target_os = "linux")]
+async fn extract_text(kind: DocumentKind, bytes: &Arc<Vec<u8>>) -> Result<String, String> {
+    doc_parse::extract_in_child(
+        &doc_parse::ParseCommand::this_executable(kind),
+        bytes,
+        doc_parse::ParseLimits::production(EXTRACTION_TIMEOUT),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Other targets keep the in-process parser until their child limits exist
+/// (items.id=838: a Job Object on Windows, an allocator cap on macOS). Not
+/// isolated: a hostile file can still exhaust this process.
+#[cfg(not(target_os = "linux"))]
+async fn extract_text(kind: DocumentKind, bytes: &Arc<Vec<u8>>) -> Result<String, String> {
+    let bytes = Arc::clone(bytes);
+    let extraction =
+        tokio::task::spawn_blocking(move || doc_parse::parse_document_text(kind, &bytes));
+    match await_bounded(extraction, EXTRACTION_TIMEOUT).await {
+        Some(Ok(text)) => Ok(text),
+        Some(Err(e)) => Err(e.to_string()),
+        None => Err("the parser timed out or its task failed".to_owned()),
     }
 }
 
@@ -475,51 +520,50 @@ pub async fn store_ingested_document(
 
     // items.id=664: one copy of the document's bytes, shared by the text
     // mirror, the extraction and the background OCR task (Arc, not clones).
-    let (bytes, mirror, original_filename, ocr_eligible): (Arc<Vec<u8>>, Mirror, String, bool) =
-        match (content, file_path) {
-            (Some(text), None) => {
-                check_paste_size(text.len(), MAX_INGEST_BYTES)?;
-                (
-                    Arc::new(text.into_bytes()),
-                    Mirror::Utf8,
-                    "pasted-content.txt".to_owned(),
-                    false,
-                )
-            }
-            (None, Some(path_str)) => {
-                let path = Path::new(&path_str);
-                let bytes = Arc::new(read_ingest_file(path, MAX_INGEST_BYTES).await?);
-                let original_filename = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path_str.clone());
-                let ocr_eligible = is_ocr_extension(path);
-                let mirror = if is_text_mirror_extension(path) {
-                    // Explicit error would be the wrong call here -- an
-                    // extension in the mirror allowlist that fails to
-                    // decode as UTF-8 is still a legitimate file to store,
-                    // it just doesn't get a searchable text mirror.
-                    Mirror::Utf8
-                } else {
-                    let path_owned = path.to_path_buf();
-                    let bytes_for_extract = Arc::clone(&bytes);
-                    let extraction = tokio::task::spawn_blocking(move || {
-                        extract_document_text(&path_owned, &bytes_for_extract)
-                    });
-                    // A timeout degrades to no text mirror, like a parse
-                    // failure: the document is still stored.
-                    match await_bounded(extraction, EXTRACTION_TIMEOUT)
-                        .await
-                        .flatten()
-                    {
-                        Some(text) => Mirror::Extracted(text),
-                        None => Mirror::Absent,
-                    }
-                };
-                (bytes, mirror, original_filename, ocr_eligible)
-            }
-            _ => unreachable!("validated exactly one of content/file_path above"),
-        };
+    let (bytes, extraction, original_filename, ocr_eligible): (
+        Arc<Vec<u8>>,
+        Extraction,
+        String,
+        bool,
+    ) = match (content, file_path) {
+        (Some(text), None) => {
+            check_paste_size(text.len(), MAX_INGEST_BYTES)?;
+            (
+                Arc::new(text.into_bytes()),
+                Extraction {
+                    mirror: Mirror::Utf8,
+                    failure: None,
+                },
+                "pasted-content.txt".to_owned(),
+                false,
+            )
+        }
+        (None, Some(path_str)) => {
+            let path = Path::new(&path_str);
+            let bytes = Arc::new(read_ingest_file(path, MAX_INGEST_BYTES).await?);
+            let original_filename = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path_str.clone());
+            let ocr_eligible = is_ocr_extension(path);
+            let extraction = if is_text_mirror_extension(path) {
+                // Explicit error would be the wrong call here -- an
+                // extension in the mirror allowlist that fails to
+                // decode as UTF-8 is still a legitimate file to store,
+                // it just doesn't get a searchable text mirror.
+                Extraction {
+                    mirror: Mirror::Utf8,
+                    failure: None,
+                }
+            } else {
+                // A failure degrades to no text mirror: the document is
+                // still stored, and the user is told after it is.
+                extract_mirror(path, &bytes).await
+            };
+            (bytes, extraction, original_filename, ocr_eligible)
+        }
+        _ => unreachable!("validated exactly one of content/file_path above"),
+    };
 
     let output_id = uuid::Uuid::new_v4().to_string();
     persist_ingested_document(
@@ -533,9 +577,21 @@ pub async fn store_ingested_document(
         &sensitivity,
         &original_filename,
         &bytes,
-        mirror.view(&bytes),
+        extraction.mirror.view(&bytes),
     )
     .await?;
+
+    // items.id=837: the document is stored, but its text could not be read, so
+    // it will not turn up in searches: tell the user (like OCR text below)
+    // instead of a log line only. After the save, so a failed save never also
+    // says "a document was saved".
+    if let Some(reason) = &extraction.failure {
+        crate::write_failure::report(
+            Some(&app_handle),
+            crate::write_failure::Lost::ExtractedText,
+            &format!("store_ingested_document: text extraction for {output_id} failed, {reason}"),
+        );
+    }
 
     // items.id=150 Part 2: OCR runs detached in the background -- it must
     // never delay this command's IPC response (see OCR_EXTENSIONS's doc
@@ -672,6 +728,13 @@ pub async fn get_ingested_document_bytes(
 mod tests {
     use super::*;
 
+    /// The parse step of extract_mirror without the child process: the same
+    /// extension selection and the same parsers, in this process (the child
+    /// path is exercised against the real binary in tests/doc_parse_child.rs).
+    fn extract_document_text(path: &Path, bytes: &[u8]) -> Option<String> {
+        doc_parse::parse_document_text(document_kind(path)?, bytes).ok()
+    }
+
     /// Builds a minimal but structurally valid single-page PDF containing
     /// `text` as its only content-stream text, with byte-exact xref offsets
     /// computed from the actual bytes written (not hardcoded) so the
@@ -779,6 +842,24 @@ mod tests {
     fn unrelated_extensions_are_not_extracted() {
         let bytes = b"whatever bytes an image would have".to_vec();
         assert_eq!(extract_document_text(Path::new("upload.png"), &bytes), None);
+    }
+
+    #[test]
+    fn only_pdf_and_docx_select_a_parser_whatever_their_case() {
+        assert_eq!(document_kind(Path::new("a.pdf")), Some(DocumentKind::Pdf));
+        assert_eq!(document_kind(Path::new("A.PDF")), Some(DocumentKind::Pdf));
+        assert_eq!(document_kind(Path::new("a.DocX")), Some(DocumentKind::Docx));
+        for other in ["a.png", "a.doc", "a.txt", "a", "a.pdf.png", ".pdf"] {
+            assert_eq!(document_kind(Path::new(other)), None, "{other}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_file_with_no_parser_is_absent_without_a_failure_notice() {
+        let bytes = Arc::new(b"whatever bytes an image would have".to_vec());
+        let got = extract_mirror(Path::new("upload.png"), &bytes).await;
+        assert!(matches!(got.mirror, Mirror::Absent));
+        assert_eq!(got.failure, None);
     }
 
     #[test]
@@ -944,34 +1025,39 @@ mod tests {
 
     // -- bounded wait on extraction (items.id=664) ---------------------------
 
-    #[tokio::test]
-    async fn a_hung_blocking_task_stops_being_waited_on() {
-        let started = std::time::Instant::now();
-        let handle = tokio::task::spawn_blocking(|| {
-            std::thread::sleep(Duration::from_secs(2));
-            Some("late".to_owned())
-        });
-        let got = await_bounded(handle, Duration::from_millis(50)).await;
-        assert_eq!(got, None);
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "the wait must end at the limit, not when the task does"
-        );
-    }
+    #[cfg(not(target_os = "linux"))]
+    mod bounded_tests {
+        use super::*;
 
-    #[tokio::test]
-    async fn a_task_that_finishes_in_time_returns_its_value() {
-        let handle = tokio::task::spawn_blocking(|| 41 + 1);
-        assert_eq!(
-            await_bounded(handle, Duration::from_secs(5)).await,
-            Some(42)
-        );
-    }
+        #[tokio::test]
+        async fn a_hung_blocking_task_stops_being_waited_on() {
+            let started = std::time::Instant::now();
+            let handle = tokio::task::spawn_blocking(|| {
+                std::thread::sleep(Duration::from_secs(2));
+                Some("late".to_owned())
+            });
+            let got = await_bounded(handle, Duration::from_millis(50)).await;
+            assert_eq!(got, None);
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "the wait must end at the limit, not when the task does"
+            );
+        }
 
-    #[tokio::test]
-    async fn a_panicking_blocking_task_is_none_not_a_panic() {
-        let handle = tokio::task::spawn_blocking(|| -> u8 { panic!("parser blew up") });
-        assert_eq!(await_bounded(handle, Duration::from_secs(5)).await, None);
+        #[tokio::test]
+        async fn a_task_that_finishes_in_time_returns_its_value() {
+            let handle = tokio::task::spawn_blocking(|| 41 + 1);
+            assert_eq!(
+                await_bounded(handle, Duration::from_secs(5)).await,
+                Some(42)
+            );
+        }
+
+        #[tokio::test]
+        async fn a_panicking_blocking_task_is_none_not_a_panic() {
+            let handle = tokio::task::spawn_blocking(|| -> u8 { panic!("parser blew up") });
+            assert_eq!(await_bounded(handle, Duration::from_secs(5)).await, None);
+        }
     }
 
     #[test]

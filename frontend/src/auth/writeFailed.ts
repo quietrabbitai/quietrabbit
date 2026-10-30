@@ -24,6 +24,8 @@ export function writeFailedSuffix(kind: string): string {
       return 'personalFlag'
     case 'ocr_text':
       return 'ocrText'
+    case 'extracted_text':
+      return 'extractedText'
     default:
       return 'generic'
   }
@@ -31,7 +33,16 @@ export function writeFailedSuffix(kind: string): string {
 
 /** Every suffix writeFailedSuffix can return, for the en.json check. */
 export function allWriteFailedSuffixes(): string[] {
-  return ['generic', 'history', 'ocrText', 'personalFlag', 'reply', 'replyStatus', 'run']
+  return [
+    'extractedText',
+    'generic',
+    'history',
+    'ocrText',
+    'personalFlag',
+    'reply',
+    'replyStatus',
+    'run',
+  ]
 }
 
 /** Narrowing guard for the untyped event payload `{ kind: string }`. Returns

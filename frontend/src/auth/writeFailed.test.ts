@@ -19,6 +19,7 @@ assert.equal(writeFailedSuffix('history'), 'history')
 assert.equal(writeFailedSuffix('reply_status'), 'replyStatus')
 assert.equal(writeFailedSuffix('personal_flag'), 'personalFlag')
 assert.equal(writeFailedSuffix('ocr_text'), 'ocrText')
+assert.equal(writeFailedSuffix('extracted_text'), 'extractedText')
 for (const kind of ['something_new', '', 'toString', '__proto__']) {
   assert.equal(writeFailedSuffix(kind), 'generic', kind)
 }

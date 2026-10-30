@@ -1358,7 +1358,14 @@ mod tests {
 
     /// Spawn sites that sit in a function with no lease in sight, each with why
     /// the work they start is safe. Keyed `file::function`.
-    const SPAWN_SITE_EXEMPT: &[(&str, &str)] = &[];
+    const SPAWN_SITE_EXEMPT: &[(&str, &str)] = &[(
+        "commands/ingest.rs::extract_text",
+        "items.id=837: the non-Linux in-process fallback (until items.id=838). It is awaited \
+         inline by store_ingested_document, which holds the Ingest lease across the whole \
+         call. It only parses in-memory bytes and writes nothing, so a blocking thread that \
+         outlives the lease after a timeout touches no store. The Linux path spawns a child \
+         process, not a task.",
+    )];
 
     /// The function a byte offset sits in: from the nearest `fn` line at or
     /// before it to the next `fn` line, with that function's name.
