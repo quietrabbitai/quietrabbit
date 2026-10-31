@@ -5,6 +5,15 @@
 # target-triple verification, none of which this item covers.
 # Traces to: D6-339 (Rust migration), item 16d-setup, items.id=207
 #
+# Job layout (items.id=787): `lint` (fmt + cargo-deny), `clippy` and `check`
+# (the plain `cargo test`, kept under its old id so its rust-cache key and
+# history stay valid) run in parallel, as does `frontend`. The `clippy` and
+# `check` jobs share one setup block (apt, SQLCipher, toolchain): GitHub
+# Actions cannot share steps between jobs, and a composite action cannot carry
+# the per-step timeout-minutes, so the block is duplicated -- EDIT BOTH COPIES
+# TOGETHER. Values that must not drift between jobs live once in the
+# workflow-level `env` below.
+#
 # Before activating build-tauri for release:
 #   1. Add TAURI_SIGNING_PRIVATE_KEY + TAURI_SIGNING_PRIVATE_KEY_PASSWORD to GitHub secrets
 #   2. Set correct node version and frontend build command
@@ -24,12 +33,48 @@ on:
         type: boolean
         default: false
 
+# Single source for values the jobs share (items.id=787). CI_RUST_TOOLCHAIN
+# must equal rust-toolchain.toml (repo root): bump both together, deliberately,
+# and re-run the full local gate (including clippy -D warnings) first -- see
+# CLAUDE.md and the pin history in the setup comment below.
+env:
+  CI_RUST_TOOLCHAIN: "1.97.1"
+  CI_SQLCIPHER_VERSION: "v4.14.0"
+  CI_APT_PACKAGES: >-
+    libwebkit2gtk-4.1-dev build-essential curl wget file libssl-dev
+    libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
+
 jobs:
-  check:
+  # fmt + cargo-deny (items.id=787): neither compiles the crate, so this job
+  # needs no apt packages, no SQLCipher and no rust-cache.
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust (CI_RUST_TOOLCHAIN, see rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.CI_RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+
+      - name: Format check
+        working-directory: src-tauri
+        run: cargo fmt --check
+
+      - name: cargo-deny (advisories, licenses, bans, sources)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: src-tauri/Cargo.toml
+
+  # Clippy (items.id=787): split from `check` so it runs beside the tests.
+  # Setup block is a copy of `check`'s -- keep both in sync.
+  clippy:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    # Least privilege for this job (items.id=800). The repo default is already
-    # read-only; this makes it explicit. The rest of items.id=645 is separate.
     permissions:
       contents: read
     steps:
@@ -46,9 +91,10 @@ jobs:
       # deliberately in both places together, and re-run the full local
       # gate (including clippy -D warnings) before pushing a bump -- see
       # CLAUDE.md.
-      - name: Install Rust 1.97.1 (pinned, see rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@1.97.1
+      - name: Install pinned Rust (CI_RUST_TOOLCHAIN, see rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.CI_RUST_TOOLCHAIN }}
           components: rustfmt, clippy
 
       - name: Cache Rust build artifacts
@@ -74,9 +120,7 @@ jobs:
         env:
           MATCHED_KEY: ${{ steps.apt-cache.outputs.cache-matched-key }}
         run: |
-          pkgs=(libwebkit2gtk-4.1-dev
-            build-essential curl wget file libssl-dev libgtk-3-dev
-            libayatana-appindicator3-dev librsvg2-dev)
+          read -ra pkgs <<< "$CI_APT_PACKAGES"
           debs="$HOME/apt-debs"
           # items.id=813: a slow mirror once stretched this step to 21 min.
           # Bound the network part (update + download only) to 300 s per attempt,
@@ -124,12 +168,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/sqlcipher-fts5
-          key: sqlcipher-fts5-v4.14.0-${{ runner.os }}-v2
+          key: sqlcipher-fts5-${{ env.CI_SQLCIPHER_VERSION }}-${{ runner.os }}-v2
 
       - name: Build SQLCipher with FTS5 from source
         if: steps.sqlcipher-cache.outputs.cache-hit != 'true'
         run: |
-          git clone --depth 1 --branch v4.14.0 https://github.com/sqlcipher/sqlcipher.git /tmp/sqlcipher-src
+          git clone --depth 1 --branch "$CI_SQLCIPHER_VERSION" https://github.com/sqlcipher/sqlcipher.git /tmp/sqlcipher-src
           cd /tmp/sqlcipher-src
           ./configure --prefix="$HOME/.cache/sqlcipher-fts5" \
             --with-tempstore=yes --fts3 --fts4 --fts5 --rtree --update-limit \
@@ -154,18 +198,141 @@ jobs:
           echo "PKG_CONFIG_PATH=$HOME/.cache/sqlcipher-fts5/lib/pkgconfig" >> "$GITHUB_ENV"
           echo "LD_LIBRARY_PATH=$HOME/.cache/sqlcipher-fts5/lib" >> "$GITHUB_ENV"
 
-      - name: Format check
-        working-directory: src-tauri
-        run: cargo fmt --check
-
       - name: Clippy
         working-directory: src-tauri
         run: cargo clippy --tests -- -D warnings
 
-      - name: cargo-deny (advisories, licenses, bans, sources)
-        uses: EmbarkStudios/cargo-deny-action@v2
+  # The plain `cargo test` (never --lib), core-dump capture and its
+  # failure-only backtrace. Keeps the id `check` (items.id=787): rust-cache keys
+  # on the job id, so the existing cache entry stays valid. Setup block is a
+  # copy of `clippy`'s -- keep both in sync.
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # Least privilege for this job (items.id=800). The repo default is already
+    # read-only; this makes it explicit. The rest of items.id=645 is separate.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned to the same version as rust-toolchain.toml (repo root) --
+      # dtolnay/rust-toolchain@stable always installs whatever is
+      # currently latest, which can pick up a newer clippy than the one
+      # Jason's local gate ran against and fail CI on lints that never
+      # fired locally (confirmed live, 2026-10-03: a `double_must_use`
+      # lint against `#[async_trait]`-generated methods, new/tightened on
+      # a newer stable, failed CI on pre-existing code that passed a
+      # same-day local `cargo clippy -- -D warnings` run). Bump
+      # deliberately in both places together, and re-run the full local
+      # gate (including clippy -D warnings) before pushing a bump -- see
+      # CLAUDE.md.
+      - name: Install pinned Rust (CI_RUST_TOOLCHAIN, see rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@master
         with:
-          manifest-path: src-tauri/Cargo.toml
+          toolchain: ${{ env.CI_RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      # items.id=821: the Linux dependency .debs come from an actions/cache entry
+      # when it holds them, so a slow mirror only matters for what the cache
+      # lacks. restore-keys returns the newest entry; the entry is saved (by the
+      # Save step below) only when the needed .deb set changed.
+      - name: Restore apt .deb cache
+        id: apt-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/apt-debs
+          key: apt-debs-v1-restore-${{ github.run_id }}
+          restore-keys: apt-debs-v1-
+
+      - name: Install Linux dependencies
+        id: apt-install
+        timeout-minutes: 20
+        env:
+          MATCHED_KEY: ${{ steps.apt-cache.outputs.cache-matched-key }}
+        run: |
+          read -ra pkgs <<< "$CI_APT_PACKAGES"
+          debs="$HOME/apt-debs"
+          # items.id=813: a slow mirror once stretched this step to 21 min.
+          # Bound the network part (update + download only) to 300 s per attempt,
+          # 3 attempts, 15 s apart. Completed .debs stay in /var/cache/apt/archives
+          # and partial ones resume, so a retry only fetches what is missing.
+          # items.id=821: after the update, .debs from the cache that match the
+          # signed index (size and SHA-256, see ci-apt-cache.sh) are put in
+          # place first, so the download below only fetches what is missing.
+          for attempt in 1 2 3; do
+            if sudo timeout --kill-after=10 300 sh -c \
+                'apt-get update && .github/scripts/ci-apt-cache.sh seed "$0" "$@" && apt-get install -y --download-only "$@"' \
+                "$debs" "${pkgs[@]}"; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::apt download failed or timed out 3 times"
+              exit 1
+            fi
+            echo "::warning::apt attempt $attempt failed or timed out, retrying in 15 s"
+            sleep 15
+          done
+          # Offline from the cache: nothing here waits on the network.
+          sudo apt-get install -y "${pkgs[@]}"
+          # Success only: stage the verified set; sets apt_key when it changed.
+          sudo .github/scripts/ci-apt-cache.sh stage "$debs" "$GITHUB_OUTPUT" "$MATCHED_KEY"
+
+      - name: Save apt .deb cache
+        if: steps.apt-install.outputs.apt_key != ''
+        uses: actions/cache/save@v4
+        with:
+          path: ~/apt-debs
+          key: ${{ steps.apt-install.outputs.apt_key }}
+
+      # Ubuntu 24.04's apt libsqlcipher-dev (4.5.6-1build2) is not compiled with
+      # SQLITE_ENABLE_FTS5, which outputs_001.sql's outputs_fts virtual table
+      # requires. No FTS5-enabled PPA exists for noble, so build SQLCipher from
+      # source here instead -- CI only, local dev (Garuda/pacman, sqlcipher
+      # 4.14.0) already has FTS5 and is unaffected. Pinned to v4.14.0 to match
+      # Garuda exactly. Flags mirror Debian's own sqlcipher packaging
+      # (salsa.debian.org debian/rules) so this build exposes the same symbol
+      # set sqlx-sqlite links against (column-metadata, unlock-notify, etc.),
+      # translated to this version's autosetup-based ./configure --help options.
+      - name: Cache SQLCipher (FTS5-enabled) build
+        id: sqlcipher-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/sqlcipher-fts5
+          key: sqlcipher-fts5-${{ env.CI_SQLCIPHER_VERSION }}-${{ runner.os }}-v2
+
+      - name: Build SQLCipher with FTS5 from source
+        if: steps.sqlcipher-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch "$CI_SQLCIPHER_VERSION" https://github.com/sqlcipher/sqlcipher.git /tmp/sqlcipher-src
+          cd /tmp/sqlcipher-src
+          ./configure --prefix="$HOME/.cache/sqlcipher-fts5" \
+            --with-tempstore=yes --fts3 --fts4 --fts5 --rtree --update-limit \
+            --column-metadata --disable-tcl \
+            CFLAGS="-fno-strict-aliasing -DSQLITE_HAS_CODEC \
+              -DSQLITE_EXTRA_INIT=sqlcipher_extra_init \
+              -DSQLITE_EXTRA_SHUTDOWN=sqlcipher_extra_shutdown \
+              -DSQLITE_SECURE_DELETE -DSQLITE_ENABLE_UNLOCK_NOTIFY \
+              -DSQLITE_SOUNDEX=1 -DSQLITE_OMIT_LOOKASIDE=1 \
+              -DSQLITE_MAX_SCHEMA_RETRY=25 -DHAVE_USLEEP=1" \
+            LDFLAGS="-lcrypto"
+          make -j"$(nproc)" install-dll install-headers install-pc
+          # build.rs probes pkg-config for a package literally named "sqlcipher";
+          # upstream's plain build only produces sqlite3.pc, so alias it.
+          sed -e 's/^Name: SQLite$/Name: SQLCipher/' \
+              -e 's/^Description: SQL database engine$/Description: SQLCipher - SQL database engine with encryption/' \
+              "$HOME/.cache/sqlcipher-fts5/lib/pkgconfig/sqlite3.pc" \
+              > "$HOME/.cache/sqlcipher-fts5/lib/pkgconfig/sqlcipher.pc"
+
+      - name: Point pkg-config / the linker at the FTS5-enabled SQLCipher build
+        run: |
+          echo "PKG_CONFIG_PATH=$HOME/.cache/sqlcipher-fts5/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$HOME/.cache/sqlcipher-fts5/lib" >> "$GITHUB_ENV"
 
       # items.id=800 / items.id=566: a SIGSEGV at test-binary exit has hit CI 5
       # times with no stack. Capture a core to /tmp/cores so the failure-only
