@@ -45,12 +45,85 @@
 //! needs an entirely different mechanism (a Job Object with
 //! `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) and is out of scope here, also
 //! tracked as a follow-on.
+//!
+//! # Scrubbed environment (items.id=616)
+//! The child does not inherit QR's environment. [`do_spawn`] clears it and
+//! passes through only the variables in [`INHERITED_ENV`] (plus the explicit
+//! `envs` the caller supplies, which win). The sidecar is the one QR process
+//! that parses model files and talks to a model registry, and decisions.id=840
+//! records a memory-disclosure CVE that exposes a process's environment
+//! variables, so it must not hold the launching shell's API keys or tokens.
+//! Every other `OLLAMA_*` variable is deliberately dropped too: those
+//! configure the user's own Ollama, which QR never uses (decisions.id=840).
 
 use std::ffi::OsString;
 use std::io;
 use std::process::ExitStatus;
 use std::sync::mpsc as std_mpsc;
 use std::sync::OnceLock;
+
+/// Variables the sidecar may inherit from QR's own environment. Everything
+/// else is dropped (items.id=616). Sources: Ollama's docs/gpu.mdx, docs/faq.mdx
+/// and envconfig/config.go for the GPU, `HOME` and proxy entries; the Vulkan
+/// loader (`VK_*`, `XDG_DATA_DIRS`) and Go's TLS stack (`SSL_CERT_*`) entries
+/// are not from Ollama's docs. `LD_LIBRARY_PATH` is not mentioned by Ollama's
+/// docs either; it stays so a user's own CUDA/ROCm library path keeps working.
+/// `HTTP_PROXY` is left out on purpose (Ollama's FAQ says to avoid it).
+const INHERITED_ENV: &[&str] = &[
+    // Process basics.
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TMPDIR",
+    "XDG_RUNTIME_DIR",
+    "XDG_DATA_DIRS",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    // Shared-library lookup.
+    "LD_LIBRARY_PATH",
+    // NVIDIA.
+    "CUDA_VISIBLE_DEVICES",
+    // AMD.
+    "ROCR_VISIBLE_DEVICES",
+    "HIP_VISIBLE_DEVICES",
+    "GPU_DEVICE_ORDINAL",
+    "HSA_OVERRIDE_GFX_VERSION",
+    // Vulkan.
+    "GGML_VK_VISIBLE_DEVICES",
+    "VK_ICD_FILENAMES",
+    "VK_DRIVER_FILES",
+    // Model pulls through a proxy or a custom CA bundle.
+    "HTTPS_PROXY",
+    "https_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+];
+
+/// Per-device AMD override: `HSA_OVERRIDE_GFX_VERSION_<N>` (docs/gpu.mdx).
+const HSA_PER_DEVICE_PREFIX: &str = "HSA_OVERRIDE_GFX_VERSION_";
+
+fn is_inherited_allowed(name: &str) -> bool {
+    if INHERITED_ENV.contains(&name) {
+        return true;
+    }
+    match name.strip_prefix(HSA_PER_DEVICE_PREFIX) {
+        Some(n) => !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()),
+        None => false,
+    }
+}
+
+/// The allowlisted subset of `vars`, in their original order.
+fn scrub_env(vars: impl Iterator<Item = (OsString, OsString)>) -> Vec<(OsString, OsString)> {
+    vars.filter(|(k, _)| k.to_str().is_some_and(is_inherited_allowed))
+        .collect()
+}
 
 struct SpawnRequest {
     program: OsString,
@@ -130,6 +203,12 @@ fn do_spawn(
 
     let mut cmd = std::process::Command::new(&program);
     cmd.args(&args);
+    // items.id=616: nothing but the allowlist is inherited; the caller's
+    // explicit `envs` are applied last and win.
+    cmd.env_clear();
+    for (k, v) in scrub_env(std::env::vars_os()) {
+        cmd.env(k, v);
+    }
     for (k, v) in &envs {
         cmd.env(k, v);
     }
@@ -282,6 +361,110 @@ mod tests {
         assert!(
             !std::path::Path::new(&format!("/proc/{pid}")).exists(),
             "pid {pid} should be fully reaped after wait(), not lingering as a zombie"
+        );
+    }
+
+    #[test]
+    fn allowlist_admits_gpu_and_basics_and_rejects_the_rest() {
+        for yes in [
+            "PATH",
+            "HOME",
+            "LD_LIBRARY_PATH",
+            "CUDA_VISIBLE_DEVICES",
+            "ROCR_VISIBLE_DEVICES",
+            "HIP_VISIBLE_DEVICES",
+            "HSA_OVERRIDE_GFX_VERSION",
+            "HSA_OVERRIDE_GFX_VERSION_0",
+            "HSA_OVERRIDE_GFX_VERSION_12",
+            "GGML_VK_VISIBLE_DEVICES",
+            "HTTPS_PROXY",
+        ] {
+            assert!(is_inherited_allowed(yes), "{yes}");
+        }
+        for no in [
+            "GROQ_API_KEY",
+            "MISTRAL_API_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "OLLAMA_HOST",
+            "OLLAMA_MODELS",
+            "OLLAMA_ORIGINS",
+            "OLLAMA_VULKAN",
+            "OLLAMA_IGPU_ENABLE",
+            "OLLAMA_LLM_LIBRARY",
+            "OLLAMA_API_KEY",
+            "HTTP_PROXY",
+            "DISPLAY",
+            "HSA_OVERRIDE_GFX_VERSION_",
+            "HSA_OVERRIDE_GFX_VERSION_x",
+            "HSA_OVERRIDE_GFX_VERSIONS",
+            "path",
+            "",
+        ] {
+            assert!(!is_inherited_allowed(no), "{no}");
+        }
+    }
+
+    /// items.id=616: a secret in QR's own environment must not reach the
+    /// sidecar, while the allowlisted variables and the caller's explicit
+    /// variables do. Uses the exit status rather than captured output
+    /// (`do_spawn` does not pipe stdout).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawned_child_does_not_inherit_secrets_or_user_ollama_settings() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        struct Restore(Vec<(&'static str, Option<OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (k, v) in &self.0 {
+                    match v {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+        let names = [
+            "GROQ_API_KEY",
+            "OLLAMA_HOST",
+            "OLLAMA_VULKAN",
+            "HSA_OVERRIDE_GFX_VERSION",
+        ];
+        let _restore = Restore(names.iter().map(|n| (*n, std::env::var_os(n))).collect());
+        std::env::set_var("GROQ_API_KEY", "secret-for-test");
+        std::env::set_var("OLLAMA_HOST", "192.168.0.2");
+        std::env::set_var("OLLAMA_VULKAN", "1");
+        std::env::set_var("HSA_OVERRIDE_GFX_VERSION", "10.3.0");
+
+        // Succeeds only if: the secret and the user's OLLAMA_* are absent,
+        // QR's explicit OLLAMA_HOST wins, the allowlisted variables
+        // (PATH, the GPU override) and the explicit OLLAMA_MODELS arrive.
+        let script = r#"
+            test -z "${GROQ_API_KEY+x}" || exit 11
+            test -z "${OLLAMA_VULKAN+x}" || exit 12
+            test "$OLLAMA_HOST" = "127.0.0.1:1" || exit 13
+            test "$OLLAMA_MODELS" = "/tmp/qr-env-test" || exit 14
+            test "$HSA_OVERRIDE_GFX_VERSION" = "10.3.0" || exit 15
+            test -n "$PATH" || exit 16
+        "#;
+        let child = spawn_with_pdeathsig(
+            "/bin/sh",
+            vec!["-c".into(), script.into()],
+            vec![
+                ("OLLAMA_HOST".into(), "127.0.0.1:1".into()),
+                ("OLLAMA_MODELS".into(), "/tmp/qr-env-test".into()),
+            ],
+        )
+        .await
+        .expect("spawn should succeed");
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
+            .await
+            .expect("wait() must not hang")
+            .expect("wait() should succeed");
+        assert!(
+            status.success(),
+            "child environment check failed with {status} (11 secret leaked, 12 user OLLAMA_* \
+             leaked, 13 explicit OLLAMA_HOST lost, 14 OLLAMA_MODELS lost, 15 GPU override \
+             dropped, 16 PATH dropped)"
         );
     }
 

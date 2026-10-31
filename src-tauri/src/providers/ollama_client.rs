@@ -71,22 +71,21 @@ const CONTEXT_HARD_LIMIT_DEFAULT: f64 = 0.95;
 /// Python oracle: `_BUFFERED_TASK_TYPES` frozenset in ollama_client.py
 const BUFFERED_TASK_TYPES: &[&str] = &["code", "research", "creative_writing", "prose"];
 
-/// Returns `http://{OLLAMA_HOST}:{OLLAMA_PORT}`.
+/// Always `http://127.0.0.1:{port}`, where the port is the one QR's own
+/// sidecar is bound to (`ollama_sidecar::port()`).
 ///
-/// `OLLAMA_HOST` must be a bare hostname or IP — not a full URL.
-/// This matches Python oracle: `f"http://{host}:{port}"`.
-///
-/// Default port is `ollama_sidecar::QR_OLLAMA_PORT` (21434) — QR's own
-/// dedicated sidecar port, never 11434, never negotiated
-/// (decisions.id=840). Safe to change here as the single default: nothing
-/// in this codebase sets `OLLAMA_HOST`/`OLLAMA_PORT` on QR's own process
-/// environment today (`ollama_sidecar.rs` only sets them on the *spawned
-/// child's* environment).
+/// The process environment is deliberately NOT consulted. QR talks only to its
+/// own sidecar and never to any other Ollama, however the user has set one up
+/// (decisions.id=840: stock Ollama has exploitable GGUF/registry
+/// vulnerabilities, so a user-configured instance is not a trust boundary QR
+/// can accept). A user's own `OLLAMA_HOST`/`OLLAMA_PORT` (often a LAN address,
+/// or `0.0.0.0:11434`) therefore has no effect here; the sidecar gets its
+/// address from QR, not from that environment. Do not hard-code the port in
+/// this file: items.id=668 turns it into sidecar state. The sidecar trust gate
+/// (items.id=586) is separate and checks that the sidecar is up, not where
+/// requests go.
 fn base_url() -> String {
-    let host = std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned());
-    let port = std::env::var("OLLAMA_PORT")
-        .unwrap_or_else(|_| crate::ollama_sidecar::QR_OLLAMA_PORT.to_string());
-    format!("http://{}:{}", host, port)
+    format!("http://127.0.0.1:{}", crate::ollama_sidecar::port())
 }
 
 fn context_warning_threshold() -> f64 {
@@ -115,9 +114,9 @@ fn context_hard_limit() -> f64 {
 /// forward a cloud-suffixed model name to ollama.com when the Ollama instance
 /// is signed in, which would send the prompt off the machine while still
 /// looking local. QR never signs its sidecar in (Chat-PM ruling, items.id=714),
-/// but the sidecar inherits the user's HOME (only OLLAMA_HOST and
-/// OLLAMA_MODELS are set), so this guard refuses such a tag whatever the
-/// sign-in state.
+/// but the sidecar keeps the user's HOME (its environment is an allowlist,
+/// items.id=616, and HOME is on it), so this guard refuses such a tag whatever
+/// the sign-in state.
 ///
 /// The final `:`-segment (the tag) is `cloud` or ends in `-cloud`,
 /// case-insensitive. VERIFIED from Ollama's cloud docs (read by Chat-PM):
@@ -156,7 +155,7 @@ fn sidecar_trusted() -> bool {
         log::warn!(
             "ollama_client: QR's own sidecar is not confirmed running -- refusing to contact \
              127.0.0.1:{} (items.id=586)",
-            crate::ollama_sidecar::QR_OLLAMA_PORT
+            crate::ollama_sidecar::port()
         );
     }
     trusted
@@ -1000,10 +999,7 @@ mod tests {
             }
         });
 
-        let saved_host = std::env::var("OLLAMA_HOST").ok();
-        let saved_port = std::env::var("OLLAMA_PORT").ok();
-        std::env::set_var("OLLAMA_HOST", "127.0.0.1");
-        std::env::set_var("OLLAMA_PORT", port.to_string());
+        let _port = crate::ollama_sidecar::ForcedPortGuard::set(port);
 
         let client = OllamaClient::new();
 
@@ -1030,15 +1026,6 @@ mod tests {
             0,
             "no HTTP call should reach the port while the sidecar is untrusted"
         );
-
-        match saved_host {
-            Some(v) => std::env::set_var("OLLAMA_HOST", v),
-            None => std::env::remove_var("OLLAMA_HOST"),
-        }
-        match saved_port {
-            Some(v) => std::env::set_var("OLLAMA_PORT", v),
-            None => std::env::remove_var("OLLAMA_PORT"),
-        }
     }
 
     /// items.id=587: a real HTTP/1.1 404 response (confirmed live against a
@@ -1070,10 +1057,7 @@ mod tests {
             }
         });
 
-        let saved_host = std::env::var("OLLAMA_HOST").ok();
-        let saved_port = std::env::var("OLLAMA_PORT").ok();
-        std::env::set_var("OLLAMA_HOST", "127.0.0.1");
-        std::env::set_var("OLLAMA_PORT", port.to_string());
+        let _port = crate::ollama_sidecar::ForcedPortGuard::set(port);
 
         let client = OllamaClient::new();
         let request = GenerateRequest {
@@ -1094,15 +1078,6 @@ mod tests {
                 );
             }
             other => panic!("expected OllamaModelMissing, got {other:?}"),
-        }
-
-        match saved_host {
-            Some(v) => std::env::set_var("OLLAMA_HOST", v),
-            None => std::env::remove_var("OLLAMA_HOST"),
-        }
-        match saved_port {
-            Some(v) => std::env::set_var("OLLAMA_PORT", v),
-            None => std::env::remove_var("OLLAMA_PORT"),
         }
     }
 
@@ -1259,10 +1234,7 @@ mod tests {
         let _lock = crate::test_support::ENV_MUTEX.lock().await;
         crate::ollama_sidecar::force_trust_for_test(true);
         let (port, count) = counting_listener();
-        let saved_host = std::env::var("OLLAMA_HOST").ok();
-        let saved_port = std::env::var("OLLAMA_PORT").ok();
-        std::env::set_var("OLLAMA_HOST", "127.0.0.1");
-        std::env::set_var("OLLAMA_PORT", port.to_string());
+        let _port = crate::ollama_sidecar::ForcedPortGuard::set(port);
 
         let client = OllamaClient::new();
         let request = |model: &str| GenerateRequest {
@@ -1319,13 +1291,69 @@ mod tests {
         );
 
         crate::ollama_sidecar::force_trust_for_test(false);
-        match saved_host {
-            Some(v) => std::env::set_var("OLLAMA_HOST", v),
-            None => std::env::remove_var("OLLAMA_HOST"),
+    }
+
+    // -- base_url ignores the process environment (items.id=616) -------------
+
+    /// Sets an environment variable for the life of the guard, restoring the
+    /// previous value on drop (including on panic).
+    struct EnvVarGuard {
+        name: &'static str,
+        saved: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            let saved = std::env::var(name).ok();
+            std::env::set_var(name, value);
+            Self { name, saved }
         }
-        match saved_port {
-            Some(v) => std::env::set_var("OLLAMA_PORT", v),
-            None => std::env::remove_var("OLLAMA_PORT"),
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.saved {
+                Some(v) => std::env::set_var(self.name, v),
+                None => std::env::remove_var(self.name),
+            }
         }
+    }
+
+    #[tokio::test]
+    async fn base_url_ignores_ollama_host_and_port() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        crate::ollama_sidecar::force_port_for_test(None);
+        let expected = format!("http://127.0.0.1:{}", crate::ollama_sidecar::QR_OLLAMA_PORT);
+        assert_eq!(base_url(), expected);
+
+        let _host = EnvVarGuard::set("OLLAMA_HOST", "192.168.0.2");
+        let _port = EnvVarGuard::set("OLLAMA_PORT", "9999");
+        assert_eq!(base_url(), expected);
+    }
+
+    /// The common user setting `OLLAMA_HOST=0.0.0.0:11434` used to yield
+    /// `http://0.0.0.0:11434:21434`.
+    #[tokio::test]
+    async fn base_url_stays_well_formed_with_host_and_port_in_ollama_host() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        crate::ollama_sidecar::force_port_for_test(None);
+        let _host = EnvVarGuard::set("OLLAMA_HOST", "0.0.0.0:11434");
+
+        let url = base_url();
+        let parsed = reqwest::Url::parse(&url).expect("base_url must parse as a URL");
+        assert_eq!(parsed.host_str(), Some("127.0.0.1"));
+        assert_eq!(
+            parsed.port(),
+            Some(crate::ollama_sidecar::QR_OLLAMA_PORT),
+            "{url}"
+        );
+    }
+
+    /// The port comes from the sidecar module, not a literal in the client.
+    #[tokio::test]
+    async fn base_url_follows_the_sidecar_modules_port() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let _port = crate::ollama_sidecar::ForcedPortGuard::set(23456);
+        assert_eq!(base_url(), "http://127.0.0.1:23456");
     }
 }

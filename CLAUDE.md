@@ -1,5 +1,7 @@
 # Quiet Rabbit — Claude Code Context
-# Last updated: October 25, 2026 (items.id=653 docs pass -- Ollama and Dev
+# Last updated: October 30, 2026 (items.id=616: Ollama section only -- client
+# port and sidecar environment). Before that, October 25, 2026 (items.id=653
+# docs pass -- Ollama and Dev
 # Environment per decisions.id=840 and 863, version, R1 Focuses, tier
 # vocabulary, key-hierarchy wording, Rust names for Python-era rules, cites.
 # Sections not touched this pass were not re-verified.)
@@ -138,6 +140,17 @@ Built today (ollama_sidecar.rs): the sidecar binds 127.0.0.1:21434
 (QR_OLLAMA_PORT), fixed, no fallback. Startup reclaims leftover QR orphans
 (items.id=586), identified by environment variable and command-line match under
 ollama_models.
+OllamaClient::base_url() is always http://127.0.0.1:{ollama_sidecar::port()}
+and never reads OLLAMA_HOST or OLLAMA_PORT (items.id=616); take the port from
+ollama_sidecar::port(), never a literal. The sidecar does not inherit QR's
+environment: ollama_spawn_thread.rs clears it and passes only the INHERITED_ENV
+allowlist (PATH, HOME, locale/XDG, LD_LIBRARY_PATH, the CUDA/ROCm/HIP/HSA/Vulkan
+device-selection variables, HTTPS_PROXY/NO_PROXY/SSL_CERT_*) plus QR's own
+OLLAMA_HOST and OLLAMA_MODELS. No user OLLAMA_* variable reaches the sidecar in
+R1, so a user's OLLAMA_VULKAN or OLLAMA_IGPU_ENABLE has no effect on it until
+QR has its own setting. wait_for_ready counts a 2xx only if the sidecar child
+is still running when it arrives. Tests aim OllamaClient at a mock listener with
+ollama_sidecar::force_port_for_test / ForcedPortGuard, not the environment.
 
 Decided in decisions.id=863, NOT built yet -- do not assume any of it in code:
 - single instance: a second launch focuses the first window and exits
@@ -147,9 +160,7 @@ Decided in decisions.id=863, NOT built yet -- do not assume any of it in code:
   (items.id=668, ready, depends on items.id=616);
 - port preferred 21434, fallback through 21435-21443, failing only if all ten
   are busy; no manual port setting in R1 (items.id=668).
-Related and still open: OllamaClient::base_url() still honours OLLAMA_HOST and
-OLLAMA_PORT (items.id=616, ready); the bundled binary is a stub (items.id=583,
-ready).
+Related and still open: the bundled binary is a stub (items.id=583, ready).
 
 ## Naming Architecture — term map
 

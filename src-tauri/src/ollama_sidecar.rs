@@ -82,6 +82,54 @@ use crate::ollama_spawn_thread::{self, SpawnedChild};
 /// was moved here after that was caught during this item's implementation.
 pub const QR_OLLAMA_PORT: u16 = 21434;
 
+/// The port `OllamaClient` must contact: the one QR's own sidecar is bound
+/// to. The client takes its port from here and never names a literal, so
+/// items.id=668 can replace the fixed constant with sidecar state (preferred
+/// 21434, fallback 21435-21443) by changing this one function.
+pub fn port() -> u16 {
+    #[cfg(test)]
+    {
+        let forced = TEST_PORT_OVERRIDE.load(Ordering::Relaxed);
+        if forced != 0 {
+            return forced;
+        }
+    }
+    QR_OLLAMA_PORT
+}
+
+/// 0 = no override. Test-only seam so a mock listener on an ephemeral port
+/// can stand in for the sidecar now that `OllamaClient` no longer reads
+/// `OLLAMA_HOST`/`OLLAMA_PORT` (items.id=616).
+#[cfg(test)]
+static TEST_PORT_OVERRIDE: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+/// Test-only. Callers must hold `test_support::ENV_MUTEX` for as long as the
+/// override is set, and should reset it with [`ForcedPortGuard`] so an assert
+/// failure cannot leak it into the next test.
+#[cfg(test)]
+pub fn force_port_for_test(port: Option<u16>) {
+    TEST_PORT_OVERRIDE.store(port.unwrap_or(0), Ordering::Relaxed);
+}
+
+/// Sets the test port override and clears it on drop (including on panic).
+#[cfg(test)]
+pub struct ForcedPortGuard;
+
+#[cfg(test)]
+impl ForcedPortGuard {
+    pub fn set(port: u16) -> Self {
+        force_port_for_test(Some(port));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForcedPortGuard {
+    fn drop(&mut self) {
+        force_port_for_test(None);
+    }
+}
+
 /// Whether QR's own sidecar started, or is unavailable.
 ///
 /// Written once in `tauri::Builder::setup()`, read frequently by
@@ -495,16 +543,21 @@ impl OllamaSidecar {
         false
     }
 
-    /// Poll 127.0.0.1:{QR_OLLAMA_PORT}/api/tags every 500 ms for up to 5 s
+    /// Poll 127.0.0.1:{port()}/api/tags every 500 ms for up to 5 s
     /// (10 attempts). This is the sidecar's own readiness check — separate
     /// from `detect()`'s 11434 contention probe. Bails out immediately if
     /// the child has already exited (e.g. the placeholder binary).
+    ///
+    /// A 2xx only counts if the child is still running when it arrives
+    /// (items.id=616): if our child lost the bind to something already on
+    /// the port and exited, the answer came from that other process, and
+    /// reporting ready would make `OllamaClient` trust it.
     async fn wait_for_ready(child: &mut SpawnedChild) -> bool {
         let client = match Client::builder().timeout(Duration::from_secs(2)).build() {
             Ok(c) => c,
             Err(_) => return false,
         };
-        let url = format!("http://127.0.0.1:{QR_OLLAMA_PORT}/api/tags");
+        let url = format!("http://127.0.0.1:{}/api/tags", port());
 
         for attempt in 1u8..=10 {
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -514,6 +567,14 @@ impl OllamaSidecar {
             }
             match client.get(&url).send().await {
                 Ok(resp) if resp.status().is_success() => {
+                    if let Ok(Some(status)) = child.try_wait() {
+                        log::warn!(
+                            "ollama_sidecar: port answered but the sidecar process had already \
+                             exited ({status}) -- the answer came from another process, not \
+                             ready"
+                        );
+                        return false;
+                    }
                     log::info!("ollama_sidecar: ready after {} poll(s)", attempt);
                     return true;
                 }
@@ -729,6 +790,96 @@ mod tests {
 
         assert!(!sidecar.liveness_tick().await);
         assert!(!is_trusted());
+    }
+
+    // -- wait_for_ready re-check (items.id=616) ------------------------------
+
+    /// Serves exactly one HTTP request on a fresh loopback port: reads it,
+    /// runs `before_reply`, then answers `200 {}`. Returns the port.
+    fn one_shot_ok_server(before_reply: impl FnOnce() + Send + 'static) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                before_reply();
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                );
+            }
+        });
+        port
+    }
+
+    /// Something other than our child answers on the port, and our child is
+    /// still alive: ready.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn wait_for_ready_accepts_a_2xx_while_the_child_is_alive() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let mut child = crate::ollama_spawn_thread::spawn_with_pdeathsig(
+            "/bin/sh",
+            vec!["-c".into(), "sleep 30".into()],
+            vec![],
+        )
+        .await
+        .expect("spawn should succeed");
+        let _port = ForcedPortGuard::set(one_shot_ok_server(|| {}));
+
+        assert!(OllamaSidecar::wait_for_ready(&mut child).await);
+
+        let _ = unsafe { libc::kill(-child.pgid, libc::SIGKILL) };
+        let _ = child.wait().await;
+    }
+
+    /// The child is alive at the first poll, then dies while the request is
+    /// in flight, and only then does the (foreign) listener answer 200. No
+    /// clock is involved: the server handler kills the child and blocks in
+    /// `waitid(WNOWAIT)` until it has exited (leaving it for `try_wait` to
+    /// reap), and only then replies, so the reply always arrives after the
+    /// exit. `wait_for_ready` must say not ready.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn wait_for_ready_rejects_a_2xx_that_arrives_after_the_child_exited() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let mut child = crate::ollama_spawn_thread::spawn_with_pdeathsig(
+            "/bin/sh",
+            vec!["-c".into(), "sleep 30".into()],
+            vec![],
+        )
+        .await
+        .expect("spawn should succeed");
+        let pid = child.pid;
+        // The handler reports its kill/waitid results back here. A panic in
+        // the handler thread drops the sender, so `recv` below errors and
+        // the test fails instead of passing vacuously on the connection
+        // that never got a reply.
+        let (tx, rx) = std::sync::mpsc::channel::<(i32, i32)>();
+        let _port = ForcedPortGuard::set(one_shot_ok_server(move || unsafe {
+            let kill_rc = libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            let waitid_rc = libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            );
+            let _ = tx.send((kill_rc, waitid_rc));
+        }));
+
+        let ready = OllamaSidecar::wait_for_ready(&mut child).await;
+        let (kill_rc, waitid_rc) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the server handler must have run to completion");
+        assert_eq!(kill_rc, 0, "kill failed");
+        assert_eq!(waitid_rc, 0, "waitid failed");
+        assert!(
+            !ready,
+            "a 2xx from the port must not count once our own child has exited"
+        );
+        let _ = child.wait().await;
     }
 
     // -- wait_for_port_free (items.id=586 fix-up) ----------------------------
