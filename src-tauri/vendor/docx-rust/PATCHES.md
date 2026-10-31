@@ -13,6 +13,9 @@ Differences from the published 0.1.11:
 2. `src/docx.rs` (`option_read_multiple!` and `option_read_multiple_files!`):
    `zip.file_names()` now yields `Result<Cow<str>, ZipError>` in zip 9, so
    `.map(|x| x.to_string())` became `.filter_map(|x| x.ok()).map(|x| x.to_string())`.
+3. `src/document/numbering.rs` (`Numbering::numbering_details`): return type
+   `Option<AbstractNum>` -> `Option<AbstractNum<'_>>`, applying the compiler's own
+   elided-lifetime suggestion shown on a dev launch; no behaviour change.
 
 Remove this directory and the patch entry once upstream releases a docx-rust
 that depends on zip >= 9 (items.id=765).
