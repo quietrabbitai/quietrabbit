@@ -71,6 +71,46 @@ fn abort_startup(app: &tauri::AppHandle, message: &str) {
         });
 }
 
+/// Callback of the single-instance guard (items.id=667): a second launch
+/// reached the first process, which brings its main window forward. Release
+/// builds only, like the guard itself, so a debug build has no dead code here.
+///
+/// The work is queued onto the main thread rather than done on the plugin's
+/// D-Bus thread: the second process waits for this call to return, and the
+/// first instance's main thread can be busy for seconds inside `setup()`
+/// (migrations), so a blocking window call here would stall the second
+/// launch's exit. The window is created at `RunEvent::Ready`; if it does not
+/// exist yet (first instance still starting) this logs and returns, and the
+/// user's relaunch is simply lost. Nothing here panics.
+///
+/// `show()` and `set_focus()` change neither the size nor the maximized state.
+/// `unminimize()` runs only for a minimized window: on Windows an unconditional
+/// restore would un-maximize a maximized one. On Wayland a focus request
+/// without an activation token may only mark the window as demanding attention.
+#[cfg(not(debug_assertions))]
+fn raise_main_window(app: &tauri::AppHandle) {
+    let handle = app.clone();
+    if let Err(e) = app.run_on_main_thread(move || {
+        let Some(window) = handle.get_webview_window("main") else {
+            log::info!("main: second launch before the main window exists -- nothing to raise");
+            return;
+        };
+        if let Err(e) = window.show() {
+            log::warn!("main: second launch: could not show the main window: {e}");
+        }
+        if window.is_minimized().unwrap_or(false) {
+            if let Err(e) = window.unminimize() {
+                log::warn!("main: second launch: could not unminimize the main window: {e}");
+            }
+        }
+        if let Err(e) = window.set_focus() {
+            log::warn!("main: second launch: could not focus the main window: {e}");
+        }
+    }) {
+        log::error!("main: second launch: could not queue raising the main window: {e}");
+    }
+}
+
 /// Plain, synchronous entry point -- NOT `#[tokio::main]`.
 ///
 /// CEF's subprocess dispatch (`cloud_chat_gpu_pane::dispatch_cef_subprocess`) must
@@ -145,6 +185,33 @@ async fn async_main() {
     // test, not at runtime -- there is no frontend to consume them yet.
     let builder = specta_builder();
 
+    // Single-instance guard (items.id=667, decisions.id=863): a second launch
+    // raises the first window and exits. Registered FIRST, so its setup runs
+    // before every other plugin and before the app's own setup(); the plugin
+    // initialises inside `.build()`, ahead of CEF init, the data directory,
+    // migrations and the sidecar, so a second process starts none of them.
+    // Both re-invocation paths -- the document parse child
+    // (doc_parse::dispatch_parse_mode) and CEF's helper processes -- are the
+    // same binary and are handled in main() before this builder exists; a
+    // test below pins that order. Release builds only: a dev run must not
+    // hand over to an installed copy. There is deliberately no environment
+    // variable, feature or flag to disable it in a shipped build.
+    //
+    // Scope: one D-Bus session bus, i.e. one login session of one OS user.
+    // The lock is the bus name derived from the tauri.conf.json identifier,
+    // so it ignores HOME and XDG_*: an XDG-isolated profile does not isolate
+    // it. Two OS users, or a separate bus, are not covered (items.id=668's
+    // port fallback covers their sidecars). With no usable session bus the
+    // guard FAILS OPEN and a second instance starts, silently (the plugin
+    // logs nothing in 2.4.5); a malformed DBUS_SESSION_BUS_ADDRESS panics
+    // plugin 2.4.5 at launch. Both are accepted limitations (CLAUDE.md).
+    let tauri_builder = tauri::Builder::default();
+    #[cfg(not(debug_assertions))]
+    let tauri_builder =
+        tauri_builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            raise_main_window(app)
+        }));
+
     // PaneHost (GTK objects throughout) is deliberately NOT stored via
     // Tauri's .manage()/.state() -- Tauri's Manager::state<T>() requires
     // T: Send + Sync, and GTK types aren't (same class of constraint
@@ -152,7 +219,7 @@ async fn async_main() {
     // in a main-thread-only thread-local (see cloud_chat_gpu_pane::pane_host's own
     // module docs on why, and how commands::cloud_chat_pane reaches it via
     // AppHandle::run_on_main_thread instead of Tauri-managed state).
-    let app = tauri::Builder::default()
+    let app = tauri_builder
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(scheduler)
@@ -945,6 +1012,69 @@ async fn async_main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// items.id=667: the single-instance plugin must be registered after both
+    /// re-invocation dispatches (the document parse child and CEF's helper
+    /// processes are this same binary and must never be mistaken for a second
+    /// instance), first among the plugins, and release-only. A textual check
+    /// of this file: it catches a reordering or a lost cfg gate, not behaviour.
+    #[test]
+    fn single_instance_plugin_is_registered_after_both_dispatches_release_only() {
+        let source = include_str!("main.rs");
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("split always yields a first part");
+        let at = |needle: &str| {
+            production
+                .find(needle)
+                .unwrap_or_else(|| panic!("main.rs no longer contains `{needle}`"))
+        };
+
+        let parse = at("quietrabbit_lib::doc_parse::dispatch_parse_mode();");
+        let cef = at("if quietrabbit_lib::cloud_chat_gpu_pane::dispatch_cef_subprocess() {");
+        let plugin = at("tauri_plugin_single_instance::init(");
+        // The release-only gate must be attached to the statement that
+        // registers the plugin: the nearest gate above it, with no statement
+        // end in between (independent of how rustfmt wraps the line).
+        let registration = production[..plugin]
+            .rfind("#[cfg(not(debug_assertions))]")
+            .expect("the single-instance registration must carry the release-only gate");
+        let gated = &production[registration..plugin];
+        assert!(
+            gated.contains("let tauri_builder") && !gated.contains(';'),
+            "the release-only gate must sit directly on the plugin registration"
+        );
+
+        assert!(
+            parse < cef,
+            "parse-child dispatch must precede CEF dispatch"
+        );
+        assert!(
+            cef < registration,
+            "CEF helper dispatch must precede the single-instance plugin"
+        );
+        assert!(
+            registration < plugin,
+            "the plugin call must sit inside the gated registration"
+        );
+        assert_eq!(
+            production
+                .matches("tauri_plugin_single_instance::init(")
+                .count(),
+            1,
+            "the plugin must be registered exactly once"
+        );
+        assert_eq!(
+            production[..registration].matches(".plugin(").count(),
+            0,
+            "no other plugin may be registered before the single-instance guard"
+        );
+        assert!(
+            production.contains("#[cfg(not(debug_assertions))]\nfn raise_main_window("),
+            "raise_main_window must carry the same release-only gate"
+        );
+    }
 
     #[test]
     fn rename_legacy_cef_cache_dir_renames_when_safe() {

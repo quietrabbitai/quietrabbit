@@ -1,5 +1,7 @@
 # Quiet Rabbit — Claude Code Context
-# Last updated: October 31, 2026 (items.id=668: Ollama section only -- sidecar
+# Last updated: October 31, 2026 (items.id=667: Ollama section only --
+# single-instance guard built, with its limits). Before that, October 31, 2026
+# (items.id=668: Ollama section only -- sidecar
 # name, recorded-group ownership proof, port fallback). Before that,
 # October 30, 2026 (items.id=616: Ollama section only -- client
 # port and sidecar environment). Before that, October 25, 2026 (items.id=653
@@ -185,15 +187,29 @@ QR has its own setting. wait_for_ready counts a 2xx only if the sidecar child
 is still running when it arrives. Tests aim OllamaClient at a mock listener with
 ollama_sidecar::force_port_for_test / ForcedPortGuard, not the environment.
 
-Decided in decisions.id=863, NOT built yet -- do not assume any of it in code:
-- single instance: a second launch focuses the first window and exits
-  (items.id=667, ready).
+Single instance (decisions.id=863, items.id=667), built in main.rs: a second
+launch raises the first window and exits. tauri-plugin-single-instance is pinned
+=2.4.5 (2.5.x needs tauri 2.12) and registered first in the Tauri builder,
+release builds only (cfg(not(debug_assertions)), no override in a shipped
+build), after doc_parse::dispatch_parse_mode and dispatch_cef_subprocess; a
+test in main.rs pins that order. It initialises inside `.build()`, so the
+second process starts no CEF, data-directory work, sidecar, reclaim or pidfile
+record. Callback: raise_main_window shows the main window, unminimizes it only if
+minimized, focuses it, and logs and returns if the window does not exist yet.
+Limits, accepted: the lock is a name on the D-Bus session bus (Linux), derived
+from the identifier, so it is per login session, ignores HOME/XDG, and does
+not cover two OS users or a separate bus; with no usable session bus it fails
+open and a second instance starts, silently; a malformed
+DBUS_SESSION_BUS_ADDRESS panics plugin 2.4.5 at launch. Wayland may only flag
+the window as demanding attention. Windows and macOS are unverified
+(items.id=700, 701). deny.toml ignores RUSTSEC-2026-0370/0371/0372 (zbus 5 pin).
 
 Related and still open: the bundled binary is a stub and the runner layout of a
 packaged build is unverified, so the member name list in ollama_ownership.rs
-must be revisited there (items.id=583, ready). Until items.id=667 lands a second
-QR instance on the same data directory starts a second sidecar on the next free
-port and its record is kept apart from the first's (neither is signalled).
+must be revisited there (items.id=583, ready). Where the guard does not apply
+(debug builds, no session bus, another OS user or bus) a second QR instance on
+the same data directory starts a second sidecar on the next free port and its
+record is kept apart from the first's (neither is signalled).
 
 ## Naming Architecture — term map
 

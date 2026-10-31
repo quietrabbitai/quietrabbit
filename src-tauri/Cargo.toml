@@ -25,6 +25,19 @@ tauri-plugin-clipboard-manager = "2"
 # existing file_path parameter (PDF/.docx parsing, items.id=386) is reachable
 # from that flow instead of only from content (in-browser File.text()).
 tauri-plugin-dialog = "2"
+# Single-instance guard (items.id=667, decisions.id=863): a second launch raises
+# the first window and exits. Registered in main.rs, release builds only.
+# Pinned EXACTLY to 2.4.5, the newest release that works with the locked tauri
+# 2.11.x: 2.5.x requires tauri 2.12, which re-locks tao/wry/tauri-utils under
+# the GTK pane host (out of scope here). Linux transport is a name on the D-Bus
+# session bus (zbus 5), so the guard is per login session and ignores HOME/XDG;
+# with no usable session bus it fails OPEN (a second instance starts, silently),
+# and a malformed DBUS_SESSION_BUS_ADDRESS panics 2.4.5 at launch (fixed in
+# 2.5.x). Both accepted and documented in CLAUDE.md. Its zbus 5 pin brings
+# zvariant, zvariant_derive and zbus_names, which RUSTSEC-2026-0370/0371/0372
+# flag as unmaintained (no CVE): ignored in deny.toml with a revisit trigger.
+# Apache-2.0 OR MIT.
+tauri-plugin-single-instance = "=2.4.5"
 tokio = { version = "1", features = ["full"] }
 
 # Serialization & Parsing

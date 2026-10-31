@@ -148,6 +148,29 @@ ignore = [
     # whose own lopdf pin reaches 0.45+, OR immediately if RUSTSEC files an
     # actual vulnerability (not merely "unmaintained") against ttf-parser.
     { id = "RUSTSEC-2026-0192", reason = "unmaintained: ttf-parser, reached via pdf-extract 0.12.0 -> lopdf 0.42.0 (items.id=386). All three are newest-published; pdf-extract's own lopdf=\"^0.42\" pin excludes lopdf 0.45.0, which has already moved off ttf-parser onto skrifa (this advisory's own recommended alternative) -- no cargo-update path exists today. UNLIKE every other entry above, this crate is NOT confirmed unreachable and is NOT build-time-only: ttf-parser executes on every user-uploaded PDF via ingest.rs's extract_document_text(). This is a forward-looking risk acceptance (advisory is 'unmaintained', not a disclosed CVE), not a proven-safe case. Revisit (tracked on items.id=502) if pdf-extract ships a lopdf-0.45+-compatible release, or if RUSTSEC files an actual vulnerability against ttf-parser." },
+
+    # --- tauri-plugin-single-instance 2.4.5 -> zbus 5 (items.id=667, decisions.id=863) ---
+    # All three are the same notice (RUSTSEC-2026-0370/0371/0372): zvariant,
+    # zbus_names and zvariant_derive were merged into zbus 6.0.0 and are no
+    # longer maintained as standalone crates. Informational "unmaintained"
+    # advisories only -- no CVE, no disclosed vulnerability.
+    #
+    # Reviewed by hand against the live tree (`cargo tree -i zvariant_derive`,
+    # and the same for the other two): quietrabbit -> tauri-plugin-single-instance
+    # 2.4.5 -> zbus 5.19.0 -> zvariant 5.15.1 -> zvariant_derive 5.15.1, with
+    # zbus_names 4.3.5 and zbus_macros hanging off zbus. Nothing else in the tree
+    # reaches them. The plugin pins `zbus = "5.9"`, so `cargo update` cannot move
+    # them to zbus 6; the plugin's 2.5.x line needs tauri 2.12 (we are on 2.11.2)
+    # and is not an option here. Runtime-reachable but only on the D-Bus
+    # session-bus path (Linux, release builds, the single-instance handoff).
+    #
+    # Revisit trigger (Chat-PM records it on items.id=503's scope): drop all three
+    # entries when tauri moves to 2.12 or later and the plugin can move to its
+    # zbus 6 release, or immediately if RUSTSEC files an actual vulnerability
+    # (not merely "unmaintained") against any of these crates.
+    { id = "RUSTSEC-2026-0370", reason = "unmaintained: zvariant 5.15.1, merged into zbus 6; reached only via tauri-plugin-single-instance 2.4.5 -> zbus 5.19.0 (items.id=667). The plugin pins zbus 5 and its 2.5.x line needs tauri 2.12, so there is no cargo-update path. Informational, no CVE. Revisit (items.id=503): drop when tauri >= 2.12 and the plugin can move to zbus 6." },
+    { id = "RUSTSEC-2026-0371", reason = "unmaintained: zbus_names 4.3.5, merged into zbus 6; same tauri-plugin-single-instance 2.4.5 -> zbus 5.19.0 chain as RUSTSEC-2026-0370 above. Informational, no CVE." },
+    { id = "RUSTSEC-2026-0372", reason = "unmaintained: zvariant_derive 5.15.1, derive macros now provided by zbus 6; same tauri-plugin-single-instance 2.4.5 -> zbus 5.19.0 -> zvariant chain as RUSTSEC-2026-0370 above. Informational, no CVE." },
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.
