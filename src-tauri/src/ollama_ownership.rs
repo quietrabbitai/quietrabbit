@@ -1,24 +1,51 @@
 //! Ownership proof and orphan reclaim for QR's own Ollama sidecar and its
-//! runner subprocesses (items.id=586).
+//! runner subprocesses (items.id=586, items.id=668, decisions.id=863).
 //!
-//! Two independent proofs, combined by every caller that actually touches a
-//! process -- neither is sufficient alone:
+//! # What QR will signal
+//! QR signals a process only if it is a live member of a process group QR
+//! itself recorded when it spawned a sidecar, *and* the member's executable
+//! file name says it is the sidecar or one of its runners ([`member_is_provable`]).
+//! Nothing else is ever signalled: not a process that merely has an argument
+//! or an environment variable pointing at QR's `ollama_models` directory
+//! (that match was the old proof and killed a user's `du` or editor), not a
+//! user's own `ollama`, and not the holder of a port.
 //!
-//! - [`is_qr_owned`]: is this process provably QR's own (its `OLLAMA_MODELS`
-//!   environment variable, or a command-line argument, points at QR's own
-//!   `ollama_models` directory)? Verified empirically this session: the
-//!   `serve` process carries `OLLAMA_MODELS` in its environment; a runner
-//!   (`llama-server`) does not reliably inherit that but always carries
-//!   `--model <path-under-ollama_models/blobs/>` directly on its command
-//!   line, so checking both covers either kind of process with one
-//!   function.
-//! - [`is_orphaned`]: is this process's parent gone, a zombie, or simply not
-//!   QR's own running executable? There is no single-instance guard on QR
-//!   itself, so two live QR instances can legitimately share one data dir,
-//!   each with its own live sidecar -- `is_qr_owned` alone cannot tell that
-//!   case apart from a genuine leftover orphan. Only a process that is
-//!   *both* QR-owned *and* orphaned is ever reclaimed; a provably-QR
-//!   process whose parent is a live QR executable is left alone.
+//! # The record
+//! [`record_spawn`] writes `{pid, start_time, pgid, owner_pid,
+//! owner_start_time}` into `ollama_sidecar.pid` (a JSON array, so a second
+//! QR instance does not overwrite the first's record) the moment a sidecar is
+//! spawned, before it is ready, so a `serve` that dies during the readiness
+//! window and leaves a runner behind is still tracked. The owner is the QR
+//! process that spawned it.
+//!
+//! # Reclaim ([`reclaim_orphans`])
+//! Only recorded groups are considered, each classified by [`classify`]:
+//!
+//! - owner still alive (pid exists and `start_time` matches): a live sibling
+//!   QR's sidecar. Not touched, the record is kept.
+//! - leader (`pid`) alive with a different `start_time`: the pid was reused,
+//!   which cannot happen while the original group still has a member (the
+//!   kernel does not hand out a pid that is still a process group id), so the
+//!   original group is gone. Stale record, dropped, nothing signalled.
+//! - leader alive with the recorded `start_time`: it must itself be provable
+//!   (exe name, `OLLAMA_MODELS` equal to `models_dir` in its environment) and
+//!   orphaned ([`is_orphaned`]); otherwise not touched.
+//! - leader gone: the group is headless. This is the shape an abrupt stop
+//!   leaves, because `PR_SET_PDEATHSIG` is armed on `serve` only, so its
+//!   runner outlives it. Whatever members the group still has are handed to
+//!   [`kill_process_group`], which signals only the provable ones.
+//!
+//! # Residual risk (documented, accepted)
+//! If the leader is gone and the whole original group has also died, the
+//! pid may later be recycled by an unrelated process that becomes a group
+//! leader and then exits while leaving members behind; those members would
+//! then sit in a group with the recorded number. They are still signalled
+//! only if their executable is named `qr-ollama` or `llama-server` (or
+//! `ollama` in a debug build, which is the PATH fallback). Reaching that
+//! needs the group to die, the pid counter to wrap, the pid to be reused as
+//! a group leader and exit, all between two QR starts. There is no signalling
+//! race-free primitive on every platform (a pid can also be recycled between
+//! the membership check and the `kill`), so this is a bound, not a proof.
 //!
 //! Process-group identification deliberately does NOT use `sysinfo::
 //! Process::group_id()` -- despite its doc comment ("the process group ID
@@ -39,30 +66,55 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System}
 // Identity proof
 // ---------------------------------------------------------------------------
 
-/// True iff `pid` is alive and provably QR's own: its environment has
-/// `OLLAMA_MODELS` equal to `models_dir` (how `serve` is spawned -- see
-/// `ollama_sidecar::try_start`), or one of its command-line arguments is a
-/// path under `models_dir` (how a runner receives its model file, observed
-/// directly this session: `llama-server --model <models_dir>/blobs/...`).
-pub fn is_qr_owned(pid: Pid, models_dir: &Path, sys: &System) -> bool {
+/// Executable file names QR's own sidecar and runners may have. The bundled
+/// binary is `qr-ollama` (decisions.id=863); its runner is `llama-server` in
+/// the layouts observed so far, or `qr-ollama runner`, which already matches.
+/// items.id=583 owns the packaged layout and must revisit this list if the
+/// runner is named differently there.
+const MEMBER_EXE_NAMES: &[&str] = &["qr-ollama", "llama-server"];
+
+/// Additionally accepted in debug builds, where the debug-only PATH fallback
+/// launches the system `ollama` as QR's sidecar (items.id=583 retires it).
+/// Never accepted in a release build.
+const DEV_MEMBER_EXE_NAMES: &[&str] = &["ollama"];
+
+/// True iff a process whose executable is `exe` may be signalled as a member
+/// of a recorded sidecar group. `None` (the executable could not be read:
+/// permission, timing, a vanished process) is **not provable and never
+/// signalled**.
+pub fn member_is_provable(exe: Option<&Path>, dev_names: bool) -> bool {
+    let Some(name) = exe.and_then(Path::file_name).and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let name = if cfg!(windows) {
+        name.strip_suffix(".exe").unwrap_or(name)
+    } else {
+        name
+    };
+    MEMBER_EXE_NAMES.contains(&name) || (dev_names && DEV_MEMBER_EXE_NAMES.contains(&name))
+}
+
+fn member_exe_ok(pid: Pid, sys: &System) -> bool {
+    member_is_provable(
+        sys.process(pid).and_then(|p| p.exe()),
+        cfg!(debug_assertions),
+    )
+}
+
+/// True iff `pid`'s environment has `OLLAMA_MODELS` equal to `models_dir`
+/// (how QR spawns `serve` -- see `ollama_sidecar::try_start`). Used only as an
+/// additional condition on a recorded, live leader, never as proof by itself:
+/// a runner does not reliably inherit it, and any process can carry it.
+pub fn leader_environ_matches(pid: Pid, models_dir: &Path, sys: &System) -> bool {
     let Some(proc_) = sys.process(pid) else {
         return false;
     };
-
-    let env_match = proc_.environ().iter().any(|e| {
+    proc_.environ().iter().any(|e| {
         e.to_str()
             .and_then(|s| s.strip_prefix("OLLAMA_MODELS="))
             .map(|v| Path::new(v) == models_dir)
             .unwrap_or(false)
-    });
-    if env_match {
-        return true;
-    }
-
-    proc_
-        .cmd()
-        .iter()
-        .any(|arg| Path::new(arg).starts_with(models_dir))
+    })
 }
 
 /// True iff `pid` should be treated as an orphan safe to reclaim: its
@@ -74,6 +126,9 @@ pub fn is_qr_owned(pid: Pid, models_dir: &Path, sys: &System) -> bool {
 /// and also, deliberately conservative, whenever the parent is alive but
 /// its own executable path couldn't be determined (permission or timing
 /// issue): "uncertain" must never resolve to "safe to kill" here.
+///
+/// Applied to a recorded group's *leader* only. A runner's parent is `serve`,
+/// not QR, so it would read as orphaned inside a perfectly live group.
 pub fn is_orphaned(pid: Pid, qr_exe_path: &Path, sys: &System) -> bool {
     let Some(proc_) = sys.process(pid) else {
         return true;
@@ -97,6 +152,20 @@ pub fn is_orphaned(pid: Pid, qr_exe_path: &Path, sys: &System) -> bool {
 // Process group
 // ---------------------------------------------------------------------------
 
+fn snapshot() -> System {
+    let mut sys = System::new();
+    refresh(&mut sys);
+    sys
+}
+
+fn refresh(sys: &mut System) {
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::everything(),
+    );
+}
+
 /// The real process group ID of `pid`, via `getpgid` -- not `sysinfo`'s
 /// `group_id()` (see module doc comment for why). `None` if the process is
 /// already gone or `getpgid` otherwise fails.
@@ -109,57 +178,76 @@ fn current_pgid(pid: Pid) -> Option<libc::pid_t> {
     }
 }
 
-/// Every live pid currently in process group `pgid`, per a fresh query of
-/// each process in `sys` (not cached group membership -- group membership
-/// can change at any time via `setpgid`, though nothing in this codebase
-/// does that for a sidecar/runner after spawn).
+/// Every live, non-zombie pid currently in process group `pgid`, per a fresh
+/// query of each process in `sys` (not cached group membership -- group
+/// membership can change at any time via `setpgid`, though nothing in this
+/// codebase does that for a sidecar/runner after spawn). A zombie is
+/// excluded: it is already dead and cannot be meaningfully signalled.
 fn group_members(pgid: libc::pid_t, sys: &System) -> Vec<Pid> {
     sys.processes()
-        .keys()
-        .copied()
+        .iter()
+        .filter(|(_, p)| p.status() != ProcessStatus::Zombie)
+        .map(|(pid, _)| *pid)
         .filter(|&pid| current_pgid(pid) == Some(pgid))
         .collect()
 }
 
-/// `SIGTERM` then `SIGKILL`, but never wider than provably QR's own.
+/// What [`kill_process_group`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GroupKill {
+    /// Provable members that were sent SIGTERM.
+    pub signalled: usize,
+    /// Provable members still alive after SIGKILL. Non-zero means the record
+    /// must be kept so the next start can try again.
+    pub survivors: usize,
+}
+
+/// `SIGTERM` then `SIGKILL` to the provable members of process group `pgid`
+/// and to nothing else.
+///
+/// `pgid` must be a group QR recorded or spawned itself; this function does
+/// not know that, so every caller is one of: the reclaim of a recorded group,
+/// `stop()`/`liveness_tick` of the child QR holds, or the cleanup of a start
+/// attempt that failed.
 ///
 /// Refuses to signal process group 1 (init) or this process's own group
 /// outright. Beyond that: enumerates every live member of `pgid` and
-/// checks each against [`is_qr_owned`] (`models_dir`) before touching
-/// anything. Only when *every* member passes does this signal the whole
-/// group by pgid, the cheap/simple path. A pre-fix orphan can share its
-/// group with the shell/terminal/`cargo-tauri` that launched it -- that's
-/// exactly today's real shape (`ollama serve` PID 204157 sharing pgid
-/// 203739 with its whole launching shell tree) -- so a group containing
-/// even one process that isn't provably QR's own is never groupkilled;
-/// only the individually-proven members are signaled directly, one PID at
-/// a time, and everything else in that group is left alone.
-pub async fn kill_process_group(pgid: libc::pid_t, models_dir: &Path) {
+/// checks each against [`member_is_provable`] before touching anything. Only
+/// when *every* member passes does this signal the whole group by pgid, the
+/// cheap/simple path that also catches a runner forked in the gap. A group
+/// containing even one member that isn't provable (a shell that launched a
+/// pre-fix orphan, a process whose `exe()` could not be read) is never
+/// groupkilled; only the individually-proven members are signalled, one pid
+/// at a time, and everything else in that group is left alone.
+pub async fn kill_process_group(pgid: libc::pid_t) -> GroupKill {
     let own_pgid = unsafe { libc::getpgid(0) };
     if pgid <= 1 || pgid == own_pgid {
         log::warn!(
             "ollama_ownership: refusing to signal process group {pgid} (own group {own_pgid})"
         );
-        return;
+        return GroupKill::default();
     }
 
-    let mut sys = System::new_all();
-    sys.refresh_processes_specifics(
-        ProcessesToUpdate::All,
-        true,
-        ProcessRefreshKind::everything(),
-    );
+    let mut sys = snapshot();
     let members = group_members(pgid, &sys);
     if members.is_empty() {
-        return;
+        return GroupKill::default();
     }
-    let owned: Vec<Pid> = members
+    let proven: Vec<Pid> = members
         .iter()
         .copied()
-        .filter(|&pid| is_qr_owned(pid, models_dir, &sys))
+        .filter(|&pid| member_exe_ok(pid, &sys))
         .collect();
+    if proven.is_empty() {
+        log::warn!(
+            "ollama_ownership: process group {pgid} has {} live member(s), none provably \
+             QR's own -- nothing signalled",
+            members.len()
+        );
+        return GroupKill::default();
+    }
 
-    if owned.len() == members.len() {
+    if proven.len() == members.len() {
         log::info!("ollama_ownership: SIGTERM to process group {pgid}");
         unsafe {
             libc::kill(-pgid, libc::SIGTERM);
@@ -167,11 +255,11 @@ pub async fn kill_process_group(pgid: libc::pid_t, models_dir: &Path) {
     } else {
         log::warn!(
             "ollama_ownership: process group {pgid} has {} member(s) not provably QR's own -- \
-             signaling only the {} proven-QR member(s) individually, never the group",
-            members.len() - owned.len(),
-            owned.len()
+             signaling only the {} proven member(s) individually, never the group",
+            members.len() - proven.len(),
+            proven.len()
         );
-        for &pid in &owned {
+        for &pid in &proven {
             unsafe {
                 libc::kill(pid.as_u32() as libc::pid_t, libc::SIGTERM);
             }
@@ -179,27 +267,42 @@ pub async fn kill_process_group(pgid: libc::pid_t, models_dir: &Path) {
     }
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
-    sys.refresh_processes_specifics(
-        ProcessesToUpdate::All,
-        true,
-        ProcessRefreshKind::everything(),
+    // Still in the group, still alive, still provable: a pid recycled in the
+    // meantime fails one of the three.
+    let still_there = |sys: &System| -> Vec<Pid> {
+        proven
+            .iter()
+            .copied()
+            .filter(|&pid| {
+                sys.process(pid)
+                    .is_some_and(|p| p.status() != ProcessStatus::Zombie)
+                    && current_pgid(pid) == Some(pgid)
+                    && member_exe_ok(pid, sys)
+            })
+            .collect()
+    };
+    refresh(&mut sys);
+    let survivors = still_there(&sys);
+    if survivors.is_empty() {
+        return GroupKill {
+            signalled: proven.len(),
+            survivors: 0,
+        };
+    }
+    log::warn!(
+        "ollama_ownership: {} proven process(es) survived SIGTERM, sending SIGKILL",
+        survivors.len()
     );
-    let survivors: Vec<Pid> = owned
-        .iter()
-        .copied()
-        .filter(|&pid| sys.process(pid).is_some())
-        .collect();
-    if !survivors.is_empty() {
-        log::warn!(
-            "ollama_ownership: {} proven-QR process(es) survived SIGTERM, sending SIGKILL",
-            survivors.len()
-        );
-        for &pid in &survivors {
-            unsafe {
-                libc::kill(pid.as_u32() as libc::pid_t, libc::SIGKILL);
-            }
+    for &pid in &survivors {
+        unsafe {
+            libc::kill(pid.as_u32() as libc::pid_t, libc::SIGKILL);
         }
-        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    refresh(&mut sys);
+    GroupKill {
+        signalled: proven.len(),
+        survivors: still_there(&sys).len(),
     }
 }
 
@@ -207,64 +310,117 @@ pub async fn kill_process_group(pgid: libc::pid_t, models_dir: &Path) {
 // Pidfile
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One recorded sidecar group. Written at spawn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PidfileRecord {
+    /// The group leader: the `serve` process (`pid == pgid` by construction,
+    /// `process_group(0)`).
     pid: u32,
-    /// `sysinfo::Process::start_time()` at write time -- guards against a
-    /// PID being reused by an unrelated process across a reboot before this
-    /// pidfile is next read.
+    /// `sysinfo::Process::start_time()` of `pid` at spawn -- guards against a
+    /// PID being reused by an unrelated process before this record is next
+    /// read.
     start_time: u64,
+    pgid: libc::pid_t,
+    /// The QR process that spawned it, and its start time: while it is alive
+    /// this sidecar belongs to a live QR and is never reclaimed.
+    owner_pid: u32,
+    owner_start_time: u64,
+}
+
+/// Test-only: `(leader pid, pgid)` of every recorded group.
+#[cfg(test)]
+pub fn recorded_groups_for_test() -> Vec<(u32, libc::pid_t)> {
+    read_records().iter().map(|r| (r.pid, r.pgid)).collect()
 }
 
 pub fn pidfile_path() -> PathBuf {
     crate::providers::utils::get_data_root().join("ollama_sidecar.pid")
 }
 
-/// Best-effort write -- a failure here only means the next startup falls
-/// back to the broad sweep instead of the pidfile-targeted pass, not a
-/// reason to fail the sidecar startup that's already succeeded. Builds its
-/// own `System` snapshot (called once per successful startup, not on any
-/// hot path) rather than asking the caller for one.
-pub fn write_pidfile(pid: u32) {
-    let mut sys = System::new_all();
+fn start_time_of(pid: u32) -> Option<u64> {
+    let mut sys = System::new();
     sys.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
         true,
         ProcessRefreshKind::everything(),
     );
-    let Some(proc_) = sys.process(Pid::from_u32(pid)) else {
-        log::warn!(
-            "ollama_ownership: cannot write pidfile -- pid {pid} not found right after spawn"
-        );
-        return;
+    sys.process(Pid::from_u32(pid)).map(|p| p.start_time())
+}
+
+/// An absent file, a corrupt one and the pre-items.id=668 single-object format
+/// (no group was recorded in it, so nothing in it can be proven) all read as
+/// "no records"; the next write replaces the file.
+fn read_records() -> Vec<PidfileRecord> {
+    let Ok(bytes) = std::fs::read(pidfile_path()) else {
+        return Vec::new();
     };
-    let record = PidfileRecord {
-        pid,
-        start_time: proc_.start_time(),
-    };
+    match serde_json::from_slice(&bytes) {
+        Ok(records) => records,
+        Err(e) => {
+            log::warn!(
+                "ollama_ownership: pidfile is unreadable or in the old single-record format \
+                 ({e}) -- ignoring it; nothing in it can be proven"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Atomic (temp file, then rename). An empty list removes the file. Not
+/// locked across two QR instances: two instances starting in the same instant
+/// can lose a record to this read-modify-write; items.id=667 (single
+/// instance) removes that case.
+fn write_records(records: &[PidfileRecord]) {
     let path = pidfile_path();
-    let write_result: io::Result<()> = serde_json::to_vec(&record)
+    if records.is_empty() {
+        if let Err(e) = std::fs::remove_file(&path) {
+            if e.kind() != io::ErrorKind::NotFound {
+                log::debug!("ollama_ownership: could not remove pidfile {path:?}: {e}");
+            }
+        }
+        return;
+    }
+    let tmp = path.with_extension("pid.tmp");
+    let result: io::Result<()> = serde_json::to_vec(records)
         .map_err(io::Error::other)
-        .and_then(|bytes| std::fs::write(&path, bytes));
-    if let Err(e) = write_result {
+        .and_then(|bytes| std::fs::write(&tmp, bytes))
+        .and_then(|()| std::fs::rename(&tmp, &path));
+    if let Err(e) = result {
         log::warn!("ollama_ownership: failed to write pidfile {path:?}: {e}");
     }
 }
 
-/// `None` on any error (missing file, corrupt content) -- never panics;
-/// a missing/corrupt pidfile just means the pidfile-targeted reclaim pass
-/// finds nothing and the broad sweep is relied on instead.
-fn read_pidfile() -> Option<PidfileRecord> {
-    let bytes = std::fs::read(pidfile_path()).ok()?;
-    serde_json::from_slice(&bytes).ok()
+/// Records the sidecar group just spawned. Called right after the spawn and
+/// before readiness. Best-effort: a failure only means this group cannot be
+/// reclaimed by the next start, not a reason to fail the startup.
+pub fn record_spawn(pid: u32, pgid: libc::pid_t) {
+    let owner_pid = std::process::id();
+    let (Some(start_time), Some(owner_start_time)) = (start_time_of(pid), start_time_of(owner_pid))
+    else {
+        log::debug!(
+            "ollama_ownership: not recording pid {pid} -- it (or this process) could not be read"
+        );
+        return;
+    };
+    let mut records = read_records();
+    records.retain(|r| !(r.pid == pid && r.start_time == start_time));
+    records.push(PidfileRecord {
+        pid,
+        start_time,
+        pgid,
+        owner_pid,
+        owner_start_time,
+    });
+    write_records(&records);
 }
 
-pub fn remove_pidfile() {
-    let path = pidfile_path();
-    if let Err(e) = std::fs::remove_file(&path) {
-        if e.kind() != io::ErrorKind::NotFound {
-            log::debug!("ollama_ownership: could not remove pidfile {path:?}: {e}");
-        }
+/// Drops the record of the group led by `pid`, if any.
+pub fn remove_record(pid: u32) {
+    let mut records = read_records();
+    let before = records.len();
+    records.retain(|r| r.pid != pid);
+    if records.len() != before {
+        write_records(&records);
     }
 }
 
@@ -272,106 +428,116 @@ pub fn remove_pidfile() {
 // Reclaim
 // ---------------------------------------------------------------------------
 
-/// Two passes, in order, both gated on `is_qr_owned(..) && is_orphaned(..)`
-/// -- never ownership proof alone (see module doc comment):
-///
-/// 1. Pidfile-targeted: the one process this QR data dir's own last sidecar
-///    recorded, if its `start_time` still matches (not a reused PID).
-/// 2. Broad sweep: every currently running process, catching an orphaned
-///    runner left behind with no live `serve` parent at all -- the
-///    pidfile alone only ever tracked `serve`, not its runners.
-///
-/// Always removes the pidfile afterward -- a fresh sidecar is about to
-/// start and will write its own once ready, regardless of whether this
-/// call found anything to reclaim.
-/// The pidfile pass's reclaim condition, extracted so it's testable on its
-/// own -- in particular the stale-`start_time` (PID reused by an unrelated
-/// process since the file was written) case, which the broad sweep that
-/// always runs afterward would otherwise independently also catch (it does
-/// not key off the pidfile at all), making that case unobservable through
-/// `reclaim_orphans` alone.
-fn pidfile_target_is_reclaimable(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// Its owner QR is alive. Leave it and keep the record.
+    LiveSibling,
+    /// The group is gone or the pid was reused. Drop the record.
+    Stale,
+    /// Something here cannot be proven. Leave it and keep the record.
+    Unprovable,
+    /// Hand the group to [`kill_process_group`].
+    Reclaim,
+}
+
+fn classify(
     record: &PidfileRecord,
     models_dir: &Path,
     qr_exe_path: &Path,
     sys: &System,
-) -> bool {
-    let pid = Pid::from_u32(record.pid);
-    sys.process(pid)
-        .map(|p| p.start_time() == record.start_time)
-        .unwrap_or(false)
-        && is_qr_owned(pid, models_dir, sys)
-        && is_orphaned(pid, qr_exe_path, sys)
-}
+) -> Verdict {
+    let owner_alive = sys
+        .process(Pid::from_u32(record.owner_pid))
+        .is_some_and(|p| {
+            p.start_time() == record.owner_start_time && p.status() != ProcessStatus::Zombie
+        });
+    if owner_alive {
+        return Verdict::LiveSibling;
+    }
+    if record.pgid <= 1 {
+        return Verdict::Stale;
+    }
 
-/// Returns `true` iff this call actually reclaimed something -- callers
-/// use that to decide whether to wait for the port to free up and retry
-/// the fresh start (items.id=586 fix-up: a group-kill that spared an
-/// unrelated process, or any kill at all, can leave the OS a brief moment
-/// before `QR_OLLAMA_PORT` is actually rebindable; confirmed empirically
-/// this session, "listen tcp 127.0.0.1:21434: bind: address already in
-/// use" on the very next start attempt).
-pub async fn reclaim_orphans(models_dir: &Path, qr_exe_path: &Path) -> bool {
-    let mut killed_anything = false;
-    let mut sys = System::new_all();
-    sys.refresh_processes_specifics(
-        ProcessesToUpdate::All,
-        true,
-        ProcessRefreshKind::everything(),
-    );
-
-    if let Some(record) = read_pidfile() {
-        let pid = Pid::from_u32(record.pid);
-        if pidfile_target_is_reclaimable(&record, models_dir, qr_exe_path, &sys) {
-            if let Some(pgid) = current_pgid(pid) {
-                log::info!(
-                    "ollama_ownership: reclaiming pidfile-tracked orphan pid {} (pgid {pgid})",
-                    record.pid
-                );
-                kill_process_group(pgid, models_dir).await;
-                killed_anything = true;
+    let leader = Pid::from_u32(record.pid);
+    match sys
+        .process(leader)
+        .filter(|p| p.status() != ProcessStatus::Zombie)
+    {
+        Some(p) => {
+            if p.start_time() != record.start_time {
+                return Verdict::Stale;
+            }
+            if current_pgid(leader) != Some(record.pgid)
+                || !member_exe_ok(leader, sys)
+                || !leader_environ_matches(leader, models_dir, sys)
+                || !is_orphaned(leader, qr_exe_path, sys)
+            {
+                return Verdict::Unprovable;
+            }
+            Verdict::Reclaim
+        }
+        None => {
+            if group_members(record.pgid, sys).is_empty() {
+                Verdict::Stale
+            } else {
+                Verdict::Reclaim
             }
         }
     }
-    remove_pidfile();
+}
 
-    // Re-snapshot: the pidfile pass above may have just killed things, and
-    // this is the broad sweep's own independent pass regardless.
-    sys.refresh_processes_specifics(
-        ProcessesToUpdate::All,
-        true,
-        ProcessRefreshKind::everything(),
-    );
-    let targets: Vec<Pid> = sys
-        .processes()
-        .keys()
-        .copied()
-        .filter(|&pid| is_qr_owned(pid, models_dir, &sys) && is_orphaned(pid, qr_exe_path, &sys))
-        .collect();
-    for pid in targets {
-        if let Some(pgid) = current_pgid(pid) {
-            log::info!("ollama_ownership: broad sweep reclaiming orphan pid {pid} (pgid {pgid})");
-            kill_process_group(pgid, models_dir).await;
-            killed_anything = true;
+/// Reclaims the recorded sidecar groups whose owner QR is gone (see the
+/// module doc comment for the rules). Returns `true` iff something was
+/// actually signalled -- callers use that to wait for the preferred port to
+/// free up before starting fresh.
+///
+/// Rewrites the pidfile afterward: records of a live sibling or of anything
+/// unprovable are kept, a group that still has a provable survivor is kept,
+/// everything else (reclaimed, stale) is dropped. A fresh sidecar is about to
+/// start and will record itself.
+pub async fn reclaim_orphans(models_dir: &Path, qr_exe_path: &Path) -> bool {
+    let records = read_records();
+    if records.is_empty() {
+        write_records(&[]);
+        return false;
+    }
+    let sys = snapshot();
+    let mut keep = Vec::new();
+    let mut signalled_any = false;
+    for record in records {
+        match classify(&record, models_dir, qr_exe_path, &sys) {
+            Verdict::LiveSibling | Verdict::Unprovable => keep.push(record),
+            Verdict::Stale => {}
+            Verdict::Reclaim => {
+                log::info!(
+                    "ollama_ownership: reclaiming recorded sidecar group {} (leader pid {})",
+                    record.pgid,
+                    record.pid
+                );
+                let outcome = kill_process_group(record.pgid).await;
+                signalled_any |= outcome.signalled > 0;
+                if outcome.survivors > 0 {
+                    keep.push(record);
+                }
+            }
         }
     }
-
-    killed_anything
+    write_records(&keep);
+    signalled_any
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::{Child, Command};
+    use crate::test_support::procs::{
+        dead_pid, is_effectively_dead, named_copy, spawn_retry, spawn_sleep_stub,
+        start_time_of as start_time, ChildGuard,
+    };
+    use crate::test_support::DataRoot;
+    use std::process::Command;
 
     fn fresh_sys() -> System {
-        let mut sys = System::new_all();
-        sys.refresh_processes_specifics(
-            ProcessesToUpdate::All,
-            true,
-            ProcessRefreshKind::everything(),
-        );
-        sys
+        snapshot()
     }
 
     /// `extra_args` land as trailing positional args on the long-lived `sh`
@@ -385,8 +551,14 @@ mod tests {
     /// own original argv, extra args included, intact for the test to
     /// observe. Plain `sleep 5 <extra_arg>` doesn't work for this either
     /// way: `sleep` parses every argument as another time interval.
-    fn spawn_sleep(extra_env: &[(&str, &str)], extra_args: &[&str]) -> Child {
-        let mut cmd = Command::new("sh");
+    ///
+    /// `program` is `sh` or a copy of it under another file name.
+    fn spawn_sleep_as(
+        program: &Path,
+        extra_env: &[(&str, &str)],
+        extra_args: &[&str],
+    ) -> ChildGuard {
+        let mut cmd = Command::new(program);
         cmd.arg("-c").arg("while true; do sleep 1; done").arg("sh");
         for arg in extra_args {
             cmd.arg(arg);
@@ -394,84 +566,88 @@ mod tests {
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
-        cmd.spawn().expect("failed to spawn test `sh` process")
+        ChildGuard::new(spawn_retry(&mut cmd))
     }
 
-    /// A stand-in process that stays alive until it is killed (or the
-    /// returned `Child`'s stdin is closed): one `sh` blocked in the `read`
-    /// builtin on a stdin pipe the `Child` keeps open. Joins process group
-    /// `group` (`0` starts a new group, a positive pgid joins that one).
-    /// Not `sleep N`: a fixed lifetime lets the process exit on its own when
-    /// a run on a contended core outlasts it, and then it reads as killed.
-    /// And not `exec <program>`: `spawn()` returns only after the child has
-    /// exec'd the `sh` image (std waits on the exec pipe), `process_group`
-    /// is applied before that exec, and the `read` builtin never execs
-    /// again, so the pid is a group member with its final image the moment
-    /// this returns -- nothing for a test to wait for.
-    fn spawn_blocked_sh(group: libc::pid_t, extra_env: &[(&str, &str)]) -> Child {
-        use std::os::unix::process::CommandExt;
-        use std::process::Stdio;
+    fn spawn_sleep(extra_env: &[(&str, &str)], extra_args: &[&str]) -> ChildGuard {
+        spawn_sleep_as(Path::new("sh"), extra_env, extra_args)
+    }
 
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg("read _").stdin(Stdio::piped());
-        cmd.process_group(group);
-        for (k, v) in extra_env {
-            cmd.env(k, v);
+    const NOT_QR_EXE: &str = "/not/actually/quietrabbit";
+
+    // -- member_is_provable --------------------------------------------------
+
+    #[test]
+    fn member_names_are_the_sidecar_and_its_runner() {
+        for yes in ["/opt/qr/qr-ollama", "/opt/qr/llama-server", "qr-ollama"] {
+            assert!(member_is_provable(Some(Path::new(yes)), false), "{yes}");
         }
-        cmd.spawn().expect("failed to spawn test `sh` process")
+        for no in [
+            "/usr/bin/ollama",
+            "/usr/bin/sleep",
+            "/bin/sh",
+            "/usr/bin/du",
+            "/opt/qr/qr-ollama.bak",
+            "/opt/qr/not-qr-ollama",
+            "/opt/qr/llama-server-extra",
+            "/",
+        ] {
+            assert!(!member_is_provable(Some(Path::new(no)), false), "{no}");
+        }
     }
-
-    /// `kill_process_group`'s job ends at signaling -- reaping is the
-    /// actual parent's responsibility, which in production is never this
-    /// process for a genuine orphan (whatever adopted it, e.g. systemd,
-    /// reaps it). A handful of tests below spawn the "orphan" directly
-    /// from the test itself for convenience, which makes the test process
-    /// its real parent, so a successfully-killed process shows up as a
-    /// zombie here rather than vanishing outright until something calls
-    /// `wait()` on it (confirmed empirically -- `sys.process()` returned
-    /// `Some(Zombie)`, not `None`, right after a kill that did work).
-    /// Checking for *either* is therefore the correct assertion, not a
-    /// loosened one.
-    fn is_effectively_dead(sys: &System, pid: Pid) -> bool {
-        sys.process(pid)
-            .map(|p| p.status() == ProcessStatus::Zombie)
-            .unwrap_or(true)
-    }
-
-    // -- is_qr_owned ----------------------------------------------------
 
     #[test]
-    fn is_qr_owned_true_via_environ() {
+    fn plain_ollama_is_provable_only_in_a_debug_build() {
+        let ollama = Some(Path::new("/usr/bin/ollama"));
+        assert!(!member_is_provable(ollama, false));
+        assert!(member_is_provable(ollama, true));
+    }
+
+    #[test]
+    fn unreadable_exe_is_never_provable() {
+        assert!(!member_is_provable(None, false));
+        assert!(!member_is_provable(None, true));
+    }
+
+    // -- leader_environ_matches ----------------------------------------------
+
+    #[test]
+    fn leader_environ_matches_true_via_environ() {
         let models_dir = Path::new("/tmp/quietrabbit-ownership-test-models");
-        let mut child = spawn_sleep(&[("OLLAMA_MODELS", models_dir.to_str().unwrap())], &[]);
-        let pid = Pid::from_u32(child.id());
+        let child = spawn_sleep(&[("OLLAMA_MODELS", models_dir.to_str().unwrap())], &[]);
         let sys = fresh_sys();
-        assert!(is_qr_owned(pid, models_dir, &sys));
-        let _ = child.kill();
-        let _ = child.wait();
+        assert!(leader_environ_matches(
+            Pid::from_u32(child.id()),
+            models_dir,
+            &sys
+        ));
     }
 
+    /// The old proof matched any command-line argument under `models_dir`.
+    /// That is not proof of anything: a user's `du` or editor has one too.
     #[test]
-    fn is_qr_owned_true_via_cmdline_path() {
+    fn an_argument_under_models_dir_is_not_proof() {
         let models_dir = Path::new("/tmp/quietrabbit-ownership-test-models");
         let model_path = models_dir.join("blobs/sha256-fake");
-        let mut child = spawn_sleep(&[], &[model_path.to_str().unwrap()]);
-        let pid = Pid::from_u32(child.id());
+        let child = spawn_sleep(&[], &[model_path.to_str().unwrap()]);
         let sys = fresh_sys();
-        assert!(is_qr_owned(pid, models_dir, &sys));
-        let _ = child.kill();
-        let _ = child.wait();
+        assert!(!leader_environ_matches(
+            Pid::from_u32(child.id()),
+            models_dir,
+            &sys
+        ));
     }
 
     #[test]
-    fn is_qr_owned_false_when_neither_matches() {
+    fn leader_environ_matches_false_when_neither_matches() {
         let models_dir = Path::new("/tmp/quietrabbit-ownership-test-models");
-        let mut child = spawn_sleep(&[], &[]);
-        let pid = Pid::from_u32(child.id());
+        let child = spawn_sleep(&[], &[]);
         let sys = fresh_sys();
-        assert!(!is_qr_owned(pid, models_dir, &sys));
-        let _ = child.kill();
-        let _ = child.wait();
+        assert!(!leader_environ_matches(
+            Pid::from_u32(child.id()),
+            models_dir,
+            &sys
+        ));
     }
 
     // -- is_orphaned ------------------------------------------------------
@@ -482,24 +658,21 @@ mod tests {
         // parent is this very process, so passing this process's own exe
         // path as `qr_exe_path` reproduces Jason's "live sibling instance"
         // safety case without needing a separate fake wrapper binary.
-        let mut child = spawn_sleep(&[], &[]);
-        let pid = Pid::from_u32(child.id());
+        let child = spawn_sleep(&[], &[]);
         let sys = fresh_sys();
         let qr_exe = std::env::current_exe().unwrap();
-        assert!(!is_orphaned(pid, &qr_exe, &sys));
-        let _ = child.kill();
-        let _ = child.wait();
+        assert!(!is_orphaned(Pid::from_u32(child.id()), &qr_exe, &sys));
     }
 
     #[test]
     fn is_orphaned_true_when_parent_alive_but_not_qr_exe() {
-        let mut child = spawn_sleep(&[], &[]);
-        let pid = Pid::from_u32(child.id());
+        let child = spawn_sleep(&[], &[]);
         let sys = fresh_sys();
-        let not_qr_exe = Path::new("/not/actually/quietrabbit");
-        assert!(is_orphaned(pid, not_qr_exe, &sys));
-        let _ = child.kill();
-        let _ = child.wait();
+        assert!(is_orphaned(
+            Pid::from_u32(child.id()),
+            Path::new("/not/actually/quietrabbit"),
+            &sys
+        ));
     }
 
     #[test]
@@ -513,329 +686,436 @@ mod tests {
 
     #[tokio::test]
     async fn group_kill_takes_down_a_member_a_plain_kill_would_miss() {
-        use std::os::unix::process::CommandExt;
-
-        // A parent in its own dedicated group, which spawns a child that
-        // inherits that group -- the same shape `ollama serve` + a runner
-        // will have once `ollama_sidecar.rs` spawns `serve` with
-        // `process_group(0)`. OLLAMA_MODELS inherits to the child too, so
-        // both members pass is_qr_owned and the group-kill path (not the
+        // A leader in its own dedicated group plus a runner that joined it:
+        // the same shape `qr-ollama serve` + `llama-server` have in a real
+        // sidecar group. Both are provable, so the group-kill path (not the
         // mixed-group fallback) is what's under test here.
-        let models_dir = Path::new("/tmp/quietrabbit-ownership-test-group-kill");
-        let mut parent = Command::new("sh");
-        parent.arg("-c").arg("sleep 20 & wait");
-        parent.env("OLLAMA_MODELS", models_dir);
-        parent.process_group(0);
-        let mut parent = parent.spawn().expect("failed to spawn test parent");
-        let parent_pid = parent.id();
-        let pgid = current_pgid(Pid::from_u32(parent_pid)).expect("parent must have a pgid");
+        let dir = tempfile::tempdir().unwrap();
+        let serve = named_copy(dir.path(), "/bin/sleep", "qr-ollama");
+        let runner = named_copy(dir.path(), "/bin/sleep", "llama-server");
+        let mut leader = spawn_sleep_stub(&serve, 0, &[]);
+        let pgid = leader.id() as libc::pid_t;
+        let member = spawn_sleep_stub(&runner, pgid, &[]);
 
-        // Give the shell a moment to fork its own `sleep` child.
-        tokio::time::sleep(Duration::from_millis(300)).await;
         let sys = fresh_sys();
         let members_before = group_members(pgid, &sys);
-        assert!(
-            members_before.len() >= 2,
-            "expected parent + child in group {pgid}, found {members_before:?}"
+        assert_eq!(
+            members_before.len(),
+            2,
+            "expected leader + runner in group {pgid}, found {members_before:?}"
         );
 
-        // A plain kill of only the parent pid leaves the child alive.
-        unsafe {
-            libc::kill(parent_pid as libc::pid_t, libc::SIGKILL);
-        }
-        let _ = parent.wait();
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // A plain kill of only the leader leaves the runner alive.
+        leader.kill_and_wait();
         let sys = fresh_sys();
-        let survivors_after_plain_kill = group_members(pgid, &sys);
-        assert!(
-            !survivors_after_plain_kill.is_empty(),
-            "a plain kill(parent_pid) should not have taken down the whole group"
+        assert_eq!(
+            group_members(pgid, &sys),
+            vec![Pid::from_u32(member.id())],
+            "a plain kill of the leader should not have taken down the runner"
         );
 
-        // The group kill takes down whatever plain kill left behind.
-        kill_process_group(pgid, models_dir).await;
-        let sys = fresh_sys();
-        assert!(
-            group_members(pgid, &sys).is_empty(),
-            "group {pgid} should be fully gone after kill_process_group"
+        // The group kill takes down whatever the plain kill left behind.
+        let outcome = kill_process_group(pgid).await;
+        assert_eq!(
+            outcome,
+            GroupKill {
+                signalled: 1,
+                survivors: 0
+            }
         );
+        assert!(is_effectively_dead(member.id()));
     }
 
     #[tokio::test]
     async fn kill_process_group_refuses_to_signal_its_own_group() {
         let own_pgid = unsafe { libc::getpgid(0) };
         // Should log and return without touching anything -- this test's
-        // own process surviving to assert afterward IS the assertion. The
-        // own-group/pgid<=1 refusal happens before any ownership check, so
-        // the models_dir value here is irrelevant.
-        kill_process_group(own_pgid, Path::new("/irrelevant")).await;
+        // own process surviving to assert afterward IS the assertion.
+        assert_eq!(kill_process_group(own_pgid).await, GroupKill::default());
+        assert_eq!(kill_process_group(1).await, GroupKill::default());
+        assert_eq!(kill_process_group(0).await, GroupKill::default());
     }
 
     /// items.id=586 fix-up (Jason): a pre-fix orphan can share its process
     /// group with an unrelated live process -- today's real shape, `ollama
     /// serve` PID 204157 sharing pgid 203739 with the whole shell/cargo-
     /// tauri tree that launched it. `kill_process_group` must never signal
-    /// that whole group; only the individually-proven-QR member(s).
+    /// that whole group; only the individually-proven member(s).
     #[tokio::test]
     async fn group_kill_spares_an_unrelated_process_sharing_the_group() {
-        let models_dir = Path::new("/tmp/quietrabbit-ownership-test-mixed-group");
+        let dir = tempfile::tempdir().unwrap();
+        let unrelated = named_copy(dir.path(), "/bin/sleep", "some-shell");
+        let runner = named_copy(dir.path(), "/bin/sleep", "llama-server");
 
-        // Each stand-in is exactly one process (`spawn_blocked_sh` -- a lone
-        // `sh -c "sleep 20"` is two on shells that don't tail-exec, which
-        // undercounted the group on the CI runner) and lives until killed.
-        //
-        // The group LEADER is the "shell" -- unrelated, no OLLAMA_MODELS --
-        // matching the real pre-fix shape where the launching shell/
-        // cargo-tauri was the leader and `ollama serve` just a member.
-        let mut leader = spawn_blocked_sh(0, &[]);
-        let leader_pid = leader.id();
-        let pgid = current_pgid(Pid::from_u32(leader_pid)).expect("leader must have a pgid");
+        // The group LEADER is the "shell" -- unrelated -- matching the real
+        // pre-fix shape where the launching shell/cargo-tauri was the leader
+        // and the runner just a member.
+        let leader = spawn_sleep_stub(&unrelated, 0, &[]);
+        let pgid = leader.id() as libc::pid_t;
+        let orphan = spawn_sleep_stub(&runner, pgid, &[]);
 
-        // The "orphan" -- provably QR's own -- joins that same group
-        // directly (a positive group means "join this existing group", not
-        // "start a new one").
-        let mut orphan = spawn_blocked_sh(pgid, &[("OLLAMA_MODELS", models_dir.to_str().unwrap())]);
-        let orphan_pid = orphan.id();
+        let outcome = kill_process_group(pgid).await;
 
-        let sys = fresh_sys();
-        // Membership, not an exact count: robust against any other
-        // incidental member the shell/OS happens to add, while still
-        // proving the two processes this test actually cares about are
-        // both really in the group before the kill.
-        let members = group_members(pgid, &sys);
+        assert_eq!(outcome.survivors, 0);
+        assert_eq!(outcome.signalled, 1);
         assert!(
-            members.contains(&Pid::from_u32(leader_pid)),
-            "expected the leader to be a member of group {pgid}, found {members:?}"
+            is_effectively_dead(orphan.id()),
+            "the provable runner should have been killed"
         );
         assert!(
-            members.contains(&Pid::from_u32(orphan_pid)),
-            "expected the orphan to be a member of group {pgid}, found {members:?}"
-        );
-
-        kill_process_group(pgid, models_dir).await;
-
-        let sys = fresh_sys();
-        assert!(
-            is_effectively_dead(&sys, Pid::from_u32(orphan_pid)),
-            "the provably-QR orphan should have been killed"
-        );
-        assert!(
-            !is_effectively_dead(&sys, Pid::from_u32(leader_pid)),
+            !is_effectively_dead(leader.id()),
             "the unrelated group leader must survive -- the group itself was never signaled"
         );
+    }
 
-        let _ = orphan.wait();
-        let _ = leader.kill();
-        let _ = leader.wait();
+    #[tokio::test]
+    async fn group_with_no_provable_member_is_left_entirely_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = named_copy(dir.path(), "/bin/sleep", "some-shell");
+        let b = named_copy(dir.path(), "/bin/sleep", "an-editor");
+        let leader = spawn_sleep_stub(&a, 0, &[]);
+        let pgid = leader.id() as libc::pid_t;
+        let member = spawn_sleep_stub(&b, pgid, &[]);
+
+        assert_eq!(kill_process_group(pgid).await, GroupKill::default());
+        assert!(!is_effectively_dead(leader.id()));
+        assert!(!is_effectively_dead(member.id()));
     }
 
     // -- pidfile ------------------------------------------------------
 
     #[tokio::test]
-    async fn write_read_pidfile_roundtrip() {
+    async fn record_spawn_roundtrips_and_remove_record_drops_it() {
         let _lock = crate::test_support::ENV_MUTEX.lock().await;
-        let tmp = tempfile::tempdir().unwrap();
-        let saved = std::env::var("QR_DATA_ROOT").ok();
-        std::env::set_var("QR_DATA_ROOT", tmp.path());
+        let _root = DataRoot::isolated();
 
-        let mut child = spawn_sleep(&[], &[]);
-        write_pidfile(child.id());
-        let record = read_pidfile().expect("pidfile should be readable right after write");
-        assert_eq!(record.pid, child.id());
+        let child = spawn_sleep(&[], &[]);
+        let pgid = unsafe { libc::getpgid(child.id() as libc::pid_t) };
+        record_spawn(child.id(), pgid);
+        let records = read_records();
+        assert_eq!(records.len(), 1);
+        let r = &records[0];
+        assert_eq!(r.pid, child.id());
+        assert_eq!(r.pgid, pgid);
+        assert_eq!(r.start_time, start_time(child.id()));
+        assert_eq!(r.owner_pid, std::process::id());
+        assert_eq!(r.owner_start_time, start_time(std::process::id()));
 
-        remove_pidfile();
-        assert!(read_pidfile().is_none());
+        // A second sidecar's record does not replace the first's.
+        let other = spawn_sleep(&[], &[]);
+        record_spawn(other.id(), pgid);
+        assert_eq!(read_records().len(), 2);
 
-        let _ = child.kill();
-        let _ = child.wait();
-        match saved {
-            Some(v) => std::env::set_var("QR_DATA_ROOT", v),
-            None => std::env::remove_var("QR_DATA_ROOT"),
-        }
+        remove_record(child.id());
+        let records = read_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].pid, other.id());
+        remove_record(other.id());
+        assert!(read_records().is_empty());
+        assert!(!pidfile_path().exists());
     }
 
     #[tokio::test]
-    async fn pidfile_target_declines_on_mismatched_start_time() {
-        // A stand-in for "the pid was reused by an unrelated process since
-        // the pidfile was written" -- same pid, same ownership/orphan
-        // proof, but a start_time that no longer matches. Tested directly
-        // against the extracted condition rather than through
-        // `reclaim_orphans`, because the broad sweep that always runs
-        // after the pidfile pass would independently catch this same
-        // process anyway (it doesn't key off the pidfile), making the
-        // pidfile pass's own decision unobservable any other way.
-        //
-        // ENV_MUTEX + an isolated QR_DATA_ROOT even though this test never
-        // reads/writes a pidfile itself: it's in the same pidfile-domain
-        // family as the tests that do, and this makes it immune by
-        // construction to ever silently starting to touch real on-disk
-        // state if `pidfile_target_is_reclaimable` or its callers change.
+    async fn legacy_single_object_pidfile_is_ignored_and_replaced() {
         let _lock = crate::test_support::ENV_MUTEX.lock().await;
-        let tmp = tempfile::tempdir().unwrap();
-        let saved_root = std::env::var("QR_DATA_ROOT").ok();
-        std::env::set_var("QR_DATA_ROOT", tmp.path());
+        let root = DataRoot::isolated();
+        let path = root.path().join("ollama_sidecar.pid");
+        std::fs::write(&path, br#"{"pid":1,"start_time":2}"#).unwrap();
 
-        let models_dir = Path::new("/tmp/quietrabbit-ownership-test-pidfile-stale");
-        let mut child = spawn_sleep(&[("OLLAMA_MODELS", models_dir.to_str().unwrap())], &[]);
-        let pid = child.id();
+        assert!(read_records().is_empty());
+        assert!(!reclaim_orphans(Path::new("/irrelevant"), Path::new(NOT_QR_EXE)).await);
+        assert!(!path.exists(), "the unusable file should be replaced");
+    }
+
+    // -- classify / reclaim -------------------------------------------------
+
+    /// A recorded group whose leader has already exited and been reaped, with
+    /// one provable runner left in it: the shape an abrupt stop leaves behind
+    /// (`serve` dies to PR_SET_PDEATHSIG, its runner does not).
+    struct HeadlessGroup {
+        runner: ChildGuard,
+        record: PidfileRecord,
+    }
+
+    fn headless_group(dir: &Path, runner_name: &str) -> HeadlessGroup {
+        // Separate directories: the runner may share the leader's file name,
+        // and a running executable cannot be overwritten.
+        let (serve_dir, runner_dir) = (dir.join("serve"), dir.join("runner"));
+        std::fs::create_dir_all(&serve_dir).unwrap();
+        std::fs::create_dir_all(&runner_dir).unwrap();
+        let serve = named_copy(&serve_dir, "/bin/sleep", "qr-ollama");
+        let runner = named_copy(&runner_dir, "/bin/sleep", runner_name);
+        let mut leader = spawn_sleep_stub(&serve, 0, &[]);
+        let pgid = leader.id() as libc::pid_t;
+        let runner = spawn_sleep_stub(&runner, pgid, &[]);
+        let record = PidfileRecord {
+            pid: leader.id(),
+            start_time: start_time(leader.id()),
+            pgid,
+            owner_pid: dead_pid(),
+            owner_start_time: 1,
+        };
+        leader.kill_and_wait();
+        HeadlessGroup { runner, record }
+    }
+
+    #[tokio::test]
+    async fn reclaim_kills_an_orphaned_runner_in_a_headless_recorded_group() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let _root = DataRoot::isolated();
+        let dir = tempfile::tempdir().unwrap();
+        let g = headless_group(dir.path(), "llama-server");
+        write_records(std::slice::from_ref(&g.record));
+
+        let signalled =
+            reclaim_orphans(Path::new("/irrelevant-models"), Path::new(NOT_QR_EXE)).await;
+
+        assert!(signalled);
+        assert!(is_effectively_dead(g.runner.id()));
+        assert!(read_records().is_empty(), "a reclaimed group's record goes");
+    }
+
+    /// The headline test of items.id=668: a process named `ollama` with
+    /// `OLLAMA_MODELS` set and an argument under `models_dir`, and a `sleep`
+    /// shell with an argument under `models_dir`, are untouched while a real
+    /// orphan in the recorded group is reclaimed.
+    #[tokio::test]
+    async fn reclaim_never_touches_lookalikes_outside_the_recorded_group() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let _root = DataRoot::isolated();
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("ollama_models");
+        let models = models_dir.to_str().unwrap();
+        let blob = models_dir.join("blobs/sha256-fake");
+
+        let sh_as_ollama = named_copy(dir.path(), "/bin/sh", "ollama");
+        let user_ollama = spawn_sleep_as(
+            &sh_as_ollama,
+            &[("OLLAMA_MODELS", models)],
+            &[blob.to_str().unwrap()],
+        );
+        let user_tool = spawn_sleep(&[], &[blob.to_str().unwrap()]);
+        let g = headless_group(dir.path(), "qr-ollama");
+        write_records(std::slice::from_ref(&g.record));
+
+        assert!(reclaim_orphans(&models_dir, Path::new(NOT_QR_EXE)).await);
+
+        assert!(
+            is_effectively_dead(g.runner.id()),
+            "the orphan is reclaimed"
+        );
+        assert!(
+            !is_effectively_dead(user_ollama.id()),
+            "a process named ollama with OLLAMA_MODELS and an arg under models_dir"
+        );
+        assert!(
+            !is_effectively_dead(user_tool.id()),
+            "a shell with an arg under models_dir"
+        );
+    }
+
+    /// No record, no signal: the sweep over every process on the machine is
+    /// gone, so even a lookalike that would have passed the old proof is
+    /// safe when nothing is recorded.
+    #[tokio::test]
+    async fn reclaim_with_no_record_signals_nothing() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let _root = DataRoot::isolated();
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("ollama_models");
+        let orphan_like = named_copy(dir.path(), "/bin/sh", "qr-ollama");
+        let lookalike = spawn_sleep_as(
+            &orphan_like,
+            &[("OLLAMA_MODELS", models_dir.to_str().unwrap())],
+            &[models_dir.join("blobs/x").to_str().unwrap()],
+        );
+
+        assert!(!reclaim_orphans(&models_dir, Path::new(NOT_QR_EXE)).await);
+        assert!(!is_effectively_dead(lookalike.id()));
+    }
+
+    #[tokio::test]
+    async fn reclaim_in_a_mixed_headless_group_spares_the_unrelated_member() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let _root = DataRoot::isolated();
+        let dir = tempfile::tempdir().unwrap();
+        let g = headless_group(dir.path(), "llama-server");
+        let stranger = named_copy(dir.path(), "/bin/sleep", "some-shell");
+        let stranger = spawn_sleep_stub(&stranger, g.record.pgid, &[]);
+        write_records(std::slice::from_ref(&g.record));
+
+        assert!(reclaim_orphans(Path::new("/irrelevant"), Path::new(NOT_QR_EXE)).await);
+
+        assert!(is_effectively_dead(g.runner.id()));
+        assert!(!is_effectively_dead(stranger.id()));
+    }
+
+    #[tokio::test]
+    async fn recorded_pid_with_a_different_start_time_is_untouched() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let _root = DataRoot::isolated();
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("ollama_models");
+        let serve = named_copy(dir.path(), "/bin/sleep", "qr-ollama");
+        // A live, otherwise provable leader (right exe, right OLLAMA_MODELS,
+        // orphaned from the "QR" below) -- only its start_time is wrong, the
+        // "pid reused since the record was written" case.
+        let leader = spawn_sleep_stub(
+            &serve,
+            0,
+            &[("OLLAMA_MODELS", models_dir.to_str().unwrap())],
+        );
+        let real = start_time(leader.id());
+        let mut record = PidfileRecord {
+            pid: leader.id(),
+            start_time: real.wrapping_add(999_999),
+            pgid: leader.id() as libc::pid_t,
+            owner_pid: dead_pid(),
+            owner_start_time: 1,
+        };
+
         let sys = fresh_sys();
-        let real_start_time = sys.process(Pid::from_u32(pid)).unwrap().start_time();
+        assert_eq!(
+            classify(&record, &models_dir, Path::new(NOT_QR_EXE), &sys),
+            Verdict::Stale
+        );
+        // Same record with the right start_time is reclaimable, so the
+        // mismatch is what made the difference.
+        record.start_time = real;
+        assert_eq!(
+            classify(&record, &models_dir, Path::new(NOT_QR_EXE), &sys),
+            Verdict::Reclaim
+        );
 
-        let stale_record = PidfileRecord {
-            pid,
-            start_time: real_start_time.wrapping_add(999_999),
-        };
-        assert!(!pidfile_target_is_reclaimable(
-            &stale_record,
-            models_dir,
-            Path::new("/not/actually/quietrabbit"),
-            &sys,
-        ));
-
-        let matching_record = PidfileRecord {
-            pid,
-            start_time: real_start_time,
-        };
-        assert!(pidfile_target_is_reclaimable(
-            &matching_record,
-            models_dir,
-            Path::new("/not/actually/quietrabbit"),
-            &sys,
-        ));
-
-        let _ = child.kill();
-        let _ = child.wait();
-        match saved_root {
-            Some(v) => std::env::set_var("QR_DATA_ROOT", v),
-            None => std::env::remove_var("QR_DATA_ROOT"),
-        }
+        record.start_time = real.wrapping_add(999_999);
+        write_records(&[record]);
+        assert!(!reclaim_orphans(&models_dir, Path::new(NOT_QR_EXE)).await);
+        assert!(!is_effectively_dead(leader.id()));
+        assert!(read_records().is_empty(), "a stale record is dropped");
     }
 
-    // -- reclaim_orphans ------------------------------------------------
+    #[tokio::test]
+    async fn live_leader_is_reclaimed_with_its_runner_when_all_conditions_hold() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let _root = DataRoot::isolated();
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("ollama_models");
+        let serve = named_copy(dir.path(), "/bin/sleep", "qr-ollama");
+        let runner = named_copy(dir.path(), "/bin/sleep", "llama-server");
+        let leader = spawn_sleep_stub(
+            &serve,
+            0,
+            &[("OLLAMA_MODELS", models_dir.to_str().unwrap())],
+        );
+        let pgid = leader.id() as libc::pid_t;
+        let member = spawn_sleep_stub(&runner, pgid, &[]);
+        write_records(&[PidfileRecord {
+            pid: leader.id(),
+            start_time: start_time(leader.id()),
+            pgid,
+            owner_pid: dead_pid(),
+            owner_start_time: 1,
+        }]);
+
+        assert!(reclaim_orphans(&models_dir, Path::new(NOT_QR_EXE)).await);
+
+        assert!(is_effectively_dead(leader.id()));
+        assert!(is_effectively_dead(member.id()));
+        assert!(read_records().is_empty());
+    }
 
     #[tokio::test]
-    async fn reclaim_leaves_a_live_qr_sibling_untouched() {
-        // ENV_MUTEX + an isolated QR_DATA_ROOT: reclaim_orphans() reads and
-        // unconditionally removes the pidfile under QR_DATA_ROOT
-        // (read_pidfile/remove_pidfile). Without this, this test races
-        // write_read_pidfile_roundtrip over the process-wide QR_DATA_ROOT
-        // env var, and -- run against a real checkout with no override --
-        // would read, and then delete, a real pidfile a real running QR
-        // instance just wrote.
+    async fn live_leader_without_models_dir_in_its_environment_is_untouched() {
         let _lock = crate::test_support::ENV_MUTEX.lock().await;
-        let tmp = tempfile::tempdir().unwrap();
-        let saved_root = std::env::var("QR_DATA_ROOT").ok();
-        std::env::set_var("QR_DATA_ROOT", tmp.path());
+        let _root = DataRoot::isolated();
+        let dir = tempfile::tempdir().unwrap();
+        let serve = named_copy(dir.path(), "/bin/sleep", "qr-ollama");
+        let leader = spawn_sleep_stub(&serve, 0, &[]);
+        let record = PidfileRecord {
+            pid: leader.id(),
+            start_time: start_time(leader.id()),
+            pgid: leader.id() as libc::pid_t,
+            owner_pid: dead_pid(),
+            owner_start_time: 1,
+        };
+        write_records(std::slice::from_ref(&record));
 
-        let models_dir = Path::new("/tmp/quietrabbit-ownership-test-reclaim-live");
-        let mut child = spawn_sleep(&[("OLLAMA_MODELS", models_dir.to_str().unwrap())], &[]);
-        let pid = child.id();
+        assert!(!reclaim_orphans(&dir.path().join("ollama_models"), Path::new(NOT_QR_EXE)).await);
+
+        assert!(!is_effectively_dead(leader.id()));
+        assert_eq!(read_records(), vec![record], "an unprovable record is kept");
+    }
+
+    #[tokio::test]
+    async fn live_leader_whose_parent_is_a_live_qr_exe_is_untouched() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let _root = DataRoot::isolated();
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("ollama_models");
+        let serve = named_copy(dir.path(), "/bin/sleep", "qr-ollama");
+        let leader = spawn_sleep_stub(
+            &serve,
+            0,
+            &[("OLLAMA_MODELS", models_dir.to_str().unwrap())],
+        );
+        write_records(&[PidfileRecord {
+            pid: leader.id(),
+            start_time: start_time(leader.id()),
+            pgid: leader.id() as libc::pid_t,
+            owner_pid: dead_pid(),
+            owner_start_time: 1,
+        }]);
+
+        // This test process stands in for "QR": it is the leader's parent.
         let qr_exe = std::env::current_exe().unwrap();
+        assert!(!reclaim_orphans(&models_dir, &qr_exe).await);
+        assert!(!is_effectively_dead(leader.id()));
+    }
 
-        reclaim_orphans(models_dir, &qr_exe).await;
-
-        let sys = fresh_sys();
-        assert!(
-            sys.process(Pid::from_u32(pid)).is_some(),
-            "a sidecar whose parent is this live QR-shaped test process must not be reclaimed"
+    /// A sibling QR (items.id=667 is not built, so two can run on one data
+    /// dir) owns a live sidecar group: never touched, record kept.
+    #[tokio::test]
+    async fn a_live_owner_means_a_live_sibling_and_nothing_is_signalled() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let _root = DataRoot::isolated();
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("ollama_models");
+        let serve = named_copy(dir.path(), "/bin/sleep", "qr-ollama");
+        let leader = spawn_sleep_stub(
+            &serve,
+            0,
+            &[("OLLAMA_MODELS", models_dir.to_str().unwrap())],
         );
-        let _ = child.kill();
-        let _ = child.wait();
-        match saved_root {
-            Some(v) => std::env::set_var("QR_DATA_ROOT", v),
-            None => std::env::remove_var("QR_DATA_ROOT"),
-        }
+        // Every other condition says "reclaimable"; only the owner differs.
+        let record = PidfileRecord {
+            pid: leader.id(),
+            start_time: start_time(leader.id()),
+            pgid: leader.id() as libc::pid_t,
+            owner_pid: std::process::id(),
+            owner_start_time: start_time(std::process::id()),
+        };
+        write_records(std::slice::from_ref(&record));
+
+        assert!(!reclaim_orphans(&models_dir, Path::new(NOT_QR_EXE)).await);
+
+        assert!(!is_effectively_dead(leader.id()));
+        assert_eq!(read_records(), vec![record], "the sibling's record is kept");
     }
 
     #[tokio::test]
-    async fn reclaim_kills_a_genuine_orphan() {
-        // ENV_MUTEX + an isolated QR_DATA_ROOT -- see
-        // reclaim_leaves_a_live_qr_sibling_untouched's own comment above.
+    async fn an_owner_with_a_reused_pid_does_not_count_as_alive() {
         let _lock = crate::test_support::ENV_MUTEX.lock().await;
-        let tmp = tempfile::tempdir().unwrap();
-        let saved_root = std::env::var("QR_DATA_ROOT").ok();
-        std::env::set_var("QR_DATA_ROOT", tmp.path());
+        let _root = DataRoot::isolated();
+        let dir = tempfile::tempdir().unwrap();
+        let g = headless_group(dir.path(), "llama-server");
+        // Owner pid is a live process (this one), but not the one that
+        // spawned the sidecar: its start_time differs.
+        let mut record = g.record.clone();
+        record.owner_pid = std::process::id();
+        record.owner_start_time = start_time(std::process::id()).wrapping_add(999_999);
+        write_records(&[record]);
 
-        let models_dir = Path::new("/tmp/quietrabbit-ownership-test-reclaim-orphan");
-        // Backgrounds a grandchild and prints its pid, then the wrapper
-        // shell exits immediately -- the grandchild is reparented away
-        // from it before this test ever looks, a real (if deliberately
-        // induced) orphan rather than a simulated one.
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "OLLAMA_MODELS={} sleep 5 & echo $!",
-                models_dir.display()
-            ))
-            .output()
-            .expect("failed to spawn orphan-producing wrapper");
-        let orphan_pid: u32 = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .parse()
-            .expect("wrapper should have printed the backgrounded pid");
-
-        // Not QR's own exe -- this orphan's real parent is already gone by
-        // construction, so is_orphaned is true via that branch regardless.
-        reclaim_orphans(models_dir, Path::new("/not/actually/quietrabbit")).await;
-
-        let sys = fresh_sys();
-        assert!(
-            sys.process(Pid::from_u32(orphan_pid)).is_none(),
-            "a genuine orphan under QR's own models dir should have been reclaimed"
-        );
-        match saved_root {
-            Some(v) => std::env::set_var("QR_DATA_ROOT", v),
-            None => std::env::remove_var("QR_DATA_ROOT"),
-        }
-    }
-
-    /// items.id=586 fix-up (Jason), through the full `reclaim_orphans` path
-    /// rather than calling `kill_process_group` directly -- proves the
-    /// mixed-group safety rule is actually wired into both the broad sweep
-    /// and `kill_process_group` together, not just correct in isolation.
-    /// Mirrors today's real pre-fix shape: the group leader is an
-    /// unrelated process (standing in for the launching shell/`cargo-
-    /// tauri`), and a provably-QR, orphaned member shares that same group.
-    #[tokio::test]
-    async fn reclaim_through_mixed_group_spares_the_unrelated_leader() {
-        // ENV_MUTEX + an isolated QR_DATA_ROOT -- see
-        // reclaim_leaves_a_live_qr_sibling_untouched's own comment above.
-        let _lock = crate::test_support::ENV_MUTEX.lock().await;
-        let tmp = tempfile::tempdir().unwrap();
-        let saved_root = std::env::var("QR_DATA_ROOT").ok();
-        std::env::set_var("QR_DATA_ROOT", tmp.path());
-
-        let models_dir = Path::new("/tmp/quietrabbit-ownership-test-reclaim-mixed-group");
-
-        let mut leader = spawn_blocked_sh(0, &[]);
-        let leader_pid = leader.id();
-        let pgid = current_pgid(Pid::from_u32(leader_pid)).expect("leader must have a pgid");
-
-        let mut orphan = spawn_blocked_sh(pgid, &[("OLLAMA_MODELS", models_dir.to_str().unwrap())]);
-        let orphan_pid = orphan.id();
-
-        // Not QR's own exe -- this test process is the orphan's real
-        // parent, so is_orphaned is true via the "not qr_exe_path" branch;
-        // the leader is never a reclaim target at all (fails is_qr_owned),
-        // so the broad sweep only ever names the orphan's pgid.
-        reclaim_orphans(models_dir, Path::new("/not/actually/quietrabbit")).await;
-
-        let sys = fresh_sys();
-        assert!(
-            is_effectively_dead(&sys, Pid::from_u32(orphan_pid)),
-            "the provably-QR orphan should have been reclaimed"
-        );
-        assert!(
-            !is_effectively_dead(&sys, Pid::from_u32(leader_pid)),
-            "the unrelated group leader must survive reclaim -- only the member was signaled"
-        );
-
-        let _ = orphan.wait();
-        let _ = leader.kill();
-        let _ = leader.wait();
-        match saved_root {
-            Some(v) => std::env::set_var("QR_DATA_ROOT", v),
-            None => std::env::remove_var("QR_DATA_ROOT"),
-        }
+        assert!(reclaim_orphans(Path::new("/irrelevant"), Path::new(NOT_QR_EXE)).await);
+        assert!(is_effectively_dead(g.runner.id()));
     }
 }

@@ -335,21 +335,20 @@ mod tests {
             .expect("wait() should succeed");
         assert!(status.success());
 
-        // kill_process_group (items.id=586 fix-up) only signals a group it
-        // can prove is entirely QR's own -- give this child a matching
-        // OLLAMA_MODELS so the group-kill path actually fires here, rather
+        // kill_process_group (items.id=668) only signals a group member whose
+        // executable is named like QR's own sidecar -- give this child that
+        // name (a copy of `sleep`, so the process image really is called
+        // `qr-ollama`) so the group-kill path actually fires here, rather
         // than falling back to "nothing provably ours in this group".
-        let models_dir = std::path::Path::new("/tmp/quietrabbit-spawn-thread-test-models");
-        let long_lived = spawn_with_pdeathsig(
-            "/bin/sh",
-            vec!["-c".into(), "sleep 30".into()],
-            vec![("OLLAMA_MODELS".into(), models_dir.as_os_str().to_owned())],
-        )
-        .await
-        .expect("spawn via dedicated thread should succeed");
+        let dir = tempfile::tempdir().unwrap();
+        let stub = crate::test_support::procs::named_copy(dir.path(), "/bin/sleep", "qr-ollama");
+        let long_lived = spawn_with_pdeathsig(stub.as_os_str(), vec!["30".into()], vec![])
+            .await
+            .expect("spawn via dedicated thread should succeed");
+        let _kill = crate::test_support::KillGroupOnDrop(long_lived.pgid);
         let pid = long_lived.pid;
 
-        crate::ollama_ownership::kill_process_group(long_lived.pgid, models_dir).await;
+        crate::ollama_ownership::kill_process_group(long_lived.pgid).await;
         let status = tokio::time::timeout(std::time::Duration::from_secs(5), long_lived.wait())
             .await
             .expect("wait() after group-kill must not hang")

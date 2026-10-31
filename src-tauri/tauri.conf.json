@@ -36,7 +36,7 @@
     "targets": "all",
     "icon": [],
     "externalBin": [
-      "binaries/ollama"
+      "binaries/qr-ollama"
     ],
     "resources": {
       "resources/ggml-backends/*": "ggml-backends/"

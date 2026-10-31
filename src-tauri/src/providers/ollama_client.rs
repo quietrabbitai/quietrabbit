@@ -26,8 +26,8 @@
 //! true only once that module has itself confirmed the sidecar it started
 //! is ready, and false again the moment it observes that sidecar has died.
 //! Without this, `OllamaClient` would otherwise independently re-probe
-//! port `QR_OLLAMA_PORT` on every call with no knowledge of whether QR
-//! started what's answering there -- confirmed concretely this session
+//! the sidecar port (`ollama_sidecar::port()`) on every call with no
+//! knowledge of whether QR started what's answering there -- confirmed concretely this session
 //! (not hypothetically): after a `cargo tauri dev` watcher restart left an
 //! old `ollama serve` instance still bound to the port, the *new* process's
 //! own `ensure_available()` correctly logged "sidecar failed to start or
@@ -1323,7 +1323,7 @@ mod tests {
     async fn base_url_ignores_ollama_host_and_port() {
         let _lock = crate::test_support::ENV_MUTEX.lock().await;
         crate::ollama_sidecar::force_port_for_test(None);
-        let expected = format!("http://127.0.0.1:{}", crate::ollama_sidecar::QR_OLLAMA_PORT);
+        let expected = format!("http://127.0.0.1:{}", crate::ollama_sidecar::port());
         assert_eq!(base_url(), expected);
 
         let _host = EnvVarGuard::set("OLLAMA_HOST", "192.168.0.2");
@@ -1342,11 +1342,7 @@ mod tests {
         let url = base_url();
         let parsed = reqwest::Url::parse(&url).expect("base_url must parse as a URL");
         assert_eq!(parsed.host_str(), Some("127.0.0.1"));
-        assert_eq!(
-            parsed.port(),
-            Some(crate::ollama_sidecar::QR_OLLAMA_PORT),
-            "{url}"
-        );
+        assert_eq!(parsed.port(), Some(crate::ollama_sidecar::port()), "{url}");
     }
 
     /// The port comes from the sidecar module, not a literal in the client.

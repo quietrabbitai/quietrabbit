@@ -1,5 +1,7 @@
 # Quiet Rabbit — Claude Code Context
-# Last updated: October 30, 2026 (items.id=616: Ollama section only -- client
+# Last updated: October 31, 2026 (items.id=668: Ollama section only -- sidecar
+# name, recorded-group ownership proof, port fallback). Before that,
+# October 30, 2026 (items.id=616: Ollama section only -- client
 # port and sidecar environment). Before that, October 25, 2026 (items.id=653
 # docs pass -- Ollama and Dev
 # Environment per decisions.id=840 and 863, version, R1 Focuses, tier
@@ -136,10 +138,41 @@ its own models directory (QR_DATA_ROOT/ollama_models). Port 11434 is probed
 only to log a GPU/RAM contention warning; it never gates or redirects the
 sidecar.
 
-Built today (ollama_sidecar.rs): the sidecar binds 127.0.0.1:21434
-(QR_OLLAMA_PORT), fixed, no fallback. Startup reclaims leftover QR orphans
-(items.id=586), identified by environment variable and command-line match under
-ollama_models.
+Built today (ollama_sidecar.rs, ollama_ownership.rs; items.id=668):
+- Port: the sidecar prefers 127.0.0.1:21434 and falls back through 21435-21443
+  in order (PORT_CANDIDATES), no manual port setting. Each attempt spawns with
+  OLLAMA_HOST=127.0.0.1:{port} and polls /api/tags only while its own child is
+  alive; a child that exits means the port is not ours, so the next is tried,
+  and a 2xx that arrives after the child died is rejected. Only an EXIT moves
+  to the next port: a child still alive after the 5 s window without answering
+  (a slow start, e.g. GPU discovery) is stopped (provable members only), no
+  other port is tried for that binary, and the next candidate binary is tried.
+  A child that is alive but not provably QR's is never waited on indefinitely:
+  it is left alone and its record is kept. All ten ports failing gives
+  Unavailable and an error in the log naming the ports tried; nothing is killed
+  and no notice is shown (a user-facing notice is a Chat-BRAND design item).
+  The winning port is ACTIVE_PORT, published (Release) before the trust flag and
+  read through ollama_sidecar::port(). The port list is a field on
+  OllamaSidecar so tests inject their own; no test binds 21434-21443.
+- Name: the bundled binary is qr-ollama (externalBin binaries/qr-ollama, stub
+  src-tauri/binaries/qr-ollama-<triple>). The debug-only PATH fallback still
+  launches the system `ollama` (items.id=583 retires it).
+- Ownership proof: QR signals a process only if it is a live, non-zombie member
+  of a process group QR recorded itself AND its exe file name is qr-ollama or
+  llama-server (plus `ollama` in debug builds only); an unreadable exe() is not
+  provable and is never signalled. Nothing matched by command-line argument or
+  environment alone is ever signalled, and the broad sweep over all processes is
+  gone. The group is recorded at spawn, before readiness, in
+  QR_DATA_ROOT/ollama_sidecar.pid, a JSON array of {pid, start_time, pgid,
+  owner_pid, owner_start_time} (the old single-object format is ignored). Reclaim
+  skips a group whose owner QR is alive, drops a record whose leader pid was
+  reused (start_time differs), and for a live leader also requires the exe name,
+  OLLAMA_MODELS equal to models_dir (env is an extra check, never sufficient) and
+  is_orphaned; a headless group (leader gone, runner left by an abrupt stop) is
+  reclaimed by member name. stop() and liveness_tick() use the same
+  kill_process_group and keep the record if a provable member survives. The
+  residual pid-reuse risk is documented in ollama_ownership.rs.
+- Startup reclaim (items.id=586) therefore touches only recorded groups.
 OllamaClient::base_url() is always http://127.0.0.1:{ollama_sidecar::port()}
 and never reads OLLAMA_HOST or OLLAMA_PORT (items.id=616); take the port from
 ollama_sidecar::port(), never a literal. The sidecar does not inherit QR's
@@ -154,13 +187,13 @@ ollama_sidecar::force_port_for_test / ForcedPortGuard, not the environment.
 
 Decided in decisions.id=863, NOT built yet -- do not assume any of it in code:
 - single instance: a second launch focuses the first window and exits
-  (items.id=667, ready);
-- the sidecar binary is named qr-ollama and QR signals only processes it can
-  prove are its own (recorded process group, not command-line match)
-  (items.id=668, ready, depends on items.id=616);
-- port preferred 21434, fallback through 21435-21443, failing only if all ten
-  are busy; no manual port setting in R1 (items.id=668).
-Related and still open: the bundled binary is a stub (items.id=583, ready).
+  (items.id=667, ready).
+
+Related and still open: the bundled binary is a stub and the runner layout of a
+packaged build is unverified, so the member name list in ollama_ownership.rs
+must be revisited there (items.id=583, ready). Until items.id=667 lands a second
+QR instance on the same data directory starts a second sidecar on the next free
+port and its record is kept apart from the first's (neither is signalled).
 
 ## Naming Architecture — term map
 
