@@ -93,6 +93,12 @@ path relative to CARGO_MANIFEST_DIR (compile-time, fixed to src-tauri),
 not CWD, so this no longer breaks quick-ask/chat under `cargo tauri dev` —
 but keep it in mind if you add other CWD-relative paths in this codebase.
 
+On Linux, SIGINT, SIGTERM and SIGHUP exit the app through the window-close path
+(glib unix signal sources installed in main.rs's RunEvent::Ready arm after
+initialize_cef; items.id=842), so Ctrl-C under `cargo tauri dev` stops the app
+and its sidecar. A kill of cargo-tauri alone never signals the app (accepted,
+dev-only limit). Windows and macOS equivalents are not built (items.id=700).
+
 `cargo tauri dev` does not enforce the CSP (tauri-2.11.2 source), so verify CSP changes with `cargo tauri build --debug --no-bundle` and the devtools console filtered on "Refused to".
 
 Key commands:

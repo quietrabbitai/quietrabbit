@@ -920,8 +920,11 @@ async fn async_main() {
             // This call is the hardening -- synchronous, so it has
             // definitely finished (sidecar and any runner it loaded killed,
             // pidfile removed) before `_exit(0)` below, regardless of how
-            // `RunEvent::Exit` was reached (window close, Ctrl-C, a signal
-            // tao translates into this same path). `block_in_place` +
+            // `RunEvent::Exit` was reached (window close, or on Linux
+            // SIGINT/SIGTERM/SIGHUP via the glib sources installed in the
+            // `RunEvent::Ready` arm below, items.id=842; tao installs no
+            // signal handling of its own, and before that item Chromium/CEF
+            // swallowed all three). `block_in_place` +
             // `Handle::current().block_on()` is the same pattern this
             // file's own `setup()` already uses twice to call async code
             // synchronously from within this same nested
@@ -1005,8 +1008,46 @@ async fn async_main() {
                 }
                 glib::ControlFlow::Continue
             });
+
+            // items.id=842: SIGINT, SIGTERM and SIGHUP leave through the
+            // same path a window close does (ExitRequested, RunEvent::Exit,
+            // the synchronous sidecar stop above). Installed here, after
+            // `initialize_cef` returned, because Chromium installs its own
+            // sigaction for these signals during CEF init and the later
+            // install wins. glib's unix signal source runs the closure on
+            // the GTK main loop, never inside the raw signal handler, so
+            // `exit` is safe to call from it.
+            #[cfg(target_os = "linux")]
+            install_exit_signal_handlers(app_handle.clone());
         }
     });
+}
+
+/// Signals that stop the app through the normal exit path (items.id=842).
+#[cfg(target_os = "linux")]
+const EXIT_SIGNALS: [i32; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+
+/// Set by the first exit signal; a later one (any of the three) finds it set
+/// and returns without calling `exit` again while the stop is in progress.
+#[cfg(target_os = "linux")]
+static EXIT_SIGNALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Must run on the GTK main thread (glib panics otherwise); the `Ready`
+/// arm of `app.run` does.
+#[cfg(target_os = "linux")]
+fn install_exit_signal_handlers(app_handle: tauri::AppHandle) {
+    for signum in EXIT_SIGNALS {
+        let app_handle = app_handle.clone();
+        glib::source::unix_signal_add_local(signum, move || {
+            if EXIT_SIGNALLED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                log::info!("main: signal {signum} while already exiting, ignored");
+            } else {
+                log::info!("main: signal {signum} received, exiting through RunEvent::Exit");
+                app_handle.exit(0);
+            }
+            glib::ControlFlow::Continue
+        });
+    }
 }
 
 #[cfg(test)]
