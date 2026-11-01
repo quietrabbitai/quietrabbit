@@ -560,6 +560,61 @@ pub async fn run_classify_blocking(
 }
 
 // ---------------------------------------------------------------------------
+// Status for the UI (always compiled, live or stub -- items.id=618)
+// ---------------------------------------------------------------------------
+
+/// Whether the outbound privacy check can run, as the frontend sees it.
+/// 618 produces `Ready` and `Unavailable` only; `Downloading` and `Verifying`
+/// are for items.id=678's first-login model download, which feeds this type.
+/// Retry is a UI affordance derived from the variant (not retryable for
+/// `NotCompiledIn`), so the type carries no retry field.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, specta::Type)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PrivacyFilterStatus {
+    Ready,
+    /// `percent` is None while the total size is not yet known.
+    Downloading {
+        percent: Option<u8>,
+    },
+    Verifying,
+    Unavailable {
+        reason: PrivacyFilterUnavailableReason,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, specta::Type)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivacyFilterUnavailableReason {
+    /// The library was not linked at build time (PRIVACY_FILTER_LIB_DIR unset).
+    NotCompiledIn,
+    /// Compiled in, but the model is missing or failed to load.
+    ModelUnavailable,
+}
+
+/// The status `get_health` reports. The first call loads the 1.6 GB model
+/// (is_available latches a load failure for the process), so it runs on the
+/// blocking pool, never on the async executor.
+pub async fn status() -> PrivacyFilterStatus {
+    let available = tokio::task::spawn_blocking(is_available)
+        .await
+        .unwrap_or(false);
+    status_from(cfg!(privacy_filter_available), available)
+}
+
+/// Pure mapping from "compiled in" and "loaded" to a status.
+fn status_from(compiled_in: bool, available: bool) -> PrivacyFilterStatus {
+    match (compiled_in, available) {
+        (_, true) => PrivacyFilterStatus::Ready,
+        (true, false) => PrivacyFilterStatus::Unavailable {
+            reason: PrivacyFilterUnavailableReason::ModelUnavailable,
+        },
+        (false, false) => PrivacyFilterStatus::Unavailable {
+            reason: PrivacyFilterUnavailableReason::NotCompiledIn,
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -581,6 +636,82 @@ mod tests {
         assert!(classify_result.is_err());
         let msg = classify_result.unwrap_err();
         assert!(msg.contains("not compiled in"), "unexpected error: {msg}");
+    }
+
+    // -- PrivacyFilterStatus (items.id=618) ----------------------------------
+
+    #[test]
+    fn status_from_maps_every_combination() {
+        use PrivacyFilterUnavailableReason::*;
+        assert_eq!(status_from(true, true), PrivacyFilterStatus::Ready);
+        assert_eq!(status_from(false, true), PrivacyFilterStatus::Ready);
+        assert_eq!(
+            status_from(true, false),
+            PrivacyFilterStatus::Unavailable {
+                reason: ModelUnavailable
+            }
+        );
+        assert_eq!(
+            status_from(false, false),
+            PrivacyFilterStatus::Unavailable {
+                reason: NotCompiledIn
+            }
+        );
+    }
+
+    #[test]
+    fn status_serializes_to_the_bindings_contract() {
+        let json = |s: &PrivacyFilterStatus| serde_json::to_string(s).unwrap();
+        assert_eq!(json(&PrivacyFilterStatus::Ready), r#"{"kind":"ready"}"#);
+        assert_eq!(
+            json(&PrivacyFilterStatus::Downloading { percent: Some(42) }),
+            r#"{"kind":"downloading","percent":42}"#
+        );
+        assert_eq!(
+            json(&PrivacyFilterStatus::Downloading { percent: None }),
+            r#"{"kind":"downloading","percent":null}"#
+        );
+        assert_eq!(
+            json(&PrivacyFilterStatus::Verifying),
+            r#"{"kind":"verifying"}"#
+        );
+        assert_eq!(
+            json(&PrivacyFilterStatus::Unavailable {
+                reason: PrivacyFilterUnavailableReason::NotCompiledIn
+            }),
+            r#"{"kind":"unavailable","reason":"not_compiled_in"}"#
+        );
+        assert_eq!(
+            json(&PrivacyFilterStatus::Unavailable {
+                reason: PrivacyFilterUnavailableReason::ModelUnavailable
+            }),
+            r#"{"kind":"unavailable","reason":"model_unavailable"}"#
+        );
+    }
+
+    #[cfg(not(privacy_filter_available))]
+    #[tokio::test]
+    async fn stub_status_is_not_compiled_in_and_agrees_with_is_available() {
+        assert!(!is_available());
+        assert_eq!(
+            status().await,
+            PrivacyFilterStatus::Unavailable {
+                reason: PrivacyFilterUnavailableReason::NotCompiledIn
+            }
+        );
+    }
+
+    #[cfg(privacy_filter_available)]
+    #[tokio::test]
+    async fn live_status_is_ready_iff_is_available() {
+        let expected = if is_available() {
+            PrivacyFilterStatus::Ready
+        } else {
+            PrivacyFilterStatus::Unavailable {
+                reason: PrivacyFilterUnavailableReason::ModelUnavailable,
+            }
+        };
+        assert_eq!(status().await, expected);
     }
 
     fn ent() -> PfEntityDecoded {

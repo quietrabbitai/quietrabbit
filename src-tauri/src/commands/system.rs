@@ -31,6 +31,7 @@ use specta::Type;
 use tokio::sync::RwLock;
 
 use crate::auth::registry::{key_hex, KeyRegistry};
+use crate::conductor::privacy::privacy_filter::{self, PrivacyFilterStatus};
 use crate::hardware_probe::{self, HardwareProfile, RamClass};
 use crate::ollama_sidecar::SidecarStartup;
 use crate::persistence::integration_keys_store::{self, QR_HOSTED_KEY_TYPE};
@@ -71,6 +72,10 @@ pub struct HealthResponse {
     /// -- get_health must stay callable pre-login (Ollama status has no such
     /// requirement).
     pub qr_hosted_configured: bool,
+    /// items.id=618: whether the outbound privacy check can run. The first
+    /// call loads the model (privacy_filter::status runs it on the blocking
+    /// pool). Ready / Downloading / Verifying / Unavailable{reason}.
+    pub privacy_filter: PrivacyFilterStatus,
 }
 
 #[derive(Debug, Serialize, Type)]
@@ -98,12 +103,14 @@ pub async fn get_health(
     let ollama = client.check_health().await;
     let startup = sidecar_startup.read().await.clone();
     let qr_hosted_configured = qr_hosted_is_configured(&pool, &key_registry).await?;
+    let privacy_filter = privacy_filter::status().await;
 
     Ok(HealthResponse {
         ollama,
         ollama_source: startup.source.as_str().to_owned(),
         system_ollama_contention: startup.system_ollama_contention,
         qr_hosted_configured,
+        privacy_filter,
     })
 }
 

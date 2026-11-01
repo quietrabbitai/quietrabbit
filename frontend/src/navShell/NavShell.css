@@ -23,6 +23,16 @@
   color: var(--text-muted);
 }
 
+/* items.id=618: placeholder strip for a Privacy Filter that cannot run.
+ * Styling, placement and severity are Chat-BRAND's to decide. */
+.nav-shell__privacy-check {
+  display: block;
+  margin: 0;
+  padding: 6px 12px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
 /* items.id=769: Account security corner button. Fixed to the bottom-right
  * corner so it never shifts the dock's layout. NOTE: a native Cloud Chat pane
  * is composited above the webview, so where it overlaps this corner the button

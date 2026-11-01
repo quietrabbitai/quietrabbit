@@ -1522,6 +1522,12 @@ export type HealthResponse = {
 	 *  requirement).
 	 */
 	qr_hosted_configured: boolean,
+	/**
+	 *  items.id=618: whether the outbound privacy check can run. The first
+	 *  call loads the model (privacy_filter::status runs it on the blocking
+	 *  pool). Ready / Downloading / Verifying / Unavailable{reason}.
+	 */
+	privacy_filter: PrivacyFilterStatus,
 };
 
 /**
@@ -2016,6 +2022,23 @@ export type PriceTierInput = {
  *  documentation_gate's freeform research text.
  */
 export type PrivacyCommitmentBasis = "contractual" | "policy_only";
+
+/**
+ *  Whether the outbound privacy check can run, as the frontend sees it.
+ *  618 produces `Ready` and `Unavailable` only; `Downloading` and `Verifying`
+ *  are for items.id=678's first-login model download, which feeds this type.
+ *  Retry is a UI affordance derived from the variant (not retryable for
+ *  `NotCompiledIn`), so the type carries no retry field.
+ */
+export type PrivacyFilterStatus = { kind: "ready" } | 
+/**  `percent` is None while the total size is not yet known. */
+{ kind: "downloading"; percent: number | null } | { kind: "verifying" } | { kind: "unavailable"; reason: PrivacyFilterUnavailableReason };
+
+export type PrivacyFilterUnavailableReason = 
+/**  The library was not linked at build time (PRIVACY_FILTER_LIB_DIR unset). */
+"not_compiled_in" | 
+/**  Compiled in, but the model is missing or failed to load. */
+"model_unavailable";
 
 /**
  *  privacy_guardian_default_level: deliberately parallel to ReviewTier's

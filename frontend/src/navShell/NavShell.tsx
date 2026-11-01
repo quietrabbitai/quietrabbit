@@ -26,10 +26,11 @@
 import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import './NavShell.css'
-import { commands, type PersonaInfo } from '../bindings'
+import { commands, type PersonaInfo, type PrivacyFilterStatus } from '../bindings'
 import { AccountSecurityScreen } from '../auth/AccountSecurityScreen'
 import type { SignOutNotice } from '../auth/rotationErrors'
 import { WorkspaceShell } from './WorkspaceShell'
+import { showPrivacyCheckBanner } from './privacyCheckBanner'
 import {
   DEFAULT_NAV_STATE,
   getCurrentUserId,
@@ -55,6 +56,10 @@ export function NavShell({ onSignOut }: NavShellProps) {
   const [navState, setNavState] = useState<NavState>(DEFAULT_NAV_STATE)
   const [personas, setPersonas] = useState<PersonaInfo[]>([])
   const [personaError, setPersonaError] = useState<string | null>(null)
+  // items.id=618: one read on mount; no live update until items.id=678 adds an
+  // event listener. A failed get_health leaves this null (no banner): the
+  // status is unknown, not known-unavailable.
+  const [privacyFilter, setPrivacyFilter] = useState<PrivacyFilterStatus | null>(null)
 
   useEffect(() => {
     // NavShell only mounts once App.tsx's login gate has confirmed a
@@ -69,6 +74,12 @@ export function NavShell({ onSignOut }: NavShellProps) {
       } else {
         setPersonaError(result.error)
       }
+    })
+  }, [])
+
+  useEffect(() => {
+    commands.getHealth().then((result) => {
+      if (result.status === 'ok') setPrivacyFilter(result.data.privacy_filter)
     })
   }, [])
 
@@ -96,6 +107,13 @@ export function NavShell({ onSignOut }: NavShellProps) {
         <p role="alert" className="nav-shell__persona-load-error">
           {t('navShell.personaLoadError', { message: personaError })}
         </p>
+      )}
+      {showPrivacyCheckBanner(privacyFilter) && (
+        // CHAT-BRAND REVIEW: copy, placement (strip vs corner chip), per-state
+        // wording, severity and the Cloud Chat native-pane z-order.
+        <output className="nav-shell__privacy-check">
+          {t('navShell.privacyCheck.placeholder')}
+        </output>
       )}
       <div className="nav-shell__content">
         <WorkspaceShell
