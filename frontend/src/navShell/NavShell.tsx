@@ -24,13 +24,20 @@
 // items.id=400's chain lands) -- not silently absorbed or worked around.
 
 import { useEffect, useState } from 'react'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { useTranslation } from 'react-i18next'
 import './NavShell.css'
 import { commands, type PersonaInfo, type PrivacyFilterStatus } from '../bindings'
 import { AccountSecurityScreen } from '../auth/AccountSecurityScreen'
 import type { SignOutNotice } from '../auth/rotationErrors'
 import { WorkspaceShell } from './WorkspaceShell'
-import { showPrivacyCheckBanner } from './privacyCheckBanner'
+import { showPrivacyCheckBanner, showPrivacyRetry } from './privacyCheckBanner'
+import {
+  effectOfProgress,
+  isPrivacyModelProgress,
+  mergeHealthRead,
+  TASK_PROGRESS_EVENT,
+} from './privacyModelProgress'
 import {
   DEFAULT_NAV_STATE,
   getCurrentUserId,
@@ -56,9 +63,10 @@ export function NavShell({ onSignOut }: NavShellProps) {
   const [navState, setNavState] = useState<NavState>(DEFAULT_NAV_STATE)
   const [personas, setPersonas] = useState<PersonaInfo[]>([])
   const [personaError, setPersonaError] = useState<string | null>(null)
-  // items.id=618: one read on mount; no live update until items.id=678 adds an
-  // event listener. A failed get_health leaves this null (no banner): the
-  // status is unknown, not known-unavailable.
+  // items.id=618, 678: a read on mount, then live updates from the model setup
+  // task's "task-progress" events (see privacyModelProgress.ts). A failed
+  // get_health leaves this null (no banner): the status is unknown, not
+  // known-unavailable.
   const [privacyFilter, setPrivacyFilter] = useState<PrivacyFilterStatus | null>(null)
 
   useEffect(() => {
@@ -77,11 +85,54 @@ export function NavShell({ onSignOut }: NavShellProps) {
     })
   }, [])
 
+  // The listener is registered BEFORE the first read, so no event can fall in
+  // the gap; a read that answers after an event arrived is ignored as stale. The
+  // cancelled flag covers React StrictMode's mount-unmount-mount: listen()
+  // resolves asynchronously, so a cleanup that runs first must detach the
+  // listener the moment it arrives.
   useEffect(() => {
-    commands.getHealth().then((result) => {
-      if (result.status === 'ok') setPrivacyFilter(result.data.privacy_filter)
+    let cancelled = false
+    let unlisten: UnlistenFn | undefined
+    let eventSeen = false
+    const readHealth = (authoritative: boolean) => {
+      commands.getHealth().then((result) => {
+        if (cancelled || result.status !== 'ok') return
+        const read = result.data.privacy_filter
+        setPrivacyFilter((current) => mergeHealthRead(eventSeen && !authoritative, current, read))
+      })
+    }
+    listen<unknown>(TASK_PROGRESS_EVENT, (event) => {
+      if (!isPrivacyModelProgress(event.payload)) return
+      const effect = effectOfProgress(event.payload)
+      if (effect.kind === 'ignore') return
+      eventSeen = true
+      if (effect.kind === 'status') setPrivacyFilter(effect.status)
+      else readHealth(true)
     })
+      .then((fn) => {
+        if (cancelled) fn()
+        else unlisten = fn
+      })
+      .catch(() => {
+        // No Tauri bridge (plain browser): the read below still works where
+        // commands do, and there is nothing else to do.
+      })
+      .then(() => {
+        if (!cancelled) readHealth(false)
+      })
+    return () => {
+      cancelled = true
+      unlisten?.()
+    }
   }, [])
+
+  const handleRetryPrivacyModel = () => {
+    // The answer is the status right after the request; progress events follow.
+    // A refusal (a build without the filter, a developer model) changes nothing.
+    commands.retryPrivacyModelSetup().then((result) => {
+      if (result.status === 'ok') setPrivacyFilter(result.data)
+    })
+  }
 
   const handleSetActivePersonaId = (personaId: string) => {
     setNavState(setActivePersonaId(personaId))
@@ -113,6 +164,15 @@ export function NavShell({ onSignOut }: NavShellProps) {
         // wording, severity and the Cloud Chat native-pane z-order.
         <output className="nav-shell__privacy-check">
           {t('navShell.privacyCheck.placeholder')}
+          {showPrivacyRetry(privacyFilter) && (
+            <button
+              type="button"
+              className="nav-shell__privacy-check-retry"
+              onClick={handleRetryPrivacyModel}
+            >
+              {t('navShell.privacyCheck.retryPlaceholder')}
+            </button>
+          )}
         </output>
       )}
       <div className="nav-shell__content">

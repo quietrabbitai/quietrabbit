@@ -33,6 +33,13 @@
   color: var(--text-muted);
 }
 
+/* items.id=678: placeholder retry control inside the strip. Styling and
+ * placement are Chat-BRAND's to decide. */
+.nav-shell__privacy-check-retry {
+  margin-left: 8px;
+  font: inherit;
+}
+
 /* items.id=769: Account security corner button. Fixed to the bottom-right
  * corner so it never shifts the dock's layout. NOTE: a native Cloud Chat pane
  * is composited above the webview, so where it overlaps this corner the button

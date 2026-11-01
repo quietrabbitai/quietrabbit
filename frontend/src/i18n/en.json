@@ -222,7 +222,8 @@
   "navShell": {
     "personaLoadError": "Could not load personas: {{message}}",
     "privacyCheck": {
-      "placeholder": "[PLACEHOLDER - Chat-BRAND] Privacy check unavailable"
+      "placeholder": "[PLACEHOLDER - Chat-BRAND] Privacy check unavailable",
+      "retryPlaceholder": "[PLACEHOLDER - Chat-BRAND] Retry"
     },
     "library": "Library",
     "content": {
