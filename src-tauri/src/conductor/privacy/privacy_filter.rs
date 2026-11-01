@@ -83,13 +83,20 @@ pub(crate) fn classify_outcome(
     match result {
         Ok(Ok(entities)) => PfOutcome::Entities(entities),
         Ok(Err(reason)) => PfOutcome::Failed { reason },
-        // JoinError's Display can carry a panic message; say only which kind.
-        Err(join_err) if join_err.is_panic() => PfOutcome::Failed {
-            reason: "Privacy Filter task panicked".to_owned(),
+        Err(join_err) => PfOutcome::Failed {
+            reason: join_error_reason(&join_err).to_owned(),
         },
-        Err(_) => PfOutcome::Failed {
-            reason: "Privacy Filter task was cancelled".to_owned(),
-        },
+    }
+}
+
+/// The one fixed text for a JoinError, for the Failed reason and for logs.
+/// JoinError's Display can carry a panic message (which could carry text), so
+/// nothing from it is ever interpolated; say only which kind.
+pub(crate) fn join_error_reason(join_err: &tokio::task::JoinError) -> &'static str {
+    if join_err.is_panic() {
+        "Privacy Filter task panicked"
+    } else {
+        "Privacy Filter task was cancelled"
     }
 }
 
@@ -894,6 +901,24 @@ mod tests {
             }
             PfOutcome::Entities(_) => panic!("a panic must map to Failed"),
         }
+    }
+
+    #[tokio::test]
+    async fn join_error_reason_never_carries_the_panic_message() {
+        const DISTINCTIVE: &str = "zq-distinctive-panic-text-7731";
+        let joined = tokio::task::spawn_blocking(|| -> Result<Vec<PfEntityDecoded>, String> {
+            panic!("{}", DISTINCTIVE)
+        })
+        .await;
+        let join_err = joined.expect_err("the task must really have panicked");
+        // The leak this helper exists to avoid is real: Display carries it.
+        assert!(
+            join_err.to_string().contains(DISTINCTIVE),
+            "premise: JoinError Display should carry the panic message"
+        );
+        let reason = join_error_reason(&join_err);
+        assert_eq!(reason, "Privacy Filter task panicked");
+        assert!(!reason.contains(DISTINCTIVE));
     }
 
     #[tokio::test]

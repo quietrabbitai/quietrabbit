@@ -64,7 +64,7 @@ use super::{
     errors::DisclosureLogWriteError,
     fact_identity,
     logger::{DisclosureLogEntry, DisclosureLogger},
-    privacy_filter::{self, classify_outcome, PfEntityDecoded, PfOutcome},
+    privacy_filter::{self, classify_outcome, join_error_reason, PfEntityDecoded, PfOutcome},
     types::{AutoResolvedSpan, ConsentRequestPayload, ConsentSpanItem, Gate3Result, ReviewTier},
     PF_TIMEOUT_SECS,
 };
@@ -437,7 +437,7 @@ async fn gate3_with_pf<L: DisclosureLogger>(
 
         // spawn_blocking panicked: treat conservatively — same path as timeout.
         Ok(Err(join_err)) => {
-            log::error!("gate3: Privacy Filter task panicked: {join_err}");
+            log::error!("gate3: {}", join_error_reason(&join_err));
             logger
                 .write(DisclosureLogEntry {
                     step_id: step_id.to_string(),
