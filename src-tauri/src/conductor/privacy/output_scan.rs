@@ -50,6 +50,11 @@
 // discipline gate3.rs already established (PF path / legacy sensitivity
 // fallback) -- not a new invented behavior.
 //
+// RELEASE BUILDS (items.id=618): when the filter is unavailable in a release
+// build the legacy fallback is not used. Full blocks (event type
+// output_scan_pf_unavailable, pf_error: true); Light never blocks. Debug and
+// test builds keep the legacy fallback above.
+//
 // PF FAILURE (items.id=613): when PF IS available but the call fails (timeout,
 // classifier error, panic), the content was not scanned. Full blocks
 // (event types output_scan_timeout / output_scan_pf_error); Light never blocks.
@@ -108,7 +113,8 @@ pub struct OutputScanResult {
     /// handling, which also fails closed (blocked=true) on PF timeout.
     pub timed_out: bool,
     /// PF classifier error or panic (not a timeout). Full intensity treats
-    /// it as fail-closed (blocked=true), like a timeout (items.id=613).
+    /// it as fail-closed (blocked=true), like a timeout (items.id=613). Also
+    /// true when a release build has no usable filter (items.id=618).
     /// Not persisted: output_store stores blocked + timed_out only.
     pub pf_error: bool,
     pub findings: Vec<OutputScanFinding>,
@@ -136,16 +142,27 @@ pub async fn scan_output<L: DisclosureLogger>(
     content_sensitivity_severity: u8,
     intensity: ScanIntensity,
 ) -> Result<OutputScanResult, DisclosureLogWriteError> {
-    if privacy_filter::is_available() {
-        return scan_with_pf(
-            logger,
-            step_id,
-            focus_run_id,
-            content_text,
-            execution_tier,
-            intensity,
-        )
-        .await;
+    use privacy_filter::UnavailableAction;
+    match privacy_filter::unavailable_action(
+        privacy_filter::is_available(),
+        privacy_filter::fail_closed_when_unavailable(),
+    ) {
+        UnavailableAction::UsePf => {
+            return scan_with_pf(
+                logger,
+                step_id,
+                focus_run_id,
+                content_text,
+                execution_tier,
+                intensity,
+            )
+            .await;
+        }
+        UnavailableAction::Block => {
+            return pf_unavailable_result(logger, step_id, focus_run_id, execution_tier, intensity)
+                .await;
+        }
+        UnavailableAction::Legacy => {}
     }
 
     scan_legacy_fallback(
@@ -303,6 +320,49 @@ async fn pf_error_result<L: DisclosureLogger>(
     reason: &str,
 ) -> Result<OutputScanResult, DisclosureLogWriteError> {
     log::warn!("output_scan: Privacy Filter failed, content not scanned: {reason}");
+    not_scanned_result(
+        logger,
+        step_id,
+        focus_run_id,
+        execution_tier,
+        intensity,
+        "output_scan_pf_error",
+    )
+    .await
+}
+
+/// Release build with no usable Privacy Filter (items.id=618): the content
+/// cannot be scanned. Same outcome as a classifier error under its own event
+/// type. Full blocks; Light never blocks.
+async fn pf_unavailable_result<L: DisclosureLogger>(
+    logger: &L,
+    step_id: &str,
+    focus_run_id: &str,
+    execution_tier: u8,
+    intensity: ScanIntensity,
+) -> Result<OutputScanResult, DisclosureLogWriteError> {
+    log::error!("output_scan: Privacy Filter unavailable in a release build, content not scanned");
+    not_scanned_result(
+        logger,
+        step_id,
+        focus_run_id,
+        execution_tier,
+        intensity,
+        "output_scan_pf_unavailable",
+    )
+    .await
+}
+
+/// CHAT-BRAND REVIEW: the plain_language text is a placeholder shared by the
+/// error and unavailable cases.
+async fn not_scanned_result<L: DisclosureLogger>(
+    logger: &L,
+    step_id: &str,
+    focus_run_id: &str,
+    execution_tier: u8,
+    intensity: ScanIntensity,
+    event_type: &str,
+) -> Result<OutputScanResult, DisclosureLogWriteError> {
     let blocked = intensity == ScanIntensity::Full;
     logger
         .write(DisclosureLogEntry {
@@ -315,7 +375,7 @@ async fn pf_error_result<L: DisclosureLogger>(
             fields_abstracted: IndexMap::new(),
             fields_withheld: vec![],
             override_declined: blocked,
-            event_type: "output_scan_pf_error".to_string(),
+            event_type: event_type.to_string(),
             category: None,
             fact_key: None,
         })
@@ -542,6 +602,63 @@ mod tests {
             .unwrap();
         assert!(!light.blocked && light.pf_error);
         assert_eq!(logger.entry_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn pf_unavailable_result_full_blocks_and_light_does_not() {
+        let logger = TestLogger::new();
+        let full = pf_unavailable_result(&logger, "s", "r", 1, ScanIntensity::Full)
+            .await
+            .unwrap();
+        assert!(full.blocked && full.pf_error && !full.timed_out);
+        assert!(full.plain_language.is_some() && full.findings.is_empty());
+        let light = pf_unavailable_result(&logger, "s", "r", 1, ScanIntensity::Light)
+            .await
+            .unwrap();
+        assert!(!light.blocked && light.pf_error && light.plain_language.is_none());
+        let entries = logger.entries();
+        assert_eq!(entries.len(), 2);
+        assert!(entries
+            .iter()
+            .all(|e| e.event_type == "output_scan_pf_unavailable"));
+        assert!(entries[0].override_declined && !entries[1].override_declined);
+    }
+
+    #[tokio::test]
+    async fn pf_unavailable_result_propagates_log_write_failure() {
+        use crate::conductor::privacy::logger::FailLogger;
+        let result = pf_unavailable_result(&FailLogger, "s", "r", 1, ScanIntensity::Full).await;
+        assert!(result.is_err());
+    }
+
+    // -- Release wiring (items.id=618) ---------------------------------------
+    // Run with: QR_ALLOW_RELEASE_WITHOUT_PRIVACY_FILTER=1 cargo test --release --lib
+    // They prove scan_output() itself reaches the block, not just the helper.
+
+    #[cfg(all(not(debug_assertions), not(privacy_filter_available)))]
+    #[tokio::test]
+    async fn release_without_pf_scan_output_full_blocks() {
+        let logger = TestLogger::new();
+        let result = scan_output(&logger, "s", "r", "text", 1, 0, ScanIntensity::Full)
+            .await
+            .unwrap();
+        assert!(result.blocked && result.pf_error && !result.timed_out);
+        let entries = logger.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].event_type, "output_scan_pf_unavailable");
+    }
+
+    #[cfg(all(not(debug_assertions), not(privacy_filter_available)))]
+    #[tokio::test]
+    async fn release_without_pf_scan_output_light_does_not_block() {
+        let logger = TestLogger::new();
+        let result = scan_output(&logger, "s", "r", "text", 1, 4, ScanIntensity::Light)
+            .await
+            .unwrap();
+        assert!(!result.blocked && result.pf_error);
+        let entries = logger.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].event_type, "output_scan_pf_unavailable");
     }
 
     #[tokio::test]

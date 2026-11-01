@@ -15,6 +15,9 @@
 //      finer-grained provider selection happens downstream via
 //      focus_provider_criteria/user_provider_preference, not this
 //      structural comparison.
+//   1b. Release builds only (items.id=618): when the Privacy Filter cannot run
+//       and target_tier >= 2, block with gate3_pf_unavailable_block. Debug and
+//       test builds skip this and keep 2b.
 //   2a. Privacy Filter path (compiled in + app_handle present):
 //       - spawn_blocking FFI call with 10s timeout (non-negotiable)
 //       - Timeout           → gate_timeout disclosure event + blocked result
@@ -26,7 +29,8 @@
 //         consent gate (High tier, empty spans list) — see D6-362/decisions.id=405
 //         note below. NOT auto-approved.
 //       - Non-zero spans    → gate3_consent_pending written THEN consent_request emit
-//   2b. Legacy sensitivity block fallback (no PF or no handle — dev/test builds):
+//   2b. Legacy sensitivity block fallback (no PF or no handle — dev/test builds;
+//       a release build without PF never reaches it for target_tier >= 2):
 //       - severity >= 3 AND target_tier >= 2 → gate3_sensitivity_block + blocked
 //       - Otherwise → gate3_promotion_approved + approved
 //
@@ -187,6 +191,21 @@ pub async fn gate3<L: DisclosureLogger>(
         });
     }
 
+    // Check 1b (items.id=618): fail closed when the Privacy Filter cannot run.
+    // Keyed on is_available(), NOT on the handle: no handle with a working
+    // filter is still the 2b path below (unit tests, golden vectors). The
+    // fail_closed guard comes first so debug builds never call is_available()
+    // here (its first call loads the model).
+    let fail_closed = privacy_filter::fail_closed_when_unavailable();
+    if fail_closed
+        && target_tier >= 2
+        && privacy_filter::unavailable_action(privacy_filter::is_available(), fail_closed)
+            == privacy_filter::UnavailableAction::Block
+    {
+        return pf_unavailable_block(logger, step_id, focus_run_id, execution_tier, content_key)
+            .await;
+    }
+
     // Check 2a: Privacy Filter path.
     // Requires PF compiled in, model loaded, and AppHandle for emit.
     // if let: idiomatic; avoids is_some() + unwrap() pattern.
@@ -306,6 +325,47 @@ async fn pf_error_block<L: DisclosureLogger>(
     Ok(Gate3Result {
         blocked: true,
         plain_language: Some("Privacy review failed. Content blocked. [Try again]".to_string()),
+        ..Gate3Result::default()
+    })
+}
+
+/// Release build, Privacy Filter unavailable, content bound for an external
+/// tier: nothing was reviewed, so nothing is promoted (items.id=618). Takes no
+/// AppHandle and emits nothing, like pf_error_block.
+///
+/// CHAT-BRAND REVIEW: the plain_language text below is a placeholder that
+/// mirrors the neighbouring hardcoded strings.
+async fn pf_unavailable_block<L: DisclosureLogger>(
+    logger: &L,
+    step_id: &str,
+    focus_run_id: &str,
+    execution_tier: u8,
+    content_key: &str,
+) -> Result<Gate3Result, DisclosureLogWriteError> {
+    log::error!("gate3: Privacy Filter unavailable in a release build, content blocked");
+    logger
+        .write(DisclosureLogEntry {
+            step_id: step_id.to_string(),
+            focus_run_id: focus_run_id.to_string(),
+            execution_tier,
+            abstraction_tier: None,
+            provider: None,
+            fields_shared: vec![],
+            fields_abstracted: IndexMap::new(),
+            fields_withheld: vec![content_key.to_string()],
+            override_declined: true,
+            event_type: "gate3_pf_unavailable_block".to_string(),
+            category: None,
+            fact_key: None,
+        })
+        .await?;
+    Ok(Gate3Result {
+        blocked: true,
+        plain_language: Some(
+            "The privacy check is unavailable, so this content was not shared. \
+             [Use local only] [Get help]"
+                .to_string(),
+        ),
         ..Gate3Result::default()
     })
 }
@@ -1052,6 +1112,90 @@ mod tests {
             .await
             .unwrap();
         assert!(result.blocked && !result.approved);
+    }
+
+    #[tokio::test]
+    async fn pf_unavailable_block_blocks_and_logs_without_approving() {
+        use crate::conductor::privacy::logger::TestLogger;
+        let logger = TestLogger::new();
+        let result = pf_unavailable_block(&logger, "step-1", "run-1", 2, "msg-1")
+            .await
+            .unwrap();
+        assert!(result.blocked && !result.approved && !result.pending_consent);
+        assert!(!result.timeout);
+        assert!(result.plain_language.is_some());
+        let entries = logger.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].event_type, "gate3_pf_unavailable_block");
+        assert_eq!(entries[0].fields_withheld, vec!["msg-1".to_string()]);
+        assert!(entries[0].fields_shared.is_empty());
+        assert!(entries[0].override_declined);
+    }
+
+    #[tokio::test]
+    async fn pf_unavailable_block_propagates_log_write_failure() {
+        use crate::conductor::privacy::logger::FailLogger;
+        let result = pf_unavailable_block(&FailLogger, "s", "r", 2, "k").await;
+        assert!(result.is_err());
+    }
+
+    // -- Release wiring (items.id=618) ---------------------------------------
+    // Run with: QR_ALLOW_RELEASE_WITHOUT_PRIVACY_FILTER=1 cargo test --release --lib
+    // They prove gate3() itself reaches the block, not just the helper.
+
+    #[cfg(all(not(debug_assertions), not(privacy_filter_available)))]
+    async fn release_gate3(
+        logger: &crate::conductor::privacy::logger::TestLogger,
+        target_tier: u8,
+    ) -> Gate3Result {
+        gate3(
+            logger,
+            "step-1",
+            "run-1",
+            "Test Focus",
+            "msg-1",
+            "test content",
+            0,
+            target_tier,
+            ExternalAccess::Unrestricted,
+            2,
+            None,
+            None,
+            true,
+            "",
+            "",
+            "",
+        )
+        .await
+        .unwrap()
+    }
+
+    #[cfg(all(not(debug_assertions), not(privacy_filter_available)))]
+    #[tokio::test]
+    async fn release_without_pf_blocks_external_promotion_with_no_handle() {
+        use crate::conductor::privacy::logger::TestLogger;
+        let logger = TestLogger::new();
+        let result = release_gate3(&logger, 2).await;
+        assert!(result.blocked && !result.approved && !result.pending_consent);
+        let entries = logger.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].event_type, "gate3_pf_unavailable_block");
+        assert!(entries[0].fields_shared.is_empty());
+        assert!(entries
+            .iter()
+            .all(|e| e.event_type != "gate3_promotion_approved"));
+    }
+
+    #[cfg(all(not(debug_assertions), not(privacy_filter_available)))]
+    #[tokio::test]
+    async fn release_without_pf_still_approves_local_only_promotion() {
+        use crate::conductor::privacy::logger::TestLogger;
+        let logger = TestLogger::new();
+        let result = release_gate3(&logger, 1).await;
+        assert!(result.approved && !result.blocked);
+        let entries = logger.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].event_type, "gate3_promotion_approved");
     }
 
     #[tokio::test]

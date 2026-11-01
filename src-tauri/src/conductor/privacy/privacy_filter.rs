@@ -615,6 +615,42 @@ fn status_from(compiled_in: bool, available: bool) -> PrivacyFilterStatus {
 }
 
 // ---------------------------------------------------------------------------
+// Fail closed when unavailable (always compiled, pure -- items.id=618)
+// ---------------------------------------------------------------------------
+
+/// What an outbound gate does, given whether the Privacy Filter can run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnavailableAction {
+    /// The filter is available: run it.
+    UsePf,
+    /// Debug and test builds: the pre-618 severity-only fallback.
+    Legacy,
+    /// Release builds: nothing external passes without the review.
+    Block,
+}
+
+/// The one decision shared by gate3 and output_scan. `fail_closed` is a
+/// parameter so both values are testable; production passes
+/// `fail_closed_when_unavailable()`.
+pub(crate) fn unavailable_action(available: bool, fail_closed: bool) -> UnavailableAction {
+    match (available, fail_closed) {
+        (true, _) => UnavailableAction::UsePf,
+        (false, true) => UnavailableAction::Block,
+        (false, false) => UnavailableAction::Legacy,
+    }
+}
+
+/// True in release builds (debug_assertions off, the repo's debug-vs-release
+/// idiom, as for the single-instance guard in main.rs). Debug and test builds
+/// keep the legacy fallback so the golden vectors and unit tests, which run
+/// without the filter, stay valid. A release build only exists with the filter
+/// linked or the explicit build-time opt-out (build.rs), so this is the
+/// runtime half of the same gate.
+pub(crate) fn fail_closed_when_unavailable() -> bool {
+    !cfg!(debug_assertions)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -712,6 +748,20 @@ mod tests {
             }
         };
         assert_eq!(status().await, expected);
+    }
+
+    #[test]
+    fn unavailable_action_covers_every_combination() {
+        use UnavailableAction::*;
+        assert_eq!(unavailable_action(true, true), UsePf);
+        assert_eq!(unavailable_action(true, false), UsePf);
+        assert_eq!(unavailable_action(false, true), Block);
+        assert_eq!(unavailable_action(false, false), Legacy);
+    }
+
+    #[test]
+    fn fail_closed_follows_debug_assertions() {
+        assert_eq!(fail_closed_when_unavailable(), !cfg!(debug_assertions));
     }
 
     fn ent() -> PfEntityDecoded {

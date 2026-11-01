@@ -1,6 +1,8 @@
 # Quiet Rabbit — Claude Code Context
 # Last updated: November 1, 2026 (items.id=618: one paragraph under "Key commands"
-# only -- release builds need PRIVACY_FILTER_LIB_DIR or the opt-out). Before that,
+# only -- release builds need PRIVACY_FILTER_LIB_DIR or the opt-out; plain
+# `cargo test --release` is not a supported gate, release_ tests are run by
+# name). Before that,
 # November 1, 2026 (items.id=844: CI paragraph under "Key commands"
 # only -- sharded Test step and the shared-vCPU test rule; also corrects the old
 # "check job runs fmt, clippy, deny" claim, stale since items.id=787). Before
@@ -135,7 +137,7 @@ Shards share 4 vCPUs, so a test must not assert a pool size or a tight
 wall-clock bound that a starved CPU can break: the idle_timeout leak test
 detects a leak by pool exhaustion for that reason (items.id=844).
 
-Release builds (`cargo build --release`, `cargo tauri build`, any profile inheriting release) fail in build.rs unless PRIVACY_FILTER_LIB_DIR is set; QR_ALLOW_RELEASE_WITHOUT_PRIVACY_FILTER=1 is the explicit local opt-out and is never for a shipped artifact (items.id=618).
+Release builds (`cargo build --release`, `cargo tauri build`, any profile inheriting release) fail in build.rs unless PRIVACY_FILTER_LIB_DIR is set; QR_ALLOW_RELEASE_WITHOUT_PRIVACY_FILTER=1 is the explicit local opt-out and is never for a shipped artifact (items.id=618). `cargo test --release` is not a supported gate: tests rely on debug-only fallbacks (the source-tree Focus path and the legacy privacy path). Release-only behaviour is covered by tests named release_*, run by name with `cargo test --release --lib -- release_` (a substring filter, so it also runs other tests that have release_ in their name; they pass in release).
 
 Frontend gate (items.id=588): CI also runs a separate `frontend` job in
 tauri-ci.yml, in parallel with `check` (Node 24: npm ci, npx tsc -b, npm test,

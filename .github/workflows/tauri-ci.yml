@@ -22,6 +22,9 @@
 #   4. Set PRIVACY_FILTER_LIB_DIR for the build (privacy-filter.cpp built with
 #      cmake --preset release-portable); shipped artifacts never set
 #      QR_ALLOW_RELEASE_WITHOUT_PRIVACY_FILTER (items.id=618)
+#   5. A release job must run only the release_ tests
+#      (cargo test --release --lib -- release_), not the full release suite
+#      (items.id=618)
 
 name: Tauri CI
 
