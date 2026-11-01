@@ -1,3 +1,7 @@
+// The release gate and rpath decisions live in build_gate.rs so
+// tests/build_gate.rs can run them (items.id=618).
+mod build_gate;
+
 fn main() {
     // -- SQLCipher (existing) --
     // Verify libsqlcipher is installed and discoverable before the build proceeds.
@@ -28,18 +32,47 @@ fn main() {
     //   ggml/src/libggml-base.so — ggml base (ggml_init, ggml_new_tensor, etc.)
     //   ggml/src/libggml.so      — ggml backend registry (ggml_backend_load_all, etc.)
     //
-    // If unset: Privacy Filter FFI is compiled out (cfg flag absent) and gate3
-    // uses the pre-filter sensitivity-based block. Acceptable for dev/test builds.
-    // Production builds MUST set PRIVACY_FILTER_LIB_DIR.
+    // If unset (or empty): Privacy Filter FFI is compiled out (cfg flag absent)
+    // and gate3 uses the pre-filter sensitivity-based block. Acceptable for
+    // debug and test builds.
+    //
+    // Release gate (items.id=618): a build whose cargo PROFILE is "release"
+    // (cargo build --release, cargo tauri build, any profile inheriting
+    // release) PANICS when PRIVACY_FILTER_LIB_DIR is unset, so a release cannot
+    // ship with the Privacy Filter silently absent. The explicit opt-out is
+    // QR_ALLOW_RELEASE_WITHOUT_PRIVACY_FILTER=1 (exact value): it builds with a
+    // loud warning and the app reports the privacy check as unavailable. Never
+    // use the opt-out for a shipped artifact. The decision is
+    // build_gate::release_gate (unit-tested in tests/build_gate.rs).
     //
     // Override library name (default "pf") via PRIVACY_FILTER_LIB_NAME if your
     // cmake build produces a differently-named output (e.g. "privacy_filter").
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=build_gate.rs");
     println!("cargo:rerun-if-env-changed=PRIVACY_FILTER_LIB_DIR");
     println!("cargo:rerun-if-env-changed=PRIVACY_FILTER_LIB_NAME");
+    println!("cargo:rerun-if-env-changed=QR_ALLOW_RELEASE_WITHOUT_PRIVACY_FILTER");
     println!("cargo:rustc-check-cfg=cfg(privacy_filter_available)");
 
-    if let Ok(lib_dir) = std::env::var("PRIVACY_FILTER_LIB_DIR") {
+    // cargo sets PROFILE for the target profile: "release", or "debug" for
+    // every profile that inherits dev (dev, test, cargo tauri dev/--debug).
+    let profile = std::env::var("PROFILE").ok();
+    let release = build_gate::is_release_profile(profile.as_deref());
+    let lib_dir_env = std::env::var("PRIVACY_FILTER_LIB_DIR").ok();
+    let gate = build_gate::release_gate(
+        profile.as_deref(),
+        lib_dir_env.as_deref(),
+        std::env::var("QR_ALLOW_RELEASE_WITHOUT_PRIVACY_FILTER")
+            .ok()
+            .as_deref(),
+    );
+    if gate == build_gate::Gate::ReleaseBlocked {
+        panic!("{}", build_gate::blocked_message());
+    }
+
+    // An empty value counts as unset (release_gate agrees): it would
+    // otherwise take this branch with lib_dir "" and fail confusingly at link.
+    if let Some(lib_dir) = lib_dir_env.filter(|d| !d.is_empty()) {
         let lib_name = std::env::var("PRIVACY_FILTER_LIB_NAME").unwrap_or_else(|_| "pf".to_owned());
 
         println!("cargo:rustc-cfg=privacy_filter_available");
@@ -160,6 +193,10 @@ fn main() {
         //     Same "bake the dev machine's absolute build path" precedent as
         //     PRIVACY_FILTER_BACKEND_DIR_DEV above, just at the ELF rpath
         //     layer instead of the ggml_backend_load_all_from_path layer.
+        //     Debug and test profiles ONLY (items.id=618): a release binary
+        //     carries entry (1) alone, so it never resolves the ggml libs
+        //     from the build machine's directory
+        //     (build_gate::rpath_link_arg).
         let ggml_src_dir = format!("{lib_dir}/ggml/src");
         for soname in ["libggml-base.so.0", "libggml.so.0"] {
             let src = std::path::Path::new(&ggml_src_dir).join(soname);
@@ -195,10 +232,14 @@ fn main() {
             // benches alike, which is what both the packaged app binary and
             // `cargo test` need here.
             println!(
-                "cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../lib/{product_name}/ggml-backends:{ggml_src_dir}"
+                "{}",
+                build_gate::rpath_link_arg(release, &product_name, &ggml_src_dir)
             );
         }
     } else {
+        if gate == build_gate::Gate::ReleaseOptOut {
+            println!("{}", build_gate::opt_out_warning());
+        }
         println!(
             "cargo:warning=PRIVACY_FILTER_LIB_DIR not set — \
              Privacy Filter FFI disabled. Gate3 will use pre-filter \

@@ -19,6 +19,9 @@
 #   1. Add TAURI_SIGNING_PRIVATE_KEY + TAURI_SIGNING_PRIVATE_KEY_PASSWORD to GitHub secrets
 #   2. Set correct node version and frontend build command
 #   3. Verify target triples: windows, macOS x86, macOS arm64, Linux
+#   4. Set PRIVACY_FILTER_LIB_DIR for the build (privacy-filter.cpp built with
+#      cmake --preset release-portable); shipped artifacts never set
+#      QR_ALLOW_RELEASE_WITHOUT_PRIVACY_FILTER (items.id=618)
 
 name: Tauri CI
 
