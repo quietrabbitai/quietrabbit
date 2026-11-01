@@ -41,6 +41,11 @@
 # auth::key_rotation_io's tmpfs test (shard B alone, 1 thread) touches it.
 # Ollama sidecar tests bind ephemeral ports, never 21434-21443.
 #
+# The three shards share the runner's 4 vCPUs, so a lib test must not assert a
+# pool size or a tight wall-clock bound that a starved CPU can break (the
+# idle_timeout pool-size test did: items.id=844). Shard times in CI vary by
+# about 50 percent between runs (C: 94 s to 150 s); that is expected.
+#
 # Run from anywhere; it cd's to src-tauri. Output lines are prefixed [A] [B] [C].
 
 set -u
