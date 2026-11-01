@@ -19,17 +19,28 @@
 // belong to items.id=678): free-disk-space check, the verified marker, sideload,
 // the login trigger, re-initialising the privacy filter, the status events.
 //
-// NETWORK DISCIPLINE. Nothing in this module runs by itself. The only callers
-// are click-driven commands (a source-scan test in provider_catalog pins that
-// for the catalog). A request carries no query string, no identifier, no app or
-// catalog version and no user content. No User-Agent is set.
+// NETWORK DISCIPLINE. Nothing in this module runs by itself. The callers are
+// click-driven commands (a source-scan test in provider_catalog pins that for
+// the catalog) and, by decisions.id=864, the Privacy Filter model setup that
+// login starts (privacy_model/install.rs; a required component with no
+// opt-out, so its address-visible request is accepted there). A request carries
+// no query string, no identifier, no app or catalog version and no user
+// content. No User-Agent is set.
 //
 // REDIRECTS. A GitHub release download answers 302 to a CDN host, so redirects
 // cannot be off as in providers/hosted_client.rs. They are limited instead:
 // at most MAX_REDIRECTS hops, every hop HTTPS, and every target host must be on
 // the caller's list. GitHub: `release-assets.githubusercontent.com`, one hop
-// (checked by Chat-PM 2026-10-11). Any Hugging Face host is UNVERIFIED and is
-// not in GITHUB_RELEASE_REDIRECT_HOSTS; items.id=678 owns that check.
+// (checked by Chat-PM 2026-10-11). Hugging Face (items.id=678, live check
+// 2026-11-01): `resolve/<revision>/<file>` answers 302 to
+// `us.aws.cdn.hf.co/xet-bridge-us/...`, which answers 200 with the exact
+// content-length and 206 to a Range request. Other regions use other `*.hf.co`
+// hosts (UNVERIFIED which), so HUGGINGFACE_REDIRECT_HOSTS lists the suffix
+// `.hf.co`. A list entry that starts with a dot matches subdomains only, never
+// the bare domain and never a look-alike (`evilhf.co`, `hf.co.evil.com`). The
+// breadth is acceptable because every body is checked against a pinned size and
+// SHA-256: a redirect can cost availability or show an address, not inject
+// content.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -48,6 +59,24 @@ pub const MAX_REDIRECTS: usize = 5;
 
 /// Hosts a GitHub release download may be redirected to.
 pub const GITHUB_RELEASE_REDIRECT_HOSTS: &[&str] = &["release-assets.githubusercontent.com"];
+
+/// Hosts a Hugging Face `resolve` download may be redirected to: the site
+/// itself (a same-site hop) and any subdomain of its CDN domain `hf.co`.
+pub const HUGGINGFACE_REDIRECT_HOSTS: &[&str] = &["huggingface.co", ".hf.co"];
+
+/// Whether `host` is on the allow-list. An entry equals the host exactly, or,
+/// when it starts with a dot, matches any subdomain of what follows the dot
+/// (never the bare domain itself). `host` is as the URL parser gives it, which
+/// is already lower-case.
+pub(crate) fn host_allowed(host: &str, allowed: &[String]) -> bool {
+    allowed.iter().any(|entry| {
+        if entry.starts_with('.') {
+            host.len() > entry.len() && host.ends_with(entry.as_str())
+        } else {
+            host == entry
+        }
+    })
+}
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// A body that stalls for this long fails (the transfer as a whole has no cap:
@@ -143,7 +172,7 @@ fn redirect_policy(allowed_hosts: Vec<String>, allow_http: bool) -> redirect::Po
         let scheme_ok = url.scheme() == "https" || (allow_http && url.scheme() == "http");
         let host_ok = url
             .host_str()
-            .is_some_and(|h| allowed_hosts.iter().any(|a| a == h));
+            .is_some_and(|h| host_allowed(h, &allowed_hosts));
         if scheme_ok && host_ok {
             attempt.follow()
         } else {

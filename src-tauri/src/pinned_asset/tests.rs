@@ -469,3 +469,52 @@ async fn fetch_small_refuses_a_body_over_the_cap_and_a_bad_status() {
 fn the_production_constructor_builds() {
     let _ = PinnedFetcher::new(GITHUB_RELEASE_REDIRECT_HOSTS);
 }
+
+fn hosts(list: &[&str]) -> Vec<String> {
+    list.iter().map(|h| (*h).to_owned()).collect()
+}
+
+#[test]
+fn an_exact_entry_matches_only_that_host() {
+    let allowed = hosts(GITHUB_RELEASE_REDIRECT_HOSTS);
+    assert!(host_allowed(
+        "release-assets.githubusercontent.com",
+        &allowed
+    ));
+    assert!(!host_allowed("githubusercontent.com", &allowed));
+    assert!(!host_allowed(
+        "x.release-assets.githubusercontent.com",
+        &allowed
+    ));
+    assert!(!host_allowed("objects.githubusercontent.com", &allowed));
+    assert!(!host_allowed("", &allowed));
+}
+
+#[test]
+fn a_dotted_entry_matches_subdomains_but_not_the_bare_domain_or_look_alikes() {
+    let allowed = hosts(HUGGINGFACE_REDIRECT_HOSTS);
+    // The host seen live on 2026-11-01, and another region's shape.
+    assert!(host_allowed("us.aws.cdn.hf.co", &allowed));
+    assert!(host_allowed("cdn-lfs.hf.co", &allowed));
+    assert!(host_allowed("huggingface.co", &allowed));
+    assert!(
+        !host_allowed("hf.co", &allowed),
+        "bare domain is not a subdomain"
+    );
+    assert!(!host_allowed(".hf.co", &allowed));
+    assert!(!host_allowed("evilhf.co", &allowed));
+    assert!(!host_allowed("hf.co.evil.com", &allowed));
+    assert!(!host_allowed("us.aws.cdn.hf.co.evil.com", &allowed));
+    assert!(!host_allowed("www.huggingface.co", &allowed));
+    assert!(!host_allowed("huggingface.co.evil.com", &allowed));
+}
+
+#[test]
+fn the_github_and_hugging_face_lists_do_not_overlap() {
+    for gh in GITHUB_RELEASE_REDIRECT_HOSTS {
+        assert!(!host_allowed(gh, &hosts(HUGGINGFACE_REDIRECT_HOSTS)));
+    }
+    for hf in ["huggingface.co", "us.aws.cdn.hf.co"] {
+        assert!(!host_allowed(hf, &hosts(GITHUB_RELEASE_REDIRECT_HOSTS)));
+    }
+}

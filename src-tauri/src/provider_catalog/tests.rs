@@ -1719,8 +1719,11 @@ fn the_catalog_network_calls_are_made_only_by_the_click_command() {
     fetch_callers.sort();
     assert_eq!(
         fetch_callers,
-        vec!["provider_catalog/flow.rs".to_owned()],
-        "only the catalog flow fetches (items.id=678 adds its own file here)"
+        vec![
+            "privacy_model/install.rs".to_owned(),
+            "provider_catalog/flow.rs".to_owned()
+        ],
+        "only the catalog flow and the Privacy Filter model setup fetch (items.id=678)"
     );
     assert_eq!(
         check_callers,

@@ -365,6 +365,15 @@ docx-rust = { path = "vendor/docx-rust" }
 [profile.dev.package.argon2]
 opt-level = 3
 
+# items.id=678: build sha2 optimized in the dev and test profiles. The Privacy
+# Filter model setup hashes a 1.6 GB file (a download as it streams, a sideload
+# or a changed file once). Measured 2026-11-01 on the development machine, same
+# file, sha2 0.10.9: 43 s at opt-level 0 against 0.85-1.2 s at opt-level 3
+# (coreutils sha256sum: 0.85 s). Like the argon2 line above, this changes how
+# fast the code runs, not what it computes; the release profile is unaffected.
+[profile.dev.package.sha2]
+opt-level = 3
+
 # The document parsers run in a child process under a memory cap (items.id=837,
 # src/doc_parse.rs). Unoptimized, a decompression or nesting bomb needs 4-9 s to
 # reach the cap in the debug binary that `cargo test` spawns (0.2-0.8 s in

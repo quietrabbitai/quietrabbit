@@ -1150,6 +1150,10 @@ mod tests {
             "CPU-bound classifier on spawn_blocking, no database",
         ),
         (
+            "privacy_model/install.rs",
+            "Privacy Filter model setup (items.id=678): the shared model file and its marker only, no database and no account key; it must keep running through a lock or logout",
+        ),
+        (
             "persistence/ingest_blob.rs",
             "spawn_blocking around AEAD on bytes already in memory; the callers hold the lease",
         ),
