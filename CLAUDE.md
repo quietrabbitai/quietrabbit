@@ -1,7 +1,8 @@
 # Quiet Rabbit — Claude Code Context
-# Last updated: October 31, 2026 (items.id=844: CI paragraph under "Key commands"
-# only -- sharded Test step; also corrects the old "check job runs fmt, clippy,
-# deny" claim, stale since items.id=787). Before that:
+# Last updated: November 1, 2026 (items.id=844: CI paragraph under "Key commands"
+# only -- sharded Test step and the shared-vCPU test rule; also corrects the old
+# "check job runs fmt, clippy, deny" claim, stale since items.id=787). Before
+# that, October 31, 2026 (items.id=844 first version). Before that:
 # Last updated: October 31, 2026 (items.id=667: Ollama section only --
 # single-instance guard built, with its limits). Before that, October 31, 2026
 # (items.id=668: Ollama section only -- sidecar
