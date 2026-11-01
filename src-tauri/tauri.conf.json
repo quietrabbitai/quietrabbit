@@ -39,7 +39,8 @@
       "binaries/qr-ollama"
     ],
     "resources": {
-      "resources/ggml-backends/*": "ggml-backends/"
+      "resources/ggml-backends/*": "ggml-backends/",
+      "../app/core_artifacts/focuses/*.focus": "core_artifacts/focuses/"
     }
   }
 }

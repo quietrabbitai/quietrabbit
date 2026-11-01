@@ -67,7 +67,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, Duration, Utc};
 use indexmap::IndexMap;
@@ -922,35 +922,77 @@ pub async fn load_focus_definition(
     Ok(focus_def)
 }
 
-fn find_focus_file(focus_id: &str) -> Result<PathBuf, LifecycleError> {
-    // Two search locations. In Tauri production, focuses are embedded via
-    // Tauri resources config (bundling TBD). Until bundled, resolve relative
-    // to CARGO_MANIFEST_DIR (src-tauri/) rather than CWD — `cargo tauri dev`
-    // always runs the app with CWD=src-tauri regardless of invocation
-    // directory (items.id=316), which made the plain-CWD-relative form
-    // resolve to a path that only ever existed when the binary happened to
-    // be launched with the repo root as CWD. CARGO_MANIFEST_DIR is baked in
-    // at compile time and is dev-workflow-only (see comment above); the
-    // production/bundled-resources path is unaffected.
-    let data_root = crate::providers::utils::get_data_root();
-    let filename = format!("{focus_id}.focus");
+/// Directory the bundled core Focus files were installed into. Set once from
+/// main.rs's setup() via set_focus_dir(), from the Tauri resource dir
+/// (bundle.resources maps app/core_artifacts/focuses/*.focus there, items.id=617).
+/// Unset in tests and before setup(), in which case the bundled root is skipped.
+static FOCUS_DIR: OnceLock<PathBuf> = OnceLock::new();
 
-    let candidates = [
+/// Records the bundled Focus directory. Second and later calls are ignored
+/// (OnceLock) with a warning, mirroring privacy_filter::set_backend_dir.
+pub fn set_focus_dir(dir: PathBuf) {
+    if FOCUS_DIR.set(dir.clone()).is_err() {
+        log::warn!(
+            "lifecycle: set_focus_dir({dir:?}) ignored -- already set to {:?}",
+            FOCUS_DIR.get()
+        );
+    }
+}
+
+/// DEV-ONLY (items.id=617 removed the release use): the source-tree Focus
+/// directory, resolved from CARGO_MANIFEST_DIR baked in at compile time. It
+/// names a path on the build machine, so a release build never consults it.
+/// It is CARGO_MANIFEST_DIR-relative, not CWD-relative, because `cargo tauri
+/// dev` always runs the app with CWD=src-tauri (items.id=316).
+#[cfg(debug_assertions)]
+fn dev_focus_dir() -> Option<PathBuf> {
+    Some(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("app")
             .join("core_artifacts")
-            .join("focuses")
-            .join(&filename),
-        data_root
-            .join("community_artifacts")
-            .join("focuses")
-            .join(&filename),
-    ];
+            .join("focuses"),
+    )
+}
 
-    for candidate in &candidates {
+#[cfg(not(debug_assertions))]
+fn dev_focus_dir() -> Option<PathBuf> {
+    None
+}
+
+fn find_focus_file(focus_id: &str) -> Result<PathBuf, LifecycleError> {
+    let data_root = crate::providers::utils::get_data_root();
+    find_focus_file_in(
+        focus_id,
+        FOCUS_DIR.get().map(PathBuf::as_path),
+        &data_root,
+        dev_focus_dir().as_deref(),
+    )
+}
+
+/// Search order: the bundled resource dir, then data_root/community_artifacts/
+/// focuses, then (debug builds only) the source tree. The first root that holds
+/// `{focus_id}.focus` wins and is logged at info.
+fn find_focus_file_in(
+    focus_id: &str,
+    bundled_dir: Option<&std::path::Path>,
+    data_root: &std::path::Path,
+    dev_dir: Option<&std::path::Path>,
+) -> Result<PathBuf, LifecycleError> {
+    let filename = format!("{focus_id}.focus");
+    let community_dir = data_root.join("community_artifacts").join("focuses");
+
+    let roots = [
+        ("bundled", bundled_dir),
+        ("community", Some(community_dir.as_path())),
+        ("dev source tree", dev_dir),
+    ];
+    for (label, root) in roots {
+        let Some(root) = root else { continue };
+        let candidate = root.join(&filename);
         if candidate.exists() {
-            return Ok(candidate.clone());
+            log::info!("lifecycle: loaded Focus '{focus_id}' from {label} root {root:?}");
+            return Ok(candidate);
         }
     }
     Err(LifecycleError::FocusNotFound(focus_id.to_owned()))
@@ -7195,5 +7237,112 @@ mod api_chat_focus_tests {
             !API_CHAT_FOCUS.to_lowercase().contains("quick"),
             "Quick Ask is a retired concept (decisions.id=804)"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// items.id=617: Focus file search roots
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod focus_search_tests {
+    use super::*;
+
+    fn quick_ask_text() -> String {
+        std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../app/core_artifacts/focuses/quick-ask.focus"),
+        )
+        .expect("quick-ask.focus is tracked in the repo")
+    }
+
+    #[test]
+    fn bundled_dir_resolves_quick_ask() {
+        let bundled = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(bundled.path().join("quick-ask.focus"), quick_ask_text()).unwrap();
+
+        let found =
+            find_focus_file_in("quick-ask", Some(bundled.path()), data.path(), None).unwrap();
+        assert_eq!(found, bundled.path().join("quick-ask.focus"));
+        let def = parse_focus_text(&std::fs::read_to_string(found).unwrap()).unwrap();
+        assert_eq!(def.focus_id, "quick-ask");
+    }
+
+    #[test]
+    fn bundled_dir_wins_over_community_and_dev() {
+        let bundled = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let dev = tempfile::tempdir().unwrap();
+        let community = data.path().join("community_artifacts/focuses");
+        std::fs::create_dir_all(&community).unwrap();
+        for dir in [bundled.path(), community.as_path(), dev.path()] {
+            std::fs::write(dir.join("quick-ask.focus"), "x").unwrap();
+        }
+
+        let found = find_focus_file_in(
+            "quick-ask",
+            Some(bundled.path()),
+            data.path(),
+            Some(dev.path()),
+        )
+        .unwrap();
+        assert_eq!(found, bundled.path().join("quick-ask.focus"));
+
+        std::fs::remove_file(bundled.path().join("quick-ask.focus")).unwrap();
+        let found = find_focus_file_in(
+            "quick-ask",
+            Some(bundled.path()),
+            data.path(),
+            Some(dev.path()),
+        )
+        .unwrap();
+        assert_eq!(found, community.join("quick-ask.focus"));
+
+        std::fs::remove_file(community.join("quick-ask.focus")).unwrap();
+        let found = find_focus_file_in(
+            "quick-ask",
+            Some(bundled.path()),
+            data.path(),
+            Some(dev.path()),
+        )
+        .unwrap();
+        assert_eq!(found, dev.path().join("quick-ask.focus"));
+    }
+
+    #[test]
+    fn missing_everywhere_is_focus_not_found() {
+        let data = tempfile::tempdir().unwrap();
+        let err = find_focus_file_in("quick-ask", None, data.path(), None).unwrap_err();
+        assert!(matches!(err, LifecycleError::FocusNotFound(id) if id == "quick-ask"));
+    }
+
+    /// Debug builds keep the source-tree fallback that `cargo tauri dev` needs.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn debug_build_consults_the_source_tree() {
+        let dev = dev_focus_dir().expect("debug builds have a dev dir");
+        assert!(dev.join("quick-ask.focus").exists());
+    }
+
+    /// A release build must never consult the build machine's path: with no
+    /// bundled dir and an empty data root, quick-ask is not found even though
+    /// the file exists in this checkout.
+    #[cfg(not(debug_assertions))]
+    #[tokio::test]
+    async fn release_build_never_consults_the_build_machine_path() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let data = tempfile::tempdir().unwrap();
+        std::env::set_var("QR_DATA_ROOT", data.path());
+
+        assert!(dev_focus_dir().is_none());
+        assert!(FOCUS_DIR.get().is_none(), "no test sets the global");
+        assert!(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../app/core_artifacts/focuses/quick-ask.focus")
+            .exists());
+        let err = find_focus_file("quick-ask").unwrap_err();
+        assert!(matches!(err, LifecycleError::FocusNotFound(_)));
+
+        std::env::remove_var("QR_DATA_ROOT");
     }
 }

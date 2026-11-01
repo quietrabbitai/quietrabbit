@@ -8,6 +8,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use quietrabbit_lib::commands::model_install::PullCancellationRegistry;
 use quietrabbit_lib::conductor::concurrency::ConductorScheduler;
+use quietrabbit_lib::conductor::lifecycle;
 use quietrabbit_lib::conductor::privacy::privacy_filter;
 use quietrabbit_lib::ipc::specta_builder;
 use quietrabbit_lib::ollama_sidecar::{OllamaSidecar, OllamaSource, SidecarStartup};
@@ -421,6 +422,18 @@ async fn async_main() {
                 Err(e) => log::warn!(
                     "main: could not resolve resource_dir for Privacy Filter \
                      backend dir: {e} — falling back to build-time dev path"
+                ),
+            }
+
+            // The bundled core Focus files (bundle.resources maps
+            // app/core_artifacts/focuses/*.focus into core_artifacts/focuses/,
+            // items.id=617). Debug builds fall back to the source tree, so a
+            // failure here only matters in a packaged build.
+            match app.path().resource_dir() {
+                Ok(dir) => lifecycle::set_focus_dir(dir.join("core_artifacts/focuses")),
+                Err(e) => log::warn!(
+                    "main: could not resolve resource_dir for the bundled Focus \
+                     directory: {e} -- bundled Focus files will not be found"
                 ),
             }
 
