@@ -1,0 +1,183 @@
+# Quiet Rabbit -- Privacy Filter model release asset (items.id=678, decisions.id=864)
+#
+# Publishes the pinned Privacy Filter model as a GitHub release asset, so the
+# app's first source (a QR release asset) exists. The app falls back to the
+# upstream Hugging Face revision while this release does not exist, and checks
+# every download against the same size and SHA-256.
+#
+# MANUAL ONLY (workflow_dispatch). Nothing here runs on push or schedule.
+#
+# TWO STEPS, BOTH JASON'S:
+#   1. Run with `publish` OFF (the default). The `verify` job downloads the
+#      model from the pinned upstream revision, checks its size and SHA-256
+#      against the constants in src-tauri/src/privacy_model/pin.rs, and keeps
+#      the staged files as a workflow artifact for ONE day. Nothing is
+#      published.
+#   2. Run again with `publish` ON. The `publish` job re-checks the hash and
+#      creates a DRAFT release (never public, never "latest"). The public step
+#      is then Jason opening the draft on GitHub, reading it, and clicking
+#      "Publish release". The workflow never publishes it and never
+#      overwrites: it refuses when the tag already exists.
+#
+# THE PIN HAS ONE SOURCE: src-tauri/src/privacy_model/pin.rs. This file reads
+# it with sed and fails if a constant is missing or malformed, so the workflow
+# cannot publish bytes the app would reject. The release tag is baked into
+# every shipped app's download URL, so a different tag means an app update.
+#
+# --latest=false: a model-only release must never become `releases/latest`,
+# which an updater endpoint may read.
+
+name: Privacy model release
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Create the DRAFT release (Jason publishes it by hand). Off = dry run: download, verify, keep a 1-day artifact."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.pin.outputs.tag }}
+      revision: ${{ steps.pin.outputs.revision }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the pin from pin.rs
+        id: pin
+        run: |
+          set -euo pipefail
+          pin=src-tauri/src/privacy_model/pin.rs
+          # `[pub ]const NAME: type = value;` on one line.
+          get() {
+            sed -n -E "s/^(pub )?const $1: [^=]+= *(.*);\$/\2/p" "$pin" | head -n 1
+          }
+          name=$(get FILE_NAME | tr -d '"')
+          size=$(get SIZE | tr -d '_')
+          sha=$(get SHA256_HEX | tr -d '"')
+          rev=$(get UPSTREAM_REVISION | tr -d '"')
+          tag=$(get RELEASE_TAG | tr -d '"')
+          repo=$(get UPSTREAM_REPO | tr -d '"')
+          [[ "$name" =~ ^[A-Za-z0-9._-]+\.gguf$ ]] || { echo "::error::bad FILE_NAME '$name'"; exit 1; }
+          [[ "$size" =~ ^[0-9]{6,}$ ]] || { echo "::error::bad SIZE '$size'"; exit 1; }
+          [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::bad SHA256_HEX '$sha'"; exit 1; }
+          [[ "$rev" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::bad UPSTREAM_REVISION '$rev'"; exit 1; }
+          [[ "$tag" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::bad RELEASE_TAG '$tag'"; exit 1; }
+          [[ "$repo" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || { echo "::error::bad UPSTREAM_REPO '$repo'"; exit 1; }
+          {
+            echo "name=$name"
+            echo "size=$size"
+            echo "sha=$sha"
+            echo "revision=$rev"
+            echo "tag=$tag"
+            echo "repo=$repo"
+          } >> "$GITHUB_OUTPUT"
+          echo "Pinned: $name, $size bytes, sha256 $sha, $repo@$rev, tag $tag"
+
+      - name: Download the model from the pinned upstream revision
+        env:
+          NAME: ${{ steps.pin.outputs.name }}
+          REV: ${{ steps.pin.outputs.revision }}
+          REPO: ${{ steps.pin.outputs.repo }}
+        run: |
+          set -euo pipefail
+          mkdir dist
+          curl --fail --location --retry 5 --retry-all-errors \
+            --connect-timeout 30 --max-time 3000 \
+            -o "dist/$NAME" \
+            "https://huggingface.co/$REPO/resolve/$REV/$NAME"
+
+      - name: Check size and SHA-256 against the pin BEFORE anything is staged
+        env:
+          NAME: ${{ steps.pin.outputs.name }}
+          SIZE: ${{ steps.pin.outputs.size }}
+          SHA: ${{ steps.pin.outputs.sha }}
+        run: |
+          set -euo pipefail
+          got_size=$(stat -c %s "dist/$NAME")
+          got_sha=$(sha256sum "dist/$NAME" | cut -d ' ' -f 1)
+          echo "size   expected $SIZE, got $got_size"
+          echo "sha256 expected $SHA, got $got_sha"
+          [ "$got_size" = "$SIZE" ] || { echo "::error::size does not match the pin"; exit 1; }
+          [ "$got_sha" = "$SHA" ] || { echo "::error::SHA-256 does not match the pin"; exit 1; }
+
+      - name: Stage the release files (model, SHA256SUMS, licence and attribution)
+        env:
+          NAME: ${{ steps.pin.outputs.name }}
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum "$NAME" > SHA256SUMS && sha256sum -c SHA256SUMS)
+          cp licenses/privacy-filter/LICENSE-Apache-2.0.txt licenses/privacy-filter/ATTRIBUTION.md dist/
+          ls -l dist
+
+      - name: Keep the staged files for one day
+        uses: actions/upload-artifact@v4
+        with:
+          name: privacy-model-dist
+          path: dist/
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
+  publish:
+    needs: verify
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.verify.outputs.tag }}
+      REVISION: ${{ needs.verify.outputs.revision }}
+    steps:
+      - name: Refuse when the release or tag already exists (assets are never overwritten)
+        run: |
+          set -euo pipefail
+          # `gh release view` does not find a draft by tag, so list releases
+          # (drafts included) and fail on any entry for this tag. A failing
+          # `gh release list` fails the step too (set -e on the assignment).
+          found=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 \
+            --json tagName,isDraft --jq '.[]|select(.tagName==env.TAG)')
+          if [ -n "$found" ]; then
+            echo "::error::a release (possibly a draft) for $TAG already exists: $found"
+            exit 1
+          fi
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then
+            echo "::error::tag $TAG already exists"
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: privacy-model-dist
+          path: dist
+
+      - name: Re-check the staged files, then create the DRAFT release
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum -c SHA256SUMS)
+          cat > notes.md <<EOF
+          Privacy Filter model for Quiet Rabbit. This is a model file, not an app release.
+
+          - File: $(ls dist/*.gguf | xargs -n1 basename)
+          - Source: LocalAI-io/privacy-filter-GGUF at revision $REVISION (a GGUF conversion of OpenAI's openai/privacy-filter, Apache-2.0)
+          - Redistributed byte for byte. The SHA-256 is in SHA256SUMS, and the app checks it against a value compiled into the app before using the file.
+          - Licence and attribution: LICENSE-Apache-2.0.txt, ATTRIBUTION.md
+          EOF
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --draft --latest=false \
+            --title "Privacy Filter model (q8, ${REVISION:0:7})" \
+            --notes-file notes.md
+          echo "Draft release $TAG created. Open it on GitHub, read it, and click Publish release."
