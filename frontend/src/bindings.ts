@@ -532,6 +532,12 @@ export const commands = {
 	getHardwareProfile: () => typedError<HardwareProfile, string>(__TAURI_INVOKE("get_hardware_profile")),
 	getProviderRecommendation: () => typedError<ProviderRecommendation, string>(__TAURI_INVOKE("get_provider_recommendation")),
 	/**
+	 *  Start the setup task if none is running, and return the status right after.
+	 *  Idempotent: while a run is alive it only reports. Errs (with text for logs,
+	 *  not for display) for a build without the filter or with a developer model.
+	 */
+	retryPrivacyModelSetup: () => typedError<PrivacyFilterStatus, string>(__TAURI_INVOKE("retry_privacy_model_setup")),
+	/**
 	 *  The selector screen's primary read path (TIER3_ACCESS_MODEL.md State 3,
 	 *  items.id=202 piece 1's remaining wiring) -- replaces
 	 *  cloudChatAccessConfig.ts's PLACEHOLDER_PROVIDERS stand-in array.
@@ -2025,20 +2031,30 @@ export type PrivacyCommitmentBasis = "contractual" | "policy_only";
 
 /**
  *  Whether the outbound privacy check can run, as the frontend sees it.
- *  618 produces `Ready` and `Unavailable` only; `Downloading` and `Verifying`
- *  are for items.id=678's first-login model download, which feeds this type.
- *  Retry is a UI affordance derived from the variant (not retryable for
- *  `NotCompiledIn`), so the type carries no retry field.
+ *  `Downloading` and `Verifying` come from the model setup task
+ *  (items.id=678, crate::privacy_model). Retry is a UI affordance derived from
+ *  the variant (not retryable for `NotCompiledIn`), so the type carries no retry
+ *  field.
  */
 export type PrivacyFilterStatus = { kind: "ready" } | 
-/**  `percent` is None while the total size is not yet known. */
+/**
+ *  The pinned total size is known from the start, so `percent` is None only
+ *  if a caller has no figure.
+ */
 { kind: "downloading"; percent: number | null } | { kind: "verifying" } | { kind: "unavailable"; reason: PrivacyFilterUnavailableReason };
 
+/**  Why the check is unavailable. Additive: items.id=678 added the last three. */
 export type PrivacyFilterUnavailableReason = 
 /**  The library was not linked at build time (PRIVACY_FILTER_LIB_DIR unset). */
 "not_compiled_in" | 
 /**  Compiled in, but the model is missing or failed to load. */
-"model_unavailable";
+"model_unavailable" | 
+/**  No source delivered the model (offline, refused, a bad status). */
+"download_failed" | 
+/**  Not enough free disk space for the model. */
+"low_disk" | 
+/**  Bytes arrived that do not match the pinned size and hash. */
+"verification_failed";
 
 /**
  *  privacy_guardian_default_level: deliberately parallel to ReviewTier's

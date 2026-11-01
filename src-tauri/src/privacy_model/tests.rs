@@ -942,3 +942,147 @@ fn the_setup_task_never_touches_the_session_key_or_the_writer_gate() {
     }
     assert!(checked >= 4, "scanned {checked} files");
 }
+
+// ---------------------------------------------------------------------------
+// the runtime: when the task may start
+// ---------------------------------------------------------------------------
+
+use super::runtime::{retry_with, start_if_applicable, RetryRefusal};
+
+async fn wait_until_idle(installer: &Installer) {
+    for _ in 0..200 {
+        if !installer.state().is_running() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("the run did not finish");
+}
+
+#[tokio::test]
+async fn the_task_starts_only_in_a_filter_build_for_the_installed_location() {
+    let data = body();
+    let server = LoopbackServer::start(vec![Canned::bytes(200, data.clone())]);
+
+    for (compiled_in, kind) in [
+        (false, Some(LocationKind::Installed)),
+        (true, Some(LocationKind::DevOverride)),
+        (true, Some(LocationKind::DevLegacy)),
+        (true, None),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (env, _) = rig(dir.path(), &[server.base()], &data);
+        let installer = Arc::new(Installer::new(env));
+        assert!(
+            !start_if_applicable(&installer, compiled_in, kind),
+            "{compiled_in} {kind:?}"
+        );
+        assert_eq!(installer.state(), InstallState::Idle);
+    }
+    assert_eq!(server.connections(), 0, "nothing was fetched");
+
+    let dir = tempfile::tempdir().unwrap();
+    let (env, probes) = rig(dir.path(), &[server.base()], &data);
+    let installer = Arc::new(Installer::new(env));
+    assert!(start_if_applicable(
+        &installer,
+        true,
+        Some(LocationKind::Installed)
+    ));
+    wait_until_idle(&installer).await;
+    assert_eq!(installer.state(), InstallState::Installed);
+    assert_eq!(probes.activations.load(Ordering::SeqCst), 1);
+    assert_eq!(server.connections(), 1);
+}
+
+#[tokio::test]
+async fn a_login_after_a_failed_run_starts_a_new_one() {
+    // ensure_started runs at every login: a failed first attempt is retried by
+    // the next login with no other trigger.
+    let dir = tempfile::tempdir().unwrap();
+    let data = body();
+    let server = LoopbackServer::start(vec![
+        Canned::bytes(404, Vec::new()),
+        Canned::bytes(200, data.clone()),
+    ]);
+    let (env, _) = rig(dir.path(), &[server.base()], &data);
+    let installer = Arc::new(Installer::new(env));
+    let installed = Some(LocationKind::Installed);
+
+    assert!(start_if_applicable(&installer, true, installed));
+    wait_until_idle(&installer).await;
+    assert_eq!(
+        installer.state(),
+        InstallState::Failed(FailReason::DownloadFailed)
+    );
+
+    assert!(
+        start_if_applicable(&installer, true, installed),
+        "second login"
+    );
+    wait_until_idle(&installer).await;
+    assert_eq!(installer.state(), InstallState::Installed);
+}
+
+#[tokio::test]
+async fn retry_is_refused_where_nothing_could_be_fetched_and_otherwise_idempotent() {
+    let data = body();
+    let dir = tempfile::tempdir().unwrap();
+    let server = LoopbackServer::start(vec![
+        Canned::bytes(200, data.clone()).with_delay(Duration::from_millis(400))
+    ]);
+    let (env, _) = rig(dir.path(), &[server.base()], &data);
+    let installer = Arc::new(Installer::new(env));
+    let installed = Some(LocationKind::Installed);
+
+    assert_eq!(
+        retry_with(Some(&installer), false, installed),
+        Err(RetryRefusal::NotCompiledIn)
+    );
+    assert_eq!(
+        retry_with(None, true, installed),
+        Err(RetryRefusal::NotInitialised)
+    );
+    assert_eq!(
+        retry_with(Some(&installer), true, Some(LocationKind::DevOverride)),
+        Err(RetryRefusal::DeveloperModel)
+    );
+    assert_eq!(
+        retry_with(Some(&installer), true, None),
+        Err(RetryRefusal::NotInitialised)
+    );
+    assert_eq!(installer.state(), InstallState::Idle);
+
+    // Two retries in a row start one run.
+    assert_eq!(retry_with(Some(&installer), true, installed), Ok(()));
+    assert_eq!(retry_with(Some(&installer), true, installed), Ok(()));
+    wait_until_idle(&installer).await;
+    assert_eq!(installer.state(), InstallState::Installed);
+    assert_eq!(server.connections(), 1);
+}
+
+#[test]
+fn every_login_path_ends_in_the_model_check() {
+    // This only reads source text. It holds the shared mutex anyway because
+    // writer_gate's resident-slot scan cannot tell a mention of the login
+    // functions in a string from a call to them (items.id=796, 797).
+    let _lock = crate::test_support::ENV_MUTEX.blocking_lock();
+    // login's three paths (new account, existing account, a resumed rotation)
+    // all end in finish_login, so one call there is every login.
+    let auth =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/auth.rs"))
+            .unwrap();
+    let start = auth.find("pub(crate) async fn finish_login(").unwrap();
+    let end = auth[start..]
+        .find("async fn install_session(")
+        .map(|i| start + i)
+        .unwrap();
+    assert!(
+        auth[start..end].contains("crate::privacy_model::runtime::ensure_started();"),
+        "finish_login must start the model check"
+    );
+    let callers = auth.matches("finish_login(").count();
+    assert!(callers >= 4, "login paths changed: re-check this test");
+    // And nothing in the login path waits on it: it is a plain call, not awaited.
+    assert!(!auth[start..end].contains("ensure_started().await"));
+}

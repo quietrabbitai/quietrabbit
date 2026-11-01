@@ -425,6 +425,14 @@ async fn async_main() {
                 ),
             }
 
+            // items.id=678: the Privacy Filter model setup. Needs the data root
+            // recorded above and the app handle for its progress events; it
+            // starts nothing here -- each login starts it
+            // (commands::auth::finish_login).
+            quietrabbit_lib::privacy_model::runtime::init(Some(
+                quietrabbit_lib::privacy_model::runtime::tauri_sink(app.handle().clone()),
+            ));
+
             // The bundled core Focus files (bundle.resources maps
             // app/core_artifacts/focuses/*.focus into core_artifacts/focuses/,
             // items.id=617). Debug builds fall back to the source tree, so a
@@ -944,6 +952,9 @@ async fn async_main() {
             // `Runtime::new().block_on(async_main())` call chain -- see
             // those call sites' comments for why a bare nested `block_on`
             // would panic here instead.
+            // items.id=678: stop a model transfer in flight (its partial file
+            // is kept and resumed at the next login).
+            quietrabbit_lib::privacy_model::runtime::cancel();
             log::info!("main: RunEvent::Exit — stopping Ollama sidecar synchronously");
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {

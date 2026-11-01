@@ -12,9 +12,16 @@
 // tokio::task::spawn_blocking — it holds a Mutex lock for the duration
 // of the C library call and must not block the async executor.
 //
-// Model path resolution (in order):
-//   1. QR_PRIVACY_FILTER_MODEL environment variable
-//   2. ~/.local/share/quietrabbit/models/privacy-filter-q8.gguf
+// Model path: crate::privacy_model::loadable_model_path (items.id=678). In a
+// release build that is <data_root>/models/privacy-filter-q8.gguf, offered only
+// while its verified marker is valid, so a missing, partial or unverified file
+// never reaches pf_load. Debug builds also honour QR_PRIVACY_FILTER_MODEL and,
+// when no data root is set, the older ~/.local/share/quietrabbit/models/ path
+// (see privacy_model/paths.rs).
+//
+// Loading: the first call loads the model; a failed pf_load is latched so it is
+// not retried on every scan, and reinitialize() clears that latch (after a
+// verified install) and tries again without a restart.
 //
 // Build setup (one-time on Garuda):
 //   git clone https://github.com/localai-org/privacy-filter.cpp
@@ -138,6 +145,102 @@ pub(crate) fn validate_span(start: i32, end: i32, len: usize) -> Result<(usize, 
 }
 
 // ---------------------------------------------------------------------------
+// Loading helpers (always compiled, pure -- items.id=678)
+// ---------------------------------------------------------------------------
+
+/// What to do with the result of `pf_load`. privacy-filter.cpp returns NULL
+/// only for a NULL path; for a missing, unreadable or corrupt model it returns
+/// a NON-NULL context whose `pf_last_error` is set and whose `pf_classify`
+/// then fails (pf.cpp, pf_load). Treating only NULL as failure made a missing
+/// model look available. Verified in the library source; the PF-enabled test
+/// below confirms it against the linked library.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(privacy_filter_available), allow(dead_code))]
+pub(crate) enum LoadDecision {
+    /// A usable context.
+    Use,
+    /// NULL: nothing to free.
+    Fail,
+    /// A context carrying an error: free it, then fail.
+    FailAndFree,
+}
+
+/// `last_error` is the text `pf_last_error` returned, None for NULL. An empty
+/// text counts as no error.
+#[cfg_attr(not(privacy_filter_available), allow(dead_code))]
+pub(crate) fn load_decision(ctx_is_null: bool, last_error: Option<&str>) -> LoadDecision {
+    if ctx_is_null {
+        LoadDecision::Fail
+    } else if last_error.is_some_and(|e| !e.is_empty()) {
+        LoadDecision::FailAndFree
+    } else {
+        LoadDecision::Use
+    }
+}
+
+/// How one attempt to fill a `ReloadableSlot` ended.
+#[cfg_attr(not(privacy_filter_available), allow(dead_code))]
+pub(crate) enum Attempt<T> {
+    Loaded(T),
+    /// Not loadable yet (no verified model): cheap to re-evaluate, so it is NOT
+    /// latched. The next call tries again.
+    NotYet,
+    /// The load itself failed (ABI mismatch, pf_load error): latched until
+    /// `clear_failure`, so a corrupt-but-right-size file is not re-read on
+    /// every scan.
+    Failed,
+}
+
+/// The filter instance. Once `loaded` it is never replaced or dropped, so a
+/// context cannot be freed while a classify uses it; the only transition after
+/// that is none -> loaded. The mutex serialises first loads (concurrent callers
+/// wait for one load, as a OnceLock did) and holds the failure latch.
+#[cfg_attr(not(privacy_filter_available), allow(dead_code))]
+pub(crate) struct ReloadableSlot<T> {
+    loaded: std::sync::OnceLock<T>,
+    failed: std::sync::Mutex<bool>,
+}
+
+#[cfg_attr(not(privacy_filter_available), allow(dead_code))]
+impl<T> ReloadableSlot<T> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            loaded: std::sync::OnceLock::new(),
+            failed: std::sync::Mutex::new(false),
+        }
+    }
+
+    pub(crate) fn get_or_try(&self, load: impl FnOnce() -> Attempt<T>) -> Option<&T> {
+        if let Some(v) = self.loaded.get() {
+            return Some(v);
+        }
+        let mut failed = self.failed.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(v) = self.loaded.get() {
+            return Some(v); // loaded by another caller while this one waited
+        }
+        if *failed {
+            return None;
+        }
+        match load() {
+            Attempt::Loaded(v) => {
+                let _ = self.loaded.set(v);
+                self.loaded.get()
+            }
+            Attempt::NotYet => None,
+            Attempt::Failed => {
+                *failed = true;
+                None
+            }
+        }
+    }
+
+    /// Forget a latched failure so the next `get_or_try` loads again.
+    pub(crate) fn clear_failure(&self) {
+        *self.failed.lock().unwrap_or_else(|e| e.into_inner()) = false;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Live path — compiled only when PRIVACY_FILTER_LIB_DIR was set at build time
 // ---------------------------------------------------------------------------
 
@@ -146,9 +249,9 @@ mod inner {
     use std::ffi::{CStr, CString};
     use std::marker::{PhantomData, PhantomPinned};
     use std::path::PathBuf;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Mutex, Once, OnceLock};
 
-    use super::PfEntityDecoded;
+    use super::{load_decision, Attempt, LoadDecision, PfEntityDecoded, ReloadableSlot};
 
     // Directory ggml should search for backend .so files (CPU-ISA variants,
     // GPU backends). Set once via set_backend_dir() — from main.rs's setup()
@@ -287,89 +390,119 @@ mod inner {
     // PF_INSTANCE — never shared between threads concurrently.
     unsafe impl Send for PrivacyFilter {}
 
-    // -- Global singleton ----------------------------------------------------
+    // -- Global instance -----------------------------------------------------
     //
-    // OnceLock<Option<Mutex<...>>>:
-    //   Some(mutex) = filter available and ready
-    //   None        = initialisation attempted and failed (permanent until
-    //                 process restart — intentional for Release 1)
-    static PF_INSTANCE: OnceLock<Option<Mutex<PrivacyFilter>>> = OnceLock::new();
+    // A ReloadableSlot (see above): loaded once, never replaced; a failed
+    // pf_load is latched until reinitialize() clears it (items.id=678). Before
+    // that item this was an OnceLock<Option<..>> that latched a failure for the
+    // life of the process, so a model installed after startup stayed unused.
+    static PF_INSTANCE: ReloadableSlot<Mutex<PrivacyFilter>> = ReloadableSlot::new();
 
+    /// ggml's backend search directory is applied once, before the first
+    /// pf_load, and never again (the loader runs once per process).
+    static BACKEND_DIR_APPLIED: Once = Once::new();
+
+    /// The model path as a C string, or None while no loadable model exists
+    /// (privacy_model::loadable_model_path: a verified installed file in a
+    /// release build). Non-UTF-8 paths are kept byte for byte on unix.
     fn model_path_cstring() -> Option<CString> {
-        // 1. Explicit env var override.
-        if let Ok(path) = std::env::var("QR_PRIVACY_FILTER_MODEL") {
-            return CString::new(path).ok();
+        let path = crate::privacy_model::loadable_model_path()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            CString::new(path.as_os_str().as_bytes()).ok()
         }
-        // 2. XDG-aligned default in user data directory.
-        let home = std::env::var("HOME").ok()?;
-        let path = format!("{home}/.local/share/quietrabbit/models/privacy-filter-q8.gguf");
-        CString::new(path).ok()
+        #[cfg(not(unix))]
+        {
+            CString::new(path.to_str()?).ok()
+        }
+    }
+
+    fn try_load() -> Attempt<Mutex<PrivacyFilter>> {
+        // ABI check — fail before model load if library version changed.
+        // Safety: pf_abi_version() has no preconditions.
+        let abi = unsafe { pf_abi_version() } as u32;
+        if abi != EXPECTED_PF_ABI_VERSION {
+            log::error!(
+                "privacy_filter: ABI mismatch — expected {EXPECTED_PF_ABI_VERSION}, \
+                 got {abi}. Update EXPECTED_PF_ABI_VERSION in privacy_filter.rs \
+                 and audit FFI declarations before using this library version."
+            );
+            return Attempt::Failed;
+        }
+
+        // Must happen before the first pf_load — see BACKEND_DIR doc comment.
+        // BACKEND_DIR is populated by set_backend_dir() (called from
+        // main.rs's setup() hook with Tauri's resolved resource dir)
+        // if this process has a Tauri AppHandle; otherwise fall back
+        // to the build-time-baked dev bin/ dir (calibration harness,
+        // `cargo test`, etc).
+        BACKEND_DIR_APPLIED.call_once(|| {
+            let backend_dir = BACKEND_DIR
+                .get()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| BACKEND_DIR_DEV_FALLBACK.to_owned());
+            match CString::new(backend_dir.clone()) {
+                Ok(c_dir) => unsafe { pf_set_backend_dir(c_dir.as_ptr()) },
+                Err(e) => log::warn!(
+                    "privacy_filter: backend dir {backend_dir:?} has interior \
+                     null byte, cannot set ({e}) — falling back to ggml's \
+                     built-in search"
+                ),
+            }
+        });
+
+        let Some(model_path) = model_path_cstring() else {
+            log::info!("privacy_filter: no verified model to load yet");
+            return Attempt::NotYet;
+        };
+
+        // Safety: model_path is a valid null-terminated C string.
+        let ctx = unsafe {
+            pf_load(
+                model_path.as_ptr(),
+                std::ptr::null(), // device: NULL → library default (cpu)
+                0,                // n_threads: 0 → library default
+            )
+        };
+
+        // pf_load returns a non-NULL context carrying an error for a missing or
+        // corrupt model (see LoadDecision), so the error text decides.
+        let last_error = if ctx.is_null() {
+            None
+        } else {
+            // Safety: ctx is a live context from pf_load; the returned pointer
+            // is valid until the next call on it and is copied here.
+            let p = unsafe { pf_last_error(ctx as *const PfCtx) };
+            if p.is_null() {
+                None
+            } else {
+                Some(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
+            }
+        };
+        match load_decision(ctx.is_null(), last_error.as_deref()) {
+            LoadDecision::Use => {
+                log::info!("privacy_filter: initialised successfully");
+                Attempt::Loaded(Mutex::new(PrivacyFilter { ctx }))
+            }
+            LoadDecision::Fail => {
+                log::warn!("privacy_filter: pf_load returned null");
+                Attempt::Failed
+            }
+            LoadDecision::FailAndFree => {
+                log::warn!(
+                    "privacy_filter: pf_load failed: {}",
+                    last_error.as_deref().unwrap_or_default()
+                );
+                // Safety: ctx came from pf_load and has not been freed or shared.
+                unsafe { pf_free(ctx) };
+                Attempt::Failed
+            }
+        }
     }
 
     fn get_or_init() -> Option<&'static Mutex<PrivacyFilter>> {
-        PF_INSTANCE
-            .get_or_init(|| {
-                // ABI check — fail before model load if library version changed.
-                // Safety: pf_abi_version() has no preconditions.
-                let abi = unsafe { pf_abi_version() } as u32;
-                if abi != EXPECTED_PF_ABI_VERSION {
-                    log::error!(
-                        "privacy_filter: ABI mismatch — expected {EXPECTED_PF_ABI_VERSION}, \
-                         got {abi}. Update EXPECTED_PF_ABI_VERSION in privacy_filter.rs \
-                         and audit FFI declarations before using this library version."
-                    );
-                    return None;
-                }
-                log::info!("privacy_filter: ABI version {abi} confirmed");
-
-                // Must happen before pf_load — see BACKEND_DIR doc comment.
-                // BACKEND_DIR is populated by set_backend_dir() (called from
-                // main.rs's setup() hook with Tauri's resolved resource dir)
-                // if this process has a Tauri AppHandle; otherwise fall back
-                // to the build-time-baked dev bin/ dir (calibration harness,
-                // `cargo test`, etc).
-                let backend_dir = BACKEND_DIR
-                    .get()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| BACKEND_DIR_DEV_FALLBACK.to_owned());
-                match CString::new(backend_dir.clone()) {
-                    Ok(c_dir) => unsafe { pf_set_backend_dir(c_dir.as_ptr()) },
-                    Err(e) => log::warn!(
-                        "privacy_filter: backend dir {backend_dir:?} has interior \
-                         null byte, cannot set ({e}) — falling back to ggml's \
-                         built-in search"
-                    ),
-                }
-
-                let model_path = match model_path_cstring() {
-                    Some(p) => p,
-                    None => {
-                        log::warn!("privacy_filter: could not resolve model path");
-                        return None;
-                    }
-                };
-
-                // Safety: model_path is a valid null-terminated C string.
-                let ctx = unsafe {
-                    pf_load(
-                        model_path.as_ptr(),
-                        std::ptr::null(), // device: NULL → library default (cpu)
-                        0,                // n_threads: 0 → library default
-                    )
-                };
-
-                if ctx.is_null() {
-                    log::warn!(
-                        "privacy_filter: pf_load returned null — \
-                         model missing or path incorrect"
-                    );
-                    return None;
-                }
-
-                log::info!("privacy_filter: initialised successfully");
-                Some(Mutex::new(PrivacyFilter { ctx }))
-            })
-            .as_ref()
+        PF_INSTANCE.get_or_try(try_load)
     }
 
     // -- Public API ----------------------------------------------------------
@@ -377,6 +510,16 @@ mod inner {
     /// Returns true if the Privacy Filter library was compiled in and the
     /// GGUF model loaded successfully on first call.
     pub fn is_available() -> bool {
+        get_or_init().is_some()
+    }
+
+    /// Clear a latched load failure and try to load again (items.id=678): called
+    /// after a verified install, so the filter turns on without a restart.
+    /// Blocking (it can load 1.6 GB): never call it from an async context
+    /// directly. True when a model is loaded afterwards. A model that is already
+    /// loaded is left as it is.
+    pub fn reinitialize() -> bool {
+        PF_INSTANCE.clear_failure();
         get_or_init().is_some()
     }
 
@@ -509,7 +652,7 @@ mod inner {
 #[cfg(privacy_filter_available)]
 use inner::run_classify_blocking_sync;
 #[cfg(privacy_filter_available)]
-pub use inner::{is_available, set_backend_dir};
+pub use inner::{is_available, reinitialize, set_backend_dir};
 
 // ---------------------------------------------------------------------------
 // Stub path — when PRIVACY_FILTER_LIB_DIR was not set at build time
@@ -532,6 +675,13 @@ fn run_classify_blocking_sync(
     Err("Privacy Filter not compiled in \
          (set PRIVACY_FILTER_LIB_DIR at build time)"
         .to_owned())
+}
+
+/// False when the Privacy Filter library was not compiled in: there is nothing
+/// to load.
+#[cfg(not(privacy_filter_available))]
+pub fn reinitialize() -> bool {
+    false
 }
 
 /// No-op when the Privacy Filter library was not compiled in — lets callers
@@ -571,15 +721,16 @@ pub async fn run_classify_blocking(
 // ---------------------------------------------------------------------------
 
 /// Whether the outbound privacy check can run, as the frontend sees it.
-/// 618 produces `Ready` and `Unavailable` only; `Downloading` and `Verifying`
-/// are for items.id=678's first-login model download, which feeds this type.
-/// Retry is a UI affordance derived from the variant (not retryable for
-/// `NotCompiledIn`), so the type carries no retry field.
+/// `Downloading` and `Verifying` come from the model setup task
+/// (items.id=678, crate::privacy_model). Retry is a UI affordance derived from
+/// the variant (not retryable for `NotCompiledIn`), so the type carries no retry
+/// field.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, specta::Type)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PrivacyFilterStatus {
     Ready,
-    /// `percent` is None while the total size is not yet known.
+    /// The pinned total size is known from the start, so `percent` is None only
+    /// if a caller has no figure.
     Downloading {
         percent: Option<u8>,
     },
@@ -589,6 +740,7 @@ pub enum PrivacyFilterStatus {
     },
 }
 
+/// Why the check is unavailable. Additive: items.id=678 added the last three.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, specta::Type)]
 #[serde(rename_all = "snake_case")]
 pub enum PrivacyFilterUnavailableReason {
@@ -596,27 +748,71 @@ pub enum PrivacyFilterUnavailableReason {
     NotCompiledIn,
     /// Compiled in, but the model is missing or failed to load.
     ModelUnavailable,
+    /// No source delivered the model (offline, refused, a bad status).
+    DownloadFailed,
+    /// Not enough free disk space for the model.
+    LowDisk,
+    /// Bytes arrived that do not match the pinned size and hash.
+    VerificationFailed,
 }
 
-/// The status `get_health` reports. The first call loads the 1.6 GB model
-/// (is_available latches a load failure for the process), so it runs on the
-/// blocking pool, never on the async executor.
+impl From<crate::privacy_model::install::FailReason> for PrivacyFilterUnavailableReason {
+    fn from(reason: crate::privacy_model::install::FailReason) -> Self {
+        use crate::privacy_model::install::FailReason;
+        match reason {
+            FailReason::DownloadFailed => Self::DownloadFailed,
+            FailReason::LowDisk => Self::LowDisk,
+            FailReason::VerificationFailed => Self::VerificationFailed,
+            FailReason::ModelUnavailable => Self::ModelUnavailable,
+        }
+    }
+}
+
+/// The status `get_health` and the retry command report. Loading the model
+/// (is_available, first call) runs on the blocking pool, never on the async
+/// executor.
 pub async fn status() -> PrivacyFilterStatus {
+    let install = crate::privacy_model::runtime::current_state();
     let available = tokio::task::spawn_blocking(is_available)
         .await
         .unwrap_or(false);
-    status_from(cfg!(privacy_filter_available), available)
+    status_from(cfg!(privacy_filter_available), available, install)
 }
 
-/// Pure mapping from "compiled in" and "loaded" to a status.
-fn status_from(compiled_in: bool, available: bool) -> PrivacyFilterStatus {
-    match (compiled_in, available) {
-        (_, true) => PrivacyFilterStatus::Ready,
-        (true, false) => PrivacyFilterStatus::Unavailable {
-            reason: PrivacyFilterUnavailableReason::ModelUnavailable,
+/// Whole percent of `current` in `total`, 0 to 100.
+fn percent_of(current: u64, total: u64) -> u8 {
+    if total == 0 {
+        return 0;
+    }
+    u8::try_from((u128::from(current) * 100 / u128::from(total)).min(100)).unwrap_or(100)
+}
+
+/// Pure mapping from "compiled in", "loaded" and the setup task's state to a
+/// status. A loaded filter is `Ready` whatever the task says.
+fn status_from(
+    compiled_in: bool,
+    available: bool,
+    install: crate::privacy_model::install::InstallState,
+) -> PrivacyFilterStatus {
+    use crate::privacy_model::install::InstallState;
+    if available {
+        return PrivacyFilterStatus::Ready;
+    }
+    match install {
+        // A run is alive and nothing is loaded: the check is being set up.
+        InstallState::Checking | InstallState::Verifying => PrivacyFilterStatus::Verifying,
+        InstallState::Downloading { current } => PrivacyFilterStatus::Downloading {
+            percent: Some(percent_of(current, crate::privacy_model::pin::SIZE)),
         },
-        (false, false) => PrivacyFilterStatus::Unavailable {
-            reason: PrivacyFilterUnavailableReason::NotCompiledIn,
+        InstallState::Failed(reason) => PrivacyFilterStatus::Unavailable {
+            reason: reason.into(),
+        },
+        InstallState::Idle | InstallState::Installed => PrivacyFilterStatus::Unavailable {
+            reason: if compiled_in {
+                PrivacyFilterUnavailableReason::ModelUnavailable
+            } else {
+                PrivacyFilterUnavailableReason::NotCompiledIn
+            },
         },
     }
 }
@@ -685,21 +881,226 @@ mod tests {
 
     #[test]
     fn status_from_maps_every_combination() {
+        use crate::privacy_model::install::InstallState;
         use PrivacyFilterUnavailableReason::*;
-        assert_eq!(status_from(true, true), PrivacyFilterStatus::Ready);
-        assert_eq!(status_from(false, true), PrivacyFilterStatus::Ready);
+        let idle = InstallState::Idle;
+        assert_eq!(status_from(true, true, idle), PrivacyFilterStatus::Ready);
+        assert_eq!(status_from(false, true, idle), PrivacyFilterStatus::Ready);
         assert_eq!(
-            status_from(true, false),
+            status_from(true, false, idle),
             PrivacyFilterStatus::Unavailable {
                 reason: ModelUnavailable
             }
         );
         assert_eq!(
-            status_from(false, false),
+            status_from(false, false, idle),
             PrivacyFilterStatus::Unavailable {
                 reason: NotCompiledIn
             }
         );
+        assert_eq!(
+            status_from(true, false, InstallState::Installed),
+            PrivacyFilterStatus::Unavailable {
+                reason: ModelUnavailable
+            },
+            "installed but not loaded is still unavailable"
+        );
+    }
+
+    #[test]
+    fn a_running_setup_task_is_reported_until_the_filter_is_loaded() {
+        use crate::privacy_model::install::InstallState;
+        use crate::privacy_model::pin::SIZE;
+        for state in [InstallState::Checking, InstallState::Verifying] {
+            assert_eq!(
+                status_from(true, false, state),
+                PrivacyFilterStatus::Verifying
+            );
+        }
+        assert_eq!(
+            status_from(true, false, InstallState::Downloading { current: 0 }),
+            PrivacyFilterStatus::Downloading { percent: Some(0) }
+        );
+        assert_eq!(
+            status_from(true, false, InstallState::Downloading { current: SIZE / 2 }),
+            PrivacyFilterStatus::Downloading { percent: Some(50) }
+        );
+        assert_eq!(
+            status_from(true, false, InstallState::Downloading { current: SIZE }),
+            PrivacyFilterStatus::Downloading { percent: Some(100) }
+        );
+        // Loaded wins over whatever the task says.
+        for state in [
+            InstallState::Checking,
+            InstallState::Verifying,
+            InstallState::Downloading { current: 5 },
+        ] {
+            assert_eq!(status_from(true, true, state), PrivacyFilterStatus::Ready);
+        }
+    }
+
+    #[test]
+    fn a_failed_setup_task_reports_its_reason() {
+        use crate::privacy_model::install::{FailReason, InstallState};
+        use PrivacyFilterUnavailableReason as R;
+        for (fail, reason) in [
+            (FailReason::DownloadFailed, R::DownloadFailed),
+            (FailReason::LowDisk, R::LowDisk),
+            (FailReason::VerificationFailed, R::VerificationFailed),
+            (FailReason::ModelUnavailable, R::ModelUnavailable),
+        ] {
+            assert_eq!(
+                status_from(true, false, InstallState::Failed(fail)),
+                PrivacyFilterStatus::Unavailable { reason }
+            );
+        }
+    }
+
+    #[test]
+    fn percent_of_is_clamped_and_total_safe() {
+        assert_eq!(percent_of(0, 0), 0);
+        assert_eq!(percent_of(5, 0), 0);
+        assert_eq!(percent_of(1, 3), 33);
+        assert_eq!(percent_of(2, 3), 66);
+        assert_eq!(percent_of(10, 10), 100);
+        assert_eq!(percent_of(u64::MAX, 1), 100);
+        assert_eq!(percent_of(u64::MAX, u64::MAX), 100);
+    }
+
+    #[test]
+    fn the_new_reasons_serialize_to_the_bindings_contract() {
+        let json = |r: PrivacyFilterUnavailableReason| {
+            serde_json::to_string(&PrivacyFilterStatus::Unavailable { reason: r }).unwrap()
+        };
+        assert_eq!(
+            json(PrivacyFilterUnavailableReason::DownloadFailed),
+            r#"{"kind":"unavailable","reason":"download_failed"}"#
+        );
+        assert_eq!(
+            json(PrivacyFilterUnavailableReason::LowDisk),
+            r#"{"kind":"unavailable","reason":"low_disk"}"#
+        );
+        assert_eq!(
+            json(PrivacyFilterUnavailableReason::VerificationFailed),
+            r#"{"kind":"unavailable","reason":"verification_failed"}"#
+        );
+    }
+
+    // -- load decision and the reloadable slot (items.id=678) -----------------
+
+    #[test]
+    fn load_decision_covers_null_error_and_clean_contexts() {
+        // NULL: fail, nothing to free.
+        assert_eq!(load_decision(true, None), LoadDecision::Fail);
+        assert_eq!(load_decision(true, Some("ignored")), LoadDecision::Fail);
+        // Non-NULL with an error set (what pf_load returns for a missing or
+        // corrupt model): fail, and the context must be freed.
+        assert_eq!(
+            load_decision(false, Some("cannot open model")),
+            LoadDecision::FailAndFree
+        );
+        // Non-NULL, no error: use it.
+        assert_eq!(load_decision(false, None), LoadDecision::Use);
+        // An empty error text is no error.
+        assert_eq!(load_decision(false, Some("")), LoadDecision::Use);
+    }
+
+    #[test]
+    fn a_slot_loads_once_and_never_replaces_what_it_holds() {
+        let slot: ReloadableSlot<u32> = ReloadableSlot::new();
+        assert_eq!(slot.get_or_try(|| Attempt::Loaded(7)), Some(&7));
+        let mut called = false;
+        assert_eq!(
+            slot.get_or_try(|| {
+                called = true;
+                Attempt::Loaded(8)
+            }),
+            Some(&7)
+        );
+        assert!(!called, "a loaded slot does not load again");
+        slot.clear_failure();
+        assert_eq!(slot.get_or_try(|| Attempt::Loaded(9)), Some(&7));
+    }
+
+    #[test]
+    fn a_failed_load_is_latched_until_it_is_cleared() {
+        let slot: ReloadableSlot<u32> = ReloadableSlot::new();
+        let loads = std::cell::Cell::new(0);
+        let fail = || {
+            loads.set(loads.get() + 1);
+            Attempt::<u32>::Failed
+        };
+        assert_eq!(slot.get_or_try(fail), None);
+        assert_eq!(slot.get_or_try(fail), None);
+        assert_eq!(slot.get_or_try(fail), None);
+        assert_eq!(loads.get(), 1, "no retry storm on a corrupt file");
+
+        slot.clear_failure();
+        assert_eq!(slot.get_or_try(|| Attempt::Loaded(3)), Some(&3));
+    }
+
+    #[test]
+    fn not_yet_is_not_latched() {
+        let slot: ReloadableSlot<u32> = ReloadableSlot::new();
+        let tries = std::cell::Cell::new(0);
+        for _ in 0..3 {
+            assert_eq!(
+                slot.get_or_try(|| {
+                    tries.set(tries.get() + 1);
+                    Attempt::NotYet
+                }),
+                None
+            );
+        }
+        assert_eq!(tries.get(), 3, "each call looks again");
+        // Once a model becomes loadable, the next call picks it up with no
+        // reinitialize at all.
+        assert_eq!(slot.get_or_try(|| Attempt::Loaded(1)), Some(&1));
+    }
+
+    #[test]
+    fn concurrent_first_callers_load_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let slot: ReloadableSlot<usize> = ReloadableSlot::new();
+        let loads = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    let got = slot.get_or_try(|| {
+                        loads.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(30));
+                        Attempt::Loaded(42)
+                    });
+                    assert_eq!(got, Some(&42));
+                });
+            }
+        });
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn availability_flips_after_a_cleared_failure_and_never_flips_back() {
+        // The same sequence is_available()/reinitialize() run, with a fake
+        // loader: unavailable, latched, cleared, available, still available.
+        let slot: ReloadableSlot<u32> = ReloadableSlot::new();
+        let model_ready = std::cell::Cell::new(false);
+        let load = || {
+            if model_ready.get() {
+                Attempt::Loaded(1)
+            } else {
+                Attempt::Failed
+            }
+        };
+        assert!(slot.get_or_try(load).is_none());
+        model_ready.set(true);
+        assert!(
+            slot.get_or_try(load).is_none(),
+            "still latched: the verified install alone does not clear it"
+        );
+        slot.clear_failure(); // what reinitialize() does first
+        assert!(slot.get_or_try(load).is_some());
+        model_ready.set(false);
+        assert!(slot.get_or_try(load).is_some(), "loaded stays loaded");
     }
 
     #[test]
@@ -769,6 +1170,102 @@ mod tests {
     #[test]
     fn fail_closed_follows_debug_assertions() {
         assert_eq!(fail_closed_when_unavailable(), !cfg!(debug_assertions));
+    }
+
+    // -- The real library and the real model (items.id=678) -------------------
+    //
+    // Compiled only into a PF-enabled build, so CI (which builds without the
+    // library) never runs it. By hand:
+    //   cd src-tauri && TMPDIR=$HOME/.cache/qr-678-tmp \
+    //     CARGO_TARGET_DIR=$HOME/.cache/qr-618-target-pf \
+    //     PRIVACY_FILTER_LIB_DIR=$HOME/privacy-filter.cpp/build/release-portable \
+    //     cargo test --lib privacy_filter::tests::pf_enabled
+    // The instance is process-wide, so every step is in ONE test, and the test
+    // skips (loudly) when the model file is absent or something already loaded.
+
+    #[cfg(privacy_filter_available)]
+    struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    #[cfg(privacy_filter_available)]
+    impl EnvRestore {
+        fn new(names: &[&'static str]) -> Self {
+            Self(names.iter().map(|n| (*n, std::env::var_os(n))).collect())
+        }
+    }
+
+    #[cfg(privacy_filter_available)]
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (name, value) in self.0.drain(..) {
+                match value {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    #[cfg(privacy_filter_available)]
+    #[test]
+    fn pf_enabled_unverified_and_corrupt_models_never_load_and_a_verified_one_does() {
+        use crate::privacy_model::{install::pin_expect, marker, paths, pin};
+
+        let home = std::env::var("HOME").unwrap_or_default();
+        let real = std::path::PathBuf::from(&home)
+            .join(".local/share/quietrabbit/models")
+            .join(pin::FILE_NAME);
+        if !real.exists() {
+            eprintln!("SKIPPED: {real:?} is not there");
+            return;
+        }
+        let _lock = crate::test_support::ENV_MUTEX.blocking_lock();
+        let _restore = EnvRestore::new(&["QR_DATA_ROOT", paths::ENV_OVERRIDE]);
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("QR_DATA_ROOT", root.path());
+        std::env::remove_var(paths::ENV_OVERRIDE);
+        if is_available() {
+            eprintln!("SKIPPED: another test already loaded the model in this process");
+            return;
+        }
+
+        // (a) No model under the data root: not available, and not latched.
+        assert!(!is_available());
+
+        // (b) The right file at the right path but no marker: it is never
+        // handed to pf_load.
+        let model = paths::model_path_in(root.path());
+        std::fs::create_dir_all(model.parent().unwrap()).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &model).unwrap();
+        #[cfg(not(unix))]
+        std::fs::copy(&real, &model).unwrap();
+        assert!(!is_available(), "an unverified file must not load");
+
+        // (c) pf_load on a corrupt file returns a NON-NULL context carrying an
+        // error. It must count as a failed load, not as available. (Debug
+        // builds only: release builds never read the override.)
+        if cfg!(debug_assertions) {
+            let junk = root.path().join("junk.gguf");
+            std::fs::write(&junk, b"this is not a gguf file").unwrap();
+            std::env::set_var(paths::ENV_OVERRIDE, &junk);
+            assert!(!reinitialize(), "a corrupt model must not look available");
+            assert!(!is_available());
+            std::env::remove_var(paths::ENV_OVERRIDE);
+        }
+
+        // (d) Verify the model (the marker), as the installer does. A failure
+        // latched in (c) holds until reinitialize() clears it.
+        marker::record(&model, &paths::marker_path_for(&model), &pin_expect()).unwrap();
+        if cfg!(debug_assertions) {
+            assert!(!is_available(), "the latch holds until reinitialize");
+        }
+        assert!(reinitialize(), "a verified model loads without a restart");
+        assert!(is_available());
+
+        // (e) And it classifies.
+        let spans = run_classify_blocking_sync("My name is Alice Smith.", 0.0)
+            .expect("classify after reinitialize");
+        assert!(!spans.is_empty(), "expected at least one span");
     }
 
     fn ent() -> PfEntityDecoded {

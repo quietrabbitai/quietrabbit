@@ -13,6 +13,7 @@ pub mod install;
 pub mod marker;
 pub mod paths;
 pub mod pin;
+pub mod runtime;
 
 #[cfg(test)]
 mod tests;

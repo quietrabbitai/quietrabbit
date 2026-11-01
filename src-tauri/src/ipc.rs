@@ -130,6 +130,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::system::get_capability_profile,
         commands::system::get_hardware_profile,
         commands::system::get_provider_recommendation,
+        commands::privacy_model::retry_privacy_model_setup,
         // Group 13 -- Cloud Chat pane lifecycle & provider catalog
         // (items.id=202 piece 5 / items.id=223, 2026-08-04)
         commands::cloud_chat_pane::list_active_providers,

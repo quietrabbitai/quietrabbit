@@ -720,6 +720,13 @@ pub(crate) async fn finish_login(
         return Err(e);
     }
 
+    // items.id=678 (decisions.id=864): the Privacy Filter model is a required
+    // component, checked at EVERY login so a failed attempt is retried. This
+    // only claims the single flight and spawns; it never waits, takes no
+    // account state, and its result is shown by the privacy-check state, never
+    // by this login.
+    crate::privacy_model::runtime::ensure_started();
+
     Ok(())
 }
 
