@@ -81,6 +81,23 @@ pub fn get_data_root() -> PathBuf {
     );
 }
 
+/// The data root if one is set, `None` otherwise; never panics. Same sources
+/// as `get_data_root` (the recorded value, and under `cfg(test)` the
+/// `QR_DATA_ROOT` fallback). For callers that also run where no root is ever
+/// set (integration tests and examples link the library without `cfg(test)`
+/// and without running main.rs's setup), such as the Privacy Filter's model
+/// path (items.id=678). Anything that writes user data uses `get_data_root`.
+pub fn try_get_data_root() -> Option<PathBuf> {
+    if let Some(root) = DATA_ROOT.read().unwrap_or_else(|e| e.into_inner()).clone() {
+        return Some(root);
+    }
+    #[cfg(test)]
+    if let Ok(root) = std::env::var("QR_DATA_ROOT") {
+        return Some(PathBuf::from(root));
+    }
+    None
+}
+
 /// Test-only: forgets the value `set_data_root` recorded, so the environment
 /// fallback applies again.
 #[cfg(test)]
@@ -306,6 +323,21 @@ mod tests {
         // Clearing the set value hands resolution back to the environment.
         clear_data_root();
         assert_eq!(get_data_root(), PathBuf::from("/tmp/qr-env-root"));
+    }
+
+    #[test]
+    fn try_get_data_root_is_none_instead_of_a_panic_and_otherwise_agrees() {
+        let _lock = ENV_MUTEX.blocking_lock();
+        let _guard = RootGuard::new();
+        std::env::remove_var("QR_DATA_ROOT");
+        assert_eq!(try_get_data_root(), None);
+
+        std::env::set_var("QR_DATA_ROOT", "/tmp/qr-env-root");
+        assert_eq!(try_get_data_root(), Some(PathBuf::from("/tmp/qr-env-root")));
+
+        set_data_root(PathBuf::from("/tmp/qr-set-root"));
+        assert_eq!(try_get_data_root(), Some(get_data_root()));
+        assert_eq!(try_get_data_root(), Some(PathBuf::from("/tmp/qr-set-root")));
     }
 
     #[test]

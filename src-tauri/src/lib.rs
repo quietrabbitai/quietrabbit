@@ -19,6 +19,7 @@ pub mod persistence;
 pub mod persona_sync;
 pub mod persona_view_sync;
 pub mod pinned_asset;
+pub mod privacy_model;
 pub mod provider_catalog;
 pub mod provider_credentials;
 pub mod providers;
