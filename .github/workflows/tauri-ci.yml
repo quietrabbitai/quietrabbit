@@ -6,8 +6,9 @@
 # Traces to: D6-339 (Rust migration), item 16d-setup, items.id=207
 #
 # Job layout (items.id=787): `lint` (fmt + cargo-deny), `clippy` and `check`
-# (the plain `cargo test`, kept under its old id so its rust-cache key and
-# history stay valid) run in parallel, as does `frontend`. The `clippy` and
+# (the tests: lib binary as 3 shards plus the other targets, items.id=844; kept
+# under its old id so its rust-cache key and history stay valid) run in
+# parallel, as does `frontend`. The `clippy` and
 # `check` jobs share one setup block (apt, SQLCipher, toolchain): GitHub
 # Actions cannot share steps between jobs, and a composite action cannot carry
 # the per-step timeout-minutes, so the block is duplicated -- EDIT BOTH COPIES
@@ -202,7 +203,8 @@ jobs:
         working-directory: src-tauri
         run: cargo clippy --tests -- -D warnings
 
-  # The plain `cargo test` (never --lib), core-dump capture and its
+  # The tests (the lib binary as 3 shards plus the other targets, items.id=844;
+  # locally plain `cargo test`, never --lib), core-dump capture and its
   # failure-only backtrace. Keeps the id `check` (items.id=787): rust-cache keys
   # on the job id, so the existing cache entry stays valid. Setup block is a
   # copy of `clippy`'s -- keep both in sync.
@@ -343,11 +345,18 @@ jobs:
       - name: Enable core dumps
         run: .github/scripts/ci-core-dump.sh enable
 
+      # items.id=844: the lib unit-test binary runs as 3 parallel shards (own
+      # process, own ENV_MUTEX, own TMPDIR/XDG dirs), then every other target
+      # plain `cargo test` runs (bins, tests/*.rs, doc tests) runs once. The
+      # script fails the job on any red shard, on a shard that died on a signal,
+      # and on a count mismatch (shards must be disjoint and sum to the full
+      # --list). No retry. Shard definitions live in the script. Local
+      # verification stays plain `cargo test` (decisions.id=776). The core-dump
+      # limit set here is inherited by every shard.
       - name: Test
-        working-directory: src-tauri
         run: |
           ulimit -c 2097152 || echo "::warning::could not raise the core size limit"
-          cargo test
+          .github/scripts/ci-test-shards.sh all
 
       # workflow_dispatch only, never on push/PR. Proves the capture path end to
       # end: a second thread idles while main crashes inside an atexit handler,
