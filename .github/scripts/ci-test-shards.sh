@@ -161,10 +161,17 @@ run_lib() {
     got=$(sed -n 's/^test result: [A-Za-z]*\. \([0-9]*\) passed; \([0-9]*\) failed; \([0-9]*\) ignored.*/\1 \2 \3/p' "$WORK/$s.log" |
       awk '{t += $1 + $2 + $3} END {print t + 0}')
     echo "shard $s: exit $rc, ${secs}s, ran passed+failed+ignored=$got of $want listed"
+    if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+      [ -s "$WORK/summary.md" ] || printf '| shard | exit | seconds | ran / listed |\n|---|---|---|---|\n' >"$WORK/summary.md"
+      printf '| %s | %s | %s | %s / %s |\n' "$s" "$rc" "$secs" "$got" "$want" >>"$WORK/summary.md"
+    fi
     [ "$rc" = 0 ] || err "lib shard $s FAILED (exit $rc)"
     grep -q 'signal: [0-9]' "$WORK/$s.log" && err "lib shard $s: a test process died on a signal (see the Core-dump backtrace step); do not retry, investigate"
     [ "$got" -eq "$want" ] || err "lib shard $s accounted for $got tests but $want were listed"
   done
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ] && [ -s "$WORK/summary.md" ]; then
+    { printf '### Lib test shards\n\n'; cat "$WORK/summary.md"; } >>"$GITHUB_STEP_SUMMARY"
+  fi
 }
 
 # Executables plain `cargo test` would build, as "name|path" sorted.
