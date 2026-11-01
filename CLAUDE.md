@@ -128,6 +128,9 @@ equals the full `--list`; a red shard, a signal exit or a missing target also
 fail it, and every failure is reported. There is no retry: a crash is
 investigated. Plain `cargo test` stays the local standard (decisions.id=776);
 `.github/scripts/ci-test-shards.sh check` runs only the count check locally.
+Shards share 4 vCPUs, so a test must not assert a pool size or a tight
+wall-clock bound that a starved CPU can break: the idle_timeout leak test
+detects a leak by pool exhaustion for that reason (items.id=844).
 
 Frontend gate (items.id=588): CI also runs a separate `frontend` job in
 tauri-ci.yml, in parallel with `check` (Node 24: npm ci, npx tsc -b, npm test,
