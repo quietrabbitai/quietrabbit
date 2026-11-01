@@ -1,4 +1,7 @@
 # Quiet Rabbit — Claude Code Context
+# Last updated: October 31, 2026 (items.id=844: CI paragraph under "Key commands"
+# only -- sharded Test step; also corrects the old "check job runs fmt, clippy,
+# deny" claim, stale since items.id=787). Before that:
 # Last updated: October 31, 2026 (items.id=667: Ollama section only --
 # single-instance guard built, with its limits). Before that, October 31, 2026
 # (items.id=668: Ollama section only -- sidecar
@@ -110,7 +113,21 @@ Key commands:
   git branch --show-current                            — verify branch (must show main)
   git log --oneline main | head -10                    — commit verification
 
-The cargo commands above run from src-tauri/. CI's check job (.github/workflows/tauri-ci.yml) runs fmt, clippy, deny and plain test; a change is not verified until build, fmt, clippy, deny and plain test all pass locally. Build plus test alone has let both a compile break and a fmt failure reach unpushed main undetected (items.id=532).
+The cargo commands above run from src-tauri/. CI (.github/workflows/tauri-ci.yml) splits the gate over parallel jobs: `lint` (fmt, deny), `clippy`, `check` (the tests) and `frontend` (items.id=787). A change is not verified until build, fmt, clippy, deny and plain test all pass locally. Build plus test alone has let both a compile break and a fmt failure reach unpushed main undetected (items.id=532).
+
+CI's `check` Test step does not run plain `cargo test` (items.id=844): it runs
+.github/scripts/ci-test-shards.sh, which builds once, runs the quietrabbit_lib
+unit-test binary as 3 parallel shards (own process, own ENV_MUTEX, own
+TMPDIR/XDG dirs; --test-threads 1/1/2), then runs the other targets (bins,
+src-tauri/tests/*.rs, doc tests) once. The shard definitions are in that script:
+A = ollama_ownership:: ollama_sidecar::, B = auth::key_rotation::
+commands::key_rotation:: auth::writer_gate::, C = everything else (skips every A
+and B filter, so a new test module lands in C). The trailing :: is mandatory.
+A count check fails the job unless the shards are disjoint and their union
+equals the full `--list`; a red shard, a signal exit or a missing target also
+fail it, and every failure is reported. There is no retry: a crash is
+investigated. Plain `cargo test` stays the local standard (decisions.id=776);
+`.github/scripts/ci-test-shards.sh check` runs only the count check locally.
 
 Frontend gate (items.id=588): CI also runs a separate `frontend` job in
 tauri-ci.yml, in parallel with `check` (Node 24: npm ci, npx tsc -b, npm test,
