@@ -27,6 +27,8 @@ pub mod retry_wait;
 pub mod spend;
 pub mod task_progress;
 pub mod task_supervision;
+#[cfg(all(test, target_os = "linux"))]
+mod test_harness;
 #[cfg(test)]
 pub mod test_support;
 pub mod write_failure;
