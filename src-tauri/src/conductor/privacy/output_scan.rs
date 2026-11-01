@@ -115,7 +115,8 @@ pub struct OutputScanResult {
     /// PF classifier error or panic (not a timeout). Full intensity treats
     /// it as fail-closed (blocked=true), like a timeout (items.id=613). Also
     /// true when a release build has no usable filter (items.id=618).
-    /// Not persisted: output_store stores blocked + timed_out only.
+    /// Persisted (items.id=809, outputs.pg_scan_pf_error) so a failed scan is
+    /// re-run rather than cached as a permanent block.
     pub pf_error: bool,
     pub findings: Vec<OutputScanFinding>,
     pub plain_language: Option<String>,

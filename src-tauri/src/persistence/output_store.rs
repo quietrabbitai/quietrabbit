@@ -100,12 +100,19 @@ pub struct OutputRecord {
     /// an ingested document) -- see pg_scan_completed_at.
     pub pg_scan_blocked: bool,
     pub pg_scan_timed_out: bool,
+    /// items.id=809: the scan failed (Privacy Filter error, or no usable
+    /// filter in a release build, items.id=613/618) -- see
+    /// OutputScanResult::pf_error. Like pg_scan_timed_out, a failed scan is
+    /// not a trustworthy cache: callers re-scan it.
+    pub pg_scan_pf_error: bool,
     pub pg_scan_plain_language: Option<String>,
     /// JSON array of OutputScanFinding, or NULL if never scanned.
     pub pg_scan_findings_json: Option<String>,
     /// NULL = never scanned (legacy row, or a creation path that doesn't
     /// call scan_output) -- the signal callers use to decide whether
-    /// pg_scan_blocked is trustworthy cache or just an unset default.
+    /// pg_scan_blocked is trustworthy cache or just an unset default. Set
+    /// is necessary but not sufficient: a row whose scan failed
+    /// (pg_scan_timed_out or pg_scan_pf_error) is also not trustworthy.
     pub pg_scan_completed_at: Option<String>,
     /// One of prime/update/fork/reference/continue_draft (decisions.id=422,
     /// outputs_007.sql). Defaults to 'prime' for qr_generated rows and
@@ -277,6 +284,7 @@ fn row_to_output_record(r: &sqlx::sqlite::SqliteRow) -> Result<OutputRecord, sql
         original_filename: r.try_get("original_filename")?,
         pg_scan_blocked: r.try_get::<i64, _>("pg_scan_blocked")? != 0,
         pg_scan_timed_out: r.try_get::<i64, _>("pg_scan_timed_out")? != 0,
+        pg_scan_pf_error: r.try_get::<i64, _>("pg_scan_pf_error")? != 0,
         pg_scan_plain_language: r.try_get("pg_scan_plain_language")?,
         pg_scan_findings_json: r.try_get("pg_scan_findings_json")?,
         pg_scan_completed_at: r.try_get("pg_scan_completed_at")?,
@@ -307,7 +315,8 @@ fn row_to_output_record(r: &sqlx::sqlite::SqliteRow) -> Result<OutputRecord, sql
 /// seeding not exercising the cache, or a future non-Focus-run creation
 /// path); a None row simply reads back as "never scanned"
 /// (pg_scan_completed_at NULL), which callers must treat as cache-miss, not
-/// as scan_result.blocked == false.
+/// as scan_result.blocked == false. A scan that FAILED (timed_out or pf_error,
+/// items.id=809) is stored as such and is also a cache-miss for callers.
 #[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
 pub async fn save_output(
     user_id: &str,
@@ -337,6 +346,7 @@ pub async fn save_output(
     let (
         pg_scan_blocked,
         pg_scan_timed_out,
+        pg_scan_pf_error,
         pg_scan_plain_language,
         pg_scan_findings_json,
         pg_scan_completed_at,
@@ -344,6 +354,7 @@ pub async fn save_output(
         Some(r) => (
             r.blocked,
             r.timed_out,
+            r.pf_error,
             r.plain_language.clone(),
             Some(
                 serde_json::to_string(
@@ -363,16 +374,16 @@ pub async fn save_output(
             ),
             Some(timestamp.clone()),
         ),
-        None => (false, false, None, None, None),
+        None => (false, false, false, None, None, None),
     };
 
     sqlx::query(
         "INSERT INTO outputs
          (id, focus_run_id, output_type, content, sensitivity,
           status, created_at, updated_at,
-          pg_scan_blocked, pg_scan_timed_out, pg_scan_plain_language,
-          pg_scan_findings_json, pg_scan_completed_at)
-         VALUES (?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?)",
+          pg_scan_blocked, pg_scan_timed_out, pg_scan_pf_error,
+          pg_scan_plain_language, pg_scan_findings_json, pg_scan_completed_at)
+         VALUES (?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&oid)
     .bind(focus_run_id)
@@ -383,6 +394,7 @@ pub async fn save_output(
     .bind(&timestamp)
     .bind(pg_scan_blocked)
     .bind(pg_scan_timed_out)
+    .bind(pg_scan_pf_error)
     .bind(pg_scan_plain_language)
     .bind(pg_scan_findings_json)
     .bind(pg_scan_completed_at)
@@ -399,6 +411,10 @@ pub async fn save_output(
 /// *next* copy of the same immutable output becomes a cache hit too, per
 /// decisions.id=767's "classify once" principle, converging every output
 /// onto the creation-time model over time rather than re-scanning it forever.
+/// items.id=809: also used to store the result of re-scanning a row whose
+/// earlier scan FAILED (timed_out or pf_error). A failed re-scan is stored as
+/// failed again, so the next copy re-scans once more; a completed one becomes
+/// a normal cache.
 pub async fn backfill_scan_result(
     user_id: &str,
     persona_id: &str,
@@ -426,12 +442,14 @@ pub async fn backfill_scan_result(
 
     sqlx::query(
         "UPDATE outputs
-         SET pg_scan_blocked = ?, pg_scan_timed_out = ?, pg_scan_plain_language = ?,
-             pg_scan_findings_json = ?, pg_scan_completed_at = ?
+         SET pg_scan_blocked = ?, pg_scan_timed_out = ?, pg_scan_pf_error = ?,
+             pg_scan_plain_language = ?, pg_scan_findings_json = ?,
+             pg_scan_completed_at = ?
          WHERE id = ?",
     )
     .bind(scan_result.blocked)
     .bind(scan_result.timed_out)
+    .bind(scan_result.pf_error)
     .bind(&scan_result.plain_language)
     .bind(&findings_json)
     .bind(&timestamp)
@@ -461,8 +479,9 @@ pub async fn get_output(
                 o.sensitivity, o.status, o.created_at, o.updated_at,
                 o.source, o.project_entity_id, o.focus_slug, o.storage_path,
                 o.storage_version, o.original_filename,
-                o.pg_scan_blocked, o.pg_scan_timed_out, o.pg_scan_plain_language,
-                o.pg_scan_findings_json, o.pg_scan_completed_at,
+                o.pg_scan_blocked, o.pg_scan_timed_out, o.pg_scan_pf_error,
+                o.pg_scan_plain_language, o.pg_scan_findings_json,
+                o.pg_scan_completed_at,
                 o.document_relationship, o.parent_output_id, o.superseded_by,
                 o.exported_at
          FROM outputs o
@@ -497,8 +516,9 @@ pub async fn get_output_for_run(
                 o.sensitivity, o.status, o.created_at, o.updated_at,
                 o.source, o.project_entity_id, o.focus_slug, o.storage_path,
                 o.storage_version, o.original_filename,
-                o.pg_scan_blocked, o.pg_scan_timed_out, o.pg_scan_plain_language,
-                o.pg_scan_findings_json, o.pg_scan_completed_at,
+                o.pg_scan_blocked, o.pg_scan_timed_out, o.pg_scan_pf_error,
+                o.pg_scan_plain_language, o.pg_scan_findings_json,
+                o.pg_scan_completed_at,
                 o.document_relationship, o.parent_output_id, o.superseded_by,
                 o.exported_at
          FROM outputs o
@@ -764,8 +784,9 @@ pub async fn list_outputs(
                 o.sensitivity, o.status, o.created_at, o.updated_at,
                 o.source, o.project_entity_id, o.focus_slug, o.storage_path,
                 o.storage_version, o.original_filename,
-                o.pg_scan_blocked, o.pg_scan_timed_out, o.pg_scan_plain_language,
-                o.pg_scan_findings_json, o.pg_scan_completed_at,
+                o.pg_scan_blocked, o.pg_scan_timed_out, o.pg_scan_pf_error,
+                o.pg_scan_plain_language, o.pg_scan_findings_json,
+                o.pg_scan_completed_at,
                 o.document_relationship, o.parent_output_id, o.superseded_by,
                 o.exported_at
          FROM outputs o
@@ -829,8 +850,9 @@ pub async fn list_forward_links(
                 o.sensitivity, o.status, o.created_at, o.updated_at,
                 o.source, o.project_entity_id, o.focus_slug, o.storage_path,
                 o.storage_version, o.original_filename,
-                o.pg_scan_blocked, o.pg_scan_timed_out, o.pg_scan_plain_language,
-                o.pg_scan_findings_json, o.pg_scan_completed_at,
+                o.pg_scan_blocked, o.pg_scan_timed_out, o.pg_scan_pf_error,
+                o.pg_scan_plain_language, o.pg_scan_findings_json,
+                o.pg_scan_completed_at,
                 o.document_relationship, o.parent_output_id, o.superseded_by,
                 o.exported_at
          FROM outputs o
@@ -878,8 +900,9 @@ pub async fn find_predecessor(
                 o.sensitivity, o.status, o.created_at, o.updated_at,
                 o.source, o.project_entity_id, o.focus_slug, o.storage_path,
                 o.storage_version, o.original_filename,
-                o.pg_scan_blocked, o.pg_scan_timed_out, o.pg_scan_plain_language,
-                o.pg_scan_findings_json, o.pg_scan_completed_at,
+                o.pg_scan_blocked, o.pg_scan_timed_out, o.pg_scan_pf_error,
+                o.pg_scan_plain_language, o.pg_scan_findings_json,
+                o.pg_scan_completed_at,
                 o.document_relationship, o.parent_output_id, o.superseded_by,
                 o.exported_at
          FROM outputs o

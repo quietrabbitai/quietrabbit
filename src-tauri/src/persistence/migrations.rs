@@ -215,6 +215,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/outputs_011.sql"),
     },
     SchemaFile {
+        prefix: "outputs",
+        version: 12,
+        sql: include_str!("../../schema/outputs_012.sql"),
+    },
+    SchemaFile {
         prefix: "personal",
         version: 1,
         sql: include_str!("../../schema/personal_001.sql"),
@@ -3785,10 +3790,10 @@ mod tests {
 
         assert_eq!(
             result.expect("migration must apply cleanly"),
-            11,
+            12,
             "outputs_001 + outputs_002 + outputs_003 + outputs_004 + outputs_005 + \
              outputs_006 + outputs_007 + outputs_008 + outputs_009 + outputs_010 + \
-             outputs_011 must all apply in one pass"
+             outputs_011 + outputs_012 must all apply in one pass"
         );
 
         let mut conn =
@@ -4538,7 +4543,7 @@ mod tests {
         let applied = run_migrations(&mut conn, "outputs", Some(TEST_KEY_HEX))
             .await
             .expect("v11 must apply to a populated outputs.db");
-        assert_eq!(applied, 1, "only outputs_011 was pending");
+        assert_eq!(applied, 2, "outputs_011 and outputs_012 were pending");
 
         for (table, expected) in FOCUS_RUN_TABLES.iter().zip(before) {
             assert_eq!(
@@ -4563,6 +4568,55 @@ mod tests {
                VALUES ('run2', 'f', 'awaiting_schedule', '2026-01-01T00:00:00Z')"],
         )
         .await;
+    }
+
+    /// items.id=809: outputs_012 adds pg_scan_pf_error. A populated v11
+    /// database keeps its rows and every existing row reads back 0.
+    #[tokio::test]
+    async fn outputs_v11_to_v12_adds_pf_error_column_and_preserves_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut conn = open_keyed_scratch(&tmp.path().join("outputs.db")).await;
+        apply_versions_up_to(&mut conn, "outputs", 11).await;
+        exec_all(
+            &mut conn,
+            &[
+                "INSERT INTO focus_runs (id, focus_id, started_at) \
+                 VALUES ('run1', 'f', '2026-01-01T00:00:00Z')",
+                "INSERT INTO outputs \
+                 (id, focus_run_id, output_type, created_at, updated_at, \
+                  pg_scan_blocked, pg_scan_timed_out, pg_scan_completed_at) \
+                 VALUES ('o1', 'run1', 'doc', '2026-01-01T00:00:00Z', \
+                         '2026-01-01T00:00:00Z', 1, 1, '2026-01-01T00:00:00Z')",
+            ],
+        )
+        .await;
+
+        let applied = run_migrations(&mut conn, "outputs", Some(TEST_KEY_HEX))
+            .await
+            .expect("v12 must apply to a populated outputs.db");
+        assert_eq!(applied, 1, "only outputs_012 was pending");
+
+        let row: (i64, i64, i64) = sqlx::query_as(
+            "SELECT pg_scan_blocked, pg_scan_timed_out, pg_scan_pf_error \
+             FROM outputs WHERE id = 'o1'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .expect("the pre-existing row must survive with the new column readable");
+        assert_eq!(
+            row,
+            (1, 1, 0),
+            "existing rows keep their flags, pf_error defaults to 0"
+        );
+        assert_eq!(row_count(&mut conn, "outputs").await, 1);
+
+        let rejected = sqlx::query("UPDATE outputs SET pg_scan_pf_error = 2 WHERE id = 'o1'")
+            .execute(&mut conn)
+            .await;
+        assert!(
+            rejected.is_err(),
+            "the CHECK must reject values other than 0 and 1"
+        );
     }
 
     #[tokio::test]

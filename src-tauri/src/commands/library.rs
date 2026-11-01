@@ -412,6 +412,15 @@ pub async fn update_active_document(
     .map_err(|e| e.to_string())
 }
 
+/// Whether the creation-time scan cached on `record` can be trusted as the
+/// answer for this content: the scan completed (pg_scan_completed_at set) and
+/// did not fail (items.id=809). `pg_scan_blocked` is ignored on purpose: a
+/// failed Full scan is always blocked, and re-scanning is the conservative
+/// direction either way.
+fn cached_scan_is_usable(record: &output_store::OutputRecord) -> bool {
+    record.pg_scan_completed_at.is_some() && !record.pg_scan_timed_out && !record.pg_scan_pf_error
+}
+
 /// The real clipboard gate (items.id=243), replacing the retired gate4.rs
 /// stub (content_approved was always true). Runs output_scan::scan_output()
 /// at Full intensity -- when Privacy Filter is available this blocks on any
@@ -451,12 +460,16 @@ async fn prepare_clipboard_copy(
     // items.id=416 (decisions.id=767): outputs are immutable after creation,
     // so a scan computed once at creation can never go stale -- reuse the
     // cached creation-time result (lifecycle.rs::output()) instead of
-    // re-scanning identical content on every copy. pg_scan_completed_at is
-    // only ever unset for a row that predates this creation-time scan, or
-    // that never went through it at all (e.g. an ingested document) -- for
-    // those, fall back to the old live-scan-at-copy-time behavior and
-    // backfill the result so the next copy of the same output is a cache hit.
-    let blocked = if record.pg_scan_completed_at.is_some() {
+    // re-scanning identical content on every copy. The cache is unusable
+    // (cached_scan_is_usable) for a row that predates this creation-time scan,
+    // or that never went through it at all (e.g. an ingested document), and
+    // (items.id=809) for a row whose scan FAILED (timeout, Privacy Filter
+    // error, or no usable filter in a release build): a failed scan stored a
+    // block that says nothing about the content. For those, fall back to the
+    // live-scan-at-copy-time behavior and backfill the result, so the next
+    // copy is a cache hit -- or, if the re-scan failed again, another re-scan.
+    // A block caused by real findings stays cached.
+    let blocked = if cached_scan_is_usable(&record) {
         record.pg_scan_blocked
     } else {
         let execution_tier = output_store::get_focus_run_routing_tier(
@@ -1024,6 +1037,287 @@ mod tests {
             "cached blocked=true must be honored even though live severity-based \
              scanning of \"general\" content would not have blocked it"
         );
+    }
+
+    // -- Failed creation-time scans are a cache miss (items.id=809) ----------
+    //
+    // Same technique as clipboard_copy_uses_cached_scan_result_instead_of_rescanning:
+    // "general" content, so a LIVE legacy-fallback scan returns blocked=false
+    // while a cache hit returns the seeded blocked=true. Ok(..) therefore
+    // proves a live re-scan ran, Err(..) proves the cache was honored.
+
+    /// Seeds a "general" output whose creation-time scan result is `scan`.
+    async fn seed_output_with_cached_scan(
+        pool: &sqlx::SqlitePool,
+        scan: &OutputScanResult,
+    ) -> String {
+        focus_settings_store::create_focus_settings(
+            pool,
+            PERSONA_ID,
+            "focus-open",
+            "bidirectional",
+            "shared",
+            2,
+            ExternalAccess::AnonymousRequired,
+            "open",
+            None,
+        )
+        .await
+        .expect("create_focus_settings must succeed in test setup");
+        output_store::test_seed_focus_run(
+            USER_ID,
+            PERSONA_ID,
+            &key_hex_str(),
+            "run-cached-scan",
+            "focus-open",
+        )
+        .await
+        .expect("test_seed_focus_run must succeed in test setup");
+        output_store::save_output(
+            USER_ID,
+            PERSONA_ID,
+            &key_hex_str(),
+            "run-cached-scan",
+            "note",
+            "harmless-looking general content",
+            "general",
+            None,
+            Some(scan),
+        )
+        .await
+        .expect("save_output must succeed in test setup")
+    }
+
+    async fn get_record(output_id: &str) -> output_store::OutputRecord {
+        output_store::get_output(USER_ID, PERSONA_ID, &key_hex_str(), output_id)
+            .await
+            .expect("get_output must succeed")
+            .expect("seeded output must exist")
+    }
+
+    fn failed_scan(timed_out: bool, pf_error: bool) -> OutputScanResult {
+        OutputScanResult {
+            blocked: true,
+            timed_out,
+            pf_error,
+            findings: vec![],
+            plain_language: Some("scan failed".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn clipboard_copy_rescans_a_cached_timed_out_scan() {
+        let _env = setup().await;
+        let output_id = seed_output_with_cached_scan(&_env.pool, &failed_scan(true, false)).await;
+        assert!(get_record(&output_id).await.pg_scan_timed_out);
+
+        let result =
+            prepare_clipboard_copy(&_env.pool, &output_id, USER_ID, PERSONA_ID, &key_hex_str())
+                .await;
+
+        assert_eq!(
+            result,
+            Ok("harmless-looking general content".to_string()),
+            "a cached timed-out scan must be re-scanned live, not kept as a block"
+        );
+        let record = get_record(&output_id).await;
+        assert!(!record.pg_scan_blocked && !record.pg_scan_timed_out && !record.pg_scan_pf_error);
+    }
+
+    #[tokio::test]
+    async fn clipboard_copy_rescans_a_cached_pf_error_scan() {
+        let _env = setup().await;
+        let output_id = seed_output_with_cached_scan(&_env.pool, &failed_scan(false, true)).await;
+        assert!(get_record(&output_id).await.pg_scan_pf_error);
+
+        let result =
+            prepare_clipboard_copy(&_env.pool, &output_id, USER_ID, PERSONA_ID, &key_hex_str())
+                .await;
+
+        assert_eq!(
+            result,
+            Ok("harmless-looking general content".to_string()),
+            "a cached Privacy Filter error scan must be re-scanned live, not kept as a block"
+        );
+        let record = get_record(&output_id).await;
+        assert!(!record.pg_scan_blocked && !record.pg_scan_timed_out && !record.pg_scan_pf_error);
+    }
+
+    #[tokio::test]
+    async fn clipboard_copy_keeps_a_cached_real_findings_block() {
+        let _env = setup().await;
+        let findings_block = OutputScanResult {
+            blocked: true,
+            timed_out: false,
+            pf_error: false,
+            findings: vec![crate::conductor::privacy::output_scan::OutputScanFinding {
+                start_byte: 0,
+                end_byte: 4,
+                label: "private_person".to_string(),
+                score: 0.99,
+            }],
+            plain_language: Some("real findings".to_string()),
+        };
+        let output_id = seed_output_with_cached_scan(&_env.pool, &findings_block).await;
+        let before = get_record(&output_id).await;
+
+        let result =
+            prepare_clipboard_copy(&_env.pool, &output_id, USER_ID, PERSONA_ID, &key_hex_str())
+                .await;
+
+        assert!(
+            result.is_err(),
+            "a block caused by real findings must stay cached (no re-scan loop)"
+        );
+        let after = get_record(&output_id).await;
+        assert_eq!(
+            after.pg_scan_completed_at, before.pg_scan_completed_at,
+            "the cached row must not have been re-scanned and backfilled"
+        );
+        assert!(after.pg_scan_blocked && !after.pg_scan_timed_out && !after.pg_scan_pf_error);
+    }
+
+    /// The shape pf_unavailable_result returns in a release build with no
+    /// filter (pinned by output_scan.rs's
+    /// pf_unavailable_result_full_blocks_and_light_does_not) round-trips
+    /// through save_output, and a failed re-scan stored via
+    /// backfill_scan_result is failed again -- so the next copy re-scans
+    /// once more rather than looping on a cache hit or sticking.
+    #[tokio::test]
+    async fn failed_scan_is_stored_as_failed_and_stays_a_cache_miss() {
+        let _env = setup().await;
+        let unavailable_shape = failed_scan(false, true);
+        let output_id = seed_output_with_cached_scan(&_env.pool, &unavailable_shape).await;
+        let record = get_record(&output_id).await;
+        assert!(record.pg_scan_blocked && record.pg_scan_pf_error && !record.pg_scan_timed_out);
+        assert!(!cached_scan_is_usable(&record));
+
+        output_store::backfill_scan_result(
+            USER_ID,
+            PERSONA_ID,
+            &key_hex_str(),
+            &output_id,
+            &failed_scan(true, false),
+        )
+        .await
+        .expect("backfill_scan_result must succeed");
+        let record = get_record(&output_id).await;
+        assert!(record.pg_scan_timed_out && !record.pg_scan_pf_error);
+        assert!(
+            !cached_scan_is_usable(&record),
+            "a failed re-scan is still a miss"
+        );
+
+        let completed = OutputScanResult {
+            blocked: false,
+            timed_out: false,
+            pf_error: false,
+            findings: vec![],
+            plain_language: None,
+        };
+        output_store::backfill_scan_result(
+            USER_ID,
+            PERSONA_ID,
+            &key_hex_str(),
+            &output_id,
+            &completed,
+        )
+        .await
+        .expect("backfill_scan_result must succeed");
+        let record = get_record(&output_id).await;
+        assert!(!record.pg_scan_timed_out && !record.pg_scan_pf_error);
+        assert!(
+            cached_scan_is_usable(&record),
+            "a completed re-scan becomes the cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_scan_is_usable_truth_table() {
+        let _env = setup().await;
+        let output_id = seed_output_with_cached_scan(&_env.pool, &failed_scan(false, false)).await;
+        let mut record = get_record(&output_id).await;
+        assert!(record.pg_scan_completed_at.is_some());
+
+        // Completed, whatever it found: usable.
+        for blocked in [false, true] {
+            record.pg_scan_blocked = blocked;
+            assert!(cached_scan_is_usable(&record));
+        }
+        // Failed in either way, blocked or not: not usable.
+        for (timed_out, pf_error) in [(true, false), (false, true), (true, true)] {
+            for blocked in [false, true] {
+                record.pg_scan_blocked = blocked;
+                record.pg_scan_timed_out = timed_out;
+                record.pg_scan_pf_error = pf_error;
+                assert!(!cached_scan_is_usable(&record));
+            }
+        }
+        // Never scanned: not usable.
+        record.pg_scan_timed_out = false;
+        record.pg_scan_pf_error = false;
+        record.pg_scan_completed_at = None;
+        assert!(!cached_scan_is_usable(&record));
+    }
+
+    /// items.id=618 + 809 end to end, release builds without the Privacy
+    /// Filter only (debug and test builds use the legacy fallback and cannot
+    /// reach the unavailable block). The output is created through the real
+    /// scan_output, so it is cached as blocked + pf_error; each copy then
+    /// re-scans live (one fresh output_scan_pf_unavailable event per copy)
+    /// and is blocked again, with no loop and no cache hit.
+    /// Run with: QR_ALLOW_RELEASE_WITHOUT_PRIVACY_FILTER=1 cargo test --release --lib -- release_
+    #[cfg(all(not(debug_assertions), not(privacy_filter_available)))]
+    #[tokio::test]
+    async fn release_without_pf_cached_unavailable_block_rescans_on_next_copy() {
+        let _env = setup().await;
+        let logger = SqliteDisclosureLogger::new(USER_ID, PERSONA_ID, &key_hex_str());
+        let created = scan_output(
+            &logger,
+            "output-creation",
+            "run-cached-scan",
+            "harmless-looking general content",
+            1,
+            0,
+            ScanIntensity::Full,
+        )
+        .await
+        .expect("scan_output must succeed");
+        assert!(created.blocked && created.pf_error);
+        let output_id = seed_output_with_cached_scan(&_env.pool, &created).await;
+
+        async fn unavailable_events() -> i64 {
+            let mut conn = crate::persistence::personal_store::open_personal_db(
+                USER_ID,
+                PERSONA_ID,
+                &key_hex_str(),
+            )
+            .await
+            .expect("open_personal_db must succeed");
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM disclosure_log WHERE extra_metadata LIKE '%output_scan_pf_unavailable%'",
+            )
+            .fetch_one(&mut conn)
+            .await
+            .expect("count must succeed")
+        }
+        assert_eq!(unavailable_events().await, 1);
+
+        for copy in 1..=2 {
+            let result =
+                prepare_clipboard_copy(&_env.pool, &output_id, USER_ID, PERSONA_ID, &key_hex_str())
+                    .await;
+            assert!(
+                result.is_err(),
+                "copy {copy}: still no filter, still blocked"
+            );
+            assert_eq!(
+                unavailable_events().await,
+                1 + copy,
+                "copy {copy} must run exactly one live re-scan"
+            );
+            assert!(get_record(&output_id).await.pg_scan_pf_error);
+        }
     }
 
     #[tokio::test]

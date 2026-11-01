@@ -369,6 +369,7 @@ TABLE outputs
   pg_scan_findings_json TEXT notnull=0 pk=0 default=None
   pg_scan_completed_at TEXT notnull=0 pk=0 default=None
   exported_at TEXT notnull=0 pk=0 default=None
+  pg_scan_pf_error INTEGER notnull=1 pk=0 default=Some("0")
 TABLE outputs_fts
   content  notnull=0 pk=0 default=None
   output_type  notnull=0 pk=0 default=None
