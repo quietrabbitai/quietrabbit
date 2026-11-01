@@ -698,20 +698,37 @@ mod tests {
         assert_eq!(still_live.0, 1, "the session must remain live too");
     }
 
-    /// items.id=483: shared.db access is pooled (max_connections=5) instead
-    /// of one-connection-per-call. Before pooling, every tick of this
+    /// items.id=483: shared.db access is pooled (max_connections=5 in main.rs)
+    /// instead of one-connection-per-call. Before pooling, every tick of this
     /// function opened a brand-new connection via open_shared_db() that was
     /// never explicitly closed -- connection count grew without bound as
     /// main.rs's periodic timer kept firing. Simulates many ticks against a
     /// non-idle-expired session (so run_periodic_check runs its full acquire
-    /// + query body every time, not the "nobody logged in" early return) and
-    /// asserts the pool's total connection count never exceeds max_connections,
-    /// proving connections are being returned to the pool and reused rather
-    /// than accumulating.
+    /// + query body every time, not the "nobody logged in" early return).
+    ///
+    /// items.id=844: this used to assert `pool.size() <= 5` on setup()'s
+    /// default pool (max 10). A returned connection reaches the pool through
+    /// a task sqlx spawns on drop, so on a starved CPU the next tick can open
+    /// a second connection before the first is back and the count reads 6-8
+    /// with nothing leaked (25 of 40 runs on one CPU shared with two busy
+    /// loops). The leak is detected by exhaustion instead: the pool here is
+    /// built like production's (max_connections=5) with a bounded acquire
+    /// timeout, so a tick that keeps a connection exhausts the pool within
+    /// five ticks (measured: the fourth), waits out the timeout, locks as
+    /// CheckFailed and fails this test. A merely late return is waited for,
+    /// not counted.
     #[tokio::test]
     async fn run_periodic_check_does_not_grow_shared_db_connection_count_across_many_ticks() {
         let _env = setup().await;
-        let app = mock_app_with_registry(_env.pool.clone());
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(5)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect_with(crate::providers::utils::connect_options_unencrypted(
+                &crate::providers::utils::db_path_shared(),
+            ))
+            .await
+            .expect("shared.db pool must connect");
+        let app = mock_app_with_registry(pool.clone());
         let registry = app.state::<KeyRegistry>();
         let group_key_registry = app.state::<GroupKeyRegistry>();
         let pool = app.state::<sqlx::SqlitePool>();
@@ -738,25 +755,25 @@ mod tests {
             .unwrap();
         drop(conn);
 
-        for _ in 0..25 {
-            run_periodic_check(
+        // 25 ticks against 5 connections: five times the pool.
+        for tick in 0..25 {
+            let locked = run_periodic_check(
                 &pool,
                 &registry,
                 &group_key_registry,
                 &ConnectSessions::default(),
             )
             .await;
+            assert_eq!(
+                locked, None,
+                "tick {tick} locked the session: a tick that keeps its connection \
+                 exhausts the 5-connection pool and the acquire times out"
+            );
         }
 
         assert!(
             registry.is_occupied().await,
             "session is still inside the idle window and must not have been cleared"
-        );
-        assert!(
-            pool.size() <= 5,
-            "shared.db pool must stay within max_connections=5 across repeated ticks, \
-             got {} -- connections are leaking instead of being returned to the pool",
-            pool.size()
         );
     }
 
