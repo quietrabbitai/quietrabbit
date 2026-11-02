@@ -969,6 +969,16 @@ async fn async_main() {
         }
     });
 
+    // items.id=622: when an account's key leaves memory, close the Cloud Chat
+    // panes and wipe CEF's jar and site data; keep the stored cookies fresh
+    // meanwhile. Registered here, not in `setup()`, because it needs CEF up.
+    if quietrabbit_lib::cloud_chat_gpu_pane::bootstrap::cef_available() {
+        quietrabbit_lib::cloud_chat_gpu_pane::session_hygiene::install(
+            app.handle(),
+            &app.state::<quietrabbit_lib::auth::registry::KeyRegistry>(),
+        );
+    }
+
     // Single-window GTK/wgpu pane host (items.id=202 real positioning fix,
     // 2026-08-07 -- see cloud_chat_gpu_pane::pane_host's module docs for the full
     // architecture). Reparents Tauri's own webview widget into a

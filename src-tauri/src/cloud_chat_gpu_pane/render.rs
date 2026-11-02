@@ -1684,10 +1684,19 @@ wrap_load_handler! {
         fn on_load_end(
             &self,
             _browser: Option<&mut cef::Browser>,
-            _frame: Option<&mut cef::Frame>,
+            frame: Option<&mut cef::Frame>,
             http_status_code: ::std::os::raw::c_int,
         ) {
             log::info!("cloud_chat_gpu_pane::render: on_load_end: status={http_status_code}");
+            // items.id=622: remember every origin this pane loaded (main frame
+            // and iframes) so its site data can be cleared when it goes.
+            if let Some(frame) = frame {
+                let url: cef::CefString = (&frame.url()).into();
+                crate::cloud_chat_gpu_pane::site_data::note_origin(
+                    &self.handler.pane_key,
+                    &url.to_string(),
+                );
+            }
         }
 
         // items.id=234: unconditional -- any main-frame navigation of this

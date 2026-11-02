@@ -68,13 +68,15 @@ use cef::{
     CookieSameSite, CookieVisitor, ImplCookieManager, ImplCookieVisitor, ImplSetCookieCallback,
     SetCookieCallback, WrapCookieVisitor, WrapSetCookieCallback,
 };
-use tauri::State;
+use tauri::{Manager, State};
 use tokio::sync::oneshot;
 
 use crate::auth::registry::{key_hex, KeyRegistry};
 use crate::cloud_chat_gpu_pane::bootstrap::{cef_available, ensure_cef_available};
 use crate::cloud_chat_gpu_pane::lock_recover;
 use crate::cloud_chat_gpu_pane::pane_host::{self, PaneCommand};
+use crate::cloud_chat_gpu_pane::session_hygiene::{self, JarGuard};
+use crate::cloud_chat_gpu_pane::site_data;
 use crate::cloud_chat_gpu_pane::PaneKey;
 use crate::persistence::cloud_chat_cookie_store::{self, StoredCookie};
 use crate::persistence::provider_store;
@@ -497,11 +499,16 @@ fn should_persist(dispatched: bool, outcome: Option<CookieVisitOutcome>) -> bool
 /// persists them (full-replace) via cloud_chat_cookie_store. Best-effort: a
 /// failure here is logged, never propagated as a reason the pane can't
 /// close.
+///
+/// items.id=622: runs under the jar gate (`jar`), which hands out the jar
+/// epoch. The key was read after the guard was taken; if a key has left since,
+/// the jar no longer belongs to `user_id` and nothing is written.
 async fn persist_cookies_from_jar(
     user_id: &str,
     key_hex_str: &str,
     provider_id: &str,
     launch_url: &str,
+    jar: &JarGuard<'_>,
 ) {
     let Some(manager) = cef::cookie_manager_get_global_manager(None) else {
         log::warn!(
@@ -556,10 +563,64 @@ async fn persist_cookies_from_jar(
 
     let collected: Vec<StoredCookie> = lock_recover(&cookies).clone();
 
+    if !jar.still_current() {
+        log::warn!(
+            "cloud_chat_pane: a key left while the cookies of provider={provider_id} were read -- \
+             not writing them to the store"
+        );
+        return;
+    }
+
     if let Err(e) =
         cloud_chat_cookie_store::upsert_cookies(user_id, key_hex_str, provider_id, &collected).await
     {
         log::warn!("cloud_chat_pane: could not persist cookies for provider={provider_id}: {e}");
+    }
+}
+
+/// items.id=622: writes every open provider's cookies into the signed-in
+/// account's encrypted store, so a lock (which deletes the jar and cannot wait
+/// for CEF) loses at most one snapshot interval. Skips quietly when nobody is
+/// signed in, a rotation holds the writer gate, or a sign-out's cleanup is
+/// pending.
+pub(crate) async fn snapshot_open_panes(app: &tauri::AppHandle) {
+    let provider_ids = session_hygiene::open_ids();
+    if provider_ids.is_empty() {
+        return;
+    }
+    let key_registry = app.state::<KeyRegistry>();
+    let pool = app.state::<sqlx::SqlitePool>();
+    let Ok(_lease) = crate::auth::writer_gate::command(&key_registry).await else {
+        return;
+    };
+    let Some(jar) = session_hygiene::acquire_jar().await else {
+        return;
+    };
+    let Some((user_id, key_hex_str)) = key_registry
+        .with_key(|k| (k.user_id.clone(), key_hex(&k.data_key)))
+        .await
+    else {
+        return;
+    };
+    for provider_id in provider_ids {
+        match provider_store::get_provider(&pool, &provider_id).await {
+            Ok(Some(provider)) => {
+                if let Some(launch_url) = provider.launch_url {
+                    persist_cookies_from_jar(
+                        &user_id,
+                        &key_hex_str,
+                        &provider_id,
+                        &launch_url,
+                        &jar,
+                    )
+                    .await;
+                }
+            }
+            Ok(None) => {}
+            Err(e) => log::warn!(
+                "cloud_chat_pane: snapshot could not resolve provider={provider_id}: {e}"
+            ),
+        }
     }
 }
 
@@ -687,6 +748,15 @@ pub async fn open_cloud_chat_panes(
     // -- treated the same as "no stored cookies" (log + proceed), not a
     // reason to refuse opening the pane, matching restore_cookies_into_jar's
     // own best-effort framing.
+    // items.id=622: the restore writes into the one global jar, so it takes the
+    // jar gate, which refuses while a sign-out is still being cleaned up (that
+    // cleanup would wipe what is restored here) and orders this against a
+    // snapshot or persist. The key is read only after the gate is held.
+    let Some(_jar) = session_hygiene::acquire_jar().await else {
+        return Err(
+            "The previous session is still being cleaned up. Try again in a moment.".to_string(),
+        );
+    };
     let session = key_registry
         .with_key(|k| (k.user_id.clone(), key_hex(&k.data_key)))
         .await;
@@ -712,6 +782,10 @@ pub async fn open_cloud_chat_panes(
             );
         }
 
+        // items.id=622: remembered for the periodic cookie snapshot and for
+        // clearing this provider's site data when the pane goes.
+        session_hygiene::note_open(&provider_id);
+        site_data::note_origin(&provider_id, &launch_url);
         app_handle
             .run_on_main_thread(move || {
                 pane_host::dispatch(PaneCommand::Open {
@@ -765,6 +839,8 @@ pub async fn close_cloud_chat_pane(
             .map_err(|e| e.to_string())?;
     }
 
+    session_hygiene::note_closed(&provider_id);
+
     // items.id=778: closing the pane itself never waits for a rotation; the
     // cookie save does. When the gate refuses (a rotation under way) the
     // cookies are not saved this time and the pane closes regardless.
@@ -775,7 +851,18 @@ pub async fn close_cloud_chat_pane(
             None
         }
     };
-    let session = if lease.is_some() {
+    // items.id=622: the same jar gate as the restore. If a sign-out's cleanup
+    // is pending or runs long, the persist is skipped, never raced against the wipe.
+    let jar = if lease.is_some() {
+        let jar = session_hygiene::acquire_jar().await;
+        if jar.is_none() {
+            log::warn!("cloud_chat_pane: cookies not saved on close, the jar is being cleared");
+        }
+        jar
+    } else {
+        None
+    };
+    let session = if lease.is_some() && jar.is_some() {
         key_registry
             .with_key(|k| (k.user_id.clone(), key_hex(&k.data_key)))
             .await
@@ -788,8 +875,9 @@ pub async fn close_cloud_chat_pane(
         provider_store::get_provider(&pool, &provider_id).await,
     ) {
         (Some((user_id, key_hex_str)), Ok(Some(provider))) => {
-            if let Some(launch_url) = provider.launch_url {
-                persist_cookies_from_jar(&user_id, &key_hex_str, &provider_id, &launch_url).await;
+            if let (Some(launch_url), Some(jar)) = (provider.launch_url, jar.as_ref()) {
+                persist_cookies_from_jar(&user_id, &key_hex_str, &provider_id, &launch_url, jar)
+                    .await;
             }
         }
         (None, _) => log::warn!(

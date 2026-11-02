@@ -147,6 +147,8 @@ pub mod gl_loader;
 pub mod pane_host;
 pub mod profile_dir;
 pub mod render;
+pub mod session_hygiene;
+pub mod site_data;
 
 pub use bootstrap::dispatch_cef_subprocess;
 

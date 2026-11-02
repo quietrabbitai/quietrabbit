@@ -98,11 +98,37 @@ pub struct UnlockedKey {
     pub(crate) unlocked_at: String,
 }
 
+/// Why an account's key left memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyLeaveReason {
+    /// `clear()`: logout, an idle or ceiling lock, a rotation finishing, a
+    /// failed sign-in rolling back.
+    Cleared,
+    /// `replace()` installed a different account's key over this one.
+    UserChanged,
+}
+
+/// An account's key just left this registry (items.id=622).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyLeft {
+    pub user_id: String,
+    pub reason: KeyLeaveReason,
+}
+
+/// A callback run synchronously, on the thread that cleared or replaced the
+/// key, once the slot no longer holds the account's key. It must be quick and
+/// must not block, await or call back into the registry: hand any real work to
+/// a task. It cannot fail the clear.
+type KeyLeaveObserver = std::sync::Arc<dyn Fn(&KeyLeft) + Send + Sync>;
+
 /// Single-slot key registry. Encapsulated -- see module header on why the
 /// inner Mutex is not exposed directly.
 #[derive(Default)]
 pub struct KeyRegistry {
     slot: tokio::sync::Mutex<Option<UnlockedKey>>,
+    /// Observers told when a key leaves (items.id=622). The registry knows
+    /// nothing of what they do with it: the Cloud Chat cleanup is one.
+    leave_observers: std::sync::Mutex<Vec<KeyLeaveObserver>>,
     /// Recovery entropy of a just-created account, held ONLY until the
     /// one-time display (commands::auth::get_recovery_key_display) takes it
     /// or the session ends (items.id=629). Never persisted. The phrase
@@ -132,7 +158,56 @@ impl KeyRegistry {
     /// path that installs a key.
     pub async fn replace(&self, new_value: UnlockedKey) {
         let mut guard = self.slot.lock().await;
+        let previous_user = guard.as_ref().map(|k| k.user_id.clone());
+        let new_user = new_value.user_id.clone();
         *guard = Some(new_value);
+        // A same-account replace (a rotation swapping in the new key) is not a
+        // key leaving: the account is still the one signed in.
+        if let Some(previous_user) = previous_user.filter(|u| *u != new_user) {
+            self.notify_leave(&KeyLeft {
+                user_id: previous_user,
+                reason: KeyLeaveReason::UserChanged,
+            });
+        }
+    }
+
+    /// Register `observer` to run whenever an account's key leaves the slot
+    /// (`clear()` with a key resident, or `replace()` over another account's
+    /// key). See [`KeyLeaveObserver`] for what an observer may do.
+    pub fn on_key_leave(&self, observer: impl Fn(&KeyLeft) + Send + Sync + 'static) {
+        self.leave_observers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(std::sync::Arc::new(observer));
+    }
+
+    fn notify_leave(&self, left: &KeyLeft) {
+        // Copied out so no observer runs under the lock.
+        let observers: Vec<KeyLeaveObserver> = self
+            .leave_observers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        for observer in observers {
+            // A panicking observer must not unwind into the clear or the login
+            // that called this, nor stop the observers after it: the key is
+            // already gone, and what follows (clearing the rest of the session,
+            // returning to the caller) still has to happen.
+            if let Err(payload) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer(left)))
+            {
+                let message = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_owned())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".to_owned());
+                log::error!(
+                    "KeyRegistry: a key-leave observer panicked (user={}, {:?}): {message}",
+                    left.user_id,
+                    left.reason
+                );
+            }
+        }
     }
 
     /// Clear the slot entirely -- logout, idle-timeout fire (items.id=311,
@@ -155,12 +230,21 @@ impl KeyRegistry {
     /// fires clear() correctly on that basis alone.
     pub async fn clear(&self) {
         let mut guard = self.slot.lock().await;
-        if let Some(outgoing) = guard.as_ref() {
-            crate::auth::epoch_guard::clear_resident_for(&outgoing.user_id);
+        let outgoing_user = guard.as_ref().map(|k| k.user_id.clone());
+        if let Some(user_id) = &outgoing_user {
+            crate::auth::epoch_guard::clear_resident_for(user_id);
         }
         *guard = None;
         *self.pending_recovery.lock().await = None;
         *self.pending_new_phrase.lock().await = None;
+        // After everything holding key material is gone, so an observer can
+        // never delay or fail the clear (items.id=621).
+        if let Some(user_id) = outgoing_user {
+            self.notify_leave(&KeyLeft {
+                user_id,
+                reason: KeyLeaveReason::Cleared,
+            });
+        }
     }
 
     /// Hold a new recovery phrase for confirmation, replacing any earlier one.
@@ -457,6 +541,112 @@ mod tests {
 
         registry.clear().await;
         assert!(!registry.is_occupied().await);
+    }
+
+    fn record_leaves(registry: &KeyRegistry) -> std::sync::Arc<std::sync::Mutex<Vec<KeyLeft>>> {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        registry.on_key_leave(move |left| sink.lock().unwrap().push(left.clone()));
+        seen
+    }
+
+    #[tokio::test]
+    async fn clear_with_a_key_resident_reports_the_account_that_left() {
+        let registry = KeyRegistry::default();
+        let seen = record_leaves(&registry);
+        registry.replace(make_key("user-a", 0xAA)).await;
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "installing a key is not a leave"
+        );
+
+        registry.clear().await;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![KeyLeft {
+                user_id: "user-a".to_owned(),
+                reason: KeyLeaveReason::Cleared
+            }]
+        );
+        // the observer ran after the slot was emptied
+        assert!(!registry.is_occupied().await);
+    }
+
+    #[tokio::test]
+    async fn clear_with_nothing_resident_reports_nothing() {
+        let registry = KeyRegistry::default();
+        let seen = record_leaves(&registry);
+        registry.clear().await;
+        registry.clear().await;
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn replace_over_another_account_reports_a_user_change() {
+        let registry = KeyRegistry::default();
+        let seen = record_leaves(&registry);
+        registry.replace(make_key("user-a", 0xAA)).await;
+        registry.replace(make_key("user-b", 0xBB)).await;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![KeyLeft {
+                user_id: "user-a".to_owned(),
+                reason: KeyLeaveReason::UserChanged
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_over_the_same_account_reports_nothing() {
+        let registry = KeyRegistry::default();
+        let seen = record_leaves(&registry);
+        registry.replace(make_key("user-a", 0xAA)).await;
+        registry.replace(make_key("user-a", 0xCC)).await;
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_panicking_observer_stops_neither_clear_nor_the_observers_after_it() {
+        let registry = KeyRegistry::default();
+        registry.on_key_leave(|_| panic!("observer bug"));
+        let after = record_leaves(&registry);
+        registry.replace(make_key("user-a", 0xAA)).await;
+
+        registry.clear().await; // must return normally
+        assert!(!registry.is_occupied().await, "the key is gone");
+        assert_eq!(
+            after.lock().unwrap().len(),
+            1,
+            "the next observer still ran"
+        );
+
+        // and what follows a clear keeps working: sign in again, switch user
+        registry.replace(make_key("user-b", 0xBB)).await;
+        registry.replace(make_key("user-c", 0xCC)).await; // UserChanged -> panics inside
+        assert_eq!(
+            registry.with_key(|k| k.user_id.clone()).await,
+            Some("user-c".to_owned()),
+            "the new key is installed even though an observer panicked"
+        );
+        assert_eq!(after.lock().unwrap().len(), 2);
+        registry.clear().await;
+        assert!(!registry.is_occupied().await);
+    }
+
+    #[tokio::test]
+    async fn every_observer_runs_and_none_is_needed() {
+        let registry = KeyRegistry::default();
+        let first = record_leaves(&registry);
+        let second = record_leaves(&registry);
+        registry.replace(make_key("user-a", 0xAA)).await;
+        registry.clear().await;
+        assert_eq!(first.lock().unwrap().len(), 1);
+        assert_eq!(second.lock().unwrap().len(), 1);
+        // no observer registered: clear still works
+        let bare = KeyRegistry::default();
+        bare.replace(make_key("user-a", 0xAA)).await;
+        bare.clear().await;
+        assert!(!bare.is_occupied().await);
     }
 
     #[tokio::test]

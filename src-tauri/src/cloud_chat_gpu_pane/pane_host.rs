@@ -760,6 +760,37 @@ impl PaneManager {
         }
     }
 
+    /// items.id=622: clears the cache and the site data of every origin any
+    /// pane has loaded this session, reporting through `tracker`. CEF has one
+    /// global profile, so one pane's browser is enough for all origins,
+    /// including those of panes already closed; with no browser up there is
+    /// nothing to send it through.
+    fn clear_site_data_all(&self, tracker: &Arc<crate::cloud_chat_gpu_pane::site_data::Tracker>) {
+        let host = self
+            .panes
+            .values()
+            .find_map(|pane| pane.browser_lifecycle.browser().and_then(|b| b.host()));
+        match host {
+            Some(host) => {
+                crate::cloud_chat_gpu_pane::site_data::request_clear(
+                    &host,
+                    &crate::cloud_chat_gpu_pane::site_data::all_origins(),
+                    tracker,
+                );
+            }
+            None => {
+                let leftover = crate::cloud_chat_gpu_pane::site_data::all_origins();
+                if !leftover.is_empty() {
+                    log::warn!(
+                        "cloud_chat_gpu_pane::pane_host: no open pane to clear the site data of \
+                         {} origin(s) through",
+                        leftover.len()
+                    );
+                }
+            }
+        }
+    }
+
     /// items.id=359 pieces 4/5: makes `key` (or `None`) the one pane that's
     /// actually composited -- see `active_pane`'s own doc for the
     /// single-active-pane invariant. A no-op if `key` already equals the
@@ -3534,6 +3565,16 @@ pub fn queue_draw() {
     HOST.with(|h| {
         if let Some(host) = h.borrow().as_ref() {
             host.queue_draw();
+        }
+    });
+}
+
+/// Main thread only, like `dispatch`. Sends every open pane's site-data clear
+/// and reports through `tracker` (items.id=622).
+pub fn clear_site_data_all(tracker: &Arc<crate::cloud_chat_gpu_pane::site_data::Tracker>) {
+    HOST.with(|h| {
+        if let Some(host) = h.borrow().as_ref() {
+            host.manager.borrow().clear_site_data_all(tracker);
         }
     });
 }
