@@ -45,7 +45,7 @@ use cef::ImplContextMenuParams;
 use wgpu::util::DeviceExt;
 use wgpu_hal::Adapter as _;
 
-use crate::cloud_chat_gpu_pane::PaneKey;
+use crate::cloud_chat_gpu_pane::{lock_recover, PaneKey};
 use crate::commands::cloud_chat_pane::PaneRectFraction;
 
 /// items.id=334: `on_paint`/`on_accelerated_paint` only ever stashed fresh
@@ -379,13 +379,13 @@ impl RenderState {
         // stash the next frame, so a slow import would leave it blocked
         // for the whole drain, not just a moment -- collecting first keeps
         // the lock held only as long as it takes to drain the map.
-        let pending_panes: Vec<_> = PANE_PENDING_PAINT.lock().unwrap().drain().collect();
+        let pending_panes: Vec<_> = lock_recover(&PANE_PENDING_PAINT).drain().collect();
         for (key, paint) in pending_panes {
             if let Some(resolved) = resolve_bind_group(&self.device, &self.queue, paint) {
                 PANE_TEXTURES.lock().unwrap().insert(key, resolved);
             }
         }
-        let pending_popups: Vec<_> = POPUP_PENDING_PAINT.lock().unwrap().drain().collect();
+        let pending_popups: Vec<_> = lock_recover(&POPUP_PENDING_PAINT).drain().collect();
         for (key, paint) in pending_popups {
             if let Some(resolved) = resolve_bind_group(&self.device, &self.queue, paint) {
                 POPUP_TEXTURES.lock().unwrap().insert(key, resolved);
@@ -823,7 +823,7 @@ static PANE_SELECTED_TEXT: LazyLock<Mutex<HashMap<PaneKey, String>>> =
 
 /// Read by `pane_host.rs`'s `KeyEvent` dispatch on Ctrl+C/Ctrl+X.
 pub fn pane_selected_text(key: &PaneKey) -> Option<String> {
-    PANE_SELECTED_TEXT.lock().unwrap().get(key).cloned()
+    lock_recover(&PANE_SELECTED_TEXT).get(key).cloned()
 }
 
 /// Mirrors `remove_pane_pending_paint` -- must be called as part of a
@@ -831,7 +831,7 @@ pub fn pane_selected_text(key: &PaneKey) -> Option<String> {
 /// the same `PaneKey` doesn't inherit a stale selection from the pane that
 /// used to hold it.
 pub fn remove_pane_selected_text(key: &PaneKey) {
-    PANE_SELECTED_TEXT.lock().unwrap().remove(key);
+    lock_recover(&PANE_SELECTED_TEXT).remove(key);
 }
 
 /// items.id=379: mirrors `PANE_SELECTED_TEXT` exactly, but for an open
@@ -846,13 +846,13 @@ static POPUP_SELECTED_TEXT: LazyLock<Mutex<HashMap<PaneKey, String>>> =
 
 /// Read by `pane_host.rs`'s context-menu Copy/Cut handling.
 pub fn popup_selected_text(key: &PaneKey) -> Option<String> {
-    POPUP_SELECTED_TEXT.lock().unwrap().get(key).cloned()
+    lock_recover(&POPUP_SELECTED_TEXT).get(key).cloned()
 }
 
 /// Mirrors `remove_pane_selected_text` -- must be called as part of a
 /// popup's own teardown (`pane_host.rs`'s `force_close_popup`).
 pub fn remove_popup_selected_text(key: &PaneKey) {
-    POPUP_SELECTED_TEXT.lock().unwrap().remove(key);
+    lock_recover(&POPUP_SELECTED_TEXT).remove(key);
 }
 
 /// Mirrors `POPUP_TEXTURES`'s own doc: keyed by the *parent* pane's
@@ -867,14 +867,14 @@ static POPUP_PENDING_PAINT: LazyLock<Mutex<HashMap<PaneKey, PendingPaint>>> =
 /// longer has a live entry in `layout` for `render()`'s dirty-tracking to
 /// pick up), until process exit.
 pub fn remove_pane_pending_paint(key: &PaneKey) {
-    PANE_PENDING_PAINT.lock().unwrap().remove(key);
+    lock_recover(&PANE_PENDING_PAINT).remove(key);
 }
 
 /// Mirrors `remove_pane_pending_paint` -- must be called as part of a
 /// popup's own teardown (`pane_host.rs`'s `force_close_popup`), alongside
 /// `remove_popup_texture`.
 pub fn remove_popup_pending_paint(key: &PaneKey) {
-    POPUP_PENDING_PAINT.lock().unwrap().remove(key);
+    lock_recover(&POPUP_PENDING_PAINT).remove(key);
 }
 
 /// Replaces `winit::dpi::LogicalSize<f32>` (winit dropped from `cloud_chat_gpu_pane`
@@ -1001,7 +1001,7 @@ wrap_render_handler! {
     impl RenderHandler {
         fn view_rect(&self, _browser: Option<&mut Browser>, rect: Option<&mut Rect>) {
             if let Some(rect) = rect {
-                let size = self.handler.size.lock().unwrap();
+                let size = lock_recover(&self.handler.size);
                 if size.width > 0.0 && size.height > 0.0 {
                     // items.id=328: round, not truncate -- CEF reconstructs
                     // its actual pixel buffer size from this DIP value x
@@ -1064,9 +1064,7 @@ wrap_render_handler! {
             let Some(pending) = capture_accelerated_paint(info) else {
                 return;
             };
-            PANE_PENDING_PAINT
-                .lock()
-                .unwrap()
+            lock_recover(&PANE_PENDING_PAINT)
                 .insert(self.handler.pane_key.clone(), pending);
             request_redraw(&self.handler.app_handle);
         }
@@ -1107,9 +1105,7 @@ wrap_render_handler! {
                 width: width as u32,
                 height: height as u32,
             };
-            PANE_PENDING_PAINT
-                .lock()
-                .unwrap()
+            lock_recover(&PANE_PENDING_PAINT)
                 .insert(self.handler.pane_key.clone(), pending);
             request_redraw(&self.handler.app_handle);
         }
@@ -1128,9 +1124,7 @@ wrap_render_handler! {
             _selected_range: Option<&Range>,
         ) {
             let text = selected_text.map(|s| s.to_string()).unwrap_or_default();
-            PANE_SELECTED_TEXT
-                .lock()
-                .unwrap()
+            lock_recover(&PANE_SELECTED_TEXT)
                 .insert(self.handler.pane_key.clone(), text);
         }
     }
@@ -1219,7 +1213,7 @@ wrap_render_handler! {
     impl RenderHandler {
         fn view_rect(&self, _browser: Option<&mut Browser>, rect: Option<&mut Rect>) {
             if let Some(rect) = rect {
-                let size = self.handler.size.lock().unwrap();
+                let size = lock_recover(&self.handler.size);
                 if size.width > 0.0 && size.height > 0.0 {
                     // items.id=328: round, not truncate -- CEF reconstructs
                     // its actual pixel buffer size from this DIP value x
@@ -1283,9 +1277,7 @@ wrap_render_handler! {
             let Some(pending) = capture_accelerated_paint(info) else {
                 return;
             };
-            POPUP_PENDING_PAINT
-                .lock()
-                .unwrap()
+            lock_recover(&POPUP_PENDING_PAINT)
                 .insert(self.handler.pane_key.clone(), pending);
             request_redraw(&self.handler.app_handle);
         }
@@ -1319,9 +1311,7 @@ wrap_render_handler! {
                 width: width as u32,
                 height: height as u32,
             };
-            POPUP_PENDING_PAINT
-                .lock()
-                .unwrap()
+            lock_recover(&POPUP_PENDING_PAINT)
                 .insert(self.handler.pane_key.clone(), pending);
             request_redraw(&self.handler.app_handle);
         }
@@ -1336,9 +1326,7 @@ wrap_render_handler! {
             _selected_range: Option<&Range>,
         ) {
             let text = selected_text.map(|s| s.to_string()).unwrap_or_default();
-            POPUP_SELECTED_TEXT
-                .lock()
-                .unwrap()
+            lock_recover(&POPUP_SELECTED_TEXT)
                 .insert(self.handler.pane_key.clone(), text);
         }
     }

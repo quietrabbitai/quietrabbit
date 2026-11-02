@@ -72,6 +72,8 @@ use tauri::State;
 use tokio::sync::oneshot;
 
 use crate::auth::registry::{key_hex, KeyRegistry};
+use crate::cloud_chat_gpu_pane::bootstrap::{cef_available, ensure_cef_available};
+use crate::cloud_chat_gpu_pane::lock_recover;
 use crate::cloud_chat_gpu_pane::pane_host::{self, PaneCommand};
 use crate::cloud_chat_gpu_pane::PaneKey;
 use crate::persistence::cloud_chat_cookie_store::{self, StoredCookie};
@@ -349,7 +351,7 @@ wrap_set_cookie_callback! {
 
     impl SetCookieCallback {
         fn on_complete(&self, success: std::os::raw::c_int) {
-            if let Some(tx) = self.tx.lock().unwrap().take() {
+            if let Some(tx) = lock_recover(&self.tx).take() {
                 let _ = tx.send(success != 0);
             }
         }
@@ -385,10 +387,10 @@ wrap_cookie_visitor! {
             _delete_cookie: Option<&mut std::os::raw::c_int>,
         ) -> std::os::raw::c_int {
             if let Some(cookie) = cookie {
-                self.cookies.lock().unwrap().push(cef_cookie_to_stored(cookie));
+                lock_recover(&self.cookies).push(cef_cookie_to_stored(cookie));
             }
             if count + 1 >= total {
-                if let Some(tx) = self.done_tx.lock().unwrap().take() {
+                if let Some(tx) = lock_recover(&self.done_tx).take() {
                     let _ = tx.send(());
                 }
             }
@@ -471,6 +473,26 @@ async fn restore_cookies_into_jar(
     }
 }
 
+/// How the bounded wait on `visit_url_cookies`' last-cookie signal ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CookieVisitOutcome {
+    /// The visitor saw the last cookie and signalled.
+    Completed,
+    /// COOKIE_OP_TIMEOUT elapsed first: a slow visit or an empty jar.
+    TimedOut,
+    /// The visitor's sender was dropped without signalling.
+    ChannelClosed,
+}
+
+/// Whether a cookie visit's result may replace the stored set. Only a visit
+/// that was dispatched and reported completion is trusted: the store write is
+/// a full replace, and an empty or partial collection from a slow visit would
+/// erase the saved session (items.id=646). `outcome` is `None` when nothing
+/// was dispatched (no wait happened).
+fn should_persist(dispatched: bool, outcome: Option<CookieVisitOutcome>) -> bool {
+    dispatched && outcome == Some(CookieVisitOutcome::Completed)
+}
+
 /// Reads back every cookie CEF's jar currently holds for `launch_url` and
 /// persists them (full-replace) via cloud_chat_cookie_store. Best-effort: a
 /// failure here is logged, never propagated as a reason the pane can't
@@ -499,17 +521,40 @@ async fn persist_cookies_from_jar(
     let dispatched = {
         let url = CefString::from(launch_url);
         manager.visit_url_cookies(Some(&url), 1, Some(&mut visitor))
-    };
+    } != 0;
 
-    if dispatched != 0 {
+    let outcome = if dispatched {
         // Timeout, not just await: visit() "may never be called if no
         // cookies are found" (visit_url_cookies' own doc, confirmed
         // against the vendored cef crate) -- an empty jar for this
         // provider would otherwise hang here forever.
-        let _ = tokio::time::timeout(COOKIE_OP_TIMEOUT, rx).await;
+        Some(match tokio::time::timeout(COOKIE_OP_TIMEOUT, rx).await {
+            Ok(Ok(())) => CookieVisitOutcome::Completed,
+            Ok(Err(_)) => CookieVisitOutcome::ChannelClosed,
+            Err(_) => CookieVisitOutcome::TimedOut,
+        })
+    } else {
+        None
+    };
+
+    // items.id=646: the upsert below is a full replace, so a visit that did
+    // not report completion (slow, or an empty jar -- indistinguishable by
+    // timeout alone) must leave the stored session alone, not wipe it.
+    if !should_persist(dispatched, outcome) {
+        log::warn!(
+            "cloud_chat_pane: cookie visit did not complete for provider={provider_id} \
+             ({}) -- keeping the stored cookies",
+            match outcome {
+                None => "visit_url_cookies rejected",
+                Some(CookieVisitOutcome::TimedOut) => "timed out",
+                Some(CookieVisitOutcome::ChannelClosed) => "visitor released without completing",
+                Some(CookieVisitOutcome::Completed) => "completed",
+            }
+        );
+        return;
     }
 
-    let collected: Vec<StoredCookie> = cookies.lock().unwrap().clone();
+    let collected: Vec<StoredCookie> = lock_recover(&cookies).clone();
 
     if let Err(e) =
         cloud_chat_cookie_store::upsert_cookies(user_id, key_hex_str, provider_id, &collected).await
@@ -629,6 +674,7 @@ pub async fn open_cloud_chat_panes(
     app_handle: tauri::AppHandle,
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<(), String> {
+    ensure_cef_available()?;
     // items.id=778: the cookie restore reads the account's cookie store, so
     // it holds a lease. Not logged in is not an error here (see below); a
     // rotation under way is.
@@ -704,6 +750,12 @@ pub async fn close_cloud_chat_pane(
     app_handle: tauri::AppHandle,
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<(), String> {
+    // items.id=646: nothing can be open when CEF never started, so there is
+    // nothing to close or persist; not an error.
+    if !cef_available() {
+        log::debug!("cloud_chat_pane: close ignored, CEF is unavailable");
+        return Ok(());
+    }
     {
         let provider_id = provider_id.clone();
         app_handle
@@ -771,6 +823,7 @@ pub async fn set_active_pane(
     provider_id: Option<String>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
+    ensure_cef_available()?;
     app_handle
         .run_on_main_thread(move || {
             pane_host::dispatch(PaneCommand::SetActivePane { key: provider_id })
@@ -801,6 +854,7 @@ pub async fn set_pane_layout(
     layout_state: State<'_, PaneLayoutState>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
+    ensure_cef_available()?;
     {
         let mut map = layout_state.0.lock().unwrap();
         map.clear();
@@ -855,6 +909,7 @@ pub async fn forward_pane_mouse_click(
     modifiers: PaneEventModifiers,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
+    ensure_cef_available()?;
     app_handle
         .run_on_main_thread(move || {
             pane_host::dispatch(PaneCommand::MouseClick {
@@ -889,6 +944,7 @@ pub async fn forward_pane_mouse_move(
     modifiers: PaneEventModifiers,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
+    ensure_cef_available()?;
     app_handle
         .run_on_main_thread(move || {
             pane_host::dispatch(PaneCommand::MouseMove {
@@ -919,6 +975,7 @@ pub async fn forward_pane_mouse_wheel(
     modifiers: PaneEventModifiers,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
+    ensure_cef_available()?;
     app_handle
         .run_on_main_thread(move || {
             pane_host::dispatch(PaneCommand::MouseWheel {
@@ -967,6 +1024,7 @@ pub async fn forward_pane_key(
     modifiers: PaneEventModifiers,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
+    ensure_cef_available()?;
     app_handle
         .run_on_main_thread(move || {
             pane_host::dispatch(PaneCommand::KeyEvent {
@@ -998,6 +1056,7 @@ pub async fn adjust_pane_zoom(
     direction: ZoomDirection,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
+    ensure_cef_available()?;
     app_handle
         .run_on_main_thread(move || {
             pane_host::dispatch(PaneCommand::AdjustZoom {
@@ -1027,6 +1086,7 @@ pub async fn forward_popup_key(
     modifiers: PaneEventModifiers,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
+    ensure_cef_available()?;
     app_handle
         .run_on_main_thread(move || {
             pane_host::dispatch(PaneCommand::PopupKeyEvent {
@@ -1061,6 +1121,7 @@ pub async fn forward_popup_mouse_click(
     modifiers: PaneEventModifiers,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
+    ensure_cef_available()?;
     app_handle
         .run_on_main_thread(move || {
             pane_host::dispatch(PaneCommand::PopupMouseClick {
@@ -1089,6 +1150,7 @@ pub async fn forward_popup_mouse_move(
     modifiers: PaneEventModifiers,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
+    ensure_cef_available()?;
     app_handle
         .run_on_main_thread(move || {
             pane_host::dispatch(PaneCommand::PopupMouseMove {
@@ -1115,6 +1177,7 @@ pub async fn forward_popup_mouse_wheel(
     modifiers: PaneEventModifiers,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
+    ensure_cef_available()?;
     app_handle
         .run_on_main_thread(move || {
             pane_host::dispatch(PaneCommand::PopupMouseWheel {
@@ -1203,5 +1266,33 @@ mod rail_summary_tests {
             !is_rail_visible(&hosted),
             "hosted API rows never join the rail"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_persist_not_dispatched() {
+        assert!(!should_persist(false, None));
+    }
+
+    #[test]
+    fn should_persist_timed_out() {
+        assert!(!should_persist(true, Some(CookieVisitOutcome::TimedOut)));
+    }
+
+    #[test]
+    fn should_persist_channel_closed() {
+        assert!(!should_persist(
+            true,
+            Some(CookieVisitOutcome::ChannelClosed)
+        ));
+    }
+
+    #[test]
+    fn should_persist_completed() {
+        assert!(should_persist(true, Some(CookieVisitOutcome::Completed)));
     }
 }

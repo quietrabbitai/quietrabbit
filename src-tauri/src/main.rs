@@ -909,7 +909,10 @@ async fn async_main() {
             // thread-local HOST requires, so no run_on_main_thread wrapper
             // is needed here -- matches how queue_draw() is already called
             // bare elsewhere in this file.
-            tauri::WindowEvent::Focused(true) => {
+            // items.id=646: no pane host is installed when CEF is unavailable.
+            tauri::WindowEvent::Focused(true)
+                if quietrabbit_lib::cloud_chat_gpu_pane::bootstrap::cef_available() =>
+            {
                 quietrabbit_lib::cloud_chat_gpu_pane::pane_host::dispatch(
                     quietrabbit_lib::cloud_chat_gpu_pane::pane_host::PaneCommand::ReassertOsFocus,
                 );
@@ -951,8 +954,18 @@ async fn async_main() {
     // separately from Tauri's GTK main thread, which is what avoids the
     // GTK/GLib main-loop busy-poll that a same-thread external-pump
     // approach hit.
+    //
+    // items.id=646: a failed init no longer aborts the app. Cloud Chat is then
+    // unavailable for this run (the pane commands return a plain error) and
+    // every other CEF touch point below is gated on cef_available().
     let _cef_init =
-        quietrabbit_lib::cloud_chat_gpu_pane::bootstrap::initialize_cef(&root_cache_path);
+        match quietrabbit_lib::cloud_chat_gpu_pane::bootstrap::initialize_cef(&root_cache_path) {
+            Ok(init) => Some(init),
+            Err(e) => {
+                log::error!("main: CEF init failed, Cloud Chat is unavailable this run: {e}");
+                None
+            }
+        };
 
     // Single-window GTK/wgpu pane host (items.id=202 real positioning fix,
     // 2026-08-07 -- see cloud_chat_gpu_pane::pane_host's module docs for the full
@@ -1025,9 +1038,14 @@ async fn async_main() {
             // open pane's browser before cef::shutdown() lets CEF release
             // its GPU resources in the order it expects, instead of having
             // them torn out from under it.
-            log::info!("main: RunEvent::Exit — closing panes and shutting down CEF");
-            quietrabbit_lib::cloud_chat_gpu_pane::pane_host::close_all_panes();
-            cef::shutdown();
+            // items.id=646: nothing to close or shut down when CEF never
+            // initialised, and shutting down a CEF that failed to start is
+            // not safe.
+            if quietrabbit_lib::cloud_chat_gpu_pane::bootstrap::cef_available() {
+                log::info!("main: RunEvent::Exit — closing panes and shutting down CEF");
+                quietrabbit_lib::cloud_chat_gpu_pane::pane_host::close_all_panes();
+                cef::shutdown();
+            }
             // items.id=315 (3rd attempt): tao's own event loop calls
             // std::process::exit() unconditionally right after this closure
             // returns (tao-0.35.3 platform_impl/linux/event_loop.rs:998), and
@@ -1053,30 +1071,34 @@ async fn async_main() {
             let main_window = app_handle
                 .get_webview_window("main")
                 .expect("quietrabbit: main window not found on RunEvent::Ready");
-            let open_pane_count = quietrabbit_lib::cloud_chat_gpu_pane::pane_host::install(
-                &main_window,
-                app_handle.clone(),
-            );
+            // items.id=646: with CEF unavailable there is nothing to composite,
+            // so the pane host (GLArea, wgpu) and its redraw timer are skipped.
+            if quietrabbit_lib::cloud_chat_gpu_pane::bootstrap::cef_available() {
+                let open_pane_count = quietrabbit_lib::cloud_chat_gpu_pane::pane_host::install(
+                    &main_window,
+                    app_handle.clone(),
+                );
 
-            // Replaces the old freeze-bug heartbeat thread (a 16ms
-            // run_on_main_thread(|| {}) loop whose entire purpose was
-            // forcing tao's own blocking GTK loop to notice a SECOND,
-            // GTK-invisible winit/Wayland connection -- see pane_host.rs's
-            // module docs on why that whole problem class no longer
-            // exists). This timeout is a real, first-class GSource on
-            // GTK's own main loop -- not a workaround for a blind spot,
-            // just the normal way to drive a periodic redraw. Gated on
-            // open_pane_count > 0 for the same on-demand-cost reason as
-            // before (items.id=223): a user who never opens Cloud Chat pays
-            // nothing here. 16ms matches the old cadence (~60fps) and
-            // CEF's own windowless_frame_rate: 60 (pane_host.rs).
-            glib::source::timeout_add_local(std::time::Duration::from_millis(16), move || {
-                let count = open_pane_count.load(std::sync::atomic::Ordering::Relaxed);
-                if count > 0 {
-                    quietrabbit_lib::cloud_chat_gpu_pane::pane_host::queue_draw();
-                }
-                glib::ControlFlow::Continue
-            });
+                // Replaces the old freeze-bug heartbeat thread (a 16ms
+                // run_on_main_thread(|| {}) loop whose entire purpose was
+                // forcing tao's own blocking GTK loop to notice a SECOND,
+                // GTK-invisible winit/Wayland connection -- see pane_host.rs's
+                // module docs on why that whole problem class no longer
+                // exists). This timeout is a real, first-class GSource on
+                // GTK's own main loop -- not a workaround for a blind spot,
+                // just the normal way to drive a periodic redraw. Gated on
+                // open_pane_count > 0 for the same on-demand-cost reason as
+                // before (items.id=223): a user who never opens Cloud Chat pays
+                // nothing here. 16ms matches the old cadence (~60fps) and
+                // CEF's own windowless_frame_rate: 60 (pane_host.rs).
+                glib::source::timeout_add_local(std::time::Duration::from_millis(16), move || {
+                    let count = open_pane_count.load(std::sync::atomic::Ordering::Relaxed);
+                    if count > 0 {
+                        quietrabbit_lib::cloud_chat_gpu_pane::pane_host::queue_draw();
+                    }
+                    glib::ControlFlow::Continue
+                });
+            }
 
             // items.id=842: SIGINT, SIGTERM and SIGHUP leave through the
             // same path a window close does (ExitRequested, RunEvent::Exit,

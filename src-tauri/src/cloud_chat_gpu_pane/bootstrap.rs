@@ -107,8 +107,46 @@ pub fn dispatch_cef_subprocess() -> bool {
 /// (not `RefCell`/`Rc`) because CEF documents this callback as callable
 /// "on any thread" -- confirmed the hard way in the spike (RefCell panicked
 /// with "already borrowed" under real cross-thread contention).
-pub fn initialize_cef(root_cache_path: &std::path::Path) -> CefInitResult {
+///
+/// Returns `Err` when `cef::initialize` reports failure (items.id=646), e.g.
+/// the cache directory is held by another process. The caller must then treat
+/// CEF as unavailable: `cef_available()` stays false, and neither
+/// `cef::shutdown()` nor any other CEF call is safe.
+pub fn initialize_cef(root_cache_path: &std::path::Path) -> Result<CefInitResult, CefInitError> {
     initialize_cef_with_pump_setting(root_cache_path, true)
+}
+
+/// Why `initialize_cef()` failed.
+#[derive(Debug, thiserror::Error)]
+pub enum CefInitError {
+    #[error("cef::initialize failed (returned {0})")]
+    InitializeFailed(i32),
+}
+
+/// True only after `initialize_cef*` returned `Ok` in this process, so a
+/// failed or never-run init reads as unavailable. Process-wide, like
+/// CEF itself.
+static CEF_AVAILABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether CEF initialised in this process (items.id=646). Gate every CEF
+/// touch point on this: the Cloud Chat pane commands, the pane host install,
+/// and `cef::shutdown()`.
+pub fn cef_available() -> bool {
+    CEF_AVAILABLE.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Returned by the Cloud Chat pane commands when CEF is unavailable. Plain
+/// text for the UI: no internals, no paths (those are in the log).
+pub const CEF_UNAVAILABLE_MESSAGE: &str = "Cloud Chat is unavailable: the embedded browser failed \
+to start. Restart Quiet Rabbit; if it keeps happening, check the log.";
+
+/// `Ok(())` when CEF initialised, otherwise `CEF_UNAVAILABLE_MESSAGE`.
+pub fn ensure_cef_available() -> Result<(), String> {
+    if cef_available() {
+        Ok(())
+    } else {
+        Err(CEF_UNAVAILABLE_MESSAGE.to_string())
+    }
 }
 
 /// Result of `initialize_cef()`. `pending_work` is retained for
@@ -128,7 +166,7 @@ pub struct CefInitResult {
 pub fn initialize_cef_with_pump_setting(
     root_cache_path: &std::path::Path,
     _external_message_pump_ignored: bool,
-) -> CefInitResult {
+) -> Result<CefInitResult, CefInitError> {
     // ROOT CAUSE + FIX HISTORY (2026-08-01, items.id=3 Phase A) --
     // read this before touching this function again.
     //
@@ -210,18 +248,34 @@ pub fn initialize_cef_with_pump_setting(
         std::ptr::null_mut(),
     );
 
-    assert_eq!(
-        init_ret, 1,
-        "cloud_chat_gpu_pane::bootstrap: cef::initialize failed (returned {init_ret})"
-    );
+    if init_ret != 1 {
+        log::error!(
+            "cloud_chat_gpu_pane::bootstrap: cef::initialize failed (returned {init_ret}), \
+             root_cache_path={root_cache_path_str} -- Cloud Chat is unavailable this run"
+        );
+        return Err(CefInitError::InitializeFailed(init_ret));
+    }
 
+    CEF_AVAILABLE.store(true, std::sync::atomic::Ordering::Release);
     log::info!(
         "cloud_chat_gpu_pane::bootstrap: CEF initialized, root_cache_path={root_cache_path_str}, multi_threaded_message_loop=true"
     );
-    CefInitResult { pending_work }
+    Ok(CefInitResult { pending_work })
 }
 
 // --- App / command-line handling ---
+
+/// Environment variable that turns on the GPU diagnostic logging switches in
+/// a debug build (items.id=646). Ignored by release builds.
+#[cfg(any(debug_assertions, test))]
+const GPU_DIAG_ENV: &str = "QR_CEF_GPU_DIAG";
+
+/// The opt-in is the exact value "1"; anything else, or unset, is off.
+#[cfg(any(debug_assertions, test))]
+fn gpu_diag_requested(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
 //
 // Two construction paths (`new` / `new_with_pump`) because
 // dispatch_cef_subprocess() runs before the pump-scheduling flag exists
@@ -282,25 +336,31 @@ wrap_app! {
             };
             command_line.append_switch_with_value(Some(&df_switch), Some(&merged.as_str().into()));
 
-            // items.id=327 diagnostic only -- MUST be stripped before any
-            // release build. Confirms whether CEF's OSR compositor is using
-            // hardware WebGL or has fallen back to SwiftShader software
-            // rendering, since Cloudflare Turnstile is known to treat the
-            // software-fallback case as a bot signal.
-            command_line.append_switch_with_value(
-                Some(&cef::CefString::from("enable-logging")),
-                Some(&"stderr".into()),
-            );
-            command_line.append_switch_with_value(
-                Some(&cef::CefString::from("v")),
-                Some(&"1".into()),
-            );
-            command_line.append_switch_with_value(
-                Some(&cef::CefString::from("vmodule")),
-                Some(
-                    &"*gpu*=2,*angle*=2,*gl_context*=2,*gl_surface*=2,*gl_display*=2".into(),
-                ),
-            );
+            // items.id=327 diagnostic only. Confirms whether CEF's OSR
+            // compositor is using hardware WebGL or has fallen back to
+            // SwiftShader software rendering, since Cloudflare Turnstile is
+            // known to treat the software-fallback case as a bot signal.
+            // DEV-ONLY PATH (items.id=646): compiled out of release builds,
+            // and in debug builds only active with QR_CEF_GPU_DIAG=1 (the
+            // switches are verbose and write to stderr). Removal tracked
+            // with items.id=327/649.
+            #[cfg(debug_assertions)]
+            if gpu_diag_requested(std::env::var_os(GPU_DIAG_ENV).as_deref()) {
+                command_line.append_switch_with_value(
+                    Some(&cef::CefString::from("enable-logging")),
+                    Some(&"stderr".into()),
+                );
+                command_line.append_switch_with_value(
+                    Some(&cef::CefString::from("v")),
+                    Some(&"1".into()),
+                );
+                command_line.append_switch_with_value(
+                    Some(&cef::CefString::from("vmodule")),
+                    Some(
+                        &"*gpu*=2,*angle*=2,*gl_context*=2,*gl_surface*=2,*gl_display*=2".into(),
+                    ),
+                );
+            }
         }
 
         fn browser_process_handler(&self) -> Option<cef::BrowserProcessHandler> {
@@ -337,7 +397,7 @@ wrap_browser_process_handler! {
         fn on_schedule_message_pump_work(&self, delay_ms: i64) {
             // Called "on any thread" per CEF's own doc comment -- Mutex, not
             // RefCell/Rc (items.id=200's finding, confirmed the hard way).
-            let mut pending = self.handler.pending_work.lock().unwrap();
+            let mut pending = super::lock_recover(&self.handler.pending_work);
             *pending = Some(delay_ms);
         }
     }
@@ -346,5 +406,27 @@ wrap_browser_process_handler! {
 impl BrowserProcessHandlerBuilder {
     pub(crate) fn build(handler: CloudChatGpuPaneBrowserProcessHandler) -> BrowserProcessHandler {
         Self::new(handler)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn gpu_diag_is_off_unless_exactly_one() {
+        assert!(!gpu_diag_requested(None));
+        assert!(!gpu_diag_requested(Some(OsStr::new(""))));
+        assert!(!gpu_diag_requested(Some(OsStr::new("0"))));
+        assert!(!gpu_diag_requested(Some(OsStr::new("true"))));
+        assert!(gpu_diag_requested(Some(OsStr::new("1"))));
+    }
+
+    #[test]
+    fn cef_is_unavailable_until_initialised() {
+        // No test in this binary initialises CEF, so the default must deny.
+        assert!(!cef_available());
+        assert_eq!(ensure_cef_available().unwrap_err(), CEF_UNAVAILABLE_MESSAGE);
     }
 }

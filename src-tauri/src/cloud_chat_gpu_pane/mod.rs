@@ -156,3 +156,54 @@ pub use bootstrap::dispatch_cef_subprocess;
 /// identified and multi-account was resolved as logout/login-managed, not
 /// simultaneous same-provider panes -- decided 2026-08-04, handoff id=148).
 pub type PaneKey = String;
+
+/// Locks `m`, recovering the data if a previous holder panicked.
+///
+/// CEF callbacks are `extern "C"`: a panic unwinding out of one aborts the
+/// whole process, so `.lock().unwrap()` on a poisoned mutex there turns one
+/// earlier panic into a crash (items.id=646). Every mutex that a CEF callback
+/// locks uses this at every site that locks it, callback or not, so the two
+/// sides agree. The guarded data (plain maps, sizes, one-shot senders) has no
+/// invariant a half-finished critical section can break. The poison flag is
+/// cleared after the first recovery, so a later lock does not warn again.
+pub(crate) fn lock_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| {
+        log::warn!("cloud_chat_gpu_pane: recovered a poisoned mutex");
+        m.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lock_recover;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn lock_recover_returns_the_data_of_a_poisoned_mutex() {
+        let m = Arc::new(Mutex::new(vec![1, 2, 3]));
+        let m2 = m.clone();
+        let _ = std::thread::spawn(move || {
+            let mut g = m2.lock().unwrap();
+            g.push(4);
+            panic!("poison the mutex while holding the guard");
+        })
+        .join();
+        assert!(m.is_poisoned());
+
+        {
+            let mut g = lock_recover(&m);
+            assert_eq!(*g, vec![1, 2, 3, 4]);
+            g.push(5);
+        }
+        // The flag is cleared, so a plain lock works again and sees the write.
+        assert!(!m.is_poisoned());
+        assert_eq!(*m.lock().unwrap(), vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn lock_recover_on_a_healthy_mutex_is_a_plain_lock() {
+        let m = Mutex::new(7);
+        assert_eq!(*lock_recover(&m), 7);
+    }
+}

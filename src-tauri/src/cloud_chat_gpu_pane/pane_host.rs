@@ -101,7 +101,7 @@ use crate::cloud_chat_gpu_pane::render::{
     ClientBuilder, ContextMenuRequested, ContextMenuSurface, LogicalSize, PaneRenderHandler,
     PopupLifecycleEvent, PopupRequested, RenderState,
 };
-use crate::cloud_chat_gpu_pane::PaneKey;
+use crate::cloud_chat_gpu_pane::{lock_recover, PaneKey};
 use crate::commands::cloud_chat_pane::{
     PaneEventModifiers, PaneKeyEventType, PaneLayoutState, PaneMouseButton, PaneRectFraction,
     PopupClosedPayload, PopupOpenedPayload, ZoomDirection,
@@ -973,7 +973,7 @@ impl PaneManager {
             // separate `device_scale_factor` reported via `GetScreenInfo`
             // is what tells the page's own layout/DPI math (not this
             // buffer's pixel count) to treat it as a scaled display.
-            *pane.browser_size.lock().unwrap() = LogicalSize {
+            *lock_recover(&pane.browser_size) = LogicalSize {
                 width: width as f32,
                 height: height as f32,
             };
@@ -1002,7 +1002,7 @@ impl PaneManager {
             }
             // items.id=328: same fix as `sync_pane_sizes` above -- see its
             // comment.
-            *popup.size.lock().unwrap() = LogicalSize {
+            *lock_recover(&popup.size) = LogicalSize {
                 width: width as f32,
                 height: height as f32,
             };
