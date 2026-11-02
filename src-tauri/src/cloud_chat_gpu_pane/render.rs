@@ -65,64 +65,6 @@ fn request_redraw(app_handle: &tauri::AppHandle) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// items.id=312: GL-context single-thread-ownership guard
-// ---------------------------------------------------------------------------
-//
-// Originally a diagnostic: `RenderState::render()` (main/GTK thread) and
-// `on_accelerated_paint`/`on_paint` (CEF's own UI thread -- confirmed a
-// genuinely separate OS thread by `multi_threaded_message_loop: 1`, see
-// `bootstrap.rs:159-183`'s own prior investigation notes) both called into
-// the SAME externally-owned GL context via the shared `wgpu::Device`, with
-// nothing serializing GL-context access between those two threads --
-// `PANE_TEXTURES`/`POPUP_TEXTURES`'s mutexes only ever protected the
-// resulting `BindGroup` maps, not the GL calls that produced them. This
-// guard proved that overlap directly (two different thread ids both active
-// at once), which is what confirmed items.id=312's root cause.
-//
-// The fix (see the "CEF-thread paint mailbox" section below) removes the
-// race by construction: none of the four CEF callback functions touch the
-// device/GL context anymore, only `RenderState::render()` does. This guard
-// now wraps that single remaining call site and stays in as a permanent,
-// cheap regression check -- `log::error!` (not `warn`/`debug`) if it ever
-// observes a second thread entering while one is already active, which
-// should now be structurally impossible.
-static DIAG_312_GL_ACTIVE: LazyLock<Mutex<HashMap<std::thread::ThreadId, &'static str>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-#[must_use]
-struct Diag312GlGuard {
-    tid: std::thread::ThreadId,
-}
-
-impl Diag312GlGuard {
-    fn enter(site: &'static str) -> Self {
-        let tid = std::thread::current().id();
-        let mut active = DIAG_312_GL_ACTIVE.lock().unwrap();
-        let others: Vec<String> = active
-            .iter()
-            .filter(|(t, _)| **t != tid)
-            .map(|(t, s)| format!("{t:?}={s}"))
-            .collect();
-        if others.is_empty() {
-            log::debug!("DIAG items.id=312: GL enter {site} thread={tid:?}");
-        } else {
-            log::error!(
-                "DIAG items.id=312: CONFIRMED CONCURRENT GL ACCESS -- {site} \
-                 entering on thread {tid:?} while already active: {others:?}"
-            );
-        }
-        active.insert(tid, site);
-        Self { tid }
-    }
-}
-
-impl Drop for Diag312GlGuard {
-    fn drop(&mut self) {
-        DIAG_312_GL_ACTIVE.lock().unwrap().remove(&self.tid);
-    }
-}
-
 /// Single shared wgpu render state for the whole app: device/queue (from
 /// GTK's own external GL context, not a `winit`-owned surface), the
 /// single-textured-quad pipeline that draws CEF's paint output, and the
@@ -289,11 +231,8 @@ impl RenderState {
         }
     }
 
-    /// DIAG items.id=312 (temporary): exposes `self.size` so
-    /// `pane_host.rs`'s `connect_render` can cross-check it against the
-    /// `GLArea`'s own live `allocated_width()/height()` at render time.
-    /// Remove alongside the rest of this session's items.id=312
-    /// instrumentation once root cause is confirmed.
+    /// The `GLArea`'s physical pixel size as of the last `resize`.
+    /// `pane_host.rs` reads it to reset the GL viewport after `render`.
     pub fn size(&self) -> (u32, u32) {
         self.size
     }
@@ -351,16 +290,6 @@ impl RenderState {
         popup_layout: &HashMap<PaneKey, PaneRectFraction>,
         target_fbo: Option<u32>,
     ) {
-        let _diag_312_guard = Diag312GlGuard::enter("RenderState::render");
-        // DIAG items.id=312 (temporary): this is the exact call site that
-        // panics with "Unable to create Texture object" -- log the size
-        // it's about to wrap immediately beforehand so a crash log always
-        // has the last-known value even if the panic's own backtrace is
-        // hard to symbolize.
-        log::debug!(
-            "DIAG items.id=312: about to create_texture_from_hal size={:?}",
-            self.size
-        );
         // items.id=312: drain this tick's CEF-thread paint captures into
         // PANE_TEXTURES/POPUP_TEXTURES *before* the render pass below reads
         // them -- this is the only place any of that captured data reaches

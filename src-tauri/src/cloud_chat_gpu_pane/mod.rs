@@ -141,6 +141,8 @@
 //!   compositing) is Linux-only.
 
 pub mod bootstrap;
+#[cfg(debug_assertions)]
+mod diag;
 pub mod gl_loader;
 pub mod pane_host;
 pub mod render;

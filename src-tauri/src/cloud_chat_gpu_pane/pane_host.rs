@@ -69,29 +69,16 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
-
-// DIAG items.id=312 (temporary -- remove after root-cause diagnosis):
-// resize/render burst investigation. Extends the existing DIAG
-// items.id=227 logging with millisecond-resolution timestamps and a
-// shared monotonic sequence number so a `connect_resize`/`connect_render`
-// burst can be reconstructed in order across both handlers from the log
-// alone.
-static DIAG_312_START: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
-static DIAG_312_SEQ: AtomicU64 = AtomicU64::new(0);
-fn diag_312_tick() -> (u64, u128) {
-    (
-        DIAG_312_SEQ.fetch_add(1, Ordering::Relaxed),
-        DIAG_312_START.elapsed().as_millis(),
-    )
-}
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use gtk::prelude::*;
 use indexmap::IndexMap;
 use tauri::Manager;
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
+#[cfg(debug_assertions)]
+use crate::cloud_chat_gpu_pane::diag;
 use cef::{
     ImplBrowser, ImplBrowserHost, ImplFrame, ImplRunContextMenuCallback, KeyEvent, KeyEventType,
     MenuId, MouseButtonType, MouseEvent,
@@ -484,19 +471,6 @@ struct PopupState {
     /// plan, Judgment call 6.5: no page-initiated popup resize support).
     rect: PaneRectFraction,
     last_applied_size: Option<(u32, u32)>,
-    /// DIAG items.id=539: when this popup was requested. Used only to log a
-    /// one-shot warning if it sits in `PopupLifecycleState::Creating` far
-    /// longer than a real popup ever should -- evidence for the still-
-    /// unconfirmed stuck-grab hypothesis from
-    /// ITEMS257_INPUT_FREEZE_INVESTIGATION_20260822.md (a popup that never
-    /// resolves and is never force-closed would leave any grab CEF took on
-    /// its behalf held forever, with none of the three existing
-    /// `force_close_popup` call sites ever firing to release it).
-    created_at: std::time::Instant,
-    /// DIAG items.id=539: set once the stuck-in-`Creating` warning below has
-    /// fired, so it logs a single time per popup instead of spamming every
-    /// render tick.
-    stuck_warned: bool,
 }
 
 /// One notification `drain_popup_requests`/`drain_popup_events`/
@@ -749,7 +723,7 @@ impl PaneManager {
         // its browser goes away -- must run before shift_remove below,
         // since force_close_popup's own defensive parent-grab-release
         // still needs to find this pane in self.panes.
-        self.force_close_popup(key, "parent pane closing");
+        self.force_close_popup(key);
 
         let Some(pane) = self.panes.shift_remove(key) else {
             return;
@@ -937,29 +911,15 @@ impl PaneManager {
             };
             let size_px = (width, height);
             if pane.last_applied_size == Some(size_px) {
-                // DIAG items.id=486 (temporary -- remove after root-cause diagnosis):
-                // cache-hit skip. Shares diag_312_tick()'s seq/elapsed_ms so this
-                // interleaves with the existing connect_resize/connect_render DIAG
-                // items.id=312 lines.
-                let (seq, elapsed_ms) = diag_312_tick();
-                let open_count = self.open_pane_count.load(Ordering::Relaxed);
-                log::debug!(
-                    "DIAG items.id=486: seq={seq} t={elapsed_ms}ms sync_pane_sizes \
-                     CACHE-HIT key={key:?} size_px={size_px:?} (== last_applied_size) \
-                     open_pane_count={open_count}"
-                );
+                // items.id=486 (deferred): debug-only, opt-in diagnostics.
+                #[cfg(debug_assertions)]
+                diag::sync_cache_hit(key, size_px, self.open_pane_count.load(Ordering::Relaxed));
                 continue;
             }
-            {
-                // DIAG items.id=486 (temporary -- remove after root-cause diagnosis):
-                // cache-miss / apply. Logged before the write so old vs. new is visible.
-                let (seq, elapsed_ms) = diag_312_tick();
-                log::debug!(
-                    "DIAG items.id=486: seq={seq} t={elapsed_ms}ms sync_pane_sizes \
-                     APPLY key={key:?} old={:?} new={size_px:?}",
-                    pane.last_applied_size
-                );
-            }
+            // items.id=486 (deferred): logged before the write so old vs. new
+            // is visible.
+            #[cfg(debug_assertions)]
+            diag::sync_apply(key, pane.last_applied_size, size_px);
             // items.id=328: `LogicalSize` here feeds CEF's `GetViewRect`
             // directly (render.rs's `view_rect`) -- confirmed live, via
             // temporary DIAG logging, that CEF's actual OSR paint buffer
@@ -1021,7 +981,7 @@ impl PaneManager {
     /// 6.6) -- unconditional, not gated on first confirming the
     /// `ITEMS257_INPUT_FREEZE_INVESTIGATION_20260822.md` stuck-grab
     /// hypothesis; cheap and idempotent if nothing was actually grabbed.
-    fn force_close_popup(&mut self, key: &PaneKey, reason: &'static str) {
+    fn force_close_popup(&mut self, key: &PaneKey) {
         let Some(popup) = self.popups.remove(key) else {
             return;
         };
@@ -1042,15 +1002,6 @@ impl PaneManager {
             host.send_capture_lost_event();
         }
         if let Some(seat) = gtk::gdk::Display::default().and_then(|d| d.default_seat()) {
-            // DIAG items.id=539: makes the defensive ungrab this fn already
-            // performs (Judgment call 6.6, added speculatively and never
-            // confirmed against a real repro) visible in the log, alongside
-            // which of the three call sites triggered it -- see
-            // ITEMS257_INPUT_FREEZE_INVESTIGATION_20260822.md's still-open
-            // stuck-grab hypothesis.
-            log::info!(
-                "cloud_chat_gpu_pane::pane_host: DIAG items.id=539: releasing seat grab for popup pane={key} (force_close_popup reason: {reason})"
-            );
             seat.ungrab();
         }
     }
@@ -1074,16 +1025,9 @@ impl PaneManager {
 
         let mut notifications = Vec::new();
         for req in requests {
-            // DIAG items.id=539: confirms whether a given interaction (e.g.
-            // a Cloudflare/Turnstile challenge) actually reaches
-            // `on_before_popup` at all -- see this fn's own doc.
-            log::info!(
-                "cloud_chat_gpu_pane::pane_host: DIAG items.id=539: popup requested for pane={}",
-                req.parent_key
-            );
             // One popup per pane (Judgment call 6.1): a second request for
             // an already-open popup replaces the first.
-            self.force_close_popup(&req.parent_key, "replaced by new popup request");
+            self.force_close_popup(&req.parent_key);
 
             let parent_pixel_rect = layout
                 .get(&req.parent_key)
@@ -1098,8 +1042,6 @@ impl PaneManager {
                     size: req.size,
                     rect,
                     last_applied_size: None,
-                    created_at: std::time::Instant::now(),
-                    stuck_warned: false,
                 },
             );
             notifications.push(PopupNotification::Opened {
@@ -1120,21 +1062,6 @@ impl PaneManager {
     fn drain_popup_events(&mut self) -> Vec<PopupNotification> {
         let mut closed_keys = Vec::new();
         for (key, popup) in self.popups.iter_mut() {
-            // DIAG items.id=539: one-shot warning if a popup never resolves
-            // out of `Creating` -- see `PopupState::stuck_warned`'s own doc.
-            // A popup stuck here forever is never covered by any of
-            // `force_close_popup`'s three call sites, so whatever grab CEF
-            // may have taken opening it would never be released either.
-            if !popup.stuck_warned
-                && matches!(popup.lifecycle, PopupLifecycleState::Creating)
-                && popup.created_at.elapsed() > std::time::Duration::from_secs(2)
-            {
-                popup.stuck_warned = true;
-                log::warn!(
-                    "cloud_chat_gpu_pane::pane_host: DIAG items.id=539: popup for pane={key} still Creating after {:.1}s -- never force-closed, any CEF-side grab it took would still be held",
-                    popup.created_at.elapsed().as_secs_f32()
-                );
-            }
             let Ok(event) = popup.events_rx.try_recv() else {
                 continue;
             };
@@ -1176,7 +1103,7 @@ impl PaneManager {
         let mut notifications = Vec::new();
         for key in keys {
             if self.popups.contains_key(&key) {
-                self.force_close_popup(&key, "parent navigated away");
+                self.force_close_popup(&key);
                 notifications.push(PopupNotification::Closed { key });
             }
         }
@@ -1727,6 +1654,19 @@ fn cef_mouse_button_from_gdk(button: u32) -> Option<MouseButtonType> {
     }
 }
 
+/// items.id=365 diagnostics (debug builds only): `(pane open, browser Ready,
+/// host() present)` for `key`, run only when `QR_CEF_PANE_DIAG` enables it.
+#[cfg(debug_assertions)]
+fn pane_input_probe(mgr: &PaneManager, key: &PaneKey) -> (bool, bool, bool) {
+    let pane = mgr.panes.get(key);
+    let browser = pane.and_then(|p| p.browser_lifecycle.browser());
+    (
+        pane.is_some(),
+        browser.is_some(),
+        browser.and_then(|b| b.host()).is_some(),
+    )
+}
+
 /// DOM-sourced counterpart to `cef_modifiers_from_gdk`, for the Path B
 /// click-routing mechanism (items.id=257, see this section's own doc
 /// above). A browser `PointerEvent`/`WheelEvent` reports its modifier keys
@@ -1852,18 +1792,16 @@ fn build_pane_hit_widget(
             | gtk::gdk::EventMask::LEAVE_NOTIFY_MASK
             | gtk::gdk::EventMask::SCROLL_MASK,
     );
-    // DIAG items.id=257: NOT cosmetic -- this is load-bearing evidence for
-    // the open blocker documented on `build_pane_hit_widget` above. Confirmed
-    // by hand this session: this handler fires every frame (hundreds of
-    // times over one manual test), yet the red tint it paints is never once
-    // visible on screen, and this widget's button-press-event never fires
-    // for a real click landing squarely inside its own confirmed-correct
-    // `get_child_position` rect either. Left in place -- along with the RAW
-    // button_press_event log below -- as the reproduction case for whoever
-    // picks up the investigation this doc points at. Do not delete without
-    // first re-confirming the blocker is actually resolved.
+    // items.id=257: NOT cosmetic -- this is evidence for the blocker
+    // documented on `build_pane_hit_widget` above. Confirmed by hand: this
+    // handler fired every frame (hundreds of times over one manual test), yet
+    // the red tint it paints was never once visible on screen, and this
+    // widget's button-press-event never fired for a real click landing
+    // squarely inside its own confirmed-correct `get_child_position` rect
+    // either. Left in place as the reproduction case for whoever picks up the
+    // investigation this doc points at; the per-event DIAG logging that went
+    // with it was removed under items.id=649.
     hit_widget.connect_draw(|_widget, cr| {
-        log::info!("DIAG items.id=257: hit_widget connect_draw FIRED");
         cr.set_source_rgba(1.0, 0.0, 0.0, 0.25);
         let _ = cr.paint();
         glib::Propagation::Proceed
@@ -1893,10 +1831,6 @@ fn build_pane_hit_widget(
             // unused dead code (see its own doc, Path A's preserved
             // investigation artifact).
             widget.grab_focus();
-            log::info!(
-                "DIAG items.id=257: RAW button_press_event fired, button={} pos={:?}",
-                event.button(), event.position()
-            );
             let Some(button) = cef_mouse_button_from_gdk(event.button()) else {
                 return glib::Propagation::Proceed;
             };
@@ -1904,11 +1838,6 @@ fn build_pane_hit_widget(
             let ev = mouse_event(&glarea, x, y, event.state());
             let mut mgr = manager.borrow_mut();
             mgr.last_focus = Some(FocusTarget::Pane(key.clone()));
-            log::info!(
-                "DIAG items.id=257: button_press pane={key} widget_local=({x},{y}) cef=({},{}) has_host={}",
-                ev.x, ev.y,
-                mgr.panes.get(&key).and_then(|p| p.browser_lifecycle.browser()).and_then(|b| b.host()).is_some()
-            );
             if let Some(host) = mgr
                 .panes
                 .get(&key)
@@ -2291,13 +2220,11 @@ fn build_overlay_and_glarea(webview_widget: gtk::Widget) -> (gtk::Overlay, gtk::
     glarea.set_has_alpha(true);
     glarea.set_hexpand(true);
     glarea.set_vexpand(true);
-    // DIAGNOSTIC (items.id=225, 2026-08-07): the GLArea overlay appears
-    // to swallow all pointer input across the whole window even with
-    // overlay pass-through set below -- confirmed via direct click
-    // testing (CloudChatSelector rows and the harness's own
-    // "Simulate response generating" button are both completely inert).
-    // set_can_focus(false) rules out one candidate cause (the GLArea
-    // grabbing keyboard/click-to-focus before pass-through routing).
+    // items.id=225 (2026-08-07): the GLArea overlay appeared to swallow all
+    // pointer input across the whole window even with overlay pass-through
+    // set below. set_can_focus(false) rules out one candidate cause (the
+    // GLArea grabbing keyboard/click-to-focus before pass-through routing);
+    // kept as it was.
     glarea.set_can_focus(false);
     // Redraw only on an explicit queue_draw() call (from the GLib
     // timeout below, gated on open_pane_count > 0) -- not on every GTK
@@ -2537,21 +2464,12 @@ fn handle_glarea_realize(
 /// `PaneHost::install`: resizes the shared `RenderState`'s target and
 /// re-syncs every open pane/popup's CEF-side size to match (items.id=234).
 fn handle_glarea_resize(
-    area: &gtk::GLArea,
     width: i32,
     height: i32,
     render_state: &Rc<RefCell<Option<RenderState>>>,
     manager: &Rc<RefCell<PaneManager>>,
     app_handle: &tauri::AppHandle,
 ) {
-    log::debug!("DIAG items.id=227: connect_resize fired width={width} height={height}");
-    let (seq, elapsed_ms) = diag_312_tick();
-    log::debug!(
-        "DIAG items.id=312: seq={seq} t={elapsed_ms}ms connect_resize \
-         width={width} height={height} allocated=({},{})",
-        area.allocated_width(),
-        area.allocated_height(),
-    );
     let (width, height) = (width.max(1) as u32, height.max(1) as u32);
     if let Some(rs) = render_state.borrow_mut().as_mut() {
         rs.resize((width, height));
@@ -2567,21 +2485,6 @@ fn handle_glarea_resize(
     // items.id=234: popup rects rescale proportionally on
     // ordinary window resize too, same mechanism as panes.
     mgr.sync_popup_sizes((width, height));
-}
-
-/// Sizing + diagnostic-correlation data computed once at the top of the
-/// GLArea's `render` handler (`PaneHost::install`) and threaded through to
-/// `render_and_present`, so its own DIAG items.id=312 log lines share one
-/// `seq`/`elapsed_ms` pair with the handler's "fired" log line.
-struct RenderTickContext {
-    /// GTK logical pixels (`allocated_width`/`allocated_height`).
-    glarea_size: (u32, u32),
-    /// `glarea_size` scaled by `scale_u32` -- what CEF/`sync_pane_sizes`/
-    /// `RenderState` all expect.
-    glarea_size_physical: (u32, u32),
-    scale_u32: u32,
-    seq: u64,
-    elapsed_ms: u128,
 }
 
 /// CRITICAL (confirmed this session): must be called before any wgpu
@@ -2712,8 +2615,7 @@ fn pump_begin_frames(manager: &Rc<RefCell<PaneManager>>) {
     }
 }
 
-/// Builds the active pane's popup-layout map, runs the items.id=312
-/// size-mismatch diagnostic, calls `RenderState::render`, then rebinds
+/// Builds the active pane's popup-layout map, calls `RenderState::render`, then rebinds
 /// `GL_DRAW_FRAMEBUFFER` to what `capture_draw_framebuffer` captured and
 /// resets scissor/viewport. Kept as one function, not split further, so
 /// "capture before any wgpu call, rebind immediately after render" can't
@@ -2724,42 +2626,11 @@ fn render_and_present(
     gl_context: &Rc<RefCell<Option<glow::Context>>>,
     manager: &Rc<RefCell<PaneManager>>,
     layout: &HashMap<PaneKey, PaneRectFraction>,
-    tick: &RenderTickContext,
     captured_fbo: Option<i32>,
 ) {
     use glow::HasContext as _;
 
     if let Some(rs) = render_state.borrow_mut().as_mut() {
-        // DIAG items.id=312 (temporary): `tick.glarea_size` is GTK
-        // *logical* pixels (`allocated_width/height`); `rs.size()` is
-        // whatever the last `connect_resize` call stored, which GTK
-        // documents as *physical* GL framebuffer pixels -- i.e. already
-        // multiplied by the device scale factor. Compare against
-        // `tick.glarea_size_physical` so this only fires on a genuine
-        // staleness mismatch (RenderState about to wrap a texture at a
-        // size GTK's own allocation has already moved past), not on the
-        // expected HiDPI unit difference.
-        let rs_size = rs.size();
-        if rs_size != tick.glarea_size_physical {
-            log::warn!(
-                "DIAG items.id=312: seq={} t={}ms SIZE MISMATCH \
-                 glarea_size_physical={:?} (logical={:?} scale={}) \
-                 render_state.size={rs_size:?}",
-                tick.seq,
-                tick.elapsed_ms,
-                tick.glarea_size_physical,
-                tick.glarea_size,
-                tick.scale_u32,
-            );
-        } else {
-            log::debug!(
-                "DIAG items.id=312: seq={} t={}ms pre-render size={rs_size:?} \
-                 (matches glarea_size_physical, scale={})",
-                tick.seq,
-                tick.elapsed_ms,
-                tick.scale_u32,
-            );
-        }
         // items.id=366: unlike the pane loop above (which only ever
         // draws a pane whose key has a `layout` entry -- the frontend
         // only reports one for the currently-visible pane, which is
@@ -2907,8 +2778,8 @@ impl PaneHost {
             let render_state = render_state.clone();
             let manager = manager.clone();
             let app_handle = app_handle.clone();
-            glarea.connect_resize(move |area, width, height| {
-                handle_glarea_resize(area, width, height, &render_state, &manager, &app_handle);
+            glarea.connect_resize(move |_area, width, height| {
+                handle_glarea_resize(width, height, &render_state, &manager, &app_handle);
             });
         }
 
@@ -2918,18 +2789,6 @@ impl PaneHost {
             let manager = manager.clone();
             let app_handle = app_handle.clone();
             glarea.connect_render(move |area, _gtk_gl_context| {
-                log::debug!(
-                    "DIAG items.id=227: connect_render fired, open_panes={}",
-                    manager.borrow().panes.len()
-                );
-                let (seq, elapsed_ms) = diag_312_tick();
-                log::debug!(
-                    "DIAG items.id=312: seq={seq} t={elapsed_ms}ms connect_render \
-                     allocated=({},{})",
-                    area.allocated_width(),
-                    area.allocated_height(),
-                );
-
                 // CRITICAL (confirmed this session): capture GTK's real
                 // bound draw framebuffer BEFORE any wgpu device/queue call
                 // -- see `capture_draw_framebuffer`'s own doc. Explicitly
@@ -2952,16 +2811,9 @@ impl PaneHost {
                 // `was_resized()`/browser_size contract generally) expect
                 // *physical* GL framebuffer pixels, same as `connect_resize`
                 // passes them -- scale up before using for anything
-                // CEF-facing, not just the diagnostic.
+                // CEF-facing.
                 let scale_u32 = area.scale_factor().max(1) as u32;
                 let glarea_size_physical = (glarea_size.0 * scale_u32, glarea_size.1 * scale_u32);
-                let tick = RenderTickContext {
-                    glarea_size,
-                    glarea_size_physical,
-                    scale_u32,
-                    seq,
-                    elapsed_ms,
-                };
 
                 sync_frame_sizes(&manager, glarea_size_physical, &layout);
                 drain_and_emit_popup_notifications(&manager, &app_handle, glarea_size, &layout);
@@ -2973,14 +2825,7 @@ impl PaneHost {
                     &layout,
                 );
                 pump_begin_frames(&manager);
-                render_and_present(
-                    &render_state,
-                    &gl_context,
-                    &manager,
-                    &layout,
-                    &tick,
-                    captured_fbo,
-                );
+                render_and_present(&render_state, &gl_context, &manager, &layout, captured_fbo);
 
                 glib::Propagation::Stop
             });
@@ -3062,17 +2907,14 @@ impl PaneHost {
                 // nothing is built or added to any widget tree before
                 // `open_pane` runs, so there's nothing left to orphan.
                 self.manager.borrow_mut().open_pane(key, url, scale, size);
-                log::debug!("DIAG items.id=227: dispatch(Open) -> queue_draw()");
                 self.queue_draw();
             }
             PaneCommand::Close { key } => {
                 self.manager.borrow_mut().close_pane(&key);
-                log::debug!("DIAG items.id=227: dispatch(Close) -> queue_draw()");
                 self.queue_draw();
             }
             PaneCommand::SetActivePane { key } => {
                 self.manager.borrow_mut().set_active_pane(key);
-                log::debug!("DIAG items.id=359: dispatch(SetActivePane) -> queue_draw()");
                 self.queue_draw();
             }
             PaneCommand::AdjustZoom { key, direction } => {
@@ -3092,30 +2934,15 @@ impl PaneHost {
                 if !mouseup {
                     mgr.last_focus = Some(FocusTarget::Pane(key.clone()));
                 }
-                // DIAG items.id=365 (temporary -- remove once the
-                // first-click-unresponsive investigation concludes):
-                // distinguishes "pane not open", "browser still Creating"
-                // (the async browser_host_create_browser race), and "host
-                // missing though Ready" (shouldn't happen) as three
-                // different reasons a click can be silently dropped below --
-                // narrows which of those is actually occurring when a
-                // freshly-opened pane's first click does nothing.
-                if !mouseup {
-                    match mgr.panes.get(&key) {
-                        None => log::warn!(
-                            "DIAG items.id=365: MouseClick dropped, pane={key} not open"
-                        ),
-                        Some(p) if p.browser_lifecycle.browser().is_none() => log::warn!(
-                            "DIAG items.id=365: MouseClick dropped, pane={key} browser not Ready yet"
-                        ),
-                        Some(p) if p.browser_lifecycle.browser().and_then(|b| b.host()).is_none() => {
-                            log::warn!(
-                                "DIAG items.id=365: MouseClick dropped, pane={key} browser Ready but host() is None"
-                            )
-                        }
-                        _ => {}
-                    }
-                }
+                // items.id=365 (deferred): debug-only, opt-in. Distinguishes
+                // "pane not open", "browser still Creating" (the async
+                // browser_host_create_browser race), and "host missing though
+                // Ready" (shouldn't happen) as three different reasons a
+                // click can be silently dropped below.
+                #[cfg(debug_assertions)]
+                diag::input_dropped("MouseClick", !mouseup, &key, || {
+                    pane_input_probe(&mgr, &key)
+                });
                 if let Some(host) = mgr
                     .panes
                     .get(&key)
@@ -3164,29 +2991,14 @@ impl PaneHost {
             } => {
                 let mut mgr = self.manager.borrow_mut();
                 mgr.last_focus = Some(FocusTarget::Pane(key.clone()));
-                // DIAG items.id=365 (temporary, see MouseClick's own DIAG
-                // comment above for what this is investigating).
-                if matches!(event_type, PaneKeyEventType::RawKeyDown) {
-                    match mgr.panes.get(&key) {
-                        None => {
-                            log::warn!("DIAG items.id=365: KeyEvent dropped, pane={key} not open")
-                        }
-                        Some(p) if p.browser_lifecycle.browser().is_none() => log::warn!(
-                            "DIAG items.id=365: KeyEvent dropped, pane={key} browser not Ready yet"
-                        ),
-                        Some(p)
-                            if p.browser_lifecycle
-                                .browser()
-                                .and_then(|b| b.host())
-                                .is_none() =>
-                        {
-                            log::warn!(
-                                "DIAG items.id=365: KeyEvent dropped, pane={key} browser Ready but host() is None"
-                            )
-                        }
-                        _ => {}
-                    }
-                }
+                // items.id=365 (deferred): see MouseClick's comment above.
+                #[cfg(debug_assertions)]
+                diag::input_dropped(
+                    "KeyEvent",
+                    matches!(event_type, PaneKeyEventType::RawKeyDown),
+                    &key,
+                    || pane_input_probe(&mgr, &key),
+                );
                 let browser_opt = mgr
                     .panes
                     .get(&key)
@@ -3227,7 +3039,7 @@ impl PaneHost {
                     // clipboard write -- see `PANE_SELECTED_TEXT`'s own doc
                     // for why this pane can't reach the platform clipboard
                     // on its own under Wayland. RawKeyDown only (matches
-                    // the DIAG check above): CEF still gets Char/KeyUp for
+                    // the dropped-key check above): CEF still gets Char/KeyUp for
                     // this same physical keypress as usual, this is purely
                     // additive. Ctrl+X (Cut) is included -- CEF's own
                     // in-page removal of the selection proceeds
@@ -3661,7 +3473,6 @@ impl PaneHost {
     /// `GtkGLArea`'s own API for exactly this -- it marks the previous
     /// render invalid AND queues the draw, guaranteeing `render` fires.
     pub fn queue_draw(&self) {
-        log::debug!("DIAG items.id=227: PaneHost::queue_draw() called");
         self.glarea.queue_render();
     }
 }
