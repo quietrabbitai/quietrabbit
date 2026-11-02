@@ -371,6 +371,31 @@ async fn async_main() {
                         });
                         match pool_result {
                             Ok(pool) => {
+                                // items.id=661: say so at startup if this data
+                                // directory predates the move of private metadata out
+                                // of shared.db. Login refuses it with a message; this
+                                // names what was found (table and column names only).
+                                let legacy_pool = pool.clone();
+                                let legacy = tokio::task::block_in_place(|| {
+                                    tokio::runtime::Handle::current().block_on(
+                                        quietrabbit_lib::persistence::legacy_shape::legacy_plaintext_objects(
+                                            &legacy_pool,
+                                        ),
+                                    )
+                                });
+                                match legacy {
+                                    Ok(found) if !found.is_empty() => log::error!(
+                                        "main: shared.db predates items.id=661 ({}); \
+                                         login will refuse it until the data directory is reset",
+                                        found.join(", ")
+                                    ),
+                                    Ok(_) => {}
+                                    Err(e) => log::warn!(
+                                        "main: could not check shared.db for pre-items.id=661 \
+                                         objects: {e}"
+                                    ),
+                                }
+
                                 // items.id=713: if a signed catalog update was
                                 // applied earlier, put it back over whatever the
                                 // migrations just wrote. Local only: no network,

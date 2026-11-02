@@ -1,10 +1,31 @@
 -- persistence/schema/shared_001.sql
 -- Instance database schema: shared.db
--- Stores personas, users, instance config, artifact versions, focus settings.
--- Not per-user encrypted — must be readable before any user logs in.
--- Contains no personal field values. instance_context limited to
--- general and personal sensitivity only (household name, shared prefs).
--- See ARCHITECTURE Section 8.1 for the explicit design rationale.
+-- Not encrypted: it is opened with no key so the login screen can read it.
+-- Anything in it is readable from disk without the password, so it holds only
+-- what must be readable before login, ids and membership, and mailbox rows
+-- (see "SHARED.DB CONTENT RULE" below). It contains no user-authored text:
+-- no Persona, group or topic names, no types, no folder paths, no labels, no
+-- provider choices. The exact contents are pinned by
+-- persistence/shared_db_residual.rs and checked by
+-- persistence/shared_db_privacy_tests.rs (items.id=661, decisions.id=862).
+-- See ARCHITECTURE Section 8.1 for the original design rationale.
+--
+-- SHARED.DB CONTENT RULE (items.id=661, decisions.id=862): a table or column
+-- may be added here only if it is (1) needed before login (the login list,
+-- key-derivation salts and wrappers, the public sharing key, instance
+-- configuration), (2) a global curated catalog with no user content, or
+-- (3) ids, status, timestamps and ciphertext (membership, focus settings and
+-- the pending_* mailbox rows a sender writes for a recipient who may be
+-- offline). User-authored or revealing text goes in the user's encrypted
+-- databases. The residual-set test fails for any table or column not listed.
+--
+-- KNOWN RESIDUAL, decided with items.id=661: focus_settings and
+-- focus_settings_friction_decisions are keyed (persona_id, focus_id), so they
+-- show which Focuses each Persona uses. They stay here (Jason, items.id=661
+-- review, option b) and are listed in the residual set for items.id=662.
+-- Also residual: authored Focus content (focuses, focus_block_customization)
+-- has no writer yet. When the Focus builder is built its authored content
+-- must go in an encrypted store, not here.
 --
 -- CONSOLIDATION NOTE (items.id=169, 2026-07-24): this file replaces the prior
 -- five-migration chain: shared_001 (initial, 'spaces'/'space_id'), shared_002
@@ -124,15 +145,12 @@ CREATE TABLE IF NOT EXISTS user_personas (
     PRIMARY KEY (user_id, persona_id)
 );
 
--- Instance-level shared context (general and personal sensitivity ONLY)
-CREATE TABLE IF NOT EXISTS instance_context (
-    id              TEXT PRIMARY KEY,
-    field_name      TEXT NOT NULL,
-    field_value     TEXT NOT NULL,
-    sensitivity     TEXT NOT NULL CHECK (sensitivity IN ('general', 'personal')),
-    created_at      TEXT NOT NULL,
-    extra_metadata  TEXT NOT NULL DEFAULT '{}'
-);
+-- instance_context and asset_index were created here as unused stubs (no
+-- reader or writer ever existed). They held free text (field_value, asset
+-- name, content_ref) in the plaintext shared.db, so items.id=661
+-- (decisions.id=862) removed them. A future feature that needs either puts it
+-- in an encrypted store. This file is edited in place, which decisions.id=857
+-- allows until first ship.
 
 -- Context groups (Release 1 schema, Release 2 UX)
 CREATE TABLE IF NOT EXISTS context_groups (
@@ -246,42 +264,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_user_capabilities_account_wide
 -- topic names are user content, so items.id=661 (decisions.id=862) removed the
 -- table. This file was edited in place, which decisions.id=857 allows until
 -- first ship.
-
--- asset_index — schema stub only, no CRUD store or UI in Release 1.
--- Activates in Layer 8+.
--- asset_id: UUID primary key.
--- persona_id: Persona-level scope for cross-focus access (Option B promotion).
--- focus_id: NULL = Persona-level asset. Non-null = focus-scoped asset.
--- asset_type: 'static' (discrete named artifact) | 'structured' (schema + append).
--- backing_type: 'local' (R1) | 'imported' | 'connected' (R2+ only).
--- name_sensitivity: sensitivity preset of the asset name itself.
---   Names with medical/financial sensitivity obfuscated in public display —
---   forward to Chat-BRAND for UI specification.
--- content_ref: pointer to actual content location (path or DB ref). NULL in R1.
--- Asset index dual-write invariant (ADR-013 Section 2.4):
---   All mutations use atomic transaction locking shared.db index pointer
---   before content layer commits. Orphaned entries detected by Boot Check.
-CREATE TABLE IF NOT EXISTS asset_index (
-    asset_id            TEXT PRIMARY KEY,
-    persona_id          TEXT NOT NULL,
-    focus_id            TEXT,
-    asset_type          TEXT NOT NULL
-                            CHECK (asset_type IN ('static', 'structured')),
-    backing_type        TEXT NOT NULL DEFAULT 'local'
-                            CHECK (backing_type IN ('local', 'imported', 'connected')),
-    name                TEXT NOT NULL,
-    name_sensitivity    TEXT NOT NULL DEFAULT 'standard'
-                            CHECK (name_sensitivity IN (
-                                'standard', 'sensitive', 'private', 'locked'
-                            )),
-    content_ref         TEXT,
-    created_at          TEXT NOT NULL,
-    last_modified_at    TEXT NOT NULL,
-    extra_metadata      TEXT NOT NULL DEFAULT '{}'
-);
-
-CREATE INDEX IF NOT EXISTS idx_asset_index_persona
-    ON asset_index (persona_id, focus_id, last_modified_at DESC);
 
 -- focus_settings — three independent Focus settings per D6-291:
 --   context_flow:       bidirectional (default) | receive_only | isolated
@@ -535,4 +517,4 @@ VALUES
 
 INSERT OR IGNORE INTO schema_version (version, applied_at, description)
 VALUES (1, datetime('now'),
-    'shared.db schema (consolidated 2026-07-24, items.id=169; auth foundation consolidated 2026-08-01, items.id=205; tier3_providers added 2026-08-04, items.id=202; tier3_providers seeded 2026-08-07, items.id=225): personas, users, user_salts, user_capabilities, artifact_versions, topic_index, asset_index, focus_settings, tier3_providers + dev seeds');
+    'shared.db schema (consolidated 2026-07-24, items.id=169; auth foundation consolidated 2026-08-01, items.id=205; tier3_providers added 2026-08-04, items.id=202; tier3_providers seeded 2026-08-07, items.id=225): personas, users, user_salts, user_capabilities, artifact_versions, focus_settings, tier3_providers + dev seeds (topic_index, asset_index and instance_context since removed by items.id=661)');

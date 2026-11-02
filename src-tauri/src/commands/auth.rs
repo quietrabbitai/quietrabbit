@@ -231,6 +231,21 @@ pub async fn login(
     group_key_registry: State<'_, GroupKeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<(), String> {
+    // items.id=661: refuse a shared.db built before private metadata moved out
+    // of it, before anything else reads it. Names the objects in the log only.
+    match crate::persistence::legacy_shape::legacy_plaintext_objects(&pool).await {
+        Ok(found) if !found.is_empty() => {
+            log::error!(
+                "login: shared.db has pre-items.id=661 objects ({}); the data directory \
+                 must be reset",
+                found.join(", ")
+            );
+            return Err(crate::persistence::legacy_shape::LEGACY_PLAINTEXT_MESSAGE.to_owned());
+        }
+        Ok(_) => {}
+        Err(e) => return Err(e.to_string()),
+    }
+
     let has_users = user_store::has_any_users(&pool)
         .await
         .map_err(|e| e.to_string())?;
@@ -1557,6 +1572,41 @@ mod tests {
         assert!(
             !kdf::derive_threads::ran_on_current_thread(),
             "a login derivation ran inline on the runtime thread"
+        );
+    }
+
+    /// items.id=661: a shared.db built before private metadata moved out of it
+    /// is refused at login with one clear message, before an account is created
+    /// or opened, and nothing is unlocked.
+    #[tokio::test]
+    async fn login_refuses_a_shared_db_that_predates_the_privacy_move() {
+        let _env = setup().await;
+        sqlx::query("ALTER TABLE personas ADD COLUMN display_name TEXT")
+            .execute(&_env.pool)
+            .await
+            .unwrap();
+        let app = mock_app_with_registry(_env.pool.clone());
+        let registry = app.state::<KeyRegistry>();
+        let group_key_registry = app.state::<GroupKeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
+
+        let result = login(
+            "Alice".to_owned(),
+            "password123".to_owned(),
+            registry.clone(),
+            group_key_registry,
+            pool.clone(),
+        )
+        .await;
+
+        assert_eq!(
+            result.unwrap_err(),
+            crate::persistence::legacy_shape::LEGACY_PLAINTEXT_MESSAGE
+        );
+        assert!(!registry.is_occupied().await);
+        assert!(
+            !user_store::has_any_users(&pool).await.unwrap(),
+            "no account may be created against the old shape"
         );
     }
 
