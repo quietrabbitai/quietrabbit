@@ -125,6 +125,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/keys_005.sql"),
     },
     SchemaFile {
+        prefix: "keys",
+        version: 6,
+        sql: include_str!("../../schema/keys_006.sql"),
+    },
+    SchemaFile {
         prefix: "messages",
         version: 1,
         sql: include_str!("../../schema/messages_001.sql"),
@@ -258,6 +263,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         prefix: "personal",
         version: 8,
         sql: include_str!("../../schema/personal_008.sql"),
+    },
+    SchemaFile {
+        prefix: "personal",
+        version: 9,
+        sql: include_str!("../../schema/personal_009.sql"),
     },
     SchemaFile {
         prefix: "plan_state",
@@ -3513,8 +3523,8 @@ mod tests {
 
         assert_eq!(
             result.expect("migration must apply cleanly to a real encrypted file"),
-            8,
-            "personal_001 + personal_002 + personal_003 + personal_004 + personal_005 + personal_006 + personal_007 + personal_008 must all apply in one pass"
+            9,
+            "personal_001 through personal_009 must all apply in one pass"
         );
 
         let mut conn = open_verify_conn(
@@ -3532,6 +3542,7 @@ mod tests {
             "document_forks",
             "group_keys",
             "group_fact_sources",
+            "persona_floor_consent",
         ] {
             assert!(
                 table_exists(&mut conn, table).await,
@@ -3586,7 +3597,7 @@ mod tests {
             std::env::remove_var("QR_DATA_ROOT");
         }
 
-        assert_eq!(first.expect("first migration must succeed"), 8);
+        assert_eq!(first.expect("first migration must succeed"), 9);
         assert_eq!(
             second.expect("second migration on an already-migrated real file must not error"),
             0,
@@ -3889,7 +3900,9 @@ mod tests {
         // ledger settlement columns, rate-limit snapshot table).
         // items.id=711: keys_005.sql added a fifth (per-user live model list
         // tables and the calibration output sample count).
-        assert_eq!(result.expect("migration must apply cleanly"), 5);
+        // items.id=661: keys_006.sql added a sixth (persona registry, provider
+        // preference and folder-sync settings moved out of plaintext shared.db).
+        assert_eq!(result.expect("migration must apply cleanly"), 6);
 
         let mut conn = open_verify_conn(
             &db_path,
@@ -3910,6 +3923,11 @@ mod tests {
             "provider_rate_snapshot",
             "provider_live_models",
             "provider_model_refresh",
+            "persona_registry",
+            "user_provider_preference",
+            "group_sync_settings",
+            "persona_share_sync_settings",
+            "persona_view_share_settings",
         ] {
             assert!(table_exists(&mut conn, table).await, "{table} must exist");
         }
@@ -3934,6 +3952,172 @@ mod tests {
         .execute(&mut conn)
         .await;
         assert!(valid.is_ok(), "a valid auth_type must insert cleanly");
+    }
+
+    // items.id=661: keys_006.sql and personal_009.sql are additive, so they
+    // must reach a database that was created before they existed. SCHEMA_FILES
+    // is a compile-time static, so the older database is hand-built: apply
+    // everything, then remove what the new file added and forget its version.
+    #[tokio::test]
+    async fn keys_006_applies_on_top_of_a_keys_005_database() {
+        let mut conn = make_test_conn().await;
+        assert_eq!(run_migrations(&mut conn, "keys", None).await.unwrap(), 6);
+
+        for table in [
+            "persona_registry",
+            "user_provider_preference",
+            "group_sync_settings",
+            "persona_share_sync_settings",
+            "persona_view_share_settings",
+        ] {
+            sqlx::query(&format!("DROP TABLE {table}"))
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+        sqlx::query("DELETE FROM schema_version WHERE version = 6")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO integration_keys \
+                (id, provider, key_type, credential_label, credential, auth_type, created_at) \
+             VALUES ('k-1', 'fixture-host', 'qr_hosted', 'fixture-host', 'secret', 'api_key', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        assert_eq!(run_migrations(&mut conn, "keys", None).await.unwrap(), 1);
+        for table in [
+            "persona_registry",
+            "user_provider_preference",
+            "group_sync_settings",
+            "persona_share_sync_settings",
+            "persona_view_share_settings",
+        ] {
+            assert!(table_exists(&mut conn, table).await, "{table} must exist");
+        }
+        let kept: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM integration_keys WHERE id = 'k-1'")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(kept.0, 1, "existing rows must survive the upgrade");
+    }
+
+    #[tokio::test]
+    async fn keys_006_preference_scopes_are_unique_and_checks_hold() {
+        let mut conn = make_test_conn().await;
+        run_migrations(&mut conn, "keys", None).await.unwrap();
+
+        let insert = |id: &'static str,
+                      persona: Option<&'static str>,
+                      focus: Option<&'static str>,
+                      pref: &'static str| {
+            sqlx::query(
+                "INSERT INTO user_provider_preference \
+                    (id, user_id, persona_id, focus_id, provider_id, user_preference, created_at) \
+                 VALUES (?, 'u1', ?, ?, 'prov-a', ?, '2026-01-01T00:00:00Z')",
+            )
+            .bind(id)
+            .bind(persona)
+            .bind(focus)
+            .bind(pref)
+        };
+
+        insert("a1", None, None, "preferred")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        insert("a2", None, None, "allowed")
+            .execute(&mut conn)
+            .await
+            .expect_err("a second account-wide row for the same provider must be rejected");
+        insert("p1", Some("persona-1"), None, "preferred")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        insert("p2", Some("persona-1"), None, "allowed")
+            .execute(&mut conn)
+            .await
+            .expect_err("a second persona-wide row must be rejected");
+        insert("f1", None, Some("focus-1"), "preferred")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        insert("f2", None, Some("focus-1"), "allowed")
+            .execute(&mut conn)
+            .await
+            .expect_err("a second focus row must be rejected");
+        insert("bad", None, Some("focus-2"), "bogus")
+            .execute(&mut conn)
+            .await
+            .expect_err("user_preference CHECK must hold");
+
+        sqlx::query(
+            "UPDATE user_provider_preference SET plan_key = 'plan', model_id = 'm' WHERE id = 'a1'",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("plan_key and model_id are ordinary columns");
+    }
+
+    #[tokio::test]
+    async fn personal_009_applies_on_top_of_a_personal_008_database() {
+        let mut conn = make_test_conn().await;
+        assert_eq!(
+            run_migrations(&mut conn, "personal", None).await.unwrap(),
+            9
+        );
+
+        sqlx::query("DROP TABLE persona_floor_consent")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE group_keys DROP COLUMN group_display_name")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_version WHERE version = 9")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO group_keys (group_id, group_key_hex, created_at) \
+             VALUES ('g-1', 'aa', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            run_migrations(&mut conn, "personal", None).await.unwrap(),
+            1
+        );
+        let name: (String,) =
+            sqlx::query_as("SELECT group_display_name FROM group_keys WHERE group_id = 'g-1'")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(
+            name.0, "",
+            "a row written before the migration defaults to ''"
+        );
+
+        sqlx::query(
+            "INSERT INTO persona_floor_consent (id, mode, abstraction_tier, consent_timestamp, consent_version) \
+             VALUES (1, 'modified', 2, '2026-01-01T00:00:00Z', '1')",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO persona_floor_consent (id, mode, abstraction_tier, consent_timestamp, consent_version) \
+             VALUES (2, 'local', NULL, '2026-01-01T00:00:00Z', '1')",
+        )
+        .execute(&mut conn)
+        .await
+        .expect_err("persona_floor_consent holds exactly one row");
     }
 
     #[tokio::test]
@@ -4193,8 +4377,8 @@ mod tests {
         }
 
         assert_eq!(
-            first.expect("first migration, which applies all 8 real versions, must succeed"),
-            8,
+            first.expect("first migration, which applies all 9 real versions, must succeed"),
+            9,
             "a brand-new personal.db must apply every real migration version on first open"
         );
         assert!(

@@ -1053,7 +1053,9 @@ mod tests {
             // keys_004 alters these tables and owns provider_rate_snapshot, and
             // keys_005 owns the live-model tables and alters calibration, so
             // all three must be re-applied together (the migrator applies
-            // versions above the highest recorded one).
+            // versions above the highest recorded one). keys_006 (items.id=661)
+            // is recorded above them, so its version is forgotten too: its
+            // statements are all IF NOT EXISTS and re-apply harmlessly.
             for table in [
                 "provider_rate_snapshot",
                 "provider_live_models",
@@ -1064,7 +1066,7 @@ mod tests {
                     .await
                     .unwrap();
             }
-            sqlx::query("DELETE FROM schema_version WHERE version IN (3, 4, 5)")
+            sqlx::query("DELETE FROM schema_version WHERE version IN (3, 4, 5, 6)")
                 .execute(&mut conn)
                 .await
                 .unwrap();

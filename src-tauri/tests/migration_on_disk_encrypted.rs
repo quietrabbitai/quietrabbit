@@ -142,3 +142,81 @@ async fn test_migration_pipeline_wrong_key_cannot_read_migrated_file() {
         "wrong key must not be able to connect to or read the migrated encrypted file"
     );
 }
+
+// items.id=661: the per-user encrypted prefixes that receive the metadata
+// moved out of shared.db. Same framework-level assertions as above, run for
+// each prefix: apply on a real encrypted file, reopen under the key and find
+// the version bookkeeping durable, re-run as a no-op, and refuse a wrong key.
+// "MAX(version) == applied" needs contiguous versions from 1, which both
+// prefixes have.
+async fn migrate_prefix_on_encrypted_file(prefix: &str) {
+    common::init_sqlcipher(); // items.id=802
+    let temp_file = NamedTempFile::new().unwrap();
+    let (file_handle, temp_path) = temp_file.into_parts();
+    drop(file_handle);
+
+    let applied;
+    {
+        let mut conn = SqliteConnectOptions::new()
+            .filename(&temp_path)
+            .create_if_missing(true)
+            .connect()
+            .await
+            .expect("failed to open on-disk connection for migration");
+        applied = run_migrations(&mut conn, prefix, Some(KEY_HEX))
+            .await
+            .unwrap_or_else(|e| panic!("{prefix} migrations must apply on an encrypted file: {e}"));
+        assert!(applied > 0, "{prefix}: expected versions to apply");
+        conn.close().await.expect("migration connection must close");
+    }
+
+    {
+        let mut conn = SqliteConnectOptions::new()
+            .filename(&temp_path)
+            .pragma("key", format!("\"x'{KEY_HEX}'\""))
+            .connect()
+            .await
+            .expect("failed reopening encrypted database after migration");
+        let version: (i64,) = sqlx::query_as("SELECT MAX(version) FROM schema_version")
+            .fetch_one(&mut conn)
+            .await
+            .expect("schema_version must be readable after reopening");
+        assert_eq!(version.0 as u32, applied, "{prefix}: persisted version");
+        let second = run_migrations(&mut conn, prefix, Some(KEY_HEX))
+            .await
+            .expect("re-running migrations must succeed");
+        assert_eq!(second, 0, "{prefix}: re-run must be a no-op");
+        conn.close()
+            .await
+            .expect("second-pass connection must close");
+    }
+
+    const WRONG_KEY_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+    let wrong_key_result = SqliteConnectOptions::new()
+        .filename(&temp_path)
+        .pragma("key", format!("\"x'{WRONG_KEY_HEX}'\""))
+        .connect()
+        .await;
+    let read_failed = match wrong_key_result {
+        Err(_) => true,
+        Ok(mut conn) => {
+            let result: Result<(i64,), _> =
+                sqlx::query_as("SELECT MAX(version) FROM schema_version")
+                    .fetch_one(&mut conn)
+                    .await;
+            conn.close().await.expect("wrong-key connection must close");
+            result.is_err()
+        }
+    };
+    assert!(read_failed, "{prefix}: wrong key must not read the file");
+}
+
+#[tokio::test]
+async fn test_keys_migrations_apply_on_real_encrypted_file() {
+    migrate_prefix_on_encrypted_file("keys").await;
+}
+
+#[tokio::test]
+async fn test_personal_migrations_apply_on_real_encrypted_file() {
+    migrate_prefix_on_encrypted_file("personal").await;
+}

@@ -96,6 +96,13 @@ TABLE calibration
   sample_count INTEGER notnull=1 pk=0 default=Some("0")
   updated_at TEXT notnull=1 pk=0 default=None
   output_sample_count INTEGER notnull=1 pk=0 default=Some("0")
+TABLE group_sync_settings
+  persona_id TEXT notnull=1 pk=1 default=None
+  group_id TEXT notnull=1 pk=2 default=None
+  folder_path TEXT notnull=1 pk=0 default=None
+  last_synced_at TEXT notnull=0 pk=0 default=None
+  last_error TEXT notnull=0 pk=0 default=None
+  updated_at TEXT notnull=1 pk=0 default=None
 TABLE integration_keys
   id TEXT notnull=0 pk=1 default=None
   provider TEXT notnull=1 pk=0 default=None
@@ -114,6 +121,28 @@ TABLE migration_lock
   id INTEGER notnull=0 pk=1 default=None
   locked_at TEXT notnull=0 pk=0 default=None
   locked_by TEXT notnull=0 pk=0 default=None
+TABLE persona_registry
+  persona_id TEXT notnull=0 pk=1 default=None
+  display_name TEXT notnull=1 pk=0 default=None
+  persona_type TEXT notnull=1 pk=0 default=None
+  color TEXT notnull=0 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+TABLE persona_share_sync_settings
+  persona_id TEXT notnull=1 pk=1 default=None
+  share_id TEXT notnull=1 pk=2 default=None
+  role TEXT notnull=1 pk=0 default=None
+  folder_path TEXT notnull=1 pk=0 default=None
+  last_synced_at TEXT notnull=0 pk=0 default=None
+  last_pushed_at TEXT notnull=0 pk=0 default=None
+  last_content_hash TEXT notnull=0 pk=0 default=None
+  last_error TEXT notnull=0 pk=0 default=None
+  updated_at TEXT notnull=1 pk=0 default=None
+TABLE persona_view_share_settings
+  recipient_user_id TEXT notnull=1 pk=1 default=None
+  share_id TEXT notnull=1 pk=2 default=None
+  folder_path TEXT notnull=1 pk=0 default=None
+  last_error TEXT notnull=0 pk=0 default=None
+  updated_at TEXT notnull=1 pk=0 default=None
 TABLE price_overrides
   provider_id TEXT notnull=1 pk=1 default=None
   model_id TEXT notnull=1 pk=2 default=None
@@ -182,6 +211,23 @@ TABLE schema_version
   version INTEGER notnull=0 pk=1 default=None
   applied_at TEXT notnull=1 pk=0 default=None
   description TEXT notnull=1 pk=0 default=None
+TABLE user_provider_preference
+  id TEXT notnull=0 pk=1 default=None
+  user_id TEXT notnull=1 pk=0 default=None
+  persona_id TEXT notnull=0 pk=0 default=None
+  focus_id TEXT notnull=0 pk=0 default=None
+  provider_id TEXT notnull=1 pk=0 default=None
+  login_available INTEGER notnull=1 pk=0 default=Some("0")
+  user_preference TEXT notnull=1 pk=0 default=None
+  enabled_at TEXT notnull=0 pk=0 default=None
+  declined_at TEXT notnull=0 pk=0 default=None
+  local_model_version TEXT notnull=0 pk=0 default=None
+  installed_at TEXT notnull=0 pk=0 default=None
+  last_verified_at TEXT notnull=0 pk=0 default=None
+  subscription_status TEXT notnull=0 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+  plan_key TEXT notnull=0 pk=0 default=None
+  model_id TEXT notnull=0 pk=0 default=None
 === messages ===
 TABLE chat_binding_targets
   context_key TEXT notnull=1 pk=1 default=None
@@ -515,6 +561,7 @@ TABLE group_keys
   group_id TEXT notnull=1 pk=1 default=None
   group_key_hex TEXT notnull=1 pk=0 default=None
   created_at TEXT notnull=1 pk=0 default=None
+  group_display_name TEXT notnull=1 pk=0 default=Some("''")
 TABLE migration_lock
   id INTEGER notnull=0 pk=1 default=None
   locked_at TEXT notnull=0 pk=0 default=None
@@ -528,6 +575,12 @@ TABLE notifications
   read_at TEXT notnull=0 pk=0 default=None
   created_at TEXT notnull=1 pk=0 default=None
   extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+TABLE persona_floor_consent
+  id INTEGER notnull=0 pk=1 default=None
+  mode TEXT notnull=1 pk=0 default=None
+  abstraction_tier INTEGER notnull=0 pk=0 default=None
+  consent_timestamp TEXT notnull=1 pk=0 default=None
+  consent_version TEXT notnull=1 pk=0 default=None
 TABLE pf_standing_preferences
   id TEXT notnull=1 pk=1 default=None
   persona_id TEXT notnull=1 pk=0 default=None
