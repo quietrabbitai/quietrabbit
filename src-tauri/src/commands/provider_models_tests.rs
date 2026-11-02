@@ -869,13 +869,7 @@ mod selection {
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::query(
-            "INSERT INTO personas (id, display_name, persona_type, created_at) \
-             VALUES ('p1', 'Fixture', 'personal', '2026-01-01T00:00:00Z')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        crate::test_support::insert_persona_anchor(&pool, "p1").await;
         let provider_id: String = sqlx::query_scalar(
             "SELECT m.provider_id FROM provider_models m JOIN providers p ON p.id = m.provider_id \
              WHERE m.is_default = 1 AND p.api_dialect IS NOT NULL ORDER BY m.provider_id LIMIT 1",

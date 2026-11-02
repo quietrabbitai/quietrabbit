@@ -63,8 +63,6 @@
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
-use sqlx::ConnectOptions;
-use sqlx::Row;
 use tauri::State;
 
 use crate::auth::registry::{key_hex, KeyRegistry};
@@ -77,7 +75,7 @@ use crate::persistence::focus_settings_store;
 use crate::persistence::output_store;
 use crate::persistence::output_store::{get_focus_run_status, set_focus_run_status};
 use crate::persistence::personal_store;
-use crate::providers::utils::{connect_options_unencrypted, db_path_shared, now};
+use crate::providers::utils::now;
 
 // ---------------------------------------------------------------------------
 // Request / response structs
@@ -243,12 +241,18 @@ pub async fn submit_floor_consent_decision(
     .await
     .map_err(|e| e.to_string())?;
 
-    // If user chose to save, write standing preference to personas.extra_metadata
-    // in shared.db (D5-152). Scoped to abstraction_tier -- not a blanket consent.
+    // If user chose to save, write the standing preference to the Persona's
+    // encrypted personal.db (D5-152; items.id=661 moved it out of shared.db).
+    // Scoped to abstraction_tier -- not a blanket consent.
     if request.save_preference && request.decision == "proceed" {
-        write_floor_consent_preference(&request.persona_id, request.abstraction_tier)
-            .await
-            .map_err(|e| e.to_string())?;
+        personal_store::write_floor_consent_preference(
+            &request.user_id,
+            &request.persona_id,
+            &key_hex_str,
+            request.abstraction_tier,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
     }
 
     Ok(())
@@ -834,56 +838,6 @@ pub async fn submit_chat_copy_consent_decision(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Write floor_consent_preference to personas.extra_metadata in shared.db.
-/// D5-152: scoped to abstraction_tier. Schema:
-///   {"mode": "modified", "abstraction_tier": N,
-///    "consent_timestamp": "...", "consent_version": "1"}
-/// shared.db is unencrypted (instance-level, not per-persona encrypted).
-///
-/// extra_metadata is fetched as Option<String> -- the column may be NULL for
-/// newly created personas. A NULL or malformed value is treated as an empty
-/// object so the preference write proceeds without data loss.
-async fn write_floor_consent_preference(
-    persona_id: &str,
-    abstraction_tier: i32,
-) -> Result<(), sqlx::Error> {
-    let db_path = db_path_shared();
-    let mut conn = connect_options_unencrypted(&db_path).connect().await?;
-
-    let timestamp = now();
-    let preference = serde_json::json!({
-        "mode": "modified",
-        "abstraction_tier": abstraction_tier,
-        "consent_timestamp": timestamp,
-        "consent_version": "1"
-    });
-
-    // Fetch as Option<String> -- NULL extra_metadata is valid for new personas.
-    let existing_json: Option<String> =
-        sqlx::query("SELECT extra_metadata FROM personas WHERE id = ?")
-            .bind(persona_id)
-            .fetch_one(&mut conn)
-            .await?
-            .try_get("extra_metadata")?;
-
-    // Merge into existing metadata rather than overwriting the whole field.
-    // Falls back to empty object if the column is NULL or contains invalid JSON.
-    let mut meta: serde_json::Value = existing_json
-        .as_deref()
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-
-    meta["floor_consent_preference"] = preference;
-
-    sqlx::query("UPDATE personas SET extra_metadata = ? WHERE id = ?")
-        .bind(meta.to_string())
-        .bind(persona_id)
-        .execute(&mut conn)
-        .await?;
-
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -994,13 +948,8 @@ mod tests {
         )
         .await
         .expect("create_user must succeed in test setup");
-        crate::persistence::persona_store::create_persona(
-            &pool,
-            PERSONA_ID,
-            "Consent Test Persona",
-            "personal",
-            USER_ID,
-            None,
+        crate::persistence::persona_store::create_persona_anchor_for_test(
+            &pool, PERSONA_ID, USER_ID,
         )
         .await
         .expect("create_persona must succeed in test setup");
@@ -1064,13 +1013,8 @@ mod tests {
         )
         .await
         .expect("create_user must succeed in test setup");
-        crate::persistence::persona_store::create_persona(
-            &pool,
-            PERSONA_ID,
-            "Consent Test Persona",
-            "personal",
-            USER_ID,
-            None,
+        crate::persistence::persona_store::create_persona_anchor_for_test(
+            &pool, PERSONA_ID, USER_ID,
         )
         .await
         .expect("create_persona must succeed in test setup");

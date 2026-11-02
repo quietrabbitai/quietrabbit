@@ -634,16 +634,9 @@ mod tests {
         )
         .await
         .expect("create_user must succeed in test setup");
-        persona_store::create_persona(
-            &pool,
-            PERSONA_ID,
-            "Lib Test Persona",
-            "personal",
-            USER_ID,
-            None,
-        )
-        .await
-        .expect("create_persona must succeed in test setup");
+        persona_store::create_persona_anchor_for_test(&pool, PERSONA_ID, USER_ID)
+            .await
+            .expect("create_persona must succeed in test setup");
 
         TestEnv {
             _tempdir: tempdir,

@@ -70,6 +70,7 @@ use x25519_dalek::StaticSecret;
 
 use crate::auth::sharing_keypair::{self, SharingKeypairError};
 use crate::persistence::entity_store::{Entity, EntityFilter, ParentFilter};
+use crate::persistence::persona_registry_store::{self, PersonaRegistryEntry};
 use crate::persistence::persona_store::{self, PersonaStoreError};
 use crate::persistence::personal_store::{self, PersonalStoreError};
 
@@ -135,6 +136,35 @@ pub enum PersonaSharingError {
     CorruptPayload(String, serde_json::Error),
     #[error("Unknown pending_persona_shares.share_type '{0}'. Must be synced or view_only.")]
     UnknownShareType(String),
+}
+
+/// The wire form of a saved floor consent preference inside the payload
+/// (unchanged since it was read from personas.extra_metadata).
+fn floor_consent_to_json(pref: &personal_store::FloorConsentPreference) -> serde_json::Value {
+    serde_json::json!({
+        "mode": pref.mode,
+        "abstraction_tier": pref.abstraction_tier,
+        "consent_timestamp": pref.consent_timestamp,
+        "consent_version": pref.consent_version,
+    })
+}
+
+/// None when the value is not a well-formed preference: a malformed one is
+/// dropped rather than failing the whole accept, and the consent gate then
+/// fires normally (the fail-closed direction).
+fn floor_consent_from_json(
+    v: &serde_json::Value,
+) -> Option<personal_store::FloorConsentPreference> {
+    Some(personal_store::FloorConsentPreference {
+        mode: v.get("mode")?.as_str()?.to_owned(),
+        abstraction_tier: v.get("abstraction_tier").and_then(|t| t.as_i64()),
+        consent_timestamp: v.get("consent_timestamp")?.as_str()?.to_owned(),
+        consent_version: v.get("consent_version")?.as_str()?.to_owned(),
+    })
+}
+
+fn registry_error(e: impl std::fmt::Display) -> PersonaSharingError {
+    PersonaSharingError::PersonaStore(PersonaStoreError::Registry(e.to_string()))
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -317,19 +347,26 @@ pub async fn send_persona_share(
     recipient_user_id: &str,
     share_type: ShareType,
 ) -> Result<String, PersonaSharingError> {
-    let persona = persona_store::get_persona_for_user(pool, owner_user_id, source_persona_id)
-        .await?
-        .ok_or_else(|| {
-            PersonaSharingError::PersonaNotOwnedByUser(
-                source_persona_id.to_owned(),
-                owner_user_id.to_owned(),
-            )
-        })?;
+    let persona =
+        persona_store::get_persona_for_user(pool, owner_user_id, owner_key_hex, source_persona_id)
+            .await?
+            .ok_or_else(|| {
+                PersonaSharingError::PersonaNotOwnedByUser(
+                    source_persona_id.to_owned(),
+                    owner_user_id.to_owned(),
+                )
+            })?;
 
-    let floor_consent_preference = persona
-        .extra_metadata
-        .get("floor_consent_preference")
-        .cloned();
+    // The sender's saved floor consent is in the Persona's encrypted
+    // personal.db (items.id=661), not in shared.db.
+    let floor_consent_preference = personal_store::read_floor_consent_preference(
+        owner_user_id,
+        source_persona_id,
+        owner_key_hex,
+    )
+    .await?
+    .as_ref()
+    .map(floor_consent_to_json);
 
     let active_entities = crate::persistence::entity_store::list_entities(
         owner_user_id,
@@ -618,30 +655,49 @@ pub async fn accept_persona_share(
             return Err(PersonaSharingError::Database(e));
         }
     }
+
+    // The sender's floor consent preference goes into the new Persona's own
+    // encrypted personal.db (items.id=661), after the content is committed.
+    if let Some(pref) = payload
+        .floor_consent_preference
+        .as_ref()
+        .and_then(floor_consent_from_json)
+    {
+        personal_store::set_floor_consent_preference_conn(&mut personal_conn, &pref).await?;
+    }
     drop(personal_conn);
 
+    // --- encrypted registry: the Persona's name and type ----------------
+    // Written BEFORE the shared.db rows (the order of items.id=614), so a
+    // shared.db Persona never exists without a place for its name. Removed
+    // again below if the shared.db part fails.
+    let mut keys_conn = persona_registry_store::open(recipient_user_id, recipient_personal_key_hex)
+        .await
+        .map_err(registry_error)?;
+    persona_registry_store::insert_conn(
+        &mut keys_conn,
+        &PersonaRegistryEntry {
+            persona_id: persona_id.clone(),
+            display_name: share.source_persona_display_name.clone(),
+            persona_type: share.source_persona_type.clone(),
+            color: None,
+            created_at: now.clone(),
+        },
+    )
+    .await?;
+
     // --- shared.db: personas, user_personas, share status ---------------
-    let extra_metadata_json = match &payload.floor_consent_preference {
-        Some(v) => serde_json::json!({ "floor_consent_preference": v }).to_string(),
-        None => "{}".to_owned(),
-    };
 
     sqlx::query("SAVEPOINT accept_persona_share")
         .execute(&mut *shared_conn)
         .await?;
 
     let registration_step: Result<(), sqlx::Error> = async {
-        sqlx::query(
-            "INSERT INTO personas (id, display_name, persona_type, created_at, extra_metadata)
-             VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(&persona_id)
-        .bind(&share.source_persona_display_name)
-        .bind(&share.source_persona_type)
-        .bind(&now)
-        .bind(&extra_metadata_json)
-        .execute(&mut *shared_conn)
-        .await?;
+        sqlx::query("INSERT INTO personas (id, created_at) VALUES (?, ?)")
+            .bind(&persona_id)
+            .bind(&now)
+            .execute(&mut *shared_conn)
+            .await?;
 
         sqlx::query("INSERT INTO user_personas (user_id, persona_id, joined_at) VALUES (?, ?, ?)")
             .bind(recipient_user_id)
@@ -673,7 +729,13 @@ pub async fn accept_persona_share(
     // and otherwise undoes the savepoint (also after a failed RELEASE), so
     // it goes back to the pool outside any transaction (items.id=822).
     let registration_step = registration_step.map_err(PersonaSharingError::Database);
-    end_savepoint(shared_conn, "accept_persona_share", registration_step).await?;
+    if let Err(e) = end_savepoint(shared_conn, "accept_persona_share", registration_step).await {
+        if let Err(cleanup) = persona_registry_store::delete_conn(&mut keys_conn, &persona_id).await
+        {
+            log::warn!("accept_persona_share: could not remove registry entry: {cleanup}");
+        }
+        return Err(e);
+    }
 
     Ok(persona_id)
 }
@@ -769,6 +831,7 @@ mod tests {
             "Shared Persona",
             "personal",
             &user_id,
+            &key_hex,
             None,
         )
         .await
@@ -1195,10 +1258,15 @@ mod tests {
         .await
         .expect("accept_persona_share must succeed");
 
-        let new_persona = persona_store::get_persona(pool, &new_persona_id)
-            .await
-            .unwrap()
-            .expect("materialized persona must exist");
+        let new_persona = persona_store::get_persona_for_user(
+            pool,
+            &recipient_id,
+            &recipient_key_hex,
+            &new_persona_id,
+        )
+        .await
+        .unwrap()
+        .expect("materialized persona must exist");
         assert_eq!(new_persona.display_name, "Shared Persona");
         assert_eq!(new_persona.persona_type, "personal");
         assert!(
@@ -1311,6 +1379,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(personas, 2, "only the two fixture personas may exist");
+
+        // The encrypted registry entry written first was removed again.
+        let mut keys = persona_registry_store::open(&recipient_id, &recipient_key_hex)
+            .await
+            .unwrap();
+        assert_eq!(
+            persona_registry_store::all_conn(&mut keys)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "only the fixture persona's entry may remain"
+        );
     }
 
     #[tokio::test]
@@ -1449,14 +1530,14 @@ mod tests {
         let (recipient_id, _, recipient_key_hex, recipient_private_key) =
             make_user_with_persona(pool, "Bob", 0x52).await;
 
-        let mut conn = pool.acquire().await.unwrap();
-        sqlx::query("UPDATE personas SET extra_metadata = ? WHERE id = ?")
-            .bind(r#"{"floor_consent_preference":{"mode":"modified","abstraction_tier":2}}"#)
-            .bind(&owner_persona)
-            .execute(&mut *conn)
-            .await
-            .unwrap();
-        drop(conn);
+        personal_store::write_floor_consent_preference(
+            &owner_id,
+            &owner_persona,
+            &owner_key_hex,
+            2,
+        )
+        .await
+        .unwrap();
 
         let (share_id, _) = send_share_with_content(
             pool,
@@ -1477,15 +1558,16 @@ mod tests {
         .await
         .unwrap();
 
-        let new_persona = persona_store::get_persona(pool, &new_persona_id)
-            .await
-            .unwrap()
-            .unwrap();
-        let pref = new_persona
-            .extra_metadata
-            .get("floor_consent_preference")
-            .expect("floor_consent_preference must be present");
-        assert_eq!(pref["abstraction_tier"], 2);
+        let pref = personal_store::read_floor_consent_preference(
+            &recipient_id,
+            &new_persona_id,
+            &recipient_key_hex,
+        )
+        .await
+        .unwrap()
+        .expect("floor_consent_preference must be present in the new persona's personal.db");
+        assert_eq!(pref.mode, "modified");
+        assert_eq!(pref.abstraction_tier, Some(2));
     }
 
     #[tokio::test]

@@ -54,13 +54,20 @@ INSERT OR IGNORE INTO migration_lock (id) VALUES (1);
 -- fields on the record. Tier enforcement is Focus-level (focus_settings),
 -- not Persona-level. effective_tier = min(focus_def.max_routing_tier,
 -- focus_settings.privacy_tier).
--- persona_type: open vocabulary, same value space as the retired life_type.
+--
+-- ONLY the id and the creation time live here (items.id=661, decisions.id=862).
+-- This table is the foreign-key anchor for user_personas, focus_settings and
+-- the pending_* rows, and shared.db is readable without the password. A
+-- Persona's display name, type (open vocabulary, same value space as the
+-- retired life_type) and colour are the domain information contextual
+-- separation protects, so they live in the user's encrypted integration_keys.db
+-- (persona_registry, keys_006.sql). The floor consent preference that used to
+-- sit in extra_metadata is in the Persona's personal.db (persona_floor_consent,
+-- personal_009.sql). Edited in place, which decisions.id=857 allows until
+-- first ship.
 CREATE TABLE IF NOT EXISTS personas (
     id              TEXT PRIMARY KEY,
-    display_name    TEXT NOT NULL,
-    persona_type    TEXT NOT NULL,
-    created_at      TEXT NOT NULL,
-    extra_metadata  TEXT NOT NULL DEFAULT '{}'
+    created_at      TEXT NOT NULL
 );
 
 -- Users

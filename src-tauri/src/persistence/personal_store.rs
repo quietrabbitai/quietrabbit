@@ -1463,6 +1463,103 @@ pub async fn get_disclosure_log_for_run(
 }
 
 // ---------------------------------------------------------------------------
+// Floor consent preference (D5-152; items.id=661, decisions.id=862)
+// ---------------------------------------------------------------------------
+//
+// The Persona's saved floor consent ("remember my abstraction choice") used to
+// be personas.extra_metadata.floor_consent_preference in the unencrypted
+// shared.db. It is one row in this Persona's encrypted personal.db
+// (persona_floor_consent, personal_009.sql). Scoped to abstraction_tier and
+// stamped with a consent timestamp and version, never a blanket consent.
+
+/// The saved preference. `mode` is "modified" (consent up to
+/// `abstraction_tier`) or "local" (keep it on this machine).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FloorConsentPreference {
+    pub mode: String,
+    pub abstraction_tier: Option<i64>,
+    pub consent_timestamp: String,
+    pub consent_version: String,
+}
+
+/// Write the preference on a connection the caller holds, replacing any
+/// earlier one. Used by the "remember this" decision and by persona-share
+/// accept (which carries the sender's preference to the new Persona).
+pub(crate) async fn set_floor_consent_preference_conn(
+    conn: &mut SqliteConnection,
+    pref: &FloorConsentPreference,
+) -> Result<(), PersonalStoreError> {
+    sqlx::query(
+        "INSERT OR REPLACE INTO persona_floor_consent
+         (id, mode, abstraction_tier, consent_timestamp, consent_version)
+         VALUES (1, ?, ?, ?, ?)",
+    )
+    .bind(&pref.mode)
+    .bind(pref.abstraction_tier)
+    .bind(&pref.consent_timestamp)
+    .bind(&pref.consent_version)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// The "remember this" write: mode "modified" at `abstraction_tier`, stamped
+/// now, consent_version "1".
+pub async fn write_floor_consent_preference(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    abstraction_tier: i32,
+) -> Result<(), PersonalStoreError> {
+    let mut conn = open_personal_db(user_id, persona_id, key_hex).await?;
+    set_floor_consent_preference_conn(
+        &mut conn,
+        &FloorConsentPreference {
+            mode: "modified".to_owned(),
+            abstraction_tier: Some(i64::from(abstraction_tier)),
+            consent_timestamp: crate::providers::utils::now(),
+            consent_version: "1".to_owned(),
+        },
+    )
+    .await
+}
+
+/// The saved preference, or None. An empty key (a run that outlived its
+/// session) is None: the consent gate then fires normally, which is the
+/// fail-closed direction.
+pub async fn read_floor_consent_preference(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+) -> Result<Option<FloorConsentPreference>, PersonalStoreError> {
+    if key_hex.is_empty() {
+        return Ok(None);
+    }
+    let mut conn = open_personal_db(user_id, persona_id, key_hex).await?;
+    read_floor_consent_preference_conn(&mut conn).await
+}
+
+pub(crate) async fn read_floor_consent_preference_conn(
+    conn: &mut SqliteConnection,
+) -> Result<Option<FloorConsentPreference>, PersonalStoreError> {
+    let row = sqlx::query(
+        "SELECT mode, abstraction_tier, consent_timestamp, consent_version
+         FROM persona_floor_consent WHERE id = 1",
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    match row {
+        None => Ok(None),
+        Some(r) => Ok(Some(FloorConsentPreference {
+            mode: r.try_get("mode")?,
+            abstraction_tier: r.try_get("abstraction_tier")?,
+            consent_timestamp: r.try_get("consent_timestamp")?,
+            consent_version: r.try_get("consent_version")?,
+        })),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2090,5 +2187,57 @@ mod tests {
         } else {
             std::env::remove_var("QR_DATA_ROOT");
         }
+    }
+
+    // -- items.id=661: floor consent preference in personal.db ---------------
+
+    #[tokio::test]
+    async fn floor_consent_preference_round_trips_and_replaces() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
+
+        let outcome = async {
+            assert_eq!(
+                read_floor_consent_preference("u1", "p1", key_hex).await?,
+                None,
+                "nothing saved yet"
+            );
+            write_floor_consent_preference("u1", "p1", key_hex, 2).await?;
+            let saved = read_floor_consent_preference("u1", "p1", key_hex)
+                .await?
+                .expect("a preference was just written");
+            assert_eq!(saved.mode, "modified");
+            assert_eq!(saved.abstraction_tier, Some(2));
+            assert_eq!(saved.consent_version, "1");
+            assert!(!saved.consent_timestamp.is_empty());
+
+            write_floor_consent_preference("u1", "p1", key_hex, 1).await?;
+            assert_eq!(
+                read_floor_consent_preference("u1", "p1", key_hex)
+                    .await?
+                    .unwrap()
+                    .abstraction_tier,
+                Some(1),
+                "a second write replaces the single row"
+            );
+            // Another Persona's file is separate.
+            assert_eq!(
+                read_floor_consent_preference("u1", "p2", key_hex).await?,
+                None
+            );
+            // No key means no preference, never an error.
+            assert_eq!(read_floor_consent_preference("u1", "p1", "").await?, None);
+            Ok::<(), PersonalStoreError>(())
+        }
+        .await;
+
+        match saved_root {
+            Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+            None => std::env::remove_var("QR_DATA_ROOT"),
+        }
+        outcome.expect("floor consent assertions must pass");
     }
 }

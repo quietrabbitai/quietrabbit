@@ -86,6 +86,19 @@ pub async fn populate_registry(
         .await;
 }
 
+/// Inserts a bare Persona anchor row into shared.db: the id and creation time
+/// are all shared.db holds about a Persona now (items.id=661). For fixtures
+/// that need the foreign-key target but no name. A fixture that needs a name
+/// creates the Persona with persona_store::create_persona.
+#[cfg(test)]
+pub async fn insert_persona_anchor(pool: &sqlx::SqlitePool, persona_id: &str) {
+    sqlx::query("INSERT INTO personas (id, created_at) VALUES (?, '2026-01-01T00:00:00Z')")
+        .bind(persona_id)
+        .execute(pool)
+        .await
+        .expect("persona anchor row");
+}
+
 // ---------------------------------------------------------------------------
 // Child-process helpers for the Ollama sidecar tests (items.id=668)
 //

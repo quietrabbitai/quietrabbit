@@ -1392,6 +1392,7 @@ mod tests {
             "Shared Persona",
             "personal",
             &user_id,
+            &key_hex,
             None,
         )
         .await

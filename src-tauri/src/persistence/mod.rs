@@ -20,6 +20,7 @@ pub mod integration_keys_store;
 pub mod message_store;
 pub mod migrations;
 pub mod output_store;
+pub mod persona_registry_store;
 pub mod persona_store;
 pub mod personal_store;
 pub mod plan_state_store;

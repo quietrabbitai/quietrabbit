@@ -1,25 +1,40 @@
 // src-tauri/src/persistence/persona_store.rs
 //
-// Persona CRUD operations for shared.db (unencrypted).
+// Persona CRUD operations. The Persona's shape is split across two stores
+// (items.id=661, decisions.id=862):
+//   shared.db (unencrypted)  personas(id, created_at), user_personas,
+//                            focus_settings: ids and membership only
+//   integration_keys.db      persona_registry: display name, type and colour
+//                            (persona_registry_store.rs)
+// shared.db is readable without the password, so a Persona's name and type
+// (the domain information contextual separation protects) live only in the
+// encrypted registry. Anything that needs a name or type therefore needs the
+// user's data key; anything that only needs ids or membership (the lock path,
+// the sweeps, access checks) uses list_persona_ids_for_user and
+// is_user_in_persona and needs none.
+//
 // Replaces life_store.py as part of Phase C Persona model migration (D6-298).
 //
 // Persona is a personalization grouping only (D6-289, D6-291).
-// No tier fields on the Persona record — tier enforcement is Focus-level.
-// get_persona_for_user() performs membership validation only.
+// No tier fields on the Persona record: tier enforcement is Focus-level.
+// get_persona_for_user() performs membership validation plus the label lookup.
 // Tier ceiling and privacy settings are read from focus_settings via
 // focus_settings_store::get_focus_settings() at AUTHORIZE.
 //
-// floor_consent_preference is stored in personas.extra_metadata (D5-152).
+// floor_consent_preference lives in the Persona's personal.db
+// (persona_floor_consent, personal_009.sql; personal_store.rs).
 //
-// QUERY STYLE: runtime sqlx::query() only — no query!() macros.
-// shared.db is unencrypted — no PRAGMA key required.
+// QUERY STYLE: runtime sqlx::query() only, no query!() macros.
 //
-// CONNECTION MODEL: pooled (items.id=483) -- shared.db is the one genuinely
-// unencrypted DB in this topology, so it's the one exception to the
-// per-call-connection rule the rest of persistence/ follows. Callers pass
-// a &sqlx::SqlitePool in; every fn here does pool.acquire() rather than
-// opening its own connection.
+// CONNECTION MODEL: the shared.db part is pooled (items.id=483): shared.db is
+// the one genuinely unencrypted DB in this topology, so it is the one
+// exception to the per-call-connection rule the rest of persistence/ follows.
+// Callers pass a &sqlx::SqlitePool in; every fn here does pool.acquire(). The
+// registry part is one encrypted connection per call.
 
+use crate::persistence::persona_registry_store::{
+    self, PersonaRegistryEntry, UNNAMED_PERSONA_NAME, UNNAMED_PERSONA_TYPE,
+};
 use crate::persistence::savepoint::end_savepoint;
 use sqlx::Row;
 use thiserror::Error;
@@ -38,6 +53,10 @@ pub enum PersonaStoreError {
     NotFound(String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// The user's encrypted registry could not be opened (no key, key epoch
+    /// changed, migration failure).
+    #[error("Persona registry unavailable: {0}")]
+    Registry(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -50,10 +69,8 @@ pub struct Persona {
     pub display_name: String,
     pub persona_type: String,
     pub created_at: String,
-    /// Stored as JSON TEXT in DB. Default is empty object {}.
-    /// Includes floor_consent_preference when set (D5-152), color when set
-    /// (items.id=237).
-    pub extra_metadata: serde_json::Value,
+    /// The Persona colour (items.id=237), from the encrypted registry.
+    pub color: Option<String>,
     /// COUNT of this persona's focus_settings rows (items.id=237). Computed
     /// via LEFT JOIN in every read query below; hardcoded to
     /// SEEDED_FOCUS_IDS.len() in create_persona, which seeds exactly those
@@ -75,38 +92,6 @@ pub struct Persona {
 /// this gap.
 pub(crate) const SEEDED_FOCUS_IDS: [&str; 3] =
     ["research-and-buy", "quick-ask", "writing-assistant"];
-
-// ---------------------------------------------------------------------------
-// DB opener (shared.db — unencrypted)
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Row extraction
-// ---------------------------------------------------------------------------
-
-fn row_to_persona(row: &sqlx::sqlite::SqliteRow) -> Result<Persona, sqlx::Error> {
-    let id: String = row.try_get("id")?;
-    let raw: Option<String> = row.try_get("extra_metadata")?;
-    let extra_metadata: serde_json::Value = match raw {
-        None => serde_json::Value::Object(serde_json::Map::new()),
-        Some(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
-            log::warn!(
-                "persona '{id}' extra_metadata failed to parse as JSON, \
-                 defaulting to empty object: {e}"
-            );
-            serde_json::Value::Object(serde_json::Map::new())
-        }),
-    };
-
-    Ok(Persona {
-        id,
-        display_name: row.try_get("display_name")?,
-        persona_type: row.try_get("persona_type")?,
-        created_at: row.try_get("created_at")?,
-        extra_metadata,
-        focus_count: row.try_get("focus_count")?,
-    })
-}
 
 // ---------------------------------------------------------------------------
 // Constraint error classifier
@@ -132,97 +117,150 @@ fn classify_constraint_error(persona_id: &str, e: sqlx::Error) -> PersonaStoreEr
     PersonaStoreError::Database(e)
 }
 
+fn registry_unavailable(e: impl std::fmt::Display) -> PersonaStoreError {
+    PersonaStoreError::Registry(e.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Read operations
 // ---------------------------------------------------------------------------
 
-/// Fetch a persona by ID. Returns None if not found.
-pub async fn get_persona(
+/// Does a Persona with this id exist at all (any member)? shared.db only.
+pub async fn persona_exists(
     pool: &sqlx::SqlitePool,
     persona_id: &str,
-) -> Result<Option<Persona>, PersonaStoreError> {
+) -> Result<bool, PersonaStoreError> {
     let mut conn = pool.acquire().await?;
+    let row = sqlx::query("SELECT 1 FROM personas WHERE id = ?")
+        .bind(persona_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+    Ok(row.is_some())
+}
 
-    let row = sqlx::query(
-        "SELECT p.id, p.display_name, p.persona_type, p.created_at, p.extra_metadata,
-         COUNT(fs.focus_id) AS focus_count
-         FROM personas p
-         LEFT JOIN focus_settings fs ON fs.persona_id = p.id
-         WHERE p.id = ?
-         GROUP BY p.id",
+/// The ids of every Persona the user belongs to, in join order. Needs neither
+/// a key nor the registry: this is what the lock path, the sweeps and the
+/// login recovery use, because they only need to know which Personas exist.
+pub async fn list_persona_ids_for_user(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+) -> Result<Vec<String>, PersonaStoreError> {
+    let mut conn = pool.acquire().await?;
+    let ids: Vec<String> = sqlx::query_scalar(
+        "SELECT persona_id FROM user_personas WHERE user_id = ? ORDER BY joined_at, persona_id",
     )
-    .bind(persona_id)
-    .fetch_optional(&mut *conn)
+    .bind(user_id)
+    .fetch_all(&mut *conn)
     .await?;
+    Ok(ids)
+}
 
-    match row {
-        None => Ok(None),
-        Some(r) => Ok(Some(
-            row_to_persona(&r).map_err(PersonaStoreError::Database)?,
-        )),
+fn assemble(
+    id: String,
+    created_at: String,
+    focus_count: i64,
+    entry: Option<&PersonaRegistryEntry>,
+) -> Persona {
+    match entry {
+        Some(e) => Persona {
+            id,
+            display_name: e.display_name.clone(),
+            persona_type: e.persona_type.clone(),
+            created_at,
+            color: e.color.clone(),
+            focus_count,
+        },
+        None => Persona {
+            id,
+            display_name: UNNAMED_PERSONA_NAME.to_owned(),
+            persona_type: UNNAMED_PERSONA_TYPE.to_owned(),
+            created_at,
+            color: None,
+            focus_count,
+        },
     }
 }
 
 /// Fetch a persona only if the user has membership.
 /// Returns None if not found or user is not a member.
-/// Membership validation only — no tier data (D6-297).
-/// Used by lifecycle AUTHORIZE to enforce access control.
+/// Membership validation plus the encrypted label (needs the data key). A
+/// caller that only needs the membership answer uses is_user_in_persona.
 pub async fn get_persona_for_user(
     pool: &sqlx::SqlitePool,
     user_id: &str,
+    key_hex: &str,
     persona_id: &str,
 ) -> Result<Option<Persona>, PersonaStoreError> {
-    let mut conn = pool.acquire().await?;
+    let row = {
+        let mut conn = pool.acquire().await?;
+        sqlx::query(
+            "SELECT p.id, p.created_at, COUNT(fs.focus_id) AS focus_count
+             FROM personas p
+             JOIN user_personas up ON up.persona_id = p.id
+             LEFT JOIN focus_settings fs ON fs.persona_id = p.id
+             WHERE up.user_id = ? AND p.id = ?
+             GROUP BY p.id",
+        )
+        .bind(user_id)
+        .bind(persona_id)
+        .fetch_optional(&mut *conn)
+        .await?
+    };
+    let Some(r) = row else {
+        return Ok(None);
+    };
 
-    let row = sqlx::query(
-        "SELECT p.id, p.display_name, p.persona_type,
-         p.created_at, p.extra_metadata,
-         COUNT(fs.focus_id) AS focus_count
-         FROM personas p
-         JOIN user_personas up ON up.persona_id = p.id
-         LEFT JOIN focus_settings fs ON fs.persona_id = p.id
-         WHERE up.user_id = ? AND p.id = ?
-         GROUP BY p.id",
-    )
-    .bind(user_id)
-    .bind(persona_id)
-    .fetch_optional(&mut *conn)
-    .await?;
-
-    match row {
-        None => Ok(None),
-        Some(r) => Ok(Some(
-            row_to_persona(&r).map_err(PersonaStoreError::Database)?,
-        )),
-    }
+    let mut keys = persona_registry_store::open(user_id, key_hex)
+        .await
+        .map_err(registry_unavailable)?;
+    let entry = persona_registry_store::get_conn(&mut keys, persona_id).await?;
+    Ok(Some(assemble(
+        r.try_get("id")?,
+        r.try_get("created_at")?,
+        r.try_get("focus_count")?,
+        entry.as_ref(),
+    )))
 }
 
-/// Return all personas accessible to a user, ordered by display_name.
+/// Return all personas accessible to a user, ordered by display_name (needs
+/// the data key for the names).
 pub async fn list_personas_for_user(
     pool: &sqlx::SqlitePool,
     user_id: &str,
+    key_hex: &str,
 ) -> Result<Vec<Persona>, PersonaStoreError> {
-    let mut conn = pool.acquire().await?;
+    let rows = {
+        let mut conn = pool.acquire().await?;
+        sqlx::query(
+            "SELECT p.id, p.created_at, COUNT(fs.focus_id) AS focus_count
+             FROM personas p
+             JOIN user_personas up ON up.persona_id = p.id
+             LEFT JOIN focus_settings fs ON fs.persona_id = p.id
+             WHERE up.user_id = ?
+             GROUP BY p.id",
+        )
+        .bind(user_id)
+        .fetch_all(&mut *conn)
+        .await?
+    };
 
-    let rows = sqlx::query(
-        "SELECT p.id, p.display_name, p.persona_type,
-         p.created_at, p.extra_metadata,
-         COUNT(fs.focus_id) AS focus_count
-         FROM personas p
-         JOIN user_personas up ON up.persona_id = p.id
-         LEFT JOIN focus_settings fs ON fs.persona_id = p.id
-         WHERE up.user_id = ?
-         GROUP BY p.id
-         ORDER BY p.display_name",
-    )
-    .bind(user_id)
-    .fetch_all(&mut *conn)
-    .await?;
+    let mut keys = persona_registry_store::open(user_id, key_hex)
+        .await
+        .map_err(registry_unavailable)?;
+    let registry = persona_registry_store::all_conn(&mut keys).await?;
 
-    let mut personas = Vec::new();
-    for r in rows {
-        personas.push(row_to_persona(&r).map_err(PersonaStoreError::Database)?);
+    let mut personas = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let id: String = r.try_get("id")?;
+        let entry = registry.get(&id);
+        personas.push(assemble(
+            id,
+            r.try_get("created_at")?,
+            r.try_get("focus_count")?,
+            entry,
+        ));
     }
+    personas.sort_by(|a, b| a.display_name.cmp(&b.display_name));
     Ok(personas)
 }
 
@@ -230,28 +268,15 @@ pub async fn list_personas_for_user(
 // Write operations
 // ---------------------------------------------------------------------------
 
-/// Create a new persona and atomically add the creator as a member.
-/// Returns Err(AlreadyExists) if persona_id already exists.
-/// Atomic: INSERT personas + INSERT user_personas under a SAVEPOINT.
-/// No tier parameters — tier settings belong to focus_settings (D6-297).
-///
-/// color (items.id=237, HANDOFF_IPC_SURFACE.md row 15: "create_persona |
-/// name, color?"): stored under extra_metadata.color when Some. No merge
-/// needed here (unlike write_floor_consent_preference's read-merge-write in
-/// commands/consent.rs) since this is the row's very first write.
-pub async fn create_persona(
+/// The shared.db half of create_persona: the personas anchor row, the
+/// creator's membership and the seeded focus_settings, atomically under one
+/// SAVEPOINT.
+async fn insert_shared_rows(
     pool: &sqlx::SqlitePool,
     persona_id: &str,
-    display_name: &str,
-    persona_type: &str,
     creator_user_id: &str,
-    color: Option<&str>,
-) -> Result<Persona, PersonaStoreError> {
-    let created_at = crate::providers::utils::now();
-    let extra_metadata_json = match color {
-        Some(c) => serde_json::json!({ "color": c }).to_string(),
-        None => "{}".to_owned(),
-    };
+    created_at: &str,
+) -> Result<(), PersonaStoreError> {
     let mut conn = pool.acquire().await?;
 
     sqlx::query("SAVEPOINT create_persona")
@@ -259,18 +284,11 @@ pub async fn create_persona(
         .await?;
 
     let step: Result<(), sqlx::Error> = async {
-        sqlx::query(
-            "INSERT INTO personas
-             (id, display_name, persona_type, created_at, extra_metadata)
-             VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(persona_id)
-        .bind(display_name)
-        .bind(persona_type)
-        .bind(&created_at)
-        .bind(&extra_metadata_json)
-        .execute(&mut *conn)
-        .await?;
+        sqlx::query("INSERT INTO personas (id, created_at) VALUES (?, ?)")
+            .bind(persona_id)
+            .bind(created_at)
+            .execute(&mut *conn)
+            .await?;
 
         sqlx::query(
             "INSERT INTO user_personas (user_id, persona_id, joined_at)
@@ -278,7 +296,7 @@ pub async fn create_persona(
         )
         .bind(creator_user_id)
         .bind(persona_id)
-        .bind(&created_at)
+        .bind(created_at)
         .execute(&mut *conn)
         .await?;
 
@@ -302,8 +320,8 @@ pub async fn create_persona(
             )
             .bind(persona_id)
             .bind(focus_id)
-            .bind(&created_at)
-            .bind(&created_at)
+            .bind(created_at)
+            .bind(created_at)
             .execute(&mut *conn)
             .await?;
         }
@@ -316,35 +334,93 @@ pub async fn create_persona(
     // (also after a failed RELEASE), so the pooled connection goes back to
     // the pool outside any transaction.
     let step = step.map_err(|e| classify_constraint_error(persona_id, e));
-    end_savepoint(conn, "create_persona", step).await?;
+    end_savepoint(conn, "create_persona", step).await
+}
+
+/// Create a new persona and atomically add the creator as a member.
+/// Returns Err(AlreadyExists) if persona_id already exists.
+/// Atomic: INSERT personas + INSERT user_personas under a SAVEPOINT.
+/// No tier parameters — tier settings belong to focus_settings (D6-297).
+///
+/// ORDER (the account-creation rule of items.id=614): the encrypted registry
+/// entry is written FIRST and the shared.db rows second, so a Persona row never
+/// exists without a place for its name. If the shared.db part fails the entry is
+/// removed again. The registry insert is a plain INSERT, so an id that already
+/// has an entry fails there and nothing existing is overwritten.
+///
+/// color (items.id=237, HANDOFF_IPC_SURFACE.md row 15: "create_persona |
+/// name, color?"): stored in the registry entry.
+pub async fn create_persona(
+    pool: &sqlx::SqlitePool,
+    persona_id: &str,
+    display_name: &str,
+    persona_type: &str,
+    creator_user_id: &str,
+    key_hex: &str,
+    color: Option<&str>,
+) -> Result<Persona, PersonaStoreError> {
+    let created_at = crate::providers::utils::now();
+
+    let mut keys = persona_registry_store::open(creator_user_id, key_hex)
+        .await
+        .map_err(registry_unavailable)?;
+    let entry = PersonaRegistryEntry {
+        persona_id: persona_id.to_owned(),
+        display_name: display_name.to_owned(),
+        persona_type: persona_type.to_owned(),
+        color: color.map(str::to_owned),
+        created_at: created_at.clone(),
+    };
+    persona_registry_store::insert_conn(&mut keys, &entry)
+        .await
+        .map_err(|e| classify_constraint_error(persona_id, e))?;
+
+    if let Err(e) = insert_shared_rows(pool, persona_id, creator_user_id, &created_at).await {
+        // Best effort: an entry left behind is inert (no shared.db row points
+        // at it) but would block a retry with the same id.
+        if let Err(cleanup) = persona_registry_store::delete_conn(&mut keys, persona_id).await {
+            log::warn!("create_persona: could not remove registry entry after failure: {cleanup}");
+        }
+        return Err(e);
+    }
 
     Ok(Persona {
         id: persona_id.to_owned(),
         display_name: display_name.to_owned(),
         persona_type: persona_type.to_owned(),
         created_at,
-        extra_metadata: serde_json::from_str(&extra_metadata_json)
-            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
+        color: color.map(str::to_owned),
         focus_count: SEEDED_FOCUS_IDS.len() as i64,
     })
 }
 
-/// Delete a persona and all user_persona memberships (CASCADE).
+/// Delete a persona and all user_persona memberships (CASCADE), and the
+/// calling user's registry entry. Other members' entries (if any) are left:
+/// they are inert once the shared.db row is gone.
 /// Returns true if deleted, false if not found.
-/// Does NOT delete per-persona databases (personal.db, outputs.db) —
+/// Does NOT delete per-persona databases (personal.db, outputs.db) --
 /// those require explicit user confirmation and a separate cleanup operation.
 pub async fn delete_persona(
     pool: &sqlx::SqlitePool,
+    user_id: &str,
+    key_hex: &str,
     persona_id: &str,
 ) -> Result<bool, PersonaStoreError> {
-    let mut conn = pool.acquire().await?;
-
-    let result = sqlx::query("DELETE FROM personas WHERE id = ?")
-        .bind(persona_id)
-        .execute(&mut *conn)
-        .await?;
-
-    Ok(result.rows_affected() > 0)
+    let deleted = {
+        let mut conn = pool.acquire().await?;
+        let result = sqlx::query("DELETE FROM personas WHERE id = ?")
+            .bind(persona_id)
+            .execute(&mut *conn)
+            .await?;
+        result.rows_affected() > 0
+    };
+    if deleted {
+        let mut keys = persona_registry_store::open(user_id, key_hex)
+            .await
+            .map_err(registry_unavailable)?;
+        persona_registry_store::delete_conn(&mut keys, persona_id).await?;
+    }
+    Ok(deleted)
 }
 
 // ---------------------------------------------------------------------------
@@ -354,13 +430,16 @@ pub async fn delete_persona(
 /// Add a user to a persona.
 /// Returns true if added, false if already a member.
 /// Returns Err(NotFound) if persona does not exist.
+/// Membership only: the added user's own registry entry (their label for the
+/// Persona) is written from that user's session; until then they see the
+/// placeholder name.
 pub async fn add_user_to_persona(
     pool: &sqlx::SqlitePool,
     user_id: &str,
     persona_id: &str,
 ) -> Result<bool, PersonaStoreError> {
     // Verify persona exists first — mirrors Python LookupError behavior.
-    if get_persona(pool, persona_id).await?.is_none() {
+    if !persona_exists(pool, persona_id).await? {
         return Err(PersonaStoreError::NotFound(persona_id.to_owned()));
     }
 
@@ -414,6 +493,52 @@ pub async fn is_user_in_persona(
         .await?;
 
     Ok(row.is_some())
+}
+
+/// Test-only: create a Persona, registry entry included, under a fixed test
+/// data key. For a fixture whose user opens integration_keys.db under that one
+/// key only (the key of a file is fixed by its first open). Fixtures with
+/// their own keys use create_persona with it, or the anchor-only helper below.
+/// The data root must already point at a tempdir (get_data_root panics
+/// otherwise, so a test can never write user data to a real location).
+#[cfg(test)]
+pub(crate) const TEST_PERSONA_KEY_HEX: &str =
+    "0101010101010101010101010101010101010101010101010101010101010101";
+
+/// Test-only: the shared.db rows of a Persona with NO registry entry, for the
+/// many fixtures that need a Persona (membership, focus_settings) but never
+/// read its name, and that run under their own data key. The Persona lists
+/// with the placeholder name. Same shared.db rows and SAVEPOINT as
+/// create_persona.
+#[cfg(test)]
+pub(crate) async fn create_persona_anchor_for_test(
+    pool: &sqlx::SqlitePool,
+    persona_id: &str,
+    creator_user_id: &str,
+) -> Result<(), PersonaStoreError> {
+    let created_at = crate::providers::utils::now();
+    insert_shared_rows(pool, persona_id, creator_user_id, &created_at).await
+}
+
+#[cfg(test)]
+pub(crate) async fn create_persona_for_test(
+    pool: &sqlx::SqlitePool,
+    persona_id: &str,
+    display_name: &str,
+    persona_type: &str,
+    creator_user_id: &str,
+    color: Option<&str>,
+) -> Result<Persona, PersonaStoreError> {
+    create_persona(
+        pool,
+        persona_id,
+        display_name,
+        persona_type,
+        creator_user_id,
+        TEST_PERSONA_KEY_HEX,
+        color,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -474,12 +599,22 @@ mod tests {
             // The personas INSERT succeeds, then user_personas fails its
             // foreign key (no such user): a real mid-savepoint failure.
             let failed =
-                create_persona(&pool, "p-fail", "Fails", "personal", "no-such-user", None).await;
+                create_persona_for_test(&pool, "p-fail", "Fails", "personal", "no-such-user", None)
+                    .await;
             assert!(
                 matches!(failed, Err(PersonaStoreError::Database(_))),
                 "{failed:?}"
             );
-            assert!(get_persona(&pool, "p-fail").await.unwrap().is_none());
+            assert!(!persona_exists(&pool, "p-fail").await.unwrap());
+            // items.id=661: the encrypted registry entry written first is
+            // removed again when the shared.db part fails.
+            let mut keys = persona_registry_store::open("no-such-user", TEST_PERSONA_KEY_HEX)
+                .await
+                .unwrap();
+            assert!(persona_registry_store::get_conn(&mut keys, "p-fail")
+                .await
+                .unwrap()
+                .is_none());
 
             crate::auth::user_store::create_user(
                 &pool,
@@ -495,7 +630,7 @@ mod tests {
             )
             .await
             .expect("create_user should succeed");
-            create_persona(&pool, "p-ok", "Works", "personal", "u1", None)
+            create_persona_for_test(&pool, "p-ok", "Works", "personal", "u1", None)
                 .await
                 .expect("a second create_persona on the same pool must succeed");
 
@@ -554,7 +689,7 @@ mod tests {
             crate::persistence::savepoint::arm_release_failure(&mut conn, "personas").await;
         }
 
-        let failed = create_persona(&pool, "p-rel", "Rel", "personal", "u1", None).await;
+        let failed = create_persona_for_test(&pool, "p-rel", "Rel", "personal", "u1", None).await;
         assert!(
             matches!(failed, Err(PersonaStoreError::Database(_))),
             "{failed:?}"
@@ -563,6 +698,181 @@ mod tests {
         // Same (only) connection: outside a transaction, the write undone.
         sqlx::query("BEGIN IMMEDIATE").execute(&pool).await.unwrap();
         sqlx::query("ROLLBACK").execute(&pool).await.unwrap();
-        assert!(get_persona(&pool, "p-rel").await.unwrap().is_none());
+        assert!(!persona_exists(&pool, "p-rel").await.unwrap());
+    }
+
+    async fn one_user_pool(tempdir: &std::path::Path) -> (RootGuard, sqlx::SqlitePool) {
+        let root = RootGuard::set(tempdir);
+        crate::persistence::migrations::migrate_shared_db()
+            .await
+            .expect("shared.db migration must succeed in test setup");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(crate::providers::utils::connect_options_unencrypted(
+                &crate::providers::utils::db_path_shared(),
+            ))
+            .await
+            .expect("shared.db pool must connect");
+        crate::auth::user_store::create_user(
+            &pool,
+            "u1",
+            "Alice",
+            "admin",
+            true,
+            b"salt1234",
+            1024,
+            1,
+            1,
+            &[0u8; 32],
+        )
+        .await
+        .expect("create_user should succeed");
+        (root, pool)
+    }
+
+    /// items.id=661: names and types are readable only through the encrypted
+    /// registry, never from the shared.db rows.
+    #[tokio::test]
+    async fn names_and_types_live_only_in_the_registry() {
+        let _lock = ENV_MUTEX.lock().await;
+        let tempdir = tempfile::tempdir().unwrap();
+        let (_root, pool) = one_user_pool(tempdir.path()).await;
+
+        let made = create_persona_for_test(&pool, "p-1", "Zeta", "protected", "u1", Some("#fff"))
+            .await
+            .unwrap();
+        create_persona_for_test(&pool, "p-2", "Alpha", "standard", "u1", None)
+            .await
+            .unwrap();
+        assert_eq!(made.display_name, "Zeta");
+
+        let listed = list_personas_for_user(&pool, "u1", TEST_PERSONA_KEY_HEX)
+            .await
+            .unwrap();
+        let names: Vec<&str> = listed.iter().map(|p| p.display_name.as_str()).collect();
+        assert_eq!(names, vec!["Alpha", "Zeta"], "ordered by name");
+        let zeta = listed.iter().find(|p| p.id == "p-1").unwrap();
+        assert_eq!(zeta.persona_type, "protected");
+        assert_eq!(zeta.color.as_deref(), Some("#fff"));
+        assert_eq!(zeta.focus_count, SEEDED_FOCUS_IDS.len() as i64);
+
+        // The shared.db row carries no name, type or colour column at all.
+        let columns: Vec<(i64, String, String, i64, Option<String>, i64)> =
+            sqlx::query_as("PRAGMA table_info(personas)")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let names: Vec<&str> = columns.iter().map(|c| c.1.as_str()).collect();
+        assert_eq!(names, vec!["id", "created_at"]);
+
+        let one = get_persona_for_user(&pool, "u1", TEST_PERSONA_KEY_HEX, "p-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(one.display_name, "Zeta");
+        assert!(
+            get_persona_for_user(&pool, "other", TEST_PERSONA_KEY_HEX, "p-1")
+                .await
+                .unwrap()
+                .is_none(),
+            "a non-member gets nothing"
+        );
+    }
+
+    /// The ids-only listing needs no key and no registry, which is what the
+    /// lock path relies on after the key registry has been cleared.
+    #[tokio::test]
+    async fn the_ids_only_listing_needs_no_key() {
+        let _lock = ENV_MUTEX.lock().await;
+        let tempdir = tempfile::tempdir().unwrap();
+        let (_root, pool) = one_user_pool(tempdir.path()).await;
+        create_persona_for_test(&pool, "p-1", "One", "standard", "u1", None)
+            .await
+            .unwrap();
+        create_persona_for_test(&pool, "p-2", "Two", "standard", "u1", None)
+            .await
+            .unwrap();
+
+        let mut ids = list_persona_ids_for_user(&pool, "u1").await.unwrap();
+        ids.sort();
+        assert_eq!(ids, vec!["p-1".to_owned(), "p-2".to_owned()]);
+        assert!(is_user_in_persona(&pool, "u1", "p-1").await.unwrap());
+        assert!(list_persona_ids_for_user(&pool, "nobody")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A Persona with a shared.db row but no registry entry for this user
+    /// lists with the placeholder instead of failing the whole list.
+    #[tokio::test]
+    async fn a_persona_without_a_registry_entry_lists_with_the_placeholder() {
+        let _lock = ENV_MUTEX.lock().await;
+        let tempdir = tempfile::tempdir().unwrap();
+        let (_root, pool) = one_user_pool(tempdir.path()).await;
+        create_persona_for_test(&pool, "p-1", "Named", "protected", "u1", None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO personas (id, created_at) VALUES ('p-bare', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        add_user_to_persona(&pool, "u1", "p-bare").await.unwrap();
+
+        let listed = list_personas_for_user(&pool, "u1", TEST_PERSONA_KEY_HEX)
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 2);
+        let bare = listed.iter().find(|p| p.id == "p-bare").unwrap();
+        assert_eq!(bare.display_name, UNNAMED_PERSONA_NAME);
+        assert_eq!(bare.persona_type, UNNAMED_PERSONA_TYPE);
+    }
+
+    /// A second create with an id that already has an entry fails without
+    /// touching the existing entry.
+    #[tokio::test]
+    async fn creating_an_existing_id_is_refused_and_changes_nothing() {
+        let _lock = ENV_MUTEX.lock().await;
+        let tempdir = tempfile::tempdir().unwrap();
+        let (_root, pool) = one_user_pool(tempdir.path()).await;
+        create_persona_for_test(&pool, "p-1", "Original", "standard", "u1", None)
+            .await
+            .unwrap();
+        let again = create_persona_for_test(&pool, "p-1", "Other", "standard", "u1", None).await;
+        assert!(
+            matches!(again, Err(PersonaStoreError::AlreadyExists(_))),
+            "{again:?}"
+        );
+        let one = get_persona_for_user(&pool, "u1", TEST_PERSONA_KEY_HEX, "p-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(one.display_name, "Original");
+    }
+
+    #[tokio::test]
+    async fn delete_persona_removes_the_shared_row_and_the_callers_entry() {
+        let _lock = ENV_MUTEX.lock().await;
+        let tempdir = tempfile::tempdir().unwrap();
+        let (_root, pool) = one_user_pool(tempdir.path()).await;
+        create_persona_for_test(&pool, "p-1", "Gone", "standard", "u1", None)
+            .await
+            .unwrap();
+        assert!(delete_persona(&pool, "u1", TEST_PERSONA_KEY_HEX, "p-1")
+            .await
+            .unwrap());
+        assert!(!persona_exists(&pool, "p-1").await.unwrap());
+        let mut keys = persona_registry_store::open("u1", TEST_PERSONA_KEY_HEX)
+            .await
+            .unwrap();
+        assert!(persona_registry_store::all_conn(&mut keys)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(!delete_persona(&pool, "u1", TEST_PERSONA_KEY_HEX, "p-1")
+            .await
+            .unwrap());
     }
 }

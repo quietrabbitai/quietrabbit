@@ -216,9 +216,9 @@ pub(crate) async fn create_api_chat_inner(
     model_id: &str,
 ) -> Result<String, String> {
     // The Persona must belong to this user.
-    match persona_store::get_persona_for_user(pool, user_id, persona_id).await {
-        Ok(Some(_)) => {}
-        Ok(None) => return Err("persona_not_found".to_owned()),
+    match persona_store::is_user_in_persona(pool, user_id, persona_id).await {
+        Ok(true) => {}
+        Ok(false) => return Err("persona_not_found".to_owned()),
         Err(e) => return Err(e.to_string()),
     }
 
@@ -660,7 +660,7 @@ mod tests {
         .await
         .expect("user");
         for persona in [PERSONA, OTHER_PERSONA] {
-            persona_store::create_persona(&pool, persona, "Fixture", "personal", USER, None)
+            persona_store::create_persona_anchor_for_test(&pool, persona, USER)
                 .await
                 .expect("persona");
         }

@@ -216,32 +216,43 @@ pub struct FrictionGateDetail {
 // Commands
 // ---------------------------------------------------------------------------
 
+/// The frontend still supplies `user_id`, but it must be the unlocked account:
+/// the names come from that user's encrypted registry, so a command for any
+/// other user_id could not be answered anyway (items.id=661).
+async fn session_for_user(key_registry: &KeyRegistry, user_id: &str) -> Result<String, String> {
+    let (session_user, key_hex_str) = key_registry
+        .with_key(|k| (k.user_id.clone(), key_hex(&k.data_key)))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())?;
+    if session_user != user_id {
+        return Err("user_id does not match the unlocked account".to_owned());
+    }
+    Ok(key_hex_str)
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn list_personas(
     user_id: String,
+    key_registry: State<'_, KeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<Vec<PersonaInfo>, String> {
-    let personas = persona_store::list_personas_for_user(&pool, &user_id)
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
+    let key_hex_str = session_for_user(&key_registry, &user_id).await?;
+
+    let personas = persona_store::list_personas_for_user(&pool, &user_id, &key_hex_str)
         .await
         .map_err(|e| e.to_string())?;
 
     Ok(personas
         .into_iter()
-        .map(|p| {
-            let color = p
-                .extra_metadata
-                .get("color")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            PersonaInfo {
-                id: p.id,
-                display_name: p.display_name,
-                persona_type: p.persona_type,
-                created_at: p.created_at,
-                color,
-                focus_count: p.focus_count as i32,
-            }
+        .map(|p| PersonaInfo {
+            id: p.id,
+            display_name: p.display_name,
+            persona_type: p.persona_type,
+            created_at: p.created_at,
+            color: p.color,
+            focus_count: p.focus_count as i32,
         })
         .collect())
 }
@@ -250,8 +261,10 @@ pub async fn list_personas(
 #[specta::specta]
 pub async fn create_persona(
     request: CreatePersonaRequest,
+    key_registry: State<'_, KeyRegistry>,
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<CreatePersonaResponse, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     if request.name.trim().is_empty() {
         return Err("persona name cannot be empty".to_string());
     }
@@ -263,6 +276,7 @@ pub async fn create_persona(
         }
     };
 
+    let key_hex_str = session_for_user(&key_registry, &request.user_id).await?;
     let persona_id = uuid::Uuid::new_v4().to_string();
 
     let persona = persona_store::create_persona(
@@ -271,6 +285,7 @@ pub async fn create_persona(
         &request.name,
         persona_type,
         &request.user_id,
+        &key_hex_str,
         request.color.as_deref(),
     )
     .await
@@ -580,14 +595,17 @@ mod tests {
             "Color Test Persona",
             "personal",
             USER_ID,
+            &key_hex(&MASTER_KEY),
             Some("indigo"),
         )
         .await
         .expect("create_persona must succeed");
 
         let app = mock_app_with_registry(_env.pool.clone());
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(&registry, USER_ID, MASTER_KEY).await;
         let pool = app.state::<sqlx::SqlitePool>();
-        let personas = list_personas(USER_ID.to_owned(), pool)
+        let personas = list_personas(USER_ID.to_owned(), registry, pool)
             .await
             .expect("list_personas must succeed");
 
@@ -608,14 +626,17 @@ mod tests {
             "No Color Persona",
             "personal",
             USER_ID,
+            &key_hex(&MASTER_KEY),
             None,
         )
         .await
         .expect("create_persona must succeed");
 
         let app = mock_app_with_registry(_env.pool.clone());
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(&registry, USER_ID, MASTER_KEY).await;
         let pool = app.state::<sqlx::SqlitePool>();
-        let personas = list_personas(USER_ID.to_owned(), pool)
+        let personas = list_personas(USER_ID.to_owned(), registry, pool)
             .await
             .expect("list_personas must succeed");
 
@@ -634,14 +655,17 @@ mod tests {
             "Focus Count Persona",
             "personal",
             USER_ID,
+            &key_hex(&MASTER_KEY),
             None,
         )
         .await
         .expect("create_persona must succeed");
 
         let app = mock_app_with_registry(_env.pool.clone());
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(&registry, USER_ID, MASTER_KEY).await;
         let pool = app.state::<sqlx::SqlitePool>();
-        let before = list_personas(USER_ID.to_owned(), pool.clone())
+        let before = list_personas(USER_ID.to_owned(), registry.clone(), pool.clone())
             .await
             .expect("list_personas must succeed");
         assert_eq!(
@@ -666,7 +690,7 @@ mod tests {
             .expect("create_focus_settings must succeed");
         }
 
-        let after = list_personas(USER_ID.to_owned(), pool)
+        let after = list_personas(USER_ID.to_owned(), registry, pool)
             .await
             .expect("list_personas must succeed");
         assert_eq!(
@@ -695,6 +719,7 @@ mod tests {
             "First Persona",
             "personal",
             USER_ID,
+            &key_hex(&MASTER_KEY),
             None,
         )
         .await
@@ -706,6 +731,7 @@ mod tests {
             "Second Persona",
             "personal",
             USER_ID,
+            &key_hex(&MASTER_KEY),
             None,
         )
         .await
@@ -744,6 +770,7 @@ mod tests {
             "Last Used Persona",
             "personal",
             USER_ID,
+            &key_hex(&MASTER_KEY),
             None,
         )
         .await
@@ -782,6 +809,7 @@ mod tests {
             "Last Used Persona 2",
             "personal",
             USER_ID,
+            &key_hex(&MASTER_KEY),
             None,
         )
         .await
@@ -829,6 +857,7 @@ mod tests {
             "Batch Persona",
             "personal",
             USER_ID,
+            &key_hex(&MASTER_KEY),
             None,
         )
         .await
@@ -880,6 +909,7 @@ mod tests {
             "Ceiling Gate Persona",
             "personal",
             USER_ID,
+            &key_hex(&MASTER_KEY),
             None,
         )
         .await
@@ -1084,5 +1114,61 @@ mod tests {
                  requested={requested:?} existing={existing:?}"
             );
         }
+    }
+
+    /// items.id=661: the names come from the unlocked user's encrypted
+    /// registry, so a user_id other than the session's is refused, and so is
+    /// a call with nobody logged in.
+    #[tokio::test]
+    async fn list_and_create_personas_refuse_a_user_id_that_is_not_the_session() {
+        let _env = setup().await;
+        let app = mock_app_with_registry(_env.pool.clone());
+        let registry = app.state::<KeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
+
+        // Nobody logged in.
+        assert!(
+            list_personas(USER_ID.to_owned(), registry.clone(), pool.clone())
+                .await
+                .is_err()
+        );
+
+        populate_registry(&registry, USER_ID, MASTER_KEY).await;
+        let other = list_personas("someone-else".to_owned(), registry.clone(), pool.clone()).await;
+        assert!(other.is_err(), "{other:?}");
+        let created = create_persona(
+            CreatePersonaRequest {
+                user_id: "someone-else".to_owned(),
+                name: "Not Mine".to_owned(),
+                color: None,
+                persona_type: None,
+            },
+            registry.clone(),
+            pool.clone(),
+        )
+        .await;
+        assert!(created.is_err(), "{created:?}");
+
+        // The session's own user works end to end, name from the registry.
+        let made = create_persona(
+            CreatePersonaRequest {
+                user_id: USER_ID.to_owned(),
+                name: "Mine".to_owned(),
+                color: Some("teal".to_owned()),
+                persona_type: Some("protected".to_owned()),
+            },
+            registry.clone(),
+            pool.clone(),
+        )
+        .await
+        .expect("create_persona for the session user must succeed");
+        let listed = list_personas(USER_ID.to_owned(), registry, pool)
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, made.persona_id);
+        assert_eq!(listed[0].display_name, "Mine");
+        assert_eq!(listed[0].persona_type, "protected");
+        assert_eq!(listed[0].color.as_deref(), Some("teal"));
     }
 }

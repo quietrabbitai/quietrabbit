@@ -803,7 +803,7 @@ async fn install_session(
     // may materialise a persona) and shared by the interrupted-run recovery and
     // the group-key rehydrate below -- each used to list it separately.
     let phase_started = std::time::Instant::now();
-    let personas = match persona_store::list_personas_for_user(pool, user_id).await {
+    let personas = match persona_store::list_persona_ids_for_user(pool, user_id).await {
         Ok(personas) => Some(personas),
         Err(e) => {
             log::warn!(
@@ -838,7 +838,7 @@ async fn install_session(
             user_id,
             zeroize::Zeroizing::new(personal_key_hex_for_sync.clone()),
             key_epoch,
-            personas.iter().map(|p| p.id.clone()).collect(),
+            personas.clone(),
         );
     }
     let phase_started = std::time::Instant::now();
@@ -873,22 +873,22 @@ async fn install_session(
     let phase_started = std::time::Instant::now();
     let personal_key_hex = key_hex(&data_key);
     if let Some(personas) = &personas {
-        for persona in personas {
-            match group_key_store::list_group_keys(user_id, &persona.id, &personal_key_hex).await {
+        for persona_id in personas {
+            match group_key_store::list_group_keys(user_id, persona_id, &personal_key_hex).await {
                 Ok(rows) => {
                     for row in rows {
                         let Some(group_key) = hex_decode_group_key(&row.group_key_hex) else {
                             log::warn!(
                                 "finish_login: malformed group_key_hex for persona={} \
                                  group={} -- skipping this row",
-                                persona.id,
+                                persona_id,
                                 row.group_id
                             );
                             continue;
                         };
                         group_key_registry
                             .replace(
-                                &persona.id,
+                                persona_id,
                                 &row.group_id,
                                 UnlockedGroupKey {
                                     group_id: row.group_id.clone(),
@@ -902,7 +902,7 @@ async fn install_session(
                 Err(e) => log::warn!(
                     "finish_login: couldn't read group_keys for persona={}: {e} -- \
                      skipping this persona",
-                    persona.id
+                    persona_id
                 ),
             }
         }
@@ -1623,26 +1623,12 @@ mod tests {
 
         let alice_persona_1 = uuid::Uuid::new_v4().to_string();
         let alice_persona_2 = uuid::Uuid::new_v4().to_string();
-        persona_store::create_persona(
-            &pool,
-            &alice_persona_1,
-            "Alice Persona 1",
-            "personal",
-            &alice.id,
-            None,
-        )
-        .await
-        .expect("create_persona must succeed");
-        persona_store::create_persona(
-            &pool,
-            &alice_persona_2,
-            "Alice Persona 2",
-            "personal",
-            &alice.id,
-            None,
-        )
-        .await
-        .expect("create_persona must succeed");
+        persona_store::create_persona_anchor_for_test(&pool, &alice_persona_1, &alice.id)
+            .await
+            .expect("create_persona must succeed");
+        persona_store::create_persona_anchor_for_test(&pool, &alice_persona_2, &alice.id)
+            .await
+            .expect("create_persona must succeed");
 
         // A different account's Persona -- registry.clear_persona() must
         // never touch this, since it belongs to an account other than the
@@ -1665,16 +1651,9 @@ mod tests {
         .await
         .expect("create_user must succeed");
         let bob_persona = uuid::Uuid::new_v4().to_string();
-        persona_store::create_persona(
-            &pool,
-            &bob_persona,
-            "Bob Persona",
-            "personal",
-            &bob_id,
-            None,
-        )
-        .await
-        .expect("create_persona must succeed");
+        persona_store::create_persona_anchor_for_test(&pool, &bob_persona, &bob_id)
+            .await
+            .expect("create_persona must succeed");
 
         for (persona_id, group_id) in [
             (&alice_persona_1, "group-a1"),
@@ -2637,16 +2616,9 @@ mod tests {
         let personal_key_hex = registry.personal_key_hex().await.unwrap();
 
         let persona_id = uuid::Uuid::new_v4().to_string();
-        persona_store::create_persona(
-            &pool,
-            &persona_id,
-            "Test Persona",
-            "personal",
-            &user.id,
-            None,
-        )
-        .await
-        .expect("create_persona must succeed");
+        persona_store::create_persona_anchor_for_test(&pool, &persona_id, &user.id)
+            .await
+            .expect("create_persona must succeed");
 
         let group_id = "group-rehydrate-1";
         let group_key_hex = "11".repeat(kdf::MASTER_KEY_LEN);
@@ -2721,16 +2693,9 @@ mod tests {
         let personal_key_hex = registry.personal_key_hex().await.unwrap();
 
         let persona_id = uuid::Uuid::new_v4().to_string();
-        persona_store::create_persona(
-            &pool,
-            &persona_id,
-            "Test Persona",
-            "personal",
-            &user.id,
-            None,
-        )
-        .await
-        .expect("create_persona must succeed");
+        persona_store::create_persona_anchor_for_test(&pool, &persona_id, &user.id)
+            .await
+            .expect("create_persona must succeed");
 
         let group_id = "group-malformed-1";
         group_key_store::save_group_key(
@@ -2803,16 +2768,9 @@ mod tests {
         let personal_key_hex = registry.personal_key_hex().await.unwrap();
 
         let persona_id = uuid::Uuid::new_v4().to_string();
-        persona_store::create_persona(
-            &pool,
-            &persona_id,
-            "Test Persona",
-            "personal",
-            &user.id,
-            None,
-        )
-        .await
-        .expect("create_persona must succeed");
+        persona_store::create_persona_anchor_for_test(&pool, &persona_id, &user.id)
+            .await
+            .expect("create_persona must succeed");
 
         crate::persistence::migrations::migrate_outputs_db(
             &user.id,
@@ -2913,7 +2871,7 @@ mod tests {
         group: Option<(&str, &str)>,
     ) -> (String, String) {
         let persona_id = uuid::Uuid::new_v4().to_string();
-        persona_store::create_persona(pool, &persona_id, "Seeded", "personal", user_id, None)
+        persona_store::create_persona_anchor_for_test(pool, &persona_id, user_id)
             .await
             .expect("create_persona must succeed");
         if let Some((group_id, group_key_hex)) = group {

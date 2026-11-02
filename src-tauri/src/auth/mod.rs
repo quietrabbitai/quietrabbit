@@ -35,11 +35,12 @@ use crate::persistence::persona_store;
 /// correctly for exactly this case, but nothing called it -- group keys
 /// outlived logout/idle-timeout until the process itself exited.
 ///
-/// ENUMERATION: persona_store::list_personas_for_user(user_id) -- the same
+/// ENUMERATION: persona_store::list_persona_ids_for_user(user_id) -- the same
 /// query commands::auth::finish_login already uses to rehydrate
-/// GroupKeyRegistry on login, run in reverse here. No dedicated "all
-/// personas under this user_id, for eviction" query was needed; this one
-/// already returns exactly that set.
+/// GroupKeyRegistry on login, run in reverse here. It reads ids from the
+/// plaintext membership table only (items.id=661): this runs AFTER
+/// key_registry.clear(), when the encrypted Persona registry can no longer be
+/// opened, and eviction needs only the ids.
 ///
 /// SAFE BY user_id ALONE: KeyRegistry is single-slot (registry.rs's own
 /// header) -- at most one account's master key is ever resident in this
@@ -55,10 +56,10 @@ pub async fn clear_group_keys_for_user(
     group_key_registry: &GroupKeyRegistry,
     user_id: &str,
 ) {
-    match persona_store::list_personas_for_user(pool, user_id).await {
-        Ok(personas) => {
-            for persona in personas {
-                group_key_registry.clear_persona(&persona.id).await;
+    match persona_store::list_persona_ids_for_user(pool, user_id).await {
+        Ok(persona_ids) => {
+            for persona_id in persona_ids {
+                group_key_registry.clear_persona(&persona_id).await;
             }
         }
         Err(e) => {

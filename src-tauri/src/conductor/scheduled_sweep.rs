@@ -36,7 +36,7 @@ use crate::conductor::concurrency::ConductorScheduler;
 use crate::conductor::lifecycle::{rehydrate_focus_run, FocusRun};
 use crate::persistence::migrations::MigrationError;
 use crate::persistence::output_store::{list_due_scheduled_focus_runs, OutputStoreError};
-use crate::persistence::persona_store::list_personas_for_user;
+use crate::persistence::persona_store::list_persona_ids_for_user;
 use crate::providers::utils::now;
 
 /// One sweep tick. Called on an interval by main.rs's spawn_supervised
@@ -63,7 +63,7 @@ pub async fn run_periodic_sweep(
         return;
     };
 
-    let personas = match list_personas_for_user(pool, &user_id).await {
+    let persona_ids = match list_persona_ids_for_user(pool, &user_id).await {
         Ok(p) => p,
         Err(e) => {
             log::warn!("scheduled_sweep: could not list personas for resident user: {e}");
@@ -73,8 +73,8 @@ pub async fn run_periodic_sweep(
 
     let now_ts = now();
 
-    for persona in personas {
-        let due = match list_due_scheduled_focus_runs(&user_id, &persona.id, &key_hex_str, &now_ts)
+    for persona_id in persona_ids {
+        let due = match list_due_scheduled_focus_runs(&user_id, &persona_id, &key_hex_str, &now_ts)
             .await
         {
             Ok(rows) => rows,
@@ -94,12 +94,12 @@ pub async fn run_periodic_sweep(
                 ) {
                     log::warn!(
                         "scheduled_sweep: could not check persona '{}' for due steps: {e}",
-                        persona.id
+                        persona_id
                     );
                 } else {
                     log::debug!(
                         "scheduled_sweep: could not check persona '{}' for due steps: {e}",
-                        persona.id
+                        persona_id
                     );
                 }
                 continue;
@@ -118,7 +118,7 @@ pub async fn run_periodic_sweep(
             };
             let result: Result<FocusRun, _> = rehydrate_focus_run(
                 user_id.clone(),
-                persona.id.clone(),
+                persona_id.clone(),
                 focus_run_id.clone(),
                 pool.clone(),
                 Arc::clone(scheduler),
@@ -167,7 +167,7 @@ pub async fn run_periodic_sweep(
             // IPC handler now does.
             crate::commands::messages::finalize_chat_reply(
                 &user_id,
-                &persona.id,
+                &persona_id,
                 &key_hex_str,
                 &focus_run_id,
                 &result,

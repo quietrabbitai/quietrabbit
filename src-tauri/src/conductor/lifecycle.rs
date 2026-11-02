@@ -1605,17 +1605,19 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
     /// Python oracle: FocusRun._get_focus_tier_ceiling()
     async fn get_focus_tier_ceiling(&self) -> Result<(ExternalAccess, u8), LifecycleError> {
         use crate::persistence::focus_settings_store::get_focus_settings;
-        use crate::persistence::persona_store::get_persona_for_user;
+        use crate::persistence::persona_store::is_user_in_persona;
 
-        let _persona = get_persona_for_user(&self.pool, &self.user_id, &self.persona_id)
+        // Membership only: the Persona's name is in the encrypted registry
+        // and AUTHORIZE has no use for it (items.id=661).
+        if !is_user_in_persona(&self.pool, &self.user_id, &self.persona_id)
             .await
             .map_err(|e| LifecycleError::PersonaStore(e.to_string()))?
-            .ok_or_else(|| {
-                LifecycleError::PersonaNotFound(format!(
-                    "Persona '{}' not found for user '{}'.",
-                    self.persona_id, self.user_id
-                ))
-            })?;
+        {
+            return Err(LifecycleError::PersonaNotFound(format!(
+                "Persona '{}' not found for user '{}'.",
+                self.persona_id, self.user_id
+            )));
+        }
 
         let settings = get_focus_settings(&self.pool, &self.persona_id, &self.focus_id)
             .await
@@ -2490,30 +2492,25 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         let scheduler = Arc::clone(&self.scheduler);
         let user_id = self.user_id.clone();
 
-        // Floor consent preference (D5-152). Read from personas.extra_metadata in shared.db.
-        // Non-fatal — consent gate fires normally if read fails.
+        // Floor consent preference (D5-152). Read from the Persona's encrypted
+        // personal.db (items.id=661). Non-fatal -- the consent gate fires
+        // normally if the read fails, or if the run has no key any more.
         let floor_consent_preference: Option<String> = async {
-            let mut conn = self.pool.acquire().await.ok()?;
-            let row = sqlx::query("SELECT extra_metadata FROM personas WHERE id = ?")
-                .bind(&persona_id)
-                .fetch_optional(&mut *conn)
-                .await
-                .ok()??;
-            let extra_str: String = row.try_get("extra_metadata").ok()?;
-            let meta: serde_json::Value = serde_json::from_str(&extra_str).ok()?;
-            let consent = meta.get("floor_consent_preference")?.as_object()?;
-            let stored_mode = consent.get("mode")?.as_str()?;
-            if stored_mode == "modified" {
-                let stored_tier = consent.get("abstraction_tier")?.as_i64()? as u8;
-                if stored_tier <= abstraction_tier {
-                    Some("modified".to_owned())
-                } else {
-                    None
+            let key_hex = self.key_hex.as_deref()?;
+            let consent = crate::persistence::personal_store::read_floor_consent_preference(
+                &user_id,
+                &persona_id,
+                key_hex,
+            )
+            .await
+            .ok()??;
+            match consent.mode.as_str() {
+                "modified" => {
+                    let stored_tier = consent.abstraction_tier? as u8;
+                    (stored_tier <= abstraction_tier).then(|| "modified".to_owned())
                 }
-            } else if stored_mode == "local" {
-                Some("local".to_owned())
-            } else {
-                None
+                "local" => Some("local".to_owned()),
+                _ => None,
             }
         }
         .await;
@@ -5508,13 +5505,8 @@ mod tests {
         .await
         .expect("create_user must succeed in test setup");
 
-        crate::persistence::persona_store::create_persona(
-            &pool,
-            persona_id,
-            "Resume Test Persona",
-            "personal",
-            user_id,
-            None,
+        crate::persistence::persona_store::create_persona_anchor_for_test(
+            &pool, persona_id, user_id,
         )
         .await
         .expect("create_persona must succeed in test setup");

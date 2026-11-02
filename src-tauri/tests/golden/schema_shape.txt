@@ -890,10 +890,7 @@ TABLE persona_view_share_settings
   updated_at TEXT notnull=1 pk=0 default=None
 TABLE personas
   id TEXT notnull=0 pk=1 default=None
-  display_name TEXT notnull=1 pk=0 default=None
-  persona_type TEXT notnull=1 pk=0 default=None
   created_at TEXT notnull=1 pk=0 default=None
-  extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
 TABLE provider_catalog_history
   version INTEGER notnull=0 pk=1 default=None
   sha256 TEXT notnull=1 pk=0 default=None

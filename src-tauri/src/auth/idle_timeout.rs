@@ -823,13 +823,10 @@ mod tests {
             .unwrap()
             .unwrap();
         let persona_id = uuid::Uuid::new_v4().to_string();
-        crate::persistence::persona_store::create_persona(
+        crate::persistence::persona_store::create_persona_anchor_for_test(
             &pool,
             &persona_id,
-            "Test Persona",
-            "personal",
             &user.id,
-            None,
         )
         .await
         .expect("create_persona must succeed");

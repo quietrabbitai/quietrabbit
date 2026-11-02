@@ -521,16 +521,9 @@ mod tests {
         .expect("create_user must succeed");
 
         let persona_id = uuid::Uuid::new_v4().to_string();
-        persona_store::create_persona(
-            pool,
-            &persona_id,
-            "Test Persona",
-            "personal",
-            &user_id,
-            None,
-        )
-        .await
-        .expect("create_persona must succeed");
+        persona_store::create_persona_anchor_for_test(pool, &persona_id, &user_id)
+            .await
+            .expect("create_persona must succeed");
 
         (user_id, persona_id, sharing_private_key)
     }
