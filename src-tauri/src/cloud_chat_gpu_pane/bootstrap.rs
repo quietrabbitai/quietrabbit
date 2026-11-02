@@ -89,16 +89,12 @@ pub fn dispatch_cef_subprocess() -> bool {
 /// confirmed to be the browser-process invocation), and before any browser
 /// instance is created.
 ///
-/// `root_cache_path` is CEF's global `Settings.root_cache_path`, required in
-/// addition to each pane's own per-provider `RequestContextSettings.cache_path`
-/// (items.id=192's finding: without this, CEF emits a startup warning and
-/// per-context persistence silently degrades to in-memory -- `flush_store`
-/// reports success but nothing persists). Phase A used a fixed
-/// `/tmp/qr_tier3_pane_root_cache` path (bootstrap/render verification only,
-/// no real per-provider persistence yet); Phase B (items.id=202 piece 5)
-/// resolves this from Tauri's `app_data_dir` instead, per this const's own
-/// prior TODO -- the caller (main.rs) is responsible for that resolution,
-/// this function just takes the result.
+/// `root_cache_path` is CEF's global `Settings.root_cache_path`. CEF 151's
+/// Chrome runtime keeps a full browser profile there whatever `cache_path`
+/// says, so the caller (main.rs) passes this run's own directory on a tmpfs
+/// from `profile_dir::init_run_dir` and deletes it at exit (items.id=622).
+/// Per-user cookie persistence is QR's own encrypted store, not this directory
+/// (items.id=224 resolution, decisions.id=711).
 ///
 /// Returns the shared flag CEF's `OnScheduleMessagePumpWork` callback
 /// writes to -- the host loop (Tauri's `RunEvent::MainEventsCleared`, see
@@ -290,6 +286,12 @@ const BACKGROUND_NETWORK_SWITCHES: &[&str] = &[
     "disable-default-apps",
 ];
 
+/// Size caps for the browser's caches, which live on a tmpfs (profile_dir.rs).
+/// Measured with four providers open: 22 MB of cache uncapped, about 50 MB for
+/// the whole profile.
+const DISK_CACHE_SIZE_BYTES: u64 = 64 * 1024 * 1024;
+const MEDIA_CACHE_SIZE_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Features turned off through `--disable-features` (names verified against
 /// the strings of the libcef 151 binary).
 ///
@@ -395,6 +397,18 @@ wrap_app! {
             // itself. See BACKGROUND_NETWORK_SWITCHES.
             for name in BACKGROUND_NETWORK_SWITCHES {
                 command_line.append_switch(Some(&cef::CefString::from(*name)));
+            }
+
+            // items.id=622: the profile is on a tmpfs, so the caches are
+            // capped. See DISK_CACHE_SIZE_BYTES.
+            for (name, bytes) in [
+                ("disk-cache-size", DISK_CACHE_SIZE_BYTES),
+                ("media-cache-size", MEDIA_CACHE_SIZE_BYTES),
+            ] {
+                command_line.append_switch_with_value(
+                    Some(&cef::CefString::from(name)),
+                    Some(&bytes.to_string().as_str().into()),
+                );
             }
 
             // items.id=327 diagnostic only. Confirms whether CEF's OSR
@@ -517,6 +531,19 @@ mod tests {
         assert!(BACKGROUND_NETWORK_SWITCHES
             .iter()
             .all(|s| !s.starts_with('-') && !s.contains('=')));
+    }
+
+    #[test]
+    fn cache_caps_are_64_and_16_mib() {
+        assert_eq!(DISK_CACHE_SIZE_BYTES, 67_108_864);
+        assert_eq!(MEDIA_CACHE_SIZE_BYTES, 16_777_216);
+        // the tmpfs floor must leave room for both caches plus the profile
+        const {
+            assert!(
+                super::super::profile_dir::MIN_FREE_BYTES
+                    > DISK_CACHE_SIZE_BYTES + MEDIA_CACHE_SIZE_BYTES
+            );
+        }
     }
 
     #[test]

@@ -14,31 +14,6 @@ use quietrabbit_lib::ipc::specta_builder;
 use quietrabbit_lib::ollama_sidecar::{OllamaSidecar, OllamaSource, SidecarStartup};
 use quietrabbit_lib::providers::ollama_client::OllamaClient;
 
-/// One-time atomic same-directory rename of the CEF cache directory,
-/// tier3_pane_cache -> cloud_chat_gpu_pane_cache (items.id=528 Phase 2).
-/// Never overwrites (does nothing if the new-named directory already
-/// exists -- covers a prior partial/failed rename attempt, or any other
-/// reason the destination is already occupied) and is a no-op once the
-/// rename has actually happened (old_path no longer exists). Same guard
-/// shape as persistence::migrations's rename_legacy_db_file_if_safe, minus
-/// the WAL/SHM sidecar check -- this is a plain directory, not a SQLite
-/// database file, so that concern has no equivalent here. A blanket
-/// identifier rename in the cloud_chat_gpu_pane module itself deliberately
-/// did NOT touch this on-disk name -- orphaning real users' existing cached
-/// Cloud Chat login sessions was exactly the risk this careful, separate
-/// step exists to avoid.
-fn rename_legacy_cef_cache_dir_if_safe(old_path: &std::path::Path, new_path: &std::path::Path) {
-    if new_path.exists() || !old_path.exists() {
-        return;
-    }
-    match std::fs::rename(old_path, new_path) {
-        Ok(()) => log::info!("main: renamed CEF cache dir {old_path:?} -> {new_path:?}"),
-        Err(e) => {
-            log::warn!("main: failed to rename CEF cache dir {old_path:?} -> {new_path:?}: {e}")
-        }
-    }
-}
-
 /// Stops startup visibly when the data directory cannot be set up
 /// (items.id=663). Returning `Err` from `setup()` would only make Tauri panic
 /// inside the event loop with a generic message, which a desktop-launched
@@ -947,8 +922,33 @@ async fn async_main() {
         );
         std::env::temp_dir().join("quietrabbit")
     });
-    let root_cache_path = app_data_dir.join("cloud_chat_gpu_pane_cache");
-    rename_legacy_cef_cache_dir_if_safe(&app_data_dir.join("tier3_pane_cache"), &root_cache_path);
+    // items.id=622: CEF's profile (cookies, localStorage, cache...) lives in a
+    // directory of its own for this run on a tmpfs and is deleted at exit, so
+    // nothing a provider stored outlives the run or reaches a real disk. With no
+    // usable tmpfs there is no CEF: Cloud Chat is unavailable, not
+    // disk-backed. The sweep of what the persistent profile left behind runs off
+    // the startup path (it can be a gigabyte) and cannot touch the new directory.
+    let root_cache_path = match quietrabbit_lib::cloud_chat_gpu_pane::profile_dir::init_run_dir() {
+        Ok(dir) => Some(dir),
+        Err(e) => {
+            log::error!("main: no CEF profile directory, Cloud Chat is unavailable this run: {e}");
+            None
+        }
+    };
+    {
+        let app_data_dir = app_data_dir.clone();
+        let sweep = std::thread::Builder::new()
+            .name("cef-profile-sweep".into())
+            .spawn(move || {
+                use quietrabbit_lib::cloud_chat_gpu_pane::profile_dir;
+                profile_dir::sweep_legacy_profiles(&app_data_dir);
+                profile_dir::sweep_stale_siblings();
+                profile_dir::report_foreign_cef_dirs_from_env();
+            });
+        if let Err(e) = sweep {
+            log::warn!("main: could not start the CEF profile sweep: {e}");
+        }
+    }
     // Uses multi_threaded_message_loop=true (see cloud_chat_gpu_pane::bootstrap docs
     // for the full root-cause history) -- CEF runs its own UI thread
     // separately from Tauri's GTK main thread, which is what avoids the
@@ -958,14 +958,16 @@ async fn async_main() {
     // items.id=646: a failed init no longer aborts the app. Cloud Chat is then
     // unavailable for this run (the pane commands return a plain error) and
     // every other CEF touch point below is gated on cef_available().
-    let _cef_init =
+    let _cef_init = root_cache_path.and_then(|root_cache_path| {
         match quietrabbit_lib::cloud_chat_gpu_pane::bootstrap::initialize_cef(&root_cache_path) {
             Ok(init) => Some(init),
             Err(e) => {
                 log::error!("main: CEF init failed, Cloud Chat is unavailable this run: {e}");
+                quietrabbit_lib::cloud_chat_gpu_pane::profile_dir::remove_run_dir();
                 None
             }
-        };
+        }
+    });
 
     // Single-window GTK/wgpu pane host (items.id=202 real positioning fix,
     // 2026-08-07 -- see cloud_chat_gpu_pane::pane_host's module docs for the full
@@ -1046,6 +1048,8 @@ async fn async_main() {
                 quietrabbit_lib::cloud_chat_gpu_pane::pane_host::close_all_panes();
                 cef::shutdown();
             }
+            // items.id=622: the profile of this run goes with it.
+            quietrabbit_lib::cloud_chat_gpu_pane::profile_dir::remove_run_dir();
             // items.id=315 (3rd attempt): tao's own event loop calls
             // std::process::exit() unconditionally right after this closure
             // returns (tao-0.35.3 platform_impl/linux/event_loop.rs:998), and
@@ -1143,8 +1147,6 @@ fn install_exit_signal_handlers(app_handle: tauri::AppHandle) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     /// items.id=667: the single-instance plugin must be registered after both
     /// re-invocation dispatches (the document parse child and CEF's helper
     /// processes are this same binary and must never be mistaken for a second
@@ -1206,74 +1208,5 @@ mod tests {
             production.contains("#[cfg(not(debug_assertions))]\nfn raise_main_window("),
             "raise_main_window must carry the same release-only gate"
         );
-    }
-
-    #[test]
-    fn rename_legacy_cef_cache_dir_renames_when_safe() {
-        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
-        let old_path = tempdir.path().join("tier3_pane_cache");
-        let new_path = tempdir.path().join("cloud_chat_gpu_pane_cache");
-        std::fs::create_dir_all(old_path.join("blob_storage")).unwrap();
-        std::fs::write(
-            old_path.join("blob_storage").join("cached.bin"),
-            b"cef cache data",
-        )
-        .unwrap();
-
-        rename_legacy_cef_cache_dir_if_safe(&old_path, &new_path);
-
-        assert!(
-            !old_path.exists(),
-            "old-named cache dir must be gone after a safe rename"
-        );
-        assert!(
-            new_path.exists(),
-            "new-named cache dir must exist after a safe rename"
-        );
-        assert!(
-            new_path.join("blob_storage").join("cached.bin").exists(),
-            "the real cached data underneath must survive the rename, not just the top-level dir"
-        );
-    }
-
-    #[test]
-    fn rename_legacy_cef_cache_dir_noop_when_old_absent() {
-        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
-        let old_path = tempdir.path().join("tier3_pane_cache");
-        let new_path = tempdir.path().join("cloud_chat_gpu_pane_cache");
-
-        rename_legacy_cef_cache_dir_if_safe(&old_path, &new_path);
-
-        assert!(
-            !new_path.exists(),
-            "nothing to rename -- new path must not appear"
-        );
-    }
-
-    #[test]
-    fn rename_legacy_cef_cache_dir_never_overwrites_existing_new_path() {
-        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
-        let old_path = tempdir.path().join("tier3_pane_cache");
-        let new_path = tempdir.path().join("cloud_chat_gpu_pane_cache");
-        std::fs::create_dir_all(&old_path).unwrap();
-        std::fs::write(old_path.join("old.bin"), b"old cache").unwrap();
-        std::fs::create_dir_all(&new_path).unwrap();
-        std::fs::write(
-            new_path.join("already-there.bin"),
-            b"already-migrated cache",
-        )
-        .unwrap();
-
-        rename_legacy_cef_cache_dir_if_safe(&old_path, &new_path);
-
-        assert!(
-            old_path.exists(),
-            "old-named dir must be left alone when the new name is already occupied"
-        );
-        assert!(
-            new_path.join("already-there.bin").exists(),
-            "existing new-named dir's contents must never be overwritten"
-        );
-        assert!(!new_path.join("old.bin").exists());
     }
 }

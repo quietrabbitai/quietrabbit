@@ -145,6 +145,7 @@ pub mod bootstrap;
 mod diag;
 pub mod gl_loader;
 pub mod pane_host;
+pub mod profile_dir;
 pub mod render;
 
 pub use bootstrap::dispatch_cef_subprocess;
