@@ -269,6 +269,7 @@ async fn run_cleanup(app: &tauri::AppHandle, left: &KeyLeft) {
         let _ = sent_tx.send(done);
     });
     if queued.is_ok() {
+        let started = tokio::time::Instant::now();
         match tokio::time::timeout(SITE_DATA_TIMEOUT, async {
             match sent_rx.await {
                 Ok(done) => done.await.is_ok(),
@@ -277,7 +278,10 @@ async fn run_cleanup(app: &tauri::AppHandle, left: &KeyLeft) {
         })
         .await
         {
-            Ok(true) => {}
+            Ok(true) => log::info!(
+                "session_hygiene: site data cleared in {:?}",
+                started.elapsed()
+            ),
             Ok(false) | Err(_) => {
                 log::warn!(
                     "session_hygiene: site data clear was not confirmed, closing panes anyway"

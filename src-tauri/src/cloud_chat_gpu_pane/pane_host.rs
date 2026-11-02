@@ -728,6 +728,11 @@ impl PaneManager {
         let Some(pane) = self.panes.shift_remove(key) else {
             return;
         };
+        // items.id=622: the last pane to close takes every recorded origin's
+        // site data with it (see site_data); a close while another pane is open
+        // leaves it alone.
+        let last_pane =
+            crate::cloud_chat_gpu_pane::site_data::should_clear_on_close(self.panes.len());
         // Forced close (no unload-confirmation dance) -- a user-initiated
         // pane close (items.id=223's whole trigger), not a navigation-away
         // the page itself might want to intercept.
@@ -737,7 +742,11 @@ impl PaneManager {
             if self.last_focus == Some(FocusTarget::Pane(key.clone())) {
                 host.set_focus(false as _);
             }
-            host.close_browser(true as _);
+            if last_pane {
+                crate::cloud_chat_gpu_pane::site_data::clear_all_then_close(host);
+            } else {
+                host.close_browser(true as _);
+            }
         }
         crate::cloud_chat_gpu_pane::render::remove_pane_texture(key);
         crate::cloud_chat_gpu_pane::render::remove_pane_pending_paint(key);
@@ -3588,6 +3597,9 @@ pub fn clear_site_data_all(tracker: &Arc<crate::cloud_chat_gpu_pane::site_data::
 /// resources cleanly, rather than tao's unconditional `process::exit()`
 /// tearing them down while a browser instance is still alive.
 pub fn close_all_panes() {
+    // items.id=622: closing every pane at once is the key-leave cleanup (which
+    // has already cleared and waited) or app exit (which must start no new work).
+    let _suppress = crate::cloud_chat_gpu_pane::site_data::suppress_last_close_clear();
     HOST.with(|h| {
         if let Some(host) = h.borrow().as_ref() {
             for key in host.pane_keys() {

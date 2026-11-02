@@ -5,7 +5,8 @@
 //! and service workers. A canary written to each survived a sign-out in the
 //! items.id=622 step 0 run. The DevTools protocol can clear them per origin
 //! (`Storage.clearDataForOrigin`, measured to clear all four on a page target;
-//! sessionStorage goes with the browser), so this module
+//! sessionStorage goes with the browser; cookies are left out, see
+//! `STORAGE_TYPES_WITHOUT_COOKIES`), so this module
 //!
 //! - remembers which origins each pane has loaded (`note_origin`, fed by the
 //!   pane's load handler, plus the provider's launch origin; kept until the
@@ -14,14 +15,18 @@
 //!   `BrowserHost` (`request_clear`), reporting when every answer has come back
 //!   (`Tracker`), so the caller can close the panes after. It runs when an
 //!   account's key leaves, not when a single pane closes: a provider's
-//!   localStorage survives a pane being closed and reopened by the same account.
+//!   localStorage survives a pane being closed while another is open and
+//!   reopened by the same account. Closing the LAST open pane clears every
+//!   recorded origin too (`clear_all_then_close`), so nothing is left behind
+//!   when no pane remains to reach it through.
 //!
 //! Everything touching CEF runs on the GTK main thread, like the rest of
 //! `pane_host`; the origin map is plain data behind a mutex.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use cef::rc::Rc as _;
 use cef::{
@@ -33,12 +38,33 @@ use tokio::sync::oneshot;
 
 use super::{lock_recover, PaneKey};
 
+/// The `storageTypes` of every `Storage.clearDataForOrigin`: all site data but
+/// cookies. `"all"` includes cookies, and clearing them here deleted a provider's
+/// session cookie from the jar before the pane-close persist (and a snapshot)
+/// could write it to the encrypted store: a cookie set within one snapshot
+/// interval of the last pane closing never came back (measured, items.id=622).
+/// Cookies are the jar's business: the persist on close and the 30 s snapshot
+/// keep them, and the key-leave cleanup deletes the jar itself.
+const STORAGE_TYPES_WITHOUT_COOKIES: &str = "appcache,file_systems,indexeddb,local_storage,\
+     shader_cache,websql,service_workers,cache_storage";
+
 /// Origins one pane is remembered for. A page that opens more than this many
 /// distinct origins is not a provider's chat page; the rest are not cleared
 /// individually (the tmpfs profile still ends with the run).
 const MAX_ORIGINS_PER_PANE: usize = 64;
 
 static ORIGINS: Mutex<Option<HashMap<PaneKey, BTreeSet<String>>>> = Mutex::new(None);
+
+/// Whether closing the last open pane clears the site data of every recorded
+/// origin. Switched off while all panes are closed at once (key leave, which has
+/// already cleared and waited; app exit, which must not start new work).
+static CLEAR_ON_LAST_CLOSE: AtomicBool = AtomicBool::new(true);
+
+/// How long a last pane's browser is kept alive for the clear to be answered.
+const CLOSE_WAIT: Duration = Duration::from_millis(1500);
+
+/// How often the main loop checks whether the answers are in.
+const CLOSE_POLL: Duration = Duration::from_millis(25);
 
 /// First DevTools message id handed out; each call takes the next, process-wide,
 /// so a result is never mistaken for another pane's.
@@ -110,6 +136,71 @@ pub fn forget_all() {
     if let Some(map) = lock_recover(&ORIGINS).as_mut() {
         map.clear();
     }
+}
+
+/// Whether a pane that just left `PaneManager` should clear all site data:
+/// it was the last one open and the close is not part of closing every pane.
+/// A single close while another pane is open never clears: the account keeps
+/// its provider storage while it is still using Cloud Chat.
+pub fn should_clear_on_close(panes_left_open: usize) -> bool {
+    panes_left_open == 0 && CLEAR_ON_LAST_CLOSE.load(Ordering::SeqCst)
+}
+
+/// Held while every pane is being closed at once; dropping it restores the
+/// last-pane clear.
+pub struct LastCloseClearSuppressed(());
+
+pub fn suppress_last_close_clear() -> LastCloseClearSuppressed {
+    CLEAR_ON_LAST_CLOSE.store(false, Ordering::SeqCst);
+    LastCloseClearSuppressed(())
+}
+
+impl Drop for LastCloseClearSuppressed {
+    fn drop(&mut self) {
+        CLEAR_ON_LAST_CLOSE.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Clear the cache and the site data of every origin any pane loaded this
+/// session through `host`, then close `host`'s browser once the answers are in
+/// (or after [`CLOSE_WAIT`]): the clear needs the browser alive, and closing it
+/// at once could drop calls still in flight. Main thread only. The pane is
+/// already gone from the UI; the browser lingers for milliseconds.
+pub fn clear_all_then_close(host: BrowserHost) {
+    let (tracker, mut done) = Tracker::new();
+    let origins = all_origins();
+    request_clear(&host, &origins, &tracker);
+    tracker.release();
+    // Everything recorded is being cleared; nothing is left to remember.
+    forget_all();
+    let started = Instant::now();
+    let deadline = started + CLOSE_WAIT;
+    glib::source::timeout_add_local(CLOSE_POLL, move || {
+        let answered = match done.try_recv() {
+            Ok(()) => true,
+            Err(oneshot::error::TryRecvError::Closed) => true,
+            Err(oneshot::error::TryRecvError::Empty) => false,
+        };
+        if answered || Instant::now() >= deadline {
+            if answered {
+                log::info!(
+                    "cloud_chat_gpu_pane::site_data: last pane closing, site data of {} origin(s) \
+                     cleared in {:?}",
+                    origins.len(),
+                    started.elapsed()
+                );
+            } else {
+                log::warn!(
+                    "cloud_chat_gpu_pane::site_data: site data clear not confirmed in {CLOSE_WAIT:?}, \
+                     closing the browser anyway"
+                );
+            }
+            host.close_browser(true as _);
+            glib::ControlFlow::Break
+        } else {
+            glib::ControlFlow::Continue
+        }
+    });
 }
 
 /// Reports once every DevTools clear sent for it has been answered.
@@ -205,9 +296,15 @@ fn calls_for(origins: &[String]) -> Vec<Call> {
 
 /// Ask `host`'s browser to clear its cache and, for each of `origins`, all of
 /// that origin's site data (the profile is global, so any pane's browser can
-/// reach every origin). `tracker` is told as each call is answered. Returns how
-/// many calls were handed to CEF.
-pub fn request_clear(host: &BrowserHost, origins: &[String], tracker: &Arc<Tracker>) -> usize {
+/// reach every origin). `tracker` is told as each call is answered.
+///
+/// `execute_dev_tools_method` returns the message id only when called on CEF's
+/// UI thread; from any other thread (this one is GTK's main thread, and CEF runs
+/// its own UI thread) it posts the call there and returns 0. So the return
+/// value says nothing about whether the call was submitted, and a 0 is not a
+/// refusal: the only confirmation is the observer's answer, and the caller's
+/// timeout covers one that never comes.
+pub fn request_clear(host: &BrowserHost, origins: &[String], tracker: &Arc<Tracker>) {
     let calls = calls_for(origins);
     let ids: Vec<i32> = calls
         .iter()
@@ -223,39 +320,33 @@ pub fn request_clear(host: &BrowserHost, origins: &[String], tracker: &Arc<Track
         lock_recover(&tracker.registrations).push(registration);
     }
 
-    let mut sent = 0;
     for (call, id) in calls.iter().zip(&ids) {
-        let params = call.origin.as_ref().and_then(|origin| {
-            let params = dictionary_value_create()?;
-            params.set_string(
+        let mut params = None;
+        if let Some(origin) = &call.origin {
+            params = dictionary_value_create();
+            let Some(dict) = params.as_ref() else {
+                // Nothing was sent, so no answer will come: settle it here.
+                log::warn!(
+                    "cloud_chat_gpu_pane::site_data: could not build the parameters for {origin}"
+                );
+                tracker.one_done();
+                continue;
+            };
+            dict.set_string(
                 Some(&CefString::from("origin")),
                 Some(&CefString::from(origin.as_str())),
             );
-            params.set_string(
+            dict.set_string(
                 Some(&CefString::from("storageTypes")),
-                Some(&CefString::from("all")),
+                Some(&CefString::from(STORAGE_TYPES_WITHOUT_COOKIES)),
             );
-            Some(params)
-        });
-        let mut params = params;
-        let accepted = host.execute_dev_tools_method(
+        }
+        let _ = host.execute_dev_tools_method(
             *id,
             Some(&CefString::from(call.method)),
             params.as_mut(),
         );
-        if accepted != 0 {
-            sent += 1;
-        } else {
-            log::warn!(
-                "cloud_chat_gpu_pane::site_data: CEF refused {} ({:?})",
-                call.method,
-                call.origin
-            );
-            // Never sent, so no answer will come: settle it here.
-            tracker.one_done();
-        }
     }
-    sent
 }
 
 #[cfg(test)]
@@ -371,6 +462,25 @@ mod tests {
     }
 
     #[test]
+    fn the_storage_types_clear_site_data_but_never_cookies() {
+        let types: Vec<&str> = STORAGE_TYPES_WITHOUT_COOKIES.split(',').collect();
+        assert!(!types.contains(&"cookies"));
+        assert!(!types.contains(&"all"), "\"all\" includes cookies");
+        for needed in [
+            "local_storage",
+            "indexeddb",
+            "cache_storage",
+            "service_workers",
+        ] {
+            assert!(types.contains(&needed), "{needed}");
+        }
+        assert!(
+            types.iter().all(|t| !t.is_empty() && !t.contains(' ')),
+            "{types:?}"
+        );
+    }
+
+    #[test]
     fn the_call_list_is_one_cache_clear_then_one_storage_clear_per_origin() {
         let calls = calls_for(&["https://a.com".to_owned(), "https://b.com".to_owned()]);
         assert_eq!(calls.len(), 3);
@@ -379,6 +489,22 @@ mod tests {
         assert_eq!(calls[1].method, "Storage.clearDataForOrigin");
         assert_eq!(calls[2].origin.as_deref(), Some("https://b.com"));
         assert_eq!(calls_for(&[]).len(), 1);
+    }
+
+    #[test]
+    fn only_the_last_pane_closing_on_its_own_clears() {
+        // the flag is process-wide: this is the only test that touches it
+        assert!(!should_clear_on_close(1), "another pane is still open");
+        assert!(!should_clear_on_close(3));
+        assert!(should_clear_on_close(0), "the last pane");
+        {
+            let _closing_everything = suppress_last_close_clear();
+            assert!(
+                !should_clear_on_close(0),
+                "key leave and exit close all panes"
+            );
+        }
+        assert!(should_clear_on_close(0), "restored when the guard drops");
     }
 
     #[tokio::test]
