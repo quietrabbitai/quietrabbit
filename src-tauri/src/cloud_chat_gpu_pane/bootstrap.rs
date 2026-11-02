@@ -270,12 +270,8 @@ pub fn initialize_cef_with_pump_setting(
 /// signed in. Page-driven traffic from a provider's own site is not covered
 /// and is not meant to be.
 ///
-/// Known remainder: one POST to accounts.google.com/ListAccounts at startup
-/// (the browser profile's Google account cookie check). Nothing tried removes
-/// it (disable-sync, signin.allowed=false in a seeded profile, a seeded
-/// gaia_cookie report time, --incognito, AvoidAutoTriggerListAccountsOnStale,
-/// several feature names), and it does not repeat while idle. Revisit with the
-/// profile replacement in items.id=622 part 2b.
+/// The one call these switches do not stop is the browser's own
+/// `POST accounts.google.com/ListAccounts` at startup (see GAIA_URL_OVERRIDE).
 const BACKGROUND_NETWORK_SWITCHES: &[&str] = &[
     "disable-background-networking",
     "disable-component-update",
@@ -285,6 +281,18 @@ const BACKGROUND_NETWORK_SWITCHES: &[&str] = &[
     "metrics-recording-only",
     "disable-default-apps",
 ];
+
+/// Where the browser's own Google-account calls go (`--gaia-url`, items.id=622).
+/// Chromium's `GaiaUrls` takes this as the GAIA base URL for its own fetchers.
+/// With the default, an idle CEF 151 sent `POST accounts.google.com/ListAccounts`
+/// once at every startup, and nothing else tried removed it: `disable-sync`, a
+/// profile with `signin.allowed=false`, a seeded `gaia_cookie` report time,
+/// `--incognito`, `AvoidAutoTriggerListAccountsOnStale`, several feature names.
+/// Pointed at a loopback port nothing listens on, the call is refused locally
+/// (a few retries with backoff, never leaving the machine) and no Google host
+/// is contacted. A provider page's own sign-in (Gemini's accounts.google.com
+/// pages) is page traffic, does not use this URL and still works (checked).
+const GAIA_URL_OVERRIDE: &str = "http://127.0.0.1:1";
 
 /// Size caps for the browser's caches, which live on a tmpfs (profile_dir.rs).
 /// Measured with four providers open: 22 MB of cache uncapped, about 50 MB for
@@ -398,6 +406,13 @@ wrap_app! {
             for name in BACKGROUND_NETWORK_SWITCHES {
                 command_line.append_switch(Some(&cef::CefString::from(*name)));
             }
+
+            // items.id=622: the browser's own Google-account call goes nowhere.
+            // See GAIA_URL_OVERRIDE.
+            command_line.append_switch_with_value(
+                Some(&cef::CefString::from("gaia-url")),
+                Some(&GAIA_URL_OVERRIDE.into()),
+            );
 
             // items.id=622: the profile is on a tmpfs, so the caches are
             // capped. See DISK_CACHE_SIZE_BYTES.
@@ -531,6 +546,21 @@ mod tests {
         assert!(BACKGROUND_NETWORK_SWITCHES
             .iter()
             .all(|s| !s.starts_with('-') && !s.contains('=')));
+    }
+
+    #[test]
+    fn the_gaia_url_override_is_a_loopback_address_with_a_port_nothing_listens_on() {
+        let rest = GAIA_URL_OVERRIDE
+            .strip_prefix("http://")
+            .expect("plain http, so no TLS handshake or name lookup is attempted");
+        let (host, port) = rest.split_once(':').expect("an explicit port");
+        assert_eq!(
+            host, "127.0.0.1",
+            "an IP literal: no DNS query for the name"
+        );
+        // port 1 (tcpmux) is reserved and unused; any real service port would be a risk
+        assert_eq!(port, "1");
+        assert!(!GAIA_URL_OVERRIDE.contains("google"));
     }
 
     #[test]
