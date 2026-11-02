@@ -521,6 +521,7 @@ mod tests {
             "group-abc",
             "deadbeef",
             "2026-09-02T00:00:00Z",
+            None,
         )
         .await
         .expect("save_group_key must succeed");

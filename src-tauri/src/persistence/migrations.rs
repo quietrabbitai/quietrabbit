@@ -3958,6 +3958,32 @@ mod tests {
     // must reach a database that was created before they existed. SCHEMA_FILES
     // is a compile-time static, so the older database is hand-built: apply
     // everything, then remove what the new file added and forget its version.
+    /// items.id=661: shared_008.sql no longer adds a column, but versions must
+    /// stay contiguous. Every version 1..=34 must have its row, 8 included,
+    /// recorded by the file's own INSERT.
+    #[tokio::test]
+    async fn every_shared_version_is_recorded_including_the_no_column_shared_008() {
+        let mut conn = make_test_conn().await;
+        run_migrations(&mut conn, "shared", None).await.unwrap();
+        let versions: Vec<(i64,)> =
+            sqlx::query_as("SELECT version FROM schema_version ORDER BY version")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        let versions: Vec<i64> = versions.into_iter().map(|v| v.0).collect();
+        assert_eq!(versions, (1..=34).collect::<Vec<i64>>());
+        let description: String =
+            sqlx::query_scalar("SELECT description FROM schema_version WHERE version = 8")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert!(
+            description.starts_with("items.id=302"),
+            "version 8 is recorded by shared_008.sql's own row, not the runner fallback: \
+             {description}"
+        );
+    }
+
     #[tokio::test]
     async fn keys_006_applies_on_top_of_a_keys_005_database() {
         let mut conn = make_test_conn().await;

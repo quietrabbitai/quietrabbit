@@ -285,8 +285,8 @@ pub async fn accept_persona_view_share(
         view_cache_store::init_meta_conn(
             &mut cache_conn,
             share_id,
-            &share.source_persona_display_name,
-            &share.source_persona_type,
+            &payload.source_persona_display_name,
+            &payload.source_persona_type,
         )
         .await?;
         view_cache_store::replace_content_conn(

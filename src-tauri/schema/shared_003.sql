@@ -38,22 +38,22 @@
 -- reference. Opaque identifier, trusted only because it arrived inside a
 -- real invitation envelope.
 --
--- group_display_name: so the recipient's accept-flow UI can identify what
--- they're being invited to before they've decrypted anything -- the
--- envelope itself (encrypted_group_key) reveals nothing until accepted.
+-- group_display_name and sender_label were plaintext columns here. They are
+-- user-authored text, and shared.db is readable without the password, so
+-- items.id=661 (decisions.id=862) moved both INSIDE the encrypted payload
+-- (auth/envelope_payload.rs, InvitationPayload). The row keeps ids, status and
+-- timestamps. A recipient who is not logged in sees that an invitation exists
+-- and nothing about it. This file is edited in place, which decisions.id=857
+-- allows until first ship.
 --
--- encrypted_group_key: the ciphertext -- the group's symmetric key,
--- encrypted specifically to this recipient Persona's public key
+-- encrypted_group_key: the ciphertext -- an InvitationPayload (the group's
+-- symmetric key, its display name and the sender's label; the column name
+-- predates the payload and is kept to limit churn), encrypted specifically to
+-- this recipient Persona's public key
 -- (Architecture/AUTH_MULTIUSER_ARCHITECTURE.md Section 4.3's asymmetric
 -- keypair mechanism). TEXT, matching this schema family's existing
 -- convention of storing encoded ciphertext/blob material as TEXT rather
 -- than BLOB (see integration_keys.db's own credential column).
---
--- sender_label: opaque, freeform identifier for who sent the invitation.
--- Deliberately NOT a FK to users/personas -- per design doc Section 2.1,
--- the sender may be a different QR install/instance entirely (household
--- and business-team members each run their own install), so there is no
--- local row to reference in the general case.
 --
 -- status / responded_at: exist so items.id=284's accept flow has somewhere
 -- to record the outcome -- no accept/decline logic is implemented by this
@@ -70,9 +70,7 @@ CREATE TABLE IF NOT EXISTS pending_group_invitations (
     id                      TEXT PRIMARY KEY,
     recipient_persona_id    TEXT NOT NULL REFERENCES personas(id) ON DELETE CASCADE,
     group_id                TEXT NOT NULL,
-    group_display_name      TEXT NOT NULL,
     encrypted_group_key     TEXT NOT NULL,
-    sender_label            TEXT NOT NULL,
     status                  TEXT NOT NULL DEFAULT 'pending'
                                 CHECK (status IN ('pending', 'accepted', 'declined')),
     created_at              TEXT NOT NULL,

@@ -42,10 +42,12 @@
 -- shared_003.sql's own header gives: group.db is a separate encrypted file,
 -- never tracked as a row in shared.db.
 --
--- sender_label (pending_group_key_rotations): matches
--- pending_group_invitations' column name for the same kind of field
--- (who/what initiated this), rather than inventing a differently-named
--- column for an identical purpose.
+-- sender_label (pending_group_key_rotations) was a plaintext column, written
+-- and never read. It is user-authored text and shared.db is readable without
+-- the password, so items.id=661 (decisions.id=862) moved it inside the
+-- encrypted payload (auth/envelope_payload.rs, RotationPayload), and the
+-- encrypted_group_key column holds that payload. This file is edited in place,
+-- which decisions.id=857 allows until first ship.
 --
 -- SCHEMA AUTHORING RULE (migrations.rs): no semicolons inside string
 -- literals -- parse_statements() is not a general-purpose SQL parser.
@@ -55,7 +57,6 @@ CREATE TABLE IF NOT EXISTS pending_group_key_rotations (
     recipient_persona_id    TEXT NOT NULL REFERENCES personas(id) ON DELETE CASCADE,
     group_id                TEXT NOT NULL,
     encrypted_group_key     TEXT NOT NULL,
-    sender_label            TEXT NOT NULL,
     status                  TEXT NOT NULL DEFAULT 'pending'
                                 CHECK (status IN ('pending', 'applied')),
     created_at              TEXT NOT NULL,

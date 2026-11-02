@@ -78,7 +78,12 @@ use crate::persistence::personal_store::{self, PersonalStoreError};
 /// (items.id=301+) is future work against a payload shape that doesn't
 /// exist yet elsewhere in this codebase -- this must be right the first
 /// time a consumer is built, not discovered as an afterthought.
-pub const PERSONA_SHARE_PAYLOAD_SCHEMA_VERSION: &str = "1.0";
+///
+/// "1.1" (items.id=661): the sender Persona's display name and type are part of
+/// the payload now. They used to be plaintext columns of pending_persona_shares
+/// in the unencrypted shared.db. Nothing reads this value back on decrypt, and
+/// there are no shipped users, so there is no "1.0" compatibility path.
+pub const PERSONA_SHARE_PAYLOAD_SCHEMA_VERSION: &str = "1.1";
 
 /// Which of decisions.id=617's two grant types a pending_persona_shares row
 /// is (items.id=304, decisions.id=723). Added to an already-shipped table
@@ -234,6 +239,10 @@ pub(crate) struct SharedVoiceProfileEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct PersonaSharePayload {
     pub(crate) schema_version: String,
+    /// The sender Persona's name and type, snapshotted at send time
+    /// (items.id=661: inside the ciphertext, not in plaintext shared.db).
+    pub(crate) source_persona_display_name: String,
+    pub(crate) source_persona_type: String,
     pub(crate) floor_consent_preference: Option<serde_json::Value>,
     pub(crate) entities: Vec<Entity>,
     pub(crate) entity_facts: Vec<SharedEntityFact>,
@@ -389,6 +398,8 @@ pub async fn send_persona_share(
 
     let payload = PersonaSharePayload {
         schema_version: PERSONA_SHARE_PAYLOAD_SCHEMA_VERSION.to_owned(),
+        source_persona_display_name: persona.display_name.clone(),
+        source_persona_type: persona.persona_type.clone(),
         floor_consent_preference,
         entities: active_entities,
         entity_facts,
@@ -409,16 +420,13 @@ pub async fn send_persona_share(
     let mut shared_conn = pool.acquire().await?;
     sqlx::query(
         "INSERT INTO pending_persona_shares
-         (id, recipient_user_id, source_persona_id, source_persona_display_name,
-          source_persona_type, payload_schema_version, encrypted_payload, status,
-          created_at, share_type)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+         (id, recipient_user_id, source_persona_id, payload_schema_version,
+          encrypted_payload, status, created_at, share_type)
+         VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
     )
     .bind(&id)
     .bind(recipient_user_id)
     .bind(source_persona_id)
-    .bind(&persona.display_name)
-    .bind(&persona.persona_type)
     .bind(PERSONA_SHARE_PAYLOAD_SCHEMA_VERSION)
     .bind(hex_encode(&envelope))
     .bind(&created_at)
@@ -438,8 +446,6 @@ pub async fn send_persona_share(
 // -- the fetch-by-(id, recipient)/pending-status logic is identical for both
 // grant types, only what happens to the decrypted payload afterward differs.
 pub(crate) struct PendingPersonaShareRow {
-    pub(crate) source_persona_display_name: String,
-    pub(crate) source_persona_type: String,
     pub(crate) encrypted_payload: String,
     /// "synced" | "view_only" (ShareType::as_str). accept_persona_share
     /// (this file) never reads this field -- it's SYNCED-only and doesn't
@@ -459,8 +465,7 @@ pub(crate) async fn fetch_pending_persona_share(
     conn: &mut SqliteConnection,
 ) -> Result<PendingPersonaShareRow, PersonaSharingError> {
     let row = sqlx::query(
-        "SELECT source_persona_display_name, source_persona_type, encrypted_payload, status,
-                share_type
+        "SELECT encrypted_payload, status, share_type
          FROM pending_persona_shares
          WHERE id = ? AND recipient_user_id = ?",
     )
@@ -476,8 +481,6 @@ pub(crate) async fn fetch_pending_persona_share(
     }
 
     Ok(PendingPersonaShareRow {
-        source_persona_display_name: row.try_get("source_persona_display_name")?,
-        source_persona_type: row.try_get("source_persona_type")?,
         encrypted_payload: row.try_get("encrypted_payload")?,
         share_type: row.try_get("share_type")?,
     })
@@ -678,8 +681,8 @@ pub async fn accept_persona_share(
         &mut keys_conn,
         &PersonaRegistryEntry {
             persona_id: persona_id.clone(),
-            display_name: share.source_persona_display_name.clone(),
-            persona_type: share.source_persona_type.clone(),
+            display_name: payload.source_persona_display_name.clone(),
+            persona_type: payload.source_persona_type.clone(),
             color: None,
             created_at: now.clone(),
         },
@@ -1004,6 +1007,53 @@ mod tests {
         assert_eq!(payload.entity_facts[0].field_value, "green");
         assert_eq!(payload.voice_profile_entries.len(), 1);
         assert_eq!(payload.voice_profile_entries[0].value, "direct");
+        // items.id=661: the sender Persona's name and type travel inside it.
+        assert_eq!(payload.source_persona_display_name, "Shared Persona");
+        assert_eq!(payload.source_persona_type, "personal");
+    }
+
+    /// items.id=661: no plaintext column carries the Persona's name or type,
+    /// and the name appears nowhere in the shared.db row.
+    #[tokio::test]
+    async fn the_shared_row_has_no_persona_name_or_type() {
+        let _env = setup().await;
+        let pool = &_env.pool;
+        let (owner_id, owner_persona, owner_key_hex, _) =
+            make_user_with_persona(pool, "Alice", 0x37).await;
+        let (recipient_id, _, _, _) = make_user_with_persona(pool, "Bob", 0x38).await;
+
+        let share_id = send_persona_share(
+            pool,
+            &owner_id,
+            &owner_persona,
+            &owner_key_hex,
+            &recipient_id,
+            ShareType::Synced,
+        )
+        .await
+        .unwrap();
+
+        let columns: Vec<(i64, String, String, i64, Option<String>, i64)> =
+            sqlx::query_as("PRAGMA table_info(pending_persona_shares)")
+                .fetch_all(pool)
+                .await
+                .unwrap();
+        for forbidden in ["source_persona_display_name", "source_persona_type"] {
+            assert!(
+                !columns.iter().any(|c| c.1 == forbidden),
+                "{forbidden} must not be a plaintext column"
+            );
+        }
+        let row = sqlx::query("SELECT * FROM pending_persona_shares WHERE id = ?")
+            .bind(&share_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        for i in 0..sqlx::Row::len(&row) {
+            if let Ok(text) = sqlx::Row::try_get::<String, _>(&row, i) {
+                assert!(!text.contains("Shared Persona"));
+            }
+        }
     }
 
     #[tokio::test]

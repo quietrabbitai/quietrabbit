@@ -8,6 +8,7 @@
 // commands/personal.rs.
 
 pub mod data_key;
+pub mod envelope_payload;
 pub mod epoch_guard;
 pub mod group_creation;
 pub mod group_invitations;

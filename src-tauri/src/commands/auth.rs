@@ -2629,6 +2629,7 @@ mod tests {
             group_id,
             &group_key_hex,
             &crate::providers::utils::now(),
+            None,
         )
         .await
         .expect("save_group_key must succeed");
@@ -2705,6 +2706,7 @@ mod tests {
             group_id,
             "not-valid-hex", // odd length AND non-hex characters
             &crate::providers::utils::now(),
+            None,
         )
         .await
         .expect(
@@ -2882,6 +2884,7 @@ mod tests {
                 group_id,
                 group_key_hex,
                 &crate::providers::utils::now(),
+                None,
             )
             .await
             .expect("save_group_key must succeed");

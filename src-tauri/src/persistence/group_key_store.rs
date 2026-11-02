@@ -38,6 +38,9 @@ pub struct GroupKeyRow {
     pub group_id: String,
     pub group_key_hex: String,
     pub created_at: String,
+    /// The group's name, written when the Persona joined (items.id=661). ''
+    /// for a row written before the column existed.
+    pub group_display_name: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -46,6 +49,11 @@ pub struct GroupKeyRow {
 
 /// Upsert one group's durable key for `persona_id`. See this module's own
 /// header for why upsert rather than plain INSERT.
+///
+/// `group_display_name` (items.id=661): the group's name, now kept here in the
+/// Persona's encrypted personal.db instead of in the plaintext shared.db
+/// invitation row. `Some` sets it (joining or creating a group), `None` leaves
+/// an existing name as it is (a key rotation changes the key, not the name).
 pub async fn save_group_key(
     user_id: &str,
     persona_id: &str,
@@ -53,19 +61,23 @@ pub async fn save_group_key(
     group_id: &str,
     group_key_hex: &str,
     created_at: &str,
+    group_display_name: Option<&str>,
 ) -> Result<(), PersonalStoreError> {
     let mut conn = open_personal_db(user_id, persona_id, key_hex).await?;
 
     sqlx::query(
-        "INSERT INTO group_keys (group_id, group_key_hex, created_at)
-         VALUES (?, ?, ?)
+        "INSERT INTO group_keys (group_id, group_key_hex, created_at, group_display_name)
+         VALUES (?, ?, ?, COALESCE(?, ''))
          ON CONFLICT(group_id) DO UPDATE SET
              group_key_hex = excluded.group_key_hex,
-             created_at = excluded.created_at",
+             created_at = excluded.created_at,
+             group_display_name = COALESCE(?, group_display_name)",
     )
     .bind(group_id)
     .bind(group_key_hex)
     .bind(created_at)
+    .bind(group_display_name)
+    .bind(group_display_name)
     .execute(&mut conn)
     .await?;
 
@@ -110,9 +122,11 @@ pub async fn list_group_keys(
 ) -> Result<Vec<GroupKeyRow>, PersonalStoreError> {
     let mut conn = open_personal_db(user_id, persona_id, key_hex).await?;
 
-    let rows = sqlx::query("SELECT group_id, group_key_hex, created_at FROM group_keys")
-        .fetch_all(&mut conn)
-        .await?;
+    let rows = sqlx::query(
+        "SELECT group_id, group_key_hex, created_at, group_display_name FROM group_keys",
+    )
+    .fetch_all(&mut conn)
+    .await?;
 
     let mut result = Vec::with_capacity(rows.len());
     for r in rows {
@@ -120,6 +134,7 @@ pub async fn list_group_keys(
             group_id: r.try_get("group_id")?,
             group_key_hex: r.try_get("group_key_hex")?,
             created_at: r.try_get("created_at")?,
+            group_display_name: r.try_get("group_display_name")?,
         });
     }
     Ok(result)
@@ -176,6 +191,7 @@ mod tests {
             "group-1",
             "aa11",
             "2026-01-01T00:00:00Z",
+            None,
         )
         .await
         .expect("save_group_key must succeed");
@@ -202,6 +218,7 @@ mod tests {
             "group-1",
             "aa11",
             "2026-01-01T00:00:00Z",
+            None,
         )
         .await
         .unwrap();
@@ -212,6 +229,7 @@ mod tests {
             "group-1",
             "bb22",
             "2026-02-02T00:00:00Z",
+            None,
         )
         .await
         .unwrap();
@@ -237,6 +255,7 @@ mod tests {
             "group-1",
             "aa11",
             "2026-01-01T00:00:00Z",
+            None,
         )
         .await
         .unwrap();
@@ -247,6 +266,7 @@ mod tests {
             "group-2",
             "cc33",
             "2026-01-02T00:00:00Z",
+            None,
         )
         .await
         .unwrap();
@@ -273,6 +293,7 @@ mod tests {
             "group-1",
             "aa11",
             "2026-01-01T00:00:00Z",
+            None,
         )
         .await
         .unwrap();
@@ -283,6 +304,7 @@ mod tests {
             "group-2",
             "cc33",
             "2026-01-02T00:00:00Z",
+            None,
         )
         .await
         .unwrap();

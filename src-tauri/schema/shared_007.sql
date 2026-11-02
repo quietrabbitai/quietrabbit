@@ -45,10 +45,13 @@
 -- personas/user_personas, reusing
 -- auth::group_invitations::resolve_persona_owner (already pub(crate)).
 --
--- source_persona_display_name: denormalized snapshot at send-time, same
--- reasoning as pending_group_invitations.group_display_name -- a future
--- accept-flow UI (items.id=301+) can identify what's being shared without
--- resolving anything or decrypting the envelope first.
+-- source_persona_display_name was a plaintext snapshot column here (and
+-- source_persona_type another, added by shared_008.sql). A Persona's name and
+-- type are the domain information contextual separation protects and shared.db
+-- is readable without the password, so items.id=661 (decisions.id=862) moved
+-- both inside the encrypted payload (PersonaSharePayload). A recipient reads
+-- them by decrypting at accept time. This file is edited in place, which
+-- decisions.id=857 allows until first ship.
 --
 -- payload_schema_version: materialization is explicit future work
 -- (items.id=301+), so the envelope's plaintext shape must be versioned now
@@ -78,7 +81,6 @@ CREATE TABLE IF NOT EXISTS pending_persona_shares (
                                         REFERENCES users(id) ON DELETE CASCADE,
     source_persona_id               TEXT NOT NULL
                                         REFERENCES personas(id) ON DELETE CASCADE,
-    source_persona_display_name     TEXT NOT NULL,
     payload_schema_version          TEXT NOT NULL,
     encrypted_payload               TEXT NOT NULL,
     status                          TEXT NOT NULL DEFAULT 'pending'

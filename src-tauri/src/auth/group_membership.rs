@@ -99,6 +99,9 @@ use sqlx::SqliteConnection;
 use thiserror::Error;
 use x25519_dalek::StaticSecret;
 
+use crate::auth::envelope_payload::{
+    decode_rotation, encode_rotation, EnvelopePayloadError, RotationPayload,
+};
 use crate::auth::group_invitations::{self, GroupInvitationError};
 use crate::auth::kdf;
 use crate::auth::registry::{GroupKeyRegistry, KeyRegistry, UnlockedGroupKey};
@@ -126,8 +129,10 @@ pub enum GroupMembershipError {
     RandomSource(String),
     #[error("Rotation '{0}' has a stored encrypted_group_key that is not valid hex")]
     CorruptStoredEnvelope(String),
-    #[error("Rotation '{0}' decrypted to a group key of the wrong length")]
-    CorruptGroupKey(String),
+    #[error("Rotation '{0}' decrypted to a payload that is not a valid rotation: {1}")]
+    CorruptPayload(String, EnvelopePayloadError),
+    #[error("Could not build the rotation payload: {0}")]
+    Payload(#[from] EnvelopePayloadError),
     #[error("Invalid departure reason '{0}' -- must be 'left' or 'removed'")]
     InvalidReason(String),
     #[error("Failed to durably persist group key: {0}")]
@@ -389,20 +394,23 @@ async fn remove_member_inner(
         let recipient_public_key = sharing_keypair::get_public_key(pool, &owner_user_id)
             .await?
             .ok_or_else(|| GroupMembershipError::RecipientHasNoSharingKey(owner_user_id.clone()))?;
-        let envelope =
-            sharing_keypair::encrypt_to_public_key(&recipient_public_key, &new_group_key)?;
+        // The sender's label is inside the encrypted payload, not in a
+        // plaintext column of shared.db (items.id=661).
+        let payload = encode_rotation(&RotationPayload {
+            group_key: new_group_key,
+            sender_label: sender_label.to_owned(),
+        })?;
+        let envelope = sharing_keypair::encrypt_to_public_key(&recipient_public_key, &payload)?;
 
         sqlx::query(
             "INSERT INTO pending_group_key_rotations
-             (id, recipient_persona_id, group_id, encrypted_group_key, sender_label,
-              status, created_at)
-             VALUES (?, ?, ?, ?, ?, 'pending', ?)",
+             (id, recipient_persona_id, group_id, encrypted_group_key, status, created_at)
+             VALUES (?, ?, ?, ?, 'pending', ?)",
         )
         .bind(uuid::Uuid::new_v4().to_string())
         .bind(&member_persona_id)
         .bind(group_id)
         .bind(hex_encode(&envelope))
-        .bind(sender_label)
         .bind(crate::providers::utils::now())
         .execute(&mut *conn)
         .await?;
@@ -475,9 +483,9 @@ pub async fn apply_pending_rotations(
 
         let envelope = hex_decode(&rotation_id, &encrypted_hex)?;
         let plaintext = sharing_keypair::decrypt_own_envelope(sharing_private_key, &envelope)?;
-        let new_group_key: [u8; kdf::MASTER_KEY_LEN] = plaintext
-            .try_into()
-            .map_err(|_| GroupMembershipError::CorruptGroupKey(rotation_id.clone()))?;
+        let new_group_key: [u8; kdf::MASTER_KEY_LEN] = decode_rotation(&plaintext)
+            .map_err(|e| GroupMembershipError::CorruptPayload(rotation_id.clone(), e))?
+            .group_key;
         let new_key_hex = crate::auth::registry::key_hex(&new_group_key);
 
         // See this fn's own doc comment (PERSONAL.DB DURABLE WRITE) -- must
@@ -489,6 +497,7 @@ pub async fn apply_pending_rotations(
             &group_id,
             &new_key_hex,
             &crate::providers::utils::now(),
+            None,
         )
         .await?;
 
@@ -832,11 +841,102 @@ mod tests {
 
         let envelope = hex_decode("test", &rows[0].1).unwrap();
         let decrypted = sharing_keypair::decrypt_own_envelope(&c_private_key, &envelope).unwrap();
+        let payload = decode_rotation(&decrypted).expect("a rotation payload");
         assert_ne!(
-            decrypted, group_key,
+            payload.group_key, group_key,
             "rotated key must be freshly generated, not the original group key resent"
         );
-        assert_eq!(decrypted.len(), kdf::MASTER_KEY_LEN);
+        // items.id=661: the label is inside the ciphertext.
+        assert_eq!(payload.sender_label, sender_persona);
+
+        let columns: Vec<(i64, String, String, i64, Option<String>, i64)> =
+            sqlx::query_as("PRAGMA table_info(pending_group_key_rotations)")
+                .fetch_all(&mut *conn)
+                .await
+                .unwrap();
+        assert!(
+            !columns.iter().any(|c| c.1 == "sender_label"),
+            "no plaintext sender_label column"
+        );
+    }
+
+    /// A rotation envelope holding just a key (the old format) is not applied:
+    /// the row stays pending and the registry keeps the old key.
+    #[tokio::test]
+    async fn a_bare_key_rotation_envelope_is_refused_and_stays_pending() {
+        let _env = setup().await;
+        let pool = &_env.pool;
+        let (_s_user, sender_persona, _) = make_user_with_persona(pool, "Sender", 0xc1).await;
+        let (_b_user, b_persona, b_private_key) = make_user_with_persona(pool, "Bob", 0xc2).await;
+
+        let group_id = "group-bare-rotation-1";
+        let group_key = [0xc3u8; kdf::MASTER_KEY_LEN];
+        let registry = GroupKeyRegistry::default();
+        let invitation = group_invitations::send_invitation(
+            pool,
+            &b_persona,
+            group_id,
+            "Test Group",
+            &sender_persona,
+            &group_key,
+        )
+        .await
+        .unwrap();
+        group_invitations::accept_invitation(
+            pool,
+            &invitation,
+            &b_persona,
+            &b_private_key,
+            &registry,
+            PERSONAL_KEY_HEX,
+        )
+        .await
+        .unwrap();
+
+        let public = x25519_dalek::PublicKey::from(&b_private_key);
+        let bare = sharing_keypair::encrypt_to_public_key(
+            public.as_bytes(),
+            &[0xc4u8; kdf::MASTER_KEY_LEN],
+        )
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO pending_group_key_rotations
+             (id, recipient_persona_id, group_id, encrypted_group_key, status, created_at)
+             VALUES ('rot-bare', ?, ?, ?, 'pending', '2026-01-01T00:00:00Z')",
+        )
+        .bind(&b_persona)
+        .bind(group_id)
+        .bind(hex_encode(&bare))
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let result = apply_pending_rotations(
+            pool,
+            &b_persona,
+            &registry,
+            &b_private_key,
+            PERSONAL_KEY_HEX,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(GroupMembershipError::CorruptPayload(_, _))),
+            "{result:?}"
+        );
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM pending_group_key_rotations WHERE id = 'rot-bare'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "pending");
+        assert_eq!(
+            registry
+                .with_key(&b_persona, group_id, |k| k.group_key)
+                .await,
+            Some(group_key),
+            "the old key is still resident"
+        );
     }
 
     /// items.id=822: when remove_member's RELEASE fails (a deferred foreign

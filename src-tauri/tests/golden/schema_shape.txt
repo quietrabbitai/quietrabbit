@@ -833,9 +833,7 @@ TABLE pending_group_invitations
   id TEXT notnull=0 pk=1 default=None
   recipient_persona_id TEXT notnull=1 pk=0 default=None
   group_id TEXT notnull=1 pk=0 default=None
-  group_display_name TEXT notnull=1 pk=0 default=None
   encrypted_group_key TEXT notnull=1 pk=0 default=None
-  sender_label TEXT notnull=1 pk=0 default=None
   status TEXT notnull=1 pk=0 default=Some("'pending'")
   created_at TEXT notnull=1 pk=0 default=None
   responded_at TEXT notnull=0 pk=0 default=None
@@ -845,7 +843,6 @@ TABLE pending_group_key_rotations
   recipient_persona_id TEXT notnull=1 pk=0 default=None
   group_id TEXT notnull=1 pk=0 default=None
   encrypted_group_key TEXT notnull=1 pk=0 default=None
-  sender_label TEXT notnull=1 pk=0 default=None
   status TEXT notnull=1 pk=0 default=Some("'pending'")
   created_at TEXT notnull=1 pk=0 default=None
   applied_at TEXT notnull=0 pk=0 default=None
@@ -854,14 +851,12 @@ TABLE pending_persona_shares
   id TEXT notnull=0 pk=1 default=None
   recipient_user_id TEXT notnull=1 pk=0 default=None
   source_persona_id TEXT notnull=1 pk=0 default=None
-  source_persona_display_name TEXT notnull=1 pk=0 default=None
   payload_schema_version TEXT notnull=1 pk=0 default=None
   encrypted_payload TEXT notnull=1 pk=0 default=None
   status TEXT notnull=1 pk=0 default=Some("'pending'")
   created_at TEXT notnull=1 pk=0 default=None
   responded_at TEXT notnull=0 pk=0 default=None
   extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
-  source_persona_type TEXT notnull=1 pk=0 default=Some("'personal'")
   materialized_persona_id TEXT notnull=0 pk=0 default=None
   share_type TEXT notnull=1 pk=0 default=Some("'synced'")
   revoked_at TEXT notnull=0 pk=0 default=None

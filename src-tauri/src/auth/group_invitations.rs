@@ -54,6 +54,16 @@
 // after populating the registry; commands::auth::finish_login reads it back
 // at login to rehydrate the registry.
 //
+// ENVELOPE CONTENT (items.id=661, decisions.id=862): the encrypted payload is
+// an envelope_payload::InvitationPayload (the group key, the group's display
+// name and the sender's label), not the bare key. shared.db is readable without
+// the password, so the name and label are NOT stored in plaintext columns any
+// more: the pending_group_invitations row keeps ids, status and timestamps, and
+// its `encrypted_group_key` column (name kept to limit churn) holds the whole
+// payload. A recipient reads the name and label only by decrypting with their
+// own resident sharing key (list_pending_invitations takes it), and the name
+// becomes durable in the Persona's encrypted personal.db at accept time.
+//
 // QUERY STYLE: runtime sqlx::query() only -- no query!() macros. shared.db
 // is unencrypted -- no PRAGMA key required (same as persona_store.rs).
 
@@ -62,6 +72,9 @@ use sqlx::SqliteConnection;
 use thiserror::Error;
 use x25519_dalek::StaticSecret;
 
+use crate::auth::envelope_payload::{
+    decode_invitation, encode_invitation, EnvelopePayloadError, InvitationPayload,
+};
 use crate::auth::kdf;
 use crate::auth::registry::{GroupKeyRegistry, UnlockedGroupKey};
 use crate::auth::sharing_keypair::{self, SharingKeypairError};
@@ -82,8 +95,10 @@ pub enum GroupInvitationError {
     RecipientHasNoSharingKey(String),
     #[error("Invitation '{0}' has a stored encrypted_group_key that is not valid hex")]
     CorruptStoredEnvelope(String),
-    #[error("Invitation '{0}' decrypted to a group key of the wrong length")]
-    CorruptGroupKey(String),
+    #[error("Invitation '{0}' decrypted to a payload that is not a valid invitation: {1}")]
+    CorruptPayload(String, EnvelopePayloadError),
+    #[error("Could not build the invitation payload: {0}")]
+    Payload(#[from] EnvelopePayloadError),
     #[error("Invitation '{0}' not found")]
     NotFound(String),
     #[error("Invitation '{0}' is not pending (status: {1})")]
@@ -144,12 +159,15 @@ pub(crate) async fn resolve_persona_owner(
 // Data type
 // ---------------------------------------------------------------------------
 
+/// One pending invitation as the recipient sees it. The name and label come
+/// from decrypting the envelope, so they are None when this install cannot open
+/// it (the sharing key rotated since it was sent, or the payload is damaged).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PendingInvitation {
     pub id: String,
     pub group_id: String,
-    pub group_display_name: String,
-    pub sender_label: String,
+    pub group_display_name: Option<String>,
+    pub sender_label: Option<String>,
     pub created_at: String,
 }
 
@@ -187,24 +205,25 @@ pub async fn send_invitation(
         .await?
         .ok_or_else(|| GroupInvitationError::RecipientHasNoSharingKey(owner_user_id.clone()))?;
 
-    let envelope =
-        sharing_keypair::encrypt_to_public_key(&recipient_public_key, group_symmetric_key)?;
+    let payload = encode_invitation(&InvitationPayload {
+        group_key: *group_symmetric_key,
+        group_display_name: group_display_name.to_owned(),
+        sender_label: sender_label.to_owned(),
+    })?;
+    let envelope = sharing_keypair::encrypt_to_public_key(&recipient_public_key, &payload)?;
 
     let id = uuid::Uuid::new_v4().to_string();
     let created_at = crate::providers::utils::now();
 
     sqlx::query(
         "INSERT INTO pending_group_invitations
-         (id, recipient_persona_id, group_id, group_display_name,
-          encrypted_group_key, sender_label, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
+         (id, recipient_persona_id, group_id, encrypted_group_key, status, created_at)
+         VALUES (?, ?, ?, ?, 'pending', ?)",
     )
     .bind(&id)
     .bind(recipient_persona_id)
     .bind(group_id)
-    .bind(group_display_name)
     .bind(hex_encode(&envelope))
-    .bind(sender_label)
     .bind(&created_at)
     .execute(&mut *conn)
     .await?;
@@ -220,11 +239,12 @@ pub async fn send_invitation(
 pub async fn list_pending_invitations(
     pool: &sqlx::SqlitePool,
     recipient_persona_id: &str,
+    sharing_private_key: &StaticSecret,
 ) -> Result<Vec<PendingInvitation>, GroupInvitationError> {
     let mut conn = pool.acquire().await?;
 
     let rows = sqlx::query(
-        "SELECT id, group_id, group_display_name, sender_label, created_at
+        "SELECT id, group_id, encrypted_group_key, created_at
          FROM pending_group_invitations
          WHERE recipient_persona_id = ? AND status = 'pending'
          ORDER BY created_at",
@@ -233,16 +253,27 @@ pub async fn list_pending_invitations(
     .fetch_all(&mut *conn)
     .await?;
 
-    Ok(rows
-        .into_iter()
-        .map(|r| PendingInvitation {
-            id: r.get("id"),
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        let id: String = r.get("id");
+        let stored: String = r.get("encrypted_group_key");
+        // A row this install cannot open still lists, without its text: the
+        // user can see an invitation exists and decline it.
+        let opened = hex_decode(&id, &stored)
+            .ok()
+            .and_then(|envelope| {
+                sharing_keypair::decrypt_own_envelope(sharing_private_key, &envelope).ok()
+            })
+            .and_then(|plaintext| decode_invitation(&plaintext).ok());
+        out.push(PendingInvitation {
+            id,
             group_id: r.get("group_id"),
-            group_display_name: r.get("group_display_name"),
-            sender_label: r.get("sender_label"),
+            group_display_name: opened.as_ref().map(|p| p.group_display_name.clone()),
+            sender_label: opened.as_ref().map(|p| p.sender_label.clone()),
             created_at: r.get("created_at"),
-        })
-        .collect())
+        });
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -326,9 +357,12 @@ pub async fn accept_invitation(
     let envelope = hex_decode(invitation_id, &invitation.encrypted_group_key)?;
     let plaintext = sharing_keypair::decrypt_own_envelope(sharing_private_key, &envelope)?;
 
-    let group_key: [u8; kdf::MASTER_KEY_LEN] = plaintext
-        .try_into()
-        .map_err(|_| GroupInvitationError::CorruptGroupKey(invitation_id.to_owned()))?;
+    let payload = decode_invitation(&plaintext)
+        .map_err(|e| GroupInvitationError::CorruptPayload(invitation_id.to_owned(), e))?;
+    // The payload wipes its key on drop, so it cannot be partly moved out of:
+    // copy the key and clone the name.
+    let group_key: [u8; kdf::MASTER_KEY_LEN] = payload.group_key;
+    let group_display_name = payload.group_display_name.clone();
 
     let unlocked_at = crate::providers::utils::now();
     group_key_registry
@@ -357,6 +391,7 @@ pub async fn accept_invitation(
         &invitation.group_id,
         &crate::auth::registry::key_hex(&group_key),
         &unlocked_at,
+        Some(&group_display_name),
     )
     .await?;
 
@@ -454,6 +489,7 @@ mod tests {
     use super::*;
     use crate::persistence::persona_store;
     use crate::test_support::ENV_MUTEX;
+    use sqlx::Column;
 
     const PERSONAL_KEY_HEX: &str =
         "aabbccddeeff00112233445566778899aabbccddeeff0011223344556677aabb";
@@ -558,12 +594,19 @@ mod tests {
         .await
         .expect("send_invitation must succeed");
 
-        let pending = list_pending_invitations(pool, &recipient_persona)
+        let pending = list_pending_invitations(pool, &recipient_persona, &recipient_private_key)
             .await
             .expect("list_pending_invitations must succeed");
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, invitation_id);
-        assert_eq!(pending[0].group_display_name, "Family Documents");
+        assert_eq!(
+            pending[0].group_display_name.as_deref(),
+            Some("Family Documents")
+        );
+        assert_eq!(
+            pending[0].sender_label.as_deref(),
+            Some(sender_persona.as_str())
+        );
 
         let registry = GroupKeyRegistry::default();
         accept_invitation(
@@ -583,9 +626,10 @@ mod tests {
         assert_eq!(stored_key, Some(group_key));
 
         // Accepted invitation must no longer show up as pending.
-        let pending_after = list_pending_invitations(pool, &recipient_persona)
-            .await
-            .expect("list_pending_invitations must succeed");
+        let pending_after =
+            list_pending_invitations(pool, &recipient_persona, &recipient_private_key)
+                .await
+                .expect("list_pending_invitations must succeed");
         assert!(pending_after.is_empty());
     }
 
@@ -640,6 +684,137 @@ mod tests {
             rows[0].group_key_hex,
             crate::auth::registry::key_hex(&group_key)
         );
+        // items.id=661: the group's name is durable in the Persona's
+        // encrypted personal.db once the invitation is accepted.
+        assert_eq!(rows[0].group_display_name, "Durable Test Group");
+    }
+
+    /// items.id=661: the name and label are inside the ciphertext. The
+    /// shared.db row has no column for either, and a distinctive name and label
+    /// appear nowhere in it, in plaintext or hex.
+    #[tokio::test]
+    async fn the_name_and_label_are_not_in_any_plaintext_column() {
+        let _env = setup().await;
+        let pool = &_env.pool;
+        let (_s, sender_persona, _) = make_user_with_persona(pool, "Alice", 0xB1).await;
+        let (_r, recipient_persona, _) = make_user_with_persona(pool, "Bob", 0xB2).await;
+
+        let invitation_id = send_invitation(
+            pool,
+            &recipient_persona,
+            "group-9",
+            "SENTINEL-GROUP-NAME",
+            "SENTINEL-SENDER-LABEL",
+            &[0x42u8; kdf::MASTER_KEY_LEN],
+        )
+        .await
+        .unwrap();
+        let _ = sender_persona;
+
+        let columns: Vec<(i64, String, String, i64, Option<String>, i64)> =
+            sqlx::query_as("PRAGMA table_info(pending_group_invitations)")
+                .fetch_all(pool)
+                .await
+                .unwrap();
+        let names: Vec<&str> = columns.iter().map(|c| c.1.as_str()).collect();
+        assert!(!names.contains(&"group_display_name"), "{names:?}");
+        assert!(!names.contains(&"sender_label"), "{names:?}");
+
+        let row = sqlx::query("SELECT * FROM pending_group_invitations WHERE id = ?")
+            .bind(&invitation_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        for c in sqlx::Row::columns(&row) {
+            let text: Option<String> = sqlx::Row::try_get(&row, c.ordinal()).ok();
+            if let Some(text) = text {
+                assert!(!text.contains("SENTINEL"), "column {} leaks", c.name());
+                // Hex of the plaintext would also be a leak.
+                assert!(!text.contains(&hex_encode(b"SENTINEL-GROUP-NAME")));
+            }
+        }
+    }
+
+    /// A row this install cannot open still lists, with no text.
+    #[tokio::test]
+    async fn an_invitation_that_cannot_be_opened_lists_without_its_text() {
+        let _env = setup().await;
+        let pool = &_env.pool;
+        let (_s, sender_persona, _) = make_user_with_persona(pool, "Alice", 0xB3).await;
+        let (_r, recipient_persona, _) = make_user_with_persona(pool, "Bob", 0xB4).await;
+        send_invitation(
+            pool,
+            &recipient_persona,
+            "group-10",
+            "Hidden Name",
+            &sender_persona,
+            &[0x43u8; kdf::MASTER_KEY_LEN],
+        )
+        .await
+        .unwrap();
+
+        let stranger = StaticSecret::from([0x5au8; 32]);
+        let listed = list_pending_invitations(pool, &recipient_persona, &stranger)
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].group_display_name, None);
+        assert_eq!(listed[0].sender_label, None);
+    }
+
+    /// The old format (a bare 32-byte key) is not accepted: nothing parses it
+    /// as an invitation, and the row stays pending.
+    #[tokio::test]
+    async fn a_bare_key_envelope_is_refused_and_leaves_the_row_pending() {
+        let _env = setup().await;
+        let pool = &_env.pool;
+        let (_s, sender_persona, _) = make_user_with_persona(pool, "Alice", 0xB5).await;
+        let (_r, recipient_persona, recipient_private_key) =
+            make_user_with_persona(pool, "Bob", 0xB6).await;
+        let invitation_id = send_invitation(
+            pool,
+            &recipient_persona,
+            "group-11",
+            "X",
+            &sender_persona,
+            &[0x44u8; kdf::MASTER_KEY_LEN],
+        )
+        .await
+        .unwrap();
+
+        // Replace the stored envelope with one holding just the key.
+        let public = x25519_dalek::PublicKey::from(&recipient_private_key);
+        let legacy = sharing_keypair::encrypt_to_public_key(
+            public.as_bytes(),
+            &[0x44u8; kdf::MASTER_KEY_LEN],
+        )
+        .unwrap();
+        sqlx::query("UPDATE pending_group_invitations SET encrypted_group_key = ? WHERE id = ?")
+            .bind(hex_encode(&legacy))
+            .bind(&invitation_id)
+            .execute(pool)
+            .await
+            .unwrap();
+
+        let registry = GroupKeyRegistry::default();
+        let result = accept_invitation(
+            pool,
+            &invitation_id,
+            &recipient_persona,
+            &recipient_private_key,
+            &registry,
+            PERSONAL_KEY_HEX,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(GroupInvitationError::CorruptPayload(_, _))),
+            "{result:?}"
+        );
+        let pending = list_pending_invitations(pool, &recipient_persona, &recipient_private_key)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].group_display_name, None);
     }
 
     #[tokio::test]
@@ -647,7 +822,7 @@ mod tests {
         let _env = setup().await;
         let pool = &_env.pool;
         let (_sender_user, sender_persona, _) = make_user_with_persona(pool, "Alice", 0x33).await;
-        let (_recipient_user, recipient_persona, _recipient_private_key) =
+        let (_recipient_user, recipient_persona, recipient_private_key) =
             make_user_with_persona(pool, "Bob", 0x44).await;
 
         let group_key = [0x77u8; kdf::MASTER_KEY_LEN];
@@ -669,7 +844,7 @@ mod tests {
         let registry = GroupKeyRegistry::default();
         assert!(!registry.is_occupied(&recipient_persona, "group-2").await);
 
-        let pending = list_pending_invitations(pool, &recipient_persona)
+        let pending = list_pending_invitations(pool, &recipient_persona, &recipient_private_key)
             .await
             .expect("list_pending_invitations must succeed");
         assert!(
@@ -739,7 +914,7 @@ mod tests {
         );
 
         // Row must still be pending -- accept must not have mutated it.
-        let pending = list_pending_invitations(pool, &recipient_persona)
+        let pending = list_pending_invitations(pool, &recipient_persona, &recipient_private_key)
             .await
             .expect("list_pending_invitations must succeed");
         assert_eq!(pending.len(), 1, "tampered accept must leave row pending");

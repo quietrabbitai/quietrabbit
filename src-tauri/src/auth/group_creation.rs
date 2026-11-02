@@ -54,6 +54,7 @@
 
 use thiserror::Error;
 
+use crate::auth::envelope_payload::{encode_invitation, EnvelopePayloadError, InvitationPayload};
 use crate::auth::group_invitations::{self, GroupInvitationError};
 use crate::auth::kdf;
 use crate::auth::registry::{key_hex, GroupKeyRegistry, KeyRegistry, UnlockedGroupKey};
@@ -74,6 +75,8 @@ pub enum GroupCreationError {
     Sharing(#[from] SharingKeypairError),
     #[error("Failed to durably persist group key: {0}")]
     PersonalStore(#[from] PersonalStoreError),
+    #[error("Could not build the invitation payload: {0}")]
+    Payload(#[from] EnvelopePayloadError),
     #[error("Could not generate random bytes: {0}")]
     RandomSource(String),
     #[error("No account is currently logged in")]
@@ -159,6 +162,7 @@ pub async fn create_group(
         &group_id,
         &group_key_hex,
         &unlocked_at,
+        Some(group_display_name),
     )
     .await?;
 
@@ -168,22 +172,29 @@ pub async fn create_group(
     let creator_public_key = sharing_keypair::get_public_key(pool, &current_user_id)
         .await?
         .ok_or_else(|| GroupCreationError::CreatorHasNoSharingKey(current_user_id.clone()))?;
-    let envelope = sharing_keypair::encrypt_to_public_key(&creator_public_key, &group_key)?;
+    // The creator's own row carries the same payload as any invitation, so the
+    // group name and label are inside the ciphertext, not in plaintext columns
+    // of shared.db (items.id=661). The name is also in the creator's encrypted
+    // personal.db (group_keys.group_display_name, saved above).
+    let payload = encode_invitation(&InvitationPayload {
+        group_key,
+        group_display_name: group_display_name.to_owned(),
+        sender_label: creator_label.to_owned(),
+    })?;
+    let envelope = sharing_keypair::encrypt_to_public_key(&creator_public_key, &payload)?;
 
     let invitation_id = uuid::Uuid::new_v4().to_string();
     let now = crate::providers::utils::now();
     sqlx::query(
         "INSERT INTO pending_group_invitations
-         (id, recipient_persona_id, group_id, group_display_name,
-          encrypted_group_key, sender_label, status, created_at, responded_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'accepted', ?, ?)",
+         (id, recipient_persona_id, group_id, encrypted_group_key, status,
+          created_at, responded_at)
+         VALUES (?, ?, ?, ?, 'accepted', ?, ?)",
     )
     .bind(&invitation_id)
     .bind(creator_persona_id)
     .bind(&group_id)
-    .bind(group_display_name)
     .bind(hex_encode(&envelope))
-    .bind(creator_label)
     .bind(&now)
     .bind(&now)
     .execute(&mut *shared_conn)
@@ -354,6 +365,61 @@ mod tests {
             .expect("list_group_keys must succeed");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].group_id, group_id);
+        // items.id=661: the group's name is durable in the creator's
+        // encrypted personal.db, its only home besides the sealed envelope.
+        assert_eq!(rows[0].group_display_name, "The Household");
+    }
+
+    /// items.id=661: the creator's own self-accepted row carries the name and
+    /// label inside the ciphertext, with no plaintext column for either.
+    #[tokio::test]
+    async fn the_creators_row_holds_the_name_and_label_only_inside_the_ciphertext() {
+        let _env = setup().await;
+        let pool = &_env.pool;
+        let key_registry = KeyRegistry::default();
+        let group_key_registry = GroupKeyRegistry::default();
+        let (user_id, persona_id) =
+            make_logged_in_user_with_persona(pool, "Frank", 0x66, &key_registry).await;
+
+        let group_id = create_group(
+            pool,
+            &persona_id,
+            "SENTINEL-GROUP-NAME",
+            "SENTINEL-CREATOR-LABEL",
+            &group_key_registry,
+            &key_registry,
+        )
+        .await
+        .expect("create_group must succeed");
+
+        let columns: Vec<(i64, String, String, i64, Option<String>, i64)> =
+            sqlx::query_as("PRAGMA table_info(pending_group_invitations)")
+                .fetch_all(pool)
+                .await
+                .unwrap();
+        assert!(!columns
+            .iter()
+            .any(|c| c.1 == "group_display_name" || c.1 == "sender_label"));
+
+        let (stored,): (String,) = sqlx::query_as(
+            "SELECT encrypted_group_key FROM pending_group_invitations WHERE group_id = ?",
+        )
+        .bind(&group_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(!stored.contains(&hex_encode(b"SENTINEL")));
+
+        let master_key = [0x66u8; kdf::MASTER_KEY_LEN];
+        let (private_key, _) = sharing_keypair::derive_sharing_keypair(&master_key, &user_id, 1);
+        let envelope: Vec<u8> = (0..stored.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&stored[i..i + 2], 16).unwrap())
+            .collect();
+        let plaintext = sharing_keypair::decrypt_own_envelope(&private_key, &envelope).unwrap();
+        let payload = crate::auth::envelope_payload::decode_invitation(&plaintext).unwrap();
+        assert_eq!(payload.group_display_name, "SENTINEL-GROUP-NAME");
+        assert_eq!(payload.sender_label, "SENTINEL-CREATOR-LABEL");
     }
 
     #[tokio::test]
