@@ -265,6 +265,71 @@ pub fn initialize_cef_with_pump_setting(
 
 // --- App / command-line handling ---
 
+/// Chromium switches that stop the browser's own background network traffic
+/// (items.id=622). A net-log of an idle CEF 151 with none of these showed
+/// calls to clients2.google.com and update.googleapis.com (component
+/// updater, the latter also fetching from edgedl.me.gvt1.com), plus
+/// accounts.google.com, safebrowsing.googleapis.com and the
+/// www.google.com AI Mode eligibility check, with no pane open and nobody
+/// signed in. Page-driven traffic from a provider's own site is not covered
+/// and is not meant to be.
+///
+/// Known remainder: one POST to accounts.google.com/ListAccounts at startup
+/// (the browser profile's Google account cookie check). Nothing tried removes
+/// it (disable-sync, signin.allowed=false in a seeded profile, a seeded
+/// gaia_cookie report time, --incognito, AvoidAutoTriggerListAccountsOnStale,
+/// several feature names), and it does not repeat while idle. Revisit with the
+/// profile replacement in items.id=622 part 2b.
+const BACKGROUND_NETWORK_SWITCHES: &[&str] = &[
+    "disable-background-networking",
+    "disable-component-update",
+    "disable-domain-reliability",
+    "no-pings",
+    "disable-sync",
+    "metrics-recording-only",
+    "disable-default-apps",
+];
+
+/// Features turned off through `--disable-features` (names verified against
+/// the strings of the libcef 151 binary).
+///
+/// - SoftNavigationDetection: crash workaround proven in items.id=192/195/196/
+///   198/199/200/201. ReadAnythingSoftNavigationObserver::OnSoftNavigation()
+///   calls tabs::TabInterface::GetFromContents(), null in CEF's tabless model,
+///   SIGSEGV on any SPA soft navigation, and every provider QR intends to
+///   embed is an SPA.
+/// - AutofillServerCommunication: Autofill's server queries. Any page with a
+///   form (a provider's prompt box) makes the browser GET
+///   content-autofill.googleapis.com/v1/pages/..., sending Google a hash of
+///   the page's form structure. Page-driven, so the background switches above
+///   do not cover it.
+/// - NetworkTimeServiceQuerying: the network time tracker's GET to
+///   clients2.google.com/time/1/current, sent at every startup.
+/// - AimEnabled, AimServerRequestOnStartupEnabled,
+///   AimServerRequestOnIdentityChangeEnabled: the AI Mode eligibility service
+///   (AimEligibilityService) fetches www.google.com/async/folae at every
+///   startup, whatever is on screen.
+const DISABLED_FEATURES: &[&str] = &[
+    "SoftNavigationDetection",
+    "AutofillServerCommunication",
+    "NetworkTimeServiceQuerying",
+    "AimEnabled",
+    "AimServerRequestOnStartupEnabled",
+    "AimServerRequestOnIdentityChangeEnabled",
+];
+
+/// `existing` (a comma-separated `--disable-features` value, possibly empty)
+/// with each of `wanted` added once. Existing entries keep their order.
+fn merge_disabled_features(existing: &str, wanted: &[&str]) -> String {
+    let mut features: Vec<&str> = existing.split(',').filter(|f| !f.is_empty()).collect();
+    for name in wanted {
+        if !features.contains(name) {
+            features.push(name);
+        }
+    }
+    features.join(",")
+}
+
 /// Environment variable that turns on the GPU diagnostic logging switches in
 /// a debug build (items.id=646). Ignored by release builds.
 #[cfg(any(debug_assertions, test))]
@@ -313,13 +378,9 @@ wrap_app! {
         ) {
             let Some(command_line) = command_line else { return; };
 
-            // Crash workaround proven in items.id=192/195/196/198/199/200/201:
-            // ReadAnythingSoftNavigationObserver::OnSoftNavigation() calls
-            // tabs::TabInterface::GetFromContents(), null in CEF's tabless
-            // model, SIGSEGV on any SPA soft navigation -- every provider QR
-            // intends to embed is an SPA. Merge into any existing
-            // disable-features value rather than overwrite, since Chromium's
-            // CommandLine takes the last value for a switch.
+            // Merge into any existing disable-features value rather than
+            // overwrite, since Chromium's CommandLine takes the last value for
+            // a switch. See DISABLED_FEATURES for what is switched off and why.
             let df_switch = cef::CefString::from("disable-features");
             let existing = if command_line.has_switch(Some(&df_switch)) != 0 {
                 let v: cef::CefString = (&command_line.switch_value(Some(&df_switch))).into();
@@ -327,14 +388,14 @@ wrap_app! {
             } else {
                 String::new()
             };
-            let merged = if existing.is_empty() {
-                "SoftNavigationDetection".to_string()
-            } else if existing.split(',').any(|f| f == "SoftNavigationDetection") {
-                existing
-            } else {
-                format!("{existing},SoftNavigationDetection")
-            };
+            let merged = merge_disabled_features(&existing, DISABLED_FEATURES);
             command_line.append_switch_with_value(Some(&df_switch), Some(&merged.as_str().into()));
+
+            // items.id=622: no background network traffic from the browser
+            // itself. See BACKGROUND_NETWORK_SWITCHES.
+            for name in BACKGROUND_NETWORK_SWITCHES {
+                command_line.append_switch(Some(&cef::CefString::from(*name)));
+            }
 
             // items.id=327 diagnostic only. Confirms whether CEF's OSR
             // compositor is using hardware WebGL or has fallen back to
@@ -421,6 +482,41 @@ mod tests {
         assert!(!gpu_diag_requested(Some(OsStr::new("0"))));
         assert!(!gpu_diag_requested(Some(OsStr::new("true"))));
         assert!(gpu_diag_requested(Some(OsStr::new("1"))));
+    }
+
+    #[test]
+    fn disabled_features_merge_keeps_existing_and_adds_each_once() {
+        assert_eq!(merge_disabled_features("", &["A", "B"]), "A,B");
+        assert_eq!(merge_disabled_features("X,A", &["A", "B"]), "X,A,B");
+        assert_eq!(merge_disabled_features("X,", &["A"]), "X,A");
+        assert_eq!(merge_disabled_features("A,B", &["A", "B"]), "A,B");
+        assert_eq!(merge_disabled_features("", &[]), "");
+    }
+
+    #[test]
+    fn soft_navigation_workaround_stays_in_the_feature_list() {
+        assert!(DISABLED_FEATURES.contains(&"SoftNavigationDetection"));
+        assert!(merge_disabled_features("", DISABLED_FEATURES).contains("SoftNavigationDetection"));
+    }
+
+    #[test]
+    fn background_network_switches_are_exactly_the_item_622_set() {
+        let mut got: Vec<&str> = BACKGROUND_NETWORK_SWITCHES.to_vec();
+        got.sort_unstable();
+        let mut want = vec![
+            "disable-background-networking",
+            "disable-component-update",
+            "disable-domain-reliability",
+            "disable-default-apps",
+            "disable-sync",
+            "metrics-recording-only",
+            "no-pings",
+        ];
+        want.sort_unstable();
+        assert_eq!(got, want);
+        assert!(BACKGROUND_NETWORK_SWITCHES
+            .iter()
+            .all(|s| !s.starts_with('-') && !s.contains('=')));
     }
 
     #[test]
