@@ -60,6 +60,21 @@ CREATE TABLE IF NOT EXISTS persona_registry (
     created_at      TEXT NOT NULL
 );
 
+-- user_provider_preference design notes, carried over from the comment that
+-- sat above this table in shared_013.sql (items.id=427/428, Part 2b):
+--   SCOPE: User x Persona x Focus. The account-wide row (persona_id and
+--   focus_id both NULL) is the comprehensive record. A Persona or Focus row is
+--   a stub that exists only when that scope needs to diverge from what it
+--   would inherit.
+--   NEW-USER DEFAULT: the absence of any row at any scope means a system-wide
+--   hardcoded default applies, never inheritance from another user's rows.
+--   UNIQUENESS: a composite primary key cannot stop two account-wide rows for
+--   the same (user_id, provider_id) because SQLite treats NULLs as distinct,
+--   so each scope level has a partial unique index below.
+--   subscription_status: paid or free tier per provider. Nullable, nothing
+--   branches on it yet.
+--   last_verified_at mirrors get_capability_profile's live-check-never-cached
+--   convention. It is not a trusted cache.
 CREATE TABLE IF NOT EXISTS user_provider_preference (
     id                    TEXT PRIMARY KEY,
     user_id               TEXT NOT NULL,

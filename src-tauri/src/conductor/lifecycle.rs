@@ -1545,6 +1545,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                         resolve_external_provider(
                             &self.pool,
                             &self.user_id,
+                            self.key_hex.as_deref().unwrap_or(""),
                             &self.persona_id,
                             &self.focus_id,
                             self._focus_external_access,
@@ -2559,6 +2560,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                     resolve_external_provider(
                         &self.pool,
                         &user_id,
+                        self.key_hex.as_deref().unwrap_or(""),
                         &persona_id,
                         &focus_id,
                         effective_access,
@@ -6873,7 +6875,6 @@ mod tests {
         drop(conn);
 
         let topic = crate::persistence::topic_store::create_topic(
-            &pool,
             user_id,
             persona_id,
             key_hex_str,

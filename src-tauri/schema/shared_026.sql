@@ -32,13 +32,10 @@
 -- qr_recommended and qr_recommendation_rank on a model are a rank within
 -- its provider, distinct from providers.qr_recommendation_rank.
 --
--- user_provider_preference: plan_key (the user's plan at that provider,
--- matched against providers.plan_inclusion) and model_id (the selected
--- model, resolved Focus then Persona then account). model_id has no foreign
--- key: uncurated models from a live list are allowed (decisions.id=875
--- point 5). subscription_status is kept as legacy. This table is plaintext
--- in shared.db and reveals which providers a user uses -- items.id=661 will
--- move the whole table to the encrypted store.
+-- user_provider_preference gained plan_key and model_id here. The table has
+-- since moved out of this plaintext file to the per-user encrypted
+-- integration_keys.db (items.id=661, keys_006.sql), which carries both
+-- columns. Edited in place, which decisions.id=857 allows until first ship.
 --
 -- DATA (items.id=703). The seeded default models were wrong: Groq retired
 -- llama-3.1-8b-instant for free and developer tiers on 2026-08-16
@@ -123,9 +120,6 @@ ALTER TABLE provider_models ADD COLUMN context_window_source TEXT
         OR context_window_source IN ('provider_api', 'curated', 'user'));
 ALTER TABLE provider_models ADD COLUMN context_window_as_of TEXT;
 
-ALTER TABLE user_provider_preference ADD COLUMN plan_key TEXT;
-ALTER TABLE user_provider_preference ADD COLUMN model_id TEXT;
-
 -- Provider rows. Hosted rows only, matched by id because these are the two
 -- rows shared_014.sql seeded. Everything else about them is untouched.
 UPDATE providers SET
@@ -181,4 +175,4 @@ VALUES
 
 INSERT OR IGNORE INTO schema_version (version, applied_at, description)
 VALUES (26, datetime('now'),
-    'items.id=708 (absorbs items.id=703): providers gains the decisions.id=875 adapter, disclosure and credential fields, provider_models gains pricing/status/privacy-override/context-window-provenance fields, user_provider_preference gains plan_key and model_id. groq and mistral rows populated as data (dialect, base URL, auth, free tier, jurisdiction, verification), old seed models replaced by openai/gpt-oss-20b and the pinned mistral-small-2603 with prices read 2026-10-11, Mistral qr_recommended cleared and ranks set per decisions.id=878');
+    'items.id=708 (absorbs items.id=703): providers gains the decisions.id=875 adapter, disclosure and credential fields, provider_models gains pricing/status/privacy-override/context-window-provenance fields. groq and mistral rows populated as data (dialect, base URL, auth, free tier, jurisdiction, verification), old seed models replaced by openai/gpt-oss-20b and the pinned mistral-small-2603 with prices read 2026-10-11, Mistral qr_recommended cleared and ranks set per decisions.id=878');

@@ -909,7 +909,7 @@ mod selection {
 
     #[tokio::test]
     async fn a_curated_model_is_selected_and_cleared_at_each_scope() {
-        with_real(|pool, cat, mut conn| async move {
+        with_real(|_pool, cat, mut conn| async move {
             let id = cat.models[0].model_id.clone();
             for scope in [
                 SelectionScope::Account,
@@ -921,7 +921,6 @@ mod selection {
                 },
             ] {
                 set_selection_impl(
-                    &pool,
                     &mut conn,
                     USER,
                     &cat,
@@ -929,12 +928,12 @@ mod selection {
                 )
                 .await
                 .unwrap();
-                set_selection_impl(&pool, &mut conn, USER, &cat, &req(&cat, scope, None, None))
+                set_selection_impl(&mut conn, USER, &cat, &req(&cat, scope, None, None))
                     .await
                     .unwrap();
             }
             let none =
-                resolve_model_selection(&pool, USER, Some("p1"), Some("f1"), &cat.provider.id)
+                resolve_model_selection(&mut conn, USER, Some("p1"), Some("f1"), &cat.provider.id)
                     .await
                     .unwrap();
             assert!(none.is_none());
@@ -955,16 +954,16 @@ mod selection {
             .unwrap();
             let cat = load_catalog(&pool, &cat.provider.id).await.unwrap();
             assert_eq!(
-                set_selection_impl(&pool, &mut conn, USER, &cat, &req(&cat, SelectionScope::Account, Some("m-retired"), None)).await.unwrap_err(),
+                set_selection_impl(&mut conn, USER, &cat, &req(&cat, SelectionScope::Account, Some("m-retired"), None)).await.unwrap_err(),
                 "spend_block.model_retired"
             );
             assert_eq!(
-                set_selection_impl(&pool, &mut conn, USER, &cat, &req(&cat, SelectionScope::Account, Some("ghost"), None)).await.unwrap_err(),
+                set_selection_impl(&mut conn, USER, &cat, &req(&cat, SelectionScope::Account, Some("ghost"), None)).await.unwrap_err(),
                 "unknown_model"
             );
-            assert!(resolve_model_selection(&pool, USER, None, None, &cat.provider.id).await.unwrap().is_none());
+            assert!(resolve_model_selection(&mut conn, USER, None, None, &cat.provider.id).await.unwrap().is_none());
             assert_eq!(
-                set_selection_impl(&pool, &mut conn, USER, &cat, &req(&cat, SelectionScope::Persona { persona_id: String::new() }, None, None)).await.unwrap_err(),
+                set_selection_impl(&mut conn, USER, &cat, &req(&cat, SelectionScope::Persona { persona_id: String::new() }, None, None)).await.unwrap_err(),
                 "invalid_scope"
             );
         })
@@ -973,7 +972,7 @@ mod selection {
 
     #[tokio::test]
     async fn an_uncurated_model_needs_an_output_limit_within_its_window() {
-        with_real(|pool, cat, mut conn| async move {
+        with_real(|_pool, cat, mut conn| async move {
             let pid = cat.provider.id.clone();
             record_refresh_conn(
                 &mut conn,
@@ -989,7 +988,6 @@ mod selection {
 
             assert_eq!(
                 set_selection_impl(
-                    &pool,
                     &mut conn,
                     USER,
                     &cat,
@@ -1002,7 +1000,6 @@ mod selection {
             for bad in [0u32, 8001] {
                 assert_eq!(
                     set_selection_impl(
-                        &pool,
                         &mut conn,
                         USER,
                         &cat,
@@ -1015,13 +1012,12 @@ mod selection {
                 );
             }
             // Nothing was selected by the refusals.
-            assert!(resolve_model_selection(&pool, USER, None, None, &pid)
+            assert!(resolve_model_selection(&mut conn, USER, None, None, &pid)
                 .await
                 .unwrap()
                 .is_none());
 
             set_selection_impl(
-                &pool,
                 &mut conn,
                 USER,
                 &cat,
@@ -1029,7 +1025,7 @@ mod selection {
             )
             .await
             .unwrap();
-            let sel = resolve_model_selection(&pool, USER, None, None, &pid)
+            let sel = resolve_model_selection(&mut conn, USER, None, None, &pid)
                 .await
                 .unwrap()
                 .unwrap();
@@ -1042,7 +1038,6 @@ mod selection {
 
             // Selecting it again at another scope reuses the stored limit.
             set_selection_impl(
-                &pool,
                 &mut conn,
                 USER,
                 &cat,
@@ -1060,7 +1055,6 @@ mod selection {
 
             // A model with no reported window takes any limit up to the cap.
             set_selection_impl(
-                &pool,
                 &mut conn,
                 USER,
                 &cat,
@@ -1077,7 +1071,6 @@ mod selection {
             .unwrap();
             assert_eq!(
                 set_selection_impl(
-                    &pool,
                     &mut conn,
                     USER,
                     &cat,
@@ -1100,7 +1093,7 @@ mod selection {
 
     #[tokio::test]
     async fn a_provider_that_is_not_a_hosted_api_is_refused() {
-        with_real(|pool, cat, mut conn| async move {
+        with_real(|_pool, cat, mut conn| async move {
             let mut local = Catalog {
                 provider: cat.provider.clone(),
                 models: cat.models.clone(),
@@ -1109,7 +1102,6 @@ mod selection {
             local.provider.api_dialect = None;
             assert_eq!(
                 set_selection_impl(
-                    &pool,
                     &mut conn,
                     USER,
                     &local,

@@ -241,10 +241,7 @@ fn lookup_or_default<T: Default, E: std::fmt::Display>(what: &str, result: Resul
 /// (presence only, the credential column is never read) and the user's plan
 /// at each provider (account-wide preference rows). Empty with no resident
 /// session.
-async fn load_user_context(
-    pool: &sqlx::SqlitePool,
-    session: Option<&(String, String)>,
-) -> UserContext {
+async fn load_user_context(session: Option<&(String, String)>) -> UserContext {
     let Some((user_id, key_hex_str)) = session else {
         return UserContext::default();
     };
@@ -253,10 +250,18 @@ async fn load_user_context(
         integration_keys_store::active_key_provider_ids(user_id, key_hex_str, QR_HOSTED_KEY_TYPE)
             .await,
     );
-    let prefs = lookup_or_default(
-        "plan keys",
-        user_provider_preference_store::list_preferences_for_user(pool, user_id).await,
-    );
+    // The preferences are in the user's encrypted integration_keys.db
+    // (items.id=661).
+    let prefs = match crate::persistence::provider_spend_store::open(user_id, key_hex_str).await {
+        Ok(mut conn) => lookup_or_default(
+            "plan keys",
+            user_provider_preference_store::list_preferences_for_user(&mut conn, user_id).await,
+        ),
+        Err(e) => {
+            log::warn!("plan keys: preference store unavailable: {e}");
+            Vec::new()
+        }
+    };
     let plan_keys = prefs
         .into_iter()
         .filter(|p| p.persona_id.is_none() && p.focus_id.is_none())
@@ -323,7 +328,7 @@ pub async fn get_provider_recommendation(
     let session = key_registry
         .with_key(|k| (k.user_id.clone(), key_hex(&k.data_key)))
         .await;
-    let ctx = load_user_context(&pool, session.as_ref()).await;
+    let ctx = load_user_context(session.as_ref()).await;
     let catalog = load_catalog(&pool, &ctx, chrono::Local::now().date_naive()).await?;
     Ok(recommendation::recommend(&profile, &catalog))
 }
@@ -497,10 +502,7 @@ mod tests {
 
     #[tokio::test]
     async fn user_context_is_empty_with_no_session() {
-        let pool = sqlx::SqlitePool::connect_lazy_with(
-            sqlx::sqlite::SqliteConnectOptions::new().filename(":memory:"),
-        );
-        let ctx = load_user_context(&pool, None).await;
+        let ctx = load_user_context(None).await;
         assert!(ctx.configured_provider_ids.is_empty());
         assert!(ctx.plan_keys.is_empty());
     }
@@ -532,15 +534,13 @@ mod tests {
         .execute(&_env.pool)
         .await
         .expect("fixture user");
-        sqlx::query(
-            "INSERT INTO personas (id, display_name, persona_type, created_at) \
-             VALUES ('fixture-persona', 'Fixture', 'personal', '2026-01-01T00:00:00Z')",
-        )
-        .execute(&_env.pool)
-        .await
-        .expect("fixture persona");
+        // The preferences live in the user's encrypted integration_keys.db.
+        let mut keys_conn =
+            crate::persistence::provider_spend_store::open("user-f", &key_hex(&master_key))
+                .await
+                .expect("open integration_keys.db");
         user_provider_preference_store::upsert_preference(
-            &_env.pool,
+            &mut keys_conn,
             user_provider_preference_store::NewUserProviderPreference {
                 user_id: "user-f",
                 persona_id: None,
@@ -558,7 +558,7 @@ mod tests {
         .expect("account-wide preference row");
         // A Persona-scoped plan is not the account-wide plan.
         user_provider_preference_store::upsert_preference(
-            &_env.pool,
+            &mut keys_conn,
             user_provider_preference_store::NewUserProviderPreference {
                 user_id: "user-f",
                 persona_id: Some("fixture-persona"),
@@ -576,7 +576,7 @@ mod tests {
         .expect("persona-scoped preference row");
 
         let session = ("user-f".to_owned(), key_hex(&master_key));
-        let ctx = load_user_context(&_env.pool, Some(&session)).await;
+        let ctx = load_user_context(Some(&session)).await;
         assert_eq!(
             ctx.configured_provider_ids.iter().collect::<Vec<_>>(),
             vec![&keyed]

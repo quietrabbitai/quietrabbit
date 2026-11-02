@@ -3,8 +3,8 @@
 -- items.id=427/428 (PROVIDER_REGISTRY_AND_TIER_MODEL_SPEC.md Parts 2/2b) --
 -- generalizes tier3_providers into a flag-based providers table spanning
 -- every tier (1, 1.5, 2, 3, and any future tier), and adds
--- user_provider_preference for per-user/Persona/Focus provider
--- configuration. Core design rule (Part 1): tier is a display label only,
+-- (the per-user/Persona/Focus provider configuration table that was added here
+-- now lives in keys_006.sql, see below). Core design rule (Part 1): tier is a display label only,
 -- never stored, never branched on by code -- this migration removes the
 -- tier column outright, with no replacement column. Every eligibility/
 -- routing decision going forward reads a decided flag column instead.
@@ -228,85 +228,12 @@ UPDATE providers SET
     user_privacy_summary = '{"summary": "Duck.ai proxies your request so Anthropic, OpenAI, and other model providers never see your identity, and doesn''t use your chats to train any model. Chats save locally on your device by default, not on DuckDuckGo''s servers.", "account_status_note": "No account needed. An optional ''Sync & Backup'' feature can store encrypted chats on DuckDuckGo''s servers, but only your device holds the decryption key.", "actions": [{"label": "Use the Fire Button", "description": "Instantly clears all local chat history from Duck.ai."}], "settings_url": "https://duckduckgo.com/duckai/privacy-terms"}'
 WHERE id = 'duckai';
 
--- user_provider_preference (Part 2b): per-user configuration, scoped
--- User x Persona x Focus. Cannot live on providers (global table would
--- corrupt across users on this multi-user install). Generalizes
--- integration_keys_store's per-user-per-provider credential-presence
--- pattern and get_capability_profile's live-check-never-cached convention
--- (last_verified_at here mirrors that, not a trusted cache).
---
--- SCOPE, not Group: confirmed live this session (per the spec) that
--- group.db has no settings-cascade mechanism -- it's Persona-scoped
--- document sharing, not User membership with cascading settings. A shared
--- Group Focus requirement collapses into an ordinary Focus-level row.
---
--- STORAGE SHAPE: the account-wide row (persona_id IS NULL AND focus_id IS
--- NULL) is the comprehensive record. A Persona- or Focus-scoped row is a
--- stub that exists only when that scope needs to diverge from what it
--- would otherwise inherit -- most Personas/Focuses have no override rows
--- at all for most providers.
---
--- NEW-USER DEFAULT: matches user_capabilities's own documented convention
--- exactly -- absence of any row (at any scope) means a system-wide
--- hardcoded default applies, never inheritance from another user's rows.
--- Verified live this session: auth/user_store.rs::create_user inserts only
--- users, user_salts, user_sharing_keys -- no copying from any other user's
--- configuration happens anywhere in account creation today.
---
--- UNIQUENESS: SQLite's composite-PK NULL-distinctness means a PK alone
--- can't stop two account-wide (persona_id/focus_id both NULL) rows for the
--- same (user_id, provider_id). user_capabilities closed this same gap with
--- a partial unique index for its one NULL-scoped level; this table extends
--- that same approach across all three scope levels below, rather than
--- integration_keys's alternative (plain UNIQUE + app-level
--- check-then-upsert) -- the spec explicitly names user_capabilities as the
--- pattern to mirror, so its own DB-level-enforcement approach is followed
--- here.
---
--- subscription_status: Part 4c's recommended dedicated column (paid vs.
--- free tier per provider) -- cheap to capture now, potentially relevant to
--- items.id=151's future direct-API scoping even though nothing in this
--- design currently branches on it. Nullable: most rows won't set it.
-CREATE TABLE IF NOT EXISTS user_provider_preference (
-    id                    TEXT PRIMARY KEY,
-    user_id               TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    persona_id            TEXT REFERENCES personas(id) ON DELETE CASCADE,
-    focus_id              TEXT,
-    provider_id           TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
-    login_available       INTEGER NOT NULL DEFAULT 0
-                              CHECK (login_available IN (0, 1)),
-    user_preference       TEXT NOT NULL
-                              CHECK (user_preference IN ('preferred', 'allowed', 'declined')),
-    enabled_at            TEXT,
-    declined_at           TEXT,
-    local_model_version   TEXT,
-    installed_at          TEXT,
-    last_verified_at      TEXT,
-    subscription_status   TEXT
-                              CHECK (subscription_status IS NULL
-                                  OR subscription_status IN ('free', 'paid')),
-    created_at            TEXT NOT NULL
-);
-
--- Account-wide row uniqueness (persona_id and focus_id both NULL).
-CREATE UNIQUE INDEX IF NOT EXISTS idx_user_provider_pref_account
-    ON user_provider_preference (user_id, provider_id)
-    WHERE persona_id IS NULL AND focus_id IS NULL;
-
--- Persona-wide row uniqueness (persona_id set, focus_id NULL).
-CREATE UNIQUE INDEX IF NOT EXISTS idx_user_provider_pref_persona
-    ON user_provider_preference (user_id, persona_id, provider_id)
-    WHERE persona_id IS NOT NULL AND focus_id IS NULL;
-
--- Focus-specific row uniqueness (focus_id set -- already pins a single
--- Persona, so provider_id + focus_id + user_id is the natural key here).
-CREATE UNIQUE INDEX IF NOT EXISTS idx_user_provider_pref_focus
-    ON user_provider_preference (user_id, focus_id, provider_id)
-    WHERE focus_id IS NOT NULL;
-
-CREATE INDEX IF NOT EXISTS idx_user_provider_pref_lookup
-    ON user_provider_preference (user_id, provider_id);
+-- user_provider_preference (Part 2b) used to be created here. It reveals which
+-- providers a user uses per Persona and Focus, so it does not belong in the
+-- plaintext shared.db: items.id=661 (decisions.id=862) moved it to the
+-- per-user encrypted integration_keys.db (keys_006.sql). This file was
+-- edited in place, which decisions.id=857 allows until first ship.
 
 INSERT OR IGNORE INTO schema_version (version, applied_at, description)
 VALUES (13, datetime('now'),
-    'items.id=427/428: providers table (generalizes tier3_providers -- flag-based, no tier column, 4 existing rows migrated with derived flags) + user_provider_preference table (Focus>Persona>account-wide cascading provider configuration) + user_privacy_summary column (consumer-facing privacy explainer, distinct from documentation_gate) + a curation pass amending claude/gemini documentation_gate and setting user_privacy_summary for all 4 migrated rows');
+    'items.id=427/428: providers table (generalizes tier3_providers -- flag-based, no tier column, 4 existing rows migrated with derived flags) + user_privacy_summary column (consumer-facing privacy explainer, distinct from documentation_gate) + a curation pass amending claude/gemini documentation_gate and setting user_privacy_summary for all 4 migrated rows');

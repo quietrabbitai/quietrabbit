@@ -4046,9 +4046,10 @@ mod tests {
         .await
     }
 
-    async fn pick_account_model(pool: &sqlx::SqlitePool, model_id: Option<&str>) {
+    async fn pick_account_model(key_hex: &str, model_id: Option<&str>) {
+        let mut conn = spend_store::open(SPEND_USER, key_hex).await.unwrap();
         set_model_selection(
-            pool,
+            &mut conn,
             SPEND_USER,
             &SelectionScope::Account,
             None,
@@ -4078,7 +4079,7 @@ mod tests {
             let picked = select_for_step(&pool, &key_hex).await.unwrap();
             assert_eq!(picked.model_id, "fixture-model-a");
 
-            pick_account_model(&pool, Some("fixture-model-b")).await;
+            pick_account_model(&key_hex, Some("fixture-model-b")).await;
             let picked = select_for_step(&pool, &key_hex).await.unwrap();
             assert_eq!(picked.model_id, "fixture-model-b");
             let model = picked.hosted_model.expect("a hosted row");
@@ -4155,7 +4156,7 @@ mod tests {
             grant_consent(&pool, &key_hex, true).await;
             // The user's stored selection says model-c; the conversation is
             // bound to model-b. The binding wins, and the ledger agrees.
-            pick_account_model(&pool, Some("fixture-model-c")).await;
+            pick_account_model(&key_hex, Some("fixture-model-c")).await;
 
             call_bound(&pool, &key_hex, &bound_to("fixture-model-b"))
                 .await
@@ -4417,11 +4418,11 @@ mod tests {
             )
             .await;
 
-            pick_account_model(&pool, Some("fixture-model-old")).await;
+            pick_account_model(&key_hex, Some("fixture-model-old")).await;
             let err = select_for_step(&pool, &key_hex).await.unwrap_err();
             assert_eq!(block_code(&err), "spend_block.model_retired");
 
-            pick_account_model(&pool, Some("fixture-model-ghost")).await;
+            pick_account_model(&key_hex, Some("fixture-model-ghost")).await;
             let err = select_for_step(&pool, &key_hex).await.unwrap_err();
             assert_eq!(block_code(&err), "spend_block.model_unavailable");
 
@@ -4458,7 +4459,7 @@ mod tests {
             .await
             .unwrap();
             set_user_output_limit_conn(&mut conn, "fixture-host-a", "live-x", Some(77)).await.unwrap();
-            pick_account_model(&pool, Some("live-x")).await;
+            pick_account_model(&key_hex, Some("live-x")).await;
 
             let picked = select_for_step(&pool, &key_hex).await.unwrap();
             assert_eq!(picked.model_id, "live-x");
@@ -4513,7 +4514,7 @@ mod tests {
             )
             .await;
             grant_consent(&pool, &key_hex, true).await;
-            pick_account_model(&pool, Some("fixture-model-weak")).await;
+            pick_account_model(&key_hex, Some("fixture-model-weak")).await;
 
             let picked = select_for_step(&pool, &key_hex).await.unwrap();
             let model = picked.hosted_model.expect("a hosted row");

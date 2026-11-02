@@ -193,7 +193,6 @@ pub async fn get_topic_list(
 pub async fn update_topic_state(
     request: UpdateTopicStateRequest,
     key_registry: State<'_, KeyRegistry>,
-    pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<(), String> {
     let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     const VALID_STATES: &[&str] = &["Active", "Paused", "Waiting on you", "Complete", "Closed"];
@@ -211,7 +210,6 @@ pub async fn update_topic_state(
         .ok_or_else(|| "not logged in".to_owned())?;
 
     topic_store::update_topic_state(
-        &pool,
         &request.user_id,
         &request.persona_id,
         &key_hex_str,

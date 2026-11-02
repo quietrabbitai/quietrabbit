@@ -490,8 +490,11 @@ pub async fn list_provider_models(
     let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let (user_id, key_hex_str) = session(&key_registry).await?;
     let cat = load_catalog(&pool, &provider_id).await?;
+    let mut conn = store::open(&user_id, &key_hex_str)
+        .await
+        .map_err(|e| internal("open spend store", e))?;
     let stored = prefs::resolve_model_selection(
-        &pool,
+        &mut conn,
         &user_id,
         persona_id.as_deref(),
         focus_id.as_deref(),
@@ -499,9 +502,6 @@ pub async fn list_provider_models(
     )
     .await
     .map_err(|e| internal("selection lookup", e))?;
-    let mut conn = store::open(&user_id, &key_hex_str)
-        .await
-        .map_err(|e| internal("open spend store", e))?;
     list_impl(&mut conn, &cat, stored.as_ref(), today_local()).await
 }
 
@@ -615,7 +615,6 @@ pub async fn refresh_available_models(
 // ---------------------------------------------------------------------------
 
 pub(crate) async fn set_selection_impl(
-    pool: &sqlx::SqlitePool,
     conn: &mut SqliteConnection,
     user_id: &str,
     cat: &Catalog,
@@ -631,7 +630,7 @@ pub(crate) async fn set_selection_impl(
 
     let Some(model_id) = req.model_id.as_deref() else {
         return prefs::set_model_selection(
-            pool,
+            conn,
             user_id,
             &req.scope,
             req.persona_id.as_deref(),
@@ -673,7 +672,7 @@ pub(crate) async fn set_selection_impl(
     }
 
     prefs::set_model_selection(
-        pool,
+        conn,
         user_id,
         &req.scope,
         req.persona_id.as_deref(),
@@ -697,7 +696,7 @@ pub async fn set_model_selection(
     let mut conn = store::open(&user_id, &key_hex_str)
         .await
         .map_err(|e| internal("open spend store", e))?;
-    set_selection_impl(&pool, &mut conn, &user_id, &cat, &request).await
+    set_selection_impl(&mut conn, &user_id, &cat, &request).await
 }
 
 // ---------------------------------------------------------------------------

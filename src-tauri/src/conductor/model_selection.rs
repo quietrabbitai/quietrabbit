@@ -157,12 +157,22 @@ pub async fn resolve_hosted_model(
     focus_id: Option<&str>,
     provider_id: &str,
 ) -> Result<ResolvedModel, ModelError> {
-    let selection = resolve_model_selection(pool, user_id, persona_id, focus_id, provider_id)
+    // The selection lives in the user's encrypted integration_keys.db
+    // (items.id=661), opened only for this lookup.
+    let mut keys_conn = crate::persistence::provider_spend_store::open(user_id, key_hex)
         .await
         .map_err(|e| {
-            log::warn!("model selection lookup failed: {e}");
+            log::warn!("model selection store unavailable: {e}");
             ModelError::Store
         })?;
+    let selection =
+        resolve_model_selection(&mut keys_conn, user_id, persona_id, focus_id, provider_id)
+            .await
+            .map_err(|e| {
+                log::warn!("model selection lookup failed: {e}");
+                ModelError::Store
+            })?;
+    drop(keys_conn);
 
     let default_model = provider_store::get_default_model(pool, provider_id)
         .await
@@ -333,24 +343,6 @@ mod tests {
             ))
             .await
             .expect("pool");
-        sqlx::query(
-            "INSERT INTO users (id, display_name, role, is_primary, auth_enabled, created_at) \
-             VALUES (?, 'Fixture', 'user', 1, 1, '2026-01-01T00:00:00Z')",
-        )
-        .bind(USER)
-        .execute(&pool)
-        .await
-        .expect("user");
-        for persona in ["p1", "p2"] {
-            sqlx::query(
-                "INSERT INTO personas (id, display_name, persona_type, created_at) \
-                 VALUES (?, 'Fixture', 'personal', '2026-01-01T00:00:00Z')",
-            )
-            .bind(persona)
-            .execute(&pool)
-            .await
-            .expect("persona");
-        }
         let (provider, default_model): (String, String) = sqlx::query_as(
             "SELECT m.provider_id, m.model_id FROM provider_models m \
              JOIN providers p ON p.id = m.provider_id \
@@ -388,7 +380,8 @@ mod tests {
         }
 
         async fn select(&self, scope: SelectionScope, model: Option<&str>) {
-            set_model_selection(&self.pool, USER, &scope, None, &self.provider, model)
+            let mut conn = spend_store::open(USER, KEY).await.unwrap();
+            set_model_selection(&mut conn, USER, &scope, None, &self.provider, model)
                 .await
                 .expect("set selection");
         }
@@ -552,14 +545,12 @@ mod tests {
                     model_id: "ghost".into()
                 }
             );
-            // With no unlocked session there is no per-user store to look in.
+            // With no unlocked session there is no per-user store to read the
+            // selection from (items.id=661), so the step stops. It must not
+            // fall back to the default model, whose cost and privacy the user
+            // did not choose.
             let no_key = resolve_hosted_model(&rig.pool, USER, "", None, None, &rig.provider).await;
-            assert_eq!(
-                no_key.unwrap_err(),
-                ModelError::Unavailable {
-                    model_id: "ghost".into()
-                }
-            );
+            assert_eq!(no_key.unwrap_err(), ModelError::Store);
         })
         .await;
     }

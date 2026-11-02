@@ -159,10 +159,15 @@ pub async fn set_qr_hosted_provider_preference(
     pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<(), String> {
     let _lease = crate::auth::writer_gate::command(&key_registry).await?;
-    let user_id = key_registry
-        .with_key(|k| k.user_id.clone())
+    let (user_id, key_hex_str) = key_registry
+        .with_key(|k| (k.user_id.clone(), key_hex(&k.data_key)))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
+    // The preference rows live in the user's encrypted integration_keys.db
+    // (items.id=661, decisions.id=862); the provider catalog is shared.db.
+    let mut conn = crate::persistence::provider_spend_store::open(&user_id, &key_hex_str)
+        .await
+        .map_err(|e| e.to_string())?;
 
     let candidates = provider_store::list_providers_by_type(&pool, "cloud_inference_api")
         .await
@@ -183,7 +188,7 @@ pub async fn set_qr_hosted_provider_preference(
 
     for candidate in &candidates {
         let existing = user_provider_preference_store::get_preference_at_scope(
-            &pool,
+            &mut conn,
             &user_id,
             None,
             None,
@@ -223,7 +228,7 @@ pub async fn set_qr_hosted_provider_preference(
         let model_id = existing.as_ref().and_then(|e| e.model_id.clone());
 
         user_provider_preference_store::upsert_preference(
-            &pool,
+            &mut conn,
             NewUserProviderPreference {
                 user_id: &user_id,
                 persona_id: None,
@@ -251,15 +256,17 @@ pub async fn set_qr_hosted_provider_preference(
 #[specta::specta]
 pub async fn get_qr_hosted_provider_preferences(
     key_registry: State<'_, KeyRegistry>,
-    pool: State<'_, sqlx::SqlitePool>,
 ) -> Result<Vec<UserProviderPreference>, String> {
     let _lease = crate::auth::writer_gate::command(&key_registry).await?;
-    let user_id = key_registry
-        .with_key(|k| k.user_id.clone())
+    let (user_id, key_hex_str) = key_registry
+        .with_key(|k| (k.user_id.clone(), key_hex(&k.data_key)))
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
+    let mut conn = crate::persistence::provider_spend_store::open(&user_id, &key_hex_str)
+        .await
+        .map_err(|e| e.to_string())?;
 
-    user_provider_preference_store::list_preferences_for_user(&pool, &user_id)
+    user_provider_preference_store::list_preferences_for_user(&mut conn, &user_id)
         .await
         .map_err(|e| e.to_string())
 }
@@ -475,8 +482,12 @@ mod tests {
             .await
             .expect("set_qr_hosted_provider_preference must succeed when logged in");
 
+        let mut conn =
+            crate::persistence::provider_spend_store::open("user-f", &key_hex(&master_key))
+                .await
+                .unwrap();
         let first_pref = user_provider_preference_store::get_preference_at_scope(
-            &pool, "user-f", None, None, &first,
+            &mut conn, "user-f", None, None, &first,
         )
         .await
         .unwrap()
@@ -492,7 +503,7 @@ mod tests {
             .expect("switching provider must succeed");
 
         let first_after = user_provider_preference_store::get_preference_at_scope(
-            &pool, "user-f", None, None, &first,
+            &mut conn, "user-f", None, None, &first,
         )
         .await
         .unwrap()
@@ -500,7 +511,7 @@ mod tests {
         assert_eq!(first_after.user_preference, UserPreference::Allowed);
 
         let second_after = user_provider_preference_store::get_preference_at_scope(
-            &pool, "user-f", None, None, &second,
+            &mut conn, "user-f", None, None, &second,
         )
         .await
         .unwrap()
@@ -508,7 +519,7 @@ mod tests {
         assert_eq!(second_after.user_preference, UserPreference::Preferred);
 
         let preferred = user_provider_preference_store::find_preferred_provider(
-            &pool,
+            &mut conn,
             "user-f",
             None,
             None,

@@ -52,9 +52,16 @@ pub enum ExternalProviderResolution {
 /// LocalOnly ceiling permits nothing, so it can never return `Selected`.
 /// Database failures collapse to `NotConfigured`, matching the previous
 /// inline behavior in lifecycle.rs (never guess a provider).
+///
+/// The preferences live in the user's encrypted integration_keys.db
+/// (items.id=661), so this needs the data key: an empty key, or a file that
+/// cannot be opened, is `NotConfigured` too. That is the fail-closed result a
+/// run that outlives its session gets once the key is gone. The catalog
+/// (providers) is still read from shared.db through `pool`.
 pub async fn resolve_external_provider(
     pool: &sqlx::SqlitePool,
     user_id: &str,
+    key_hex: &str,
     persona_id: &str,
     focus_id: &str,
     access: ExternalAccess,
@@ -67,9 +74,18 @@ pub async fn resolve_external_provider(
     let eligible_ids: Vec<String> = eligible.iter().map(|p| p.id.clone()).collect();
     let all_ids: Vec<String> = candidates.iter().map(|p| p.id.clone()).collect();
 
+    // One open of the encrypted file for both lookups below.
+    if key_hex.is_empty() {
+        return ExternalProviderResolution::NotConfigured;
+    }
+    let Ok(mut conn) = crate::persistence::provider_spend_store::open(user_id, key_hex).await
+    else {
+        return ExternalProviderResolution::NotConfigured;
+    };
+
     // Explicit preference among permitted providers (exactly one, as before).
     if let Ok(preferred) = preferred_providers(
-        pool,
+        &mut conn,
         user_id,
         Some(persona_id),
         Some(focus_id),
@@ -89,8 +105,14 @@ pub async fn resolve_external_provider(
 
     // Nothing permitted is preferred. Is the user's single preferred provider
     // one the ceiling excluded?
-    if let Ok(preferred_all) =
-        preferred_providers(pool, user_id, Some(persona_id), Some(focus_id), &all_ids).await
+    if let Ok(preferred_all) = preferred_providers(
+        &mut conn,
+        user_id,
+        Some(persona_id),
+        Some(focus_id),
+        &all_ids,
+    )
+    .await
     {
         if let [only] = preferred_all.as_slice() {
             if let Some(p) = candidates.iter().find(|p| &p.id == only) {
@@ -139,6 +161,15 @@ mod tests {
     const USER: &str = "u1";
     const PERSONA: &str = "p1";
     const FOCUS: &str = "f1";
+    const KEY_HEX: &str = "0101010101010101010101010101010101010101010101010101010101010101";
+
+    /// The user's encrypted integration_keys.db, where the preferences live
+    /// (items.id=661).
+    async fn open_keys() -> sqlx::SqliteConnection {
+        crate::persistence::provider_spend_store::open(USER, KEY_HEX)
+            .await
+            .expect("open integration_keys.db")
+    }
 
     async fn setup_real_db() -> (tempfile::TempDir, sqlx::SqlitePool) {
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
@@ -152,20 +183,12 @@ mod tests {
             ))
             .await
             .expect("shared.db pool must connect");
-        // user_provider_preference.user_id is a foreign key.
-        sqlx::query(
-            "INSERT INTO users (id, display_name, role, is_primary, auth_enabled, created_at) \
-             VALUES ('u1', 'Test User', 'user', 1, 1, '2026-01-01T00:00:00Z')",
-        )
-        .execute(&pool)
-        .await
-        .expect("seed user");
         (tempdir, pool)
     }
 
-    async fn prefer(pool: &sqlx::SqlitePool, provider_id: &str) {
+    async fn prefer(provider_id: &str) {
         upsert_preference(
-            pool,
+            &mut open_keys().await,
             NewUserProviderPreference {
                 user_id: USER,
                 persona_id: None,
@@ -202,7 +225,7 @@ mod tests {
         pool: &sqlx::SqlitePool,
         access: ExternalAccess,
     ) -> ExternalProviderResolution {
-        resolve_external_provider(pool, USER, PERSONA, FOCUS, access).await
+        resolve_external_provider(pool, USER, KEY_HEX, PERSONA, FOCUS, access).await
     }
 
     /// Runs `body` against a fresh real shared.db, restoring QR_DATA_ROOT.
@@ -227,10 +250,10 @@ mod tests {
         with_db(|pool| async move {
             for (id, name) in hosted_pair(&pool).await {
                 sqlx::query("DELETE FROM user_provider_preference")
-                    .execute(&pool)
+                    .execute(&mut open_keys().await)
                     .await
                     .expect("clear preferences");
-                prefer(&pool, &id).await;
+                prefer(&id).await;
                 assert_eq!(
                     resolve(&pool, ExternalAccess::AnonymousRequired).await,
                     ExternalProviderResolution::ExcludedByCeiling {
@@ -247,7 +270,7 @@ mod tests {
     async fn anonymous_preferred_allows_the_users_preferred_provider() {
         with_db(|pool| async move {
             let [(first, _), _] = hosted_pair(&pool).await;
-            prefer(&pool, &first).await;
+            prefer(&first).await;
             assert_eq!(
                 resolve(&pool, ExternalAccess::AnonymousPreferred).await,
                 ExternalProviderResolution::Selected(first)
@@ -260,7 +283,7 @@ mod tests {
     async fn unrestricted_allows_the_users_preferred_provider() {
         with_db(|pool| async move {
             let [_, (second, _)] = hosted_pair(&pool).await;
-            prefer(&pool, &second).await;
+            prefer(&second).await;
             assert_eq!(
                 resolve(&pool, ExternalAccess::Unrestricted).await,
                 ExternalProviderResolution::Selected(second)
@@ -291,8 +314,8 @@ mod tests {
     async fn two_preferred_providers_stay_ambiguous() {
         with_db(|pool| async move {
             let [(first, _), (second, _)] = hosted_pair(&pool).await;
-            prefer(&pool, &first).await;
-            prefer(&pool, &second).await;
+            prefer(&first).await;
+            prefer(&second).await;
             assert_eq!(
                 resolve(&pool, ExternalAccess::Unrestricted).await,
                 ExternalProviderResolution::NotConfigured
@@ -305,7 +328,7 @@ mod tests {
     async fn local_only_never_selects_a_provider() {
         with_db(|pool| async move {
             let [(first, _), _] = hosted_pair(&pool).await;
-            prefer(&pool, &first).await;
+            prefer(&first).await;
             // The executor never asks for LocalOnly steps; if asked anyway
             // the ceiling permits nothing.
             assert!(!matches!(
@@ -320,24 +343,9 @@ mod tests {
     // narrower scope must not change which provider is chosen, and what a
     // stale copy of the preference does is pinned here, not asserted in prose.
 
-    async fn add_persona(pool: &sqlx::SqlitePool, id: &str) {
-        sqlx::query(
-            "INSERT INTO personas (id, display_name, persona_type, created_at) \
-             VALUES (?, 'Fixture', 'personal', '2026-01-01T00:00:00Z')",
-        )
-        .bind(id)
-        .execute(pool)
-        .await
-        .expect("persona");
-    }
-
-    async fn set_account_preference(
-        pool: &sqlx::SqlitePool,
-        provider_id: &str,
-        user_preference: UserPreference,
-    ) {
+    async fn set_account_preference(provider_id: &str, user_preference: UserPreference) {
         upsert_preference(
-            pool,
+            &mut open_keys().await,
             NewUserProviderPreference {
                 user_id: USER,
                 persona_id: None,
@@ -362,17 +370,23 @@ mod tests {
         };
         with_db(|pool| async move {
             let [(first, _), (second, _)] = hosted_pair(&pool).await;
-            add_persona(&pool, PERSONA).await;
-            prefer(&pool, &first).await;
+            prefer(&first).await;
             let scope = SelectionScope::Persona {
                 persona_id: PERSONA.to_owned(),
             };
 
             // The chosen provider: the new row copies Preferred, so the choice
             // is unchanged.
-            set_model_selection(&pool, USER, &scope, None, &first, Some("m-1"))
-                .await
-                .unwrap();
+            set_model_selection(
+                &mut open_keys().await,
+                USER,
+                &scope,
+                None,
+                &first,
+                Some("m-1"),
+            )
+            .await
+            .unwrap();
             assert_eq!(
                 resolve(&pool, ExternalAccess::Unrestricted).await,
                 ExternalProviderResolution::Selected(first.clone())
@@ -380,9 +394,16 @@ mod tests {
 
             // A provider with no row anywhere: the new row is `allowed`, never
             // Preferred, so storing a model for it cannot make it the choice.
-            set_model_selection(&pool, USER, &scope, None, &second, Some("m-2"))
-                .await
-                .unwrap();
+            set_model_selection(
+                &mut open_keys().await,
+                USER,
+                &scope,
+                None,
+                &second,
+                Some("m-2"),
+            )
+            .await
+            .unwrap();
             assert_eq!(
                 resolve(&pool, ExternalAccess::Unrestricted).await,
                 ExternalProviderResolution::Selected(first)
@@ -404,11 +425,9 @@ mod tests {
         };
         with_db(|pool| async move {
             let [(first, _), (second, _)] = hosted_pair(&pool).await;
-            add_persona(&pool, PERSONA).await;
-            add_persona(&pool, "p2").await;
-            prefer(&pool, &first).await;
+            prefer(&first).await;
             set_model_selection(
-                &pool,
+                &mut open_keys().await,
                 USER,
                 &SelectionScope::Persona {
                     persona_id: PERSONA.to_owned(),
@@ -421,13 +440,13 @@ mod tests {
             .unwrap();
 
             // The user moves the account-level choice to the other provider.
-            set_account_preference(&pool, &first, UserPreference::Allowed).await;
-            set_account_preference(&pool, &second, UserPreference::Preferred).await;
+            set_account_preference(&first, UserPreference::Allowed).await;
+            set_account_preference(&second, UserPreference::Preferred).await;
 
             // At the Persona that holds the stale copy both are Preferred.
             let preferred =
                 crate::persistence::user_provider_preference_store::preferred_providers(
-                    &pool,
+                    &mut open_keys().await,
                     USER,
                     Some(PERSONA),
                     Some(FOCUS),
@@ -444,8 +463,15 @@ mod tests {
 
             // Every other Persona follows the new account-level choice.
             assert_eq!(
-                resolve_external_provider(&pool, USER, "p2", FOCUS, ExternalAccess::Unrestricted)
-                    .await,
+                resolve_external_provider(
+                    &pool,
+                    USER,
+                    KEY_HEX,
+                    "p2",
+                    FOCUS,
+                    ExternalAccess::Unrestricted
+                )
+                .await,
                 ExternalProviderResolution::Selected(second)
             );
         })
@@ -465,7 +491,7 @@ mod tests {
             );
             // A preference for ANOTHER provider changes nothing.
             let [_, (second, _)] = hosted_pair(&pool).await;
-            prefer(&pool, &second).await;
+            prefer(&second).await;
             assert_eq!(
                 resolve_bound_provider(&pool, &first, ExternalAccess::Unrestricted).await,
                 ExternalProviderResolution::Selected(first)

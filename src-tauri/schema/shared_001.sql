@@ -234,41 +234,11 @@ CREATE TABLE IF NOT EXISTS user_capabilities (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_user_capabilities_account_wide
     ON user_capabilities (user_id, capability) WHERE persona_id IS NULL;
 
--- topic_index — Persona-level pointer to active topics (Phase B, D6-226+).
--- Allows Persona dashboard to surface active/paused topics across all
--- focuses without opening per-persona encrypted databases.
--- topic_id: references topics.id in outputs.db (cross-db FK by value only —
---   SQLite cannot enforce cross-database FK constraints).
--- lifecycle_state: mirrored from outputs.db topics table for dashboard queries.
---   outputs.db topics table is the authoritative source of truth.
---   topic_index.lifecycle_state is a cache copy — updated by Phase 5A and
---   Reconciliation Boot Check. On conflict, outputs.db governs.
--- display_name: resolved from topics.name OR topics.placeholder_name.
---   Never derived from user input content directly.
--- content_summary: NULL in Release 1. Phase 5B standing summary cache (R2+).
--- session_count: mirrored from plan_state.db topic_header — cache copy.
-CREATE TABLE IF NOT EXISTS topic_index (
-    topic_id            TEXT PRIMARY KEY,
-    persona_id          TEXT NOT NULL,
-    focus_id            TEXT NOT NULL,
-    display_name        TEXT NOT NULL,
-    lifecycle_state     TEXT NOT NULL
-                            CHECK (lifecycle_state IN (
-                                'active', 'paused', 'awaiting',
-                                'complete', 'closed'
-                            )),
-    last_active_at      TEXT NOT NULL,
-    session_count       INTEGER NOT NULL DEFAULT 0,
-    content_summary     TEXT,
-    created_at          TEXT NOT NULL,
-    updated_at          TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_topic_index_persona
-    ON topic_index (persona_id, lifecycle_state, last_active_at DESC);
-
-CREATE INDEX IF NOT EXISTS idx_topic_index_focus
-    ON topic_index (focus_id, lifecycle_state);
+-- topic_index used to be created here, a plaintext cache of topic names for
+-- the dashboard. Nothing read it (the dashboard reads outputs.db topics), and
+-- topic names are user content, so items.id=661 (decisions.id=862) removed the
+-- table. This file was edited in place, which decisions.id=857 allows until
+-- first ship.
 
 -- asset_index — schema stub only, no CRUD store or UI in Release 1.
 -- Activates in Layer 8+.
