@@ -483,7 +483,8 @@ async fn push_one_view_share(
                  owner_persona={owner_persona_id}: {e}"
             );
             if let Err(e2) = owner_settings_store::record_push_result(
-                pool,
+                owner_user_id,
+                owner_personal_key_hex,
                 owner_persona_id,
                 share_id,
                 Err(&e.to_string()),
@@ -508,9 +509,13 @@ async fn push_if_changed_view(
     recipient_user_id: &str,
     revoked: bool,
 ) -> Result<bool, PersonaViewSyncError> {
-    let Some(settings) =
-        owner_settings_store::get_persona_share_sync_settings(pool, owner_persona_id, share_id)
-            .await?
+    let Some(settings) = owner_settings_store::get_persona_share_sync_settings(
+        owner_user_id,
+        owner_personal_key_hex,
+        owner_persona_id,
+        share_id,
+    )
+    .await?
     else {
         return Ok(false);
     };
@@ -559,8 +564,14 @@ async fn push_if_changed_view(
     };
 
     if settings.last_content_hash.as_deref() == Some(hash.as_str()) {
-        owner_settings_store::record_push_result(pool, owner_persona_id, share_id, Ok(None))
-            .await?;
+        owner_settings_store::record_push_result(
+            owner_user_id,
+            owner_personal_key_hex,
+            owner_persona_id,
+            share_id,
+            Ok(None),
+        )
+        .await?;
         return Ok(false);
     }
 
@@ -578,8 +589,14 @@ async fn push_if_changed_view(
     let path = sync_file_path(&settings.folder_path, share_id);
     write_envelope_atomic(&path, &envelope).await?;
 
-    owner_settings_store::record_push_result(pool, owner_persona_id, share_id, Ok(Some(&hash)))
-        .await?;
+    owner_settings_store::record_push_result(
+        owner_user_id,
+        owner_personal_key_hex,
+        owner_persona_id,
+        share_id,
+        Ok(Some(&hash)),
+    )
+    .await?;
 
     Ok(true)
 }
@@ -606,7 +623,6 @@ async fn pull_all_accepted_view_shares(
 
     for share_id in shares {
         let result = pull_if_newer_view(
-            pool,
             recipient_user_id,
             recipient_personal_key_hex,
             &share_id,
@@ -617,8 +633,8 @@ async fn pull_all_accepted_view_shares(
         if let Err(e) = result {
             log::warn!("persona_view_sync: pull failed for share={share_id}: {e}");
             if let Err(e2) = settings_store::record_pull_result(
-                pool,
                 recipient_user_id,
+                recipient_personal_key_hex,
                 &share_id,
                 Err(&e.to_string()),
             )
@@ -636,15 +652,17 @@ async fn pull_all_accepted_view_shares(
 /// that will never change again), no envelope is waiting yet, or it isn't
 /// newer than the last one applied.
 async fn pull_if_newer_view(
-    pool: &sqlx::SqlitePool,
     recipient_user_id: &str,
     recipient_personal_key_hex: &str,
     share_id: &str,
     sharing_private_key: &StaticSecret,
 ) -> Result<bool, PersonaViewSyncError> {
-    let Some(settings) =
-        settings_store::get_persona_view_share_sync_settings(pool, recipient_user_id, share_id)
-            .await?
+    let Some(settings) = settings_store::get_persona_view_share_sync_settings(
+        recipient_user_id,
+        recipient_personal_key_hex,
+        share_id,
+    )
+    .await?
     else {
         return Ok(false);
     };
@@ -727,7 +745,13 @@ async fn pull_if_newer_view(
         }
     }
 
-    settings_store::record_pull_result(pool, recipient_user_id, share_id, Ok(())).await?;
+    settings_store::record_pull_result(
+        recipient_user_id,
+        recipient_personal_key_hex,
+        share_id,
+        Ok(()),
+    )
+    .await?;
 
     Ok(true)
 }
@@ -1074,7 +1098,8 @@ mod tests {
         let shared_folder = tempfile::tempdir().unwrap();
         let folder_path = shared_folder.path().to_str().unwrap();
         owner_settings_store::set_persona_share_sync_folder(
-            pool,
+            &owner_id,
+            &owner_key,
             &owner_persona,
             &share_id,
             owner_settings_store::SyncRole::Owner,
@@ -1083,8 +1108,8 @@ mod tests {
         .await
         .unwrap();
         settings_store::set_persona_view_share_sync_folder(
-            pool,
             &recipient_id,
+            &recipient_key,
             &share_id,
             folder_path,
         )
@@ -1123,15 +1148,9 @@ mod tests {
         .expect("push_if_changed_view must succeed");
         assert!(pushed);
 
-        let applied = pull_if_newer_view(
-            pool,
-            &recipient_id,
-            &recipient_key,
-            &share_id,
-            &recipient_priv,
-        )
-        .await
-        .expect("pull_if_newer_view must succeed");
+        let applied = pull_if_newer_view(&recipient_id, &recipient_key, &share_id, &recipient_priv)
+            .await
+            .expect("pull_if_newer_view must succeed");
         assert!(applied);
 
         let mut cache_conn =
@@ -1172,7 +1191,8 @@ mod tests {
         let shared_folder = tempfile::tempdir().unwrap();
         let folder_path = shared_folder.path().to_str().unwrap();
         owner_settings_store::set_persona_share_sync_folder(
-            pool,
+            &owner_id,
+            &owner_key,
             &owner_persona,
             &share_id,
             owner_settings_store::SyncRole::Owner,
@@ -1253,7 +1273,8 @@ mod tests {
         let shared_folder = tempfile::tempdir().unwrap();
         let folder_path = shared_folder.path().to_str().unwrap();
         owner_settings_store::set_persona_share_sync_folder(
-            pool,
+            &owner_id,
+            &owner_key,
             &owner_persona,
             &share_id,
             owner_settings_store::SyncRole::Owner,
@@ -1262,8 +1283,8 @@ mod tests {
         .await
         .unwrap();
         settings_store::set_persona_view_share_sync_folder(
-            pool,
             &recipient_id,
+            &recipient_key,
             &share_id,
             folder_path,
         )
@@ -1282,15 +1303,9 @@ mod tests {
         )
         .await
         .unwrap();
-        pull_if_newer_view(
-            pool,
-            &recipient_id,
-            &recipient_key,
-            &share_id,
-            &recipient_priv,
-        )
-        .await
-        .unwrap();
+        pull_if_newer_view(&recipient_id, &recipient_key, &share_id, &recipient_priv)
+            .await
+            .unwrap();
 
         revoke_persona_view_share(pool, &owner_id, &share_id)
             .await
@@ -1309,15 +1324,9 @@ mod tests {
         .expect("tombstone push must succeed");
         assert!(tombstone_pushed);
 
-        let applied = pull_if_newer_view(
-            pool,
-            &recipient_id,
-            &recipient_key,
-            &share_id,
-            &recipient_priv,
-        )
-        .await
-        .expect("tombstone pull must succeed");
+        let applied = pull_if_newer_view(&recipient_id, &recipient_key, &share_id, &recipient_priv)
+            .await
+            .expect("tombstone pull must succeed");
         assert!(applied);
 
         let mut cache_conn =
@@ -1339,15 +1348,9 @@ mod tests {
 
         // A terminal share must not be re-pulled even if somehow the folder
         // still holds a file -- pull_if_newer_view short-circuits on status.
-        let repeat = pull_if_newer_view(
-            pool,
-            &recipient_id,
-            &recipient_key,
-            &share_id,
-            &recipient_priv,
-        )
-        .await
-        .unwrap();
+        let repeat = pull_if_newer_view(&recipient_id, &recipient_key, &share_id, &recipient_priv)
+            .await
+            .unwrap();
         assert!(!repeat, "an already-ended share must not be pulled again");
     }
 

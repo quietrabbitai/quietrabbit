@@ -219,7 +219,10 @@ pub struct FrictionGateDetail {
 /// The frontend still supplies `user_id`, but it must be the unlocked account:
 /// the names come from that user's encrypted registry, so a command for any
 /// other user_id could not be answered anyway (items.id=661).
-async fn session_for_user(key_registry: &KeyRegistry, user_id: &str) -> Result<String, String> {
+pub(crate) async fn session_for_user(
+    key_registry: &KeyRegistry,
+    user_id: &str,
+) -> Result<String, String> {
     let (session_user, key_hex_str) = key_registry
         .with_key(|k| (k.user_id.clone(), key_hex(&k.data_key)))
         .await
@@ -228,6 +231,17 @@ async fn session_for_user(key_registry: &KeyRegistry, user_id: &str) -> Result<S
         return Err("user_id does not match the unlocked account".to_owned());
     }
     Ok(key_hex_str)
+}
+
+/// The unlocked account's id and data key as hex, for commands that act on the
+/// session's own user and take no user_id argument.
+pub(crate) async fn session_user_and_key(
+    key_registry: &KeyRegistry,
+) -> Result<(String, String), String> {
+    key_registry
+        .with_key(|k| (k.user_id.clone(), key_hex(&k.data_key)))
+        .await
+        .ok_or_else(|| "not logged in".to_owned())
 }
 
 #[tauri::command]

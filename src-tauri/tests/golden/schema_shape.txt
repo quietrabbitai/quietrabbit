@@ -815,13 +815,6 @@ TABLE group_departures
   persona_id TEXT notnull=1 pk=2 default=None
   departed_at TEXT notnull=1 pk=0 default=None
   reason TEXT notnull=1 pk=0 default=None
-TABLE group_sync_settings
-  persona_id TEXT notnull=1 pk=1 default=None
-  group_id TEXT notnull=1 pk=2 default=None
-  folder_path TEXT notnull=1 pk=0 default=None
-  last_synced_at TEXT notnull=0 pk=0 default=None
-  last_error TEXT notnull=0 pk=0 default=None
-  updated_at TEXT notnull=1 pk=0 default=None
 TABLE instance_config
   key TEXT notnull=0 pk=1 default=None
   value TEXT notnull=1 pk=0 default=None
@@ -872,22 +865,6 @@ TABLE pending_persona_shares
   materialized_persona_id TEXT notnull=0 pk=0 default=None
   share_type TEXT notnull=1 pk=0 default=Some("'synced'")
   revoked_at TEXT notnull=0 pk=0 default=None
-TABLE persona_share_sync_settings
-  persona_id TEXT notnull=1 pk=1 default=None
-  share_id TEXT notnull=1 pk=2 default=None
-  role TEXT notnull=1 pk=0 default=None
-  folder_path TEXT notnull=1 pk=0 default=None
-  last_synced_at TEXT notnull=0 pk=0 default=None
-  last_pushed_at TEXT notnull=0 pk=0 default=None
-  last_content_hash TEXT notnull=0 pk=0 default=None
-  last_error TEXT notnull=0 pk=0 default=None
-  updated_at TEXT notnull=1 pk=0 default=None
-TABLE persona_view_share_settings
-  recipient_user_id TEXT notnull=1 pk=1 default=None
-  share_id TEXT notnull=1 pk=2 default=None
-  folder_path TEXT notnull=1 pk=0 default=None
-  last_error TEXT notnull=0 pk=0 default=None
-  updated_at TEXT notnull=1 pk=0 default=None
 TABLE personas
   id TEXT notnull=0 pk=1 default=None
   created_at TEXT notnull=1 pk=0 default=None

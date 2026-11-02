@@ -379,8 +379,16 @@ pub async fn accept_invitation(
     // as every other push/pull call site -- a sync failure must not turn
     // an otherwise-successful accept_invitation into an Err.
     let group_key_hex = crate::auth::registry::key_hex(&group_key);
+    // The sync settings are in the recipient's encrypted integration_keys.db
+    // (items.id=661): the engine needs the account's id and DATA key, which
+    // are the owner id resolved above and `personal_key_hex`. The group key
+    // above is a different key.
+    let sync_ctx = crate::group_sync::settings_store::GroupSyncCtx {
+        user_id: &owner_user_id,
+        data_key_hex: personal_key_hex,
+    };
     if let Err(e) = crate::group_sync::engine::pull_if_newer(
-        pool,
+        &sync_ctx,
         recipient_persona_id,
         &invitation.group_id,
         &group_key_hex,
@@ -394,7 +402,7 @@ pub async fn accept_invitation(
         );
     }
     if let Err(e) = crate::group_sync::engine::pull_permissions_if_newer(
-        pool,
+        &sync_ctx,
         recipient_persona_id,
         &invitation.group_id,
         &group_key_hex,

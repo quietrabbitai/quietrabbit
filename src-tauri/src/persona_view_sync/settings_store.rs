@@ -1,15 +1,21 @@
 // src-tauri/src/persona_view_sync/settings_store.rs
 //
-// persona_view_share_settings CRUD for shared.db (unencrypted) -- items.id=304
-// (decisions.id=723). This is the VIEW-ONLY *recipient's* own folder-sync
+// persona_view_share_settings CRUD -- items.id=304 (decisions.id=723). This is the VIEW-ONLY *recipient's* own folder-sync
 // bookkeeping only: where this install looks for the owner's push, and
-// whether the last pull attempt errored. See schema/shared_010.sql's own
-// header for why this is a new table rather than a reuse of
-// persona_sync::settings_store's persona_share_sync_settings (that table's
-// PK is (persona_id, share_id); a VIEW-ONLY recipient has no persona_id for
-// this share at all) -- and why it carries no last_synced_at (that value's
-// single source of truth is view_cache_meta.last_synced_at, in the encrypted
-// cache db this same pull already opens every sweep).
+// whether the last pull attempt errored. It is a table of its own rather than
+// a reuse of persona_sync::settings_store's persona_share_sync_settings (that
+// table's PK is (persona_id, share_id); a VIEW-ONLY recipient has no
+// persona_id for this share at all), and it carries no last_synced_at (that
+// value's single source of truth is view_cache_meta.last_synced_at, in the
+// encrypted cache db this same pull already opens every sweep).
+//
+// The table lives in the recipient's encrypted integration_keys.db
+// (keys_006.sql), not in shared.db (items.id=661, decisions.id=862): the folder
+// path is a user-chosen location and last_error can embed one. Every function
+// takes the recipient's user id and data key and opens that file. It is an
+// account-level table (the key is the share), not a view_cache.db one,
+// because the settings are written before the share is accepted and the cache
+// file does not exist yet.
 //
 // The VIEW-ONLY *owner* side reuses persona_sync::settings_store directly
 // (role='owner') -- unchanged, no new table needed there.
@@ -17,11 +23,13 @@
 // PK is (recipient_user_id, share_id) -- full PK required for all reads.
 //
 // QUERY STYLE: runtime sqlx::query() only -- no query!() macros.
-// shared.db is unencrypted -- no PRAGMA key required.
 //
-// CONNECTION MODEL: one connection per call, same as every other shared.db
-// store in this codebase.
+// CONNECTION MODEL: one encrypted connection per call
+// (integration_keys_store::open_integration_keys_db).
 
+use crate::persistence::integration_keys_store::{
+    open_integration_keys_db, IntegrationKeysStoreError,
+};
 use sqlx::Row;
 use thiserror::Error;
 
@@ -31,6 +39,9 @@ pub enum PersonaViewShareSyncSettingsError {
     Database(#[from] sqlx::Error),
     #[error("Validation error: {0}")]
     Validation(String),
+    /// The encrypted file could not be opened (no key, epoch changed).
+    #[error("{0}")]
+    Keys(#[from] IntegrationKeysStoreError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,11 +73,11 @@ fn row_to_settings(
 /// (engine.rs's pull sweep) treat that as "sync not set up yet", a silent
 /// no-op, matching persona_sync::settings_store's own contract.
 pub async fn get_persona_view_share_sync_settings(
-    pool: &sqlx::SqlitePool,
     recipient_user_id: &str,
+    key_hex: &str,
     share_id: &str,
 ) -> Result<Option<PersonaViewShareSyncSettings>, PersonaViewShareSyncSettingsError> {
-    let mut conn = pool.acquire().await?;
+    let mut conn = open_integration_keys_db(recipient_user_id, key_hex).await?;
 
     let row = sqlx::query(
         "SELECT recipient_user_id, share_id, folder_path, last_error, updated_at
@@ -74,7 +85,7 @@ pub async fn get_persona_view_share_sync_settings(
     )
     .bind(recipient_user_id)
     .bind(share_id)
-    .fetch_optional(&mut *conn)
+    .fetch_optional(&mut conn)
     .await?;
 
     match row {
@@ -93,8 +104,8 @@ pub async fn get_persona_view_share_sync_settings(
 /// establishes. Does not touch last_error: pointing at a new folder doesn't
 /// retroactively change the outcome of the last attempt against the old one.
 pub async fn set_persona_view_share_sync_folder(
-    pool: &sqlx::SqlitePool,
     recipient_user_id: &str,
+    key_hex: &str,
     share_id: &str,
     folder_path: &str,
 ) -> Result<(), PersonaViewShareSyncSettingsError> {
@@ -105,7 +116,7 @@ pub async fn set_persona_view_share_sync_folder(
     }
 
     let now = crate::providers::utils::now();
-    let mut conn = pool.acquire().await?;
+    let mut conn = open_integration_keys_db(recipient_user_id, key_hex).await?;
 
     sqlx::query(
         "INSERT INTO persona_view_share_settings
@@ -118,7 +129,7 @@ pub async fn set_persona_view_share_sync_folder(
     .bind(share_id)
     .bind(folder_path)
     .bind(&now)
-    .execute(&mut *conn)
+    .execute(&mut conn)
     .await?;
 
     Ok(())
@@ -128,12 +139,12 @@ pub async fn set_persona_view_share_sync_folder(
 /// sets it. No-op if no settings row exists yet for this pair -- matching
 /// persona_sync::settings_store's own "no row = nothing to record" contract.
 pub async fn record_pull_result(
-    pool: &sqlx::SqlitePool,
     recipient_user_id: &str,
+    key_hex: &str,
     share_id: &str,
     result: Result<(), &str>,
 ) -> Result<(), PersonaViewShareSyncSettingsError> {
-    let mut conn = pool.acquire().await?;
+    let mut conn = open_integration_keys_db(recipient_user_id, key_hex).await?;
 
     match result {
         Ok(()) => {
@@ -143,7 +154,7 @@ pub async fn record_pull_result(
             )
             .bind(recipient_user_id)
             .bind(share_id)
-            .execute(&mut *conn)
+            .execute(&mut conn)
             .await?;
         }
         Err(msg) => {
@@ -154,7 +165,7 @@ pub async fn record_pull_result(
             .bind(msg)
             .bind(recipient_user_id)
             .bind(share_id)
-            .execute(&mut *conn)
+            .execute(&mut conn)
             .await?;
         }
     }
@@ -171,11 +182,12 @@ mod tests {
     use super::*;
     use crate::test_support::ENV_MUTEX;
 
+    const KEY: &str = "0101010101010101010101010101010101010101010101010101010101010101";
+
     struct TestEnv {
         _tempdir: tempfile::TempDir,
         _lock: tokio::sync::MutexGuard<'static, ()>,
         saved_root: Option<String>,
-        pool: sqlx::SqlitePool,
     }
 
     impl Drop for TestEnv {
@@ -193,30 +205,17 @@ mod tests {
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
 
-        crate::persistence::migrations::migrate_shared_db()
-            .await
-            .expect("shared.db migration must succeed in test setup");
-
-        let pool =
-            sqlx::SqlitePool::connect_with(crate::providers::utils::connect_options_unencrypted(
-                &crate::providers::utils::db_path_shared(),
-            ))
-            .await
-            .expect("shared.db pool must connect");
-
         TestEnv {
             _tempdir: tempdir,
             _lock: lock,
             saved_root,
-            pool,
         }
     }
 
     #[tokio::test]
     async fn get_settings_returns_none_when_unconfigured() {
         let _env = setup().await;
-        let pool = &_env.pool;
-        let result = get_persona_view_share_sync_settings(pool, "user-1", "share-1")
+        let result = get_persona_view_share_sync_settings("user-1", KEY, "share-1")
             .await
             .expect("get must succeed");
         assert!(result.is_none());
@@ -225,12 +224,11 @@ mod tests {
     #[tokio::test]
     async fn set_then_get_round_trips() {
         let _env = setup().await;
-        let pool = &_env.pool;
-        set_persona_view_share_sync_folder(pool, "user-1", "share-1", "/mnt/nas/family")
+        set_persona_view_share_sync_folder("user-1", KEY, "share-1", "/mnt/nas/family")
             .await
             .expect("set must succeed");
 
-        let settings = get_persona_view_share_sync_settings(pool, "user-1", "share-1")
+        let settings = get_persona_view_share_sync_settings("user-1", KEY, "share-1")
             .await
             .expect("get must succeed")
             .expect("settings must exist after set");
@@ -241,8 +239,7 @@ mod tests {
     #[tokio::test]
     async fn set_rejects_empty_path() {
         let _env = setup().await;
-        let pool = &_env.pool;
-        let result = set_persona_view_share_sync_folder(pool, "user-1", "share-1", "   ").await;
+        let result = set_persona_view_share_sync_folder("user-1", KEY, "share-1", "   ").await;
         assert!(matches!(
             result,
             Err(PersonaViewShareSyncSettingsError::Validation(_))
@@ -252,15 +249,14 @@ mod tests {
     #[tokio::test]
     async fn set_reconfigures_folder_path_rather_than_erroring() {
         let _env = setup().await;
-        let pool = &_env.pool;
-        set_persona_view_share_sync_folder(pool, "user-1", "share-1", "/mnt/old")
+        set_persona_view_share_sync_folder("user-1", KEY, "share-1", "/mnt/old")
             .await
             .unwrap();
-        set_persona_view_share_sync_folder(pool, "user-1", "share-1", "/mnt/new")
+        set_persona_view_share_sync_folder("user-1", KEY, "share-1", "/mnt/new")
             .await
             .expect("reconfiguring an already-set pair must not error");
 
-        let settings = get_persona_view_share_sync_settings(pool, "user-1", "share-1")
+        let settings = get_persona_view_share_sync_settings("user-1", KEY, "share-1")
             .await
             .unwrap()
             .unwrap();
@@ -270,18 +266,17 @@ mod tests {
     #[tokio::test]
     async fn record_pull_result_ok_clears_a_prior_error() {
         let _env = setup().await;
-        let pool = &_env.pool;
-        set_persona_view_share_sync_folder(pool, "user-1", "share-1", "/mnt/nas")
+        set_persona_view_share_sync_folder("user-1", KEY, "share-1", "/mnt/nas")
             .await
             .unwrap();
-        record_pull_result(pool, "user-1", "share-1", Err("unreachable"))
+        record_pull_result("user-1", KEY, "share-1", Err("unreachable"))
             .await
             .unwrap();
-        record_pull_result(pool, "user-1", "share-1", Ok(()))
+        record_pull_result("user-1", KEY, "share-1", Ok(()))
             .await
             .expect("record_pull_result must succeed");
 
-        let settings = get_persona_view_share_sync_settings(pool, "user-1", "share-1")
+        let settings = get_persona_view_share_sync_settings("user-1", KEY, "share-1")
             .await
             .unwrap()
             .unwrap();
@@ -291,15 +286,50 @@ mod tests {
     #[tokio::test]
     async fn record_result_on_unconfigured_pair_is_a_noop_not_an_error() {
         let _env = setup().await;
-        let pool = &_env.pool;
-        assert!(record_pull_result(pool, "user-1", "share-1", Ok(()))
+        assert!(record_pull_result("user-1", KEY, "share-1", Ok(()))
             .await
             .is_ok());
         assert!(
-            get_persona_view_share_sync_settings(pool, "user-1", "share-1")
+            get_persona_view_share_sync_settings("user-1", KEY, "share-1")
                 .await
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn the_path_is_not_readable_from_disk_without_the_key() {
+        let _env = setup().await;
+        set_persona_view_share_sync_folder("user-1", KEY, "share-1", "/mnt/SENTINEL-VIEW-PATH")
+            .await
+            .unwrap();
+        record_pull_result(
+            "user-1",
+            KEY,
+            "share-1",
+            Err("cannot read /mnt/SENTINEL-VIEW-PATH"),
+        )
+        .await
+        .unwrap();
+
+        let db = crate::providers::utils::db_path_integration_keys("user-1");
+        let mut raw = std::fs::read(&db).unwrap();
+        for sidecar in ["-wal", "-shm"] {
+            let mut name = db.clone().into_os_string();
+            name.push(sidecar);
+            if let Ok(more) = std::fs::read(std::path::PathBuf::from(name)) {
+                raw.extend(more);
+            }
+        }
+        assert!(
+            !raw.windows(b"SENTINEL-VIEW-PATH".len())
+                .any(|w| w == b"SENTINEL-VIEW-PATH"),
+            "the folder path must not appear in the file's bytes"
+        );
+        let got = get_persona_view_share_sync_settings("user-1", KEY, "share-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.folder_path, "/mnt/SENTINEL-VIEW-PATH");
     }
 }

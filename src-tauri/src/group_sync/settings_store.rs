@@ -1,22 +1,40 @@
 // src-tauri/src/group_sync/settings_store.rs
 //
-// group_sync_settings CRUD for shared.db (unencrypted) -- items.id=287.
-// Where this install's folder-sync destination for a (persona_id, group_id)
-// pair is, and the outcome of the most recent push/pull attempt. See
-// schema/shared_005.sql's own header for the full placement reasoning.
+// group_sync_settings CRUD -- items.id=287. Where this install's folder-sync
+// destination for a (persona_id, group_id) pair is, and the outcome of the
+// most recent push/pull attempt.
+//
+// The table lives in the user's encrypted integration_keys.db (keys_006.sql),
+// not in shared.db (items.id=661, decisions.id=862): the folder path is a
+// user-chosen location and last_error can embed one, and shared.db is
+// readable without the password. Every function therefore takes the owning
+// user's id and data key (GroupSyncCtx for the engine) and opens that file.
+// The group engine's own `key_hex` is the GROUP's symmetric key and is never
+// used here.
 //
 // PK is (persona_id, group_id) -- full PK required for all reads, same
 // shape as persistence::focus_settings_store's (persona_id, focus_id).
 //
 // QUERY STYLE: runtime sqlx::query() only -- no query!() macros.
-// shared.db is unencrypted -- no PRAGMA key required.
 //
-// CONNECTION MODEL: one connection per call, same as every other shared.db
-// store in this codebase (focus_settings_store.rs's own header notes this
-// is Phase 1, not the final architecture).
+// CONNECTION MODEL: one encrypted connection per call
+// (integration_keys_store::open_integration_keys_db).
 
+use crate::persistence::integration_keys_store::{
+    open_integration_keys_db, IntegrationKeysStoreError,
+};
 use sqlx::Row;
 use thiserror::Error;
+
+/// Whose encrypted settings a group-sync call reads and writes: the unlocked
+/// account's id and its DATA key as hex. Passed down the group engine in place
+/// of the shared.db pool it used to take, because the engine's functions have
+/// the group key but not the account's key (items.id=661).
+#[derive(Debug, Clone, Copy)]
+pub struct GroupSyncCtx<'a> {
+    pub user_id: &'a str,
+    pub data_key_hex: &'a str,
+}
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -28,6 +46,9 @@ pub enum GroupSyncSettingsError {
     Database(#[from] sqlx::Error),
     #[error("Validation error: {0}")]
     Validation(String),
+    /// The encrypted file could not be opened (no key, epoch changed).
+    #[error("{0}")]
+    Keys(#[from] IntegrationKeysStoreError),
 }
 
 // ---------------------------------------------------------------------------
@@ -64,11 +85,11 @@ fn row_to_settings(r: &sqlx::sqlite::SqliteRow) -> Result<GroupSyncSettings, sql
 /// (engine.rs's push/pull) treat that as "sync not set up yet", a silent
 /// no-op, not an error.
 pub async fn get_group_sync_settings(
-    pool: &sqlx::SqlitePool,
+    ctx: &GroupSyncCtx<'_>,
     persona_id: &str,
     group_id: &str,
 ) -> Result<Option<GroupSyncSettings>, GroupSyncSettingsError> {
-    let mut conn = pool.acquire().await?;
+    let mut conn = open_integration_keys_db(ctx.user_id, ctx.data_key_hex).await?;
 
     let row = sqlx::query(
         "SELECT persona_id, group_id, folder_path, last_synced_at, last_error, updated_at
@@ -76,7 +97,7 @@ pub async fn get_group_sync_settings(
     )
     .bind(persona_id)
     .bind(group_id)
-    .fetch_optional(&mut *conn)
+    .fetch_optional(&mut conn)
     .await?;
 
     match row {
@@ -97,7 +118,7 @@ pub async fn get_group_sync_settings(
 /// at a new folder doesn't retroactively change the outcome of the last
 /// attempt against the old one.
 pub async fn set_group_sync_folder(
-    pool: &sqlx::SqlitePool,
+    ctx: &GroupSyncCtx<'_>,
     persona_id: &str,
     group_id: &str,
     folder_path: &str,
@@ -109,7 +130,7 @@ pub async fn set_group_sync_folder(
     }
 
     let now = crate::providers::utils::now();
-    let mut conn = pool.acquire().await?;
+    let mut conn = open_integration_keys_db(ctx.user_id, ctx.data_key_hex).await?;
 
     sqlx::query(
         "INSERT INTO group_sync_settings (persona_id, group_id, folder_path, updated_at)
@@ -121,7 +142,7 @@ pub async fn set_group_sync_folder(
     .bind(group_id)
     .bind(folder_path)
     .bind(&now)
-    .execute(&mut *conn)
+    .execute(&mut conn)
     .await?;
 
     Ok(())
@@ -136,13 +157,13 @@ pub async fn set_group_sync_folder(
 /// row exists yet for this pair -- e.g. a push attempted before the folder
 /// was ever configured has nothing to record against.
 pub async fn record_sync_result(
-    pool: &sqlx::SqlitePool,
+    ctx: &GroupSyncCtx<'_>,
     persona_id: &str,
     group_id: &str,
     result: Result<(), &str>,
 ) -> Result<(), GroupSyncSettingsError> {
     let now = crate::providers::utils::now();
-    let mut conn = pool.acquire().await?;
+    let mut conn = open_integration_keys_db(ctx.user_id, ctx.data_key_hex).await?;
 
     match result {
         Ok(()) => {
@@ -154,7 +175,7 @@ pub async fn record_sync_result(
             .bind(&now)
             .bind(persona_id)
             .bind(group_id)
-            .execute(&mut *conn)
+            .execute(&mut conn)
             .await?;
         }
         Err(msg) => {
@@ -166,7 +187,7 @@ pub async fn record_sync_result(
             .bind(msg)
             .bind(persona_id)
             .bind(group_id)
-            .execute(&mut *conn)
+            .execute(&mut conn)
             .await?;
         }
     }
@@ -183,11 +204,15 @@ mod tests {
     use super::*;
     use crate::test_support::ENV_MUTEX;
 
+    const CTX: GroupSyncCtx<'static> = GroupSyncCtx {
+        user_id: "user-1",
+        data_key_hex: "0101010101010101010101010101010101010101010101010101010101010101",
+    };
+
     struct TestEnv {
         _tempdir: tempfile::TempDir,
         _lock: tokio::sync::MutexGuard<'static, ()>,
         saved_root: Option<String>,
-        pool: sqlx::SqlitePool,
     }
 
     impl Drop for TestEnv {
@@ -205,30 +230,17 @@ mod tests {
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
 
-        crate::persistence::migrations::migrate_shared_db()
-            .await
-            .expect("shared.db migration must succeed in test setup");
-
-        let pool =
-            sqlx::SqlitePool::connect_with(crate::providers::utils::connect_options_unencrypted(
-                &crate::providers::utils::db_path_shared(),
-            ))
-            .await
-            .expect("shared.db pool must connect");
-
         TestEnv {
             _tempdir: tempdir,
             _lock: lock,
             saved_root,
-            pool,
         }
     }
 
     #[tokio::test]
     async fn get_group_sync_settings_returns_none_when_unconfigured() {
         let _env = setup().await;
-        let pool = &_env.pool;
-        let result = get_group_sync_settings(pool, "persona-1", "group-1")
+        let result = get_group_sync_settings(&CTX, "persona-1", "group-1")
             .await
             .expect("get_group_sync_settings must succeed");
         assert!(result.is_none());
@@ -237,12 +249,11 @@ mod tests {
     #[tokio::test]
     async fn set_then_get_round_trips() {
         let _env = setup().await;
-        let pool = &_env.pool;
-        set_group_sync_folder(pool, "persona-1", "group-1", "/mnt/nas/family")
+        set_group_sync_folder(&CTX, "persona-1", "group-1", "/mnt/nas/family")
             .await
             .expect("set_group_sync_folder must succeed");
 
-        let settings = get_group_sync_settings(pool, "persona-1", "group-1")
+        let settings = get_group_sync_settings(&CTX, "persona-1", "group-1")
             .await
             .expect("get_group_sync_settings must succeed")
             .expect("settings must exist after set_group_sync_folder");
@@ -254,23 +265,21 @@ mod tests {
     #[tokio::test]
     async fn set_group_sync_folder_rejects_empty_path() {
         let _env = setup().await;
-        let pool = &_env.pool;
-        let result = set_group_sync_folder(pool, "persona-1", "group-1", "   ").await;
+        let result = set_group_sync_folder(&CTX, "persona-1", "group-1", "   ").await;
         assert!(matches!(result, Err(GroupSyncSettingsError::Validation(_))));
     }
 
     #[tokio::test]
     async fn set_group_sync_folder_reconfigures_rather_than_erroring() {
         let _env = setup().await;
-        let pool = &_env.pool;
-        set_group_sync_folder(pool, "persona-1", "group-1", "/mnt/nas/old")
+        set_group_sync_folder(&CTX, "persona-1", "group-1", "/mnt/nas/old")
             .await
             .unwrap();
-        set_group_sync_folder(pool, "persona-1", "group-1", "/mnt/nas/new")
+        set_group_sync_folder(&CTX, "persona-1", "group-1", "/mnt/nas/new")
             .await
             .expect("reconfiguring an already-set group must not error");
 
-        let settings = get_group_sync_settings(pool, "persona-1", "group-1")
+        let settings = get_group_sync_settings(&CTX, "persona-1", "group-1")
             .await
             .unwrap()
             .unwrap();
@@ -280,18 +289,17 @@ mod tests {
     #[tokio::test]
     async fn record_sync_result_ok_sets_last_synced_at_and_clears_last_error() {
         let _env = setup().await;
-        let pool = &_env.pool;
-        set_group_sync_folder(pool, "persona-1", "group-1", "/mnt/nas/family")
+        set_group_sync_folder(&CTX, "persona-1", "group-1", "/mnt/nas/family")
             .await
             .unwrap();
-        record_sync_result(pool, "persona-1", "group-1", Err("folder unreachable"))
+        record_sync_result(&CTX, "persona-1", "group-1", Err("folder unreachable"))
             .await
             .unwrap();
-        record_sync_result(pool, "persona-1", "group-1", Ok(()))
+        record_sync_result(&CTX, "persona-1", "group-1", Ok(()))
             .await
             .expect("record_sync_result must succeed");
 
-        let settings = get_group_sync_settings(pool, "persona-1", "group-1")
+        let settings = get_group_sync_settings(&CTX, "persona-1", "group-1")
             .await
             .unwrap()
             .unwrap();
@@ -305,24 +313,23 @@ mod tests {
     #[tokio::test]
     async fn record_sync_result_err_sets_last_error_without_touching_last_synced_at() {
         let _env = setup().await;
-        let pool = &_env.pool;
-        set_group_sync_folder(pool, "persona-1", "group-1", "/mnt/nas/family")
+        set_group_sync_folder(&CTX, "persona-1", "group-1", "/mnt/nas/family")
             .await
             .unwrap();
-        record_sync_result(pool, "persona-1", "group-1", Ok(()))
+        record_sync_result(&CTX, "persona-1", "group-1", Ok(()))
             .await
             .unwrap();
-        let after_success = get_group_sync_settings(pool, "persona-1", "group-1")
+        let after_success = get_group_sync_settings(&CTX, "persona-1", "group-1")
             .await
             .unwrap()
             .unwrap();
         let synced_at = after_success.last_synced_at.clone();
 
-        record_sync_result(pool, "persona-1", "group-1", Err("folder unreachable"))
+        record_sync_result(&CTX, "persona-1", "group-1", Err("folder unreachable"))
             .await
             .expect("record_sync_result must succeed");
 
-        let after_failure = get_group_sync_settings(pool, "persona-1", "group-1")
+        let after_failure = get_group_sync_settings(&CTX, "persona-1", "group-1")
             .await
             .unwrap()
             .unwrap();
@@ -339,15 +346,70 @@ mod tests {
     #[tokio::test]
     async fn record_sync_result_on_unconfigured_pair_is_a_noop_not_an_error() {
         let _env = setup().await;
-        let pool = &_env.pool;
-        let result = record_sync_result(pool, "persona-1", "group-1", Ok(())).await;
+        let result = record_sync_result(&CTX, "persona-1", "group-1", Ok(())).await;
         assert!(
             result.is_ok(),
             "recording against a never-configured pair must not error"
         );
-        assert!(get_group_sync_settings(pool, "persona-1", "group-1")
+        assert!(get_group_sync_settings(&CTX, "persona-1", "group-1")
             .await
             .unwrap()
             .is_none());
+    }
+
+    /// items.id=661: the folder path and an error that embeds it are stored
+    /// in the encrypted file, so neither is readable from disk without the
+    /// key, and shared.db has no such table at all.
+    #[tokio::test]
+    async fn the_path_and_the_error_are_not_readable_from_disk_without_the_key() {
+        let _env = setup().await;
+        set_group_sync_folder(&CTX, "persona-1", "group-1", "/mnt/SENTINEL-GROUP-PATH")
+            .await
+            .unwrap();
+        record_sync_result(
+            &CTX,
+            "persona-1",
+            "group-1",
+            Err("cannot open /mnt/SENTINEL-GROUP-PATH"),
+        )
+        .await
+        .unwrap();
+
+        let got = get_group_sync_settings(&CTX, "persona-1", "group-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.folder_path, "/mnt/SENTINEL-GROUP-PATH");
+
+        let db = crate::providers::utils::db_path_integration_keys(CTX.user_id);
+        let mut raw = std::fs::read(&db).unwrap();
+        for sidecar in ["-wal", "-shm"] {
+            let mut name = db.clone().into_os_string();
+            name.push(sidecar);
+            if let Ok(more) = std::fs::read(std::path::PathBuf::from(name)) {
+                raw.extend(more);
+            }
+        }
+        assert!(
+            !raw.windows(b"SENTINEL-GROUP-PATH".len())
+                .any(|w| w == b"SENTINEL-GROUP-PATH"),
+            "the folder path must not appear in the file's bytes"
+        );
+    }
+
+    /// A different account's key cannot open this account's settings file.
+    #[tokio::test]
+    async fn another_data_key_cannot_read_the_settings() {
+        let _env = setup().await;
+        set_group_sync_folder(&CTX, "persona-1", "group-1", "/mnt/nas")
+            .await
+            .unwrap();
+        let wrong = GroupSyncCtx {
+            user_id: CTX.user_id,
+            data_key_hex: "0202020202020202020202020202020202020202020202020202020202020202",
+        };
+        assert!(get_group_sync_settings(&wrong, "persona-1", "group-1")
+            .await
+            .is_err());
     }
 }

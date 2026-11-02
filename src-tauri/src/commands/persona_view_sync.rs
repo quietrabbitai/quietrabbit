@@ -11,15 +11,17 @@
 // primitives with no #[tauri::command] yet -- this item's job is the
 // mechanism, not the UI, same scoping items.id=302 (materialization) used.
 //
-// No key_hex / State<...Registry> needed: persona_view_share_settings lives
-// in shared.db, unencrypted, keyed only by (recipient_user_id, share_id) --
-// the folder path itself is not share content, same reasoning
-// commands/persona_sync.rs's own header gives for its settings pair.
+// Both commands need the unlocked session (items.id=661, decisions.id=862):
+// persona_view_share_settings lives in the recipient's encrypted
+// integration_keys.db, not shared.db, because the folder path is a user-chosen
+// location that must not be readable without the password.
+// recipient_user_id stays an argument but must be the unlocked account.
 
 use serde::Serialize;
 use specta::Type;
 use tauri::State;
 
+use crate::auth::registry::KeyRegistry;
 use crate::persona_view_sync::settings_store;
 
 #[derive(Debug, Serialize, Type)]
@@ -37,11 +39,14 @@ pub async fn set_persona_view_share_sync_folder(
     recipient_user_id: String,
     share_id: String,
     folder_path: String,
-    pool: State<'_, sqlx::SqlitePool>,
+    key_registry: State<'_, KeyRegistry>,
 ) -> Result<(), String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
+    let key_hex_str =
+        crate::commands::persona::session_for_user(&key_registry, &recipient_user_id).await?;
     settings_store::set_persona_view_share_sync_folder(
-        &pool,
         &recipient_user_id,
+        &key_hex_str,
         &share_id,
         &folder_path,
     )
@@ -58,12 +63,18 @@ pub async fn set_persona_view_share_sync_folder(
 pub async fn get_persona_view_share_sync_folder(
     recipient_user_id: String,
     share_id: String,
-    pool: State<'_, sqlx::SqlitePool>,
+    key_registry: State<'_, KeyRegistry>,
 ) -> Result<Option<PersonaViewShareSyncSettingsInfo>, String> {
-    let settings =
-        settings_store::get_persona_view_share_sync_settings(&pool, &recipient_user_id, &share_id)
-            .await
-            .map_err(|e| e.to_string())?;
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
+    let key_hex_str =
+        crate::commands::persona::session_for_user(&key_registry, &recipient_user_id).await?;
+    let settings = settings_store::get_persona_view_share_sync_settings(
+        &recipient_user_id,
+        &key_hex_str,
+        &share_id,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
     Ok(settings.map(|s| PersonaViewShareSyncSettingsInfo {
         folder_path: s.folder_path,
@@ -79,7 +90,7 @@ pub async fn get_persona_view_share_sync_folder(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::ENV_MUTEX;
+    use crate::test_support::{mock_app_with_registry, populate_registry, ENV_MUTEX};
     use tauri::Manager;
 
     struct TestEnv {
@@ -124,18 +135,22 @@ mod tests {
     }
 
     fn mock_app_with_pool(pool: sqlx::SqlitePool) -> tauri::App<tauri::test::MockRuntime> {
-        let app = tauri::test::mock_app();
-        app.manage(pool);
-        app
+        mock_app_with_registry(pool)
     }
 
     #[tokio::test]
     async fn get_persona_view_share_sync_folder_is_none_before_any_configuration() {
         let _env = setup().await;
         let app = mock_app_with_pool(_env.pool.clone());
-        let pool = app.state::<sqlx::SqlitePool>();
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(
+            &registry,
+            "user-1",
+            [0x11u8; crate::auth::kdf::MASTER_KEY_LEN],
+        )
+        .await;
         let result =
-            get_persona_view_share_sync_folder("user-1".to_owned(), "share-1".to_owned(), pool)
+            get_persona_view_share_sync_folder("user-1".to_owned(), "share-1".to_owned(), registry)
                 .await
                 .expect("get_persona_view_share_sync_folder must succeed");
         assert!(result.is_none());
@@ -145,18 +160,24 @@ mod tests {
     async fn set_then_get_round_trips_through_the_command_layer() {
         let _env = setup().await;
         let app = mock_app_with_pool(_env.pool.clone());
-        let pool = app.state::<sqlx::SqlitePool>();
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(
+            &registry,
+            "user-1",
+            [0x11u8; crate::auth::kdf::MASTER_KEY_LEN],
+        )
+        .await;
         set_persona_view_share_sync_folder(
             "user-1".to_owned(),
             "share-1".to_owned(),
             "/mnt/nas/family".to_owned(),
-            pool.clone(),
+            registry.clone(),
         )
         .await
         .expect("set_persona_view_share_sync_folder must succeed");
 
         let info =
-            get_persona_view_share_sync_folder("user-1".to_owned(), "share-1".to_owned(), pool)
+            get_persona_view_share_sync_folder("user-1".to_owned(), "share-1".to_owned(), registry)
                 .await
                 .expect("get_persona_view_share_sync_folder must succeed")
                 .expect("settings must exist after set_persona_view_share_sync_folder");
@@ -168,14 +189,59 @@ mod tests {
     async fn set_rejects_empty_path_with_a_string_error() {
         let _env = setup().await;
         let app = mock_app_with_pool(_env.pool.clone());
-        let pool = app.state::<sqlx::SqlitePool>();
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(
+            &registry,
+            "user-1",
+            [0x11u8; crate::auth::kdf::MASTER_KEY_LEN],
+        )
+        .await;
         let result = set_persona_view_share_sync_folder(
             "user-1".to_owned(),
             "share-1".to_owned(),
             "   ".to_owned(),
-            pool,
+            registry,
         )
         .await;
         assert!(result.is_err());
+    }
+
+    /// items.id=661: nobody logged in, or a recipient_user_id that is not the
+    /// unlocked account, is refused by both commands.
+    #[tokio::test]
+    async fn both_commands_refuse_without_a_session_or_for_another_user() {
+        let _env = setup().await;
+        let app = mock_app_with_pool(_env.pool.clone());
+        let registry = app.state::<KeyRegistry>();
+
+        assert!(get_persona_view_share_sync_folder(
+            "user-1".to_owned(),
+            "share-1".to_owned(),
+            registry.clone()
+        )
+        .await
+        .is_err());
+
+        populate_registry(
+            &registry,
+            "user-1",
+            [0x11u8; crate::auth::kdf::MASTER_KEY_LEN],
+        )
+        .await;
+        assert!(get_persona_view_share_sync_folder(
+            "someone-else".to_owned(),
+            "share-1".to_owned(),
+            registry.clone()
+        )
+        .await
+        .is_err());
+        assert!(set_persona_view_share_sync_folder(
+            "someone-else".to_owned(),
+            "share-1".to_owned(),
+            "/mnt/nas".to_owned(),
+            registry
+        )
+        .await
+        .is_err());
     }
 }

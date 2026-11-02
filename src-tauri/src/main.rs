@@ -626,7 +626,27 @@ async fn async_main() {
                                 }
                             }
 
+                            // The sync settings are in the unlocked user's encrypted
+                            // integration_keys.db (items.id=661), so the pulls need the
+                            // account's id and DATA key. With nobody unlocked there is
+                            // nothing to poll (resident group keys are cleared at lock).
+                            let group_sync_account = match (
+                                key_registry.user_id().await,
+                                key_registry.personal_key_hex().await,
+                            ) {
+                                (Some(user_id), Some(data_key_hex)) => Some((user_id, data_key_hex)),
+                                _ => None,
+                            };
                             for (persona_id, group_id) in registry.resident_keys().await {
+                                let Some((sync_user_id, sync_data_key_hex)) =
+                                    group_sync_account.as_ref()
+                                else {
+                                    break;
+                                };
+                                let sync_ctx = quietrabbit_lib::group_sync::settings_store::GroupSyncCtx {
+                                    user_id: sync_user_id,
+                                    data_key_hex: sync_data_key_hex,
+                                };
                                 let key_hex_opt =
                                     registry.key_hex_for(&persona_id, &group_id).await;
                                 let Some(key_hex_str) = key_hex_opt else {
@@ -635,7 +655,7 @@ async fn async_main() {
                                     continue;
                                 };
                                 if let Err(e) = quietrabbit_lib::group_sync::engine::pull_if_newer(
-                                    &pool,
+                                    &sync_ctx,
                                     &persona_id,
                                     &group_id,
                                     &key_hex_str,
@@ -649,7 +669,7 @@ async fn async_main() {
                                 }
                                 if let Err(e) =
                                     quietrabbit_lib::group_sync::engine::pull_permissions_if_newer(
-                                        &pool,
+                                        &sync_ctx,
                                         &persona_id,
                                         &group_id,
                                         &key_hex_str,

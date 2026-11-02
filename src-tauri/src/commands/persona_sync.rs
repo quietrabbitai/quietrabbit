@@ -7,15 +7,16 @@
 // ahead of frontend" precedent commands/group.rs's own header already
 // documents for group.db's identically-shaped pair (items.id=287).
 //
-// No key_hex / State<...Registry> needed: persona_share_sync_settings lives
-// in shared.db, unencrypted, keyed only by (persona_id, share_id) -- the
-// folder path itself is not share content, same reasoning
-// schema/shared_009.sql's own header gives.
+// Both commands need the unlocked session (items.id=661, decisions.id=862):
+// persona_share_sync_settings lives in the user's encrypted integration_keys.db,
+// not shared.db, because the folder path is a user-chosen location that must
+// not be readable without the password.
 
 use serde::Serialize;
 use specta::Type;
 use tauri::State;
 
+use crate::auth::registry::KeyRegistry;
 use crate::persona_sync::settings_store::{self, SyncRole};
 
 #[derive(Debug, Serialize, Type)]
@@ -40,12 +41,22 @@ pub async fn set_persona_share_sync_folder(
     share_id: String,
     role: String,
     folder_path: String,
-    pool: State<'_, sqlx::SqlitePool>,
+    key_registry: State<'_, KeyRegistry>,
 ) -> Result<(), String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let role = SyncRole::parse(&role).map_err(|e| e.to_string())?;
-    settings_store::set_persona_share_sync_folder(&pool, &persona_id, &share_id, role, &folder_path)
-        .await
-        .map_err(|e| e.to_string())
+    let (user_id, key_hex_str) =
+        crate::commands::persona::session_user_and_key(&key_registry).await?;
+    settings_store::set_persona_share_sync_folder(
+        &user_id,
+        &key_hex_str,
+        &persona_id,
+        &share_id,
+        role,
+        &folder_path,
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Fetch this install's folder-sync settings for a (persona_id, share_id)
@@ -57,11 +68,19 @@ pub async fn set_persona_share_sync_folder(
 pub async fn get_persona_share_sync_folder(
     persona_id: String,
     share_id: String,
-    pool: State<'_, sqlx::SqlitePool>,
+    key_registry: State<'_, KeyRegistry>,
 ) -> Result<Option<PersonaShareSyncSettingsInfo>, String> {
-    let settings = settings_store::get_persona_share_sync_settings(&pool, &persona_id, &share_id)
-        .await
-        .map_err(|e| e.to_string())?;
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
+    let (user_id, key_hex_str) =
+        crate::commands::persona::session_user_and_key(&key_registry).await?;
+    let settings = settings_store::get_persona_share_sync_settings(
+        &user_id,
+        &key_hex_str,
+        &persona_id,
+        &share_id,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
     Ok(settings.map(|s| PersonaShareSyncSettingsInfo {
         role: s.role.as_str().to_owned(),
@@ -81,7 +100,7 @@ pub async fn get_persona_share_sync_folder(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::ENV_MUTEX;
+    use crate::test_support::{mock_app_with_registry, populate_registry, ENV_MUTEX};
     use tauri::Manager;
 
     struct TestEnv {
@@ -126,18 +145,22 @@ mod tests {
     }
 
     fn mock_app_with_pool(pool: sqlx::SqlitePool) -> tauri::App<tauri::test::MockRuntime> {
-        let app = tauri::test::mock_app();
-        app.manage(pool);
-        app
+        mock_app_with_registry(pool)
     }
 
     #[tokio::test]
     async fn get_persona_share_sync_folder_is_none_before_any_configuration() {
         let _env = setup().await;
         let app = mock_app_with_pool(_env.pool.clone());
-        let pool = app.state::<sqlx::SqlitePool>();
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(
+            &registry,
+            "user-1",
+            [0x11u8; crate::auth::kdf::MASTER_KEY_LEN],
+        )
+        .await;
         let result =
-            get_persona_share_sync_folder("persona-1".to_owned(), "share-1".to_owned(), pool)
+            get_persona_share_sync_folder("persona-1".to_owned(), "share-1".to_owned(), registry)
                 .await
                 .expect("get_persona_share_sync_folder must succeed");
         assert!(result.is_none());
@@ -147,19 +170,25 @@ mod tests {
     async fn set_then_get_round_trips_through_the_command_layer() {
         let _env = setup().await;
         let app = mock_app_with_pool(_env.pool.clone());
-        let pool = app.state::<sqlx::SqlitePool>();
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(
+            &registry,
+            "user-1",
+            [0x11u8; crate::auth::kdf::MASTER_KEY_LEN],
+        )
+        .await;
         set_persona_share_sync_folder(
             "persona-1".to_owned(),
             "share-1".to_owned(),
             "owner".to_owned(),
             "/mnt/nas/family".to_owned(),
-            pool.clone(),
+            registry.clone(),
         )
         .await
         .expect("set_persona_share_sync_folder must succeed");
 
         let info =
-            get_persona_share_sync_folder("persona-1".to_owned(), "share-1".to_owned(), pool)
+            get_persona_share_sync_folder("persona-1".to_owned(), "share-1".to_owned(), registry)
                 .await
                 .expect("get_persona_share_sync_folder must succeed")
                 .expect("settings must exist after set_persona_share_sync_folder");
@@ -172,13 +201,19 @@ mod tests {
     async fn set_rejects_an_unknown_role_with_a_string_error() {
         let _env = setup().await;
         let app = mock_app_with_pool(_env.pool.clone());
-        let pool = app.state::<sqlx::SqlitePool>();
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(
+            &registry,
+            "user-1",
+            [0x11u8; crate::auth::kdf::MASTER_KEY_LEN],
+        )
+        .await;
         let result = set_persona_share_sync_folder(
             "persona-1".to_owned(),
             "share-1".to_owned(),
             "bystander".to_owned(),
             "/mnt/nas/family".to_owned(),
-            pool,
+            registry,
         )
         .await;
         assert!(result.is_err());
@@ -188,13 +223,19 @@ mod tests {
     async fn set_rejects_empty_path_with_a_string_error() {
         let _env = setup().await;
         let app = mock_app_with_pool(_env.pool.clone());
-        let pool = app.state::<sqlx::SqlitePool>();
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(
+            &registry,
+            "user-1",
+            [0x11u8; crate::auth::kdf::MASTER_KEY_LEN],
+        )
+        .await;
         let result = set_persona_share_sync_folder(
             "persona-1".to_owned(),
             "share-1".to_owned(),
             "recipient".to_owned(),
             "   ".to_owned(),
-            pool,
+            registry,
         )
         .await;
         assert!(result.is_err());

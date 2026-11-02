@@ -518,9 +518,19 @@ pub async fn apply_pending_rotations(
         // Best-effort, same failure-handling contract as every other
         // group_sync call site -- a re-push failure must not turn an
         // otherwise-successful rotation apply into an Err.
-        if let Err(e) =
-            group_sync_engine::republish_owned_documents(pool, persona_id, &group_id, &new_key_hex)
-                .await
+        // Sync settings are in the owner's encrypted integration_keys.db
+        // (items.id=661): the account's id and DATA key, not the group key.
+        let sync_ctx = crate::group_sync::settings_store::GroupSyncCtx {
+            user_id: &owner_user_id,
+            data_key_hex: personal_key_hex,
+        };
+        if let Err(e) = group_sync_engine::republish_owned_documents(
+            &sync_ctx,
+            persona_id,
+            &group_id,
+            &new_key_hex,
+        )
+        .await
         {
             log::warn!(
                 "apply_pending_rotations: republish_owned_documents failed for \

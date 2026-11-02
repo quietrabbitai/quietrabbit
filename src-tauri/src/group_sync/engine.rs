@@ -10,6 +10,11 @@
 //     settings_store::record_sync_result, retried next cycle -- they never
 //     turn a local group.db write into an Err. Local edits are never
 //     blocked on the sync folder's reachability.
+//   - settings (items.id=661): the folder path and last outcome live in the
+//     unlocked user's encrypted integration_keys.db, not shared.db. Every entry
+//     point takes a GroupSyncCtx (user id + DATA key) for that. The `key_hex`
+//     argument next to it is a different key, the group's symmetric key, and
+//     opens group.db and the .qrsync files only.
 //
 // SAVE HOOK: group_store.rs's create_document/update_document have no
 // #[tauri::command] wrapper yet (nothing calls them outside tests except
@@ -51,7 +56,7 @@
 
 use thiserror::Error;
 
-use crate::group_sync::settings_store::{self, GroupSyncSettingsError};
+use crate::group_sync::settings_store::{self, GroupSyncCtx, GroupSyncSettingsError};
 use crate::persistence::group_store::{self, DocumentRecord, GroupStoreError, PermissionGrant};
 
 // ---------------------------------------------------------------------------
@@ -305,7 +310,7 @@ async fn read_permissions_sync_file(
 /// is the document's owner. Push failure is logged and recorded, never
 /// turns this into an Err -- the local create already succeeded.
 pub async fn create_and_push_document(
-    pool: &sqlx::SqlitePool,
+    ctx: &GroupSyncCtx<'_>,
     persona_id: &str,
     group_id: &str,
     key_hex: &str,
@@ -323,7 +328,7 @@ pub async fn create_and_push_document(
     )
     .await?;
 
-    push_if_owner(pool, persona_id, group_id, key_hex, &document_id).await;
+    push_if_owner(ctx, persona_id, group_id, key_hex, &document_id).await;
 
     Ok(document_id)
 }
@@ -332,7 +337,7 @@ pub async fn create_and_push_document(
 /// push it if `persona_id` is the document's owner. Same failure-handling
 /// contract as create_and_push_document.
 pub async fn update_and_push_document(
-    pool: &sqlx::SqlitePool,
+    ctx: &GroupSyncCtx<'_>,
     persona_id: &str,
     group_id: &str,
     key_hex: &str,
@@ -341,7 +346,7 @@ pub async fn update_and_push_document(
 ) -> Result<(), GroupSyncError> {
     group_store::update_document(persona_id, group_id, key_hex, document_id, content).await?;
 
-    push_if_owner(pool, persona_id, group_id, key_hex, document_id).await;
+    push_if_owner(ctx, persona_id, group_id, key_hex, document_id).await;
 
     Ok(())
 }
@@ -362,7 +367,7 @@ pub async fn update_and_push_document(
 /// a known, accepted limitation (items.id=288's own scoping), not solved by
 /// this function.
 pub async fn republish_owned_documents(
-    pool: &sqlx::SqlitePool,
+    ctx: &GroupSyncCtx<'_>,
     persona_id: &str,
     group_id: &str,
     key_hex: &str,
@@ -375,18 +380,18 @@ pub async fn republish_owned_documents(
         .collect();
 
     for document_id in &owned_ids {
-        push_if_owner(pool, persona_id, group_id, key_hex, document_id).await;
+        push_if_owner(ctx, persona_id, group_id, key_hex, document_id).await;
         // A stale permissions .qrsync file (still encrypted under the old,
         // now-evicted key) needs the same re-publish the content file just
         // got above -- same reasoning, items.id=292 extending items.id=288.
-        push_permissions(pool, persona_id, group_id, key_hex, document_id).await;
+        push_permissions(ctx, persona_id, group_id, key_hex, document_id).await;
     }
 
     Ok(())
 }
 
 async fn push_if_owner(
-    pool: &sqlx::SqlitePool,
+    ctx: &GroupSyncCtx<'_>,
     persona_id: &str,
     group_id: &str,
     key_hex: &str,
@@ -408,7 +413,7 @@ async fn push_if_owner(
         return;
     }
 
-    let result = push_document_inner(pool, persona_id, group_id, key_hex, &doc).await;
+    let result = push_document_inner(ctx, persona_id, group_id, key_hex, &doc).await;
     let record_result = result
         .as_ref()
         .map(|_| ())
@@ -420,7 +425,7 @@ async fn push_if_owner(
         );
     }
     if let Err(e) = settings_store::record_sync_result(
-        pool,
+        ctx,
         persona_id,
         group_id,
         record_result.as_ref().map(|_| ()).map_err(|s| s.as_str()),
@@ -432,14 +437,13 @@ async fn push_if_owner(
 }
 
 async fn push_document_inner(
-    pool: &sqlx::SqlitePool,
+    ctx: &GroupSyncCtx<'_>,
     persona_id: &str,
     group_id: &str,
     key_hex: &str,
     doc: &DocumentRecord,
 ) -> Result<(), GroupSyncError> {
-    let Some(settings) =
-        settings_store::get_group_sync_settings(pool, persona_id, group_id).await?
+    let Some(settings) = settings_store::get_group_sync_settings(ctx, persona_id, group_id).await?
     else {
         // Sync not configured for this group on this install yet -- silent
         // no-op, not an error (design doc: "configurable folder-location
@@ -462,7 +466,7 @@ async fn push_document_inner(
 /// grant_permission already requires `persona_id` to be the document's
 /// owner to succeed at all, so reaching the push step already confirms it.
 pub async fn grant_and_push_permission(
-    pool: &sqlx::SqlitePool,
+    ctx: &GroupSyncCtx<'_>,
     persona_id: &str,
     group_id: &str,
     key_hex: &str,
@@ -480,7 +484,7 @@ pub async fn grant_and_push_permission(
     )
     .await?;
 
-    push_permissions(pool, persona_id, group_id, key_hex, document_id).await;
+    push_permissions(ctx, persona_id, group_id, key_hex, document_id).await;
 
     Ok(())
 }
@@ -491,7 +495,7 @@ pub async fn grant_and_push_permission(
 /// persona's absence from that manifest (see apply_synced_permissions'
 /// own doc comment: full-replace, not a separate revoke artifact).
 pub async fn revoke_and_push_permission(
-    pool: &sqlx::SqlitePool,
+    ctx: &GroupSyncCtx<'_>,
     persona_id: &str,
     group_id: &str,
     key_hex: &str,
@@ -507,7 +511,7 @@ pub async fn revoke_and_push_permission(
     )
     .await?;
 
-    push_permissions(pool, persona_id, group_id, key_hex, document_id).await;
+    push_permissions(ctx, persona_id, group_id, key_hex, document_id).await;
 
     Ok(())
 }
@@ -517,7 +521,7 @@ pub async fn revoke_and_push_permission(
 /// failure contract as push_if_owner/push_document_inner -- a sync failure
 /// must not turn an otherwise-successful local grant/revoke into an Err.
 async fn push_permissions(
-    pool: &sqlx::SqlitePool,
+    ctx: &GroupSyncCtx<'_>,
     persona_id: &str,
     group_id: &str,
     key_hex: &str,
@@ -543,7 +547,7 @@ async fn push_permissions(
     };
 
     let result =
-        push_permissions_inner(pool, persona_id, group_id, key_hex, document_id, &grants).await;
+        push_permissions_inner(ctx, persona_id, group_id, key_hex, document_id, &grants).await;
     let record_result = result
         .as_ref()
         .map(|_| ())
@@ -555,7 +559,7 @@ async fn push_permissions(
         );
     }
     if let Err(e) = settings_store::record_sync_result(
-        pool,
+        ctx,
         persona_id,
         group_id,
         record_result.as_ref().map(|_| ()).map_err(|s| s.as_str()),
@@ -567,15 +571,14 @@ async fn push_permissions(
 }
 
 async fn push_permissions_inner(
-    pool: &sqlx::SqlitePool,
+    ctx: &GroupSyncCtx<'_>,
     persona_id: &str,
     group_id: &str,
     key_hex: &str,
     document_id: &str,
     grants: &[PermissionGrant],
 ) -> Result<(), GroupSyncError> {
-    let Some(settings) =
-        settings_store::get_group_sync_settings(pool, persona_id, group_id).await?
+    let Some(settings) = settings_store::get_group_sync_settings(ctx, persona_id, group_id).await?
     else {
         // Sync not configured for this group on this install yet -- silent
         // no-op, matches push_document_inner's own contract.
@@ -609,13 +612,12 @@ pub struct PullSummary {
 /// this install, or the sync folder/documents dir doesn't exist yet
 /// (nobody has pushed anything).
 pub async fn pull_if_newer(
-    pool: &sqlx::SqlitePool,
+    ctx: &GroupSyncCtx<'_>,
     persona_id: &str,
     group_id: &str,
     key_hex: &str,
 ) -> Result<PullSummary, GroupSyncError> {
-    let Some(settings) =
-        settings_store::get_group_sync_settings(pool, persona_id, group_id).await?
+    let Some(settings) = settings_store::get_group_sync_settings(ctx, persona_id, group_id).await?
     else {
         return Ok(PullSummary::default());
     };
@@ -629,7 +631,7 @@ pub async fn pull_if_newer(
             // Sync folder (or its documents subdir) doesn't exist yet --
             // nobody has pushed anything to this group. Not a failure.
             if let Err(e2) =
-                settings_store::record_sync_result(pool, persona_id, group_id, Ok(())).await
+                settings_store::record_sync_result(ctx, persona_id, group_id, Ok(())).await
             {
                 log::warn!("group_sync: could not record pull result: {e2}");
             }
@@ -642,7 +644,7 @@ pub async fn pull_if_newer(
                  persona={persona_id} group={group_id}: {e}"
             );
             if let Err(e2) =
-                settings_store::record_sync_result(pool, persona_id, group_id, Err(msg.as_str()))
+                settings_store::record_sync_result(ctx, persona_id, group_id, Err(msg.as_str()))
                     .await
             {
                 log::warn!("group_sync: could not record pull failure: {e2}");
@@ -675,9 +677,12 @@ pub async fn pull_if_newer(
             Err(e) => {
                 // A bad/corrupt individual file is logged and skipped, not
                 // fatal to the sweep -- one damaged sync file must not
-                // block pulling every other document.
+                // block pulling every other document. Only the file name
+                // ({document_id}.qrsync) is logged, never the full path: the
+                // folder is a user-chosen location (items.id=661).
+                let file_name = path.file_name().unwrap_or_default();
                 log::warn!(
-                    "group_sync: skipping unreadable sync file {path:?} for \
+                    "group_sync: skipping unreadable sync file {file_name:?} for \
                      persona={persona_id} group={group_id}: {e}"
                 );
                 summary.skipped += 1;
@@ -685,7 +690,7 @@ pub async fn pull_if_newer(
         }
     }
 
-    if let Err(e) = settings_store::record_sync_result(pool, persona_id, group_id, Ok(())).await {
+    if let Err(e) = settings_store::record_sync_result(ctx, persona_id, group_id, Ok(())).await {
         log::warn!("group_sync: could not record pull result: {e}");
     }
 
@@ -750,13 +755,12 @@ async fn apply_one_synced_file(
 /// NotFound/per-file-error handling, same record_sync_result bookkeeping,
 /// same PullSummary shape.
 pub async fn pull_permissions_if_newer(
-    pool: &sqlx::SqlitePool,
+    ctx: &GroupSyncCtx<'_>,
     persona_id: &str,
     group_id: &str,
     key_hex: &str,
 ) -> Result<PullSummary, GroupSyncError> {
-    let Some(settings) =
-        settings_store::get_group_sync_settings(pool, persona_id, group_id).await?
+    let Some(settings) = settings_store::get_group_sync_settings(ctx, persona_id, group_id).await?
     else {
         return Ok(PullSummary::default());
     };
@@ -768,7 +772,7 @@ pub async fn pull_permissions_if_newer(
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             if let Err(e2) =
-                settings_store::record_sync_result(pool, persona_id, group_id, Ok(())).await
+                settings_store::record_sync_result(ctx, persona_id, group_id, Ok(())).await
             {
                 log::warn!("group_sync: could not record permissions pull result: {e2}");
             }
@@ -781,7 +785,7 @@ pub async fn pull_permissions_if_newer(
                  persona={persona_id} group={group_id}: {e}"
             );
             if let Err(e2) =
-                settings_store::record_sync_result(pool, persona_id, group_id, Err(msg.as_str()))
+                settings_store::record_sync_result(ctx, persona_id, group_id, Err(msg.as_str()))
                     .await
             {
                 log::warn!("group_sync: could not record permissions pull failure: {e2}");
@@ -812,8 +816,10 @@ pub async fn pull_permissions_if_newer(
             Ok(true) => summary.applied += 1,
             Ok(false) => summary.skipped += 1,
             Err(e) => {
+                // File name only, never the full path (items.id=661).
+                let file_name = path.file_name().unwrap_or_default();
                 log::warn!(
-                    "group_sync: skipping unreadable permissions sync file {path:?} for \
+                    "group_sync: skipping unreadable permissions sync file {file_name:?} for \
                      persona={persona_id} group={group_id}: {e}"
                 );
                 summary.skipped += 1;
@@ -821,7 +827,7 @@ pub async fn pull_permissions_if_newer(
         }
     }
 
-    if let Err(e) = settings_store::record_sync_result(pool, persona_id, group_id, Ok(())).await {
+    if let Err(e) = settings_store::record_sync_result(ctx, persona_id, group_id, Ok(())).await {
         log::warn!("group_sync: could not record permissions pull result: {e}");
     }
 
@@ -916,11 +922,19 @@ mod tests {
 
     const KEY_HEX: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
 
+    /// The account whose encrypted settings the engine reads (items.id=661).
+    /// KEY_HEX above is the GROUP's key, a different key. The personas
+    /// "alice", "bob" and "carol" are all this one account's, which is how
+    /// one install holds several Personas' settings.
+    const CTX: GroupSyncCtx<'static> = GroupSyncCtx {
+        user_id: "user-1",
+        data_key_hex: "0101010101010101010101010101010101010101010101010101010101010101",
+    };
+
     struct TestEnv {
         _tempdir: tempfile::TempDir,
         _lock: tokio::sync::MutexGuard<'static, ()>,
         saved_root: Option<String>,
-        pool: sqlx::SqlitePool,
     }
 
     impl Drop for TestEnv {
@@ -938,32 +952,20 @@ mod tests {
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         std::env::set_var("QR_DATA_ROOT", tempdir.path());
 
-        crate::persistence::migrations::migrate_shared_db()
-            .await
-            .expect("shared.db migration must succeed in test setup");
-
-        let pool =
-            sqlx::SqlitePool::connect_with(crate::providers::utils::connect_options_unencrypted(
-                &crate::providers::utils::db_path_shared(),
-            ))
-            .await
-            .expect("shared.db pool must connect");
-
         TestEnv {
             _tempdir: tempdir,
             _lock: lock,
             saved_root,
-            pool,
         }
     }
 
     #[tokio::test]
     async fn push_is_a_silent_noop_when_folder_is_unset() {
         let _env = setup().await;
-        let pool = &_env.pool;
+        let ctx = &CTX;
         // No set_group_sync_folder call -- sync not configured.
         let doc_id =
-            create_and_push_document(pool, "alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
+            create_and_push_document(ctx, "alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
                 .await
                 .expect(
                     "create_and_push_document must succeed even with no sync folder configured",
@@ -978,19 +980,19 @@ mod tests {
     #[tokio::test]
     async fn push_then_pull_round_trips_a_new_document_between_two_installs() {
         let _env = setup().await;
-        let pool = &_env.pool;
+        let ctx = &CTX;
         let shared_folder = tempfile::tempdir().expect("failed to create shared folder tempdir");
         let shared_path = shared_folder.path().to_str().unwrap();
 
-        settings_store::set_group_sync_folder(pool, "alice", "group-1", shared_path)
+        settings_store::set_group_sync_folder(ctx, "alice", "group-1", shared_path)
             .await
             .unwrap();
-        settings_store::set_group_sync_folder(pool, "bob", "group-1", shared_path)
+        settings_store::set_group_sync_folder(ctx, "bob", "group-1", shared_path)
             .await
             .unwrap();
 
         let doc_id = create_and_push_document(
-            pool,
+            ctx,
             "alice",
             "group-1",
             KEY_HEX,
@@ -1008,7 +1010,7 @@ mod tests {
             .unwrap();
         assert!(before.is_none());
 
-        let summary = pull_if_newer(pool, "bob", "group-1", KEY_HEX)
+        let summary = pull_if_newer(ctx, "bob", "group-1", KEY_HEX)
             .await
             .expect("pull_if_newer must succeed");
         assert_eq!(
@@ -1030,28 +1032,24 @@ mod tests {
     #[tokio::test]
     async fn a_second_push_is_picked_up_by_the_next_pull_an_unchanged_doc_is_not_reapplied() {
         let _env = setup().await;
-        let pool = &_env.pool;
+        let ctx = &CTX;
         let shared_folder = tempfile::tempdir().expect("failed to create shared folder tempdir");
         let shared_path = shared_folder.path().to_str().unwrap();
-        settings_store::set_group_sync_folder(pool, "alice", "group-1", shared_path)
+        settings_store::set_group_sync_folder(ctx, "alice", "group-1", shared_path)
             .await
             .unwrap();
-        settings_store::set_group_sync_folder(pool, "bob", "group-1", shared_path)
+        settings_store::set_group_sync_folder(ctx, "bob", "group-1", shared_path)
             .await
             .unwrap();
 
         let doc_id =
-            create_and_push_document(pool, "alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
+            create_and_push_document(ctx, "alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
                 .await
                 .unwrap();
-        pull_if_newer(pool, "bob", "group-1", KEY_HEX)
-            .await
-            .unwrap();
+        pull_if_newer(ctx, "bob", "group-1", KEY_HEX).await.unwrap();
 
         // Pulling again with nothing new pushed must not re-apply.
-        let repeat = pull_if_newer(pool, "bob", "group-1", KEY_HEX)
-            .await
-            .unwrap();
+        let repeat = pull_if_newer(ctx, "bob", "group-1", KEY_HEX).await.unwrap();
         assert_eq!(
             repeat,
             PullSummary {
@@ -1063,7 +1061,7 @@ mod tests {
         // updated_at is a timestamp with second-ish granularity in some
         // environments -- force a strictly-later value so the "newer" check
         // is unambiguous rather than racing the clock.
-        update_and_push_document(pool, "alice", "group-1", KEY_HEX, &doc_id, "v2")
+        update_and_push_document(ctx, "alice", "group-1", KEY_HEX, &doc_id, "v2")
             .await
             .unwrap();
         {
@@ -1079,11 +1077,9 @@ mod tests {
         // Re-push the forced-later timestamp (update_and_push_document
         // above already pushed the pre-forced version; push again so the
         // shared-folder copy reflects the forced updated_at too).
-        push_if_owner(pool, "alice", "group-1", KEY_HEX, &doc_id).await;
+        push_if_owner(ctx, "alice", "group-1", KEY_HEX, &doc_id).await;
 
-        let after_second_pull = pull_if_newer(pool, "bob", "group-1", KEY_HEX)
-            .await
-            .unwrap();
+        let after_second_pull = pull_if_newer(ctx, "bob", "group-1", KEY_HEX).await.unwrap();
         assert_eq!(
             after_second_pull,
             PullSummary {
@@ -1102,21 +1098,21 @@ mod tests {
     #[tokio::test]
     async fn pull_never_applies_a_document_owned_by_the_pulling_persona() {
         let _env = setup().await;
-        let pool = &_env.pool;
+        let ctx = &CTX;
         let shared_folder = tempfile::tempdir().expect("failed to create shared folder tempdir");
         let shared_path = shared_folder.path().to_str().unwrap();
-        settings_store::set_group_sync_folder(pool, "alice", "group-1", shared_path)
+        settings_store::set_group_sync_folder(ctx, "alice", "group-1", shared_path)
             .await
             .unwrap();
 
-        create_and_push_document(pool, "alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
+        create_and_push_document(ctx, "alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
             .await
             .unwrap();
 
         // Alice pulling her own group must not error or attempt to apply
         // her own pushed document back over herself -- the file is seen
         // (hence skipped: 1, not 0), just never applied (applied: 0).
-        let summary = pull_if_newer(pool, "alice", "group-1", KEY_HEX)
+        let summary = pull_if_newer(ctx, "alice", "group-1", KEY_HEX)
             .await
             .unwrap();
         assert_eq!(
@@ -1131,23 +1127,21 @@ mod tests {
     #[tokio::test]
     async fn pull_preserves_a_local_checkout_across_an_applied_update() {
         let _env = setup().await;
-        let pool = &_env.pool;
+        let ctx = &CTX;
         let shared_folder = tempfile::tempdir().expect("failed to create shared folder tempdir");
         let shared_path = shared_folder.path().to_str().unwrap();
-        settings_store::set_group_sync_folder(pool, "alice", "group-1", shared_path)
+        settings_store::set_group_sync_folder(ctx, "alice", "group-1", shared_path)
             .await
             .unwrap();
-        settings_store::set_group_sync_folder(pool, "bob", "group-1", shared_path)
+        settings_store::set_group_sync_folder(ctx, "bob", "group-1", shared_path)
             .await
             .unwrap();
 
         let doc_id =
-            create_and_push_document(pool, "alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
+            create_and_push_document(ctx, "alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
                 .await
                 .unwrap();
-        pull_if_newer(pool, "bob", "group-1", KEY_HEX)
-            .await
-            .unwrap();
+        pull_if_newer(ctx, "bob", "group-1", KEY_HEX).await.unwrap();
 
         // Bob grants himself no permission (irrelevant to checkout, which
         // is independent of document_permissions) and checks the document
@@ -1173,12 +1167,10 @@ mod tests {
             .unwrap();
         }
 
-        update_and_push_document(pool, "alice", "group-1", KEY_HEX, &doc_id, "v2")
+        update_and_push_document(ctx, "alice", "group-1", KEY_HEX, &doc_id, "v2")
             .await
             .unwrap();
-        let summary = pull_if_newer(pool, "bob", "group-1", KEY_HEX)
-            .await
-            .unwrap();
+        let summary = pull_if_newer(ctx, "bob", "group-1", KEY_HEX).await.unwrap();
         assert_eq!(
             summary,
             PullSummary {
@@ -1202,9 +1194,9 @@ mod tests {
     #[tokio::test]
     async fn pull_against_a_missing_shared_folder_does_not_error_or_panic() {
         let _env = setup().await;
-        let pool = &_env.pool;
+        let ctx = &CTX;
         settings_store::set_group_sync_folder(
-            pool,
+            ctx,
             "bob",
             "group-1",
             "/nonexistent/path/for/testing",
@@ -1212,12 +1204,12 @@ mod tests {
         .await
         .unwrap();
 
-        let summary = pull_if_newer(pool, "bob", "group-1", KEY_HEX)
+        let summary = pull_if_newer(ctx, "bob", "group-1", KEY_HEX)
             .await
             .expect("pull_if_newer must return Ok even when the folder doesn't exist");
         assert_eq!(summary, PullSummary::default());
 
-        let settings = settings_store::get_group_sync_settings(pool, "bob", "group-1")
+        let settings = settings_store::get_group_sync_settings(ctx, "bob", "group-1")
             .await
             .unwrap()
             .unwrap();
@@ -1231,9 +1223,9 @@ mod tests {
     #[tokio::test]
     async fn pull_is_a_noop_when_sync_is_not_configured() {
         let _env = setup().await;
-        let pool = &_env.pool;
+        let ctx = &CTX;
         // No set_group_sync_folder call at all for this pair.
-        let summary = pull_if_newer(pool, "nobody", "group-1", KEY_HEX)
+        let summary = pull_if_newer(ctx, "nobody", "group-1", KEY_HEX)
             .await
             .expect("pull_if_newer must succeed with no configured folder");
         assert_eq!(summary, PullSummary::default());
@@ -1244,14 +1236,14 @@ mod tests {
     #[tokio::test]
     async fn permissions_push_is_a_silent_noop_when_folder_is_unset() {
         let _env = setup().await;
-        let pool = &_env.pool;
+        let ctx = &CTX;
         let doc_id =
-            create_and_push_document(pool, "alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
+            create_and_push_document(ctx, "alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
                 .await
                 .unwrap();
 
         // No set_group_sync_folder call -- sync not configured.
-        grant_and_push_permission(pool, "alice", "group-1", KEY_HEX, &doc_id, "bob", "write")
+        grant_and_push_permission(ctx, "alice", "group-1", KEY_HEX, &doc_id, "bob", "write")
             .await
             .expect("grant_and_push_permission must succeed even with no sync folder configured");
     }
@@ -1259,32 +1251,32 @@ mod tests {
     #[tokio::test]
     async fn grant_then_pull_round_trips_a_new_grant_to_a_second_install() {
         let _env = setup().await;
-        let pool = &_env.pool;
+        let ctx = &CTX;
         let shared_folder = tempfile::tempdir().expect("failed to create shared folder tempdir");
         let shared_path = shared_folder.path().to_str().unwrap();
-        settings_store::set_group_sync_folder(pool, "alice", "group-1", shared_path)
+        settings_store::set_group_sync_folder(ctx, "alice", "group-1", shared_path)
             .await
             .unwrap();
-        settings_store::set_group_sync_folder(pool, "carol", "group-1", shared_path)
+        settings_store::set_group_sync_folder(ctx, "carol", "group-1", shared_path)
             .await
             .unwrap();
 
         let doc_id =
-            create_and_push_document(pool, "alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
+            create_and_push_document(ctx, "alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
                 .await
                 .unwrap();
         // Carol must have the document locally before her own permissions
         // pull can attach a grant to it (documents/ and permissions/ are
         // independent sweeps).
-        pull_if_newer(pool, "carol", "group-1", KEY_HEX)
+        pull_if_newer(ctx, "carol", "group-1", KEY_HEX)
             .await
             .unwrap();
 
-        grant_and_push_permission(pool, "alice", "group-1", KEY_HEX, &doc_id, "carol", "write")
+        grant_and_push_permission(ctx, "alice", "group-1", KEY_HEX, &doc_id, "carol", "write")
             .await
             .unwrap();
 
-        let summary = pull_permissions_if_newer(pool, "carol", "group-1", KEY_HEX)
+        let summary = pull_permissions_if_newer(ctx, "carol", "group-1", KEY_HEX)
             .await
             .expect("pull_permissions_if_newer must succeed");
         assert_eq!(
@@ -1307,28 +1299,28 @@ mod tests {
     #[tokio::test]
     async fn revoke_then_pull_removes_the_grantees_local_row_on_another_install() {
         let _env = setup().await;
-        let pool = &_env.pool;
+        let ctx = &CTX;
         let shared_folder = tempfile::tempdir().expect("failed to create shared folder tempdir");
         let shared_path = shared_folder.path().to_str().unwrap();
-        settings_store::set_group_sync_folder(pool, "alice", "group-1", shared_path)
+        settings_store::set_group_sync_folder(ctx, "alice", "group-1", shared_path)
             .await
             .unwrap();
-        settings_store::set_group_sync_folder(pool, "carol", "group-1", shared_path)
+        settings_store::set_group_sync_folder(ctx, "carol", "group-1", shared_path)
             .await
             .unwrap();
 
         let doc_id =
-            create_and_push_document(pool, "alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
+            create_and_push_document(ctx, "alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
                 .await
                 .unwrap();
-        pull_if_newer(pool, "carol", "group-1", KEY_HEX)
+        pull_if_newer(ctx, "carol", "group-1", KEY_HEX)
             .await
             .unwrap();
 
-        grant_and_push_permission(pool, "alice", "group-1", KEY_HEX, &doc_id, "carol", "write")
+        grant_and_push_permission(ctx, "alice", "group-1", KEY_HEX, &doc_id, "carol", "write")
             .await
             .unwrap();
-        pull_permissions_if_newer(pool, "carol", "group-1", KEY_HEX)
+        pull_permissions_if_newer(ctx, "carol", "group-1", KEY_HEX)
             .await
             .unwrap();
         assert_eq!(
@@ -1340,10 +1332,10 @@ mod tests {
             "carol must have the grant locally before it can be revoked away"
         );
 
-        revoke_and_push_permission(pool, "alice", "group-1", KEY_HEX, &doc_id, "carol")
+        revoke_and_push_permission(ctx, "alice", "group-1", KEY_HEX, &doc_id, "carol")
             .await
             .unwrap();
-        let summary = pull_permissions_if_newer(pool, "carol", "group-1", KEY_HEX)
+        let summary = pull_permissions_if_newer(ctx, "carol", "group-1", KEY_HEX)
             .await
             .expect("pull_permissions_if_newer must succeed");
         assert_eq!(
@@ -1367,28 +1359,28 @@ mod tests {
     #[tokio::test]
     async fn an_unchanged_permissions_manifest_is_not_reapplied_on_a_repeat_pull() {
         let _env = setup().await;
-        let pool = &_env.pool;
+        let ctx = &CTX;
         let shared_folder = tempfile::tempdir().expect("failed to create shared folder tempdir");
         let shared_path = shared_folder.path().to_str().unwrap();
-        settings_store::set_group_sync_folder(pool, "alice", "group-1", shared_path)
+        settings_store::set_group_sync_folder(ctx, "alice", "group-1", shared_path)
             .await
             .unwrap();
-        settings_store::set_group_sync_folder(pool, "carol", "group-1", shared_path)
+        settings_store::set_group_sync_folder(ctx, "carol", "group-1", shared_path)
             .await
             .unwrap();
 
         let doc_id =
-            create_and_push_document(pool, "alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
+            create_and_push_document(ctx, "alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
                 .await
                 .unwrap();
-        pull_if_newer(pool, "carol", "group-1", KEY_HEX)
+        pull_if_newer(ctx, "carol", "group-1", KEY_HEX)
             .await
             .unwrap();
-        grant_and_push_permission(pool, "alice", "group-1", KEY_HEX, &doc_id, "carol", "write")
+        grant_and_push_permission(ctx, "alice", "group-1", KEY_HEX, &doc_id, "carol", "write")
             .await
             .unwrap();
 
-        let first = pull_permissions_if_newer(pool, "carol", "group-1", KEY_HEX)
+        let first = pull_permissions_if_newer(ctx, "carol", "group-1", KEY_HEX)
             .await
             .unwrap();
         assert_eq!(
@@ -1399,7 +1391,7 @@ mod tests {
             }
         );
 
-        let second = pull_permissions_if_newer(pool, "carol", "group-1", KEY_HEX)
+        let second = pull_permissions_if_newer(ctx, "carol", "group-1", KEY_HEX)
             .await
             .unwrap();
         assert_eq!(
@@ -1415,24 +1407,24 @@ mod tests {
     #[tokio::test]
     async fn permissions_pull_never_applies_a_manifest_for_a_document_the_puller_owns() {
         let _env = setup().await;
-        let pool = &_env.pool;
+        let ctx = &CTX;
         let shared_folder = tempfile::tempdir().expect("failed to create shared folder tempdir");
         let shared_path = shared_folder.path().to_str().unwrap();
-        settings_store::set_group_sync_folder(pool, "alice", "group-1", shared_path)
+        settings_store::set_group_sync_folder(ctx, "alice", "group-1", shared_path)
             .await
             .unwrap();
 
         let doc_id =
-            create_and_push_document(pool, "alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
+            create_and_push_document(ctx, "alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
                 .await
                 .unwrap();
-        grant_and_push_permission(pool, "alice", "group-1", KEY_HEX, &doc_id, "bob", "write")
+        grant_and_push_permission(ctx, "alice", "group-1", KEY_HEX, &doc_id, "bob", "write")
             .await
             .unwrap();
 
         // Alice pulling her own group must see the file (skipped: 1) but
         // never apply her own document's manifest back over herself.
-        let summary = pull_permissions_if_newer(pool, "alice", "group-1", KEY_HEX)
+        let summary = pull_permissions_if_newer(ctx, "alice", "group-1", KEY_HEX)
             .await
             .unwrap();
         assert_eq!(
@@ -1448,28 +1440,28 @@ mod tests {
     async fn a_permissions_manifest_ahead_of_its_document_is_skipped_then_applied_once_the_document_exists(
     ) {
         let _env = setup().await;
-        let pool = &_env.pool;
+        let ctx = &CTX;
         let shared_folder = tempfile::tempdir().expect("failed to create shared folder tempdir");
         let shared_path = shared_folder.path().to_str().unwrap();
-        settings_store::set_group_sync_folder(pool, "alice", "group-1", shared_path)
+        settings_store::set_group_sync_folder(ctx, "alice", "group-1", shared_path)
             .await
             .unwrap();
-        settings_store::set_group_sync_folder(pool, "carol", "group-1", shared_path)
+        settings_store::set_group_sync_folder(ctx, "carol", "group-1", shared_path)
             .await
             .unwrap();
 
         let doc_id =
-            create_and_push_document(pool, "alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
+            create_and_push_document(ctx, "alice", "group-1", KEY_HEX, "alice", "Doc", "v1")
                 .await
                 .unwrap();
-        grant_and_push_permission(pool, "alice", "group-1", KEY_HEX, &doc_id, "carol", "write")
+        grant_and_push_permission(ctx, "alice", "group-1", KEY_HEX, &doc_id, "carol", "write")
             .await
             .unwrap();
 
         // Carol pulls permissions before ever having pulled the document
         // itself -- the manifest must be skipped, not applied, and must not
         // error the sweep.
-        let before = pull_permissions_if_newer(pool, "carol", "group-1", KEY_HEX)
+        let before = pull_permissions_if_newer(ctx, "carol", "group-1", KEY_HEX)
             .await
             .expect("pull_permissions_if_newer must not error on an unsynced document");
         assert_eq!(
@@ -1488,10 +1480,10 @@ mod tests {
 
         // Once the document itself has synced, a later sweep picks the
         // already-waiting manifest up.
-        pull_if_newer(pool, "carol", "group-1", KEY_HEX)
+        pull_if_newer(ctx, "carol", "group-1", KEY_HEX)
             .await
             .unwrap();
-        let after = pull_permissions_if_newer(pool, "carol", "group-1", KEY_HEX)
+        let after = pull_permissions_if_newer(ctx, "carol", "group-1", KEY_HEX)
             .await
             .unwrap();
         assert_eq!(

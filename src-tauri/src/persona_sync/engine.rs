@@ -525,7 +525,8 @@ async fn push_one_share(
                  owner_persona={owner_persona_id}: {e}"
             );
             if let Err(e2) = settings_store::record_push_result(
-                pool,
+                owner_user_id,
+                owner_personal_key_hex,
                 owner_persona_id,
                 share_id,
                 Err(&e.to_string()),
@@ -552,8 +553,13 @@ async fn push_if_changed(
     share_id: &str,
     recipient_user_id: &str,
 ) -> Result<bool, PersonaSyncError> {
-    let Some(settings) =
-        settings_store::get_persona_share_sync_settings(pool, owner_persona_id, share_id).await?
+    let Some(settings) = settings_store::get_persona_share_sync_settings(
+        owner_user_id,
+        owner_personal_key_hex,
+        owner_persona_id,
+        share_id,
+    )
+    .await?
     else {
         // Sync not configured for this share on this install yet -- silent
         // no-op, matching group_sync::engine's own contract.
@@ -589,7 +595,14 @@ async fn push_if_changed(
     let hash = content_hash(&active_entities, &entity_facts, &voice_profile_entries)?;
 
     if settings.last_content_hash.as_deref() == Some(hash.as_str()) {
-        settings_store::record_push_result(pool, owner_persona_id, share_id, Ok(None)).await?;
+        settings_store::record_push_result(
+            owner_user_id,
+            owner_personal_key_hex,
+            owner_persona_id,
+            share_id,
+            Ok(None),
+        )
+        .await?;
         return Ok(false);
     }
 
@@ -614,7 +627,14 @@ async fn push_if_changed(
     let path = sync_file_path(&settings.folder_path, share_id);
     write_envelope_atomic(&path, &envelope).await?;
 
-    settings_store::record_push_result(pool, owner_persona_id, share_id, Ok(Some(&hash))).await?;
+    settings_store::record_push_result(
+        owner_user_id,
+        owner_personal_key_hex,
+        owner_persona_id,
+        share_id,
+        Ok(Some(&hash)),
+    )
+    .await?;
 
     Ok(true)
 }
@@ -644,7 +664,6 @@ async fn pull_all_accepted_shares(
 
     for (share_id, persona_id) in shares {
         let result = pull_if_newer(
-            pool,
             recipient_user_id,
             &persona_id,
             recipient_personal_key_hex,
@@ -656,7 +675,8 @@ async fn pull_all_accepted_shares(
         if let Err(e) = result {
             log::warn!("persona_sync: pull failed for share={share_id} persona={persona_id}: {e}");
             if let Err(e2) = settings_store::record_pull_result(
-                pool,
+                recipient_user_id,
+                recipient_personal_key_hex,
                 &persona_id,
                 &share_id,
                 Err(&e.to_string()),
@@ -673,15 +693,19 @@ async fn pull_all_accepted_shares(
 /// Returns Ok(true) if applied, Ok(false) if sync isn't configured, no
 /// envelope is waiting yet, or it isn't newer than the last one applied.
 async fn pull_if_newer(
-    pool: &sqlx::SqlitePool,
     recipient_user_id: &str,
     persona_id: &str,
     recipient_personal_key_hex: &str,
     share_id: &str,
     sharing_private_key: &StaticSecret,
 ) -> Result<bool, PersonaSyncError> {
-    let Some(settings) =
-        settings_store::get_persona_share_sync_settings(pool, persona_id, share_id).await?
+    let Some(settings) = settings_store::get_persona_share_sync_settings(
+        recipient_user_id,
+        recipient_personal_key_hex,
+        persona_id,
+        share_id,
+    )
+    .await?
     else {
         return Ok(false);
     };
@@ -715,7 +739,14 @@ async fn pull_if_newer(
     )
     .await?;
 
-    settings_store::record_pull_result(pool, persona_id, share_id, Ok(&payload.emitted_at)).await?;
+    settings_store::record_pull_result(
+        recipient_user_id,
+        recipient_personal_key_hex,
+        persona_id,
+        share_id,
+        Ok(&payload.emitted_at),
+    )
+    .await?;
 
     Ok(true)
 }
@@ -1585,7 +1616,8 @@ mod tests {
         let shared_folder = tempfile::tempdir().unwrap();
         let folder_path = shared_folder.path().to_str().unwrap();
         settings_store::set_persona_share_sync_folder(
-            pool,
+            &owner_id,
+            &owner_key,
             &owner_persona,
             &share_id,
             settings_store::SyncRole::Owner,
@@ -1632,11 +1664,15 @@ mod tests {
         assert_eq!(payload.entities[0].display_name, "Contact");
 
         // Settings must reflect the write actually happened, not a skip.
-        let settings =
-            settings_store::get_persona_share_sync_settings(pool, &owner_persona, &share_id)
-                .await
-                .unwrap()
-                .unwrap();
+        let settings = settings_store::get_persona_share_sync_settings(
+            &owner_id,
+            &owner_key,
+            &owner_persona,
+            &share_id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(settings.last_pushed_at.is_some());
         assert!(settings.last_content_hash.is_some());
     }
@@ -1723,7 +1759,8 @@ mod tests {
         let shared_folder = tempfile::tempdir().unwrap();
         let folder_path = shared_folder.path().to_str().unwrap();
         settings_store::set_persona_share_sync_folder(
-            pool,
+            &owner_id,
+            &owner_key,
             &owner_persona,
             &share_id,
             settings_store::SyncRole::Owner,
@@ -1732,7 +1769,8 @@ mod tests {
         .await
         .unwrap();
         settings_store::set_persona_share_sync_folder(
-            pool,
+            &recipient_id,
+            &recipient_key,
             &persona_id,
             &share_id,
             settings_store::SyncRole::Recipient,
@@ -1774,7 +1812,6 @@ mod tests {
         assert!(pushed);
 
         let applied = pull_if_newer(
-            pool,
             &recipient_id,
             &persona_id,
             &recipient_key,
@@ -1855,7 +1892,8 @@ mod tests {
         let shared_folder = tempfile::tempdir().unwrap();
         let folder_path = shared_folder.path().to_str().unwrap();
         settings_store::set_persona_share_sync_folder(
-            pool,
+            &owner_id,
+            &owner_key,
             &owner_persona,
             &share_id,
             settings_store::SyncRole::Owner,
@@ -1864,7 +1902,8 @@ mod tests {
         .await
         .unwrap();
         settings_store::set_persona_share_sync_folder(
-            pool,
+            &recipient_id,
+            &recipient_key,
             &persona_id,
             &share_id,
             settings_store::SyncRole::Recipient,
@@ -1913,7 +1952,6 @@ mod tests {
         assert!(pushed);
 
         let applied = pull_if_newer(
-            pool,
             &recipient_id,
             &persona_id,
             &recipient_key,
@@ -1975,7 +2013,8 @@ mod tests {
 
         let shared_folder = tempfile::tempdir().unwrap();
         settings_store::set_persona_share_sync_folder(
-            pool,
+            &owner_id,
+            &owner_key,
             &owner_persona,
             &share_id,
             settings_store::SyncRole::Owner,
@@ -2057,7 +2096,8 @@ mod tests {
         let shared_folder = tempfile::tempdir().unwrap();
         let folder_path = shared_folder.path().to_str().unwrap();
         settings_store::set_persona_share_sync_folder(
-            pool,
+            &owner_id,
+            &owner_key,
             &owner_persona,
             &share_id,
             settings_store::SyncRole::Owner,
@@ -2066,7 +2106,8 @@ mod tests {
         .await
         .unwrap();
         settings_store::set_persona_share_sync_folder(
-            pool,
+            &recipient_id,
+            &recipient_key,
             &persona_id,
             &share_id,
             settings_store::SyncRole::Recipient,
@@ -2116,7 +2157,6 @@ mod tests {
         .unwrap();
 
         let applied = pull_if_newer(
-            pool,
             &recipient_id,
             &persona_id,
             &recipient_key,
@@ -2199,7 +2239,8 @@ mod tests {
         let shared_folder = tempfile::tempdir().unwrap();
         let folder_path = shared_folder.path().to_str().unwrap();
         settings_store::set_persona_share_sync_folder(
-            pool,
+            &owner_id,
+            &owner_key,
             &owner_persona,
             &share_id,
             settings_store::SyncRole::Owner,
@@ -2208,7 +2249,8 @@ mod tests {
         .await
         .unwrap();
         settings_store::set_persona_share_sync_folder(
-            pool,
+            &recipient_id,
+            &recipient_key,
             &persona_id,
             &share_id,
             settings_store::SyncRole::Recipient,
@@ -2257,7 +2299,6 @@ mod tests {
         .unwrap();
 
         let applied = pull_if_newer(
-            pool,
             &recipient_id,
             &persona_id,
             &recipient_key,
@@ -2347,7 +2388,8 @@ mod tests {
         let shared_folder = tempfile::tempdir().unwrap();
         let folder_path = shared_folder.path().to_str().unwrap();
         settings_store::set_persona_share_sync_folder(
-            pool,
+            &owner_id,
+            &owner_key,
             &owner_persona,
             &share_id,
             settings_store::SyncRole::Owner,
@@ -2356,7 +2398,8 @@ mod tests {
         .await
         .unwrap();
         settings_store::set_persona_share_sync_folder(
-            pool,
+            &recipient_id,
+            &recipient_key,
             &persona_id,
             &share_id,
             settings_store::SyncRole::Recipient,
@@ -2390,7 +2433,6 @@ mod tests {
         .await
         .unwrap();
         pull_if_newer(
-            pool,
             &recipient_id,
             &persona_id,
             &recipient_key,
@@ -2465,7 +2507,8 @@ mod tests {
         let shared_folder = tempfile::tempdir().unwrap();
         let folder_path = shared_folder.path().to_str().unwrap();
         settings_store::set_persona_share_sync_folder(
-            pool,
+            &owner_id,
+            &owner_key,
             &owner_persona,
             &share_id,
             settings_store::SyncRole::Owner,
@@ -2474,7 +2517,8 @@ mod tests {
         .await
         .unwrap();
         settings_store::set_persona_share_sync_folder(
-            pool,
+            &recipient_id,
+            &recipient_key,
             &persona_id,
             &share_id,
             settings_store::SyncRole::Recipient,
@@ -2516,7 +2560,6 @@ mod tests {
         assert!(pushed);
 
         let applied = pull_if_newer(
-            pool,
             &recipient_id,
             &persona_id,
             &recipient_key,
@@ -2598,7 +2641,8 @@ mod tests {
         let shared_folder = tempfile::tempdir().unwrap();
         let folder_path = shared_folder.path().to_str().unwrap();
         settings_store::set_persona_share_sync_folder(
-            pool,
+            &owner_id,
+            &owner_key,
             &owner_persona,
             &share_id,
             settings_store::SyncRole::Owner,
@@ -2607,7 +2651,8 @@ mod tests {
         .await
         .unwrap();
         settings_store::set_persona_share_sync_folder(
-            pool,
+            &recipient_id,
+            &recipient_key,
             &persona_id,
             &share_id,
             settings_store::SyncRole::Recipient,
@@ -2650,7 +2695,6 @@ mod tests {
         .await
         .unwrap();
         pull_if_newer(
-            pool,
             &recipient_id,
             &persona_id,
             &recipient_key,
@@ -2704,7 +2748,6 @@ mod tests {
         assert!(pushed);
 
         let applied = pull_if_newer(
-            pool,
             &recipient_id,
             &persona_id,
             &recipient_key,
@@ -2805,7 +2848,8 @@ mod tests {
         let shared_folder = tempfile::tempdir().unwrap();
         let folder_path = shared_folder.path().to_str().unwrap();
         settings_store::set_persona_share_sync_folder(
-            pool,
+            &owner_id,
+            &owner_key,
             &owner_persona,
             &share_id,
             settings_store::SyncRole::Owner,
@@ -2814,7 +2858,8 @@ mod tests {
         .await
         .unwrap();
         settings_store::set_persona_share_sync_folder(
-            pool,
+            &recipient_id,
+            &recipient_key,
             &persona_id,
             &share_id,
             settings_store::SyncRole::Recipient,
@@ -2870,7 +2915,6 @@ mod tests {
         .unwrap();
 
         let applied = pull_if_newer(
-            pool,
             &recipient_id,
             &persona_id,
             &recipient_key,
@@ -2954,7 +2998,8 @@ mod tests {
         let shared_folder = tempfile::tempdir().unwrap();
         let folder_path = shared_folder.path().to_str().unwrap();
         settings_store::set_persona_share_sync_folder(
-            pool,
+            &owner_id,
+            &owner_key,
             &owner_persona,
             &share_id,
             settings_store::SyncRole::Owner,
@@ -2963,7 +3008,8 @@ mod tests {
         .await
         .unwrap();
         settings_store::set_persona_share_sync_folder(
-            pool,
+            &recipient_id,
+            &recipient_key,
             &persona_id,
             &share_id,
             settings_store::SyncRole::Recipient,
@@ -2983,7 +3029,6 @@ mod tests {
         .await
         .unwrap();
         pull_if_newer(
-            pool,
             &recipient_id,
             &persona_id,
             &recipient_key,
@@ -3020,7 +3065,6 @@ mod tests {
         assert!(pushed);
 
         let applied = pull_if_newer(
-            pool,
             &recipient_id,
             &persona_id,
             &recipient_key,
@@ -3091,7 +3135,8 @@ mod tests {
         let shared_folder = tempfile::tempdir().unwrap();
         let folder_path = shared_folder.path().to_str().unwrap();
         settings_store::set_persona_share_sync_folder(
-            pool,
+            &owner_id,
+            &owner_key,
             &owner_persona,
             &share_id,
             settings_store::SyncRole::Owner,
@@ -3100,7 +3145,8 @@ mod tests {
         .await
         .unwrap();
         settings_store::set_persona_share_sync_folder(
-            pool,
+            &recipient_id,
+            &recipient_key,
             &persona_id,
             &share_id,
             settings_store::SyncRole::Recipient,
@@ -3120,7 +3166,6 @@ mod tests {
         .await
         .unwrap();
         pull_if_newer(
-            pool,
             &recipient_id,
             &persona_id,
             &recipient_key,
@@ -3170,7 +3215,6 @@ mod tests {
         .unwrap();
 
         let applied = pull_if_newer(
-            pool,
             &recipient_id,
             &persona_id,
             &recipient_key,
@@ -3239,7 +3283,8 @@ mod tests {
         let shared_folder = tempfile::tempdir().unwrap();
         let folder_path = shared_folder.path().to_str().unwrap();
         settings_store::set_persona_share_sync_folder(
-            pool,
+            &owner_id,
+            &owner_key,
             &owner_persona,
             &share_id,
             settings_store::SyncRole::Owner,
@@ -3248,7 +3293,8 @@ mod tests {
         .await
         .unwrap();
         settings_store::set_persona_share_sync_folder(
-            pool,
+            &recipient_id,
+            &recipient_key,
             &persona_id,
             &share_id,
             settings_store::SyncRole::Recipient,
@@ -3287,7 +3333,6 @@ mod tests {
         .await
         .unwrap();
         let applied = pull_if_newer(
-            pool,
             &recipient_id,
             &persona_id,
             &recipient_key,

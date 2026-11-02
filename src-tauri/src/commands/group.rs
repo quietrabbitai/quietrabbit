@@ -8,11 +8,11 @@
 // document_fork_store.rs's own #[allow(dead_code)] history). Matches the
 // codebase's established pattern of shipping commands ahead of frontend.
 //
-// No key_hex / State<...Registry> needed: group_sync_settings lives in
-// shared.db, unencrypted, keyed only by (persona_id, group_id) -- the
-// folder path itself is not group content and reading/setting it isn't
-// gated on the group key being unlocked (see schema/shared_005.sql's own
-// header for the full placement reasoning).
+// Both commands need the unlocked session (items.id=661, decisions.id=862):
+// group_sync_settings lives in the user's encrypted integration_keys.db, not
+// shared.db, because the folder path is a user-chosen location that must not
+// be readable without the password. They are not gated on the GROUP key being
+// unlocked, only on the account being unlocked.
 //
 // Group 16 — Group membership (items.id=288, group.db 266f).
 // Commands: remove_group_member.
@@ -62,9 +62,16 @@ pub async fn set_group_sync_folder(
     persona_id: String,
     group_id: String,
     folder_path: String,
-    pool: State<'_, sqlx::SqlitePool>,
+    key_registry: State<'_, KeyRegistry>,
 ) -> Result<(), String> {
-    settings_store::set_group_sync_folder(&pool, &persona_id, &group_id, &folder_path)
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
+    let (user_id, key_hex_str) =
+        crate::commands::persona::session_user_and_key(&key_registry).await?;
+    let ctx = settings_store::GroupSyncCtx {
+        user_id: &user_id,
+        data_key_hex: &key_hex_str,
+    };
+    settings_store::set_group_sync_folder(&ctx, &persona_id, &group_id, &folder_path)
         .await
         .map_err(|e| e.to_string())
 }
@@ -78,9 +85,16 @@ pub async fn set_group_sync_folder(
 pub async fn get_group_sync_folder(
     persona_id: String,
     group_id: String,
-    pool: State<'_, sqlx::SqlitePool>,
+    key_registry: State<'_, KeyRegistry>,
 ) -> Result<Option<GroupSyncSettingsInfo>, String> {
-    let settings = settings_store::get_group_sync_settings(&pool, &persona_id, &group_id)
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
+    let (user_id, key_hex_str) =
+        crate::commands::persona::session_user_and_key(&key_registry).await?;
+    let ctx = settings_store::GroupSyncCtx {
+        user_id: &user_id,
+        data_key_hex: &key_hex_str,
+    };
+    let settings = settings_store::get_group_sync_settings(&ctx, &persona_id, &group_id)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -326,8 +340,14 @@ mod tests {
     async fn get_group_sync_folder_is_none_before_any_configuration() {
         let _env = setup().await;
         let app = mock_app(_env.pool.clone());
-        let pool = app.state::<sqlx::SqlitePool>();
-        let result = get_group_sync_folder("persona-1".to_owned(), "group-1".to_owned(), pool)
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(
+            &registry,
+            "user-1",
+            [0x11u8; crate::auth::kdf::MASTER_KEY_LEN],
+        )
+        .await;
+        let result = get_group_sync_folder("persona-1".to_owned(), "group-1".to_owned(), registry)
             .await
             .expect("get_group_sync_folder must succeed");
         assert!(result.is_none());
@@ -337,17 +357,23 @@ mod tests {
     async fn set_then_get_round_trips_through_the_command_layer() {
         let _env = setup().await;
         let app = mock_app(_env.pool.clone());
-        let pool = app.state::<sqlx::SqlitePool>();
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(
+            &registry,
+            "user-1",
+            [0x11u8; crate::auth::kdf::MASTER_KEY_LEN],
+        )
+        .await;
         set_group_sync_folder(
             "persona-1".to_owned(),
             "group-1".to_owned(),
             "/mnt/nas/family".to_owned(),
-            pool.clone(),
+            registry.clone(),
         )
         .await
         .expect("set_group_sync_folder must succeed");
 
-        let info = get_group_sync_folder("persona-1".to_owned(), "group-1".to_owned(), pool)
+        let info = get_group_sync_folder("persona-1".to_owned(), "group-1".to_owned(), registry)
             .await
             .expect("get_group_sync_folder must succeed")
             .expect("settings must exist after set_group_sync_folder");
@@ -360,12 +386,18 @@ mod tests {
     async fn set_group_sync_folder_rejects_empty_path_with_a_string_error() {
         let _env = setup().await;
         let app = mock_app(_env.pool.clone());
-        let pool = app.state::<sqlx::SqlitePool>();
+        let registry = app.state::<KeyRegistry>();
+        populate_registry(
+            &registry,
+            "user-1",
+            [0x11u8; crate::auth::kdf::MASTER_KEY_LEN],
+        )
+        .await;
         let result = set_group_sync_folder(
             "persona-1".to_owned(),
             "group-1".to_owned(),
             "   ".to_owned(),
-            pool,
+            registry,
         )
         .await;
         assert!(result.is_err());

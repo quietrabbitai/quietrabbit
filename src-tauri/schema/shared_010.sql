@@ -31,30 +31,12 @@
 -- point 4), not this column.
 --
 -- persona_view_share_settings: the VIEW-ONLY recipient's own folder-sync
--- bookkeeping. NOT a reuse of persona_share_sync_settings (shared_009.sql):
--- that table's PK is (persona_id, share_id), and a VIEW-ONLY recipient has no
--- persona_id at all for this share -- decisions.id=723's whole point is that
--- no Persona is ever created. The VIEW-ONLY *owner* side is structurally
--- identical to SYNCED's owner side (a real persona_id that pushes), so owner
--- rows reuse persona_share_sync_settings (role='owner') unchanged; only the
--- recipient side needed a new shape, keyed by (recipient_user_id, share_id)
--- instead.
---
--- Deliberately NO last_synced_at column here (contrast with
--- persona_share_sync_settings' recipient rows) -- unlike SYNCED, VIEW-ONLY's
--- content lives in exactly one place, the encrypted view_cache.db this same
--- pull already has to open every sweep to check view_cache_meta.status
--- (terminal 'ended' short-circuit, decisions.id=723). Tracking last_synced_at
--- twice, once here and once in view_cache_meta, would just be two copies of
--- the same value with a chance to drift; view_cache_meta.last_synced_at
--- (view_cache_001.sql) is the single source of truth for "is this update
--- newer than the last one applied". This table stays purely install-local
--- mechanics: where to look, and whether the last attempt errored.
---
--- Deliberately NO FK on recipient_user_id/share_id -- matching
--- persona_share_sync_settings' (shared_009.sql) own precedent of plain TEXT
--- id columns, no REFERENCES. This is settings bookkeeping keyed by id, not a
--- relationship shared.db itself needs to enforce.
+-- bookkeeping, keyed by (recipient_user_id, share_id) because a VIEW-ONLY
+-- recipient has no persona_id for the share. items.id=661 (decisions.id=862)
+-- moved this table out of the plaintext shared.db into the recipient's
+-- encrypted integration_keys.db (keys_006.sql): the folder path is a
+-- user-chosen location and last_error can embed one. This file is edited in
+-- place, which decisions.id=857 allows until first ship.
 --
 -- SCHEMA AUTHORING RULE (migrations.rs): no semicolons inside string
 -- literals -- parse_statements() is not a general-purpose SQL parser.
@@ -62,15 +44,6 @@
 ALTER TABLE pending_persona_shares ADD COLUMN share_type TEXT NOT NULL DEFAULT 'synced';
 ALTER TABLE pending_persona_shares ADD COLUMN revoked_at TEXT;
 
-CREATE TABLE IF NOT EXISTS persona_view_share_settings (
-    recipient_user_id   TEXT NOT NULL,
-    share_id             TEXT NOT NULL,
-    folder_path          TEXT NOT NULL,
-    last_error           TEXT,
-    updated_at           TEXT NOT NULL,
-    PRIMARY KEY (recipient_user_id, share_id)
-);
-
 INSERT OR IGNORE INTO schema_version (version, applied_at, description)
 VALUES (10, datetime('now'),
-    'items.id=304: pending_persona_shares.share_type/.revoked_at + persona_view_share_settings -- VIEW-ONLY persona-sharing grant type and recipient-side sync bookkeeping');
+    'items.id=304: pending_persona_shares.share_type/.revoked_at -- VIEW-ONLY persona-sharing grant type (persona_view_share_settings since moved to the encrypted integration_keys.db by items.id=661)');
