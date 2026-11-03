@@ -1,5 +1,6 @@
 # Quiet Rabbit — Claude Code Context
-# Last updated: November 1, 2026 (items.id=678: new "Privacy model" section and
+# Last updated: November 3, 2026 (items.id=848: one bullet in the "Ollama"
+# section only). Before that, November 1, 2026 (items.id=678: new "Privacy model" section and
 # the dev-only paths paragraph under "Dev Environment" only). Before that,
 # November 1, 2026 (items.id=618: one paragraph under "Key commands"
 # only -- release builds need PRIVACY_FILTER_LIB_DIR or the opt-out; plain
@@ -211,6 +212,17 @@ Built today (ollama_sidecar.rs, ollama_ownership.rs; items.id=668):
   kill_process_group and keep the record if a provable member survives. The
   residual pid-reuse risk is documented in ollama_ownership.rs.
 - Startup reclaim (items.id=586) therefore touches only recorded groups.
+- No cloud (items.id=848): every launch sets OLLAMA_NO_CLOUD=1 (sidecar_env() in
+  ollama_sidecar.rs, with OLLAMA_HOST and OLLAMA_MODELS). Without it Ollama 0.40.13
+  fetches its model-recommendations list from ollama.com at startup and every 4 h,
+  which left a TCP connection to ollama.com open (about 90 s per refresh in the
+  captures; items.id=848 first saw it last a whole 13 min run), with no user
+  action, and read the user's ~/.ollama/id_ed25519 while doing so. With it:
+  no non-loopback connection and no key read in idle, model load or chat. The
+  variable is not on the inherited allowlist, so a user's own value cannot reach or
+  override it; a user's ~/.ollama/server.json can only add to it (HOME is inherited).
+  Verified on 0.40.13 only; the packaged binary's version is unknown, so
+  items.id=583/619 must assert the variable and the capture on it.
 OllamaClient::base_url() is always http://127.0.0.1:{ollama_sidecar::port()}
 and never reads OLLAMA_HOST or OLLAMA_PORT (items.id=616); take the port from
 ollama_sidecar::port(), never a literal. The sidecar does not inherit QR's

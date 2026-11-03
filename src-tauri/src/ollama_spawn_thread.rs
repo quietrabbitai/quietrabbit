@@ -55,6 +55,9 @@
 //! variables, so it must not hold the launching shell's API keys or tokens.
 //! Every other `OLLAMA_*` variable is deliberately dropped too: those
 //! configure the user's own Ollama, which QR never uses (decisions.id=840).
+//! The one `OLLAMA_*` value QR always passes besides the host and models
+//! directory is `OLLAMA_NO_CLOUD=1` (items.id=848, `ollama_sidecar::sidecar_env`);
+//! it is not on the allowlist, so only the caller's explicit value can set it.
 
 use std::ffi::OsString;
 use std::io;
@@ -426,17 +429,21 @@ mod tests {
             "GROQ_API_KEY",
             "OLLAMA_HOST",
             "OLLAMA_VULKAN",
+            "OLLAMA_NO_CLOUD",
             "HSA_OVERRIDE_GFX_VERSION",
         ];
         let _restore = Restore(names.iter().map(|n| (*n, std::env::var_os(n))).collect());
         std::env::set_var("GROQ_API_KEY", "secret-for-test");
         std::env::set_var("OLLAMA_HOST", "192.168.0.2");
         std::env::set_var("OLLAMA_VULKAN", "1");
+        std::env::set_var("OLLAMA_NO_CLOUD", "0");
         std::env::set_var("HSA_OVERRIDE_GFX_VERSION", "10.3.0");
 
         // Succeeds only if: the secret and the user's OLLAMA_* are absent,
         // QR's explicit OLLAMA_HOST wins, the allowlisted variables
-        // (PATH, the GPU override) and the explicit OLLAMA_MODELS arrive.
+        // (PATH, the GPU override) and the explicit OLLAMA_MODELS arrive,
+        // and QR's explicit OLLAMA_NO_CLOUD=1 beats the user's value
+        // (items.id=848).
         let script = r#"
             test -z "${GROQ_API_KEY+x}" || exit 11
             test -z "${OLLAMA_VULKAN+x}" || exit 12
@@ -444,6 +451,7 @@ mod tests {
             test "$OLLAMA_MODELS" = "/tmp/qr-env-test" || exit 14
             test "$HSA_OVERRIDE_GFX_VERSION" = "10.3.0" || exit 15
             test -n "$PATH" || exit 16
+            test "$OLLAMA_NO_CLOUD" = "1" || exit 17
         "#;
         let child = spawn_with_pdeathsig(
             "/bin/sh",
@@ -451,6 +459,7 @@ mod tests {
             vec![
                 ("OLLAMA_HOST".into(), "127.0.0.1:1".into()),
                 ("OLLAMA_MODELS".into(), "/tmp/qr-env-test".into()),
+                ("OLLAMA_NO_CLOUD".into(), "1".into()),
             ],
         )
         .await
@@ -463,7 +472,7 @@ mod tests {
             status.success(),
             "child environment check failed with {status} (11 secret leaked, 12 user OLLAMA_* \
              leaked, 13 explicit OLLAMA_HOST lost, 14 OLLAMA_MODELS lost, 15 GPU override \
-             dropped, 16 PATH dropped)"
+             dropped, 16 PATH dropped, 17 explicit OLLAMA_NO_CLOUD lost)"
         );
     }
 

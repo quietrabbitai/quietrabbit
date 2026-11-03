@@ -666,16 +666,7 @@ impl OllamaSidecar {
     /// instead, which (unlike `kill_on_drop`) also covers `_exit()`/
     /// `SIGKILL` of this process itself, not just a normal Rust unwind.
     async fn try_start(&mut self, program: &OsStr, models_dir: &Path, port: u16) -> Attempt {
-        let envs = vec![
-            (
-                OsString::from("OLLAMA_HOST"),
-                OsString::from(format!("127.0.0.1:{port}")),
-            ),
-            (
-                OsString::from("OLLAMA_MODELS"),
-                models_dir.as_os_str().to_owned(),
-            ),
-        ];
+        let envs = sidecar_env(port, models_dir);
         let mut child =
             match ollama_spawn_thread::spawn_with_pdeathsig(program, vec!["serve".into()], envs)
                 .await
@@ -769,6 +760,31 @@ impl OllamaSidecar {
         }
         ReadyOutcome::TimedOut
     }
+}
+
+/// The explicit environment of every sidecar launch, applied on top of the
+/// scrubbed inheritance in `ollama_spawn_thread` (explicit values win, and
+/// `OLLAMA_NO_CLOUD` is not on the inherited allowlist, so a user's own value
+/// can neither reach nor override it).
+///
+/// `OLLAMA_NO_CLOUD=1` is Ollama's documented switch for its cloud features
+/// (cloud models and web search; the log then says "Ollama cloud disabled:
+/// true"). It is set so the sidecar makes no unrequested connection to
+/// ollama.com (items.id=848, privacy floor member 2). Behaviour verified
+/// on Ollama 0.40.13 only; items.id=583/619 must assert it again on the
+/// packaged binary.
+fn sidecar_env(port: u16, models_dir: &Path) -> Vec<(OsString, OsString)> {
+    vec![
+        (
+            OsString::from("OLLAMA_HOST"),
+            OsString::from(format!("127.0.0.1:{port}")),
+        ),
+        (
+            OsString::from("OLLAMA_MODELS"),
+            models_dir.as_os_str().to_owned(),
+        ),
+        (OsString::from("OLLAMA_NO_CLOUD"), OsString::from("1")),
+    ]
 }
 
 /// Waits up to 2 s for a child to have exited, then reaps it. Returns whether
@@ -941,6 +957,32 @@ mod tests {
         assert_eq!(PORT_CANDIDATES[9], 21443);
         assert!(PORT_CANDIDATES.windows(2).all(|w| w[1] == w[0] + 1));
         assert!(!PORT_CANDIDATES.contains(&11434));
+    }
+
+    /// items.id=848: every launch gets exactly these three variables, with
+    /// OLLAMA_HOST following the port being tried.
+    #[test]
+    fn sidecar_env_is_host_models_and_no_cloud_for_every_port() {
+        let models = Path::new("/data/ollama_models");
+        for port in PORT_CANDIDATES {
+            let got: Vec<(String, String)> = sidecar_env(port, models)
+                .into_iter()
+                .map(|(k, v)| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.to_string_lossy().into_owned(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                got,
+                vec![
+                    ("OLLAMA_HOST".to_owned(), format!("127.0.0.1:{port}")),
+                    ("OLLAMA_MODELS".to_owned(), "/data/ollama_models".to_owned()),
+                    ("OLLAMA_NO_CLOUD".to_owned(), "1".to_owned()),
+                ]
+            );
+        }
     }
 
     /// A free port from the OS's ephemeral range -- never one of
