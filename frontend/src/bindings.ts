@@ -749,6 +749,17 @@ export const commands = {
 	 *  OS-level focus round-trip).
 	 */
 	forwardPopupKey: (providerId: string, eventType: PaneKeyEventType, windowsKeyCode: number, character: number, modifiers: PaneEventModifiers) => typedError<null, string>(__TAURI_INVOKE("forward_popup_key", { providerId, eventType, windowsKeyCode, character, modifiers })),
+	/**
+	 *  items.id=853: the user closes `provider_id`'s popup (the content-head
+	 *  "Close popup" button, or Ctrl+W while one is open). `provider_id` names the
+	 *  *parent* pane, as for the other popup commands. A no-op, not an error, when
+	 *  that pane has no popup (it may have closed itself first): the pane host
+	 *  only closes a popup it still tracks. The popup's own page sees a closed
+	 *  window (`close_browser(true)`, no unload prompt), the same as a user closing
+	 *  a browser popup, so a provider's OAuth code treats it as a cancelled
+	 *  sign-in. The pane itself is untouched.
+	 */
+	closeCloudChatPopup: (providerId: string) => typedError<null, string>(__TAURI_INVOKE("close_cloud_chat_popup", { providerId })),
 	sendMessage: (request: SendMessageRequest) => typedError<MessageInfo[], string>(__TAURI_INVOKE("send_message", { request })),
 	listMessages: (userId: string, personaId: string, contextKey: string) => typedError<MessageInfo[], string>(__TAURI_INVOKE("list_messages", { userId, personaId, contextKey })),
 	/**

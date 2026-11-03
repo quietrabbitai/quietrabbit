@@ -27,6 +27,7 @@ import {
   type PaneMouseButton,
   type PaneRectFraction,
 } from '../bindings'
+import { isPopupCloseKey } from './popupCloseKey'
 
 export interface PopupHitLayerProps {
   popups: Record<string, PaneRectFraction>
@@ -153,6 +154,27 @@ export function PopupHitLayer({ popups }: PopupHitLayerProps) {
     wrapper.addEventListener('wheel', handler, { passive: false })
     return () => wrapper.removeEventListener('wheel', handler)
   }, [])
+
+  // items.id=853: Ctrl+W closes the open popup, whatever has DOM focus -- a
+  // window-level capture listener, so it runs before the hit div's own
+  // onKeyDown below and the key is never forwarded to the page. Only
+  // registered while a popup is open; with none, Ctrl+W is untouched. A
+  // provider id is a plain slug, so a comma-joined key is a stable dependency.
+  const openIds = Object.keys(popups).join(',')
+  useEffect(() => {
+    if (openIds === '') return
+    const providerIds = openIds.split(',')
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (!isPopupCloseKey(e)) return
+      e.preventDefault()
+      e.stopPropagation()
+      for (const providerId of providerIds) {
+        void commands.closeCloudChatPopup(providerId)
+      }
+    }
+    window.addEventListener('keydown', onKeyDown, true)
+    return () => window.removeEventListener('keydown', onKeyDown, true)
+  }, [openIds])
 
   return (
     <div ref={wrapperRef} style={{ position: 'fixed', inset: 0, pointerEvents: 'none' }}>

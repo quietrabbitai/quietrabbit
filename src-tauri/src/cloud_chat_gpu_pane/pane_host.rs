@@ -357,6 +357,14 @@ pub enum PaneCommand {
         character: u16,
         modifiers: PaneEventModifiers,
     },
+    /// items.id=853: the user closes `key`'s popup (the content-head popup
+    /// close button, or Ctrl+W). `key` is the *parent* pane's key, as for
+    /// every other popup command. The arm only queues the key on
+    /// `popup_close_tx`; `drain_popup_close_requests` does the
+    /// `force_close_popup` and the `cloud-chat-popup-closed` notification.
+    ClosePopup {
+        key: PaneKey,
+    },
     /// items.id=368: reasserts activation on whichever single browser
     /// `PaneManager::last_focus` (a `FocusTarget`, not a bare `PaneKey`)
     /// says actually last held focus -- the active pane, OR its popup, never
@@ -1134,18 +1142,19 @@ impl PaneManager {
     /// items.id=234: drains `PaneLoadHandler::on_load_start`'s navigate-away
     /// close requests (render.rs) -- see that handler's own doc for the
     /// parent-vs-popup disambiguation this relies on.
+    ///
+    /// items.id=853: also drains `PaneCommand::ClosePopup`, the user's own
+    /// close (button or Ctrl+W), which sends on the same channel.
     fn drain_popup_close_requests(&mut self) -> Vec<PopupNotification> {
-        let mut keys = Vec::new();
+        let mut requested = Vec::new();
         while let Ok(key) = self.popup_close_rx.try_recv() {
-            keys.push(key);
+            requested.push(key);
         }
 
         let mut notifications = Vec::new();
-        for key in keys {
-            if self.popups.contains_key(&key) {
-                self.force_close_popup(&key);
-                notifications.push(PopupNotification::Closed { key });
-            }
+        for key in popup_close_targets(requested, |k| self.popups.contains_key(k)) {
+            self.force_close_popup(&key);
+            notifications.push(PopupNotification::Closed { key });
         }
         notifications
     }
@@ -1450,6 +1459,25 @@ fn present_context_menu(
     );
 }
 
+/// items.id=853: which of the keys queued on `popup_close_tx` name a popup that
+/// is still open, each once and in arrival order. A close can race the popup
+/// closing itself (or its pane closing), so a key with no open popup is
+/// dropped, not an error; two closes for one popup produce one notification.
+/// Pure, so the decision is testable without a `PaneManager` (which needs a
+/// live `tauri::AppHandle`).
+fn popup_close_targets(
+    requested: Vec<PaneKey>,
+    is_open: impl Fn(&PaneKey) -> bool,
+) -> Vec<PaneKey> {
+    let mut targets: Vec<PaneKey> = Vec::new();
+    for key in requested {
+        if is_open(&key) && !targets.contains(&key) {
+            targets.push(key);
+        }
+    }
+    targets
+}
+
 /// items.id=234: resolves a newly-requested popup's on-screen rect (as a
 /// `PaneRectFraction` of the whole GLArea, matching every other pane-
 /// geometry consumer's convention) from the size CEF's `PopupFeatures`
@@ -1463,6 +1491,14 @@ fn present_context_menu(
 /// not a precision guarantee. `features.x`/`features.y` are intentionally
 /// unused: centering over the parent pane is this design's whole policy,
 /// not honoring a page-requested position.
+///
+/// items.id=853: when the parent pane's rect is known the popup is also capped
+/// to that rect's width and height, so a page asking for a window-sized popup
+/// cannot cover the content-head close buttons or the provider rail (both
+/// DOM, drawn under the GLArea, so a popup over them leaves no clickable way
+/// out). Without a parent rect (the layout has no entry for it, e.g. a modal
+/// hid the panes) only the window cap applies; the popup close button and
+/// Ctrl+W are the backstop there.
 fn resolve_popup_rect(
     glarea_size: (u32, u32),
     parent_pixel_rect: Option<(u32, u32, u32, u32)>,
@@ -1471,19 +1507,23 @@ fn resolve_popup_rect(
     const DEFAULT_WIDTH: u32 = 480;
     const DEFAULT_HEIGHT: u32 = 640;
     let (glarea_w, glarea_h) = (glarea_size.0.max(1), glarea_size.1.max(1));
+    let (max_w, max_h) = match parent_pixel_rect {
+        Some((_, _, pw, ph)) => (glarea_w.min(pw.max(1)), glarea_h.min(ph.max(1))),
+        None => (glarea_w, glarea_h),
+    };
 
     let width = features
         .width
         .filter(|w| *w > 0)
         .map(|w| w as u32)
         .unwrap_or(DEFAULT_WIDTH)
-        .min(glarea_w);
+        .min(max_w);
     let height = features
         .height
         .filter(|h| *h > 0)
         .map(|h| h as u32)
         .unwrap_or(DEFAULT_HEIGHT)
-        .min(glarea_h);
+        .min(max_h);
 
     let (center_x, center_y) = match parent_pixel_rect {
         Some((px, py, pw, ph)) => (px + pw / 2, py + ph / 2),
@@ -3408,6 +3448,12 @@ impl PaneHost {
                     host.send_key_event(Some(&ev));
                 }
             }
+            PaneCommand::ClosePopup { key } => {
+                // A send error means the receiver is gone (app teardown):
+                // nothing left to close.
+                let _ = self.manager.borrow().popup_close_tx.send(key);
+                self.queue_draw();
+            }
             PaneCommand::ReassertOsFocus => {
                 let mgr = self.manager.borrow();
                 let Some(target) = mgr.last_focus.clone() else {
@@ -3607,4 +3653,158 @@ pub fn close_all_panes() {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod popup_tests {
+    //! items.id=853: popup placement and the user-close decision. A
+    //! `PaneManager` needs a live `tauri::AppHandle`, so the close path is
+    //! covered through the pure `popup_close_targets` plus the channel
+    //! `PaneCommand::ClosePopup` feeds, not through `force_close_popup`.
+    use super::*;
+    use crate::cloud_chat_gpu_pane::render::PopupFeatureInts;
+
+    const WINDOW: (u32, u32) = (1600, 1000);
+    /// The content-body pane rect (x, y, w, h) inside `WINDOW`, clear of the
+    /// rail and the content-head.
+    const PANE: (u32, u32, u32, u32) = (300, 120, 800, 600);
+
+    fn features(w: Option<i32>, h: Option<i32>) -> PopupFeatureInts {
+        PopupFeatureInts {
+            x: None,
+            y: None,
+            width: w,
+            height: h,
+        }
+    }
+
+    fn pixels(frac: &PaneRectFraction) -> (u32, u32, u32, u32) {
+        pane_pixel_rect(WINDOW, frac).expect("popup rect is non-degenerate")
+    }
+
+    fn inside(inner: (u32, u32, u32, u32), outer: (u32, u32, u32, u32)) -> bool {
+        // One pixel of slack: the rect is stored as fractions and rounded back.
+        inner.0 + 1 >= outer.0
+            && inner.1 + 1 >= outer.1
+            && inner.0 + inner.2 <= outer.0 + outer.2 + 1
+            && inner.1 + inner.3 <= outer.1 + outer.3 + 1
+    }
+
+    #[test]
+    fn huge_request_is_capped_to_the_parent_pane() {
+        let r = resolve_popup_rect(WINDOW, Some(PANE), &features(Some(3000), Some(3000)));
+        let p = pixels(&r);
+        assert_eq!((p.2, p.3), (800, 600));
+        assert!(inside(p, PANE), "popup {p:?} escapes pane {PANE:?}");
+    }
+
+    #[test]
+    fn huge_request_in_an_800x600_pane_keeps_the_pane_chrome_clear() {
+        // The pane x sits in the content-head directly above the pane body.
+        let head = (PANE.0, PANE.1 - 40, PANE.2, 40);
+        let p = pixels(&resolve_popup_rect(
+            WINDOW,
+            Some(PANE),
+            &features(Some(3000), Some(3000)),
+        ));
+        assert!(
+            p.1 >= head.1 + head.3,
+            "popup {p:?} reaches the head {head:?}"
+        );
+    }
+
+    #[test]
+    fn default_size_is_capped_in_a_small_pane() {
+        let small = (400, 300, 300, 300);
+        let p = pixels(&resolve_popup_rect(
+            WINDOW,
+            Some(small),
+            &features(None, None),
+        ));
+        // 480x640 default, capped to the 300x300 pane.
+        assert_eq!((p.2, p.3), (300, 300));
+        assert!(inside(p, small));
+    }
+
+    #[test]
+    fn smaller_than_the_pane_request_is_honoured_and_centred() {
+        let p = pixels(&resolve_popup_rect(
+            WINDOW,
+            Some(PANE),
+            &features(Some(300), Some(200)),
+        ));
+        assert_eq!((p.2, p.3), (300, 200));
+        assert!(inside(p, PANE));
+        // Centred on the pane.
+        assert_eq!(p.0 + p.2 / 2, PANE.0 + PANE.2 / 2);
+        assert_eq!(p.1 + p.3 / 2, PANE.1 + PANE.3 / 2);
+    }
+
+    #[test]
+    fn no_parent_keeps_the_window_fallback() {
+        // Unchanged behaviour: window cap only, centred on the window.
+        let big = pixels(&resolve_popup_rect(
+            WINDOW,
+            None,
+            &features(Some(3000), Some(3000)),
+        ));
+        assert_eq!((big.2, big.3), WINDOW);
+        let default = pixels(&resolve_popup_rect(WINDOW, None, &features(None, None)));
+        assert_eq!((default.2, default.3), (480, 640));
+        assert_eq!(default.0 + default.2 / 2, WINDOW.0 / 2);
+        assert_eq!(default.1 + default.3 / 2, WINDOW.1 / 2);
+    }
+
+    #[test]
+    fn result_never_leaves_the_window() {
+        let corner = (1500, 900, 100, 100);
+        for parent in [Some(PANE), Some(corner), None] {
+            for f in [
+                features(None, None),
+                features(Some(3000), Some(3000)),
+                features(Some(1), Some(1)),
+                features(Some(-5), Some(0)),
+            ] {
+                let p = pixels(&resolve_popup_rect(WINDOW, parent, &f));
+                assert!(p.0 + p.2 <= WINDOW.0 && p.1 + p.3 <= WINDOW.1, "{p:?}");
+            }
+        }
+        // A tiny window: the popup is never larger than the window.
+        let p = pane_pixel_rect(
+            (200, 150),
+            &resolve_popup_rect((200, 150), None, &features(Some(3000), Some(3000))),
+        )
+        .unwrap();
+        assert_eq!((p.2, p.3), (200, 150));
+    }
+
+    #[test]
+    fn close_targets_keep_open_popups_once_in_order() {
+        let open = ["a".to_string(), "b".to_string()];
+        let requested = vec![
+            "b".to_string(),
+            "gone".to_string(),
+            "a".to_string(),
+            "b".to_string(),
+        ];
+        let targets = popup_close_targets(requested, |k| open.contains(k));
+        assert_eq!(targets, vec!["b".to_string(), "a".to_string()]);
+        assert!(popup_close_targets(vec![], |_| true).is_empty());
+        assert!(popup_close_targets(vec!["x".to_string()], |_| false).is_empty());
+    }
+
+    #[test]
+    fn close_popup_key_travels_the_popup_close_channel() {
+        // ClosePopup's dispatch arm does exactly this send; the drain reads it
+        // back and hands it to popup_close_targets.
+        let (tx, rx) = std::sync::mpsc::channel::<PaneKey>();
+        tx.send("duckai".to_string()).unwrap();
+        tx.send("duckai".to_string()).unwrap();
+        let mut requested = Vec::new();
+        while let Ok(key) = rx.try_recv() {
+            requested.push(key);
+        }
+        let targets = popup_close_targets(requested, |k| k == "duckai");
+        assert_eq!(targets, vec!["duckai".to_string()]);
+    }
 }

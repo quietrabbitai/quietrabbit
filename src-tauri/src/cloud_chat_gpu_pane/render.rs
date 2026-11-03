@@ -1614,10 +1614,25 @@ wrap_life_span_handler! {
         fn on_after_created(&self, browser: Option<&mut cef::Browser>) {
             let Some(browser) = browser else { return; };
             log::info!("cloud_chat_gpu_pane::render: popup on_after_created fired");
-            let _ = self
+            // items.id=853: a failed send means the pane host already dropped
+            // this popup (the user closed it, its pane closed, or a second
+            // popup replaced it) while it was still being created, so nothing
+            // holds this browser and nothing would ever close it. Close it
+            // here, on CEF's UI thread, instead of leaking a windowless browser.
+            if self
                 .handler
                 .events_tx
-                .send(PopupLifecycleEvent::Ready(browser.clone()));
+                .send(PopupLifecycleEvent::Ready(browser.clone()))
+                .is_err()
+            {
+                log::info!(
+                    "cloud_chat_gpu_pane::render: popup created after its host dropped it, \
+                     closing the browser"
+                );
+                if let Some(host) = browser.host() {
+                    host.close_browser(true as _);
+                }
+            }
         }
 
         fn on_before_close(&self, _browser: Option<&mut cef::Browser>) {

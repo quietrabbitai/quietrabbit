@@ -150,6 +150,8 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::cloud_chat_pane::forward_popup_mouse_move,
         commands::cloud_chat_pane::forward_popup_mouse_wheel,
         commands::cloud_chat_pane::forward_popup_key,
+        // items.id=853 -- user-driven popup close (button, Ctrl+W)
+        commands::cloud_chat_pane::close_cloud_chat_popup,
         // Group 14 -- Messages/transcript (ChatPane.tsx backing)
         commands::messages::send_message,
         commands::messages::list_messages,

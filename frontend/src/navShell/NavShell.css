@@ -291,6 +291,25 @@
   background: var(--border);
 }
 
+/* items.id=853: text button beside the pane close, only while a popup is open. */
+.cloud-chat-access-pane__content-head-popup-close {
+  flex: 0 0 auto;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 6px;
+  border: none;
+  background: var(--surface);
+  color: inherit;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.cloud-chat-access-pane__content-head-popup-close:hover {
+  background: var(--border);
+}
+
 /* This element's own bounding rect IS the active pane's on-screen rect
  * (paneLayout.ts's computeActivePaneRect) -- Rust composites CEF's
  * texture directly into exactly this box, so nothing meant to stay

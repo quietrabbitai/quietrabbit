@@ -395,6 +395,7 @@
       "openError": "Could not open pane(s): {{message}}",
       "contentEmptyPrompt": "Select a provider to start a Cloud Chat.",
       "contentCloseButton": "Close this session",
+      "popupCloseButton": "Close popup",
       "contentHeadReclaimTitle": "Click to collapse Cloud Chat and bring QR chat forward"
     }
   },

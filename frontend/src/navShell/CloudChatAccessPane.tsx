@@ -1002,6 +1002,28 @@ export function CloudChatAccessPane({
                 <span className="cloud-chat-access-pane__content-head-name">
                   {activeProvider?.name ?? activeProviderId}
                 </span>
+                {/* items.id=853: the user's way out of a popup. Lives here,
+                    in the head, because the head is outside the pane rect
+                    (never under the GLArea texture) and the popup rect is
+                    capped to the pane rect (pane_host.rs resolve_popup_rect),
+                    so a popup cannot cover this button. Only while the
+                    active pane's popup is open. Ctrl+W does the same
+                    (PopupHitLayer). Wording is Chat-BRAND copy. */}
+                {activeProviderId in activePopupRects && (
+                  <button
+                    type="button"
+                    className="cloud-chat-access-pane__content-head-popup-close"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      void commands.closeCloudChatPopup(activeProviderId)
+                    }}
+                    // The head's own Enter/Space handler reclaims Chat; a key
+                    // press on this button must only activate the button.
+                    onKeyDown={(e) => e.stopPropagation()}
+                  >
+                    {t('navShell.cloudChatAccessPane.popupCloseButton')}
+                  </button>
+                )}
                 <button
                   type="button"
                   className="cloud-chat-access-pane__content-head-close"

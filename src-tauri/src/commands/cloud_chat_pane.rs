@@ -1280,6 +1280,28 @@ pub async fn forward_popup_mouse_wheel(
         .map_err(|e| e.to_string())
 }
 
+/// items.id=853: the user closes `provider_id`'s popup (the content-head
+/// "Close popup" button, or Ctrl+W while one is open). `provider_id` names the
+/// *parent* pane, as for the other popup commands. A no-op, not an error, when
+/// that pane has no popup (it may have closed itself first): the pane host
+/// only closes a popup it still tracks. The popup's own page sees a closed
+/// window (`close_browser(true)`, no unload prompt), the same as a user closing
+/// a browser popup, so a provider's OAuth code treats it as a cancelled
+/// sign-in. The pane itself is untouched.
+#[tauri::command]
+#[specta::specta]
+pub async fn close_cloud_chat_popup(
+    provider_id: String,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    ensure_cef_available()?;
+    app_handle
+        .run_on_main_thread(move || {
+            pane_host::dispatch(PaneCommand::ClosePopup { key: provider_id })
+        })
+        .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod rail_summary_tests {
     use super::*;
