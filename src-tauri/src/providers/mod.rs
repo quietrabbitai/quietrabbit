@@ -1,5 +1,6 @@
 // src-tauri/src/providers/mod.rs
 
+pub mod curated_models;
 pub mod errors;
 pub mod evaluation;
 pub mod hosted_call;

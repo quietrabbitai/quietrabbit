@@ -11,11 +11,15 @@
 //!
 //! `stream` is always `false` in Release 1 — resolved by `StepExecutor`.
 //!
-//! Four [`reqwest::Client`] instances are held:
-//! - `client` (120s): inference calls (`/api/generate`, `/api/chat`, `/api/create`)
+//! Three [`reqwest::Client`] instances are held:
+//! - `client` (120s): inference calls (`/api/generate`, `/api/chat`)
 //! - `health_client` (5s): health, model enumeration, modelfile show
-//! - `modelfile_client` (300s): modelfile application (`/api/create`)
 //! - `pull_client` (no timeout): model pull/delete (items.id=436)
+//!
+//! Model pulls are limited to the curated set (items.id=856, decisions.id=840):
+//! `pull_model` refuses any tag that is not exactly one of
+//! `providers::curated_models::CURATED_LOCAL_MODEL_TAGS`, and `apply_modelfile`
+//! (`/api/create`, which can pull or load unreviewed weights) is disabled.
 //!
 //! # Sidecar trust gate (items.id=586)
 //! Every method that makes an HTTP call checks `ollama_sidecar::is_trusted()`
@@ -57,7 +61,6 @@ use crate::providers::types::{
 
 const OLLAMA_TIMEOUT_SECS: u64 = 120;
 const OLLAMA_CONNECT_TIMEOUT_SECS: u64 = 5;
-const OLLAMA_MODELFILE_TIMEOUT_SECS: u64 = 300;
 
 const CONTEXT_WARNING_THRESHOLD_DEFAULT: f64 = 0.75;
 const CONTEXT_HARD_LIMIT_DEFAULT: f64 = 0.95;
@@ -167,10 +170,9 @@ fn sidecar_trusted() -> bool {
 
 /// Ollama qr_local HTTP client.
 ///
-/// Holds four `reqwest::Client` instances with different timeouts:
+/// Holds three `reqwest::Client` instances with different timeouts:
 /// - `client` (120s): inference calls (`/api/generate`, `/api/chat`).
 /// - `health_client` (5s): health check, tags, show.
-/// - `modelfile_client` (300s): modelfile application (`/api/create`).
 /// - `pull_client` (no timeout): model pull/delete (`/api/pull`,
 ///   `/api/delete`, items.id=436) — a pull can legitimately run for many
 ///   minutes; cancellation is via `CancellationToken`
@@ -180,7 +182,6 @@ fn sidecar_trusted() -> bool {
 pub struct OllamaClient {
     client: Client,
     health_client: Client,
-    modelfile_client: Client,
     pull_client: Client,
 }
 
@@ -201,10 +202,6 @@ impl OllamaClient {
                 .timeout(Duration::from_secs(OLLAMA_CONNECT_TIMEOUT_SECS))
                 .build()
                 .expect("reqwest health client build should never fail"),
-            modelfile_client: Client::builder()
-                .timeout(Duration::from_secs(OLLAMA_MODELFILE_TIMEOUT_SECS))
-                .build()
-                .expect("reqwest modelfile client build should never fail"),
             pull_client: Client::builder()
                 .build()
                 .expect("reqwest pull client build should never fail"),
@@ -585,60 +582,30 @@ impl OllamaClient {
         }
     }
 
-    /// Apply a Modelfile via `/api/create`.
+    /// DISABLED (items.id=856, decisions.id=840): always refuses and returns
+    /// `false` without contacting the sidecar.
     ///
-    /// Accepts modelfile content as `&str` — file I/O is the caller's
-    /// responsibility (keeps provider client as a pure network gateway).
+    /// A Modelfile can make Ollama pull from a registry host the user
+    /// supplied (`FROM host/name:tag`) or load weights nobody reviewed
+    /// (`FROM <path>`, `ADAPTER <path>`), which is exactly what the curated
+    /// model boundary exists to prevent. Nothing calls this method, so it is
+    /// closed rather than guarded: a check that mirrors Ollama's Modelfile
+    /// parser could drift from it and let something through. Re-enabling it
+    /// needs a caller, its own reviewed design and an approved change.
     ///
-    /// Validates NDJSON response body — HTTP 200 does not guarantee success.
-    /// Checks the final non-empty line for `{"status":"success"}` before
-    /// confirming. This is a documented NotebookLM bug fix — do not simplify
-    /// to `resp.status().is_success()`.
+    /// The refusal comes before the sidecar trust check and before any
+    /// request is built, so no connection is ever made. Returns `false`,
+    /// never raises, as the original "infallible per oracle contract"
+    /// signature required.
     ///
-    /// Returns `true` if applied successfully, `false` otherwise.
-    /// Never raises — infallible per oracle contract.
-    ///
-    /// Python oracle: `apply_modelfile()`
-    pub async fn apply_modelfile(&self, model_name: &str, modelfile_content: &str) -> bool {
-        if !sidecar_trusted() {
-            return false;
-        }
-
-        let url = format!("{}/api/create", base_url());
-        let resp = self
-            .modelfile_client
-            .post(&url)
-            .json(&serde_json::json!({
-                "name": model_name,
-                "modelfile": modelfile_content,
-            }))
-            .send()
-            .await;
-
-        let resp = match resp {
-            Ok(r) if r.status().is_success() => r,
-            _ => return false,
-        };
-
-        let body = match resp.text().await {
-            Ok(t) => t,
-            Err(_) => return false,
-        };
-
-        // Validate final non-empty NDJSON line for {"status":"success"}.
-        // HTTP 200 alone does not mean the model was created successfully.
-        let success = body
-            .lines()
-            .rfind(|l| !l.trim().is_empty())
-            .and_then(|line| serde_json::from_str::<Value>(line).ok())
-            .and_then(|v| {
-                v.get("status")
-                    .and_then(|s| s.as_str())
-                    .map(|s| s == "success")
-            })
-            .unwrap_or(false);
-
-        success
+    /// Python oracle: `apply_modelfile()` (the oracle's behavior is
+    /// intentionally not preserved here).
+    pub async fn apply_modelfile(&self, model_name: &str, _modelfile_content: &str) -> bool {
+        log::warn!(
+            "ollama_client: apply_modelfile is disabled; refusing to create '{model_name}' \
+             (items.id=856, decisions.id=840)"
+        );
+        false
     }
 
     // -----------------------------------------------------------------------
@@ -648,7 +615,7 @@ impl OllamaClient {
     /// Pull a model via `/api/pull`, returning a stream of decoded NDJSON
     /// progress lines.
     ///
-    /// Unlike `apply_modelfile()` above, this genuinely streams: each
+    /// This genuinely streams (unlike the old whole-body `/api/create` handling): each
     /// `Bytes` chunk from `reqwest::Response::bytes_stream()` is buffered
     /// and split on `\n` as it arrives, so a caller can report live
     /// progress on a pull that runs for minutes, rather than waiting for
@@ -657,14 +624,15 @@ impl OllamaClient {
     /// precedent existed in this codebase to reuse — this is new
     /// streaming-parse code (`ndjson_lines` below).
     ///
-    /// Resolves explicitly against Ollama's own configured default
-    /// registry (`registry.ollama.ai`) — `tag` is passed straight through
-    /// as `{"model": tag}` with no registry-host override in the request,
-    /// matching decisions.id=840's requirement that pulls never resolve
-    /// against a user-suppliable registry host. Callers (
-    /// `providers::ollama_install`) are additionally responsible for only
-    /// ever passing a `tag` that matches a curated `providers.local_model_tag`
-    /// row — this method itself does not re-validate the curated list.
+    /// Resolves against Ollama's own configured default registry
+    /// (`registry.ollama.ai`), never a user-suppliable host
+    /// (decisions.id=840). This method enforces that itself (items.id=856):
+    /// `tag` must be exactly one of
+    /// `providers::curated_models::CURATED_LOCAL_MODEL_TAGS`, otherwise
+    /// `OllamaModelError::ModelNotCurated` is returned before any
+    /// connection is made. A host or path prefix, a digest, a different
+    /// case or any tag nobody curated is refused. An accepted `tag` is
+    /// passed through unchanged as `{"model": tag}`.
     ///
     /// A per-line `{"error": "..."}` (Ollama can report this mid-stream on
     /// an otherwise-200 response, e.g. a failed digest) is decoded into
@@ -680,6 +648,13 @@ impl OllamaClient {
                 "ollama_client: refusing to pull cloud-classified model tag '{tag}' (items.id=714)"
             );
             return Err(OllamaModelError::CloudModelRefused);
+        }
+        if !crate::providers::curated_models::is_curated_local_model_tag(tag) {
+            log::warn!(
+                "ollama_client: refusing to pull '{tag}': not in the curated local model set \
+                 (items.id=856, decisions.id=840)"
+            );
+            return Err(OllamaModelError::ModelNotCurated);
         }
         if !sidecar_trusted() {
             return Err(OllamaModelError::SidecarUntrusted);
@@ -806,6 +781,11 @@ pub enum OllamaModelError {
     /// names a model served from a remote service (`is_cloud_model_tag`).
     #[error("that model runs on a remote service; refusing to pull it on the local sidecar")]
     CloudModelRefused,
+    /// items.id=856: refused before making any HTTP call, because the tag is
+    /// not exactly one of `providers::curated_models::CURATED_LOCAL_MODEL_TAGS`
+    /// (decisions.id=840: only curated models, only from registry.ollama.ai).
+    #[error("that model is not in Quiet Rabbit's curated list; refusing to pull it")]
+    ModelNotCurated,
 }
 
 /// One decoded line of Ollama's `/api/pull` NDJSON stream.
@@ -1291,6 +1271,157 @@ mod tests {
         );
 
         crate::ollama_sidecar::force_trust_for_test(false);
+    }
+
+    // -- curated-model guard (items.id=856) -----------------------------------
+
+    /// Forces the sidecar trust gate TRUE for a test (so the trust gate is not
+    /// what stops a call) and resets it on drop, including on a panic.
+    struct TrustGuard;
+    impl TrustGuard {
+        fn trusted() -> Self {
+            crate::ollama_sidecar::force_trust_for_test(true);
+            TrustGuard
+        }
+    }
+    impl Drop for TrustGuard {
+        fn drop(&mut self) {
+            crate::ollama_sidecar::force_trust_for_test(false);
+        }
+    }
+
+    fn loopback_port(server: &crate::providers::loopback_test_server::LoopbackServer) -> u16 {
+        server
+            .base()
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .expect("loopback base ends with a port")
+    }
+
+    /// A tag that is not exactly a curated one never reaches the sidecar: a
+    /// host or path prefix, a digest, a different case, whitespace, an
+    /// uncurated tag. Cloud tags keep their own error.
+    #[tokio::test]
+    async fn pull_model_refuses_uncurated_tags_without_connecting() {
+        use crate::providers::loopback_test_server::{Canned, LoopbackServer};
+
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let _trust = TrustGuard::trusted();
+        let server = LoopbackServer::start(vec![Canned::json(200, "{\"status\":\"success\"}\n")]);
+        let _port = crate::ollama_sidecar::ForcedPortGuard::set(loopback_port(&server));
+        let client = OllamaClient::new();
+
+        for tag in [
+            "registry.ollama.ai/library/llama3.2:3b",
+            "library/llama3.2:3b",
+            "evil.example/llama3.2:3b",
+            "evil.example:5000/library/qwen2.5:7b",
+            "hf.co/someone/model:latest",
+            "http://evil.example/llama3.2:3b",
+            "llama3.2:3b@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "LLAMA3.2:3B",
+            " llama3.2:3b",
+            "llama3.2:3b ",
+            "llama3.2",
+            "llama3.3:70b",
+            "gpt-oss:20b",
+            "",
+        ] {
+            let p = client.pull_model(tag).await;
+            assert!(
+                matches!(p, Err(OllamaModelError::ModelNotCurated)),
+                "pull {tag:?} must be refused as not curated"
+            );
+        }
+        for tag in ["gpt-oss:cloud", "evil.example/m:7b-cloud"] {
+            let p = client.pull_model(tag).await;
+            assert!(
+                matches!(p, Err(OllamaModelError::CloudModelRefused)),
+                "pull {tag:?} stays a cloud refusal"
+            );
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(
+            server.connections(),
+            0,
+            "a refused tag must never reach the sidecar"
+        );
+        assert!(server.captured().is_empty());
+    }
+
+    /// The seeded curated tags still pull: each is accepted and sent
+    /// unchanged as `POST /api/pull` with `{"model": tag}`, and the NDJSON
+    /// progress stream decodes.
+    #[tokio::test]
+    async fn pull_model_sends_each_curated_tag_unchanged() {
+        use crate::providers::curated_models::CURATED_LOCAL_MODEL_TAGS;
+        use crate::providers::loopback_test_server::{Canned, LoopbackServer};
+
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let _trust = TrustGuard::trusted();
+        let server = LoopbackServer::start(vec![Canned::json(
+            200,
+            "{\"status\":\"pulling manifest\"}\n{\"status\":\"success\"}\n",
+        )]);
+        let _port = crate::ollama_sidecar::ForcedPortGuard::set(loopback_port(&server));
+        let client = OllamaClient::new();
+
+        for tag in CURATED_LOCAL_MODEL_TAGS {
+            let stream = match client.pull_model(tag).await {
+                Ok(s) => s,
+                Err(e) => panic!("curated tag {tag} must be accepted: {e}"),
+            };
+            let lines: Vec<_> = Box::pin(stream).collect().await;
+            assert_eq!(lines.len(), 2, "{tag}: two progress lines");
+            assert!(lines.iter().all(|l| l.is_ok()), "{tag}");
+        }
+
+        let captured = server.captured();
+        assert_eq!(captured.len(), CURATED_LOCAL_MODEL_TAGS.len());
+        for (request, tag) in captured.iter().zip(CURATED_LOCAL_MODEL_TAGS) {
+            assert_eq!(request.method, "POST");
+            assert_eq!(request.path, "/api/pull");
+            assert_eq!(request.json(), serde_json::json!({ "model": tag }), "{tag}");
+        }
+    }
+
+    /// apply_modelfile is disabled (items.id=856): false and zero
+    /// connections for every input, even a curated FROM, with the trust gate
+    /// open.
+    #[tokio::test]
+    async fn apply_modelfile_always_refuses_without_connecting() {
+        use crate::providers::loopback_test_server::{Canned, LoopbackServer};
+
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let _trust = TrustGuard::trusted();
+        let server = LoopbackServer::start(vec![Canned::json(200, "{\"status\":\"success\"}\n")]);
+        let _port = crate::ollama_sidecar::ForcedPortGuard::set(loopback_port(&server));
+        let client = OllamaClient::new();
+
+        for content in [
+            "FROM llama3.2:3b",
+            "FROM llama3.2:3b\nSYSTEM \"\"\"You are terse.\"\"\"\nPARAMETER temperature 0.2\n",
+            "FROM evil.example/llama3.2:3b",
+            "FROM hf.co/someone/model:latest",
+            "FROM ./model.gguf",
+            "FROM /abs/model.gguf",
+            "FROM llama3.2:3b\nADAPTER ./adapter.gguf",
+            "",
+        ] {
+            assert!(
+                !client.apply_modelfile("qr-test", content).await,
+                "apply_modelfile must refuse {content:?}"
+            );
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(
+            server.connections(),
+            0,
+            "apply_modelfile must never reach the sidecar"
+        );
     }
 
     // -- base_url ignores the process environment (items.id=616) -------------

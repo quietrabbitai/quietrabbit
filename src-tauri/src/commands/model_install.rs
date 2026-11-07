@@ -118,6 +118,25 @@ pub async fn list_local_models(
     Ok(providers.into_iter().map(LocalModelSummary::from).collect())
 }
 
+/// Refuses a `local_model_tag` that is not exactly one of the curated tags
+/// (items.id=856, decisions.id=840) before a background task is created, so a
+/// tampered `providers` row (shared.db is unencrypted) is reported to the
+/// caller at once instead of leaving the progress feed on "starting".
+/// `OllamaClient::pull_model` makes the same check and is the authoritative
+/// one; this is an earlier second layer using the same predicate.
+fn ensure_curated_tag(provider_id: &str, tag: &str) -> Result<(), String> {
+    if crate::providers::curated_models::is_curated_local_model_tag(tag) {
+        return Ok(());
+    }
+    log::warn!(
+        "commands::model_install: provider '{provider_id}' has local_model_tag '{tag}', which is \
+         not in the curated local model set; refusing to install (items.id=856)"
+    );
+    Err(format!(
+        "'{provider_id}' is not in Quiet Rabbit's curated model list and cannot be installed"
+    ))
+}
+
 /// Starts a background pull and returns a `task_id` immediately -- the
 /// frontend listens for `"task-progress"` events carrying that `task_id`
 /// rather than waiting on this call. Errors returned here are only the
@@ -145,6 +164,7 @@ pub async fn install_local_model(
     let local_model_tag = provider
         .local_model_tag
         .ok_or_else(|| format!("provider '{id}' has no local_model_tag"))?;
+    ensure_curated_tag(&id, &local_model_tag)?;
 
     let task_id = uuid::Uuid::new_v4().to_string();
     let cancel_token = CancellationToken::new();
@@ -235,4 +255,32 @@ pub async fn delete_local_model(
     ollama_install::run_delete(&pool, &client, &id, &local_model_tag)
         .await
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seeded_curated_tags_pass_the_early_check() {
+        for tag in ["llama3.2:3b", "llama3.1:8b", "qwen2.5:7b"] {
+            assert_eq!(ensure_curated_tag(&format!("ollama:{tag}"), tag), Ok(()));
+        }
+    }
+
+    #[test]
+    fn host_prefixed_and_uncurated_tags_fail_the_early_check() {
+        for tag in [
+            "evil.example/llama3.2:3b",
+            "registry.ollama.ai/library/llama3.2:3b",
+            "hf.co/someone/model:latest",
+            "llama3.3:70b",
+            "llama3.2:3b ",
+            "",
+        ] {
+            let err = ensure_curated_tag("ollama:fixture", tag)
+                .expect_err("an uncurated tag must be refused");
+            assert!(err.contains("curated"), "{tag:?}: {err}");
+        }
+    }
 }
