@@ -104,8 +104,20 @@ jobs:
           toolchain: ${{ env.CI_RUST_TOOLCHAIN }}
           components: rustfmt, clippy
 
+      # items.id=864: a stalled download of the ~5 GB cache (run 42342779703,
+      # stuck at 74.6%) held the job for the 10-minute default of the cache
+      # toolkit's per-SEGMENT download timeout (128 MB segments), then it fell
+      # through to a cold build. Capped at 3 minutes per segment: a healthy
+      # restore (73-130 s for the whole cache) never gets near it, and a
+      # stalled segment now costs 3 minutes, not 10. On timeout the toolkit
+      # logs a warning and reports a cache miss ("No cache found"), a cold
+      # build of about 6.5 minutes, never a failed step. rust-cache bundles
+      # @actions/cache (6.3.0), which reads this variable from the step env.
+      # Same value in both copies of this step (clippy and check).
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: "3"
         with:
           workspaces: src-tauri -> target
 
@@ -241,8 +253,20 @@ jobs:
           toolchain: ${{ env.CI_RUST_TOOLCHAIN }}
           components: rustfmt, clippy
 
+      # items.id=864: a stalled download of the ~5 GB cache (run 42342779703,
+      # stuck at 74.6%) held the job for the 10-minute default of the cache
+      # toolkit's per-SEGMENT download timeout (128 MB segments), then it fell
+      # through to a cold build. Capped at 3 minutes per segment: a healthy
+      # restore (73-130 s for the whole cache) never gets near it, and a
+      # stalled segment now costs 3 minutes, not 10. On timeout the toolkit
+      # logs a warning and reports a cache miss ("No cache found"), a cold
+      # build of about 6.5 minutes, never a failed step. rust-cache bundles
+      # @actions/cache (6.3.0), which reads this variable from the step env.
+      # Same value in both copies of this step (clippy and check).
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: "3"
         with:
           workspaces: src-tauri -> target
 
