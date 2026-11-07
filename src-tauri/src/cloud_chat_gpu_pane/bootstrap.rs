@@ -319,6 +319,12 @@ const MEDIA_CACHE_SIZE_BYTES: u64 = 16 * 1024 * 1024;
 ///   AimServerRequestOnIdentityChangeEnabled: the AI Mode eligibility service
 ///   (AimEligibilityService) fetches www.google.com/async/folae at every
 ///   startup, whatever is on screen.
+/// - PreconnectToSearch (items.id=857): SearchEnginePreconnector::PreconnectDSE
+///   preconnects (DNS, TCP and TLS, no HTTP request) to the default search
+///   engine's origin, https://www.google.com. Page-driven: it fires on every
+///   page load, popup open and popup close in a pane, so the background
+///   switches above do not cover it. Name verified in the strings of the
+///   libcef 151 binary (the feature and the PreconnectDSE symbol).
 const DISABLED_FEATURES: &[&str] = &[
     "SoftNavigationDetection",
     "AutofillServerCommunication",
@@ -326,6 +332,7 @@ const DISABLED_FEATURES: &[&str] = &[
     "AimEnabled",
     "AimServerRequestOnStartupEnabled",
     "AimServerRequestOnIdentityChangeEnabled",
+    "PreconnectToSearch",
 ];
 
 /// `existing` (a comma-separated `--disable-features` value, possibly empty)
@@ -526,6 +533,12 @@ mod tests {
     fn soft_navigation_workaround_stays_in_the_feature_list() {
         assert!(DISABLED_FEATURES.contains(&"SoftNavigationDetection"));
         assert!(merge_disabled_features("", DISABLED_FEATURES).contains("SoftNavigationDetection"));
+    }
+
+    #[test]
+    fn search_preconnect_stays_in_the_feature_list() {
+        assert!(DISABLED_FEATURES.contains(&"PreconnectToSearch"));
+        assert!(merge_disabled_features("", DISABLED_FEATURES).contains("PreconnectToSearch"));
     }
 
     #[test]
