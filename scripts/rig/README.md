@@ -21,6 +21,8 @@ Everything here is for scratch runs only. Nothing in it reads or writes the real
    `XDG_DATA_HOME`, `XDG_CACHE_HOME` and `XDG_CONFIG_HOME` to directories inside the scratch dir, unsets
    every `QR_*` and `OLLAMA_*` variable, and refuses to run if the scratch dir is, contains or sits
    inside your home directory, `~/.local/share`, `~/.cache` or `~/.config`, or if it is not new or empty.
+   The one exception to "new or empty" is `--reuse` (see below), which adds conditions and removes none:
+   the home/XDG refusals are checked first and apply to a reused dir exactly as to a new one.
    `QR_DATA_ROOT` does **not** isolate the data directory (a dev run once hit the real one); the XDG
    variables do. Do not launch the app any other way for these checks.
 2. **XDG_RUNTIME_DIR is not isolated.** The GUI session needs it, so the app's CEF profile lives in
@@ -46,10 +48,22 @@ All CDP scripts take `--port N` (else `RIG_CDP_PORT`, else 9222) and print names
 ### scratch-run.sh: isolated scratch run
 
 ```
-scripts/rig/scratch-run.sh [--ns SIZE] [--secs N] SCRATCH_DIR [-- APP_ARGS...]
+scripts/rig/scratch-run.sh [--ns SIZE] [--secs N] [--reuse] SCRATCH_DIR [-- APP_ARGS...]
 
 scripts/rig/scratch-run.sh --secs 60 "$TMPDIR/qr-rig" -- --remote-debugging-port=9333
 ```
+
+`--reuse` relaunches into a scratch dir this script created earlier, for a **two-phase run** (create the
+data, stop the app, edit `shared.db`, relaunch). The script writes a `.rig-scratch` marker holding the
+dir's own path when it creates a scratch dir; `--reuse` on a non-empty dir is accepted only if that marker
+is there (a regular file) and names the same path, the pid in `app.pid` is no longer alive, and `--ns` is
+not used (the tmpfs does not outlive its run, so there is nothing to reuse). Anything else is refused as
+before. The previous `app.log` and `net.json` are renamed to `app.N.log` and `net.N.json`, never
+overwritten. The marker is a guard against reusing a directory the script did not make, not a security
+boundary: the home/XDG refusals are what keep a run off the real data, and they run before the marker is
+looked at. Without `--reuse`, a non-empty dir is refused as always. Passing `--reuse` for a new or empty
+dir is harmless (it is simply a first run). Editing a database under a running app is the alternative this
+replaces; do not do that when two phases will do.
 
 Writes `app.log`, `net.json` (net log), `app.pid` into `SCRATCH_DIR`, and the app's data, cache and
 config under `SCRATCH_DIR/{data,cache,config}`. `--secs N` stops the app after N seconds; without it
@@ -80,10 +94,18 @@ node scripts/rig/netlog.mjs "$TMPDIR/qr-rig/net.json"
 
 Reports URL requests by origin and by method+URL with time offsets from the start of the capture, the
 socket addresses of connect events (loopback, non-loopback TCP/other, non-loopback UDP), and DNS names
-looked up. Reads a log from a killed app up to its last complete event (an empty one is reported as
-such). Exit 0: nothing non-loopback; exit 3: a non-loopback URL host, DNS name or TCP/other socket
-address. A non-loopback UDP `connect()` alone is Chromium's IPv6 reachability probe (a route lookup;
-no packet is sent): it is printed on its own line and does not change the exit code unless `--strict`.
+looked up. A final section says **why**: speculative DNS requests (an event carrying `is_speculative` and
+a `host`) and preconnects (`is_preconnect` and a `url`), grouped by source type, event type and name,
+with the count, every offset (the first 12) and the first and last time as an offset and as UTC wall
+clock. Matching is on those parameters, not on event names. It prints the host (speculative DNS) or the
+origin (preconnect) only, never a path or query string, not even with `--full`. Reads a log from a killed
+app up to its last complete event (an empty one is reported as such). Exit 0: nothing non-loopback; exit
+3: a non-loopback URL host, DNS name or TCP/other socket address. A non-loopback UDP `connect()` alone is
+Chromium's IPv6 reachability probe (a route lookup; no packet is sent): it is printed on its own line and
+does not change the exit code unless `--strict`. The speculative/preconnect section is likewise
+informational (it adds a note to the RESULT line) unless `--strict`, which makes a non-loopback name in it
+fail with exit 3. The section was checked against synthetic logs only, built from the event shapes in the
+items.id=855 handoff; the first real capture with a pane open is the real test of the parameter names.
 
 ### ss-sample.sh and ss-report.mjs: socket sampling
 
@@ -115,7 +137,8 @@ Storage cache, all named `qrrig_canary*`. Both modes print the browser-level coo
 canary count, and per page `canary/total` for each store. `--expect absent` exits 1 if any canary exists;
 `--expect present` exits 1 if the cookie, localStorage, IndexedDB or Cache Storage canary is missing
 (sessionStorage does not outlive a reload, so it is not required). Exit 2: no matching page target.
-The app has no page target until a pane is open; a pane for a provider is opened from the app itself.
+The app has no page target until a pane is open; a pane for a provider is opened from the app itself
+(see "Opening a pane in a scratch run" below).
 
 ### clear-check.mjs: site-data clear check
 
@@ -134,6 +157,37 @@ node scripts/rig/jar.mjs [--port N]
 ```
 
 Targets (type and origin), the cookie jar as domain to cookie names, and per page the storage counts.
+
+## Notes on driving a scratch run
+
+### Blank main window on a plain debug build
+
+A plain debug build (`cargo build`, not `cargo tauri dev`) loads the main window from the configured
+`devUrl`, `http://localhost:1420` (`src-tauri/tauri.conf.json`; the Vite port in `frontend/vite.config.ts`).
+With nothing serving that address the main window is **blank**. That is expected, not a crash. Serve
+something on port 1420 first (`cargo tauri dev` serves the real frontend there, but it is not a scratch
+run; for a rig run a stub page is enough, and the page doubles as the main webview's allowed IPC origin
+when you call commands by hand). Bind the stub to 127.0.0.1 so it adds no non-loopback traffic.
+
+### Opening a pane in a scratch run
+
+A Cloud Chat pane can be opened **logged out**: `open_cloud_chat_panes` (Tauri IPC command, argument
+`providerIds`) treats "not logged in" as "no stored cookies" and opens the pane anyway, so no account is
+needed (`src-tauri/src/commands/cloud_chat_pane.rs`). It needs a CEF build and the provider's
+`launch_url` in the `providers` table of `shared.db`. A provider row is looked up by id, and the
+frontend never passes a URL. To point a provider at a local test page, edit `launch_url` in the scratch
+tree's `shared.db` (`SCRATCH_DIR/data/ai.quietrabbit.app/shared.db`; the data root is named after the Tauri
+identifier) **between two phases** with `--reuse`, never in the real data directory:
+
+1. `scratch-run.sh --secs 15 DIR`: the first launch creates `shared.db`.
+2. `sqlite3 DIR/data/ai.quietrabbit.app/shared.db "update providers set launch_url='http://127.0.0.1:8181/a.html' where id='duckai'"`
+3. `scratch-run.sh --reuse DIR -- --remote-debugging-port=9333`, then call `open_cloud_chat_panes`
+   with `["duckai"]` from the main webview (it must be on an allowed IPC origin; see the previous note).
+
+Reaching the main webview to call the command: the items.id=855 run did it through the WebKitGTK
+inspector socket (`WEBKIT_INSPECTOR_HTTP_SERVER`, set in the environment of `scratch-run.sh`), with
+desktop control not available in that session. That route is recorded here as what worked once, not as a
+tested recipe.
 
 ## Recipes
 

@@ -3,9 +3,15 @@
 # OLLAMA_* unset, a net log written beside them. Optionally inside a private mount namespace whose
 # whole data/cache/config tree is a size-limited tmpfs.
 #
-#   scratch-run.sh [--ns SIZE] [--secs N] SCRATCH_DIR [-- APP_ARGS...]
+#   scratch-run.sh [--ns SIZE] [--secs N] [--reuse] SCRATCH_DIR [-- APP_ARGS...]
 #
 #   SCRATCH_DIR  must not exist or must be empty; it is created. Nothing is ever deleted by this script.
+#                A `.rig-scratch` marker holding the directory's own path is written into it.
+#   --reuse      relaunch into a scratch dir this script made earlier (a two-phase run: create the data,
+#                stop the app, edit shared.db, relaunch). Allowed only if the marker is there and matches the
+#                dir's path, the previous app is no longer running, and --ns is not used (a tmpfs does not
+#                outlive its run). The previous app.log and net.json are renamed to app.N.log / net.N.json,
+#                never overwritten. All other refusals below still apply first.
 #   --ns SIZE    run under `unshare -Urm` with a tmpfs of SIZE (e.g. 64m) as the data/cache/config tree
 #   --secs N     stop the app after N seconds (SIGTERM to the main process, SIGKILL to its group after 20 s);
 #                without it the script waits until the app exits
@@ -27,17 +33,20 @@ self=$(realpath -- "$0")
 orig_args=("$@")
 ns=""
 secs=0
+reuse=""
 while [ $# -gt 0 ]; do
   case $1 in
     --ns) ns=${2:-}; [ -n "$ns" ] || die "--ns needs a size" 64; shift 2 ;;
     --secs) secs=${2:-}; shift 2 ;;
+    --reuse) reuse=1; shift ;;
     --) break ;;
     -*) die "unknown option $1" 64 ;;
     *) break ;;
   esac
 done
 case $secs in '' | *[!0-9]*) die "--secs needs whole seconds" 64 ;; esac
-[ $# -ge 1 ] || { sed -n '2,22p' "$self" | sed 's/^# \{0,1\}//' >&2; exit 64; }
+[ $# -ge 1 ] || { awk 'NR > 1 { if (/^#/) { sub(/^# ?/, ""); print } else exit }' "$self" >&2; exit 64; }
+[ -z "$reuse" ] || [ -z "$ns" ] || die "--reuse cannot be combined with --ns (the tmpfs does not outlive its run)" 64
 scratch=$1
 shift
 [ "${1:-}" = "--" ] && shift
@@ -59,11 +68,20 @@ for real in "$home" "$home/.local/share" "$home/.cache" "$home/.config" \
 done
 [ "$scratch" != "/" ] || die "refusing: scratch dir is /"
 
+marker=$scratch/.rig-scratch
 if [ -e "$scratch" ]; then
   [ -d "$scratch" ] || die "$scratch exists and is not a directory"
-  left=$(ls -A -- "$scratch")
-  if [ -n "$left" ] && ! { [ -n "${RIG_IN_NS:-}" ] && [ "$left" = "mnt" ]; }; then
-    die "$scratch is not empty; pass a new or empty directory"
+  # The marker never counts as content; in the namespace re-exec, neither does the mnt dir the parent made.
+  left=$(ls -A -- "$scratch" | grep -vxF -e .rig-scratch ${RIG_IN_NS:+-e mnt})
+  if [ -n "$left" ]; then
+    [ -n "$reuse" ] || die "$scratch is not empty; pass a new or empty directory (or --reuse for a dir this script made)"
+    [ -f "$marker" ] && [ ! -L "$marker" ] || die "refusing --reuse: $scratch has no .rig-scratch marker, so it was not made by this script"
+    [ "$(cat -- "$marker")" = "$scratch" ] || die "refusing --reuse: the marker in $scratch names a different path"
+    if [ -f "$scratch/app.pid" ]; then
+      prev=$(cat -- "$scratch/app.pid")
+      case $prev in '' | *[!0-9]*) die "refusing --reuse: app.pid is not a pid" ;; esac
+      ! kill -0 "$prev" 2>/dev/null || die "refusing --reuse: the previous app (pid $prev) is still running"
+    fi
   fi
 fi
 
@@ -76,6 +94,7 @@ cwd=$(realpath -- "$cwd")
 
 mkdir -p -- "$scratch" || die "cannot create $scratch"
 chmod 700 -- "$scratch"
+[ -e "$marker" ] || printf '%s\n' "$scratch" >"$marker"
 
 if [ -n "$ns" ] && [ -z "${RIG_IN_NS:-}" ]; then
   command -v unshare >/dev/null || die "unshare not found" 69
@@ -103,6 +122,16 @@ done
 export XDG_DATA_HOME XDG_CACHE_HOME XDG_CONFIG_HOME
 for v in $(compgen -e); do
   case $v in QR_* | OLLAMA_*) unset "$v" ;; esac
+done
+
+# --reuse: keep the previous run's logs under numbered names.
+for f in app.log net.json; do
+  [ -e "$scratch/$f" ] || continue
+  stem=${f%.*}
+  ext=${f##*.}
+  n=1
+  while [ -e "$scratch/$stem.$n.$ext" ]; do n=$((n + 1)); done
+  mv -- "$scratch/$f" "$scratch/$stem.$n.$ext"
 done
 
 cd -- "$cwd" || die "cannot cd to $cwd"
