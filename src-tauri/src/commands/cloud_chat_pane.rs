@@ -288,11 +288,89 @@ fn priority_from_i32(v: i32) -> CookiePriority {
     }
 }
 
-fn stored_cookie_to_cef(c: &StoredCookie) -> Cookie {
+/// The domain a restored cookie is set with (items.id=873 Part B, handoff 618).
+///
+/// CEF reads a host-only cookie back with its host and no leading dot
+/// ("gemini.google.com"), and a domain cookie with a leading dot
+/// (".google.com"). `set_cookie` documents the opposite rule for what it is given:
+/// an empty domain makes a HOST cookie, a non-empty one a DOMAIN cookie. Restoring
+/// the stored string verbatim therefore turned every host-only cookie into a second,
+/// domain-form copy beside the one the live jar still held (".gemini.google.com"
+/// next to "gemini.google.com" for OSID, __Secure-OSID and COMPASS). The browser
+/// then sent both, and Google answered accounts.google.com/CookieMismatch. Deleting
+/// only those copies made Gemini load again, and closing and reopening the pane
+/// brought them back (rig test, this item).
+///
+/// So: a leading dot stays a domain cookie. A domain with no dot that is the launch
+/// host is a host cookie, set with an EMPTY domain (the `set_cookie` URL then binds
+/// it to the launch host). Anything else is kept as stored, as before: a host-only
+/// cookie can only match its own host, so the launch URL's cookies never hold one
+/// for another host, and a legacy row like that keeps its old behaviour rather than
+/// being bound to the wrong host. Stored rows need no migration: the dot is
+/// already in them.
+fn restore_domain(stored_domain: &str, launch_host: &str) -> String {
+    if stored_domain.starts_with('.') {
+        return stored_domain.to_owned();
+    }
+    let normalised = stored_domain.strip_suffix('.').unwrap_or(stored_domain);
+    if !normalised.is_empty() && normalised.eq_ignore_ascii_case(launch_host) {
+        return String::new();
+    }
+    stored_domain.to_owned()
+}
+
+/// The launch host in the form used to compare stored domains: lowercase, one
+/// trailing dot stripped.
+fn normalised_host(host: &str) -> String {
+    host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase()
+}
+
+/// The stored cookies to restore, with every DOMAIN-form row that shadows a
+/// host-only row left out (items.id=873 Part B, handoff 618).
+///
+/// The old restore wrote a ".{launch host}" domain cookie beside each host-only
+/// cookie, and the 30 s snapshot saves every cookie the launch URL sees, so a store
+/// written before the fix can hold BOTH rows for one name and path. Restoring both
+/// recreates the shadowing the empty-domain fix removes. When a host-only row of the
+/// launch host and a ".{launch host}" row share name and path, only the host-only row
+/// is restored. A domain row with no host-only twin is kept, a host-only row is
+/// always kept, and the same name on a different path is a different cookie. Domain
+/// rows of any other domain (".google.com") are never touched.
+fn without_shadowing_domain_rows<'a>(
+    stored: &'a [StoredCookie],
+    launch_host: &str,
+) -> Vec<&'a StoredCookie> {
+    let host = normalised_host(launch_host);
+    if host.is_empty() {
+        return stored.iter().collect();
+    }
+    let dotted = format!(".{host}");
+    let is_host_only = |c: &StoredCookie| normalised_host(&c.domain) == host;
+    let is_dotted = |c: &StoredCookie| c.domain.to_ascii_lowercase() == dotted;
+    stored
+        .iter()
+        .filter(|c| {
+            !(is_dotted(c)
+                && stored
+                    .iter()
+                    .any(|h| is_host_only(h) && h.name == c.name && h.path == c.path))
+        })
+        .collect()
+}
+
+/// The lowercase host of a launch URL, or empty when it has none.
+fn launch_host_of(launch_url: &str) -> String {
+    reqwest::Url::parse(launch_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+        .unwrap_or_default()
+}
+
+fn stored_cookie_to_cef(c: &StoredCookie, launch_host: &str) -> Cookie {
     Cookie {
         name: CefString::from(c.name.as_str()),
         value: CefString::from(c.value.as_str()),
-        domain: CefString::from(c.domain.as_str()),
+        domain: CefString::from(restore_domain(&c.domain, launch_host).as_str()),
         path: CefString::from(c.path.as_str()),
         secure: c.secure as i32,
         httponly: c.httponly as i32,
@@ -439,7 +517,16 @@ async fn restore_cookies_into_jar(
         return;
     };
 
-    for cookie in &stored {
+    let launch_host = launch_host_of(launch_url);
+    let to_restore = without_shadowing_domain_rows(&stored, &launch_host);
+    if to_restore.len() != stored.len() {
+        log::info!(
+            "cloud_chat_pane: provider={provider_id} store holds {} shadowed domain-form \
+             cookie(s), restoring the host-only rows only",
+            stored.len() - to_restore.len()
+        );
+    }
+    for cookie in to_restore {
         let (tx, rx) = oneshot::channel();
         let mut callback = SetCookieDone::new(Arc::new(Mutex::new(Some(tx))));
 
@@ -448,7 +535,7 @@ async fn restore_cookies_into_jar(
         // dropped before the `.await` below, not held across it.
         let dispatched = {
             let url = CefString::from(launch_url);
-            let cef_cookie = stored_cookie_to_cef(cookie);
+            let cef_cookie = stored_cookie_to_cef(cookie, &launch_host);
             manager.set_cookie(Some(&url), Some(&cef_cookie), Some(&mut callback))
         };
         if dispatched == 0 {
@@ -1404,6 +1491,180 @@ mod rail_summary_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stored(name: &str, domain: &str) -> StoredCookie {
+        StoredCookie {
+            name: name.to_owned(),
+            value: "v".to_owned(),
+            domain: domain.to_owned(),
+            path: "/".to_owned(),
+            secure: true,
+            httponly: true,
+            same_site: 0,
+            priority: 0,
+            has_expires: false,
+            expires: None,
+            creation: 0,
+            last_access: 0,
+        }
+    }
+
+    // items.id=873 Part B: a host-only cookie must not come back as a domain cookie.
+    #[test]
+    fn a_domain_cookie_keeps_its_leading_dot() {
+        assert_eq!(
+            restore_domain(".google.com", "gemini.google.com"),
+            ".google.com"
+        );
+        assert_eq!(
+            restore_domain(".gemini.google.com", "gemini.google.com"),
+            ".gemini.google.com"
+        );
+    }
+
+    #[test]
+    fn a_host_only_cookie_of_the_launch_host_is_restored_with_an_empty_domain() {
+        assert_eq!(restore_domain("gemini.google.com", "gemini.google.com"), "");
+        // Case and one trailing dot do not change that.
+        assert_eq!(restore_domain("Gemini.Google.com", "gemini.google.com"), "");
+        assert_eq!(
+            restore_domain("gemini.google.com.", "gemini.google.com"),
+            ""
+        );
+    }
+
+    #[test]
+    fn a_dotless_domain_that_is_not_the_launch_host_is_kept_as_stored() {
+        assert_eq!(
+            restore_domain("accounts.google.com", "gemini.google.com"),
+            "accounts.google.com"
+        );
+        assert_eq!(
+            restore_domain("evilgemini.google.com", "gemini.google.com"),
+            "evilgemini.google.com"
+        );
+        // No launch host known: nothing is rewritten.
+        assert_eq!(restore_domain("gemini.google.com", ""), "gemini.google.com");
+        // An empty stored domain stays empty.
+        assert_eq!(restore_domain("", "gemini.google.com"), "");
+    }
+
+    fn row(name: &str, domain: &str, path: &str) -> StoredCookie {
+        let mut c = stored(name, domain);
+        c.path = path.to_owned();
+        c
+    }
+
+    fn kept(rows: &[StoredCookie]) -> Vec<(String, String, String)> {
+        without_shadowing_domain_rows(rows, "gemini.google.com")
+            .into_iter()
+            .map(|c| (c.name.clone(), c.domain.clone(), c.path.clone()))
+            .collect()
+    }
+
+    fn t(name: &str, domain: &str, path: &str) -> (String, String, String) {
+        (name.to_owned(), domain.to_owned(), path.to_owned())
+    }
+
+    // Stores written before the fix can hold both forms of one cookie.
+    #[test]
+    fn a_duplicate_pair_restores_the_host_only_row_only() {
+        let rows = [
+            row("OSID", ".gemini.google.com", "/"),
+            row("OSID", "gemini.google.com", "/"),
+            row("COMPASS", "gemini.google.com", "/"),
+            row("COMPASS", ".gemini.google.com", "/"),
+        ];
+        assert_eq!(
+            kept(&rows),
+            vec![
+                t("OSID", "gemini.google.com", "/"),
+                t("COMPASS", "gemini.google.com", "/")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_domain_row_with_no_host_only_twin_is_kept() {
+        let rows = [row("OSID", ".gemini.google.com", "/")];
+        assert_eq!(kept(&rows), vec![t("OSID", ".gemini.google.com", "/")]);
+    }
+
+    #[test]
+    fn a_host_only_row_with_no_domain_twin_is_kept() {
+        let rows = [row("OSID", "gemini.google.com", "/")];
+        assert_eq!(kept(&rows), vec![t("OSID", "gemini.google.com", "/")]);
+    }
+
+    #[test]
+    fn the_same_name_on_a_different_path_is_a_different_cookie() {
+        let rows = [
+            row("OSID", "gemini.google.com", "/a"),
+            row("OSID", ".gemini.google.com", "/b"),
+        ];
+        assert_eq!(
+            kept(&rows),
+            vec![
+                t("OSID", "gemini.google.com", "/a"),
+                t("OSID", ".gemini.google.com", "/b")
+            ]
+        );
+    }
+
+    #[test]
+    fn other_domains_are_never_dropped_and_matching_ignores_case() {
+        let rows = [
+            row("SID", ".google.com", "/"),
+            row("SID", "gemini.google.com", "/"),
+            row("OSID", "Gemini.Google.com", "/"),
+            row("OSID", ".GEMINI.google.com", "/"),
+        ];
+        assert_eq!(
+            kept(&rows),
+            vec![
+                t("SID", ".google.com", "/"),
+                t("SID", "gemini.google.com", "/"),
+                t("OSID", "Gemini.Google.com", "/"),
+            ]
+        );
+        // No launch host known: nothing is dropped.
+        assert_eq!(without_shadowing_domain_rows(&rows, "").len(), rows.len());
+    }
+
+    #[test]
+    fn the_launch_host_is_read_lowercase_from_the_launch_url() {
+        assert_eq!(
+            launch_host_of("https://Gemini.Google.com/app?x=1"),
+            "gemini.google.com"
+        );
+        assert_eq!(launch_host_of("not a url"), "");
+        assert_eq!(launch_host_of(""), "");
+    }
+
+    #[test]
+    fn the_cef_cookie_carries_the_restored_domain_and_nothing_else_changes() {
+        let host_only =
+            stored_cookie_to_cef(&stored("OSID", "gemini.google.com"), "gemini.google.com");
+        assert_eq!(host_only.domain.to_string(), "");
+        assert_eq!(host_only.name.to_string(), "OSID");
+        assert_eq!(host_only.path.to_string(), "/");
+        assert_eq!(host_only.secure, 1);
+        assert_eq!(host_only.httponly, 1);
+        let domain = stored_cookie_to_cef(&stored("SID", ".google.com"), "gemini.google.com");
+        assert_eq!(domain.domain.to_string(), ".google.com");
+        assert_eq!(domain.name.to_string(), "SID");
+    }
+
+    // The persist side keeps the host/domain distinction in what it stores (the stored
+    // domain is CEF's own string), which is what restore_domain reads back.
+    #[test]
+    fn stored_domains_round_trip_through_the_cef_cookie_struct() {
+        let c = stored_cookie_to_cef(
+            &stored("COMPASS", ".gemini.google.com"),
+            "gemini.google.com",
+        );
+        assert_eq!(cef_cookie_to_stored(&c).domain, ".gemini.google.com");
+    }
 
     #[test]
     fn should_persist_not_dispatched() {
