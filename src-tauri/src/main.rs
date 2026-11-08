@@ -1093,6 +1093,14 @@ async fn async_main() {
                     app_handle.clone(),
                 );
 
+                // items.id=860: debug-only rig hooks (scratch runs); absent flags change
+                // nothing. DEV-ONLY: compiled out of release builds (tests/rig_gate.rs).
+                #[cfg(debug_assertions)]
+                quietrabbit_lib::rig_hooks::spawn_from_process_args(
+                    app_handle,
+                    open_pane_count.clone(),
+                );
+
                 // Replaces the old freeze-bug heartbeat thread (a 16ms
                 // run_on_main_thread(|| {}) loop whose entire purpose was
                 // forcing tao's own blocking GTK loop to notice a SECOND,

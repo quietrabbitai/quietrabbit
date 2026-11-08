@@ -1380,6 +1380,14 @@ mod tests {
              writer lease itself (commands::cloud_chat_pane::snapshot_open_panes calls \
              writer_gate::command) before it reads the key or writes the cookie store.",
         ),
+        (
+            "rig_hooks.rs::spawn",
+            "items.id=860: debug-only (the module is compiled out of release builds), scratch \
+             runs only. Its two tasks only call commands::cloud_chat_pane commands: \
+             open_cloud_chat_panes takes its own lease (writer_gate::command, a logged-out run \
+             gets none and skips the cookie restore) and close_cloud_chat_popup touches no \
+             store. The tasks write nothing themselves.",
+        ),
     ];
 
     /// The function a byte offset sits in: from the nearest `fn` line at or

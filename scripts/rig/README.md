@@ -137,8 +137,8 @@ Storage cache, all named `qrrig_canary*`. Both modes print the browser-level coo
 canary count, and per page `canary/total` for each store. `--expect absent` exits 1 if any canary exists;
 `--expect present` exits 1 if the cookie, localStorage, IndexedDB or Cache Storage canary is missing
 (sessionStorage does not outlive a reload, so it is not required). Exit 2: no matching page target.
-The app has no page target until a pane is open; a pane for a provider is opened from the app itself
-(see "Opening a pane in a scratch run" below).
+The app has no page target until a pane is open; open one with `--qr-rig-open-pane` (see "Opening a pane
+in a scratch run" below).
 
 ### clear-check.mjs: site-data clear check
 
@@ -181,13 +181,53 @@ identifier) **between two phases** with `--reuse`, never in the real data direct
 
 1. `scratch-run.sh --secs 15 DIR`: the first launch creates `shared.db`.
 2. `sqlite3 DIR/data/ai.quietrabbit.app/shared.db "update providers set launch_url='http://127.0.0.1:8181/a.html' where id='duckai'"`
-3. `scratch-run.sh --reuse DIR -- --remote-debugging-port=9333`, then call `open_cloud_chat_panes`
-   with `["duckai"]` from the main webview (it must be on an allowed IPC origin; see the previous note).
+3. `scratch-run.sh --reuse DIR -- --remote-debugging-port=9333 --qr-rig-open-pane=duckai`: the app opens
+   the pane itself (next section); no GUI and no main-webview access are needed.
 
-Reaching the main webview to call the command: the items.id=855 run did it through the WebKitGTK
-inspector socket (`WEBKIT_INSPECTOR_HTTP_SERVER`, set in the environment of `scratch-run.sh`), with
-desktop control not available in that session. That route is recorded here as what worked once, not as a
-tested recipe.
+### Rig flags: open a pane and close its popup without the GUI (items.id=860)
+
+Two **debug-build-only** app arguments (`src-tauri/src/rig_hooks.rs`), passed after `--` like any other
+app argument. They are arguments, not environment variables, because `scratch-run.sh` unsets every `QR_*`
+variable; that rule is unchanged.
+
+- `--qr-rig-open-pane=<provider_id>`: after startup the app calls `open_cloud_chat_panes` (the real
+  command function: logged out, no cookie restore, the `launch_url` from the scratch `shared.db`) and
+  repeats it every 500 ms until a pane exists (the pane host drops an open that arrives before its
+  GLArea is realized), for at most 30 s. With `RIG_RUST_LOG='warn,quietrabbit_lib::rig_hooks=info'` (the default `warn` hides it) `app.log` gets
+  `rig_hooks: pane open for provider=<id>`.
+- `--qr-rig-close-popup-after-ms=<N>`: after each `cloud-chat-popup-opened` event, wait N ms (so you can
+  look at the popup over CDP first), then call `close_cloud_chat_popup`, the command behind the popup-close
+  button and Ctrl+W. With the same `RIG_RUST_LOG`, `app.log` gets `rig_hooks: closing the popup of provider=<id>`.
+
+Flags absent: nothing changes. Unknown arguments (CEF's `--remote-debugging-port=...` and so on) are
+ignored, and a malformed rig flag is logged and ignored; neither stops the app. Logs carry provider ids
+and counts only.
+
+```
+# phase 1 and 2 as above (launch_url pointed at a local page), then:
+scripts/rig/scratch-run.sh --reuse --secs 60 DIR -- --remote-debugging-port=9333 \
+  --qr-rig-open-pane=duckai --qr-rig-close-popup-after-ms=8000
+# meanwhile: RIG_CDP_PORT=9333 node scripts/rig/jar.mjs shows the pane's page target; open a popup from
+# the page with CDP Runtime.evaluate {expression: "window.open('/b.html')", userGesture: true}; jar.mjs
+# shows the popup target, and about 8 s later it is gone.
+```
+
+What this does and does not cover. It exercises the command, the `ClosePopup` dispatch, the pane host's
+close channel and drain, `force_close_popup`, the page-side effect (`close_browser(true)`, so the page sees
+a closed window) and the `cloud-chat-popup-closed` event. It does **not** exercise the button's React
+`onClick` or the Tauri IPC serialisation of the call: the button is in the real frontend, which sits behind
+the login screen, and the rig does not log in. items.id=857 closed popups with `window.close()` through
+CDP, which skips the app's own close path altogether; this does not.
+
+It must not exist in a release build, three ways: `tests/rig_gate.rs` (the flag text and every use of
+`rig_hooks` sit behind `#[cfg(debug_assertions)]`, checked over the source tree), the
+`release_has_no_rig_hooks` test in `lib.rs` (the release test executable does not contain the flag text;
+`cargo test --release --lib -- release_`, build with `QR_ALLOW_RELEASE_WITHOUT_PRIVACY_FILTER=1` if the
+Privacy Filter library is not at hand), and `strings` on a release binary finding no `qr-rig`.
+Do not copy a flag name into code outside `rig_hooks.rs`.
+
+The earlier route to the main webview (the WebKitGTK inspector socket, `WEBKIT_INSPECTOR_HTTP_SERVER`,
+used once in items.id=855) is no longer needed for opening a pane. It was never a tested recipe.
 
 ## Recipes
 
