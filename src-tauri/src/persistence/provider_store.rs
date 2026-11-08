@@ -777,6 +777,36 @@ pub(crate) async fn get_provider_conn(
     }
 }
 
+/// The declared login hosts of one provider row, as stored: raw JSON text
+/// (items.id=873, decisions.id=934 addendum 2). The pane's navigation scope
+/// (cloud_chat_gpu_pane/nav_hosts.rs) parses it and fails open on anything that is
+/// not an array of plain host strings. Read apart from `Provider` so the many
+/// `Provider` literals stay untouched and the signed catalog, which fingerprints
+/// every other column, treats the column as release-only. None when the row does
+/// not exist.
+pub async fn get_login_hosts_conn(
+    conn: &mut sqlx::SqliteConnection,
+    provider_id: &str,
+) -> Result<Option<String>, ProviderStoreError> {
+    let row = sqlx::query("SELECT login_hosts FROM providers WHERE id = ?")
+        .bind(provider_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+    match row {
+        None => Ok(None),
+        Some(r) => Ok(Some(r.try_get("login_hosts")?)),
+    }
+}
+
+/// `get_login_hosts_conn` on a pooled connection.
+pub async fn get_login_hosts(
+    pool: &sqlx::SqlitePool,
+    provider_id: &str,
+) -> Result<Option<String>, ProviderStoreError> {
+    let mut conn = pool.acquire().await?;
+    get_login_hosts_conn(&mut conn, provider_id).await
+}
+
 /// The selector screen's primary read path (TIER3_ACCESS_MODEL.md State 3):
 /// all 'active' providers, ordered provider_type then display_name so a
 /// caller can group the result for display without a second query. No
@@ -1597,6 +1627,131 @@ mod tests {
             missing.is_empty(),
             "rail-visible rows without a level: {missing:?}"
         );
+    }
+
+    /// items.id=873 (decisions.id=934 addendum 2): shared_037.sql adds login_hosts,
+    /// seeds Gemini only from Google's published host documentation, leaves every
+    /// other row empty (unrestricted), and the two columns shared_035.sql added are
+    /// gone again (shared_036.sql).
+    #[tokio::test]
+    async fn login_hosts_column_and_gemini_only_seed() {
+        use crate::cloud_chat_gpu_pane::nav_hosts::{
+            classify, normalize_host, HostSet, NavDecision,
+        };
+
+        let mut conn = make_test_conn().await;
+        crate::persistence::migrations::run_migrations(&mut conn, "shared", None)
+            .await
+            .expect("run shared migrations");
+
+        let gone: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pragma_table_info('providers') \
+             WHERE name IN ('navigate_hosts', 'page_traffic_hosts')",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(gone, 0, "shared_036 dropped the earlier host columns");
+
+        // Only Gemini declares hosts.
+        for id in ["duckai", "claude", "chatgpt"] {
+            let raw = get_login_hosts_conn(&mut conn, id)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{id} row must exist"));
+            assert_eq!(raw, "[]", "{id} declares no login hosts");
+        }
+        assert!(get_login_hosts_conn(&mut conn, "no-such-row")
+            .await
+            .unwrap()
+            .is_none());
+
+        let raw = get_login_hosts_conn(&mut conn, "gemini")
+            .await
+            .unwrap()
+            .expect("gemini row");
+        let hosts: Vec<String> = serde_json::from_str(&raw).expect("a JSON array of strings");
+
+        // The three documented hosts and the 24 documented country forms, nothing else.
+        for h in [
+            "gemini.google.com",
+            "accounts.google.com",
+            "accounts.youtube.com",
+        ] {
+            assert!(hosts.iter().any(|x| x == h), "{h} must be declared");
+        }
+        let country: Vec<&String> = hosts
+            .iter()
+            .filter(|h| h.starts_with("accounts.google.co."))
+            .collect();
+        assert_eq!(country.len(), 24, "the 24 .google.co.<cc> entries");
+        assert_eq!(hosts.len(), 27);
+        for jp_like in [
+            "accounts.google.co.jp",
+            "accounts.google.co.uk",
+            "accounts.google.co.za",
+        ] {
+            assert!(hosts.iter().any(|x| x == jp_like), "{jp_like}");
+        }
+        for h in &hosts {
+            assert_eq!(
+                normalize_host(h).as_deref(),
+                Some(h.as_str()),
+                "{h} must be a canonical plain host"
+            );
+        }
+        // Hosts the documentation does not list as sign-in hosts are not declared.
+        for h in [
+            "myaccount.google.com",
+            "www.google.com",
+            "accounts.google.de",
+            "accounts.google.com.au",
+        ] {
+            assert!(!hosts.iter().any(|x| x == h), "{h} must not be declared");
+        }
+
+        // End to end with the row's own launch_url: the sign-in hosts load, the account
+        // hub and the apps-menu hosts bounce home.
+        let p = get_provider_via_conn(&mut conn, "gemini").await;
+        let set = HostSet::from_row("gemini", p.launch_url.as_deref().unwrap(), &raw);
+        assert!(set.is_restricted());
+        for url in [
+            "https://gemini.google.com/app",
+            "https://accounts.google.com/v3/signin/identifier",
+            "https://accounts.youtube.com/accounts/SetSID",
+            "https://accounts.google.co.jp/ServiceLogin",
+        ] {
+            assert_eq!(classify(&set, url), NavDecision::Allow, "{url}");
+        }
+        for url in [
+            "https://myaccount.google.com/",
+            "https://www.google.com/search?q=x",
+            "https://maps.google.com/",
+            "https://drive.google.com/",
+            "https://accounts.google.de/ServiceLogin",
+        ] {
+            assert!(
+                matches!(classify(&set, url), NavDecision::Bounce { .. }),
+                "{url}"
+            );
+        }
+
+        // A non-JSON value is refused by the CHECK.
+        let bad = sqlx::query("UPDATE providers SET login_hosts = 'not json' WHERE id = 'duckai'")
+            .execute(&mut conn)
+            .await;
+        assert!(bad.is_err(), "login_hosts must pass json_valid");
+
+        // The telemetry placeholder sentence from shared_035.sql is kept.
+        for id in ["duckai", "claude", "chatgpt", "gemini"] {
+            let p = get_provider_via_conn(&mut conn, id).await;
+            let summary = p.user_privacy_summary.expect("summary row");
+            let text = summary["summary"].as_str().expect("summary text");
+            assert!(
+                text.ends_with("The provider page may also send telemetry to its own hosts."),
+                "{id}: telemetry placeholder kept"
+            );
+        }
     }
 
     async fn get_provider_via_conn(conn: &mut SqliteConnection, id: &str) -> Provider {

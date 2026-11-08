@@ -84,9 +84,10 @@ use cef::{
     MenuId, MouseButtonType, MouseEvent,
 };
 
+use crate::cloud_chat_gpu_pane::nav_hosts::HostSet;
 use crate::cloud_chat_gpu_pane::render::{
-    ClientBuilder, ContextMenuRequested, ContextMenuSurface, LogicalSize, PaneRenderHandler,
-    PopupLifecycleEvent, PopupRequested, RenderState,
+    ClientBuilder, ContextMenuRequested, ContextMenuSurface, LogicalSize, PaneNav,
+    PaneRenderHandler, PopupLifecycleEvent, PopupRequested, RenderState,
 };
 use crate::cloud_chat_gpu_pane::{lock_recover, PaneKey};
 use crate::commands::cloud_chat_pane::{
@@ -254,6 +255,10 @@ pub enum PaneCommand {
     Open {
         key: PaneKey,
         url: String,
+        /// items.id=873: the row's login hosts, built by
+        /// `commands::cloud_chat_pane::open_cloud_chat_panes` (a snapshot: a change
+        /// takes effect the next time the pane is opened).
+        login_hosts: Arc<HostSet>,
     },
     Close {
         key: PaneKey,
@@ -607,6 +612,7 @@ impl PaneManager {
         &mut self,
         key: PaneKey,
         url: String,
+        login_hosts: Arc<HostSet>,
         device_scale_factor: f32,
         initial_logical_size: LogicalSize,
     ) {
@@ -677,11 +683,11 @@ impl PaneManager {
             Some(&mut ClientBuilder::build(
                 render_handler,
                 tx,
-                key.clone(),
                 self.popup_requested_tx.clone(),
                 self.popup_close_tx.clone(),
                 self.context_menu_requested_tx.clone(),
                 self.app_handle.clone(),
+                PaneNav::new(key.clone(), login_hosts),
             )),
             None,
             Some(&browser_settings),
@@ -2967,7 +2973,11 @@ impl PaneHost {
     /// analogous wake-timing gap here.
     pub fn dispatch(&self, command: PaneCommand) {
         match command {
-            PaneCommand::Open { key, url } => {
+            PaneCommand::Open {
+                key,
+                url,
+                login_hosts,
+            } => {
                 let render_state = match self.render_state_for_open() {
                     Some(rs) => rs,
                     None => {
@@ -2986,7 +2996,9 @@ impl PaneHost {
                 // anymore: unlike the superseded sibling-widget design,
                 // nothing is built or added to any widget tree before
                 // `open_pane` runs, so there's nothing left to orphan.
-                self.manager.borrow_mut().open_pane(key, url, scale, size);
+                self.manager
+                    .borrow_mut()
+                    .open_pane(key, url, login_hosts, scale, size);
                 self.queue_draw();
             }
             PaneCommand::Close { key } => {

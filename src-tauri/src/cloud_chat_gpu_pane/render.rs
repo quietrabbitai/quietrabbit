@@ -45,8 +45,13 @@ use cef::ImplContextMenuParams;
 use wgpu::util::DeviceExt;
 use wgpu_hal::Adapter as _;
 
+use crate::cloud_chat_gpu_pane::nav_hosts::{
+    classify, classify_new_window, log_host, BounceGuard, HostSet, NavDecision, NewWindowDecision,
+    WindowKind,
+};
 use crate::cloud_chat_gpu_pane::{lock_recover, PaneKey};
 use crate::commands::cloud_chat_pane::PaneRectFraction;
+use crate::provider_credentials::opener::{SystemOpener, UrlOpener};
 
 /// items.id=334: `on_paint`/`on_accelerated_paint` only ever stashed fresh
 /// pixels into `PANE_PENDING_PAINT`/`POPUP_PENDING_PAINT` -- nothing told
@@ -1317,11 +1322,17 @@ wrap_client! {
         life_span_handler: LifeSpanHandler,
         load_handler: LoadHandler,
         context_menu_handler: ContextMenuHandler,
+        request_handler: RequestHandler,
     }
 
     impl Client {
         fn render_handler(&self) -> Option<cef::RenderHandler> {
             Some(self.render_handler.clone())
+        }
+
+        // items.id=873: the pane's navigation scope (decisions.id=934 addendum 2).
+        fn request_handler(&self) -> Option<cef::RequestHandler> {
+            Some(self.request_handler.clone())
         }
 
         fn life_span_handler(&self) -> Option<cef::LifeSpanHandler> {
@@ -1342,12 +1353,14 @@ impl ClientBuilder {
     pub(crate) fn build(
         render_handler: PaneRenderHandler,
         browser_ready_tx: std::sync::mpsc::Sender<cef::Browser>,
-        pane_key: PaneKey,
         popup_requested_tx: std::sync::mpsc::Sender<PopupRequested>,
         popup_close_tx: std::sync::mpsc::Sender<PaneKey>,
         context_menu_tx: std::sync::mpsc::Sender<ContextMenuRequested>,
         app_handle: tauri::AppHandle,
+        nav: PaneNav,
     ) -> Client {
+        // The nav scope carries this pane's own key.
+        let pane_key = nav.pane_key().clone();
         Self::new(
             RenderHandlerBuilder::build(render_handler),
             LifeSpanHandlerBuilder::build(PaneLifeSpanHandler::new(
@@ -1356,12 +1369,14 @@ impl ClientBuilder {
                 popup_requested_tx,
                 context_menu_tx.clone(),
                 app_handle,
+                nav.clone(),
             )),
             LoadHandlerBuilder::build(PaneLoadHandler::new(pane_key.clone(), popup_close_tx)),
             ContextMenuHandlerBuilder::build(PaneContextMenuHandler::new(
                 pane_key,
                 context_menu_tx,
             )),
+            RequestHandlerBuilder::build(nav, true),
         )
     }
 }
@@ -1379,11 +1394,19 @@ wrap_client! {
         life_span_handler: LifeSpanHandler,
         load_handler: LoadHandler,
         context_menu_handler: ContextMenuHandler,
+        request_handler: RequestHandler,
     }
 
     impl Client {
         fn render_handler(&self) -> Option<cef::RenderHandler> {
             Some(self.render_handler.clone())
+        }
+
+        // items.id=873: a popup only gets the new-tab rule, never the main-frame
+        // scope (in-place navigation inside a popup stays ungated, the residual
+        // decisions.id=934 addendum 2 names).
+        fn request_handler(&self) -> Option<cef::RequestHandler> {
+            Some(self.request_handler.clone())
         }
 
         fn life_span_handler(&self) -> Option<cef::LifeSpanHandler> {
@@ -1406,16 +1429,208 @@ impl PopupClientBuilder {
         events_tx: std::sync::mpsc::Sender<PopupLifecycleEvent>,
         parent_key: PaneKey,
         context_menu_tx: std::sync::mpsc::Sender<ContextMenuRequested>,
+        nav: PaneNav,
     ) -> Client {
         Self::new(
             PopupRenderHandlerBuilder::build(render_handler),
-            PopupLifeSpanHandlerBuilder::build(PopupLifeSpanHandler::new(events_tx)),
+            PopupLifeSpanHandlerBuilder::build(PopupLifeSpanHandler::new(events_tx, nav.clone())),
             PopupLoadHandlerBuilder::build(PopupLoadHandler),
             PopupContextMenuHandlerBuilder::build(PopupContextMenuHandler::new(
                 parent_key,
                 context_menu_tx,
             )),
+            RequestHandlerBuilder::build(nav, false),
         )
+    }
+}
+
+/// items.id=873 (decisions.id=934 addendum 2): one pane's navigation scope, shared
+/// by the pane's own handlers and its popup's. Holds the host set the pane opened
+/// with (a snapshot: handlers run on CEF's UI thread and never read the database),
+/// the loop guard, and the opener for rule 3. Rule 1 (main-frame scope) is in
+/// `nav_hosts::classify`, rule 3 (new tab from a user click) in
+/// `nav_hosts::classify_new_window`: this type only carries them to CEF.
+#[derive(Clone)]
+pub struct PaneNav {
+    pane_key: PaneKey,
+    hosts: Arc<HostSet>,
+    guard: Arc<BounceGuard>,
+    opener: Arc<dyn UrlOpener>,
+}
+
+impl PaneNav {
+    pub fn new(pane_key: PaneKey, hosts: Arc<HostSet>) -> Self {
+        Self::with_opener(pane_key, hosts, Arc::new(SystemOpener))
+    }
+
+    /// The seam tests use to record the URL instead of launching a browser.
+    pub fn with_opener(pane_key: PaneKey, hosts: Arc<HostSet>, opener: Arc<dyn UrlOpener>) -> Self {
+        Self {
+            pane_key,
+            hosts,
+            guard: Arc::new(BounceGuard::new()),
+            opener,
+        }
+    }
+
+    /// The pane this scope belongs to.
+    pub(crate) fn pane_key(&self) -> &PaneKey {
+        &self.pane_key
+    }
+
+    /// Rule 1 for one main-frame navigation. Returns true when the navigation is
+    /// cancelled (the row's launch_url is then loaded in its place). Logs the host
+    /// and a reason code only, never a path or query.
+    fn main_frame_target(&self, frame: &Frame, url: &str, is_redirect: bool) -> bool {
+        if !self.hosts.is_restricted() {
+            return false;
+        }
+        let NavDecision::Bounce { reason, host } = classify(&self.hosts, url) else {
+            return false;
+        };
+        let source = if is_redirect { "redirect" } else { "browse" };
+        if !self.guard.permit(std::time::Instant::now()) {
+            // Deliberate fail-open (nav_hosts.rs): a second bounce inside the window is
+            // let through, so an unlisted login host cannot lock a user out.
+            log::warn!(
+                "cloud_chat_gpu_pane::nav_hosts: pane={} source={source} host={host} \
+                 reason={} second bounce inside the window, allowed (fail-open)",
+                self.pane_key,
+                reason.as_str(),
+            );
+            return false;
+        }
+        log::info!(
+            "cloud_chat_gpu_pane::nav_hosts: pane={} source={source} host={host} reason={} \
+             bounce to the launch url",
+            self.pane_key,
+            reason.as_str(),
+        );
+        let mut task = LoadLaunchUrl::new(frame.clone(), self.hosts.launch_url().to_owned());
+        cef::post_task(cef::ThreadId::UI, Some(&mut task));
+        true
+    }
+
+    /// Rule 3 for one new window or tab the page asked for. Returns true when the
+    /// request is cancelled because the target went to the system browser. Logs
+    /// the kind, the gesture and the host only: this line is also the rig record
+    /// of how each provider opens its sign-in window.
+    fn new_window(
+        &self,
+        source: &str,
+        disposition: &WindowOpenDisposition,
+        user_gesture: bool,
+        features_set: bool,
+        target: &str,
+    ) -> bool {
+        let kind = window_kind(disposition);
+        let decision = classify_new_window(kind, user_gesture, target);
+        let verdict = match decision {
+            NewWindowDecision::StayInPane => "stay",
+            NewWindowDecision::SystemBrowser { .. } => "system_browser",
+        };
+        log::info!(
+            "cloud_chat_gpu_pane::nav_hosts: new window pane={} source={source} kind={} \
+             gesture={user_gesture} sized={features_set} host={} decision={verdict}",
+            self.pane_key,
+            kind.as_str(),
+            log_host(target),
+        );
+        match decision {
+            NewWindowDecision::StayInPane => false,
+            NewWindowDecision::SystemBrowser { url, .. } => {
+                if let Err(e) = self.opener.open(&url) {
+                    log::warn!("cloud_chat_gpu_pane::nav_hosts: system browser open failed: {e}");
+                }
+                true
+            }
+        }
+    }
+}
+
+/// CEF's disposition as the CEF-free `WindowKind`.
+fn window_kind(d: &WindowOpenDisposition) -> WindowKind {
+    if *d == WindowOpenDisposition::NEW_FOREGROUND_TAB
+        || *d == WindowOpenDisposition::NEW_BACKGROUND_TAB
+    {
+        WindowKind::Tab
+    } else if *d == WindowOpenDisposition::NEW_POPUP || *d == WindowOpenDisposition::NEW_WINDOW {
+        WindowKind::Popup
+    } else {
+        WindowKind::Other
+    }
+}
+
+// Loads the row's launch_url into a frame, on CEF's UI thread, after the cancelled
+// navigation has finished unwinding (`on_before_browse` must not start a load of
+// its own).
+wrap_task! {
+    struct LoadLaunchUrl {
+        frame: Frame,
+        url: String,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            self.frame.load_url(Some(&CefString::from(self.url.as_str())));
+        }
+    }
+}
+
+// items.id=873: `gate_main_frame` is true for a pane and false for its popup. A
+// pane's main-frame navigations are scoped by rule 1 (redirects included, so a
+// listed host that redirects to an unlisted one bounces too). Both get rule 3 for
+// ctrl or middle click (`on_open_urlfrom_tab`). Subframe navigations and
+// subresources are page traffic and are never touched.
+wrap_request_handler! {
+    pub(crate) struct RequestHandlerBuilder {
+        nav: PaneNav,
+        gate_main_frame: bool,
+    }
+
+    impl RequestHandler {
+        fn on_before_browse(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            request: Option<&mut Request>,
+            _user_gesture: ::std::os::raw::c_int,
+            is_redirect: ::std::os::raw::c_int,
+        ) -> ::std::os::raw::c_int {
+            if !self.gate_main_frame {
+                return 0;
+            }
+            let (Some(frame), Some(request)) = (frame, request) else {
+                return 0;
+            };
+            if frame.is_main() == 0 {
+                return 0;
+            }
+            let url = CefString::from(&request.url()).to_string();
+            if self.nav.main_frame_target(frame, &url, is_redirect != 0) { 1 } else { 0 }
+        }
+
+        fn on_open_urlfrom_tab(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            target_url: Option<&CefString>,
+            target_disposition: WindowOpenDisposition,
+            user_gesture: ::std::os::raw::c_int,
+        ) -> ::std::os::raw::c_int {
+            let target = target_url.map(|u| u.to_string()).unwrap_or_default();
+            if self.nav.new_window("open_url_from_tab", &target_disposition, user_gesture != 0, false, &target) {
+                1
+            } else {
+                0
+            }
+        }
+    }
+}
+
+impl RequestHandlerBuilder {
+    pub(crate) fn build(nav: PaneNav, gate_main_frame: bool) -> cef::RequestHandler {
+        Self::new(nav, gate_main_frame)
     }
 }
 
@@ -1455,6 +1670,8 @@ pub struct PaneLifeSpanHandler {
     /// `request_redraw`'s own doc) when `on_before_popup` fires -- cheap
     /// clone, same handle `PaneRenderHandler` itself holds.
     app_handle: tauri::AppHandle,
+    /// items.id=873: rule 3, a new tab from a user click goes to the system browser.
+    nav: PaneNav,
 }
 
 impl PaneLifeSpanHandler {
@@ -1464,6 +1681,7 @@ impl PaneLifeSpanHandler {
         popup_requested_tx: std::sync::mpsc::Sender<PopupRequested>,
         context_menu_tx: std::sync::mpsc::Sender<ContextMenuRequested>,
         app_handle: tauri::AppHandle,
+        nav: PaneNav,
     ) -> Self {
         Self {
             browser_ready_tx,
@@ -1471,6 +1689,7 @@ impl PaneLifeSpanHandler {
             popup_requested_tx,
             context_menu_tx,
             app_handle,
+            nav,
         }
     }
 }
@@ -1514,8 +1733,8 @@ wrap_life_span_handler! {
             _popup_id: ::std::os::raw::c_int,
             target_url: Option<&CefString>,
             _target_frame_name: Option<&CefString>,
-            _target_disposition: WindowOpenDisposition,
-            _user_gesture: ::std::os::raw::c_int,
+            target_disposition: WindowOpenDisposition,
+            user_gesture: ::std::os::raw::c_int,
             popup_features: Option<&PopupFeatures>,
             window_info: Option<&mut WindowInfo>,
             client: Option<&mut Option<Client>>,
@@ -1528,6 +1747,20 @@ wrap_life_span_handler! {
                 self.handler.pane_key,
                 target_url.map(|u| u.to_string()),
             );
+
+            // items.id=873 rule 3: a new tab from a user click goes to the system
+            // browser and no pane popup is built. A sized popup stays (below).
+            let sized = popup_features.is_some_and(|f| {
+                f.width_set != 0 || f.height_set != 0 || f.x_set != 0 || f.y_set != 0
+            });
+            let target = target_url.map(|u| u.to_string()).unwrap_or_default();
+            if self
+                .handler
+                .nav
+                .new_window("popup", &target_disposition, user_gesture != 0, sized, &target)
+            {
+                return 1;
+            }
 
             let accelerated_osr = cfg!(any(
                 target_os = "macos",
@@ -1579,6 +1812,7 @@ wrap_life_span_handler! {
                     events_tx,
                     self.handler.pane_key.clone(),
                     self.handler.context_menu_tx.clone(),
+                    self.handler.nav.clone(),
                 ));
             }
 
@@ -1609,11 +1843,13 @@ impl LifeSpanHandlerBuilder {
 #[derive(Clone)]
 pub struct PopupLifeSpanHandler {
     events_tx: std::sync::mpsc::Sender<PopupLifecycleEvent>,
+    /// items.id=873: the parent pane's rule 3.
+    nav: PaneNav,
 }
 
 impl PopupLifeSpanHandler {
-    fn new(events_tx: std::sync::mpsc::Sender<PopupLifecycleEvent>) -> Self {
-        Self { events_tx }
+    fn new(events_tx: std::sync::mpsc::Sender<PopupLifecycleEvent>, nav: PaneNav) -> Self {
+        Self { events_tx, nav }
     }
 }
 
@@ -1644,6 +1880,40 @@ wrap_life_span_handler! {
                 if let Some(host) = browser.host() {
                     host.close_browser(true as _);
                 }
+            }
+        }
+
+        // items.id=873 rule 3 inside a popup: a link that opens a new tab from a user
+        // click goes to the system browser. Anything else keeps CEF's default for a
+        // popup opened from a popup, exactly as before this callback existed.
+        fn on_before_popup(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _popup_id: ::std::os::raw::c_int,
+            target_url: Option<&CefString>,
+            _target_frame_name: Option<&CefString>,
+            target_disposition: WindowOpenDisposition,
+            user_gesture: ::std::os::raw::c_int,
+            popup_features: Option<&PopupFeatures>,
+            _window_info: Option<&mut WindowInfo>,
+            _client: Option<&mut Option<Client>>,
+            _settings: Option<&mut BrowserSettings>,
+            _extra_info: Option<&mut Option<DictionaryValue>>,
+            _no_javascript_access: Option<&mut ::std::os::raw::c_int>,
+        ) -> ::std::os::raw::c_int {
+            let sized = popup_features.is_some_and(|f| {
+                f.width_set != 0 || f.height_set != 0 || f.x_set != 0 || f.y_set != 0
+            });
+            let target = target_url.map(|u| u.to_string()).unwrap_or_default();
+            if self
+                .handler
+                .nav
+                .new_window("nested_popup", &target_disposition, user_gesture != 0, sized, &target)
+            {
+                1
+            } else {
+                0
             }
         }
 

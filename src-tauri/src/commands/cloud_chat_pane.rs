@@ -773,6 +773,27 @@ pub async fn open_cloud_chat_panes(
             ));
         };
 
+        // items.id=873: the row's login hosts (a snapshot for this pane). A read
+        // failure or a bad value fails OPEN to an unrestricted pane
+        // (cloud_chat_gpu_pane/nav_hosts.rs), never refuses the open.
+        let login_hosts_json = match provider_store::get_login_hosts(&pool, &provider_id).await {
+            Ok(Some(json)) => json,
+            Ok(None) => "[]".to_string(),
+            Err(e) => {
+                log::warn!(
+                    "cloud_chat_pane: could not read login_hosts for provider={provider_id}: {e} \
+                     -- opening the pane unrestricted"
+                );
+                "[]".to_string()
+            }
+        };
+        let login_hosts =
+            std::sync::Arc::new(crate::cloud_chat_gpu_pane::nav_hosts::HostSet::from_row(
+                &provider_id,
+                &launch_url,
+                &login_hosts_json,
+            ));
+
         if let Some((user_id, key_hex_str)) = session.as_ref() {
             restore_cookies_into_jar(user_id, key_hex_str, &provider_id, &launch_url).await;
         } else {
@@ -791,6 +812,7 @@ pub async fn open_cloud_chat_panes(
                 pane_host::dispatch(PaneCommand::Open {
                     key: provider_id,
                     url: launch_url,
+                    login_hosts,
                 })
             })
             .map_err(|e| e.to_string())?;

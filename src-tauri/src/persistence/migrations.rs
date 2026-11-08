@@ -460,6 +460,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/shared_036.sql"),
     },
     SchemaFile {
+        prefix: "shared",
+        version: 37,
+        sql: include_str!("../../schema/shared_037.sql"),
+    },
+    SchemaFile {
         prefix: "tier3_cookies",
         version: 1,
         sql: include_str!("../../schema/tier3_cookies_001.sql"),
@@ -2346,15 +2351,15 @@ mod tests {
             .await
             .expect("shared migration chain must apply cleanly on a fresh db");
         assert_eq!(
-            applied, 36,
-            "expected all thirty-six shared schema versions to apply"
+            applied, 37,
+            "expected all thirty-seven shared schema versions to apply"
         );
 
         let version: (i64,) = sqlx::query_as("SELECT MAX(version) FROM schema_version")
             .fetch_one(&mut conn)
             .await
             .unwrap();
-        assert_eq!(version.0, 36);
+        assert_eq!(version.0, 37);
     }
 
     /// items.id=708 / items.id=703 / items.id=724: shared_026.sql and
@@ -2923,8 +2928,8 @@ mod tests {
             .expect("drift-healing run must succeed");
 
         assert_eq!(
-            applied, 35,
-            "shared v2 through v36 should count as newly applied from a stale v1 database"
+            applied, 36,
+            "shared v2 through v37 should count as newly applied from a stale v1 database"
         );
 
         // items.id=427: shared_013.sql drops tier3_providers (generalized
@@ -3969,7 +3974,7 @@ mod tests {
     // is a compile-time static, so the older database is hand-built: apply
     // everything, then remove what the new file added and forget its version.
     /// items.id=661: shared_008.sql no longer adds a column, but versions must
-    /// stay contiguous. Every version 1..=36 must have its row, 8 included,
+    /// stay contiguous. Every version 1..=37 must have its row, 8 included,
     /// recorded by the file's own INSERT.
     #[tokio::test]
     async fn every_shared_version_is_recorded_including_the_no_column_shared_008() {
@@ -3981,7 +3986,7 @@ mod tests {
                 .await
                 .unwrap();
         let versions: Vec<i64> = versions.into_iter().map(|v| v.0).collect();
-        assert_eq!(versions, (1..=36).collect::<Vec<i64>>());
+        assert_eq!(versions, (1..=37).collect::<Vec<i64>>());
         let description: String =
             sqlx::query_scalar("SELECT description FROM schema_version WHERE version = 8")
                 .fetch_one(&mut conn)
