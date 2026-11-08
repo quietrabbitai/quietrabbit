@@ -93,19 +93,52 @@ node scripts/rig/netlog.mjs "$TMPDIR/qr-rig/net.json"
 ```
 
 Reports URL requests by origin and by method+URL with time offsets from the start of the capture, the
-socket addresses of connect events (loopback, non-loopback TCP/other, non-loopback UDP), and DNS names
-looked up. A final section says **why**: speculative DNS requests (an event carrying `is_speculative` and
-a `host`) and preconnects (`is_preconnect` and a `url`), grouped by source type, event type and name,
-with the count, every offset (the first 12) and the first and last time as an offset and as UTC wall
-clock. Matching is on those parameters, not on event names. It prints the host (speculative DNS) or the
-origin (preconnect) only, never a path or query string, not even with `--full`. Reads a log from a killed
-app up to its last complete event (an empty one is reported as such). Exit 0: nothing non-loopback; exit
-3: a non-loopback URL host, DNS name or TCP/other socket address. A non-loopback UDP `connect()` alone is
-Chromium's IPv6 reachability probe (a route lookup; no packet is sent): it is printed on its own line and
-does not change the exit code unless `--strict`. The speculative/preconnect section is likewise
-informational (it adds a note to the RESULT line) unless `--strict`, which makes a non-loopback name in it
-fail with exit 3. The section was checked against synthetic logs only, built from the event shapes in the
-items.id=855 handoff; the first real capture with a pane open is the real test of the parameter names.
+socket addresses of connect events with the outcome of each attempt, and the DNS names looked up. A final
+section says **why**: speculative DNS requests (an event carrying `is_speculative` and a `host`) and
+preconnects (`is_preconnect` and a `url`), grouped by source type, event type and name, with the count,
+every offset (the first 12) and the first and last time as an offset and as UTC wall clock. Matching is on
+those parameters, not on event names. It prints the host (speculative DNS) or the origin (preconnect) only,
+never a path or query string, not even with `--full`. Reads a log from a killed app up to its last complete
+event (an empty one is reported as such).
+
+**Socket addresses** are grouped as loopback, non-loopback TCP/other, **unspecified** (`0.0.0.0` and `::`)
+and non-loopback UDP, one address per line with its attempt count and outcomes: `ok`, `os_error=N`
+(TCP, from the END of `TCP_CONNECT_ATTEMPT`) or `net_error=N` (UDP, from the END of `UDP_CONNECT`), or `no
+result in log` for an attempt with no END event (a log cut short). Unspecified addresses are what a
+sinkholing resolver hands out, and a connect to one is local on Linux; in the items.id=870 capture all 24
+attempts per address were refused (`os_error=111`). They used to be listed as non-loopback and looked like 48
+connections that left the machine. The `UDP` probe line is Chromium's IPv6 reachability check (a route
+lookup; no packet is sent).
+
+**DNS names** each show `requests N, jobs M` and `resolved to:` the addresses the log shows. `requests` is
+the number of `HOST_RESOLVER_MANAGER_REQUEST` BEGIN events for the name (one per lookup request; most are
+answered from the cache) and `jobs` the number of `HOST_RESOLVER_MANAGER_JOB` BEGIN events (a real
+resolution, shared by the requests attached to it). The old single `xN` added the two. The addresses come
+from `HOST_RESOLVER_MANAGER_CACHE_HIT` events (`results.ip_endpoints[].endpoint_address`), which carry no
+host: they are tied to the name of the request open on the same source id. A resolution whose result is
+never logged as a cache hit shows `no address logged`. A name whose addresses are all unspecified is marked
+`sinkholed`.
+
+**Exit codes.** 0: nothing non-loopback. 3: a non-loopback URL host, DNS name or TCP/other socket address;
+the RESULT line lists which of these counted. Not counted by themselves, printed and noted on the RESULT
+line: a TCP/other connect to an **unspecified** address (this narrows the old rule, items.id=871: it used to
+exit 3), and a non-loopback UDP `connect()` (the route probe). A sinkholed name still exits 3, because the
+name is a looked-up non-loopback DNS name and its URL host a non-loopback origin; only an unspecified address
+with no such name or URL behind it stops failing the run. The speculative/preconnect section is likewise
+informational (it adds a note to the RESULT line). `--strict` makes an unspecified address, a non-loopback
+UDP address and a non-loopback name in the speculative/preconnect section exit 3 too. 64: bad usage. 66:
+empty log.
+
+Checked on a real capture (items.id=870, duck.ai logged out, one pane open): the per-source parameter names
+`is_speculative` + `host` (on `HOST_RESOLVER_MANAGER_REQUEST`) and `is_preconnect` + `url` (on
+`HTTP_STREAM_JOB_CONTROLLER`) match. The DNS-result and connect-outcome shapes above were taken from a second
+real capture (items.id=871, same setup). Not checked on a real log: a connect-attempt outcome other than
+`ok` and `os_error=111` (TCP) or `net_error=-109` (UDP), a resolver result for a name that is not a cache
+hit, and a log from a build with another Chromium version.
+
+`netlog.test.mjs` tests the parser on small logs with invented values (hostnames under `example.test`,
+documentation address ranges, no query strings). Run it by hand: `node --test scripts/rig/netlog.test.mjs`.
+CI does not run it.
 
 ### ss-sample.sh and ss-report.mjs: socket sampling
 
@@ -208,9 +241,23 @@ and counts only.
 scripts/rig/scratch-run.sh --reuse --secs 60 DIR -- --remote-debugging-port=9333 \
   --qr-rig-open-pane=duckai --qr-rig-close-popup-after-ms=8000
 # meanwhile: RIG_CDP_PORT=9333 node scripts/rig/jar.mjs shows the pane's page target; open a popup from
-# the page with CDP Runtime.evaluate {expression: "window.open('/b.html')", userGesture: true}; jar.mjs
-# shows the popup target, and about 8 s later it is gone.
+# the page with CDP Runtime.evaluate {expression: "window.open('/b.html')", userGesture: true}; in the
+# items.id=860 run jar.mjs listed that popup as a second page target, and about 8 s later it was gone.
 ```
+
+Which popups show up as a target (items.id=871). The listing above held for a popup opened with
+`window.open` from a local test page over CDP (items.id=860). What is known about the items.id=870 run
+(duck.ai): a popup was opened from the duck.ai page by a route the handoff does not record (it may have
+been the scripted `window.open`), the rig logged closing it, and the CDP poll never listed a second page
+target. The 871 run (same setup, a 250 ms `/json/list` poll plus browser-level `Target.getTargets`) opened
+no popup, so nothing was compared. The cause of the 870 miss stays unconfirmed. The guess that a windowless,
+host-managed popup is not in `/json/list` is refuted, since the 860 popup is windowless and was listed, and
+so are the panes. jar.mjs does not filter targets away (its `targets:` line prints every `/json/list` entry;
+its `PAGE` lines only skip a target with no `webSocketDebuggerUrl`). The 870 poll was a separate driver, not
+jar.mjs, so the miss was never seen in jar.mjs itself. Do not read the `about:srcdoc` `on_load_error` line
+in `app.log` as a popup: it is the pane's own handler (the popup handler logs `popup on_load_error`), and it
+appeared in a run with no popup. The line that shows a rig popup is
+`rig_hooks: closing the popup of provider=<id>`.
 
 What this does and does not cover. It exercises the command, the `ClosePopup` dispatch, the pane host's
 close channel and drain, `force_close_popup`, the page-side effect (`close_browser(true)`, so the page sees

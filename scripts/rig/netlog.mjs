@@ -1,8 +1,13 @@
 #!/usr/bin/env node
 // Net-log parser. Reads a Chromium net log (the app's --log-net-log=PATH file) and reports:
 //   - URL requests, by origin and by method+URL, with time offsets from the start of the capture
-//   - socket addresses of connect events (TCP/other and UDP), flagging any non-loopback one
-//   - DNS names looked up, flagging any non-loopback one
+//   - socket addresses of connect events (TCP/other and UDP) with the outcome of each connect attempt
+//     (ok, os_error=N or net_error=N), in four groups: loopback, non-loopback TCP/other, unspecified
+//     (0.0.0.0 and ::, which Linux treats as the local host and which a sinkholing resolver hands out)
+//     and non-loopback UDP
+//   - DNS names looked up, each with its request count, its resolver-job count and the addresses the
+//     log shows it resolved to (flagging any non-loopback name, and a name that resolved only to
+//     unspecified addresses)
 //   - why: speculative DNS requests (is_speculative) and preconnects (is_preconnect), per source type
 //     and event type, with every offset and its UTC wall-clock time (host or origin only, never a
 //     path or query string, even with --full)
@@ -12,9 +17,14 @@
 //   node netlog.mjs <net.json> [--host-regex RE] [--full] [--strict]
 //
 // Exit 0: nothing non-loopback. Exit 3: a non-loopback URL host, DNS name or TCP/other socket address.
-// A non-loopback UDP connect() alone is printed as a route probe (it sends no packet) and does not
-// change the exit code unless --strict is given, which also makes a non-loopback speculative DNS name
-// or preconnect origin fail (without --strict that section is informational). Exit 64: bad usage. Exit 66: empty log.
+// Not counted by themselves (printed, and noted on the RESULT line): a TCP/other connect to an
+// UNSPECIFIED address (0.0.0.0, ::; items.id=871), and a non-loopback UDP connect(), which is
+// Chromium's IPv6 route probe and sends no packet. A name that resolved to an unspecified address is
+// still a looked-up non-loopback name and its URL host is still a non-loopback origin, so such a
+// sinkholed name keeps the exit at 3 through those two rules; only an unspecified address with no
+// non-loopback name or URL behind it stops failing the run. --strict also fails on an unspecified or
+// non-loopback UDP address, and on a non-loopback speculative DNS name or preconnect origin (without
+// --strict that section is informational). Exit 64: bad usage. Exit 66: empty log.
 import fs from 'node:fs';
 import { parseArgs } from './lib/args.mjs';
 
@@ -51,6 +61,7 @@ const { j, truncated } = load(pos[0]);
 const C = j.constants;
 const evName = Object.fromEntries(Object.entries(C.logEventTypes).map(([k, v]) => [v, k]));
 const srcName = Object.fromEntries(Object.entries(C.logSourceType).map(([k, v]) => [v, k]));
+const PH = C.logEventPhase ?? { PHASE_NONE: 0, PHASE_BEGIN: 1, PHASE_END: 2 };
 const base = Number(C.timeTickOffset);
 const events = j.events ?? [];
 const t0 = events.length ? Math.min(...events.map((e) => Number(e.time))) : 0;
@@ -62,6 +73,11 @@ const bareHost = (h) => h.replace(/^\[|\]$/g, '').toLowerCase();
 const isLoopback = (h) => {
   h = bareHost(h);
   return /^127\./.test(h) || h === '::1' || /^::ffff:127\./.test(h) || h === 'localhost' || h.endsWith('.localhost');
+};
+// 0.0.0.0 and :: (also ::ffff:0.0.0.0 and the long form): "this host", what a sinkholing resolver returns.
+const isUnspecified = (h) => {
+  h = bareHost(h);
+  return h === '0.0.0.0' || h === '::ffff:0.0.0.0' || /^(0{1,4}:){2,7}0{0,4}$/.test(h) || h === '::';
 };
 const addrHost = (a) => {
   const m = a.match(/^\[(.*)\]:\d+$/) || a.match(/^(.*):\d+$/);
@@ -113,15 +129,68 @@ for (const e of events) {
   s.perName[n] = (s.perName[n] || 0) + 1;
   socks.set(k, s);
 }
-const sockRows = [...socks.values()].map((s) => ({ ...s, n: Math.max(...Object.values(s.perName)), loop: isLoopback(addrHost(s.a)) }));
-
-// DNS names.
-const dns = new Map();
+// Outcome of each connect attempt: the BEGIN of TCP_CONNECT_ATTEMPT / UDP_CONNECT carries the address, the
+// END of the same source carries os_error (TCP) or net_error (UDP) on failure and no such parameter on success.
+const ATTEMPT = { TCP_CONNECT_ATTEMPT: 'tcp/other', UDP_CONNECT: 'udp' };
+const openAttempt = new Map(); // `${source id}|${event}` -> address
+const outcomes = new Map(); // `${kind} ${address}` -> { label: n }
+const addOutcome = (kind, a, label) => {
+  const o = outcomes.get(`${kind} ${a}`) || {};
+  o[label] = (o[label] || 0) + 1;
+  outcomes.set(`${kind} ${a}`, o);
+};
 for (const e of events) {
+  const n = evName[e.type];
+  if (!(n in ATTEMPT)) continue;
+  const key = `${e.source.id}|${n}`;
+  if (e.phase === PH.PHASE_BEGIN && typeof e.params?.address === 'string') {
+    openAttempt.set(key, e.params.address);
+  } else if (e.phase === PH.PHASE_END && openAttempt.has(key)) {
+    const p = e.params || {};
+    const label = p.os_error !== undefined ? `os_error=${p.os_error}` : p.net_error !== undefined ? `net_error=${p.net_error}` : 'ok';
+    addOutcome(ATTEMPT[n], openAttempt.get(key), label);
+    openAttempt.delete(key);
+  }
+}
+for (const [key, a] of openAttempt) addOutcome(ATTEMPT[key.split('|')[1]], a, 'no result in log');
+const sockRows = [...socks.values()].map((s) => {
+  const h = addrHost(s.a);
+  const group = isLoopback(h) ? 'loopback' : isUnspecified(h) ? 'unspecified' : 'non-loopback';
+  return { ...s, n: Math.max(...Object.values(s.perName)), group, out: outcomes.get(`${s.kind} ${s.a}`) };
+});
+
+// DNS names. Counted per name: requests (HOST_RESOLVER_MANAGER_REQUEST BEGIN events: one per lookup request,
+// most answered from the cache) and jobs (HOST_RESOLVER_MANAGER_JOB BEGIN events: actual resolver jobs, which
+// share one resolution between requests). The addresses come from HOST_RESOLVER_MANAGER_CACHE_HIT results,
+// attached to the name of the request open on the same source; a resolution the log does not show a result for
+// has no addresses here.
+const dns = new Map(); // name -> { requests, jobs, addrs: Set }
+const dnsEntry = (name) => {
+  if (!dns.has(name)) dns.set(name, { requests: 0, jobs: 0, addrs: new Set() });
+  return dns.get(name);
+};
+const openReq = new Map(); // source id -> name of the request in flight on it
+for (const e of events) {
+  const n = evName[e.type];
   const h = e.params?.host;
-  if (typeof h !== 'string' || !/^HOST_RESOLVER_MANAGER_(REQUEST|JOB)$/.test(evName[e.type])) continue;
-  const name = h.replace(/^[a-z]+:\/\//, '').replace(/:\d+$/, '');
-  dns.set(name, (dns.get(name) || 0) + 1);
+  if (n === 'HOST_RESOLVER_MANAGER_REQUEST' || n === 'HOST_RESOLVER_MANAGER_JOB') {
+    if (typeof h === 'string') {
+      const name = h.replace(/^[a-z]+:\/\//, '').replace(/:\d+$/, '');
+      const d = dnsEntry(name);
+      if (n === 'HOST_RESOLVER_MANAGER_REQUEST') {
+        d.requests++;
+        openReq.set(e.source.id, name);
+      } else {
+        d.jobs++;
+      }
+    } else if (n === 'HOST_RESOLVER_MANAGER_REQUEST' && e.phase === PH.PHASE_END) {
+      openReq.delete(e.source.id);
+    }
+  } else if (n === 'HOST_RESOLVER_MANAGER_CACHE_HIT' && openReq.has(e.source.id)) {
+    for (const ep of e.params?.results?.ip_endpoints ?? []) {
+      if (typeof ep?.endpoint_address === 'string') dnsEntry(openReq.get(e.source.id)).addrs.add(ep.endpoint_address);
+    }
+  }
 }
 const nonLoopbackDns = [...dns.keys()].filter((h) => !isLoopback(h));
 
@@ -179,15 +248,35 @@ for (const [k, v] of [...groups].sort((a, b) => a[1].first - b[1].first)) {
   console.log(`  ${String(v.n).padStart(4)}  ${k}  ${v.n > 1 ? `${f1(v.first)}..${f1(v.last)}` : f1(v.first)}`);
 }
 
-console.log('\nSocket addresses (connect events):');
-const nonLoopTcp = sockRows.filter((s) => !s.loop && s.kind === 'tcp/other');
-const nonLoopUdp = sockRows.filter((s) => !s.loop && s.kind === 'udp');
-const loopRows = sockRows.filter((s) => s.loop);
-console.log(`  loopback: ${loopRows.length ? loopRows.map((s) => `${s.a} x${s.n}`).join(', ') : 'none'}`);
-console.log(`  non-loopback TCP/other: ${nonLoopTcp.length ? nonLoopTcp.map((s) => `${s.a} x${s.n} (${Object.keys(s.perName).join('+')})`).join(', ') : 'none'}`);
-console.log(`  non-loopback UDP connect (route probe, sends no packet): ${nonLoopUdp.length ? nonLoopUdp.map((s) => `${s.a} x${s.n} (${Object.keys(s.perName).join('+')})`).join(', ') : 'none'}`);
+console.log('\nSocket addresses (connect events), with the outcome of each connect attempt:');
+const inGroup = (g, kind) => sockRows.filter((s) => s.group === g && (!kind || s.kind === kind));
+const loopRows = inGroup('loopback');
+const nonLoopTcp = inGroup('non-loopback', 'tcp/other');
+const nonLoopUdp = inGroup('non-loopback', 'udp');
+const unspecRows = inGroup('unspecified');
+const fmtOut = (s) => (s.out ? Object.entries(s.out).map(([l, n]) => `${l} x${n}`).join(', ') : 'outcome not logged');
+const printGroup = (title, rows) => {
+  console.log(`  ${title}:${rows.length ? '' : ' none'}`);
+  for (const s of rows) console.log(`    ${s.a} x${s.n} [${fmtOut(s)}] (${Object.keys(s.perName).join('+')})`);
+};
+printGroup('loopback', loopRows);
+printGroup('non-loopback TCP/other', nonLoopTcp);
+printGroup('unspecified address, 0.0.0.0 or :: (not counted by itself; Linux treats it as the local host; usually a resolver sinkhole)', unspecRows);
+printGroup('non-loopback UDP connect (route probe, sends no packet)', nonLoopUdp);
 
-console.log(`\nDNS names looked up: ${dns.size ? [...dns].map(([h, n]) => `${h} x${n}`).join(', ') : 'none'}`);
+const nameNote = (d) => {
+  const addrs = [...d.addrs];
+  if (addrs.length && addrs.every(isUnspecified)) return '   (resolved only to unspecified addresses: sinkholed)';
+  if (addrs.some(isUnspecified)) return '   (includes an unspecified address)';
+  return '';
+};
+console.log('\nDNS names looked up (requests = resolver requests, mostly cache hits; jobs = resolver jobs, one per real resolution):');
+if (!dns.size) console.log('  none');
+for (const [name, d] of dns) {
+  const shown = [...d.addrs].slice(0, 8).join(', ') + (d.addrs.size > 8 ? ` ... (+${d.addrs.size - 8} more)` : '');
+  console.log(`  ${name}   requests ${d.requests}, jobs ${d.jobs}`);
+  console.log(`        resolved to: ${d.addrs.size ? shown : 'no address logged'}${nameNote(d)}`);
+}
 
 console.log('\nSpeculative DNS and preconnects, by source (names, counts and offsets only):');
 if (!whyRows.length) console.log('  none');
@@ -200,11 +289,24 @@ for (const r of whyRows) {
   console.log(`        at ${shown}`);
 }
 
-const fail =
-  nonLoopbackUrls > 0 ||
-  nonLoopTcp.length > 0 ||
-  nonLoopbackDns.length > 0 ||
-  (flags.strict && (nonLoopUdp.length > 0 || nonLoopWhy.length > 0));
+const unspecAttempts = unspecRows.reduce((t, r) => t + r.n, 0);
+const strictOnly = [];
+if (flags.strict && nonLoopUdp.length) strictOnly.push(`UDP addresses ${nonLoopUdp.length}`);
+if (flags.strict && unspecRows.length) strictOnly.push(`unspecified addresses ${unspecRows.length}`);
+if (flags.strict && nonLoopWhy.length) strictOnly.push(`speculative DNS or preconnect names ${nonLoopWhy.length}`);
+const reasons = [
+  nonLoopbackUrls > 0 && `URL requests to non-loopback hosts ${nonLoopbackUrls}`,
+  nonLoopTcp.length > 0 && `non-loopback TCP/other addresses ${nonLoopTcp.length}`,
+  nonLoopbackDns.length > 0 && `non-loopback DNS names ${nonLoopbackDns.length}`,
+  ...strictOnly,
+].filter(Boolean);
+const fail = reasons.length > 0;
 const whyNote = !fail && nonLoopWhy.length ? ' (speculative DNS or preconnect to a non-loopback name listed above; --strict makes it fail)' : '';
-console.log(`\nRESULT: ${fail ? 'NON-LOOPBACK ACTIVITY' : 'nothing non-loopback'}${!fail && nonLoopUdp.length ? ' (UDP route probe only)' : ''}${whyNote}`);
+const unspecNote =
+  !flags.strict && unspecRows.length
+    ? ` (${unspecAttempts} connect attempt${unspecAttempts === 1 ? '' : 's'} to 0.0.0.0 or :: not counted; --strict counts them)`
+    : '';
+console.log(
+  `\nRESULT: ${fail ? `NON-LOOPBACK ACTIVITY (${reasons.join('; ')})` : 'nothing non-loopback'}${!fail && nonLoopUdp.length ? ' (UDP route probe only)' : ''}${whyNote}${unspecNote}`,
+);
 process.exit(fail ? 3 : 0);
