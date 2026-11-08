@@ -760,15 +760,6 @@ export const commands = {
 	 *  sign-in. The pane itself is untouched.
 	 */
 	closeCloudChatPopup: (providerId: string) => typedError<null, string>(__TAURI_INVOKE("close_cloud_chat_popup", { providerId })),
-	/**
-	 *  items.id=873 (decisions.id=934): the user's answer to a pane's "open this link
-	 *  in your browser?" request. The command carries ONLY the request id and the
-	 *  decision: the URL was kept in Rust when the load was cancelled, so the
-	 *  frontend never supplies what gets opened (a test pins the signature). Only an
-	 *  http(s) URL without userinfo ever reaches the system browser, and only on
-	 *  Open. An unknown, already-answered or purged id does nothing and is logged.
-	 */
-	answerCloudChatNavConfirm: (requestId: string, openInBrowser: boolean) => typedError<null, string>(__TAURI_INVOKE("answer_cloud_chat_nav_confirm", { requestId, openInBrowser })),
 	sendMessage: (request: SendMessageRequest) => typedError<MessageInfo[], string>(__TAURI_INVOKE("send_message", { request })),
 	listMessages: (userId: string, personaId: string, contextKey: string) => typedError<MessageInfo[], string>(__TAURI_INVOKE("list_messages", { userId, personaId, contextKey })),
 	/**

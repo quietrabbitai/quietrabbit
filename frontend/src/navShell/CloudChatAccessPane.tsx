@@ -52,7 +52,6 @@ import { createUnsentChat, returnStep, type ReturnStepState } from './unsentChat
 import { computeActivePaneRect, pixelRectToFraction, type PanePixelRect } from '../cloudChatAccess/paneLayout'
 import { PaneHitLayer } from '../cloudChatAccess/PaneHitLayer'
 import { PopupHitLayer } from '../cloudChatAccess/PopupHitLayer'
-import { CloudChatNavPrompts } from '../cloudChatAccess/CloudChatNavPrompts'
 import { CloudChatSelector } from '../cloudChatAccess/CloudChatSelector'
 import {
   fetchActiveProviders,
@@ -1063,9 +1062,6 @@ export function CloudChatAccessPane({
           {t('navShell.cloudChatAccessPane.openError', { message: openError })}
         </p>
       )}
-
-      {/* items.id=873: navigation confirm and blocked-link notice. */}
-      <CloudChatNavPrompts />
     </div>
   )
 }

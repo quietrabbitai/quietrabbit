@@ -926,8 +926,6 @@ TABLE providers
   spend_limit_url TEXT notnull=0 pk=0 default=None
   logo_key TEXT notnull=0 pk=0 default=None
   required_request_options TEXT notnull=0 pk=0 default=None
-  navigate_hosts TEXT notnull=1 pk=0 default=Some("'[]'")
-  page_traffic_hosts TEXT notnull=1 pk=0 default=Some("'[]'")
 TABLE schema_version
   version INTEGER notnull=0 pk=1 default=None
   applied_at TEXT notnull=1 pk=0 default=None

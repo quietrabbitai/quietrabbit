@@ -341,9 +341,6 @@ pub const RESIDUAL_SHARED_SCHEMA: &[ResidualTable] = &[
             "spend_limit_url",
             "logo_key",
             "required_request_options",
-            // items.id=873: declared hosts, curated catalog data with no user content.
-            "navigate_hosts",
-            "page_traffic_hosts",
         ],
     },
     ResidualTable {

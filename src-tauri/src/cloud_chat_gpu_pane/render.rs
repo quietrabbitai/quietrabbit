@@ -45,8 +45,6 @@ use cef::ImplContextMenuParams;
 use wgpu::util::DeviceExt;
 use wgpu_hal::Adapter as _;
 
-use crate::cloud_chat_gpu_pane::nav_confirm::{NavBlockKind, NavBlocked};
-use crate::cloud_chat_gpu_pane::nav_policy::{classify, HostSet, NavDecision};
 use crate::cloud_chat_gpu_pane::{lock_recover, PaneKey};
 use crate::commands::cloud_chat_pane::PaneRectFraction;
 
@@ -1319,17 +1317,11 @@ wrap_client! {
         life_span_handler: LifeSpanHandler,
         load_handler: LoadHandler,
         context_menu_handler: ContextMenuHandler,
-        request_handler: RequestHandler,
     }
 
     impl Client {
         fn render_handler(&self) -> Option<cef::RenderHandler> {
             Some(self.render_handler.clone())
-        }
-
-        // items.id=873: the navigation policy (decisions.id=934).
-        fn request_handler(&self) -> Option<cef::RequestHandler> {
-            Some(self.request_handler.clone())
         }
 
         fn life_span_handler(&self) -> Option<cef::LifeSpanHandler> {
@@ -1350,14 +1342,12 @@ impl ClientBuilder {
     pub(crate) fn build(
         render_handler: PaneRenderHandler,
         browser_ready_tx: std::sync::mpsc::Sender<cef::Browser>,
+        pane_key: PaneKey,
         popup_requested_tx: std::sync::mpsc::Sender<PopupRequested>,
         popup_close_tx: std::sync::mpsc::Sender<PaneKey>,
         context_menu_tx: std::sync::mpsc::Sender<ContextMenuRequested>,
         app_handle: tauri::AppHandle,
-        guard: NavGuard,
     ) -> Client {
-        // The guard carries this pane's own key.
-        let pane_key = guard.pane_key().clone();
         Self::new(
             RenderHandlerBuilder::build(render_handler),
             LifeSpanHandlerBuilder::build(PaneLifeSpanHandler::new(
@@ -1366,14 +1356,12 @@ impl ClientBuilder {
                 popup_requested_tx,
                 context_menu_tx.clone(),
                 app_handle,
-                guard.clone(),
             )),
             LoadHandlerBuilder::build(PaneLoadHandler::new(pane_key.clone(), popup_close_tx)),
             ContextMenuHandlerBuilder::build(PaneContextMenuHandler::new(
                 pane_key,
                 context_menu_tx,
             )),
-            RequestHandlerBuilder::build(guard),
         )
     }
 }
@@ -1391,18 +1379,11 @@ wrap_client! {
         life_span_handler: LifeSpanHandler,
         load_handler: LoadHandler,
         context_menu_handler: ContextMenuHandler,
-        request_handler: RequestHandler,
     }
 
     impl Client {
         fn render_handler(&self) -> Option<cef::RenderHandler> {
             Some(self.render_handler.clone())
-        }
-
-        // items.id=873: a popup's own navigations obey the same host set as
-        // its parent pane (decisions.id=934).
-        fn request_handler(&self) -> Option<cef::RequestHandler> {
-            Some(self.request_handler.clone())
         }
 
         fn life_span_handler(&self) -> Option<cef::LifeSpanHandler> {
@@ -1425,154 +1406,16 @@ impl PopupClientBuilder {
         events_tx: std::sync::mpsc::Sender<PopupLifecycleEvent>,
         parent_key: PaneKey,
         context_menu_tx: std::sync::mpsc::Sender<ContextMenuRequested>,
-        guard: NavGuard,
     ) -> Client {
         Self::new(
             PopupRenderHandlerBuilder::build(render_handler),
-            PopupLifeSpanHandlerBuilder::build(PopupLifeSpanHandler::new(events_tx, guard.clone())),
+            PopupLifeSpanHandlerBuilder::build(PopupLifeSpanHandler::new(events_tx)),
             PopupLoadHandlerBuilder::build(PopupLoadHandler),
             PopupContextMenuHandlerBuilder::build(PopupContextMenuHandler::new(
                 parent_key,
                 context_menu_tx,
             )),
-            RequestHandlerBuilder::build(guard),
         )
-    }
-}
-
-/// items.id=873 (decisions.id=934): one pane's navigation policy, shared by the
-/// pane's own handlers and its popup's. Holds the host set the pane opened with
-/// (a snapshot: handlers run on CEF's UI thread and never read the database) and
-/// the channel the host drains into a confirm or a notice.
-#[derive(Clone)]
-pub struct NavGuard {
-    pane_key: PaneKey,
-    hosts: Arc<HostSet>,
-    nav_tx: std::sync::mpsc::Sender<NavBlocked>,
-}
-
-impl NavGuard {
-    pub fn new(
-        pane_key: PaneKey,
-        hosts: Arc<HostSet>,
-        nav_tx: std::sync::mpsc::Sender<NavBlocked>,
-    ) -> Self {
-        Self {
-            pane_key,
-            hosts,
-            nav_tx,
-        }
-    }
-
-    /// The pane this policy belongs to.
-    pub(crate) fn pane_key(&self) -> &PaneKey {
-        &self.pane_key
-    }
-
-    /// Decides `url` and, when it is not allowed, queues the confirm or notice.
-    /// Returns true when the target may load as today. Never blocks: the only
-    /// effect besides the log line is one channel send. Logs the host and the
-    /// decision, never a path or query. `source` names the callback.
-    pub(crate) fn check(&self, source: &str, url: &str) -> bool {
-        let decision = classify(&self.hosts, url);
-        let (label, kind) = match &decision {
-            NavDecision::Allow => ("allow", None),
-            NavDecision::Confirm { host, url } => (
-                "confirm",
-                Some(NavBlockKind::Confirm {
-                    host: host.clone(),
-                    url: url.clone(),
-                }),
-            ),
-            NavDecision::BlockScheme { scheme } => (
-                "block_scheme",
-                Some(NavBlockKind::Notice {
-                    scheme: Some(scheme.clone()),
-                }),
-            ),
-            NavDecision::BlockMalformed => (
-                "block_malformed",
-                Some(NavBlockKind::Notice { scheme: None }),
-            ),
-        };
-        log::info!(
-            "cloud_chat_gpu_pane::render: nav policy pane={} source={} decision={} target={}",
-            self.pane_key,
-            source,
-            label,
-            match &decision {
-                NavDecision::Confirm { host, .. } => host.as_str(),
-                NavDecision::BlockScheme { scheme } => scheme.as_str(),
-                _ => "-",
-            },
-        );
-        match kind {
-            None => true,
-            Some(kind) => {
-                // A closed receiver (app teardown) means nobody can be asked;
-                // the load stays cancelled.
-                let _ = self.nav_tx.send(NavBlocked {
-                    pane_key: self.pane_key.clone(),
-                    kind,
-                });
-                false
-            }
-        }
-    }
-}
-
-// items.id=873: top-level navigation policy for a pane and for its popup.
-// on_before_browse covers main-frame navigations, redirects included (a
-// declared host that redirects to an undeclared one is cancelled); subframe
-// navigations and subresources are page traffic, not navigation, and are not
-// touched. on_open_urlfrom_tab covers the open-in-new-tab path. Both return 1
-// (cancel) at once and leave the asking to the host (NavGuard::check).
-wrap_request_handler! {
-    pub(crate) struct RequestHandlerBuilder {
-        guard: NavGuard,
-    }
-
-    impl RequestHandler {
-        fn on_before_browse(
-            &self,
-            _browser: Option<&mut Browser>,
-            frame: Option<&mut Frame>,
-            request: Option<&mut Request>,
-            _user_gesture: ::std::os::raw::c_int,
-            is_redirect: ::std::os::raw::c_int,
-        ) -> ::std::os::raw::c_int {
-            // No frame is treated as the main frame: fail closed.
-            if frame.as_ref().is_some_and(|f| f.is_main() == 0) {
-                return 0;
-            }
-            let Some(request) = request else {
-                log::warn!(
-                    "cloud_chat_gpu_pane::render: on_before_browse without a request, cancelled"
-                );
-                return 1;
-            };
-            let url = CefString::from(&request.url()).to_string();
-            let source = if is_redirect != 0 { "redirect" } else { "browse" };
-            if self.guard.check(source, &url) { 0 } else { 1 }
-        }
-
-        fn on_open_urlfrom_tab(
-            &self,
-            _browser: Option<&mut Browser>,
-            _frame: Option<&mut Frame>,
-            target_url: Option<&CefString>,
-            _target_disposition: WindowOpenDisposition,
-            _user_gesture: ::std::os::raw::c_int,
-        ) -> ::std::os::raw::c_int {
-            let target = target_url.map(|u| u.to_string()).unwrap_or_default();
-            if self.guard.check("open_url_from_tab", &target) { 0 } else { 1 }
-        }
-    }
-}
-
-impl RequestHandlerBuilder {
-    pub(crate) fn build(guard: NavGuard) -> cef::RequestHandler {
-        Self::new(guard)
     }
 }
 
@@ -1612,9 +1455,6 @@ pub struct PaneLifeSpanHandler {
     /// `request_redraw`'s own doc) when `on_before_popup` fires -- cheap
     /// clone, same handle `PaneRenderHandler` itself holds.
     app_handle: tauri::AppHandle,
-    /// items.id=873: the pane's navigation policy, checked before a popup is
-    /// created and handed to the popup's own client.
-    guard: NavGuard,
 }
 
 impl PaneLifeSpanHandler {
@@ -1624,7 +1464,6 @@ impl PaneLifeSpanHandler {
         popup_requested_tx: std::sync::mpsc::Sender<PopupRequested>,
         context_menu_tx: std::sync::mpsc::Sender<ContextMenuRequested>,
         app_handle: tauri::AppHandle,
-        guard: NavGuard,
     ) -> Self {
         Self {
             browser_ready_tx,
@@ -1632,7 +1471,6 @@ impl PaneLifeSpanHandler {
             popup_requested_tx,
             context_menu_tx,
             app_handle,
-            guard,
         }
     }
 }
@@ -1691,17 +1529,6 @@ wrap_life_span_handler! {
                 target_url.map(|u| u.to_string()),
             );
 
-            // items.id=873 (decisions.id=934): decide by TARGET HOST before
-            // anything is built. A target off the declared hosts never gets a
-            // popup (no `PopupRequested`, no clamp, nothing to close): the
-            // load is cancelled and the host asks the user instead. Never by
-            // disposition -- a link and a bare window.open look identical here
-            // (items.id=853).
-            let target = target_url.map(|u| u.to_string()).unwrap_or_default();
-            if !self.handler.guard.check("popup", &target) {
-                return 1;
-            }
-
             let accelerated_osr = cfg!(any(
                 target_os = "macos",
                 target_os = "windows",
@@ -1752,7 +1579,6 @@ wrap_life_span_handler! {
                     events_tx,
                     self.handler.pane_key.clone(),
                     self.handler.context_menu_tx.clone(),
-                    self.handler.guard.clone(),
                 ));
             }
 
@@ -1783,13 +1609,11 @@ impl LifeSpanHandlerBuilder {
 #[derive(Clone)]
 pub struct PopupLifeSpanHandler {
     events_tx: std::sync::mpsc::Sender<PopupLifecycleEvent>,
-    /// items.id=873: the parent pane's navigation policy.
-    guard: NavGuard,
 }
 
 impl PopupLifeSpanHandler {
-    fn new(events_tx: std::sync::mpsc::Sender<PopupLifecycleEvent>, guard: NavGuard) -> Self {
-        Self { events_tx, guard }
+    fn new(events_tx: std::sync::mpsc::Sender<PopupLifecycleEvent>) -> Self {
+        Self { events_tx }
     }
 }
 
@@ -1821,38 +1645,6 @@ wrap_life_span_handler! {
                     host.close_browser(true as _);
                 }
             }
-        }
-
-        // items.id=873 (decisions.id=934): a popup opened from inside a popup is
-        // never created. Before this the popup client had no on_before_popup at
-        // all, so a nested window.open fell to CEF's default. Always cancelled:
-        // an undeclared target raises the same confirm as anywhere else, a
-        // declared one is only logged (the rig measures whether any real flow
-        // needs it).
-        fn on_before_popup(
-            &self,
-            _browser: Option<&mut Browser>,
-            _frame: Option<&mut Frame>,
-            _popup_id: ::std::os::raw::c_int,
-            target_url: Option<&CefString>,
-            _target_frame_name: Option<&CefString>,
-            _target_disposition: WindowOpenDisposition,
-            _user_gesture: ::std::os::raw::c_int,
-            _popup_features: Option<&PopupFeatures>,
-            _window_info: Option<&mut WindowInfo>,
-            _client: Option<&mut Option<Client>>,
-            _settings: Option<&mut BrowserSettings>,
-            _extra_info: Option<&mut Option<DictionaryValue>>,
-            _no_javascript_access: Option<&mut ::std::os::raw::c_int>,
-        ) -> ::std::os::raw::c_int {
-            let target = target_url.map(|u| u.to_string()).unwrap_or_default();
-            if self.handler.guard.check("nested_popup", &target) {
-                log::info!(
-                    "cloud_chat_gpu_pane::render: a nested popup to a declared host was \
-                     cancelled"
-                );
-            }
-            1
         }
 
         fn on_before_close(&self, _browser: Option<&mut cef::Browser>) {
