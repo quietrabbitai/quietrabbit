@@ -57,7 +57,7 @@ pub enum CloudChatCookieStoreError {
 // ---------------------------------------------------------------------------
 
 /// One stored cookie row. Field shape mirrors cef::Cookie (vendored cef
-/// crate v151.1.0+151.3.12) minus `size` (a wire-protocol field, not data)
+/// crate; the cookie struct is identical in v151.1.0 and v156.3.1, items.id=872) minus `size` (a wire-protocol field, not data)
 /// -- see schema/tier3_cookies_001.sql's header for the full field-by-field
 /// rationale. Conversions to/from cef::Cookie live in
 /// commands/cloud_chat_pane.rs, the only caller that touches the CEF type --

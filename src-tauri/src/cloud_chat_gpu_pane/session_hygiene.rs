@@ -1,7 +1,7 @@
 //! Cloud Chat session hygiene (items.id=622): what happens to CEF's one global
 //! profile when an account's key leaves memory.
 //!
-//! CEF 151's Chrome runtime has a single global profile (decisions.id=711), so
+//! CEF's Chrome runtime (151, and 156 per items.id=872) has a single global profile (decisions.id=711), so
 //! the cookies, localStorage and open pages of one signed-in account are, to
 //! the browser, simply the profile. Without this module a sign-out left the
 //! panes, their cookies and their storage alive, and the next sign-in

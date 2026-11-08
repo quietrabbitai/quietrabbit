@@ -223,13 +223,16 @@ specta-typescript = "0.0.12"
 
 # Tier 2/Tier 3 external session embedding (items.id=3 States 4-5,
 # decisions.id=699 -- Option 3b, CEF off-screen rendering). Version pinned to
-# the current published crates.io release, one patch ahead of 151.0.0+151.3.11
-# (the exact version the full items.id=192/195/196/198/199/200/201 evidence
-# chain tested) -- verified current/active via the crates.io sparse index
-# (index.crates.io/3/c/cef) this session, 2026-08-01. Behavior will be
-# validated against the spike's proven results during Phase A build/test,
-# not assumed identical on version alone.
-cef = { version = "151.1.0", features = ["accelerated_osr"] }
+# the latest published crates.io release, 156.3.1+156.0.15 (published
+# 2026-11-07; items.id=872). It was 151.1.0+151.3.12 from 2026-08-01 (one patch
+# ahead of 151.0.0+151.3.11, the version the items.id=192/195/196/198/199/200/
+# 201 evidence chain tested). decisions.id=935: with component updates off this
+# pin is QR's only route to Chromium fixes, so bump it to the current CEF stable
+# at least every 8 weeks and within 7 days of a Chrome fix marked exploited in
+# the wild; .github/workflows/cef-currency.yml warns when the pinned crate is
+# older than 8 weeks. After every bump re-verify the feature and switch names in
+# cloud_chat_gpu_pane/bootstrap.rs against the new libcef strings.
+cef = { version = "156.3.1", features = ["accelerated_osr"] }
 # OSR render pipeline + single-window GTK/wgpu compositing (items.id=202
 # piece 5 real fix, 2026-08-07 -- replaces the separate-winit-window-per-pane
 # architecture, which depended on tauri::Window::inner_position()/inner_size(),

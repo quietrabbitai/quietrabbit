@@ -711,7 +711,19 @@ fn resolve_bind_group(
         PendingPaint::Accelerated { info } => {
             use cef::osr_texture_import::shared_texture_handle::SharedTextureHandle;
             let shared_handle = SharedTextureHandle::new(&info.info);
-            match shared_handle.import_texture(device) {
+            // SAFETY (items.id=872, cef 156): the cef crate's `import_texture`
+            // is unsafe and requires the import to run inside the originating
+            // `on_accelerated_paint` callback, while CEF's source frame is
+            // still valid, with a device/queue on the same GPU as CEF. This
+            // call breaks that contract: the import runs later, on the GTK
+            // thread, from dup'd fds (see `capture_accelerated_paint`). It is
+            // sound to ship only because the path is unreachable on Linux:
+            // `shared_texture_enabled` is false for panes and popups
+            // (items.id=257), so CEF never calls `on_accelerated_paint`.
+            // items.id=721 and items.id=868 must redesign this import (inside
+            // the callback) before the accelerated path is enabled on any OS
+            // (decisions.id=933 leads with the GPU path on macOS).
+            match unsafe { shared_handle.import_texture(device, queue) } {
                 Ok(texture) => {
                     let size = (texture.width(), texture.height());
                     Some((build_bind_group(device, &texture), size))

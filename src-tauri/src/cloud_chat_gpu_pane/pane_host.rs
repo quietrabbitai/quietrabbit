@@ -3169,7 +3169,7 @@ impl PaneHost {
                     // "no replacement, insert at cursor") fixed that.
                     // Confirmed the Rust binding itself is not the cause --
                     // the generated binding (cef 151.1.0+151.3.12,
-                    // x86_64_unknown_linux_gnu.rs) marshals
+                    // x86_64_unknown_linux_gnu.rs; not re-read on 156) marshals
                     // `replacement_range: Option<&Range>` via
                     // `.map(...).unwrap_or(std::ptr::null())`, so `None`
                     // correctly crosses the FFI boundary as a true null

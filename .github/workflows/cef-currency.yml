@@ -1,0 +1,30 @@
+# CEF currency check (items.id=872, decisions.id=935).
+#
+# Warns, never fails, when the pinned cef crate (src-tauri/Cargo.lock) was
+# published more than 8 weeks ago. Component updates are off, so a bump of the
+# pin is QR's only route to Chromium fixes; the warning is the automated
+# reminder. A warning notifies nobody: read the run's log or step summary.
+#
+# A separate workflow, not a job in tauri-ci.yml: it is scheduled (weekly, not
+# on every push or PR), needs no Rust toolchain and touches neither the Rust
+# jobs nor their caches. Scheduled workflows run only from the default branch
+# and GitHub pauses them after 60 days without repository activity; run it by
+# hand with workflow_dispatch.
+name: CEF currency
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  cef-currency:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Warn when the pinned cef crate is older than 8 weeks
+        run: .github/scripts/ci-cef-currency.sh

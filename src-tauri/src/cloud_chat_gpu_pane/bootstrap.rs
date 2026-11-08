@@ -89,10 +89,11 @@ pub fn dispatch_cef_subprocess() -> bool {
 /// confirmed to be the browser-process invocation), and before any browser
 /// instance is created.
 ///
-/// `root_cache_path` is CEF's global `Settings.root_cache_path`. CEF 151's
-/// Chrome runtime keeps a full browser profile there whatever `cache_path`
-/// says, so the caller (main.rs) passes this run's own directory on a tmpfs
-/// from `profile_dir::init_run_dir` and deletes it at exit (items.id=622).
+/// `root_cache_path` is CEF's global `Settings.root_cache_path`. CEF's (151, and
+/// 156 per items.id=872) Chrome runtime keeps a full browser profile there
+/// whatever `cache_path` says, so the caller (main.rs) passes this run's own
+/// directory on a tmpfs from `profile_dir::init_run_dir` and deletes it at exit
+/// (items.id=622).
 /// Per-user cookie persistence is QR's own encrypted store, not this directory
 /// (items.id=224 resolution, decisions.id=711).
 ///
@@ -262,7 +263,9 @@ pub fn initialize_cef_with_pump_setting(
 // --- App / command-line handling ---
 
 /// Chromium switches that stop the browser's own background network traffic
-/// (items.id=622). A net-log of an idle CEF 151 with none of these showed
+/// (items.id=622). On CEF 156 these switches no longer stop the component
+/// updater: see COMPONENT_UPDATER_URL_SOURCE (items.id=872), which is what does.
+/// A net-log of an idle CEF 151 with none of these showed
 /// calls to clients2.google.com and update.googleapis.com (component
 /// updater, the latter also fetching from edgedl.me.gvt1.com), plus
 /// accounts.google.com, safebrowsing.googleapis.com and the
@@ -294,16 +297,56 @@ const BACKGROUND_NETWORK_SWITCHES: &[&str] = &[
 /// pages) is page traffic, does not use this URL and still works (checked).
 const GAIA_URL_OVERRIDE: &str = "http://127.0.0.1:1";
 
+/// Where the browser's component updater sends its update checks and downloads
+/// (`--component-updater=url-source=...`, items.id=872). On CEF 156 the
+/// background switches above no longer stop the updater: at every startup, with
+/// no pane open, the browser sent `POST update.googleapis.com/service/update2/json`
+/// and then fetched a delta from `edgedl.me.gvt1.com`, with `disable-component-update`
+/// and `disable-background-networking` present on the browser's command line
+/// (net-log `clientInfo.command_line`; passing the same two switches on the real
+/// argv changed nothing, so it is not switch timing). Chromium's component
+/// updater takes its server URL from this key of the `component-updater` switch
+/// (the key is in the libcef 151 and 156 strings), and pointed at a loopback
+/// port nothing listens on, the check is refused locally and no Google host is
+/// resolved or contacted (checked on 156: startup traffic was one request to
+/// 127.0.0.1:1). Same pattern as GAIA_URL_OVERRIDE. All existing switches stay.
+const COMPONENT_UPDATER_URL_SOURCE: &str = "http://127.0.0.1:1";
+
+/// `existing` (a comma-separated `--component-updater` value, possibly empty)
+/// with any `url-source=` entry replaced by ours. Other entries keep their
+/// order; ours is last and so wins.
+fn merge_component_updater(existing: &str) -> String {
+    let mut parts: Vec<String> = existing
+        .split(',')
+        .filter(|p| !p.is_empty() && !p.starts_with("url-source="))
+        .map(str::to_owned)
+        .collect();
+    parts.push(format!("url-source={COMPONENT_UPDATER_URL_SOURCE}"));
+    parts.join(",")
+}
+
 /// Size caps for the browser's caches, which live on a tmpfs (profile_dir.rs).
 /// Measured with four providers open: 22 MB of cache uncapped, about 50 MB for
 /// the whole profile.
 const DISK_CACHE_SIZE_BYTES: u64 = 64 * 1024 * 1024;
 const MEDIA_CACHE_SIZE_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Features turned off through `--disable-features` (names verified against
-/// the strings of the libcef 151 binary).
+/// Features turned off through `--disable-features`. Names were verified against
+/// the libcef 151 binary's strings, and re-verified on libcef 156 (items.id=872,
+/// 2026-11-07) by a different method, because 156 no longer holds them as
+/// standalone strings. Chromium's feature macro now derives the name from the
+/// variable, so 156 stores `kAimEnabled` and the `base::Feature` points one byte
+/// into it, at `AimEnabled`. Method for any later bump: find the `k`-prefixed
+/// literal in `.rodata` (a NUL-terminated `kName`), then confirm a RELATIVE
+/// relocation whose addend is that literal's address plus one (the Feature's
+/// name pointer). A plain `strings | grep -x Name` finds nothing and proves
+/// nothing. On 156 this holds for every name below except SoftNavigationDetection.
 ///
-/// - SoftNavigationDetection: crash workaround proven in items.id=192/195/196/
+/// - SoftNavigationDetection: ABSENT FROM 156 (no occurrence of the name in the
+///   binary, in any form), so listing it does nothing there; ReadAnything's
+///   soft-navigation observer is still compiled in. Kept, not removed, until the
+///   crash is tested on 156 (items.id=872). Original reason (CEF 151): crash
+///   workaround proven in items.id=192/195/196/
 ///   198/199/200/201. ReadAnythingSoftNavigationObserver::OnSoftNavigation()
 ///   calls tabs::TabInterface::GetFromContents(), null in CEF's tabless model,
 ///   SIGSEGV on any SPA soft navigation, and every provider QR intends to
@@ -324,7 +367,8 @@ const MEDIA_CACHE_SIZE_BYTES: u64 = 16 * 1024 * 1024;
 ///   engine's origin, https://www.google.com. Page-driven: it fires on every
 ///   page load, popup open and popup close in a pane, so the background
 ///   switches above do not cover it. Name verified in the strings of the
-///   libcef 151 binary (the feature and the PreconnectDSE symbol).
+///   libcef 151 binary (the feature and the PreconnectDSE symbol), and on 156 as
+///   described above.
 const DISABLED_FEATURES: &[&str] = &[
     "SoftNavigationDetection",
     "AutofillServerCommunication",
@@ -419,6 +463,21 @@ wrap_app! {
             command_line.append_switch_with_value(
                 Some(&cef::CefString::from("gaia-url")),
                 Some(&GAIA_URL_OVERRIDE.into()),
+            );
+
+            // items.id=872: the component updater's server goes nowhere. Merge
+            // into any existing value (a comma-separated list), ours wins.
+            // See COMPONENT_UPDATER_URL_SOURCE.
+            let cu_switch = cef::CefString::from("component-updater");
+            let cu_existing = if command_line.has_switch(Some(&cu_switch)) != 0 {
+                let v: cef::CefString = (&command_line.switch_value(Some(&cu_switch))).into();
+                v.to_string()
+            } else {
+                String::new()
+            };
+            command_line.append_switch_with_value(
+                Some(&cu_switch),
+                Some(&merge_component_updater(&cu_existing).as_str().into()),
             );
 
             // items.id=622: the profile is on a tmpfs, so the caches are
@@ -574,6 +633,29 @@ mod tests {
         // port 1 (tcpmux) is reserved and unused; any real service port would be a risk
         assert_eq!(port, "1");
         assert!(!GAIA_URL_OVERRIDE.contains("google"));
+    }
+
+    #[test]
+    fn component_updater_url_source_is_loopback_and_replaces_any_other() {
+        assert_eq!(merge_component_updater(""), "url-source=http://127.0.0.1:1");
+        assert_eq!(
+            merge_component_updater("fast-update"),
+            "fast-update,url-source=http://127.0.0.1:1"
+        );
+        // a user-passed url-source must not survive: it would point the updater
+        // at a real host
+        assert_eq!(
+            merge_component_updater("url-source=https://example.invalid/x,fast-update,"),
+            "fast-update,url-source=http://127.0.0.1:1"
+        );
+        let rest = COMPONENT_UPDATER_URL_SOURCE
+            .strip_prefix("http://")
+            .expect("plain http, so no TLS handshake or name lookup is attempted");
+        assert_eq!(
+            rest, "127.0.0.1:1",
+            "an IP literal and a port nothing listens on"
+        );
+        assert!(!COMPONENT_UPDATER_URL_SOURCE.contains("google"));
     }
 
     #[test]

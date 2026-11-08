@@ -1,6 +1,7 @@
 //! Where CEF keeps its profile (items.id=622).
 //!
-//! CEF 151's Chrome runtime keeps a full browser profile under
+//! CEF's Chrome runtime (measured on 151; the bump to 156, items.id=872, kept the
+//! same layout in the scratch runs, see that item) keeps a full browser profile under
 //! `root_cache_path` (cookies, localStorage, IndexedDB, cache, service workers)
 //! whatever `cache_path` says, and with a persistent directory that profile
 //! survived sign-out and app restart and handed one user's provider sessions to
