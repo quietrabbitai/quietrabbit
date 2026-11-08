@@ -777,6 +777,45 @@ pub(crate) async fn get_provider_conn(
     }
 }
 
+/// The two declared-host columns of a provider row, as stored (items.id=873,
+/// decisions.id=934). Raw JSON text: the pane's navigation policy
+/// (cloud_chat_gpu_pane/nav_policy.rs) parses it and fails closed on anything
+/// that is not an array of plain host strings. Read apart from `Provider` so
+/// the many `Provider` literals stay untouched and the signed catalog, which
+/// fingerprints every other column, treats both as release-only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredHostsRaw {
+    pub navigate_hosts: String,
+    pub page_traffic_hosts: String,
+}
+
+/// The declared hosts of one provider row, or None when the row does not exist.
+pub async fn get_declared_hosts_conn(
+    conn: &mut sqlx::SqliteConnection,
+    provider_id: &str,
+) -> Result<Option<DeclaredHostsRaw>, ProviderStoreError> {
+    let row = sqlx::query("SELECT navigate_hosts, page_traffic_hosts FROM providers WHERE id = ?")
+        .bind(provider_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+    match row {
+        None => Ok(None),
+        Some(r) => Ok(Some(DeclaredHostsRaw {
+            navigate_hosts: r.try_get("navigate_hosts")?,
+            page_traffic_hosts: r.try_get("page_traffic_hosts")?,
+        })),
+    }
+}
+
+/// `get_declared_hosts_conn` on a pooled connection.
+pub async fn get_declared_hosts(
+    pool: &sqlx::SqlitePool,
+    provider_id: &str,
+) -> Result<Option<DeclaredHostsRaw>, ProviderStoreError> {
+    let mut conn = pool.acquire().await?;
+    get_declared_hosts_conn(&mut conn, provider_id).await
+}
+
 /// The selector screen's primary read path (TIER3_ACCESS_MODEL.md State 3):
 /// all 'active' providers, ordered provider_type then display_name so a
 /// caller can group the result for display without a second query. No
@@ -1733,6 +1772,98 @@ mod tests {
 
         result.expect("migrate_shared_db must succeed");
         outcome.expect("public API assertions must pass");
+    }
+
+    /// items.id=873: shared_035.sql adds the two declared-host columns, seeds
+    /// the four embedded rows, and appends the telemetry placeholder sentence
+    /// to their user_privacy_summary without changing the existing wording.
+    #[tokio::test]
+    async fn declared_hosts_columns_and_seeds() {
+        let mut conn = make_test_conn().await;
+        crate::persistence::migrations::run_migrations(&mut conn, "shared", None)
+            .await
+            .expect("run shared migrations");
+
+        let hosts = |raw: &DeclaredHostsRaw| -> (Vec<String>, Vec<String>) {
+            (
+                serde_json::from_str(&raw.navigate_hosts).unwrap(),
+                serde_json::from_str(&raw.page_traffic_hosts).unwrap(),
+            )
+        };
+        let seeded = [
+            ("duckai", vec!["duck.ai"], vec!["improving.duckduckgo.com"]),
+            (
+                "gemini",
+                vec!["gemini.google.com", "accounts.google.com"],
+                vec![],
+            ),
+            ("claude", vec!["claude.ai"], vec![]),
+            ("chatgpt", vec!["chatgpt.com"], vec![]),
+        ];
+        for (id, navigate, traffic) in seeded {
+            let raw = get_declared_hosts_conn(&mut conn, id)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{id} row must exist"));
+            let (n, t) = hosts(&raw);
+            assert_eq!(n, navigate, "{id} navigate_hosts");
+            assert_eq!(t, traffic, "{id} page_traffic_hosts");
+
+            // Every seeded row's launch host is declared explicitly.
+            let p = get_provider_via_conn(&mut conn, id).await;
+            let launch = reqwest::Url::parse(p.launch_url.as_deref().unwrap()).unwrap();
+            assert!(
+                n.iter().any(|h| Some(h.as_str()) == launch.host_str()),
+                "{id}: the launch host must be in navigate_hosts"
+            );
+        }
+
+        // A row with no declaration reads as an empty array, and a non-JSON
+        // value is refused by the CHECK.
+        assert!(get_declared_hosts_conn(&mut conn, "no-such-row")
+            .await
+            .unwrap()
+            .is_none());
+        let bad =
+            sqlx::query("UPDATE providers SET navigate_hosts = 'not json' WHERE id = 'duckai'")
+                .execute(&mut conn)
+                .await;
+        assert!(bad.is_err(), "navigate_hosts must pass json_valid");
+        let bad =
+            sqlx::query("UPDATE providers SET page_traffic_hosts = '[oops' WHERE id = 'duckai'")
+                .execute(&mut conn)
+                .await;
+        assert!(bad.is_err(), "page_traffic_hosts must pass json_valid");
+
+        // The telemetry sentence is appended to the summary of the four rows,
+        // the JSON stays valid, and the original wording is a prefix.
+        for id in ["duckai", "claude", "chatgpt", "gemini"] {
+            let p = get_provider_via_conn(&mut conn, id).await;
+            let summary = p.user_privacy_summary.expect("summary row").clone();
+            let text = summary["summary"].as_str().expect("summary text");
+            assert!(
+                text.ends_with("The provider page may also send telemetry to its own hosts."),
+                "{id}: telemetry placeholder missing"
+            );
+            assert!(summary["actions"].is_array(), "{id}: other keys kept");
+            let valid: i64 = sqlx::query_scalar(
+                "SELECT json_valid(user_privacy_summary) FROM providers WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+            assert_eq!(valid, 1, "{id}: user_privacy_summary must stay valid JSON");
+        }
+        let claude = get_provider_via_conn(&mut conn, "claude").await;
+        let claude_text = claude.user_privacy_summary.unwrap()["summary"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            claude_text.starts_with("Claude Free, Pro, and Max plans train on your conversations"),
+            "existing wording must be unchanged"
+        );
     }
 
     /// items.id=430/432, items.id=724: the seeded hosted rows (every row with

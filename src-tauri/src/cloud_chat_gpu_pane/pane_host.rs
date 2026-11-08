@@ -84,9 +84,13 @@ use cef::{
     MenuId, MouseButtonType, MouseEvent,
 };
 
+use crate::cloud_chat_gpu_pane::nav_confirm::{
+    self, NavBlockKind, NavBlocked, NavConfirmCancelledPayload, NavConfirmPayload, NavNoticePayload,
+};
+use crate::cloud_chat_gpu_pane::nav_policy::HostSet;
 use crate::cloud_chat_gpu_pane::render::{
-    ClientBuilder, ContextMenuRequested, ContextMenuSurface, LogicalSize, PaneRenderHandler,
-    PopupLifecycleEvent, PopupRequested, RenderState,
+    ClientBuilder, ContextMenuRequested, ContextMenuSurface, LogicalSize, NavGuard,
+    PaneRenderHandler, PopupLifecycleEvent, PopupRequested, RenderState,
 };
 use crate::cloud_chat_gpu_pane::{lock_recover, PaneKey};
 use crate::commands::cloud_chat_pane::{
@@ -254,6 +258,10 @@ pub enum PaneCommand {
     Open {
         key: PaneKey,
         url: String,
+        /// items.id=873: the hosts this pane may load, built from the provider
+        /// row by `commands::cloud_chat_pane::open_cloud_chat_panes` (a
+        /// snapshot: edits take effect the next time the pane is opened).
+        hosts: Arc<HostSet>,
     },
     Close {
         key: PaneKey,
@@ -579,6 +587,11 @@ struct PaneManager {
     /// resolve an on-screen rect and pop a native `gtk::Menu`.
     context_menu_requested_tx: std::sync::mpsc::Sender<ContextMenuRequested>,
     context_menu_requested_rx: std::sync::mpsc::Receiver<ContextMenuRequested>,
+    /// items.id=873: fed by the pane navigation policy (render.rs `NavGuard`,
+    /// CEF's UI thread) when a target is cancelled and the user has to be told
+    /// or asked. Drained once per GTK render tick (`drain_and_emit_nav_events`).
+    nav_tx: std::sync::mpsc::Sender<NavBlocked>,
+    nav_rx: std::sync::mpsc::Receiver<NavBlocked>,
     /// items.id=359 (rail+content-pane redesign): the one pane, if any,
     /// that is actually composited/painted right now -- every other open
     /// pane is "loaded" (browser alive, `was_hidden(true)`, reachable
@@ -607,6 +620,7 @@ impl PaneManager {
         &mut self,
         key: PaneKey,
         url: String,
+        hosts: Arc<HostSet>,
         device_scale_factor: f32,
         initial_logical_size: LogicalSize,
     ) {
@@ -677,11 +691,11 @@ impl PaneManager {
             Some(&mut ClientBuilder::build(
                 render_handler,
                 tx,
-                key.clone(),
                 self.popup_requested_tx.clone(),
                 self.popup_close_tx.clone(),
                 self.context_menu_requested_tx.clone(),
                 self.app_handle.clone(),
+                NavGuard::new(key.clone(), hosts, self.nav_tx.clone()),
             )),
             None,
             Some(&browser_settings),
@@ -732,6 +746,24 @@ impl PaneManager {
         // since force_close_popup's own defensive parent-grab-release
         // still needs to find this pane in self.panes.
         self.force_close_popup(key);
+
+        // items.id=873: a pending "open in your browser?" request dies with its
+        // pane, and the frontend is told so its modal dismisses.
+        if nav_confirm::store().purge_pane(key) {
+            use tauri::Emitter;
+            let payload = NavConfirmCancelledPayload {
+                provider_id: key.clone(),
+            };
+            if let Err(e) = self
+                .app_handle
+                .emit("cloud-chat-nav-confirm-cancelled", &payload)
+            {
+                log::warn!(
+                    "cloud_chat_gpu_pane::pane_host: failed to emit \
+                     cloud-chat-nav-confirm-cancelled: {e}"
+                );
+            }
+        }
 
         let Some(pane) = self.panes.shift_remove(key) else {
             return;
@@ -2334,6 +2366,7 @@ fn build_pane_manager(app_handle: tauri::AppHandle) -> Rc<RefCell<PaneManager>> 
     let (popup_requested_tx, popup_requested_rx) = std::sync::mpsc::channel();
     let (popup_close_tx, popup_close_rx) = std::sync::mpsc::channel();
     let (context_menu_requested_tx, context_menu_requested_rx) = std::sync::mpsc::channel();
+    let (nav_tx, nav_rx) = std::sync::mpsc::channel();
     Rc::new(RefCell::new(PaneManager {
         panes: IndexMap::new(),
         open_pane_count: Arc::new(AtomicUsize::new(0)),
@@ -2345,6 +2378,8 @@ fn build_pane_manager(app_handle: tauri::AppHandle) -> Rc<RefCell<PaneManager>> 
         popup_close_rx,
         context_menu_requested_tx,
         context_menu_requested_rx,
+        nav_tx,
+        nav_rx,
         active_pane: None,
         app_handle,
     }))
@@ -2609,6 +2644,69 @@ fn sync_frame_sizes(
     let mut mgr = manager.borrow_mut();
     mgr.sync_pane_sizes(glarea_size_physical, layout);
     mgr.sync_popup_sizes(glarea_size_physical);
+}
+
+/// items.id=873: turns what the pane navigation policy queued this tick into
+/// events for the frontend: a confirm naming the host (the URL stays in
+/// `nav_confirm::store()`), or a notice for a blocked scheme. Events for a
+/// pane that is no longer open are dropped.
+fn drain_and_emit_nav_events(manager: &Rc<RefCell<PaneManager>>, app_handle: &tauri::AppHandle) {
+    use tauri::Emitter;
+
+    let events: Vec<NavBlocked> = {
+        let mgr = manager.borrow();
+        let mut v = Vec::new();
+        while let Ok(ev) = mgr.nav_rx.try_recv() {
+            if mgr.panes.contains_key(&ev.pane_key) {
+                v.push(ev);
+            }
+        }
+        v
+    };
+    let store = nav_confirm::store();
+    for ev in events {
+        match ev.kind {
+            NavBlockKind::Confirm { host, url } => {
+                let registered = store.register_confirm(&ev.pane_key, host.clone(), url);
+                for pane in registered.cancelled_panes {
+                    let payload = NavConfirmCancelledPayload { provider_id: pane };
+                    if let Err(e) = app_handle.emit("cloud-chat-nav-confirm-cancelled", &payload) {
+                        log::warn!(
+                            "cloud_chat_gpu_pane::pane_host: failed to emit \
+                             cloud-chat-nav-confirm-cancelled: {e}"
+                        );
+                    }
+                }
+                if let Some(request_id) = registered.request_id {
+                    let payload = NavConfirmPayload {
+                        request_id,
+                        provider_id: ev.pane_key,
+                        host,
+                    };
+                    if let Err(e) = app_handle.emit("cloud-chat-nav-confirm", &payload) {
+                        log::warn!(
+                            "cloud_chat_gpu_pane::pane_host: failed to emit \
+                             cloud-chat-nav-confirm: {e}"
+                        );
+                    }
+                }
+            }
+            NavBlockKind::Notice { scheme } => {
+                if store.allow_notice(&ev.pane_key, scheme.as_deref(), std::time::Instant::now()) {
+                    let payload = NavNoticePayload {
+                        provider_id: ev.pane_key,
+                        scheme,
+                    };
+                    if let Err(e) = app_handle.emit("cloud-chat-nav-notice", &payload) {
+                        log::warn!(
+                            "cloud_chat_gpu_pane::pane_host: failed to emit \
+                             cloud-chat-nav-notice: {e}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// items.id=234: resolves any new popup requests, reacts to popup
@@ -2897,6 +2995,7 @@ impl PaneHost {
 
                 sync_frame_sizes(&manager, glarea_size_physical, &layout);
                 drain_and_emit_popup_notifications(&manager, &app_handle, glarea_size, &layout);
+                drain_and_emit_nav_events(&manager, &app_handle);
                 drain_and_show_context_menus(
                     &manager,
                     &app_handle,
@@ -2967,7 +3066,7 @@ impl PaneHost {
     /// analogous wake-timing gap here.
     pub fn dispatch(&self, command: PaneCommand) {
         match command {
-            PaneCommand::Open { key, url } => {
+            PaneCommand::Open { key, url, hosts } => {
                 let render_state = match self.render_state_for_open() {
                     Some(rs) => rs,
                     None => {
@@ -2986,7 +3085,9 @@ impl PaneHost {
                 // anymore: unlike the superseded sibling-widget design,
                 // nothing is built or added to any widget tree before
                 // `open_pane` runs, so there's nothing left to orphan.
-                self.manager.borrow_mut().open_pane(key, url, scale, size);
+                self.manager
+                    .borrow_mut()
+                    .open_pane(key, url, hosts, scale, size);
                 self.queue_draw();
             }
             PaneCommand::Close { key } => {

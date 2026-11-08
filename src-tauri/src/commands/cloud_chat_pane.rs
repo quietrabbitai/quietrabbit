@@ -74,12 +74,15 @@ use tokio::sync::oneshot;
 use crate::auth::registry::{key_hex, KeyRegistry};
 use crate::cloud_chat_gpu_pane::bootstrap::{cef_available, ensure_cef_available};
 use crate::cloud_chat_gpu_pane::lock_recover;
+use crate::cloud_chat_gpu_pane::nav_confirm::{self, NavConfirmStore};
+use crate::cloud_chat_gpu_pane::nav_policy::HostSet;
 use crate::cloud_chat_gpu_pane::pane_host::{self, PaneCommand};
 use crate::cloud_chat_gpu_pane::session_hygiene::{self, JarGuard};
 use crate::cloud_chat_gpu_pane::site_data;
 use crate::cloud_chat_gpu_pane::PaneKey;
 use crate::persistence::cloud_chat_cookie_store::{self, StoredCookie};
 use crate::persistence::provider_store;
+use crate::provider_credentials::opener::{SystemOpener, UrlOpener};
 
 /// How long to wait for a single CEF cookie-jar round trip
 /// (set_cookie's completion callback, or visit_url_cookies' last-cookie
@@ -773,6 +776,26 @@ pub async fn open_cloud_chat_panes(
             ));
         };
 
+        // items.id=873 (decisions.id=934): the pane's navigation policy, built
+        // from the row BEFORE any side effect below (cookie restore, jar state).
+        // Fails closed: a launch address that is not an https host name, or a
+        // declared-host column that cannot be read, opens no pane. A malformed
+        // navigate_hosts value is not an error here, it declares nothing
+        // (HostSet::from_row logs it) and the launch host alone is allowed.
+        let declared = provider_store::get_declared_hosts(&pool, &provider_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let hosts = HostSet::from_row(
+            &provider_id,
+            &launch_url,
+            declared
+                .as_ref()
+                .map(|d| d.navigate_hosts.as_str())
+                .unwrap_or("[]"),
+        )
+        .map_err(|e| format!("provider '{display_name}': {e}"))?;
+        let hosts = Arc::new(hosts);
+
         if let Some((user_id, key_hex_str)) = session.as_ref() {
             restore_cookies_into_jar(user_id, key_hex_str, &provider_id, &launch_url).await;
         } else {
@@ -791,6 +814,7 @@ pub async fn open_cloud_chat_panes(
                 pane_host::dispatch(PaneCommand::Open {
                     key: provider_id,
                     url: launch_url,
+                    hosts,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -1300,6 +1324,161 @@ pub async fn close_cloud_chat_popup(
             pane_host::dispatch(PaneCommand::ClosePopup { key: provider_id })
         })
         .map_err(|e| e.to_string())
+}
+
+/// items.id=873 (decisions.id=934): the user's answer to a pane's "open this link
+/// in your browser?" request. The command carries ONLY the request id and the
+/// decision: the URL was kept in Rust when the load was cancelled, so the
+/// frontend never supplies what gets opened (a test pins the signature). Only an
+/// http(s) URL without userinfo ever reaches the system browser, and only on
+/// Open. An unknown, already-answered or purged id does nothing and is logged.
+#[tauri::command]
+#[specta::specta]
+pub async fn answer_cloud_chat_nav_confirm(
+    request_id: String,
+    open_in_browser: bool,
+) -> Result<(), String> {
+    answer_nav_confirm(
+        nav_confirm::store(),
+        &SystemOpener,
+        &request_id,
+        open_in_browser,
+    )
+}
+
+fn answer_nav_confirm(
+    store: &NavConfirmStore,
+    opener: &dyn UrlOpener,
+    request_id: &str,
+    open_in_browser: bool,
+) -> Result<(), String> {
+    let Some(pending) = store.take(request_id) else {
+        log::warn!("cloud_chat_pane: nav confirm answer for an unknown or used request id");
+        return Ok(());
+    };
+    if !open_in_browser {
+        return Ok(());
+    }
+    let Some(url) = nav_confirm::openable_url(&pending.url) else {
+        log::warn!(
+            "cloud_chat_pane: nav confirm for pane={} held a URL that is not openable, dropped",
+            pending.pane_key
+        );
+        return Ok(());
+    };
+    opener.open(&url)
+}
+
+#[cfg(test)]
+mod nav_confirm_answer_tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Default)]
+    struct Recorder(StdMutex<Vec<String>>);
+    impl UrlOpener for Recorder {
+        fn open(&self, url: &str) -> Result<(), String> {
+            self.0.lock().unwrap().push(url.to_owned());
+            Ok(())
+        }
+    }
+    impl Recorder {
+        fn opened(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    fn pending(store: &NavConfirmStore, pane: &str, url: &str) -> String {
+        store
+            .register_confirm(pane, "a.example.test".to_owned(), url.to_owned())
+            .request_id
+            .expect("registered")
+    }
+
+    #[test]
+    fn open_hands_the_stored_url_to_the_opener_once() {
+        let store = NavConfirmStore::new();
+        let rec = Recorder::default();
+        let id = pending(&store, "p1", "https://a.example.test/x?y=1");
+        answer_nav_confirm(&store, &rec, &id, true).unwrap();
+        assert_eq!(
+            rec.opened(),
+            vec!["https://a.example.test/x?y=1".to_owned()]
+        );
+        // The id is used: a second answer does nothing.
+        answer_nav_confirm(&store, &rec, &id, true).unwrap();
+        assert_eq!(rec.opened().len(), 1);
+    }
+
+    #[test]
+    fn cancel_opens_nothing_and_drops_the_request() {
+        let store = NavConfirmStore::new();
+        let rec = Recorder::default();
+        let id = pending(&store, "p1", "https://a.example.test/");
+        answer_nav_confirm(&store, &rec, &id, false).unwrap();
+        assert!(rec.opened().is_empty());
+        answer_nav_confirm(&store, &rec, &id, true).unwrap();
+        assert!(rec.opened().is_empty(), "a cancelled id cannot be reopened");
+    }
+
+    #[test]
+    fn an_unknown_id_does_nothing() {
+        let store = NavConfirmStore::new();
+        let rec = Recorder::default();
+        answer_nav_confirm(&store, &rec, "nav-424242", true).unwrap();
+        answer_nav_confirm(&store, &rec, "", true).unwrap();
+        assert!(rec.opened().is_empty());
+    }
+
+    #[test]
+    fn a_request_purged_with_its_pane_cannot_be_answered() {
+        let store = NavConfirmStore::new();
+        let rec = Recorder::default();
+        let id = pending(&store, "p1", "https://a.example.test/");
+        assert!(store.purge_pane("p1"));
+        answer_nav_confirm(&store, &rec, &id, true).unwrap();
+        assert!(rec.opened().is_empty());
+    }
+
+    #[test]
+    fn only_http_and_https_ever_reach_the_opener() {
+        // Nothing but a classified http(s) target is ever registered, but the
+        // answer re-checks anyway.
+        let store = NavConfirmStore::new();
+        let rec = Recorder::default();
+        for url in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "data:text/html,x",
+            "blob:https://a.example.test/x",
+            "mailto:a@example.test",
+            "https://user:pw@a.example.test/",
+        ] {
+            let id = pending(&store, "p1", url);
+            answer_nav_confirm(&store, &rec, &id, true).unwrap();
+        }
+        assert!(rec.opened().is_empty());
+        let id = pending(&store, "p1", "http://a.example.test/");
+        answer_nav_confirm(&store, &rec, &id, true).unwrap();
+        assert_eq!(rec.opened(), vec!["http://a.example.test/".to_owned()]);
+    }
+
+    /// The command takes the request id and the decision, never a URL.
+    #[test]
+    fn the_answer_command_takes_no_url_parameter() {
+        let src = include_str!("cloud_chat_pane.rs");
+        let start = src
+            .find("pub async fn answer_cloud_chat_nav_confirm(")
+            .expect("command present");
+        let params = &src[start..];
+        let params = &params[..params.find(") -> Result").expect("signature end")];
+        assert!(
+            !params.to_ascii_lowercase().contains("url"),
+            "answer_cloud_chat_nav_confirm must not take a URL: {params}"
+        );
+        assert!(params.contains("request_id: String"));
+        assert!(params.contains("open_in_browser: bool"));
+    }
 }
 
 #[cfg(test)]

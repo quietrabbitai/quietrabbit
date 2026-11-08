@@ -396,6 +396,13 @@
       "contentEmptyPrompt": "Select a provider to start a Cloud Chat.",
       "contentCloseButton": "Close this session",
       "popupCloseButton": "Close popup",
+      "navConfirmTitle": "[PLACEHOLDER - Chat-BRAND] Open this link in your browser?",
+      "navConfirmBody": "[PLACEHOLDER - Chat-BRAND] A page in this session tried to open a link to:",
+      "navConfirmOpen": "Open in your browser",
+      "navConfirmCancel": "Cancel",
+      "navNoticeScheme": "[PLACEHOLDER - Chat-BRAND] A {{scheme}} link was blocked.",
+      "navNoticeMalformed": "[PLACEHOLDER - Chat-BRAND] A link was blocked.",
+      "navNoticeDismiss": "Dismiss",
       "contentHeadReclaimTitle": "Click to collapse Cloud Chat and bring QR chat forward"
     }
   },

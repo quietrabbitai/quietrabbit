@@ -144,6 +144,8 @@ pub mod bootstrap;
 #[cfg(debug_assertions)]
 mod diag;
 pub mod gl_loader;
+pub mod nav_confirm;
+pub mod nav_policy;
 pub mod pane_host;
 pub mod profile_dir;
 pub mod render;
