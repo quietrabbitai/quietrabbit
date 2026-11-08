@@ -49,7 +49,10 @@ pub struct TaskProgressPayload {
 
 /// Emit a `task-progress` event. Errors are logged and swallowed -- same
 /// idiom as every other `.emit()` call site in this codebase.
-pub fn emit_progress(handle: &tauri::AppHandle, payload: &TaskProgressPayload) {
+pub fn emit_progress<R: tauri::Runtime>(
+    handle: &tauri::AppHandle<R>,
+    payload: &TaskProgressPayload,
+) {
     if let Err(e) = handle.emit(TASK_PROGRESS_EVENT, payload) {
         log::warn!(
             "task_progress: emit failed for task '{}': {e}",
