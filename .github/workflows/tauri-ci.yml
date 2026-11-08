@@ -13,7 +13,8 @@
 # Actions cannot share steps between jobs, and a composite action cannot carry
 # the per-step timeout-minutes, so the block is duplicated -- EDIT BOTH COPIES
 # TOGETHER. Values that must not drift between jobs live once in the
-# workflow-level `env` below.
+# workflow-level `env` below. CARGO_PROFILE_DEV_DEBUG (items.id=865) is set in
+# `check` only, on purpose, so it is not part of the duplicated setup block.
 #
 # Before activating build-tauri for release:
 #   1. Add TAURI_SIGNING_PRIVATE_KEY + TAURI_SIGNING_PRIVATE_KEY_PASSWORD to GitHub secrets
@@ -233,6 +234,17 @@ jobs:
     # read-only; this makes it explicit. The rest of items.id=645 is separate.
     permissions:
       contents: read
+    # items.id=865: build the test binaries with line tables only (file and line
+    # per frame, no variable or type info) to shrink the rust-cache and the build.
+    # The dev and test profiles both read this, so every dependency and the test
+    # binaries are covered. The core-dump backtrace keeps function names and
+    # file:line, but some frames lose their module path and every frame loses its
+    # argument list (measured locally, items.id=865). rust-cache hashes CARGO_*
+    # variables into its key, so the first run after this change is a cold build.
+    # Set in `check` ONLY: `cargo clippy` emits no debuginfo, so the same value in
+    # `clippy` would only invalidate its cache for no gain.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
 
