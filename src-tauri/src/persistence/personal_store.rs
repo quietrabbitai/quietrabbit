@@ -1412,7 +1412,7 @@ pub async fn get_disclosure_log_for_run(
     let mut conn = open_personal_db(user_id, persona_id, key_hex).await?;
 
     let rows = sqlx::query(
-        "SELECT id, user_id, persona_id, focus_run_id, step_id,
+        "SELECT id, user_id, persona_id, focus_run_id, action_id,
          routing_tier, provider, fields_shared, fields_abstracted,
          fields_withheld, override_declined, declined_at, created_at,
          extra_metadata, execution_tier, abstraction_tier
@@ -1445,7 +1445,7 @@ pub async fn get_disclosure_log_for_run(
             "user_id": r.try_get::<String, _>("user_id")?,
             "persona_id": r.try_get::<String, _>("persona_id")?,
             "focus_run_id": r.try_get::<String, _>("focus_run_id")?,
-            "step_id": r.try_get::<String, _>("step_id")?,
+            "action_id": r.try_get::<String, _>("action_id")?,
             "routing_tier": r.try_get::<i64, _>("routing_tier")? as i32,
             "provider": r.try_get::<Option<String>, _>("provider")?,
             "fields_shared": fields_shared,

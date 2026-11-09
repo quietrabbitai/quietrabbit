@@ -13,8 +13,8 @@ FocusDefinition {
     high_priority_trigger: None,
 }
 --- step
-StepDefinition {
-    step_id: "jd_intake",
+ActionDefinition {
+    action_id: "jd_intake",
     display_name: "Reading the job description",
     guide_id: "role-assessment-analyst",
     task_type: "general",
@@ -38,8 +38,8 @@ StepDefinition {
 field_requirements: {"employer": Recommended, "industry": Recommended, "job_title": Recommended}
 options_override: {"num_predict":512,"temperature":0.2}
 --- step
-StepDefinition {
-    step_id: "fit_analysis",
+ActionDefinition {
+    action_id: "fit_analysis",
     display_name: "Analysing fit",
     guide_id: "role-assessment-analyst",
     task_type: "research",
@@ -63,8 +63,8 @@ StepDefinition {
 field_requirements: {}
 options_override: {"num_predict":768,"temperature":0.4}
 --- step
-StepDefinition {
-    step_id: "salary_research",
+ActionDefinition {
+    action_id: "salary_research",
     display_name: "Researching salary",
     guide_id: "role-assessment-analyst",
     task_type: "research",
@@ -88,8 +88,8 @@ StepDefinition {
 field_requirements: {}
 options_override: {"num_predict":512,"temperature":0.3}
 --- step
-StepDefinition {
-    step_id: "disposition",
+ActionDefinition {
+    action_id: "disposition",
     display_name: "Your next step",
     guide_id: "role-assessment-analyst",
     task_type: "general",

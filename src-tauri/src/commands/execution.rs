@@ -99,7 +99,7 @@ pub struct ResumeRunRequest {
 #[derive(Debug, Deserialize, Type)]
 pub struct ReenterStepRequest {
     pub run_id: String,
-    pub target_step_id: String,
+    pub target_action_id: String,
     pub user_id: String,
     pub persona_id: String,
 }
@@ -111,7 +111,7 @@ pub struct ReenterStepResponse {
     // types (usize/isize/i64/u64/i128/u128) across the IPC boundary to
     // avoid TS precision loss. A step index safely fits u32.
     pub resume_from_index: u32,
-    pub discarded_step_ids: Vec<String>,
+    pub discarded_action_ids: Vec<String>,
     pub stale_output_vars: Vec<String>,
 }
 
@@ -721,7 +721,7 @@ pub async fn reenter_step(
     let focus_step_order: Vec<String> = run
         .focus_def
         .as_ref()
-        .map(|fd| fd.steps.iter().map(|s| s.step_id.clone()).collect())
+        .map(|fd| fd.steps.iter().map(|s| s.action_id.clone()).collect())
         .unwrap_or_default();
 
     let target_step = run
@@ -730,16 +730,16 @@ pub async fn reenter_step(
         .and_then(|fd| {
             fd.steps
                 .iter()
-                .find(|s| s.step_id == request.target_step_id)
+                .find(|s| s.action_id == request.target_action_id)
         })
-        .ok_or_else(|| format!("step_not_found:{}", request.target_step_id))?;
+        .ok_or_else(|| format!("step_not_found:{}", request.target_action_id))?;
 
     if !target_step.revisitable {
-        return Err(format!("step_not_revisitable:{}", request.target_step_id));
+        return Err(format!("step_not_revisitable:{}", request.target_action_id));
     }
 
     let plan = run
-        .reenter_step(&focus_step_order, &request.target_step_id)
+        .reenter_step(&focus_step_order, &request.target_action_id)
         .await
         .map_err(|e| match e {
             LifecycleError::Reentry(ReentryError::StepNotFound(id)) => {
@@ -754,7 +754,7 @@ pub async fn reenter_step(
     Ok(ReenterStepResponse {
         run_id: request.run_id,
         resume_from_index: plan.resume_from_index as u32,
-        discarded_step_ids: plan.discarded_step_ids,
+        discarded_action_ids: plan.discarded_action_ids,
         stale_output_vars: plan.stale_output_vars,
     })
 }
@@ -832,7 +832,7 @@ mod tests {
         for i in 0..snapshots {
             sqlx::query(
                 "INSERT INTO focus_run_snapshots
-                 (id, focus_run_id, step_id, phase, checkpoint_hash, created_at)
+                 (id, focus_run_id, action_id, phase, checkpoint_hash, created_at)
                  VALUES (?, ?, 's1', 4, 'h', '2026-10-26T00:00:00Z')",
             )
             .bind(format!("{run_id}-snap-{i}"))

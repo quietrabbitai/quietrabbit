@@ -268,7 +268,7 @@ pub struct FailureResult {
     pub plain_language: String,
     pub is_recoverable: bool,
     pub severity: FailureSeverity,
-    pub step_id: Option<String>,
+    pub action_id: Option<String>,
     pub focus_id: Option<String>,
     pub metadata: Option<HashMap<String, serde_json::Value>>,
 }
@@ -321,12 +321,12 @@ impl FailureHandler {
     pub fn handle(
         &self,
         error: &ConductorError,
-        step_id: Option<&str>,
+        action_id: Option<&str>,
         focus_id: Option<&str>,
         retry_count: u32,
     ) -> FailureResult {
         let msg = error.plain_language().to_owned();
-        let sid = step_id.map(|s| s.to_owned());
+        let sid = action_id.map(|s| s.to_owned());
         let fid = focus_id.map(|s| s.to_owned());
 
         match error {
@@ -340,7 +340,7 @@ impl FailureHandler {
                 plain_language: msg,
                 is_recoverable: false,
                 severity: FailureSeverity::Stop,
-                step_id: sid,
+                action_id: sid,
                 focus_id: fid,
                 metadata: None,
             },
@@ -359,7 +359,7 @@ impl FailureHandler {
                     plain_language: msg,
                     is_recoverable: true,
                     severity: FailureSeverity::Require,
-                    step_id: sid,
+                    action_id: sid,
                     focus_id: fid,
                     metadata: None,
                 }
@@ -376,7 +376,7 @@ impl FailureHandler {
                 plain_language: msg,
                 is_recoverable: false,
                 severity: FailureSeverity::Stop,
-                step_id: sid,
+                action_id: sid,
                 focus_id: fid,
                 metadata: None,
             },
@@ -391,7 +391,7 @@ impl FailureHandler {
                 plain_language: msg,
                 is_recoverable: true,
                 severity: FailureSeverity::Require,
-                step_id: sid,
+                action_id: sid,
                 focus_id: fid,
                 metadata: None,
             },
@@ -404,7 +404,7 @@ impl FailureHandler {
                 plain_language: msg,
                 is_recoverable: true,
                 severity: FailureSeverity::Stop,
-                step_id: sid,
+                action_id: sid,
                 focus_id: fid,
                 metadata: None,
             },
@@ -417,7 +417,7 @@ impl FailureHandler {
                 plain_language: msg,
                 is_recoverable: false,
                 severity: FailureSeverity::Stop,
-                step_id: sid,
+                action_id: sid,
                 focus_id: fid,
                 metadata: None,
             },
@@ -430,7 +430,7 @@ impl FailureHandler {
                 plain_language: msg,
                 is_recoverable: false,
                 severity: FailureSeverity::Stop,
-                step_id: sid,
+                action_id: sid,
                 focus_id: fid,
                 metadata: None,
             },
@@ -448,7 +448,7 @@ impl FailureHandler {
                 .to_owned(),
                 is_recoverable: true,
                 severity: FailureSeverity::Suggest,
-                step_id: sid,
+                action_id: sid,
                 focus_id: fid,
                 metadata: None,
             },
@@ -465,7 +465,7 @@ impl FailureHandler {
                 .to_owned(),
                 is_recoverable: false,
                 severity: FailureSeverity::Stop,
-                step_id: sid,
+                action_id: sid,
                 focus_id: fid,
                 metadata: None,
             },
@@ -478,7 +478,7 @@ impl FailureHandler {
                     plain_language: msg,
                     is_recoverable: true,
                     severity: FailureSeverity::Require,
-                    step_id: sid,
+                    action_id: sid,
                     focus_id: fid,
                     metadata: None,
                 }
@@ -499,7 +499,7 @@ impl FailureHandler {
                     plain_language: msg,
                     is_recoverable: true,
                     severity: FailureSeverity::Suggest,
-                    step_id: sid,
+                    action_id: sid,
                     focus_id: fid,
                     metadata: retry_after_secs.map(|secs| {
                         let mut m = HashMap::new();
@@ -519,7 +519,7 @@ impl FailureHandler {
                 plain_language: msg,
                 is_recoverable: true,
                 severity: FailureSeverity::Require,
-                step_id: sid,
+                action_id: sid,
                 focus_id: fid,
                 metadata: params
                     .as_object()
@@ -537,7 +537,7 @@ impl FailureHandler {
                     plain_language: msg,
                     is_recoverable: true,
                     severity: FailureSeverity::Require,
-                    step_id: sid,
+                    action_id: sid,
                     focus_id: fid,
                     metadata: None,
                 }
@@ -550,7 +550,7 @@ impl FailureHandler {
                 plain_language: msg,
                 is_recoverable: true,
                 severity: FailureSeverity::Require,
-                step_id: sid,
+                action_id: sid,
                 focus_id: fid,
                 metadata: None,
             },
@@ -562,7 +562,7 @@ impl FailureHandler {
                 plain_language: msg,
                 is_recoverable: false,
                 severity: FailureSeverity::Stop,
-                step_id: sid,
+                action_id: sid,
                 focus_id: fid,
                 metadata: None,
             },
@@ -574,7 +574,7 @@ impl FailureHandler {
                 plain_language: msg,
                 is_recoverable: true,
                 severity: FailureSeverity::Require,
-                step_id: sid,
+                action_id: sid,
                 focus_id: fid,
                 metadata: None,
             },
@@ -588,7 +588,7 @@ impl FailureHandler {
                 plain_language: msg,
                 is_recoverable: true,
                 severity: FailureSeverity::Require,
-                step_id: sid,
+                action_id: sid,
                 focus_id: fid,
                 metadata: None,
             },
@@ -600,7 +600,7 @@ impl FailureHandler {
                 plain_language: msg,
                 is_recoverable: false,
                 severity: FailureSeverity::Stop,
-                step_id: sid,
+                action_id: sid,
                 focus_id: fid,
                 metadata: None,
             },
@@ -612,7 +612,7 @@ impl FailureHandler {
                 plain_language: msg,
                 is_recoverable: false,
                 severity: FailureSeverity::Stop,
-                step_id: sid,
+                action_id: sid,
                 focus_id: fid,
                 metadata: None,
             },
@@ -624,7 +624,7 @@ impl FailureHandler {
                 plain_language: msg,
                 is_recoverable: false,
                 severity: FailureSeverity::Stop,
-                step_id: sid,
+                action_id: sid,
                 focus_id: fid,
                 metadata: None,
             },
@@ -639,7 +639,7 @@ impl FailureHandler {
     /// Python oracle: the final fallthrough in FailureHandler.handle()
     pub fn handle_unexpected(
         &self,
-        step_id: Option<&str>,
+        action_id: Option<&str>,
         focus_id: Option<&str>,
     ) -> FailureResult {
         FailureResult {
@@ -652,7 +652,7 @@ impl FailureHandler {
             .to_owned(),
             is_recoverable: false,
             severity: FailureSeverity::Stop,
-            step_id: step_id.map(|s| s.to_owned()),
+            action_id: action_id.map(|s| s.to_owned()),
             focus_id: focus_id.map(|s| s.to_owned()),
             metadata: None,
         }
@@ -663,7 +663,7 @@ impl FailureHandler {
     fn handle_f1_unavailable(
         &self,
         msg: String,
-        step_id: Option<String>,
+        action_id: Option<String>,
         focus_id: Option<String>,
     ) -> FailureResult {
         if self.offers_escalation() {
@@ -673,7 +673,7 @@ impl FailureHandler {
                 plain_language: msg,
                 is_recoverable: true,
                 severity: FailureSeverity::Require,
-                step_id,
+                action_id,
                 focus_id,
                 metadata: None,
             };
@@ -699,7 +699,7 @@ impl FailureHandler {
             plain_language: plain_language.to_owned(),
             is_recoverable: false,
             severity: FailureSeverity::Stop,
-            step_id,
+            action_id,
             focus_id,
             metadata: None,
         }
@@ -708,7 +708,7 @@ impl FailureHandler {
     fn handle_f2(
         &self,
         _msg: String,
-        step_id: Option<String>,
+        action_id: Option<String>,
         focus_id: Option<String>,
         retry_count: u32,
     ) -> FailureResult {
@@ -738,7 +738,7 @@ impl FailureHandler {
                 } else {
                     FailureSeverity::Suggest
                 },
-                step_id,
+                action_id,
                 focus_id,
                 metadata: None,
             };
@@ -765,7 +765,7 @@ impl FailureHandler {
             } else {
                 FailureSeverity::Suggest
             },
-            step_id,
+            action_id,
             focus_id,
             metadata: None,
         }
@@ -781,7 +781,7 @@ impl FailureHandler {
     fn escalate_failed_retry(
         &self,
         mode: &str,
-        step_id: Option<String>,
+        action_id: Option<String>,
         focus_id: Option<String>,
         hosted: bool,
     ) -> FailureResult {
@@ -792,7 +792,7 @@ impl FailureHandler {
                 plain_language: "This step failed repeatedly and has been paused.".to_owned(),
                 is_recoverable: true,
                 severity: FailureSeverity::Stop,
-                step_id,
+                action_id,
                 focus_id,
                 metadata: None,
             };
@@ -808,7 +808,7 @@ impl FailureHandler {
                 .to_owned(),
                 is_recoverable: true,
                 severity: FailureSeverity::Require,
-                step_id,
+                action_id,
                 focus_id,
                 metadata: None,
             };
@@ -823,7 +823,7 @@ impl FailureHandler {
             .to_owned(),
             is_recoverable: true,
             severity: FailureSeverity::Stop,
-            step_id,
+            action_id,
             focus_id,
             metadata: None,
         }
@@ -888,7 +888,7 @@ mod tests {
         );
         assert_eq!(r.failure_mode.as_deref(), Some("F_SYSTEM"));
         assert!(!r.is_recoverable);
-        assert_eq!(r.step_id.as_deref(), Some("s1"));
+        assert_eq!(r.action_id.as_deref(), Some("s1"));
         assert_eq!(r.focus_id.as_deref(), Some("f1"));
     }
 
@@ -1288,7 +1288,7 @@ mod tests {
             ] {
                 let r = h.handle(&e, Some("s"), Some("f"), MAX_RETRIES);
                 assert_eq!(r.action, FailureAction::AwaitUser, "tier {tier}");
-                assert_eq!(r.step_id.as_deref(), Some("s"));
+                assert_eq!(r.action_id.as_deref(), Some("s"));
                 assert_eq!(r.focus_id.as_deref(), Some("f"));
             }
         }
@@ -1334,11 +1334,11 @@ mod tests {
         assert_eq!(r.failure_mode.as_deref(), Some("F_UNEXPECTED"));
         assert!(!r.is_recoverable);
         assert!(r.plain_language.contains("unexpected happened"));
-        assert_eq!(r.step_id.as_deref(), Some("s1"));
+        assert_eq!(r.action_id.as_deref(), Some("s1"));
         assert_eq!(r.focus_id.as_deref(), Some("f1"));
     }
 
-    // -- step_id / focus_id threading ----------------------------------------
+    // -- action_id / focus_id threading ----------------------------------------
 
     #[test]
     fn step_and_focus_id_threaded_through() {
@@ -1351,7 +1351,7 @@ mod tests {
             Some("focus-7"),
             0,
         );
-        assert_eq!(r.step_id.as_deref(), Some("step-42"));
+        assert_eq!(r.action_id.as_deref(), Some("step-42"));
         assert_eq!(r.focus_id.as_deref(), Some("focus-7"));
     }
 

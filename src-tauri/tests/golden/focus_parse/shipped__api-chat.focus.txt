@@ -13,8 +13,8 @@ FocusDefinition {
     high_priority_trigger: None,
 }
 --- step
-StepDefinition {
-    step_id: "reply",
+ActionDefinition {
+    action_id: "reply",
     display_name: "Replying...",
     guide_id: "api-chat-guide",
     task_type: "general",

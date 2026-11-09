@@ -159,7 +159,7 @@ pub(crate) async fn write_conn(
 
     sqlx::query(
         "INSERT INTO disclosure_log
-         (id, user_id, persona_id, focus_run_id, step_id, routing_tier,
+         (id, user_id, persona_id, focus_run_id, action_id, routing_tier,
           provider, fields_shared, fields_abstracted, fields_withheld,
           override_declined, declined_at, created_at, extra_metadata,
           execution_tier, abstraction_tier, category, fact_key)
@@ -169,7 +169,7 @@ pub(crate) async fn write_conn(
     .bind(user_id)
     .bind(persona_id)
     .bind(&entry.focus_run_id)
-    .bind(&entry.step_id)
+    .bind(&entry.action_id)
     .bind(entry.execution_tier as i64)
     .bind(&entry.provider)
     .bind(&fields_shared_json)
@@ -235,7 +235,7 @@ mod tests {
 
     fn sample_entry(event_type: &str) -> DisclosureLogEntry {
         DisclosureLogEntry {
-            step_id: "step-1".to_owned(),
+            action_id: "step-1".to_owned(),
             focus_run_id: "run-1".to_owned(),
             execution_tier: 2,
             abstraction_tier: Some(1),
@@ -267,7 +267,7 @@ mod tests {
         let user_id: String = row.try_get("user_id").unwrap();
         let persona_id: String = row.try_get("persona_id").unwrap();
         let focus_run_id: String = row.try_get("focus_run_id").unwrap();
-        let step_id: String = row.try_get("step_id").unwrap();
+        let action_id: String = row.try_get("action_id").unwrap();
         let routing_tier: i64 = row.try_get("routing_tier").unwrap();
         let provider: Option<String> = row.try_get("provider").unwrap();
         let execution_tier: Option<i64> = row.try_get("execution_tier").unwrap();
@@ -276,7 +276,7 @@ mod tests {
         assert_eq!(user_id, "user-1");
         assert_eq!(persona_id, "persona-1");
         assert_eq!(focus_run_id, "run-1");
-        assert_eq!(step_id, "step-1");
+        assert_eq!(action_id, "step-1");
         assert_eq!(
             routing_tier, 2,
             "routing_tier must be sourced from execution_tier"

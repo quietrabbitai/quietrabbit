@@ -511,7 +511,7 @@ impl PersonalContextManifest {
 /// produce no named output variable). DEC-001 incorrectly used bare String.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskStep {
-    pub step_id: String,
+    pub action_id: String,
     pub output_var: Option<String>,
     pub content: String,
     pub sensitivity_severity: i32,
@@ -606,7 +606,7 @@ impl Default for TaskTrack {
 /// Python oracle: frozen=True dataclass.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromotedContentEntry {
-    pub step_id: String,
+    pub action_id: String,
     pub content_key: String,
     pub content: String,
 }
@@ -638,24 +638,24 @@ impl SharedStateTrack {
 
     /// Write abstracted field values for a step.
     /// Called by PG_GATE_1. Raw personal values must never be passed here.
-    /// REPLACEMENT semantics — overwrites any prior entry for this step_id.
+    /// REPLACEMENT semantics — overwrites any prior entry for this action_id.
     /// Python oracle: write_disclosure_buffer()
     pub fn write_disclosure_buffer(
         &mut self,
-        step_id: impl Into<String>,
+        action_id: impl Into<String>,
         approved_fields: HashMap<String, String>,
     ) {
         self.step_disclosure_buffers
-            .insert(step_id.into(), approved_fields);
+            .insert(action_id.into(), approved_fields);
     }
 
     /// Read abstracted field values for a step.
     /// Returns empty map if no buffer exists for this step.
     /// NEVER falls back to PersonalTrack.
     /// Python oracle: read_disclosure_buffer()
-    pub fn read_disclosure_buffer(&self, step_id: &str) -> HashMap<String, String> {
+    pub fn read_disclosure_buffer(&self, action_id: &str) -> HashMap<String, String> {
         self.step_disclosure_buffers
-            .get(step_id)
+            .get(action_id)
             .cloned()
             .unwrap_or_default()
     }
@@ -664,12 +664,12 @@ impl SharedStateTrack {
     /// Python oracle: promote_content()
     pub fn promote_content(
         &mut self,
-        step_id: impl Into<String>,
+        action_id: impl Into<String>,
         content_key: impl Into<String>,
         content: impl Into<String>,
     ) {
         self.promotions.push(PromotedContentEntry {
-            step_id: step_id.into(),
+            action_id: action_id.into(),
             content_key: content_key.into(),
             content: content.into(),
         });
@@ -1224,7 +1224,7 @@ mod tests {
     fn task_track_add_step_updates_ceiling() {
         let mut tt = TaskTrack::new();
         tt.add_step(TaskStep {
-            step_id: "s1".to_owned(),
+            action_id: "s1".to_owned(),
             output_var: Some("draft".to_owned()),
             content: "hello".to_owned(),
             sensitivity_severity: 3,
@@ -1239,7 +1239,7 @@ mod tests {
     fn task_track_ceiling_monotonic() {
         let mut tt = TaskTrack::new();
         tt.add_step(TaskStep {
-            step_id: "s1".to_owned(),
+            action_id: "s1".to_owned(),
             output_var: None,
             content: "x".to_owned(),
             sensitivity_severity: 3,
@@ -1248,7 +1248,7 @@ mod tests {
             audit_unavailable: false,
         });
         tt.add_step(TaskStep {
-            step_id: "s2".to_owned(),
+            action_id: "s2".to_owned(),
             output_var: None,
             content: "y".to_owned(),
             sensitivity_severity: 1,
@@ -1263,7 +1263,7 @@ mod tests {
     fn task_track_get_output_and_last() {
         let mut tt = TaskTrack::new();
         tt.add_step(TaskStep {
-            step_id: "s1".to_owned(),
+            action_id: "s1".to_owned(),
             output_var: Some("draft".to_owned()),
             content: "hello world".to_owned(),
             sensitivity_severity: 1,
@@ -1280,7 +1280,7 @@ mod tests {
     fn task_track_no_output_var_skips_cache() {
         let mut tt = TaskTrack::new();
         tt.add_step(TaskStep {
-            step_id: "s1".to_owned(),
+            action_id: "s1".to_owned(),
             output_var: None,
             content: "internal".to_owned(),
             sensitivity_severity: 1,
@@ -1297,7 +1297,7 @@ mod tests {
         // Some("") is treated as no output var — must not insert empty key
         let mut tt = TaskTrack::new();
         tt.add_step(TaskStep {
-            step_id: "s1".to_owned(),
+            action_id: "s1".to_owned(),
             output_var: Some(String::new()),
             content: "something".to_owned(),
             sensitivity_severity: 1,

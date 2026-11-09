@@ -17,8 +17,8 @@ FocusDefinition {
     high_priority_trigger: None,
 }
 --- step
-StepDefinition {
-    step_id: "draft",
+ActionDefinition {
+    action_id: "draft",
     display_name: "Writing draft...",
     guide_id: "quick-ask-guide",
     task_type: "creative_writing",

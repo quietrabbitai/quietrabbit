@@ -58,9 +58,8 @@ Use the correct terms in all contributions:
 | **.guide file** | .specialist file |
 | **.operator file** | .specialist file (system operators) |
 
-Code identifiers `step_id` and `StepDefinition` predate the Task to Action rename, which is
-tracked as items.id=552. Until it lands, match the existing identifiers when editing code, and
-use Action in docs and UI text.
+Code identifiers use `action_id` and `ActionDefinition`; the retired `step_id` and `StepDefinition`
+were renamed under items.id=552.
 
 ## Community Conduct
 Be direct, be kind, assume good intent.

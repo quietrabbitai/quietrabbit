@@ -4,7 +4,7 @@
 # Milestone: produces coherent output in outputs.db.
 #
 # guide_id is not declared per-step. The runtime parser resolves
-# StepDefinition.guide_id from the focus-level guides list at load time.
+# ActionDefinition.guide_id from the focus-level guides list at load time.
 # Not registered in artifact_versions at Layer 3.
 # _load_guide_versions() returns {} — no crash, empty manifest versions.
 # Register in artifact_versions when Personal Specialist layer activates (Layer 5).

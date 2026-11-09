@@ -242,7 +242,7 @@ fn validate_field_name(field_name: &str) -> bool {
 /// Run the extraction pass over step outputs for a focus run.
 ///
 /// Steps:
-///   1. Concatenate step outputs with "STEP: <step_id>" separators.
+///   1. Concatenate step outputs with "STEP: <action_id>" separators.
 ///   2. Build exclusion list from focus field_requirements + field_names
 ///      of any existing personal.db rows (passed in as `excluded_fields`).
 ///   3. Prompt llama3.2:3b for JSON array of extraction candidates.
@@ -252,7 +252,7 @@ fn validate_field_name(field_name: &str) -> bool {
 ///      when all candidates are filtered -- caller proceeds to output().
 ///
 /// `excluded_fields`: focus field_requirements + existing personal.db field names.
-/// `step_outputs`:    Vec of (step_id, output_text) in execution order.
+/// `step_outputs`:    Vec of (action_id, output_text) in execution order.
 /// `source`:          provenance tag for the resulting candidates -- one of
 ///                     SOURCE_CONDUCTOR_BATCH/SOURCE_INGEST_PATHWAY_A/SOURCE_QUICK_CLOSE.
 pub async fn extract_candidates(
@@ -268,7 +268,7 @@ pub async fn extract_candidates(
     // Step 1: concatenate with separators
     let conversation_text = step_outputs
         .iter()
-        .map(|(step_id, text)| format!("STEP: {step_id}\n{text}"))
+        .map(|(action_id, text)| format!("STEP: {action_id}\n{text}"))
         .collect::<Vec<_>>()
         .join("\n\n");
 

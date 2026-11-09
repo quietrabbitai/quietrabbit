@@ -103,9 +103,9 @@ CREATE TABLE IF NOT EXISTS focuses (
 );
 
 -- Focus composition (decisions.id=595 concern #2, part A): the ordered
--- block list. One row = one step-equivalent slot -- 1:1 with StepDefinition
+-- block list. One row = one step-equivalent slot -- 1:1 with ActionDefinition
 -- -- so focus_run_steps/reenter_step()/rehydrate_focus_run()'s existing
--- (focus_run_id, step_id, sequence_index) keying needs no change.
+-- (focus_run_id, action_id, sequence_index) keying needs no change.
 -- block_stable_id NULL means "plain LLM-generate step", the same shape
 -- every YAML-authored step has today -- not every real Focus step is
 -- backed by a cataloged block (items.id=496's own status_detail leaves
@@ -113,7 +113,7 @@ CREATE TABLE IF NOT EXISTS focuses (
 CREATE TABLE IF NOT EXISTS focus_block_compositions (
     id                             TEXT PRIMARY KEY,
     focus_id                       TEXT NOT NULL REFERENCES focuses(focus_id) ON DELETE CASCADE,
-    step_id                        TEXT NOT NULL,
+    action_id                        TEXT NOT NULL,
     block_stable_id                TEXT REFERENCES building_blocks(stable_id),
     sequence_index                 INTEGER NOT NULL,
     -- decisions.id=712 vocabulary reused verbatim, placed per-composition-
@@ -126,7 +126,7 @@ CREATE TABLE IF NOT EXISTS focus_block_compositions (
     schedule_trigger_offset        TEXT,
     created_at                     TEXT NOT NULL,
     updated_at                     TEXT NOT NULL,
-    UNIQUE (focus_id, step_id),
+    UNIQUE (focus_id, action_id),
     UNIQUE (focus_id, sequence_index)
 );
 
@@ -151,7 +151,7 @@ CREATE INDEX IF NOT EXISTS idx_focus_block_compositions_focus
 -- helper the YAML path uses. When non-NULL, the shape belongs to whatever
 -- block's Rust handler eventually reads it -- open-ended at this layer,
 -- same "schema intentionally open-ended, typed struct deferred" precedent
--- StepDefinition.options_override already established.
+-- ActionDefinition.options_override already established.
 CREATE TABLE IF NOT EXISTS focus_block_customization (
     id              TEXT PRIMARY KEY,
     composition_id  TEXT NOT NULL REFERENCES focus_block_compositions(id) ON DELETE CASCADE,

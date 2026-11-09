@@ -15,7 +15,7 @@
 //
 // EVENT CONTRACT (hand-declared on the front end like the other push events;
 // not exported to bindings.ts):
-//   "message-delta"  { focus_run_id, step_id, seq, event }
+//   "message-delta"  { focus_run_id, action_id, seq, event }
 //     event = { type: "delta", text }          display-only text
 //           | { type: "end", outcome, personal_flagged, audit_unavailable }
 //   `message-content-ready` REMAINS the completion signal: it fires after the
@@ -87,7 +87,7 @@ pub enum DeltaEvent {
 #[derive(Clone, Serialize, Type)]
 pub struct MessageDeltaPayload {
     pub focus_run_id: String,
-    pub step_id: String,
+    pub action_id: String,
     pub seq: u32,
     pub event: DeltaEvent,
 }
@@ -97,7 +97,7 @@ impl std::fmt::Debug for MessageDeltaPayload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut d = f.debug_struct("MessageDeltaPayload");
         d.field("focus_run_id", &self.focus_run_id)
-            .field("step_id", &self.step_id)
+            .field("action_id", &self.action_id)
             .field("seq", &self.seq);
         match &self.event {
             DeltaEvent::Delta { text } => d.field("delta_len", &text.len()),
@@ -122,7 +122,7 @@ impl std::fmt::Debug for MessageDeltaPayload {
 pub struct TauriDeltaSink {
     handle: tauri::AppHandle<tauri::Wry>,
     focus_run_id: String,
-    step_id: String,
+    action_id: String,
     next_seq: AtomicU32,
 }
 
@@ -130,12 +130,12 @@ impl TauriDeltaSink {
     pub fn new(
         handle: tauri::AppHandle<tauri::Wry>,
         focus_run_id: String,
-        step_id: String,
+        action_id: String,
     ) -> Self {
         Self {
             handle,
             focus_run_id,
-            step_id,
+            action_id,
             next_seq: AtomicU32::new(0),
         }
     }
@@ -144,7 +144,7 @@ impl TauriDeltaSink {
         use tauri::Emitter;
         let payload = MessageDeltaPayload {
             focus_run_id: self.focus_run_id.clone(),
-            step_id: self.step_id.clone(),
+            action_id: self.action_id.clone(),
             seq,
             event,
         };
@@ -443,7 +443,7 @@ mod tests {
     fn payload_debug_never_prints_text() {
         let p = MessageDeltaPayload {
             focus_run_id: "r".to_owned(),
-            step_id: "s".to_owned(),
+            action_id: "s".to_owned(),
             seq: 3,
             event: DeltaEvent::Delta {
                 text: "secret reply".to_owned(),
@@ -458,7 +458,7 @@ mod tests {
     fn payload_wire_shape() {
         let p = MessageDeltaPayload {
             focus_run_id: "r".to_owned(),
-            step_id: "s".to_owned(),
+            action_id: "s".to_owned(),
             seq: 0,
             event: DeltaEvent::Delta {
                 text: "hi".to_owned(),
@@ -466,7 +466,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_value(&p).unwrap(),
-            serde_json::json!({"focus_run_id":"r","step_id":"s","seq":0,
+            serde_json::json!({"focus_run_id":"r","action_id":"s","seq":0,
                 "event":{"type":"delta","text":"hi"}})
         );
         let e = MessageDeltaPayload {

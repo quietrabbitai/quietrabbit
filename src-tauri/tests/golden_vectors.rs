@@ -649,7 +649,7 @@ async fn test_gate1_normal_paths() {
 
         step += 1;
         run += 1;
-        let step_id = format!("step-{step:04}");
+        let action_id = format!("step-{step:04}");
         let run_id = format!("run-{run:04}");
 
         let (trk, abstraction_tier, raw_abstraction, execution_tier, provider) =
@@ -658,7 +658,7 @@ async fn test_gate1_normal_paths() {
         let logger = TestLogger::new();
         let result = gate1(
             &logger,
-            &step_id,
+            &action_id,
             &run_id,
             &trk,
             abstraction_tier,

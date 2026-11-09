@@ -1,7 +1,7 @@
 // src-tauri/src/conductor/scheduled_sweep.rs
 //
 // items.id=496 (point 3): the scheduled-trigger firing mechanism. A
-// composition-authored step's schedule_trigger (tokens.rs::StepDefinition,
+// composition-authored step's schedule_trigger (tokens.rs::ActionDefinition,
 // execute()'s gate in lifecycle.rs) parks its run at
 // focus_runs.status='awaiting_schedule' with focus_run_steps.scheduled_for
 // set to the trigger's resolved fire time. This module is the other half:

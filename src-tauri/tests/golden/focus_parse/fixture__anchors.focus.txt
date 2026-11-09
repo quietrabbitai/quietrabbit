@@ -13,8 +13,8 @@ FocusDefinition {
     high_priority_trigger: None,
 }
 --- step
-StepDefinition {
-    step_id: "one",
+ActionDefinition {
+    action_id: "one",
     display_name: "one",
     guide_id: "shared-guide",
     task_type: "generic",
@@ -36,8 +36,8 @@ StepDefinition {
 field_requirements: {}
 options_override: {}
 --- step
-StepDefinition {
-    step_id: "two",
+ActionDefinition {
+    action_id: "two",
     display_name: "two",
     guide_id: "shared-guide",
     task_type: "generic",

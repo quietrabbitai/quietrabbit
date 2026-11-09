@@ -13,8 +13,8 @@ FocusDefinition {
     high_priority_trigger: None,
 }
 --- step
-StepDefinition {
-    step_id: "voice_analysis",
+ActionDefinition {
+    action_id: "voice_analysis",
     display_name: "Understanding your style...",
     guide_id: "writing-voice",
     task_type: "quick_response",
@@ -38,8 +38,8 @@ StepDefinition {
 field_requirements: {"voice_profile": Recommended}
 options_override: {"num_predict":256,"temperature":0.3}
 --- step
-StepDefinition {
-    step_id: "draft_writing",
+ActionDefinition {
+    action_id: "draft_writing",
     display_name: "Writing your draft...",
     guide_id: "writing-voice",
     task_type: "creative_writing",
@@ -63,8 +63,8 @@ StepDefinition {
 field_requirements: {"employer": Optional, "job_title": Optional, "location_city": Optional}
 options_override: {"num_predict":1024,"temperature":0.5}
 --- step
-StepDefinition {
-    step_id: "voice_transform",
+ActionDefinition {
+    action_id: "voice_transform",
     display_name: "Refining your voice...",
     guide_id: "writing-voice",
     task_type: "quick_response",

@@ -972,7 +972,7 @@ mod tests {
                 plain_language: plain_language.to_owned(),
                 is_recoverable: false,
                 severity: crate::conductor::failure::FailureSeverity::Stop,
-                step_id: None,
+                action_id: None,
                 focus_id: None,
                 metadata: None,
             }),

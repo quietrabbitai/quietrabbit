@@ -59,67 +59,67 @@ pub enum ReentryError {
 // ReentryPlan
 // ---------------------------------------------------------------------------
 
-/// The computed effect of jumping back to `target_step_id` with new
+/// The computed effect of jumping back to `target_action_id` with new
 /// information. Read-only -- applying it (rebuilding TaskTrack, resetting
 /// FocusRun.current_step, re-invoking execute()) is the caller's job.
 #[derive(Debug, Clone)]
 pub struct ReentryPlan {
     /// The step index (into the focus definition's step list) execution
-    /// should resume from. Equal to the index of target_step_id.
+    /// should resume from. Equal to the index of target_action_id.
     pub resume_from_index: usize,
-    pub target_step_id: String,
-    /// step_ids whose recorded output is now stale and must be discarded
-    /// -- target_step_id itself plus every step that ran after it.
+    pub target_action_id: String,
+    /// action_ids whose recorded output is now stale and must be discarded
+    /// -- target_action_id itself plus every step that ran after it.
     /// In original execution order.
-    pub discarded_step_ids: Vec<String>,
+    pub discarded_action_ids: Vec<String>,
     /// output_var names produced by any discarded step, deduplicated.
     /// A caller can use this to also invalidate downstream references
     /// (e.g. SharedStateTrack promotions) that read one of these vars,
     /// though this module does not perform that invalidation itself
     /// (see module doc "DELTA SCOPE").
     pub stale_output_vars: Vec<String>,
-    /// Steps strictly before target_step_id -- their outputs remain valid
+    /// Steps strictly before target_action_id -- their outputs remain valid
     /// and are preserved as-is in the rebuilt TaskTrack.
-    pub preserved_step_ids: Vec<String>,
+    pub preserved_action_ids: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
 // plan_reentry
 // ---------------------------------------------------------------------------
 
-/// Compute a ReentryPlan for jumping back to `target_step_id` within an
+/// Compute a ReentryPlan for jumping back to `target_action_id` within an
 /// already-executed TaskTrack. `focus_step_order` is the full ordered list
-/// of step_ids from the focus definition -- needed because TaskTrack alone
-/// (types.rs) does not expose a step_id -> index lookup, and a caller must
+/// of action_ids from the focus definition -- needed because TaskTrack alone
+/// (types.rs) does not expose an action_id -> index lookup, and a caller must
 /// know which index to resume execute() from, not just which steps to drop.
 ///
-/// Errors if target_step_id was never executed (StepNotFound), or if it is
+/// Errors if target_action_id was never executed (StepNotFound), or if it is
 /// already the run's most recently completed step -- there is nothing
 /// after it to discard, so re-entering "from" it is a no-op the caller
 /// should instead handle as a plain re-run (NothingToDiscard).
 pub fn plan_reentry(
     task_track: &TaskTrack,
     focus_step_order: &[String],
-    target_step_id: &str,
+    target_action_id: &str,
 ) -> Result<ReentryPlan, ReentryError> {
     let executed: Vec<&TaskStep> = task_track.steps().iter().collect();
 
     let target_pos = executed
         .iter()
-        .position(|s| s.step_id == target_step_id)
-        .ok_or_else(|| ReentryError::StepNotFound(target_step_id.to_owned()))?;
+        .position(|s| s.action_id == target_action_id)
+        .ok_or_else(|| ReentryError::StepNotFound(target_action_id.to_owned()))?;
 
     if target_pos == executed.len() - 1 {
-        return Err(ReentryError::NothingToDiscard(target_step_id.to_owned()));
+        return Err(ReentryError::NothingToDiscard(target_action_id.to_owned()));
     }
 
-    let preserved_step_ids: Vec<String> = executed[..target_pos]
+    let preserved_action_ids: Vec<String> = executed[..target_pos]
         .iter()
-        .map(|s| s.step_id.clone())
+        .map(|s| s.action_id.clone())
         .collect();
 
     let discarded: &[&TaskStep] = &executed[target_pos..];
-    let discarded_step_ids: Vec<String> = discarded.iter().map(|s| s.step_id.clone()).collect();
+    let discarded_action_ids: Vec<String> = discarded.iter().map(|s| s.action_id.clone()).collect();
 
     let mut seen = HashSet::new();
     let mut stale_output_vars = Vec::new();
@@ -133,15 +133,15 @@ pub fn plan_reentry(
 
     let resume_from_index = focus_step_order
         .iter()
-        .position(|id| id == target_step_id)
-        .ok_or_else(|| ReentryError::StepNotFound(target_step_id.to_owned()))?;
+        .position(|id| id == target_action_id)
+        .ok_or_else(|| ReentryError::StepNotFound(target_action_id.to_owned()))?;
 
     Ok(ReentryPlan {
         resume_from_index,
-        target_step_id: target_step_id.to_owned(),
-        discarded_step_ids,
+        target_action_id: target_action_id.to_owned(),
+        discarded_action_ids,
         stale_output_vars,
-        preserved_step_ids,
+        preserved_action_ids,
     })
 }
 
@@ -149,7 +149,7 @@ pub fn plan_reentry(
 /// from an existing track and a plan. A convenience for the common case --
 /// a caller with more specific rebuild needs (e.g. also replaying some
 /// preserved steps through a fresh pipeline) can instead read
-/// plan.preserved_step_ids directly and build their own track.
+/// plan.preserved_action_ids directly and build their own track.
 ///
 /// sensitivity_ceiling on the rebuilt track is recomputed from the
 /// preserved steps only (TaskTrack::add_step's own monotonic-max logic) --
@@ -157,9 +157,13 @@ pub fn plan_reentry(
 /// those steps' content no longer exists in this track.
 pub fn rebuild_preserved_track(task_track: &TaskTrack, plan: &ReentryPlan) -> TaskTrack {
     let mut rebuilt = TaskTrack::new();
-    let preserved: HashSet<&str> = plan.preserved_step_ids.iter().map(|s| s.as_str()).collect();
+    let preserved: HashSet<&str> = plan
+        .preserved_action_ids
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
     for step in task_track.steps() {
-        if preserved.contains(step.step_id.as_str()) {
+        if preserved.contains(step.action_id.as_str()) {
             rebuilt.add_step(step.clone());
         }
     }
@@ -176,7 +180,7 @@ mod tests {
 
     fn step(id: &str, output_var: Option<&str>, severity: i32) -> TaskStep {
         TaskStep {
-            step_id: id.to_owned(),
+            action_id: id.to_owned(),
             output_var: output_var.map(|s| s.to_owned()),
             content: format!("content for {id}"),
             sensitivity_severity: severity,
@@ -219,13 +223,13 @@ mod tests {
         ]);
         let order = vec!["s1".to_owned(), "s2".to_owned(), "s3".to_owned()];
         let plan = plan_reentry(&track, &order, "s2").unwrap();
-        assert_eq!(plan.preserved_step_ids, vec!["s1".to_owned()]);
+        assert_eq!(plan.preserved_action_ids, vec!["s1".to_owned()]);
         assert_eq!(
-            plan.discarded_step_ids,
+            plan.discarded_action_ids,
             vec!["s2".to_owned(), "s3".to_owned()]
         );
         assert_eq!(plan.resume_from_index, 1);
-        assert_eq!(plan.target_step_id, "s2");
+        assert_eq!(plan.target_action_id, "s2");
     }
 
     #[test]
@@ -233,9 +237,9 @@ mod tests {
         let track = track_with(&[step("s1", None, 1), step("s2", None, 1)]);
         let order = vec!["s1".to_owned(), "s2".to_owned()];
         let plan = plan_reentry(&track, &order, "s1").unwrap();
-        assert!(plan.preserved_step_ids.is_empty());
+        assert!(plan.preserved_action_ids.is_empty());
         assert_eq!(
-            plan.discarded_step_ids,
+            plan.discarded_action_ids,
             vec!["s1".to_owned(), "s2".to_owned()]
         );
         assert_eq!(plan.resume_from_index, 0);
@@ -280,7 +284,7 @@ mod tests {
         let plan = plan_reentry(&track, &order, "s2").unwrap();
         let rebuilt = rebuild_preserved_track(&track, &plan);
         assert_eq!(rebuilt.steps().len(), 1);
-        assert_eq!(rebuilt.steps()[0].step_id, "s1");
+        assert_eq!(rebuilt.steps()[0].action_id, "s1");
         assert_eq!(rebuilt.get_output("a"), Some("content for s1"));
         assert_eq!(rebuilt.get_output("b"), None);
     }

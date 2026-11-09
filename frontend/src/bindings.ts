@@ -1383,7 +1383,7 @@ export type EstimateCostRequest = {
  *  Replaces ordinal tier comparisons at the five capability-gate call sites
  *  named in Part 6e: "may this step's execution leave the device at all,"
  *  decoupled from the old routing_tier==3 "pause for user handoff" signal
- *  (see StepDefinition::requires_user_handoff) and from the abstraction axis
+ *  (see ActionDefinition::requires_user_handoff) and from the abstraction axis
  *  (focus_settings.privacy_tier, items.id=444 — untouched by this enum).
  * 
  *  Declaration order IS the ordering derive(Ord) uses — local_only is the
@@ -2331,7 +2331,7 @@ export type RecoveryKeyDisplay = {
 
 export type ReenterStepRequest = {
 	run_id: string,
-	target_step_id: string,
+	target_action_id: string,
 	user_id: string,
 	persona_id: string,
 };
@@ -2339,7 +2339,7 @@ export type ReenterStepRequest = {
 export type ReenterStepResponse = {
 	run_id: string,
 	resume_from_index: number,
-	discarded_step_ids: string[],
+	discarded_action_ids: string[],
 	stale_output_vars: string[],
 };
 

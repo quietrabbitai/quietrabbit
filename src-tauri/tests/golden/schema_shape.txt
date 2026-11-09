@@ -326,7 +326,7 @@ TABLE extract_confirm_candidates
 TABLE focus_run_snapshots
   id TEXT notnull=0 pk=1 default=None
   focus_run_id TEXT notnull=1 pk=0 default=None
-  step_id TEXT notnull=1 pk=0 default=None
+  action_id TEXT notnull=1 pk=0 default=None
   phase INTEGER notnull=1 pk=0 default=None
   task_track_json TEXT notnull=1 pk=0 default=Some("'{}'")
   shared_state_json TEXT notnull=1 pk=0 default=Some("'{}'")
@@ -338,7 +338,7 @@ TABLE focus_run_snapshots
 TABLE focus_run_steps
   id TEXT notnull=0 pk=1 default=None
   focus_run_id TEXT notnull=1 pk=0 default=None
-  step_id TEXT notnull=1 pk=0 default=None
+  action_id TEXT notnull=1 pk=0 default=None
   attempt INTEGER notnull=1 pk=0 default=Some("1")
   sequence_index INTEGER notnull=1 pk=0 default=None
   status TEXT notnull=1 pk=0 default=Some("'pending'")
@@ -491,7 +491,7 @@ TABLE disclosure_log
   user_id TEXT notnull=1 pk=0 default=None
   persona_id TEXT notnull=1 pk=0 default=None
   focus_run_id TEXT notnull=1 pk=0 default=None
-  step_id TEXT notnull=1 pk=0 default=None
+  action_id TEXT notnull=1 pk=0 default=None
   routing_tier INTEGER notnull=1 pk=0 default=None
   provider TEXT notnull=0 pk=0 default=None
   fields_shared TEXT notnull=1 pk=0 default=Some("'[]'")
@@ -736,7 +736,7 @@ TABLE building_blocks
 TABLE focus_block_compositions
   id TEXT notnull=0 pk=1 default=None
   focus_id TEXT notnull=1 pk=0 default=None
-  step_id TEXT notnull=1 pk=0 default=None
+  action_id TEXT notnull=1 pk=0 default=None
   block_stable_id TEXT notnull=0 pk=0 default=None
   sequence_index INTEGER notnull=1 pk=0 default=None
   schedule_trigger_anchor_field TEXT notnull=0 pk=0 default=None

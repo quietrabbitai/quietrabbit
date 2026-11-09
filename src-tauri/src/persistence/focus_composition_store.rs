@@ -33,7 +33,7 @@ pub struct FocusRow {
 
 #[derive(Debug, Clone)]
 pub struct CompositionRow {
-    pub step_id: String,
+    pub action_id: String,
     pub block_stable_id: Option<String>,
     pub sequence_index: i64,
     pub schedule_trigger_anchor_field: Option<String>,
@@ -87,7 +87,7 @@ pub async fn get_focus(
 }
 
 /// Ordered composition rows for a Focus (sequence_index ASC — the same
-/// order Vec<StepDefinition> needs). Joined against each row's Focus-type-
+/// order Vec<ActionDefinition> needs). Joined against each row's Focus-type-
 /// default customization row via LEFT JOIN, not INNER — a composition row
 /// authored without a customization row yet is valid (defaults to `{}`),
 /// same "missing = default, not an error" shape focus_settings.
@@ -98,7 +98,7 @@ pub async fn list_compositions(
 ) -> Result<Vec<CompositionRow>, sqlx::Error> {
     let mut conn = pool.acquire().await?;
     let rows = sqlx::query(
-        "SELECT c.step_id, c.block_stable_id, c.sequence_index,
+        "SELECT c.action_id, c.block_stable_id, c.sequence_index,
                 c.schedule_trigger_anchor_field, c.schedule_trigger_offset,
                 COALESCE(cu.customization, '{}') AS customization
          FROM focus_block_compositions c
@@ -114,7 +114,7 @@ pub async fn list_compositions(
     rows.iter()
         .map(|row| {
             Ok(CompositionRow {
-                step_id: row.try_get("step_id")?,
+                action_id: row.try_get("action_id")?,
                 block_stable_id: row.try_get("block_stable_id")?,
                 sequence_index: row.try_get("sequence_index")?,
                 schedule_trigger_anchor_field: row.try_get("schedule_trigger_anchor_field")?,
@@ -222,7 +222,7 @@ mod tests {
 
         sqlx::query(
             "INSERT INTO focus_block_compositions
-                (id, focus_id, step_id, block_stable_id, sequence_index,
+                (id, focus_id, action_id, block_stable_id, sequence_index,
                  created_at, updated_at)
              VALUES ('comp-1', 'test-focus', 'step_a', NULL, 0,
                      datetime('now'), datetime('now'))",
@@ -247,7 +247,7 @@ mod tests {
 
         let compositions = list_compositions(pool, "test-focus").await.unwrap();
         assert_eq!(compositions.len(), 1);
-        assert_eq!(compositions[0].step_id, "step_a");
+        assert_eq!(compositions[0].action_id, "step_a");
         assert_eq!(compositions[0].block_stable_id, None);
         assert!(compositions[0].customization.contains("Hi {user_input}"));
     }
@@ -271,7 +271,7 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO focus_block_compositions
-                (id, focus_id, step_id, block_stable_id, sequence_index,
+                (id, focus_id, action_id, block_stable_id, sequence_index,
                  created_at, updated_at)
              VALUES ('comp-2', 'test-focus-2', 'step_a', NULL, 0,
                      datetime('now'), datetime('now'))",

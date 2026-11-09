@@ -19,7 +19,7 @@ use super::errors::DisclosureLogWriteError;
 /// event_type carried explicitly (stored in extra_metadata JSON in Python).
 #[derive(Debug, Clone)]
 pub struct DisclosureLogEntry {
-    pub step_id: String,
+    pub action_id: String,
     pub focus_run_id: String,
     pub execution_tier: u8,
     pub abstraction_tier: Option<u8>,

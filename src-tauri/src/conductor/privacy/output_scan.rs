@@ -131,12 +131,12 @@ pub struct OutputScanResult {
 /// injected logger, exactly as every other privacy gate does -- an
 /// unlogged egress-boundary scan would be a silent audit gap.
 ///
-/// step_id / focus_run_id / execution_tier are passed straight through to
+/// action_id / focus_run_id / execution_tier are passed straight through to
 /// DisclosureLogEntry, matching every other gate function's signature shape.
 #[allow(clippy::too_many_arguments)] // Explicit architecture boundary; matches gate1-4's own allow.
 pub async fn scan_output<L: DisclosureLogger>(
     logger: &L,
-    step_id: &str,
+    action_id: &str,
     focus_run_id: &str,
     content_text: &str,
     execution_tier: u8,
@@ -151,7 +151,7 @@ pub async fn scan_output<L: DisclosureLogger>(
         UnavailableAction::UsePf => {
             return scan_with_pf(
                 logger,
-                step_id,
+                action_id,
                 focus_run_id,
                 content_text,
                 execution_tier,
@@ -160,15 +160,21 @@ pub async fn scan_output<L: DisclosureLogger>(
             .await;
         }
         UnavailableAction::Block => {
-            return pf_unavailable_result(logger, step_id, focus_run_id, execution_tier, intensity)
-                .await;
+            return pf_unavailable_result(
+                logger,
+                action_id,
+                focus_run_id,
+                execution_tier,
+                intensity,
+            )
+            .await;
         }
         UnavailableAction::Legacy => {}
     }
 
     scan_legacy_fallback(
         logger,
-        step_id,
+        action_id,
         focus_run_id,
         execution_tier,
         content_sensitivity_severity,
@@ -181,7 +187,7 @@ pub async fn scan_output<L: DisclosureLogger>(
 
 async fn scan_with_pf<L: DisclosureLogger>(
     logger: &L,
-    step_id: &str,
+    action_id: &str,
     focus_run_id: &str,
     content_text: &str,
     execution_tier: u8,
@@ -200,7 +206,7 @@ async fn scan_with_pf<L: DisclosureLogger>(
             log::warn!("output_scan: Privacy Filter timed out after {PF_TIMEOUT_SECS}s");
             logger
                 .write(DisclosureLogEntry {
-                    step_id: step_id.to_string(),
+                    action_id: action_id.to_string(),
                     focus_run_id: focus_run_id.to_string(),
                     execution_tier,
                     abstraction_tier: None,
@@ -239,7 +245,7 @@ async fn scan_with_pf<L: DisclosureLogger>(
             PfOutcome::Failed { reason } => {
                 return pf_error_result(
                     logger,
-                    step_id,
+                    action_id,
                     focus_run_id,
                     execution_tier,
                     intensity,
@@ -265,7 +271,7 @@ async fn scan_with_pf<L: DisclosureLogger>(
 
     logger
         .write(DisclosureLogEntry {
-            step_id: step_id.to_string(),
+            action_id: action_id.to_string(),
             focus_run_id: focus_run_id.to_string(),
             execution_tier,
             abstraction_tier: None,
@@ -314,7 +320,7 @@ async fn scan_with_pf<L: DisclosureLogger>(
 /// only, never the scanned text.
 async fn pf_error_result<L: DisclosureLogger>(
     logger: &L,
-    step_id: &str,
+    action_id: &str,
     focus_run_id: &str,
     execution_tier: u8,
     intensity: ScanIntensity,
@@ -323,7 +329,7 @@ async fn pf_error_result<L: DisclosureLogger>(
     log::warn!("output_scan: Privacy Filter failed, content not scanned: {reason}");
     not_scanned_result(
         logger,
-        step_id,
+        action_id,
         focus_run_id,
         execution_tier,
         intensity,
@@ -337,7 +343,7 @@ async fn pf_error_result<L: DisclosureLogger>(
 /// type. Full blocks; Light never blocks.
 async fn pf_unavailable_result<L: DisclosureLogger>(
     logger: &L,
-    step_id: &str,
+    action_id: &str,
     focus_run_id: &str,
     execution_tier: u8,
     intensity: ScanIntensity,
@@ -345,7 +351,7 @@ async fn pf_unavailable_result<L: DisclosureLogger>(
     log::error!("output_scan: Privacy Filter unavailable in a release build, content not scanned");
     not_scanned_result(
         logger,
-        step_id,
+        action_id,
         focus_run_id,
         execution_tier,
         intensity,
@@ -358,7 +364,7 @@ async fn pf_unavailable_result<L: DisclosureLogger>(
 /// error and unavailable cases.
 async fn not_scanned_result<L: DisclosureLogger>(
     logger: &L,
-    step_id: &str,
+    action_id: &str,
     focus_run_id: &str,
     execution_tier: u8,
     intensity: ScanIntensity,
@@ -367,7 +373,7 @@ async fn not_scanned_result<L: DisclosureLogger>(
     let blocked = intensity == ScanIntensity::Full;
     logger
         .write(DisclosureLogEntry {
-            step_id: step_id.to_string(),
+            action_id: action_id.to_string(),
             focus_run_id: focus_run_id.to_string(),
             execution_tier,
             abstraction_tier: None,
@@ -403,7 +409,7 @@ async fn not_scanned_result<L: DisclosureLogger>(
 
 async fn scan_legacy_fallback<L: DisclosureLogger>(
     logger: &L,
-    step_id: &str,
+    action_id: &str,
     focus_run_id: &str,
     execution_tier: u8,
     content_sensitivity_severity: u8,
@@ -414,7 +420,7 @@ async fn scan_legacy_fallback<L: DisclosureLogger>(
 
     logger
         .write(DisclosureLogEntry {
-            step_id: step_id.to_string(),
+            action_id: action_id.to_string(),
             focus_run_id: focus_run_id.to_string(),
             execution_tier,
             abstraction_tier: None,

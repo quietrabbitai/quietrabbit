@@ -13,8 +13,8 @@ FocusDefinition {
     high_priority_trigger: None,
 }
 --- step
-StepDefinition {
-    step_id: "requirements_capture",
+ActionDefinition {
+    action_id: "requirements_capture",
     display_name: "Understanding what you need",
     guide_id: "research-analysis",
     task_type: "general",
@@ -38,8 +38,8 @@ StepDefinition {
 field_requirements: {"location_city": Recommended}
 options_override: {"num_predict":512,"temperature":0.3}
 --- step
-StepDefinition {
-    step_id: "research",
+ActionDefinition {
+    action_id: "research",
     display_name: "Researching options",
     guide_id: "research-analysis",
     task_type: "research",
@@ -63,8 +63,8 @@ StepDefinition {
 field_requirements: {}
 options_override: {"num_predict":1024,"temperature":0.4}
 --- step
-StepDefinition {
-    step_id: "recommendation",
+ActionDefinition {
+    action_id: "recommendation",
     display_name: "Building your recommendation",
     guide_id: "research-analysis",
     task_type: "general",

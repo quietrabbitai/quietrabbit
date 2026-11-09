@@ -19,10 +19,10 @@
 --     outputs rows are independent documents (UUIDs with no inherent
 --     ordering), so knowing WHICH row replaced a stale one genuinely
 --     requires a stored pointer. focus_run_steps rows are NOT independent
---     -- they are already keyed by (focus_run_id, step_id, attempt), and
+--     -- they are already keyed by (focus_run_id, action_id, attempt), and
 --     attempt is a plain monotonically increasing integer per step. "the
 --     row that superseded this one" is therefore always exactly the row
---     with attempt+1 for the same (focus_run_id, step_id) -- a one-line
+--     with attempt+1 for the same (focus_run_id, action_id) -- a one-line
 --     query against the natural key, not a fact that needs its own column.
 --     Carrying superseded_by anyway would mean two mechanisms (the pointer
 --     AND the attempt sequence) encoding the same relationship, with no
@@ -44,7 +44,7 @@
 --
 -- ATTEMPT-VERSIONED, MIRRORING outputs' OWN PROVEN PATTERN in spirit
 -- (outputs_007.sql, decisions.id=421/422) but not mechanically: one row per
--- (focus_run_id, step_id) ATTEMPT, never mutated into a different attempt
+-- (focus_run_id, action_id) ATTEMPT, never mutated into a different attempt
 -- in place. Re-entering a step (the follow-up dispatch's reenter_step())
 -- sets the current live row's status to 'discarded', then inserts a fresh
 -- row with attempt+1. One table, no second history table to drift out of
@@ -54,7 +54,7 @@
 --
 -- sequence_index: this attempt's position in focus_def.steps at the time
 -- the row was created (NOT the same thing as `attempt`, which counts
--- revisits of one step_id, not step order). Needed by reenter_step() to
+-- revisits of one action_id, not step order). Needed by reenter_step() to
 -- reason about "everything before/after this point" without re-parsing
 -- the .focus file, and by any ordered per-run history view.
 --
@@ -68,7 +68,7 @@
 -- output_id: REVERSE FK from step to output, not a new column on outputs
 -- pointing the other way -- outputs.focus_run_id already identifies which
 -- run an output belongs to, and adding a second, opposite-direction
--- pointer (outputs.step_id) would create a two-way-pointing FK hazard
+-- pointer (outputs.action_id) would create a two-way-pointing FK hazard
 -- (which side is authoritative on conflict) for no query this item's
 -- design needs. Nullable -- only the subset of steps whose content became
 -- a real Library output ever set it.
@@ -101,14 +101,14 @@
 -- on one step could produce hundreds of discarded attempts in an afternoon,
 -- all well inside any age-based retention window, so a purge_after column
 -- would not actually cap the growth this item's review flagged. A per-
--- (focus_run_id, step_id) COUNT cap does, directly: keep the most recent N
+-- (focus_run_id, action_id) COUNT cap does, directly: keep the most recent N
 -- discarded attempts for a given step and drop the rest, so worst-case
 -- table size becomes O(steps_per_run x N) regardless of how many times any
 -- one step gets revisited, which is the exact unbounded-growth vector
 -- described. This also needs no purge_after column or startup sweep at
 -- all -- unlike focus_run_snapshots' deferred/scheduled purge, the cap is
 -- enforced SYNCHRONOUSLY at the same point growth happens (reenter_step()
--- retires the old live row and trims that step_id's 'discarded' history to
+-- retires the old live row and trims that action_id's 'discarded' history to
 -- N in the same transaction), so there is no backlog window where an
 -- un-swept excess can accumulate. 'complete'/'failed'/'pending'/'running'
 -- rows never need capping in the first place -- idx_focus_run_steps_live
@@ -127,7 +127,7 @@
 --     this IS the "live state" query this item's record describes ("live
 --     state is a partial-unique-index query, history is the same table
 --     unfiltered including discarded rows"): at most one non-discarded
---     attempt may exist per (focus_run_id, step_id) at a time, whatever
+--     attempt may exist per (focus_run_id, action_id) at a time, whatever
 --     its own status (pending/running/complete/failed) — and reading
 --     WHERE status != 'discarded' for a run returns exactly its current
 --     per-step state. The UNIQUE-ness is a real data-integrity guard, not
@@ -139,10 +139,10 @@
 --   idx_focus_run_steps_output: mirrors idx_outputs_superseded_by/
 --     idx_outputs_parent's partial-index-on-nullable-FK shape, for the
 --     reverse output_id lookup described above.
---   idx_focus_run_steps_retention: (focus_run_id, step_id, attempt DESC) --
---     supports both the per-step_id retention cap above (an indexed
+--   idx_focus_run_steps_retention: (focus_run_id, action_id, attempt DESC) --
+--     supports both the per-action_id retention cap above (an indexed
 --     top-N-by-attempt scan instead of a full table scan) and a per-step
---     "what changed" audit view (a single step_id's full attempt history,
+--     "what changed" audit view (a single action_id's full attempt history,
 --     most recent first).
 --
 -- SCHEMA AUTHORING RULE (migrations.rs): no semicolons inside string
@@ -151,7 +151,7 @@
 CREATE TABLE IF NOT EXISTS focus_run_steps (
     id                      TEXT PRIMARY KEY,
     focus_run_id            TEXT NOT NULL REFERENCES focus_runs(id) ON DELETE CASCADE,
-    step_id                 TEXT NOT NULL,
+    action_id                 TEXT NOT NULL,
     attempt                 INTEGER NOT NULL DEFAULT 1,
     sequence_index          INTEGER NOT NULL,
     status                  TEXT NOT NULL DEFAULT 'pending'
@@ -170,7 +170,7 @@ CREATE TABLE IF NOT EXISTS focus_run_steps (
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_focus_run_steps_live
-    ON focus_run_steps (focus_run_id, step_id)
+    ON focus_run_steps (focus_run_id, action_id)
     WHERE status != 'discarded';
 
 CREATE INDEX IF NOT EXISTS idx_focus_run_steps_run
@@ -181,8 +181,8 @@ CREATE INDEX IF NOT EXISTS idx_focus_run_steps_output
     WHERE output_id IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_focus_run_steps_retention
-    ON focus_run_steps (focus_run_id, step_id, attempt DESC);
+    ON focus_run_steps (focus_run_id, action_id, attempt DESC);
 
 INSERT OR IGNORE INTO schema_version (version, applied_at, description)
 VALUES (9, datetime('now'),
-    'items.id=574 (shared foundation, revised): focus_run_steps -- attempt-versioned per-step ledger for Active Board surfacing, reenter_step() navigation, and scheduled steps; 5-value status (pending/running/complete/failed/discarded) replaces a superseded_by pointer since attempt already encodes ordering; per-step_id retention cap replaces an age-based purge_after since growth here is user-revisit-driven, not system-cadence-driven');
+    'items.id=574 (shared foundation, revised): focus_run_steps -- attempt-versioned per-step ledger for Active Board surfacing, reenter_step() navigation, and scheduled steps; 5-value status (pending/running/complete/failed/discarded) replaces a superseded_by pointer since attempt already encodes ordering; per-action_id retention cap replaces an age-based purge_after since growth here is user-revisit-driven, not system-cadence-driven');

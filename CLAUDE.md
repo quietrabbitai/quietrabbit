@@ -1,4 +1,6 @@
 # Quiet Rabbit — Claude Code Context
+# Last updated: November 8, 2026 (items.id=552: Naming Architecture Task->Action
+# row and intro only). Before that:
 # Last updated: November 3, 2026 (items.id=848: one bullet in the "Ollama"
 # section only). Before that, November 1, 2026 (items.id=678: new "Privacy model" section and
 # the dev-only paths paragraph under "Dev Environment" only). Before that,
@@ -316,9 +318,9 @@ release tag privacy-filter-q8-935d868), paths.rs, marker.rs, install.rs, runtime
 ## Naming Architecture — term map
 
 Most legacy terms are retired; canonical terms are used in all new code.
-Two exceptions below (Plan->Topic, Task->Action) are ADR-013-locked
-canonical pairs whose code-level rename status differs -- check the Notes
-column, don't assume every row here is fully propagated to code.
+Two rows below (Plan->Topic, Task->Action) are ADR-013-locked canonical
+pairs; both are now propagated to code (Task->Action by items.id=552).
+Check the Notes column for any remaining exception.
 
 | Retired term         | Canonical term      | Notes                                        |
 |----------------------|---------------------|----------------------------------------------|
@@ -347,17 +349,12 @@ column, don't assume every row here is fully propagated to code.
 |                      |                     | needs update before Focus builds             |
 | Plan                 | Topic               | plan_id → topic_id; migration complete,      |
 |                      |                     | topic_id/topic_store.rs used throughout      |
-| Task                 | Action              | ADR-013-locked (D6-214--D6-225) but NOT      |
-|                      |                     | propagated to code (confirmed 2026-09-23):   |
-|                      |                     | action_id appears only in                    |
-|                      |                     | plan_state_store.rs as a bind parameter.     |
-|                      |                     | Runtime code still uses step_id/             |
-|                      |                     | StepDefinition throughout conductor/         |
-|                      |                     | lifecycle.rs, executor.rs, and 8 other       |
-|                      |                     | files. Rename tracked as items.id=552 --     |
-|                      |                     | until that lands, use step_id/               |
-|                      |                     | StepDefinition when writing/reading code,    |
-|                      |                     | Action/action_id only in ADR-013/design docs.|
+| Task                 | Action              | ADR-013-locked (D6-214--D6-225); migration   |
+|                      |                     | complete (items.id=552): action_id and       |
+|                      |                     | ActionDefinition used throughout code and    |
+|                      |                     | schema. Retired: step_id, StepDefinition.    |
+|                      |                     | Table focus_run_steps and reenter_step()     |
+|                      |                     | keep their "step" names (not renamed).       |
 
 ## R1 Focuses
 R1 core (ships installed) is Writing Assistant and Tech Support only; every

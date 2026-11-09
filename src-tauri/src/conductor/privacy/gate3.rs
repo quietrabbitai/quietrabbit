@@ -94,7 +94,7 @@ const LOW_TIER_CATEGORIES: &[&str] = &["private_email", "private_phone", "accoun
 #[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
 pub async fn gate3<L: DisclosureLogger>(
     logger: &L,
-    step_id: &str,
+    action_id: &str,
     focus_run_id: &str,
     focus_name: &str,
     content_key: &str,
@@ -163,7 +163,7 @@ pub async fn gate3<L: DisclosureLogger>(
     if candidate_requires_external && focus_external_access == ExternalAccess::LocalOnly {
         logger
             .write(DisclosureLogEntry {
-                step_id: step_id.to_string(),
+                action_id: action_id.to_string(),
                 focus_run_id: focus_run_id.to_string(),
                 execution_tier,
                 abstraction_tier: None,
@@ -202,7 +202,7 @@ pub async fn gate3<L: DisclosureLogger>(
         && privacy_filter::unavailable_action(privacy_filter::is_available(), fail_closed)
             == privacy_filter::UnavailableAction::Block
     {
-        return pf_unavailable_block(logger, step_id, focus_run_id, execution_tier, content_key)
+        return pf_unavailable_block(logger, action_id, focus_run_id, execution_tier, content_key)
             .await;
     }
 
@@ -213,7 +213,7 @@ pub async fn gate3<L: DisclosureLogger>(
         if let Some(handle) = app_handle {
             return gate3_with_pf(
                 logger,
-                step_id,
+                action_id,
                 focus_run_id,
                 focus_name,
                 content_key,
@@ -238,7 +238,7 @@ pub async fn gate3<L: DisclosureLogger>(
     if content_sensitivity_severity >= 3 && target_tier >= 2 {
         logger
             .write(DisclosureLogEntry {
-                step_id: step_id.to_string(),
+                action_id: action_id.to_string(),
                 focus_run_id: focus_run_id.to_string(),
                 execution_tier,
                 abstraction_tier: None,
@@ -268,7 +268,7 @@ pub async fn gate3<L: DisclosureLogger>(
     // Approved.
     logger
         .write(DisclosureLogEntry {
-            step_id: step_id.to_string(),
+            action_id: action_id.to_string(),
             focus_run_id: focus_run_id.to_string(),
             execution_tier,
             abstraction_tier: None,
@@ -299,7 +299,7 @@ pub async fn gate3<L: DisclosureLogger>(
 /// emits nothing: this is not a gate_timeout.
 async fn pf_error_block<L: DisclosureLogger>(
     logger: &L,
-    step_id: &str,
+    action_id: &str,
     focus_run_id: &str,
     execution_tier: u8,
     content_key: &str,
@@ -308,7 +308,7 @@ async fn pf_error_block<L: DisclosureLogger>(
     log::error!("gate3: Privacy Filter error, content blocked (fail closed): {reason}");
     logger
         .write(DisclosureLogEntry {
-            step_id: step_id.to_string(),
+            action_id: action_id.to_string(),
             focus_run_id: focus_run_id.to_string(),
             execution_tier,
             abstraction_tier: None,
@@ -337,7 +337,7 @@ async fn pf_error_block<L: DisclosureLogger>(
 /// mirrors the neighbouring hardcoded strings.
 async fn pf_unavailable_block<L: DisclosureLogger>(
     logger: &L,
-    step_id: &str,
+    action_id: &str,
     focus_run_id: &str,
     execution_tier: u8,
     content_key: &str,
@@ -345,7 +345,7 @@ async fn pf_unavailable_block<L: DisclosureLogger>(
     log::error!("gate3: Privacy Filter unavailable in a release build, content blocked");
     logger
         .write(DisclosureLogEntry {
-            step_id: step_id.to_string(),
+            action_id: action_id.to_string(),
             focus_run_id: focus_run_id.to_string(),
             execution_tier,
             abstraction_tier: None,
@@ -373,7 +373,7 @@ async fn pf_unavailable_block<L: DisclosureLogger>(
 #[allow(clippy::too_many_arguments)]
 async fn gate3_with_pf<L: DisclosureLogger>(
     logger: &L,
-    step_id: &str,
+    action_id: &str,
     focus_run_id: &str,
     focus_name: &str,
     content_key: &str,
@@ -407,7 +407,7 @@ async fn gate3_with_pf<L: DisclosureLogger>(
             log::warn!("gate3: Privacy Filter timed out after {PF_TIMEOUT_SECS}s");
             logger
                 .write(DisclosureLogEntry {
-                    step_id: step_id.to_string(),
+                    action_id: action_id.to_string(),
                     focus_run_id: focus_run_id.to_string(),
                     execution_tier,
                     abstraction_tier: None,
@@ -440,7 +440,7 @@ async fn gate3_with_pf<L: DisclosureLogger>(
             log::error!("gate3: {}", join_error_reason(&join_err));
             logger
                 .write(DisclosureLogEntry {
-                    step_id: step_id.to_string(),
+                    action_id: action_id.to_string(),
                     focus_run_id: focus_run_id.to_string(),
                     execution_tier,
                     abstraction_tier: None,
@@ -477,7 +477,7 @@ async fn gate3_with_pf<L: DisclosureLogger>(
             PfOutcome::Failed { reason } => {
                 return pf_error_block(
                     logger,
-                    step_id,
+                    action_id,
                     focus_run_id,
                     execution_tier,
                     content_key,
@@ -500,7 +500,7 @@ async fn gate3_with_pf<L: DisclosureLogger>(
         user_id,
         persona_id,
         key_hex,
-        step_id,
+        action_id,
         focus_run_id,
         execution_tier,
         entities,
@@ -532,7 +532,7 @@ async fn gate3_with_pf<L: DisclosureLogger>(
     {
         logger
             .write(DisclosureLogEntry {
-                step_id: step_id.to_string(),
+                action_id: action_id.to_string(),
                 focus_run_id: focus_run_id.to_string(),
                 execution_tier,
                 abstraction_tier: None,
@@ -584,7 +584,7 @@ async fn gate3_with_pf<L: DisclosureLogger>(
 
     logger
         .write(DisclosureLogEntry {
-            step_id: step_id.to_string(),
+            action_id: action_id.to_string(),
             focus_run_id: focus_run_id.to_string(),
             execution_tier,
             abstraction_tier: None,
@@ -696,7 +696,7 @@ async fn partition_by_prior_decision<L: DisclosureLogger>(
     user_id: &str,
     persona_id: &str,
     key_hex: &str,
-    step_id: &str,
+    action_id: &str,
     focus_run_id: &str,
     execution_tier: u8,
     entities: Vec<PfEntityDecoded>,
@@ -784,7 +784,7 @@ async fn partition_by_prior_decision<L: DisclosureLogger>(
                 // append-only invariant; NOT skipping the check).
                 logger
                     .write(DisclosureLogEntry {
-                        step_id: step_id.to_string(),
+                        action_id: action_id.to_string(),
                         focus_run_id: focus_run_id.to_string(),
                         execution_tier,
                         abstraction_tier: None,

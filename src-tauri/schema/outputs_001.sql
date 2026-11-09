@@ -172,7 +172,7 @@ CREATE TABLE IF NOT EXISTS focus_run_snapshots (
     id                          TEXT PRIMARY KEY,
     focus_run_id                TEXT NOT NULL REFERENCES focus_runs(id)
                                     ON DELETE CASCADE,
-    step_id                     TEXT NOT NULL,
+    action_id                     TEXT NOT NULL,
     phase                       INTEGER NOT NULL,
     task_track_json             TEXT NOT NULL DEFAULT '{}',
     shared_state_json           TEXT NOT NULL DEFAULT '{}',

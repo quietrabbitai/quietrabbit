@@ -267,7 +267,7 @@ mod tests {
             plain_language: "SECRET-USER-TEXT-IN-AN-ERROR".to_owned(),
             is_recoverable: true,
             severity: FailureSeverity::Suggest,
-            step_id: Some("s1".to_owned()),
+            action_id: Some("s1".to_owned()),
             focus_id: Some("focus-1".to_owned()),
             metadata: Some(HashMap::new()),
         };

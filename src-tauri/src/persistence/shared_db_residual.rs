@@ -193,7 +193,7 @@ pub const RESIDUAL_SHARED_SCHEMA: &[ResidualTable] = &[
         columns: &[
             "id",
             "focus_id",
-            "step_id",
+            "action_id",
             "block_stable_id",
             "sequence_index",
             "schedule_trigger_anchor_field",

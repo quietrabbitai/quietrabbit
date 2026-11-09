@@ -41,7 +41,7 @@ impl<L: DisclosureLogger> PrivacyGateway<L> {
     #[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
     pub async fn gate1(
         &self,
-        step_id: &str,
+        action_id: &str,
         focus_run_id: &str,
         personal_track: &PersonalTrack,
         abstraction_tier: u8,
@@ -52,7 +52,7 @@ impl<L: DisclosureLogger> PrivacyGateway<L> {
     ) -> Result<Gate1Result, DisclosureLogWriteError> {
         gate1::gate1(
             &self.logger,
-            step_id,
+            action_id,
             focus_run_id,
             personal_track,
             abstraction_tier,
@@ -67,7 +67,7 @@ impl<L: DisclosureLogger> PrivacyGateway<L> {
     #[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
     pub async fn gate2(
         &self,
-        step_id: &str,
+        action_id: &str,
         focus_run_id: &str,
         response_content: &str,
         personal_track: &PersonalTrack,
@@ -78,7 +78,7 @@ impl<L: DisclosureLogger> PrivacyGateway<L> {
     ) -> Result<Gate2Result, DisclosureLogWriteError> {
         gate2::gate2(
             &self.logger,
-            step_id,
+            action_id,
             focus_run_id,
             response_content,
             personal_track,
@@ -93,7 +93,7 @@ impl<L: DisclosureLogger> PrivacyGateway<L> {
     #[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
     pub async fn gate3(
         &self,
-        step_id: &str,
+        action_id: &str,
         focus_run_id: &str,
         focus_name: &str,
         content_key: &str,
@@ -111,7 +111,7 @@ impl<L: DisclosureLogger> PrivacyGateway<L> {
     ) -> Result<Gate3Result, DisclosureLogWriteError> {
         gate3::gate3(
             &self.logger,
-            step_id,
+            action_id,
             focus_run_id,
             focus_name,
             content_key,
@@ -137,7 +137,7 @@ impl<L: DisclosureLogger> PrivacyGateway<L> {
     #[allow(clippy::too_many_arguments)] // Explicit architecture boundary; matches gate1-4's own allow.
     pub async fn scan_output(
         &self,
-        step_id: &str,
+        action_id: &str,
         focus_run_id: &str,
         content_text: &str,
         execution_tier: u8,
@@ -146,7 +146,7 @@ impl<L: DisclosureLogger> PrivacyGateway<L> {
     ) -> Result<output_scan::OutputScanResult, DisclosureLogWriteError> {
         output_scan::scan_output(
             &self.logger,
-            step_id,
+            action_id,
             focus_run_id,
             content_text,
             execution_tier,

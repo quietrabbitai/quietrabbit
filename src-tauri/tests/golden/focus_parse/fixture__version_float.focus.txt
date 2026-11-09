@@ -13,8 +13,8 @@ FocusDefinition {
     high_priority_trigger: None,
 }
 --- step
-StepDefinition {
-    step_id: "one",
+ActionDefinition {
+    action_id: "one",
     display_name: "One",
     guide_id: "quick-ask-guide",
     task_type: "generic",

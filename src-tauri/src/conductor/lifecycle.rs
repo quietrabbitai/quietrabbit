@@ -91,7 +91,7 @@ use crate::conductor::privacy::types::sensitivity_severity;
 use crate::conductor::privacy::{logger::DisclosureLoggerForRun, PrivacyGateway};
 use crate::conductor::reentry::{self, ReentryError, ReentryPlan};
 use crate::conductor::tokens::{
-    validate_step, ExternalAccess, FieldRequirement, StepDefinition, StepType,
+    validate_step, ActionDefinition, ExternalAccess, FieldRequirement, StepType,
 };
 use crate::conductor::types::{
     PersonalContextManifest, PersonalTrack, PromotedContentEntry, SharedStateTrack, TaskStep,
@@ -364,7 +364,7 @@ fn execution_tier_ordinal(access: ExternalAccess) -> u8 {
 /// options_override arrive pre-converted (Vec<{name,scope}> -> HashMap,
 /// source Value -> HashMap<String, serde_json::Value>) because that
 /// conversion is genuinely source-format-specific (a parsed YAML value vs
-/// plain JSON); everything build_step_definition() does with these fields
+/// plain JSON); everything build_action_definition() does with these fields
 /// is not.
 struct NormalizedRawStep {
     display_name: Option<String>,
@@ -379,21 +379,21 @@ struct NormalizedRawStep {
     options_override: HashMap<String, serde_json::Value>,
 }
 
-/// Shared StepDefinition derivation (items.id=496): the routing_tier ->
+/// Shared ActionDefinition derivation (items.id=496): the routing_tier ->
 /// requires_user_handoff / external_access_override / revisitable math
 /// (items.id=439/528/574) is identical regardless of whether a step came
 /// from a .focus YAML file or a focus_block_compositions/
 /// focus_block_customization row pair -- this is the literal code both
 /// paths run, not a re-implementation, which is what "produce the
-/// equivalent of today's fixed StepDefinition sequence" concretely means.
+/// equivalent of today's fixed ActionDefinition sequence" concretely means.
 /// block_stable_id/block_customization/schedule_trigger are always None
 /// here -- the DB path sets them itself afterward; a YAML-authored step
 /// never has them (see load_focus_definition_from_db()).
-fn build_step_definition(
-    step_id: String,
+fn build_action_definition(
+    action_id: String,
     default_guide_id: &str,
     raw: NormalizedRawStep,
-) -> StepDefinition {
+) -> ActionDefinition {
     let step_type = raw
         .step_type
         .as_deref()
@@ -415,8 +415,8 @@ fn build_step_definition(
     };
     let revisitable = step_type.default_revisitable();
 
-    StepDefinition {
-        display_name: raw.display_name.unwrap_or_else(|| step_id.clone()),
+    ActionDefinition {
+        display_name: raw.display_name.unwrap_or_else(|| action_id.clone()),
         guide_id: raw.guide_id.unwrap_or_else(|| default_guide_id.to_owned()),
         task_type: raw.task_type.unwrap_or_else(|| "general".to_owned()),
         routing_tier,
@@ -431,7 +431,7 @@ fn build_step_definition(
         block_stable_id: None,
         block_customization: None,
         schedule_trigger: None,
-        step_id,
+        action_id,
     }
 }
 
@@ -443,7 +443,7 @@ fn parse_focus_definition(raw: RawFocusFile) -> Result<FocusDefinition, Lifecycl
     let focus_id = raw.id.unwrap_or_default();
 
     // Focus-level guides list: first entry is the step default (COMPATIBILITY shim).
-    // conductor-brief declares guides at focus level; StepDefinition still requires
+    // conductor-brief declares guides at focus level; ActionDefinition still requires
     // a guide_id per step. When multi-guide Focuses exist, per-step guide_id required.
     let default_guide_id = raw
         .guides
@@ -503,9 +503,9 @@ fn parse_focus_definition(raw: RawFocusFile) -> Result<FocusDefinition, Lifecycl
         None => ("Hidden item".to_owned(), None),
     };
 
-    let mut steps: Vec<StepDefinition> = Vec::new();
+    let mut steps: Vec<ActionDefinition> = Vec::new();
     if let Some(raw_steps) = raw.steps {
-        for (step_id_key, raw_step) in raw_steps {
+        for (action_id_key, raw_step) in raw_steps {
             // field_requirements: list of {name, scope} -> HashMap<String, FieldRequirement>
             let field_requirements = raw_step
                 .field_requirements
@@ -538,13 +538,13 @@ fn parse_focus_definition(raw: RawFocusFile) -> Result<FocusDefinition, Lifecycl
             // to raw_routing_tier == 3 when absent -- byte-identical for
             // every .focus file authored before this field existed (none of
             // the 4 shipped Focuses use routing_tier: 3). See
-            // build_step_definition() for the rest of the derivation
+            // build_action_definition() for the rest of the derivation
             // (items.id=496 extracted it for reuse by the DB-composition
             // path) -- external_access_override deliberately NOT gated on
             // requires_user_handoff (the two conditions used to always
             // coincide; see git blame for the full historical reasoning).
-            steps.push(build_step_definition(
-                step_id_key.clone(),
+            steps.push(build_action_definition(
+                action_id_key.clone(),
                 &default_guide_id,
                 NormalizedRawStep {
                     display_name: raw_step.display_name,
@@ -618,9 +618,9 @@ struct RawStepFromDb {
 /// them today.
 ///
 /// A composition row with block_stable_id NULL runs its customization JSON
-/// through the exact same build_step_definition() helper
+/// through the exact same build_action_definition() helper
 /// parse_focus_definition() uses for a YAML step -- this IS what "produce
-/// the equivalent of today's fixed StepDefinition sequence" means: literal
+/// the equivalent of today's fixed ActionDefinition sequence" means: literal
 /// code reuse, not a re-implementation (items.id=496 judgment calls 2/5).
 /// A composition row with block_stable_id Some(id) is validated against
 /// shared.db's building_blocks mirror (LOAD-time failure if `id` is
@@ -667,7 +667,7 @@ async fn load_focus_definition_from_db(
     for row in composition_rows {
         let schedule_trigger = parse_optional_trigger(
             focus_id,
-            Some(&row.step_id),
+            Some(&row.action_id),
             row.schedule_trigger_anchor_field,
             row.schedule_trigger_offset,
         )?;
@@ -678,7 +678,7 @@ async fn load_focus_definition_from_db(
                     serde_json::from_str(&row.customization).map_err(|e| {
                         LifecycleError::ValidationFailed(format!(
                             "Focus '{focus_id}' step '{}': customization JSON: {e}",
-                            row.step_id
+                            row.action_id
                         ))
                     })?;
                 let field_requirements = raw_step
@@ -702,8 +702,8 @@ async fn load_focus_definition_from_db(
                         }
                     })
                     .unwrap_or_default();
-                build_step_definition(
-                    row.step_id.clone(),
+                build_action_definition(
+                    row.action_id.clone(),
                     default_guide_id,
                     NormalizedRawStep {
                         display_name: raw_step.display_name,
@@ -727,14 +727,14 @@ async fn load_focus_definition_from_db(
                     return Err(LifecycleError::ValidationFailed(format!(
                         "Focus '{focus_id}' step '{}': block_stable_id '{stable_id}' is not a \
                          known inline_composable block",
-                        row.step_id
+                        row.action_id
                     )));
                 }
                 let block_customization: serde_json::Value =
                     serde_json::from_str(&row.customization).map_err(|e| {
                         LifecycleError::ValidationFailed(format!(
                             "Focus '{focus_id}' step '{}': customization JSON: {e}",
-                            row.step_id
+                            row.action_id
                         ))
                     })?;
                 // LLM-generate-shaped fields are unused for a real block
@@ -743,9 +743,9 @@ async fn load_focus_definition_from_db(
                 // them are read. No real handler exists yet, so this arm
                 // is unreachable in a running system: the validation check
                 // just above already rejects any Focus that would reach it.
-                StepDefinition {
-                    step_id: row.step_id.clone(),
-                    display_name: row.step_id.clone(),
+                ActionDefinition {
+                    action_id: row.action_id.clone(),
+                    display_name: row.action_id.clone(),
                     guide_id: default_guide_id.to_owned(),
                     task_type: "general".to_owned(),
                     routing_tier: ExternalAccess::LocalOnly,
@@ -786,18 +786,18 @@ async fn load_focus_definition_from_db(
 /// focuses.high_priority_trigger_* (Focus-level, decisions.id=712) and
 /// focus_block_compositions.schedule_trigger_* (per-step, items.id=496 Q2)
 /// -- same two-column-or-neither shape, same parse_offset() underneath.
-/// `step_id` is None for the Focus-level call, Some for the per-step call;
+/// `action_id` is None for the Focus-level call, Some for the per-step call;
 /// only used to make a validation error message locate the right row.
 fn parse_optional_trigger(
     focus_id: &str,
-    step_id: Option<&str>,
+    action_id: Option<&str>,
     anchor_field: Option<String>,
     offset: Option<String>,
 ) -> Result<Option<HighPriorityTrigger>, LifecycleError> {
     let Some(anchor_field) = anchor_field else {
         return Ok(None);
     };
-    let location = match step_id {
+    let location = match action_id {
         Some(s) => format!("Focus '{focus_id}' step '{s}'"),
         None => format!("Focus '{focus_id}'"),
     };
@@ -1021,7 +1021,7 @@ pub struct FocusDefinition {
     /// u8 to ExternalAccess directly (removing the separate
     /// max_external_access shadow field this used to require).
     pub max_routing_tier: ExternalAccess,
-    pub steps: Vec<StepDefinition>,
+    pub steps: Vec<ActionDefinition>,
     pub output_type: String,
     pub suggest_in_focuses: Vec<String>,
     pub multi_source_validation: bool,
@@ -1589,7 +1589,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                 if override_ > self._focus_external_access {
                     return Err(LifecycleError::TierViolation(format!(
                         "Step '{}' requires external access '{}' but focus ceiling is '{}'.",
-                        step.step_id,
+                        step.action_id,
                         override_.as_str(),
                         self._focus_external_access.as_str()
                     )));
@@ -1997,7 +1997,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             if let Some(gateway) = self.privacy_gateway.as_ref() {
                 use crate::conductor::privacy::logger::DisclosureLogEntry;
                 let entry = DisclosureLogEntry {
-                    step_id: "initialize".to_string(),
+                    action_id: "initialize".to_string(),
                     focus_run_id: self.focus_run_id.clone().unwrap_or_default(),
                     // Local context assembly — no external call.
                     execution_tier: 1,
@@ -2185,14 +2185,14 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             // periodic/Tier-3 checkpoint writes elsewhere in this loop
             // already have -- a ledger-write failure shouldn't abort an
             // otherwise-successful step.
-            if let Err(e) = self.ensure_focus_run_step_row(&step.step_id, i).await {
+            if let Err(e) = self.ensure_focus_run_step_row(&step.action_id, i).await {
                 log::warn!("lifecycle: focus_run_steps ledger write failed: {e}");
             }
 
             // items.id=496 (Q2): a composition-authored step's one-shot
             // schedule_trigger gates execution eligibility, checked before
             // requires_user_handoff. YAML-authored steps never have one
-            // (tokens.rs::StepDefinition's own doc comment), so this is a
+            // (tokens.rs::ActionDefinition's own doc comment), so this is a
             // no-op for every Focus shipped before this item. A
             // schedule_trigger step on a run with no topic_id is a real
             // authoring error (same Topic-anchor requirement
@@ -2204,7 +2204,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                 if self.topic_id.is_none() {
                     return Err(LifecycleError::ValidationFailed(format!(
                         "step '{}' declares a schedule_trigger but this run has no topic_id",
-                        step.step_id
+                        step.action_id
                     )));
                 }
                 let anchor = self.resolve_trigger_anchor(trigger).await?;
@@ -2218,13 +2218,13 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                     // it -- a self-correcting retry, not a stuck state.
                     let scheduled_for = anchor.map(|a| a + trigger.offset).unwrap_or(now_ts);
                     if let Err(e) = self
-                        .mark_focus_run_step_scheduled(&step.step_id, scheduled_for)
+                        .mark_focus_run_step_scheduled(&step.action_id, scheduled_for)
                         .await
                     {
                         log::warn!("lifecycle: schedule_trigger ledger write failed: {e}");
                     }
                     if !self._checkpointing_suspended {
-                        if let Err(e) = self.write_checkpoint(&step.step_id).await {
+                        if let Err(e) = self.write_checkpoint(&step.action_id).await {
                             log::warn!("lifecycle: schedule checkpoint write failed: {e}");
                         }
                     }
@@ -2247,7 +2247,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             // checkpoint (if not suspended), set status, return early.
             if step.requires_user_handoff {
                 if !self._checkpointing_suspended {
-                    if let Err(e) = self.write_checkpoint(&step.step_id).await {
+                    if let Err(e) = self.write_checkpoint(&step.action_id).await {
                         log::warn!("lifecycle: Tier 3 checkpoint write failed: {e}");
                     }
                 }
@@ -2325,7 +2325,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
 
             checkpoint_counter += 1;
             if checkpoint_counter >= checkpoint_every && !self._checkpointing_suspended {
-                if let Err(e) = self.write_checkpoint(&step.step_id).await {
+                if let Err(e) = self.write_checkpoint(&step.action_id).await {
                     log::warn!("lifecycle: periodic checkpoint write failed: {e}");
                 }
                 checkpoint_counter = 0;
@@ -2402,7 +2402,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
     /// Python oracle: FocusRun._execute_step()
     async fn execute_step(
         &mut self,
-        step: &StepDefinition,
+        step: &ActionDefinition,
         step_index: usize,
     ) -> Result<Option<FailureResult>, LifecycleError> {
         // items.id=496 (judgment calls 5/6): block_stable_id dispatch. Today
@@ -2414,12 +2414,12 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         // rejects any composition row citing an unregistered block before a
         // run can start. This is the interface a future block's generic
         // Rust code would parameterize from step.block_customization -- see
-        // tokens.rs::StepDefinition's own doc comment for the shape.
+        // tokens.rs::ActionDefinition's own doc comment for the shape.
         if let Some(block_id) = &step.block_stable_id {
             return Err(LifecycleError::ValidationFailed(format!(
                 "step '{}': no registered handler for block '{block_id}' -- unreachable if \
                  LOAD-time validation ran, see execute_step()'s own doc comment",
-                step.step_id
+                step.action_id
             )));
         }
 
@@ -2459,7 +2459,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         log::debug!(
             "lifecycle: step={} execution_tier={} effective_access={} abstraction_tier={} \
              raw_abstraction={} focus_privacy_tier={}",
-            step.step_id,
+            step.action_id,
             execution_tier,
             effective_access.as_str(),
             abstraction_tier,
@@ -2665,12 +2665,12 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             // status=='awaiting_user' branch resumes AT the last-checkpointed
             // step, so without this write a resume would land on a stale
             // periodic checkpoint (or step 0, if none exists yet) instead of
-            // the step that actually paused. failure.step_id is always Some()
-            // on this path: every real call site threads Some(&ctx.step.step_id)
+            // the step that actually paused. failure.action_id is always Some()
+            // on this path: every real call site threads Some(&ctx.step.action_id)
             // into failure_handler.handle() (see executor.rs/failure.rs).
             if !self._checkpointing_suspended {
-                if let Some(step_id) = failure.step_id.clone() {
-                    if let Err(e) = self.write_checkpoint(&step_id).await {
+                if let Some(action_id) = failure.action_id.clone() {
+                    if let Err(e) = self.write_checkpoint(&action_id).await {
                         log::warn!("lifecycle: consent-gate pause checkpoint write failed: {e}");
                     }
                 }
@@ -2720,7 +2720,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
     /// PersonalTrack is never serialized — only the manifest (field names + hashes).
     /// SHA-256 of (task_json + shared_json + manifest_json) forms the integrity hash.
     /// Python oracle: FocusRun._write_checkpoint()
-    async fn write_checkpoint(&self, step_id: &str) -> Result<(), LifecycleError> {
+    async fn write_checkpoint(&self, action_id: &str) -> Result<(), LifecycleError> {
         let personal_track = self.personal_track.as_ref().unwrap();
         let task_track = self.task_track.as_ref().unwrap();
         let shared_state = self.shared_state.as_ref().unwrap();
@@ -2730,7 +2730,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         // Task track JSON — matches Python oracle dict structure
         let task_data = serde_json::json!({
             "steps": task_track.steps().iter().map(|s| serde_json::json!({
-                "step_id": s.step_id,
+                "action_id": s.action_id,
                 "output_var": s.output_var,
                 "content": s.content,
                 "sensitivity_severity": s.sensitivity_severity,
@@ -2745,7 +2745,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         let shared_data = serde_json::json!({
             "step_disclosure_buffers": shared_state.buffers(),
             "promotions": shared_state.promotions().iter().map(|p| serde_json::json!({
-                "step_id": p.step_id,
+                "action_id": p.action_id,
                 "content_key": p.content_key,
                 "content": p.content,
             })).collect::<Vec<_>>(),
@@ -2774,14 +2774,14 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
 
         sqlx::query(
             "INSERT INTO focus_run_snapshots
-             (id, focus_run_id, step_id, phase, task_track_json,
+             (id, focus_run_id, action_id, phase, task_track_json,
               shared_state_json, personal_context_manifest,
               checkpoint_hash, created_at)
              VALUES (?, ?, ?, 4, ?, ?, ?, ?, ?)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(focus_run_id)
-        .bind(step_id)
+        .bind(action_id)
         .bind(&task_json)
         .bind(&shared_json)
         .bind(&manifest_json)
@@ -2797,14 +2797,14 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
     /// schedule_trigger gate (execute(), below): the ordinary forward
     /// execute() loop had no insert path into focus_run_steps at all before
     /// this -- only reenter_step() wrote to this table. Ensures a 'pending'
-    /// live row exists for (focus_run_id, step_id) at attempt 1; no-op if a
+    /// live row exists for (focus_run_id, action_id) at attempt 1; no-op if a
     /// live row already exists (idx_focus_run_steps_live) -- e.g. a
     /// rehydrated/resumed run re-entering a step it already has a row for.
     /// Does not attempt items.id=574's other remaining pieces (input_vars
     /// wiring, piece (b)) -- out of scope here.
     async fn ensure_focus_run_step_row(
         &self,
-        step_id: &str,
+        action_id: &str,
         sequence_index: usize,
     ) -> Result<(), LifecycleError> {
         let focus_run_id = self.focus_run_id.as_deref().unwrap();
@@ -2814,11 +2814,11 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
 
         let exists: Option<i64> = sqlx::query_scalar(
             "SELECT 1 FROM focus_run_steps
-             WHERE focus_run_id = ? AND step_id = ? AND status != 'discarded'
+             WHERE focus_run_id = ? AND action_id = ? AND status != 'discarded'
              LIMIT 1",
         )
         .bind(focus_run_id)
-        .bind(step_id)
+        .bind(action_id)
         .fetch_optional(&mut conn)
         .await?;
         if exists.is_some() {
@@ -2827,12 +2827,12 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
 
         sqlx::query(
             "INSERT INTO focus_run_steps
-             (id, focus_run_id, step_id, attempt, sequence_index, status, created_at, updated_at)
+             (id, focus_run_id, action_id, attempt, sequence_index, status, created_at, updated_at)
              VALUES (?, ?, ?, 1, ?, 'pending', ?, ?)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(focus_run_id)
-        .bind(step_id)
+        .bind(action_id)
         .bind(sequence_index as i64)
         .bind(&timestamp)
         .bind(&timestamp)
@@ -2849,7 +2849,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
     /// step this call (execute()'s loop always calls it first).
     async fn mark_focus_run_step_scheduled(
         &self,
-        step_id: &str,
+        action_id: &str,
         scheduled_for: DateTime<Utc>,
     ) -> Result<(), LifecycleError> {
         let focus_run_id = self.focus_run_id.as_deref().unwrap();
@@ -2858,12 +2858,12 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
 
         sqlx::query(
             "UPDATE focus_run_steps SET scheduled_for = ?, updated_at = ?
-             WHERE focus_run_id = ? AND step_id = ? AND status != 'discarded'",
+             WHERE focus_run_id = ? AND action_id = ? AND status != 'discarded'",
         )
         .bind(scheduled_for.to_rfc3339())
         .bind(now())
         .bind(focus_run_id)
-        .bind(step_id)
+        .bind(action_id)
         .execute(&mut conn)
         .await?;
 
@@ -3131,7 +3131,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                             plain_language: conductor_err.plain_language().to_owned(),
                             is_recoverable: false,
                             severity: FailureSeverity::Stop,
-                            step_id: None,
+                            action_id: None,
                             focus_id: Some(self.focus_id.clone()),
                             metadata: None,
                         }
@@ -3221,7 +3221,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             .map(|tt| {
                 tt.steps()
                     .iter()
-                    .map(|s| (s.step_id.clone(), s.content.clone()))
+                    .map(|s| (s.action_id.clone(), s.content.clone()))
                     .collect()
             })
             .unwrap_or_default();
@@ -3381,7 +3381,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
     }
 
     /// Named re-entry with delta scope (items.id=574 follow-up, cb-07):
-    /// jump back to `target_step_id` with new information, discard the now-
+    /// jump back to `target_action_id` with new information, discard the now-
     /// stale downstream steps, and leave the run positioned to resume
     /// forward from there on the next call to execute()/resume_execution().
     ///
@@ -3402,12 +3402,12 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
     pub async fn reenter_step(
         &mut self,
         focus_step_order: &[String],
-        target_step_id: &str,
+        target_action_id: &str,
     ) -> Result<ReentryPlan, LifecycleError> {
         let plan = reentry::plan_reentry(
             self.task_track.as_ref().unwrap(),
             focus_step_order,
-            target_step_id,
+            target_action_id,
         )?;
 
         self.task_track = Some(reentry::rebuild_preserved_track(
@@ -3420,7 +3420,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         let mut conn = open_outputs_db(&self.user_id, &self.persona_id, key_hex).await?;
         let timestamp = now();
 
-        for step_id in &plan.discarded_step_ids {
+        for action_id in &plan.discarded_action_ids {
             // No-op (0 rows) is expected and fine when this step never got a
             // focus_run_steps row in the first place -- nothing writes rows
             // for ordinary forward execution yet (items.id=574 follow-up,
@@ -3428,39 +3428,39 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             // reenter_step() call itself inserted.
             sqlx::query(
                 "UPDATE focus_run_steps SET status = 'discarded', updated_at = ?
-                 WHERE focus_run_id = ? AND step_id = ? AND status != 'discarded'",
+                 WHERE focus_run_id = ? AND action_id = ? AND status != 'discarded'",
             )
             .bind(&timestamp)
             .bind(focus_run_id)
-            .bind(step_id)
+            .bind(action_id)
             .execute(&mut conn)
             .await?;
         }
 
         // HARD INVARIANT (Jason, items.id=574): focus_run_steps has no
         // superseded_by pointer column -- the schema relies entirely on
-        // `attempt` being a monotonic integer per (focus_run_id, step_id),
+        // `attempt` being a monotonic integer per (focus_run_id, action_id),
         // so the successor to any row is always MAX(attempt)+1 for that same
         // key. Nothing in the schema enforces this -- it MUST be computed
         // here, never a caller-supplied or independently-derived value, or
         // the "no pointer column needed" simplification silently breaks.
         let next_attempt: i64 = sqlx::query_scalar(
             "SELECT COALESCE(MAX(attempt), 0) + 1 FROM focus_run_steps
-             WHERE focus_run_id = ? AND step_id = ?",
+             WHERE focus_run_id = ? AND action_id = ?",
         )
         .bind(focus_run_id)
-        .bind(target_step_id)
+        .bind(target_action_id)
         .fetch_one(&mut conn)
         .await?;
 
         sqlx::query(
             "INSERT INTO focus_run_steps
-             (id, focus_run_id, step_id, attempt, sequence_index, status, created_at, updated_at)
+             (id, focus_run_id, action_id, attempt, sequence_index, status, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(focus_run_id)
-        .bind(target_step_id)
+        .bind(target_action_id)
         .bind(next_attempt)
         .bind(plan.resume_from_index as i64)
         .bind(&timestamp)
@@ -3475,11 +3475,11 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         // Required, not cosmetic: rehydrate_focus_run()'s own resume-index
         // derivation only resumes AT the checkpointed step when status ==
         // "awaiting_user" -- every other status resumes AFTER it (i + 1).
-        // We are about to checkpoint at target_step_id and need a future
+        // We are about to checkpoint at target_action_id and need a future
         // rehydrate (e.g. after a crash before the next execute() call) to
         // land exactly there, not one step later.
         self.write_focus_run_record("awaiting_user").await?;
-        self.write_checkpoint(target_step_id).await?;
+        self.write_checkpoint(target_action_id).await?;
 
         Ok(plan)
     }
@@ -3576,7 +3576,7 @@ pub async fn demote_interrupted_runs(
 /// writes to focus_runs (the row already exists; its status is the
 /// caller's to change, not this function's) and never calls execute().
 ///
-/// current_step derivation: the checkpointed step_id is looked up in
+/// current_step derivation: the checkpointed action_id is looked up in
 /// focus_def.steps to find its index. The two call sites that write a
 /// checkpoint (write_checkpoint(), this file) leave that step in different
 /// states:
@@ -3595,7 +3595,7 @@ pub async fn demote_interrupted_runs(
 /// So: status=='awaiting_user'/'awaiting_schedule' resumes AT the
 /// checkpointed step; any other status resumes AFTER it. No snapshot row at
 /// all means the run was interrupted before its first checkpoint — current_step stays 0, exactly
-/// like a fresh run. A step_id that no longer matches any step in the
+/// like a fresh run. A action_id that no longer matches any step in the
 /// current focus_def (the .focus file changed underneath the run) also
 /// falls back to 0 rather than erroring — the same "re-read fresh" posture
 /// this item's design already takes for composition changes.
@@ -3640,7 +3640,7 @@ pub async fn rehydrate_focus_run<L: DisclosureLoggerForRun>(
         .unwrap_or_default();
 
     let snapshot_row = sqlx::query(
-        "SELECT step_id, task_track_json, shared_state_json
+        "SELECT action_id, task_track_json, shared_state_json
          FROM focus_run_snapshots
          WHERE focus_run_id = ?
          ORDER BY created_at DESC
@@ -3696,7 +3696,7 @@ pub async fn rehydrate_focus_run<L: DisclosureLoggerForRun>(
 
     let (task_track, shared_state, current_step) = match snapshot_row {
         Some(row) => {
-            let step_id: String = row.try_get("step_id")?;
+            let action_id: String = row.try_get("action_id")?;
             let task_json: String = row.try_get("task_track_json")?;
             let shared_json: String = row.try_get("shared_state_json")?;
 
@@ -3709,7 +3709,7 @@ pub async fn rehydrate_focus_run<L: DisclosureLoggerForRun>(
                 .unwrap()
                 .steps
                 .iter()
-                .position(|s| s.step_id == step_id);
+                .position(|s| s.action_id == action_id);
             let resume_at = match step_index {
                 // items.id=496: awaiting_schedule's checkpoint is written
                 // for the step BEFORE it runs, same as awaiting_user's
@@ -3765,11 +3765,11 @@ fn deserialize_shared_state_track(json: &str) -> Result<SharedStateTrack, Lifecy
     }
     let stored: StoredSharedData = serde_json::from_str(json)?;
     let mut track = SharedStateTrack::new();
-    for (step_id, fields) in stored.step_disclosure_buffers {
-        track.write_disclosure_buffer(step_id, fields);
+    for (action_id, fields) in stored.step_disclosure_buffers {
+        track.write_disclosure_buffer(action_id, fields);
     }
     for p in stored.promotions {
-        track.promote_content(p.step_id, p.content_key, p.content);
+        track.promote_content(p.action_id, p.content_key, p.content);
     }
     Ok(track)
 }
@@ -4033,7 +4033,7 @@ mod tests {
         let def = parse_focus_definition(raw).unwrap();
         assert_eq!(def.steps.len(), 1);
         assert_eq!(def.steps[0].guide_id, "custom-guide");
-        assert_eq!(def.steps[0].step_id, "step_a");
+        assert_eq!(def.steps[0].action_id, "step_a");
         assert_eq!(def.steps[0].output_var.as_deref(), Some("result"));
     }
 
@@ -4071,7 +4071,7 @@ mod tests {
         let revisitable = |id: &str| {
             def.steps
                 .iter()
-                .find(|s| s.step_id == id)
+                .find(|s| s.action_id == id)
                 .unwrap()
                 .revisitable
         };
@@ -4135,7 +4135,7 @@ mod tests {
     fn parse_single_step_focus(
         routing_tier: Option<u8>,
         requires_user_handoff: Option<bool>,
-    ) -> StepDefinition {
+    ) -> ActionDefinition {
         let mut steps_map = IndexMap::new();
         steps_map.insert(
             "step_a".to_owned(),
@@ -4450,13 +4450,13 @@ mod tests {
                     !step.requires_user_handoff,
                     "{filename}: step '{}' unexpectedly requires_user_handoff -- \
                      no shipped Focus uses routing_tier: 3",
-                    step.step_id
+                    step.action_id
                 );
                 assert!(
                     step.external_access_override.is_some(),
                     "{filename}: step '{}' has no external_access_override -- \
                      every step here uses routing_tier 1 or 2, never Unrestricted",
-                    step.step_id
+                    step.action_id
                 );
             }
         }
@@ -4503,7 +4503,7 @@ mod tests {
         );
         let mut tt = TaskTrack::new();
         tt.add_step(TaskStep {
-            step_id: "s".to_owned(),
+            action_id: "s".to_owned(),
             output_var: None,
             content: "x".to_owned(),
             sensitivity_severity: ceiling,
@@ -5043,7 +5043,7 @@ mod tests {
             "the decline must produce exactly one disclosure-log entry"
         );
         let entry = &logger.entries()[0];
-        assert_eq!(entry.step_id, "initialize");
+        assert_eq!(entry.action_id, "initialize");
         // Key format is "entity_id:field_name" (compute_content_hash's own
         // convention, per the surrounding source comment) — NOT the fact's
         // own id. make_fact() gives this fact entity_id=None and
@@ -5248,7 +5248,7 @@ mod tests {
         with_temp_data_root(async {
             let mut run = tier3_ready_run(false);
             run.task_track.as_mut().unwrap().add_step(TaskStep {
-                step_id: "step_prior".to_owned(),
+                action_id: "step_prior".to_owned(),
                 output_var: None,
                 content: "the draft awaiting gate3 review".to_owned(),
                 sensitivity_severity: 1,
@@ -5339,7 +5339,7 @@ mod tests {
             plain_language: "Something went wrong.".to_owned(),
             is_recoverable: false,
             severity: FailureSeverity::Stop,
-            step_id: Some("step_a".to_owned()),
+            action_id: Some("step_a".to_owned()),
             focus_id: Some("f".to_owned()),
             metadata: None,
         }
@@ -5352,7 +5352,7 @@ mod tests {
             plain_language: "Needs your input to continue.".to_owned(),
             is_recoverable: true,
             severity: FailureSeverity::Pause,
-            step_id: Some("step_a".to_owned()),
+            action_id: Some("step_a".to_owned()),
             focus_id: Some("f".to_owned()),
             metadata: None,
         }
@@ -5441,20 +5441,21 @@ mod tests {
             let mut conn = open_outputs_db(&run.user_id, &run.persona_id, CRISIS_TEST_KEY_HEX)
                 .await
                 .expect("open_outputs_db must succeed");
-            let row = sqlx::query("SELECT step_id FROM focus_run_snapshots WHERE focus_run_id = ?")
-                .bind(&focus_run_id)
-                .fetch_optional(&mut conn)
-                .await
-                .expect("snapshot query must succeed");
+            let row =
+                sqlx::query("SELECT action_id FROM focus_run_snapshots WHERE focus_run_id = ?")
+                    .bind(&focus_run_id)
+                    .fetch_optional(&mut conn)
+                    .await
+                    .expect("snapshot query must succeed");
             let row = row.expect(
                 "handle_step_failure's awaiting_user branch must write a checkpoint \
                  for the paused step",
             );
-            let step_id: String = row.try_get("step_id").unwrap();
+            let action_id: String = row.try_get("action_id").unwrap();
             assert_eq!(
-                step_id, "step_a",
+                action_id, "step_a",
                 "checkpoint must be keyed to the step that actually paused \
-                 (await_user_failure()'s FailureResult.step_id), not some other step"
+                 (await_user_failure()'s FailureResult.action_id), not some other step"
             );
         })
         .await;
@@ -5521,7 +5522,7 @@ mod tests {
 
     fn flagged_step(severity: i32, audit_unavailable: bool) -> TaskStep {
         TaskStep {
-            step_id: "draft".to_owned(),
+            action_id: "draft".to_owned(),
             output_var: Some("draft_output".to_owned()),
             content: "Reply that echoed a withheld value".to_owned(),
             sensitivity_severity: severity,
@@ -5533,7 +5534,7 @@ mod tests {
 
     #[test]
     fn an_old_checkpoint_without_the_gate_2_fields_deserializes_with_both_false() {
-        let json = r#"{"steps":[{"step_id":"s1","output_var":"o","content":"c",
+        let json = r#"{"steps":[{"action_id":"s1","output_var":"o","content":"c",
             "sensitivity_severity":3,"routing_tier_used":2}],"sensitivity_ceiling":3}"#;
         let track = deserialize_task_track(json).unwrap();
         let step = &track.steps()[0];
@@ -5544,9 +5545,9 @@ mod tests {
     #[test]
     fn replaying_flagged_steps_restores_the_flags_and_the_raised_ceiling() {
         let json = r#"{"steps":[
-            {"step_id":"s1","output_var":"a","content":"c1","sensitivity_severity":1,
+            {"action_id":"s1","output_var":"a","content":"c1","sensitivity_severity":1,
              "routing_tier_used":2,"personal_flagged":false,"audit_unavailable":false},
-            {"step_id":"s2","output_var":"b","content":"c2","sensitivity_severity":4,
+            {"action_id":"s2","output_var":"b","content":"c2","sensitivity_severity":4,
              "routing_tier_used":2,"personal_flagged":true,"audit_unavailable":true}
           ],"sensitivity_ceiling":4}"#;
         let track = deserialize_task_track(json).unwrap();
@@ -5932,7 +5933,7 @@ mod tests {
             seed_run.personal_track = Some(personal_track);
             let mut task_track = TaskTrack::new();
             task_track.add_step(TaskStep {
-                step_id: "draft".to_owned(),
+                action_id: "draft".to_owned(),
                 output_var: Some("draft_output".to_owned()),
                 content: "Original draft output".to_owned(),
                 sensitivity_severity: 1,
@@ -6274,8 +6275,8 @@ mod tests {
             );
             run.focus_run_id = Some(uuid::Uuid::new_v4().to_string());
             let mut def = parse_focus_definition(minimal_raw()).unwrap();
-            def.steps.push(crate::conductor::tokens::StepDefinition {
-                step_id: "s1".to_owned(),
+            def.steps.push(crate::conductor::tokens::ActionDefinition {
+                action_id: "s1".to_owned(),
                 display_name: "Step 1".to_owned(),
                 guide_id: "g".to_owned(),
                 task_type: "general".to_owned(),
@@ -6349,8 +6350,8 @@ mod tests {
         );
         run.focus_run_id = Some(uuid::Uuid::new_v4().to_string());
         let mut def = parse_focus_definition(minimal_raw()).unwrap();
-        def.steps.push(crate::conductor::tokens::StepDefinition {
-            step_id: "s1".to_owned(),
+        def.steps.push(crate::conductor::tokens::ActionDefinition {
+            action_id: "s1".to_owned(),
             display_name: "Step 1".to_owned(),
             guide_id: "g".to_owned(),
             task_type: "general".to_owned(),
@@ -6500,7 +6501,7 @@ mod tests {
                 plain_language: "This was stopped.".to_owned(),
                 is_recoverable: false,
                 severity: FailureSeverity::Stop,
-                step_id: Some("s1".to_owned()),
+                action_id: Some("s1".to_owned()),
                 focus_id: Some("f".to_owned()),
                 metadata: None,
             };
@@ -6589,7 +6590,7 @@ mod tests {
             seed_run.personal_track = Some(personal_track);
             let mut task_track = TaskTrack::new();
             task_track.add_step(TaskStep {
-                step_id: "voice_analysis".to_owned(),
+                action_id: "voice_analysis".to_owned(),
                 output_var: Some("voice_analysis_output".to_owned()),
                 content: "Analysis".to_owned(),
                 sensitivity_severity: 1,
@@ -6598,7 +6599,7 @@ mod tests {
                 audit_unavailable: false,
             });
             task_track.add_step(TaskStep {
-                step_id: "draft_writing".to_owned(),
+                action_id: "draft_writing".to_owned(),
                 output_var: Some("draft_output".to_owned()),
                 content: "Original draft".to_owned(),
                 sensitivity_severity: 1,
@@ -6607,7 +6608,7 @@ mod tests {
                 audit_unavailable: false,
             });
             task_track.add_step(TaskStep {
-                step_id: "voice_transform".to_owned(),
+                action_id: "voice_transform".to_owned(),
                 output_var: Some("final_output".to_owned()),
                 content: "Original final".to_owned(),
                 sensitivity_severity: 1,
@@ -6643,7 +6644,7 @@ mod tests {
             .unwrap()
             .steps
             .iter()
-            .map(|s| s.step_id.clone())
+            .map(|s| s.action_id.clone())
             .collect();
         assert_eq!(
             focus_step_order,
@@ -6660,9 +6661,9 @@ mod tests {
             .expect("reenter_step must succeed");
 
         assert_eq!(plan.resume_from_index, 1);
-        assert_eq!(plan.preserved_step_ids, vec!["voice_analysis".to_owned()]);
+        assert_eq!(plan.preserved_action_ids, vec!["voice_analysis".to_owned()]);
         assert_eq!(
-            plan.discarded_step_ids,
+            plan.discarded_action_ids,
             vec!["draft_writing".to_owned(), "voice_transform".to_owned()]
         );
 
@@ -6689,7 +6690,7 @@ mod tests {
         assert_eq!(
             status, "awaiting_user",
             "must be set so a future rehydrate resumes AT the checkpointed \
-             step (target_step_id), not one index past it"
+             step (target_action_id), not one index past it"
         );
 
         // First-ever write to focus_run_steps for this run: only
@@ -6697,8 +6698,8 @@ mod tests {
         // other discarded step (voice_transform) never had a live row to
         // begin with, so its UPDATE was a no-op -- correct, not a bug.
         let rows: Vec<(String, i64, String)> = sqlx::query_as(
-            "SELECT step_id, attempt, status FROM focus_run_steps
-             WHERE focus_run_id = ? ORDER BY step_id",
+            "SELECT action_id, attempt, status FROM focus_run_steps
+             WHERE focus_run_id = ? ORDER BY action_id",
         )
         .bind(&focus_run_id)
         .fetch_all(&mut conn)
@@ -6715,7 +6716,7 @@ mod tests {
         // for reenter_step() itself (that's execute()'s own forward loop,
         // exercised separately; ticket point 3 confirms it needs no change).
         run.task_track.as_mut().unwrap().add_step(TaskStep {
-            step_id: "draft_writing".to_owned(),
+            action_id: "draft_writing".to_owned(),
             output_var: Some("draft_output".to_owned()),
             content: "Second draft".to_owned(),
             sensitivity_severity: 1,
@@ -6724,7 +6725,7 @@ mod tests {
             audit_unavailable: false,
         });
         run.task_track.as_mut().unwrap().add_step(TaskStep {
-            step_id: "voice_transform".to_owned(),
+            action_id: "voice_transform".to_owned(),
             output_var: Some("final_output".to_owned()),
             content: "Second final".to_owned(),
             sensitivity_severity: 1,
@@ -6734,7 +6735,7 @@ mod tests {
         });
 
         // Reenter draft_writing again -- the HARD INVARIANT under test:
-        // attempt must be MAX(attempt)+1 for (focus_run_id, step_id) =
+        // attempt must be MAX(attempt)+1 for (focus_run_id, action_id) =
         // (this run, draft_writing), i.e. 2 (the first call's row is still
         // attempt=1/'pending'), never reset to 1 and never independently
         // derived from anything else.
@@ -6743,14 +6744,17 @@ mod tests {
             .await
             .expect("second reenter_step of the same step must succeed");
         assert_eq!(plan2.resume_from_index, 1);
-        assert_eq!(plan2.preserved_step_ids, vec!["voice_analysis".to_owned()]);
+        assert_eq!(
+            plan2.preserved_action_ids,
+            vec!["voice_analysis".to_owned()]
+        );
 
         let mut conn = open_outputs_db(user_id, persona_id, RESUME_TEST_KEY_HEX)
             .await
             .expect("open_outputs_db must succeed");
         let rows: Vec<(String, i64, String)> = sqlx::query_as(
-            "SELECT step_id, attempt, status FROM focus_run_steps
-             WHERE focus_run_id = ? ORDER BY step_id, attempt",
+            "SELECT action_id, attempt, status FROM focus_run_steps
+             WHERE focus_run_id = ? ORDER BY action_id, attempt",
         )
         .bind(&focus_run_id)
         .fetch_all(&mut conn)
@@ -6838,7 +6842,7 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO focus_block_compositions
-                (id, focus_id, step_id, block_stable_id, sequence_index,
+                (id, focus_id, action_id, block_stable_id, sequence_index,
                  schedule_trigger_anchor_field, schedule_trigger_offset,
                  created_at, updated_at)
              VALUES ('comp-sched-1', 'sched-focus', 'step_a', NULL, 0,
@@ -6965,7 +6969,7 @@ mod tests {
         // fallback to a .focus YAML file, which has no file named
         // 'sched-focus') and that schedule_trigger parsed correctly.
         let step = &run.focus_def.as_ref().unwrap().steps[0];
-        assert_eq!(step.step_id, "step_a");
+        assert_eq!(step.action_id, "step_a");
         assert_eq!(step.block_stable_id, None);
         assert_eq!(
             step.schedule_trigger.as_ref().unwrap().anchor_field,
@@ -6985,7 +6989,7 @@ mod tests {
             .unwrap();
         let scheduled_for: Option<String> = sqlx::query_scalar(
             "SELECT scheduled_for FROM focus_run_steps
-             WHERE focus_run_id = ? AND step_id = 'step_a' AND status != 'discarded'",
+             WHERE focus_run_id = ? AND action_id = 'step_a' AND status != 'discarded'",
         )
         .bind(&focus_run_id)
         .fetch_one(&mut conn)
@@ -7029,7 +7033,7 @@ mod tests {
                 .unwrap();
             sqlx::query(
                 "UPDATE focus_run_steps SET scheduled_for = ?
-                 WHERE focus_run_id = ? AND step_id = 'step_a'",
+                 WHERE focus_run_id = ? AND action_id = 'step_a'",
             )
             .bind((Utc::now() - Duration::hours(2)).to_rfc3339())
             .bind(&focus_run_id)

@@ -239,7 +239,7 @@ CREATE TABLE IF NOT EXISTS disclosure_log (
     user_id             TEXT NOT NULL,
     persona_id          TEXT NOT NULL,
     focus_run_id        TEXT NOT NULL,
-    step_id             TEXT NOT NULL,
+    action_id             TEXT NOT NULL,
     routing_tier        INTEGER NOT NULL,
     provider            TEXT,
     fields_shared       TEXT NOT NULL DEFAULT '[]',

@@ -72,7 +72,7 @@ use crate::conductor::privacy::types::{
     AbstractionPolicy, PersonalField as GateField, PersonalTrack as GateTrack, Sensitivity,
 };
 use crate::conductor::privacy::PrivacyGateway;
-use crate::conductor::tokens::{ExternalAccess, StepDefinition};
+use crate::conductor::tokens::{ActionDefinition, ExternalAccess};
 use crate::conductor::types::{PersonalTrack, SharedStateTrack, TaskStep, TaskTrack};
 use crate::final_failure;
 use crate::persistence::integration_keys_store::{self, QR_HOSTED_KEY_TYPE};
@@ -208,7 +208,7 @@ fn ollama_client() -> &'static OllamaClient {
 ///   (architecture: "no prescribed default"). Always None when
 ///   effective_access == LocalOnly.
 pub struct StepContext {
-    pub step: StepDefinition,
+    pub step: ActionDefinition,
     pub focus_id: String,
     pub focus_run_id: String,
     pub user_input: String,
@@ -260,7 +260,7 @@ pub struct StepContext {
     pub focus_external_access: ExternalAccess,
     /// items.id=528 Phase 2: this step's own effective external-access
     /// ceiling -- focus_external_access folded with the step's own
-    /// external_access_override (StepDefinition::external_access_override)
+    /// external_access_override (ActionDefinition::external_access_override)
     /// via ExternalAccess::min(). Previously computed by lifecycle.rs and
     /// used only locally there (the ADR-012 floor clamp below), then
     /// discarded; promoted onto StepContext so the "does this step require
@@ -436,12 +436,12 @@ impl StepExecutor {
                         plain_language: format!(
                             "Step '{}' requires external access '{}' but this life only \
                              permits '{}'. [Get help]",
-                            ctx.step.step_id,
+                            ctx.step.action_id,
                             override_.as_str(),
                             ctx.focus_external_access.as_str()
                         ),
                     },
-                    Some(&ctx.step.step_id),
+                    Some(&ctx.step.action_id),
                     Some(&ctx.focus_id),
                     retry_count,
                 )));
@@ -464,7 +464,7 @@ impl StepExecutor {
                     &spend_block_error(
                         &SpendBlock::new(code).with("provider_id", bound.provider_id.clone()),
                     ),
-                    Some(&ctx.step.step_id),
+                    Some(&ctx.step.action_id),
                     Some(&ctx.focus_id),
                     retry_count,
                 )));
@@ -486,7 +486,7 @@ impl StepExecutor {
         ) {
             return Ok(Some(failure_handler.handle(
                 &error,
-                Some(&ctx.step.step_id),
+                Some(&ctx.step.action_id),
                 Some(&ctx.focus_id),
                 retry_count,
             )));
@@ -520,7 +520,7 @@ impl StepExecutor {
         // -- Steps 6-7 — PG_GATE_1: field approval + abstraction --
         let g1 = privacy_gateway
             .gate1(
-                &ctx.step.step_id,
+                &ctx.step.action_id,
                 &ctx.focus_run_id,
                 &gate_track,
                 abstraction_tier,
@@ -554,7 +554,7 @@ impl StepExecutor {
                 let _ = privacy_gateway
                     .logger
                     .write(DisclosureLogEntry {
-                        step_id: ctx.step.step_id.clone(),
+                        action_id: ctx.step.action_id.clone(),
                         focus_run_id: ctx.focus_run_id.clone(),
                         execution_tier,
                         abstraction_tier: Some(abstraction_tier),
@@ -586,8 +586,8 @@ impl StepExecutor {
                     }),
                 );
                 meta.insert(
-                    "step_id".to_owned(),
-                    serde_json::Value::String(ctx.step.step_id.clone()),
+                    "action_id".to_owned(),
+                    serde_json::Value::String(ctx.step.action_id.clone()),
                 );
                 meta.insert(
                     "execution_tier".to_owned(),
@@ -605,7 +605,7 @@ impl StepExecutor {
                         .to_owned(),
                     is_recoverable: true,
                     severity: FailureSeverity::Pause,
-                    step_id: Some(ctx.step.step_id.clone()),
+                    action_id: Some(ctx.step.action_id.clone()),
                     focus_id: Some(ctx.focus_id.clone()),
                     metadata: Some(meta),
                 }));
@@ -613,7 +613,7 @@ impl StepExecutor {
         }
 
         // -- Write projected fields to disclosure buffer (pre-Step 8) --
-        shared_state.write_disclosure_buffer(&ctx.step.step_id, projected_fields.clone());
+        shared_state.write_disclosure_buffer(&ctx.step.action_id, projected_fields.clone());
 
         // -- Step 8 — assemble final prompt --
         // Collect output_vars and previous_output before render (read-only task_track access).
@@ -628,7 +628,7 @@ impl StepExecutor {
         let voice_profile_str = format_voice_profile(&cleaned_voice_profile);
 
         let prompt = if ctx.effective_access != ExternalAccess::LocalOnly {
-            let disclosure = shared_state.read_disclosure_buffer(&ctx.step.step_id);
+            let disclosure = shared_state.read_disclosure_buffer(&ctx.step.action_id);
             render_prompt_with_disclosure(
                 ctx,
                 &output_vars,
@@ -679,7 +679,7 @@ impl StepExecutor {
                             .to_owned()
                     }),
                 },
-                Some(&ctx.step.step_id),
+                Some(&ctx.step.action_id),
                 Some(&ctx.focus_id),
                 retry_count,
             )));
@@ -710,7 +710,7 @@ impl StepExecutor {
                         [Try again] [Get help]"
                             .to_owned(),
                     },
-                    Some(&ctx.step.step_id),
+                    Some(&ctx.step.action_id),
                     Some(&ctx.focus_id),
                     retry_count,
                 ),
@@ -725,7 +725,7 @@ impl StepExecutor {
                 Some(h) => Box::new(crate::chat_stream::TauriDeltaSink::new(
                     h.clone(),
                     ctx.focus_run_id.clone(),
-                    ctx.step.step_id.clone(),
+                    ctx.step.action_id.clone(),
                 )),
                 None => Box::new(NullSink),
             }),
@@ -835,7 +835,7 @@ impl StepExecutor {
                 // selected model).
                 let handled = failure_handler.handle(
                     &e,
-                    Some(&ctx.step.step_id),
+                    Some(&ctx.step.action_id),
                     Some(&ctx.focus_id),
                     retry_count,
                 );
@@ -907,11 +907,15 @@ impl StepExecutor {
         // Only when next step has higher execution_tier.
         if let Some(next_tier) = ctx.next_execution_tier {
             if next_tier > execution_tier {
-                let content_key = ctx.step.output_var.as_deref().unwrap_or(&ctx.step.step_id);
+                let content_key = ctx
+                    .step
+                    .output_var
+                    .as_deref()
+                    .unwrap_or(&ctx.step.action_id);
 
                 let g3 = privacy_gateway
                     .gate3(
-                        &ctx.step.step_id,
+                        &ctx.step.action_id,
                         &ctx.focus_run_id,
                         &ctx.focus_name,
                         content_key,
@@ -948,7 +952,7 @@ impl StepExecutor {
                                     .to_owned()
                             }),
                         },
-                        Some(&ctx.step.step_id),
+                        Some(&ctx.step.action_id),
                         Some(&ctx.focus_id),
                         retry_count,
                     )));
@@ -963,14 +967,18 @@ impl StepExecutor {
                             .to_owned(),
                         is_recoverable: true,
                         severity: FailureSeverity::Pause,
-                        step_id: Some(ctx.step.step_id.clone()),
+                        action_id: Some(ctx.step.action_id.clone()),
                         focus_id: Some(ctx.focus_id.clone()),
                         metadata: None,
                     }));
                 }
 
                 if g3.approved {
-                    shared_state.promote_content(&ctx.step.step_id, content_key, &response.content);
+                    shared_state.promote_content(
+                        &ctx.step.action_id,
+                        content_key,
+                        &response.content,
+                    );
                 }
             }
         }
@@ -991,7 +999,7 @@ impl StepExecutor {
 fn render_template(
     template: &str,
     tokens: &HashMap<String, String>,
-    step_id: &str,
+    action_id: &str,
     focus_id: &str,
 ) -> String {
     let mut result = template.to_owned();
@@ -1001,7 +1009,7 @@ fn render_template(
     let unresolved = find_tokens(&result);
     if !unresolved.is_empty() {
         log::debug!(
-            "executor: unresolved tokens stripped: {:?} step={step_id} focus={focus_id}",
+            "executor: unresolved tokens stripped: {:?} step={action_id} focus={focus_id}",
             unresolved
         );
         result = strip_tokens(&result);
@@ -1031,7 +1039,7 @@ fn render_prompt(
     render_template(
         &ctx.step.prompt_template,
         &tokens,
-        &ctx.step.step_id,
+        &ctx.step.action_id,
         &ctx.focus_id,
     )
 }
@@ -1063,7 +1071,7 @@ fn render_prompt_with_disclosure(
     render_template(
         &ctx.step.prompt_template,
         &tokens,
-        &ctx.step.step_id,
+        &ctx.step.action_id,
         &ctx.focus_id,
     )
 }
@@ -1129,7 +1137,7 @@ async fn scan_voice_profile<L: DisclosureLogger>(
                  tier={} focus={} step={}",
                 ctx.execution_tier,
                 ctx.focus_id,
-                ctx.step.step_id,
+                ctx.step.action_id,
             );
 
             // Audit: log the contamination event via the disclosure logger.
@@ -1137,7 +1145,7 @@ async fn scan_voice_profile<L: DisclosureLogger>(
             let _ = privacy_gateway
                 .logger
                 .write(DisclosureLogEntry {
-                    step_id: ctx.step.step_id.clone(),
+                    action_id: ctx.step.action_id.clone(),
                     focus_run_id: ctx.focus_run_id.clone(),
                     execution_tier: ctx.execution_tier,
                     abstraction_tier: Some(ctx.abstraction_tier),
@@ -1695,7 +1703,7 @@ async fn retry_loop<A: StepAttempt>(
             Err(e) => {
                 return Some(failure_handler.handle(
                     &e,
-                    Some(&ctx.step.step_id),
+                    Some(&ctx.step.action_id),
                     Some(&ctx.focus_id),
                     retry_count,
                 ));
@@ -1953,7 +1961,7 @@ async fn reply_gate2<L: DisclosureLogger>(
     }
     let found = privacy_gateway
         .gate2(
-            &ctx.step.step_id,
+            &ctx.step.action_id,
             &ctx.focus_run_id,
             text,
             gate_track,
@@ -1975,7 +1983,7 @@ async fn reply_gate2<L: DisclosureLogger>(
                 "executor: Gate 2 matched a reply but its disclosure-log entry \
                  could not be written (run {}, step {}); the reply is kept and flagged",
                 ctx.focus_run_id,
-                ctx.step.step_id
+                ctx.step.action_id
             );
             // The error carries no result, so recover the severity from the
             // same pure scan.
@@ -2063,7 +2071,7 @@ fn stopped_failure(ctx: &StepContext) -> FailureResult {
         plain_language: "This was stopped.".to_owned(),
         is_recoverable: false,
         severity: FailureSeverity::Stop,
-        step_id: Some(ctx.step.step_id.clone()),
+        action_id: Some(ctx.step.action_id.clone()),
         focus_id: Some(ctx.focus_id.clone()),
         metadata: None,
     }
@@ -2180,10 +2188,10 @@ fn completed_step(
         .step
         .output_var
         .clone()
-        .or_else(|| Some(ctx.step.step_id.clone()))
+        .or_else(|| Some(ctx.step.action_id.clone()))
         .filter(|v| !v.is_empty());
     TaskStep {
-        step_id: ctx.step.step_id.clone(),
+        action_id: ctx.step.action_id.clone(),
         output_var,
         content: content.to_owned(),
         sensitivity_severity: g2.apply_to(computed_sensitivity),
@@ -3464,7 +3472,7 @@ mod tests {
     fn collect_output_vars_filters_empty_key() {
         let steps = vec![
             TaskStep {
-                step_id: "s1".to_owned(),
+                action_id: "s1".to_owned(),
                 output_var: Some("draft".to_owned()),
                 content: "hello".to_owned(),
                 sensitivity_severity: 1,
@@ -3473,7 +3481,7 @@ mod tests {
                 audit_unavailable: false,
             },
             TaskStep {
-                step_id: "s2".to_owned(),
+                action_id: "s2".to_owned(),
                 output_var: Some(String::new()),
                 content: "world".to_owned(),
                 sensitivity_severity: 1,
@@ -3492,7 +3500,7 @@ mod tests {
     fn collect_output_vars_last_write_wins() {
         let steps = vec![
             TaskStep {
-                step_id: "s1".to_owned(),
+                action_id: "s1".to_owned(),
                 output_var: Some("result".to_owned()),
                 content: "first".to_owned(),
                 sensitivity_severity: 1,
@@ -3501,7 +3509,7 @@ mod tests {
                 audit_unavailable: false,
             },
             TaskStep {
-                step_id: "s2".to_owned(),
+                action_id: "s2".to_owned(),
                 output_var: Some("result".to_owned()),
                 content: "second".to_owned(),
                 sensitivity_severity: 1,
@@ -3615,7 +3623,7 @@ mod tests {
 
     #[test]
     fn step_sensitivity_tier2_uses_projected_fields() {
-        use crate::conductor::tokens::{StepDefinition, StepType};
+        use crate::conductor::tokens::{ActionDefinition, StepType};
         use crate::conductor::types::PersonalField as CF;
         let mut pt = PersonalTrack::new();
         pt.add_field(CF {
@@ -3641,8 +3649,8 @@ mod tests {
         pt.seal();
         let ctx = StepContext {
             stop: None,
-            step: StepDefinition {
-                step_id: "s1".to_owned(),
+            step: ActionDefinition {
+                action_id: "s1".to_owned(),
                 display_name: "Step 1".to_owned(),
                 guide_id: "g".to_owned(),
                 task_type: "general".to_owned(),
@@ -3688,7 +3696,7 @@ mod tests {
 
     #[test]
     fn step_sensitivity_tier1_uses_template_scan() {
-        use crate::conductor::tokens::{StepDefinition, StepType};
+        use crate::conductor::tokens::{ActionDefinition, StepType};
         use crate::conductor::types::PersonalField as CF;
         let mut pt = PersonalTrack::new();
         pt.add_field(CF {
@@ -3704,8 +3712,8 @@ mod tests {
         pt.seal();
         let ctx = StepContext {
             stop: None,
-            step: StepDefinition {
-                step_id: "s1".to_owned(),
+            step: ActionDefinition {
+                action_id: "s1".to_owned(),
                 display_name: "Step 1".to_owned(),
                 guide_id: "g".to_owned(),
                 task_type: "general".to_owned(),
@@ -3749,12 +3757,12 @@ mod tests {
 
     #[test]
     fn step_sensitivity_no_personal_fields_is_1() {
-        use crate::conductor::tokens::{StepDefinition, StepType};
+        use crate::conductor::tokens::{ActionDefinition, StepType};
         let pt = PersonalTrack::new();
         let ctx = StepContext {
             stop: None,
-            step: StepDefinition {
-                step_id: "s1".to_owned(),
+            step: ActionDefinition {
+                action_id: "s1".to_owned(),
                 display_name: "Step 1".to_owned(),
                 guide_id: "g".to_owned(),
                 task_type: "general".to_owned(),
@@ -3811,11 +3819,11 @@ mod tests {
         r#"{"input_per_mtok":0.50,"output_per_mtok":1.50,"as_of":"2026-10-11","source":"curated"}"#;
 
     fn hosted_ctx(attendance: RunAttendance, key_hex: &str) -> StepContext {
-        use crate::conductor::tokens::{StepDefinition, StepType};
+        use crate::conductor::tokens::{ActionDefinition, StepType};
         StepContext {
             stop: None,
-            step: StepDefinition {
-                step_id: "s1".to_owned(),
+            step: ActionDefinition {
+                action_id: "s1".to_owned(),
                 display_name: "Step 1".to_owned(),
                 guide_id: "g".to_owned(),
                 task_type: "general".to_owned(),
@@ -4831,7 +4839,7 @@ mod tests {
             plain_language: "429".to_owned(),
             is_recoverable: true,
             severity: FailureSeverity::Suggest,
-            step_id: Some("s1".to_owned()),
+            action_id: Some("s1".to_owned()),
             focus_id: Some("focus-1".to_owned()),
             metadata,
         }

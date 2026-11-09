@@ -1,12 +1,12 @@
 // src-tauri/src/conductor/tokens.rs
 //
-// System token constants and StepDefinition.
+// System token constants and ActionDefinition.
 // Ported from conductor/tokens.py.
 //
 // SYSTEM_TOKENS: reserved variable names injected by the Conductor into
 // prompt templates. output_var names in .focus files must not collide.
 //
-// StepDefinition: internal representation of one step from a .focus file.
+// ActionDefinition: internal representation of one step from a .focus file.
 // Populated during Phase 1 LOAD. Immutable by construction (no &mut methods).
 // Python used frozen=True + MappingProxyType — Rust ownership gives this
 // for free once the struct is constructed.
@@ -51,7 +51,7 @@ pub fn is_system_token(name: &str) -> bool {
 // StepType
 // ---------------------------------------------------------------------------
 
-/// Valid step_type values for a StepDefinition.
+/// Valid step_type values for an ActionDefinition.
 /// Python oracle: Literal["generate", "voice_transform", "post_process"]
 ///
 /// Using an enum means invalid step_type values are impossible to construct —
@@ -92,7 +92,7 @@ impl StepType {
 
     /// items.id=574 (reenter_step()): whether a step of this type is safe to
     /// re-run with new information, given only what the type itself does --
-    /// never a per-instance customization choice (see StepDefinition::revisitable's
+    /// never a per-instance customization choice (see ActionDefinition::revisitable's
     /// own doc comment for why there is no .focus YAML override). executor.rs
     /// does not yet branch on step_type at all, so this is a product judgment
     /// call, not something derivable from current execution behavior --
@@ -144,7 +144,7 @@ impl FromStr for FieldRequirement {
 /// Replaces ordinal tier comparisons at the five capability-gate call sites
 /// named in Part 6e: "may this step's execution leave the device at all,"
 /// decoupled from the old routing_tier==3 "pause for user handoff" signal
-/// (see StepDefinition::requires_user_handoff) and from the abstraction axis
+/// (see ActionDefinition::requires_user_handoff) and from the abstraction axis
 /// (focus_settings.privacy_tier, items.id=444 — untouched by this enum).
 ///
 /// Declaration order IS the ordering derive(Ord) uses — local_only is the
@@ -200,7 +200,7 @@ impl FromStr for ExternalAccess {
 }
 
 // ---------------------------------------------------------------------------
-// StepDefinition
+// ActionDefinition
 // ---------------------------------------------------------------------------
 
 /// Internal representation of a single step from a .focus file.
@@ -230,8 +230,8 @@ impl FromStr for ExternalAccess {
 /// dict[str, object]. Schema is intentionally open-ended at this layer;
 /// typed options struct deferred to focus loader implementation.
 #[derive(Debug, Clone)]
-pub struct StepDefinition {
-    pub step_id: String,
+pub struct ActionDefinition {
+    pub action_id: String,
     pub display_name: String,
     pub guide_id: String,
     pub task_type: String, // validated against task_types.yaml at LOAD
@@ -304,7 +304,7 @@ pub struct StepDefinition {
 // validate_step
 // ---------------------------------------------------------------------------
 
-/// Validate a StepDefinition after Phase 1 LOAD.
+/// Validate an ActionDefinition after Phase 1 LOAD.
 /// Returns Vec of error strings. Empty vec = valid.
 /// Python oracle: validate_step() in conductor/tokens.py.
 ///
@@ -317,7 +317,7 @@ pub struct StepDefinition {
 /// an invalid value unrepresentable, so the out-of-range .focus YAML case
 /// (routing_tier: 0, 4, 7, ...) is now rejected at parse time
 /// (lifecycle.rs::parse_focus_definition()) rather than deferred here.
-pub fn validate_step(step: &StepDefinition) -> Vec<String> {
+pub fn validate_step(step: &ActionDefinition) -> Vec<String> {
     let mut errors = Vec::new();
 
     if let Some(ref var) = step.output_var {
@@ -325,7 +325,7 @@ pub fn validate_step(step: &StepDefinition) -> Vec<String> {
             errors.push(format!(
                 "Step '{}': output_var '{}' collides with a system token. \
                  System tokens: {:?}",
-                step.step_id, var, SYSTEM_TOKENS,
+                step.action_id, var, SYSTEM_TOKENS,
             ));
         }
     }
@@ -345,7 +345,7 @@ mod tests {
         output_var: Option<&str>,
         routing_tier: u8,
         requires_user_handoff: bool,
-    ) -> StepDefinition {
+    ) -> ActionDefinition {
         // Mirrors lifecycle.rs's parse_focus_definition() derivation exactly
         // (items.id=528 Phase 2): external_access_override depends on
         // routing_tier ALONE (None only for Unrestricted) -- independent of
@@ -364,8 +364,8 @@ mod tests {
         } else {
             Some(access)
         };
-        StepDefinition {
-            step_id: "test-step".to_owned(),
+        ActionDefinition {
+            action_id: "test-step".to_owned(),
             display_name: "Test Step".to_owned(),
             guide_id: "writing-voice".to_owned(),
             task_type: "generate_text".to_owned(),

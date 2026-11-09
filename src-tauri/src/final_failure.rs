@@ -191,7 +191,7 @@ mod tests {
             plain_language: "fallback".to_owned(),
             is_recoverable: true,
             severity: FailureSeverity::Stop,
-            step_id: Some("s1".to_owned()),
+            action_id: Some("s1".to_owned()),
             focus_id: Some("f1".to_owned()),
             metadata: None,
         }

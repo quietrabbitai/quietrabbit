@@ -4727,13 +4727,13 @@ mod tests {
                  VALUES ('run1', 'f', '2026-01-01T00:00:00Z')",
                 // ON DELETE CASCADE children
                 "INSERT INTO focus_run_snapshots \
-                 (id, focus_run_id, step_id, phase, checkpoint_hash, created_at) \
+                 (id, focus_run_id, action_id, phase, checkpoint_hash, created_at) \
                  VALUES ('s1', 'run1', 'st', 1, 'h', '2026-01-01T00:00:00Z')",
                 "INSERT INTO extract_confirm_candidates \
                  (focus_run_id, field_name, extracted_value, sensitivity, confidence) \
                  VALUES ('run1', 'n', 'v', 'personal', 0.5)",
                 "INSERT INTO focus_run_steps \
-                 (id, focus_run_id, step_id, sequence_index, created_at, updated_at) \
+                 (id, focus_run_id, action_id, sequence_index, created_at, updated_at) \
                  VALUES ('fs1', 'run1', 'st', 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
                 // NO ACTION children
                 "INSERT INTO model_quality_scores \

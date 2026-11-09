@@ -33,7 +33,7 @@ use super::{
 #[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
 pub async fn gate1<L: DisclosureLogger>(
     logger: &L,
-    step_id: &str,
+    action_id: &str,
     focus_run_id: &str,
     personal_track: &PersonalTrack,
     abstraction_tier: u8,
@@ -100,7 +100,7 @@ pub async fn gate1<L: DisclosureLogger>(
     let log_id = {
         let result = logger
             .write(DisclosureLogEntry {
-                step_id: step_id.to_string(),
+                action_id: action_id.to_string(),
                 focus_run_id: focus_run_id.to_string(),
                 execution_tier,
                 abstraction_tier: Some(abstraction_tier),

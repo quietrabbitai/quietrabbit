@@ -5,7 +5,7 @@
 //! site. No [`ProviderError`] intermediary — qr_local maps directly.
 //! EXCEPTION (items.id=436): `pull_model`/`delete_model` map to
 //! [`OllamaModelError`] instead — model install/delete has no
-//! step_id/FocusRun context, so it isn't a fit for `ConductorError`'s
+//! action_id/FocusRun context, so it isn't a fit for `ConductorError`'s
 //! Conductor step-execution failure taxonomy. See that type's own doc
 //! comment.
 //!
@@ -749,8 +749,8 @@ impl OllamaClient {
 /// `ConductorError`: that type's variants (`OllamaUnavailable`,
 /// `OllamaTimeout`, etc.) are coupled to the Conductor step-execution
 /// failure taxonomy (`conductor/failure.rs`'s F1/F_SYSTEM handling,
-/// `step_id`/`focus_id`, retry-count branching) — a background model
-/// install/delete has no step_id or FocusRun context and isn't a
+/// `action_id`/`focus_id`, retry-count branching) — a background model
+/// install/delete has no action_id or FocusRun context and isn't a
 /// candidate for that state machine's retry/tier-fallback semantics. This
 /// is its own small error type instead, surfaced to the frontend as a
 /// plain string by `commands::model_install`.

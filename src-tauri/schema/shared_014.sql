@@ -10,7 +10,7 @@
 --
 -- SCOPE, deliberate (judgment call 1, this session's plan): this migration
 -- is ADDITIVE, parallel infrastructure only. It does NOT touch
--- focus_settings.max_permitted_tier/privacy_tier, StepDefinition.routing_tier,
+-- focus_settings.max_permitted_tier/privacy_tier, ActionDefinition.routing_tier,
 -- or any of gate3.rs/failure.rs/lifecycle.rs's numeric-tier ceiling
 -- enforcement -- those are golden-vector-verified Privacy Guardian code
 -- (CLAUDE.md) and a real cutover has to additionally design a flag-based
