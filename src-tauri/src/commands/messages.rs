@@ -685,6 +685,7 @@ pub async fn send_message(
         key_hex_str.clone(),
         crisis_detected,
         None,
+        Some(context_key.clone()),
         request,
     )
     .await?;

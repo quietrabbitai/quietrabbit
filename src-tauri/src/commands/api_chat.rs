@@ -559,6 +559,7 @@ pub async fn send_api_chat_message(
         key_hex_str.clone(),
         crisis_detected,
         Some(destination.clone()),
+        Some(context_key.clone()),
         run_request,
     )
     .await?;

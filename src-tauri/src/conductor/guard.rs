@@ -49,11 +49,21 @@
 //     router must run. Of the five operators only ne and present can be true for
 //     OTHER, so one of those is the fallback row.
 //
-// NOT HERE: back-edges, user turns, session variables, G4 and Tech Support
-// (decisions.id=938).
+// BOUND NAMES (items.id=886, decisions.id=939 section 2): a guard variable may
+// also be a bound name (bound_spec.rs), a value read from the session or case
+// store at pass start. It is available from row 0, before any row runs, and
+// feeds path enumeration with its spec's literals: a Closed domain is exactly
+// those literals (write_mode: open, suppressed), an Authored one is the guard
+// literals plus OTHER, as for a router. A session name that can be ABSENT adds
+// one more state, unset, in which every value test is false, so a Focus that
+// routes on locked_intent must have a row that still runs on the first message.
+// A row's output_var may not be a bound name.
+//
+// NOT HERE: back-edges, user turns and Tech Support (decisions.id=938).
 
 use std::collections::{HashMap, HashSet};
 
+use crate::conductor::bound_spec::{self, Literals, Presence};
 use crate::conductor::types::TaskTrack;
 
 /// Most paths LOAD will enumerate for one Focus. An authoring guard only: there
@@ -260,6 +270,8 @@ pub struct RowShape<'a> {
 pub enum CompositionError {
     #[error("step '{action_id}': guard variable '{var}' is not the output_var of any earlier step (unknown variable)")]
     UnknownVariable { action_id: String, var: String },
+    #[error("step '{action_id}': output_var '{var}' is the name of a session or case variable read from the store at pass start")]
+    BoundNameCollision { action_id: String, var: String },
     #[error("more than {MAX_PATHS} execution paths through the guards (authoring cap)")]
     TooManyPaths,
     #[error("step '{action_id}' is unreachable: no path through the guards runs it")]
@@ -276,6 +288,31 @@ pub enum CompositionError {
     },
     #[error("router variable '{var}' has no fallback row: when it matches none of its literals no step guarded on it runs ({path}). Add a row with an 'ne' or 'present' guard on '{var}'")]
     NoFallback { var: String, path: String },
+}
+
+/// A bound name as the analysis sees it (from bound_spec::SPECS).
+pub struct BoundVar<'a> {
+    pub name: &'a str,
+    /// Some: the value is always one of these. None: the guards supply the
+    /// literals, plus OTHER.
+    pub closed: Option<&'a [&'a str]>,
+    /// True when the name can be absent (a session name never written).
+    pub optional: bool,
+}
+
+/// The registry's names as the analysis sees them.
+fn registry_bound() -> Vec<BoundVar<'static>> {
+    bound_spec::SPECS
+        .iter()
+        .map(|s| BoundVar {
+            name: s.name,
+            closed: match s.literals {
+                Literals::Closed(l) => Some(l),
+                Literals::Authored => None,
+            },
+            optional: s.presence == Presence::Optional,
+        })
+        .collect()
 }
 
 /// One enumerated path: the executed row indices, and the modelled value of
@@ -304,12 +341,37 @@ struct Walk<'a, 'b> {
     rows: &'b [RowShape<'a>],
     domains: &'b HashMap<String, Vec<String>>,
     guard_vars: &'b [String],
+    /// Bound guard variables and the states each can start a pass in
+    /// (None = absent).
+    bound_start: &'b [(String, Vec<Option<String>>)],
     state: HashMap<String, String>,
     current: Vec<usize>,
     out: Vec<Path>,
 }
 
 impl Walk<'_, '_> {
+    /// Branch over the starting state of each bound guard variable, then walk
+    /// the rows from row 0.
+    fn seed(&mut self, k: usize) -> Result<(), CompositionError> {
+        let Some((var, states)) = self.bound_start.get(k) else {
+            return self.go(0);
+        };
+        let (var, states) = (var.clone(), states.clone());
+        let mut res = Ok(());
+        for st in states {
+            match st {
+                Some(v) => self.state.insert(var.clone(), v),
+                None => self.state.remove(&var),
+            };
+            res = self.seed(k + 1);
+            if res.is_err() {
+                break;
+            }
+        }
+        self.state.remove(&var);
+        res
+    }
+
     fn go(&mut self, i: usize) -> Result<(), CompositionError> {
         if i == self.rows.len() {
             if self.out.len() >= MAX_PATHS {
@@ -365,11 +427,35 @@ impl Walk<'_, '_> {
 /// Validates the guards of one composition and returns the number of paths.
 /// An unguarded composition has exactly one path.
 pub fn analyze_composition(rows: &[RowShape]) -> Result<usize, CompositionError> {
-    // 1. Every guard variable comes from an earlier row's output.
+    analyze_composition_with(rows, &registry_bound())
+}
+
+/// analyze_composition() over an explicit set of bound names (tests).
+pub fn analyze_composition_with(
+    rows: &[RowShape],
+    bound: &[BoundVar],
+) -> Result<usize, CompositionError> {
+    // 0. No row's output is a bound name: the seed and the output would share
+    // one variable.
+    for row in rows {
+        if let Some(v) = row
+            .output_var
+            .filter(|v| bound.iter().any(|b| b.name == *v))
+        {
+            return Err(CompositionError::BoundNameCollision {
+                action_id: row.action_id.to_owned(),
+                var: v.to_owned(),
+            });
+        }
+    }
+
+    // 1. Every guard variable comes from an earlier row's output, or is a
+    // bound name (available from row 0).
     for (i, row) in rows.iter().enumerate() {
         if let Some(g) = row.guard {
             let earlier = rows[..i].iter().any(|r| r.output_var == Some(&*g.var));
-            if !earlier {
+            let is_bound = bound.iter().any(|b| b.name == g.var);
+            if !earlier && !is_bound {
                 return Err(CompositionError::UnknownVariable {
                     action_id: row.action_id.to_owned(),
                     var: g.var.clone(),
@@ -396,20 +482,38 @@ pub fn analyze_composition(rows: &[RowShape]) -> Result<usize, CompositionError>
             routers.push(g.var.clone());
         }
     }
-    for d in domains.values_mut() {
-        d.push(OTHER.to_owned());
+    // A bound variable with a Closed domain takes exactly those literals (its
+    // validator guarantees it), so it has no OTHER. Every other variable is its
+    // guard literals plus OTHER.
+    let mut bound_start: Vec<(String, Vec<Option<String>>)> = Vec::new();
+    for (var, d) in domains.iter_mut() {
+        let b = bound.iter().find(|b| b.name == var.as_str());
+        match b.and_then(|b| b.closed) {
+            Some(closed) => *d = closed.iter().map(|l| (*l).to_owned()).collect(),
+            None => d.push(OTHER.to_owned()),
+        }
+        if let Some(b) = b {
+            let mut states: Vec<Option<String>> = d.iter().cloned().map(Some).collect();
+            if b.optional {
+                states.push(None);
+            }
+            bound_start.push((var.clone(), states));
+        }
     }
+    // Deterministic order: the order the variables first appear in guards.
+    bound_start.sort_by_key(|(v, _)| guard_vars.iter().position(|g| g == v));
 
     // 3. Enumerate.
     let mut walk = Walk {
         rows,
         domains: &domains,
         guard_vars: &guard_vars,
+        bound_start: &bound_start,
         state: HashMap::new(),
         current: Vec::new(),
         out: Vec::new(),
     };
-    walk.go(0)?;
+    walk.seed(0)?;
     let paths = walk.out;
 
     // 4. Per-path and whole-composition checks.
@@ -889,5 +993,166 @@ mod tests {
         ];
         // detail is a router (eq): when detail is OTHER, fb2 (present) runs.
         assert_eq!(analyze(&rows), Ok(3));
+    }
+
+    // -- bound names (items.id=886) -----------------------------------------
+
+    /// Rows over the REAL registry (analyze_composition, not _with).
+    #[test]
+    fn a_guard_may_read_a_closed_bound_name_from_row_zero() {
+        // write_mode is Closed {open, suppressed} and always present.
+        let rows = [
+            r("save", Some(g("write_mode", "eq", Some("open"))), None),
+            r(
+                "skip",
+                Some(g("write_mode", "eq", Some("suppressed"))),
+                None,
+            ),
+            r("always", None, None),
+        ];
+        // Two paths, no OTHER: the value is always one of the two literals.
+        assert_eq!(analyze(&rows), Ok(2));
+    }
+
+    #[test]
+    fn a_closed_bound_name_has_no_other_so_no_fallback_row_is_demanded() {
+        let rows = [
+            r("a", Some(g("write_mode", "eq", Some("open"))), None),
+            r("b", Some(g("write_mode", "ne", Some("open"))), None),
+        ];
+        assert_eq!(analyze(&rows), Ok(2));
+    }
+
+    #[test]
+    fn a_guard_literal_outside_a_closed_domain_makes_its_row_unreachable() {
+        let rows = [
+            r("typo", Some(g("write_mode", "eq", Some("supressed"))), None),
+            r("always", None, None),
+        ];
+        assert!(matches!(
+            analyze(&rows),
+            Err(CompositionError::Unreachable { ref action_id }) if action_id == "typo"
+        ));
+    }
+
+    #[test]
+    fn an_optional_authored_bound_name_has_unset_literals_and_other() {
+        // locked_intent: literals a and b, OTHER, and unset = 4 states. A row
+        // that runs on unset (absent guard) and one that runs on OTHER (ne) are
+        // both needed, or LOAD fails.
+        let rows = [
+            r("a", Some(g("locked_intent", "eq", Some("a"))), None),
+            r("b", Some(g("locked_intent", "eq", Some("b"))), None),
+            r("fallback", Some(g("locked_intent", "ne", Some("a"))), None),
+            r("first_turn", Some(g("locked_intent", "absent", None)), None),
+        ];
+        assert_eq!(analyze(&rows), Ok(4));
+    }
+
+    #[test]
+    fn routing_only_on_an_optional_name_needs_a_row_that_runs_when_it_is_unset() {
+        // With locked_intent unset every value test is false, so ne is false
+        // too: nothing runs on the first message.
+        let rows = [
+            r("a", Some(g("locked_intent", "eq", Some("a"))), None),
+            r("fb", Some(g("locked_intent", "ne", Some("a"))), None),
+        ];
+        assert!(matches!(
+            analyze(&rows),
+            Err(CompositionError::EmptyPath { ref path }) if path.contains("locked_intent unset")
+        ));
+    }
+
+    #[test]
+    fn a_derived_bound_name_always_exists_so_absent_never_holds() {
+        // open_ticket_state is Closed {none, one, many} and never unset.
+        let rows = [
+            r(
+                "none",
+                Some(g("open_ticket_state", "eq", Some("none"))),
+                None,
+            ),
+            r("one", Some(g("open_ticket_state", "eq", Some("one"))), None),
+            r(
+                "many",
+                Some(g("open_ticket_state", "eq", Some("many"))),
+                None,
+            ),
+        ];
+        assert_eq!(analyze(&rows), Ok(3));
+        let dead = [
+            r("always", None, None),
+            r("never", Some(g("open_ticket_state", "absent", None)), None),
+        ];
+        assert!(matches!(
+            analyze(&dead),
+            Err(CompositionError::Unreachable { ref action_id }) if action_id == "never"
+        ));
+    }
+
+    #[test]
+    fn a_row_output_var_that_is_a_bound_name_fails_the_analysis() {
+        let rows = [r("a", None, Some("case_context")), r("b", None, None)];
+        assert!(matches!(
+            analyze(&rows),
+            Err(CompositionError::BoundNameCollision { ref var, .. }) if var == "case_context"
+        ));
+    }
+
+    #[test]
+    fn a_bound_guard_variable_combines_with_a_router_in_path_enumeration() {
+        // Two states of write_mode times intent (a, OTHER) = 4 paths.
+        let rows = [
+            r("route", None, Some("intent")),
+            r("a_open", Some(g("intent", "eq", Some("a"))), None),
+            r("fb", Some(g("intent", "ne", Some("a"))), None),
+            r("open", Some(g("write_mode", "eq", Some("open"))), None),
+            r(
+                "held",
+                Some(g("write_mode", "eq", Some("suppressed"))),
+                None,
+            ),
+        ];
+        assert_eq!(analyze(&rows), Ok(4));
+    }
+
+    #[test]
+    fn an_explicit_bound_set_is_honoured_and_path_cap_still_applies() {
+        let rows = [
+            r("x", Some(g("flag", "eq", Some("on"))), None),
+            r("y", Some(g("flag", "ne", Some("on"))), None),
+        ];
+        let shapes: Vec<RowShape> = rows
+            .iter()
+            .map(|x| RowShape {
+                action_id: x.id,
+                guard: x.guard.as_ref(),
+                output_var: x.out,
+                is_block: false,
+                local_and_no_handoff: true,
+            })
+            .collect();
+        let bound = [BoundVar {
+            name: "flag",
+            closed: None,
+            optional: true,
+        }];
+        // on, OTHER, unset: three states, each runs exactly one of x or y
+        // (unset runs neither, so it is an empty path).
+        assert!(matches!(
+            analyze_composition_with(&shapes, &bound),
+            Err(CompositionError::EmptyPath { .. })
+        ));
+        let bound_present = [BoundVar {
+            name: "flag",
+            closed: Some(&["on", "off"]),
+            optional: false,
+        }];
+        assert_eq!(analyze_composition_with(&shapes, &bound_present), Ok(2));
+        // Without the name registered it is an unknown variable.
+        assert!(matches!(
+            analyze_composition_with(&shapes, &[]),
+            Err(CompositionError::UnknownVariable { .. })
+        ));
     }
 }

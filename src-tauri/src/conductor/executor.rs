@@ -294,6 +294,11 @@ pub struct StepContext {
     pub retry_count: u32,
     /// Display name of the Focus, passed to gate3 for the consent modal header.
     pub focus_name: String,
+    /// items.id=886: this pass's seeds of the bound names (session and case
+    /// store content) and the set of names a step sees only when its own
+    /// template names them. Applied in render_prompt* beside the system tokens;
+    /// see conductor::taint. Empty for a Focus that uses no bound name.
+    pub store_tokens: crate::conductor::taint::StoreTokens,
 }
 
 // ---------------------------------------------------------------------------
@@ -1020,7 +1025,7 @@ fn render_template(
 /// qr_local prompt render. Never reads disclosure buffer.
 /// Token merge order: output_vars -> SYSTEM_TOKENS.
 /// Python oracle: StepExecutor._render_prompt()
-fn render_prompt(
+pub(crate) fn render_prompt(
     ctx: &StepContext,
     output_vars: &HashMap<String, String>,
     previous_output: &str,
@@ -1036,6 +1041,10 @@ fn render_prompt(
     tokens.insert("focus_context".to_owned(), ctx.focus_id.clone());
     tokens.insert("persona_context".to_owned(), ctx.persona_context.clone());
     tokens.insert("voice_profile".to_owned(), voice_profile_str.to_owned());
+    // items.id=886: bound-name seeds, beside the system tokens. A seed reaches
+    // only a step whose own template names it.
+    ctx.store_tokens
+        .apply(&ctx.step.prompt_template, &mut tokens);
     render_template(
         &ctx.step.prompt_template,
         &tokens,
@@ -1068,6 +1077,11 @@ fn render_prompt_with_disclosure(
     tokens.insert("focus_context".to_owned(), ctx.focus_id.clone());
     tokens.insert("persona_context".to_owned(), ctx.persona_context.clone());
     tokens.insert("voice_profile".to_owned(), voice_profile_str.to_owned());
+    // items.id=886: as in render_prompt. (While STORE_NAMES_EXTERNAL_ALLOWED is
+    // false no external step names a bound name, so for an external step this
+    // only strips store-derived variables a user turn tried to pull in.)
+    ctx.store_tokens
+        .apply(&ctx.step.prompt_template, &mut tokens);
     render_template(
         &ctx.step.prompt_template,
         &tokens,
@@ -2435,7 +2449,7 @@ fn to_gate_track(ct: &PersonalTrack) -> GateTrack {
 /// Matches TaskTrack's internal output_vars HashMap without adding a public
 /// accessor (avoids modifying types.rs in this commit).
 /// Python oracle: ctx.task_track.output_vars.items()
-fn collect_output_vars(steps: &[TaskStep]) -> HashMap<String, String> {
+pub(crate) fn collect_output_vars(steps: &[TaskStep]) -> HashMap<String, String> {
     steps
         .iter()
         .filter_map(|s| {
@@ -3690,6 +3704,7 @@ mod tests {
             attendance: RunAttendance::Attended,
             stream: None,
             bound: None,
+            store_tokens: Default::default(),
         };
         let mut projected = HashMap::new();
         projected.insert("name".to_owned(), "Alice (abstracted)".to_owned());
@@ -3755,6 +3770,7 @@ mod tests {
             attendance: RunAttendance::Attended,
             stream: None,
             bound: None,
+            store_tokens: Default::default(),
         };
         assert_eq!(compute_step_sensitivity(&ctx, &pt, &HashMap::new()), 2);
     }
@@ -3806,6 +3822,7 @@ mod tests {
             attendance: RunAttendance::Attended,
             stream: None,
             bound: None,
+            store_tokens: Default::default(),
         };
         assert_eq!(compute_step_sensitivity(&ctx, &pt, &HashMap::new()), 1);
     }
@@ -3869,6 +3886,7 @@ mod tests {
             attendance,
             stream: None,
             bound: None,
+            store_tokens: Default::default(),
         }
     }
 

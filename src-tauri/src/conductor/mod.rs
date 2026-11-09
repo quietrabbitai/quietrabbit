@@ -1,6 +1,7 @@
 // src-tauri/src/conductor/mod.rs
 
 pub mod block_dispatch;
+pub mod bound_spec;
 pub mod checkin;
 pub mod concurrency;
 pub mod crisis;
@@ -19,6 +20,10 @@ pub mod provider_selection;
 pub mod quality;
 pub mod reentry;
 pub mod scheduled_sweep;
+pub mod seeding;
+#[cfg(test)]
+mod store_seed_tests;
+pub mod taint;
 pub mod tier_manifest;
 pub mod tokens;
 pub mod types;

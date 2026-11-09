@@ -148,10 +148,21 @@ pub struct ReenterStepResponse {
 /// to. It is set before AUTHORIZE because authorize builds the failure handler
 /// from provider resolution. Every other caller passes None.
 ///
+/// `context_key` (items.id=886, decisions.id=939 section 2) is the chat the run
+/// belongs to: the key of its session variables and one-time write latch. It is
+/// a parameter here, passed by each server-side caller from the chat it has
+/// already resolved, and deliberately NOT a SubmitFocusRunRequest field: that
+/// DTO is deserialized from the frontend, and a client must never choose which
+/// chat's session state a run reads. None for a run with no chat.
+///
 /// items.id=778: the caller holds the run's writer lease (taken before anything
 /// was written) across this call and moves it into `run.lease` afterwards, so
 /// the run keeps it until it is dropped. If LOAD or AUTHORIZE fails the lease
 /// is dropped with the error.
+// 8 arguments: the Tauri-injected state, the caller's key, crisis flag, API Chat
+// binding and chat key, and the request. Bundling them would hide which are
+// server-side (never the DTO), which is the point of the signature.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn load_and_authorize_run(
     app_handle: tauri::AppHandle,
     scheduler: tauri::State<'_, Arc<ConductorScheduler>>,
@@ -159,6 +170,7 @@ pub(crate) async fn load_and_authorize_run(
     key_hex: String,
     crisis_detected: bool,
     bound: Option<crate::api_chat::BoundDestination>,
+    context_key: Option<String>,
     request: SubmitFocusRunRequest,
 ) -> Result<FocusRun, String> {
     let is_quick_ask = is_quick_ask_focus(&request.focus_id);
@@ -190,6 +202,7 @@ pub(crate) async fn load_and_authorize_run(
     );
     run.crisis_floor_triggered = crisis_detected;
     run.chat_binding = bound;
+    run.context_key = context_key;
     // A user started this run from the app (items.id=710): attended.
     run.attendance = crate::spend::gate::RunAttendance::Attended;
 
@@ -240,6 +253,7 @@ pub async fn submit_focus_run(
         key_hex_str,
         crisis_detected,
         None,
+        None, // submit_focus_run belongs to no chat
         request,
     )
     .await?;

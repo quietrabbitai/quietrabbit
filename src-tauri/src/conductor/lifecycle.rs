@@ -181,6 +181,11 @@ pub enum LifecycleError {
     FocusSettingsStore(String),
     #[error("Topic store: {0}")]
     TopicStore(String),
+    /// items.id=886: the pass could not read the session or case store it needs,
+    /// so it did not run (fail closed, decisions.id=939 section 2). The message
+    /// names the variable, never its value.
+    #[error("Session store: {0}")]
+    StoreSeed(#[from] crate::conductor::seeding::SeedError),
     #[error("JSON: {0}")]
     Json(#[from] serde_json::Error),
     #[error("IO: {0}")]
@@ -934,10 +939,22 @@ fn parse_optional_trigger(
 /// The (action_id, content) pairs the Phase 5 extraction pass reads
 /// (extract_candidates). A block step's content is the block's own advisory
 /// verdict, not conversation, so it is left out (items.id=129).
-fn extraction_step_outputs(
+///
+/// items.id=886 (decisions.id=939 section 3): a TAINTED step is left out too,
+/// one whose prompt named a bound name (session or case content) or, through
+/// the closure in conductor::taint, a variable derived from one. Case symptoms,
+/// device configuration and the like must not come back out of the generic
+/// extraction as "facts about the user".
+pub(crate) fn extraction_step_outputs(
     task_track: &TaskTrack,
     focus_def: &FocusDefinition,
 ) -> Vec<(String, String)> {
+    let tainted = crate::conductor::taint::taint_closure(
+        &focus_def.steps,
+        &row_output_vars(&focus_def.steps),
+        crate::conductor::declared_inputs::bound_names(),
+    )
+    .actions;
     task_track
         .steps()
         .iter()
@@ -947,6 +964,7 @@ fn extraction_step_outputs(
                 .iter()
                 .any(|d| d.action_id == s.action_id && d.block_stable_id.is_some())
         })
+        .filter(|s| !tainted.contains(&s.action_id))
         .map(|s| (s.action_id.clone(), s.content.clone()))
         .collect()
 }
@@ -1478,6 +1496,18 @@ pub struct FocusRun<L: DisclosureLoggerForRun = SqliteDisclosureLogger> {
     /// resolution. A rehydrated run re-derives it from its conversation's
     /// binding.
     pub chat_binding: Option<crate::api_chat::BoundDestination>,
+    /// items.id=886 (decisions.id=939 section 2): the chat this run belongs to,
+    /// the key of its session variables and one-time write latch. Set by the
+    /// SERVER, as a parameter of load_and_authorize_run, never from the frontend
+    /// request DTO. None for a run that belongs to no chat (submit_focus_run, a
+    /// rehydrated or swept run): a session name then reads as absent, and
+    /// write_mode, which cannot be read without a chat, fails the pass closed.
+    /// items.id=888 (resume pin) must carry it across a resume.
+    pub context_key: Option<String>,
+    /// items.id=886: the seeds read at the start of the current pass and the
+    /// names a step sees only when its own template names them. Empty until
+    /// execute() seeds it.
+    pub(crate) store_tokens: crate::conductor::taint::StoreTokens,
     /// items.id=778 (decisions.id=896): this run's writer lease. Taken by the
     /// caller that starts or resumes the run, BEFORE the run can touch a
     /// database, and held until the run is dropped, which for a spawned run is
@@ -1537,6 +1567,8 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             attendance: crate::spend::gate::RunAttendance::Unattended,
             chat_stream: None,
             chat_binding: None,
+            context_key: None,
+            store_tokens: crate::conductor::taint::StoreTokens::default(),
             lease: None,
         }
     }
@@ -2317,6 +2349,32 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
     // Phase 4 — EXECUTE
     // =========================================================================
 
+    /// items.id=886: seed this pass's store tokens (see conductor::seeding).
+    /// Called once at the start of every execute(), so a resumed or re-entered
+    /// pass reads the stores again. A Focus that uses no bound name does no I/O.
+    /// A failure is a LifecycleError and no step runs.
+    async fn seed_store_tokens(&mut self) -> Result<(), LifecycleError> {
+        let tokens = {
+            let def = self
+                .focus_def
+                .as_ref()
+                .expect("execute() asserted focus_def");
+            let row_vars = row_output_vars(&def.steps);
+            crate::conductor::seeding::seed_pass(
+                &self.user_id,
+                &self.persona_id,
+                self.key_hex.as_deref().unwrap_or(""),
+                self.context_key.as_deref(),
+                &self.focus_id,
+                &def.steps,
+                &row_vars,
+            )
+            .await?
+        };
+        self.store_tokens = tokens;
+        Ok(())
+    }
+
     /// Run the step loop. Returns Some(RunResult) on early exit (cloud_frontier boundary
     /// or step failure), None when all steps complete normally -> proceed to output().
     /// Python oracle: FocusRun.execute()
@@ -2347,6 +2405,11 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             self.privacy_gateway.is_some(),
             "execute() requires privacy_gateway"
         );
+
+        // items.id=886: pass start. Read the bound names this Focus uses from the
+        // session and case stores (none: no database is opened). A read that
+        // fails fails the pass here, before any step runs.
+        self.seed_store_tokens().await?;
 
         let checkpoint_every = std::env::var("QR_CHECKPOINT_EVERY_N_STEPS")
             .ok()
@@ -2379,7 +2442,11 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             // track (rehydrate_focus_run restores every recorded output), so it
             // lands on the same path. YAML-authored steps never carry a guard.
             if let Some(g) = &step.guard {
-                let vars = guard::track_vars(self.task_track.as_ref().unwrap());
+                let mut vars = guard::track_vars(self.task_track.as_ref().unwrap());
+                // items.id=886: a bound name is a variable from row 0. LOAD
+                // rejects an output_var with a bound name, so nothing is
+                // overwritten here. An absent session name has no entry.
+                vars.extend(self.store_tokens.seeds.clone());
                 if !g.evaluate(&vars) {
                     log::debug!(
                         "lifecycle: step '{}' skipped, guard on '{}' is false",
@@ -2877,6 +2944,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             stream: self.chat_stream.clone(),
             stop: self.lease.as_ref().map(|l| l.stop_token().clone()),
             bound: self.chat_binding.clone(),
+            store_tokens: self.store_tokens.clone(),
         };
 
         // Borrow distinct fields of self simultaneously — Rust borrow checker allows
@@ -9114,6 +9182,379 @@ mod tests {
             assert_eq!(ran_ids(&run), original);
         })
         .await;
+    }
+
+    // -- items.id=886: bound names, seeding, taint, interim invariant --------
+
+    /// An ordinary LOCAL step with `template`, recording `out`.
+    fn local_step(id: &str, template: &str, out: Option<&str>) -> ActionDefinition {
+        let mut s = single_tier3_step_focus_def().steps[0].clone();
+        s.action_id = id.to_owned();
+        s.display_name = id.to_owned();
+        s.routing_tier = ExternalAccess::LocalOnly;
+        s.external_access_override = None;
+        s.requires_user_handoff = false;
+        s.prompt_template = template.to_owned();
+        s.output_var = out.map(str::to_owned);
+        s
+    }
+
+    fn recorded(id: &str, out: Option<&str>, content: &str) -> TaskStep {
+        TaskStep {
+            action_id: id.to_owned(),
+            output_var: out.map(str::to_owned),
+            content: content.to_owned(),
+            sensitivity_severity: 1,
+            routing_tier_used: 1,
+            personal_flagged: false,
+            audit_unavailable: false,
+        }
+    }
+
+    /// Direct taint: a step whose template names a bound name is dropped from
+    /// the extraction input, and so is nothing else.
+    #[test]
+    fn extraction_drops_a_step_that_names_a_bound_name() {
+        let mut def = single_tier3_step_focus_def();
+        def.steps = vec![
+            local_step("clean", "{user_input}", Some("c")),
+            local_step("direct", "{case_context}", Some("d")),
+        ];
+        let mut tt = TaskTrack::new();
+        tt.add_step(recorded("clean", Some("c"), "clean content"));
+        tt.add_step(recorded("direct", Some("d"), "CASE CONTENT"));
+        assert_eq!(
+            extraction_step_outputs(&tt, &def),
+            vec![("clean".to_owned(), "clean content".to_owned())]
+        );
+    }
+
+    /// Transitive taint: a step naming a tainted variable is dropped, through
+    /// any number of hops, whatever the row order, and so is a step that names
+    /// {previous_output} after a tainted row.
+    #[test]
+    fn extraction_drops_steps_that_name_a_tainted_variable_transitively() {
+        let mut def = single_tier3_step_focus_def();
+        def.steps = vec![
+            local_step("hop3", "polish {v2}", Some("v3")),
+            local_step("root", "{locked_intent}", Some("v1")),
+            local_step("hop2", "summarise {v1}", Some("v2")),
+            local_step("carry", "{previous_output}", Some("v4")),
+            local_step("clean", "{user_input}", Some("c")),
+        ];
+        let mut tt = TaskTrack::new();
+        for (id, out) in [
+            ("root", "v1"),
+            ("hop2", "v2"),
+            ("hop3", "v3"),
+            ("carry", "v4"),
+            ("clean", "c"),
+        ] {
+            tt.add_step(recorded(id, Some(out), &format!("{id} content")));
+        }
+        assert_eq!(
+            extraction_step_outputs(&tt, &def),
+            vec![("clean".to_owned(), "clean content".to_owned())]
+        );
+    }
+
+    #[test]
+    fn extraction_is_unchanged_when_no_step_names_a_bound_name() {
+        let mut def = single_tier3_step_focus_def();
+        def.steps = vec![
+            local_step("a", "{user_input} {persona_context}", Some("v1")),
+            local_step("b", "{v1} {previous_output}", Some("v2")),
+        ];
+        let mut tt = TaskTrack::new();
+        tt.add_step(recorded("a", Some("v1"), "one"));
+        tt.add_step(recorded("b", Some("v2"), "two"));
+        assert_eq!(extraction_step_outputs(&tt, &def).len(), 2);
+    }
+
+    /// A Focus with a guard on a bound name and two exclusive block rows.
+    fn write_mode_def() -> FocusDefinition {
+        let block = |id: &str, mode: &str| {
+            let mut s = hand_built_cb06_step();
+            s.action_id = id.to_owned();
+            s.display_name = id.to_owned();
+            s.guard =
+                guard::Guard::from_columns(Some("write_mode"), Some("eq"), Some(mode)).unwrap();
+            s
+        };
+        let mut def = single_tier3_step_focus_def();
+        def.steps = vec![
+            block("open_check", "open"),
+            block("held_check", "suppressed"),
+        ];
+        def
+    }
+
+    /// No chat means write_mode cannot be read: the pass fails closed and no
+    /// step runs. It does not fall back to open.
+    #[tokio::test]
+    async fn execute_fails_closed_when_write_mode_cannot_be_read() {
+        with_temp_data_root(async {
+            let mut run = tier3_ready_run(false);
+            run.focus_def = Some(write_mode_def());
+            run.context_key = None;
+            run.task_track
+                .as_mut()
+                .unwrap()
+                .add_step(draft_step("the assessed draft"));
+            let err = run.execute().await.unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    LifecycleError::StoreSeed(crate::conductor::seeding::SeedError::NoContextKey(
+                        "write_mode"
+                    ))
+                ),
+                "{err:?}"
+            );
+            assert_eq!(ran_ids(&run), ["draft_writing"], "no step ran");
+        })
+        .await;
+    }
+
+    /// The seed reaches the guard: the open row runs while the chat is open, the
+    /// suppressed row once the one-time latch is set, read at pass start from
+    /// the real encrypted outputs.db.
+    #[tokio::test]
+    async fn execute_seeds_write_mode_from_the_store_and_the_guard_follows_it() {
+        with_temp_data_root(async {
+            let make_run = || {
+                let mut run = tier3_ready_run(false);
+                run.focus_def = Some(write_mode_def());
+                run.context_key = Some("chat-wm".to_owned());
+                run.task_track
+                    .as_mut()
+                    .unwrap()
+                    .add_step(draft_step("the assessed draft"));
+                run
+            };
+
+            let mut run = make_run();
+            run.execute().await.unwrap();
+            assert_eq!(ran_ids(&run), ["draft_writing", "open_check"]);
+            assert_eq!(
+                run.store_tokens.seeds.get("write_mode").map(String::as_str),
+                Some("open")
+            );
+
+            let mut conn = open_outputs_db(&run.user_id, &run.persona_id, CRISIS_TEST_KEY_HEX)
+                .await
+                .unwrap();
+            crate::persistence::session_store::latch_write_suppressed(
+                &mut conn, "chat-wm", "f", "run-x",
+            )
+            .await
+            .unwrap();
+            drop(conn);
+
+            let mut latched = make_run();
+            latched.execute().await.unwrap();
+            assert_eq!(ran_ids(&latched), ["draft_writing", "held_check"]);
+            assert_eq!(
+                latched
+                    .store_tokens
+                    .seeds
+                    .get("write_mode")
+                    .map(String::as_str),
+                Some("suppressed")
+            );
+
+            // Another chat is still open: the latch is per chat.
+            let mut other = make_run();
+            other.context_key = Some("chat-other".to_owned());
+            other.execute().await.unwrap();
+            assert_eq!(ran_ids(&other), ["draft_writing", "open_check"]);
+        })
+        .await;
+    }
+
+    /// A Focus that names no bound name never touches the store: no chat is
+    /// needed and no database is opened (the data root stays empty).
+    #[tokio::test]
+    async fn a_focus_with_no_bound_name_reads_nothing() {
+        with_temp_data_root(async {
+            let mut run = tier3_ready_run(false);
+            run.key_hex = None; // would fail an open, so none may be attempted
+            run.context_key = None;
+            run.focus_def = Some({
+                let mut d = single_tier3_step_focus_def();
+                d.steps = vec![hand_built_cb06_step()];
+                d
+            });
+            run.task_track
+                .as_mut()
+                .unwrap()
+                .add_step(draft_step("the assessed draft"));
+            run.execute().await.unwrap();
+            assert!(run.store_tokens.seeds.is_empty());
+        })
+        .await;
+    }
+
+    // LOAD (database path): the interim invariant, collisions, guards.
+
+    #[tokio::test]
+    async fn store_names_db_an_external_step_cannot_name_or_declare_one() {
+        with_temp_data_root(async {
+            // Declared, so the declared-inputs rule is met: the interim
+            // invariant is what refuses it.
+            let m = declared_load(
+                "sn-declared",
+                vec![dstep(
+                    "e",
+                    2,
+                    "{case_context}",
+                    &["case_context"],
+                    &[],
+                    None,
+                )],
+            )
+            .await
+            .unwrap_err();
+            assert!(m.contains("Focus 'sn-declared'"), "{m}");
+            assert!(
+                m.contains("step 'e'") && m.contains("'case_context'"),
+                "{m}"
+            );
+            assert!(m.contains("items.id=884"), "{m}");
+
+            // Undeclared: the declared-inputs rule speaks first.
+            let m = declared_load(
+                "sn-undeclared",
+                vec![dstep("e", 2, "{delta_context}", &[], &[], None)],
+            )
+            .await
+            .unwrap_err();
+            assert!(m.contains("session-bound"), "{m}");
+
+            // Transitive: an external step naming a variable a local step
+            // derived from a store name.
+            let m = declared_load(
+                "sn-transitive",
+                vec![
+                    dstep("a", 1, "{locked_intent}", &[], &[], Some("echo1")),
+                    dstep("b", 1, "{echo1}", &[], &[], Some("echo2")),
+                    dstep("e", 2, "{echo2}", &["echo2"], &[], None),
+                ],
+            )
+            .await
+            .unwrap_err();
+            assert!(m.contains("step 'e'") && m.contains("'echo2'"), "{m}");
+            assert!(m.contains("items.id=884"), "{m}");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn store_names_db_local_steps_and_clean_external_steps_still_load() {
+        with_temp_data_root(async {
+            declared_load(
+                "sn-local",
+                vec![
+                    dstep(
+                        "a",
+                        1,
+                        "{case_context} {delta_context} {write_mode}",
+                        &["case_context"],
+                        &[],
+                        Some("echo1"),
+                    ),
+                    dstep("e", 2, "{user_input}", &["user_input"], &[], None),
+                ],
+            )
+            .await
+            .unwrap();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn store_names_db_an_output_var_cannot_be_a_bound_name() {
+        with_temp_data_root(async {
+            let m = declared_load(
+                "sn-collide",
+                vec![dstep("a", 1, "x", &[], &[], Some("case_context"))],
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                m.contains("step 'a'") && m.contains("output_var 'case_context'"),
+                "{m}"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn store_names_db_a_guard_on_a_bound_name_loads_and_is_path_checked() {
+        with_temp_data_root(async {
+            let pool = block_load_pool().await;
+            seed_guarded_focus(
+                &pool,
+                "sn-guard",
+                vec![
+                    gplain("a", None, None),
+                    gplain("b", None, Some(("write_mode", "eq", Some("open")))),
+                    gplain("c", None, Some(("write_mode", "eq", Some("suppressed")))),
+                ],
+            )
+            .await;
+            let def = load_focus_definition_from_db(&pool, "sn-guard")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                analyze_guarded_composition("sn-guard", &def.steps).unwrap(),
+                2
+            );
+
+            // A literal outside write_mode's closed domain leaves its row
+            // unreachable, which LOAD refuses.
+            seed_guarded_focus(
+                &pool,
+                "sn-guard-typo",
+                vec![
+                    gplain("a", None, None),
+                    gplain("b", None, Some(("write_mode", "eq", Some("supressed")))),
+                ],
+            )
+            .await;
+            let m = load_err_text(load_focus_definition_from_db(&pool, "sn-guard-typo").await);
+            assert!(m.contains("unreachable") && m.contains("'b'"), "{m}");
+        })
+        .await;
+    }
+
+    /// The YAML loader runs the same lint, so a Focus file cannot smuggle a
+    /// store name to an external step either.
+    #[test]
+    fn store_names_yaml_an_external_step_cannot_name_one() {
+        let text = r#"
+id: sn-yaml
+max_routing_tier: 2
+steps:
+  first:
+    routing_tier: 1
+    output_var: v
+    prompt_template: "{case_context}"
+  second:
+    routing_tier: 2
+    prompt_template: "use {v}"
+    declared_inputs:
+      - v
+"#;
+        let def = parse_focus_text(text).unwrap();
+        let LifecycleError::ValidationFailed(m) =
+            lint_declared_inputs(&def.focus_id, &def.steps).unwrap_err()
+        else {
+            panic!("expected ValidationFailed");
+        };
+        assert!(m.contains("step 'second'") && m.contains("'v'"), "{m}");
+        assert!(m.contains("items.id=884"), "{m}");
     }
 
     // -- items.id=879: declared-inputs LOAD lint -----------------------------
