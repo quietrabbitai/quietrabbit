@@ -91,6 +91,7 @@ use crate::conductor::privacy::output_scan::{scan_output, ScanIntensity};
 use crate::conductor::privacy::types::sensitivity_severity;
 use crate::conductor::privacy::{logger::DisclosureLoggerForRun, PrivacyGateway};
 use crate::conductor::reentry::{self, ReentryError, ReentryPlan};
+use crate::conductor::store_op;
 use crate::conductor::tokens::{
     validate_step, ActionDefinition, ExternalAccess, FieldRequirement, StepType,
 };
@@ -186,6 +187,11 @@ pub enum LifecycleError {
     /// names the variable, never its value.
     #[error("Session store: {0}")]
     StoreSeed(#[from] crate::conductor::seeding::SeedError),
+    /// items.id=887: a store writer row failed, so the pass stops and nothing
+    /// after it runs (fail closed). A one-time chat's refusal is not this: it
+    /// is an Ok outcome that writes nothing.
+    #[error("Session store write: {0}")]
+    StoreWrite(#[from] crate::conductor::store_writer::StoreWriteError),
     #[error("JSON: {0}")]
     Json(#[from] serde_json::Error),
     #[error("IO: {0}")]
@@ -445,6 +451,7 @@ fn build_action_definition(
         schedule_trigger: None,
         guard: None,
         declared_inputs: raw.declared_inputs.unwrap_or_default(),
+        store_op: None,
         action_id,
     }
 }
@@ -710,6 +717,37 @@ async fn load_focus_definition_from_db(
             ))
         })?;
 
+        // items.id=887: the typed store-writer columns. A malformed one fails
+        // LOAD here with its own message, as a malformed guard does.
+        let store_writer = store_op::StoreOp::from_columns(
+            row.store_op.as_deref(),
+            row.store_target.as_deref(),
+            row.store_args.as_deref(),
+        )
+        .map_err(|e| {
+            LifecycleError::ValidationFailed(format!(
+                "Focus '{focus_id}' step '{}': {e}",
+                row.action_id
+            ))
+        })?;
+
+        // A writer is neither a model step nor a cataloged block: it is built
+        // here, guard and all, and the rest of the loop is for the other two.
+        if let Some(op) = store_writer {
+            let mut step = store_writer_step(
+                focus_id,
+                &row.action_id,
+                row.block_stable_id.is_some(),
+                schedule_trigger.is_some(),
+                &row.customization,
+                default_guide_id,
+                op,
+            )?;
+            step.guard = guard;
+            steps.push(step);
+            continue;
+        }
+
         let mut step = match &row.block_stable_id {
             None => {
                 let raw_step: RawStepFromDb =
@@ -817,6 +855,7 @@ async fn load_focus_definition_from_db(
                     schedule_trigger: None,
                     guard: None,
                     declared_inputs: Vec::new(),
+                    store_op: None,
                 }
             }
         };
@@ -838,6 +877,12 @@ async fn load_focus_definition_from_db(
     //
     // items.id=879: the declared-inputs lint runs first, so an undeclared name
     // in an external step is reported as that and not as a placement failure.
+    //
+    // items.id=887: the store writers' own cross-row checks run first, so an
+    // argument that names a later row's variable or a derived name is reported
+    // as that (conductor::store_op).
+    store_op::check_composition(&steps, &row_output_vars(&steps))
+        .map_err(|e| LifecycleError::ValidationFailed(format!("Focus '{focus_id}' {e}")))?;
     lint_declared_inputs(focus_id, &steps)?;
     analyze_guarded_composition(focus_id, &steps)?;
 
@@ -873,6 +918,12 @@ fn analyze_guarded_composition(
             is_block: s.block_stable_id.is_some(),
             local_and_no_handoff: s.routing_tier == ExternalAccess::LocalOnly
                 && !s.requires_user_handoff,
+            transparent: s.store_op.is_some(),
+            reads: s
+                .store_op
+                .as_ref()
+                .map(|o| o.arg_vars().collect())
+                .unwrap_or_default(),
         })
         .collect();
     guard::analyze_composition(&shapes)
@@ -891,9 +942,68 @@ fn row_output_vars(steps: &[ActionDefinition]) -> Vec<Option<String>> {
                 let handler = crate::conductor::block_dispatch::block_handler(id)?;
                 (handler.output_var)(s.block_customization.as_ref()?)
             }
-            None => s.output_var.clone().filter(|v| !v.is_empty()),
+            // items.id=887: a store writer records nothing on the track, but it
+            // may publish an id under a pass variable (case_open, delta_record).
+            None => match &s.store_op {
+                Some(op) => op.published_var().map(str::to_owned),
+                None => s.output_var.clone().filter(|v| !v.is_empty()),
+            },
         })
         .collect()
+}
+
+/// items.id=887: the ActionDefinition of a store-writer row. It is not a model
+/// step and not a cataloged block: LocalOnly, no handoff, no template, no output
+/// variable of its own. The loader refuses a writer that also cites a block, has
+/// a schedule trigger or carries customization, each with its own message.
+fn store_writer_step(
+    focus_id: &str,
+    action_id: &str,
+    cites_block: bool,
+    has_schedule_trigger: bool,
+    customization: &str,
+    default_guide_id: &str,
+    op: store_op::StoreOp,
+) -> Result<ActionDefinition, LifecycleError> {
+    let fail = |why: &str| {
+        Err(LifecycleError::ValidationFailed(format!(
+            "Focus '{focus_id}' step '{action_id}': a store writer {why}"
+        )))
+    };
+    if cites_block {
+        return fail("cannot also cite a building block");
+    }
+    if has_schedule_trigger {
+        return fail("cannot carry a schedule trigger");
+    }
+    let empty = serde_json::from_str::<serde_json::Value>(customization)
+        .ok()
+        .and_then(|v| v.as_object().map(|o| o.is_empty()))
+        .unwrap_or(false);
+    if !empty {
+        return fail("takes no customization (its arguments are store_args)");
+    }
+    Ok(ActionDefinition {
+        action_id: action_id.to_owned(),
+        display_name: action_id.to_owned(),
+        guide_id: default_guide_id.to_owned(),
+        task_type: "general".to_owned(),
+        routing_tier: ExternalAccess::LocalOnly,
+        step_type: StepType::default(),
+        output_var: None,
+        prompt_template: String::new(),
+        field_requirements: HashMap::new(),
+        options_override: HashMap::new(),
+        external_access_override: None,
+        requires_user_handoff: false,
+        revisitable: false,
+        block_stable_id: None,
+        block_customization: None,
+        schedule_trigger: None,
+        guard: None,
+        declared_inputs: Vec::new(),
+        store_op: Some(op),
+    })
 }
 
 /// items.id=879: the declared-inputs lint (conductor::declared_inputs) over a
@@ -1082,6 +1192,12 @@ pub async fn load_focus_definition(
     // items.id=879: declared-inputs lint on the YAML path (the DB path runs its
     // own inside load_focus_definition_from_db).
     lint_declared_inputs(&focus_def.focus_id, &focus_def.steps)?;
+    // items.id=887: store writers are database-only, so a YAML step is never one
+    // and this passes trivially. It runs on both paths so that a YAML field that
+    // ever populated store_op could not skip the checks.
+    store_op::check_composition(&focus_def.steps, &row_output_vars(&focus_def.steps)).map_err(
+        |e| LifecycleError::ValidationFailed(format!("Focus '{}' {e}", focus_def.focus_id)),
+    )?;
 
     let mut all_errors: Vec<String> = Vec::new();
     for step in &focus_def.steps {
@@ -1508,6 +1624,11 @@ pub struct FocusRun<L: DisclosureLoggerForRun = SqliteDisclosureLogger> {
     /// names a step sees only when its own template names them. Empty until
     /// execute() seeds it.
     pub(crate) store_tokens: crate::conductor::taint::StoreTokens,
+    /// items.id=887: ids that store writers published during this pass
+    /// (case_open and delta_record, under the row's store_target), for later
+    /// writers' arguments and guards. Pass-local: never a TaskTrack step, never
+    /// checkpointed, never in a prompt or in extraction.
+    pub(crate) store_vars: HashMap<String, String>,
     /// items.id=778 (decisions.id=896): this run's writer lease. Taken by the
     /// caller that starts or resumes the run, BEFORE the run can touch a
     /// database, and held until the run is dropped, which for a spawned run is
@@ -1569,6 +1690,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             chat_binding: None,
             context_key: None,
             store_tokens: crate::conductor::taint::StoreTokens::default(),
+            store_vars: HashMap::new(),
             lease: None,
         }
     }
@@ -2447,6 +2569,8 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                 // rejects an output_var with a bound name, so nothing is
                 // overwritten here. An absent session name has no entry.
                 vars.extend(self.store_tokens.seeds.clone());
+                // items.id=887: and the ids store writers published this pass.
+                vars.extend(self.store_vars.clone());
                 if !g.evaluate(&vars) {
                     log::debug!(
                         "lifecycle: step '{}' skipped, guard on '{}' is false",
@@ -2455,6 +2579,15 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                     );
                     continue;
                 }
+            }
+
+            // items.id=887: a store writer. Reached only when its guard is true
+            // (a skipped row never gets here, so it writes nothing). It makes no
+            // model call and emits, ledgers, checkpoints and records NOTHING, like
+            // a skipped row, and a failure stops the pass here (fail closed).
+            if let Some(op) = &step.store_op {
+                self.execute_store_writer(&step, op).await?;
+                continue;
             }
 
             // items.id=129: a block step is internal bookkeeping, not
@@ -2680,6 +2813,55 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             failure: None,
             crisis_resource_block: None,
         }
+    }
+
+    /// items.id=887: run one store-writer row (decisions.id=939 section 4). The
+    /// handler (conductor::store_writer) calls only the typed, latch-gated store
+    /// functions with the running focus_id and context_key. Arguments are read
+    /// from the pass's variables: the track's outputs, the ids earlier writers
+    /// published, and the seeded session names. A failure of any kind is an Err
+    /// and ends the pass; a one-time chat's refusal is Ok and writes nothing.
+    async fn execute_store_writer(
+        &mut self,
+        step: &ActionDefinition,
+        op: &store_op::StoreOp,
+    ) -> Result<(), LifecycleError> {
+        use crate::conductor::store_writer::{run_store_op, StoreWriteError, WriterContext};
+
+        let run_id = self.focus_run_id.clone().unwrap_or_default();
+        let mut vars = guard::track_vars(self.task_track.as_ref().ok_or_else(|| {
+            LifecycleError::ValidationFailed(format!(
+                "step '{}': store writer run without a task track",
+                step.action_id
+            ))
+        })?);
+        vars.extend(self.store_vars.clone());
+        vars.extend(self.store_tokens.seeds.clone());
+
+        let mut conn = crate::persistence::output_store::open_outputs_db(
+            &self.user_id,
+            &self.persona_id,
+            self.key_hex.as_deref().unwrap_or(""),
+        )
+        .await
+        .map_err(|e| StoreWriteError::Open(e.to_string()))?;
+        let ctx = WriterContext {
+            context_key: self.context_key.as_deref(),
+            focus_id: &self.focus_id,
+            run_id: &run_id,
+            action_id: &step.action_id,
+        };
+        let done = run_store_op(&mut conn, &ctx, op, &vars).await?;
+        log::debug!(
+            "lifecycle: store writer '{}' ({}) -> {:?}",
+            step.action_id,
+            op.op.as_str(),
+            done.outcome
+        );
+        if let Some((var, id)) = done.published {
+            self.store_vars.insert(var, id);
+        }
+        Ok(())
     }
 
     /// items.id=129: run a composition-authored block step. Pure over the
@@ -4069,6 +4251,11 @@ fn next_execution_tier(
     let upcoming = steps.get(step_index + 1..).unwrap_or_default();
     let mut candidates = Vec::new();
     for next in upcoming {
+        // items.id=887: a store writer makes no call and sends nothing, so it
+        // is neither a candidate nor a row that ends the scan.
+        if next.store_op.is_some() {
+            continue;
+        }
         candidates.push(next);
         if next.guard.is_none() {
             break;
@@ -6667,6 +6854,7 @@ mod tests {
                 schedule_trigger: None,
                 guard: None,
                 declared_inputs: Vec::new(),
+                store_op: None,
             });
             run.focus_def = Some(def);
             let mut personal_track = PersonalTrack::new();
@@ -6744,6 +6932,7 @@ mod tests {
             schedule_trigger: None,
             guard: None,
             declared_inputs: Vec::new(),
+            store_op: None,
         });
         run.focus_def = Some(def);
         let mut personal_track = PersonalTrack::new();
@@ -9924,6 +10113,1081 @@ steps:
             assert!(load_focus_definition_from_db(&pool, "writing-assistant")
                 .await
                 .is_ok());
+        })
+        .await;
+    }
+
+    // -- items.id=887: store writers on composition rows --------------------
+
+    /// One composition row for seed_store_focus().
+    struct SRow {
+        id: &'static str,
+        op: Option<&'static str>,
+        target: Option<&'static str>,
+        args: Option<&'static str>,
+        guard: Option<(&'static str, &'static str, Option<&'static str>)>,
+        block: Option<&'static str>,
+        custom: String,
+        trigger: bool,
+    }
+
+    /// An ordinary local step recording `out`.
+    fn smodel(id: &'static str, out: &str) -> SRow {
+        SRow {
+            id,
+            op: None,
+            target: None,
+            args: None,
+            guard: None,
+            block: None,
+            custom: serde_json::json!({
+                "routing_tier": 1, "prompt_template": "x", "output_var": out
+            })
+            .to_string(),
+            trigger: false,
+        }
+    }
+
+    /// A store writer row: empty customization, as LOAD requires.
+    fn swriter(
+        id: &'static str,
+        op: &'static str,
+        target: Option<&'static str>,
+        args: Option<&'static str>,
+    ) -> SRow {
+        SRow {
+            id,
+            op: Some(op),
+            target,
+            args,
+            guard: None,
+            block: None,
+            custom: "{}".to_owned(),
+            trigger: false,
+        }
+    }
+
+    impl SRow {
+        fn guarded(
+            mut self,
+            var: &'static str,
+            op: &'static str,
+            value: Option<&'static str>,
+        ) -> Self {
+            self.guard = Some((var, op, value));
+            self
+        }
+    }
+
+    async fn seed_store_focus(pool: &sqlx::SqlitePool, focus_id: &str, rows: Vec<SRow>) {
+        let mut conn = pool.acquire().await.unwrap();
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO focuses
+                (focus_id, display_name, description, version, max_routing_tier,
+                 output_type, suggest_in_focuses, multi_source_validation,
+                 generic_title_template, status, created_at, updated_at)
+             VALUES (?, 'Store Writer Test Focus', '', '1.0', 'local_only',
+                     'general', '[]', 0, 'Hidden item', 'shipped',
+                     datetime('now'), datetime('now'))",
+        )
+        .bind(focus_id)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        for (seq, row) in rows.iter().enumerate() {
+            let comp_id = format!("comp-{focus_id}-{}", row.id);
+            let (gv, go, gval) = match row.guard {
+                Some((v, o, val)) => (Some(v), Some(o), val),
+                None => (None, None, None),
+            };
+            let (anchor, offset) = if row.trigger {
+                (Some("topic_date"), Some("+1d"))
+            } else {
+                (None, None)
+            };
+            sqlx::query(
+                "INSERT INTO focus_block_compositions
+                    (id, focus_id, action_id, block_stable_id, sequence_index,
+                     schedule_trigger_anchor_field, schedule_trigger_offset,
+                     guard_var, guard_op, guard_value,
+                     store_op, store_target, store_args, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))",
+            )
+            .bind(&comp_id)
+            .bind(focus_id)
+            .bind(row.id)
+            .bind(row.block)
+            .bind(seq as i64)
+            .bind(anchor)
+            .bind(offset)
+            .bind(gv)
+            .bind(go)
+            .bind(gval)
+            .bind(row.op)
+            .bind(row.target)
+            .bind(row.args)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO focus_block_customization
+                    (id, composition_id, persona_id, customization, created_at, updated_at)
+                 VALUES (?, ?, NULL, ?, datetime('now'), datetime('now'))",
+            )
+            .bind(format!("cust-{comp_id}"))
+            .bind(&comp_id)
+            .bind(&row.custom)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn store_load(focus_id: &str, rows: Vec<SRow>) -> Result<FocusDefinition, String> {
+        let pool = block_load_pool().await;
+        seed_store_focus(&pool, focus_id, rows).await;
+        match load_focus_definition_from_db(&pool, focus_id).await {
+            Ok(Some(def)) => Ok(def),
+            Ok(None) => panic!("no focuses row"),
+            Err(LifecycleError::ValidationFailed(m)) => Err(m),
+            Err(other) => panic!("expected a LOAD ValidationFailed, got {other:?}"),
+        }
+    }
+
+    const PUT_INTENT: &str = r#"{"value": "intent_out"}"#;
+
+    #[tokio::test]
+    async fn store_load_good_writer_rows_populate_the_typed_row_and_the_step_shape() {
+        with_temp_data_root(async {
+            let def = store_load(
+                "sw-ok",
+                vec![
+                    smodel("route", "intent_out"),
+                    swriter(
+                        "lock",
+                        "session_put",
+                        Some("locked_intent"),
+                        Some(PUT_INTENT),
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+            assert!(def.steps[0].store_op.is_none());
+            let w = &def.steps[1];
+            let op = w.store_op.as_ref().expect("a typed store row");
+            assert_eq!(op.op, store_op::Op::SessionPut);
+            assert_eq!(op.target.as_deref(), Some("locked_intent"));
+            assert_eq!(op.arg(store_op::Slot::Value), Some("intent_out"));
+            // Not a model step, not a block: LocalOnly, no template, no output.
+            assert_eq!(w.routing_tier, ExternalAccess::LocalOnly);
+            assert!(w.block_stable_id.is_none() && w.output_var.is_none());
+            assert!(w.prompt_template.is_empty() && !w.requires_user_handoff);
+            assert_eq!(analyze_guarded_composition("sw-ok", &def.steps).unwrap(), 1);
+        })
+        .await;
+    }
+
+    /// A whole case flow: ids published by one writer feed a later writer and a
+    /// guard, every operation of the closed set loads.
+    #[tokio::test]
+    async fn store_load_a_full_case_flow_loads() {
+        with_temp_data_root(async {
+            let def = store_load(
+                "sw-flow",
+                vec![
+                    smodel("ent", "ent_out"),
+                    smodel("lab", "label_out"),
+                    smodel("sym", "sym_out"),
+                    smodel("strat", "strat_out"),
+                    smodel("outc", "outc_out"),
+                    smodel("ents", "ents_out"),
+                    smodel("desc", "desc_out"),
+                    swriter("hold", "latch", None, None).guarded(
+                        "write_mode",
+                        "eq",
+                        Some("suppressed"),
+                    ),
+                    swriter(
+                        "open",
+                        "case_open",
+                        Some("new_case"),
+                        Some(r#"{"entity":"ent_out","label":"label_out","symptoms":"sym_out"}"#),
+                    )
+                    .guarded("write_mode", "eq", Some("open")),
+                    swriter(
+                        "remember",
+                        "session_put",
+                        Some("active_case_id"),
+                        Some(r#"{"value":"new_case"}"#),
+                    )
+                    .guarded("new_case", "present", None),
+                    swriter(
+                        "log",
+                        "strategy_append",
+                        None,
+                        Some(r#"{"case":"new_case","strategy":"strat_out","outcome":"outc_out"}"#),
+                    )
+                    .guarded("new_case", "present", None),
+                    swriter(
+                        "advance",
+                        "case_update",
+                        None,
+                        Some(r#"{"case":"active_case_id","outcome":"outc_out"}"#),
+                    )
+                    .guarded("active_case_id", "present", None),
+                    swriter(
+                        "delta",
+                        "delta_record",
+                        Some("new_delta"),
+                        Some(
+                            r#"{"entities":"ents_out","description":"desc_out","case":"new_case"}"#,
+                        ),
+                    )
+                    .guarded("new_case", "present", None),
+                    swriter(
+                        "confirm",
+                        "delta_confirm",
+                        None,
+                        Some(r#"{"delta":"new_delta","entity":"ent_out"}"#),
+                    )
+                    .guarded("new_delta", "present", None),
+                    swriter(
+                        "event",
+                        "delta_changed",
+                        None,
+                        Some(r#"{"delta":"new_delta","entity":"ent_out"}"#),
+                    )
+                    .guarded("new_delta", "present", None),
+                    smodel("answer", "answer_out"),
+                ],
+            )
+            .await;
+            let def = def.unwrap_or_else(|m| panic!("a full case flow must load: {m}"));
+            let ops: Vec<&str> = def
+                .steps
+                .iter()
+                .filter_map(|s| s.store_op.as_ref().map(|o| o.op.as_str()))
+                .collect();
+            assert_eq!(
+                ops,
+                [
+                    "latch",
+                    "case_open",
+                    "session_put",
+                    "strategy_append",
+                    "case_update",
+                    "delta_record",
+                    "delta_confirm",
+                    "delta_changed"
+                ]
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn store_load_rejections_each_have_their_own_message() {
+        with_temp_data_root(async {
+            let put = |target: &'static str| {
+                vec![
+                    smodel("route", "intent_out"),
+                    swriter("w", "session_put", Some(target), Some(PUT_INTENT)),
+                ]
+            };
+            let with_arg = |op: &'static str, target: Option<&'static str>, args: &'static str| {
+                vec![
+                    smodel("a", "v"),
+                    swriter("w", op, target, Some(args)),
+                    smodel("z", "zz"),
+                ]
+            };
+            let cases: Vec<(&str, Vec<SRow>, &str)> = vec![
+                (
+                    "unknown op",
+                    vec![smodel("a", "v"), swriter("w", "drop_table", None, None)],
+                    "unknown store_op 'drop_table'",
+                ),
+                (
+                    "target without op",
+                    vec![
+                        smodel("a", "v"),
+                        SRow {
+                            target: Some("locked_intent"),
+                            ..swriter("w", "latch", None, None)
+                        }
+                        .no_op(),
+                    ],
+                    "without store_op",
+                ),
+                (
+                    "latch through session_put",
+                    put("write_mode"),
+                    "can only be set by the latch operation",
+                ),
+                ("derived target", put("case_context"), "derived, read-only"),
+                (
+                    "unknown target",
+                    put("anything_else"),
+                    "not a registered session variable",
+                ),
+                (
+                    "latch with args",
+                    vec![smodel("a", "v"), swriter("w", "latch", None, Some("{}"))],
+                    "takes no store_args",
+                ),
+                (
+                    "unknown slot",
+                    with_arg(
+                        "session_put",
+                        Some("locked_intent"),
+                        r#"{"value":"v","bogus":"v"}"#,
+                    ),
+                    "has no slot 'bogus'",
+                ),
+                (
+                    "missing slot",
+                    with_arg("case_open", None, r#"{"entity":"v"}"#),
+                    "needs slot 'label'",
+                ),
+                (
+                    "argument from a later row",
+                    vec![
+                        swriter("w", "session_put", Some("locked_intent"), Some(PUT_INTENT)),
+                        smodel("route", "intent_out"),
+                    ],
+                    "cannot sit before the data it needs",
+                ),
+                (
+                    "argument nobody produces",
+                    with_arg("session_put", Some("locked_intent"), r#"{"value":"ghost"}"#),
+                    "no earlier step produces",
+                ),
+                (
+                    "derived argument",
+                    with_arg(
+                        "session_put",
+                        Some("locked_intent"),
+                        r#"{"value":"case_context"}"#,
+                    ),
+                    "derived name",
+                ),
+                (
+                    "system token argument",
+                    with_arg(
+                        "session_put",
+                        Some("locked_intent"),
+                        r#"{"value":"user_input"}"#,
+                    ),
+                    "never a store argument",
+                ),
+                (
+                    "write_mode argument",
+                    with_arg(
+                        "session_put",
+                        Some("locked_intent"),
+                        r#"{"value":"write_mode"}"#,
+                    ),
+                    "only the latch operation touches the one-time latch",
+                ),
+                (
+                    "published name collides",
+                    with_arg(
+                        "case_open",
+                        Some("active_case_id"),
+                        r#"{"entity":"v","label":"v"}"#,
+                    ),
+                    "collides",
+                ),
+                (
+                    "optional session argument unguarded",
+                    with_arg(
+                        "case_update",
+                        None,
+                        r#"{"case":"active_case_id","outcome":"v"}"#,
+                    ),
+                    "needs a guard on 'active_case_id'",
+                ),
+                (
+                    "writer cites a block",
+                    vec![
+                        smodel("a", "v"),
+                        SRow {
+                            block: Some("cb-06"),
+                            ..swriter("w", "latch", None, None)
+                        },
+                    ],
+                    "cannot also cite a building block",
+                ),
+                (
+                    "writer with a schedule trigger",
+                    vec![
+                        smodel("a", "v"),
+                        SRow {
+                            trigger: true,
+                            ..swriter("w", "latch", None, None)
+                        },
+                    ],
+                    "cannot carry a schedule trigger",
+                ),
+                (
+                    "writer with customization",
+                    vec![
+                        smodel("a", "v"),
+                        SRow {
+                            custom: r#"{"prompt_template":"x"}"#.to_owned(),
+                            ..swriter("w", "latch", None, None)
+                        },
+                    ],
+                    "takes no customization",
+                ),
+                (
+                    "a path of writers alone",
+                    vec![swriter("w", "latch", None, None)],
+                    "runs no step",
+                ),
+                (
+                    "guard on an unknown variable still checked",
+                    vec![
+                        smodel("a", "v"),
+                        swriter("w", "latch", None, None).guarded("ghost", "present", None),
+                    ],
+                    "unknown variable",
+                ),
+            ];
+            for (i, (label, rows, want)) in cases.into_iter().enumerate() {
+                let m = store_load(&format!("sw-rej-{i}"), rows).await.unwrap_err();
+                assert!(m.contains(want), "{label}: expected '{want}' in: {m}");
+                assert!(m.contains(&format!("Focus 'sw-rej-{i}'")), "{label}: {m}");
+            }
+        })
+        .await;
+    }
+
+    impl SRow {
+        /// A row with store_target set and store_op NULL (half set).
+        fn no_op(mut self) -> Self {
+            self.op = None;
+            self
+        }
+    }
+
+    /// A writer's arguments may be tainted (the strategy log is a summary written
+    /// by a step whose prompt held case_context). The writer is not tainted
+    /// itself: its template is empty and it records nothing, so extraction and
+    /// the external-step rules see exactly what they saw before.
+    #[tokio::test]
+    async fn store_load_a_tainted_argument_is_allowed_and_the_writer_is_not_tainted() {
+        with_temp_data_root(async {
+            let mut summarise = smodel("summarise", "summary");
+            summarise.custom = serde_json::json!({
+                "routing_tier": 1,
+                "prompt_template": "Summarise: {case_context}",
+                "output_var": "summary"
+            })
+            .to_string();
+            let def = store_load(
+                "sw-taint",
+                vec![
+                    summarise,
+                    swriter(
+                        "keep",
+                        "session_put",
+                        Some("locked_intent"),
+                        Some(r#"{"value":"summary"}"#),
+                    ),
+                    smodel("answer", "answer_out"),
+                ],
+            )
+            .await
+            .unwrap_or_else(|m| panic!("a tainted argument must load: {m}"));
+            let taint = crate::conductor::taint::taint_closure(
+                &def.steps,
+                &row_output_vars(&def.steps),
+                crate::conductor::declared_inputs::bound_names(),
+            );
+            assert!(taint.actions.contains("summarise"));
+            assert!(!taint.actions.contains("keep"), "the writer is not tainted");
+            assert!(taint.vars.contains("summary"));
+        })
+        .await;
+    }
+
+    /// The path-sensitive half of "a write row cannot sit before the data it
+    /// needs": the row that produces the argument is guarded away on some path
+    /// that still runs the writer.
+    #[tokio::test]
+    async fn store_load_a_producer_that_does_not_run_before_the_writer_on_a_path_fails() {
+        with_temp_data_root(async {
+            let m = store_load(
+                "sw-path",
+                vec![
+                    smodel("route", "r"),
+                    smodel("produce", "v").guarded("r", "eq", Some("x")),
+                    swriter(
+                        "w",
+                        "session_put",
+                        Some("locked_intent"),
+                        Some(r#"{"value":"v"}"#),
+                    )
+                    .guarded("r", "present", None),
+                ],
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                m.contains("'w'")
+                    && m.contains("reads 'v'")
+                    && m.contains("does not run before it"),
+                "{m}"
+            );
+
+            // Guarding the writer the same way as its producer loads.
+            let ok = store_load(
+                "sw-path-ok",
+                vec![
+                    smodel("route", "r"),
+                    smodel("produce", "v").guarded("r", "eq", Some("x")),
+                    swriter(
+                        "w",
+                        "session_put",
+                        Some("locked_intent"),
+                        Some(r#"{"value":"v"}"#),
+                    )
+                    .guarded("r", "eq", Some("x")),
+                    smodel("fallback", "fb").guarded("r", "ne", Some("x")),
+                ],
+            )
+            .await;
+            assert!(ok.is_ok(), "{ok:?}");
+        })
+        .await;
+    }
+
+    /// A writer between a block and the next ordinary step is transparent to the
+    /// block-placement rule: the block still needs an ordinary local step after.
+    #[tokio::test]
+    async fn store_load_writers_are_transparent_to_block_placement() {
+        with_temp_data_root(async {
+            let block = |id: &'static str| SRow {
+                id,
+                op: None,
+                target: None,
+                args: None,
+                guard: None,
+                block: Some("cb-06"),
+                custom: serde_json::json!({
+                    "input_var": "draft_output",
+                    "output_var": "verdict",
+                    "criteria": [{"name": "has_content", "kind": "non_empty"}],
+                    "on_fail": "advisory"
+                })
+                .to_string(),
+                trigger: false,
+            };
+            // block, writer, END: the block's verdict would become the output.
+            let m = store_load(
+                "sw-blk-last",
+                vec![
+                    smodel("draft_writing", "draft_output"),
+                    block("check"),
+                    swriter("w", "latch", None, None),
+                ],
+            )
+            .await
+            .unwrap_err();
+            assert!(m.contains("cannot be the final step"), "{m}");
+            // block, writer, ordinary step: fine.
+            assert!(store_load(
+                "sw-blk-ok",
+                vec![
+                    smodel("draft_writing", "draft_output"),
+                    block("check"),
+                    swriter("w", "latch", None, None),
+                    smodel("tail", "tail_out"),
+                ],
+            )
+            .await
+            .is_ok());
+        })
+        .await;
+    }
+
+    /// Store writers are database-only (decisions.id=938): a .focus file cannot
+    /// express one, and a store_op key in a YAML step has no effect.
+    #[test]
+    fn a_yaml_step_cannot_be_a_store_writer() {
+        let def = parse_focus_text(
+            "id: yaml-focus\nsteps:\n  a:\n    store_op: latch\n    store_target: locked_intent\n    prompt_template: hi\n",
+        )
+        .unwrap();
+        assert_eq!(def.steps.len(), 1);
+        assert!(def.steps[0].store_op.is_none());
+        assert_eq!(def.steps[0].prompt_template, "hi");
+    }
+
+    /// Gate3's look-ahead sees through a writer: it makes no call and ends no scan.
+    #[test]
+    fn the_look_ahead_skips_store_writers() {
+        let model = |tier: ExternalAccess| {
+            let mut s = hand_built_cb06_step();
+            s.block_stable_id = None;
+            s.block_customization = None;
+            s.routing_tier = tier;
+            s
+        };
+        let writer = || {
+            store_writer_step(
+                "f",
+                "w",
+                false,
+                false,
+                "{}",
+                "g",
+                store_op::StoreOp::from_columns(Some("latch"), None, None)
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let steps = [
+            model(ExternalAccess::LocalOnly),
+            writer(),
+            model(ExternalAccess::AnonymousRequired),
+        ];
+        let ceiling = ExternalAccess::AnonymousRequired;
+        // Without the skip the unguarded writer (LocalOnly) would end the scan
+        // and hide the external step behind it.
+        assert_eq!(
+            next_execution_tier(&steps, 0, ceiling),
+            Some(execution_tier_ordinal(ExternalAccess::AnonymousRequired))
+        );
+    }
+
+    // -- execute(): store writers over real encrypted outputs.db -------------
+
+    fn writer_step(
+        id: &str,
+        op: &str,
+        target: Option<&str>,
+        args: serde_json::Value,
+        guard: Option<(&str, &str, Option<&str>)>,
+    ) -> ActionDefinition {
+        let args = if args.is_null() {
+            None
+        } else {
+            Some(args.to_string())
+        };
+        let parsed = store_op::StoreOp::from_columns(Some(op), target, args.as_deref())
+            .expect("row parses")
+            .expect("a writer");
+        let mut s = store_writer_step("f", id, false, false, "{}", "g", parsed).unwrap();
+        s.guard = guard
+            .and_then(|(v, o, val)| guard::Guard::from_columns(Some(v), Some(o), val).unwrap());
+        s
+    }
+
+    fn writer_run(
+        steps: Vec<ActionDefinition>,
+        chat: Option<&str>,
+        recorded_vars: &[(&str, &str)],
+    ) -> FocusRun<crate::conductor::privacy::logger::TestLogger> {
+        let mut run = tier3_ready_run(false);
+        let mut def = single_tier3_step_focus_def();
+        def.steps = steps;
+        run.focus_def = Some(def);
+        run.context_key = chat.map(str::to_owned);
+        for (i, (var, value)) in recorded_vars.iter().enumerate() {
+            run.task_track.as_mut().unwrap().add_step(recorded(
+                &format!("seed{i}"),
+                Some(var),
+                value,
+            ));
+        }
+        run
+    }
+
+    async fn outputs(
+        run: &FocusRun<crate::conductor::privacy::logger::TestLogger>,
+    ) -> sqlx::SqliteConnection {
+        open_outputs_db(&run.user_id, &run.persona_id, CRISIS_TEST_KEY_HEX)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn execute_runs_a_store_writer_and_it_records_emits_and_ledgers_nothing() {
+        with_temp_data_root(async {
+            let mut run = writer_run(
+                vec![writer_step(
+                    "lock",
+                    "session_put",
+                    Some("locked_intent"),
+                    serde_json::json!({"value": "intent_out"}),
+                    None,
+                )],
+                Some("chat-sw"),
+                &[("intent_out", "billing")],
+            );
+            assert!(run.execute().await.unwrap().is_none());
+            let mut conn = outputs(&run).await;
+            let row = crate::persistence::session_store::get_session_variable(
+                &mut conn,
+                "chat-sw",
+                "f",
+                "locked_intent",
+            )
+            .await
+            .unwrap()
+            .expect("the writer wrote through the typed store");
+            assert_eq!(row.value, "billing");
+            assert_eq!(row.written_by_run, run.focus_run_id.clone().unwrap());
+            // Only the seeded value is on the track: the writer recorded nothing.
+            assert_eq!(ran_ids(&run), ["seed0"]);
+            assert!(run.emitted_for_test.lock().unwrap().is_empty());
+            let ledger: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM focus_run_steps")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+            assert_eq!(ledger, 0, "no ledger row for a writer");
+        })
+        .await;
+    }
+
+    /// Guards still apply to a writer: a row whose guard is false writes nothing.
+    #[tokio::test]
+    async fn a_store_writer_whose_guard_is_false_writes_nothing() {
+        with_temp_data_root(async {
+            let mut run = writer_run(
+                vec![
+                    writer_step(
+                        "lock",
+                        "session_put",
+                        Some("locked_intent"),
+                        serde_json::json!({"value": "intent_out"}),
+                        Some(("intent_out", "eq", Some("network"))),
+                    ),
+                    writer_step(
+                        "open",
+                        "case_open",
+                        Some("nc"),
+                        serde_json::json!({"entity": "intent_out", "label": "intent_out"}),
+                        Some(("intent_out", "absent", None)),
+                    ),
+                    writer_step(
+                        "hold",
+                        "latch",
+                        None,
+                        serde_json::Value::Null,
+                        Some(("never", "present", None)),
+                    ),
+                ],
+                Some("chat-sg"),
+                &[("intent_out", "billing")],
+            );
+            assert!(run.execute().await.unwrap().is_none());
+            let mut conn = outputs(&run).await;
+            for table in [
+                "session_variables",
+                "case_records",
+                "case_entities",
+                "case_strategies",
+                "config_deltas",
+            ] {
+                let n: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                    .fetch_one(&mut conn)
+                    .await
+                    .unwrap();
+                assert_eq!(n, 0, "{table}");
+            }
+            assert_eq!(
+                crate::persistence::session_store::write_mode(&mut conn, "chat-sg")
+                    .await
+                    .unwrap(),
+                crate::persistence::session_store::WriteMode::Open
+            );
+            assert!(
+                run.store_vars.is_empty(),
+                "a skipped open published nothing"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_latched_chat_pass_goes_on_and_a_writer_writes_nothing() {
+        with_temp_data_root(async {
+            let mut run = writer_run(
+                vec![
+                    writer_step(
+                        "lock",
+                        "session_put",
+                        Some("locked_intent"),
+                        serde_json::json!({"value": "intent_out"}),
+                        None,
+                    ),
+                    hand_built_cb06_step_after_draft(),
+                ],
+                Some("chat-sl"),
+                &[("intent_out", "billing"), ("draft_output", "a draft")],
+            );
+            let mut conn = outputs(&run).await;
+            crate::persistence::session_store::latch_write_suppressed(
+                &mut conn, "chat-sl", "f", "run-x",
+            )
+            .await
+            .unwrap();
+            drop(conn);
+
+            assert!(
+                run.execute().await.unwrap().is_none(),
+                "the pass is not failed"
+            );
+            assert!(
+                ran_ids(&run).contains(&"quality_check".to_owned()),
+                "the row after the refused writer still ran: {:?}",
+                ran_ids(&run)
+            );
+            let mut conn = outputs(&run).await;
+            assert!(crate::persistence::session_store::get_session_variable(
+                &mut conn,
+                "chat-sl",
+                "f",
+                "locked_intent",
+            )
+            .await
+            .unwrap()
+            .is_none());
+        })
+        .await;
+    }
+
+    fn hand_built_cb06_step_after_draft() -> ActionDefinition {
+        hand_built_cb06_step()
+    }
+
+    /// The latch row in a pass closes every later writer of the SAME pass, even
+    /// though write_mode was seeded open at pass start.
+    #[tokio::test]
+    async fn a_latch_row_closes_the_writers_after_it_in_the_same_pass() {
+        with_temp_data_root(async {
+            let mut run = writer_run(
+                vec![
+                    writer_step("hold", "latch", None, serde_json::Value::Null, None),
+                    writer_step(
+                        "lock",
+                        "session_put",
+                        Some("locked_intent"),
+                        serde_json::json!({"value": "intent_out"}),
+                        None,
+                    ),
+                ],
+                Some("chat-slr"),
+                &[("intent_out", "billing")],
+            );
+            assert!(run.execute().await.unwrap().is_none());
+            let mut conn = outputs(&run).await;
+            assert_eq!(
+                crate::persistence::session_store::write_mode(&mut conn, "chat-slr")
+                    .await
+                    .unwrap(),
+                crate::persistence::session_store::WriteMode::Suppressed
+            );
+            assert!(crate::persistence::session_store::get_session_variable(
+                &mut conn,
+                "chat-slr",
+                "f",
+                "locked_intent",
+            )
+            .await
+            .unwrap()
+            .is_none());
+        })
+        .await;
+    }
+
+    /// A failing writer ends the pass: the error comes back, and no later row of
+    /// the pass runs or writes.
+    #[tokio::test]
+    async fn a_failing_writer_fails_the_pass_closed_and_later_rows_do_not_run() {
+        with_temp_data_root(async {
+            let mut run = writer_run(
+                vec![
+                    // "Not Valid!" is not an intent identifier.
+                    writer_step(
+                        "bad",
+                        "session_put",
+                        Some("locked_intent"),
+                        serde_json::json!({"value": "intent_out"}),
+                        None,
+                    ),
+                    writer_step(
+                        "after",
+                        "session_put",
+                        Some("active_case_id"),
+                        serde_json::json!({"value": "case_out"}),
+                        None,
+                    ),
+                ],
+                Some("chat-sf"),
+                &[("intent_out", "Not Valid!"), ("case_out", "case-1")],
+            );
+            let err = run.execute().await.unwrap_err();
+            assert!(matches!(err, LifecycleError::StoreWrite(_)), "{err:?}");
+            assert!(
+                !err.to_string().contains("Not Valid"),
+                "no value in the error: {err}"
+            );
+            let mut conn = outputs(&run).await;
+            let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_variables")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+            assert_eq!(n, 0, "the row after the failure never ran");
+        })
+        .await;
+    }
+
+    /// A run that belongs to no chat cannot write: it fails closed.
+    #[tokio::test]
+    async fn a_run_with_no_chat_fails_closed_at_a_store_writer() {
+        with_temp_data_root(async {
+            let mut run = writer_run(
+                vec![writer_step(
+                    "lock",
+                    "session_put",
+                    Some("locked_intent"),
+                    serde_json::json!({"value": "intent_out"}),
+                    None,
+                )],
+                None,
+                &[("intent_out", "billing")],
+            );
+            let err = run.execute().await.unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    LifecycleError::StoreWrite(
+                        crate::conductor::store_writer::StoreWriteError::NoContextKey
+                    )
+                ),
+                "{err:?}"
+            );
+        })
+        .await;
+    }
+
+    /// An id one writer publishes is an argument and a guard variable for a later
+    /// writer in the same pass, and the case carries the running Focus.
+    #[tokio::test]
+    async fn a_published_id_reaches_a_later_writer_and_guard_in_the_same_pass() {
+        with_temp_data_root(async {
+            let mut run = writer_run(
+                vec![
+                    writer_step(
+                        "open",
+                        "case_open",
+                        Some("new_case"),
+                        serde_json::json!({"entity": "ent_out", "label": "label_out"}),
+                        None,
+                    ),
+                    writer_step(
+                        "log",
+                        "strategy_append",
+                        None,
+                        serde_json::json!({"case": "new_case", "strategy": "s_out", "outcome": "o_out"}),
+                        Some(("new_case", "present", None)),
+                    ),
+                ],
+                Some("chat-sp"),
+                &[
+                    ("ent_out", "ent-router"),
+                    ("label_out", "Router"),
+                    ("s_out", "restart it"),
+                    ("o_out", "no change"),
+                ],
+            );
+            assert!(run.execute().await.unwrap().is_none());
+            let run_id = run.focus_run_id.clone().unwrap();
+            let case_id = format!("{run_id}:open");
+            assert_eq!(run.store_vars.get("new_case"), Some(&case_id));
+            let mut conn = outputs(&run).await;
+            let case = crate::persistence::case_store::get_case(&mut conn, &case_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(case.focus_id, "f");
+            let strategies =
+                crate::persistence::case_store::list_case_strategies(&mut conn, &case_id)
+                    .await
+                    .unwrap();
+            assert_eq!(strategies.len(), 1);
+            assert_eq!(strategies[0].rung_at, Some(1));
+            // The published id is not on the track, so it cannot reach {previous_output}.
+            assert!(!ran_ids(&run).iter().any(|a| a == "open" || a == "log"));
+        })
+        .await;
+    }
+
+    /// A session-bound name is seeded because a writer names it as an argument
+    /// (seeding.required_names), and reaches the writer.
+    #[tokio::test]
+    async fn a_seeded_session_name_reaches_a_writer_as_an_argument() {
+        with_temp_data_root(async {
+            let mut run = writer_run(
+                vec![writer_step(
+                    "advance",
+                    "case_update",
+                    None,
+                    serde_json::json!({"case": "active_case_id", "outcome": "o_out"}),
+                    Some(("active_case_id", "present", None)),
+                )],
+                Some("chat-ss"),
+                &[("o_out", "restarted the router")],
+            );
+            // Plant the case and the active_case_id through the typed store.
+            let run_id = run.focus_run_id.clone().unwrap();
+            let mut conn = outputs(&run).await;
+            crate::persistence::case_store::open_case(
+                &mut conn,
+                &crate::persistence::case_store::NewCase {
+                    case_id: "case-seeded",
+                    focus_id: "f",
+                    context_key: "chat-ss",
+                    primary_entity_id: "ent-router",
+                    subject_label: "Router",
+                    symptoms: "",
+                    opened_by_run: &run_id,
+                },
+            )
+            .await
+            .unwrap();
+            crate::persistence::session_store::put_session_variable(
+                &mut conn,
+                &crate::persistence::session_store::SessionWrite {
+                    context_key: "chat-ss",
+                    focus_id: "f",
+                    name: "active_case_id",
+                    value: "case-seeded",
+                    written_by_run: &run_id,
+                    expected_version: None,
+                },
+            )
+            .await
+            .unwrap();
+            drop(conn);
+
+            assert!(run.execute().await.unwrap().is_none());
+            let mut conn = outputs(&run).await;
+            let case = crate::persistence::case_store::get_case(&mut conn, "case-seeded")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(case.outcome.as_deref(), Some("restarted the router"));
         })
         .await;
     }

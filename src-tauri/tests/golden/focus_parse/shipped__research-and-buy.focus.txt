@@ -36,6 +36,7 @@ ActionDefinition {
     schedule_trigger: None,
     guard: None,
     declared_inputs: [],
+    store_op: None,
 }
 field_requirements: {"location_city": Recommended}
 options_override: {"num_predict":512,"temperature":0.3}
@@ -67,6 +68,7 @@ ActionDefinition {
         "requirements",
         "persona_context",
     ],
+    store_op: None,
 }
 field_requirements: {}
 options_override: {"num_predict":1024,"temperature":0.4}
@@ -98,6 +100,7 @@ ActionDefinition {
         "requirements",
         "research_results",
     ],
+    store_op: None,
 }
 field_requirements: {}
 options_override: {"num_predict":768,"temperature":0.3}

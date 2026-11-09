@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use super::guard::Guard;
 use super::lifecycle::HighPriorityTrigger;
+use super::store_op::StoreOp;
 
 // ---------------------------------------------------------------------------
 // SYSTEM_TOKENS
@@ -316,6 +317,14 @@ pub struct ActionDefinition {
     /// conductor::declared_inputs (a loader lint, not a runtime filter); empty
     /// for a block row and for any step that needs no declaration.
     pub declared_inputs: Vec<String>,
+    /// items.id=887 (decisions.id=939 section 4): a typed STORE WRITER. Some
+    /// means this row is not a model step: when reached (and its guard is true)
+    /// it calls one typed, latch-gated store function and records nothing on the
+    /// TaskTrack (conductor::store_op, conductor::store_writer). Composition-
+    /// authored rows only -- always None for a YAML-authored step (the language
+    /// is database-only) and for a block row. Populated by the DB loader from
+    /// focus_block_compositions.store_op/store_target/store_args.
+    pub store_op: Option<StoreOp>,
 }
 
 // ---------------------------------------------------------------------------
@@ -401,6 +410,7 @@ mod tests {
             schedule_trigger: None,
             guard: None,
             declared_inputs: Vec::new(),
+            store_op: None,
         }
     }
 

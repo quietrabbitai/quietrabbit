@@ -208,6 +208,12 @@ pub const RESIDUAL_SHARED_SCHEMA: &[ResidualTable] = &[
             "guard_var",
             "guard_op",
             "guard_value",
+            // items.id=887 (shared_041.sql): shipped store-writer content, an
+            // operation name, a target name and a JSON object of variable
+            // NAMES. No personal values.
+            "store_op",
+            "store_target",
+            "store_args",
         ],
     },
     ResidualTable {

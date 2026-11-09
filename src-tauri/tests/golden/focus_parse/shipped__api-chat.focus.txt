@@ -36,6 +36,7 @@ ActionDefinition {
     declared_inputs: [
         "user_input",
     ],
+    store_op: None,
 }
 field_requirements: {}
 options_override: {}

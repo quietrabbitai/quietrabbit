@@ -71,6 +71,7 @@ fn step(id: &str, template: &str, out: &str) -> ActionDefinition {
         schedule_trigger: None,
         guard: None,
         declared_inputs: Vec::new(),
+        store_op: None,
     }
 }
 

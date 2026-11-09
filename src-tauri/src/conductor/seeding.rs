@@ -87,6 +87,11 @@ pub fn required_names(steps: &[ActionDefinition]) -> Vec<&'static str> {
         if let Some(g) = &s.guard {
             wanted.insert(g.var.clone());
         }
+        // items.id=887: the variables a store writer reads as arguments (a
+        // session-bound name among them is seeded at pass start).
+        if let Some(op) = &s.store_op {
+            wanted.extend(op.arg_vars().map(str::to_owned));
+        }
     }
     spec::NAMES
         .iter()
@@ -426,6 +431,7 @@ mod tests {
             schedule_trigger: None,
             guard: None,
             declared_inputs: Vec::new(),
+            store_op: None,
         }
     }
 
@@ -464,6 +470,20 @@ mod tests {
         );
         // Nothing bound anywhere: nothing is read.
         assert!(required_names(&[step("x", "{user_input} {v1}")]).is_empty());
+    }
+
+    /// items.id=887: a store writer's argument variables are read at pass start
+    /// when they are bound names, and only then.
+    #[test]
+    fn a_store_writers_bound_arguments_are_required_names() {
+        let mut w = step("w", "");
+        w.store_op = crate::conductor::store_op::StoreOp::from_columns(
+            Some("case_update"),
+            None,
+            Some(r#"{"case":"active_case_id","outcome":"summary"}"#),
+        )
+        .unwrap();
+        assert_eq!(required_names(&[w]), [ACTIVE_CASE_ID]);
     }
 
     #[test]

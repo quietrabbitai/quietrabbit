@@ -36,6 +36,7 @@ ActionDefinition {
     schedule_trigger: None,
     guard: None,
     declared_inputs: [],
+    store_op: None,
 }
 field_requirements: {"voice_profile": Recommended}
 options_override: {"num_predict":256,"temperature":0.3}
@@ -67,6 +68,7 @@ ActionDefinition {
         "voice_analysis_output",
         "voice_profile",
     ],
+    store_op: None,
 }
 field_requirements: {"employer": Optional, "job_title": Optional, "location_city": Optional}
 options_override: {"num_predict":1024,"temperature":0.5}
@@ -94,6 +96,7 @@ ActionDefinition {
     schedule_trigger: None,
     guard: None,
     declared_inputs: [],
+    store_op: None,
 }
 field_requirements: {"voice_profile": Recommended}
 options_override: {"num_predict":1024,"temperature":0.3}

@@ -264,6 +264,16 @@ pub struct RowShape<'a> {
     /// True for an ordinary local step with no handoff: the only kind of row
     /// that may directly follow a block.
     pub local_and_no_handoff: bool,
+    /// items.id=887: a store writer. It runs but records nothing on the track,
+    /// so it is TRANSPARENT to the block-placement rule (what a block must be
+    /// followed by is the next executed row that is not a writer) and does not
+    /// by itself make a path non-empty.
+    pub transparent: bool,
+    /// items.id=887: the variables a store writer reads as arguments (empty for
+    /// every other row). On every path that runs the row, each one that some
+    /// row produces must have been produced by a row that ran EARLIER on that
+    /// path.
+    pub reads: Vec<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -285,6 +295,12 @@ pub enum CompositionError {
         action_id: String,
         next: String,
         on_path: String,
+    },
+    #[error("step '{action_id}': store writer reads '{var}', but the step that produces it does not run before it on this path ({path})")]
+    ReadsUnsetVariable {
+        action_id: String,
+        var: String,
+        path: String,
     },
     #[error("router variable '{var}' has no fallback row: when it matches none of its literals no step guarded on it runs ({path}). Add a row with an 'ne' or 'present' guard on '{var}'")]
     NoFallback { var: String, path: String },
@@ -519,7 +535,9 @@ pub fn analyze_composition_with(
     // 4. Per-path and whole-composition checks.
     let mut ran = vec![false; rows.len()];
     for p in &paths {
-        if p.rows.is_empty() {
+        // A path of store writers alone runs no step the user sees: it is as
+        // empty as one that runs nothing.
+        if p.rows.iter().all(|&i| rows[i].transparent) {
             return Err(CompositionError::EmptyPath {
                 path: describe(&p.values),
             });
@@ -545,7 +563,9 @@ pub fn analyze_composition_with(
             if !row.is_block {
                 continue;
             }
-            let Some(&next_i) = p.rows.get(pos + 1) else {
+            // The next executed row that records something: a store writer in
+            // between changes neither the block's verdict nor what follows it.
+            let Some(&next_i) = p.rows[pos + 1..].iter().find(|&&j| !rows[j].transparent) else {
                 return Err(CompositionError::BlockLast {
                     action_id: row.action_id.to_owned(),
                     on_path,
@@ -558,6 +578,23 @@ pub fn analyze_composition_with(
                     next: next.action_id.to_owned(),
                     on_path,
                 });
+            }
+        }
+        // A store writer's arguments: where some row produces the variable, a
+        // row that produces it must run earlier on this path.
+        for (pos, &i) in p.rows.iter().enumerate() {
+            for var in &rows[i].reads {
+                let produced_somewhere = rows.iter().any(|r| r.output_var == Some(*var));
+                let produced_earlier = p.rows[..pos]
+                    .iter()
+                    .any(|&j| rows[j].output_var == Some(*var));
+                if produced_somewhere && !produced_earlier {
+                    return Err(CompositionError::ReadsUnsetVariable {
+                        action_id: rows[i].action_id.to_owned(),
+                        var: (*var).to_owned(),
+                        path: describe(&p.values),
+                    });
+                }
             }
         }
         for router in &routers {
@@ -775,6 +812,8 @@ mod tests {
                 output_var: x.out,
                 is_block: x.block,
                 local_and_no_handoff: x.local,
+                transparent: false,
+                reads: Vec::new(),
             })
             .collect();
         analyze_composition(&shapes)
@@ -1116,6 +1155,89 @@ mod tests {
         assert_eq!(analyze(&rows), Ok(4));
     }
 
+    // -- items.id=887: store writers in the analysis -------------------------
+
+    fn shape<'a>(
+        id: &'a str,
+        guard: Option<&'a Guard>,
+        out: Option<&'a str>,
+        block: bool,
+        writer: bool,
+        reads: &[&'a str],
+    ) -> RowShape<'a> {
+        RowShape {
+            action_id: id,
+            guard,
+            output_var: out,
+            is_block: block,
+            local_and_no_handoff: true,
+            transparent: writer,
+            reads: reads.to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_writer_between_a_block_and_the_end_does_not_stand_in_for_an_ordinary_step() {
+        let rows = [
+            shape("draft", None, Some("d"), false, false, &[]),
+            shape("check", None, Some("verdict"), true, false, &[]),
+            shape("w", None, None, false, true, &[]),
+        ];
+        assert!(matches!(
+            analyze_composition(&rows),
+            Err(CompositionError::BlockLast { .. })
+        ));
+        let ok = [
+            shape("draft", None, Some("d"), false, false, &[]),
+            shape("check", None, Some("verdict"), true, false, &[]),
+            shape("w", None, None, false, true, &[]),
+            shape("tail", None, None, false, false, &[]),
+        ];
+        assert_eq!(analyze_composition(&ok), Ok(1));
+    }
+
+    #[test]
+    fn a_path_of_writers_alone_is_an_empty_path() {
+        let rows = [shape("w", None, None, false, true, &[])];
+        assert!(matches!(
+            analyze_composition(&rows),
+            Err(CompositionError::EmptyPath { .. })
+        ));
+    }
+
+    #[test]
+    fn a_writers_arguments_must_be_produced_earlier_on_every_path_that_runs_it() {
+        let eq_x = g("r", "eq", Some("x"));
+        let present_r = g("r", "present", None);
+        let bad = [
+            shape("route", None, Some("r"), false, false, &[]),
+            shape("produce", Some(&eq_x), Some("v"), false, false, &[]),
+            shape("w", Some(&present_r), None, false, true, &["v"]),
+        ];
+        let e = analyze_composition(&bad).unwrap_err();
+        assert!(
+            matches!(&e, CompositionError::ReadsUnsetVariable { action_id, var, .. }
+                if action_id == "w" && var == "v"),
+            "{e:?}"
+        );
+        // The writer guarded as its producer is: every path that runs it has run
+        // the producer first. (A fallback row covers r's OTHER value.)
+        let ne_x = g("r", "ne", Some("x"));
+        let good = [
+            shape("route", None, Some("r"), false, false, &[]),
+            shape("produce", Some(&eq_x), Some("v"), false, false, &[]),
+            shape("w", Some(&eq_x), None, false, true, &["v"]),
+            shape("fallback", Some(&ne_x), None, false, false, &[]),
+        ];
+        assert_eq!(analyze_composition(&good), Ok(2));
+        // A variable no row produces (a seeded session name) is not this check's.
+        let seeded = [
+            shape("a", None, None, false, false, &[]),
+            shape("w", None, None, false, true, &["active_case_id"]),
+        ];
+        assert_eq!(analyze_composition(&seeded), Ok(1));
+    }
+
     #[test]
     fn an_explicit_bound_set_is_honoured_and_path_cap_still_applies() {
         let rows = [
@@ -1130,6 +1252,8 @@ mod tests {
                 output_var: x.out,
                 is_block: false,
                 local_and_no_handoff: true,
+                transparent: false,
+                reads: Vec::new(),
             })
             .collect();
         let bound = [BoundVar {

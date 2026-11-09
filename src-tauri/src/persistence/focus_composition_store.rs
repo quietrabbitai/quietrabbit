@@ -44,6 +44,12 @@ pub struct CompositionRow {
     pub guard_var: Option<String>,
     pub guard_op: Option<String>,
     pub guard_value: Option<String>,
+    /// items.id=887 (shared_041.sql): the raw store-writer columns, all None on
+    /// a row that is not a writer. Parsed and validated by conductor::store_op
+    /// at LOAD, never here.
+    pub store_op: Option<String>,
+    pub store_target: Option<String>,
+    pub store_args: Option<String>,
     /// The Focus-type-default (persona_id IS NULL) customization row's JSON,
     /// or `"{}"` when no such row exists yet (LEFT JOIN — see
     /// list_compositions()'s own query). No Persona-scoped override row is
@@ -107,6 +113,7 @@ pub async fn list_compositions(
         "SELECT c.action_id, c.block_stable_id, c.sequence_index,
                 c.schedule_trigger_anchor_field, c.schedule_trigger_offset,
                 c.guard_var, c.guard_op, c.guard_value,
+                c.store_op, c.store_target, c.store_args,
                 COALESCE(cu.customization, '{}') AS customization
          FROM focus_block_compositions c
          LEFT JOIN focus_block_customization cu
@@ -129,6 +136,9 @@ pub async fn list_compositions(
                 guard_var: row.try_get("guard_var")?,
                 guard_op: row.try_get("guard_op")?,
                 guard_value: row.try_get("guard_value")?,
+                store_op: row.try_get("store_op")?,
+                store_target: row.try_get("store_target")?,
+                store_args: row.try_get("store_args")?,
                 customization: row.try_get("customization")?,
             })
         })

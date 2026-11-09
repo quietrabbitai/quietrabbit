@@ -21,8 +21,12 @@ pub mod quality;
 pub mod reentry;
 pub mod scheduled_sweep;
 pub mod seeding;
+pub mod store_op;
+#[cfg(test)]
+mod store_op_tests;
 #[cfg(test)]
 mod store_seed_tests;
+pub mod store_writer;
 pub mod taint;
 pub mod tier_manifest;
 pub mod tokens;

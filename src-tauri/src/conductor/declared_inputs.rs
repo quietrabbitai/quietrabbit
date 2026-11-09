@@ -305,6 +305,7 @@ mod tests {
             schedule_trigger: None,
             guard: None,
             declared_inputs: declared.iter().map(|d| (*d).to_owned()).collect(),
+            store_op: None,
         }
     }
 

@@ -157,6 +157,7 @@ mod tests {
             schedule_trigger: None,
             guard: None,
             declared_inputs: Vec::new(),
+            store_op: None,
         }
     }
 

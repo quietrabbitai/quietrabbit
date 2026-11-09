@@ -40,6 +40,7 @@ ActionDefinition {
     schedule_trigger: None,
     guard: None,
     declared_inputs: [],
+    store_op: None,
 }
 field_requirements: {}
 options_override: {"num_predict":512,"temperature":0.4}

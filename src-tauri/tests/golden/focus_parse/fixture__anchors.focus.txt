@@ -34,6 +34,7 @@ ActionDefinition {
     schedule_trigger: None,
     guard: None,
     declared_inputs: [],
+    store_op: None,
 }
 field_requirements: {}
 options_override: {}
@@ -59,6 +60,7 @@ ActionDefinition {
     schedule_trigger: None,
     guard: None,
     declared_inputs: [],
+    store_op: None,
 }
 field_requirements: {}
 options_override: {}
