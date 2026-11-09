@@ -42,6 +42,11 @@
 --     decisions.id=594's second-adopter catalog-admission gate. Seeding a
 --     promotion candidate here would let a Focus composition reference a
 --     block the catalog itself hasn't confirmed yet.
+-- AMENDED (items.id=129, shared_038.sql): the "confirmed only" rule above is
+-- relaxed for one row. pc-03 (promotion_candidate, single adopter: Writing
+-- Assistant) is seeded by shared_038.sql as mirror bookkeeping. It has no
+-- compiled-in handler, so a Focus citing it still fails at LOAD. The mirror is
+-- 10 rows after shared_038. pc-01, pc-02 and pc-04 stay out.
 -- None of the 9 seeded rows has real Rust execution code today (confirmed
 -- live against conductor/executor.rs) -- seeding the mirror row is
 -- authoring-time bookkeeping, independent of whether a handler exists yet;

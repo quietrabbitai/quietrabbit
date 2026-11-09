@@ -298,6 +298,31 @@ mod tests {
             .unwrap());
     }
 
+    /// items.id=129: shared_038 takes the mirror from 9 rows to 10 (pc-03 in).
+    /// pc-04, cb-04 and cb-09 stay out, and pc-03 is a member with no handler.
+    #[tokio::test]
+    async fn mirror_has_ten_rows_with_pc03_in_and_pc04_cb04_cb09_out() {
+        let env = setup().await;
+        let pool = &env.pool;
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM building_blocks")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 10);
+        assert!(is_inline_composable_block(pool, "pc-03").await.unwrap());
+        for absent in ["pc-04", "cb-04", "cb-09"] {
+            assert!(!is_inline_composable_block(pool, absent).await.unwrap());
+            let any: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM building_blocks WHERE stable_id = ?")
+                    .bind(absent)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+            assert_eq!(any, 0, "{absent} must not be in the mirror");
+        }
+        assert!(crate::conductor::block_dispatch::block_handler("pc-03").is_none());
+    }
+
     /// items.id=129: every compiled-in handler's stable_id must be a mirror
     /// member, or a Focus could never cite it (membership is checked first).
     #[tokio::test]

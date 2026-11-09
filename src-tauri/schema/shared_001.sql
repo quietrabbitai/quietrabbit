@@ -23,9 +23,12 @@
 -- focus_settings_friction_decisions are keyed (persona_id, focus_id), so they
 -- show which Focuses each Persona uses. They stay here (Jason, items.id=661
 -- review, option b) and are listed in the residual set for items.id=662.
--- Also residual: authored Focus content (focuses, focus_block_customization)
--- has no writer yet. When the Focus builder is built its authored content
--- must go in an encrypted store, not here.
+-- Shipped core Focus content (the focuses, focus_block_compositions and
+-- default focus_block_customization rows seeded by migrations) is identical
+-- for every install and holds no personal values (decisions.id=862,
+-- items.id=129). User-authored Focus content has no writer yet. When the Focus
+-- builder is built its authored content must still go in an encrypted store,
+-- not here.
 --
 -- CONSOLIDATION NOTE (items.id=169, 2026-07-24): this file replaces the prior
 -- five-migration chain: shared_001 (initial, 'spaces'/'space_id'), shared_002

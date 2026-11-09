@@ -131,6 +131,12 @@ fn parse_cb06(customization: &serde_json::Value) -> Result<Cb06Config, String> {
             cfg.input_var
         ));
     }
+    if crate::conductor::tokens::is_system_token(&cfg.output_var) {
+        return Err(format!(
+            "cb-06 config: output_var '{}' collides with a system token",
+            cfg.output_var
+        ));
+    }
     if cfg.on_fail != CB06_ON_FAIL_ADVISORY {
         return Err(format!(
             "cb-06 config: on_fail must be '{CB06_ON_FAIL_ADVISORY}' (the only supported value), \
@@ -398,6 +404,11 @@ mod tests {
         let mut bad = good.clone();
         bad.as_object_mut().unwrap().remove("on_fail");
         assert!(v(&bad).is_err());
+
+        // output_var naming a system token.
+        let mut bad = good.clone();
+        bad["output_var"] = json!("previous_output");
+        assert!(v(&bad).unwrap_err().contains("system token"));
 
         // output_var == input_var.
         let mut bad = good.clone();

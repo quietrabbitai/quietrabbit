@@ -38,9 +38,12 @@
 //                  focus_settings and focus_settings_friction_decisions are
 //                  keyed (persona_id, focus_id), so they show which Focuses
 //                  each Persona uses (Jason, items.id=661 review, option b).
-//                  focus_block_customization holds per-Persona Focus
-//                  customization JSON; it has no writer yet, and when the Focus
-//                  builder writes it, it must move to an encrypted store.
+//                  focus_block_customization: its default rows (persona_id
+//                  NULL) are shipped core Focus content, identical for every
+//                  install and holding no personal values (decisions.id=862,
+//                  items.id=129). Any user-authored or per-Persona customization
+//                  has no writer yet, and when the Focus builder writes it, it
+//                  must go to an encrypted store.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResidualClass {
@@ -446,6 +449,10 @@ pub const RESIDUAL_SHARED_SCHEMA: &[ResidualTable] = &[
             "revoked_at",
         ],
     },
+    // Default rows (persona_id NULL) are shipped core Focus content: identical
+    // for every install, no personal values (decisions.id=862, items.id=129).
+    // User-authored Focus content must still go to encrypted storage. The class
+    // stays KnownResidual because a Persona-scoped row would show per-Persona use.
     ResidualTable {
         name: "focus_block_customization",
         class: ResidualClass::KnownResidual,

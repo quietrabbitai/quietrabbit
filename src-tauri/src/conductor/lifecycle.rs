@@ -789,6 +789,30 @@ async fn load_focus_definition_from_db(
         steps.push(step);
     }
 
+    // Placement rules for block steps (items.id=129). A block step's recorded
+    // content is its verdict, and last_output() feeds both OUTPUT and the
+    // handoff-pause draft, so a block must be followed by an ordinary local
+    // step: never last, never directly before an external or handoff step.
+    for (i, step) in steps.iter().enumerate() {
+        if step.block_stable_id.is_none() {
+            continue;
+        }
+        let Some(next) = steps.get(i + 1) else {
+            return Err(LifecycleError::ValidationFailed(format!(
+                "Focus '{focus_id}' step '{}': a block step cannot be the final step (its \
+                 verdict would become the run's output)",
+                step.action_id
+            )));
+        };
+        if next.routing_tier != ExternalAccess::LocalOnly || next.requires_user_handoff {
+            return Err(LifecycleError::ValidationFailed(format!(
+                "Focus '{focus_id}' step '{}': a block step cannot come directly before an \
+                 external or handoff step ('{}')",
+                step.action_id, next.action_id
+            )));
+        }
+    }
+
     Ok(Some(FocusDefinition {
         focus_id: focus_id.to_owned(),
         display_name: focus_row.display_name,
@@ -835,6 +859,26 @@ fn parse_optional_trigger(
         anchor_field,
         offset,
     }))
+}
+
+/// The (action_id, content) pairs the Phase 5 extraction pass reads
+/// (extract_candidates). A block step's content is the block's own advisory
+/// verdict, not conversation, so it is left out (items.id=129).
+fn extraction_step_outputs(
+    task_track: &TaskTrack,
+    focus_def: &FocusDefinition,
+) -> Vec<(String, String)> {
+    task_track
+        .steps()
+        .iter()
+        .filter(|s| {
+            !focus_def
+                .steps
+                .iter()
+                .any(|d| d.action_id == s.action_id && d.block_stable_id.is_some())
+        })
+        .map(|s| (s.action_id.clone(), s.content.clone()))
+        .collect()
 }
 
 /// Parse the text of a `.focus` file into a FocusDefinition. The one place
@@ -903,7 +947,22 @@ pub async fn load_focus_definition(
     pool: &sqlx::SqlitePool,
     focus_id: &str,
 ) -> Result<FocusDefinition, LifecycleError> {
-    if let Some(focus_def) = load_focus_definition_from_db(pool, focus_id).await? {
+    if let Some(mut focus_def) = load_focus_definition_from_db(pool, focus_id).await? {
+        // items.id=129: a shipped Focus also exists as a bundled .focus file.
+        // The loader takes the STRICTER of the DB row's max_routing_tier and
+        // the bundled file's, so a wrong seed row (or a tampered shared.db,
+        // which is unencrypted) can narrow a shipped Focus's ceiling but can
+        // never widen it. Only the bundled and dev-source roots count: the
+        // community directory is not a shipped source. A Focus with no
+        // bundled file (a composition-authored one) is not cross-checked. A
+        // bundled file that cannot be read or parsed fails the load rather
+        // than silently skipping the check.
+        if let Some(path) = find_shipped_focus_file(focus_id) {
+            let text = tokio::fs::read_to_string(&path).await?;
+            let shipped = parse_focus_text(&text)?;
+            focus_def.max_routing_tier =
+                ExternalAccess::min(focus_def.max_routing_tier, shipped.max_routing_tier);
+        }
         for step in &focus_def.steps {
             let errors = validate_step(step);
             if !errors.is_empty() {
@@ -980,6 +1039,19 @@ fn dev_focus_dir() -> Option<PathBuf> {
 #[cfg(not(debug_assertions))]
 fn dev_focus_dir() -> Option<PathBuf> {
     None
+}
+
+/// The bundled (or, in debug builds, dev source tree) `{focus_id}.focus`, if
+/// one exists. Unlike find_focus_file_in this ignores the community directory.
+fn find_shipped_focus_file(focus_id: &str) -> Option<PathBuf> {
+    let filename = format!("{focus_id}.focus");
+    let dev = dev_focus_dir();
+    let found = [FOCUS_DIR.get().map(PathBuf::as_path), dev.as_deref()]
+        .into_iter()
+        .flatten()
+        .map(|root| root.join(&filename))
+        .find(|candidate| candidate.exists());
+    found
 }
 
 fn find_focus_file(focus_id: &str) -> Result<PathBuf, LifecycleError> {
@@ -1246,6 +1318,12 @@ pub struct FocusRun<L: DisclosureLoggerForRun = SqliteDisclosureLogger> {
     // Tauri AppHandle for push events — None in tests, Some in production (D6-345)
     pub app_handle: Option<tauri::AppHandle<tauri::Wry>>,
 
+    /// Test-only recorder of every run-status-update payload this run would
+    /// emit (items.id=129): there is no AppHandle in tests, so this is how a
+    /// test observes which step boundaries emit.
+    #[cfg(test)]
+    pub(crate) emitted_for_test: std::sync::Mutex<Vec<RunStatusPayload>>,
+
     // State populated during lifecycle phases (all Option — None until populated)
     pub focus_run_id: Option<String>,
     pub focus_def: Option<FocusDefinition>,
@@ -1358,6 +1436,8 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             is_quick_ask,
             confirmed_cross_persona_fact_ids,
             app_handle,
+            #[cfg(test)]
+            emitted_for_test: std::sync::Mutex::new(Vec::new()),
             focus_run_id: None,
             focus_def: None,
             personal_track: None,
@@ -1454,6 +1534,17 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         crisis_resource_block: Option<&str>,
         reply_flags: Option<bool>,
     ) {
+        #[cfg(test)]
+        self.emitted_for_test
+            .lock()
+            .unwrap()
+            .push(self.build_status_payload(
+                status,
+                step_display_name,
+                step_content,
+                crisis_resource_block,
+                reply_flags,
+            ));
         let Some(handle) = &self.app_handle else {
             return; // no handle in tests — silent no-op
         };
@@ -2197,7 +2288,16 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             // Clone step to release focus_def borrow before &mut self calls below.
             let step = self.focus_def.as_ref().unwrap().steps[i].clone();
 
-            self.emit_status("running", Some(&step.display_name));
+            // items.id=129: a block step is internal bookkeeping, not
+            // something the user is waiting on. It emits neither a start nor a
+            // completion event: its verdict is advisory text and must not
+            // reach the chat's live view (ChatPane replaces its live content
+            // with every step_content). The step is still recorded on the
+            // TaskTrack so later steps can read it by output_var.
+            let is_block = step.block_stable_id.is_some();
+            if !is_block {
+                self.emit_status("running", Some(&step.display_name));
+            }
 
             // items.id=574 piece (c), pulled in by items.id=496: the
             // schedule_trigger gate just below needs a ledger row to set
@@ -2338,12 +2438,14 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             // distinct from the step-START announcement above (which fires
             // before content exists). last_output() is the step just pushed
             // by execute_step() above.
-            let step_content = self
-                .task_track
-                .as_ref()
-                .and_then(|tt| tt.last_output())
-                .map(|s| s.to_owned());
-            self.emit_step_complete(&step.display_name, step_content.as_deref());
+            if !is_block {
+                let step_content = self
+                    .task_track
+                    .as_ref()
+                    .and_then(|tt| tt.last_output())
+                    .map(|s| s.to_owned());
+                self.emit_step_complete(&step.display_name, step_content.as_deref());
+            }
 
             checkpoint_counter += 1;
             if checkpoint_counter >= checkpoint_every && !self._checkpointing_suspended {
@@ -3288,16 +3390,10 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         // Capture step outputs while task_track is still live.
         // cleanup() later releases task_track, so extraction input
         // must be captured before output() completes.
-        let step_outputs: Vec<(String, String)> = self
-            .task_track
-            .as_ref()
-            .map(|tt| {
-                tt.steps()
-                    .iter()
-                    .map(|s| (s.action_id.clone(), s.content.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let step_outputs: Vec<(String, String)> = match (&self.task_track, &self.focus_def) {
+            (Some(tt), Some(fd)) => extraction_step_outputs(tt, fd),
+            _ => Vec::new(),
+        };
 
         // Phase 5 OUTPUT -- runs unconditionally before the extract pass.
         // output() saves content, writes run_history, and sets status='awaiting_feedback'.
@@ -6681,6 +6777,15 @@ mod tests {
                 audit_unavailable: false,
             });
             task_track.add_step(TaskStep {
+                action_id: "quality_check".to_owned(),
+                output_var: Some("draft_quality_verdict".to_owned()),
+                content: "Quality check (advisory): passed.".to_owned(),
+                sensitivity_severity: 1,
+                routing_tier_used: 1,
+                personal_flagged: false,
+                audit_unavailable: false,
+            });
+            task_track.add_step(TaskStep {
                 action_id: "voice_transform".to_owned(),
                 output_var: Some("final_output".to_owned()),
                 content: "Original final".to_owned(),
@@ -6724,8 +6829,10 @@ mod tests {
             vec![
                 "voice_analysis".to_owned(),
                 "draft_writing".to_owned(),
+                "quality_check".to_owned(),
                 "voice_transform".to_owned()
-            ]
+            ],
+            "writing-assistant now loads from the DB path with its cb-06 step (items.id=129)"
         );
 
         let plan = run
@@ -6737,7 +6844,18 @@ mod tests {
         assert_eq!(plan.preserved_action_ids, vec!["voice_analysis".to_owned()]);
         assert_eq!(
             plan.discarded_action_ids,
-            vec!["draft_writing".to_owned(), "voice_transform".to_owned()]
+            vec![
+                "draft_writing".to_owned(),
+                "quality_check".to_owned(),
+                "voice_transform".to_owned()
+            ]
+        );
+        // The block's verdict variable goes stale with the steps it described.
+        assert!(
+            plan.stale_output_vars
+                .contains(&"draft_quality_verdict".to_owned()),
+            "{:?}",
+            plan.stale_output_vars
         );
 
         assert_eq!(run.current_step, 1);
@@ -6794,6 +6912,15 @@ mod tests {
             content: "Second draft".to_owned(),
             sensitivity_severity: 1,
             routing_tier_used: 2,
+            personal_flagged: false,
+            audit_unavailable: false,
+        });
+        run.task_track.as_mut().unwrap().add_step(TaskStep {
+            action_id: "quality_check".to_owned(),
+            output_var: Some("draft_quality_verdict".to_owned()),
+            content: "Quality check (advisory): passed.".to_owned(),
+            sensitivity_severity: 1,
+            routing_tier_used: 1,
             personal_flagged: false,
             audit_unavailable: false,
         });
@@ -7314,6 +7441,53 @@ mod tests {
         .execute(&mut *conn)
         .await
         .unwrap();
+        drop(conn);
+        // A block step may not be last, so every seeded Focus gets an
+        // ordinary local step after it.
+        seed_plain_step(
+            pool,
+            focus_id,
+            "after_block",
+            1,
+            serde_json::json!({"routing_tier": 1, "prompt_template": "Refine {draft_output}"}),
+        )
+        .await;
+    }
+
+    /// An ordinary (block_stable_id NULL) composition step at `seq`.
+    async fn seed_plain_step(
+        pool: &sqlx::SqlitePool,
+        focus_id: &str,
+        action_id: &str,
+        seq: i64,
+        customization: serde_json::Value,
+    ) {
+        let mut conn = pool.acquire().await.unwrap();
+        let comp_id = format!("comp-{focus_id}-{action_id}");
+        sqlx::query(
+            "INSERT INTO focus_block_compositions
+                (id, focus_id, action_id, block_stable_id, sequence_index,
+                 created_at, updated_at)
+             VALUES (?, ?, ?, NULL, ?, datetime('now'), datetime('now'))",
+        )
+        .bind(&comp_id)
+        .bind(focus_id)
+        .bind(action_id)
+        .bind(seq)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO focus_block_customization
+                (id, composition_id, persona_id, customization, created_at, updated_at)
+             VALUES (?, ?, NULL, ?, datetime('now'), datetime('now'))",
+        )
+        .bind(format!("cust-{focus_id}-{action_id}"))
+        .bind(&comp_id)
+        .bind(customization.to_string())
+        .execute(&mut *conn)
+        .await
+        .unwrap();
     }
 
     fn good_cb06_json() -> String {
@@ -7430,6 +7604,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn block_load_placement_rules() {
+        with_temp_data_root(async {
+            let pool = block_load_pool().await;
+
+            // Last step: rejected.
+            seed_block_focus(&pool, "last", "cb-06", &good_cb06_json()).await;
+            sqlx::query("DELETE FROM focus_block_compositions WHERE id = 'comp-last-after_block'")
+                .execute(&pool)
+                .await
+                .unwrap();
+            let m = load_err_text(load_focus_definition_from_db(&pool, "last").await);
+            assert!(m.contains("final step"), "{m}");
+
+            // Directly before an external (Tier 2) step: rejected.
+            seed_block_focus(&pool, "ext", "cb-06", &good_cb06_json()).await;
+            sqlx::query("DELETE FROM focus_block_compositions WHERE id = 'comp-ext-after_block'")
+                .execute(&pool)
+                .await
+                .unwrap();
+            seed_plain_step(
+                &pool,
+                "ext",
+                "tier2_step",
+                1,
+                serde_json::json!({"routing_tier": 2, "prompt_template": "x"}),
+            )
+            .await;
+            let m = load_err_text(load_focus_definition_from_db(&pool, "ext").await);
+            assert!(m.contains("external or handoff"), "{m}");
+
+            // Directly before a handoff step: rejected.
+            seed_block_focus(&pool, "hand", "cb-06", &good_cb06_json()).await;
+            sqlx::query("DELETE FROM focus_block_compositions WHERE id = 'comp-hand-after_block'")
+                .execute(&pool)
+                .await
+                .unwrap();
+            seed_plain_step(
+                &pool,
+                "hand",
+                "handoff_step",
+                1,
+                serde_json::json!({"routing_tier": 1, "requires_user_handoff": true,
+                                   "prompt_template": "x"}),
+            )
+            .await;
+            let m = load_err_text(load_focus_definition_from_db(&pool, "hand").await);
+            assert!(m.contains("external or handoff"), "{m}");
+
+            // After an external step and before a local one (the Writing
+            // Assistant shape): accepted.
+            seed_block_focus(&pool, "ok", "cb-06", &good_cb06_json()).await;
+            seed_plain_step(
+                &pool,
+                "ok",
+                "tier2_step",
+                -1,
+                serde_json::json!({"routing_tier": 2, "prompt_template": "x"}),
+            )
+            .await;
+            let def = load_focus_definition_from_db(&pool, "ok")
+                .await
+                .unwrap()
+                .unwrap();
+            let ids: Vec<&str> = def.steps.iter().map(|s| s.action_id.as_str()).collect();
+            assert_eq!(ids, ["tier2_step", "quality_check", "after_block"]);
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn block_step_dispatch_records_verdict_on_the_track() {
         with_temp_data_root(async {
             let pool = block_load_pool().await;
@@ -7476,6 +7720,123 @@ mod tests {
         .await;
     }
 
+    /// A block ActionDefinition built by hand (the loader's own output shape).
+    fn hand_built_cb06_step() -> ActionDefinition {
+        let mut step = single_tier3_step_focus_def().steps[0].clone();
+        step.action_id = "quality_check".to_owned();
+        step.display_name = "quality_check".to_owned();
+        step.routing_tier = ExternalAccess::LocalOnly;
+        step.external_access_override = None;
+        step.requires_user_handoff = false;
+        step.block_stable_id = Some("cb-06".to_owned());
+        step.block_customization = Some(serde_json::from_str(&good_cb06_json()).unwrap());
+        step
+    }
+
+    fn draft_step(content: &str) -> TaskStep {
+        TaskStep {
+            action_id: "draft_writing".to_owned(),
+            output_var: Some("draft_output".to_owned()),
+            content: content.to_owned(),
+            sensitivity_severity: 1,
+            routing_tier_used: 2,
+            personal_flagged: false,
+            audit_unavailable: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn block_step_emits_no_start_or_complete_event() {
+        with_temp_data_root(async {
+            let mut run = tier3_ready_run(false);
+            let mut def = single_tier3_step_focus_def();
+            def.steps = vec![hand_built_cb06_step()];
+            run.focus_def = Some(def);
+            run.task_track
+                .as_mut()
+                .unwrap()
+                .add_step(draft_step("the assessed draft"));
+
+            let r = run.execute().await.expect("execute must not error");
+            assert!(r.is_none(), "all steps done, nothing parked: {r:?}");
+
+            // The step ran and is on the track for later steps ...
+            let tt = run.task_track.as_ref().unwrap();
+            assert!(tt.get_output("quality_verdict").is_some());
+            // ... but nothing was emitted for it.
+            let emitted = run.emitted_for_test.lock().unwrap();
+            assert!(
+                emitted.is_empty(),
+                "a block step must emit no start or complete event, got {emitted:?}"
+            );
+        })
+        .await;
+    }
+
+    /// Control for the test above: the recorder does see an ordinary step's
+    /// boundary event, so an empty record for a block step is meaningful.
+    #[tokio::test]
+    async fn ordinary_step_boundary_is_recorded_by_the_same_recorder() {
+        with_temp_data_root(async {
+            let mut run = tier3_ready_run(false);
+            let r = run.execute().await.unwrap();
+            assert_eq!(r.unwrap().status, "awaiting_user");
+            let emitted = run.emitted_for_test.lock().unwrap();
+            assert!(
+                emitted
+                    .iter()
+                    .any(|p| p.status == "running"
+                        && p.step_display_name.as_deref() == Some("Step A")),
+                "an ordinary step announces its start: {emitted:?}"
+            );
+        })
+        .await;
+    }
+
+    #[test]
+    fn block_steps_are_absent_from_the_extraction_input() {
+        let mut def = single_tier3_step_focus_def();
+        let mut plain_a = def.steps[0].clone();
+        plain_a.action_id = "draft_writing".to_owned();
+        let mut plain_b = def.steps[0].clone();
+        plain_b.action_id = "voice_transform".to_owned();
+        def.steps = vec![plain_a, hand_built_cb06_step(), plain_b];
+
+        let mut tt = TaskTrack::new();
+        tt.add_step(draft_step("the draft"));
+        tt.add_step(TaskStep {
+            action_id: "quality_check".to_owned(),
+            output_var: Some("quality_verdict".to_owned()),
+            content: "Quality check (advisory): passed.".to_owned(),
+            sensitivity_severity: 1,
+            routing_tier_used: 1,
+            personal_flagged: false,
+            audit_unavailable: false,
+        });
+        tt.add_step(TaskStep {
+            action_id: "voice_transform".to_owned(),
+            output_var: Some("final_output".to_owned()),
+            content: "the refined draft".to_owned(),
+            sensitivity_severity: 1,
+            routing_tier_used: 1,
+            personal_flagged: false,
+            audit_unavailable: false,
+        });
+
+        let out = extraction_step_outputs(&tt, &def);
+        assert_eq!(
+            out,
+            vec![
+                ("draft_writing".to_owned(), "the draft".to_owned()),
+                ("voice_transform".to_owned(), "the refined draft".to_owned()),
+            ]
+        );
+        // With no block step in the Focus, nothing is filtered.
+        let mut plain_def = single_tier3_step_focus_def();
+        plain_def.steps[0].action_id = "quality_check".to_owned();
+        assert_eq!(extraction_step_outputs(&tt, &plain_def).len(), 3);
+    }
+
     #[tokio::test]
     async fn block_step_with_no_handler_is_a_validation_error_not_a_panic() {
         with_temp_data_root(async {
@@ -7488,6 +7849,274 @@ mod tests {
                 matches!(&err, LifecycleError::ValidationFailed(m) if m.contains("no compiled-in handler")),
                 "{err:?}"
             );
+        })
+        .await;
+    }
+
+    // -- items.id=129: Writing Assistant on the DB composition path ---------
+
+    const WRITING_ASSISTANT_FOCUS: &str =
+        include_str!("../../../app/core_artifacts/focuses/writing-assistant.focus");
+
+    /// The seeded writing-assistant row, loaded through the DB path only (no
+    /// bundled-file cross-check).
+    async fn seeded_wa(pool: &sqlx::SqlitePool) -> FocusDefinition {
+        load_focus_definition_from_db(pool, "writing-assistant")
+            .await
+            .expect("seeded writing-assistant must load")
+            .expect("shared_038 seeds a writing-assistant row")
+    }
+
+    /// PARITY: the DB-loaded Focus equals the parsed .focus field for field,
+    /// plus exactly one extra step (the cb-06 block).
+    #[tokio::test]
+    async fn writing_assistant_db_focus_matches_the_focus_file_plus_one_block() {
+        with_temp_data_root(async {
+            let pool = block_load_pool().await;
+            let db = seeded_wa(&pool).await;
+            let yaml = parse_focus_text(WRITING_ASSISTANT_FOCUS).expect("file parses");
+
+            // Focus level.
+            assert_eq!(db.focus_id, yaml.focus_id);
+            assert_eq!(db.display_name, yaml.display_name);
+            assert_eq!(db.description, yaml.description);
+            assert_eq!(db.version, yaml.version);
+            assert_eq!(db.max_routing_tier, yaml.max_routing_tier);
+            assert_eq!(db.max_routing_tier, ExternalAccess::AnonymousRequired);
+            assert_eq!(db.output_type, yaml.output_type);
+            assert_eq!(db.suggest_in_focuses, yaml.suggest_in_focuses);
+            assert_eq!(db.multi_source_validation, yaml.multi_source_validation);
+            assert_eq!(db.generic_title_template, yaml.generic_title_template);
+            assert_eq!(
+                db.high_priority_trigger.is_some(),
+                yaml.high_priority_trigger.is_some()
+            );
+
+            // Exactly one extra step, and it is cb-06 between the two.
+            assert_eq!(db.steps.len(), yaml.steps.len() + 1);
+            let ids: Vec<&str> = db.steps.iter().map(|s| s.action_id.as_str()).collect();
+            assert_eq!(
+                ids,
+                [
+                    "voice_analysis",
+                    "draft_writing",
+                    "quality_check",
+                    "voice_transform"
+                ]
+            );
+            let blocks: Vec<&ActionDefinition> = db
+                .steps
+                .iter()
+                .filter(|s| s.block_stable_id.is_some())
+                .collect();
+            assert_eq!(blocks.len(), 1);
+            assert_eq!(blocks[0].action_id, "quality_check");
+            assert_eq!(blocks[0].block_stable_id.as_deref(), Some("cb-06"));
+
+            // Every ordinary step, field for field.
+            let ordinary: Vec<&ActionDefinition> = db
+                .steps
+                .iter()
+                .filter(|s| s.block_stable_id.is_none())
+                .collect();
+            assert_eq!(ordinary.len(), yaml.steps.len());
+            for (d, y) in ordinary.iter().zip(yaml.steps.iter()) {
+                let n = &y.action_id;
+                assert_eq!(d.action_id, y.action_id);
+                assert_eq!(d.display_name, y.display_name, "{n}");
+                assert_eq!(d.guide_id, y.guide_id, "{n}");
+                assert_eq!(d.guide_id, "writing-voice", "{n}");
+                assert_eq!(d.task_type, y.task_type, "{n}");
+                assert_eq!(d.routing_tier, y.routing_tier, "{n}");
+                assert_eq!(d.step_type, y.step_type, "{n}");
+                assert_eq!(d.output_var, y.output_var, "{n}");
+                assert_eq!(d.prompt_template, y.prompt_template, "{n}");
+                assert_eq!(d.field_requirements, y.field_requirements, "{n}");
+                assert_eq!(d.options_override, y.options_override, "{n}");
+                assert_eq!(
+                    d.external_access_override, y.external_access_override,
+                    "{n}"
+                );
+                assert_eq!(d.requires_user_handoff, y.requires_user_handoff, "{n}");
+                assert_eq!(d.revisitable, y.revisitable, "{n}");
+                assert!(d.block_stable_id.is_none() && d.block_customization.is_none());
+                assert!(d.schedule_trigger.is_none() && y.schedule_trigger.is_none());
+            }
+        })
+        .await;
+    }
+
+    /// EXTERNAL-STEP PIN: adding cb-06 adds no external behavior and does not
+    /// change what voice_transform reads or what becomes the run's output.
+    #[tokio::test]
+    async fn writing_assistant_external_step_pin() {
+        with_temp_data_root(async {
+            let pool = block_load_pool().await;
+            let db = seeded_wa(&pool).await;
+            let yaml = parse_focus_text(WRITING_ASSISTANT_FOCUS).unwrap();
+
+            // Every block step is LocalOnly, no override, no handoff.
+            for b in db.steps.iter().filter(|s| s.block_stable_id.is_some()) {
+                assert_eq!(b.routing_tier, ExternalAccess::LocalOnly);
+                assert!(b.external_access_override.is_none());
+                assert!(!b.requires_user_handoff);
+            }
+            // Step tiers match the YAML: only draft_writing is external.
+            for y in &yaml.steps {
+                let d = db
+                    .steps
+                    .iter()
+                    .find(|s| s.action_id == y.action_id)
+                    .unwrap();
+                assert_eq!(d.routing_tier, y.routing_tier, "{}", y.action_id);
+            }
+            let ext: Vec<&str> = db
+                .steps
+                .iter()
+                .filter(|s| s.routing_tier != ExternalAccess::LocalOnly)
+                .map(|s| s.action_id.as_str())
+                .collect();
+            assert_eq!(ext, ["draft_writing"]);
+
+            // The block is not directly before an external step and is not last.
+            let qi = db
+                .steps
+                .iter()
+                .position(|s| s.block_stable_id.is_some())
+                .unwrap();
+            let next = &db.steps[qi + 1];
+            assert_eq!(next.action_id, "voice_transform");
+            assert_eq!(next.routing_tier, ExternalAccess::LocalOnly);
+            assert!(qi + 1 < db.steps.len());
+
+            // voice_transform's input resolution is unchanged: it names
+            // draft_output explicitly, never previous_output, and nothing
+            // reads the verdict variable.
+            let vt = db
+                .steps
+                .iter()
+                .find(|s| s.action_id == "voice_transform")
+                .unwrap();
+            assert!(vt.prompt_template.contains("{draft_output}"));
+            assert!(!vt.prompt_template.contains("{previous_output}"));
+            let verdict_var = db.steps[qi]
+                .block_customization
+                .as_ref()
+                .and_then(|c| c["output_var"].as_str())
+                .unwrap()
+                .to_owned();
+            for s in &db.steps {
+                assert!(
+                    !s.prompt_template.contains(&format!("{{{verdict_var}}}")),
+                    "{} reads the verdict",
+                    s.action_id
+                );
+            }
+            // The verdict never shares an output_var with a real step.
+            assert!(db
+                .steps
+                .iter()
+                .filter(|s| s.block_stable_id.is_none())
+                .all(|s| s.output_var.as_deref() != Some(verdict_var.as_str())));
+
+            // The run's output (last_output) stays voice_transform's: the
+            // block does not become output().
+            assert_eq!(db.steps.last().unwrap().action_id, "voice_transform");
+            assert_eq!(
+                db.steps.last().unwrap().output_var.as_deref(),
+                Some("final_output")
+            );
+        })
+        .await;
+    }
+
+    /// END TO END over the seeded row: run the real cb-06 step, dispatched
+    /// through execute_step, over a track holding the Writing Assistant's real
+    /// earlier outputs. The generate steps themselves are covered by parity
+    /// and need a model, so a real Tier 2 run stays a by-hand check.
+    #[tokio::test]
+    async fn writing_assistant_seeded_cb06_step_runs_over_a_seeded_track() {
+        with_temp_data_root(async {
+            let pool = block_load_pool().await;
+            let db = seeded_wa(&pool).await;
+            let step = db
+                .steps
+                .iter()
+                .find(|s| s.block_stable_id.is_some())
+                .unwrap()
+                .clone();
+
+            for (draft, expect_pass) in [
+                (
+                    "A solid draft that is comfortably longer than forty characters.",
+                    true,
+                ),
+                ("too short", false),
+            ] {
+                let mut run = tier3_ready_run(false);
+                run.focus_def = Some(db.clone());
+                let tt = run.task_track.as_mut().unwrap();
+                tt.add_step(TaskStep {
+                    action_id: "voice_analysis".to_owned(),
+                    output_var: Some("voice_analysis_output".to_owned()),
+                    content: "analysis".to_owned(),
+                    sensitivity_severity: 1,
+                    routing_tier_used: 1,
+                    personal_flagged: false,
+                    audit_unavailable: false,
+                });
+                tt.add_step(draft_step(draft));
+
+                assert!(run.execute_step(&step, 2).await.unwrap().is_none());
+
+                let tt = run.task_track.as_ref().unwrap();
+                assert_eq!(tt.get_output("draft_output"), Some(draft));
+                let verdict = tt.get_output("draft_quality_verdict").unwrap();
+                assert_eq!(verdict.contains("not passed"), !expect_pass, "{verdict}");
+                assert!(!verdict.contains("comfortably"), "no draft text: {verdict}");
+                assert!(!verdict.contains("too short"), "no draft text: {verdict}");
+                assert_eq!(tt.steps().len(), 3);
+            }
+        })
+        .await;
+    }
+
+    /// RUNTIME CROSS-CHECK: load_focus_definition takes the stricter of the DB
+    /// row's tier and the bundled file's, for a shipped focus_id.
+    #[tokio::test]
+    async fn loader_takes_the_stricter_of_db_and_bundled_tier_for_a_shipped_focus() {
+        with_temp_data_root(async {
+            let pool = block_load_pool().await;
+
+            // Seeded row agrees with the file.
+            let def = load_focus_definition(&pool, "writing-assistant").await.unwrap();
+            assert_eq!(def.max_routing_tier, ExternalAccess::AnonymousRequired);
+            assert_eq!(def.steps.len(), 4);
+
+            // A widened DB row cannot widen the Focus.
+            sqlx::query("UPDATE focuses SET max_routing_tier = 'unrestricted' WHERE focus_id = 'writing-assistant'")
+                .execute(&pool)
+                .await
+                .unwrap();
+            let def = load_focus_definition(&pool, "writing-assistant").await.unwrap();
+            assert_eq!(def.max_routing_tier, ExternalAccess::AnonymousRequired);
+
+            // A stricter DB row narrows it.
+            sqlx::query("UPDATE focuses SET max_routing_tier = 'local_only' WHERE focus_id = 'writing-assistant'")
+                .execute(&pool)
+                .await
+                .unwrap();
+            let def = load_focus_definition(&pool, "writing-assistant").await.unwrap();
+            assert_eq!(def.max_routing_tier, ExternalAccess::LocalOnly);
+
+            // A composition-authored Focus with no bundled file is untouched.
+            seed_block_focus(&pool, "no-bundled-file", "cb-06", &good_cb06_json()).await;
+            sqlx::query("UPDATE focuses SET max_routing_tier = 'unrestricted' WHERE focus_id = 'no-bundled-file'")
+                .execute(&pool)
+                .await
+                .unwrap();
+            let def = load_focus_definition(&pool, "no-bundled-file").await.unwrap();
+            assert_eq!(def.max_routing_tier, ExternalAccess::Unrestricted);
         })
         .await;
     }
