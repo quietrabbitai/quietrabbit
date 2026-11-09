@@ -225,6 +225,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/outputs_012.sql"),
     },
     SchemaFile {
+        prefix: "outputs",
+        version: 13,
+        sql: include_str!("../../schema/outputs_013.sql"),
+    },
+    SchemaFile {
         prefix: "personal",
         version: 1,
         sql: include_str!("../../schema/personal_001.sql"),
@@ -3831,10 +3836,10 @@ mod tests {
 
         assert_eq!(
             result.expect("migration must apply cleanly"),
-            12,
+            13,
             "outputs_001 + outputs_002 + outputs_003 + outputs_004 + outputs_005 + \
              outputs_006 + outputs_007 + outputs_008 + outputs_009 + outputs_010 + \
-             outputs_011 + outputs_012 must all apply in one pass"
+             outputs_011 + outputs_012 + outputs_013 must all apply in one pass"
         );
 
         let mut conn =
@@ -4937,7 +4942,10 @@ mod tests {
         let applied = run_migrations(&mut conn, "outputs", Some(TEST_KEY_HEX))
             .await
             .expect("v11 must apply to a populated outputs.db");
-        assert_eq!(applied, 2, "outputs_011 and outputs_012 were pending");
+        assert_eq!(
+            applied, 3,
+            "outputs_011, outputs_012 and outputs_013 were pending"
+        );
 
         for (table, expected) in FOCUS_RUN_TABLES.iter().zip(before) {
             assert_eq!(
@@ -4988,7 +4996,7 @@ mod tests {
         let applied = run_migrations(&mut conn, "outputs", Some(TEST_KEY_HEX))
             .await
             .expect("v12 must apply to a populated outputs.db");
-        assert_eq!(applied, 1, "only outputs_012 was pending");
+        assert_eq!(applied, 2, "outputs_012 and outputs_013 were pending");
 
         let row: (i64, i64, i64) = sqlx::query_as(
             "SELECT pg_scan_blocked, pg_scan_timed_out, pg_scan_pf_error \
@@ -5010,6 +5018,74 @@ mod tests {
         assert!(
             rejected.is_err(),
             "the CHECK must reject values other than 0 and 1"
+        );
+    }
+
+    /// items.id=881: outputs_013 adds the session and case stores. A populated
+    /// v12 database keeps its rows, gains the six tables, and the new tables
+    /// declare no foreign key to focus_runs or focus_run_snapshots (items.id=633
+    /// rebuilds both) and no trigger (decisions.id=939).
+    #[tokio::test]
+    async fn outputs_v12_to_v13_adds_session_and_case_stores_without_run_foreign_keys() {
+        const NEW_TABLES: [&str; 6] = [
+            "session_variables",
+            "case_records",
+            "case_entities",
+            "case_strategies",
+            "config_deltas",
+            "config_delta_entities",
+        ];
+        let tmp = tempfile::tempdir().unwrap();
+        let mut conn = open_keyed_scratch(&tmp.path().join("outputs.db")).await;
+        apply_versions_up_to(&mut conn, "outputs", 12).await;
+        exec_all(
+            &mut conn,
+            &[
+                "INSERT INTO focus_runs (id, focus_id, started_at) \
+                 VALUES ('run1', 'f', '2026-01-01T00:00:00Z')",
+                "INSERT INTO outputs (id, focus_run_id, output_type, created_at, updated_at) \
+                 VALUES ('o1', 'run1', 'doc', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            ],
+        )
+        .await;
+
+        let applied = run_migrations(&mut conn, "outputs", Some(TEST_KEY_HEX))
+            .await
+            .expect("v13 must apply to a populated outputs.db");
+        assert_eq!(applied, 1, "only outputs_013 was pending");
+        assert_eq!(row_count(&mut conn, "outputs").await, 1);
+        assert_eq!(row_count(&mut conn, "focus_runs").await, 1);
+
+        for table in NEW_TABLES {
+            assert_eq!(row_count(&mut conn, table).await, 0, "{table} starts empty");
+            let fks: Vec<(String,)> = sqlx::query_as(&format!(
+                "SELECT \"table\" FROM pragma_foreign_key_list('{table}')"
+            ))
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+            for (parent,) in fks {
+                assert!(
+                    NEW_TABLES.contains(&parent.as_str()),
+                    "{table} must only reference tables of this file, found {parent}"
+                );
+            }
+        }
+        let triggers: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name IN \
+             ('session_variables','case_records','case_entities','case_strategies', \
+              'config_deltas','config_delta_entities')",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        assert!(
+            triggers.is_empty(),
+            "no triggers on the new tables: {triggers:?}"
+        );
+        assert!(
+            fk_violations(&mut conn).await.is_empty(),
+            "foreign_key_check must be clean"
         );
     }
 

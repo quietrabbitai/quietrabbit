@@ -1,5 +1,6 @@
 // src-tauri/src/persistence/mod.rs
 
+pub mod case_store;
 pub mod chat_binding_store;
 pub mod chat_store;
 pub mod cloud_chat_cookie_store;
@@ -30,6 +31,9 @@ pub mod provider_models_store;
 pub mod provider_spend_store;
 pub mod provider_store;
 pub mod savepoint;
+#[cfg(test)]
+mod session_case_tests;
+pub mod session_store;
 #[cfg(test)]
 mod shared_db_privacy_tests;
 pub mod shared_db_residual;

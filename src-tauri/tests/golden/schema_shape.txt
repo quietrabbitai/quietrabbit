@@ -270,6 +270,35 @@ TABLE schema_version
   applied_at TEXT notnull=1 pk=0 default=None
   description TEXT notnull=1 pk=0 default=None
 === outputs ===
+TABLE case_entities
+  case_id TEXT notnull=1 pk=1 default=None
+  entity_id TEXT notnull=1 pk=2 default=None
+  role TEXT notnull=1 pk=0 default=None
+  linked_at TEXT notnull=1 pk=0 default=None
+TABLE case_records
+  case_id TEXT notnull=0 pk=1 default=None
+  lifecycle_state TEXT notnull=1 pk=0 default=Some("'open'")
+  subject_label TEXT notnull=1 pk=0 default=Some("''")
+  symptoms TEXT notnull=1 pk=0 default=Some("''")
+  current_rung INTEGER notnull=1 pk=0 default=Some("1")
+  resolution_path TEXT notnull=0 pk=0 default=None
+  outcome TEXT notnull=0 pk=0 default=None
+  durable_facts_extracted TEXT notnull=1 pk=0 default=Some("'[]'")
+  version INTEGER notnull=1 pk=0 default=Some("1")
+  opened_by_run TEXT notnull=1 pk=0 default=None
+  opened_at TEXT notnull=1 pk=0 default=None
+  closed_at TEXT notnull=0 pk=0 default=None
+  updated_at TEXT notnull=1 pk=0 default=None
+TABLE case_strategies
+  strategy_id INTEGER notnull=0 pk=1 default=None
+  case_id TEXT notnull=1 pk=0 default=None
+  source_run_id TEXT notnull=1 pk=0 default=None
+  source_action_id TEXT notnull=1 pk=0 default=None
+  source_attempt INTEGER notnull=1 pk=0 default=None
+  strategy TEXT notnull=1 pk=0 default=None
+  outcome TEXT notnull=1 pk=0 default=None
+  user_signal TEXT notnull=0 pk=0 default=None
+  recorded_at TEXT notnull=1 pk=0 default=None
 TABLE classification_preferences
   id TEXT notnull=0 pk=1 default=None
   focus_id TEXT notnull=1 pk=0 default=None
@@ -284,6 +313,19 @@ TABLE classification_preferences
   created_at TEXT notnull=1 pk=0 default=None
   updated_at TEXT notnull=1 pk=0 default=None
   extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+TABLE config_delta_entities
+  delta_id TEXT notnull=1 pk=1 default=None
+  entity_id TEXT notnull=1 pk=2 default=None
+  status TEXT notnull=1 pk=0 default=Some("'believed-active'")
+  status_changed_at TEXT notnull=1 pk=0 default=None
+TABLE config_deltas
+  delta_id TEXT notnull=0 pk=1 default=None
+  session_reference TEXT notnull=1 pk=0 default=None
+  description TEXT notnull=1 pk=0 default=None
+  relevance_tags TEXT notnull=1 pk=0 default=Some("'[]'")
+  changed_at TEXT notnull=1 pk=0 default=None
+  recorded_by_run TEXT notnull=1 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
 TABLE consent_decisions
   id TEXT notnull=0 pk=1 default=None
   focus_run_id TEXT notnull=1 pk=0 default=None
@@ -455,6 +497,15 @@ TABLE schema_version
   version INTEGER notnull=0 pk=1 default=None
   applied_at TEXT notnull=1 pk=0 default=None
   description TEXT notnull=1 pk=0 default=None
+TABLE session_variables
+  context_key TEXT notnull=1 pk=1 default=None
+  focus_id TEXT notnull=1 pk=2 default=None
+  name TEXT notnull=1 pk=3 default=None
+  value TEXT notnull=1 pk=0 default=None
+  version INTEGER notnull=1 pk=0 default=Some("1")
+  written_by_run TEXT notnull=1 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+  updated_at TEXT notnull=1 pk=0 default=None
 TABLE topic_storage_locations
   topic_id TEXT notnull=0 pk=1 default=None
   db_path TEXT notnull=1 pk=0 default=None
