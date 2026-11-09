@@ -274,16 +274,17 @@ pub struct ActionDefinition {
     /// YAML-authored step, always). Some(id) means this step's actual
     /// execution is delegated to a registered block handler keyed by `id`
     /// instead of today's StepExecutor/prompt-template pipeline --
-    /// execute_step() dispatches on this field. No handler is registered
-    /// for any id yet; a composition row citing one is rejected at LOAD
-    /// (conductor::lifecycle::load_focus_definition_from_db()), never at
-    /// execute_step() itself. See lifecycle.rs's execute_step() doc comment
-    /// for the dispatch shape.
+    /// execute_step() dispatches on this field through
+    /// conductor::block_dispatch::block_handler(). A composition row citing an
+    /// id that is not in the building_blocks mirror, or that has no
+    /// compiled-in handler, or whose customization does not parse, is
+    /// rejected at LOAD (conductor::lifecycle::load_focus_definition_from_db()),
+    /// not mid-run.
     pub block_stable_id: Option<String>,
     /// items.id=496: the raw customization payload for a composition row
-    /// whose block_stable_id is Some -- opaque at this layer, same
-    /// "schema intentionally open-ended, typed struct deferred" precedent
-    /// options_override already established. Always None when
+    /// whose block_stable_id is Some -- opaque at this layer (each handler
+    /// owns a typed deny_unknown_fields struct and parses it at LOAD, see
+    /// conductor::block_dispatch). Always None when
     /// block_stable_id is None (the payload becomes this struct's own
     /// fields instead, via the same derivation path a YAML step uses --
     /// see load_focus_definition_from_db()).

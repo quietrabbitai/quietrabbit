@@ -127,11 +127,12 @@ pub async fn list_compositions(
 
 /// LOAD-time validation gate for a composition row's block_stable_id
 /// (items.id=496 judgment call 7): this table is a validation-only mirror
-/// of qr_docs.db's own catalog, never the dispatch source (Rust's match
-/// statement in conductor::lifecycle::execute_step() dispatches) -- this
-/// just lets an unknown or non-inline_composable stable_id fail at LOAD,
-/// the same failure class validate_step() already produces for a malformed
-/// .focus YAML file, rather than surfacing mid-run.
+/// of qr_docs.db's own catalog, never the dispatch source (the compiled-in
+/// conductor::block_dispatch::block_handler() registry dispatches, and the
+/// loader checks handler existence separately) -- this just lets an unknown
+/// or non-inline_composable stable_id fail at LOAD, the same failure class
+/// validate_step() already produces for a malformed .focus YAML file, rather
+/// than surfacing mid-run.
 pub async fn is_inline_composable_block(
     pool: &sqlx::SqlitePool,
     stable_id: &str,
@@ -295,5 +296,18 @@ mod tests {
         assert!(!is_inline_composable_block(pool, "not-a-block")
             .await
             .unwrap());
+    }
+
+    /// items.id=129: every compiled-in handler's stable_id must be a mirror
+    /// member, or a Focus could never cite it (membership is checked first).
+    #[tokio::test]
+    async fn every_registered_handler_is_a_mirror_member() {
+        let env = setup().await;
+        for id in crate::conductor::block_dispatch::REGISTERED_STABLE_IDS {
+            assert!(
+                is_inline_composable_block(&env.pool, id).await.unwrap(),
+                "{id} has a handler but is not an inline_composable mirror row"
+            );
+        }
     }
 }

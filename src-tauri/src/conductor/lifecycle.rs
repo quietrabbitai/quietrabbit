@@ -622,12 +622,18 @@ struct RawStepFromDb {
 /// parse_focus_definition() uses for a YAML step -- this IS what "produce
 /// the equivalent of today's fixed ActionDefinition sequence" means: literal
 /// code reuse, not a re-implementation (items.id=496 judgment calls 2/5).
-/// A composition row with block_stable_id Some(id) is validated against
-/// shared.db's building_blocks mirror (LOAD-time failure if `id` is
-/// unknown or not inline_composable -- judgment call 7) and carries its raw
-/// customization JSON through opaque, for whatever handler eventually
-/// dispatches on it (execute_step(), judgment call 6) -- no handler exists
-/// yet, so no real Focus can be authored referencing one until one does.
+/// A composition row with block_stable_id Some(id) must pass three LOAD-time
+/// checks, each with its own error (items.id=129):
+///   1. mirror membership: `id` is in shared.db's building_blocks mirror as
+///      an inline_composable block (items.id=496 judgment call 7);
+///   2. handler existence: conductor::block_dispatch::block_handler(id) is
+///      Some -- a cataloged block with no compiled-in handler fails here, not
+///      mid-run;
+///   3. customization: the row's JSON parses into the handler's typed,
+///      deny_unknown_fields struct (BlockHandler::validate).
+///
+/// The validated JSON is then carried on the step for execute_step(), which
+/// dispatches through the same block_handler() registry.
 async fn load_focus_definition_from_db(
     pool: &sqlx::SqlitePool,
     focus_id: &str,
@@ -720,16 +726,26 @@ async fn load_focus_definition_from_db(
                 )
             }
             Some(stable_id) => {
+                // Check 1: mirror membership.
                 if !store::is_inline_composable_block(pool, stable_id)
                     .await
                     .map_err(LifecycleError::Database)?
                 {
                     return Err(LifecycleError::ValidationFailed(format!(
-                        "Focus '{focus_id}' step '{}': block_stable_id '{stable_id}' is not a \
-                         known inline_composable block",
+                        "Focus '{focus_id}' step '{}': block_stable_id '{stable_id}' is not in \
+                         the building_blocks mirror as an inline_composable block",
                         row.action_id
                     )));
                 }
+                // Check 2: handler existence, distinct from membership.
+                let Some(handler) = crate::conductor::block_dispatch::block_handler(stable_id)
+                else {
+                    return Err(LifecycleError::ValidationFailed(format!(
+                        "Focus '{focus_id}' step '{}': block '{stable_id}' is cataloged but has \
+                         no compiled-in handler",
+                        row.action_id
+                    )));
+                };
                 let block_customization: serde_json::Value =
                     serde_json::from_str(&row.customization).map_err(|e| {
                         LifecycleError::ValidationFailed(format!(
@@ -737,12 +753,18 @@ async fn load_focus_definition_from_db(
                             row.action_id
                         ))
                     })?;
+                // Check 3: the handler's typed customization struct.
+                (handler.validate)(&block_customization).map_err(|e| {
+                    LifecycleError::ValidationFailed(format!(
+                        "Focus '{focus_id}' step '{}': block '{stable_id}' customization: {e}",
+                        row.action_id
+                    ))
+                })?;
                 // LLM-generate-shaped fields are unused for a real block
                 // (items.id=496 judgment call 5) -- execute_step()'s
                 // dispatch on block_stable_id short-circuits before any of
-                // them are read. No real handler exists yet, so this arm
-                // is unreachable in a running system: the validation check
-                // just above already rejects any Focus that would reach it.
+                // them are read. routing_tier is LocalOnly with no
+                // external_access_override: a block step is never external.
                 ActionDefinition {
                     action_id: row.action_id.clone(),
                     display_name: row.action_id.clone(),
@@ -2389,6 +2411,64 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         }
     }
 
+    /// items.id=129: run a composition-authored block step. Pure over the
+    /// TaskTrack: no provider call, no PersonalTrack, no tier computation
+    /// (a block step is LocalOnly by construction, see
+    /// load_focus_definition_from_db()). The handler's output is recorded with
+    /// TaskTrack::add_step, the only writer, so later steps can read it by
+    /// output_var.
+    ///
+    /// A missing handler or customization here means a FocusDefinition was
+    /// built without going through the loader (LOAD checks both). That is
+    /// reported as a ValidationFailed error rather than assumed away.
+    fn execute_block_step(
+        &mut self,
+        step: &ActionDefinition,
+        block_id: &str,
+    ) -> Result<Option<FailureResult>, LifecycleError> {
+        let handler =
+            crate::conductor::block_dispatch::block_handler(block_id).ok_or_else(|| {
+                LifecycleError::ValidationFailed(format!(
+                    "step '{}': block '{block_id}' has no compiled-in handler (the loader checks \
+                     this at LOAD, so this FocusDefinition did not come from it)",
+                    step.action_id
+                ))
+            })?;
+        let customization = step.block_customization.as_ref().ok_or_else(|| {
+            LifecycleError::ValidationFailed(format!(
+                "step '{}': block '{block_id}' has no customization payload",
+                step.action_id
+            ))
+        })?;
+        let task_track = self.task_track.as_mut().ok_or_else(|| {
+            LifecycleError::ValidationFailed(format!(
+                "step '{}': block step run without a task track",
+                step.action_id
+            ))
+        })?;
+
+        let out = (handler.run)(customization, task_track).map_err(|e| {
+            LifecycleError::ValidationFailed(format!(
+                "step '{}': block '{block_id}': {e}",
+                step.action_id
+            ))
+        })?;
+
+        task_track.add_step(TaskStep {
+            action_id: step.action_id.clone(),
+            output_var: Some(out.output_var),
+            content: out.content,
+            // 1 = general: a block step never raises the run's sensitivity
+            // ceiling (add_step keeps the max).
+            sensitivity_severity: 1,
+            // Local, no provider.
+            routing_tier_used: 1,
+            personal_flagged: false,
+            audit_unavailable: false,
+        });
+        Ok(None)
+    }
+
     /// Compute tier values (ADR-012 Amendment 3); construct StepContext;
     /// read floor_consent_preference; delegate to StepExecutor.
     ///
@@ -2405,22 +2485,15 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         step: &ActionDefinition,
         step_index: usize,
     ) -> Result<Option<FailureResult>, LifecycleError> {
-        // items.id=496 (judgment calls 5/6): block_stable_id dispatch. Today
-        // this match has exactly one real arm -- None, the unchanged path
-        // every YAML-authored step (and a NULL-block composition row) takes.
-        // No block handler is registered for any stable_id yet, so Some(id)
-        // is unreachable in practice: load_focus_definition_from_db()'s own
-        // LOAD-time validation (building_blocks mirror lookup) already
-        // rejects any composition row citing an unregistered block before a
-        // run can start. This is the interface a future block's generic
-        // Rust code would parameterize from step.block_customization -- see
-        // tokens.rs::ActionDefinition's own doc comment for the shape.
+        // items.id=496 (judgment calls 5/6), items.id=129: block_stable_id
+        // dispatch. None is the unchanged path every YAML-authored step (and
+        // a NULL-block composition row) takes. Some(id) runs the compiled-in
+        // handler from conductor::block_dispatch::block_handler() -- the same
+        // registry load_focus_definition_from_db() checks at LOAD -- and
+        // records the result on the TaskTrack. A block step makes no provider
+        // call and never reaches StepExecutor.
         if let Some(block_id) = &step.block_stable_id {
-            return Err(LifecycleError::ValidationFailed(format!(
-                "step '{}': no registered handler for block '{block_id}' -- unreachable if \
-                 LOAD-time validation ran, see execute_step()'s own doc comment",
-                step.action_id
-            )));
+            return self.execute_block_step(step, block_id);
         }
 
         // Axis 1: execution_tier — min(focus_max_permitted, focus_max_routing, step.routing_tier).
@@ -7171,6 +7244,252 @@ mod tests {
         } else {
             std::env::remove_var("QR_DATA_ROOT");
         }
+    }
+
+    // -- items.id=129: block handler registry, LOAD validation, dispatch ----
+
+    /// A migrated shared.db pool for the block LOAD tests. Caller holds the
+    /// data-root guard (with_temp_data_root).
+    async fn block_load_pool() -> sqlx::SqlitePool {
+        crate::persistence::migrations::migrate_shared_db()
+            .await
+            .expect("shared.db migration must succeed in test setup");
+        sqlx::SqlitePool::connect_with(crate::providers::utils::connect_options_unencrypted(
+            &crate::providers::utils::db_path_shared(),
+        ))
+        .await
+        .expect("shared.db pool must connect")
+    }
+
+    /// One composition-authored Focus with a single block step citing
+    /// `block_id`, customization `customization` (raw text, so a test can
+    /// store invalid JSON). Foreign keys are switched off on the seeding
+    /// connection only, so a row citing an id absent from the mirror can be
+    /// stored and the loader's own check is what rejects it.
+    async fn seed_block_focus(
+        pool: &sqlx::SqlitePool,
+        focus_id: &str,
+        block_id: &str,
+        customization: &str,
+    ) {
+        let mut conn = pool.acquire().await.unwrap();
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO focuses
+                (focus_id, display_name, description, version, max_routing_tier,
+                 output_type, suggest_in_focuses, multi_source_validation,
+                 generic_title_template, status, created_at, updated_at)
+             VALUES (?, 'Block Test Focus', '', '1.0', 'local_only',
+                     'general', '[]', 0, 'Hidden item', 'shipped',
+                     datetime('now'), datetime('now'))",
+        )
+        .bind(focus_id)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        let comp_id = format!("comp-{focus_id}");
+        sqlx::query(
+            "INSERT INTO focus_block_compositions
+                (id, focus_id, action_id, block_stable_id, sequence_index,
+                 created_at, updated_at)
+             VALUES (?, ?, 'quality_check', ?, 0, datetime('now'), datetime('now'))",
+        )
+        .bind(&comp_id)
+        .bind(focus_id)
+        .bind(block_id)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO focus_block_customization
+                (id, composition_id, persona_id, customization, created_at, updated_at)
+             VALUES (?, ?, NULL, ?, datetime('now'), datetime('now'))",
+        )
+        .bind(format!("cust-{focus_id}"))
+        .bind(&comp_id)
+        .bind(customization)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    }
+
+    fn good_cb06_json() -> String {
+        serde_json::json!({
+            "input_var": "draft_output",
+            "output_var": "quality_verdict",
+            "criteria": [
+                {"name": "has_content", "kind": "non_empty"},
+                {"name": "long_enough", "kind": "min_length", "min_length": 10}
+            ],
+            "on_fail": "advisory"
+        })
+        .to_string()
+    }
+
+    fn load_err_text(r: Result<Option<FocusDefinition>, LifecycleError>) -> String {
+        match r {
+            Err(LifecycleError::ValidationFailed(m)) => m,
+            other => panic!("expected a LOAD ValidationFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn block_load_unknown_block_fails_on_mirror_membership() {
+        with_temp_data_root(async {
+            let pool = block_load_pool().await;
+            seed_block_focus(&pool, "unk", "not-a-block", "{}").await;
+            let m = load_err_text(load_focus_definition_from_db(&pool, "unk").await);
+            assert!(m.contains("'not-a-block'"), "{m}");
+            assert!(m.contains("building_blocks mirror"), "{m}");
+            assert!(!m.contains("no compiled-in handler"), "{m}");
+
+            // A mirror row that is not inline_composable fails the same check.
+            sqlx::query(
+                "INSERT INTO building_blocks
+                    (stable_id, display_name, invocation_mode, created_at, updated_at)
+                 VALUES ('test-gw', 'gateway', 'standing_gateway',
+                         datetime('now'), datetime('now'))",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            seed_block_focus(&pool, "gw", "test-gw", "{}").await;
+            let m = load_err_text(load_focus_definition_from_db(&pool, "gw").await);
+            assert!(m.contains("building_blocks mirror"), "{m}");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn block_load_cataloged_block_without_handler_fails_at_load() {
+        with_temp_data_root(async {
+            let pool = block_load_pool().await;
+            // cb-02 and cb-10 are in the mirror as inline_composable and have
+            // no handler: valid catalog data, not runnable.
+            for id in ["cb-02", "cb-10", "cb-01"] {
+                let focus = format!("nohandler-{id}");
+                seed_block_focus(&pool, &focus, id, "{}").await;
+                let m = load_err_text(load_focus_definition_from_db(&pool, &focus).await);
+                assert!(m.contains(&format!("'{id}'")), "{m}");
+                assert!(m.contains("no compiled-in handler"), "{m}");
+                assert!(
+                    !m.contains("building_blocks mirror"),
+                    "membership and handler errors must be distinct: {m}"
+                );
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn block_load_bad_cb06_customization_fails_at_load() {
+        with_temp_data_root(async {
+            let pool = block_load_pool().await;
+            let mut with_extra: serde_json::Value =
+                serde_json::from_str(&good_cb06_json()).unwrap();
+            with_extra["surprise"] = serde_json::json!(true);
+            let mut retry: serde_json::Value = serde_json::from_str(&good_cb06_json()).unwrap();
+            retry["on_fail"] = serde_json::json!("retry");
+            let cases = [
+                ("unknown-key", with_extra.to_string()),
+                ("on-fail-retry", retry.to_string()),
+                ("not-json", "{not json".to_owned()),
+                ("empty-object", "{}".to_owned()),
+            ];
+            for (name, json) in cases {
+                let focus = format!("bad-{name}");
+                seed_block_focus(&pool, &focus, "cb-06", &json).await;
+                let m = load_err_text(load_focus_definition_from_db(&pool, &focus).await);
+                assert!(m.contains("customization"), "{name}: {m}");
+                assert!(m.contains("quality_check"), "{name}: {m}");
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn block_load_good_cb06_loads_as_local_only_block_step() {
+        with_temp_data_root(async {
+            let pool = block_load_pool().await;
+            seed_block_focus(&pool, "good", "cb-06", &good_cb06_json()).await;
+            let def = load_focus_definition_from_db(&pool, "good")
+                .await
+                .unwrap()
+                .expect("focus row exists");
+            let step = &def.steps[0];
+            assert_eq!(step.block_stable_id.as_deref(), Some("cb-06"));
+            assert!(step.block_customization.is_some());
+            assert_eq!(step.routing_tier, ExternalAccess::LocalOnly);
+            assert_eq!(step.external_access_override, None);
+            assert!(!step.requires_user_handoff);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn block_step_dispatch_records_verdict_on_the_track() {
+        with_temp_data_root(async {
+            let pool = block_load_pool().await;
+            seed_block_focus(&pool, "disp", "cb-06", &good_cb06_json()).await;
+            let def = load_focus_definition_from_db(&pool, "disp")
+                .await
+                .unwrap()
+                .unwrap();
+            let step = def.steps[0].clone();
+
+            let mut run = tier3_ready_run(false);
+            run.focus_def = Some(def);
+            let tt = run.task_track.as_mut().unwrap();
+            tt.add_step(TaskStep {
+                action_id: "draft_writing".to_owned(),
+                output_var: Some("draft_output".to_owned()),
+                content: "short".to_owned(),
+                sensitivity_severity: 2,
+                routing_tier_used: 2,
+                personal_flagged: false,
+                audit_unavailable: false,
+            });
+
+            let failure = run.execute_step(&step, 0).await.expect("block step runs");
+            assert!(
+                failure.is_none(),
+                "an advisory block never reports a failure"
+            );
+
+            let tt = run.task_track.as_ref().unwrap();
+            assert_eq!(tt.steps().len(), 2);
+            // The assessed output is untouched.
+            assert_eq!(tt.get_output("draft_output"), Some("short"));
+            let verdict = tt.get_output("quality_verdict").expect("verdict recorded");
+            assert!(verdict.contains("not passed"), "{verdict}");
+            assert!(verdict.contains("long_enough"), "{verdict}");
+            assert!(!verdict.contains("short"), "no draft text: {verdict}");
+            // The block step does not raise the sensitivity ceiling.
+            assert_eq!(tt.sensitivity_ceiling(), 2);
+            let recorded = tt.steps().last().unwrap();
+            assert_eq!(recorded.action_id, "quality_check");
+            assert_eq!(recorded.routing_tier_used, 1);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn block_step_with_no_handler_is_a_validation_error_not_a_panic() {
+        with_temp_data_root(async {
+            let mut run = tier3_ready_run(false);
+            let mut step = single_tier3_step_focus_def().steps[0].clone();
+            step.block_stable_id = Some("cb-02".to_owned());
+            step.block_customization = Some(serde_json::json!({}));
+            let err = run.execute_step(&step, 0).await.unwrap_err();
+            assert!(
+                matches!(&err, LifecycleError::ValidationFailed(m) if m.contains("no compiled-in handler")),
+                "{err:?}"
+            );
+        })
+        .await;
     }
 }
 

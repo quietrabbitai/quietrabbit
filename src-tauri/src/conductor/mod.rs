@@ -1,5 +1,6 @@
 // src-tauri/src/conductor/mod.rs
 
+pub mod block_dispatch;
 pub mod checkin;
 pub mod concurrency;
 pub mod crisis;
