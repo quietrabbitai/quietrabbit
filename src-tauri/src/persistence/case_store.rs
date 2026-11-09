@@ -1166,6 +1166,82 @@ async fn set_status_inner(
     Ok(())
 }
 
+/// Record `status` for EVERY entity row of one delta and restart each clock at
+/// now (items.id=889: confirmation by a handle names a delta, never an entity).
+/// Returns the rows changed, and NotFound for a delta with no entity rows. Never
+/// takes an explicit time, for the reason set_delta_entity_status's callers
+/// never pass one (the clock is not clamped). Refused once the chat is latched.
+pub async fn set_delta_status(
+    conn: &mut SqliteConnection,
+    context_key: &str,
+    delta_id: &str,
+    status: DeltaStatus,
+) -> Result<u64, CaseStoreError> {
+    check_context(context_key)?;
+    check_id("delta_id", delta_id)?;
+    let at = crate::providers::utils::now();
+
+    begin_write(conn).await?;
+    let result = async {
+        ensure_writable(conn, context_key).await?;
+        let done = sqlx::query(
+            "UPDATE config_delta_entities SET status = ?, status_changed_at = ?
+             WHERE delta_id = ?",
+        )
+        .bind(status.as_str())
+        .bind(&at)
+        .bind(delta_id)
+        .execute(&mut *conn)
+        .await?;
+        if done.rows_affected() == 0 {
+            return Err(CaseStoreError::NotFound(delta_id.to_owned()));
+        }
+        Ok(done.rows_affected())
+    }
+    .await;
+    finish_write(conn, result).await
+}
+
+/// The event hook of decisions.id=510, keyed by an entity (items.id=889): an
+/// event happened on `entity_id`, so EVERY delta of that entity that THIS Focus
+/// recorded moves to believed-changed, with its clock restarted at now. A delta
+/// already believed-changed is left alone (nothing to move, and its clock does
+/// not matter because that status never degrades), and another Focus's deltas on
+/// the same entity are never touched (decisions.id=509). Returns the rows moved,
+/// which is 0 when there was nothing to move. Never takes an explicit time.
+/// Refused once the chat is latched.
+pub async fn mark_entity_deltas_changed(
+    conn: &mut SqliteConnection,
+    context_key: &str,
+    focus_id: &str,
+    entity_id: &str,
+) -> Result<u64, CaseStoreError> {
+    check_context(context_key)?;
+    check_id("focus_id", focus_id)?;
+    check_id("entity_id", entity_id)?;
+    let at = crate::providers::utils::now();
+
+    begin_write(conn).await?;
+    let result = async {
+        ensure_writable(conn, context_key).await?;
+        let done = sqlx::query(
+            "UPDATE config_delta_entities SET status = ?, status_changed_at = ?
+             WHERE entity_id = ? AND status <> ?
+               AND delta_id IN (SELECT delta_id FROM config_deltas WHERE focus_id = ?)",
+        )
+        .bind(DeltaStatus::BelievedChanged.as_str())
+        .bind(&at)
+        .bind(entity_id)
+        .bind(DeltaStatus::BelievedChanged.as_str())
+        .bind(focus_id)
+        .execute(&mut *conn)
+        .await?;
+        Ok::<u64, CaseStoreError>(done.rows_affected())
+    }
+    .await;
+    finish_write(conn, result).await
+}
+
 /// What a stored status reads as at `now` (decisions.id=510). A believed-active
 /// or confirmed-active status whose clock is older than `degrade_after_days`
 /// reads as unknown, and so does one whose timestamp cannot be parsed (the

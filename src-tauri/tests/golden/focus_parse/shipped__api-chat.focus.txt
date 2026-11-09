@@ -33,6 +33,7 @@ ActionDefinition {
     block_customization: None,
     schedule_trigger: None,
     guard: None,
+    and_guards: [],
     declared_inputs: [
         "user_input",
     ],

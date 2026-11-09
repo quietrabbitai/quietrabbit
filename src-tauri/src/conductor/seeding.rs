@@ -27,6 +27,14 @@
 //   open_tickets_brief  one line per open case (at most BRIEF_CASES)
 //   case_context        the active case (active_case_id) and the strategies tried
 //   delta_context       config deltas of the active case's primary entity
+//
+// HANDLES (items.id=889): every ticket line and every delta line starts with
+// the row's short opaque HANDLE (T-XXXXXXXX, D-XXXXXXXX, persistence::handles),
+// and case_context names its ticket the same way. The internal id is never in
+// the text. A model that must pick a ticket or a delta says the handle, and a
+// typed store writer (case_select, delta_confirm) resolves it store-side. The
+// size caps below are unchanged: a handle adds 10 characters to a line, and a
+// cut at the cap can only shorten a handle, which then resolves to nothing.
 // case_context and delta_context read the session variable active_case_id
 // internally to find the case; that read is part of the derived name, and
 // active_case_id itself is seeded only when something asks for it.
@@ -51,6 +59,7 @@ use crate::conductor::executor::find_tokens;
 use crate::conductor::taint::{taint_closure, StoreTokens};
 use crate::conductor::tokens::ActionDefinition;
 use crate::persistence::case_store::{self, CaseRecord, EntityConfigDelta};
+use crate::persistence::handles;
 use crate::persistence::session_store::{self, WriteMode};
 
 /// Most open cases open_tickets_brief lists.
@@ -84,7 +93,8 @@ pub fn required_names(steps: &[ActionDefinition]) -> Vec<&'static str> {
             wanted.extend(find_tokens(&s.prompt_template));
         }
         wanted.extend(s.declared_inputs.iter().cloned());
-        if let Some(g) = &s.guard {
+        // items.id=889: every clause variable of the row's AND-guard set.
+        for g in s.guards() {
             wanted.insert(g.var.clone());
         }
         // items.id=887: the variables a store writer reads as arguments (a
@@ -204,7 +214,7 @@ pub async fn read_seeds(
             );
         }
         if wants(OPEN_TICKETS_BRIEF) {
-            out.insert(OPEN_TICKETS_BRIEF.to_owned(), render_brief(&open));
+            out.insert(OPEN_TICKETS_BRIEF.to_owned(), render_brief(focus_id, &open));
         }
     }
 
@@ -224,7 +234,7 @@ pub async fn read_seeds(
                     let strategies = case_store::list_case_strategies(conn, &c.case_id)
                         .await
                         .map_err(|e| store_err(CASE_CONTEXT, e))?;
-                    render_case(c, &strategies)
+                    render_case(focus_id, c, &strategies)
                 }
                 None => String::new(),
             };
@@ -241,7 +251,7 @@ pub async fn read_seeds(
                     )
                     .await
                     .map_err(|e| store_err(DELTA_CONTEXT, e))?;
-                    render_deltas(&deltas)
+                    render_deltas(focus_id, &deltas)
                 }
                 None => String::new(),
             };
@@ -330,13 +340,14 @@ fn label(subject: &str) -> String {
     }
 }
 
-fn render_brief(open: &[CaseRecord]) -> String {
+fn render_brief(focus_id: &str, open: &[CaseRecord]) -> String {
     let mut lines: Vec<String> = open
         .iter()
         .take(BRIEF_CASES)
         .map(|c| {
             format!(
-                "- {} ({}, step {} of 5)",
+                "- {}: {} ({}, step {} of 5)",
+                handles::case_handle(focus_id, &c.case_id),
                 label(&c.subject_label),
                 c.state.as_str(),
                 c.current_rung
@@ -349,8 +360,9 @@ fn render_brief(open: &[CaseRecord]) -> String {
     cap(lines.join("\n"))
 }
 
-fn render_case(c: &CaseRecord, strategies: &[case_store::CaseStrategy]) -> String {
+fn render_case(focus_id: &str, c: &CaseRecord, strategies: &[case_store::CaseStrategy]) -> String {
     let mut lines = vec![
+        format!("Ticket: {}", handles::case_handle(focus_id, &c.case_id)),
         format!("Subject: {}", label(&c.subject_label)),
         format!("State: {} (step {} of 5)", c.state.as_str(), c.current_rung),
     ];
@@ -380,13 +392,14 @@ fn render_case(c: &CaseRecord, strategies: &[case_store::CaseStrategy]) -> Strin
     cap(lines.join("\n"))
 }
 
-fn render_deltas(deltas: &[EntityConfigDelta]) -> String {
+fn render_deltas(focus_id: &str, deltas: &[EntityConfigDelta]) -> String {
     let lines: Vec<String> = deltas
         .iter()
         .take(DELTA_LINES)
         .map(|d| {
             format!(
-                "- {} [{}, changed {}]",
+                "- {}: {} [{}, changed {}]",
+                handles::delta_handle(focus_id, &d.delta_id),
                 clean(&d.description),
                 d.effective_status.as_str(),
                 clean(&d.changed_at)
@@ -432,6 +445,7 @@ mod tests {
             guard: None,
             declared_inputs: Vec::new(),
             store_op: None,
+            and_guards: Vec::new(),
         }
     }
 
@@ -470,6 +484,27 @@ mod tests {
         );
         // Nothing bound anywhere: nothing is read.
         assert!(required_names(&[step("x", "{user_input} {v1}")]).is_empty());
+    }
+
+    /// items.id=889: every clause of a row's AND-guard set names a variable, so a
+    /// bound name that only a clause of the LIST mentions is still read.
+    #[test]
+    fn a_bound_name_in_a_clause_list_is_a_required_name() {
+        let mut row = step("c", "plain");
+        row.guard = Guard::from_columns(Some("model_var"), Some("present"), None).unwrap();
+        row.and_guards = vec![
+            Guard::from_columns(Some("write_mode"), Some("eq"), Some("open"))
+                .unwrap()
+                .unwrap(),
+            Guard::from_columns(Some("open_ticket_state"), Some("ne"), Some("none"))
+                .unwrap()
+                .unwrap(),
+        ];
+        assert_eq!(
+            required_names(&[row]),
+            [WRITE_MODE, OPEN_TICKET_STATE],
+            "both list clauses are read, a model variable is not a bound name"
+        );
     }
 
     /// items.id=887: a store writer's argument variables are read at pass start
@@ -652,17 +687,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(s[OPEN_TICKET_STATE], "one");
+        // items.id=889: each line starts with the ticket's handle, never its id.
+        let ticket = handles::case_handle(FOCUS, "case-1");
         assert_eq!(
             s[OPEN_TICKETS_BRIEF],
-            "- Living room router (open, step 1 of 5)"
+            format!("- {ticket}: Living room router (open, step 1 of 5)")
         );
+        assert!(!s[OPEN_TICKETS_BRIEF].contains("case-1"));
         let case = &s[CASE_CONTEXT];
+        assert!(case.contains(&format!("Ticket: {ticket}")), "{case}");
+        assert!(!case.contains("case-1"), "{case}");
         assert!(case.contains("Subject: Living room router"), "{case}");
         // Braces in stored text cannot become tokens.
         assert!(case.contains("Symptoms: drops every (hour)"), "{case}");
         assert!(!case.contains('{') && !case.contains('}'), "{case}");
         assert!(case.contains("- reboot the router -> no change (user said: still drops)"));
         assert!(s[DELTA_CONTEXT].contains("moved the router to channel 36"));
+        assert!(s[DELTA_CONTEXT].contains(&handles::delta_handle(FOCUS, "delta-1")));
+        assert!(!s[DELTA_CONTEXT].contains("delta-1"));
         assert!(s[DELTA_CONTEXT].contains("believed-active"));
         // active_case_id was read to find the case but not seeded: not asked for.
         assert!(!s.contains_key(ACTIVE_CASE_ID));

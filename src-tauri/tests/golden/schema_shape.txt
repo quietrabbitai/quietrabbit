@@ -804,6 +804,7 @@ TABLE focus_block_compositions
   store_op TEXT notnull=0 pk=0 default=None
   store_target TEXT notnull=0 pk=0 default=None
   store_args TEXT notnull=0 pk=0 default=None
+  guard_clauses TEXT notnull=0 pk=0 default=None
 TABLE focus_block_customization
   id TEXT notnull=0 pk=1 default=None
   composition_id TEXT notnull=1 pk=0 default=None

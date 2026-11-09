@@ -44,6 +44,11 @@ pub struct CompositionRow {
     pub guard_var: Option<String>,
     pub guard_op: Option<String>,
     pub guard_value: Option<String>,
+    /// items.id=889 (shared_042.sql): the raw AND-guard clause list, a JSON
+    /// array, None on a row with no clause list. Every clause must hold, as
+    /// well as the single guard above. Parsed and validated by
+    /// conductor::guard at LOAD, never here.
+    pub guard_clauses: Option<String>,
     /// items.id=887 (shared_041.sql): the raw store-writer columns, all None on
     /// a row that is not a writer. Parsed and validated by conductor::store_op
     /// at LOAD, never here.
@@ -112,7 +117,7 @@ pub async fn list_compositions(
     let rows = sqlx::query(
         "SELECT c.action_id, c.block_stable_id, c.sequence_index,
                 c.schedule_trigger_anchor_field, c.schedule_trigger_offset,
-                c.guard_var, c.guard_op, c.guard_value,
+                c.guard_var, c.guard_op, c.guard_value, c.guard_clauses,
                 c.store_op, c.store_target, c.store_args,
                 COALESCE(cu.customization, '{}') AS customization
          FROM focus_block_compositions c
@@ -136,6 +141,7 @@ pub async fn list_compositions(
                 guard_var: row.try_get("guard_var")?,
                 guard_op: row.try_get("guard_op")?,
                 guard_value: row.try_get("guard_value")?,
+                guard_clauses: row.try_get("guard_clauses")?,
                 store_op: row.try_get("store_op")?,
                 store_target: row.try_get("store_target")?,
                 store_args: row.try_get("store_args")?,

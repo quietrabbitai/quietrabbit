@@ -308,6 +308,12 @@ pub struct ActionDefinition {
     /// it is false (conductor::guard). Populated by the DB loader from
     /// focus_block_compositions.guard_var/guard_op/guard_value.
     pub guard: Option<Guard>,
+    /// items.id=889 (decisions.id=940 ruling 1, shared_042.sql): AND-guards. The
+    /// further clauses of the row, parsed from focus_block_compositions.
+    /// guard_clauses. The row runs only when `guard` (when set) AND every clause
+    /// here holds (conductor::guard). Empty for a YAML-authored step and for any
+    /// row without a clause list. Read the whole set through `guards()`.
+    pub and_guards: Vec<Guard>,
     /// items.id=879 (decisions.id=937 point 1): the variable and token names an
     /// EXTERNAL (non-LocalOnly) step's prompt template may name, beyond the
     /// field names in its own field_requirements (Gate 1's declaration, so
@@ -325,6 +331,20 @@ pub struct ActionDefinition {
     /// is database-only) and for a block row. Populated by the DB loader from
     /// focus_block_compositions.store_op/store_target/store_args.
     pub store_op: Option<StoreOp>,
+}
+
+impl ActionDefinition {
+    /// items.id=889: the row's whole AND-guard clause set, the single guard
+    /// first and then the clause list. The row runs only when every one holds;
+    /// empty means unguarded.
+    pub fn guards(&self) -> Vec<&Guard> {
+        super::guard::clause_set(self.guard.as_ref(), &self.and_guards)
+    }
+
+    /// True when the row carries any clause at all (the single guard or a list).
+    pub fn is_guarded(&self) -> bool {
+        self.guard.is_some() || !self.and_guards.is_empty()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -411,6 +431,7 @@ mod tests {
             guard: None,
             declared_inputs: Vec::new(),
             store_op: None,
+            and_guards: Vec::new(),
         }
     }
 

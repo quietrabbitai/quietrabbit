@@ -833,3 +833,143 @@ fn case_strategies_has_no_update_delete_or_replace_anywhere_in_the_source() {
         ["append_case_strategy", "list_case_strategies"]
     );
 }
+
+// ---------------------------------------------------------------------------
+// items.id=889: the three new store writers are latch-gated in their own
+// transaction (the store, not the handler, holds the latch)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_bulk_delta_writers_and_session_clear_are_refused_in_a_latched_chat() {
+    use super::case_store::{
+        mark_entity_deltas_changed, set_delta_entity_status, set_delta_status, DeltaStatus,
+    };
+    use super::session_store::{clear_session_state, CLEARABLE_SESSION_NAMES};
+
+    let _root = TestRoot::new().await;
+    let mut conn = open_outputs_db("u-889", "p-889", KEY_HEX).await.unwrap();
+    open_case(
+        &mut conn,
+        &NewCase {
+            case_id: "case-1",
+            focus_id: FOCUS,
+            context_key: CHAT,
+            primary_entity_id: ROUTER,
+            subject_label: "Router",
+            symptoms: "",
+            opened_by_run: "run-1",
+        },
+    )
+    .await
+    .unwrap();
+    record_config_delta(
+        &mut conn,
+        &NewConfigDelta {
+            delta_id: "delta-1",
+            focus_id: FOCUS,
+            source_case_id: None,
+            context_key: CHAT,
+            session_reference: "s",
+            description: "d",
+            relevance_tags: &[],
+            entity_ids: &[ROUTER],
+            changed_at: None,
+            recorded_by_run: "run-1",
+        },
+    )
+    .await
+    .unwrap();
+    for name in CLEARABLE_SESSION_NAMES {
+        put_session_variable(
+            &mut conn,
+            &SessionWrite {
+                context_key: CHAT,
+                focus_id: FOCUS,
+                name,
+                value: "case-1",
+                written_by_run: "run-1",
+                expected_version: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    // Open chat: each works.
+    assert_eq!(
+        mark_entity_deltas_changed(&mut conn, CHAT, FOCUS, ROUTER)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        set_delta_status(&mut conn, CHAT, "delta-1", DeltaStatus::ConfirmedActive)
+            .await
+            .unwrap(),
+        1
+    );
+    // A missing delta is NotFound, not a silent success.
+    assert!(matches!(
+        set_delta_status(&mut conn, CHAT, "nope", DeltaStatus::ConfirmedActive).await,
+        Err(CaseStoreError::NotFound(_))
+    ));
+
+    latch_write_suppressed(&mut conn, CHAT, FOCUS, "run-2")
+        .await
+        .unwrap();
+    let before = list_config_deltas_for_entity(&mut conn, ROUTER, Some(FOCUS), Utc::now())
+        .await
+        .unwrap();
+    let e = mark_entity_deltas_changed(&mut conn, CHAT, FOCUS, ROUTER)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(e, CaseStoreError::Latch(LatchError::Suppressed)),
+        "{e}"
+    );
+    let e = set_delta_status(&mut conn, CHAT, "delta-1", DeltaStatus::BelievedChanged)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(e, CaseStoreError::Latch(LatchError::Suppressed)),
+        "{e}"
+    );
+    let e = clear_session_state(&mut conn, CHAT, FOCUS)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(e, SessionStoreError::Latch(LatchError::Suppressed)),
+        "{e}"
+    );
+    assert_eq!(
+        list_config_deltas_for_entity(&mut conn, ROUTER, Some(FOCUS), Utc::now())
+            .await
+            .unwrap(),
+        before,
+        "nothing changed"
+    );
+    for name in CLEARABLE_SESSION_NAMES {
+        assert!(get_session_variable(&mut conn, CHAT, FOCUS, name)
+            .await
+            .unwrap()
+            .is_some());
+    }
+    assert_eq!(
+        write_mode(&mut conn, CHAT).await.unwrap(),
+        WriteMode::Suppressed
+    );
+    // The per-entity writer is gated too (887), for completeness.
+    let e = set_delta_entity_status(
+        &mut conn,
+        CHAT,
+        "delta-1",
+        ROUTER,
+        DeltaStatus::Unknown,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(e, CaseStoreError::Latch(LatchError::Suppressed)),
+        "{e}"
+    );
+}

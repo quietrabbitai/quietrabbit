@@ -466,6 +466,49 @@ async fn put_inner(
     }
 }
 
+/// The session variables session_clear resets (items.id=889). Exactly these two:
+/// the locked intent and the active case. The one-time latch, write_mode, is
+/// NOT here and no function in this store removes it, so clearing a chat's
+/// session state can never reopen a one-time chat (decisions.id=939 addendum:
+/// the latch is irreversible within a chat). A test pins that the list never
+/// holds the latch name.
+pub const CLEARABLE_SESSION_NAMES: [&str; 2] = ["locked_intent", "active_case_id"];
+
+/// Reset the locked intent and the active case of one Focus in one chat
+/// (items.id=889 session_clear): the rows named in CLEARABLE_SESSION_NAMES are
+/// removed, so the next pass finds both ABSENT, as on a fresh chat. Every other
+/// variable and the latch are untouched. Returns the rows removed (0 when there
+/// was nothing to clear). Refused once the chat is latched, inside its own
+/// transaction, like every writer here.
+pub async fn clear_session_state(
+    conn: &mut SqliteConnection,
+    context_key: &str,
+    focus_id: &str,
+) -> Result<u64, SessionStoreError> {
+    validate_context_key(context_key).map_err(SessionStoreError::Validation)?;
+    validate_text("focus_id", focus_id, FOCUS_ID_MAX_CHARS)
+        .map_err(SessionStoreError::Validation)?;
+
+    begin_write(conn).await?;
+    let result = async {
+        ensure_writable(conn, context_key).await?;
+        let done = sqlx::query(
+            "DELETE FROM session_variables
+             WHERE context_key = ? AND focus_id = ? AND name IN (?, ?) AND name <> ?",
+        )
+        .bind(context_key)
+        .bind(focus_id)
+        .bind(CLEARABLE_SESSION_NAMES[0])
+        .bind(CLEARABLE_SESSION_NAMES[1])
+        .bind(WRITE_MODE_NAME)
+        .execute(&mut *conn)
+        .await?;
+        Ok::<u64, SessionStoreError>(done.rows_affected())
+    }
+    .await;
+    finish_write(conn, result).await
+}
+
 async fn get_session_variable_inner(
     conn: &mut SqliteConnection,
     context_key: &str,

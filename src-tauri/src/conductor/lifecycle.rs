@@ -452,6 +452,7 @@ fn build_action_definition(
         guard: None,
         declared_inputs: raw.declared_inputs.unwrap_or_default(),
         store_op: None,
+        and_guards: Vec::new(),
         action_id,
     }
 }
@@ -717,6 +718,21 @@ async fn load_focus_definition_from_db(
             ))
         })?;
 
+        // items.id=889: the AND-guard clause list (shared_042.sql). Each clause
+        // is parsed with the same operators as the single guard, the total over
+        // both is capped, and a malformed list fails LOAD with its own message.
+        let and_guards = guard::parse_clauses(row.guard_clauses.as_deref())
+            .and_then(|clauses| {
+                guard::check_clause_total(guard.as_ref(), &clauses)?;
+                Ok(clauses)
+            })
+            .map_err(|e| {
+                LifecycleError::ValidationFailed(format!(
+                    "Focus '{focus_id}' step '{}': {e}",
+                    row.action_id
+                ))
+            })?;
+
         // items.id=887: the typed store-writer columns. A malformed one fails
         // LOAD here with its own message, as a malformed guard does.
         let store_writer = store_op::StoreOp::from_columns(
@@ -744,6 +760,7 @@ async fn load_focus_definition_from_db(
                 op,
             )?;
             step.guard = guard;
+            step.and_guards = and_guards;
             steps.push(step);
             continue;
         }
@@ -856,11 +873,13 @@ async fn load_focus_definition_from_db(
                     guard: None,
                     declared_inputs: Vec::new(),
                     store_op: None,
+                    and_guards: Vec::new(),
                 }
             }
         };
         step.schedule_trigger = schedule_trigger;
         step.guard = guard;
+        step.and_guards = and_guards;
         steps.push(step);
     }
 
@@ -907,13 +926,23 @@ fn analyze_guarded_composition(
     focus_id: &str,
     steps: &[ActionDefinition],
 ) -> Result<usize, LifecycleError> {
+    guarded_composition_paths(focus_id, steps).map(|p| p.len())
+}
+
+/// items.id=889: analyze_guarded_composition() returning the enumerated paths
+/// themselves (rows run and modelled guard variables), for the acceptance
+/// report of the six-intent draft.
+fn guarded_composition_paths(
+    focus_id: &str,
+    steps: &[ActionDefinition],
+) -> Result<Vec<guard::Path>, LifecycleError> {
     let row_vars = row_output_vars(steps);
     let shapes: Vec<guard::RowShape> = steps
         .iter()
         .zip(row_vars.iter())
         .map(|(s, row_var)| guard::RowShape {
             action_id: &s.action_id,
-            guard: s.guard.as_ref(),
+            guards: s.guards(),
             output_var: row_var.as_deref(),
             is_block: s.block_stable_id.is_some(),
             local_and_no_handoff: s.routing_tier == ExternalAccess::LocalOnly
@@ -924,9 +953,11 @@ fn analyze_guarded_composition(
                 .as_ref()
                 .map(|o| o.arg_vars().collect())
                 .unwrap_or_default(),
+            case_write: s.store_op.as_ref().is_some_and(|o| o.op.writes_case()),
+            state_var: s.store_op.as_ref().and_then(|o| o.state_var()),
         })
         .collect();
-    guard::analyze_composition(&shapes)
+    guard::analyze_composition_paths(&shapes)
         .map_err(|e| LifecycleError::ValidationFailed(format!("Focus '{focus_id}' {e}")))
 }
 
@@ -1001,6 +1032,7 @@ fn store_writer_step(
         block_customization: None,
         schedule_trigger: None,
         guard: None,
+        and_guards: Vec::new(),
         declared_inputs: Vec::new(),
         store_op: Some(op),
     })
@@ -2563,7 +2595,8 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             // after a checkpointed step re-evaluates the guard on the rebuilt
             // track (rehydrate_focus_run restores every recorded output), so it
             // lands on the same path. YAML-authored steps never carry a guard.
-            if let Some(g) = &step.guard {
+            let clauses = step.guards();
+            if !clauses.is_empty() {
                 let mut vars = guard::track_vars(self.task_track.as_ref().unwrap());
                 // items.id=886: a bound name is a variable from row 0. LOAD
                 // rejects an output_var with a bound name, so nothing is
@@ -2571,7 +2604,9 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                 vars.extend(self.store_tokens.seeds.clone());
                 // items.id=887: and the ids store writers published this pass.
                 vars.extend(self.store_vars.clone());
-                if !g.evaluate(&vars) {
+                // items.id=889: every clause must hold (AND). The first one
+                // that does not is the one logged.
+                if let Some(g) = guard::first_false(&clauses, &vars) {
                     log::debug!(
                         "lifecycle: step '{}' skipped, guard on '{}' is false",
                         step.action_id,
@@ -4257,7 +4292,7 @@ fn next_execution_tier(
             continue;
         }
         candidates.push(next);
-        if next.guard.is_none() {
+        if !next.is_guarded() {
             break;
         }
     }
@@ -6855,6 +6890,7 @@ mod tests {
                 guard: None,
                 declared_inputs: Vec::new(),
                 store_op: None,
+                and_guards: Vec::new(),
             });
             run.focus_def = Some(def);
             let mut personal_track = PersonalTrack::new();
@@ -6933,6 +6969,7 @@ mod tests {
             guard: None,
             declared_inputs: Vec::new(),
             store_op: None,
+            and_guards: Vec::new(),
         });
         run.focus_def = Some(def);
         let mut personal_track = PersonalTrack::new();
@@ -10129,6 +10166,8 @@ steps:
         block: Option<&'static str>,
         custom: String,
         trigger: bool,
+        /// items.id=889: the raw guard_clauses column (a JSON array), or None.
+        clauses: Option<String>,
     }
 
     /// An ordinary local step recording `out`.
@@ -10145,6 +10184,7 @@ steps:
             })
             .to_string(),
             trigger: false,
+            clauses: None,
         }
     }
 
@@ -10164,10 +10204,18 @@ steps:
             block: None,
             custom: "{}".to_owned(),
             trigger: false,
+            clauses: None,
         }
     }
 
     impl SRow {
+        /// items.id=889: the guard_clauses column, raw text (so a test can store
+        /// anything).
+        fn with_clauses(mut self, raw: &str) -> Self {
+            self.clauses = Some(raw.to_owned());
+            self
+        }
+
         fn guarded(
             mut self,
             var: &'static str,
@@ -10213,9 +10261,9 @@ steps:
                 "INSERT INTO focus_block_compositions
                     (id, focus_id, action_id, block_stable_id, sequence_index,
                      schedule_trigger_anchor_field, schedule_trigger_offset,
-                     guard_var, guard_op, guard_value,
+                     guard_var, guard_op, guard_value, guard_clauses,
                      store_op, store_target, store_args, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))",
             )
             .bind(&comp_id)
             .bind(focus_id)
@@ -10227,6 +10275,7 @@ steps:
             .bind(gv)
             .bind(go)
             .bind(gval)
+            .bind(row.clauses.as_deref())
             .bind(row.op)
             .bind(row.target)
             .bind(row.args)
@@ -10307,6 +10356,7 @@ steps:
                     smodel("outc", "outc_out"),
                     smodel("ents", "ents_out"),
                     smodel("desc", "desc_out"),
+                    smodel("hand", "hand_out"),
                     swriter("hold", "latch", None, None).guarded(
                         "write_mode",
                         "eq",
@@ -10353,7 +10403,7 @@ steps:
                         "confirm",
                         "delta_confirm",
                         None,
-                        Some(r#"{"delta":"new_delta","entity":"ent_out"}"#),
+                        Some(r#"{"handle":"hand_out"}"#),
                     )
                     .guarded("new_delta", "present", None),
                     swriter(
@@ -10688,6 +10738,7 @@ steps:
                 })
                 .to_string(),
                 trigger: false,
+                clauses: None,
             };
             // block, writer, END: the block's verdict would become the output.
             let m = store_load(
@@ -10766,6 +10817,907 @@ steps:
             next_execution_tier(&steps, 0, ceiling),
             Some(execution_tier_ordinal(ExternalAccess::AnonymousRequired))
         );
+    }
+
+    // -- items.id=889: AND-guards, handles, the new operations, the lint ------
+
+    fn clause_json(var: &str, op: &str, value: Option<serde_json::Value>) -> serde_json::Value {
+        let mut o = serde_json::Map::new();
+        o.insert("var".into(), var.into());
+        o.insert("op".into(), op.into());
+        if let Some(v) = value {
+            o.insert("value".into(), v);
+        }
+        serde_json::Value::Object(o)
+    }
+
+    /// Two model rows then a row with a single guard AND a clause list.
+    fn and_rows(extra: Vec<SRow>) -> Vec<SRow> {
+        let mut rows = vec![smodel("route", "intent"), smodel("step", "stage")];
+        rows.extend(extra);
+        rows
+    }
+
+    #[tokio::test]
+    async fn and_guard_load_accepts_a_single_guard_plus_a_clause_list_and_keeps_both() {
+        with_temp_data_root(async {
+            let clauses = serde_json::json!([
+                clause_json("stage", "in", Some(serde_json::json!(["one", "two"]))),
+                clause_json("write_mode", "eq", Some("open".into())),
+            ])
+            .to_string();
+            let def = store_load(
+                "and-ok",
+                and_rows(vec![
+                    smodel("both", "out")
+                        .guarded("intent", "eq", Some("a"))
+                        .with_clauses(&clauses),
+                    // The legacy single guard alone is unchanged.
+                    smodel("legacy", "out2").guarded("intent", "ne", Some("a")),
+                    // A clause list alone, no single guard.
+                    smodel("list_only", "out3").with_clauses(
+                        &serde_json::json!([clause_json("intent", "present", None)]).to_string(),
+                    ),
+                    // `stage` is a router (the in clause), so it needs a row
+                    // that still runs when it matches none of its literals.
+                    smodel("stage_fb", "out4").guarded("stage", "present", None),
+                ]),
+            )
+            .await;
+            let def = def.unwrap_or_else(|m| panic!("AND-guards must load: {m}"));
+            let both = &def.steps[2];
+            assert!(both.guard.is_some());
+            assert_eq!(both.and_guards.len(), 2);
+            assert_eq!(both.guards().len(), 3);
+            assert!(def.steps[3].and_guards.is_empty() && def.steps[3].guard.is_some());
+            assert!(def.steps[4].guard.is_none() && def.steps[4].and_guards.len() == 1);
+            // Every other row has no clause list.
+            assert!(def.steps[..2].iter().all(|s| !s.is_guarded()));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn and_guard_load_rejections_each_have_their_own_message() {
+        with_temp_data_root(async {
+            let cases: Vec<(&str, String, &str)> = vec![
+                (
+                    "not-json",
+                    "not json".to_owned(),
+                    "not a JSON array of clause objects",
+                ),
+                (
+                    "not-array",
+                    r#"{"var":"intent"}"#.to_owned(),
+                    "not a JSON array of clause objects",
+                ),
+                ("empty", "[]".to_owned(), "empty array"),
+                (
+                    "unknown-key",
+                    r#"[{"var":"intent","op":"present","extra":1}]"#.to_owned(),
+                    "unknown field",
+                ),
+                ("no-op", r#"[{"var":"intent"}]"#.to_owned(), "missing field"),
+                (
+                    "not-object",
+                    r#"["intent"]"#.to_owned(),
+                    "not a JSON array of clause objects",
+                ),
+                (
+                    "bad-operator",
+                    r#"[{"var":"intent","op":"matches","value":"x"}]"#.to_owned(),
+                    "unknown guard operator 'matches'",
+                ),
+                (
+                    "eq-array",
+                    r#"[{"var":"intent","op":"eq","value":["a"]}]"#.to_owned(),
+                    "one JSON string",
+                ),
+                (
+                    "in-string",
+                    r#"[{"var":"intent","op":"in","value":"a"}]"#.to_owned(),
+                    "JSON array of strings",
+                ),
+                (
+                    "eq-no-value",
+                    r#"[{"var":"intent","op":"eq"}]"#.to_owned(),
+                    "needs a guard_value",
+                ),
+                (
+                    "present-with-value",
+                    r#"[{"var":"intent","op":"present","value":"x"}]"#.to_owned(),
+                    "takes no guard_value",
+                ),
+                (
+                    "in-empty",
+                    r#"[{"var":"intent","op":"in","value":[]}]"#.to_owned(),
+                    "the array is empty",
+                ),
+                (
+                    "duplicate",
+                    r#"[{"var":"intent","op":"present"},{"var":"intent","op":"present"}]"#
+                        .to_owned(),
+                    "duplicates an earlier clause",
+                ),
+                (
+                    "empty-var",
+                    r#"[{"var":" ","op":"present"}]"#.to_owned(),
+                    "variable name is empty",
+                ),
+            ];
+            for (label, raw, expect) in cases {
+                let m = store_load(
+                    &format!("and-bad-{label}"),
+                    and_rows(vec![smodel("bad", "out").with_clauses(&raw)]),
+                )
+                .await
+                .unwrap_err();
+                assert!(m.contains("step 'bad'"), "{label}: {m}");
+                assert!(
+                    m.contains("guard_clauses[") || m.contains("guard_clauses"),
+                    "{label}: {m}"
+                );
+                assert!(m.contains(expect), "{label}: expected '{expect}' in: {m}");
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn and_guard_load_caps_the_whole_clause_set_single_guard_included() {
+        with_temp_data_root(async {
+            let four = serde_json::json!([
+                clause_json("intent", "present", None),
+                clause_json("stage", "present", None),
+                clause_json("third", "present", None),
+                clause_json("stage", "ne", Some("y".into())),
+            ])
+            .to_string();
+            // Four clauses in the list alone is exactly the cap.
+            let def = store_load(
+                "and-cap-ok",
+                and_rows(vec![
+                    smodel("third_step", "third"),
+                    smodel("four", "out").with_clauses(&four),
+                ]),
+            )
+            .await;
+            assert!(def.is_ok(), "{:?}", def.err());
+            // One single guard plus four in the list is five.
+            let m = store_load(
+                "and-cap-over",
+                and_rows(vec![
+                    smodel("third_step", "third"),
+                    smodel("five", "out")
+                        .guarded("intent", "eq", Some("a"))
+                        .with_clauses(&four),
+                ]),
+            )
+            .await
+            .unwrap_err();
+            assert!(m.contains("at most 4 guard clauses in total"), "{m}");
+            assert!(m.contains("this one has 5"), "{m}");
+            // The single guard repeated in the list is a duplicate.
+            let dup =
+                serde_json::json!([clause_json("intent", "eq", Some("a".into()))]).to_string();
+            let m = store_load(
+                "and-cap-dup",
+                and_rows(vec![smodel("dup", "out")
+                    .guarded("intent", "eq", Some("a"))
+                    .with_clauses(&dup)]),
+            )
+            .await
+            .unwrap_err();
+            assert!(m.contains("duplicates an earlier clause"), "{m}");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn and_guard_load_checks_every_clause_variable_and_the_clause_sets_paths() {
+        with_temp_data_root(async {
+            // An unknown variable in the SECOND clause.
+            let unk = serde_json::json!([
+                clause_json("intent", "present", None),
+                clause_json("nope", "present", None),
+            ])
+            .to_string();
+            let m = store_load(
+                "and-unk",
+                and_rows(vec![smodel("u", "o").with_clauses(&unk)]),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                m.contains("step 'u'") && m.contains("'nope'") && m.contains("unknown variable"),
+                "{m}"
+            );
+
+            // Two different eq literals on one variable never hold together.
+            let contra =
+                serde_json::json!([clause_json("intent", "eq", Some("b".into()))]).to_string();
+            let m = store_load(
+                "and-contra",
+                and_rows(vec![
+                    smodel("a", "o").guarded("intent", "eq", Some("a")),
+                    smodel("never", "o2")
+                        .guarded("intent", "eq", Some("a"))
+                        .with_clauses(&contra),
+                    smodel("fb", "o3").guarded("intent", "ne", Some("a")),
+                    smodel("fb2", "o4").guarded("intent", "present", None),
+                ]),
+            )
+            .await
+            .unwrap_err();
+            assert!(m.contains("step 'never' is unreachable"), "{m}");
+
+            // The router fallback rule over clause sets: a row with an ne clause
+            // AND another clause still counts, because on OTHER it runs only when
+            // both hold. Here the second clause never blocks it.
+            let ne_and = serde_json::json!([clause_json("stage", "present", None)]).to_string();
+            let def = store_load(
+                "and-fallback",
+                and_rows(vec![
+                    smodel("a", "o").guarded("intent", "eq", Some("a")),
+                    smodel("fb", "o2")
+                        .guarded("intent", "ne", Some("a"))
+                        .with_clauses(&ne_and),
+                ]),
+            )
+            .await;
+            assert!(def.is_ok(), "{:?}", def.err());
+            // Without any row that can run on OTHER the router has no fallback.
+            let m = store_load(
+                "and-nofallback",
+                and_rows(vec![
+                    smodel("a", "o").guarded("intent", "eq", Some("a")),
+                    smodel("b", "o2")
+                        .guarded("intent", "eq", Some("b"))
+                        .with_clauses(&ne_and),
+                    smodel("end", "o3"),
+                ]),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                m.contains("router variable 'intent' has no fallback row"),
+                "{m}"
+            );
+        })
+        .await;
+    }
+
+    /// The optional session-bound argument rule (items.id=887) no longer needs
+    /// the argument to be the row's ONLY guard.
+    #[tokio::test]
+    async fn an_optional_session_argument_may_be_covered_by_any_clause_of_the_row() {
+        with_temp_data_root(async {
+            let args = Some(r#"{"case":"active_case_id","outcome":"intent"}"#);
+            let covered =
+                serde_json::json!([clause_json("active_case_id", "present", None)]).to_string();
+            // The single guard is another variable, the clause list covers it.
+            let def = store_load(
+                "and-opt-ok",
+                vec![
+                    smodel("route", "intent"),
+                    swriter("up", "case_update", None, args)
+                        .guarded("intent", "eq", Some("close"))
+                        .with_clauses(&covered),
+                    smodel("fb", "o").guarded("intent", "ne", Some("close")),
+                ],
+            )
+            .await;
+            assert!(def.is_ok(), "{:?}", def.err());
+            // Not covered by any clause: refused, as before.
+            let other = serde_json::json!([clause_json("intent", "present", None)]).to_string();
+            let m = store_load(
+                "and-opt-bad",
+                vec![
+                    smodel("route", "intent"),
+                    swriter("up", "case_update", None, args)
+                        .guarded("intent", "eq", Some("close"))
+                        .with_clauses(&other),
+                    smodel("fb", "o").guarded("intent", "ne", Some("close")),
+                ],
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                m.contains("can be absent") && m.contains("active_case_id"),
+                "{m}"
+            );
+            // An `absent` clause on the argument does not cover it.
+            let absent =
+                serde_json::json!([clause_json("active_case_id", "absent", None)]).to_string();
+            let m = store_load(
+                "and-opt-absent",
+                vec![
+                    smodel("route", "intent"),
+                    swriter("up", "case_update", None, args)
+                        .guarded("intent", "eq", Some("close"))
+                        .with_clauses(&absent),
+                    smodel("fb", "o").guarded("intent", "ne", Some("close")),
+                ],
+            )
+            .await
+            .unwrap_err();
+            assert!(m.contains("can be absent"), "{m}");
+            // The legacy shape, the argument as the single guard, still loads.
+            let def = store_load(
+                "and-opt-legacy",
+                vec![
+                    smodel("route", "intent"),
+                    swriter("up", "case_update", None, args).guarded(
+                        "active_case_id",
+                        "present",
+                        None,
+                    ),
+                ],
+            )
+            .await;
+            assert!(def.is_ok(), "{:?}", def.err());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_handle_slot_takes_model_output_never_a_bound_name_or_a_published_id() {
+        with_temp_data_root(async {
+            // Model output: fine, for both handle operations.
+            let def = store_load(
+                "hnd-ok",
+                vec![
+                    smodel("pick", "ticket_handle"),
+                    swriter(
+                        "sel",
+                        "case_select",
+                        None,
+                        Some(r#"{"handle":"ticket_handle"}"#),
+                    ),
+                    smodel("pick2", "delta_handle"),
+                    swriter(
+                        "conf",
+                        "delta_confirm",
+                        None,
+                        Some(r#"{"handle":"delta_handle"}"#),
+                    ),
+                ],
+            )
+            .await;
+            assert!(def.is_ok(), "{:?}", def.err());
+            // A seeded name is an internal id or an intent, not a handle.
+            for name in ["active_case_id", "locked_intent"] {
+                let args = format!(r#"{{"handle":"{name}"}}"#);
+                let args: &'static str = Box::leak(args.into_boxed_str());
+                let m = store_load(
+                    &format!("hnd-bound-{name}"),
+                    vec![
+                        smodel("route", "intent"),
+                        swriter("sel", "case_select", None, Some(args))
+                            .guarded(name, "present", None),
+                        smodel("fb", "o").guarded("intent", "present", None),
+                    ],
+                )
+                .await
+                .unwrap_err();
+                assert!(m.contains("a bound name") && m.contains("handle"), "{m}");
+            }
+            // The id a case_open published is an internal id.
+            let m = store_load(
+                "hnd-published",
+                vec![
+                    smodel("ent", "ent_out"),
+                    smodel("lab", "label_out"),
+                    swriter(
+                        "open",
+                        "case_open",
+                        Some("new_case"),
+                        Some(r#"{"entity":"ent_out","label":"label_out"}"#),
+                    ),
+                    swriter("sel", "case_select", None, Some(r#"{"handle":"new_case"}"#)),
+                    smodel("tail", "t"),
+                ],
+            )
+            .await
+            .unwrap_err();
+            assert!(m.contains("an id published by a store writer"), "{m}");
+        })
+        .await;
+    }
+
+    // -- the close-ticket lint ----------------------------------------------
+
+    /// Rows for the lint tests: a closure router, a strategy log and a closing
+    /// update, in the order given.
+    fn close_rows(order: &[&'static str], pin: Option<&'static str>) -> Vec<SRow> {
+        let ac = |r: SRow| r.guarded("active_case_id", "present", None);
+        let mut rows = vec![smodel("route", "closure"), smodel("note", "note")];
+        for id in order {
+            let row = match *id {
+                "log" => ac(swriter(
+                    "log",
+                    "strategy_append",
+                    None,
+                    Some(r#"{"case":"active_case_id","strategy":"note","outcome":"note"}"#),
+                )),
+                "close" => ac(swriter(
+                    "close",
+                    "case_update",
+                    None,
+                    Some(r#"{"case":"active_case_id","state":"closure"}"#),
+                )),
+                "link" => ac(swriter(
+                    "link",
+                    "case_link",
+                    None,
+                    Some(r#"{"case":"active_case_id","entity":"note"}"#),
+                )),
+                other => panic!("{other}"),
+            };
+            let row = match (*id, pin) {
+                ("close", Some(literals)) => row.with_clauses(
+                    &serde_json::json!([clause_json(
+                        "closure",
+                        "in",
+                        Some(serde_json::from_str(literals).unwrap())
+                    )])
+                    .to_string(),
+                ),
+                _ => row,
+            };
+            rows.push(row);
+        }
+        // A reply and a fallback for the router.
+        rows.push(smodel("reply", "reply").guarded("closure", "present", None));
+        rows
+    }
+
+    #[tokio::test]
+    async fn the_closing_case_update_must_be_the_last_case_write_on_its_path() {
+        with_temp_data_root(async {
+            let terminal = Some(r#"["resolved","replaced","closed"]"#);
+            // Log first, close last: loads.
+            let ok = store_load("cl-ok", close_rows(&["log", "close"], terminal)).await;
+            assert!(ok.is_ok(), "{:?}", ok.err());
+            // Close first, then a strategy append to the closed case: refused.
+            let m = store_load("cl-bad", close_rows(&["close", "log"], terminal))
+                .await
+                .unwrap_err();
+            assert!(
+                m.contains(
+                    "step 'close' may close the ticket but step 'log' writes the case after it"
+                ),
+                "{m}"
+            );
+            assert!(m.contains("closure='resolved'"), "the path is named: {m}");
+            // An entity link after the close is a case write too.
+            let m = store_load("cl-link", close_rows(&["close", "link"], terminal))
+                .await
+                .unwrap_err();
+            assert!(m.contains("step 'link' writes the case after it"), "{m}");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_state_pinned_to_non_terminal_literals_may_be_followed_by_case_writes() {
+        with_temp_data_root(async {
+            let open_states = Some(r#"["open","in-progress","escalated","awaiting-external"]"#);
+            let ok = store_load("cl-pin-open", close_rows(&["close", "log"], open_states)).await;
+            assert!(ok.is_ok(), "{:?}", ok.err());
+            // Pinned, but one literal is terminal: that path closes.
+            let mixed = Some(r#"["in-progress","closed"]"#);
+            let m = store_load("cl-pin-mixed", close_rows(&["close", "log"], mixed))
+                .await
+                .unwrap_err();
+            assert!(m.contains("closure='closed'"), "{m}");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_unpinned_state_is_treated_as_possibly_closing() {
+        with_temp_data_root(async {
+            // No clause names the state: the cautious side.
+            let m = store_load("cl-unpinned", close_rows(&["close", "log"], None))
+                .await
+                .unwrap_err();
+            assert!(m.contains("may close the ticket"), "{m}");
+            // The same rows in the safe order load.
+            let ok = store_load("cl-unpinned-ok", close_rows(&["log", "close"], None)).await;
+            assert!(ok.is_ok(), "{:?}", ok.err());
+        })
+        .await;
+    }
+
+    /// A case_update that sets no state cannot close, so a later write is fine.
+    #[tokio::test]
+    async fn a_case_update_that_sets_no_state_is_never_a_closing_write() {
+        with_temp_data_root(async {
+            let ok = store_load(
+                "cl-nostate",
+                vec![
+                    smodel("route", "intent"),
+                    smodel("note", "note"),
+                    swriter(
+                        "outcome",
+                        "case_update",
+                        None,
+                        Some(r#"{"case":"active_case_id","outcome":"note"}"#),
+                    )
+                    .guarded("active_case_id", "present", None),
+                    swriter(
+                        "log",
+                        "strategy_append",
+                        None,
+                        Some(r#"{"case":"active_case_id","strategy":"note","outcome":"note"}"#),
+                    )
+                    .guarded("active_case_id", "present", None),
+                    smodel("reply", "reply"),
+                ],
+            )
+            .await;
+            assert!(ok.is_ok(), "{:?}", ok.err());
+        })
+        .await;
+    }
+
+    // -- ACCEPTANCE: the six-intent Tech Support draft ------------------------
+
+    fn draft_srows(variant: crate::conductor::tech_support_draft::Variant) -> Vec<SRow> {
+        use crate::conductor::tech_support_draft::{rows, Clause, Kind};
+        fn json(rest: &[Clause]) -> Option<String> {
+            if rest.is_empty() {
+                return None;
+            }
+            Some(
+                serde_json::Value::Array(
+                    rest.iter()
+                        .map(|(var, op, value)| {
+                            let v = value.map(|v| {
+                                if *op == "in" {
+                                    serde_json::from_str(v).expect("an in list is JSON")
+                                } else {
+                                    serde_json::Value::String(v.to_owned())
+                                }
+                            });
+                            clause_json(var, op, v)
+                        })
+                        .collect(),
+                )
+                .to_string(),
+            )
+        }
+        rows(variant)
+            .into_iter()
+            .map(|r| {
+                let mut row = match &r.kind {
+                    Kind::Model { template, out } => {
+                        let mut s = smodel(r.id, out);
+                        s.custom = serde_json::json!({
+                            "routing_tier": 1, "prompt_template": template, "output_var": out
+                        })
+                        .to_string();
+                        s
+                    }
+                    Kind::Writer { op, target, args } => swriter(r.id, op, *target, *args),
+                };
+                if let Some((v, o, val)) = r.clauses.first().copied() {
+                    row.guard = Some((v, o, val));
+                }
+                if r.clauses.len() > 1 {
+                    row.clauses = json(&r.clauses[1..]);
+                }
+                row
+            })
+            .collect()
+    }
+
+    /// What the report says about one loaded draft.
+    struct DraftReport {
+        rows: usize,
+        paths: usize,
+        calls_min: usize,
+        calls_max: usize,
+        wasted_total: usize,
+        wasted_max: usize,
+        wasted_paths: usize,
+        by_intent: Vec<(String, usize, usize, usize)>,
+    }
+
+    fn report_draft(def: &FocusDefinition) -> (DraftReport, Vec<guard::Path>) {
+        let paths = guarded_composition_paths("draft", &def.steps).expect("the draft analyses");
+        let is_model = |i: usize| def.steps[i].store_op.is_none();
+        let mut calls_min = usize::MAX;
+        let mut calls_max = 0;
+        let (mut wasted_total, mut wasted_max, mut wasted_paths) = (0, 0, 0);
+        let mut by_intent: std::collections::BTreeMap<String, (usize, usize, usize)> =
+            Default::default();
+        for p in &paths {
+            let models: Vec<usize> = p.rows.iter().copied().filter(|&i| is_model(i)).collect();
+            calls_min = calls_min.min(models.len());
+            calls_max = calls_max.max(models.len());
+            // A call is WASTED when it is not the reply (the last model row) and
+            // nothing that runs after it on the path reads its variable: not a
+            // clause, not a writer argument, not a template token.
+            let last = models.last().copied();
+            let mut wasted = 0;
+            for (pos, &i) in p.rows.iter().enumerate() {
+                if !is_model(i) || Some(i) == last {
+                    continue;
+                }
+                let Some(var) = def.steps[i].output_var.as_deref() else {
+                    continue;
+                };
+                let read = p.rows[pos + 1..].iter().any(|&j| {
+                    let t = &def.steps[j];
+                    t.guards().iter().any(|g| g.var == var)
+                        || t.store_op
+                            .as_ref()
+                            .is_some_and(|o| o.arg_vars().any(|a| a == var))
+                        || crate::conductor::executor::find_tokens(&t.prompt_template)
+                            .iter()
+                            .any(|tok| tok == var)
+                });
+                if !read {
+                    wasted += 1;
+                }
+            }
+            wasted_total += wasted;
+            wasted_max = wasted_max.max(wasted);
+            wasted_paths += usize::from(wasted > 0);
+            let intent = p
+                .values
+                .iter()
+                .find(|(v, _)| v == "intent")
+                .and_then(|(_, v)| v.clone())
+                .unwrap_or_else(|| "(unset)".to_owned());
+            let e = by_intent
+                .entry(intent.replace('\u{0}', "OTHER"))
+                .or_insert((0, usize::MAX, 0));
+            e.0 += 1;
+            e.1 = e.1.min(models.len());
+            e.2 = e.2.max(models.len());
+        }
+        (
+            DraftReport {
+                rows: def.steps.len(),
+                paths: paths.len(),
+                calls_min,
+                calls_max,
+                wasted_total,
+                wasted_max,
+                wasted_paths,
+                by_intent: by_intent
+                    .into_iter()
+                    .map(|(k, (n, lo, hi))| (k, n, lo, hi))
+                    .collect(),
+            },
+            paths,
+        )
+    }
+
+    fn ran(def: &FocusDefinition, p: &guard::Path) -> Vec<String> {
+        p.rows
+            .iter()
+            .map(|&i| def.steps[i].action_id.clone())
+            .collect()
+    }
+
+    fn value<'a>(p: &'a guard::Path, var: &str) -> Option<&'a str> {
+        p.values
+            .iter()
+            .find(|(v, _)| v == var)
+            .and_then(|(_, v)| v.as_deref())
+    }
+
+    #[tokio::test]
+    async fn the_six_intent_tech_support_draft_loads_and_enumerates_under_the_cap() {
+        use crate::conductor::tech_support_draft::Variant;
+        with_temp_data_root(async {
+            let lean = store_load("draft-lean", draft_srows(Variant::Lean))
+                .await
+                .unwrap_or_else(|m| panic!("the six-intent draft must load: {m}"));
+            let (r, paths) = report_draft(&lean);
+            let naive = store_load("draft-naive", draft_srows(Variant::Naive))
+                .await
+                .unwrap_or_else(|m| panic!("the naive variant must load: {m}"));
+            let (n, _) = report_draft(&naive);
+
+            println!("== items.id=889 acceptance: six-intent Tech Support draft (test fixture) ==");
+            for (label, rep) in [("lean", &r), ("naive", &n)] {
+                println!(
+                    "{label}: rows={} paths={} (cap {}) local calls per path {}..{} \
+                     wasted local calls: total={} max/path={} paths-with-waste={}",
+                    rep.rows,
+                    rep.paths,
+                    guard::MAX_PATHS,
+                    rep.calls_min,
+                    rep.calls_max,
+                    rep.wasted_total,
+                    rep.wasted_max,
+                    rep.wasted_paths
+                );
+            }
+            println!("lean, by classified intent: (intent, paths, min calls, max calls)");
+            for (intent, count, lo, hi) in &r.by_intent {
+                println!("  {intent:<18} paths={count:<3} calls={lo}..{hi}");
+            }
+
+            // Under the cap, with room.
+            assert!(r.paths <= guard::MAX_PATHS, "paths {}", r.paths);
+            assert!(r.rows >= 30, "a real six-intent shape: {} rows", r.rows);
+            // The disambiguation pass is cheap and the new-issue pass is the
+            // costly one, about six calls (decisions.id=940 ruling 7).
+            assert_eq!(r.calls_min, 2);
+            assert_eq!(r.calls_max, 6);
+            // Lean wastes no local call anywhere, Naive does: the metric bites.
+            assert_eq!(r.wasted_total, 0, "lean wastes nothing");
+            assert!(n.wasted_total > 0, "naive: {}", n.wasted_total);
+            assert!(n.wasted_paths > 0);
+
+            // -- every intent is a path of its own, with its own reply --------
+            let reply_for = [
+                ("new_issue", "nc_reply"),
+                ("continue_ticket", "resume_reply"),
+                ("check_in_update", "ci_reply"),
+                ("close_ticket", "close_reply"),
+                ("device_library", "dl_reply"),
+                ("one_time_session", "ot_reply"),
+            ];
+            for (intent, reply) in reply_for {
+                assert!(
+                    paths.iter().any(|p| value(p, "intent") == Some(intent)
+                        && ran(&lean, p).contains(&reply.to_owned())),
+                    "{intent} reaches {reply}"
+                );
+            }
+
+            // -- decisions.id=515: Cases A, B and C ----------------------------
+            let unsure = |state: &str| -> Vec<&guard::Path> {
+                paths
+                    .iter()
+                    .filter(|p| {
+                        value(p, "intent") == Some("unsure")
+                            && value(p, "open_ticket_state") == Some(state)
+                    })
+                    .collect()
+            };
+            // Case A: ONE open ticket, intent unclear: surface it before anything
+            // else. One extra local call, no case work, no new-issue extraction.
+            let a = unsure("one");
+            assert!(!a.is_empty());
+            for p in &a {
+                let ids = ran(&lean, p);
+                assert!(ids.contains(&"ask_one_ticket".to_owned()), "{ids:?}");
+                assert!(!ids.contains(&"ask_which_ticket".to_owned()));
+                assert!(
+                    !ids.iter().any(|i| i.starts_with("nc_") || i == "open_case"),
+                    "{ids:?}"
+                );
+            }
+            // Case B: MANY open tickets: the capped list.
+            let b = unsure("many");
+            assert!(!b.is_empty());
+            for p in &b {
+                let ids = ran(&lean, p);
+                assert!(ids.contains(&"ask_which_ticket".to_owned()), "{ids:?}");
+                assert!(!ids.contains(&"ask_one_ticket".to_owned()));
+                assert!(
+                    !ids.iter().any(|i| i.starts_with("nc_") || i == "open_case"),
+                    "{ids:?}"
+                );
+            }
+            // Case C: NO open ticket, intent unclear: straight into the new-issue
+            // flow, no question. A saving chat opens the case.
+            let c = unsure("none");
+            assert!(!c.is_empty());
+            for p in &c {
+                let ids = ran(&lean, p);
+                assert!(ids.contains(&"nc_reply".to_owned()), "{ids:?}");
+                assert!(!ids.contains(&"ask_one_ticket".to_owned()));
+                assert!(!ids.contains(&"ask_which_ticket".to_owned()));
+                assert_eq!(
+                    ids.contains(&"open_case".to_owned()),
+                    value(p, "write_mode") == Some("open"),
+                    "{ids:?}"
+                );
+            }
+            // A new issue while tickets are open surfaces them first.
+            assert!(paths.iter().any(|p| {
+                value(p, "intent") == Some("new_issue")
+                    && value(p, "open_ticket_state") == Some("one")
+                    && ran(&lean, p).contains(&"confirm_new".to_owned())
+            }));
+
+            // -- the one-time session never saves ------------------------------
+            for p in paths
+                .iter()
+                .filter(|p| value(p, "intent") == Some("one_time_session"))
+            {
+                let ids = ran(&lean, p);
+                assert!(
+                    ids.contains(&"one_time".to_owned()) && ids.contains(&"ot_reply".to_owned())
+                );
+                assert!(!ids.contains(&"lock_intent".to_owned()));
+            }
+            // A latched or saving chat decides every other writer: no path with
+            // write_mode suppressed runs a case or delta writer except the latch.
+            let non_latch_writers = |ids: &[String]| {
+                ids.iter().any(|i| {
+                    [
+                        "open_case",
+                        "select_new",
+                        "link_affected",
+                        "select_ticket",
+                        "ci_changed",
+                        "ci_confirm",
+                        "close_log",
+                        "close_write",
+                        "close_clear",
+                        "lock_intent",
+                    ]
+                    .contains(&i.as_str())
+                })
+            };
+            for p in paths
+                .iter()
+                .filter(|p| value(p, "write_mode") == Some("suppressed"))
+            {
+                let ids = ran(&lean, p);
+                assert!(!non_latch_writers(&ids), "{ids:?}");
+            }
+            // The close path ends its case writes with the closing update.
+            for p in paths
+                .iter()
+                .filter(|p| ran(&lean, p).contains(&"close_write".to_owned()))
+            {
+                let ids = ran(&lean, p);
+                let pos = |n: &str| ids.iter().position(|i| i == n).unwrap();
+                assert!(pos("close_log") < pos("close_write"), "{ids:?}");
+            }
+            // The reply is the last model row on every path.
+            for p in &paths {
+                let last_model = p
+                    .rows
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|&i| lean.steps[i].store_op.is_none())
+                    .unwrap();
+                assert_eq!(
+                    lean.steps[last_model].output_var.as_deref(),
+                    Some("reply"),
+                    "{:?}",
+                    ran(&lean, p)
+                );
+            }
+        })
+        .await;
+    }
+
+    /// The draft is a fixture: nothing seeds it and no shipped Focus is wired to
+    /// it. The shipped database carries no Tech Support composition.
+    #[tokio::test]
+    async fn no_tech_support_focus_is_seeded_by_the_draft() {
+        with_temp_data_root(async {
+            let pool = block_load_pool().await;
+            let n: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM focus_block_compositions WHERE focus_id LIKE 'tech%'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(n, 0);
+            let rows: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM focus_block_compositions WHERE guard_clauses IS NOT NULL",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(rows, 0, "no shipped row carries a clause list");
+        })
+        .await;
     }
 
     // -- execute(): store writers over real encrypted outputs.db -------------
@@ -10914,6 +11866,220 @@ steps:
                 run.store_vars.is_empty(),
                 "a skipped open published nothing"
             );
+        })
+        .await;
+    }
+
+    /// items.id=889: a row runs only when EVERY clause holds, the single guard
+    /// and each one of guard_clauses, evaluated at run time over the live track.
+    #[tokio::test]
+    async fn an_and_guarded_row_runs_only_when_every_clause_holds() {
+        with_temp_data_root(async {
+            let mk = |id: &str,
+                      op: &str,
+                      target: Option<&str>,
+                      args: serde_json::Value,
+                      single: (&str, &str, Option<&str>),
+                      clauses: &[(&str, &str, Option<&str>)]| {
+                let mut s = writer_step(id, op, target, args, Some(single));
+                s.and_guards = clauses
+                    .iter()
+                    .map(|(v, o, val)| {
+                        guard::Guard::from_columns(Some(v), Some(o), *val)
+                            .unwrap()
+                            .unwrap()
+                    })
+                    .collect();
+                s
+            };
+            let mut run = writer_run(
+                vec![
+                    // Both hold: writes.
+                    mk(
+                        "lock",
+                        "session_put",
+                        Some("locked_intent"),
+                        serde_json::json!({"value": "intent_out"}),
+                        ("intent_out", "eq", Some("billing")),
+                        &[("stage", "eq", Some("go"))],
+                    ),
+                    // The single guard holds, a LIST clause does not.
+                    mk(
+                        "open",
+                        "case_open",
+                        Some("nc"),
+                        serde_json::json!({"entity": "intent_out", "label": "intent_out"}),
+                        ("intent_out", "eq", Some("billing")),
+                        &[("stage", "eq", Some("stop"))],
+                    ),
+                    // The single guard does not hold, the list does.
+                    mk(
+                        "hold",
+                        "latch",
+                        None,
+                        serde_json::Value::Null,
+                        ("intent_out", "eq", Some("network")),
+                        &[("stage", "eq", Some("go"))],
+                    ),
+                    // The second of three clauses does not hold.
+                    mk(
+                        "open2",
+                        "case_open",
+                        Some("nc2"),
+                        serde_json::json!({"entity": "intent_out", "label": "intent_out"}),
+                        ("intent_out", "present", None),
+                        &[
+                            ("stage", "in", Some(r#"["x","y"]"#)),
+                            ("intent_out", "ne", Some("z")),
+                        ],
+                    ),
+                ],
+                Some("chat-and"),
+                &[("intent_out", "billing"), ("stage", "go")],
+            );
+            assert!(run.execute().await.unwrap().is_none());
+            let mut conn = outputs(&run).await;
+            let rows = crate::persistence::session_store::list_session_variables(
+                &mut conn, "chat-and", "f",
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+                ["locked_intent"],
+                "only the row whose every clause held wrote"
+            );
+            let cases: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM case_records")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+            assert_eq!(cases, 0);
+            assert!(
+                run.store_vars.is_empty(),
+                "a skipped open published nothing"
+            );
+            assert_eq!(
+                crate::persistence::session_store::write_mode(&mut conn, "chat-and")
+                    .await
+                    .unwrap(),
+                crate::persistence::session_store::WriteMode::Open,
+                "the latch row's second clause was on a false single guard"
+            );
+        })
+        .await;
+    }
+
+    /// A bound name used ONLY in a clause of the list is still seeded at pass
+    /// start (seeding reads exactly the names the row set mentions).
+    #[tokio::test]
+    async fn a_bound_name_named_only_in_a_clause_list_is_seeded() {
+        with_temp_data_root(async {
+            let mut step = writer_step(
+                "lock",
+                "session_put",
+                Some("locked_intent"),
+                serde_json::json!({"value": "intent_out"}),
+                None,
+            );
+            step.and_guards =
+                vec![
+                    guard::Guard::from_columns(Some("write_mode"), Some("eq"), Some("open"))
+                        .unwrap()
+                        .unwrap(),
+                ];
+            let mut run = writer_run(
+                vec![step],
+                Some("chat-seed-and"),
+                &[("intent_out", "billing")],
+            );
+            assert!(run.execute().await.unwrap().is_none());
+            let mut conn = outputs(&run).await;
+            let row = crate::persistence::session_store::get_session_variable(
+                &mut conn,
+                "chat-seed-and",
+                "f",
+                "locked_intent",
+            )
+            .await
+            .unwrap();
+            assert!(
+                row.is_some(),
+                "write_mode was seeded for the clause, so it held"
+            );
+        })
+        .await;
+    }
+
+    /// case_select through execute(): a handle a model produced resolves
+    /// store-side, a made-up one fails the pass closed and writes nothing.
+    #[tokio::test]
+    async fn execute_selects_a_ticket_by_handle_and_a_wrong_handle_fails_the_pass() {
+        with_temp_data_root(async {
+            let select = || {
+                writer_step(
+                    "sel",
+                    "case_select",
+                    None,
+                    serde_json::json!({"handle": "ticket_handle"}),
+                    None,
+                )
+            };
+            // A case this Focus opened, in the run's own persona database.
+            let mut run = writer_run(
+                vec![select()],
+                Some("chat-hnd"),
+                &[("ticket_handle", "T-00000000")],
+            );
+            let mut conn = outputs(&run).await;
+            crate::persistence::case_store::open_case(
+                &mut conn,
+                &crate::persistence::case_store::NewCase {
+                    case_id: "run-0:open",
+                    focus_id: "f",
+                    context_key: "chat-hnd",
+                    primary_entity_id: "ent-router",
+                    subject_label: "Router",
+                    symptoms: "",
+                    opened_by_run: "run-0",
+                },
+            )
+            .await
+            .unwrap();
+            drop(conn);
+
+            // A made-up handle: the pass fails closed, nothing is selected.
+            let err = run.execute().await.unwrap_err();
+            assert!(matches!(err, LifecycleError::StoreWrite(_)), "{err:?}");
+            assert!(!err.to_string().contains("T-00000000"), "{err}");
+            let mut conn = outputs(&run).await;
+            let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_variables")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+            assert_eq!(n, 0);
+            drop(conn);
+
+            // The real handle selects the case.
+            let handle = crate::persistence::handles::case_handle("f", "run-0:open");
+            let mut run2 = writer_run(
+                vec![select()],
+                Some("chat-hnd"),
+                &[("ticket_handle", handle.as_str())],
+            );
+            run2.user_id = run.user_id.clone();
+            run2.persona_id = run.persona_id.clone();
+            assert!(run2.execute().await.unwrap().is_none());
+            let mut conn = outputs(&run2).await;
+            let row = crate::persistence::session_store::get_session_variable(
+                &mut conn,
+                "chat-hnd",
+                "f",
+                "active_case_id",
+            )
+            .await
+            .unwrap()
+            .expect("selected");
+            assert_eq!(row.value, "run-0:open");
         })
         .await;
     }

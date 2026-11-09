@@ -20,7 +20,8 @@ use crate::conductor::store_op::StoreOp;
 use crate::conductor::store_writer::{
     run_store_op, Outcome, StoreWriteError, WriterContext, MAX_LIST_ITEMS,
 };
-use crate::persistence::case_store::{self, CaseState, DeltaStatus, EntityRole};
+use crate::persistence::case_store::{self, CaseState, CaseStoreError, DeltaStatus, EntityRole};
+use crate::persistence::handles;
 use crate::persistence::output_store::open_outputs_db;
 use crate::persistence::session_store::{self, LatchError, SessionStoreError, WriteMode};
 
@@ -442,12 +443,17 @@ async fn delta_confirm_and_delta_changed_set_the_two_statuses_with_the_clock_at_
     )
     .await
     .unwrap();
-    let ids = vars(&[("d", "run-1:rec"), ("e", "ent-router")]);
+    let ids = vars(&[
+        ("d", "run-1:rec"),
+        ("e", "ent-router"),
+        ("h", &handles::delta_handle(FOCUS, "run-1:rec")),
+    ]);
 
+    // items.id=889: confirmation names the delta by its HANDLE.
     let confirm = op(
         "delta_confirm",
         None,
-        Some(serde_json::json!({"delta": "d", "entity": "e"})),
+        Some(serde_json::json!({"handle": "h"})),
     );
     let d = run(&mut conn, &ctx(FOCUS, "run-2", "conf"), &confirm, &ids)
         .await
@@ -502,6 +508,8 @@ fn every_writer() -> Vec<(StoreOp, HashMap<String, String>)> {
         ("ents", r#"["ent-router"]"#),
         ("d", "a change"),
         ("did", "run-0:rec"),
+        ("th", &handles::case_handle(FOCUS, "run-0:open")),
+        ("dh", &handles::delta_handle(FOCUS, "run-0:rec")),
     ]);
     vec![
         (
@@ -548,7 +556,7 @@ fn every_writer() -> Vec<(StoreOp, HashMap<String, String>)> {
             op(
                 "delta_confirm",
                 None,
-                Some(serde_json::json!({"delta": "did", "entity": "e"})),
+                Some(serde_json::json!({"handle": "dh"})),
             ),
             v.clone(),
         ),
@@ -558,8 +566,34 @@ fn every_writer() -> Vec<(StoreOp, HashMap<String, String>)> {
                 None,
                 Some(serde_json::json!({"delta": "did", "entity": "e"})),
             ),
-            v,
+            v.clone(),
         ),
+        // items.id=889.
+        (
+            op(
+                "case_select",
+                None,
+                Some(serde_json::json!({"handle": "th"})),
+            ),
+            v.clone(),
+        ),
+        (
+            op(
+                "case_link",
+                None,
+                Some(serde_json::json!({"case": "c", "entity": "e"})),
+            ),
+            v.clone(),
+        ),
+        (
+            op(
+                "entity_changed",
+                None,
+                Some(serde_json::json!({"case": "c"})),
+            ),
+            v.clone(),
+        ),
+        (op("session_clear", None, None), v),
     ]
 }
 
@@ -848,24 +882,46 @@ async fn another_focus_cannot_write_a_case_or_a_delta_it_did_not_record() {
             "{name}: {err}"
         );
     }
-    for name in ["delta_confirm", "delta_changed"] {
-        let err = run(
-            &mut conn,
-            &foreign,
-            &op(
-                name,
-                None,
-                Some(serde_json::json!({"delta": "d", "entity": "e"})),
-            ),
-            &v,
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            matches!(err, StoreWriteError::DeltaNotInFocus),
-            "{name}: {err}"
-        );
-    }
+    let err = run(
+        &mut conn,
+        &foreign,
+        &op(
+            "delta_changed",
+            None,
+            Some(serde_json::json!({"delta": "d", "entity": "e"})),
+        ),
+        &v,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, StoreWriteError::DeltaNotInFocus),
+        "delta_changed: {err}"
+    );
+    // delta_confirm names the delta by handle: the first Focus's handle is no
+    // handle at all for another Focus (the Focus is inside the hash and the
+    // lookup is scoped by it).
+    let mut hv = v.clone();
+    hv.insert("h".into(), handles::delta_handle(FOCUS, "run-1:rec"));
+    let err = run(
+        &mut conn,
+        &foreign,
+        &op(
+            "delta_confirm",
+            None,
+            Some(serde_json::json!({"handle": "h"})),
+        ),
+        &hv,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StoreWriteError::Handle(crate::persistence::handles::HandleError::NotFound(_))
+        ),
+        "delta_confirm: {err}"
+    );
     // A delta may not claim another Focus's case as its source.
     let claim = op(
         "delta_record",
@@ -1203,6 +1259,619 @@ async fn a_closed_case_takes_no_writer_and_the_pass_is_told() {
 }
 
 // ---------------------------------------------------------------------------
+// items.id=889: handles, case_select, case_link, entity_changed, delta_confirm
+// by handle, session_clear
+// ---------------------------------------------------------------------------
+
+use crate::persistence::handles::HandleError;
+
+/// delta_record then return the delta id it published.
+async fn record_a_delta(
+    conn: &mut SqliteConnection,
+    focus: &str,
+    run_id: &str,
+    entities: &str,
+) -> String {
+    let o = op(
+        "delta_record",
+        Some("new_delta"),
+        Some(serde_json::json!({"entities": "ents", "description": "d"})),
+    );
+    let d = run(
+        conn,
+        &ctx(focus, run_id, "rec"),
+        &o,
+        &vars(&[("ents", entities), ("d", "changed DNS")]),
+    )
+    .await
+    .expect("delta_record");
+    assert_eq!(d.outcome, Outcome::Applied);
+    d.published.expect("published the delta id").1
+}
+
+fn select_op() -> StoreOp {
+    op(
+        "case_select",
+        None,
+        Some(serde_json::json!({"handle": "h"})),
+    )
+}
+
+async fn active_case(conn: &mut SqliteConnection, focus: &str) -> Option<String> {
+    session_store::get_session_variable(conn, CHAT, focus, "active_case_id")
+        .await
+        .unwrap()
+        .map(|v| v.value)
+}
+
+#[tokio::test]
+async fn case_select_resolves_a_ticket_handle_store_side_to_the_active_case() {
+    let _root = TestRoot::new().await;
+    let mut conn = open(PERSONA).await;
+    let one = open_a_case(&mut conn, FOCUS, "run-1").await;
+    let two = open_a_case(&mut conn, FOCUS, "run-2").await;
+    assert_ne!(one, two);
+
+    let h1 = handles::case_handle(FOCUS, &one);
+    let d = run(
+        &mut conn,
+        &ctx(FOCUS, "run-3", "sel"),
+        &select_op(),
+        &vars(&[("h", &h1)]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(d.outcome, Outcome::Applied);
+    assert_eq!(
+        active_case(&mut conn, FOCUS).await.as_deref(),
+        Some(one.as_str())
+    );
+
+    // The same handle again changes nothing.
+    let d = run(
+        &mut conn,
+        &ctx(FOCUS, "run-4", "sel"),
+        &select_op(),
+        &vars(&[("h", &h1)]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(d.outcome, Outcome::AlreadyApplied);
+
+    // Another ticket, the way a model echoes a token: lower case, in brackets.
+    let h2 = format!("[{}]", handles::case_handle(FOCUS, &two).to_lowercase());
+    let d = run(
+        &mut conn,
+        &ctx(FOCUS, "run-5", "sel"),
+        &select_op(),
+        &vars(&[("h", &h2)]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(d.outcome, Outcome::Applied);
+    assert_eq!(
+        active_case(&mut conn, FOCUS).await.as_deref(),
+        Some(two.as_str())
+    );
+    let row = session_store::get_session_variable(&mut conn, CHAT, FOCUS, "active_case_id")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.version, 2, "moved through the compare-and-set");
+}
+
+#[tokio::test]
+async fn case_select_with_a_wrong_or_foreign_handle_writes_nothing_and_fails_closed() {
+    let _root = TestRoot::new().await;
+    let mut conn = open(PERSONA).await;
+    let mine = open_a_case(&mut conn, FOCUS, "run-1").await;
+    // A case another Focus opened, with its own handle.
+    let theirs = open_a_case(&mut conn, OTHER_FOCUS, "run-9").await;
+    let delta = record_a_delta(&mut conn, FOCUS, "run-2", r#"["ent-router"]"#).await;
+
+    // Closing a case takes it out of reach.
+    let closed = open_a_case(&mut conn, FOCUS, "run-3").await;
+    let c = case_store::get_case(&mut conn, &closed)
+        .await
+        .unwrap()
+        .unwrap();
+    case_store::update_case(
+        &mut conn,
+        CHAT,
+        &closed,
+        c.version,
+        &case_store::CaseUpdate {
+            state: Some(CaseState::Resolved),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let before = row_counts(&mut conn).await;
+    let cases: Vec<(&str, String)> = vec![
+        ("empty", String::new()),
+        ("garbage", "banana".to_owned()),
+        ("an internal id", mine.clone()),
+        ("wrong length", "T-ABC".to_owned()),
+        ("right shape, no such ticket", "T-00000000".to_owned()),
+        ("a delta handle", handles::delta_handle(FOCUS, &delta)),
+        // Another Focus's ticket, under either Focus's hash.
+        (
+            "foreign, own hash",
+            handles::case_handle(OTHER_FOCUS, &theirs),
+        ),
+        ("foreign, our hash", handles::case_handle(FOCUS, &theirs)),
+        ("closed ticket", handles::case_handle(FOCUS, &closed)),
+    ];
+    for (label, handle) in cases {
+        let err = run(
+            &mut conn,
+            &ctx(FOCUS, "run-5", "sel"),
+            &select_op(),
+            &vars(&[("h", &handle)]),
+        )
+        .await
+        .unwrap_err();
+        match &err {
+            StoreWriteError::Handle(HandleError::Malformed(_))
+            | StoreWriteError::Handle(HandleError::NotFound(_)) => {}
+            StoreWriteError::ArgumentEmpty { .. } if label == "empty" => {}
+            other => panic!("{label}: {other}"),
+        }
+        assert!(
+            !err.to_string().contains(&handle) || handle.is_empty(),
+            "{label}: the error must not echo the value: {err}"
+        );
+    }
+    assert_eq!(row_counts(&mut conn).await, before, "nothing was written");
+    assert_eq!(active_case(&mut conn, FOCUS).await, None);
+
+    // The foreign Focus can still select its own case, and only its own.
+    let d = run(
+        &mut conn,
+        &ctx(OTHER_FOCUS, "run-9", "sel"),
+        &select_op(),
+        &vars(&[("h", &handles::case_handle(OTHER_FOCUS, &theirs))]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(d.outcome, Outcome::Applied);
+    assert_eq!(
+        active_case(&mut conn, OTHER_FOCUS).await.as_deref(),
+        Some(theirs.as_str())
+    );
+    assert_eq!(
+        active_case(&mut conn, FOCUS).await,
+        None,
+        "session variables are per Focus"
+    );
+}
+
+#[tokio::test]
+async fn case_link_adds_an_affected_entity_and_a_closed_case_takes_no_link() {
+    let _root = TestRoot::new().await;
+    let mut conn = open(PERSONA).await;
+    let id = open_a_case(&mut conn, FOCUS, "run-1").await;
+    let link = op(
+        "case_link",
+        None,
+        Some(serde_json::json!({"case": "c", "entity": "e"})),
+    );
+    let v = vars(&[("c", &id), ("e", "ent-modem")]);
+    let d = run(&mut conn, &ctx(FOCUS, "run-2", "link"), &link, &v)
+        .await
+        .unwrap();
+    assert_eq!(d.outcome, Outcome::Applied);
+    let links = case_store::list_case_entities(&mut conn, &id)
+        .await
+        .unwrap();
+    assert_eq!(links.len(), 2);
+    assert!(links
+        .iter()
+        .any(|l| l.entity_id == "ent-modem" && l.role == EntityRole::Affected));
+    let d = run(&mut conn, &ctx(FOCUS, "run-3", "link"), &link, &v)
+        .await
+        .unwrap();
+    assert_eq!(d.outcome, Outcome::AlreadyApplied);
+    assert_eq!(count(&mut conn, "case_entities").await, 2);
+
+    // Another Focus cannot link to this Focus's case.
+    let err = run(&mut conn, &ctx(OTHER_FOCUS, "run-9", "link"), &link, &v)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreWriteError::CaseNotInFocus), "{err}");
+
+    // A closed case takes no further links.
+    let case = case_store::get_case(&mut conn, &id).await.unwrap().unwrap();
+    case_store::update_case(
+        &mut conn,
+        CHAT,
+        &id,
+        case.version,
+        &case_store::CaseUpdate {
+            state: Some(CaseState::Closed),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let err = run(
+        &mut conn,
+        &ctx(FOCUS, "run-4", "link"),
+        &link,
+        &vars(&[("c", &id), ("e", "ent-printer")]),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, StoreWriteError::Case(CaseStoreError::CaseClosed(_))),
+        "{err}"
+    );
+    assert_eq!(count(&mut conn, "case_entities").await, 2);
+}
+
+#[tokio::test]
+async fn entity_changed_moves_every_delta_of_the_cases_entity_for_this_focus_only() {
+    let _root = TestRoot::new().await;
+    let mut conn = open(PERSONA).await;
+    let case = open_a_case(&mut conn, FOCUS, "run-1").await; // primary ent-router
+    let d1 = record_a_delta(&mut conn, FOCUS, "run-2", r#"["ent-router"]"#).await;
+    let d2 = record_a_delta(&mut conn, FOCUS, "run-3", r#"["ent-router","ent-modem"]"#).await;
+    let other_entity = record_a_delta(&mut conn, FOCUS, "run-4", r#"["ent-printer"]"#).await;
+    let other_focus = record_a_delta(&mut conn, OTHER_FOCUS, "run-5", r#"["ent-router"]"#).await;
+    // One delta is already confirmed: the event still moves it.
+    case_store::set_delta_entity_status(
+        &mut conn,
+        CHAT,
+        &d1,
+        "ent-router",
+        DeltaStatus::ConfirmedActive,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let ev = op(
+        "entity_changed",
+        None,
+        Some(serde_json::json!({"case": "c"})),
+    );
+    let v = vars(&[("c", &case)]);
+    let before = Utc::now();
+    let d = run(&mut conn, &ctx(FOCUS, "run-6", "evt"), &ev, &v)
+        .await
+        .unwrap();
+    assert_eq!(d.outcome, Outcome::Applied);
+
+    let status = |deltas: &[case_store::EntityConfigDelta], id: &str, entity: &str| {
+        deltas
+            .iter()
+            .find(|d| d.delta_id == id && d.entity_id == entity)
+            .map(|d| (d.stored_status, d.status_changed_at.clone()))
+            .unwrap_or_else(|| panic!("{id}/{entity}"))
+    };
+    let router =
+        case_store::list_config_deltas_for_entity(&mut conn, "ent-router", None, Utc::now())
+            .await
+            .unwrap();
+    // Both of this Focus's router deltas moved, whatever they were.
+    for id in [&d1, &d2] {
+        let (st, at) = status(&router, id, "ent-router");
+        assert_eq!(st, DeltaStatus::BelievedChanged, "{id}");
+        // Never an explicit time: the clock is the moment of the write.
+        let stamped = chrono::DateTime::parse_from_rfc3339(&at).unwrap();
+        assert!(stamped >= before - chrono::Duration::seconds(1), "{id}");
+    }
+    // The other Focus's delta on the SAME entity is untouched (decisions.id=509).
+    assert_eq!(
+        status(&router, &other_focus, "ent-router").0,
+        DeltaStatus::BelievedActive
+    );
+    // A delta's other entity is not the event's entity.
+    let modem = case_store::list_config_deltas_for_entity(&mut conn, "ent-modem", None, Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(
+        status(&modem, &d2, "ent-modem").0,
+        DeltaStatus::BelievedActive
+    );
+    // A delta on another entity is untouched.
+    let printer =
+        case_store::list_config_deltas_for_entity(&mut conn, "ent-printer", None, Utc::now())
+            .await
+            .unwrap();
+    assert_eq!(
+        status(&printer, &other_entity, "ent-printer").0,
+        DeltaStatus::BelievedActive
+    );
+
+    // The same event again has nothing to move.
+    let d = run(&mut conn, &ctx(FOCUS, "run-7", "evt"), &ev, &v)
+        .await
+        .unwrap();
+    assert_eq!(d.outcome, Outcome::AlreadyApplied);
+
+    // The case must be this Focus's.
+    let err = run(&mut conn, &ctx(OTHER_FOCUS, "run-9", "evt"), &ev, &v)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreWriteError::CaseNotInFocus), "{err}");
+}
+
+#[tokio::test]
+async fn delta_confirm_by_handle_confirms_every_entity_of_the_delta_for_this_focus() {
+    let _root = TestRoot::new().await;
+    let mut conn = open(PERSONA).await;
+    let two_entities =
+        record_a_delta(&mut conn, FOCUS, "run-1", r#"["ent-router","ent-modem"]"#).await;
+    let foreign = record_a_delta(&mut conn, OTHER_FOCUS, "run-2", r#"["ent-router"]"#).await;
+    let confirm = op(
+        "delta_confirm",
+        None,
+        Some(serde_json::json!({"handle": "h"})),
+    );
+
+    let d = run(
+        &mut conn,
+        &ctx(FOCUS, "run-3", "conf"),
+        &confirm,
+        &vars(&[("h", &handles::delta_handle(FOCUS, &two_entities))]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(d.outcome, Outcome::Applied);
+    for entity in ["ent-router", "ent-modem"] {
+        let rows =
+            case_store::list_config_deltas_for_entity(&mut conn, entity, Some(FOCUS), Utc::now())
+                .await
+                .unwrap();
+        assert_eq!(
+            rows[0].stored_status,
+            DeltaStatus::ConfirmedActive,
+            "{entity}"
+        );
+    }
+
+    // Unknown, malformed, a ticket handle and another Focus's delta: nothing.
+    let before_foreign =
+        case_store::list_config_deltas_for_entity(&mut conn, "ent-router", None, Utc::now())
+            .await
+            .unwrap();
+    for handle in [
+        "D-00000000".to_owned(),
+        "not a handle".to_owned(),
+        handles::case_handle(FOCUS, &two_entities),
+        handles::delta_handle(OTHER_FOCUS, &foreign),
+        handles::delta_handle(FOCUS, &foreign),
+    ] {
+        let err = run(
+            &mut conn,
+            &ctx(FOCUS, "run-4", "conf"),
+            &confirm,
+            &vars(&[("h", &handle)]),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, StoreWriteError::Handle(_)), "{handle}: {err}");
+    }
+    let after_foreign =
+        case_store::list_config_deltas_for_entity(&mut conn, "ent-router", None, Utc::now())
+            .await
+            .unwrap();
+    assert_eq!(before_foreign, after_foreign, "nothing changed");
+}
+
+#[tokio::test]
+async fn session_clear_resets_the_intent_and_the_active_case_and_never_the_latch() {
+    let _root = TestRoot::new().await;
+    let mut conn = open(PERSONA).await;
+    let case = open_a_case(&mut conn, FOCUS, "run-1").await;
+    let other_case = open_a_case(&mut conn, OTHER_FOCUS, "run-2").await;
+    let put = |name: &'static str, var: &'static str| {
+        op(
+            "session_put",
+            Some(name),
+            Some(serde_json::json!({ "value": var })),
+        )
+    };
+    let v = vars(&[("i", "billing"), ("c", &case), ("oc", &other_case)]);
+    for (focus, name, var) in [
+        (FOCUS, "locked_intent", "i"),
+        (FOCUS, "active_case_id", "c"),
+        (OTHER_FOCUS, "locked_intent", "i"),
+        (OTHER_FOCUS, "active_case_id", "oc"),
+    ] {
+        run(&mut conn, &ctx(focus, "run-3", "put"), &put(name, var), &v)
+            .await
+            .unwrap();
+    }
+    // Another chat has a latch and an active case of its own.
+    session_store::latch_write_suppressed(&mut conn, "chat-other", FOCUS, "run-x")
+        .await
+        .unwrap();
+    let clear = op("session_clear", None, None);
+
+    let d = run(&mut conn, &ctx(FOCUS, "run-4", "clear"), &clear, &vars(&[]))
+        .await
+        .unwrap();
+    assert_eq!(d.outcome, Outcome::Applied);
+    async fn get(
+        conn: &mut SqliteConnection,
+        focus: &str,
+        name: &str,
+    ) -> Option<session_store::SessionVariable> {
+        session_store::get_session_variable(conn, CHAT, focus, name)
+            .await
+            .unwrap()
+    }
+    assert!(get(&mut conn, FOCUS, "locked_intent").await.is_none());
+    assert!(get(&mut conn, FOCUS, "active_case_id").await.is_none());
+    // Another Focus's rows in this chat are untouched.
+    assert!(get(&mut conn, OTHER_FOCUS, "locked_intent").await.is_some());
+    assert!(get(&mut conn, OTHER_FOCUS, "active_case_id")
+        .await
+        .is_some());
+    // The case itself is untouched: clearing the pointer closes nothing.
+    assert!(case_store::get_case(&mut conn, &case)
+        .await
+        .unwrap()
+        .is_some());
+    // Another chat's latch is untouched.
+    assert_eq!(
+        session_store::write_mode(&mut conn, "chat-other")
+            .await
+            .unwrap(),
+        WriteMode::Suppressed
+    );
+    // A second clear has nothing to do.
+    let d = run(&mut conn, &ctx(FOCUS, "run-5", "clear"), &clear, &vars(&[]))
+        .await
+        .unwrap();
+    assert_eq!(d.outcome, Outcome::AlreadyApplied);
+
+    // The latch is not in the list of what it may remove, and a latched chat
+    // refuses the writer instead (every_writer covers that), so the chat's own
+    // latch cannot be cleared through here.
+    assert!(!session_store::CLEARABLE_SESSION_NAMES.contains(&session_store::WRITE_MODE_NAME));
+    assert_eq!(
+        session_store::CLEARABLE_SESSION_NAMES,
+        [
+            crate::conductor::bound_spec::LOCKED_INTENT,
+            crate::conductor::bound_spec::ACTIVE_CASE_ID
+        ],
+        "the clearable names are exactly the two session names"
+    );
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/persistence/session_store.rs"),
+    )
+    .unwrap();
+    let production = source.split("#[cfg(test)]").next().unwrap();
+    let flat = production.split_whitespace().collect::<Vec<_>>().join(" ");
+    let delete = flat
+        .match_indices("DELETE FROM session_variables")
+        .map(|(i, _)| &flat[i..i + 200])
+        .collect::<Vec<_>>();
+    assert_eq!(delete.len(), 1, "one delete in the store: {delete:?}");
+    assert!(
+        delete[0].contains("AND name <> ?") && delete[0].contains("name IN (?, ?)"),
+        "the delete names its two variables and excludes the latch: {}",
+        delete[0]
+    );
+}
+
+#[tokio::test]
+async fn the_new_operations_are_isolated_per_persona() {
+    let _root = TestRoot::new().await;
+    let mut one = open("persona-one").await;
+    let mut two = open("persona-two").await;
+    let case = open_a_case(&mut one, FOCUS, "run-1").await;
+    let delta = record_a_delta(&mut one, FOCUS, "run-2", r#"["ent-router"]"#).await;
+    run(
+        &mut one,
+        &ctx(FOCUS, "run-3", "sel"),
+        &select_op(),
+        &vars(&[("h", &handles::case_handle(FOCUS, &case))]),
+    )
+    .await
+    .unwrap();
+
+    // Persona one's handles resolve to nothing in persona two's file.
+    let err = run(
+        &mut two,
+        &ctx(FOCUS, "run-4", "sel"),
+        &select_op(),
+        &vars(&[("h", &handles::case_handle(FOCUS, &case))]),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, StoreWriteError::Handle(HandleError::NotFound(_))),
+        "{err}"
+    );
+    let err = run(
+        &mut two,
+        &ctx(FOCUS, "run-4", "conf"),
+        &op(
+            "delta_confirm",
+            None,
+            Some(serde_json::json!({"handle": "h"})),
+        ),
+        &vars(&[("h", &handles::delta_handle(FOCUS, &delta))]),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, StoreWriteError::Handle(HandleError::NotFound(_))),
+        "{err}"
+    );
+    // Clearing persona two's session state leaves persona one's alone.
+    run(
+        &mut two,
+        &ctx(FOCUS, "run-5", "clear"),
+        &op("session_clear", None, None),
+        &vars(&[]),
+    )
+    .await
+    .unwrap();
+    assert!(active_case(&mut one, FOCUS).await.is_some());
+    assert_eq!(row_counts(&mut two).await, [0, 0, 0, 0, 0, 0]);
+}
+
+/// A guard-false row writes nothing, and the new operations are no exception:
+/// the guard is decided before a handler is reached (lifecycle execute tests),
+/// and a refused handle leaves no partial write behind.
+#[tokio::test]
+async fn a_failed_handle_resolution_leaves_no_partial_write_behind() {
+    let _root = TestRoot::new().await;
+    let mut conn = open(PERSONA).await;
+    let case = open_a_case(&mut conn, FOCUS, "run-1").await;
+    let delta = record_a_delta(&mut conn, FOCUS, "run-2", r#"["ent-router"]"#).await;
+    let before = row_counts(&mut conn).await;
+    let stored =
+        case_store::list_config_deltas_for_entity(&mut conn, "ent-router", Some(FOCUS), Utc::now())
+            .await
+            .unwrap();
+    run(
+        &mut conn,
+        &ctx(FOCUS, "run-3", "sel"),
+        &select_op(),
+        &vars(&[("h", "T-ZZZZZZZZ")]),
+    )
+    .await
+    .unwrap_err();
+    run(
+        &mut conn,
+        &ctx(FOCUS, "run-3", "conf"),
+        &op(
+            "delta_confirm",
+            None,
+            Some(serde_json::json!({"handle": "h"})),
+        ),
+        &vars(&[("h", "D-ZZZZZZZZ")]),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(row_counts(&mut conn).await, before);
+    assert_eq!(
+        case_store::list_config_deltas_for_entity(&mut conn, "ent-router", Some(FOCUS), Utc::now())
+            .await
+            .unwrap(),
+        stored
+    );
+    // And the real handles still work afterwards.
+    run(
+        &mut conn,
+        &ctx(FOCUS, "run-4", "sel"),
+        &select_op(),
+        &vars(&[("h", &handles::case_handle(FOCUS, &case))]),
+    )
+    .await
+    .unwrap();
+    let _ = delta;
+}
+
+// ---------------------------------------------------------------------------
 // Source scans
 // ---------------------------------------------------------------------------
 
@@ -1228,7 +1897,7 @@ fn the_status_writer_never_passes_an_explicit_at() {
     let rest = &flat[calls[0] + needle.len()..];
     let args = &rest[..rest.find(')').expect("call closes")];
     assert!(
-        args.trim_end().ends_with(", None"),
+        args.trim_end().trim_end_matches(',').ends_with(", None"),
         "the last argument (at) must be None: {args}"
     );
     // No other source of a timestamp reaches a status call.

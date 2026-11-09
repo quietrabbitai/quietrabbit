@@ -59,12 +59,39 @@
 // routes on locked_intent must have a row that still runs on the first message.
 // A row's output_var may not be a bound name.
 //
+// AND-GUARDS (items.id=889, decisions.id=940 ruling 1, shared_042.sql). A row may
+// carry the single guard above AND a list of further clauses (guard_clauses, a
+// JSON array of {var, op, value}); the row runs only when EVERY clause holds.
+// AND only: no OR, no negation, no expression string, the same five operators.
+// The row's whole clause set, single guard included, is capped at
+// MAX_GUARD_CLAUSES. Every clause variable must come from an earlier row or be a
+// bound name, the path enumeration branches over every clause's variable, and
+// the unreachable-row, empty-path and router-fallback checks run over the clause
+// SETS (a row whose clauses contradict, such as two different eq literals on one
+// variable, runs on no path and fails LOAD as unreachable).
+//
+// CLOSE-TICKET LINT (items.id=889): a case that reaches a terminal state takes no
+// further writes (case_store), so a row that writes the case AFTER one that may
+// have closed it would fail the pass at run time. LOAD proves it cannot happen:
+// on every path, a case_update whose state may be terminal is the LAST case
+// write (case_update, strategy_append, case_link) that runs. "May be terminal"
+// is read off the path: a state variable the row's own clauses pin to a
+// non-terminal literal is not closing, one pinned to resolved, replaced or closed
+// is, and one no clause pins is treated as closing (the cautious side), so an
+// author orders it last or pins it.
+//
 // NOT HERE: back-edges, user turns and Tech Support (decisions.id=938).
 
 use std::collections::{HashMap, HashSet};
 
 use crate::conductor::bound_spec::{self, Literals, Presence};
 use crate::conductor::types::TaskTrack;
+
+/// Most clauses one row may carry in total: the single guard (when set) plus the
+/// guard_clauses list (items.id=889). Four covers the Tech Support draft (an
+/// intent, a ticket state, the write mode and one result variable) and keeps the
+/// path enumeration, which multiplies over every variable a clause reads, small.
+pub const MAX_GUARD_CLAUSES: usize = 4;
 
 /// Most paths LOAD will enumerate for one Focus. An authoring guard only: there
 /// is no runtime turn cap (decisions.id=938, decisions.id=519 stands).
@@ -110,6 +137,20 @@ pub enum GuardError {
     BadLiteral(String),
     #[error("guard_value for 'in' is not a JSON array of strings: {0}")]
     BadInList(String),
+    #[error("guard_clauses is not a JSON array of clause objects (var, op, value): {0}")]
+    BadClauses(String),
+    #[error("guard_clauses is an empty array (leave the column NULL for no clauses)")]
+    EmptyClauses,
+    #[error("guard_clauses[{index}]: {source}")]
+    Clause {
+        index: usize,
+        #[source]
+        source: Box<GuardError>,
+    },
+    #[error("guard_clauses[{index}] duplicates an earlier clause")]
+    DuplicateClause { index: usize },
+    #[error("a row may carry at most {MAX_GUARD_CLAUSES} guard clauses in total (the single guard counts as one), this one has {0}")]
+    TooManyClauses(usize),
 }
 
 fn check_literal(raw: &str) -> Result<String, GuardError> {
@@ -233,6 +274,100 @@ impl Guard {
     }
 }
 
+/// One clause of the guard_clauses JSON array. Unknown keys are an error (and
+/// serde rejects a repeated key), so a typo cannot silently drop a condition.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawClause {
+    var: String,
+    op: String,
+    #[serde(default)]
+    value: Option<serde_json::Value>,
+}
+
+impl RawClause {
+    fn into_guard(self) -> Result<Guard, GuardError> {
+        use serde_json::Value;
+        // The value's JSON type is checked per operator HERE, so that an eq
+        // literal can never be an array that from_columns would read as text.
+        let value: Option<String> = match (self.op.as_str(), self.value) {
+            ("eq" | "ne", Some(Value::String(s))) => Some(s),
+            ("eq" | "ne", Some(_)) => {
+                return Err(GuardError::BadLiteral(
+                    "the value of eq and ne is one JSON string".to_owned(),
+                ))
+            }
+            ("in", Some(v @ Value::Array(_))) => Some(v.to_string()),
+            ("in", Some(_)) => {
+                return Err(GuardError::BadInList(
+                    "the value of in is a JSON array of strings".to_owned(),
+                ))
+            }
+            ("present" | "absent", Some(v)) => Some(v.to_string()),
+            (_, None) => None,
+            (_, Some(_)) => None,
+        };
+        Guard::from_columns(Some(&self.var), Some(&self.op), value.as_deref())
+            .map(|g| g.expect("var and op are set, so a guard is built"))
+    }
+}
+
+/// Parses the guard_clauses column (shared_042.sql). `None` and an absent column
+/// are the empty list. The caller adds the single guard to get the row's whole
+/// clause set and checks the total with check_clause_total().
+pub fn parse_clauses(text: Option<&str>) -> Result<Vec<Guard>, GuardError> {
+    let Some(text) = text else {
+        return Ok(Vec::new());
+    };
+    let raw: Vec<RawClause> =
+        serde_json::from_str(text).map_err(|e| GuardError::BadClauses(e.to_string()))?;
+    if raw.is_empty() {
+        return Err(GuardError::EmptyClauses);
+    }
+    let mut out: Vec<Guard> = Vec::with_capacity(raw.len());
+    for (index, clause) in raw.into_iter().enumerate() {
+        let g = clause.into_guard().map_err(|e| GuardError::Clause {
+            index,
+            source: Box::new(e),
+        })?;
+        if out.contains(&g) {
+            return Err(GuardError::DuplicateClause { index });
+        }
+        out.push(g);
+    }
+    Ok(out)
+}
+
+/// The cap over a row's whole clause set: the single guard plus the list.
+pub fn check_clause_total(single: Option<&Guard>, clauses: &[Guard]) -> Result<(), GuardError> {
+    let total = clauses.len() + usize::from(single.is_some());
+    if total > MAX_GUARD_CLAUSES {
+        return Err(GuardError::TooManyClauses(total));
+    }
+    if let Some(s) = single {
+        if let Some(index) = clauses.iter().position(|c| c == s) {
+            return Err(GuardError::DuplicateClause { index });
+        }
+    }
+    Ok(())
+}
+
+/// A row's whole clause set in evaluation order: the single guard, then the list.
+pub fn clause_set<'a>(single: Option<&'a Guard>, clauses: &'a [Guard]) -> Vec<&'a Guard> {
+    single.into_iter().chain(clauses.iter()).collect()
+}
+
+/// AND over a clause set: true when every clause holds. The empty set holds, so
+/// an unguarded row runs.
+pub fn all_hold(clauses: &[&Guard], vars: &HashMap<String, String>) -> bool {
+    clauses.iter().all(|g| g.evaluate(vars))
+}
+
+/// The first clause of the set that does not hold (for the skip log line).
+pub fn first_false<'a>(clauses: &[&'a Guard], vars: &HashMap<String, String>) -> Option<&'a Guard> {
+    clauses.iter().copied().find(|g| !g.evaluate(vars))
+}
+
 /// The track's variables, last write wins by name: the same view
 /// collect_output_vars() gives a step's prompt. A step with no or an empty
 /// output_var contributes nothing.
@@ -256,7 +391,9 @@ pub fn track_vars(track: &TaskTrack) -> HashMap<String, String> {
 /// What the analysis needs to know about one composition row.
 pub struct RowShape<'a> {
     pub action_id: &'a str,
-    pub guard: Option<&'a Guard>,
+    /// The row's whole clause set, ALL of which must hold for it to run (the
+    /// single guard first, then guard_clauses). Empty for an unguarded row.
+    pub guards: Vec<&'a Guard>,
     /// The variable the row records when it runs. For a block row this is the
     /// handler's declared output variable, not ActionDefinition.output_var.
     pub output_var: Option<&'a str>,
@@ -274,6 +411,12 @@ pub struct RowShape<'a> {
     /// row produces must have been produced by a row that ran EARLIER on that
     /// path.
     pub reads: Vec<&'a str>,
+    /// items.id=889: a store writer that writes the CASE (case_update,
+    /// strategy_append or case_link). Used by the close-ticket lint.
+    pub case_write: bool,
+    /// items.id=889: for a case_update that sets the lifecycle state, the
+    /// variable that supplies it. None for every other row.
+    pub state_var: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -300,6 +443,12 @@ pub enum CompositionError {
     ReadsUnsetVariable {
         action_id: String,
         var: String,
+        path: String,
+    },
+    #[error("step '{closing}' may close the ticket but step '{later}' writes the case after it: a terminal case takes no further writes, so the closing case_update must be the last case write on every path ({path}). Reorder the rows, or pin the state variable to non-terminal literals with a clause")]
+    CloseNotLast {
+        closing: String,
+        later: String,
         path: String,
     },
     #[error("router variable '{var}' has no fallback row: when it matches none of its literals no step guarded on it runs ({path}). Add a row with an 'ne' or 'present' guard on '{var}'")]
@@ -333,9 +482,17 @@ fn registry_bound() -> Vec<BoundVar<'static>> {
 
 /// One enumerated path: the executed row indices, and the modelled value of
 /// every guard variable at the end of it (None = never set on this path).
-struct Path {
-    rows: Vec<usize>,
-    values: Vec<(String, Option<String>)>,
+#[derive(Debug, Clone)]
+pub struct Path {
+    pub rows: Vec<usize>,
+    pub values: Vec<(String, Option<String>)>,
+}
+
+impl Path {
+    /// The modelled guard variables of the path as text, for reports.
+    pub fn describe(&self) -> String {
+        describe(&self.values)
+    }
 }
 
 fn describe(values: &[(String, Option<String>)]) -> String {
@@ -406,7 +563,7 @@ impl Walk<'_, '_> {
         }
         let row = &self.rows[i];
         // The same evaluator the runtime uses, over the modelled values.
-        let runs = row.guard.is_none_or(|g| g.evaluate(&self.state));
+        let runs = row.guards.iter().all(|g| g.evaluate(&self.state));
         if !runs {
             return self.go(i + 1);
         }
@@ -443,7 +600,14 @@ impl Walk<'_, '_> {
 /// Validates the guards of one composition and returns the number of paths.
 /// An unguarded composition has exactly one path.
 pub fn analyze_composition(rows: &[RowShape]) -> Result<usize, CompositionError> {
-    analyze_composition_with(rows, &registry_bound())
+    analyze_composition_paths(rows).map(|p| p.len())
+}
+
+/// analyze_composition() returning the enumerated paths themselves (the rows
+/// each one runs and its modelled guard variables), for the acceptance report
+/// of items.id=889.
+pub fn analyze_composition_paths(rows: &[RowShape]) -> Result<Vec<Path>, CompositionError> {
+    analyze_paths_with(rows, &registry_bound())
 }
 
 /// analyze_composition() over an explicit set of bound names (tests).
@@ -451,6 +615,13 @@ pub fn analyze_composition_with(
     rows: &[RowShape],
     bound: &[BoundVar],
 ) -> Result<usize, CompositionError> {
+    analyze_paths_with(rows, bound).map(|p| p.len())
+}
+
+fn analyze_paths_with(
+    rows: &[RowShape],
+    bound: &[BoundVar],
+) -> Result<Vec<Path>, CompositionError> {
     // 0. No row's output is a bound name: the seed and the output would share
     // one variable.
     for row in rows {
@@ -468,7 +639,7 @@ pub fn analyze_composition_with(
     // 1. Every guard variable comes from an earlier row's output, or is a
     // bound name (available from row 0).
     for (i, row) in rows.iter().enumerate() {
-        if let Some(g) = row.guard {
+        for g in &row.guards {
             let earlier = rows[..i].iter().any(|r| r.output_var == Some(&*g.var));
             let is_bound = bound.iter().any(|b| b.name == g.var);
             if !earlier && !is_bound {
@@ -484,7 +655,7 @@ pub fn analyze_composition_with(
     let mut domains: HashMap<String, Vec<String>> = HashMap::new();
     let mut guard_vars: Vec<String> = Vec::new();
     let mut routers: Vec<String> = Vec::new();
-    for g in rows.iter().filter_map(|r| r.guard) {
+    for g in rows.iter().flat_map(|r| r.guards.iter().copied()) {
         let d = domains.entry(g.var.clone()).or_insert_with(|| {
             guard_vars.push(g.var.clone());
             Vec::new()
@@ -597,6 +768,7 @@ pub fn analyze_composition_with(
                 }
             }
         }
+        check_close_is_last(rows, p)?;
         for router in &routers {
             let is_other = p
                 .values
@@ -605,10 +777,13 @@ pub fn analyze_composition_with(
             if !is_other {
                 continue;
             }
+            // A row that runs on this path with a clause on the router: while
+            // the router is OTHER only an ne or present clause can hold, so any
+            // such row that ran is the fallback.
             let has_fallback = p
                 .rows
                 .iter()
-                .any(|&i| rows[i].guard.is_some_and(|g| &g.var == router));
+                .any(|&i| rows[i].guards.iter().any(|g| &g.var == router));
             if !has_fallback {
                 return Err(CompositionError::NoFallback {
                     var: router.clone(),
@@ -618,7 +793,43 @@ pub fn analyze_composition_with(
         }
     }
 
-    Ok(paths.len())
+    Ok(paths)
+}
+
+/// True when `value` names a terminal case state (resolved, replaced, closed).
+fn is_terminal_state(value: &str) -> bool {
+    crate::persistence::case_store::CaseState::parse(value)
+        .is_some_and(crate::persistence::case_store::CaseState::is_terminal)
+}
+
+/// The close-ticket lint over one path (see the module header): a case_update
+/// that may reach a terminal state must be the last case write that runs.
+fn check_close_is_last(rows: &[RowShape], p: &Path) -> Result<(), CompositionError> {
+    for (pos, &i) in p.rows.iter().enumerate() {
+        let Some(state_var) = rows[i].state_var else {
+            continue;
+        };
+        let may_close = match p.values.iter().find(|(v, _)| v == state_var) {
+            // A modelled literal: closing exactly when it is a terminal state.
+            // OTHER stands for any value no clause names, a terminal state
+            // among them, so it may close. An unset variable fails the writer.
+            Some((_, Some(v))) => v == OTHER || is_terminal_state(v),
+            Some((_, None)) => false,
+            // Not pinned by any clause anywhere: the cautious side.
+            None => true,
+        };
+        if !may_close {
+            continue;
+        }
+        if let Some(&j) = p.rows[pos + 1..].iter().find(|&&j| rows[j].case_write) {
+            return Err(CompositionError::CloseNotLast {
+                closing: rows[i].action_id.to_owned(),
+                later: rows[j].action_id.to_owned(),
+                path: p.describe(),
+            });
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -808,12 +1019,14 @@ mod tests {
             .iter()
             .map(|x| RowShape {
                 action_id: x.id,
-                guard: x.guard.as_ref(),
+                guards: x.guard.as_ref().into_iter().collect(),
                 output_var: x.out,
                 is_block: x.block,
                 local_and_no_handoff: x.local,
                 transparent: false,
                 reads: Vec::new(),
+                case_write: false,
+                state_var: None,
             })
             .collect();
         analyze_composition(&shapes)
@@ -1167,12 +1380,14 @@ mod tests {
     ) -> RowShape<'a> {
         RowShape {
             action_id: id,
-            guard,
+            guards: guard.into_iter().collect(),
             output_var: out,
             is_block: block,
             local_and_no_handoff: true,
             transparent: writer,
             reads: reads.to_vec(),
+            case_write: false,
+            state_var: None,
         }
     }
 
@@ -1248,12 +1463,14 @@ mod tests {
             .iter()
             .map(|x| RowShape {
                 action_id: x.id,
-                guard: x.guard.as_ref(),
+                guards: x.guard.as_ref().into_iter().collect(),
                 output_var: x.out,
                 is_block: false,
                 local_and_no_handoff: true,
                 transparent: false,
                 reads: Vec::new(),
+                case_write: false,
+                state_var: None,
             })
             .collect();
         let bound = [BoundVar {
@@ -1278,5 +1495,419 @@ mod tests {
             analyze_composition_with(&shapes, &[]),
             Err(CompositionError::UnknownVariable { .. })
         ));
+    }
+
+    // -- items.id=889: AND-guards --------------------------------------------
+
+    fn cl(text: &str) -> Result<Vec<Guard>, GuardError> {
+        parse_clauses(Some(text))
+    }
+
+    #[test]
+    fn no_clause_list_is_the_empty_list_and_every_operator_parses() {
+        assert_eq!(parse_clauses(None), Ok(Vec::new()));
+        let v = cl(r#"[
+            {"var":"a","op":"eq","value":" x "},
+            {"var":"a","op":"ne","value":"y"},
+            {"var":"b","op":"in","value":["p","q"]},
+            {"var":"b","op":"present"},
+            {"var":"c","op":"absent"}
+        ]"#)
+        .unwrap();
+        assert_eq!(v.len(), 5);
+        assert_eq!(v[0].condition, Condition::Eq("x".into()));
+        assert_eq!(v[2].condition, Condition::In(vec!["p".into(), "q".into()]));
+        assert_eq!(v[4].condition, Condition::Absent);
+    }
+
+    #[test]
+    fn a_malformed_clause_list_has_its_own_error_per_fault() {
+        assert!(matches!(cl("nope"), Err(GuardError::BadClauses(_))));
+        assert!(matches!(cl("{}"), Err(GuardError::BadClauses(_))));
+        assert_eq!(cl("[]"), Err(GuardError::EmptyClauses));
+        // Unknown key, missing key, repeated key: all structural.
+        for bad in [
+            r#"[{"var":"a","op":"present","x":1}]"#,
+            r#"[{"var":"a"}]"#,
+            r#"[{"op":"present"}]"#,
+            r#"[{"var":"a","var":"b","op":"present"}]"#,
+            r#"["a"]"#,
+        ] {
+            assert!(matches!(cl(bad), Err(GuardError::BadClauses(_))), "{bad}");
+        }
+        // A fault inside a clause names its index.
+        match cl(r#"[{"var":"a","op":"present"},{"var":"a","op":"matches","value":"x"}]"#) {
+            Err(GuardError::Clause { index: 1, source }) => {
+                assert_eq!(*source, GuardError::UnknownOperator("matches".into()));
+            }
+            other => panic!("{other:?}"),
+        }
+        // The JSON type of the value is checked per operator.
+        assert!(matches!(
+            cl(r#"[{"var":"a","op":"eq","value":["x"]}]"#),
+            Err(GuardError::Clause { index: 0, .. })
+        ));
+        assert!(matches!(
+            cl(r#"[{"var":"a","op":"in","value":"x"}]"#),
+            Err(GuardError::Clause { index: 0, .. })
+        ));
+        assert!(matches!(
+            cl(r#"[{"var":"a","op":"present","value":"x"}]"#),
+            Err(GuardError::Clause { index: 0, .. })
+        ));
+        assert_eq!(
+            cl(r#"[{"var":"a","op":"present"},{"var":"a","op":"present"}]"#),
+            Err(GuardError::DuplicateClause { index: 1 })
+        );
+    }
+
+    #[test]
+    fn the_clause_cap_counts_the_single_guard() {
+        let four = cl(r#"[
+            {"var":"a","op":"present"},{"var":"b","op":"present"},
+            {"var":"c","op":"present"},{"var":"d","op":"present"}
+        ]"#)
+        .unwrap();
+        assert_eq!(four.len(), MAX_GUARD_CLAUSES);
+        assert_eq!(check_clause_total(None, &four), Ok(()));
+        let single = g("e", "present", None);
+        assert_eq!(
+            check_clause_total(Some(&single), &four),
+            Err(GuardError::TooManyClauses(5))
+        );
+        assert_eq!(
+            check_clause_total(Some(&single), &four[..3]),
+            Ok(()),
+            "single + three is exactly the cap"
+        );
+        // The single guard repeated in the list is a duplicate.
+        assert_eq!(
+            check_clause_total(Some(&four[0]), &four[..3]),
+            Err(GuardError::DuplicateClause { index: 0 })
+        );
+    }
+
+    #[test]
+    fn a_clause_set_holds_only_when_every_clause_holds() {
+        let a = g("intent", "eq", Some("a"));
+        let b = g("state", "in", Some(r#"["x","y"]"#));
+        let c = g("mode", "present", None);
+        let set = [&a, &b, &c];
+        let all = vars(&[("intent", "a"), ("state", "y"), ("mode", "m")]);
+        assert!(all_hold(&set, &all));
+        assert!(first_false(&set, &all).is_none());
+        for broken in [
+            vars(&[("intent", "b"), ("state", "y"), ("mode", "m")]),
+            vars(&[("intent", "a"), ("state", "z"), ("mode", "m")]),
+            vars(&[("intent", "a"), ("state", "y")]),
+        ] {
+            assert!(!all_hold(&set, &broken), "{broken:?}");
+        }
+        // The first clause that fails is the one reported.
+        let broken = vars(&[("intent", "a"), ("state", "z"), ("mode", "m")]);
+        assert_eq!(
+            first_false(&set, &broken).map(|g| g.var.as_str()),
+            Some("state")
+        );
+        // The empty set holds: an unguarded row runs.
+        assert!(all_hold(&[], &vars(&[])));
+        // Order of the set is single guard first, then the list.
+        let list = [b.clone(), c.clone()];
+        let ordered = clause_set(Some(&a), &list);
+        assert_eq!(
+            ordered.iter().map(|g| g.var.as_str()).collect::<Vec<_>>(),
+            ["intent", "state", "mode"]
+        );
+    }
+
+    struct M {
+        id: &'static str,
+        guards: Vec<Guard>,
+        out: Option<&'static str>,
+        case_write: bool,
+        state_var: Option<&'static str>,
+    }
+
+    fn mrow(id: &'static str, guards: Vec<Guard>, out: Option<&'static str>) -> M {
+        M {
+            id,
+            guards,
+            out,
+            case_write: false,
+            state_var: None,
+        }
+    }
+
+    fn analyze_m(rows: &[M]) -> Result<Vec<Path>, CompositionError> {
+        let shapes: Vec<RowShape> = rows
+            .iter()
+            .map(|x| RowShape {
+                action_id: x.id,
+                guards: x.guards.iter().collect(),
+                output_var: x.out,
+                is_block: false,
+                local_and_no_handoff: true,
+                transparent: false,
+                reads: Vec::new(),
+                case_write: x.case_write,
+                state_var: x.state_var,
+            })
+            .collect();
+        analyze_composition_paths(&shapes)
+    }
+
+    #[test]
+    fn two_clauses_are_anded_over_two_routers() {
+        // intent (a, OTHER) x stage (x, OTHER): four combinations. The row runs on
+        // exactly one of them.
+        let rows = [
+            mrow("route", vec![], Some("intent")),
+            mrow("step", vec![], Some("stage")),
+            mrow(
+                "both",
+                vec![g("intent", "eq", Some("a")), g("stage", "eq", Some("x"))],
+                None,
+            ),
+            mrow("fb", vec![g("intent", "present", None)], None),
+            mrow("fb2", vec![g("stage", "present", None)], None),
+        ];
+        let paths = analyze_m(&rows).unwrap();
+        assert_eq!(paths.len(), 4);
+        let ran_both = paths.iter().filter(|p| p.rows.contains(&2)).count();
+        assert_eq!(ran_both, 1, "only intent=a AND stage=x");
+    }
+
+    #[test]
+    fn contradicting_clauses_make_a_row_unreachable() {
+        let rows = [
+            mrow("route", vec![], Some("intent")),
+            mrow(
+                "never",
+                vec![g("intent", "eq", Some("a")), g("intent", "eq", Some("b"))],
+                None,
+            ),
+            mrow("fb", vec![g("intent", "present", None)], None),
+        ];
+        assert!(matches!(
+            analyze_m(&rows),
+            Err(CompositionError::Unreachable { ref action_id }) if action_id == "never"
+        ));
+        // eq and ne of the same literal never hold together either.
+        let rows = [
+            mrow("route", vec![], Some("intent")),
+            mrow(
+                "never",
+                vec![g("intent", "eq", Some("a")), g("intent", "ne", Some("a"))],
+                None,
+            ),
+            mrow("fb", vec![g("intent", "present", None)], None),
+        ];
+        assert!(matches!(
+            analyze_m(&rows),
+            Err(CompositionError::Unreachable { .. })
+        ));
+    }
+
+    #[test]
+    fn an_in_clause_is_an_or_over_one_variable_inside_an_and() {
+        let rows = [
+            mrow("route", vec![], Some("intent")),
+            mrow("step", vec![], Some("stage")),
+            mrow(
+                "either",
+                vec![
+                    g("intent", "in", Some(r#"["a","b"]"#)),
+                    g("stage", "eq", Some("x")),
+                ],
+                None,
+            ),
+            mrow("fb", vec![g("intent", "present", None)], None),
+            mrow("fb2", vec![g("stage", "present", None)], None),
+        ];
+        let paths = analyze_m(&rows).unwrap();
+        // intent: a, b, OTHER; stage: x, OTHER = 6 paths, the row on 2 of them.
+        assert_eq!(paths.len(), 6);
+        assert_eq!(paths.iter().filter(|p| p.rows.contains(&2)).count(), 2);
+    }
+
+    #[test]
+    fn an_unknown_variable_in_any_clause_fails() {
+        let rows = [
+            mrow("route", vec![], Some("intent")),
+            mrow(
+                "bad",
+                vec![g("intent", "present", None), g("ghost", "present", None)],
+                None,
+            ),
+        ];
+        assert!(matches!(
+            analyze_m(&rows),
+            Err(CompositionError::UnknownVariable { ref var, .. }) if var == "ghost"
+        ));
+        // A clause may name a bound name (write_mode) from row 0.
+        let rows = [
+            mrow("a", vec![], None),
+            mrow("b", vec![g("write_mode", "eq", Some("open"))], None),
+            mrow("c", vec![g("write_mode", "ne", Some("open"))], None),
+        ];
+        assert_eq!(analyze_m(&rows).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_fallback_row_with_other_clauses_still_counts_when_it_runs_on_other() {
+        let rows = [
+            mrow("route", vec![], Some("intent")),
+            mrow("a", vec![g("intent", "eq", Some("a"))], None),
+            mrow(
+                "fb",
+                vec![
+                    g("intent", "ne", Some("a")),
+                    g("write_mode", "present", None),
+                ],
+                None,
+            ),
+        ];
+        assert_eq!(analyze_m(&rows).unwrap().len(), 4);
+        // The same row, but its second clause can never hold together with OTHER
+        // routing: no row guarded on the router runs when it is OTHER.
+        let rows = [
+            mrow("route", vec![], Some("intent")),
+            mrow("step", vec![], Some("stage")),
+            mrow("a", vec![g("intent", "eq", Some("a"))], None),
+            mrow(
+                "fb",
+                vec![g("intent", "ne", Some("a")), g("stage", "eq", Some("x"))],
+                None,
+            ),
+            mrow("sfb", vec![g("stage", "present", None)], None),
+        ];
+        // intent=OTHER with stage=OTHER: fb needs stage=x, so no row on intent runs.
+        assert!(matches!(
+            analyze_m(&rows),
+            Err(CompositionError::NoFallback { ref var, .. }) if var == "intent"
+        ));
+    }
+
+    #[test]
+    fn eight_independent_two_literal_routers_still_hit_the_path_cap_exactly() {
+        // The cap is on PATHS, not on clauses: clause sets do not change it.
+        let names = ["v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7"];
+        let mut rows: Vec<M> = names.iter().map(|&n| mrow(n, vec![], Some(n))).collect();
+        for n in names {
+            rows.push(mrow(n, vec![g(n, "eq", Some("x"))], None));
+            rows.push(mrow(n, vec![g(n, "ne", Some("x"))], None));
+        }
+        assert_eq!(analyze_m(&rows).unwrap().len(), MAX_PATHS);
+    }
+
+    // -- the close-ticket lint ------------------------------------------------
+
+    fn writer(
+        id: &'static str,
+        guards: Vec<Guard>,
+        case_write: bool,
+        state_var: Option<&'static str>,
+    ) -> M {
+        M {
+            id,
+            guards,
+            out: None,
+            case_write,
+            state_var,
+        }
+    }
+
+    #[test]
+    fn a_closing_update_before_another_case_write_is_refused_on_that_path() {
+        let terminal = || g("closure", "in", Some(r#"["resolved","closed"]"#));
+        let rows = [
+            mrow("route", vec![], Some("closure")),
+            writer("close", vec![terminal()], true, Some("closure")),
+            writer("log", vec![terminal()], true, None),
+            mrow("reply", vec![g("closure", "present", None)], None),
+        ];
+        match analyze_m(&rows) {
+            Err(CompositionError::CloseNotLast {
+                closing,
+                later,
+                path,
+            }) => {
+                assert_eq!((closing.as_str(), later.as_str()), ("close", "log"));
+                assert!(path.contains("closure='resolved'") || path.contains("closure='closed'"));
+            }
+            other => panic!("{other:?}"),
+        }
+        // Log first, close last: fine.
+        let rows = [
+            mrow("route", vec![], Some("closure")),
+            writer("log", vec![terminal()], true, None),
+            writer("close", vec![terminal()], true, Some("closure")),
+            mrow("reply", vec![g("closure", "present", None)], None),
+        ];
+        assert!(analyze_m(&rows).is_ok());
+    }
+
+    #[test]
+    fn only_a_possibly_terminal_state_counts_as_closing() {
+        let open = || g("closure", "in", Some(r#"["open","in-progress"]"#));
+        let rows = [
+            mrow("route", vec![], Some("closure")),
+            writer("update", vec![open()], true, Some("closure")),
+            writer("log", vec![open()], true, None),
+            mrow("reply", vec![g("closure", "present", None)], None),
+        ];
+        assert!(analyze_m(&rows).is_ok(), "pinned non-terminal never closes");
+        // An ne clause does not pin a state: OTHER may be any terminal value.
+        let rows = [
+            mrow("route", vec![], Some("closure")),
+            writer(
+                "update",
+                vec![g("closure", "ne", Some("open"))],
+                true,
+                Some("closure"),
+            ),
+            writer("log", vec![g("closure", "present", None)], true, None),
+            mrow("reply", vec![g("closure", "present", None)], None),
+        ];
+        assert!(matches!(
+            analyze_m(&rows),
+            Err(CompositionError::CloseNotLast { .. })
+        ));
+        // A state variable no clause names is the cautious side.
+        let rows = [
+            mrow("route", vec![], Some("closure")),
+            writer("update", vec![], true, Some("closure")),
+            writer("log", vec![], true, None),
+            mrow("reply", vec![], None),
+        ];
+        assert!(matches!(
+            analyze_m(&rows),
+            Err(CompositionError::CloseNotLast { .. })
+        ));
+        // A writer that is not a case write never trips it.
+        let rows = [
+            mrow("route", vec![], Some("closure")),
+            writer("update", vec![], true, Some("closure")),
+            writer("other", vec![], false, None),
+            mrow("reply", vec![], None),
+        ];
+        assert!(analyze_m(&rows).is_ok());
+    }
+
+    #[test]
+    fn terminal_states_are_exactly_the_stores_terminal_states() {
+        for s in ["resolved", "replaced", "closed"] {
+            assert!(is_terminal_state(s), "{s}");
+        }
+        for s in [
+            "open",
+            "in-progress",
+            "escalated",
+            "awaiting-external",
+            "nonsense",
+            "",
+        ] {
+            assert!(!is_terminal_state(s), "{s}");
+        }
     }
 }

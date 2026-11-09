@@ -16,6 +16,7 @@ pub mod group_fact_sources_store;
 pub mod group_fact_store;
 pub mod group_key_store;
 pub mod group_store;
+pub mod handles;
 pub mod ingest_blob;
 pub mod integration_keys_store;
 pub mod legacy_shape;

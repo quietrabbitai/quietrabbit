@@ -25,6 +25,15 @@
 //     never uses another's history). focus_id of a row never changes, so the
 //     check cannot go stale between the read and the write.
 //
+// HANDLES (items.id=889). case_select and delta_confirm take a HANDLE, the short
+// opaque text derived text shows (persistence::handles), never an id. The handler
+// resolves it store-side, scoped to the running focus_id: a handle that is
+// malformed, matches nothing of this Focus, or matches more than one writes
+// nothing and fails the pass closed (a latched chat still refuses first, like
+// every writer). entity_changed and case_link name a case by the session-bound
+// active_case_id or a published id, which the store checks belongs to this Focus.
+// session_clear removes only locked_intent and active_case_id, never the latch.
+//
 // NEVER AN EXPLICIT `at`. set_delta_entity_status is always called with
 // at = None, so the 90-day clock of decisions.id=510 starts at the moment of the
 // write and a row can neither back-date nor push it forward (items.id=881
@@ -59,9 +68,10 @@ use sqlx::SqliteConnection;
 use crate::conductor::bound_spec::{self, ACTIVE_CASE_ID};
 use crate::conductor::store_op::{Op, Slot, StoreOp};
 use crate::persistence::case_store::{
-    self, AppendOutcome, CaseState, CaseStoreError, CaseUpdate, DeltaOutcome, DeltaStatus, NewCase,
-    NewConfigDelta, NewStrategy, OpenOutcome, ResolutionPath,
+    self, AppendOutcome, CaseState, CaseStoreError, CaseUpdate, DeltaOutcome, DeltaStatus,
+    LinkOutcome, NewCase, NewConfigDelta, NewStrategy, OpenOutcome, ResolutionPath,
 };
+use crate::persistence::handles::{self, HandleError};
 use crate::persistence::session_store::{
     self, LatchError, LatchOutcome, PutOutcome, SessionStoreError, SessionWrite, WriteMode,
 };
@@ -122,6 +132,10 @@ pub enum StoreWriteError {
     DeltaNotInFocus,
     #[error("the id derived for this row is not valid")]
     DerivedIdInvalid,
+    #[error("the case has no primary subject entity to key the event on")]
+    CaseHasNoEntity,
+    #[error("{0}")]
+    Handle(#[from] HandleError),
     #[error("{0}")]
     Session(#[from] SessionStoreError),
     #[error("{0}")]
@@ -215,23 +229,55 @@ async fn run_inner(
             if name == ACTIVE_CASE_ID {
                 own_case(conn, ctx, value).await?;
             }
-            let current =
-                session_store::get_session_variable(conn, key, ctx.focus_id, name).await?;
-            let out = session_store::put_session_variable(
-                conn,
-                &SessionWrite {
-                    context_key: key,
-                    focus_id: ctx.focus_id,
-                    name,
-                    value,
-                    written_by_run: ctx.run_id,
-                    expected_version: current.map(|v| v.version),
-                },
-            )
-            .await?;
+            put_session(conn, key, ctx, name, value).await
+        }
+
+        Op::CaseSelect => {
+            // The handle is resolved HERE, in the store layer, to an open case
+            // this Focus opened: nothing a model says can reach another Focus's
+            // case, a closed case or an invented id.
+            let handle = a.required(Slot::Handle)?;
+            let case_id = handles::resolve_case_handle(conn, ctx.focus_id, handle).await?;
+            let valid = bound_spec::spec(ACTIVE_CASE_ID).is_some_and(|s| (s.validate)(&case_id));
+            if !valid {
+                return Err(StoreWriteError::DerivedIdInvalid);
+            }
+            put_session(conn, key, ctx, ACTIVE_CASE_ID, &case_id).await
+        }
+
+        Op::CaseLink => {
+            let case = own_case(conn, ctx, a.required(Slot::Case)?).await?;
+            let entity = a.required(Slot::Entity)?;
+            let out = case_store::link_case_entity(conn, key, &case.case_id, entity).await?;
             Ok(done(match out {
-                PutOutcome::Created { .. } | PutOutcome::Updated { .. } => Outcome::Applied,
-                PutOutcome::Unchanged { .. } => Outcome::AlreadyApplied,
+                LinkOutcome::Linked => Outcome::Applied,
+                LinkOutcome::AlreadyLinked => Outcome::AlreadyApplied,
+            }))
+        }
+
+        Op::EntityChanged => {
+            // The entity is the case's primary subject, read from the store: a
+            // model never names an entity id. Only this Focus's deltas move.
+            let case = own_case(conn, ctx, a.required(Slot::Case)?).await?;
+            let entity = case
+                .primary_entity_id
+                .as_deref()
+                .ok_or(StoreWriteError::CaseHasNoEntity)?;
+            let moved =
+                case_store::mark_entity_deltas_changed(conn, key, ctx.focus_id, entity).await?;
+            Ok(done(if moved > 0 {
+                Outcome::Applied
+            } else {
+                Outcome::AlreadyApplied
+            }))
+        }
+
+        Op::SessionClear => {
+            let removed = session_store::clear_session_state(conn, key, ctx.focus_id).await?;
+            Ok(done(if removed > 0 {
+                Outcome::Applied
+            } else {
+                Outcome::AlreadyApplied
             }))
         }
 
@@ -365,12 +411,16 @@ async fn run_inner(
             Ok(d)
         }
 
-        Op::DeltaConfirm | Op::DeltaChanged => {
-            let status = if op.op == Op::DeltaConfirm {
-                DeltaStatus::ConfirmedActive
-            } else {
-                DeltaStatus::BelievedChanged
-            };
+        Op::DeltaConfirm => {
+            // By handle: the delta is resolved store-side among the deltas THIS
+            // Focus recorded, and confirmed for every entity it names.
+            let handle = a.required(Slot::Handle)?;
+            let delta = handles::resolve_delta_handle(conn, ctx.focus_id, handle).await?;
+            case_store::set_delta_status(conn, key, &delta, DeltaStatus::ConfirmedActive).await?;
+            Ok(done(Outcome::Applied))
+        }
+
+        Op::DeltaChanged => {
             let delta = a.required(Slot::Delta)?;
             let entity = a.required(Slot::Entity)?;
             // Only this Focus's own deltas: the list is scoped by focus_id.
@@ -384,10 +434,46 @@ async fn run_inner(
             if !own.iter().any(|d| d.delta_id == delta) {
                 return Err(StoreWriteError::DeltaNotInFocus);
             }
-            case_store::set_delta_entity_status(conn, key, delta, entity, status, None).await?;
+            case_store::set_delta_entity_status(
+                conn,
+                key,
+                delta,
+                entity,
+                DeltaStatus::BelievedChanged,
+                None,
+            )
+            .await?;
             Ok(done(Outcome::Applied))
         }
     }
+}
+
+/// One session variable write through the typed store: read the current version
+/// and put with it as the compare-and-set. The caller has validated the value.
+async fn put_session(
+    conn: &mut SqliteConnection,
+    key: &str,
+    ctx: &WriterContext<'_>,
+    name: &str,
+    value: &str,
+) -> Result<Done, StoreWriteError> {
+    let current = session_store::get_session_variable(conn, key, ctx.focus_id, name).await?;
+    let out = session_store::put_session_variable(
+        conn,
+        &SessionWrite {
+            context_key: key,
+            focus_id: ctx.focus_id,
+            name,
+            value,
+            written_by_run: ctx.run_id,
+            expected_version: current.map(|v| v.version),
+        },
+    )
+    .await?;
+    Ok(done(match out {
+        PutOutcome::Created { .. } | PutOutcome::Updated { .. } => Outcome::Applied,
+        PutOutcome::Unchanged { .. } => Outcome::AlreadyApplied,
+    }))
 }
 
 /// The idempotency key of a case or delta this row creates.

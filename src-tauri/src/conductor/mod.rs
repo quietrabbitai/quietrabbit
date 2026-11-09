@@ -28,6 +28,8 @@ mod store_op_tests;
 mod store_seed_tests;
 pub mod store_writer;
 pub mod taint;
+#[cfg(test)]
+mod tech_support_draft;
 pub mod tier_manifest;
 pub mod tokens;
 pub mod types;

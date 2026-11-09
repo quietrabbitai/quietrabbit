@@ -18,9 +18,28 @@
 //   case_update      case_store::update_case
 //   strategy_append  case_store::append_case_strategy (with rung_at)
 //   delta_record     case_store::record_config_delta (with source_case_id)
-//   delta_confirm    case_store::set_delta_entity_status -> confirmed-active
+//   delta_confirm    case_store::set_delta_status -> confirmed-active, for a
+//                    configuration change named by its HANDLE (items.id=889)
 //   delta_changed    case_store::set_delta_entity_status -> believed-changed
-//                    (the event hook of decisions.id=510)
+//                    for one delta and entity id (the event hook of
+//                    decisions.id=510, by ids; a model cannot reach those ids,
+//                    so entity_changed below is the one a Focus uses)
+//
+// items.id=889 adds four more (decisions.id=940, handoff 629 gap G2):
+//
+//   case_select      session_store::put_session_variable on active_case_id,
+//                    from a ticket HANDLE resolved store-side to an open case
+//                    this Focus opened (persistence::handles)
+//   case_link        case_store::link_case_entity (an affected entity)
+//   entity_changed   case_store::mark_entity_deltas_changed: an event on the
+//                    active case's primary entity moves every delta of that
+//                    entity this Focus recorded to believed-changed
+//   session_clear    session_store::clear_session_state: resets locked_intent
+//                    and active_case_id, never the latch
+//
+// A HANDLE slot (case_select, delta_confirm) takes the OUTPUT of a model step:
+// the model is shown handles in derived text and names one. It is never an id,
+// so LOAD refuses a bound name or a published id there.
 //
 // COLUMN SHAPE:
 //   store_target  session_put: the session variable written (a bound name with
@@ -83,11 +102,15 @@ pub enum Op {
     DeltaRecord,
     DeltaConfirm,
     DeltaChanged,
+    CaseSelect,
+    CaseLink,
+    EntityChanged,
+    SessionClear,
 }
 
 impl Op {
     /// The closed set, in documentation order.
-    pub const ALL: [Op; 8] = [
+    pub const ALL: [Op; 12] = [
         Op::Latch,
         Op::SessionPut,
         Op::CaseOpen,
@@ -96,6 +119,10 @@ impl Op {
         Op::DeltaRecord,
         Op::DeltaConfirm,
         Op::DeltaChanged,
+        Op::CaseSelect,
+        Op::CaseLink,
+        Op::EntityChanged,
+        Op::SessionClear,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -108,7 +135,19 @@ impl Op {
             Op::DeltaRecord => "delta_record",
             Op::DeltaConfirm => "delta_confirm",
             Op::DeltaChanged => "delta_changed",
+            Op::CaseSelect => "case_select",
+            Op::CaseLink => "case_link",
+            Op::EntityChanged => "entity_changed",
+            Op::SessionClear => "session_clear",
         }
+    }
+
+    /// True for the operations that write the CASE itself (its record, its
+    /// strategy log or its entity links). A terminal case takes none of them, so
+    /// the close-ticket lint (guard.rs) keeps every one of them before a closing
+    /// case_update on any path.
+    pub fn writes_case(self) -> bool {
+        matches!(self, Op::CaseUpdate | Op::StrategyAppend | Op::CaseLink)
     }
 
     pub fn parse(s: &str) -> Option<Op> {
@@ -127,14 +166,15 @@ impl Op {
 pub enum Slot {
     /// session_put: the value.
     Value,
-    /// case_open: the primary subject entity id. delta_confirm and
+    /// case_open: the primary subject entity id. case_link: the entity to link.
     /// delta_changed: the entity of the delta.
     Entity,
     /// case_open: the subject label.
     Label,
     /// case_open and case_update: the symptoms text.
     Symptoms,
-    /// case_update, strategy_append and delta_record (optional): a case id.
+    /// case_update, strategy_append, case_link, entity_changed and delta_record
+    /// (optional): a case id.
     Case,
     /// case_update: the lifecycle state.
     State,
@@ -156,8 +196,11 @@ pub enum Slot {
     Description,
     /// delta_record: a JSON array of relevance tags, optional.
     Tags,
-    /// delta_confirm and delta_changed: the delta id.
+    /// delta_changed: the delta id.
     Delta,
+    /// case_select: a ticket handle. delta_confirm: a configuration-change
+    /// handle. The value of a model step's output, resolved store-side.
+    Handle,
 }
 
 impl Slot {
@@ -179,6 +222,7 @@ impl Slot {
             Slot::Description => "description",
             Slot::Tags => "tags",
             Slot::Delta => "delta",
+            Slot::Handle => "handle",
         }
     }
 }
@@ -257,7 +301,7 @@ pub const OP_SPECS: &[OpSpec] = &[
     OpSpec {
         op: Op::DeltaConfirm,
         target: TargetRule::None,
-        required: &[Slot::Delta, Slot::Entity],
+        required: &[Slot::Handle],
         optional: &[],
         needs_an_optional: false,
     },
@@ -265,6 +309,34 @@ pub const OP_SPECS: &[OpSpec] = &[
         op: Op::DeltaChanged,
         target: TargetRule::None,
         required: &[Slot::Delta, Slot::Entity],
+        optional: &[],
+        needs_an_optional: false,
+    },
+    OpSpec {
+        op: Op::CaseSelect,
+        target: TargetRule::None,
+        required: &[Slot::Handle],
+        optional: &[],
+        needs_an_optional: false,
+    },
+    OpSpec {
+        op: Op::CaseLink,
+        target: TargetRule::None,
+        required: &[Slot::Case, Slot::Entity],
+        optional: &[],
+        needs_an_optional: false,
+    },
+    OpSpec {
+        op: Op::EntityChanged,
+        target: TargetRule::None,
+        required: &[Slot::Case],
+        optional: &[],
+        needs_an_optional: false,
+    },
+    OpSpec {
+        op: Op::SessionClear,
+        target: TargetRule::None,
+        required: &[],
         optional: &[],
         needs_an_optional: false,
     },
@@ -290,7 +362,7 @@ pub struct StoreOp {
 pub enum StoreOpError {
     #[error("store_target or store_args is set without store_op (set: {0}): the three columns go together")]
     HalfSet(String),
-    #[error("unknown store_op '{0}' (expected one of latch, session_put, case_open, case_update, strategy_append, delta_record, delta_confirm, delta_changed)")]
+    #[error("unknown store_op '{0}' (expected one of latch, session_put, case_open, case_update, strategy_append, delta_record, delta_confirm, delta_changed, case_select, case_link, entity_changed, session_clear)")]
     UnknownOp(String),
     #[error("store_op '{0}' needs a store_target")]
     TargetRequired(&'static str),
@@ -349,6 +421,13 @@ pub enum StoreOpError {
     },
     #[error("step '{action_id}': slot '{slot}' names '{var}', which a store writer cannot read as an argument ({reason})")]
     ArgumentNotAllowed {
+        action_id: String,
+        slot: &'static str,
+        var: String,
+        reason: &'static str,
+    },
+    #[error("step '{action_id}': slot '{slot}' names '{var}', which is {reason}: a handle is the output of a model step that was shown handles in derived text, never an id and never a seeded name")]
+    HandleNotFromModel {
         action_id: String,
         slot: &'static str,
         var: String,
@@ -512,6 +591,15 @@ impl StoreOp {
         }
     }
 
+    /// For a case_update that sets the lifecycle state, the variable that
+    /// supplies it (the close-ticket lint, guard.rs). None for every other row.
+    pub fn state_var(&self) -> Option<&str> {
+        match self.op {
+            Op::CaseUpdate => self.arg(Slot::State),
+            _ => None,
+        }
+    }
+
     /// Every variable name this row reads.
     pub fn arg_vars(&self) -> impl Iterator<Item = &str> {
         self.args.iter().map(|(_, v)| v.as_str())
@@ -581,9 +669,31 @@ pub fn check_composition(
         }
 
         // Every argument variable.
-        for (slot, var) in &op.args {
-            let slot = slot.as_str();
+        for (slot_kind, var) in &op.args {
+            let slot = slot_kind.as_str();
             let var = var.as_str();
+            // A handle is model output: not a seeded name (active_case_id holds
+            // an internal id, locked_intent an intent) and not an id this pass
+            // published (an internal id too). Refused before anything else so
+            // the reason names the handle rule.
+            if *slot_kind == Slot::Handle {
+                let bound = bound_spec::spec(var).is_some();
+                let published = steps
+                    .iter()
+                    .any(|o| o.store_op.as_ref().and_then(StoreOp::published_var) == Some(var));
+                if bound || published {
+                    return Err(StoreOpError::HandleNotFromModel {
+                        action_id,
+                        slot,
+                        var: var.to_owned(),
+                        reason: if bound {
+                            "a bound name"
+                        } else {
+                            "an id published by a store writer"
+                        },
+                    });
+                }
+            }
             if var == WRITE_MODE {
                 return Err(StoreOpError::ArgumentNotAllowed {
                     action_id,
@@ -601,10 +711,15 @@ pub fn check_composition(
                     });
                 }
                 if s.presence == Presence::Optional {
+                    // items.id=889: ANY clause of the row's AND-guard set that
+                    // tests the name for a value or presence covers it. The
+                    // clauses are ANDed, so the row cannot run unless that one
+                    // holds, whatever else it also requires. (Before the clause
+                    // list the single guard had to be it.)
                     let covered = step
-                        .guard
-                        .as_ref()
-                        .is_some_and(|g| g.var == var && !matches!(g.condition, Condition::Absent));
+                        .guards()
+                        .iter()
+                        .any(|g| g.var == var && !matches!(g.condition, Condition::Absent));
                     if !covered {
                         return Err(StoreOpError::OptionalArgumentUnguarded {
                             action_id,
@@ -707,12 +822,97 @@ mod tests {
             Some(r#"{"entities":"e","description":"d"}"#)
         )
         .is_ok());
-        assert!(parse("delta_confirm", None, Some(r#"{"delta":"d","entity":"e"}"#)).is_ok());
+        assert!(parse("delta_confirm", None, Some(r#"{"handle":"h"}"#)).is_ok());
         assert!(parse("delta_changed", None, Some(r#"{"delta":"d","entity":"e"}"#)).is_ok());
+        // items.id=889: the four new operations.
+        assert!(parse("case_select", None, Some(r#"{"handle":"h"}"#)).is_ok());
+        assert!(parse("case_link", None, Some(r#"{"case":"c","entity":"e"}"#)).is_ok());
+        assert!(parse("entity_changed", None, Some(r#"{"case":"c"}"#)).is_ok());
+        assert_eq!(
+            parse("session_clear", None, None).unwrap().op,
+            Op::SessionClear
+        );
         assert_eq!(Op::ALL.len(), OP_SPECS.len());
         for op in Op::ALL {
             assert_eq!(Op::parse(op.as_str()), Some(op));
         }
+    }
+
+    // -- items.id=889: the four new operations -------------------------------
+
+    #[test]
+    fn the_new_operations_have_their_own_slot_errors() {
+        // session_clear takes nothing, like the latch.
+        assert_eq!(
+            parse("session_clear", None, Some("{}")),
+            Err(StoreOpError::ArgsNotAllowed("session_clear"))
+        );
+        assert_eq!(
+            parse("session_clear", Some("x"), None),
+            Err(StoreOpError::TargetNotAllowed("session_clear"))
+        );
+        // case_select and delta_confirm need their handle and nothing else.
+        for op in ["case_select", "delta_confirm"] {
+            assert_eq!(
+                parse(op, None, Some("{}")),
+                Err(StoreOpError::MissingSlot {
+                    op: Op::parse(op).unwrap().as_str(),
+                    slot: "handle"
+                })
+            );
+            assert!(matches!(
+                parse(op, None, Some(r#"{"handle":"h","case":"c"}"#)),
+                Err(StoreOpError::UnknownSlot { .. })
+            ));
+            assert_eq!(
+                parse(op, Some("t"), Some(r#"{"handle":"h"}"#)),
+                Err(StoreOpError::TargetNotAllowed(
+                    Op::parse(op).unwrap().as_str()
+                ))
+            );
+        }
+        // delta_confirm no longer takes ids.
+        assert!(matches!(
+            parse("delta_confirm", None, Some(r#"{"delta":"d","entity":"e"}"#)),
+            Err(StoreOpError::UnknownSlot { .. })
+        ));
+        // case_link and entity_changed.
+        assert_eq!(
+            parse("case_link", None, Some(r#"{"case":"c"}"#)),
+            Err(StoreOpError::MissingSlot {
+                op: "case_link",
+                slot: "entity"
+            })
+        );
+        assert_eq!(
+            parse("entity_changed", None, Some(r#"{"entity":"e"}"#)),
+            Err(StoreOpError::UnknownSlot {
+                op: "entity_changed",
+                slot: "entity".into()
+            }),
+            "an entity id is never an argument: the case names it"
+        );
+    }
+
+    #[test]
+    fn only_the_case_writing_operations_are_case_writes_and_only_a_state_is_a_state_var() {
+        let writes: Vec<&str> = Op::ALL
+            .iter()
+            .filter(|o| o.writes_case())
+            .map(|o| o.as_str())
+            .collect();
+        assert_eq!(writes, ["case_update", "strategy_append", "case_link"]);
+        let upd = parse("case_update", None, Some(r#"{"case":"c","state":"s"}"#)).unwrap();
+        assert_eq!(upd.state_var(), Some("s"));
+        let no_state = parse("case_update", None, Some(r#"{"case":"c","outcome":"o"}"#)).unwrap();
+        assert_eq!(no_state.state_var(), None);
+        let log = parse(
+            "strategy_append",
+            None,
+            Some(r#"{"case":"c","strategy":"s","outcome":"o"}"#),
+        )
+        .unwrap();
+        assert_eq!(log.state_var(), None);
     }
 
     #[test]
@@ -922,9 +1122,28 @@ mod tests {
                 vec!["tags", "case"]
             )
         );
-        for op in [Op::DeltaConfirm, Op::DeltaChanged] {
-            assert_eq!(row(op), (TargetRule::None, vec!["delta", "entity"], vec![]));
-        }
+        // items.id=889: delta_confirm takes a handle, not ids.
+        assert_eq!(
+            row(Op::DeltaConfirm),
+            (TargetRule::None, vec!["handle"], vec![])
+        );
+        assert_eq!(
+            row(Op::DeltaChanged),
+            (TargetRule::None, vec!["delta", "entity"], vec![])
+        );
+        assert_eq!(
+            row(Op::CaseSelect),
+            (TargetRule::None, vec!["handle"], vec![])
+        );
+        assert_eq!(
+            row(Op::CaseLink),
+            (TargetRule::None, vec!["case", "entity"], vec![])
+        );
+        assert_eq!(
+            row(Op::EntityChanged),
+            (TargetRule::None, vec!["case"], vec![])
+        );
+        assert_eq!(row(Op::SessionClear), (TargetRule::None, vec![], vec![]));
     }
 
     // -- composition checks ---------------------------------------------------
@@ -950,6 +1169,7 @@ mod tests {
             guard: None,
             declared_inputs: Vec::new(),
             store_op: None,
+            and_guards: Vec::new(),
         }
     }
 
