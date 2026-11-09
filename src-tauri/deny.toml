@@ -171,6 +171,27 @@ ignore = [
     { id = "RUSTSEC-2026-0370", reason = "unmaintained: zvariant 5.15.1, merged into zbus 6; reached only via tauri-plugin-single-instance 2.4.5 -> zbus 5.19.0 (items.id=667). The plugin pins zbus 5 and its 2.5.x line needs tauri 2.12, so there is no cargo-update path. Informational, no CVE. Revisit (items.id=503): drop when tauri >= 2.12 and the plugin can move to zbus 6." },
     { id = "RUSTSEC-2026-0371", reason = "unmaintained: zbus_names 4.3.5, merged into zbus 6; same tauri-plugin-single-instance 2.4.5 -> zbus 5.19.0 chain as RUSTSEC-2026-0370 above. Informational, no CVE." },
     { id = "RUSTSEC-2026-0372", reason = "unmaintained: zvariant_derive 5.15.1, derive macros now provided by zbus 6; same tauri-plugin-single-instance 2.4.5 -> zbus 5.19.0 -> zvariant chain as RUSTSEC-2026-0370 above. Informational, no CVE." },
+
+    # --- libsqlite3-sys 0.30.1 (sqlx 0.8.6) ---
+    # RUSTSEC-2026-0459: SQLite before 3.54.0 can return uninitialized
+    # page-cache memory when a process opens a database file together with a
+    # sibling -wal file whose page size differs from the database's. The
+    # advisory is written against the crate's BUNDLED SQLite (the `bundled`
+    # features). QR does not use that copy: libsqlite3-sys 0.30.1 is built with
+    # the sqlcipher feature, not bundled, so QR links the system SQLCipher and
+    # its exposure is that library's SQLite (3.53.4 in SQLCipher 4.18.0 locally,
+    # CI builds v4.14.0), not the crate's bundled source.
+    #
+    # Exposure: local only. The attack needs a crafted database plus a sibling
+    # -wal file written where QR opens it. A code search found no import,
+    # restore or attach path that opens such a file (a search, not an exhaustive
+    # proof). No fix is available without the sqlx 0.9 upgrade: sqlx 0.8.6 pins
+    # libsqlite3-sys 0.30.x.
+    #
+    # Revisit trigger: drop this entry when a SQLCipher release embeds SQLite
+    # 3.54.0 or later (and local and CI builds move to it), or when sqlx moves
+    # to 0.9.
+    { id = "RUSTSEC-2026-0459", reason = "SQLite before 3.54.0 can return uninitialized page-cache memory for a database opened with a sibling -wal file of a different page size. libsqlite3-sys 0.30.1 is built with the sqlcipher feature (not bundled), so QR links the system SQLCipher and its exposure is that library's SQLite (3.53.4 in SQLCipher 4.18.0 locally, CI builds v4.14.0), not the crate's bundled copy. The attack needs a crafted database plus sibling -wal file written where QR opens it; a code search found no import, restore or attach path (not an exhaustive proof). No fix without the sqlx 0.9 upgrade (sqlx 0.8.6 pins libsqlite3-sys 0.30.x). Revisit when a SQLCipher release embeds SQLite 3.54.0 or later, or when sqlx moves to 0.9." },
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.
