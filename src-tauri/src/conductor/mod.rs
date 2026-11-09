@@ -4,6 +4,7 @@ pub mod block_dispatch;
 pub mod checkin;
 pub mod concurrency;
 pub mod crisis;
+pub mod declared_inputs;
 pub mod executor;
 pub mod extract;
 pub mod failure;

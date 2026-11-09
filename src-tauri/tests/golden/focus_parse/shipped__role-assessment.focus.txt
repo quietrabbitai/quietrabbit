@@ -35,6 +35,7 @@ ActionDefinition {
     block_customization: None,
     schedule_trigger: None,
     guard: None,
+    declared_inputs: [],
 }
 field_requirements: {"employer": Recommended, "industry": Recommended, "job_title": Recommended}
 options_override: {"num_predict":512,"temperature":0.2}
@@ -61,6 +62,11 @@ ActionDefinition {
     block_customization: None,
     schedule_trigger: None,
     guard: None,
+    declared_inputs: [
+        "voice_profile",
+        "jd_summary",
+        "persona_context",
+    ],
 }
 field_requirements: {}
 options_override: {"num_predict":768,"temperature":0.4}
@@ -87,6 +93,10 @@ ActionDefinition {
     block_customization: None,
     schedule_trigger: None,
     guard: None,
+    declared_inputs: [
+        "voice_profile",
+        "jd_summary",
+    ],
 }
 field_requirements: {}
 options_override: {"num_predict":512,"temperature":0.3}
@@ -113,6 +123,11 @@ ActionDefinition {
     block_customization: None,
     schedule_trigger: None,
     guard: None,
+    declared_inputs: [
+        "voice_profile",
+        "fit_analysis",
+        "salary_context",
+    ],
 }
 field_requirements: {}
 options_override: {"num_predict":512,"temperature":0.3}

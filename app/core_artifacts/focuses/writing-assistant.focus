@@ -97,6 +97,10 @@ steps:
         scope: optional
       - name: location_city
         scope: optional
+    declared_inputs:
+      - user_input
+      - voice_analysis_output
+      - voice_profile
     options_override:
       temperature: 0.5
       num_predict: 1024

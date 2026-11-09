@@ -33,6 +33,9 @@ ActionDefinition {
     block_customization: None,
     schedule_trigger: None,
     guard: None,
+    declared_inputs: [
+        "user_input",
+    ],
 }
 field_requirements: {}
 options_override: {}

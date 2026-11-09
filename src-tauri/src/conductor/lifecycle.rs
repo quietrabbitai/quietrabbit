@@ -261,6 +261,9 @@ struct RawStep {
     prompt_template: Option<String>,
     field_requirements: Option<Vec<RawFieldRequirement>>,
     options_override: Option<serde_json::Value>, // YAML map -> HashMap<String, json::Value>
+    // items.id=879: same field name in the YAML step and the database
+    // customization JSON. Absent = the step declares nothing (default none).
+    declared_inputs: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -378,6 +381,9 @@ struct NormalizedRawStep {
     prompt_template: Option<String>,
     field_requirements: HashMap<String, FieldRequirement>,
     options_override: HashMap<String, serde_json::Value>,
+    /// items.id=879: names an external step's template may use, beyond its own
+    /// field_requirements (conductor::declared_inputs). None = declares nothing.
+    declared_inputs: Option<Vec<String>>,
 }
 
 /// Shared ActionDefinition derivation (items.id=496): the routing_tier ->
@@ -433,6 +439,7 @@ fn build_action_definition(
         block_customization: None,
         schedule_trigger: None,
         guard: None,
+        declared_inputs: raw.declared_inputs.unwrap_or_default(),
         action_id,
     }
 }
@@ -559,6 +566,7 @@ fn parse_focus_definition(raw: RawFocusFile) -> Result<FocusDefinition, Lifecycl
                     prompt_template: raw_step.prompt_template,
                     field_requirements,
                     options_override,
+                    declared_inputs: raw_step.declared_inputs,
                 },
             ));
         }
@@ -609,6 +617,8 @@ struct RawStepFromDb {
     prompt_template: Option<String>,
     field_requirements: Option<Vec<RawFieldRequirement>>,
     options_override: Option<serde_json::Value>,
+    // items.id=879: see RawStep::declared_inputs.
+    declared_inputs: Option<Vec<String>>,
 }
 
 /// items.id=496: the DB-composition path. Returns Ok(None) when no
@@ -739,6 +749,7 @@ async fn load_focus_definition_from_db(
                         prompt_template: raw_step.prompt_template,
                         field_requirements,
                         options_override,
+                        declared_inputs: raw_step.declared_inputs,
                     },
                 )
             }
@@ -800,6 +811,7 @@ async fn load_focus_definition_from_db(
                     block_customization: Some(block_customization),
                     schedule_trigger: None,
                     guard: None,
+                    declared_inputs: Vec::new(),
                 }
             }
         };
@@ -818,6 +830,10 @@ async fn load_focus_definition_from_db(
     // so a block must be followed by an ordinary local step: never last, never
     // directly before an external or handoff step. An unguarded Focus has one
     // path, which is every row in order, so this is the Stage 1 rule unchanged.
+    //
+    // items.id=879: the declared-inputs lint runs first, so an undeclared name
+    // in an external step is reported as that and not as a placement failure.
+    lint_declared_inputs(focus_id, &steps)?;
     analyze_guarded_composition(focus_id, &steps)?;
 
     Ok(Some(FocusDefinition {
@@ -841,33 +857,44 @@ fn analyze_guarded_composition(
     focus_id: &str,
     steps: &[ActionDefinition],
 ) -> Result<usize, LifecycleError> {
-    // A block row's output variable is the handler's declared one:
-    // ActionDefinition.output_var is None for a block row.
-    let block_vars: Vec<Option<String>> = steps
-        .iter()
-        .map(|s| {
-            let id = s.block_stable_id.as_deref()?;
-            let handler = crate::conductor::block_dispatch::block_handler(id)?;
-            (handler.output_var)(s.block_customization.as_ref()?)
-        })
-        .collect();
+    let row_vars = row_output_vars(steps);
     let shapes: Vec<guard::RowShape> = steps
         .iter()
-        .zip(block_vars.iter())
-        .map(|(s, block_var)| guard::RowShape {
+        .zip(row_vars.iter())
+        .map(|(s, row_var)| guard::RowShape {
             action_id: &s.action_id,
             guard: s.guard.as_ref(),
-            output_var: if s.block_stable_id.is_some() {
-                block_var.as_deref()
-            } else {
-                s.output_var.as_deref().filter(|v| !v.is_empty())
-            },
+            output_var: row_var.as_deref(),
             is_block: s.block_stable_id.is_some(),
             local_and_no_handoff: s.routing_tier == ExternalAccess::LocalOnly
                 && !s.requires_user_handoff,
         })
         .collect();
     guard::analyze_composition(&shapes)
+        .map_err(|e| LifecycleError::ValidationFailed(format!("Focus '{focus_id}' {e}")))
+}
+
+/// The variable each row records when it runs, in row order: an ordinary
+/// step's non-empty output_var, or a block handler's declared output variable
+/// (ActionDefinition.output_var is None for a block row). Shared by the guard
+/// analysis (items.id=878) and the declared-inputs lint (items.id=879).
+fn row_output_vars(steps: &[ActionDefinition]) -> Vec<Option<String>> {
+    steps
+        .iter()
+        .map(|s| match s.block_stable_id.as_deref() {
+            Some(id) => {
+                let handler = crate::conductor::block_dispatch::block_handler(id)?;
+                (handler.output_var)(s.block_customization.as_ref()?)
+            }
+            None => s.output_var.clone().filter(|v| !v.is_empty()),
+        })
+        .collect()
+}
+
+/// items.id=879: the declared-inputs lint (conductor::declared_inputs) over a
+/// loaded step list, shared by both loaders.
+fn lint_declared_inputs(focus_id: &str, steps: &[ActionDefinition]) -> Result<(), LifecycleError> {
+    crate::conductor::declared_inputs::lint(steps, &row_output_vars(steps))
         .map_err(|e| LifecycleError::ValidationFailed(format!("Focus '{focus_id}' {e}")))
 }
 
@@ -1034,6 +1061,9 @@ pub async fn load_focus_definition(
     let focus_file = find_focus_file(focus_id)?;
     let text = tokio::fs::read_to_string(&focus_file).await?;
     let focus_def = parse_focus_text(&text)?;
+    // items.id=879: declared-inputs lint on the YAML path (the DB path runs its
+    // own inside load_focus_definition_from_db).
+    lint_declared_inputs(&focus_def.focus_id, &focus_def.steps)?;
 
     let mut all_errors: Vec<String> = Vec::new();
     for step in &focus_def.steps {
@@ -4294,6 +4324,7 @@ mod tests {
                 prompt_template: Some("Hello {user_input}".to_owned()),
                 field_requirements: None,
                 options_override: None,
+                declared_inputs: None,
             },
         );
         let mut raw = minimal_raw();
@@ -4331,6 +4362,7 @@ mod tests {
                     prompt_template: None,
                     field_requirements: None,
                     options_override: None,
+                    declared_inputs: None,
                 },
             );
         }
@@ -4366,6 +4398,7 @@ mod tests {
                 prompt_template: None,
                 field_requirements: None,
                 options_override: None,
+                declared_inputs: None,
             },
         );
         let mut raw = minimal_raw();
@@ -4399,6 +4432,7 @@ mod tests {
             prompt_template: Some("Hello {user_input}".to_owned()),
             field_requirements: None,
             options_override: None,
+            declared_inputs: None,
         }
     }
 
@@ -5418,6 +5452,7 @@ mod tests {
                 prompt_template: Some("Hello {user_input}".to_owned()),
                 field_requirements: None,
                 options_override: None,
+                declared_inputs: None,
             },
         );
         let mut raw = minimal_raw();
@@ -6563,6 +6598,7 @@ mod tests {
                 block_customization: None,
                 schedule_trigger: None,
                 guard: None,
+                declared_inputs: Vec::new(),
             });
             run.focus_def = Some(def);
             let mut personal_track = PersonalTrack::new();
@@ -6639,6 +6675,7 @@ mod tests {
             block_customization: None,
             schedule_trigger: None,
             guard: None,
+            declared_inputs: Vec::new(),
         });
         run.focus_def = Some(def);
         let mut personal_track = PersonalTrack::new();
@@ -8042,6 +8079,8 @@ mod tests {
                 );
                 assert_eq!(d.requires_user_handoff, y.requires_user_handoff, "{n}");
                 assert_eq!(d.revisitable, y.revisitable, "{n}");
+                // items.id=879: the declaration is part of the parity.
+                assert_eq!(d.declared_inputs, y.declared_inputs, "{n}");
                 assert!(d.block_stable_id.is_none() && d.block_customization.is_none());
                 assert!(d.schedule_trigger.is_none() && y.schedule_trigger.is_none());
             }
@@ -8080,6 +8119,18 @@ mod tests {
                 .map(|s| s.action_id.as_str())
                 .collect();
             assert_eq!(ext, ["draft_writing"]);
+            // items.id=879: and its declaration, in the seed and in the file.
+            for set in [&db, &yaml] {
+                let dw = set
+                    .steps
+                    .iter()
+                    .find(|s| s.action_id == "draft_writing")
+                    .unwrap();
+                assert_eq!(
+                    dw.declared_inputs,
+                    ["user_input", "voice_analysis_output", "voice_profile"]
+                );
+            }
 
             // The block is not directly before an external step and is not last.
             let qi = db
@@ -9061,6 +9112,377 @@ mod tests {
             // lands on the same path again.
             run.execute().await.unwrap();
             assert_eq!(ran_ids(&run), original);
+        })
+        .await;
+    }
+
+    // -- items.id=879: declared-inputs LOAD lint -----------------------------
+
+    /// An ordinary step at `tier` with a template, a declaration and field names.
+    fn dstep(
+        id: &str,
+        tier: u8,
+        template: &str,
+        declared: &[&str],
+        fields: &[&str],
+        out: Option<&str>,
+    ) -> GRow {
+        let mut c = serde_json::json!({
+            "routing_tier": tier,
+            "prompt_template": template,
+            "declared_inputs": declared,
+            "field_requirements": fields
+                .iter()
+                .map(|f| serde_json::json!({"name": f, "scope": "optional"}))
+                .collect::<Vec<_>>(),
+        });
+        if let Some(o) = out {
+            c["output_var"] = serde_json::json!(o);
+        }
+        GRow {
+            id: id.to_owned(),
+            block: None,
+            guard: None,
+            custom: c.to_string(),
+        }
+    }
+
+    async fn declared_load(focus_id: &str, rows: Vec<GRow>) -> Result<(), String> {
+        let pool = block_load_pool().await;
+        seed_guarded_focus(&pool, focus_id, rows).await;
+        match load_focus_definition_from_db(&pool, focus_id).await {
+            Ok(_) => Ok(()),
+            Err(LifecycleError::ValidationFailed(m)) => Err(m),
+            Err(other) => panic!("unexpected error {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn declared_inputs_db_undeclared_variable_in_an_external_template_fails_load() {
+        with_temp_data_root(async {
+            let m = declared_load(
+                "di-undeclared",
+                vec![
+                    dstep("a", 1, "x", &[], &[], Some("v")),
+                    dstep("e", 2, "use {v}", &[], &[], None),
+                ],
+            )
+            .await
+            .unwrap_err();
+            assert!(m.contains("Focus 'di-undeclared'"), "{m}");
+            assert!(m.contains("step 'e'") && m.contains("{v}"), "{m}");
+            assert!(m.contains("does not declare"), "{m}");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn declared_inputs_db_a_declared_name_loads() {
+        with_temp_data_root(async {
+            declared_load(
+                "di-declared",
+                vec![
+                    dstep("a", 1, "x", &[], &[], Some("v")),
+                    dstep(
+                        "e",
+                        2,
+                        "use {v} {user_input}",
+                        &["v", "user_input"],
+                        &[],
+                        None,
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn declared_inputs_db_a_field_requirements_name_is_implicitly_declared() {
+        with_temp_data_root(async {
+            declared_load(
+                "di-field",
+                vec![dstep("e", 2, "{job_title}", &[], &["job_title"], None)],
+            )
+            .await
+            .unwrap();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn declared_inputs_db_a_local_step_needs_no_declaration() {
+        with_temp_data_root(async {
+            declared_load(
+                "di-local",
+                vec![
+                    dstep("a", 1, "x", &[], &[], Some("v")),
+                    dstep("l", 1, "{v} {persona_context} {user_input}", &[], &[], None),
+                ],
+            )
+            .await
+            .unwrap();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn declared_inputs_db_a_declared_name_nothing_produces_fails_load() {
+        with_temp_data_root(async {
+            let m = declared_load("di-ghost", vec![dstep("e", 2, "x", &["ghost"], &[], None)])
+                .await
+                .unwrap_err();
+            assert!(m.contains("declared_inputs names 'ghost'"), "{m}");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn declared_inputs_db_a_step_after_a_block_cannot_name_the_block_variable_undeclared() {
+        with_temp_data_root(async {
+            let rows = |declared: &[&str]| {
+                vec![
+                    dstep("draft", 1, "x", &[], &[], Some("draft_output")),
+                    gblock("qc", "draft_quality_verdict", None),
+                    dstep(
+                        "tail",
+                        1,
+                        "Refine {draft_output}",
+                        &[],
+                        &[],
+                        Some("tail_out"),
+                    ),
+                    dstep("e", 2, "{draft_quality_verdict}", declared, &[], None),
+                ]
+            };
+            let m = declared_load("di-block-undeclared", rows(&[]))
+                .await
+                .unwrap_err();
+            assert!(
+                m.contains("{draft_quality_verdict}") && m.contains("does not declare"),
+                "{m}"
+            );
+            declared_load("di-block-declared", rows(&["draft_quality_verdict"]))
+                .await
+                .unwrap();
+        })
+        .await;
+    }
+
+    /// The lint runs before the block-placement analysis: an external step
+    /// directly after a block fails as an undeclared name, not as placement.
+    #[tokio::test]
+    async fn declared_inputs_db_lint_message_wins_over_placement() {
+        with_temp_data_root(async {
+            let m = declared_load(
+                "di-order",
+                vec![
+                    dstep("draft", 1, "x", &[], &[], Some("draft_output")),
+                    gblock("qc", "draft_quality_verdict", None),
+                    dstep("e", 2, "{draft_quality_verdict}", &[], &[], None),
+                ],
+            )
+            .await
+            .unwrap_err();
+            assert!(m.contains("does not declare"), "{m}");
+        })
+        .await;
+    }
+
+    // Shipped Focuses ---------------------------------------------------------
+
+    const SHIPPED_FOCUS_IDS: [&str; 6] = [
+        "quick-ask",
+        "writing-assistant",
+        "research-and-buy",
+        "role-assessment",
+        "api-chat",
+        "qr-admin",
+    ];
+
+    fn shipped_focus_text(id: &str) -> String {
+        std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../app/core_artifacts/focuses")
+                .join(format!("{id}.focus")),
+        )
+        .unwrap()
+    }
+
+    /// (step, external) pairs: the steps each shipped Focus reaches externally.
+    /// Pinned so that declaring inputs makes nothing newly external or reachable.
+    fn shipped_external_steps(id: &str) -> &'static [&'static str] {
+        match id {
+            "writing-assistant" => &["draft_writing"],
+            "research-and-buy" => &["research", "recommendation"],
+            "role-assessment" => &["fit_analysis", "salary_research", "disposition"],
+            "api-chat" => &["reply"],
+            _ => &[],
+        }
+    }
+
+    #[tokio::test]
+    async fn declared_inputs_every_shipped_focus_loads_with_its_declarations() {
+        with_temp_data_root(async {
+            let pool = block_load_pool().await;
+            // load_focus_definition: writing-assistant takes the DB path (its
+            // shared_038/040 seed rows), the other five take the YAML path.
+            for id in SHIPPED_FOCUS_IDS {
+                let def = load_focus_definition(&pool, id)
+                    .await
+                    .unwrap_or_else(|e| panic!("{id} must load: {e}"));
+                let ext: Vec<&str> = def
+                    .steps
+                    .iter()
+                    .filter(|s| s.routing_tier != ExternalAccess::LocalOnly)
+                    .map(|s| s.action_id.as_str())
+                    .collect();
+                assert_eq!(ext, shipped_external_steps(id), "{id}: external steps");
+            }
+            // writing-assistant's YAML file also passes the YAML-path lint
+            // (its DB row shadows it in load_focus_definition above).
+            let yaml = parse_focus_text(&shipped_focus_text("writing-assistant")).unwrap();
+            lint_declared_inputs(&yaml.focus_id, &yaml.steps).unwrap();
+        })
+        .await;
+    }
+
+    /// Nothing is papered over: for every shipped external step the declaration
+    /// plus its field_requirements names equals the names find_tokens finds in
+    /// its template (nothing missing, nothing over-declared).
+    #[tokio::test]
+    async fn declared_inputs_match_exactly_what_each_shipped_template_uses() {
+        with_temp_data_root(async {
+            let pool = block_load_pool().await;
+            let mut defs: Vec<(String, FocusDefinition)> = SHIPPED_FOCUS_IDS
+                .iter()
+                .map(|id| {
+                    (
+                        (*id).to_owned(),
+                        parse_focus_text(&shipped_focus_text(id)).unwrap(),
+                    )
+                })
+                .collect();
+            // And the seeded database row for writing-assistant.
+            defs.push(("writing-assistant(db)".to_owned(), seeded_wa(&pool).await));
+            for (id, def) in &defs {
+                for s in def
+                    .steps
+                    .iter()
+                    .filter(|s| s.block_stable_id.is_none())
+                    .filter(|s| s.routing_tier != ExternalAccess::LocalOnly)
+                {
+                    let used: std::collections::BTreeSet<String> =
+                        crate::conductor::executor::find_tokens(&s.prompt_template)
+                            .into_iter()
+                            .collect();
+                    let declared: std::collections::BTreeSet<String> =
+                        s.declared_inputs.iter().cloned().collect();
+                    let fields: std::collections::BTreeSet<String> =
+                        s.field_requirements.keys().cloned().collect();
+                    let covered: std::collections::BTreeSet<String> =
+                        declared.union(&fields).cloned().collect();
+                    assert_eq!(used, covered, "{id}/{}", s.action_id);
+                    // No name is declared that is also a field (no double entry).
+                    assert!(declared.is_disjoint(&fields), "{id}/{}", s.action_id);
+                }
+            }
+        })
+        .await;
+    }
+
+    /// Each shipped external declaration is load-bearing: removing it fails the
+    /// lint on that step.
+    #[test]
+    fn declared_inputs_removing_a_shipped_declaration_fails_the_lint() {
+        for id in SHIPPED_FOCUS_IDS {
+            let def = parse_focus_text(&shipped_focus_text(id)).unwrap();
+            for (i, s) in def.steps.iter().enumerate() {
+                if s.declared_inputs.is_empty() {
+                    continue;
+                }
+                let mut steps = def.steps.clone();
+                steps[i].declared_inputs.clear();
+                let err = lint_declared_inputs(id, &steps).unwrap_err();
+                let LifecycleError::ValidationFailed(m) = err else {
+                    panic!("expected ValidationFailed");
+                };
+                assert!(m.contains(&format!("step '{}'", s.action_id)), "{id}: {m}");
+            }
+        }
+    }
+
+    #[test]
+    fn declared_inputs_yaml_parses_the_field_and_the_lint_runs_on_that_path() {
+        let text = r#"
+id: di-yaml
+max_routing_tier: 2
+steps:
+  first:
+    routing_tier: 1
+    output_var: v
+    prompt_template: "x"
+  second:
+    routing_tier: 2
+    prompt_template: "use {v}"
+    declared_inputs:
+      - v
+"#;
+        let def = parse_focus_text(text).unwrap();
+        assert_eq!(def.steps[0].declared_inputs, Vec::<String>::new());
+        assert_eq!(def.steps[1].declared_inputs, ["v"]);
+        lint_declared_inputs("di-yaml", &def.steps).unwrap();
+
+        let undeclared = text.replace("    declared_inputs:\n      - v\n", "");
+        let def = parse_focus_text(&undeclared).unwrap();
+        let LifecycleError::ValidationFailed(m) =
+            lint_declared_inputs("di-yaml", &def.steps).unwrap_err()
+        else {
+            panic!("expected ValidationFailed");
+        };
+        assert!(m.contains("step 'second'") && m.contains("{v}") && m.contains("does not declare"));
+    }
+
+    /// shared_038 seeded draft_writing WITHOUT a declaration. An existing
+    /// install holding that row fails the lint (which is why shared_040 exists),
+    /// and the repaired row loads.
+    #[tokio::test]
+    async fn declared_inputs_a_stale_writing_assistant_seed_row_fails_and_the_repair_loads() {
+        with_temp_data_root(async {
+            let pool = block_load_pool().await;
+            sqlx::query(
+                "UPDATE focus_block_customization \
+                 SET customization = json_remove(customization, '$.declared_inputs') \
+                 WHERE id = 'writing-assistant:draft_writing:default'",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            let err = load_focus_definition_from_db(&pool, "writing-assistant")
+                .await
+                .unwrap_err();
+            let LifecycleError::ValidationFailed(m) = err else {
+                panic!("expected ValidationFailed");
+            };
+            assert!(
+                m.contains("step 'draft_writing'") && m.contains("does not declare"),
+                "{m}"
+            );
+
+            sqlx::query(
+                "UPDATE focus_block_customization \
+                 SET customization = json_set(customization, '$.declared_inputs', \
+                     json('[\"user_input\",\"voice_analysis_output\",\"voice_profile\"]')) \
+                 WHERE id = 'writing-assistant:draft_writing:default'",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            assert!(load_focus_definition_from_db(&pool, "writing-assistant")
+                .await
+                .is_ok());
         })
         .await;
     }

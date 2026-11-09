@@ -307,6 +307,15 @@ pub struct ActionDefinition {
     /// it is false (conductor::guard). Populated by the DB loader from
     /// focus_block_compositions.guard_var/guard_op/guard_value.
     pub guard: Option<Guard>,
+    /// items.id=879 (decisions.id=937 point 1): the variable and token names an
+    /// EXTERNAL (non-LocalOnly) step's prompt template may name, beyond the
+    /// field names in its own field_requirements (Gate 1's declaration, so
+    /// implicitly declared). Default empty: an external step receives nothing it
+    /// does not declare. Authored as `declared_inputs` in both the .focus YAML
+    /// step and the database customization JSON. Enforced at LOAD by
+    /// conductor::declared_inputs (a loader lint, not a runtime filter); empty
+    /// for a block row and for any step that needs no declaration.
+    pub declared_inputs: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -391,6 +400,7 @@ mod tests {
             block_customization: None,
             schedule_trigger: None,
             guard: None,
+            declared_inputs: Vec::new(),
         }
     }
 

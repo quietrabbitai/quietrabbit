@@ -67,6 +67,10 @@ steps:
       Requirements: {requirements}
       {persona_context}
     field_requirements: []
+    declared_inputs:
+      - voice_profile
+      - requirements
+      - persona_context
     options_override:
       temperature: 0.4
       num_predict: 1024
@@ -87,6 +91,10 @@ steps:
       Requirements: {requirements}
       Research: {research_results}
     field_requirements: []
+    declared_inputs:
+      - voice_profile
+      - requirements
+      - research_results
     options_override:
       temperature: 0.3
       num_predict: 768

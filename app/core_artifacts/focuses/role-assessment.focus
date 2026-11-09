@@ -112,6 +112,10 @@ steps:
       Job summary: {jd_summary}
       {persona_context}
     field_requirements: []
+    declared_inputs:
+      - voice_profile
+      - jd_summary
+      - persona_context
     options_override:
       temperature: 0.4
       num_predict: 768
@@ -137,6 +141,9 @@ steps:
 
       Job summary: {jd_summary}
     field_requirements: []
+    declared_inputs:
+      - voice_profile
+      - jd_summary
     options_override:
       temperature: 0.3
       num_predict: 512
@@ -165,6 +172,10 @@ steps:
       Fit analysis: {fit_analysis}
       Salary context: {salary_context}
     field_requirements: []
+    declared_inputs:
+      - voice_profile
+      - fit_analysis
+      - salary_context
     options_override:
       temperature: 0.3
       num_predict: 512

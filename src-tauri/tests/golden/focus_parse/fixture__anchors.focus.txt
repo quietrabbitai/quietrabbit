@@ -33,6 +33,7 @@ ActionDefinition {
     block_customization: None,
     schedule_trigger: None,
     guard: None,
+    declared_inputs: [],
 }
 field_requirements: {}
 options_override: {}
@@ -57,6 +58,7 @@ ActionDefinition {
     block_customization: None,
     schedule_trigger: None,
     guard: None,
+    declared_inputs: [],
 }
 field_requirements: {}
 options_override: {}

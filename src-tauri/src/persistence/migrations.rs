@@ -475,6 +475,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/shared_039.sql"),
     },
     SchemaFile {
+        prefix: "shared",
+        version: 40,
+        sql: include_str!("../../schema/shared_040.sql"),
+    },
+    SchemaFile {
         prefix: "tier3_cookies",
         version: 1,
         sql: include_str!("../../schema/tier3_cookies_001.sql"),
@@ -2361,15 +2366,15 @@ mod tests {
             .await
             .expect("shared migration chain must apply cleanly on a fresh db");
         assert_eq!(
-            applied, 39,
-            "expected all thirty-nine shared schema versions to apply"
+            applied, 40,
+            "expected all forty shared schema versions to apply"
         );
 
         let version: (i64,) = sqlx::query_as("SELECT MAX(version) FROM schema_version")
             .fetch_one(&mut conn)
             .await
             .unwrap();
-        assert_eq!(version.0, 39);
+        assert_eq!(version.0, 40);
     }
 
     /// items.id=708 / items.id=703 / items.id=724: shared_026.sql and
@@ -2938,8 +2943,8 @@ mod tests {
             .expect("drift-healing run must succeed");
 
         assert_eq!(
-            applied, 38,
-            "shared v2 through v39 should count as newly applied from a stale v1 database"
+            applied, 39,
+            "shared v2 through v40 should count as newly applied from a stale v1 database"
         );
 
         // items.id=427: shared_013.sql drops tier3_providers (generalized
@@ -4019,7 +4024,9 @@ mod tests {
             .await
             .unwrap();
         }
-        sqlx::query("DELETE FROM schema_version WHERE version = 39")
+        // A database at 038 has neither 039 nor 040 (the runner applies what is
+        // above its highest recorded version), so forget both.
+        sqlx::query("DELETE FROM schema_version WHERE version IN (39, 40)")
             .execute(&mut conn)
             .await
             .unwrap();
@@ -4029,7 +4036,7 @@ mod tests {
             .unwrap();
         assert!(before.0 > 0, "the 038 seed rows are there");
 
-        assert_eq!(run_migrations(&mut conn, "shared", None).await.unwrap(), 1);
+        assert_eq!(run_migrations(&mut conn, "shared", None).await.unwrap(), 2);
 
         let after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM focus_block_compositions")
             .fetch_one(&mut conn)
@@ -4048,7 +4055,87 @@ mod tests {
             .fetch_one(&mut conn)
             .await
             .unwrap();
-        assert_eq!(v.0, 39);
+        assert_eq!(v.0, 40);
+    }
+
+    // items.id=879: shared_040.sql repairs the applied Writing Assistant
+    // draft_writing seed row with a declared_inputs key and nothing else.
+    async fn wa_draft_customization(conn: &mut sqlx::SqliteConnection) -> serde_json::Value {
+        let raw: String = sqlx::query_scalar(
+            "SELECT customization FROM focus_block_customization \
+             WHERE id = 'writing-assistant:draft_writing:default'",
+        )
+        .fetch_one(conn)
+        .await
+        .unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    #[tokio::test]
+    async fn shared_040_declares_the_draft_writing_inputs_on_a_fresh_database() {
+        let mut conn = make_test_conn().await;
+        run_migrations(&mut conn, "shared", None).await.unwrap();
+        let c = wa_draft_customization(&mut conn).await;
+        assert_eq!(
+            c["declared_inputs"],
+            serde_json::json!(["user_input", "voice_analysis_output", "voice_profile"])
+        );
+        // Data only: no other draft_writing key moved, and no other row gained one.
+        assert_eq!(c["routing_tier"], 2);
+        assert_eq!(c["output_var"], "draft_output");
+        assert!(c["prompt_template"]
+            .as_str()
+            .unwrap()
+            .contains("{user_input}"));
+        let others: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM focus_block_customization \
+             WHERE customization LIKE '%declared_inputs%' \
+               AND id <> 'writing-assistant:draft_writing:default'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(others.0, 0);
+    }
+
+    #[tokio::test]
+    async fn shared_040_applies_to_a_database_already_at_039_and_changes_one_row() {
+        let mut conn = make_test_conn().await;
+        run_migrations(&mut conn, "shared", None).await.unwrap();
+        // Hand-build the 039 state: the seeded row as shared_038 wrote it.
+        let fixed = wa_draft_customization(&mut conn).await;
+        sqlx::query(
+            "UPDATE focus_block_customization \
+             SET customization = json_remove(customization, '$.declared_inputs') \
+             WHERE id = 'writing-assistant:draft_writing:default'",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM schema_version WHERE version = 40")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let before = wa_draft_customization(&mut conn).await;
+        assert!(before.get("declared_inputs").is_none());
+        let rows_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM focus_block_customization")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+
+        assert_eq!(run_migrations(&mut conn, "shared", None).await.unwrap(), 1);
+
+        assert_eq!(wa_draft_customization(&mut conn).await, fixed);
+        let rows_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM focus_block_customization")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(rows_after.0, rows_before.0, "no row added or removed");
+        let v: (i64,) = sqlx::query_as("SELECT MAX(version) FROM schema_version")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(v.0, 40);
     }
 
     // items.id=661: keys_006.sql and personal_009.sql are additive, so they
@@ -4056,7 +4143,7 @@ mod tests {
     // is a compile-time static, so the older database is hand-built: apply
     // everything, then remove what the new file added and forget its version.
     /// items.id=661: shared_008.sql no longer adds a column, but versions must
-    /// stay contiguous. Every version 1..=39 must have its row, 8 included,
+    /// stay contiguous. Every version 1..=40 must have its row, 8 included,
     /// recorded by the file's own INSERT.
     #[tokio::test]
     async fn every_shared_version_is_recorded_including_the_no_column_shared_008() {
@@ -4068,7 +4155,7 @@ mod tests {
                 .await
                 .unwrap();
         let versions: Vec<i64> = versions.into_iter().map(|v| v.0).collect();
-        assert_eq!(versions, (1..=39).collect::<Vec<i64>>());
+        assert_eq!(versions, (1..=40).collect::<Vec<i64>>());
         let description: String =
             sqlx::query_scalar("SELECT description FROM schema_version WHERE version = 8")
                 .fetch_one(&mut conn)

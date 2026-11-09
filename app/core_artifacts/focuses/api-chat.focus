@@ -43,3 +43,5 @@ steps:
 
       {user_input}
     field_requirements: []
+    declared_inputs:
+      - user_input

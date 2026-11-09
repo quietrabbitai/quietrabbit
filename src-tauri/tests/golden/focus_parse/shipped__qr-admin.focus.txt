@@ -35,6 +35,7 @@ ActionDefinition {
     block_customization: None,
     schedule_trigger: None,
     guard: None,
+    declared_inputs: [],
 }
 field_requirements: {}
 options_override: {"num_predict":64,"temperature":0.2}

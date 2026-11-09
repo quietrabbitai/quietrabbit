@@ -2454,7 +2454,7 @@ fn collect_output_vars(steps: &[TaskStep]) -> HashMap<String, String> {
 /// Find all {snake_case_token} patterns in a template string.
 /// Matches [a-z_][a-z0-9_]* — identical to Python oracle's _TOKEN_PATTERN.
 /// Returns deduplicated list in discovery order.
-fn find_tokens(template: &str) -> Vec<String> {
+pub(crate) fn find_tokens(template: &str) -> Vec<String> {
     let chars: Vec<char> = template.chars().collect();
     let n = chars.len();
     let mut tokens: Vec<String> = Vec::new();
@@ -3667,6 +3667,7 @@ mod tests {
                 block_customization: None,
                 schedule_trigger: None,
                 guard: None,
+                declared_inputs: Vec::new(),
             },
             focus_id: "f".to_owned(),
             focus_run_id: "fr".to_owned(),
@@ -3731,6 +3732,7 @@ mod tests {
                 block_customization: None,
                 schedule_trigger: None,
                 guard: None,
+                declared_inputs: Vec::new(),
             },
             focus_id: "f".to_owned(),
             focus_run_id: "fr".to_owned(),
@@ -3781,6 +3783,7 @@ mod tests {
                 block_customization: None,
                 schedule_trigger: None,
                 guard: None,
+                declared_inputs: Vec::new(),
             },
             focus_id: "f".to_owned(),
             focus_run_id: "fr".to_owned(),
@@ -3843,6 +3846,7 @@ mod tests {
                 block_customization: None,
                 schedule_trigger: None,
                 guard: None,
+                declared_inputs: Vec::new(),
             },
             focus_id: "focus-1".to_owned(),
             focus_run_id: "run-1".to_owned(),
