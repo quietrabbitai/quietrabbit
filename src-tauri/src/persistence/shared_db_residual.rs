@@ -203,6 +203,11 @@ pub const RESIDUAL_SHARED_SCHEMA: &[ResidualTable] = &[
             "schedule_trigger_offset",
             "created_at",
             "updated_at",
+            // items.id=878 (shared_039.sql): shipped guard content, a variable
+            // name, an operator and literals. No personal values.
+            "guard_var",
+            "guard_op",
+            "guard_value",
         ],
     },
     ResidualTable {

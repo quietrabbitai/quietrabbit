@@ -38,6 +38,12 @@ pub struct CompositionRow {
     pub sequence_index: i64,
     pub schedule_trigger_anchor_field: Option<String>,
     pub schedule_trigger_offset: Option<String>,
+    /// items.id=878 (shared_039.sql): the raw guard columns, all None on an
+    /// unguarded row. Parsed and validated by conductor::guard at LOAD, never
+    /// here, so a malformed guard reaches the loader with its own error.
+    pub guard_var: Option<String>,
+    pub guard_op: Option<String>,
+    pub guard_value: Option<String>,
     /// The Focus-type-default (persona_id IS NULL) customization row's JSON,
     /// or `"{}"` when no such row exists yet (LEFT JOIN — see
     /// list_compositions()'s own query). No Persona-scoped override row is
@@ -100,6 +106,7 @@ pub async fn list_compositions(
     let rows = sqlx::query(
         "SELECT c.action_id, c.block_stable_id, c.sequence_index,
                 c.schedule_trigger_anchor_field, c.schedule_trigger_offset,
+                c.guard_var, c.guard_op, c.guard_value,
                 COALESCE(cu.customization, '{}') AS customization
          FROM focus_block_compositions c
          LEFT JOIN focus_block_customization cu
@@ -119,6 +126,9 @@ pub async fn list_compositions(
                 sequence_index: row.try_get("sequence_index")?,
                 schedule_trigger_anchor_field: row.try_get("schedule_trigger_anchor_field")?,
                 schedule_trigger_offset: row.try_get("schedule_trigger_offset")?,
+                guard_var: row.try_get("guard_var")?,
+                guard_op: row.try_get("guard_op")?,
+                guard_value: row.try_get("guard_value")?,
                 customization: row.try_get("customization")?,
             })
         })

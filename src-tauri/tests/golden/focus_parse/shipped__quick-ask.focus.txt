@@ -38,6 +38,7 @@ ActionDefinition {
     block_stable_id: None,
     block_customization: None,
     schedule_trigger: None,
+    guard: None,
 }
 field_requirements: {}
 options_override: {"num_predict":512,"temperature":0.4}

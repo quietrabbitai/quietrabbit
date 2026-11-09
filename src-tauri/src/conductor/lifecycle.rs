@@ -85,6 +85,7 @@ use crate::conductor::executor::{is_user_stop, StepContext, StepExecutor};
 use crate::conductor::failure::{
     ConductorError, FailureAction, FailureHandler, FailureResult, FailureSeverity,
 };
+use crate::conductor::guard;
 use crate::conductor::memory_broker::MemoryBroker;
 use crate::conductor::privacy::output_scan::{scan_output, ScanIntensity};
 use crate::conductor::privacy::types::sensitivity_severity;
@@ -431,6 +432,7 @@ fn build_action_definition(
         block_stable_id: None,
         block_customization: None,
         schedule_trigger: None,
+        guard: None,
         action_id,
     }
 }
@@ -678,6 +680,21 @@ async fn load_focus_definition_from_db(
             row.schedule_trigger_offset,
         )?;
 
+        // items.id=878: an unparseable guard, an unknown operator or a
+        // malformed value each fail LOAD here with their own message. Whether
+        // the guard's variable exists is checked below, over the whole row list.
+        let guard = guard::Guard::from_columns(
+            row.guard_var.as_deref(),
+            row.guard_op.as_deref(),
+            row.guard_value.as_deref(),
+        )
+        .map_err(|e| {
+            LifecycleError::ValidationFailed(format!(
+                "Focus '{focus_id}' step '{}': {e}",
+                row.action_id
+            ))
+        })?;
+
         let mut step = match &row.block_stable_id {
             None => {
                 let raw_step: RawStepFromDb =
@@ -782,36 +799,26 @@ async fn load_focus_definition_from_db(
                     block_stable_id: Some(stable_id.clone()),
                     block_customization: Some(block_customization),
                     schedule_trigger: None,
+                    guard: None,
                 }
             }
         };
         step.schedule_trigger = schedule_trigger;
+        step.guard = guard;
         steps.push(step);
     }
 
-    // Placement rules for block steps (items.id=129). A block step's recorded
-    // content is its verdict, and last_output() feeds both OUTPUT and the
-    // handoff-pause draft, so a block must be followed by an ordinary local
-    // step: never last, never directly before an external or handoff step.
-    for (i, step) in steps.iter().enumerate() {
-        if step.block_stable_id.is_none() {
-            continue;
-        }
-        let Some(next) = steps.get(i + 1) else {
-            return Err(LifecycleError::ValidationFailed(format!(
-                "Focus '{focus_id}' step '{}': a block step cannot be the final step (its \
-                 verdict would become the run's output)",
-                step.action_id
-            )));
-        };
-        if next.routing_tier != ExternalAccess::LocalOnly || next.requires_user_handoff {
-            return Err(LifecycleError::ValidationFailed(format!(
-                "Focus '{focus_id}' step '{}': a block step cannot come directly before an \
-                 external or handoff step ('{}')",
-                step.action_id, next.action_id
-            )));
-        }
-    }
+    // Guard and placement analysis (items.id=878 over items.id=129). Guard
+    // variables must come from an earlier row, and every PATH through the
+    // guards must hold: no unreachable row, no empty path, a router has a
+    // fallback row, and the block-placement rule against the next EXECUTED row.
+    //
+    // Block placement (items.id=129): a block step's recorded content is its
+    // verdict, and last_output() feeds both OUTPUT and the handoff-pause draft,
+    // so a block must be followed by an ordinary local step: never last, never
+    // directly before an external or handoff step. An unguarded Focus has one
+    // path, which is every row in order, so this is the Stage 1 rule unchanged.
+    analyze_guarded_composition(focus_id, &steps)?;
 
     Ok(Some(FocusDefinition {
         focus_id: focus_id.to_owned(),
@@ -826,6 +833,42 @@ async fn load_focus_definition_from_db(
         generic_title_template: focus_row.generic_title_template,
         high_priority_trigger,
     }))
+}
+
+/// items.id=878: LOAD analysis of a composition's guards. Returns the number of
+/// paths (1 for an unguarded Focus). See conductor::guard for the rules.
+fn analyze_guarded_composition(
+    focus_id: &str,
+    steps: &[ActionDefinition],
+) -> Result<usize, LifecycleError> {
+    // A block row's output variable is the handler's declared one:
+    // ActionDefinition.output_var is None for a block row.
+    let block_vars: Vec<Option<String>> = steps
+        .iter()
+        .map(|s| {
+            let id = s.block_stable_id.as_deref()?;
+            let handler = crate::conductor::block_dispatch::block_handler(id)?;
+            (handler.output_var)(s.block_customization.as_ref()?)
+        })
+        .collect();
+    let shapes: Vec<guard::RowShape> = steps
+        .iter()
+        .zip(block_vars.iter())
+        .map(|(s, block_var)| guard::RowShape {
+            action_id: &s.action_id,
+            guard: s.guard.as_ref(),
+            output_var: if s.block_stable_id.is_some() {
+                block_var.as_deref()
+            } else {
+                s.output_var.as_deref().filter(|v| !v.is_empty())
+            },
+            is_block: s.block_stable_id.is_some(),
+            local_and_no_handoff: s.routing_tier == ExternalAccess::LocalOnly
+                && !s.requires_user_handoff,
+        })
+        .collect();
+    guard::analyze_composition(&shapes)
+        .map_err(|e| LifecycleError::ValidationFailed(format!("Focus '{focus_id}' {e}")))
 }
 
 /// Shared anchor_field+offset -> HighPriorityTrigger parse, used by both
@@ -963,6 +1006,14 @@ pub async fn load_focus_definition(
             focus_def.max_routing_tier =
                 ExternalAccess::min(focus_def.max_routing_tier, shipped.max_routing_tier);
         }
+        // items.id=878: and the bundled tier manifest (conductor::tier_manifest),
+        // which also covers a database-only shipped Focus that has no .focus
+        // file to compare against. A focus_id with no manifest entry is held to
+        // the most restrictive tier. Strictest of the three wins.
+        focus_def.max_routing_tier = crate::conductor::tier_manifest::apply_manifest(
+            &focus_def.focus_id,
+            focus_def.max_routing_tier,
+        );
         for step in &focus_def.steps {
             let errors = validate_step(step);
             if !errors.is_empty() {
@@ -2288,6 +2339,27 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             // Clone step to release focus_def borrow before &mut self calls below.
             let step = self.focus_def.as_ref().unwrap().steps[i].clone();
 
+            // items.id=878 (decisions.id=938, G1): a row whose guard is false is
+            // SKIPPED, evaluated now over the live track variables. This sits
+            // before everything else in the iteration on purpose, so a skipped
+            // step emits no status or completion event, writes no ledger row,
+            // gate or checkpoint, advances no checkpoint counter and records
+            // nothing on the track. Its ordinal is simply passed over. A resume
+            // after a checkpointed step re-evaluates the guard on the rebuilt
+            // track (rehydrate_focus_run restores every recorded output), so it
+            // lands on the same path. YAML-authored steps never carry a guard.
+            if let Some(g) = &step.guard {
+                let vars = guard::track_vars(self.task_track.as_ref().unwrap());
+                if !g.evaluate(&vars) {
+                    log::debug!(
+                        "lifecycle: step '{}' skipped, guard on '{}' is false",
+                        step.action_id,
+                        g.var
+                    );
+                    continue;
+                }
+            }
+
             // items.id=129: a block step is internal bookkeeping, not
             // something the user is waiting on. It emits neither a start nor a
             // completion event: its verdict is advisory text and must not
@@ -2642,18 +2714,14 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             self._focus_privacy_tier,
         );
 
-        // Gate3 look-ahead: next step's execution_tier
+        // Gate3 look-ahead: next step's execution_tier (see next_execution_tier()).
         let next_execution_tier: Option<u8> = {
             let fd = self.focus_def.as_ref().unwrap();
-            if step_index + 1 < fd.steps.len() {
-                let next = &fd.steps[step_index + 1];
-                Some(execution_tier_ordinal(ExternalAccess::min(
-                    ExternalAccess::min(self._focus_max_permitted_tier, fd.max_routing_tier),
-                    next.routing_tier,
-                )))
-            } else {
-                None
-            }
+            next_execution_tier(
+                &fd.steps,
+                step_index,
+                ExternalAccess::min(self._focus_max_permitted_tier, fd.max_routing_tier),
+            )
         };
 
         // Clone values needed in the async block / StepContext before any &mut borrows.
@@ -3872,24 +3940,8 @@ pub async fn rehydrate_focus_run<L: DisclosureLoggerForRun>(
             let task_track = deserialize_task_track(&task_json)?;
             let shared_state = deserialize_shared_state_track(&shared_json)?;
 
-            let step_index = run
-                .focus_def
-                .as_ref()
-                .unwrap()
-                .steps
-                .iter()
-                .position(|s| s.action_id == action_id);
-            let resume_at = match step_index {
-                // items.id=496: awaiting_schedule's checkpoint is written
-                // for the step BEFORE it runs, same as awaiting_user's
-                // handoff-pause checkpoint (see execute()'s schedule_trigger
-                // gate) -- resume must re-enter at that same index, not the
-                // next one, or the step whose trigger just fired would be
-                // skipped entirely.
-                Some(i) if status == "awaiting_user" || status == "awaiting_schedule" => i,
-                Some(i) => i + 1,
-                None => 0,
-            };
+            let resume_at =
+                resume_index(&run.focus_def.as_ref().unwrap().steps, &action_id, &status);
             (task_track, shared_state, resume_at)
         }
         None => (TaskTrack::new(), SharedStateTrack::new(), 0),
@@ -3900,6 +3952,55 @@ pub async fn rehydrate_focus_run<L: DisclosureLoggerForRun>(
     run.current_step = current_step;
 
     Ok(run)
+}
+
+/// Gate3 look-ahead: the execution tier of the step after `step_index`, under
+/// `ceiling` (the Focus-level cap).
+///
+/// items.id=878: a guarded row may be skipped, and which row runs next can
+/// depend on the current step's own output, so this takes the HIGHEST tier among
+/// every row that could run next: the following rows up to and including the
+/// first unguarded one. For a Focus with no guards that is exactly the single
+/// following row, as before. Never lower than the real next step, so Gate3 can
+/// fire when it need not but cannot be missed.
+fn next_execution_tier(
+    steps: &[ActionDefinition],
+    step_index: usize,
+    ceiling: ExternalAccess,
+) -> Option<u8> {
+    let upcoming = steps.get(step_index + 1..).unwrap_or_default();
+    let mut candidates = Vec::new();
+    for next in upcoming {
+        candidates.push(next);
+        if next.guard.is_none() {
+            break;
+        }
+    }
+    candidates
+        .iter()
+        .map(|next| execution_tier_ordinal(ExternalAccess::min(ceiling, next.routing_tier)))
+        .max()
+}
+
+/// Where a rehydrated run resumes: the index of the step after the
+/// checkpointed one, or AT it for a run parked on that very step.
+///
+/// items.id=496: awaiting_schedule's checkpoint is written for the step BEFORE
+/// it runs, same as awaiting_user's handoff-pause checkpoint (see execute()'s
+/// schedule_trigger gate) -- resume must re-enter at that same index, not the
+/// next one, or the step whose trigger just fired would be skipped entirely.
+///
+/// items.id=878: unchanged by guards. A checkpoint is only ever written for a
+/// step that ran (a skipped step writes none), and the rows between it and the
+/// next executed one are simply reached again, where their guards are evaluated
+/// over the restored track and give the same answer as before the interruption.
+/// Extracted from rehydrate_focus_run() unchanged so a test can drive the rule.
+fn resume_index(steps: &[ActionDefinition], action_id: &str, status: &str) -> usize {
+    match steps.iter().position(|s| s.action_id == action_id) {
+        Some(i) if status == "awaiting_user" || status == "awaiting_schedule" => i,
+        Some(i) => i + 1,
+        None => 0,
+    }
 }
 
 /// Rebuild a TaskTrack from write_checkpoint()'s stored JSON shape
@@ -6461,6 +6562,7 @@ mod tests {
                 block_stable_id: None,
                 block_customization: None,
                 schedule_trigger: None,
+                guard: None,
             });
             run.focus_def = Some(def);
             let mut personal_track = PersonalTrack::new();
@@ -6536,6 +6638,7 @@ mod tests {
             block_stable_id: None,
             block_customization: None,
             schedule_trigger: None,
+            guard: None,
         });
         run.focus_def = Some(def);
         let mut personal_track = PersonalTrack::new();
@@ -8109,14 +8212,855 @@ mod tests {
             let def = load_focus_definition(&pool, "writing-assistant").await.unwrap();
             assert_eq!(def.max_routing_tier, ExternalAccess::LocalOnly);
 
-            // A composition-authored Focus with no bundled file is untouched.
+            // A composition-authored Focus with no bundled file has no .focus
+            // reference, but items.id=878's manifest holds it to the most
+            // restrictive tier because it has no manifest entry either.
             seed_block_focus(&pool, "no-bundled-file", "cb-06", &good_cb06_json()).await;
             sqlx::query("UPDATE focuses SET max_routing_tier = 'unrestricted' WHERE focus_id = 'no-bundled-file'")
                 .execute(&pool)
                 .await
                 .unwrap();
             let def = load_focus_definition(&pool, "no-bundled-file").await.unwrap();
-            assert_eq!(def.max_routing_tier, ExternalAccess::Unrestricted);
+            assert_eq!(def.max_routing_tier, ExternalAccess::LocalOnly);
+        })
+        .await;
+    }
+    // -- items.id=878: guards on composition rows (G1) ----------------------
+
+    /// One composition row for seed_guarded_focus(): (action_id, block id,
+    /// guard (var, op, value), customization JSON).
+    struct GRow {
+        id: String,
+        block: Option<&'static str>,
+        guard: Option<(&'static str, &'static str, Option<&'static str>)>,
+        custom: String,
+    }
+
+    /// An ordinary local step recording `out`.
+    fn gplain(
+        id: &str,
+        out: Option<&str>,
+        guard: Option<(&'static str, &'static str, Option<&'static str>)>,
+    ) -> GRow {
+        let mut c = serde_json::json!({"routing_tier": 1, "prompt_template": "x"});
+        if let Some(o) = out {
+            c["output_var"] = serde_json::json!(o);
+        }
+        GRow {
+            id: id.to_owned(),
+            block: None,
+            guard,
+            custom: c.to_string(),
+        }
+    }
+
+    /// An ordinary EXTERNAL (tier 2) step.
+    fn gext(id: &str) -> GRow {
+        GRow {
+            id: id.to_owned(),
+            block: None,
+            guard: None,
+            custom: serde_json::json!({"routing_tier": 2, "prompt_template": "x"}).to_string(),
+        }
+    }
+
+    /// A cb-06 block step recording `out`.
+    fn gblock(
+        id: &str,
+        out: &str,
+        guard: Option<(&'static str, &'static str, Option<&'static str>)>,
+    ) -> GRow {
+        GRow {
+            id: id.to_owned(),
+            block: Some("cb-06"),
+            guard,
+            custom: serde_json::json!({
+                "input_var": "draft_output",
+                "output_var": out,
+                "criteria": [{"name": "has_content", "kind": "non_empty"}],
+                "on_fail": "advisory"
+            })
+            .to_string(),
+        }
+    }
+
+    /// Seeds a Focus whose rows (in order) carry their guard columns.
+    async fn seed_guarded_focus(pool: &sqlx::SqlitePool, focus_id: &str, rows: Vec<GRow>) {
+        let mut conn = pool.acquire().await.unwrap();
+        sqlx::query(
+            "INSERT INTO focuses
+                (focus_id, display_name, description, version, max_routing_tier,
+                 output_type, suggest_in_focuses, multi_source_validation,
+                 generic_title_template, status, created_at, updated_at)
+             VALUES (?, 'Guard Test Focus', '', '1.0', 'local_only',
+                     'general', '[]', 0, 'Hidden item', 'shipped',
+                     datetime('now'), datetime('now'))",
+        )
+        .bind(focus_id)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        for (seq, row) in rows.iter().enumerate() {
+            let comp_id = format!("comp-{focus_id}-{}", row.id);
+            let (gv, go, gval) = match row.guard {
+                Some((v, o, val)) => (Some(v), Some(o), val),
+                None => (None, None, None),
+            };
+            sqlx::query(
+                "INSERT INTO focus_block_compositions
+                    (id, focus_id, action_id, block_stable_id, sequence_index,
+                     guard_var, guard_op, guard_value, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))",
+            )
+            .bind(&comp_id)
+            .bind(focus_id)
+            .bind(&row.id)
+            .bind(row.block)
+            .bind(seq as i64)
+            .bind(gv)
+            .bind(go)
+            .bind(gval)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO focus_block_customization
+                    (id, composition_id, persona_id, customization, created_at, updated_at)
+                 VALUES (?, ?, NULL, ?, datetime('now'), datetime('now'))",
+            )
+            .bind(format!("cust-{comp_id}"))
+            .bind(&comp_id)
+            .bind(&row.custom)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn guarded_load_err(focus_id: &str, rows: Vec<GRow>) -> String {
+        let pool = block_load_pool().await;
+        seed_guarded_focus(&pool, focus_id, rows).await;
+        load_err_text(load_focus_definition_from_db(&pool, focus_id).await)
+    }
+
+    #[tokio::test]
+    async fn guard_load_unknown_variable_fails_with_its_own_message() {
+        with_temp_data_root(async {
+            let m = guarded_load_err(
+                "g-unk",
+                vec![
+                    gplain("a", Some("x"), None),
+                    gplain("b", None, Some(("nope", "present", None))),
+                ],
+            )
+            .await;
+            assert!(m.contains("step 'b'"), "{m}");
+            assert!(m.contains("'nope'"), "{m}");
+            assert!(m.contains("unknown variable"), "{m}");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn guard_load_variable_from_a_later_row_is_unknown() {
+        with_temp_data_root(async {
+            let m = guarded_load_err(
+                "g-later",
+                vec![
+                    gplain("b", None, Some(("x", "present", None))),
+                    gplain("a", Some("x"), None),
+                ],
+            )
+            .await;
+            assert!(m.contains("unknown variable"), "{m}");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn guard_load_bad_columns_each_have_their_own_message() {
+        with_temp_data_root(async {
+            let m = guarded_load_err(
+                "g-op",
+                vec![
+                    gplain("a", Some("x"), None),
+                    gplain("b", None, Some(("x", "matches", Some("v")))),
+                ],
+            )
+            .await;
+            assert!(m.contains("unknown guard operator 'matches'"), "{m}");
+
+            let m = guarded_load_err(
+                "g-half",
+                vec![
+                    gplain("a", Some("x"), None),
+                    gplain("b", None, Some(("x", "", None))),
+                ],
+            )
+            .await;
+            // An empty-string op is an unknown operator, not NULL.
+            assert!(m.contains("unknown guard operator"), "{m}");
+
+            let m = guarded_load_err(
+                "g-val",
+                vec![
+                    gplain("a", Some("x"), None),
+                    gplain("b", None, Some(("x", "eq", None))),
+                ],
+            )
+            .await;
+            assert!(m.contains("needs a guard_value"), "{m}");
+
+            let m = guarded_load_err(
+                "g-in",
+                vec![
+                    gplain("a", Some("x"), None),
+                    gplain("b", None, Some(("x", "in", Some("not json")))),
+                ],
+            )
+            .await;
+            assert!(m.contains("not a JSON array"), "{m}");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn guard_load_half_set_guard_columns_fail() {
+        with_temp_data_root(async {
+            let pool = block_load_pool().await;
+            seed_guarded_focus(&pool, "g-half2", vec![gplain("a", Some("x"), None)]).await;
+            sqlx::query(
+                "UPDATE focus_block_compositions SET guard_var = 'x' WHERE focus_id = 'g-half2'",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            let m = load_err_text(load_focus_definition_from_db(&pool, "g-half2").await);
+            assert!(m.contains("half set"), "{m}");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn guard_load_unreachable_row_fails() {
+        with_temp_data_root(async {
+            let m = guarded_load_err(
+                "g-unreach",
+                vec![
+                    gplain("a", Some("x"), None),
+                    gplain("never", None, Some(("x", "absent", None))),
+                    gplain("end", None, None),
+                ],
+            )
+            .await;
+            assert!(m.contains("'never' is unreachable"), "{m}");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn guard_load_empty_path_fails() {
+        with_temp_data_root(async {
+            // A focuses row with no composition rows runs nothing.
+            let pool = block_load_pool().await;
+            seed_guarded_focus(&pool, "g-empty", vec![]).await;
+            let m = load_err_text(load_focus_definition_from_db(&pool, "g-empty").await);
+            assert!(m.contains("runs no step"), "{m}");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn guard_load_path_cap_overflow_fails_with_a_clear_message() {
+        with_temp_data_root(async {
+            let names = ["v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8"];
+            let mut rows: Vec<GRow> = names
+                .iter()
+                .map(|&n| gplain(&format!("set_{n}"), Some(n), None))
+                .collect();
+            for n in names {
+                rows.push(gplain(&format!("eq_{n}"), None, Some((n, "eq", Some("x")))));
+                rows.push(gplain(&format!("ne_{n}"), None, Some((n, "ne", Some("x")))));
+            }
+            let m = guarded_load_err("g-cap", rows).await;
+            assert!(m.contains("more than 256 execution paths"), "{m}");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn guard_load_block_placement_is_checked_per_path() {
+        with_temp_data_root(async {
+            // On the path where intent is OTHER the guarded local row after the
+            // block is skipped, so the next executed row is the external one.
+            let m = guarded_load_err(
+                "g-place",
+                vec![
+                    gplain("route", Some("intent"), None),
+                    gplain("fb", None, Some(("intent", "present", None))),
+                    gblock("blk", "verdict", None),
+                    gplain("loc", None, Some(("intent", "eq", Some("a")))),
+                    gext("ext"),
+                ],
+            )
+            .await;
+            assert!(m.contains("external or handoff step ('ext')"), "{m}");
+            assert!(m.contains("intent=OTHER"), "{m}");
+
+            // The same Focus is fine when every path follows the block with a
+            // local row.
+            let pool = block_load_pool().await;
+            seed_guarded_focus(
+                &pool,
+                "g-place-ok",
+                vec![
+                    gplain("route", Some("intent"), None),
+                    gblock("blk", "verdict", None),
+                    gplain("loc", None, Some(("intent", "eq", Some("a")))),
+                    gplain("fb", None, Some(("intent", "ne", Some("a")))),
+                ],
+            )
+            .await;
+            let def = load_focus_definition_from_db(&pool, "g-place-ok")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(def.steps.len(), 4);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn guard_load_router_without_a_fallback_row_fails() {
+        with_temp_data_root(async {
+            let m = guarded_load_err(
+                "g-nofb",
+                vec![
+                    gplain("route", Some("intent"), None),
+                    gplain("billing", None, Some(("intent", "eq", Some("billing")))),
+                    gplain(
+                        "tech",
+                        None,
+                        Some(("intent", "in", Some(r#"["tech","hw"]"#))),
+                    ),
+                    gplain("end", None, None),
+                ],
+            )
+            .await;
+            assert!(
+                m.contains("router variable 'intent' has no fallback row"),
+                "{m}"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn guard_load_good_router_populates_the_guards_on_the_steps() {
+        with_temp_data_root(async {
+            let pool = block_load_pool().await;
+            seed_guarded_focus(
+                &pool,
+                "g-ok",
+                vec![
+                    gplain("route", Some("intent"), None),
+                    gplain("billing", None, Some(("intent", "eq", Some("billing")))),
+                    gplain("fallback", None, Some(("intent", "ne", Some("billing")))),
+                ],
+            )
+            .await;
+            let def = load_focus_definition_from_db(&pool, "g-ok")
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(def.steps[0].guard.is_none());
+            assert_eq!(
+                def.steps[1].guard,
+                Some(guard::Guard {
+                    var: "intent".to_owned(),
+                    condition: guard::Condition::Eq("billing".to_owned()),
+                })
+            );
+            assert_eq!(
+                def.steps[2].guard.as_ref().map(|g| &g.condition),
+                Some(&guard::Condition::Ne("billing".to_owned()))
+            );
+            assert_eq!(analyze_guarded_composition("g-ok", &def.steps).unwrap(), 2);
+        })
+        .await;
+    }
+
+    /// A guard on a cb-06 block row reads that block's declared output variable
+    /// as an earlier row's output.
+    #[tokio::test]
+    async fn guard_load_reads_a_blocks_declared_output_var() {
+        with_temp_data_root(async {
+            let pool = block_load_pool().await;
+            seed_guarded_focus(
+                &pool,
+                "g-blockvar",
+                vec![
+                    gblock("blk", "verdict", None),
+                    gplain("after", None, Some(("verdict", "present", None))),
+                ],
+            )
+            .await;
+            let def = load_focus_definition_from_db(&pool, "g-blockvar")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(def.steps.len(), 2);
+        })
+        .await;
+    }
+
+    /// PARITY: the seeded Writing Assistant has no guards and exactly one path.
+    #[tokio::test]
+    async fn writing_assistant_has_no_guards_and_one_path() {
+        with_temp_data_root(async {
+            let pool = block_load_pool().await;
+            let db = seeded_wa(&pool).await;
+            assert!(db.steps.iter().all(|s| s.guard.is_none()));
+            assert_eq!(
+                analyze_guarded_composition("writing-assistant", &db.steps).unwrap(),
+                1
+            );
+        })
+        .await;
+    }
+
+    // -- items.id=878: tier manifest through the loader ---------------------
+
+    #[tokio::test]
+    async fn manifest_a_db_row_cannot_widen_a_shipped_focus_without_a_focus_file() {
+        with_temp_data_root(async {
+            let pool = block_load_pool().await;
+            // writing-assistant: the manifest and the .focus file agree, and a
+            // widened row is held to them. (The .focus file is only found when
+            // the dev source dir resolves, so also prove it by the manifest
+            // alone through apply_manifest in tier_manifest's own tests.)
+            sqlx::query("UPDATE focuses SET max_routing_tier = 'unrestricted' WHERE focus_id = 'writing-assistant'")
+                .execute(&pool)
+                .await
+                .unwrap();
+            let def = load_focus_definition(&pool, "writing-assistant").await.unwrap();
+            assert_eq!(def.max_routing_tier, ExternalAccess::AnonymousRequired);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn manifest_missing_entry_loads_at_the_most_restrictive_tier() {
+        with_temp_data_root(async {
+            let pool = block_load_pool().await;
+            seed_guarded_focus(&pool, "g-noentry", vec![gplain("a", None, None)]).await;
+            sqlx::query(
+                "UPDATE focuses SET max_routing_tier = 'unrestricted' WHERE focus_id = 'g-noentry'",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                crate::conductor::tier_manifest::manifest_tier("g-noentry"),
+                None
+            );
+            let def = load_focus_definition(&pool, "g-noentry").await.unwrap();
+            assert_eq!(def.max_routing_tier, ExternalAccess::LocalOnly);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn manifest_a_stricter_row_narrows_a_shipped_focus() {
+        with_temp_data_root(async {
+            let pool = block_load_pool().await;
+            sqlx::query("UPDATE focuses SET max_routing_tier = 'local_only' WHERE focus_id = 'writing-assistant'")
+                .execute(&pool)
+                .await
+                .unwrap();
+            let def = load_focus_definition(&pool, "writing-assistant").await.unwrap();
+            assert_eq!(def.max_routing_tier, ExternalAccess::LocalOnly);
+        })
+        .await;
+    }
+
+    /// DRIFT: every bundled .focus file has a manifest entry equal to the tier
+    /// its YAML gives, and every entry has a bundled file (today all shipped
+    /// Focuses are YAML Focuses: relax the second half for a database-only one).
+    #[test]
+    fn manifest_matches_every_bundled_focus_file() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("app")
+            .join("core_artifacts")
+            .join("focuses");
+        let mut seen = 0;
+        for entry in std::fs::read_dir(&dir).expect("bundled focus dir") {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("focus") {
+                continue;
+            }
+            let focus_id = path.file_stem().unwrap().to_str().unwrap().to_owned();
+            let parsed = parse_focus_text(&std::fs::read_to_string(&path).unwrap())
+                .unwrap_or_else(|e| panic!("{focus_id}: {e}"));
+            assert_eq!(
+                crate::conductor::tier_manifest::manifest_tier(&focus_id),
+                Some(parsed.max_routing_tier),
+                "tier manifest entry for '{focus_id}' is missing or differs from its .focus file"
+            );
+            seen += 1;
+        }
+        assert!(seen >= 6, "expected the bundled .focus files, saw {seen}");
+        for (id, _) in crate::conductor::tier_manifest::SHIPPED_FOCUS_TIERS {
+            assert!(
+                dir.join(format!("{id}.focus")).exists(),
+                "manifest entry '{id}' has no bundled .focus file"
+            );
+        }
+    }
+
+    /// Gate3's look-ahead takes the highest tier a guarded next row could have.
+    #[test]
+    fn gate3_look_ahead_covers_every_row_that_could_run_next() {
+        let step = |tier: ExternalAccess, guarded: bool| {
+            let mut s = single_tier3_step_focus_def().steps[0].clone();
+            s.routing_tier = tier;
+            s.guard = guarded.then(|| {
+                guard::Guard::from_columns(Some("v"), Some("present"), None)
+                    .unwrap()
+                    .unwrap()
+            });
+            s
+        };
+        let c = ExternalAccess::Unrestricted;
+        // No guards: just the following row, as before.
+        let plain = [
+            step(ExternalAccess::LocalOnly, false),
+            step(ExternalAccess::LocalOnly, false),
+            step(ExternalAccess::Unrestricted, false),
+        ];
+        assert_eq!(next_execution_tier(&plain, 0, c), Some(1));
+        assert_eq!(next_execution_tier(&plain, 1, c), Some(3));
+        assert_eq!(next_execution_tier(&plain, 2, c), None);
+        // A guarded local row next, an unguarded external one after it: either
+        // may run next, so the look-ahead sees the external one.
+        let guarded = [
+            step(ExternalAccess::LocalOnly, false),
+            step(ExternalAccess::LocalOnly, true),
+            step(ExternalAccess::Unrestricted, false),
+            step(ExternalAccess::Unrestricted, false),
+        ];
+        assert_eq!(next_execution_tier(&guarded, 0, c), Some(3));
+        // The scan stops at the first unguarded row.
+        let stops = [
+            step(ExternalAccess::LocalOnly, false),
+            step(ExternalAccess::LocalOnly, false),
+            step(ExternalAccess::Unrestricted, false),
+        ];
+        assert_eq!(next_execution_tier(&stops, 0, c), Some(1));
+        // The ceiling still caps it.
+        assert_eq!(
+            next_execution_tier(&guarded, 0, ExternalAccess::LocalOnly),
+            Some(1)
+        );
+    }
+
+    // -- items.id=878: execute() skips a guarded row ------------------------
+
+    /// A hand-built Focus (bypassing LOAD, like the block tests above) of
+    /// model-free work: three cb-06 blocks that run and two ordinary steps whose
+    /// guards are false, so a skipped step that WOULD have needed a model must
+    /// leave no trace. The draft is on the track already.
+    ///
+    ///   0 check_a      block, unguarded                 -> quality_verdict
+    ///   1 skip_plain   ordinary, guard verdict absent   -> skipped
+    ///   2 check_b      block, guard verdict present     -> second_verdict
+    ///   3 skip_plain2  ordinary, guard second absent    -> skipped
+    ///   4 check_c      block, guard second present      -> third_verdict
+    fn guarded_hand_built_def() -> FocusDefinition {
+        let block = |id: &str, out: &str, guard: Option<guard::Guard>| {
+            let mut s = hand_built_cb06_step();
+            s.action_id = id.to_owned();
+            s.display_name = id.to_owned();
+            let mut cfg: serde_json::Value = serde_json::from_str(&good_cb06_json()).unwrap();
+            cfg["output_var"] = serde_json::json!(out);
+            s.block_customization = Some(cfg);
+            s.guard = guard;
+            s
+        };
+        let plain = |id: &str, guard: guard::Guard| {
+            let mut s = single_tier3_step_focus_def().steps[0].clone();
+            s.action_id = id.to_owned();
+            s.display_name = id.to_owned();
+            s.routing_tier = ExternalAccess::LocalOnly;
+            s.external_access_override = None;
+            s.requires_user_handoff = false;
+            s.guard = Some(guard);
+            s
+        };
+        let g = |var: &str, op: &str| {
+            guard::Guard::from_columns(Some(var), Some(op), None)
+                .unwrap()
+                .unwrap()
+        };
+        let mut def = single_tier3_step_focus_def();
+        def.steps = vec![
+            block("check_a", "quality_verdict", None),
+            plain("skip_plain", g("quality_verdict", "absent")),
+            block(
+                "check_b",
+                "second_verdict",
+                Some(g("quality_verdict", "present")),
+            ),
+            plain("skip_plain2", g("second_verdict", "absent")),
+            block(
+                "check_c",
+                "third_verdict",
+                Some(g("second_verdict", "present")),
+            ),
+        ];
+        def
+    }
+
+    fn ran_ids(run: &FocusRun<crate::conductor::privacy::logger::TestLogger>) -> Vec<String> {
+        run.task_track
+            .as_ref()
+            .unwrap()
+            .steps()
+            .iter()
+            .map(|s| s.action_id.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_skipped_step_emits_nothing_records_nothing_and_leaves_no_ledger_row() {
+        with_temp_data_root(async {
+            let mut run = tier3_ready_run(false);
+            run.focus_def = Some(guarded_hand_built_def());
+            run.task_track
+                .as_mut()
+                .unwrap()
+                .add_step(draft_step("the assessed draft"));
+            // The ledger row's FK needs the focus_runs row AUTHORIZE writes.
+            crate::persistence::output_store::test_seed_focus_run(
+                &run.user_id,
+                &run.persona_id,
+                CRISIS_TEST_KEY_HEX,
+                run.focus_run_id.as_deref().unwrap(),
+                "f",
+            )
+            .await
+            .unwrap();
+
+            let r = run.execute().await.expect("execute must not error");
+            assert!(r.is_none(), "every row done or skipped: {r:?}");
+
+            // Only the unskipped rows ran, in order, after the seeded draft.
+            assert_eq!(
+                ran_ids(&run),
+                ["draft_writing", "check_a", "check_b", "check_c"]
+            );
+            // The skipped ordinary steps would have announced themselves.
+            assert!(
+                run.emitted_for_test.lock().unwrap().is_empty(),
+                "a skipped step emits no event: {:?}",
+                run.emitted_for_test.lock().unwrap()
+            );
+            // The track holds no value for a skipped step.
+            let tt = run.task_track.as_ref().unwrap();
+            assert!(tt.steps().iter().all(|s| !s.action_id.starts_with("skip_")));
+
+            // No focus_run_steps ledger row for a skipped step; one per ran step.
+            let focus_run_id = run.focus_run_id.clone().unwrap();
+            let mut conn = open_outputs_db(&run.user_id, &run.persona_id, CRISIS_TEST_KEY_HEX)
+                .await
+                .unwrap();
+            let rows: Vec<(String,)> = sqlx::query_as(
+                "SELECT action_id FROM focus_run_steps WHERE focus_run_id = ? ORDER BY sequence_index",
+            )
+            .bind(&focus_run_id)
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+            let ledger: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+            assert_eq!(ledger, ["check_a", "check_b", "check_c"]);
+        })
+        .await;
+    }
+
+    /// A guard on a variable nothing sets is false: the row is skipped, and so is
+    /// every row that reads what it would have recorded.
+    #[tokio::test]
+    async fn a_guard_on_a_variable_nothing_sets_skips_the_row_and_its_dependents() {
+        with_temp_data_root(async {
+            let mut run = tier3_ready_run(false);
+            let mut def = guarded_hand_built_def();
+            def.steps[2].guard = Some(
+                guard::Guard::from_columns(Some("never_set"), Some("present"), None)
+                    .unwrap()
+                    .unwrap(),
+            );
+            run.focus_def = Some(def);
+            run.task_track
+                .as_mut()
+                .unwrap()
+                .add_step(draft_step("the assessed draft"));
+            run.execute().await.unwrap();
+            assert_eq!(ran_ids(&run), ["draft_writing", "check_a"]);
+        })
+        .await;
+    }
+
+    /// Checkpoints are written only for steps that ran. A crash after any of
+    /// them resumes on the same path: the guards between the checkpoint and the
+    /// next executed step are evaluated over the restored track and agree with
+    /// the uninterrupted run.
+    #[tokio::test]
+    async fn resume_after_a_checkpoint_stays_on_the_same_path_as_the_uninterrupted_run() {
+        with_temp_data_root(async {
+            let saved = std::env::var("QR_CHECKPOINT_EVERY_N_STEPS").ok();
+            std::env::set_var("QR_CHECKPOINT_EVERY_N_STEPS", "1");
+
+            let full = guarded_hand_built_def();
+
+            // The uninterrupted run, as the reference.
+            let mut reference = tier3_ready_run(false);
+            reference.focus_def = Some(full.clone());
+            reference
+                .task_track
+                .as_mut()
+                .unwrap()
+                .add_step(draft_step("the assessed draft"));
+            reference.execute().await.unwrap();
+            let expected = ran_ids(&reference);
+            assert_eq!(expected, ["draft_writing", "check_a", "check_b", "check_c"]);
+
+            // Interrupt after each executed row k (a crash right after its
+            // checkpoint), including the ones directly before a skipped row.
+            for crash_after in 0..full.steps.len() {
+                let mut first = tier3_ready_run(false);
+                let mut truncated = full.clone();
+                truncated.steps.truncate(crash_after + 1);
+                first.focus_def = Some(truncated);
+                first
+                    .task_track
+                    .as_mut()
+                    .unwrap()
+                    .add_step(draft_step("the assessed draft"));
+                let focus_run_id = first.focus_run_id.clone().unwrap();
+                crate::persistence::output_store::test_seed_focus_run(
+                    &first.user_id,
+                    &first.persona_id,
+                    CRISIS_TEST_KEY_HEX,
+                    &focus_run_id,
+                    "f",
+                )
+                .await
+                .unwrap();
+                first.execute().await.unwrap();
+
+                let mut conn =
+                    open_outputs_db(&first.user_id, &first.persona_id, CRISIS_TEST_KEY_HEX)
+                        .await
+                        .unwrap();
+                let snap = sqlx::query(
+                    "SELECT action_id, task_track_json FROM focus_run_snapshots
+                     WHERE focus_run_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                )
+                .bind(&focus_run_id)
+                .fetch_optional(&mut conn)
+                .await
+                .unwrap();
+                drop(conn);
+
+                // The resumed run, exactly as rehydrate_focus_run() builds it.
+                let mut resumed = tier3_ready_run(false);
+                resumed.focus_def = Some(full.clone());
+                match snap {
+                    Some(row) => {
+                        let action_id: String = row.try_get("action_id").unwrap();
+                        let json: String = row.try_get("task_track_json").unwrap();
+                        // A checkpoint is never keyed to a skipped step.
+                        assert!(!action_id.starts_with("skip_"), "{action_id}");
+                        resumed.task_track = Some(deserialize_task_track(&json).unwrap());
+                        resumed.current_step = resume_index(&full.steps, &action_id, "running");
+                    }
+                    None => {
+                        // Nothing checkpointed yet (the crash came before any
+                        // executed row): a fresh start.
+                        resumed
+                            .task_track
+                            .as_mut()
+                            .unwrap()
+                            .add_step(draft_step("the assessed draft"));
+                    }
+                }
+                resumed.execute().await.unwrap();
+                assert_eq!(
+                    ran_ids(&resumed),
+                    expected,
+                    "crash after row {crash_after} resumed on a different path"
+                );
+            }
+
+            match saved {
+                Some(v) => std::env::set_var("QR_CHECKPOINT_EVERY_N_STEPS", v),
+                None => std::env::remove_var("QR_CHECKPOINT_EVERY_N_STEPS"),
+            }
+        })
+        .await;
+    }
+
+    /// Re-entering at an earlier step rebuilds the track without the later
+    /// outputs, so a later row's guard is evaluated over the REBUILT track and
+    /// the rows after the re-entry point run again under it.
+    #[tokio::test]
+    async fn reentry_re_evaluates_guards_on_the_rebuilt_track() {
+        with_temp_data_root(async {
+            let full = guarded_hand_built_def();
+            let order: Vec<String> = full.steps.iter().map(|s| s.action_id.clone()).collect();
+
+            let mut run = tier3_ready_run(false);
+            run.focus_def = Some(full.clone());
+            run.task_track
+                .as_mut()
+                .unwrap()
+                .add_step(draft_step("the assessed draft"));
+            let focus_run_id = run.focus_run_id.clone().unwrap();
+            crate::persistence::output_store::test_seed_focus_run(
+                &run.user_id,
+                &run.persona_id,
+                CRISIS_TEST_KEY_HEX,
+                &focus_run_id,
+                "f",
+            )
+            .await
+            .unwrap();
+            run.execute().await.unwrap();
+            let original = ran_ids(&run);
+            assert_eq!(original, ["draft_writing", "check_a", "check_b", "check_c"]);
+
+            // check_c's guard (second_verdict present) holds on the finished
+            // track, skip_plain2's (second_verdict absent) does not.
+            let finished = guard::track_vars(run.task_track.as_ref().unwrap());
+            assert!(full.steps[4].guard.as_ref().unwrap().evaluate(&finished));
+            assert!(!full.steps[3].guard.as_ref().unwrap().evaluate(&finished));
+
+            run.reenter_step(&order, "check_b")
+                .await
+                .expect("re-entry at check_b");
+            assert_eq!(run.current_step, 2);
+            assert_eq!(ran_ids(&run), ["draft_writing", "check_a"]);
+
+            // On the rebuilt track the answers flip.
+            let rebuilt = guard::track_vars(run.task_track.as_ref().unwrap());
+            assert!(!full.steps[4].guard.as_ref().unwrap().evaluate(&rebuilt));
+            assert!(full.steps[3].guard.as_ref().unwrap().evaluate(&rebuilt));
+
+            // Running forward from the re-entry point re-evaluates them live and
+            // lands on the same path again.
+            run.execute().await.unwrap();
+            assert_eq!(ran_ids(&run), original);
         })
         .await;
     }

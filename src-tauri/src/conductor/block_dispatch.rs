@@ -52,6 +52,11 @@ pub struct BlockHandler {
     /// Run the block over the track. Err only for a customization that did not
     /// validate (LOAD guarantees it did) -- never for a quality verdict.
     pub run: fn(&serde_json::Value, &TaskTrack) -> Result<BlockOutput, String>,
+    /// The variable name a row with this customization records when it runs
+    /// (the BlockOutput.output_var it will produce). items.id=878: the LOAD
+    /// guard analysis needs it, because ActionDefinition.output_var is None for
+    /// a block row. None when the customization does not name one.
+    pub output_var: fn(&serde_json::Value) -> Option<String>,
 }
 
 /// The registry. Handlers: cb-06 only (items.id=129 Stage 1).
@@ -74,7 +79,12 @@ static CB06: BlockHandler = BlockHandler {
     stable_id: "cb-06",
     validate: cb06_validate,
     run: cb06_run,
+    output_var: cb06_output_var,
 };
+
+fn cb06_output_var(customization: &serde_json::Value) -> Option<String> {
+    parse_cb06(customization).ok().map(|c| c.output_var)
+}
 
 /// The only on_fail value cb-06 accepts. The block reports a verdict and never
 /// retries, routes or raises; anything stronger (raising QualityBelowFloor

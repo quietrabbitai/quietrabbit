@@ -34,6 +34,7 @@ ActionDefinition {
     block_stable_id: None,
     block_customization: None,
     schedule_trigger: None,
+    guard: None,
 }
 field_requirements: {"voice_profile": Recommended}
 options_override: {"num_predict":256,"temperature":0.3}
@@ -59,6 +60,7 @@ ActionDefinition {
     block_stable_id: None,
     block_customization: None,
     schedule_trigger: None,
+    guard: None,
 }
 field_requirements: {"employer": Optional, "job_title": Optional, "location_city": Optional}
 options_override: {"num_predict":1024,"temperature":0.5}
@@ -84,6 +86,7 @@ ActionDefinition {
     block_stable_id: None,
     block_customization: None,
     schedule_trigger: None,
+    guard: None,
 }
 field_requirements: {"voice_profile": Recommended}
 options_override: {"num_predict":1024,"temperature":0.3}

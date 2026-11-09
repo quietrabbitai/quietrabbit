@@ -24,6 +24,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+use super::guard::Guard;
 use super::lifecycle::HighPriorityTrigger;
 
 // ---------------------------------------------------------------------------
@@ -299,6 +300,13 @@ pub struct ActionDefinition {
     /// gate shape and conductor::scheduled_sweep for how a fired trigger
     /// resumes the run (via resume_run/rehydrate_focus_run, not a bypass).
     pub schedule_trigger: Option<HighPriorityTrigger>,
+    /// items.id=878 (decisions.id=938, G1): a typed guard on a composition row.
+    /// Composition-authored steps only -- always None for a YAML-authored step
+    /// (the guard language is database-only). execute() evaluates it when the
+    /// step is reached, over the live track variables, and SKIPS the step when
+    /// it is false (conductor::guard). Populated by the DB loader from
+    /// focus_block_compositions.guard_var/guard_op/guard_value.
+    pub guard: Option<Guard>,
 }
 
 // ---------------------------------------------------------------------------
@@ -382,6 +390,7 @@ mod tests {
             block_stable_id: None,
             block_customization: None,
             schedule_trigger: None,
+            guard: None,
         }
     }
 
