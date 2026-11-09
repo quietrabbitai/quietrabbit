@@ -88,6 +88,7 @@ fn put<'a>(name: &'a str, value: &'a str, run: &'a str, expected: Option<i64>) -
 fn case<'a>(case_id: &'a str) -> NewCase<'a> {
     NewCase {
         case_id,
+        focus_id: FOCUS,
         context_key: CHAT,
         primary_entity_id: ROUTER,
         subject_label: "Router",
@@ -105,6 +106,7 @@ fn strat<'a>(case_id: &'a str, run: &'a str, action: &'a str, attempt: i64) -> N
         strategy: "restart the router",
         outcome: "no change",
         user_signal: None,
+        rung_at: None,
     }
 }
 
@@ -130,6 +132,8 @@ async fn one_personas_rows_are_invisible_to_another_persona_of_the_same_user() {
         &mut a,
         &NewConfigDelta {
             delta_id: "d1",
+            focus_id: FOCUS,
+            source_case_id: None,
             context_key: CHAT,
             session_reference: "s1",
             description: "changed DNS",
@@ -160,7 +164,7 @@ async fn one_personas_rows_are_invisible_to_another_persona_of_the_same_user() {
         .unwrap()
         .is_empty());
     assert!(get_case(&mut b, "case-1").await.unwrap().is_none());
-    assert!(list_open_cases_for_entity(&mut b, ROUTER, None)
+    assert!(list_open_cases_for_entity(&mut b, ROUTER, None, None)
         .await
         .unwrap()
         .is_empty());
@@ -168,10 +172,12 @@ async fn one_personas_rows_are_invisible_to_another_persona_of_the_same_user() {
         .await
         .unwrap()
         .is_empty());
-    assert!(list_config_deltas_for_entity(&mut b, ROUTER, Utc::now())
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        list_config_deltas_for_entity(&mut b, ROUTER, None, Utc::now())
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(
         write_mode(&mut b, CHAT).await.unwrap(),
         WriteMode::Open,

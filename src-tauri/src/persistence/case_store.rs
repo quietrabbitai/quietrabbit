@@ -87,8 +87,11 @@ pub enum CaseStoreError {
     #[error("case '{0}' is closed")]
     CaseClosed(String),
     /// The case id exists but belongs to a different primary subject.
-    #[error("case id '{0}' is already used for a different subject")]
+    #[error("case id '{0}' is already used for a different subject or Focus")]
     CaseIdConflict(String),
+    /// The delta id exists but was recorded by another Focus.
+    #[error("config delta id '{0}' is already used by another Focus")]
+    DeltaIdConflict(String),
     #[error("case version conflict (current version {current_version})")]
     VersionConflict { current_version: i64 },
     #[error("{0}")]
@@ -238,6 +241,8 @@ impl DeltaStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaseRecord {
     pub case_id: String,
+    /// The Focus that opened the case (outputs_014). A case keeps it for life.
+    pub focus_id: String,
     pub state: CaseState,
     pub subject_label: String,
     pub symptoms: String,
@@ -272,6 +277,9 @@ pub struct CaseStrategy {
     pub strategy: String,
     pub outcome: String,
     pub user_signal: Option<String>,
+    /// The escalation rung (1 to 5) the strategy was tried at, when the writer
+    /// said. NULL otherwise.
+    pub rung_at: Option<i64>,
     pub recorded_at: String,
 }
 
@@ -280,6 +288,11 @@ pub struct CaseStrategy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntityConfigDelta {
     pub delta_id: String,
+    /// The Focus that recorded the delta (outputs_014).
+    pub focus_id: String,
+    /// The case the change was made for, if any. Cleared when the case is
+    /// deleted.
+    pub source_case_id: Option<String>,
     pub session_reference: String,
     pub description: String,
     pub relevance_tags: Vec<String>,
@@ -299,6 +312,8 @@ pub struct EntityConfigDelta {
 #[derive(Debug, Clone)]
 pub struct NewCase<'a> {
     pub case_id: &'a str,
+    /// The running Focus's id. Open cases are listed per Focus.
+    pub focus_id: &'a str,
     pub context_key: &'a str,
     pub primary_entity_id: &'a str,
     pub subject_label: &'a str,
@@ -349,6 +364,8 @@ pub struct NewStrategy<'a> {
     pub strategy: &'a str,
     pub outcome: &'a str,
     pub user_signal: Option<&'a str>,
+    /// The rung the strategy was tried at, 1 to 5, or None.
+    pub rung_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -367,8 +384,15 @@ pub enum AppendOutcome {
 #[derive(Debug, Clone)]
 pub struct NewConfigDelta<'a> {
     pub delta_id: &'a str,
+    /// The running Focus's id. A delta belongs to the Focus that recorded it,
+    /// and the reads that feed a prompt filter on it (decisions.id=509).
+    pub focus_id: &'a str,
+    /// The case this change was made for, if any. It must exist and belong to
+    /// the same Focus.
+    pub source_case_id: Option<&'a str>,
     pub context_key: &'a str,
-    /// The session the change was made in.
+    /// The opaque id of the session the change was made in (provenance for
+    /// "we changed this in March"). Not the case link: that is source_case_id.
     pub session_reference: &'a str,
     pub description: &'a str,
     pub relevance_tags: &'a [&'a str],
@@ -430,7 +454,8 @@ fn decode_err(msg: String) -> sqlx::Error {
 // Row mapping
 // ---------------------------------------------------------------------------
 
-const CASE_SELECT: &str = "SELECT c.case_id, c.lifecycle_state, c.subject_label, c.symptoms,
+const CASE_SELECT: &str =
+    "SELECT c.case_id, c.focus_id, c.lifecycle_state, c.subject_label, c.symptoms,
         c.current_rung, c.resolution_path, c.outcome, c.durable_facts_extracted,
         c.version, c.opened_by_run, c.opened_at, c.closed_at, c.updated_at,
         (SELECT e.entity_id FROM case_entities e
@@ -442,6 +467,7 @@ fn row_to_case(r: &sqlx::sqlite::SqliteRow) -> Result<CaseRecord, sqlx::Error> {
     let path: Option<String> = r.try_get("resolution_path")?;
     Ok(CaseRecord {
         case_id: r.try_get("case_id")?,
+        focus_id: r.try_get("focus_id")?,
         state: CaseState::parse(&state)
             .ok_or_else(|| decode_err(format!("unknown lifecycle_state '{state}'")))?,
         subject_label: r.try_get("subject_label")?,
@@ -475,6 +501,7 @@ fn row_to_strategy(r: &sqlx::sqlite::SqliteRow) -> Result<CaseStrategy, sqlx::Er
         strategy: r.try_get("strategy")?,
         outcome: r.try_get("outcome")?,
         user_signal: r.try_get("user_signal")?,
+        rung_at: r.try_get("rung_at")?,
         recorded_at: r.try_get("recorded_at")?,
     })
 }
@@ -503,6 +530,7 @@ pub async fn open_case(
 ) -> Result<OpenOutcome, CaseStoreError> {
     check_context(new.context_key)?;
     check_id("case_id", new.case_id)?;
+    check_id("focus_id", new.focus_id)?;
     check_id("primary_entity_id", new.primary_entity_id)?;
     check_run("opened_by_run", new.opened_by_run)?;
     check_bytes("subject_label", new.subject_label, SUBJECT_LABEL_MAX_BYTES)?;
@@ -520,7 +548,11 @@ async fn open_case_inner(
     ensure_writable(conn, new.context_key).await?;
 
     if let Some(existing) = fetch_case(conn, new.case_id).await? {
-        return if existing.primary_entity_id.as_deref() == Some(new.primary_entity_id) {
+        // The same id for another subject, or another Focus, is a conflict: a
+        // case belongs to the Focus that opened it.
+        return if existing.primary_entity_id.as_deref() == Some(new.primary_entity_id)
+            && existing.focus_id == new.focus_id
+        {
             Ok(OpenOutcome::Existing(existing))
         } else {
             Err(CaseStoreError::CaseIdConflict(new.case_id.to_owned()))
@@ -530,11 +562,12 @@ async fn open_case_inner(
     let now = crate::providers::utils::now();
     sqlx::query(
         "INSERT INTO case_records
-         (case_id, lifecycle_state, subject_label, symptoms, current_rung,
+         (case_id, focus_id, lifecycle_state, subject_label, symptoms, current_rung,
           version, opened_by_run, opened_at, updated_at)
-         VALUES (?, 'open', ?, ?, 1, 1, ?, ?, ?)",
+         VALUES (?, ?, 'open', ?, ?, 1, 1, ?, ?, ?)",
     )
     .bind(new.case_id)
+    .bind(new.focus_id)
     .bind(new.subject_label)
     .bind(new.symptoms)
     .bind(new.opened_by_run)
@@ -568,25 +601,63 @@ pub async fn get_case(
 
 /// Open cases (any non-terminal state) linked to an entity, oldest first.
 /// `role` narrows to the case's primary subject or to an affected entity, None
-/// takes either.
+/// takes either. `focus_id` narrows to one Focus's cases (the P0 "you have an
+/// open ticket for this device" check); None takes every Focus's, which is what
+/// the entity-level readers need (the entity purge of items.id=888 and a device
+/// reference sheet read across Focuses).
 pub async fn list_open_cases_for_entity(
     conn: &mut SqliteConnection,
     entity_id: &str,
     role: Option<EntityRole>,
+    focus_id: Option<&str>,
 ) -> Result<Vec<CaseRecord>, CaseStoreError> {
     check_id("entity_id", entity_id)?;
+    if let Some(f) = focus_id {
+        check_id("focus_id", f)?;
+    }
     let role = role.map(EntityRole::as_str);
     let rows = sqlx::query(&format!(
         "{CASE_SELECT}
          WHERE c.lifecycle_state IN {OPEN_STATES_SQL}
+           AND (? IS NULL OR c.focus_id = ?)
            AND EXISTS (SELECT 1 FROM case_entities l
                         WHERE l.case_id = c.case_id AND l.entity_id = ?
                           AND (? IS NULL OR l.role = ?))
          ORDER BY c.opened_at, c.case_id"
     ))
+    .bind(focus_id)
+    .bind(focus_id)
     .bind(entity_id)
     .bind(role)
     .bind(role)
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(row_to_case)
+        .collect::<Result<Vec<_>, _>>()?)
+}
+
+/// The open cases (any non-terminal state) of one Focus in this persona's
+/// outputs.db, oldest first. READ ONLY. items.id=886 seeds open_ticket_state and
+/// open_tickets_brief from it at pass start, when no entity has been chosen yet,
+/// so the entity-keyed list above cannot answer. The file is the persona (see
+/// the module header), so "this Focus's open cases" is the whole scope: a case
+/// another Focus opened is not listed.
+pub async fn list_open_cases(
+    conn: &mut SqliteConnection,
+    focus_id: &str,
+) -> Result<Vec<CaseRecord>, CaseStoreError> {
+    check_id("focus_id", focus_id)?;
+    // closed_at IS NULL is exactly the open states (the CHECK on case_records),
+    // written out so the partial index idx_case_records_open_by_focus applies.
+    let rows = sqlx::query(&format!(
+        "{CASE_SELECT}
+         WHERE c.focus_id = ? AND c.closed_at IS NULL
+           AND c.lifecycle_state IN {OPEN_STATES_SQL}
+         ORDER BY c.opened_at, c.case_id"
+    ))
+    .bind(focus_id)
     .fetch_all(&mut *conn)
     .await?;
     Ok(rows
@@ -840,6 +911,11 @@ pub async fn append_case_strategy(
     if let Some(s) = new.user_signal {
         check_bytes("user_signal", s, STRATEGY_TEXT_MAX_BYTES)?;
     }
+    if let Some(r) = new.rung_at {
+        if !(1..=5).contains(&r) {
+            return Err(invalid("rung_at must be between 1 and 5"));
+        }
+    }
 
     begin_write(conn).await?;
     let result = append_inner(conn, context_key, new).await;
@@ -877,8 +953,8 @@ async fn append_inner(
     let done = sqlx::query(
         "INSERT INTO case_strategies
          (case_id, source_run_id, source_action_id, source_attempt,
-          strategy, outcome, user_signal, recorded_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+          strategy, outcome, user_signal, rung_at, recorded_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(new.case_id)
     .bind(new.source_run_id)
@@ -887,6 +963,7 @@ async fn append_inner(
     .bind(new.strategy)
     .bind(new.outcome)
     .bind(new.user_signal)
+    .bind(new.rung_at)
     .bind(crate::providers::utils::now())
     .execute(&mut *conn)
     .await?;
@@ -903,7 +980,7 @@ pub async fn list_case_strategies(
     check_id("case_id", case_id)?;
     let rows = sqlx::query(
         "SELECT strategy_id, case_id, source_run_id, source_action_id, source_attempt,
-                strategy, outcome, user_signal, recorded_at
+                strategy, outcome, user_signal, rung_at, recorded_at
          FROM case_strategies WHERE case_id = ? ORDER BY strategy_id",
     )
     .bind(case_id)
@@ -928,6 +1005,10 @@ pub async fn record_config_delta(
 ) -> Result<DeltaOutcome, CaseStoreError> {
     check_context(new.context_key)?;
     check_id("delta_id", new.delta_id)?;
+    check_id("focus_id", new.focus_id)?;
+    if let Some(c) = new.source_case_id {
+        check_id("source_case_id", c)?;
+    }
     check_run("session_reference", new.session_reference)?;
     check_run("recorded_by_run", new.recorded_by_run)?;
     if new.description.is_empty() {
@@ -970,15 +1051,40 @@ async fn record_delta_inner(
 ) -> Result<DeltaOutcome, CaseStoreError> {
     ensure_writable(conn, new.context_key).await?;
 
+    // A delta id recorded by another Focus is a conflict, not a replay.
+    let existing_focus: Option<String> =
+        sqlx::query_scalar("SELECT focus_id FROM config_deltas WHERE delta_id = ?")
+            .bind(new.delta_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    match existing_focus {
+        Some(f) if f == new.focus_id => return Ok(DeltaOutcome::Existing),
+        Some(_) => return Err(CaseStoreError::DeltaIdConflict(new.delta_id.to_owned())),
+        None => {}
+    }
+    // The case a delta is made for must exist and be this Focus's own.
+    if let Some(case_id) = new.source_case_id {
+        let case = fetch_case(conn, case_id)
+            .await?
+            .ok_or_else(|| CaseStoreError::NotFound(case_id.to_owned()))?;
+        if case.focus_id != new.focus_id {
+            return Err(invalid(format!(
+                "source case '{case_id}' belongs to another Focus"
+            )));
+        }
+    }
+
     let now = crate::providers::utils::now();
     let done = sqlx::query(
         "INSERT INTO config_deltas
-         (delta_id, session_reference, description, relevance_tags, changed_at,
-          recorded_by_run, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+         (delta_id, focus_id, source_case_id, session_reference, description,
+          relevance_tags, changed_at, recorded_by_run, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(delta_id) DO NOTHING",
     )
     .bind(new.delta_id)
+    .bind(new.focus_id)
+    .bind(new.source_case_id)
     .bind(new.session_reference)
     .bind(new.description)
     .bind(tags_json)
@@ -1090,21 +1196,34 @@ pub fn effective_status(
 
 /// Every config delta that names an entity, newest change first, each with its
 /// status as stored and as it reads at `now`. Nothing is written back.
+///
+/// SCOPE (decisions.id=509: configuration history is never used in another Focus
+/// without authorization). `focus_id` Some(f) returns only the deltas Focus f
+/// recorded: every read that feeds a prompt (delta_context seeding) passes it.
+/// None returns every Focus's deltas for the entity and is for the entity-keyed
+/// maintenance readers that act on the device itself (the entity purge of
+/// items.id=888), never for a prompt.
 pub async fn list_config_deltas_for_entity(
     conn: &mut SqliteConnection,
     entity_id: &str,
+    focus_id: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<Vec<EntityConfigDelta>, CaseStoreError> {
     check_id("entity_id", entity_id)?;
+    if let Some(f) = focus_id {
+        check_id("focus_id", f)?;
+    }
     let rows = sqlx::query(
-        "SELECT d.delta_id, d.session_reference, d.description, d.relevance_tags,
-                d.changed_at, e.entity_id, e.status, e.status_changed_at
+        "SELECT d.delta_id, d.focus_id, d.source_case_id, d.session_reference, d.description,
+                d.relevance_tags, d.changed_at, e.entity_id, e.status, e.status_changed_at
          FROM config_delta_entities e
          JOIN config_deltas d ON d.delta_id = e.delta_id
-         WHERE e.entity_id = ?
+         WHERE e.entity_id = ? AND (? IS NULL OR d.focus_id = ?)
          ORDER BY d.changed_at DESC, d.delta_id",
     )
     .bind(entity_id)
+    .bind(focus_id)
+    .bind(focus_id)
     .fetch_all(&mut *conn)
     .await?;
     rows.iter()
@@ -1116,6 +1235,8 @@ pub async fn list_config_deltas_for_entity(
             let tags: String = r.try_get("relevance_tags")?;
             Ok(EntityConfigDelta {
                 delta_id: r.try_get("delta_id")?,
+                focus_id: r.try_get("focus_id")?,
+                source_case_id: r.try_get("source_case_id")?,
                 session_reference: r.try_get("session_reference")?,
                 description: r.try_get("description")?,
                 relevance_tags: serde_json::from_str(&tags)
@@ -1157,6 +1278,7 @@ mod tests {
     fn new_case<'a>(case_id: &'a str, entity: &'a str) -> NewCase<'a> {
         NewCase {
             case_id,
+            focus_id: FOCUS,
             context_key: CHAT,
             primary_entity_id: entity,
             subject_label: "Living room router",
@@ -1186,6 +1308,7 @@ mod tests {
             strategy: "isolate the network layer",
             outcome: "device can ping the router, the issue is upstream",
             user_signal: None,
+            rung_at: None,
         }
     }
 
@@ -1357,7 +1480,7 @@ mod tests {
             "warranty-rma stays open (decisions.id=508)"
         );
         assert_eq!(
-            list_open_cases_for_entity(&mut conn, ROUTER, None)
+            list_open_cases_for_entity(&mut conn, ROUTER, None, None)
                 .await
                 .unwrap()
                 .len(),
@@ -1378,7 +1501,7 @@ mod tests {
             Some(ResolutionPath::WarrantyRma),
             "path is kept"
         );
-        assert!(list_open_cases_for_entity(&mut conn, ROUTER, None)
+        assert!(list_open_cases_for_entity(&mut conn, ROUTER, None, None)
             .await
             .unwrap()
             .is_empty());
@@ -1480,26 +1603,175 @@ mod tests {
             .await
             .unwrap();
 
-        let any = list_open_cases_for_entity(&mut conn, ROUTER, None)
+        let any = list_open_cases_for_entity(&mut conn, ROUTER, None, None)
             .await
             .unwrap();
         assert_eq!(
             any.iter().map(|c| c.case_id.as_str()).collect::<Vec<_>>(),
             ["case-a", "case-b"]
         );
-        let primary = list_open_cases_for_entity(&mut conn, ROUTER, Some(EntityRole::Primary))
-            .await
-            .unwrap();
+        let primary =
+            list_open_cases_for_entity(&mut conn, ROUTER, Some(EntityRole::Primary), None)
+                .await
+                .unwrap();
         assert_eq!(primary.len(), 1);
         assert_eq!(primary[0].case_id, "case-a");
-        let affected = list_open_cases_for_entity(&mut conn, ROUTER, Some(EntityRole::Affected))
-            .await
-            .unwrap();
+        let affected =
+            list_open_cases_for_entity(&mut conn, ROUTER, Some(EntityRole::Affected), None)
+                .await
+                .unwrap();
         assert_eq!(affected[0].case_id, "case-b");
-        assert!(list_open_cases_for_entity(&mut conn, "nobody", None)
+        assert!(list_open_cases_for_entity(&mut conn, "nobody", None, None)
             .await
             .unwrap()
             .is_empty());
+    }
+
+    /// items.id=886: the persona-wide open list, read only.
+    #[tokio::test]
+    async fn every_open_case_is_listed_and_terminal_cases_are_not() {
+        let mut conn = mem_outputs_conn().await;
+        assert!(list_open_cases(&mut conn, FOCUS).await.unwrap().is_empty());
+        open_case(&mut conn, &new_case("case-a", ROUTER))
+            .await
+            .unwrap();
+        open_case(&mut conn, &new_case("case-b", MODEM))
+            .await
+            .unwrap();
+        let close = CaseUpdate {
+            state: Some(CaseState::Closed),
+            ..Default::default()
+        };
+        update_case(&mut conn, CHAT, "case-a", 1, &close)
+            .await
+            .unwrap();
+        let open = list_open_cases(&mut conn, FOCUS).await.unwrap();
+        assert_eq!(
+            open.iter().map(|c| c.case_id.as_str()).collect::<Vec<_>>(),
+            ["case-b"]
+        );
+        assert_eq!(open[0].primary_entity_id.as_deref(), Some(MODEM));
+        // It reads: a latched chat can still list.
+        latch_write_suppressed(&mut conn, CHAT, FOCUS, "run-1")
+            .await
+            .unwrap();
+        assert_eq!(list_open_cases(&mut conn, FOCUS).await.unwrap().len(), 1);
+    }
+
+    /// outputs_014: a case belongs to the Focus that opened it, and the lists
+    /// are per Focus.
+    #[tokio::test]
+    async fn open_cases_are_listed_per_focus() {
+        let mut conn = mem_outputs_conn().await;
+        let mine = |id: &'static str, focus: &'static str| NewCase {
+            focus_id: focus,
+            ..new_case(id, ROUTER)
+        };
+        for c in [
+            mine("ts-a", FOCUS),
+            mine("ts-b", FOCUS),
+            mine("other-a", "other-focus"),
+        ] {
+            open_case(&mut conn, &c).await.unwrap();
+        }
+        // The record carries it.
+        assert_eq!(
+            get_case(&mut conn, "ts-a").await.unwrap().unwrap().focus_id,
+            FOCUS
+        );
+
+        let ids = |v: Vec<CaseRecord>| v.into_iter().map(|c| c.case_id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(list_open_cases(&mut conn, FOCUS).await.unwrap()),
+            ["ts-a", "ts-b"]
+        );
+        assert_eq!(
+            ids(list_open_cases(&mut conn, "other-focus").await.unwrap()),
+            ["other-a"]
+        );
+        assert!(list_open_cases(&mut conn, "nobody")
+            .await
+            .unwrap()
+            .is_empty());
+
+        // The entity list: None sees every Focus's cases on the device, Some one's.
+        assert_eq!(
+            list_open_cases_for_entity(&mut conn, ROUTER, None, None)
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            ids(
+                list_open_cases_for_entity(&mut conn, ROUTER, None, Some("other-focus"))
+                    .await
+                    .unwrap()
+            ),
+            ["other-a"]
+        );
+        assert_eq!(
+            list_open_cases_for_entity(&mut conn, ROUTER, Some(EntityRole::Primary), Some(FOCUS))
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // A terminal case leaves its Focus's list.
+        let close = CaseUpdate {
+            state: Some(CaseState::Closed),
+            ..Default::default()
+        };
+        update_case(&mut conn, CHAT, "ts-a", 1, &close)
+            .await
+            .unwrap();
+        assert_eq!(
+            ids(list_open_cases(&mut conn, FOCUS).await.unwrap()),
+            ["ts-b"]
+        );
+    }
+
+    /// Opening the same case id again for the same subject is idempotent only
+    /// for the same Focus: another Focus claiming the id is a conflict.
+    #[tokio::test]
+    async fn a_case_id_belongs_to_the_focus_that_opened_it() {
+        let mut conn = mem_outputs_conn().await;
+        open_case(&mut conn, &new_case("case-1", ROUTER))
+            .await
+            .unwrap();
+        let again = open_case(&mut conn, &new_case("case-1", ROUTER))
+            .await
+            .unwrap();
+        assert!(matches!(again, OpenOutcome::Existing(_)));
+        let other = NewCase {
+            focus_id: "other-focus",
+            ..new_case("case-1", ROUTER)
+        };
+        assert!(matches!(
+            open_case(&mut conn, &other).await,
+            Err(CaseStoreError::CaseIdConflict(_))
+        ));
+        // The stored case is unchanged.
+        assert_eq!(
+            get_case(&mut conn, "case-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .focus_id,
+            FOCUS
+        );
+        // An empty or oversize focus_id never reaches the database.
+        for bad in ["", &"f".repeat(129)] {
+            let c = NewCase {
+                focus_id: bad,
+                ..new_case("case-2", ROUTER)
+            };
+            assert!(matches!(
+                open_case(&mut conn, &c).await,
+                Err(CaseStoreError::Validation(_))
+            ));
+        }
     }
 
     #[tokio::test]
@@ -1525,6 +1797,29 @@ mod tests {
         .await
         .unwrap();
         assert!(def.contains("WHERE"), "the index must be partial: {def}");
+    }
+
+    /// outputs_014's partial index serves the per-Focus open list.
+    #[tokio::test]
+    async fn the_per_focus_open_list_uses_its_partial_index() {
+        let mut conn = mem_outputs_conn().await;
+        let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(&format!(
+            "EXPLAIN QUERY PLAN SELECT case_id FROM case_records
+             WHERE focus_id = 'tech-support' AND closed_at IS NULL
+               AND lifecycle_state IN {OPEN_STATES_SQL} ORDER BY opened_at, case_id"
+        ))
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        let text = plan
+            .iter()
+            .map(|r| r.3.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            text.contains("idx_case_records_open_by_focus"),
+            "plan: {text}"
+        );
     }
 
     // -- entity links ---------------------------------------------------------
@@ -1597,6 +1892,8 @@ mod tests {
             &mut conn,
             &NewConfigDelta {
                 delta_id: "d1",
+                focus_id: FOCUS,
+                source_case_id: None,
                 context_key: CHAT,
                 session_reference: "s",
                 description: "dns",
@@ -1814,6 +2111,8 @@ mod tests {
     ) -> NewConfigDelta<'a> {
         NewConfigDelta {
             delta_id: id,
+            focus_id: FOCUS,
+            source_case_id: None,
             context_key: CHAT,
             session_reference: "session-1",
             description: "changed the DNS servers",
@@ -1851,7 +2150,7 @@ mod tests {
             "the retry changed nothing"
         );
 
-        let listed = list_config_deltas_for_entity(&mut conn, ROUTER, Utc::now())
+        let listed = list_config_deltas_for_entity(&mut conn, ROUTER, None, Utc::now())
             .await
             .unwrap();
         assert_eq!(listed.len(), 1);
@@ -1941,11 +2240,11 @@ mod tests {
         .await
         .unwrap();
 
-        let early = list_config_deltas_for_entity(&mut conn, ROUTER, at(2026, 2, 1))
+        let early = list_config_deltas_for_entity(&mut conn, ROUTER, None, at(2026, 2, 1))
             .await
             .unwrap();
         assert_eq!(early[0].effective_status, DeltaStatus::BelievedActive);
-        let late = list_config_deltas_for_entity(&mut conn, ROUTER, at(2026, 6, 1))
+        let late = list_config_deltas_for_entity(&mut conn, ROUTER, None, at(2026, 6, 1))
             .await
             .unwrap();
         assert_eq!(late[0].effective_status, DeltaStatus::Unknown);
@@ -1973,7 +2272,7 @@ mod tests {
         .unwrap();
         let june = at(2026, 6, 1);
         assert_eq!(
-            list_config_deltas_for_entity(&mut conn, ROUTER, june)
+            list_config_deltas_for_entity(&mut conn, ROUTER, None, june)
                 .await
                 .unwrap()[0]
                 .effective_status,
@@ -1990,7 +2289,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let row = &list_config_deltas_for_entity(&mut conn, ROUTER, june)
+        let row = &list_config_deltas_for_entity(&mut conn, ROUTER, None, june)
             .await
             .unwrap()[0];
         assert_eq!(
@@ -2008,7 +2307,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let row = &list_config_deltas_for_entity(&mut conn, ROUTER, Utc::now())
+        let row = &list_config_deltas_for_entity(&mut conn, ROUTER, None, Utc::now())
             .await
             .unwrap()[0];
         assert_eq!(row.effective_status, DeltaStatus::BelievedChanged);
@@ -2024,6 +2323,329 @@ mod tests {
                 .execute(&mut conn)
                 .await;
         assert!(bad.is_err(), "status names are closed by the schema");
+    }
+
+    /// The stored clock of delta d1's only entity row.
+    async fn delta_clock(conn: &mut SqliteConnection) -> String {
+        sqlx::query_scalar(
+            "SELECT status_changed_at FROM config_delta_entities WHERE delta_id = 'd1'",
+        )
+        .fetch_one(conn)
+        .await
+        .unwrap()
+    }
+
+    /// decisions.id=510: confirming a delta restarts the 90-day clock, including
+    /// when it is ALREADY confirmed-active, and effective_status reads that clock.
+    /// status_changed_at is the one clock column: it is set by every status write
+    /// (a confirmation, an event moving the entity to believed-changed, a move to
+    /// unknown) to the time of that write. That is right for the degradation read,
+    /// which looks at it only for believed-active and confirmed-active, the two
+    /// states a confirmation or the original recording can leave an entity in.
+    #[tokio::test]
+    async fn re_confirming_a_confirmed_delta_moves_the_clock_forward_and_the_read_uses_it() {
+        let mut conn = mem_outputs_conn().await;
+        record_config_delta(
+            &mut conn,
+            &delta("d1", &[ROUTER], Some("2026-01-01T12:00:00+00:00")),
+        )
+        .await
+        .unwrap();
+        // First confirmation: believed-active -> confirmed-active, clock = March 1.
+        set_delta_entity_status(
+            &mut conn,
+            CHAT,
+            "d1",
+            ROUTER,
+            DeltaStatus::ConfirmedActive,
+            Some("2026-03-01T12:00:00+00:00"),
+        )
+        .await
+        .unwrap();
+        let first = delta_clock(&mut conn).await;
+        assert_eq!(first, "2026-03-01T12:00:00+00:00");
+        // 92 days after March 1 the confirmation has lapsed.
+        let june = at(2026, 6, 1);
+        let row = &list_config_deltas_for_entity(&mut conn, ROUTER, None, june)
+            .await
+            .unwrap()[0];
+        assert_eq!(row.stored_status, DeltaStatus::ConfirmedActive);
+        assert_eq!(row.effective_status, DeltaStatus::Unknown);
+
+        // Confirm again, while it is already confirmed-active: the stored status
+        // is unchanged and the clock moves forward.
+        set_delta_entity_status(
+            &mut conn,
+            CHAT,
+            "d1",
+            ROUTER,
+            DeltaStatus::ConfirmedActive,
+            Some("2026-05-20T12:00:00+00:00"),
+        )
+        .await
+        .unwrap();
+        let second = delta_clock(&mut conn).await;
+        assert_eq!(second, "2026-05-20T12:00:00+00:00");
+        assert!(
+            DateTime::parse_from_rfc3339(&second).unwrap()
+                > DateTime::parse_from_rfc3339(&first).unwrap(),
+            "the clock moved forward"
+        );
+        let row = &list_config_deltas_for_entity(&mut conn, ROUTER, None, june)
+            .await
+            .unwrap()[0];
+        assert_eq!(row.status_changed_at, second);
+        assert_eq!(
+            (row.stored_status, row.effective_status),
+            (DeltaStatus::ConfirmedActive, DeltaStatus::ConfirmedActive),
+            "the same read that said unknown now says confirmed-active"
+        );
+        // And it lapses 90 days after the NEW clock, not the old one.
+        let aug = at(2026, 8, 20);
+        let row = &list_config_deltas_for_entity(&mut conn, ROUTER, None, aug)
+            .await
+            .unwrap()[0];
+        assert_eq!(row.effective_status, DeltaStatus::Unknown);
+
+        // A confirmation with no explicit time uses now.
+        set_delta_entity_status(
+            &mut conn,
+            CHAT,
+            "d1",
+            ROUTER,
+            DeltaStatus::ConfirmedActive,
+            None,
+        )
+        .await
+        .unwrap();
+        let third = delta_clock(&mut conn).await;
+        assert!(
+            DateTime::parse_from_rfc3339(&third).unwrap()
+                > DateTime::parse_from_rfc3339(&second).unwrap()
+        );
+
+        // A non-confirming write also stamps the column. It does not matter to
+        // the degradation read: believed-changed never degrades on read.
+        set_delta_entity_status(
+            &mut conn,
+            CHAT,
+            "d1",
+            ROUTER,
+            DeltaStatus::BelievedChanged,
+            Some("2026-09-01T12:00:00+00:00"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(delta_clock(&mut conn).await, "2026-09-01T12:00:00+00:00");
+        let row = &list_config_deltas_for_entity(&mut conn, ROUTER, None, at(2027, 6, 1))
+            .await
+            .unwrap()[0];
+        assert_eq!(row.effective_status, DeltaStatus::BelievedChanged);
+    }
+
+    /// outputs_014: a delta belongs to the Focus that recorded it. Prompt reads
+    /// filter on it, the entity-keyed maintenance read (None) sees every Focus's.
+    #[tokio::test]
+    async fn config_deltas_are_recorded_and_read_per_focus() {
+        let mut conn = mem_outputs_conn().await;
+        let other = |id: &'static str| NewConfigDelta {
+            focus_id: "other-focus",
+            description: "OTHER FOCUS CHANGE",
+            ..delta(id, &[ROUTER], None)
+        };
+        record_config_delta(&mut conn, &delta("mine-1", &[ROUTER], None))
+            .await
+            .unwrap();
+        record_config_delta(&mut conn, &delta("mine-2", &[ROUTER, MODEM], None))
+            .await
+            .unwrap();
+        record_config_delta(&mut conn, &other("theirs-1"))
+            .await
+            .unwrap();
+
+        let ids = |v: Vec<EntityConfigDelta>| {
+            let mut ids: Vec<String> = v.into_iter().map(|d| d.delta_id).collect();
+            ids.sort();
+            ids
+        };
+        let now = Utc::now();
+        let mine = list_config_deltas_for_entity(&mut conn, ROUTER, Some(FOCUS), now)
+            .await
+            .unwrap();
+        assert!(mine.iter().all(|d| d.focus_id == FOCUS));
+        assert_eq!(ids(mine), ["mine-1", "mine-2"]);
+        let theirs = list_config_deltas_for_entity(&mut conn, ROUTER, Some("other-focus"), now)
+            .await
+            .unwrap();
+        assert_eq!(ids(theirs), ["theirs-1"]);
+        // A Focus with no deltas of its own sees none, on a device that has three.
+        assert!(
+            list_config_deltas_for_entity(&mut conn, ROUTER, Some("third"), now)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // None: unscoped, entity-keyed maintenance reads only.
+        assert_eq!(
+            ids(list_config_deltas_for_entity(&mut conn, ROUTER, None, now)
+                .await
+                .unwrap()),
+            ["mine-1", "mine-2", "theirs-1"]
+        );
+
+        // A replay by the same Focus is Existing, by another Focus a conflict.
+        assert_eq!(
+            record_config_delta(&mut conn, &delta("mine-1", &[ROUTER], None))
+                .await
+                .unwrap(),
+            DeltaOutcome::Existing
+        );
+        let thief = NewConfigDelta {
+            focus_id: "other-focus",
+            ..delta("mine-1", &[ROUTER], None)
+        };
+        assert!(matches!(
+            record_config_delta(&mut conn, &thief).await,
+            Err(CaseStoreError::DeltaIdConflict(_))
+        ));
+
+        // The focus_id is validated like the case's.
+        for bad in ["", &"f".repeat(129)] {
+            let d = NewConfigDelta {
+                focus_id: bad,
+                ..delta("bad-1", &[ROUTER], None)
+            };
+            assert!(matches!(
+                record_config_delta(&mut conn, &d).await,
+                Err(CaseStoreError::Validation(_))
+            ));
+        }
+    }
+
+    /// outputs_014: source_case_id is a real foreign key that is cleared, not
+    /// cascaded, when the case is deleted. It must exist and be the same
+    /// Focus's case.
+    #[tokio::test]
+    async fn a_delta_can_name_its_source_case_and_survives_the_cases_deletion() {
+        let mut conn = mem_outputs_conn().await;
+        open_case(&mut conn, &new_case("case-1", ROUTER))
+            .await
+            .unwrap();
+        open_case(
+            &mut conn,
+            &NewCase {
+                focus_id: "other-focus",
+                ..new_case("case-other", MODEM)
+            },
+        )
+        .await
+        .unwrap();
+
+        let with_case = |id: &'static str, case: &'static str| NewConfigDelta {
+            source_case_id: Some(case),
+            ..delta(id, &[ROUTER], None)
+        };
+        record_config_delta(&mut conn, &with_case("d1", "case-1"))
+            .await
+            .unwrap();
+        let listed = list_config_deltas_for_entity(&mut conn, ROUTER, Some(FOCUS), Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(listed[0].source_case_id.as_deref(), Some("case-1"));
+
+        // A case that does not exist, or belongs to another Focus, is refused.
+        assert!(matches!(
+            record_config_delta(&mut conn, &with_case("d2", "no-such-case")).await,
+            Err(CaseStoreError::NotFound(_))
+        ));
+        assert!(matches!(
+            record_config_delta(&mut conn, &with_case("d3", "case-other")).await,
+            Err(CaseStoreError::Validation(_))
+        ));
+        assert_eq!(count(&mut conn, "config_deltas").await, 1);
+
+        // The foreign key is declared SET NULL and enforced: deleting the case
+        // clears the link and keeps the delta and its entity rows.
+        let on_delete: String = sqlx::query_scalar(
+            "SELECT on_delete FROM pragma_foreign_key_list('config_deltas')
+             WHERE \"from\" = 'source_case_id'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(on_delete, "SET NULL");
+        sqlx::query("DELETE FROM case_records WHERE case_id = 'case-1'")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let after = list_config_deltas_for_entity(&mut conn, ROUTER, Some(FOCUS), Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(after.len(), 1, "the delta outlives its case");
+        assert_eq!(after[0].source_case_id, None);
+        assert_eq!(count(&mut conn, "config_delta_entities").await, 1);
+        // A raw insert naming a missing case is refused by the database itself.
+        let raw = sqlx::query(
+            "INSERT INTO config_deltas
+             (delta_id, focus_id, source_case_id, session_reference, description,
+              changed_at, recorded_by_run, created_at)
+             VALUES ('raw', 'f', 'missing', 's', 'd', 't', 'r', 't')",
+        )
+        .execute(&mut conn)
+        .await;
+        assert!(raw.is_err(), "the foreign key is enforced");
+    }
+
+    /// outputs_014: case_strategies.rung_at, 1 to 5 or absent.
+    #[tokio::test]
+    async fn a_strategy_can_record_the_rung_it_was_tried_at() {
+        let mut conn = mem_outputs_conn().await;
+        open_case(&mut conn, &new_case("case-1", ROUTER))
+            .await
+            .unwrap();
+        let with_rung = |action: &'static str, rung: Option<i64>| NewStrategy {
+            rung_at: rung,
+            ..strategy("case-1", "run-a", action, 0)
+        };
+        append_case_strategy(&mut conn, CHAT, &with_rung("a", Some(3)))
+            .await
+            .unwrap();
+        append_case_strategy(&mut conn, CHAT, &with_rung("b", None))
+            .await
+            .unwrap();
+        append_case_strategy(&mut conn, CHAT, &with_rung("c", Some(1)))
+            .await
+            .unwrap();
+        let rows = list_case_strategies(&mut conn, "case-1").await.unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.rung_at).collect::<Vec<_>>(),
+            [Some(3), None, Some(1)]
+        );
+        for bad in [0, 6, -1] {
+            assert!(matches!(
+                append_case_strategy(&mut conn, CHAT, &with_rung("d", Some(bad))).await,
+                Err(CaseStoreError::Validation(_))
+            ));
+        }
+        // The schema holds the same line against a raw write.
+        let raw = sqlx::query(
+            "INSERT INTO case_strategies
+             (case_id, source_run_id, source_action_id, source_attempt, strategy,
+              outcome, rung_at, recorded_at)
+             VALUES ('case-1', 'r', 'x', 0, 's', 'o', 9, 't')",
+        )
+        .execute(&mut conn)
+        .await;
+        assert!(raw.is_err(), "the CHECK rejects rung 9");
+        // A replay of an attempt keeps the original row, rung included.
+        let again = append_case_strategy(&mut conn, CHAT, &with_rung("a", Some(5)))
+            .await
+            .unwrap();
+        assert!(matches!(again, AppendOutcome::Duplicate { .. }));
+        assert_eq!(
+            list_case_strategies(&mut conn, "case-1").await.unwrap()[0].rung_at,
+            Some(3)
+        );
     }
 
     #[test]
@@ -2129,7 +2751,7 @@ mod tests {
         // Reads are not gated.
         assert!(get_case(&mut conn, "case-1").await.unwrap().is_some());
         assert_eq!(
-            list_config_deltas_for_entity(&mut conn, ROUTER, Utc::now())
+            list_config_deltas_for_entity(&mut conn, ROUTER, None, Utc::now())
                 .await
                 .unwrap()
                 .len(),

@@ -289,6 +289,7 @@ TABLE case_records
   opened_at TEXT notnull=1 pk=0 default=None
   closed_at TEXT notnull=0 pk=0 default=None
   updated_at TEXT notnull=1 pk=0 default=None
+  focus_id TEXT notnull=1 pk=0 default=Some("''")
 TABLE case_strategies
   strategy_id INTEGER notnull=0 pk=1 default=None
   case_id TEXT notnull=1 pk=0 default=None
@@ -299,6 +300,7 @@ TABLE case_strategies
   outcome TEXT notnull=1 pk=0 default=None
   user_signal TEXT notnull=0 pk=0 default=None
   recorded_at TEXT notnull=1 pk=0 default=None
+  rung_at INTEGER notnull=0 pk=0 default=None
 TABLE classification_preferences
   id TEXT notnull=0 pk=1 default=None
   focus_id TEXT notnull=1 pk=0 default=None
@@ -326,6 +328,8 @@ TABLE config_deltas
   changed_at TEXT notnull=1 pk=0 default=None
   recorded_by_run TEXT notnull=1 pk=0 default=None
   created_at TEXT notnull=1 pk=0 default=None
+  focus_id TEXT notnull=1 pk=0 default=Some("''")
+  source_case_id TEXT notnull=0 pk=0 default=None
 TABLE consent_decisions
   id TEXT notnull=0 pk=1 default=None
   focus_run_id TEXT notnull=1 pk=0 default=None

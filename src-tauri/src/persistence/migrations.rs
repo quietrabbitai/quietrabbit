@@ -230,6 +230,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/outputs_013.sql"),
     },
     SchemaFile {
+        prefix: "outputs",
+        version: 14,
+        sql: include_str!("../../schema/outputs_014.sql"),
+    },
+    SchemaFile {
         prefix: "personal",
         version: 1,
         sql: include_str!("../../schema/personal_001.sql"),
@@ -3836,10 +3841,10 @@ mod tests {
 
         assert_eq!(
             result.expect("migration must apply cleanly"),
-            13,
+            14,
             "outputs_001 + outputs_002 + outputs_003 + outputs_004 + outputs_005 + \
              outputs_006 + outputs_007 + outputs_008 + outputs_009 + outputs_010 + \
-             outputs_011 + outputs_012 + outputs_013 must all apply in one pass"
+             outputs_011 + outputs_012 + outputs_013 + outputs_014 must all apply in one pass"
         );
 
         let mut conn =
@@ -4943,8 +4948,8 @@ mod tests {
             .await
             .expect("v11 must apply to a populated outputs.db");
         assert_eq!(
-            applied, 3,
-            "outputs_011, outputs_012 and outputs_013 were pending"
+            applied, 4,
+            "outputs_011, outputs_012, outputs_013 and outputs_014 were pending"
         );
 
         for (table, expected) in FOCUS_RUN_TABLES.iter().zip(before) {
@@ -4996,7 +5001,10 @@ mod tests {
         let applied = run_migrations(&mut conn, "outputs", Some(TEST_KEY_HEX))
             .await
             .expect("v12 must apply to a populated outputs.db");
-        assert_eq!(applied, 2, "outputs_012 and outputs_013 were pending");
+        assert_eq!(
+            applied, 3,
+            "outputs_012, outputs_013 and outputs_014 were pending"
+        );
 
         let row: (i64, i64, i64) = sqlx::query_as(
             "SELECT pg_scan_blocked, pg_scan_timed_out, pg_scan_pf_error \
@@ -5052,7 +5060,7 @@ mod tests {
         let applied = run_migrations(&mut conn, "outputs", Some(TEST_KEY_HEX))
             .await
             .expect("v13 must apply to a populated outputs.db");
-        assert_eq!(applied, 1, "only outputs_013 was pending");
+        assert_eq!(applied, 2, "outputs_013 and outputs_014 were pending");
         assert_eq!(row_count(&mut conn, "outputs").await, 1);
         assert_eq!(row_count(&mut conn, "focus_runs").await, 1);
 
@@ -5083,6 +5091,153 @@ mod tests {
             triggers.is_empty(),
             "no triggers on the new tables: {triggers:?}"
         );
+        assert!(
+            fk_violations(&mut conn).await.is_empty(),
+            "foreign_key_check must be clean"
+        );
+    }
+
+    /// items.id=881 follow-up: outputs_014 adds case_records.focus_id. A
+    /// POPULATED v13 database keeps its case, its entity link and its strategy,
+    /// the old row reads back an empty focus_id (listed for no Focus), the
+    /// per-Focus partial index exists, and no foreign key or trigger appears.
+    #[tokio::test]
+    async fn outputs_v13_to_v14_adds_case_focus_id_and_preserves_a_populated_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut conn = open_keyed_scratch(&tmp.path().join("outputs.db")).await;
+        apply_versions_up_to(&mut conn, "outputs", 13).await;
+        exec_all(
+            &mut conn,
+            &[
+                "INSERT INTO case_records \
+                 (case_id, opened_by_run, opened_at, updated_at) \
+                 VALUES ('case-old', 'run1', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                "INSERT INTO case_entities (case_id, entity_id, role, linked_at) \
+                 VALUES ('case-old', 'ent-1', 'primary', '2026-01-01T00:00:00Z')",
+                "INSERT INTO case_strategies \
+                 (case_id, source_run_id, source_action_id, source_attempt, strategy, \
+                  outcome, recorded_at) \
+                 VALUES ('case-old', 'run1', 'a', 0, 's', 'o', '2026-01-01T00:00:00Z')",
+                "INSERT INTO session_variables \
+                 (context_key, focus_id, name, value, written_by_run, created_at, updated_at) \
+                 VALUES ('c', 'f', 'locked_intent', 'x', 'run1', \
+                         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                "INSERT INTO config_deltas \
+                 (delta_id, session_reference, description, changed_at, recorded_by_run, \
+                  created_at) \
+                 VALUES ('delta-old', 's', 'd', '2026-01-01T00:00:00Z', 'run1', \
+                         '2026-01-01T00:00:00Z')",
+                "INSERT INTO config_delta_entities (delta_id, entity_id, status_changed_at) \
+                 VALUES ('delta-old', 'ent-1', '2026-01-01T00:00:00Z')",
+            ],
+        )
+        .await;
+
+        let applied = run_migrations(&mut conn, "outputs", Some(TEST_KEY_HEX))
+            .await
+            .expect("v14 must apply to a populated outputs.db");
+        assert_eq!(applied, 1, "only outputs_014 was pending");
+
+        for table in [
+            "case_records",
+            "case_entities",
+            "case_strategies",
+            "config_deltas",
+            "config_delta_entities",
+        ] {
+            assert_eq!(row_count(&mut conn, table).await, 1, "{table} kept its row");
+        }
+        // The other three new columns: an old delta belongs to no Focus and no
+        // case, an old strategy names no rung.
+        let delta: (String, Option<String>) = sqlx::query_as(
+            "SELECT focus_id, source_case_id FROM config_deltas WHERE delta_id = 'delta-old'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(delta, (String::new(), None));
+        let rung: (Option<i64>,) =
+            sqlx::query_as("SELECT rung_at FROM case_strategies WHERE case_id = 'case-old'")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(rung.0, None);
+        let rung_check = sqlx::query(
+            "INSERT INTO case_strategies \
+             (case_id, source_run_id, source_action_id, source_attempt, strategy, \
+              outcome, rung_at, recorded_at) \
+             VALUES ('case-old', 'run1', 'b', 0, 's', 'o', 6, '2026-01-01T00:00:00Z')",
+        )
+        .execute(&mut conn)
+        .await;
+        assert!(
+            rung_check.is_err(),
+            "rung_at is held to 1..=5 by the schema"
+        );
+        let fk: Vec<(String, String)> = sqlx::query_as(
+            "SELECT \"table\", on_delete FROM pragma_foreign_key_list('config_deltas')",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            fk,
+            [("case_records".to_owned(), "SET NULL".to_owned())],
+            "source_case_id is the only foreign key and it clears on delete"
+        );
+        for idx in ["idx_config_deltas_focus", "idx_config_deltas_source_case"] {
+            let n: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?",
+            )
+            .bind(idx)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+            assert_eq!(n, 1, "{idx} exists");
+        }
+        assert_eq!(row_count(&mut conn, "session_variables").await, 1);
+        let old: (String,) =
+            sqlx::query_as("SELECT focus_id FROM case_records WHERE case_id = 'case-old'")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(old.0, "", "a pre-existing case belongs to no Focus");
+
+        // The column is NOT NULL and a new row can carry a real Focus id.
+        let null_insert = sqlx::query(
+            "INSERT INTO case_records (case_id, focus_id, opened_by_run, opened_at, updated_at) \
+             VALUES ('case-null', NULL, 'run1', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z')",
+        )
+        .execute(&mut conn)
+        .await;
+        assert!(null_insert.is_err(), "focus_id is NOT NULL");
+        exec_all(
+            &mut conn,
+            &["INSERT INTO case_records \
+               (case_id, focus_id, opened_by_run, opened_at, updated_at) \
+               VALUES ('case-new', 'tech-support', 'run1', \
+                       '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z')"],
+        )
+        .await;
+
+        let index: (String,) = sqlx::query_as(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' \
+             AND name = 'idx_case_records_open_by_focus'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .expect("the per-Focus open index exists");
+        assert!(
+            index.0.contains("focus_id, updated_at DESC") && index.0.contains("closed_at IS NULL"),
+            "{}",
+            index.0
+        );
+        let fks: Vec<(String,)> =
+            sqlx::query_as("SELECT \"table\" FROM pragma_foreign_key_list('case_records')")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        assert!(fks.is_empty(), "case_records references nothing: {fks:?}");
         assert!(
             fk_violations(&mut conn).await.is_empty(),
             "foreign_key_check must be clean"
