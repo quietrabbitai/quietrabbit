@@ -76,7 +76,40 @@
 // --system-num-gpu N sets Ollama's num_gpu for the pass (0 = CPU only), for when
 // another app holds the GPU memory. The index title then says so.
 
-use std::collections::BTreeMap;
+// ---------------------------------------------------------------------------
+// VARIANT RUN (items.id=894 part 0). Also DEV-ONLY, and an EXPERIMENT: the prompt
+// written in this file (VARIANT_TEMPLATE) is not a shipped template and nothing
+// here changes one. It tests whether prompt and input changes fix two faults Jason
+// read in the items.id=893 drafts: the supplied context is used inconsistently,
+// and details are embellished or invented.
+//   cargo run --example focus_calibration -- --variant [--compare-to <run>]
+//   cargo run --example focus_calibration -- --variant --resume <variant-run>
+// Same five synthetic briefs, same three bundled models, QR's own sidecar, same
+// conventions under $HOME/.cache/qr-892-calibration/<run>/ (the run is named
+// variant-<timestamp>). What differs from the original run, all at once:
+//   - facts-only instruction (nothing not supplied; leave it out, no placeholder);
+//   - no request for polish; a plain, complete draft; no remarks about the draft;
+//   - the brief is a structured list of points and facts, not prose;
+//   - sender name, address and date are in the synthetic persona context;
+//   - the voice-analysis step is NOT run (its prose output is a loose input that
+//     itself adds characterisation; the original draft prompt fed it in);
+//   - temperature 0.2 for the draft (shipped 0.5); other options as shipped;
+//   - four samples per brief and model (60 generations) instead of two.
+// Deterministic measures per draft (no quality scoring): coverage of the brief's
+// listed points (keyword matching), unsupported specifics (numbers, dates, spelled
+// numbers, capitalised names and places not in the brief or persona context, listed
+// for a reader to check), bracketed placeholders, opening and closing chatter, word
+// count and latency. The same measures are recomputed on the original run's saved
+// drafts for the summary table (summary.html / summary.md and the top of index.html).
+// WHAT THE CHECKS CANNOT CATCH is printed on the pages: soft embellishment with no
+// number or capitalised name ("seasoned professional"), invented causes or
+// consequences, lower-case invented groups, a wrong sentence that happens to contain
+// the keywords, a correct paraphrase that does not, tone, and readability.
+// Latency is steady state: each model is warmed up with the same options before its
+// samples (cb525cb). The original run's latency is taken from sample 2 only because
+// its first sample carried a model reload.
+
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -709,6 +742,1209 @@ fn index_page(out_dir: &Path, run: &str, title: &str, bs: &[Brief], records: &[R
 }
 
 // ---------------------------------------------------------------------------
+// Sidecar start (shared by the original and the variant run)
+// ---------------------------------------------------------------------------
+
+/// Starts QR's own sidecar against a scratch data root whose ollama_models is a
+/// symlink to the real models directory. Exits the process if it does not start.
+/// Returns the base URL.
+async fn start_sidecar(
+    sidecar: &mut OllamaSidecar,
+    home: &Path,
+    root: &Path,
+    models_dir: Option<PathBuf>,
+) -> String {
+    let real_models =
+        models_dir.unwrap_or_else(|| home.join(".local/share/ai.quietrabbit.app/ollama_models"));
+    assert!(
+        real_models.is_dir(),
+        "models dir {} not found",
+        real_models.display()
+    );
+    let scratch_root = root.join("dataroot");
+    fs::create_dir_all(&scratch_root).expect("scratch data root");
+    let link = scratch_root.join("ollama_models");
+    if link.symlink_metadata().is_err() {
+        std::os::unix::fs::symlink(&real_models, &link).expect("symlink ollama_models");
+    }
+    set_data_root(scratch_root.clone());
+    // An empty resource dir so only the debug PATH fallback is tried, not the
+    // bundled stub script (which exits at once and would burn the port list).
+    let empty_resources = scratch_root.join("no-resources");
+    fs::create_dir_all(&empty_resources).expect("resources dir");
+    println!(
+        "sidecar: scratch data root {}, models {} (symlink)",
+        scratch_root.display(),
+        real_models.display()
+    );
+    let startup = sidecar.ensure_available(&empty_resources).await;
+    if startup.source != OllamaSource::Sidecar {
+        eprintln!("QR's sidecar did not start; nothing was run");
+        std::process::exit(1);
+    }
+    let base = format!("http://127.0.0.1:{}", ollama_sidecar::port());
+    println!("sidecar: ready at {base}");
+    base
+}
+
+// ---------------------------------------------------------------------------
+// Variant run (items.id=894 part 0): briefs, prompt, measures
+// ---------------------------------------------------------------------------
+
+const VARIANT_SAMPLES: u32 = 4;
+const VARIANT_TEMPERATURE: f64 = 0.2;
+const DEFAULT_COMPARE_TO: &str = "run-20261113-194518";
+
+/// EXPERIMENT prompt, not a shipped template. Facts-only, no polish, no remarks
+/// about the draft, structured points, sender details supplied.
+const VARIANT_TEMPLATE: &str = "Write a plain, complete {form} from the points below. \
+Use only the points and facts supplied here. Do not add any claim, number, name, place or date \
+that is not given. If something is not supplied, leave it out; do not write a placeholder such as \
+[Name] or [Date]. Do not try to make it polished or impressive: plain wording is wanted. \
+Output only the {form} itself, with no opening or closing remarks about it, no notes and no questions.\n\
+\n\
+Task: {task}\n\
+Recipient: {recipient}\n\
+Format: {format}\n\
+\n\
+Points and facts (cover every one, add nothing):\n\
+{points}\n\
+\n\
+Sender details (use only where the format or a point calls for them):\n\
+- Name: {sender_name}\n\
+- Address: {sender_address}\n\
+- Role: {job_title}, {employer}\n\
+- Date: {date}\n\
+\n\
+Voice preferences: {voice_profile}\n";
+
+struct Point {
+    /// Shown in the prompt and on the pages.
+    text: &'static str,
+    /// Coverage test: every group must match, a group matches when any of its
+    /// alternatives is found (lower case, at the start of a word) in the draft.
+    keys: &'static [&'static [&'static str]],
+}
+
+struct Sender {
+    name: &'static str,
+    address: &'static str,
+    date: &'static str,
+}
+
+/// The variant's structured form of one brief. Persona role/organisation and voice
+/// come from the matching `Brief`. Every name, address and date is invented.
+struct VBrief {
+    id: &'static str,
+    form: &'static str,
+    task: &'static str,
+    recipient: &'static str,
+    format: &'static str,
+    sender: Sender,
+    points: Vec<Point>,
+}
+
+const DATE: &str = "13 November 2026";
+
+fn variant_briefs() -> Vec<VBrief> {
+    let warehouse = || Sender {
+        name: "Tomas Brandvold",
+        address: "418 Larch Street, Duluth, MN 55802",
+        date: DATE,
+    };
+    let clerk = || Sender {
+        name: "Renata Voss",
+        address: "92 Alder Court, Spokane, WA 99201",
+        date: DATE,
+    };
+    let library = || Sender {
+        name: "Ilse Marchetti",
+        address: "7 Quarry Lane, Bozeman, MT 59715",
+        date: DATE,
+    };
+    vec![
+        VBrief {
+            id: "rma-letter",
+            form: "letter",
+            task: "Ask for a return authorization for a laptop.",
+            recipient: "Returns department, Brightwater Electronics",
+            format: "Business letter: sender's name and address, date, recipient, salutation, body, sign-off with the sender's name.",
+            sender: warehouse(),
+            points: vec![
+                Point { text: "Wants a return authorization", keys: &[&["return authorization", "return authorisation", "return merchandise", "rma"]] },
+                Point { text: "Product: Vantelle X14 laptop", keys: &[&["vantelle x14"]] },
+                Point { text: "Serial number: VX14-0042718", keys: &[&["vx14-0042718"]] },
+                Point { text: "Bought on 3 August 2026 from Brightwater Electronics", keys: &[&["3 august 2026", "august 3, 2026", "august 3 2026", "august 3rd", "3rd august"]] },
+                Point { text: "Order number: BW-558201", keys: &[&["bw-558201"]] },
+                Point { text: "The left hinge cracked in the second week", keys: &[&["hinge"], &["second week", "2nd week", "two weeks", "week two"]] },
+                Point { text: "The screen now wobbles", keys: &[&["wobble"]] },
+                Point { text: "Wants a replacement, not a refund", keys: &[&["replacement"], &["refund"]] },
+                Point { text: "Can ship it at own cost if they send a label", keys: &[&["label"], &["own cost", "own expense", "my expense", "my cost", "at my own", "pay for", "pay the", "cover the", "cover shipping", "shipping cost", "shipping expense", "shipping fee", "postage"]] },
+            ],
+        },
+        VBrief {
+            id: "cover-letter",
+            form: "cover letter",
+            task: "Apply for a job as logistics coordinator.",
+            recipient: "Northgate Freight Partners, Tacoma",
+            format: "Cover letter: sender's name and address, date, salutation, body, sign-off with the sender's name.",
+            sender: warehouse(),
+            points: vec![
+                Point { text: "Applying for the logistics coordinator job at Northgate Freight Partners in Tacoma", keys: &[&["logistics coordinator"], &["northgate"]] },
+                Point { text: "Six years in warehouse operations", keys: &[&["six years", "6 years"], &["warehouse"]] },
+                Point { text: "Cut mis-picks by a third at the current job", keys: &[&["mis-pick", "mispick", "mis pick"], &["a third", "one-third", "one third"]] },
+                Point { text: "Did it by redoing the bin labelling", keys: &[&["bin label"]] },
+                Point { text: "Taught themselves spreadsheet reporting", keys: &[&["spreadsheet"], &["taught", "self-taught", "teach"]] },
+                Point { text: "The team stopped doing the reporting by hand", keys: &[&["by hand", "manual"]] },
+                Point { text: "Wants to move into planning work", keys: &[&["planning"]] },
+            ],
+        },
+        VBrief {
+            id: "complaint-email",
+            form: "email",
+            task: "Make a formal complaint.",
+            recipient: "Customer service manager, Corvid Broadband",
+            format: "Email: a Subject line, salutation, body, sign-off with the sender's name. No address block or date line.",
+            sender: clerk(),
+            points: vec![
+                Point { text: "Router: TR-220", keys: &[&["tr-220"]] },
+                Point { text: "The connection has dropped every evening", keys: &[&["evening", "night"], &["drop", "disconnect", "cut out", "lost", "interrupt", "unstable", "intermittent"]] },
+                Point { text: "For five weeks", keys: &[&["five weeks", "5 weeks", "five-week"]] },
+                Point { text: "Four support tickets logged", keys: &[&["four", "4 ticket", "4 support", "4 separate"], &["ticket"]] },
+                Point { text: "Ticket numbers: CB-77120, CB-77391, CB-77804, CB-78213", keys: &[&["cb-77120"], &["cb-77391"], &["cb-77804"], &["cb-78213"]] },
+                Point { text: "Told each time to restart it", keys: &[&["restart"]] },
+                Point { text: "A technician visit on 14 October never happened", keys: &[&["technician"], &["14 october", "october 14"]] },
+                Point { text: "Nobody called", keys: &[&["nobody", "no one", "never called", "did not call", "didn't call", "no call", "not called", "no phone call", "without calling", "failed to call", "follow-up", "follow up", "not contacted", "never contacted", "no contact", "no communication", "not received any", "was not contacted", "wasn't contacted"]] },
+                Point { text: "Wants the fault fixed", keys: &[&["fix", "repair", "resolv", "rectif"]] },
+                Point { text: "Wants a credit for the weeks paid for service not received", keys: &[&["credit"]] },
+                Point { text: "Wants a named contact", keys: &[&["named", "dedicated", "direct contact", "contact person", "point of contact"]] },
+            ],
+        },
+        VBrief {
+            id: "personal-note",
+            form: "note",
+            task: "Thank a neighbour.",
+            recipient: "Dorrie, a neighbour",
+            format: "Short personal note of a few lines: salutation and sign-off with the sender's first name. No address block or date line.",
+            sender: clerk(),
+            points: vec![
+                Point { text: "Thanks to Dorrie", keys: &[&["dorrie"], &["thank"]] },
+                Point { text: "She kept an eye on the house", keys: &[&["house"], &["eye", "watch", "look", "check"]] },
+                Point { text: "She watered the tomatoes", keys: &[&["tomato"], &["water"]] },
+                Point { text: "They were away for ten days", keys: &[&["ten days", "10 days"]] },
+                Point { text: "They left her a jar of lemon curd", keys: &[&["lemon curd"]] },
+                Point { text: "She liked the lemon curd", keys: &[&["liked", "enjoy", "love", "favourite", "favorite"]] },
+            ],
+        },
+        VBrief {
+            id: "essay-section",
+            form: "essay section",
+            task: "Write one section of an essay.",
+            recipient: "General readers of the essay",
+            format: "One essay section of about one page: plain argument in paragraphs, no list, no heading, no letterhead, no sign-off.",
+            sender: library(),
+            points: vec![
+                Point { text: "Argument: small towns should keep their paper-based public notice boards", keys: &[&["notice board", "notice-board", "bulletin board"], &["paper"]] },
+                Point { text: "This holds even when the council also posts notices online", keys: &[&["council"], &["online"]] },
+                Point { text: "Cover who gets left out by online-only notices", keys: &[&["left out", "leave out", "leaves out", "excluded", "exclude", "miss out", "shut out", "locked out", "cut off", "no access", "cannot access", "can't access", "unable to access", "no internet", "without internet", "without access", "lack access", "lack internet", "don't have access", "do not have access"]] },
+                Point { text: "A board in the library or post office is read by people who never visit the council website", keys: &[&["library"], &["post office"]] },
+                Point { text: "Those readers never visit the council website", keys: &[&["website", "web site"]] },
+            ],
+        },
+    ]
+}
+
+fn variant_options(step: &ShippedStep, model: &str) -> Value {
+    let mut o = options_for(step, model);
+    o["temperature"] = json!(VARIANT_TEMPERATURE);
+    o
+}
+
+fn variant_prompt(b: &Brief, vb: &VBrief) -> String {
+    let points = vb
+        .points
+        .iter()
+        .map(|p| format!("- {}", p.text))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let tokens = BTreeMap::from([
+        ("form", vb.form.to_owned()),
+        ("task", vb.task.to_owned()),
+        ("recipient", vb.recipient.to_owned()),
+        ("format", vb.format.to_owned()),
+        ("points", points),
+        ("sender_name", vb.sender.name.to_owned()),
+        ("sender_address", vb.sender.address.to_owned()),
+        ("job_title", b.persona.job_title.to_owned()),
+        ("employer", b.persona.employer.to_owned()),
+        ("date", vb.sender.date.to_owned()),
+        ("voice_profile", format_voice(&b.voice)),
+    ]);
+    render_template(VARIANT_TEMPLATE, &tokens)
+}
+
+/// The text a draft may draw its specifics from. Original run: the prose request
+/// and the persona context it had. Variant: the structured brief and the persona
+/// context it had, which adds the sender name, address and date.
+fn allowed_text(b: &Brief, vb: &VBrief, variant: bool) -> String {
+    if !variant {
+        return format!(
+            "{} {} {} {}",
+            b.user_input, b.persona.job_title, b.persona.employer, b.persona.location_city
+        );
+    }
+    let mut s = format!(
+        "{} {} {} {} {} {} {} {}",
+        vb.task,
+        vb.recipient,
+        vb.sender.name,
+        vb.sender.address,
+        vb.sender.date,
+        b.persona.job_title,
+        b.persona.employer,
+        b.persona.location_city
+    );
+    for p in &vb.points {
+        s.push(' ');
+        s.push_str(p.text);
+    }
+    s
+}
+
+// -- Deterministic measures -------------------------------------------------
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct Measures {
+    points_total: usize,
+    points_covered: usize,
+    missing_points: Vec<String>,
+    /// Numbers, dates, spelled numbers and capitalised names or places that are
+    /// not in the brief or persona context. A list for a reader to check.
+    unsupported: Vec<String>,
+    placeholders: Vec<String>,
+    opening_chatter: Option<String>,
+    closing_chatter: Option<String>,
+}
+
+/// Lower-cases and folds typographic quotes, dashes and no-break spaces, so the
+/// keyword tests are not defeated by them.
+fn norm(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\u{2018}' | '\u{2019}' => '\'',
+            '\u{2010}'..='\u{2015}' => '-',
+            '\u{00a0}' => ' ',
+            c => c,
+        })
+        .collect::<String>()
+        .to_lowercase()
+}
+
+/// `term` (already lower case) occurs in `hay` at the start of a word.
+fn has_term(hay: &str, term: &str) -> bool {
+    hay.match_indices(term).any(|(i, _)| {
+        hay[..i]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric())
+    })
+}
+
+fn point_covered(hay: &str, keys: &[&[&str]]) -> bool {
+    keys.iter()
+        .all(|alts| alts.iter().any(|a| has_term(hay, a)))
+}
+
+/// Bracketed placeholders such as [Your Name], {date} or <Name>. Returns the spans
+/// and the text with each span replaced by a space. A bracket pair with no letters
+/// inside (a citation like [1]) or that starts with white space is not a span.
+fn split_placeholders(text: &str) -> (Vec<String>, String) {
+    let mut spans: Vec<String> = Vec::new();
+    let mut rest = String::with_capacity(text.len());
+    for (li, line) in text.lines().enumerate() {
+        if li > 0 {
+            rest.push('\n');
+        }
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            let close = match chars[i] {
+                '[' => ']',
+                '{' => '}',
+                '<' => '>',
+                c => {
+                    rest.push(c);
+                    i += 1;
+                    continue;
+                }
+            };
+            let end = chars[i + 1..].iter().take(80).position(|&c| c == close);
+            if let Some(e) = end {
+                let inner: String = chars[i + 1..i + 1 + e].iter().collect();
+                if inner.chars().any(char::is_alphabetic)
+                    && !inner.starts_with(char::is_whitespace)
+                    && !inner.starts_with('/')
+                {
+                    spans.push(chars[i..i + e + 2].iter().collect());
+                    rest.push(' ');
+                    i += e + 2;
+                    continue;
+                }
+            }
+            rest.push(chars[i]);
+            i += 1;
+        }
+    }
+    (spans, rest)
+}
+
+fn starts_with_word(s: &str, w: &str) -> bool {
+    s.starts_with(w)
+        && s[w.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric())
+}
+
+/// First non-empty line is remarks about the draft rather than the draft.
+fn opening_chatter(text: &str) -> Option<String> {
+    const STARTS: &[&str] = &[
+        "here is",
+        "here's",
+        "here are",
+        "here you",
+        "sure",
+        "certainly",
+        "of course",
+        "absolutely",
+        "okay",
+        "ok",
+        "below is",
+        "i've written",
+        "i have written",
+        "i've drafted",
+        "i have drafted",
+        "i've put together",
+        "happy to",
+        "great",
+    ];
+    const WORDS: &[&str] = &[
+        "draft", "letter", "email", "note", "essay", "section", "version",
+    ];
+    let first = text.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let low = norm(first);
+    let low = low.trim_start_matches(|c: char| "*#>-_ ".contains(c));
+    let starts = STARTS.iter().any(|s| starts_with_word(low, s));
+    let colon = low.ends_with(':')
+        && !low.starts_with("dear")
+        && WORDS.iter().any(|w| low.contains(w))
+        && low.split_whitespace().count() <= 14;
+    (starts || colon).then(|| first.to_owned())
+}
+
+/// The last paragraph talks about the draft itself (an offer to revise, a note).
+fn closing_chatter(text: &str) -> Option<String> {
+    const PHRASES: &[&str] = &[
+        "this draft",
+        "this letter is",
+        "this email is",
+        "this note is",
+        "i hope this helps",
+        "hope this helps",
+        "let me know if you'd like me",
+        "let me know if you want me",
+        "let me know if you would like me",
+        "feel free to adjust",
+        "feel free to modify",
+        "feel free to customize",
+        "feel free to customise",
+        "you can adjust",
+        "you may want to",
+        "note:",
+        "(note",
+        "adjust as needed",
+        "if you'd like me to",
+        "if you would like me to",
+        "would you like me to",
+        "i can adjust",
+        "i can revise",
+    ];
+    let last = text
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .last()?;
+    let low = norm(last);
+    PHRASES
+        .iter()
+        .any(|p| low.contains(p))
+        .then(|| last.lines().next().unwrap_or(last).to_owned())
+}
+
+/// Capitalised words that are fine anywhere (greetings, closings, headings).
+const COMMON_CAPS: &[&str] = &[
+    "dear",
+    "hello",
+    "hi",
+    "hey",
+    "sincerely",
+    "regards",
+    "best",
+    "thanks",
+    "thank",
+    "you",
+    "yours",
+    "kind",
+    "kindly",
+    "warm",
+    "warmly",
+    "cheers",
+    "respectfully",
+    "faithfully",
+    "truly",
+    "subject",
+    "re",
+    "sir",
+    "madam",
+    "to",
+    "from",
+    "date",
+    "cc",
+    "please",
+    "mr",
+    "mrs",
+    "ms",
+    "miss",
+    "dr",
+    "mx",
+    "regarding",
+    "cordially",
+    "gratefully",
+    "with",
+    "and",
+    "the",
+    "of",
+    "for",
+    "in",
+    "on",
+    "at",
+    "a",
+    "an",
+    "hiring",
+    "manager",
+    "team",
+    "committee",
+];
+const HONORIFICS: &[&str] = &["mr", "mrs", "ms", "dr", "miss", "mx", "st"];
+const NUMBER_WORDS: &[&str] = &[
+    "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve",
+    "twenty", "thirty", "forty", "fifty", "hundred", "thousand", "dozen", "half", "third",
+    "quarter",
+];
+
+fn word_set(text: &str) -> HashSet<String> {
+    norm(text)
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Every alphanumeric part of `core` (split at hyphens, slashes and so on) is a
+/// word of the allowed text. So VX14-0042718 passes when both parts are supplied
+/// and VX14-0042719 does not.
+fn parts_allowed(core: &str, allowed: &HashSet<String>) -> bool {
+    norm(core)
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .all(|w| allowed.contains(w))
+}
+
+fn core_token(t: &str) -> &str {
+    t.trim_matches(|c: char| !c.is_alphanumeric())
+}
+
+fn starts_upper(s: &str) -> bool {
+    s.chars().next().is_some_and(char::is_uppercase)
+}
+
+fn ends_sentence(t: &str) -> bool {
+    t.trim_end_matches(['"', '\'', ')', '*', '_', '\u{201d}', '\u{2019}'])
+        .ends_with(['.', '!', '?', ':'])
+}
+
+/// Numbers, dates, spelled numbers and capitalised names or places in the draft
+/// that are not in the allowed text. Heuristic, built to be listed for a person to
+/// check, not to be exact: it has false positives (a title-case word in a heading,
+/// a product word) and false negatives (see the page text). Placeholders are cut out
+/// first (counted separately). A single capitalised word that opens a sentence is
+/// skipped unless it has a digit, an inner capital, or sits on a short all-capitalised
+/// line (a name or greeting line); a Subject line is checked for numbers only.
+fn unsupported_specifics(text: &str, allowed: &HashSet<String>) -> Vec<String> {
+    let (_, text) = split_placeholders(text);
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        let Some(first) = toks.first() else { continue };
+        let first_low = norm(core_token(first));
+        let heading = first_low == "subject" || first_low == "re";
+        let name_line = toks.len() <= 3 && toks.iter().all(|t| starts_upper(core_token(t)));
+        let mut sentence_start = true;
+        for (i, t) in toks.iter().enumerate() {
+            let core = core_token(t);
+            let initial = sentence_start;
+            let low = norm(core);
+            sentence_start = !HONORIFICS.contains(&low.as_str()) && ends_sentence(t);
+            if core.is_empty() {
+                continue;
+            }
+            let digits_only = core.chars().all(|c| c.is_ascii_digit());
+            if i == 0 && digits_only && (t.ends_with('.') || t.ends_with(')')) {
+                sentence_start = true; // a list marker such as "1."
+                continue;
+            }
+            let mut flag = None;
+            if core.chars().any(|c| c.is_ascii_digit()) {
+                if !parts_allowed(core, allowed) {
+                    flag = Some(core);
+                }
+            } else if heading {
+                continue;
+            } else if starts_upper(core) {
+                let p = core.split(['\'', '\u{2019}']).next().unwrap_or(core);
+                let common = norm(p)
+                    .split(|c: char| !c.is_alphanumeric())
+                    .filter(|w| !w.is_empty())
+                    .all(|w| COMMON_CAPS.contains(&w));
+                let inner_caps = p.chars().skip(1).any(char::is_uppercase);
+                if p.chars().count() > 1
+                    && !common
+                    && !(initial && !name_line && !inner_caps)
+                    && !parts_allowed(p, allowed)
+                {
+                    flag = Some(p);
+                }
+            } else if NUMBER_WORDS.contains(&low.as_str()) && !allowed.contains(&low) {
+                flag = Some(core);
+            }
+            if let Some(f) = flag {
+                if !out.iter().any(|x| x == f) {
+                    out.push(f.to_owned());
+                }
+            }
+        }
+    }
+    out
+}
+
+fn measure(text: &str, points: &[Point], allowed: &HashSet<String>) -> Measures {
+    let hay = norm(text);
+    let missing: Vec<String> = points
+        .iter()
+        .filter(|p| !point_covered(&hay, p.keys))
+        .map(|p| p.text.to_owned())
+        .collect();
+    Measures {
+        points_total: points.len(),
+        points_covered: points.len() - missing.len(),
+        missing_points: missing,
+        unsupported: unsupported_specifics(text, allowed),
+        placeholders: split_placeholders(text).0,
+        opening_chatter: opening_chatter(text),
+        closing_chatter: closing_chatter(text),
+    }
+}
+
+/// One saved draft with its generation record and measures.
+struct Draft {
+    brief: String,
+    model: String,
+    sample: u32,
+    rec: Record,
+    text: String,
+    m: Measures,
+}
+
+/// Reads every saved draft under `dir` and measures it. `variant` picks which
+/// allowed text a draft is checked against.
+fn load_drafts(
+    dir: &Path,
+    bs: &[Brief],
+    vbs: &[VBrief],
+    samples: u32,
+    variant: bool,
+) -> Vec<Draft> {
+    let mut out = Vec::new();
+    for (b, vb) in bs.iter().zip(vbs) {
+        assert_eq!(b.id, vb.id, "briefs and variant briefs are out of step");
+        let allowed = word_set(&allowed_text(b, vb, variant));
+        for m in MODELS {
+            for n in 1..=samples {
+                let stem = format!("{}-{n}", slug(m));
+                let base = dir.join(b.id);
+                let (Ok(js), Ok(text)) = (
+                    fs::read_to_string(base.join(format!("{stem}.json"))),
+                    fs::read_to_string(base.join(format!("{stem}.md"))),
+                ) else {
+                    continue;
+                };
+                let Ok(rec) = serde_json::from_str::<Record>(&js) else {
+                    continue;
+                };
+                let measures = measure(&text, &vb.points, &allowed);
+                out.push(Draft {
+                    brief: b.id.to_owned(),
+                    model: (*m).to_owned(),
+                    sample: n,
+                    rec,
+                    text,
+                    m: measures,
+                });
+            }
+        }
+    }
+    out
+}
+
+// -- Summary ----------------------------------------------------------------
+
+struct Stats {
+    n: usize,
+    cov_covered: usize,
+    cov_total: usize,
+    all_cov: usize,
+    unsup_total: usize,
+    unsup_any: usize,
+    ph_any: usize,
+    ph_total: usize,
+    open: usize,
+    close: usize,
+    words_mean: f64,
+    lat_median_s: f64,
+    spread2: f64,
+    spread_all: f64,
+}
+
+/// Mean over briefs of (max - min) points covered across the samples of that brief,
+/// using samples up to `max_sample`.
+fn spread(ds: &[&Draft], max_sample: u32) -> f64 {
+    let mut by: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+    for d in ds.iter().filter(|d| d.sample <= max_sample) {
+        let c = d.m.points_covered;
+        let e = by.entry(d.brief.as_str()).or_insert((c, c));
+        e.0 = e.0.min(c);
+        e.1 = e.1.max(c);
+    }
+    if by.is_empty() {
+        0.0
+    } else {
+        by.values().map(|(lo, hi)| (hi - lo) as f64).sum::<f64>() / by.len() as f64
+    }
+}
+
+/// `latency_sample`: when set, only drafts of that sample number count for latency.
+fn stats(ds: &[&Draft], latency_sample: Option<u32>) -> Stats {
+    let mut lat: Vec<f64> = ds
+        .iter()
+        .filter(|d| latency_sample.is_none_or(|s| d.sample == s))
+        .map(|d| d.rec.latency_ms / 1000.0)
+        .collect();
+    lat.sort_by(|a, b| a.total_cmp(b));
+    let lat_median_s = match lat.len() {
+        0 => 0.0,
+        l if l % 2 == 1 => lat[l / 2],
+        l => (lat[l / 2 - 1] + lat[l / 2]) / 2.0,
+    };
+    Stats {
+        n: ds.len(),
+        cov_covered: ds.iter().map(|d| d.m.points_covered).sum(),
+        cov_total: ds.iter().map(|d| d.m.points_total).sum(),
+        all_cov: ds
+            .iter()
+            .filter(|d| d.m.points_covered == d.m.points_total)
+            .count(),
+        unsup_total: ds.iter().map(|d| d.m.unsupported.len()).sum(),
+        unsup_any: ds.iter().filter(|d| !d.m.unsupported.is_empty()).count(),
+        ph_any: ds.iter().filter(|d| !d.m.placeholders.is_empty()).count(),
+        ph_total: ds.iter().map(|d| d.m.placeholders.len()).sum(),
+        open: ds.iter().filter(|d| d.m.opening_chatter.is_some()).count(),
+        close: ds.iter().filter(|d| d.m.closing_chatter.is_some()).count(),
+        words_mean: ds.iter().map(|d| d.rec.words as f64).sum::<f64>() / ds.len().max(1) as f64,
+        lat_median_s,
+        spread2: spread(ds, 2),
+        spread_all: spread(ds, u32::MAX),
+    }
+}
+
+const SUMMARY_HEADER: [&str; 14] = [
+    "Model",
+    "Run",
+    "Drafts",
+    "Brief points covered",
+    "Drafts with every point",
+    "Unsupported specifics per draft",
+    "Drafts with 1+ unsupported",
+    "Drafts with a placeholder (placeholders)",
+    "Opening chatter",
+    "Closing chatter",
+    "Mean words",
+    "Median latency (s)",
+    "Coverage spread, first 2 samples (points)",
+    "Coverage spread, all samples (points)",
+];
+
+fn stats_row(model: &str, run: &str, s: &Stats) -> Vec<String> {
+    let n = s.n.max(1) as f64;
+    vec![
+        model.to_owned(),
+        run.to_owned(),
+        s.n.to_string(),
+        format!(
+            "{}/{} ({:.0}%)",
+            s.cov_covered,
+            s.cov_total,
+            100.0 * s.cov_covered as f64 / s.cov_total.max(1) as f64
+        ),
+        format!("{}/{}", s.all_cov, s.n),
+        format!("{:.2}", s.unsup_total as f64 / n),
+        format!("{}/{}", s.unsup_any, s.n),
+        format!("{}/{} ({})", s.ph_any, s.n, s.ph_total),
+        format!("{}/{}", s.open, s.n),
+        format!("{}/{}", s.close, s.n),
+        format!("{:.0}", s.words_mean),
+        format!("{:.1}", s.lat_median_s),
+        format!("{:.2}", s.spread2),
+        format!("{:.2}", s.spread_all),
+    ]
+}
+
+/// Rows: per model, the original run then the variant, over the briefs the variant
+/// run has finished. Original latency is sample 2 only (sample 1 carried a reload).
+fn summary_rows(orig: &[Draft], var: &[Draft]) -> Vec<Vec<String>> {
+    let done: HashSet<&str> = var.iter().map(|d| d.brief.as_str()).collect();
+    let mut rows = Vec::new();
+    for m in MODELS {
+        let o: Vec<&Draft> = orig
+            .iter()
+            .filter(|d| d.model == m && d.rec.error.is_none() && done.contains(d.brief.as_str()))
+            .collect();
+        let v: Vec<&Draft> = var
+            .iter()
+            .filter(|d| d.model == m && d.rec.error.is_none())
+            .collect();
+        rows.push(stats_row(
+            m,
+            "original (2 samples, temp 0.5)",
+            &stats(&o, Some(2)),
+        ));
+        rows.push(stats_row(
+            m,
+            "variant (4 samples, temp 0.2)",
+            &stats(&v, None),
+        ));
+    }
+    rows
+}
+
+const SUMMARY_NOTES: &[&str] = &[
+    "Both runs: the same five synthetic briefs, the same three bundled models, QR's own sidecar. The measures were recomputed on the saved original drafts with the same code, so the two are comparable.",
+    "The variant changed several things at once: facts-only instruction, no request for polish, no remarks about the draft, a structured list of points, sender name, address and date supplied, no voice-analysis step, temperature 0.2. This table cannot say which change did what.",
+    "Samples: original 2 per brief and model (30 drafts), variant 4 (60). Coverage spread is max minus min of points covered across the samples of one brief, averaged over briefs. It grows with the number of samples, so compare the first-2-samples column across the two runs.",
+    "Latency: the variant is steady state (warm-up with the same options before each model's samples). Original latency uses sample 2 only, because its first sample included a model reload. The variant does not make the shared voice-analysis call that fed the original draft prompt.",
+    "Unsupported specifics are checked against the brief and persona context supplied in that run. The variant's context includes a sender name, address and date that the original had none of, so a name in an original draft counts as unsupported while the same supplied name in a variant draft does not.",
+];
+
+const LIMITS: &[&str] = &[
+    "Soft embellishment that carries no number or capitalised name: praise and filler such as \"seasoned professional\" or \"dedicated team player\", invented reasons or consequences (\"rendering the laptop unusable\"), claims about warranty, urgency or what the reader wants, and invented groups written in lower case (\"elderly residents\"). A reader has to find these.",
+    "Meaning, not words: coverage is keyword matching, so a correct paraphrase of a point can count as missing, and a wrong sentence that happens to contain the keywords counts as covered. A number is matched by value anywhere in the brief, not by what it refers to.",
+    "A single invented capitalised word that opens a sentence (and is not on a short name line) is skipped on purpose; a title-case word in a heading or a product word can be listed although it is harmless. The list is for a person to check, not a score.",
+    "Chatter is found by a phrase list on the first line and the last paragraph. Tone, voice, how well it reads, and whether the sender details were used where the format calls for them are not measured.",
+];
+
+fn md_table(header: &[&str], rows: &[Vec<String>]) -> String {
+    let mut s = format!(
+        "| {} |\n|{}\n",
+        header.join(" | "),
+        "---|".repeat(header.len())
+    );
+    for r in rows {
+        s.push_str(&format!("| {} |\n", r.join(" | ")));
+    }
+    s
+}
+
+fn html_table(header: &[&str], rows: &[Vec<String>]) -> String {
+    let mut h = String::from("<table><tr>");
+    for c in header {
+        h.push_str(&format!("<th>{}</th>", esc(c)));
+    }
+    h.push_str("</tr>");
+    for r in rows {
+        h.push_str("<tr>");
+        for c in r {
+            h.push_str(&format!("<td>{}</td>", esc(c)));
+        }
+        h.push_str("</tr>");
+    }
+    h.push_str("</table>");
+    h
+}
+
+fn summary_md(rows: &[Vec<String>], compare_to: &str, run: &str) -> String {
+    let mut s = format!(
+        "# Variant run {run} vs original {compare_to}\n\n{}\n",
+        md_table(&SUMMARY_HEADER, rows)
+    );
+    s.push_str("Notes:\n");
+    for n in SUMMARY_NOTES {
+        s.push_str(&format!("- {n}\n"));
+    }
+    s.push_str("\nWhat the deterministic checks cannot catch:\n");
+    for n in LIMITS {
+        s.push_str(&format!("- {n}\n"));
+    }
+    s
+}
+
+fn summary_html_block(rows: &[Vec<String>]) -> String {
+    let mut h = String::from("<h2>Variant vs original</h2>");
+    h.push_str(&html_table(&SUMMARY_HEADER, rows));
+    h.push_str("<ul>");
+    for n in SUMMARY_NOTES {
+        h.push_str(&format!("<li>{}</li>", esc(n)));
+    }
+    h.push_str("</ul><h2>What the deterministic checks cannot catch</h2><ul>");
+    for n in LIMITS {
+        h.push_str(&format!("<li>{}</li>", esc(n)));
+    }
+    h.push_str("</ul>");
+    h
+}
+
+// -- Pages ------------------------------------------------------------------
+
+fn variant_meta(d: &Draft) -> String {
+    let m = &d.m;
+    let mut s = format!(
+        "{} words &middot; {:.1} s &middot; coverage {}/{} &middot; placeholders {} &middot; opening chatter {} &middot; closing chatter {}",
+        d.rec.words,
+        d.rec.latency_ms / 1000.0,
+        m.points_covered,
+        m.points_total,
+        m.placeholders.len(),
+        if m.opening_chatter.is_some() { "<span class=warn>yes</span>" } else { "no" },
+        if m.closing_chatter.is_some() { "<span class=warn>yes</span>" } else { "no" },
+    );
+    if d.rec.hit_cap {
+        s.push_str(" &middot; <span class=warn>stopped at the 1024-token cap</span>");
+    }
+    if let Some(e) = &d.rec.error {
+        s.push_str(&format!(
+            " &middot; <span class=warn>ERROR {}</span>",
+            esc(e)
+        ));
+    }
+    s
+}
+
+fn variant_compare_page(
+    out_dir: &Path,
+    b: &Brief,
+    vb: &VBrief,
+    drafts: &[Draft],
+    compare_to: &str,
+) {
+    let points: String = vb
+        .points
+        .iter()
+        .map(|p| format!("<li>{}</li>", esc(p.text)))
+        .collect();
+    let mut h = format!(
+        "<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">\
+         <title>{t} variant comparison</title><style>{PAGE_CSS}</style><h1>{t} &middot; variant</h1>\
+         <p class=note>Synthetic brief. VARIANT run (items.id=894 part 0, dev-only experiment): facts-only prompt, \
+         structured points, sender details supplied, temperature 0.2, four samples. Measures are deterministic and \
+         listed so you can check them; nothing is scored. They cannot catch soft embellishment (\"seasoned professional\"), \
+         invented reasons, or a wrong sentence that contains the keywords. \
+         <a href=\"../../{compare_to}/{id}/compare.html\">Same brief in the original run</a>.</p>\
+         <details open><summary>Points and facts supplied</summary><ul>{points}</ul>\
+         <p class=meta>Task: {task} Recipient: {rec}. Format: {fmt} Sender: {name}, {addr}, {date}. \
+         Role: {job}, {emp}. Voice: {voice}.</p></details>\
+         <p><a href=\"../index.html\">Index and summary</a> &middot; <a href=\"prompt.txt\">prompt</a></p><div class=grid>",
+        t = esc(b.title),
+        id = b.id,
+        task = esc(vb.task),
+        rec = esc(vb.recipient),
+        fmt = esc(vb.format),
+        name = esc(vb.sender.name),
+        addr = esc(vb.sender.address),
+        date = esc(vb.sender.date),
+        job = esc(b.persona.job_title),
+        emp = esc(b.persona.employer),
+        voice = esc(&format_voice(&b.voice)),
+    );
+    for n in 1..=VARIANT_SAMPLES {
+        for m in MODELS {
+            let Some(d) = drafts
+                .iter()
+                .find(|d| d.brief == b.id && d.model == m && d.sample == n)
+            else {
+                h.push_str(&format!(
+                    "<div class=cell><h2>{} &middot; sample {n}</h2><p class=meta>not run</p></div>",
+                    esc(m)
+                ));
+                continue;
+            };
+            let missing = if d.m.missing_points.is_empty() {
+                "none".to_owned()
+            } else {
+                d.m.missing_points
+                    .iter()
+                    .map(|p| esc(p))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            let unsupported = if d.m.unsupported.is_empty() {
+                "none".to_owned()
+            } else {
+                format!(
+                    "<span class=warn>{}</span>",
+                    d.m.unsupported
+                        .iter()
+                        .map(|u| esc(u))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            let placeholders = if d.m.placeholders.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "<br>Placeholders: <span class=warn>{}</span>",
+                    d.m.placeholders
+                        .iter()
+                        .map(|p| esc(p))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            let chatter = [
+                d.m.opening_chatter
+                    .as_ref()
+                    .map(|c| format!("Opening: {}", esc(c))),
+                d.m.closing_chatter
+                    .as_ref()
+                    .map(|c| format!("Closing: {}", esc(c))),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" &middot; ");
+            h.push_str(&format!(
+                "<div class=cell><h2>{} &middot; sample {n}</h2><p class=meta>{}</p>\
+                 <p class=meta>Points not found: {missing}<br>Unsupported specifics (check these): {unsupported}{placeholders}{}</p><pre>{}</pre></div>",
+                esc(m),
+                variant_meta(d),
+                if chatter.is_empty() { String::new() } else { format!("<br>{chatter}") },
+                esc(&d.text)
+            ));
+        }
+    }
+    h.push_str("</div>");
+    write(&out_dir.join(b.id).join("compare.html"), &h);
+}
+
+fn variant_index_page(
+    out_dir: &Path,
+    run: &str,
+    bs: &[Brief],
+    drafts: &[Draft],
+    summary_block: &str,
+    compare_to: &str,
+) {
+    let mut h = format!(
+        "<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">\
+         <title>Writing Assistant calibration variant</title><style>{PAGE_CSS}</style>\
+         <h1>Writing Assistant calibration, variant &middot; {}</h1>\
+         <p class=note>Dev-only experiment (items.id=894 part 0, not a shipped template). Compared with the original run \
+         {}. Open a brief to read the drafts side by side. Measures are deterministic, nothing is a quality score. \
+         Also saved as summary.md.</p>{summary_block}",
+        esc(run),
+        esc(compare_to)
+    );
+    for b in bs {
+        let ds: Vec<&Draft> = drafts.iter().filter(|d| d.brief == b.id).collect();
+        if ds.is_empty() {
+            continue;
+        }
+        h.push_str(&format!(
+            "<h2><a href=\"{0}/compare.html\">{1}</a></h2><table><tr><th>Model</th><th>Sample</th><th>Words</th>\
+             <th>Latency</th><th>Coverage</th><th>Unsupported specifics</th><th>Placeholders</th>\
+             <th>Opening chatter</th><th>Closing chatter</th><th>Notes</th></tr>",
+            b.id,
+            esc(b.title)
+        ));
+        for d in ds {
+            let mut notes = Vec::new();
+            if d.rec.hit_cap {
+                notes.push("token cap".to_owned());
+            }
+            if let Some(e) = &d.rec.error {
+                notes.push(format!("ERROR {}", esc(e)));
+            }
+            h.push_str(&format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{:.1} s</td><td>{}/{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                esc(&d.model),
+                d.sample,
+                d.rec.words,
+                d.rec.latency_ms / 1000.0,
+                d.m.points_covered,
+                d.m.points_total,
+                if d.m.unsupported.is_empty() {
+                    "none".to_owned()
+                } else {
+                    format!("{}: {}", d.m.unsupported.len(), esc(&d.m.unsupported.join(", ")))
+                },
+                d.m.placeholders.len(),
+                if d.m.opening_chatter.is_some() { "yes" } else { "no" },
+                if d.m.closing_chatter.is_some() { "yes" } else { "no" },
+                notes.join(", ")
+            ));
+        }
+        h.push_str("</table>");
+    }
+    write(&out_dir.join("index.html"), &h);
+}
+
+/// Rewrites every derived file (measures json, compare pages, summary, index) from
+/// the drafts on disk. Called after each brief, so a stopped run still has pages.
+fn write_variant_outputs(
+    out_dir: &Path,
+    run: &str,
+    compare_to: &str,
+    bs: &[Brief],
+    vbs: &[VBrief],
+    orig: &[Draft],
+) -> String {
+    let drafts = load_drafts(out_dir, bs, vbs, VARIANT_SAMPLES, true);
+    for d in &drafts {
+        write(
+            &out_dir
+                .join(&d.brief)
+                .join(format!("{}-{}.measures.json", slug(&d.model), d.sample)),
+            &serde_json::to_string_pretty(&d.m).expect("serialize measures"),
+        );
+    }
+    for (b, vb) in bs.iter().zip(vbs) {
+        if drafts.iter().any(|d| d.brief == b.id) {
+            variant_compare_page(out_dir, b, vb, &drafts, compare_to);
+        }
+    }
+    let rows = summary_rows(orig, &drafts);
+    let md = summary_md(&rows, compare_to, run);
+    write(&out_dir.join("summary.md"), &md);
+    variant_index_page(
+        out_dir,
+        run,
+        bs,
+        &drafts,
+        &summary_html_block(&rows),
+        compare_to,
+    );
+    md
+}
+
+async fn run_variant(args: Args, home: PathBuf, root: PathBuf) {
+    let run = args.resume.clone().unwrap_or_else(|| {
+        chrono::Local::now()
+            .format("variant-%Y%m%d-%H%M%S")
+            .to_string()
+    });
+    let compare_to = args
+        .compare_to
+        .clone()
+        .unwrap_or_else(|| DEFAULT_COMPARE_TO.to_owned());
+    let orig_dir = root.join(&compare_to);
+    assert!(
+        orig_dir.is_dir(),
+        "original run {} not found (--compare-to)",
+        orig_dir.display()
+    );
+    let out_dir = root.join(&run);
+    fs::create_dir_all(&out_dir).expect("create run dir");
+
+    let http = reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .expect("http client");
+    let bs = briefs();
+    let vbs = variant_briefs();
+    let draft_step = shipped_step("writing-assistant:draft_writing:default");
+    let orig = load_drafts(&orig_dir, &bs, &vbs, SAMPLES, false);
+    println!(
+        "original run {compare_to}: {} saved drafts measured for the summary",
+        orig.len()
+    );
+
+    let mut sidecar = OllamaSidecar::new();
+    let base = start_sidecar(&mut sidecar, &home, &root, args.models_dir.clone()).await;
+
+    let started = Instant::now();
+    for (bi, (b, vb)) in bs.iter().zip(&vbs).enumerate() {
+        let brief_start = Instant::now();
+        println!("\n== {} ({}/{})", b.title, bi + 1, bs.len());
+        let prompt = variant_prompt(b, vb);
+        write(&out_dir.join(b.id).join("prompt.txt"), &prompt);
+        for m in MODELS {
+            let opts = variant_options(&draft_step, m);
+            let finished = (1..=VARIANT_SAMPLES).all(|n| {
+                out_dir
+                    .join(b.id)
+                    .join(format!("{}-{n}.json", slug(m)))
+                    .exists()
+            });
+            if !finished {
+                warm_up(&http, &base, m, &opts).await;
+            }
+            for n in 1..=VARIANT_SAMPLES {
+                run_one(&http, &base, &out_dir, b, m, n, &prompt, &opts).await;
+            }
+        }
+        write_variant_outputs(&out_dir, &run, &compare_to, &bs, &vbs, &orig);
+
+        if bi == 0 {
+            let first = brief_start.elapsed().as_secs_f64();
+            let projected = first * bs.len() as f64;
+            println!(
+                "\nTIMING after brief 1: {:.1} min for brief 1 ({} drafts after warm-ups). Projected full run if the \
+                 other briefs cost the same: {:.0} min ({:.0} min still to go). The essay and complaint briefs ask for \
+                 longer output, so treat this as a floor.",
+                first / 60.0,
+                MODELS.len() as u32 * VARIANT_SAMPLES,
+                projected / 60.0,
+                first * (bs.len() - 1) as f64 / 60.0
+            );
+            if projected > LONG_RUN_LIMIT_SECS && !args.approve_long_run {
+                println!(
+                    "STOP: the projected run is over an hour. Brief 1 is saved under {}. \
+                     Re-run with --variant --resume {run} --approve-long-run to continue.",
+                    out_dir.display()
+                );
+                sidecar.stop().await;
+                std::process::exit(3);
+            }
+        }
+    }
+    sidecar.stop().await;
+    let md = write_variant_outputs(&out_dir, &run, &compare_to, &bs, &vbs, &orig);
+    println!(
+        "\nvariant run finished in {:.1} min. Pages: {}\n\n{md}",
+        started.elapsed().as_secs_f64() / 60.0,
+        out_dir.join("index.html").display()
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Run
 // ---------------------------------------------------------------------------
 
@@ -718,6 +1954,8 @@ struct Args {
     resume: Option<String>,
     models_dir: Option<PathBuf>,
     system_num_gpu: Option<u32>,
+    variant: bool,
+    compare_to: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -727,6 +1965,8 @@ fn parse_args() -> Args {
         resume: None,
         models_dir: None,
         system_num_gpu: None,
+        variant: false,
+        compare_to: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -734,6 +1974,8 @@ fn parse_args() -> Args {
             "--approve-long-run" => a.approve_long_run = true,
             "--system-pass" => a.system_pass = true,
             "--resume" => a.resume = it.next(),
+            "--variant" => a.variant = true,
+            "--compare-to" => a.compare_to = it.next(),
             "--models-dir" => a.models_dir = it.next().map(PathBuf::from),
             // System pass only: Ollama's num_gpu option (layers on the GPU). 0 = CPU
             // only, for when another app holds the GPU memory.
@@ -755,6 +1997,14 @@ async fn main() {
     let args = parse_args();
     let home = PathBuf::from(std::env::var("HOME").expect("HOME"));
     let root = home.join(".cache/qr-892-calibration");
+    if args.variant {
+        assert!(
+            !args.system_pass,
+            "--variant and --system-pass are separate runs"
+        );
+        run_variant(args, home, root).await;
+        return;
+    }
     let run = args
         .resume
         .clone()
@@ -791,38 +2041,7 @@ async fn main() {
     let main_run_needed = !args.system_pass;
     let mut sidecar_base = String::new();
     if main_run_needed {
-        let real_models = args
-            .models_dir
-            .clone()
-            .unwrap_or_else(|| home.join(".local/share/ai.quietrabbit.app/ollama_models"));
-        assert!(
-            real_models.is_dir(),
-            "models dir {} not found",
-            real_models.display()
-        );
-        let scratch_root = root.join("dataroot");
-        fs::create_dir_all(&scratch_root).expect("scratch data root");
-        let link = scratch_root.join("ollama_models");
-        if link.symlink_metadata().is_err() {
-            std::os::unix::fs::symlink(&real_models, &link).expect("symlink ollama_models");
-        }
-        set_data_root(scratch_root.clone());
-        // An empty resource dir so only the debug PATH fallback is tried, not the
-        // bundled stub script (which exits at once and would burn the port list).
-        let empty_resources = scratch_root.join("no-resources");
-        fs::create_dir_all(&empty_resources).expect("resources dir");
-        println!(
-            "sidecar: scratch data root {}, models {} (symlink)",
-            scratch_root.display(),
-            real_models.display()
-        );
-        let startup = sidecar.ensure_available(&empty_resources).await;
-        if startup.source != OllamaSource::Sidecar {
-            eprintln!("QR's sidecar did not start; nothing was run");
-            std::process::exit(1);
-        }
-        sidecar_base = format!("http://127.0.0.1:{}", ollama_sidecar::port());
-        println!("sidecar: ready at {sidecar_base}");
+        sidecar_base = start_sidecar(&mut sidecar, &home, &root, args.models_dir.clone()).await;
     }
 
     if main_run_needed {
@@ -1004,5 +2223,136 @@ async fn main() {
             "\nsystem pass finished. Pages: {}",
             sys_dir.join("index.html").display()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn allowed(s: &str) -> HashSet<String> {
+        word_set(s)
+    }
+
+    #[test]
+    fn placeholders_are_found_and_cut_out() {
+        let (spans, rest) = split_placeholders("Dear [Name],\nSee [1] and {date} <Your Name>.\n");
+        assert_eq!(spans, vec!["[Name]", "{date}", "<Your Name>"]);
+        assert!(rest.contains("[1]"));
+        assert!(!rest.contains("Name"));
+    }
+
+    #[test]
+    fn opening_and_closing_chatter() {
+        assert!(opening_chatter("Here is a polished draft:\n\nDear X,").is_some());
+        assert!(opening_chatter("Sure, here you go.\nDear X,").is_some());
+        assert!(opening_chatter("Dear Returns Department,\nSurely this is fine.").is_none());
+        assert!(closing_chatter(
+            "Dear X,\n\nBody.\n\nTomas\n\nLet me know if you'd like me to adjust the tone."
+        )
+        .is_some());
+        assert!(
+            closing_chatter("Dear X,\n\nPlease let me know if you need anything.\n\nTomas")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn coverage_uses_word_starts_and_groups() {
+        let hay = norm("The left hinge cracked in the 2nd week. Ticket CB-77804 only.");
+        assert!(point_covered(
+            &hay,
+            &[&["hinge"], &["second week", "2nd week"]]
+        ));
+        assert!(!point_covered(&hay, &[&["hinge"], &["refund"]]));
+        // "4" must start a word: it does not match inside cb-77804.
+        assert!(!has_term(&hay, "4 ticket"));
+        assert!(has_term(&hay, "cb-77804"));
+    }
+
+    #[test]
+    fn unsupported_specifics_flags_invented_and_passes_supplied() {
+        let a = allowed(
+            "laptop serial VX14-0042718 bought on 3 August 2026 order BW-558201. \
+             Tomas Brandvold, 418 Larch Street, Duluth, MN 55802. Returns department. five weeks",
+        );
+        let draft = "Tomas Brandvold\n418 Larch Street, Duluth, MN 55802\n\n13 November 2026\n\n\
+                     Dear Returns Department,\n\n\
+                     I bought the laptop (serial VX14-0042718) on 3 August 2026, order BW-558201, \
+                     and called Mr. Harlow in Seattle on 12 September. It failed after 33 percent of \
+                     the warranty, within three weeks.\n\nSincerely,\nTomas Brandvold";
+        let u = unsupported_specifics(draft, &a);
+        for expected in [
+            "13",
+            "November",
+            "Harlow",
+            "Seattle",
+            "12",
+            "September",
+            "33",
+            "three",
+        ] {
+            assert!(
+                u.iter().any(|x| x == expected),
+                "{expected} missing from {u:?}"
+            );
+        }
+        for fine in [
+            "VX14-0042718",
+            "BW-558201",
+            "3",
+            "August",
+            "Tomas",
+            "Brandvold",
+            "Duluth",
+            "Returns",
+            "Department",
+            "Sincerely",
+            "I",
+        ] {
+            assert!(
+                !u.iter().any(|x| x == fine),
+                "{fine} wrongly flagged in {u:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn changed_identifier_digit_is_flagged() {
+        let a = allowed("serial VX14-0042718");
+        let u = unsupported_specifics("Serial VX14-0042719 here.", &a);
+        assert_eq!(u, vec!["VX14-0042719"]);
+    }
+
+    #[test]
+    fn subject_line_and_list_markers_are_not_names() {
+        let a = allowed("complaint about the router");
+        let u = unsupported_specifics(
+            "Subject: Formal Complaint Regarding Disruptions\n1. First point\n",
+            &a,
+        );
+        assert!(u.is_empty(), "{u:?}");
+    }
+
+    #[test]
+    fn variant_prompt_renders_without_leftover_tokens() {
+        let bs = briefs();
+        for (b, vb) in bs.iter().zip(variant_briefs().iter()) {
+            let p = variant_prompt(b, vb);
+            assert!(p.contains(vb.sender.name) && p.contains(vb.sender.address));
+            assert!(p.contains("no opening or closing remarks"));
+            assert!(!p.contains("polished draft"));
+            assert_eq!(vb.id, b.id);
+        }
+    }
+
+    #[test]
+    fn every_variant_brief_has_points_with_keys() {
+        for vb in variant_briefs() {
+            assert!(vb.points.len() >= 5);
+            for p in &vb.points {
+                assert!(!p.keys.is_empty(), "{}", p.text);
+            }
+        }
     }
 }
