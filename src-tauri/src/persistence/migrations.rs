@@ -280,6 +280,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/personal_009.sql"),
     },
     SchemaFile {
+        prefix: "personal",
+        version: 10,
+        sql: include_str!("../../schema/personal_010.sql"),
+    },
+    SchemaFile {
         prefix: "plan_state",
         version: 1,
         sql: include_str!("../../schema/plan_state_001.sql"),
@@ -503,6 +508,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         prefix: "shared",
         version: 43,
         sql: include_str!("../../schema/shared_043.sql"),
+    },
+    SchemaFile {
+        prefix: "shared",
+        version: 44,
+        sql: include_str!("../../schema/shared_044.sql"),
     },
     SchemaFile {
         prefix: "tier3_cookies",
@@ -2083,6 +2093,19 @@ mod tests {
             .expect("in-memory connection failed")
     }
 
+    /// items.id=920: forget shared_044.sql on a fully migrated test database, so
+    /// a test that rewinds to an older version can apply it again. The version
+    /// row is deleted by the caller's own DELETE.
+    async fn drop_shared_044(conn: &mut SqliteConnection) {
+        for stmt in [
+            "ALTER TABLE focus_settings DROP COLUMN collection_consent",
+            "ALTER TABLE focus_settings DROP COLUMN collection_consent_version",
+            "ALTER TABLE focuses DROP COLUMN collection_posture",
+        ] {
+            sqlx::query(stmt).execute(&mut *conn).await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn sqlite_build_supports_fts5() {
         // Standalone capability probe, independent of ENV_MUTEX/setup(): if the
@@ -2391,15 +2414,15 @@ mod tests {
             .await
             .expect("shared migration chain must apply cleanly on a fresh db");
         assert_eq!(
-            applied, 43,
-            "expected all forty-three shared schema versions to apply"
+            applied, 44,
+            "expected all forty-four shared schema versions to apply"
         );
 
         let version: (i64,) = sqlx::query_as("SELECT MAX(version) FROM schema_version")
             .fetch_one(&mut conn)
             .await
             .unwrap();
-        assert_eq!(version.0, 43);
+        assert_eq!(version.0, 44);
     }
 
     /// items.id=708 / items.id=703 / items.id=724: shared_026.sql and
@@ -2968,8 +2991,8 @@ mod tests {
             .expect("drift-healing run must succeed");
 
         assert_eq!(
-            applied, 42,
-            "shared v2 through v43 should count as newly applied from a stale v1 database"
+            applied, 43,
+            "shared v2 through v44 should count as newly applied from a stale v1 database"
         );
 
         // items.id=427: shared_013.sql drops tier3_providers (generalized
@@ -3578,8 +3601,8 @@ mod tests {
 
         assert_eq!(
             result.expect("migration must apply cleanly to a real encrypted file"),
-            9,
-            "personal_001 through personal_009 must all apply in one pass"
+            10,
+            "personal_001 through personal_010 must all apply in one pass"
         );
 
         let mut conn = open_verify_conn(
@@ -3652,7 +3675,7 @@ mod tests {
             std::env::remove_var("QR_DATA_ROOT");
         }
 
-        assert_eq!(first.expect("first migration must succeed"), 9);
+        assert_eq!(first.expect("first migration must succeed"), 10);
         assert_eq!(
             second.expect("second migration on an already-migrated real file must not error"),
             0,
@@ -4052,9 +4075,9 @@ mod tests {
             .await
             .unwrap();
         }
-        // A database at 038 has none of 039 through 043 (the runner applies
-        // what is above its highest recorded version), so forget all five, and
-        // drop the columns 041 and 042 added.
+        // A database at 038 has none of 039 through 044 (the runner applies
+        // what is above its highest recorded version), so forget all six, and
+        // drop the columns 041, 042 and 044 added.
         for col in ["store_op", "store_target", "store_args", "guard_clauses"] {
             sqlx::query(&format!(
                 "ALTER TABLE focus_block_compositions DROP COLUMN {col}"
@@ -4063,17 +4086,18 @@ mod tests {
             .await
             .unwrap();
         }
-        sqlx::query("DELETE FROM schema_version WHERE version IN (39, 40, 41, 42, 43)")
+        sqlx::query("DELETE FROM schema_version WHERE version IN (39, 40, 41, 42, 43, 44)")
             .execute(&mut conn)
             .await
             .unwrap();
+        drop_shared_044(&mut conn).await;
         let before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM focus_block_compositions")
             .fetch_one(&mut conn)
             .await
             .unwrap();
         assert!(before.0 > 0, "the 038 seed rows are there");
 
-        assert_eq!(run_migrations(&mut conn, "shared", None).await.unwrap(), 5);
+        assert_eq!(run_migrations(&mut conn, "shared", None).await.unwrap(), 6);
 
         let after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM focus_block_compositions")
             .fetch_one(&mut conn)
@@ -4092,7 +4116,7 @@ mod tests {
             .fetch_one(&mut conn)
             .await
             .unwrap();
-        assert_eq!(v.0, 43);
+        assert_eq!(v.0, 44);
     }
 
     // items.id=879: shared_040.sql repairs the applied Writing Assistant
@@ -4159,10 +4183,11 @@ mod tests {
             .await
             .unwrap();
         }
-        sqlx::query("DELETE FROM schema_version WHERE version IN (40, 41, 42, 43)")
+        sqlx::query("DELETE FROM schema_version WHERE version IN (40, 41, 42, 43, 44)")
             .execute(&mut conn)
             .await
             .unwrap();
+        drop_shared_044(&mut conn).await;
         let before = wa_draft_customization(&mut conn).await;
         assert!(before.get("declared_inputs").is_none());
         let rows_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM focus_block_customization")
@@ -4170,7 +4195,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(run_migrations(&mut conn, "shared", None).await.unwrap(), 4);
+        assert_eq!(run_migrations(&mut conn, "shared", None).await.unwrap(), 5);
 
         assert_eq!(wa_draft_customization(&mut conn).await, fixed);
         let rows_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM focus_block_customization")
@@ -4182,7 +4207,7 @@ mod tests {
             .fetch_one(&mut conn)
             .await
             .unwrap();
-        assert_eq!(v.0, 43);
+        assert_eq!(v.0, 44);
     }
 
     // items.id=887: shared_041.sql adds three nullable store-writer columns to
@@ -4220,7 +4245,7 @@ mod tests {
             .fetch_one(&mut conn)
             .await
             .unwrap();
-        assert_eq!(v.0, 43);
+        assert_eq!(v.0, 44);
     }
 
     #[tokio::test]
@@ -4236,17 +4261,18 @@ mod tests {
             .await
             .unwrap();
         }
-        sqlx::query("DELETE FROM schema_version WHERE version IN (41, 42, 43)")
+        sqlx::query("DELETE FROM schema_version WHERE version IN (41, 42, 43, 44)")
             .execute(&mut conn)
             .await
             .unwrap();
+        drop_shared_044(&mut conn).await;
         let before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM focus_block_compositions")
             .fetch_one(&mut conn)
             .await
             .unwrap();
         assert!(before.0 > 0, "the seed rows are there");
 
-        assert_eq!(run_migrations(&mut conn, "shared", None).await.unwrap(), 3);
+        assert_eq!(run_migrations(&mut conn, "shared", None).await.unwrap(), 4);
 
         let after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM focus_block_compositions")
             .fetch_one(&mut conn)
@@ -4265,7 +4291,7 @@ mod tests {
             .fetch_one(&mut conn)
             .await
             .unwrap();
-        assert_eq!(v.0, 43);
+        assert_eq!(v.0, 44);
     }
 
     // items.id=889: shared_042.sql adds one nullable clause-list column to
@@ -4309,17 +4335,18 @@ mod tests {
             .execute(&mut conn)
             .await
             .unwrap();
-        sqlx::query("DELETE FROM schema_version WHERE version IN (42, 43)")
+        sqlx::query("DELETE FROM schema_version WHERE version IN (42, 43, 44)")
             .execute(&mut conn)
             .await
             .unwrap();
+        drop_shared_044(&mut conn).await;
         let before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM focus_block_compositions")
             .fetch_one(&mut conn)
             .await
             .unwrap();
         assert!(before.0 > 0, "the seed rows are there");
 
-        assert_eq!(run_migrations(&mut conn, "shared", None).await.unwrap(), 2);
+        assert_eq!(run_migrations(&mut conn, "shared", None).await.unwrap(), 3);
 
         let after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM focus_block_compositions")
             .fetch_one(&mut conn)
@@ -4338,7 +4365,7 @@ mod tests {
             .fetch_one(&mut conn)
             .await
             .unwrap();
-        assert_eq!(v.0, 43);
+        assert_eq!(v.0, 44);
     }
 
     // items.id=661: keys_006.sql and personal_009.sql are additive, so they
@@ -4346,7 +4373,7 @@ mod tests {
     // is a compile-time static, so the older database is hand-built: apply
     // everything, then remove what the new file added and forget its version.
     /// items.id=661: shared_008.sql no longer adds a column, but versions must
-    /// stay contiguous. Every version 1..=43 must have its row, 8 included,
+    /// stay contiguous. Every version 1..=44 must have its row, 8 included,
     /// recorded by the file's own INSERT.
     #[tokio::test]
     async fn every_shared_version_is_recorded_including_the_no_column_shared_008() {
@@ -4358,7 +4385,7 @@ mod tests {
                 .await
                 .unwrap();
         let versions: Vec<i64> = versions.into_iter().map(|v| v.0).collect();
-        assert_eq!(versions, (1..=43).collect::<Vec<i64>>());
+        assert_eq!(versions, (1..=44).collect::<Vec<i64>>());
         let description: String =
             sqlx::query_scalar("SELECT description FROM schema_version WHERE version = 8")
                 .fetch_one(&mut conn)
@@ -4480,7 +4507,7 @@ mod tests {
         let mut conn = make_test_conn().await;
         assert_eq!(
             run_migrations(&mut conn, "personal", None).await.unwrap(),
-            9
+            10
         );
 
         sqlx::query("DROP TABLE persona_floor_consent")
@@ -4491,7 +4518,13 @@ mod tests {
             .execute(&mut conn)
             .await
             .unwrap();
-        sqlx::query("DELETE FROM schema_version WHERE version = 9")
+        // A database at 008 has neither 009 nor 010 (the runner applies what is
+        // above its highest recorded version), so forget both.
+        sqlx::query("DROP TABLE consent_audit_records")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_version WHERE version IN (9, 10)")
             .execute(&mut conn)
             .await
             .unwrap();
@@ -4505,7 +4538,7 @@ mod tests {
 
         assert_eq!(
             run_migrations(&mut conn, "personal", None).await.unwrap(),
-            1
+            2
         );
         let name: (String,) =
             sqlx::query_as("SELECT group_display_name FROM group_keys WHERE group_id = 'g-1'")
@@ -4531,6 +4564,113 @@ mod tests {
         .execute(&mut conn)
         .await
         .expect_err("persona_floor_consent holds exactly one row");
+    }
+
+    /// items.id=920: personal_010.sql is additive, so it reaches a database
+    /// created before it existed, and re-running it is a no-op.
+    #[tokio::test]
+    async fn personal_010_applies_on_top_of_a_personal_009_database() {
+        let mut conn = make_test_conn().await;
+        assert_eq!(
+            run_migrations(&mut conn, "personal", None).await.unwrap(),
+            10
+        );
+        sqlx::query("DROP TABLE consent_audit_records")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_version WHERE version = 10")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            run_migrations(&mut conn, "personal", None).await.unwrap(),
+            1
+        );
+        // The table is there, takes a row, and has the index.
+        sqlx::query(
+            "INSERT INTO consent_audit_records
+             (id, event_type, focus_slug, content_summary, created_at)
+             VALUES ('e1', 'collection_consent_granted', 'tech-support', 'x', 't')",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        let idx: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index'
+             AND name = 'idx_consent_audit_records_focus'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(idx, 1);
+        assert_eq!(
+            run_migrations(&mut conn, "personal", None).await.unwrap(),
+            0,
+            "a second run is a no-op"
+        );
+    }
+
+    /// items.id=920: shared_044.sql reaches a database at 043, existing rows get
+    /// the closed defaults (never a grant, never "not required"), and the CHECKs
+    /// refuse anything else.
+    #[tokio::test]
+    async fn shared_044_applies_to_a_database_at_043_with_closed_defaults() {
+        let mut conn = make_test_conn().await;
+        run_migrations(&mut conn, "shared", None).await.unwrap();
+        drop_shared_044(&mut conn).await;
+        sqlx::query("DELETE FROM schema_version WHERE version = 44")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO focus_settings (persona_id, focus_id, created_at, updated_at)
+             VALUES ('p1', 'f1', 't', 't')",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO focuses (focus_id, display_name, max_routing_tier, status,
+                                  created_at, updated_at)
+             VALUES ('f1', 'F', 'local_only', 'shipped', 't', 't')",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        assert_eq!(run_migrations(&mut conn, "shared", None).await.unwrap(), 1);
+
+        let row: (String, i64) = sqlx::query_as(
+            "SELECT collection_consent, collection_consent_version FROM focus_settings",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(row, ("not_asked".to_owned(), 0));
+        let posture: String = sqlx::query_scalar("SELECT collection_posture FROM focuses")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(posture, "per_field");
+
+        sqlx::query("UPDATE focus_settings SET collection_consent = 'maybe'")
+            .execute(&mut conn)
+            .await
+            .expect_err("the CHECK refuses an unknown consent state");
+        sqlx::query("UPDATE focuses SET collection_posture = 'not_required'")
+            .execute(&mut conn)
+            .await
+            .expect_err("the CHECK refuses an unknown posture");
+        assert_eq!(
+            run_migrations(&mut conn, "shared", None).await.unwrap(),
+            0,
+            "a second run is a no-op"
+        );
     }
 
     #[tokio::test]
@@ -4790,8 +4930,8 @@ mod tests {
         }
 
         assert_eq!(
-            first.expect("first migration, which applies all 9 real versions, must succeed"),
-            9,
+            first.expect("first migration, which applies all 10 real versions, must succeed"),
+            10,
             "a brand-new personal.db must apply every real migration version on first open"
         );
         assert!(

@@ -1063,6 +1063,104 @@ mod tests {
         );
     }
 
+    /// items.id=920: the friction gate applies a settings change and records a
+    /// decision, and it cannot move the collection-consent columns: a granted
+    /// state stays granted at the same version, and a state that was never given
+    /// is not made a grant by a "proceed".
+    #[tokio::test]
+    async fn submit_friction_gate_decision_cannot_move_the_collection_consent_columns() {
+        let _env = setup().await;
+        crate::persistence::migrations::migrate_shared_db()
+            .await
+            .expect("shared.db migration must succeed in test setup");
+        let pool =
+            sqlx::SqlitePool::connect_with(crate::providers::utils::connect_options_unencrypted(
+                &crate::providers::utils::db_path_shared(),
+            ))
+            .await
+            .expect("shared.db pool must connect");
+        crate::auth::user_store::create_user(
+            &pool,
+            USER_ID,
+            "Consent Test User",
+            "user",
+            false,
+            &[0u8; crate::auth::kdf::SALT_LEN],
+            crate::auth::kdf::DEFAULT_ARGON2_MEMORY_KIB,
+            crate::auth::kdf::DEFAULT_ARGON2_ITERATIONS,
+            crate::auth::kdf::DEFAULT_ARGON2_PARALLELISM,
+            &[0u8; 32],
+        )
+        .await
+        .expect("create_user must succeed in test setup");
+        crate::persistence::persona_store::create_persona_anchor_for_test(
+            &pool, PERSONA_ID, USER_ID,
+        )
+        .await
+        .expect("create_persona must succeed in test setup");
+
+        let app = mock_app_with_registry(pool.clone());
+        for (start, version) in [
+            (focus_settings_store::CollectionConsent::Granted, 1),
+            (focus_settings_store::CollectionConsent::NotAsked, 0),
+        ] {
+            focus_settings_store::set_collection_consent(
+                &pool,
+                PERSONA_ID,
+                CLOUD_FRONTIER_DRAFT_FOCUS_ID,
+                start,
+                version,
+            )
+            .await
+            .expect("test setup sets the starting state");
+            // Back to the seeded ceiling, so each round is a real loosening.
+            focus_settings_store::update_focus_settings(
+                &pool,
+                PERSONA_ID,
+                CLOUD_FRONTIER_DRAFT_FOCUS_ID,
+                None,
+                None,
+                None,
+                Some(ExternalAccess::AnonymousRequired),
+                None,
+                None,
+            )
+            .await
+            .expect("test setup resets the ceiling");
+            let original_request = crate::commands::persona::UpdateFocusSettingsRequest {
+                persona_id: PERSONA_ID.to_owned(),
+                focus_id: CLOUD_FRONTIER_DRAFT_FOCUS_ID.to_owned(),
+                context_flow: None,
+                library_visibility: None,
+                privacy_tier: None,
+                max_permitted_tier: Some(ExternalAccess::Unrestricted),
+                focus_profile: None,
+            };
+            let pool_state = app.state::<sqlx::SqlitePool>();
+            submit_friction_gate_decision(
+                SubmitFrictionGateDecisionRequest {
+                    decision: "proceed".to_owned(),
+                    original_request,
+                },
+                pool_state,
+            )
+            .await
+            .expect("the decision applies")
+            .expect("proceed returns the applied settings");
+
+            let state = focus_settings_store::get_collection_consent(
+                &pool,
+                PERSONA_ID,
+                CLOUD_FRONTIER_DRAFT_FOCUS_ID,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(state.consent, start);
+            assert_eq!(state.version, version);
+        }
+    }
+
     // items.id=501 slice 2: the copy review assumes a non-private
     // destination. The command itself takes an AppHandle (no mock path, see
     // the note above this module), so the parameters are pinned as

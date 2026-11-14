@@ -17,6 +17,13 @@
 // focus_profile:      convenience label for the three settings (D6-294).
 // voice_override:     Focus-level voice JSON or None (D6-302).
 //
+// COLLECTION CONSENT (items.id=920, decisions.id=944, shared_044.sql):
+// collection_consent / collection_consent_version are the Persona's state on a
+// Focus's silent collection. They are deliberately NOT part of
+// update_focus_settings() or create_focus_settings(): the ONLY writer is
+// set_collection_consent(), called by stage 2's command and by nothing else, so
+// neither a model, the settings command nor the friction gate can move them.
+//
 // QUERY STYLE: runtime sqlx::query() only — no query!() macros.
 // shared.db is unencrypted — no PRAGMA key required.
 //
@@ -35,6 +42,12 @@ use crate::conductor::tokens::ExternalAccess;
 const VALID_CONTEXT_FLOWS: &[&str] = &["bidirectional", "receive_only", "isolated"];
 const VALID_LIBRARY_VISIBILITY: &[&str] = &["shared", "persona_visible", "persona_hidden"];
 const VALID_FOCUS_PROFILES: &[&str] = &["open", "organized", "protected"];
+/// The version of the collection-consent text the user is asked to agree to
+/// (items.id=920). The collection gate opens only while the stored
+/// collection_consent_version equals this, so a changed text asks again. Stage 1
+/// keeps the constant here, the simplest home next to the setter. Stage 2 moves
+/// it into a versioned data file with the consent text itself.
+pub const COLLECTION_CONSENT_TEXT_VERSION: i64 = 1;
 const TIER_MIN: i32 = 1;
 const TIER_MAX: i32 = 3;
 
@@ -58,6 +71,58 @@ pub enum FocusSettingsStoreError {
 }
 
 // ---------------------------------------------------------------------------
+// Collection consent (items.id=920)
+// ---------------------------------------------------------------------------
+
+/// Where a Persona stands on one Focus's silent collection. Stored as the
+/// CHECK-constrained text of focus_settings.collection_consent (shared_044.sql).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollectionConsent {
+    NotAsked,
+    Granted,
+    Declined,
+    Withdrawn,
+}
+
+impl CollectionConsent {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CollectionConsent::NotAsked => "not_asked",
+            CollectionConsent::Granted => "granted",
+            CollectionConsent::Declined => "declined",
+            CollectionConsent::Withdrawn => "withdrawn",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<CollectionConsent> {
+        match s {
+            "not_asked" => Some(CollectionConsent::NotAsked),
+            "granted" => Some(CollectionConsent::Granted),
+            "declined" => Some(CollectionConsent::Declined),
+            "withdrawn" => Some(CollectionConsent::Withdrawn),
+            _ => None,
+        }
+    }
+}
+
+/// The consent state and the text version it was given for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollectionConsentState {
+    pub consent: CollectionConsent,
+    pub version: i64,
+}
+
+impl CollectionConsentState {
+    /// True only for a grant of the CURRENT text. Anything else, an old
+    /// version included, is not a grant.
+    pub fn is_current_grant(&self) -> bool {
+        self.consent == CollectionConsent::Granted
+            && self.version == COLLECTION_CONSENT_TEXT_VERSION
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Data type
 // ---------------------------------------------------------------------------
 
@@ -72,6 +137,9 @@ pub struct FocusSettings {
     pub focus_profile: String,
     /// None if no voice override is set for this Focus.
     pub voice_override: Option<serde_json::Value>,
+    /// items.id=920: read-only here. Only set_collection_consent() writes it.
+    pub collection_consent: CollectionConsent,
+    pub collection_consent_version: i64,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -114,6 +182,16 @@ fn row_to_focus_settings(row: &sqlx::sqlite::SqliteRow) -> Result<FocusSettings,
             .map_err(|e: String| sqlx::Error::Decode(e.into()))?,
         focus_profile: row.try_get("focus_profile")?,
         voice_override,
+        // shared_044.sql's CHECK guarantees a known string, so a failed parse
+        // means the check was bypassed: a decode error, never a default that
+        // could read as a grant.
+        collection_consent: {
+            let raw: String = row.try_get("collection_consent")?;
+            CollectionConsent::parse(&raw).ok_or_else(|| {
+                sqlx::Error::Decode(format!("unknown collection_consent '{raw}'").into())
+            })?
+        },
+        collection_consent_version: row.try_get("collection_consent_version")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -177,6 +255,7 @@ pub async fn get_focus_settings(
     let row = sqlx::query(
         "SELECT persona_id, focus_id, context_flow, library_visibility,
          privacy_tier, max_permitted_tier, focus_profile, voice_override,
+         collection_consent, collection_consent_version,
          created_at, updated_at
          FROM focus_settings WHERE persona_id = ? AND focus_id = ?",
     )
@@ -203,6 +282,7 @@ pub async fn list_focus_settings_for_persona(
     let rows = sqlx::query(
         "SELECT persona_id, focus_id, context_flow, library_visibility,
          privacy_tier, max_permitted_tier, focus_profile, voice_override,
+         collection_consent, collection_consent_version,
          created_at, updated_at
          FROM focus_settings WHERE persona_id = ?
          ORDER BY focus_id",
@@ -281,6 +361,9 @@ pub async fn create_focus_settings(
         max_permitted_tier,
         focus_profile: focus_profile.to_owned(),
         voice_override,
+        // A new row is always not_asked (the column default).
+        collection_consent: CollectionConsent::NotAsked,
+        collection_consent_version: 0,
         created_at: created_at.clone(),
         updated_at: created_at,
     })
@@ -403,9 +486,96 @@ pub async fn update_focus_settings(
         max_permitted_tier: new_mtier,
         focus_profile: new_profile.to_owned(),
         voice_override: new_voice,
+        // Untouched: update_focus_settings never writes the consent columns.
+        collection_consent: existing.collection_consent,
+        collection_consent_version: existing.collection_consent_version,
         created_at: existing.created_at,
         updated_at,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Collection consent (items.id=920)
+// ---------------------------------------------------------------------------
+
+/// The Persona's collection-consent state for one Focus, read fresh from the
+/// pool. Ok(None) when the Focus has no focus_settings row. The writer gate
+/// (conductor::lifecycle) calls this immediately before EACH store write, so a
+/// withdrawal takes effect on the very next op.
+pub async fn get_collection_consent(
+    pool: &sqlx::SqlitePool,
+    persona_id: &str,
+    focus_id: &str,
+) -> Result<Option<CollectionConsentState>, FocusSettingsStoreError> {
+    let mut conn = pool.acquire().await?;
+    let row = sqlx::query(
+        "SELECT collection_consent, collection_consent_version
+         FROM focus_settings WHERE persona_id = ? AND focus_id = ?",
+    )
+    .bind(persona_id)
+    .bind(focus_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let raw: String = row.try_get("collection_consent")?;
+    let consent = CollectionConsent::parse(&raw).ok_or_else(|| {
+        FocusSettingsStoreError::Validation(format!("unknown collection_consent '{raw}'"))
+    })?;
+    Ok(Some(CollectionConsentState {
+        consent,
+        version: row.try_get("collection_consent_version")?,
+    }))
+}
+
+/// THE ONLY WRITER of focus_settings.collection_consent and
+/// collection_consent_version (items.id=920). The user's own confirm (stage 2's
+/// commands) is its only caller; nothing in the conductor, no model path,
+/// update_focus_settings and submit_friction_gate_decision never reach it.
+/// `version` is the consent text version the user was shown. It is stored for
+/// Granted AND Declined (both must name a version of 1 or more, so a changed text
+/// asks again) and stored as 0 for NotAsked and Withdrawn. The gate is unchanged:
+/// it opens only for Granted at the current text version. Returns Err(NotFound)
+/// when the row does not exist.
+pub async fn set_collection_consent(
+    pool: &sqlx::SqlitePool,
+    persona_id: &str,
+    focus_id: &str,
+    consent: CollectionConsent,
+    version: i64,
+) -> Result<(), FocusSettingsStoreError> {
+    let keeps_version = matches!(
+        consent,
+        CollectionConsent::Granted | CollectionConsent::Declined
+    );
+    if keeps_version && version < 1 {
+        return Err(FocusSettingsStoreError::Validation(
+            "a grant or a decline must name the consent text version shown, 1 or more".to_owned(),
+        ));
+    }
+    let stored_version = if keeps_version { version } else { 0 };
+    let updated_at = crate::providers::utils::now();
+    let mut conn = pool.acquire().await?;
+    let done = sqlx::query(
+        "UPDATE focus_settings
+         SET collection_consent = ?, collection_consent_version = ?, updated_at = ?
+         WHERE persona_id = ? AND focus_id = ?",
+    )
+    .bind(consent.as_str())
+    .bind(stored_version)
+    .bind(&updated_at)
+    .bind(persona_id)
+    .bind(focus_id)
+    .execute(&mut *conn)
+    .await?;
+    if done.rows_affected() == 0 {
+        return Err(FocusSettingsStoreError::NotFound {
+            persona_id: persona_id.to_owned(),
+            focus_id: focus_id.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -491,4 +661,291 @@ pub async fn record_friction_gate_decision(
     .await?;
 
     Ok(id)
+}
+
+// ---------------------------------------------------------------------------
+// Tests (items.id=920: collection consent)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{insert_persona_anchor, ENV_MUTEX};
+
+    const PERSONA: &str = "p-consent";
+    const FOCUS: &str = "tech-support";
+
+    struct Env {
+        _lock: tokio::sync::MutexGuard<'static, ()>,
+        saved: Option<String>,
+        _dir: tempfile::TempDir,
+        pool: sqlx::SqlitePool,
+    }
+
+    impl Drop for Env {
+        fn drop(&mut self) {
+            match &self.saved {
+                Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+                None => std::env::remove_var("QR_DATA_ROOT"),
+            }
+        }
+    }
+
+    /// A real shared.db (all migrations, so shared_044 is in) with one Persona
+    /// anchor and one focus_settings row.
+    async fn env() -> Env {
+        let lock = ENV_MUTEX.lock().await;
+        let saved = std::env::var("QR_DATA_ROOT").ok();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("QR_DATA_ROOT", dir.path());
+        crate::persistence::migrations::migrate_shared_db()
+            .await
+            .expect("shared.db migration");
+        let pool =
+            sqlx::SqlitePool::connect_with(crate::providers::utils::connect_options_unencrypted(
+                &crate::providers::utils::db_path_shared(),
+            ))
+            .await
+            .expect("shared.db pool");
+        insert_persona_anchor(&pool, PERSONA).await;
+        create_focus_settings(
+            &pool,
+            PERSONA,
+            FOCUS,
+            "bidirectional",
+            "shared",
+            2,
+            ExternalAccess::LocalOnly,
+            "open",
+            None,
+        )
+        .await
+        .expect("focus_settings row");
+        Env {
+            _lock: lock,
+            saved,
+            _dir: dir,
+            pool,
+        }
+    }
+
+    #[test]
+    fn collection_consent_strings_round_trip() {
+        for c in [
+            CollectionConsent::NotAsked,
+            CollectionConsent::Granted,
+            CollectionConsent::Declined,
+            CollectionConsent::Withdrawn,
+        ] {
+            assert_eq!(CollectionConsent::parse(c.as_str()), Some(c));
+        }
+        assert_eq!(CollectionConsent::parse("yes"), None);
+        assert_eq!(COLLECTION_CONSENT_TEXT_VERSION, 1);
+    }
+
+    #[tokio::test]
+    async fn a_new_row_is_not_asked_and_never_a_grant() {
+        let e = env().await;
+        let state = get_collection_consent(&e.pool, PERSONA, FOCUS)
+            .await
+            .unwrap()
+            .expect("row exists");
+        assert_eq!(state.consent, CollectionConsent::NotAsked);
+        assert_eq!(state.version, 0);
+        assert!(!state.is_current_grant());
+        let full = get_focus_settings(&e.pool, PERSONA, FOCUS)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(full.collection_consent, CollectionConsent::NotAsked);
+        assert_eq!(full.collection_consent_version, 0);
+        // A row that does not exist is None, which the gate reads as not granted.
+        assert!(get_collection_consent(&e.pool, PERSONA, "no-such-focus")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn only_a_grant_of_the_current_text_version_is_a_current_grant() {
+        let e = env().await;
+        set_collection_consent(
+            &e.pool,
+            PERSONA,
+            FOCUS,
+            CollectionConsent::Granted,
+            COLLECTION_CONSENT_TEXT_VERSION,
+        )
+        .await
+        .unwrap();
+        let s = get_collection_consent(&e.pool, PERSONA, FOCUS)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(s.is_current_grant());
+
+        // A grant of an older text is not current.
+        set_collection_consent(&e.pool, PERSONA, FOCUS, CollectionConsent::Granted, 99)
+            .await
+            .unwrap();
+        let s = get_collection_consent(&e.pool, PERSONA, FOCUS)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.consent, CollectionConsent::Granted);
+        assert_eq!(s.version, 99);
+        assert!(!s.is_current_grant());
+
+        // A decline stores the version shown, and is never a grant.
+        set_collection_consent(&e.pool, PERSONA, FOCUS, CollectionConsent::Declined, 1)
+            .await
+            .unwrap();
+        let s = get_collection_consent(&e.pool, PERSONA, FOCUS)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((s.consent, s.version), (CollectionConsent::Declined, 1));
+        assert!(!s.is_current_grant());
+
+        // Withdrawn and NotAsked store 0 whatever version is passed.
+        for c in [CollectionConsent::Withdrawn, CollectionConsent::NotAsked] {
+            set_collection_consent(&e.pool, PERSONA, FOCUS, c, COLLECTION_CONSENT_TEXT_VERSION)
+                .await
+                .unwrap();
+            let s = get_collection_consent(&e.pool, PERSONA, FOCUS)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!((s.consent, s.version), (c, 0));
+            assert!(!s.is_current_grant());
+        }
+    }
+
+    #[tokio::test]
+    async fn the_setter_validates_and_reports_a_missing_row() {
+        let e = env().await;
+        for c in [CollectionConsent::Granted, CollectionConsent::Declined] {
+            for bad in [0, -1] {
+                assert!(
+                    matches!(
+                        set_collection_consent(&e.pool, PERSONA, FOCUS, c, bad).await,
+                        Err(FocusSettingsStoreError::Validation(_))
+                    ),
+                    "{c:?} v{bad}"
+                );
+            }
+        }
+        assert!(matches!(
+            set_collection_consent(
+                &e.pool,
+                PERSONA,
+                "no-such-focus",
+                CollectionConsent::Granted,
+                1
+            )
+            .await,
+            Err(FocusSettingsStoreError::NotFound { .. })
+        ));
+        let s = get_collection_consent(&e.pool, PERSONA, FOCUS)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            s.consent,
+            CollectionConsent::NotAsked,
+            "nothing was written"
+        );
+    }
+
+    /// update_focus_settings writes the other columns and never the consent
+    /// ones, whatever it is asked to change.
+    #[tokio::test]
+    async fn update_focus_settings_never_moves_the_consent_columns() {
+        let e = env().await;
+        set_collection_consent(&e.pool, PERSONA, FOCUS, CollectionConsent::Granted, 1)
+            .await
+            .unwrap();
+        let updated = update_focus_settings(
+            &e.pool,
+            PERSONA,
+            FOCUS,
+            Some("isolated"),
+            Some("persona_hidden"),
+            Some(3),
+            Some(ExternalAccess::Unrestricted),
+            Some("protected"),
+            Some(Some(serde_json::json!({"tone": "x"}))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated.collection_consent, CollectionConsent::Granted);
+        assert_eq!(updated.collection_consent_version, 1);
+        let s = get_collection_consent(&e.pool, PERSONA, FOCUS)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(s.is_current_grant(), "the stored state is untouched too");
+
+        // And a declined state stays declined through the same call.
+        set_collection_consent(&e.pool, PERSONA, FOCUS, CollectionConsent::Declined, 1)
+            .await
+            .unwrap();
+        update_focus_settings(
+            &e.pool,
+            PERSONA,
+            FOCUS,
+            None,
+            None,
+            Some(1),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let s = get_collection_consent(&e.pool, PERSONA, FOCUS)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.consent, CollectionConsent::Declined);
+    }
+
+    /// The only SQL in this module that names the consent columns in a write is
+    /// set_collection_consent's UPDATE. update_focus_settings, create and the
+    /// friction-gate writer never do, and the IPC request struct has no such field.
+    #[test]
+    fn only_set_collection_consent_writes_the_consent_columns() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let store = std::fs::read_to_string(
+            std::path::Path::new(manifest).join("src/persistence/focus_settings_store.rs"),
+        )
+        .unwrap();
+        let production = store.split("#[cfg(test)]").next().unwrap();
+        let writes: Vec<&str> = production
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .filter(|l| {
+                let l = l.to_lowercase();
+                l.contains("collection_consent =") || l.contains("collection_consent_version =")
+            })
+            .collect();
+        // The one UPDATE assigns both columns, on two lines.
+        assert_eq!(writes.len(), 1, "{writes:?}");
+        assert!(
+            writes[0].contains("SET collection_consent = ?"),
+            "{writes:?}"
+        );
+
+        let persona =
+            std::fs::read_to_string(std::path::Path::new(manifest).join("src/commands/persona.rs"))
+                .unwrap();
+        let start = persona
+            .find("pub struct UpdateFocusSettingsRequest")
+            .expect("request struct");
+        let body = &persona[start..start + persona[start..].find("\n}\n").unwrap()];
+        assert!(
+            !body.contains("collection") && !body.contains("consent"),
+            "UpdateFocusSettingsRequest must not carry consent: {body}"
+        );
+    }
 }

@@ -1,6 +1,7 @@
 # Quiet Rabbit — Claude Code Context
-# Last updated: November 14, 2026 (items.id=894: new "Model blocks" section only).
-# Before that, November 8, 2026 (items.id=552: Naming Architecture Task->Action
+# Last updated: November 14, 2026 (items.id=920 stage 1: new "Collection consent"
+# section only). Before that, November 14, 2026 (items.id=894: new "Model blocks"
+# section only). Before that, November 8, 2026 (items.id=552: Naming Architecture Task->Action
 # row and intro only). Before that:
 # Last updated: November 3, 2026 (items.id=848: one bullet in the "Ollama"
 # section only). Before that, November 1, 2026 (items.id=678: new "Privacy model" section and
@@ -352,6 +353,48 @@ does not read `requirement` yet (select_model still decides, until the resolver 
   test in lifecycle.rs; B5 changes it).
 - The unsupported-additions measures live only in examples/focus_calibration.rs for
   now. They move into one shipped module at B6b; do not add a second copy.
+
+## Collection consent (items.id=920 stage 1, decisions.id=944, decisions.id=509)
+A focus_level Focus (Tech Support) collects silently after ONE informed consent at
+setup. Stage 1 is the store and the gate; the commands, the consent text file and
+the frontend are stages 2 and 3 (nothing calls the setter yet).
+- State: focus_settings.collection_consent (not_asked, granted, declined, withdrawn)
+  and collection_consent_version (shared_044.sql). Default not_asked, so a row never
+  asked never opens the gate. focuses.collection_posture (per_field default,
+  focus_level) is DECLARED BY THE FOCUS (the focuses row or the .focus key
+  collection_posture) and is never "not required". focus_level also means the generic
+  extraction pass is skipped, wired by items.id=914, not here.
+- ONLY focus_settings_store::set_collection_consent writes the state (stage 2's
+  command is its only intended caller). The columns are NOT in
+  UpdateFocusSettingsRequest, update_focus_settings does not touch them, so
+  submit_friction_gate_decision cannot move them. No model path records consent:
+  source scans in conductor/store_op_tests.rs pin that store_writer.rs, store_op.rs
+  and lifecycle.rs never name the audit table or the setter, and that nothing outside
+  tests calls either yet. COLLECTION_CONSENT_TEXT_VERSION = 1 lives in
+  focus_settings_store.rs for now; stage 2 moves it into the versioned text data file.
+- Audit: consent_audit_records in each Persona's encrypted personal.db
+  (personal_010.sql, next to disclosure_log; never shared.db, decisions.id=862).
+  persistence/consent_audit_store.rs has append, list and latest_for_focus ONLY: no
+  UPDATE, no DELETE (source-scan test). Event types are the Rust enum
+  ConsentEventType (no SQL CHECK, round-trip test). content_summary is a fixed abstract
+  description, never user content. A purge is a separate user-initiated function.
+- Gate: WriterContext.collection (Granted or NotGranted) is built in
+  FocusRun::current_collection() from a FRESH read of focus_settings immediately before
+  EACH writer op (not the AUTHORIZE snapshot). A per_field Focus is always Granted and
+  never reads the row. A focus_level Focus is Granted only if collection_consent =
+  granted AND the version equals the current text version; a missing row, a missing
+  definition or an unreadable state is NotGranted. run_store_op checks it FIRST (before
+  the context key and the latch) for every Op::requires_collection_consent() op and
+  returns Outcome::RefusedNoConsent, writing nothing and calling no store function.
+  NOT gated: Latch (it suppresses writes) and SessionClear (it removes data). Declining
+  is not a block: the Focus keeps working and saves nothing.
+- Latch and consent are independent: granted and open writes, granted and latched is
+  RefusedOneTime, not granted is RefusedNoConsent. Granting mid-chat never lifts a latch.
+- write_focus_run_record's keep_input is also consent-aware: the blended chat window is
+  not persisted in focus_runs.user_input for a focus_level Focus without the current
+  consent (an unreadable state counts as not granted).
+- items.id=633 will fold personal_010 and shared_044 into the baselines; both files are
+  self-explanatory in their headers (decisions.id=857).
 
 ## Naming Architecture — term map
 

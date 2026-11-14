@@ -92,6 +92,7 @@ use crate::conductor::privacy::types::sensitivity_severity;
 use crate::conductor::privacy::{logger::DisclosureLoggerForRun, PrivacyGateway};
 use crate::conductor::reentry::{self, ReentryError, ReentryPlan};
 use crate::conductor::store_op;
+use crate::conductor::store_writer::Collection;
 use crate::conductor::tokens::{
     validate_step, ActionDefinition, ExternalAccess, FieldRequirement, StepType,
 };
@@ -100,6 +101,7 @@ use crate::conductor::types::{
     TaskTrack,
 };
 use crate::persistence::disclosure_log_store::SqliteDisclosureLogger;
+use crate::persistence::focus_composition_store::CollectionPosture;
 use crate::providers::utils::{connect_options_encrypted, db_path_outputs, now};
 
 // ---------------------------------------------------------------------------
@@ -216,6 +218,9 @@ struct RawFocusFile {
     guides: Option<Vec<String>>,       // focus-level; first entry = step default
     suggest_in_focuses: Option<Vec<String>>,
     multi_source_validation: Option<bool>,
+    // items.id=920: "per_field" (default) or "focus_level". See
+    // persistence::focus_composition_store::CollectionPosture.
+    collection_posture: Option<String>,
     steps: Option<IndexMap<String, RawStep>>, // IndexMap preserves YAML dict order
     // D6-343: accepted in any shape for forward compat, not wired in Release 1.
     // IgnoredAny reads and drops it, so a brief can never fail a Focus load.
@@ -604,6 +609,15 @@ fn parse_focus_definition(raw: RawFocusFile) -> Result<FocusDefinition, Lifecycl
             LifecycleError::ValidationFailed(format!("Focus '{focus_id}': max_routing_tier: {e}"))
         })?;
 
+    let collection_posture = match raw.collection_posture.as_deref() {
+        None => CollectionPosture::default(),
+        Some(s) => CollectionPosture::parse(s).ok_or_else(|| {
+            LifecycleError::ValidationFailed(format!(
+                "Focus '{focus_id}': collection_posture must be per_field or focus_level"
+            ))
+        })?,
+    };
+
     Ok(FocusDefinition {
         display_name: raw.display_name.unwrap_or_else(|| focus_id.clone()),
         description: raw.description.unwrap_or_default(),
@@ -625,6 +639,7 @@ fn parse_focus_definition(raw: RawFocusFile) -> Result<FocusDefinition, Lifecycl
         suggest_in_focuses,
         generic_title_template,
         high_priority_trigger,
+        collection_posture,
     })
 }
 
@@ -969,6 +984,7 @@ pub(crate) async fn load_focus_definition_from_db(
         multi_source_validation: focus_row.multi_source_validation,
         generic_title_template: focus_row.generic_title_template,
         high_priority_trigger,
+        collection_posture: focus_row.collection_posture,
     }))
 }
 
@@ -1432,6 +1448,12 @@ pub struct FocusDefinition {
     /// when-empty behavior). No .focus file in this repo declares one yet;
     /// consumed by commands::active_board::get_active_board.
     pub high_priority_trigger: Option<HighPriorityTrigger>,
+    /// items.id=920 (decisions.id=944): whether the Focus needs the one setup
+    /// consent before its store writers may write. Declared by the Focus (the
+    /// `focuses` row, or the .focus key `collection_posture`), default
+    /// PerField, never "not required". FocusLevel Focuses are gated in
+    /// execute_store_writer.
+    pub collection_posture: CollectionPosture,
 }
 
 /// decisions.id=712: a Focus type's Active Board high-priority section
@@ -2072,7 +2094,46 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         // deliberately separate axis, bridged via ExternalAccess::min() +
         // execution_tier_ordinal(), out of this item's scope to unify
         // further (items.id=528 territory).
+        // items.id=920: logged for diagnosis only. The writer gate never uses
+        // this AUTHORIZE-time value: it re-reads the state before every op.
+        log::debug!(
+            "lifecycle: focus '{}' collection_consent at authorize: {} (v{})",
+            self.focus_id,
+            settings.collection_consent.as_str(),
+            settings.collection_consent_version
+        );
         Ok((settings.max_permitted_tier, settings.privacy_tier as u8))
+    }
+
+    /// items.id=920 (decisions.id=944): whether this run's Focus may SAVE to the
+    /// stores right now. A Focus that is not focus_level never consults the gate.
+    /// A focus_level Focus is Granted only if focus_settings.collection_consent =
+    /// granted AND collection_consent_version equals the current text version,
+    /// read FRESH from the shared pool at the moment of the call (never the
+    /// AUTHORIZE snapshot). An unreadable state, a missing row or a missing
+    /// definition counts as NotGranted: the failure direction is not writing.
+    async fn current_collection(&self) -> Collection {
+        use crate::persistence::focus_settings_store::get_collection_consent;
+        let posture = self
+            .focus_def
+            .as_ref()
+            .map(|d| d.collection_posture)
+            .unwrap_or(CollectionPosture::FocusLevel);
+        if posture == CollectionPosture::PerField {
+            return Collection::Granted;
+        }
+        match get_collection_consent(&self.pool, &self.persona_id, &self.focus_id).await {
+            Ok(Some(state)) if state.is_current_grant() => Collection::Granted,
+            Ok(_) => Collection::NotGranted,
+            Err(e) => {
+                log::warn!(
+                    "lifecycle: collection consent for focus '{}' could not be read, treating \
+                     it as not granted: {e}",
+                    self.focus_id
+                );
+                Collection::NotGranted
+            }
+        }
     }
 
     /// Write or update the focus_run record in outputs.db.
@@ -2103,8 +2164,14 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         // (latched) chat, where nothing is to persist (decisions.id=509). An
         // unreadable latch counts as latched: the failure direction is not
         // writing. A run that belongs to no chat has no latch to honour.
-        let keep_input =
-            !user_input_is_cleared_at(status) && !self.chat_is_latched(&mut conn).await;
+        //
+        // items.id=920: nor is it kept for a focus_level Focus without the
+        // current collection consent (the chat window is exactly what that
+        // consent covers). The state is read fresh here, and an unreadable state
+        // counts as not granted, for the same reason.
+        let keep_input = !user_input_is_cleared_at(status)
+            && !self.chat_is_latched(&mut conn).await
+            && self.current_collection().await == Collection::Granted;
 
         if existing {
             if keep_input {
@@ -2947,7 +3014,24 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         step: &ActionDefinition,
         op: &store_op::StoreOp,
     ) -> Result<(), LifecycleError> {
-        use crate::conductor::store_writer::{run_store_op, StoreWriteError, WriterContext};
+        use crate::conductor::store_writer::{
+            run_store_op, Collection, Outcome, StoreWriteError, WriterContext,
+        };
+
+        // items.id=920: a FRESH read, immediately before THIS op, mirroring how
+        // the store re-reads the latch inside every write. Not the AUTHORIZE
+        // snapshot: a withdrawal between two ops refuses the second. It comes
+        // FIRST, before the outputs.db is opened: a refusal opens no store.
+        let collection = self.current_collection().await;
+        if collection != Collection::Granted && op.op.requires_collection_consent() {
+            log::debug!(
+                "lifecycle: store writer '{}' ({}) -> {:?}",
+                step.action_id,
+                op.op.as_str(),
+                Outcome::RefusedNoConsent
+            );
+            return Ok(());
+        }
 
         let run_id = self.focus_run_id.clone().unwrap_or_default();
         let mut vars = guard::track_vars(self.task_track.as_ref().ok_or_else(|| {
@@ -2971,6 +3055,9 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             focus_id: &self.focus_id,
             run_id: &run_id,
             action_id: &step.action_id,
+            // Re-checked inside run_store_op, which is the contract the writer
+            // tests pin.
+            collection,
         };
         let done = run_store_op(&mut conn, &ctx, op, &vars).await?;
         log::debug!(
@@ -4499,6 +4586,7 @@ mod tests {
             guides: Some(vec!["quick-ask-guide".to_owned()]),
             suggest_in_focuses: None,
             multi_source_validation: None,
+            collection_posture: None,
             steps: None,
             brief: None,
             display_config: None,
@@ -12474,6 +12562,387 @@ steps:
     }
 
     // -------------------------------------------------------------------------
+    // items.id=920: the collection-consent gate over real shared.db and
+    // encrypted outputs.db files (decisions.id=944). The writers themselves are
+    // covered in store_op_tests.rs.
+    // -------------------------------------------------------------------------
+
+    /// A real shared.db pool holding the Persona anchor and a focus_settings row
+    /// for ("p", "f"), the ids tier3_ready_run uses. Call inside
+    /// with_temp_data_root.
+    async fn consent_pool() -> sqlx::SqlitePool {
+        use crate::persistence::focus_settings_store as fs;
+        let pool = block_load_pool().await;
+        crate::test_support::insert_persona_anchor(&pool, "p").await;
+        fs::create_focus_settings(
+            &pool,
+            "p",
+            "f",
+            "bidirectional",
+            "shared",
+            2,
+            ExternalAccess::LocalOnly,
+            "open",
+            None,
+        )
+        .await
+        .unwrap();
+        pool
+    }
+
+    async fn set_consent(
+        pool: &sqlx::SqlitePool,
+        c: crate::persistence::focus_settings_store::CollectionConsent,
+        version: i64,
+    ) {
+        crate::persistence::focus_settings_store::set_collection_consent(
+            pool, "p", "f", c, version,
+        )
+        .await
+        .unwrap();
+    }
+
+    fn put_step(id: &str, value_var: &str) -> ActionDefinition {
+        writer_step(
+            id,
+            "session_put",
+            Some("locked_intent"),
+            serde_json::json!({"value": value_var}),
+            None,
+        )
+    }
+
+    async fn locked_intent(
+        run: &FocusRun<crate::conductor::privacy::logger::TestLogger>,
+    ) -> Option<String> {
+        let mut conn = outputs(run).await;
+        crate::persistence::session_store::get_session_variable(
+            &mut conn,
+            "chat-consent",
+            "f",
+            "locked_intent",
+        )
+        .await
+        .unwrap()
+        .map(|v| v.value)
+    }
+
+    /// A focus_level run on a real pool.
+    fn focus_level_writer_run(
+        pool: &sqlx::SqlitePool,
+        steps: Vec<ActionDefinition>,
+    ) -> FocusRun<crate::conductor::privacy::logger::TestLogger> {
+        let mut run = writer_run(
+            steps,
+            Some("chat-consent"),
+            &[("v1", "billing"), ("v2", "network")],
+        );
+        run.pool = pool.clone();
+        run.focus_def.as_mut().unwrap().collection_posture = CollectionPosture::FocusLevel;
+        run
+    }
+
+    /// The state is read FRESH before EACH op: the same pass, the same run, and a
+    /// flip between two writer ops. A grant lets the first write, a withdrawal
+    /// before the second refuses it, and a re-grant lets a third through.
+    #[tokio::test]
+    async fn the_gate_re_reads_consent_before_each_writer_op() {
+        use crate::persistence::focus_settings_store::{
+            CollectionConsent, COLLECTION_CONSENT_TEXT_VERSION as V,
+        };
+        with_temp_data_root(async {
+            let pool = consent_pool().await;
+            set_consent(&pool, CollectionConsent::Granted, V).await;
+            let mut run = focus_level_writer_run(&pool, vec![]);
+            let first = put_step("one", "v1");
+            let second = put_step("two", "v2");
+            let third = put_step("three", "v1");
+            let op_of = |s: &ActionDefinition| s.store_op.clone().unwrap();
+
+            run.execute_store_writer(&first, &op_of(&first))
+                .await
+                .unwrap();
+            assert_eq!(locked_intent(&run).await.as_deref(), Some("billing"));
+
+            // Withdrawn between the two ops of the same pass.
+            set_consent(&pool, CollectionConsent::Withdrawn, V).await;
+            run.execute_store_writer(&second, &op_of(&second))
+                .await
+                .unwrap();
+            assert_eq!(
+                locked_intent(&run).await.as_deref(),
+                Some("billing"),
+                "the second op was refused: nothing changed"
+            );
+
+            // Granted again, but for an older text: still not a grant.
+            set_consent(&pool, CollectionConsent::Granted, V + 1).await;
+            run.execute_store_writer(&second, &op_of(&second))
+                .await
+                .unwrap();
+            assert_eq!(locked_intent(&run).await.as_deref(), Some("billing"));
+
+            set_consent(&pool, CollectionConsent::Granted, V).await;
+            run.execute_store_writer(&second, &op_of(&second))
+                .await
+                .unwrap();
+            assert_eq!(locked_intent(&run).await.as_deref(), Some("network"));
+            let _ = third;
+        })
+        .await;
+    }
+
+    /// Through execute(): a focus_level Focus without consent finishes its pass,
+    /// saves nothing and publishes nothing (declining is not a block), and the
+    /// same Focus with the current consent writes.
+    #[tokio::test]
+    async fn execute_saves_nothing_for_a_focus_level_focus_without_consent() {
+        use crate::persistence::focus_settings_store::{
+            CollectionConsent, COLLECTION_CONSENT_TEXT_VERSION as V,
+        };
+        with_temp_data_root(async {
+            let pool = consent_pool().await;
+            let steps = || {
+                vec![
+                    put_step("lock", "v1"),
+                    writer_step(
+                        "open",
+                        "case_open",
+                        Some("nc"),
+                        serde_json::json!({"entity": "v1", "label": "v1"}),
+                        None,
+                    ),
+                ]
+            };
+            // not_asked, declined, withdrawn, and a grant of another text version.
+            for (state, version) in [
+                (CollectionConsent::NotAsked, 0),
+                (CollectionConsent::Declined, V),
+                (CollectionConsent::Withdrawn, 0),
+                (CollectionConsent::Granted, V + 1),
+            ] {
+                set_consent(&pool, state, version).await;
+                let mut run = focus_level_writer_run(&pool, steps());
+                assert!(
+                    run.execute().await.unwrap().is_none(),
+                    "{state:?}: the pass completes"
+                );
+                assert_eq!(locked_intent(&run).await, None, "{state:?}");
+                let mut conn = outputs(&run).await;
+                let cases: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM case_records")
+                    .fetch_one(&mut conn)
+                    .await
+                    .unwrap();
+                assert_eq!(cases, 0, "{state:?}");
+                assert!(
+                    run.store_vars.is_empty(),
+                    "{state:?}: nothing was published"
+                );
+            }
+
+            set_consent(&pool, CollectionConsent::Granted, V).await;
+            let mut run = focus_level_writer_run(&pool, steps());
+            assert!(run.execute().await.unwrap().is_none());
+            assert_eq!(locked_intent(&run).await.as_deref(), Some("billing"));
+            assert_eq!(run.store_vars.len(), 1, "the case id was published");
+        })
+        .await;
+    }
+
+    /// A refusal opens no store: with no key the outputs.db cannot be opened at
+    /// all, yet a gated op without consent is a clean refusal, while an op that
+    /// is not gated (the latch) still reaches the open and fails there.
+    #[tokio::test]
+    async fn a_consent_refusal_opens_no_store() {
+        with_temp_data_root(async {
+            let pool = consent_pool().await;
+            let mut run = focus_level_writer_run(&pool, vec![]);
+            run.key_hex = None;
+            let step = put_step("one", "v1");
+            run.execute_store_writer(&step, step.store_op.as_ref().unwrap())
+                .await
+                .expect("refused before any open");
+            let latch = writer_step("hold", "latch", None, serde_json::Value::Null, None);
+            assert!(
+                run.execute_store_writer(&latch, latch.store_op.as_ref().unwrap())
+                    .await
+                    .is_err(),
+                "the ungated latch does open the store, and fails on the empty key"
+            );
+        })
+        .await;
+    }
+
+    /// A Focus that is not focus_level never consults the gate: it writes with a
+    /// not_asked state, with no focus_settings row at all, and on a pool that has
+    /// no tables.
+    #[tokio::test]
+    async fn a_per_field_focus_is_never_gated() {
+        with_temp_data_root(async {
+            // not_asked row.
+            let pool = consent_pool().await;
+            let mut run = focus_level_writer_run(&pool, vec![put_step("lock", "v1")]);
+            run.focus_def.as_mut().unwrap().collection_posture = CollectionPosture::PerField;
+            assert!(run.execute().await.unwrap().is_none());
+            assert_eq!(locked_intent(&run).await.as_deref(), Some("billing"));
+
+            // No settings row, a pool with no tables: the gate is not consulted.
+            let mut run = writer_run(
+                vec![put_step("lock", "v1")],
+                Some("chat-consent"),
+                &[("v1", "network")],
+            );
+            assert_eq!(
+                run.focus_def.as_ref().unwrap().collection_posture,
+                CollectionPosture::PerField,
+                "the default posture"
+            );
+            assert!(run.execute().await.unwrap().is_none());
+            assert_eq!(locked_intent(&run).await.as_deref(), Some("network"));
+        })
+        .await;
+    }
+
+    /// An unreadable consent state (no row, a pool that cannot answer) counts as
+    /// not granted for a focus_level Focus: the failure direction is not writing.
+    #[tokio::test]
+    async fn an_unreadable_consent_state_counts_as_not_granted() {
+        use crate::persistence::focus_settings_store::{
+            CollectionConsent, COLLECTION_CONSENT_TEXT_VERSION as V,
+        };
+        with_temp_data_root(async {
+            let pool = consent_pool().await;
+            set_consent(&pool, CollectionConsent::Granted, V).await;
+            // A Focus id with no focus_settings row.
+            let mut run = focus_level_writer_run(&pool, vec![]);
+            run.focus_id = "no-such-focus".to_owned();
+            assert_eq!(run.current_collection().await, Collection::NotGranted);
+            // A pool with no tables.
+            let mut run = focus_level_writer_run(&dummy_pool(), vec![]);
+            assert_eq!(run.current_collection().await, Collection::NotGranted);
+            // A run whose definition is missing.
+            run.focus_def = None;
+            assert_eq!(run.current_collection().await, Collection::NotGranted);
+            // And the granted case reads as granted.
+            let run = focus_level_writer_run(&pool, vec![]);
+            assert_eq!(run.current_collection().await, Collection::Granted);
+        })
+        .await;
+    }
+
+    /// The chat window is not persisted for a focus_level Focus without the current
+    /// consent (at insert, and cleared at the next status write if consent was
+    /// withdrawn meanwhile), and an unreadable state fails to not writing. A
+    /// granted focus_level Focus and a per_field Focus keep it as before.
+    #[tokio::test]
+    async fn user_input_is_not_kept_for_a_focus_level_focus_without_consent() {
+        use crate::persistence::focus_settings_store::{
+            CollectionConsent, COLLECTION_CONSENT_TEXT_VERSION as V,
+        };
+        with_temp_data_root(async {
+            let pool = consent_pool().await;
+            let focus_level_run = |pool: &sqlx::SqlitePool| {
+                let mut run = run_with_input();
+                run.pool = pool.clone();
+                run.focus_def.as_mut().unwrap().collection_posture = CollectionPosture::FocusLevel;
+                run
+            };
+
+            // Not asked: not stored at insert, nor at a later status.
+            let run = focus_level_run(&pool);
+            run.write_focus_run_record("initializing").await.unwrap();
+            assert_eq!(stored_user_input(&run).await, None);
+            run.write_focus_run_record("awaiting_user").await.unwrap();
+            assert_eq!(stored_user_input(&run).await, None);
+
+            // Granted: kept while the run can resume.
+            set_consent(&pool, CollectionConsent::Granted, V).await;
+            let run = focus_level_run(&pool);
+            run.write_focus_run_record("initializing").await.unwrap();
+            assert_eq!(stored_user_input(&run).await.as_deref(), Some(WINDOW));
+            // Withdrawn meanwhile: cleared at the next status write.
+            set_consent(&pool, CollectionConsent::Withdrawn, V).await;
+            run.write_focus_run_record("awaiting_user").await.unwrap();
+            assert_eq!(stored_user_input(&run).await, None);
+
+            // A grant of an older text does not keep it.
+            set_consent(&pool, CollectionConsent::Granted, V + 1).await;
+            let run = focus_level_run(&pool);
+            run.write_focus_run_record("awaiting_user").await.unwrap();
+            assert_eq!(stored_user_input(&run).await, None);
+
+            // Unreadable state: a pool with no tables fails to not writing.
+            let run = focus_level_run(&dummy_pool());
+            run.write_focus_run_record("awaiting_user").await.unwrap();
+            assert_eq!(stored_user_input(&run).await, None);
+
+            // A per_field Focus keeps it whatever the consent row says.
+            set_consent(&pool, CollectionConsent::Declined, V).await;
+            let mut run = focus_level_run(&pool);
+            run.focus_def.as_mut().unwrap().collection_posture = CollectionPosture::PerField;
+            run.write_focus_run_record("awaiting_user").await.unwrap();
+            assert_eq!(stored_user_input(&run).await.as_deref(), Some(WINDOW));
+        })
+        .await;
+    }
+
+    /// The loader carries the posture: a `focuses` row's column, and the YAML key,
+    /// default per_field and never "not required".
+    #[tokio::test]
+    async fn the_loader_carries_collection_posture_and_defaults_to_per_field() {
+        with_temp_data_root(async {
+            let pool = block_load_pool().await;
+            seed_block_focus(&pool, "posture-default", "cb-06", &good_cb06_json()).await;
+            seed_plain_step(
+                &pool,
+                "posture-default",
+                "tier2_step",
+                -1,
+                serde_json::json!({"routing_tier": 2, "prompt_template": "x"}),
+            )
+            .await;
+            // A row that does not name it is per_field.
+            let def = load_focus_definition_from_db(&pool, "posture-default")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(def.collection_posture, CollectionPosture::PerField);
+
+            sqlx::query("UPDATE focuses SET collection_posture = 'focus_level' WHERE focus_id = ?")
+                .bind("posture-default")
+                .execute(&pool)
+                .await
+                .unwrap();
+            let def = load_focus_definition_from_db(&pool, "posture-default")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(def.collection_posture, CollectionPosture::FocusLevel);
+        })
+        .await;
+
+        // YAML.
+        let parse = |extra: &str| parse_focus_text(&format!("id: x\n{extra}"));
+        assert_eq!(
+            parse("").unwrap().collection_posture,
+            CollectionPosture::PerField
+        );
+        assert_eq!(
+            parse("collection_posture: focus_level\n")
+                .unwrap()
+                .collection_posture,
+            CollectionPosture::FocusLevel
+        );
+        assert_eq!(
+            parse("collection_posture: per_field\n")
+                .unwrap()
+                .collection_posture,
+            CollectionPosture::PerField
+        );
+        assert!(parse("collection_posture: not_required\n").is_err());
+    }
+
+    // -------------------------------------------------------------------------
     // items.id=894 B0: focus_runs.user_input is written with the row and cleared
     // when the run can no longer resume.
     // -------------------------------------------------------------------------
@@ -12493,6 +12962,9 @@ steps:
 
     fn run_with_input() -> FocusRun {
         let mut run = failure_ready_run(false);
+        // A loaded run always has its definition (items.id=920: the collection
+        // gate reads the posture from it, and a missing one counts as gated).
+        run.focus_def = Some(single_tier3_step_focus_def());
         run.user_input = WINDOW.to_owned();
         run
     }

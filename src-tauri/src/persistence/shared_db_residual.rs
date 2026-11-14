@@ -257,6 +257,9 @@ pub const RESIDUAL_SHARED_SCHEMA: &[ResidualTable] = &[
             "status",
             "created_at",
             "updated_at",
+            // items.id=920: whether the Focus needs the one setup consent.
+            // Shipped Focus catalog data, identical for every install.
+            "collection_posture",
         ],
     },
     ResidualTable {
@@ -494,6 +497,13 @@ pub const RESIDUAL_SHARED_SCHEMA: &[ResidualTable] = &[
             "voice_override",
             "created_at",
             "updated_at",
+            // items.id=920 (shared_044.sql): a consent state and the version of
+            // the text it was given for, per Persona and Focus. No content. Like
+            // the rest of this table it shows which Focuses a Persona uses, and
+            // is listed for items.id=662 with it. Only
+            // focus_settings_store::set_collection_consent writes them.
+            "collection_consent",
+            "collection_consent_version",
         ],
     },
     ResidualTable {

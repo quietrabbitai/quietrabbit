@@ -16,6 +16,35 @@
 
 use sqlx::Row;
 
+/// items.id=920 (shared_044.sql): whether a Focus needs the one setup consent
+/// before its store writers may write. The default is PerField, NEVER "not
+/// required": whether a Focus needs consent is declared by the Focus, so a
+/// missing or default row cannot open the gate. FocusLevel also means the
+/// generic extraction pass is skipped (wired by items.id=914, not here).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CollectionPosture {
+    #[default]
+    PerField,
+    FocusLevel,
+}
+
+impl CollectionPosture {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CollectionPosture::PerField => "per_field",
+            CollectionPosture::FocusLevel => "focus_level",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<CollectionPosture> {
+        match s {
+            "per_field" => Some(CollectionPosture::PerField),
+            "focus_level" => Some(CollectionPosture::FocusLevel),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FocusRow {
     pub focus_id: String,
@@ -29,6 +58,8 @@ pub struct FocusRow {
     pub generic_title_template: String,
     pub high_priority_trigger_anchor_field: Option<String>,
     pub high_priority_trigger_offset: Option<String>,
+    /// items.id=920. The CHECK in shared_044.sql guarantees a known value.
+    pub collection_posture: CollectionPosture,
 }
 
 #[derive(Debug, Clone)]
@@ -74,7 +105,7 @@ pub async fn get_focus(
         "SELECT focus_id, display_name, description, version, max_routing_tier,
                 output_type, suggest_in_focuses, multi_source_validation,
                 generic_title_template, high_priority_trigger_anchor_field,
-                high_priority_trigger_offset
+                high_priority_trigger_offset, collection_posture
          FROM focuses WHERE focus_id = ?",
     )
     .bind(focus_id)
@@ -100,6 +131,12 @@ pub async fn get_focus(
         generic_title_template: row.try_get("generic_title_template")?,
         high_priority_trigger_anchor_field: row.try_get("high_priority_trigger_anchor_field")?,
         high_priority_trigger_offset: row.try_get("high_priority_trigger_offset")?,
+        collection_posture: {
+            let raw: String = row.try_get("collection_posture")?;
+            CollectionPosture::parse(&raw).ok_or_else(|| {
+                sqlx::Error::Decode(format!("unknown collection_posture '{raw}'").into())
+            })?
+        },
     }))
 }
 

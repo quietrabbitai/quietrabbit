@@ -19,4 +19,5 @@ FocusDefinition {
             },
         },
     ),
+    collection_posture: PerField,
 }

@@ -253,6 +253,7 @@ mod tests {
                 anchor_field: "departure_time".to_owned(),
                 offset: Duration::hours(-4),
             }),
+            collection_posture: Default::default(),
         }
     }
 
@@ -275,6 +276,7 @@ mod tests {
                 anchor_field: "due_date".to_owned(),
                 offset: Duration::zero(),
             }),
+            collection_posture: Default::default(),
         }
     }
 
@@ -295,6 +297,7 @@ mod tests {
             multi_source_validation: false,
             generic_title_template: "Hidden item".to_owned(),
             high_priority_trigger: None,
+            collection_posture: Default::default(),
         }
     }
 

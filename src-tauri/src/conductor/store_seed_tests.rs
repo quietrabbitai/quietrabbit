@@ -90,6 +90,7 @@ fn focus_def(steps: Vec<ActionDefinition>) -> FocusDefinition {
         multi_source_validation: false,
         generic_title_template: String::new(),
         high_priority_trigger: None,
+        collection_posture: Default::default(),
     }
 }
 

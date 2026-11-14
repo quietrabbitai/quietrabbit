@@ -11,6 +11,7 @@ FocusDefinition {
     multi_source_validation: false,
     generic_title_template: "Hidden item",
     high_priority_trigger: None,
+    collection_posture: PerField,
 }
 --- step
 ActionDefinition {

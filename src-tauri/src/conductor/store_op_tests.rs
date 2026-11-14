@@ -16,9 +16,9 @@ use std::collections::HashMap;
 use chrono::Utc;
 use sqlx::SqliteConnection;
 
-use crate::conductor::store_op::StoreOp;
+use crate::conductor::store_op::{Op, StoreOp};
 use crate::conductor::store_writer::{
-    run_store_op, Outcome, StoreWriteError, WriterContext, MAX_LIST_ITEMS,
+    run_store_op, Collection, Outcome, StoreWriteError, WriterContext, MAX_LIST_ITEMS,
 };
 use crate::persistence::case_store::{self, CaseState, CaseStoreError, DeltaStatus, EntityRole};
 use crate::persistence::handles;
@@ -87,6 +87,7 @@ fn ctx<'a>(focus: &'a str, run: &'a str, action: &'a str) -> WriterContext<'a> {
         focus_id: focus,
         run_id: run,
         action_id: action,
+        collection: Collection::Granted,
     }
 }
 
@@ -1929,5 +1930,389 @@ fn the_handlers_write_no_sql_of_their_own() {
             hits.is_empty(),
             "`{forbidden}` in store_writer.rs: {hits:?}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// items.id=920: the collection-consent gate (decisions.id=944)
+// ---------------------------------------------------------------------------
+
+/// The context of a focus_level Focus whose Persona has not given the current
+/// consent.
+fn ctx_no_consent<'a>(focus: &'a str, run: &'a str, action: &'a str) -> WriterContext<'a> {
+    WriterContext {
+        collection: Collection::NotGranted,
+        ..ctx(focus, run, action)
+    }
+}
+
+/// The ten operations that save something, written out so the gate's own
+/// classification (Op::requires_collection_consent) is checked against the
+/// decision and not against itself.
+const GATED_OPS: [&str; 10] = [
+    "session_put",
+    "case_select",
+    "case_link",
+    "entity_changed",
+    "case_open",
+    "case_update",
+    "strategy_append",
+    "delta_record",
+    "delta_confirm",
+    "delta_changed",
+];
+
+/// An open chat holding a case and a delta, so a writer that was NOT refused
+/// would have real rows to touch.
+async fn seed_case_and_delta(conn: &mut SqliteConnection) {
+    open_a_case(conn, FOCUS, "run-0").await;
+    let rec = op(
+        "delta_record",
+        None,
+        Some(serde_json::json!({"entities": "ents", "description": "d"})),
+    );
+    run(
+        conn,
+        &ctx(FOCUS, "run-0", "rec"),
+        &rec,
+        &vars(&[("ents", r#"["ent-router"]"#), ("d", "x")]),
+    )
+    .await
+    .unwrap();
+}
+
+#[test]
+fn the_gate_classifies_every_operation_as_the_decision_says() {
+    let gated: Vec<&str> = Op::ALL
+        .iter()
+        .filter(|o| o.requires_collection_consent())
+        .map(|o| o.as_str())
+        .collect();
+    let mut expect = GATED_OPS.to_vec();
+    let mut got = gated.clone();
+    expect.sort_unstable();
+    got.sort_unstable();
+    assert_eq!(got, expect);
+    // Latch suppresses writes and session_clear removes data: neither is gated.
+    assert!(!Op::Latch.requires_collection_consent());
+    assert!(!Op::SessionClear.requires_collection_consent());
+    assert_eq!(Op::ALL.len(), GATED_OPS.len() + 2, "every op is classified");
+}
+
+/// Without the current consent EVERY gated operation is refused, writes nothing,
+/// publishes nothing and is not an error. The latch and session_clear behave as
+/// designed.
+#[tokio::test]
+async fn without_consent_every_gated_writer_is_refused_and_writes_nothing() {
+    let _root = TestRoot::new().await;
+    let mut conn = open(PERSONA).await;
+    seed_case_and_delta(&mut conn).await;
+    let before = row_counts(&mut conn).await;
+    let case_before = case_store::get_case(&mut conn, "run-0:open")
+        .await
+        .unwrap()
+        .unwrap();
+
+    let writers = every_writer();
+    let names: Vec<&str> = writers.iter().map(|(w, _)| w.op.as_str()).collect();
+    // every_writer() plus the latch is the whole closed set.
+    for o in Op::ALL {
+        assert!(
+            o == Op::Latch || names.contains(&o.as_str()),
+            "{} is not exercised",
+            o.as_str()
+        );
+    }
+
+    for (writer, v) in &writers {
+        let name = writer.op.as_str();
+        if name == "session_clear" {
+            continue; // below, last: it removes rows
+        }
+        let d = run(&mut conn, &ctx_no_consent(FOCUS, "run-2", "w"), writer, v)
+            .await
+            .unwrap_or_else(|e| panic!("{name}: a consent refusal is not an error: {e}"));
+        assert!(GATED_OPS.contains(&name), "{name}");
+        assert_eq!(d.outcome, Outcome::RefusedNoConsent, "{name}");
+        assert_eq!(d.published, None, "{name}");
+    }
+    assert_eq!(row_counts(&mut conn).await, before, "nothing was written");
+    assert_eq!(
+        case_store::get_case(&mut conn, "run-0:open")
+            .await
+            .unwrap()
+            .unwrap(),
+        case_before,
+        "the case is untouched"
+    );
+    let deltas =
+        case_store::list_config_deltas_for_entity(&mut conn, "ent-router", Some(FOCUS), Utc::now())
+            .await
+            .unwrap();
+    assert_eq!(deltas[0].stored_status, DeltaStatus::BelievedActive);
+    assert_eq!(
+        session_store::write_mode(&mut conn, CHAT).await.unwrap(),
+        WriteMode::Open
+    );
+
+    // The latch is NOT gated: it suppresses writes, so a no-consent chat may
+    // still declare itself one-time.
+    let d = run(
+        &mut conn,
+        &ctx_no_consent(FOCUS, "run-3", "latch"),
+        &op("latch", None, None),
+        &vars(&[]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(d.outcome, Outcome::Applied);
+    assert_eq!(
+        session_store::write_mode(&mut conn, CHAT).await.unwrap(),
+        WriteMode::Suppressed
+    );
+}
+
+/// session_clear REMOVES data, so the user can always cause it: it runs without
+/// consent (in an open chat), and removes what was there.
+#[tokio::test]
+async fn session_clear_runs_without_consent_and_removes_the_sessions_state() {
+    let _root = TestRoot::new().await;
+    let mut conn = open(PERSONA).await;
+    let put = op(
+        "session_put",
+        Some("locked_intent"),
+        Some(serde_json::json!({"value": "val"})),
+    );
+    run(
+        &mut conn,
+        &ctx(FOCUS, "run-0", "put"),
+        &put,
+        &vars(&[("val", "billing")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(count(&mut conn, "session_variables").await, 1);
+    let d = run(
+        &mut conn,
+        &ctx_no_consent(FOCUS, "run-1", "clear"),
+        &op("session_clear", None, None),
+        &vars(&[]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(d.outcome, Outcome::Applied);
+    assert_eq!(count(&mut conn, "session_variables").await, 0);
+}
+
+/// The latch and the consent are independent. Granted and open: writes happen.
+/// Granted and latched: RefusedOneTime. Not granted: RefusedNoConsent, checked
+/// first, so a latched chat without consent, and a run with no chat, both read
+/// as "no consent". Granting consent later never lifts a latch.
+#[tokio::test]
+async fn the_latch_and_the_consent_are_independent_and_consent_is_checked_first() {
+    let _root = TestRoot::new().await;
+    let mut conn = open(PERSONA).await;
+    let put = op(
+        "session_put",
+        Some("locked_intent"),
+        Some(serde_json::json!({"value": "val"})),
+    );
+    let v = vars(&[("val", "billing")]);
+
+    // Not granted, open chat.
+    let d = run(&mut conn, &ctx_no_consent(FOCUS, "r1", "put"), &put, &v)
+        .await
+        .unwrap();
+    assert_eq!(d.outcome, Outcome::RefusedNoConsent);
+    assert_eq!(count(&mut conn, "session_variables").await, 0);
+
+    // Granted, open chat: writes.
+    let d = run(&mut conn, &ctx(FOCUS, "r2", "put"), &put, &v)
+        .await
+        .unwrap();
+    assert_eq!(d.outcome, Outcome::Applied);
+    assert_eq!(count(&mut conn, "session_variables").await, 1);
+
+    // Latch the chat.
+    run(
+        &mut conn,
+        &ctx(FOCUS, "r3", "latch"),
+        &op("latch", None, None),
+        &vars(&[]),
+    )
+    .await
+    .unwrap();
+
+    // Granted and latched: the latch refuses.
+    let d = run(&mut conn, &ctx(FOCUS, "r4", "put"), &put, &v)
+        .await
+        .unwrap();
+    assert_eq!(d.outcome, Outcome::RefusedOneTime);
+
+    // Not granted and latched: consent is checked first.
+    let d = run(&mut conn, &ctx_no_consent(FOCUS, "r5", "put"), &put, &v)
+        .await
+        .unwrap();
+    assert_eq!(d.outcome, Outcome::RefusedNoConsent);
+
+    // Consent given mid-chat does not lift the latch.
+    let d = run(
+        &mut conn,
+        &ctx(FOCUS, "r6", "put"),
+        &put,
+        &vars(&[("val", "network")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(d.outcome, Outcome::RefusedOneTime);
+    assert_eq!(
+        session_store::write_mode(&mut conn, CHAT).await.unwrap(),
+        WriteMode::Suppressed
+    );
+
+    // No chat: not granted is still a refusal, not the NoContextKey error; a
+    // granted run with no chat keeps its own error.
+    let no_chat = WriterContext {
+        context_key: None,
+        collection: Collection::NotGranted,
+        ..ctx(FOCUS, "r7", "put")
+    };
+    assert_eq!(
+        run(&mut conn, &no_chat, &put, &v).await.unwrap().outcome,
+        Outcome::RefusedNoConsent
+    );
+    let no_chat_granted = WriterContext {
+        collection: Collection::Granted,
+        ..no_chat
+    };
+    assert!(matches!(
+        run(&mut conn, &no_chat_granted, &put, &v).await,
+        Err(StoreWriteError::NoContextKey)
+    ));
+}
+
+/// A refusal opens no store and calls no store function: it succeeds against a
+/// connection whose tables do not exist at all.
+#[tokio::test]
+async fn a_consent_refusal_touches_no_store() {
+    use sqlx::sqlite::SqliteConnectOptions;
+    use sqlx::ConnectOptions;
+    let mut bare = SqliteConnectOptions::new()
+        .filename(":memory:")
+        .connect()
+        .await
+        .unwrap();
+    for (w, v) in every_writer() {
+        if !w.op.requires_collection_consent() {
+            continue;
+        }
+        let d = run(&mut bare, &ctx_no_consent(FOCUS, "r", "a"), &w, &v)
+            .await
+            .unwrap();
+        assert_eq!(d.outcome, Outcome::RefusedNoConsent, "{}", w.op.as_str());
+    }
+}
+
+// -- Source scans: no model path records consent ------------------------------
+
+fn production_source(rel: &str) -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{rel}: {e}"));
+    // The production code is everything before the file's first test module.
+    text.split("\n#[cfg(test)]").next().unwrap().to_owned()
+}
+
+fn code_lines_containing(src: &str, needle: &str) -> Vec<String> {
+    let needle = needle.to_lowercase();
+    src.lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .filter(|l| l.to_lowercase().contains(&needle))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Nothing in the writer, its op definitions or the lifecycle writes the consent
+/// audit table or the consent columns. The lifecycle only READS the state
+/// (get_collection_consent) and a model has no path to the setter.
+#[test]
+fn nothing_the_conductor_runs_can_record_or_change_consent() {
+    for rel in [
+        "src/conductor/store_writer.rs",
+        "src/conductor/store_op.rs",
+        "src/conductor/lifecycle.rs",
+    ] {
+        let src = production_source(rel);
+        for forbidden in [
+            "consent_audit_records",
+            "consent_audit_store",
+            "set_collection_consent",
+            "update focus_settings",
+            "insert into focus_settings",
+            "insert or replace into focus_settings",
+            "collection_consent =",
+            "collection_consent_version =",
+            "collection_consent, ",
+        ] {
+            let hits = code_lines_containing(&src, forbidden);
+            assert!(hits.is_empty(), "{rel}: `{forbidden}`: {hits:?}");
+        }
+    }
+    // The lifecycle does read it, through the getter, in one place.
+    let lifecycle = production_source("src/conductor/lifecycle.rs");
+    assert_eq!(
+        code_lines_containing(&lifecycle, "get_collection_consent").len(),
+        2, // the import and the call
+    );
+}
+
+fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            rust_files(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// Only set_collection_consent writes the consent state, and until stage 2's
+/// command exists nothing outside tests calls it or the audit store's append.
+#[test]
+fn the_consent_setter_and_the_audit_append_have_no_production_caller_yet() {
+    let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    rust_files(&src_dir, &mut files);
+    assert!(files.len() > 50);
+    for file in files {
+        let rel = file
+            .strip_prefix(&src_dir)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let own = rel == "persistence/focus_settings_store.rs"
+            || rel == "persistence/consent_audit_store.rs";
+        // Files that mod.rs includes under #[cfg(test)] only (this one included).
+        let test_only = rel.ends_with("tests.rs") || rel == "test_support.rs";
+        if own || test_only {
+            continue;
+        }
+        let text = std::fs::read_to_string(&file).unwrap();
+        let production = text.split("\n#[cfg(test)]").next().unwrap();
+        for forbidden in [
+            "set_collection_consent",
+            "consent_audit_store",
+            "consent_audit_records",
+        ] {
+            let hits = code_lines_containing(production, forbidden);
+            // persistence/mod.rs declares the module and nothing else.
+            let hits: Vec<_> = hits
+                .into_iter()
+                .filter(|l| {
+                    !(rel == "persistence/mod.rs" && l.trim() == "pub mod consent_audit_store;")
+                })
+                .collect();
+            assert!(hits.is_empty(), "{rel}: `{forbidden}`: {hits:?}");
+        }
     }
 }

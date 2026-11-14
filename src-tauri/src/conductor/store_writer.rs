@@ -45,6 +45,19 @@
 // retry, a resume) is Existing and writes nothing. The id is published to later
 // rows through the row's store_target (a pass variable, not a TaskTrack step).
 //
+// COLLECTION CONSENT (items.id=920). WriterContext carries `collection`, built by
+// the lifecycle from a FRESH read of focus_settings immediately before EACH op
+// (never the AUTHORIZE snapshot), so a withdrawal takes effect on the very next
+// op. A Focus that is not focus_level is always Granted here (it never consults
+// the gate). run_store_op checks it FIRST, ahead of the context key and the
+// latch, for every op that Op::requires_collection_consent(). The latch and the
+// consent are independent: granted and open writes, granted and latched is
+// RefusedOneTime, not granted is RefusedNoConsent (consent first). The lifecycle
+// computes the state and returns the refusal BEFORE it opens the outputs.db, so a
+// refusal opens no store. This module
+// only READS the state: nothing here can record or change consent, and a source
+// scan (conductor/store_op_tests.rs) pins that.
+//
 // OUTCOMES.
 //   Applied         the store wrote.
 //   AlreadyApplied  the store found the write already there (an idempotent
@@ -55,6 +68,12 @@
 //                   its writers on write_mode, and a row that was not guarded
 //                   still writes nothing. In a latched chat EVERY writer is a
 //                   refusal, including one whose arguments would not resolve.
+//   RefusedNoConsent  items.id=920 (decisions.id=944): the Focus is focus_level
+//                   and the Persona has not given the current consent, so the
+//                   op is refused BEFORE anything else: nothing is written and
+//                   no store function is called. Like RefusedOneTime, the pass
+//                   goes on: declining is not a block, the Focus keeps working
+//                   and saves nothing.
 // Every other failure is an Err and FAILS THE PASS CLOSED (lifecycle): an
 // unreadable latch, a version conflict, a closed case, an argument that is
 // unset, empty, or the wrong shape, a store error. Error text names the slot
@@ -79,6 +98,18 @@ use crate::persistence::session_store::{
 /// Most entity ids one delta_record row names, and most tags.
 pub const MAX_LIST_ITEMS: usize = 32;
 
+/// items.id=920: whether the running Focus may save to the stores. Built by the
+/// lifecycle per op from a fresh read; see the module header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Collection {
+    /// The Focus is not focus_level, or it is and the Persona has given the
+    /// current consent.
+    Granted,
+    /// A focus_level Focus without the current consent, or an unreadable state:
+    /// the failure direction is not writing.
+    NotGranted,
+}
+
 /// The running pass, as the writer needs it. All three ids come from the run.
 #[derive(Debug, Clone, Copy)]
 pub struct WriterContext<'a> {
@@ -87,6 +118,8 @@ pub struct WriterContext<'a> {
     pub focus_id: &'a str,
     pub run_id: &'a str,
     pub action_id: &'a str,
+    /// items.id=920. See Collection.
+    pub collection: Collection,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +127,8 @@ pub enum Outcome {
     Applied,
     AlreadyApplied,
     RefusedOneTime,
+    /// items.id=920: focus_level Focus without the current consent.
+    RefusedNoConsent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,6 +199,11 @@ pub async fn run_store_op(
     op: &StoreOp,
     vars: &HashMap<String, String>,
 ) -> Result<Done, StoreWriteError> {
+    // items.id=920: consent is checked FIRST, before the context key and the
+    // latch, and a refusal calls no store function at all.
+    if op.op.requires_collection_consent() && ctx.collection != Collection::Granted {
+        return Ok(refused_no_consent());
+    }
     let key = ctx.context_key.ok_or(StoreWriteError::NoContextKey)?;
     let result = run_inner(conn, key, ctx, op, vars).await;
     let err = match result {
@@ -187,6 +227,13 @@ pub async fn run_store_op(
 fn refused() -> Done {
     Done {
         outcome: Outcome::RefusedOneTime,
+        published: None,
+    }
+}
+
+fn refused_no_consent() -> Done {
+    Done {
+        outcome: Outcome::RefusedNoConsent,
         published: None,
     }
 }

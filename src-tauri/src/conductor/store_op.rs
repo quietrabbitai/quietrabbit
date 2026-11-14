@@ -150,6 +150,29 @@ impl Op {
         matches!(self, Op::CaseUpdate | Op::StrategyAppend | Op::CaseLink)
     }
 
+    /// items.id=920 (decisions.id=944): true for the operations that SAVE
+    /// something about the user's situation, which a focus_level Focus may do
+    /// only after the one setup consent (store_writer::Collection). Exhaustive on
+    /// purpose, so a new operation must be classified here.
+    ///   NOT gated: Latch (it SUPPRESSES writes, so refusing it would only widen
+    ///   what a no-consent chat can save) and SessionClear (it REMOVES data, which
+    ///   the user must always be able to cause).
+    pub fn requires_collection_consent(self) -> bool {
+        match self {
+            Op::Latch | Op::SessionClear => false,
+            Op::SessionPut
+            | Op::CaseOpen
+            | Op::CaseUpdate
+            | Op::StrategyAppend
+            | Op::DeltaRecord
+            | Op::DeltaConfirm
+            | Op::DeltaChanged
+            | Op::CaseSelect
+            | Op::CaseLink
+            | Op::EntityChanged => true,
+        }
+    }
+
     pub fn parse(s: &str) -> Option<Op> {
         Op::ALL.iter().copied().find(|o| o.as_str() == s)
     }
