@@ -30,6 +30,15 @@
 //           closed case is not selectable: it takes no writes (case_store).
 //   delta   any configuration change this Focus recorded (config_deltas.focus_id).
 //
+// ENTITY HANDLES (items.id=891). E-XXXXXXXX names a device the running Focus OWNS
+// (entities.owner_focus, personal_011.sql), from the same derivation. It is the
+// one way a model picks an EXISTING device: device_library_brief shows handles, a
+// model step names one, and entity_find_or_create resolves it store-side among the
+// Focus's own active entities in personal.db. Another Focus's device, an
+// unowned entity, an archived or purge-marked one and an invented handle all
+// resolve to nothing. An entity id is never shown to a model and never accepted
+// from one.
+//
 // A handle is not a secret and not an authorization: it is an unguessable name
 // for a row the Focus is already allowed to touch. Error text never echoes a
 // value (the handle is model output).
@@ -41,6 +50,7 @@ use sha2::{Digest, Sha256};
 use sqlx::SqliteConnection;
 
 use crate::persistence::case_store::{self, CaseStoreError};
+use crate::persistence::owned_entity_store::{self, OwnedEntityError};
 
 /// Versioned so a future change of the derivation is a deliberate break.
 const DOMAIN: &str = "qr-handle-v1";
@@ -53,6 +63,7 @@ pub const HANDLE_CHARS: usize = 8;
 pub enum Kind {
     Ticket,
     Delta,
+    Entity,
 }
 
 impl Kind {
@@ -60,6 +71,7 @@ impl Kind {
         match self {
             Kind::Ticket => 'T',
             Kind::Delta => 'D',
+            Kind::Entity => 'E',
         }
     }
 
@@ -67,6 +79,7 @@ impl Kind {
         match self {
             Kind::Ticket => "case",
             Kind::Delta => "delta",
+            Kind::Entity => "entity",
         }
     }
 }
@@ -81,6 +94,8 @@ pub enum HandleError {
     Ambiguous(&'static str),
     #[error("{0}")]
     Store(#[from] CaseStoreError),
+    #[error("{0}")]
+    Owned(#[from] OwnedEntityError),
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
 }
@@ -112,6 +127,19 @@ pub fn case_handle(focus_id: &str, case_id: &str) -> String {
 
 pub fn delta_handle(focus_id: &str, delta_id: &str) -> String {
     handle_for(Kind::Delta, focus_id, delta_id)
+}
+
+/// items.id=891: the handle of a device a Focus owns.
+pub fn entity_handle(focus_id: &str, entity_id: &str) -> String {
+    handle_for(Kind::Entity, focus_id, entity_id)
+}
+
+/// True when `raw` is shaped like an entity handle (E-XXXXXXXX, however a model
+/// echoes it). Text that is NOT handle-shaped (a model saying "none") is not a
+/// handle at all and the caller goes on without one. Text that IS handle-shaped
+/// and resolves to nothing is an error: that is an invented or stale handle.
+pub fn looks_like_entity_handle(raw: &str) -> bool {
+    canonical(raw, Kind::Entity).is_some()
 }
 
 /// Reads a model-supplied handle into its canonical text, or None when it is not
@@ -175,6 +203,24 @@ pub async fn resolve_delta_handle(
         .filter(|id| delta_handle(focus_id, id) == want)
         .collect();
     pick(matches, "configuration change")
+}
+
+/// items.id=891: the entity id behind a device handle: an ACTIVE entity that
+/// `focus_id` owns, read from the persona's personal.db (the connection is
+/// personal.db, not the outputs.db the other two resolvers take).
+pub async fn resolve_entity_handle(
+    personal: &mut SqliteConnection,
+    focus_id: &str,
+    handle: &str,
+) -> Result<String, HandleError> {
+    let want = canonical(handle, Kind::Entity).ok_or(HandleError::Malformed('E'))?;
+    let owned = owned_entity_store::list_owned_active(personal, focus_id).await?;
+    let matches: Vec<String> = owned
+        .into_iter()
+        .filter(|e| entity_handle(focus_id, &e.id) == want)
+        .map(|e| e.id)
+        .collect();
+    pick(matches, "device")
 }
 
 #[cfg(test)]
@@ -411,5 +457,40 @@ mod tests {
             resolve_delta_handle(&mut conn, FOCUS, &case_handle(FOCUS, "delta-1")).await,
             Err(HandleError::Malformed('D'))
         ));
+    }
+
+    #[test]
+    fn an_entity_handle_is_its_own_kind_and_never_resolves_as_another() {
+        let h = entity_handle("tech-support", "ent-1");
+        assert_eq!(h, entity_handle("tech-support", "ent-1"));
+        assert!(h.starts_with("E-") && h.len() == 2 + HANDLE_CHARS);
+        assert!(!h.contains("ent-1"), "the id is not in the handle");
+        // Kind and Focus are inside the hash.
+        assert_ne!(h[2..], case_handle("tech-support", "ent-1")[2..]);
+        assert_ne!(h, entity_handle("other-focus", "ent-1"));
+        // The shape test a model's text goes through.
+        for ok in [
+            h.clone(),
+            h.to_lowercase(),
+            format!("[{h}]"),
+            format!(" {h}\n"),
+        ] {
+            assert!(looks_like_entity_handle(&ok), "{ok}");
+        }
+        for not in [
+            "none",
+            "new",
+            "",
+            "T-ABCDEFGH",
+            "D-ABCDEFGH",
+            "E-ABC",
+            "E-ABCDEFGHI",
+            "E-ABCDEFGI",
+            &format!("{h} and more"),
+        ] {
+            assert!(!looks_like_entity_handle(not), "{not}");
+        }
+        assert_eq!(canonical(&h, Kind::Ticket), None);
+        assert_eq!(canonical(&case_handle("f", "c"), Kind::Entity), None);
     }
 }

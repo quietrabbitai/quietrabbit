@@ -37,9 +37,6 @@
 //
 // QUERY STYLE: runtime sqlx::query() only, never the query!() macros.
 
-// Stage 3's entity writer is the first non-test caller of these functions.
-#![allow(dead_code)]
-
 use sqlx::{Row, SqliteConnection};
 use thiserror::Error;
 
@@ -378,6 +375,7 @@ pub struct ActiveFact {
 /// An owned entity's active facts that are in the catalogue, in catalogue order.
 /// A row whose field the catalogue no longer lists is skipped (a data edit can
 /// retire a field without erasing history): it is neither shown nor deleted here.
+#[allow(dead_code)] // items.id=891 stage 5 (device sheet) and stage 6 (subject_context) are its first callers
 pub(crate) async fn list_active_facts(
     conn: &mut SqliteConnection,
     focus: &str,

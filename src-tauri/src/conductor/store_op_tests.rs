@@ -18,7 +18,7 @@ use sqlx::SqliteConnection;
 
 use crate::conductor::store_op::{Op, StoreOp};
 use crate::conductor::store_writer::{
-    run_store_op, Collection, Outcome, StoreWriteError, WriterContext, MAX_LIST_ITEMS,
+    run_store_op, Collection, Entities, Outcome, StoreWriteError, WriterContext, MAX_LIST_ITEMS,
 };
 use crate::persistence::case_store::{self, CaseState, CaseStoreError, DeltaStatus, EntityRole};
 use crate::persistence::handles;
@@ -84,6 +84,7 @@ fn vars(pairs: &[(&str, &str)]) -> HashMap<String, String> {
 fn ctx<'a>(focus: &'a str, run: &'a str, action: &'a str) -> WriterContext<'a> {
     WriterContext {
         context_key: Some(CHAT),
+        persona_id: PERSONA,
         focus_id: focus,
         run_id: run,
         action_id: action,
@@ -97,7 +98,8 @@ async fn run(
     o: &StoreOp,
     v: &HashMap<String, String>,
 ) -> Result<crate::conductor::store_writer::Done, StoreWriteError> {
-    run_store_op(conn, c, o, v).await
+    // These tests exercise the outputs.db writers alone: no entity store.
+    run_store_op(conn, Entities::Unchecked, c, o, v).await
 }
 
 /// case_open then return the case id it published.
@@ -1183,7 +1185,10 @@ async fn bad_arguments_and_store_errors_are_errors_not_silent_skips() {
         Some(serde_json::json!({"entities": "ents", "description": "d"})),
     );
     for bad in [
-        "ent-router".to_owned(),
+        // A bare word that is not a JSON array is ONE id (the published entity
+        // variable form, items.id=891), so it is not in this list any more: an
+        // unterminated array is still not one.
+        r#"["ent-router""#.to_owned(),
         r#"["a", " "]"#.to_owned(),
         serde_json::to_string(
             &(0..=MAX_LIST_ITEMS)
@@ -1201,6 +1206,17 @@ async fn bad_arguments_and_store_errors_are_errors_not_silent_skips() {
         );
     }
     assert_eq!(count(&mut conn, "config_deltas").await, 0);
+    // items.id=891: ONE id (a published entity variable) is a list of one.
+    let d = run(
+        &mut conn,
+        &ctx(FOCUS, "run-9", "one"),
+        &rec,
+        &vars(&[("ents", "ent-router"), ("d", "x")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(d.outcome, Outcome::Applied);
+    assert_eq!(count(&mut conn, "config_delta_entities").await, 1);
     // The error text names the slot, never the model's value.
     let err = run(&mut conn, &c, &put, &vars(&[("v", "Secret Value!")]))
         .await
@@ -1946,10 +1962,12 @@ fn ctx_no_consent<'a>(focus: &'a str, run: &'a str, action: &'a str) -> WriterCo
     }
 }
 
-/// The ten operations that save something, written out so the gate's own
+/// The twelve operations that save something, written out so the gate's own
 /// classification (Op::requires_collection_consent) is checked against the
-/// decision and not against itself.
-const GATED_OPS: [&str; 10] = [
+/// decision and not against itself. The last two are the Focus-owned entity
+/// writers (items.id=891), exercised with real entity stores in
+/// entity_writer_tests.rs.
+const GATED_OPS: [&str; 12] = [
     "session_put",
     "case_select",
     "case_link",
@@ -1960,6 +1978,8 @@ const GATED_OPS: [&str; 10] = [
     "delta_record",
     "delta_confirm",
     "delta_changed",
+    "entity_find_or_create",
+    "entity_fact_put",
 ];
 
 /// An open chat holding a case and a delta, so a writer that was NOT refused
@@ -2018,7 +2038,7 @@ async fn without_consent_every_gated_writer_is_refused_and_writes_nothing() {
     // every_writer() plus the latch is the whole closed set.
     for o in Op::ALL {
         assert!(
-            o == Op::Latch || names.contains(&o.as_str()),
+            o == Op::Latch || o.is_entity_op() || names.contains(&o.as_str()),
             "{} is not exercised",
             o.as_str()
         );
@@ -2240,6 +2260,7 @@ fn nothing_the_conductor_runs_can_record_or_change_consent() {
         "src/conductor/store_writer.rs",
         "src/conductor/store_op.rs",
         "src/conductor/lifecycle.rs",
+        "src/conductor/entity_writer.rs",
     ] {
         let src = production_source(rel);
         for forbidden in [

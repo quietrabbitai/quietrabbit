@@ -8,6 +8,9 @@ pub mod concurrency;
 pub mod crisis;
 pub mod declared_inputs;
 pub mod device_fields;
+pub mod entity_writer;
+#[cfg(test)]
+mod entity_writer_tests;
 pub mod executor;
 pub mod extract;
 pub mod failure;

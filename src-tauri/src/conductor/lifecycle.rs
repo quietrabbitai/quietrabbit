@@ -967,8 +967,12 @@ pub(crate) async fn load_focus_definition_from_db(
     // items.id=887: the store writers' own cross-row checks run first, so an
     // argument that names a later row's variable or a derived name is reported
     // as that (conductor::store_op).
-    store_op::check_composition(&steps, &row_output_vars(&steps))
-        .map_err(|e| LifecycleError::ValidationFailed(format!("Focus '{focus_id}' {e}")))?;
+    store_op::check_composition(
+        &steps,
+        &row_output_vars(&steps),
+        focus_row.collection_posture,
+    )
+    .map_err(|e| LifecycleError::ValidationFailed(format!("Focus '{focus_id}' {e}")))?;
     lint_declared_inputs(focus_id, &steps)?;
     analyze_guarded_composition(focus_id, &steps)?;
 
@@ -1296,9 +1300,12 @@ pub async fn load_focus_definition(
     // items.id=887: store writers are database-only, so a YAML step is never one
     // and this passes trivially. It runs on both paths so that a YAML field that
     // ever populated store_op could not skip the checks.
-    store_op::check_composition(&focus_def.steps, &row_output_vars(&focus_def.steps)).map_err(
-        |e| LifecycleError::ValidationFailed(format!("Focus '{}' {e}", focus_def.focus_id)),
-    )?;
+    store_op::check_composition(
+        &focus_def.steps,
+        &row_output_vars(&focus_def.steps),
+        focus_def.collection_posture,
+    )
+    .map_err(|e| LifecycleError::ValidationFailed(format!("Focus '{}' {e}", focus_def.focus_id)))?;
 
     let mut all_errors: Vec<String> = Vec::new();
     for step in &focus_def.steps {
@@ -3015,7 +3022,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         op: &store_op::StoreOp,
     ) -> Result<(), LifecycleError> {
         use crate::conductor::store_writer::{
-            run_store_op, Collection, Outcome, StoreWriteError, WriterContext,
+            run_store_op, Collection, Entities, Outcome, StoreWriteError, WriterContext,
         };
 
         // items.id=920: a FRESH read, immediately before THIS op, mirroring how
@@ -3050,8 +3057,30 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         )
         .await
         .map_err(|e| StoreWriteError::Open(e.to_string()))?;
+        // items.id=891: the persona's personal.db is opened only for an operation
+        // that writes an entity or names an entity id. Its connection travels as
+        // Entities::Verified, so every entity id the row names is checked against
+        // it before the write (conductor::entity_writer).
+        let mut personal = if op.op.is_entity_op() || op.op.takes_entity_ids() {
+            Some(
+                crate::persistence::personal_store::open_personal_db(
+                    &self.user_id,
+                    &self.persona_id,
+                    self.key_hex.as_deref().unwrap_or(""),
+                )
+                .await
+                .map_err(|e| StoreWriteError::Open(e.to_string()))?,
+            )
+        } else {
+            None
+        };
+        let entities = match personal.as_mut() {
+            Some(conn) => Entities::Verified(conn),
+            None => Entities::NotNeeded,
+        };
         let ctx = WriterContext {
             context_key: self.context_key.as_deref(),
+            persona_id: &self.persona_id,
             focus_id: &self.focus_id,
             run_id: &run_id,
             action_id: &step.action_id,
@@ -3059,7 +3088,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             // tests pin.
             collection,
         };
-        let done = run_store_op(&mut conn, &ctx, op, &vars).await?;
+        let done = run_store_op(&mut conn, entities, &ctx, op, &vars).await?;
         log::debug!(
             "lifecycle: store writer '{}' ({}) -> {:?}",
             step.action_id,
@@ -10440,9 +10469,10 @@ steps:
             "INSERT INTO focuses
                 (focus_id, display_name, description, version, max_routing_tier,
                  output_type, suggest_in_focuses, multi_source_validation,
-                 generic_title_template, status, created_at, updated_at)
+                 generic_title_template, status, collection_posture,
+                 created_at, updated_at)
              VALUES (?, 'Store Writer Test Focus', '', '1.0', 'local_only',
-                     'general', '[]', 0, 'Hidden item', 'shipped',
+                     'general', '[]', 0, 'Hidden item', 'shipped', 'focus_level',
                      datetime('now'), datetime('now'))",
         )
         .bind(focus_id)
@@ -10552,12 +10582,32 @@ steps:
             let def = store_load(
                 "sw-flow",
                 vec![
-                    smodel("ent", "ent_out"),
                     smodel("lab", "label_out"),
+                    // items.id=891: the two devices are entities this Focus owns,
+                    // published by entity_find_or_create rows.
+                    swriter(
+                        "ent",
+                        "entity_find_or_create",
+                        Some("ent_out"),
+                        Some(r#"{"label":"label_out"}"#),
+                    ),
                     smodel("sym", "sym_out"),
                     smodel("strat", "strat_out"),
                     smodel("outc", "outc_out"),
-                    smodel("ents", "ents_out"),
+                    swriter(
+                        "ents",
+                        "entity_find_or_create",
+                        Some("ents_out"),
+                        Some(r#"{"label":"label_out"}"#),
+                    ),
+                    smodel("field", "field_out"),
+                    smodel("value", "value_out"),
+                    swriter(
+                        "fact",
+                        "entity_fact_put",
+                        None,
+                        Some(r#"{"entity":"ent_out","field":"field_out","value":"value_out"}"#),
+                    ),
                     smodel("desc", "desc_out"),
                     smodel("hand", "hand_out"),
                     swriter("hold", "latch", None, None).guarded(
@@ -10629,6 +10679,9 @@ steps:
             assert_eq!(
                 ops,
                 [
+                    "entity_find_or_create",
+                    "entity_find_or_create",
+                    "entity_fact_put",
                     "latch",
                     "case_open",
                     "session_put",
@@ -10638,6 +10691,76 @@ steps:
                     "delta_confirm",
                     "delta_changed"
                 ]
+            );
+        })
+        .await;
+    }
+
+    /// items.id=891 at the loader: an entity slot names the id an earlier
+    /// entity_find_or_create row published, and the entity writers are for a
+    /// focus_level Focus only.
+    #[tokio::test]
+    async fn store_load_refuses_a_model_named_entity_and_a_per_field_entity_writer() {
+        with_temp_data_root(async {
+            // A model output as an entity id.
+            let m = store_load(
+                "ent-model",
+                vec![
+                    smodel("e", "ent_out"),
+                    smodel("l", "label_out"),
+                    swriter(
+                        "open",
+                        "case_open",
+                        Some("new_case"),
+                        Some(r#"{"entity":"ent_out","label":"label_out"}"#),
+                    ),
+                    smodel("z", "zz"),
+                ],
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                m.contains("a model never names an entity id") && m.contains("'ent_out'"),
+                "{m}"
+            );
+
+            // The same rows with the device made by entity_find_or_create load.
+            let rows = || {
+                vec![
+                    smodel("l", "label_out"),
+                    swriter(
+                        "ent",
+                        "entity_find_or_create",
+                        Some("ent_out"),
+                        Some(r#"{"label":"label_out"}"#),
+                    ),
+                    swriter(
+                        "open",
+                        "case_open",
+                        Some("new_case"),
+                        Some(r#"{"entity":"ent_out","label":"label_out"}"#),
+                    ),
+                    smodel("z", "zz"),
+                ]
+            };
+            let ok = store_load("ent-ok", rows()).await;
+            assert!(ok.is_ok(), "{:?}", ok.err());
+
+            // A per_field Focus may not carry an entity writer at all.
+            let pool = block_load_pool().await;
+            seed_store_focus(&pool, "ent-per-field", rows()).await;
+            sqlx::query("UPDATE focuses SET collection_posture = 'per_field' WHERE focus_id = ?")
+                .bind("ent-per-field")
+                .execute(&pool)
+                .await
+                .unwrap();
+            let m = match load_focus_definition_from_db(&pool, "ent-per-field").await {
+                Err(LifecycleError::ValidationFailed(m)) => m,
+                other => panic!("expected a LOAD refusal, got {other:?}"),
+            };
+            assert!(
+                m.contains("focus_level") && m.contains("entity_find_or_create"),
+                "{m}"
             );
         })
         .await;
@@ -11409,8 +11532,13 @@ steps:
             let m = store_load(
                 "hnd-published",
                 vec![
-                    smodel("ent", "ent_out"),
                     smodel("lab", "label_out"),
+                    swriter(
+                        "ent",
+                        "entity_find_or_create",
+                        Some("ent_out"),
+                        Some(r#"{"label":"label_out"}"#),
+                    ),
                     swriter(
                         "open",
                         "case_open",
@@ -11435,6 +11563,16 @@ steps:
     fn close_rows(order: &[&'static str], pin: Option<&'static str>) -> Vec<SRow> {
         let ac = |r: SRow| r.guarded("active_case_id", "present", None);
         let mut rows = vec![smodel("route", "closure"), smodel("note", "note")];
+        if order.contains(&"link") {
+            // items.id=891: the affected device is an owned entity, published by
+            // an entity_find_or_create row.
+            rows.push(swriter(
+                "aff",
+                "entity_find_or_create",
+                Some("aff_ent"),
+                Some(r#"{"label":"note"}"#),
+            ));
+        }
         for id in order {
             let row = match *id {
                 "log" => ac(swriter(
@@ -11453,7 +11591,7 @@ steps:
                     "link",
                     "case_link",
                     None,
-                    Some(r#"{"case":"active_case_id","entity":"note"}"#),
+                    Some(r#"{"case":"active_case_id","entity":"aff_ent"}"#),
                 )),
                 other => panic!("{other}"),
             };
@@ -12457,6 +12595,15 @@ steps:
         with_temp_data_root(async {
             let mut run = writer_run(
                 vec![
+                    // items.id=891: the device is an entity this Focus owns, made by
+                    // an entity_find_or_create row whose published id the case names.
+                    writer_step(
+                        "ent",
+                        "entity_find_or_create",
+                        Some("ent_out"),
+                        serde_json::json!({"label": "label_out"}),
+                        None,
+                    ),
                     writer_step(
                         "open",
                         "case_open",
@@ -12474,7 +12621,6 @@ steps:
                 ],
                 Some("chat-sp"),
                 &[
-                    ("ent_out", "ent-router"),
                     ("label_out", "Router"),
                     ("s_out", "restart it"),
                     ("o_out", "no change"),
@@ -12490,6 +12636,23 @@ steps:
                 .unwrap()
                 .unwrap();
             assert_eq!(case.focus_id, "f");
+            // The case's primary subject is the entity the first row published.
+            let entity_id = run.store_vars.get("ent_out").expect("entity id").clone();
+            assert_eq!(case.primary_entity_id.as_deref(), Some(entity_id.as_str()));
+            let mut personal = crate::persistence::personal_store::open_personal_db(
+                &run.user_id,
+                &run.persona_id,
+                CRISIS_TEST_KEY_HEX,
+            )
+            .await
+            .unwrap();
+            let owner: Option<String> =
+                sqlx::query_scalar("SELECT owner_focus FROM entities WHERE id = ?")
+                    .bind(&entity_id)
+                    .fetch_one(&mut personal)
+                    .await
+                    .unwrap();
+            assert_eq!(owner.as_deref(), Some("f"), "the device is owned by the running Focus");
             let strategies =
                 crate::persistence::case_store::list_case_strategies(&mut conn, &case_id)
                     .await
@@ -12497,7 +12660,9 @@ steps:
             assert_eq!(strategies.len(), 1);
             assert_eq!(strategies[0].rung_at, Some(1));
             // The published id is not on the track, so it cannot reach {previous_output}.
-            assert!(!ran_ids(&run).iter().any(|a| a == "open" || a == "log"));
+            assert!(!ran_ids(&run)
+                .iter()
+                .any(|a| a == "ent" || a == "open" || a == "log"));
         })
         .await;
     }
@@ -12706,13 +12871,36 @@ steps:
                 vec![
                     put_step("lock", "v1"),
                     writer_step(
+                        "ent",
+                        "entity_find_or_create",
+                        Some("ent_out"),
+                        serde_json::json!({"label": "v1"}),
+                        None,
+                    ),
+                    writer_step(
                         "open",
                         "case_open",
                         Some("nc"),
-                        serde_json::json!({"entity": "v1", "label": "v1"}),
+                        serde_json::json!({"entity": "ent_out", "label": "v1"}),
                         None,
                     ),
                 ]
+            };
+            let entities_of = |run: &FocusRun<crate::conductor::privacy::logger::TestLogger>| {
+                let (u, p) = (run.user_id.clone(), run.persona_id.clone());
+                async move {
+                    let mut conn = crate::persistence::personal_store::open_personal_db(
+                        &u,
+                        &p,
+                        CRISIS_TEST_KEY_HEX,
+                    )
+                    .await
+                    .unwrap();
+                    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM entities")
+                        .fetch_one(&mut conn)
+                        .await
+                        .unwrap()
+                }
             };
             // not_asked, declined, withdrawn, and a grant of another text version.
             for (state, version) in [
@@ -12734,6 +12922,11 @@ steps:
                     .await
                     .unwrap();
                 assert_eq!(cases, 0, "{state:?}");
+                assert_eq!(
+                    entities_of(&run).await,
+                    0,
+                    "{state:?}: no device was made either"
+                );
                 assert!(
                     run.store_vars.is_empty(),
                     "{state:?}: nothing was published"
@@ -12744,7 +12937,12 @@ steps:
             let mut run = focus_level_writer_run(&pool, steps());
             assert!(run.execute().await.unwrap().is_none());
             assert_eq!(locked_intent(&run).await.as_deref(), Some("billing"));
-            assert_eq!(run.store_vars.len(), 1, "the case id was published");
+            assert_eq!(
+                run.store_vars.len(),
+                2,
+                "the entity id and the case id were published"
+            );
+            assert_eq!(entities_of(&run).await, 1);
         })
         .await;
     }

@@ -58,6 +58,19 @@
 // only READS the state: nothing here can record or change consent, and a source
 // scan (conductor/store_op_tests.rs) pins that.
 //
+// ENTITIES (items.id=891). Two operations write a Focus-owned entity in the
+// persona's personal.db (entity_find_or_create, entity_fact_put), run by
+// conductor::entity_writer, and four more take an entity id argument (case_open,
+// case_link, delta_record, delta_changed). The caller hands this function the
+// persona's personal.db connection as `Entities::Verified`. Every entity id an
+// operation names is checked there before anything is written (owned by the
+// running Focus, active), so an id that a purge removed mid-run, another Focus's
+// entity or an invented id writes nothing and fails the pass closed. A latched
+// chat is checked first and refuses, like every writer. `Entities::Unchecked`
+// exists for the store tests that exercise the outputs.db writers alone, and a
+// source scan pins that no production code names it: the lifecycle always
+// supplies the connection.
+//
 // OUTCOMES.
 //   Applied         the store wrote.
 //   AlreadyApplied  the store found the write already there (an idempotent
@@ -85,12 +98,14 @@ use chrono::Utc;
 use sqlx::SqliteConnection;
 
 use crate::conductor::bound_spec::{self, ACTIVE_CASE_ID};
+use crate::conductor::entity_writer;
 use crate::conductor::store_op::{Op, Slot, StoreOp};
 use crate::persistence::case_store::{
     self, AppendOutcome, CaseState, CaseStoreError, CaseUpdate, DeltaOutcome, DeltaStatus,
     LinkOutcome, NewCase, NewConfigDelta, NewStrategy, OpenOutcome, ResolutionPath,
 };
 use crate::persistence::handles::{self, HandleError};
+use crate::persistence::owned_entity_store::OwnedEntityError;
 use crate::persistence::session_store::{
     self, LatchError, LatchOutcome, PutOutcome, SessionStoreError, SessionWrite, WriteMode,
 };
@@ -110,11 +125,29 @@ pub enum Collection {
     NotGranted,
 }
 
-/// The running pass, as the writer needs it. All three ids come from the run.
+/// items.id=891: the persona's personal.db, where a Focus-owned entity lives.
+pub enum Entities<'a> {
+    /// A connection to the running persona's personal.db. The lifecycle always
+    /// supplies this.
+    Verified(&'a mut SqliteConnection),
+    /// The operation takes no entity and writes none (the lifecycle passes this
+    /// for every operation that is not entity_find_or_create or entity_fact_put
+    /// and carries no entity id). An operation that DOES need the entity store
+    /// and gets this fails closed.
+    NotNeeded,
+    /// No entity store and no verification: entity operations fail and entity-id
+    /// arguments are NOT checked. For the store tests that exercise the outputs.db
+    /// writers alone; no production code may name it (a source scan pins that).
+    Unchecked,
+}
+
+/// The running pass, as the writer needs it. All the ids come from the run.
 #[derive(Debug, Clone, Copy)]
 pub struct WriterContext<'a> {
     /// The chat. None for a run that belongs to no chat: nothing can be written.
     pub context_key: Option<&'a str>,
+    /// items.id=891: the running persona (the provenance of an entity fact).
+    pub persona_id: &'a str,
     pub focus_id: &'a str,
     pub run_id: &'a str,
     pub action_id: &'a str,
@@ -161,6 +194,14 @@ pub enum StoreWriteError {
     },
     #[error("session variable '{0}' does not accept that value")]
     InvalidSessionValue(String),
+    /// items.id=891: an entity operation or an entity argument could not be
+    /// checked because no personal.db connection was supplied.
+    #[error("this operation needs the persona's entity store, which was not supplied")]
+    EntityStoreUnavailable,
+    /// items.id=891: the entity store refused (no such entity for this Focus, an
+    /// unknown catalogue field, a value that does not fit, a store error).
+    #[error("{0}")]
+    Entity(#[from] OwnedEntityError),
     #[error("no such case for this Focus")]
     CaseNotInFocus,
     #[error("no such configuration change for this Focus")]
@@ -195,6 +236,7 @@ impl StoreWriteError {
 /// variables, the ids earlier writers published, and the seeded session names.
 pub async fn run_store_op(
     conn: &mut SqliteConnection,
+    mut entities: Entities<'_>,
     ctx: &WriterContext<'_>,
     op: &StoreOp,
     vars: &HashMap<String, String>,
@@ -205,7 +247,7 @@ pub async fn run_store_op(
         return Ok(refused_no_consent());
     }
     let key = ctx.context_key.ok_or(StoreWriteError::NoContextKey)?;
-    let result = run_inner(conn, key, ctx, op, vars).await;
+    let result = run_inner(conn, &mut entities, key, ctx, op, vars).await;
     let err = match result {
         Ok(done) => return Ok(done),
         Err(e) => e,
@@ -238,7 +280,7 @@ fn refused_no_consent() -> Done {
     }
 }
 
-fn done(outcome: Outcome) -> Done {
+pub(crate) fn done(outcome: Outcome) -> Done {
     Done {
         outcome,
         published: None,
@@ -247,13 +289,36 @@ fn done(outcome: Outcome) -> Done {
 
 async fn run_inner(
     conn: &mut SqliteConnection,
+    entities: &mut Entities<'_>,
     key: &str,
     ctx: &WriterContext<'_>,
     op: &StoreOp,
     vars: &HashMap<String, String>,
 ) -> Result<Done, StoreWriteError> {
     let a = Args { op, vars };
+    // items.id=891: every entity id this row names is checked against the
+    // personal.db before anything is written. The entity operations check their
+    // own (they also need the latch first), and the four that merely carry an id
+    // are checked here.
+    if op.op.takes_entity_ids() && !op.op.is_entity_op() {
+        match entities {
+            Entities::Verified(personal) => {
+                entity_writer::verify_entity_arguments(personal, ctx, &a).await?
+            }
+            Entities::Unchecked => {}
+            Entities::NotNeeded => return Err(StoreWriteError::EntityStoreUnavailable),
+        }
+    }
     match op.op {
+        Op::EntityFindOrCreate | Op::EntityFactPut => match entities {
+            Entities::Verified(personal) => {
+                entity_writer::run_entity_op(conn, personal, key, ctx, &a).await
+            }
+            Entities::NotNeeded | Entities::Unchecked => {
+                Err(StoreWriteError::EntityStoreUnavailable)
+            }
+        },
+
         Op::Latch => {
             let out =
                 session_store::latch_write_suppressed(conn, key, ctx.focus_id, ctx.run_id).await?;
@@ -423,12 +488,12 @@ async fn run_inner(
 
         Op::DeltaRecord => {
             let delta_id = derived_id(ctx);
-            let entities = a
-                .list(Slot::Entities)?
-                .ok_or(StoreWriteError::ArgumentEmpty {
-                    op: op.op.as_str(),
-                    slot: Slot::Entities.as_str(),
-                })?;
+            let entities =
+                a.list_or_one(Slot::Entities)?
+                    .ok_or(StoreWriteError::ArgumentEmpty {
+                        op: op.op.as_str(),
+                        slot: Slot::Entities.as_str(),
+                    })?;
             let tags = a.list(Slot::Tags)?.unwrap_or_default();
             let entity_refs: Vec<&str> = entities.iter().map(String::as_str).collect();
             let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
@@ -523,8 +588,8 @@ async fn put_session(
     }))
 }
 
-/// The idempotency key of a case or delta this row creates.
-fn derived_id(ctx: &WriterContext<'_>) -> String {
+/// The idempotency key of a case, delta or entity this row creates.
+pub(crate) fn derived_id(ctx: &WriterContext<'_>) -> String {
     format!("{}:{}", ctx.run_id, ctx.action_id)
 }
 
@@ -541,13 +606,13 @@ async fn own_case(
 }
 
 /// Argument access over the pass's variable view.
-struct Args<'a> {
-    op: &'a StoreOp,
-    vars: &'a HashMap<String, String>,
+pub(crate) struct Args<'a> {
+    pub(crate) op: &'a StoreOp,
+    pub(crate) vars: &'a HashMap<String, String>,
 }
 
 impl<'a> Args<'a> {
-    fn invalid(&self, slot: Slot, reason: &'static str) -> StoreWriteError {
+    pub(crate) fn invalid(&self, slot: Slot, reason: &'static str) -> StoreWriteError {
         StoreWriteError::ArgumentInvalid {
             op: self.op.op.as_str(),
             slot: slot.as_str(),
@@ -557,7 +622,7 @@ impl<'a> Args<'a> {
 
     /// The trimmed value of a configured slot. A configured slot whose variable
     /// is unset is an error, an empty value is Some("").
-    fn raw(&self, slot: Slot) -> Result<Option<&'a str>, StoreWriteError> {
+    pub(crate) fn raw(&self, slot: Slot) -> Result<Option<&'a str>, StoreWriteError> {
         let Some(var) = self.op.arg(slot) else {
             return Ok(None);
         };
@@ -572,7 +637,7 @@ impl<'a> Args<'a> {
     }
 
     /// A required slot: configured (LOAD guarantees it), set and non-empty.
-    fn required(&self, slot: Slot) -> Result<&'a str, StoreWriteError> {
+    pub(crate) fn required(&self, slot: Slot) -> Result<&'a str, StoreWriteError> {
         match self.raw(slot)? {
             Some(v) if !v.is_empty() => Ok(v),
             _ => Err(StoreWriteError::ArgumentEmpty {
@@ -584,8 +649,19 @@ impl<'a> Args<'a> {
 
     /// An optional slot: None when not configured or empty, an error when
     /// configured and its variable is unset.
-    fn optional(&self, slot: Slot) -> Result<Option<&'a str>, StoreWriteError> {
+    pub(crate) fn optional(&self, slot: Slot) -> Result<Option<&'a str>, StoreWriteError> {
         Ok(self.raw(slot)?.filter(|v| !v.is_empty()))
+    }
+
+    /// items.id=891: an entity-ids slot. Either a JSON array of ids (the form the
+    /// store tests use) or ONE id (the form a published entity variable has, which
+    /// is the only form LOAD allows a Focus). None when the slot is not configured
+    /// or empty.
+    pub(crate) fn list_or_one(&self, slot: Slot) -> Result<Option<Vec<String>>, StoreWriteError> {
+        match self.optional(slot)? {
+            Some(text) if !text.starts_with('[') => Ok(Some(vec![text.to_owned()])),
+            _ => self.list(slot),
+        }
     }
 
     /// A slot whose value is a JSON array of non-empty strings, at most

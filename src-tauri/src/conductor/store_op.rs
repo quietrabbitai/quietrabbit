@@ -25,6 +25,26 @@
 //                    decisions.id=510, by ids; a model cannot reach those ids,
 //                    so entity_changed below is the one a Focus uses)
 //
+// items.id=891 adds two more, the FOCUS-OWNED ENTITY writers (decisions.id=507,
+// 940 ruling 2). They write the persona's personal.db, not outputs.db, and are
+// run by conductor::entity_writer:
+//
+//   entity_find_or_create  persistence::owned_entity_store: one device the Focus
+//                          owns, found by a handle, by name, or by the replay of
+//                          this very row, else created. PUBLISHES the entity id.
+//   entity_fact_put        owned_entity_store::put_owned_fact: one catalogued fact
+//                          (conductor::device_fields) on an entity this pass
+//                          published. An unknown field fails the pass.
+//
+// A model never names an entity id. Every entity slot of case_open, case_link,
+// delta_record, delta_changed and entity_fact_put must be the id PUBLISHED by an
+// earlier entity_find_or_create row (LOAD), the model picks an existing device by
+// an opaque E- handle (a Handle slot), and the store checks again that the entity
+// is this Focus's and active before the write. Both new operations save the
+// user's equipment, so both are gated by the collection consent. They are refused
+// at LOAD in a Focus that is not focus_level, because the consent gate never
+// consults such a Focus.
+//
 // items.id=889 adds four more (decisions.id=940, handoff 629 gap G2):
 //
 //   case_select      session_store::put_session_variable on active_case_id,
@@ -87,6 +107,7 @@ use serde::{Deserialize, Deserializer};
 use crate::conductor::bound_spec::{self, Presence, Source, WRITE_MODE};
 use crate::conductor::guard::Condition;
 use crate::conductor::tokens::{is_system_token, ActionDefinition};
+use crate::persistence::focus_composition_store::CollectionPosture;
 
 // ---------------------------------------------------------------------------
 // Operations and slots
@@ -106,11 +127,13 @@ pub enum Op {
     CaseLink,
     EntityChanged,
     SessionClear,
+    EntityFindOrCreate,
+    EntityFactPut,
 }
 
 impl Op {
     /// The closed set, in documentation order.
-    pub const ALL: [Op; 12] = [
+    pub const ALL: [Op; 14] = [
         Op::Latch,
         Op::SessionPut,
         Op::CaseOpen,
@@ -123,6 +146,8 @@ impl Op {
         Op::CaseLink,
         Op::EntityChanged,
         Op::SessionClear,
+        Op::EntityFindOrCreate,
+        Op::EntityFactPut,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -139,6 +164,52 @@ impl Op {
             Op::CaseLink => "case_link",
             Op::EntityChanged => "entity_changed",
             Op::SessionClear => "session_clear",
+            Op::EntityFindOrCreate => "entity_find_or_create",
+            Op::EntityFactPut => "entity_fact_put",
+        }
+    }
+
+    /// items.id=891: true for the two operations that write a Focus-owned entity
+    /// in personal.db (conductor::entity_writer), as opposed to the stores in
+    /// outputs.db. Exhaustive on purpose.
+    pub fn is_entity_op(self) -> bool {
+        match self {
+            Op::EntityFindOrCreate | Op::EntityFactPut => true,
+            Op::Latch
+            | Op::SessionPut
+            | Op::CaseOpen
+            | Op::CaseUpdate
+            | Op::StrategyAppend
+            | Op::DeltaRecord
+            | Op::DeltaConfirm
+            | Op::DeltaChanged
+            | Op::CaseSelect
+            | Op::CaseLink
+            | Op::EntityChanged
+            | Op::SessionClear => false,
+        }
+    }
+
+    /// items.id=891: true for the operations that take an ENTITY ID argument, which
+    /// the lifecycle verifies (owned by this Focus, active) before the write:
+    /// case_open, case_link and delta_changed (slot entity), delta_record (slot
+    /// entities) and entity_fact_put (slot entity). Exhaustive on purpose.
+    pub fn takes_entity_ids(self) -> bool {
+        match self {
+            Op::CaseOpen
+            | Op::CaseLink
+            | Op::DeltaRecord
+            | Op::DeltaChanged
+            | Op::EntityFactPut => true,
+            Op::Latch
+            | Op::SessionPut
+            | Op::CaseUpdate
+            | Op::StrategyAppend
+            | Op::DeltaConfirm
+            | Op::CaseSelect
+            | Op::EntityChanged
+            | Op::SessionClear
+            | Op::EntityFindOrCreate => false,
         }
     }
 
@@ -169,7 +240,9 @@ impl Op {
             | Op::DeltaChanged
             | Op::CaseSelect
             | Op::CaseLink
-            | Op::EntityChanged => true,
+            | Op::EntityChanged
+            | Op::EntityFindOrCreate
+            | Op::EntityFactPut => true,
         }
     }
 
@@ -222,8 +295,13 @@ pub enum Slot {
     /// delta_changed: the delta id.
     Delta,
     /// case_select: a ticket handle. delta_confirm: a configuration-change
-    /// handle. The value of a model step's output, resolved store-side.
+    /// handle. entity_find_or_create (optional): a device handle. The value of a
+    /// model step's output, resolved store-side.
     Handle,
+    /// entity_find_or_create (optional): the subject class, colon-separated.
+    Class,
+    /// entity_fact_put: the catalogued field name.
+    Field,
 }
 
 impl Slot {
@@ -246,6 +324,8 @@ impl Slot {
             Slot::Tags => "tags",
             Slot::Delta => "delta",
             Slot::Handle => "handle",
+            Slot::Class => "class",
+            Slot::Field => "field",
         }
     }
 }
@@ -259,6 +339,9 @@ pub enum TargetRule {
     SessionName,
     /// Optional: the pass variable a new id is published under.
     PublishId,
+    /// Required: the pass variable the entity id is published under, because every
+    /// later entity slot must name it (items.id=891).
+    PublishIdRequired,
 }
 
 pub struct OpSpec {
@@ -363,6 +446,20 @@ pub const OP_SPECS: &[OpSpec] = &[
         optional: &[],
         needs_an_optional: false,
     },
+    OpSpec {
+        op: Op::EntityFindOrCreate,
+        target: TargetRule::PublishIdRequired,
+        required: &[Slot::Label],
+        optional: &[Slot::Handle, Slot::Class],
+        needs_an_optional: false,
+    },
+    OpSpec {
+        op: Op::EntityFactPut,
+        target: TargetRule::None,
+        required: &[Slot::Entity, Slot::Field, Slot::Value],
+        optional: &[],
+        needs_an_optional: false,
+    },
 ];
 
 /// Longest variable name a row may name.
@@ -385,7 +482,7 @@ pub struct StoreOp {
 pub enum StoreOpError {
     #[error("store_target or store_args is set without store_op (set: {0}): the three columns go together")]
     HalfSet(String),
-    #[error("unknown store_op '{0}' (expected one of latch, session_put, case_open, case_update, strategy_append, delta_record, delta_confirm, delta_changed, case_select, case_link, entity_changed, session_clear)")]
+    #[error("unknown store_op '{0}' (expected one of latch, session_put, case_open, case_update, strategy_append, delta_record, delta_confirm, delta_changed, case_select, case_link, entity_changed, session_clear, entity_find_or_create, entity_fact_put)")]
     UnknownOp(String),
     #[error("store_op '{0}' needs a store_target")]
     TargetRequired(&'static str),
@@ -462,6 +559,28 @@ pub enum StoreOpError {
         slot: &'static str,
         var: String,
     },
+    // -- items.id=891: the Focus-owned entity writers -------------------------
+    #[error("step '{action_id}': slot '{slot}' names '{var}', which is not the id published by an EARLIER entity_find_or_create row: a model never names an entity id, so an entity slot must name the variable an earlier entity_find_or_create row publishes")]
+    EntitySlotNotPublished {
+        action_id: String,
+        slot: &'static str,
+        var: String,
+    },
+    #[error("step '{action_id}': store_op '{op}' saves facts about the user's equipment and is allowed only in a Focus whose collection_posture is focus_level: the consent gate never consults a per_field Focus, so the row would write without the one setup consent")]
+    EntityOpNeedsFocusLevel { action_id: String, op: &'static str },
+}
+
+/// True for the slots that carry an entity id: the entity of case_open,
+/// case_link, delta_changed and entity_fact_put, and the entities of
+/// delta_record.
+fn is_entity_id_slot(op: Op, slot: Slot) -> bool {
+    matches!(
+        (op, slot),
+        (
+            Op::CaseOpen | Op::CaseLink | Op::DeltaChanged | Op::EntityFactPut,
+            Slot::Entity
+        ) | (Op::DeltaRecord, Slot::Entities)
+    )
 }
 
 /// Names a row may use for variables and published ids.
@@ -527,8 +646,12 @@ impl StoreOp {
         let target = match (spec.target, target) {
             (TargetRule::None, Some(_)) => return Err(StoreOpError::TargetNotAllowed(name)),
             (TargetRule::None, None) | (TargetRule::PublishId, None) => None,
-            (TargetRule::SessionName, None) => return Err(StoreOpError::TargetRequired(name)),
-            (TargetRule::SessionName, Some(t)) | (TargetRule::PublishId, Some(t)) => {
+            (TargetRule::SessionName, None) | (TargetRule::PublishIdRequired, None) => {
+                return Err(StoreOpError::TargetRequired(name))
+            }
+            (TargetRule::SessionName, Some(t))
+            | (TargetRule::PublishId, Some(t))
+            | (TargetRule::PublishIdRequired, Some(t)) => {
                 let t = t.trim();
                 if !valid_var_name(t) {
                     return Err(StoreOpError::BadTarget(t.to_owned()));
@@ -606,10 +729,10 @@ impl StoreOp {
     }
 
     /// The pass variable this row publishes a new id under (case_open and
-    /// delta_record with a store_target), else None.
+    /// delta_record with a store_target, entity_find_or_create always), else None.
     pub fn published_var(&self) -> Option<&str> {
         match self.op {
-            Op::CaseOpen | Op::DeltaRecord => self.target.as_deref(),
+            Op::CaseOpen | Op::DeltaRecord | Op::EntityFindOrCreate => self.target.as_deref(),
             _ => None,
         }
     }
@@ -642,14 +765,27 @@ impl StoreOp {
 /// run by the loader; this is the cross-row part. The per-PATH part ("the row
 /// that produces an argument actually runs before the writer on every path
 /// that runs the writer") is guard::analyze_composition.
+///
+/// items.id=891: `posture` is the Focus's declared collection_posture. The entity
+/// writers are refused in a per_field Focus (the consent gate never consults it),
+/// and every entity-id slot must name a variable an earlier entity_find_or_create
+/// row publishes.
 pub fn check_composition(
     steps: &[ActionDefinition],
     row_vars: &[Option<String>],
+    posture: CollectionPosture,
 ) -> Result<(), StoreOpError> {
     debug_assert_eq!(steps.len(), row_vars.len());
     for (i, step) in steps.iter().enumerate() {
         let Some(op) = &step.store_op else { continue };
         let action_id = step.action_id.clone();
+
+        if op.op.is_entity_op() && posture != CollectionPosture::FocusLevel {
+            return Err(StoreOpError::EntityOpNeedsFocusLevel {
+                action_id,
+                op: op.op.as_str(),
+            });
+        }
 
         // The target of session_put is a registered session name, and the latch
         // is out of its reach.
@@ -695,6 +831,24 @@ pub fn check_composition(
         for (slot_kind, var) in &op.args {
             let slot = slot_kind.as_str();
             let var = var.as_str();
+            // items.id=891: an entity-id slot names the id an earlier
+            // entity_find_or_create row published, and nothing else (not a model
+            // output, not a seeded name, not another writer's id).
+            if is_entity_id_slot(op.op, *slot_kind) {
+                let published_earlier = steps[..i].iter().any(|o| {
+                    o.store_op.as_ref().is_some_and(|w| {
+                        w.op == Op::EntityFindOrCreate && w.published_var() == Some(var)
+                    })
+                });
+                if !published_earlier {
+                    return Err(StoreOpError::EntitySlotNotPublished {
+                        action_id,
+                        slot,
+                        var: var.to_owned(),
+                    });
+                }
+                continue;
+            }
             // A handle is model output: not a seeded name (active_case_id holds
             // an internal id, locked_intent an intent) and not an id this pass
             // published (an internal id too). Refused before anything else so
@@ -1167,6 +1321,19 @@ mod tests {
             (TargetRule::None, vec!["case"], vec![])
         );
         assert_eq!(row(Op::SessionClear), (TargetRule::None, vec![], vec![]));
+        // items.id=891: the two Focus-owned entity writers.
+        assert_eq!(
+            row(Op::EntityFindOrCreate),
+            (
+                TargetRule::PublishIdRequired,
+                vec!["label"],
+                vec!["handle", "class"]
+            )
+        );
+        assert_eq!(
+            row(Op::EntityFactPut),
+            (TargetRule::None, vec!["entity", "field", "value"], vec![])
+        );
     }
 
     // -- composition checks ---------------------------------------------------
@@ -1204,6 +1371,18 @@ mod tests {
         (s, Some(out.to_owned()))
     }
 
+    /// An entity_find_or_create row that publishes `var`. Its label comes from the
+    /// variable `l`, which the test supplies with model("l", "l") before it.
+    fn ent(var: &str) -> (ActionDefinition, Option<String>) {
+        writer(
+            &format!("ent_{var}"),
+            "entity_find_or_create",
+            Some(var),
+            Some(r#"{"label":"l"}"#),
+            None,
+        )
+    }
+
     fn writer(
         id: &str,
         op: &str,
@@ -1223,8 +1402,15 @@ mod tests {
     }
 
     fn check(rows: Vec<(ActionDefinition, Option<String>)>) -> Result<(), StoreOpError> {
+        check_with(rows, CollectionPosture::FocusLevel)
+    }
+
+    fn check_with(
+        rows: Vec<(ActionDefinition, Option<String>)>,
+        posture: CollectionPosture,
+    ) -> Result<(), StoreOpError> {
         let (steps, vars): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
-        check_composition(&steps, &vars)
+        check_composition(&steps, &vars, posture)
     }
 
     fn put(target: &str, var: &str) -> (ActionDefinition, Option<String>) {
@@ -1338,8 +1524,8 @@ mod tests {
         };
         assert_eq!(
             check(vec![
-                model("e", "e"),
                 model("l", "l"),
+                ent("e"),
                 model("s", "s"),
                 open(),
                 update()
@@ -1348,8 +1534,8 @@ mod tests {
         );
         assert!(matches!(
             check(vec![
-                model("e", "e"),
                 model("l", "l"),
+                ent("e"),
                 model("s", "s"),
                 update(),
                 open()
@@ -1460,5 +1646,322 @@ mod tests {
     #[test]
     fn a_composition_without_writers_always_passes() {
         assert_eq!(check(vec![model("a", "v"), model("b", "w")]), Ok(()));
+    }
+
+    // -- items.id=891: the Focus-owned entity writers --------------------------
+
+    /// The five rows that take an entity id, each with its slot name and the
+    /// variable it names ("e").
+    fn rows_taking_an_entity() -> Vec<(&'static str, (ActionDefinition, Option<String>))> {
+        vec![
+            (
+                "case_open",
+                writer(
+                    "w",
+                    "case_open",
+                    None,
+                    Some(r#"{"entity":"e","label":"l"}"#),
+                    None,
+                ),
+            ),
+            (
+                "case_link",
+                writer(
+                    "w",
+                    "case_link",
+                    None,
+                    Some(r#"{"case":"c","entity":"e"}"#),
+                    None,
+                ),
+            ),
+            (
+                "delta_changed",
+                writer(
+                    "w",
+                    "delta_changed",
+                    None,
+                    Some(r#"{"delta":"c","entity":"e"}"#),
+                    None,
+                ),
+            ),
+            (
+                "delta_record",
+                writer(
+                    "w",
+                    "delta_record",
+                    None,
+                    Some(r#"{"entities":"e","description":"l"}"#),
+                    None,
+                ),
+            ),
+            (
+                "entity_fact_put",
+                writer(
+                    "w",
+                    "entity_fact_put",
+                    None,
+                    Some(r#"{"entity":"e","field":"l","value":"l"}"#),
+                    None,
+                ),
+            ),
+        ]
+    }
+
+    /// An entity slot names the id an EARLIER entity_find_or_create row published,
+    /// for every operation that takes one, and nothing else: not a model output,
+    /// not a later row's id, not another writer's published id, not a seeded name.
+    #[test]
+    fn every_entity_slot_must_name_an_earlier_published_entity_id() {
+        for (name, w) in rows_taking_an_entity() {
+            // The published id of an earlier entity row: loads.
+            assert_eq!(
+                check(vec![model("l", "l"), model("c", "c"), ent("e"), w.clone()]),
+                Ok(()),
+                "{name}"
+            );
+            // The same name produced by a MODEL step: refused, the id is the
+            // model's text.
+            assert!(
+                matches!(
+                    check(vec![
+                        model("l", "l"),
+                        model("c", "c"),
+                        model("e", "e"),
+                        w.clone()
+                    ]),
+                    Err(StoreOpError::EntitySlotNotPublished { .. })
+                ),
+                "{name}: a model output as an entity id"
+            );
+            // Published by a LATER entity row: refused.
+            assert!(
+                matches!(
+                    check(vec![model("l", "l"), model("c", "c"), w.clone(), ent("e")]),
+                    Err(StoreOpError::EntitySlotNotPublished { .. })
+                ),
+                "{name}: a later row's id"
+            );
+            // Nothing produces it.
+            assert!(
+                matches!(
+                    check(vec![model("l", "l"), model("c", "c"), w.clone()]),
+                    Err(StoreOpError::EntitySlotNotPublished { .. })
+                ),
+                "{name}: an unknown name"
+            );
+        }
+    }
+
+    /// A published CASE id, a seeded name and a system token cannot stand in for an
+    /// entity id either.
+    #[test]
+    fn a_case_id_a_seeded_name_or_a_token_is_not_an_entity_id() {
+        let link_with = |var: &str| {
+            writer(
+                "link",
+                "case_link",
+                None,
+                Some(&format!(r#"{{"case":"c","entity":"{var}"}}"#)),
+                None,
+            )
+        };
+        let open = || {
+            writer(
+                "open",
+                "case_open",
+                Some("new_case"),
+                Some(r#"{"entity":"e","label":"l"}"#),
+                None,
+            )
+        };
+        for var in ["new_case", "active_case_id", "locked_intent", "user_input"] {
+            assert!(
+                matches!(
+                    check(vec![
+                        model("l", "l"),
+                        model("c", "c"),
+                        ent("e"),
+                        open(),
+                        link_with(var)
+                    ]),
+                    Err(StoreOpError::EntitySlotNotPublished { .. })
+                ),
+                "{var}"
+            );
+        }
+    }
+
+    /// Only an entity_find_or_create row publishes an entity id: another entity row
+    /// may publish a second device (the affected one), and each slot picks its own.
+    #[test]
+    fn two_entity_rows_publish_two_ids() {
+        let link = writer(
+            "link",
+            "case_link",
+            None,
+            Some(r#"{"case":"new_case","entity":"affected"}"#),
+            None,
+        );
+        let open = writer(
+            "open",
+            "case_open",
+            Some("new_case"),
+            Some(r#"{"entity":"e","label":"l"}"#),
+            None,
+        );
+        assert_eq!(
+            check(vec![model("l", "l"), ent("e"), ent("affected"), open, link]),
+            Ok(())
+        );
+    }
+
+    /// The entity writers save the user's equipment, so they are for a focus_level
+    /// Focus only: a per_field Focus is never consulted by the consent gate.
+    #[test]
+    fn the_entity_writers_are_refused_in_a_per_field_focus() {
+        let put = writer(
+            "put",
+            "entity_fact_put",
+            None,
+            Some(r#"{"entity":"e","field":"l","value":"l"}"#),
+            None,
+        );
+        // The first entity row of the Focus is the one named.
+        assert!(matches!(
+            check_with(
+                vec![model("l", "l"), ent("e"), put.clone()],
+                CollectionPosture::PerField
+            ),
+            Err(StoreOpError::EntityOpNeedsFocusLevel {
+                op: "entity_find_or_create",
+                ..
+            })
+        ));
+        assert!(matches!(
+            check_with(vec![model("l", "l"), ent("e")], CollectionPosture::PerField),
+            Err(StoreOpError::EntityOpNeedsFocusLevel { .. })
+        ));
+        assert_eq!(
+            check_with(
+                vec![model("l", "l"), ent("e"), put],
+                CollectionPosture::FocusLevel
+            ),
+            Ok(())
+        );
+        // A Focus with no entity writer loads in either posture.
+        assert_eq!(
+            check_with(vec![model("l", "l")], CollectionPosture::PerField),
+            Ok(())
+        );
+    }
+
+    /// entity_find_or_create must publish its id (every later entity slot names
+    /// it), and its handle slot is model output, never a bound name or an id this
+    /// pass published.
+    #[test]
+    fn find_or_create_needs_a_target_and_takes_a_model_handle_only() {
+        assert_eq!(
+            parse("entity_find_or_create", None, Some(r#"{"label":"l"}"#)),
+            Err(StoreOpError::TargetRequired("entity_find_or_create"))
+        );
+        let with_handle = |handle: &str| {
+            writer(
+                "ent2",
+                "entity_find_or_create",
+                Some("e2"),
+                Some(&format!(r#"{{"label":"l","handle":"{handle}"}}"#)),
+                None,
+            )
+        };
+        assert_eq!(
+            check(vec![model("l", "l"), model("h", "h"), with_handle("h")]),
+            Ok(())
+        );
+        for bad in ["active_case_id", "e"] {
+            assert!(
+                matches!(
+                    check(vec![model("l", "l"), ent("e"), with_handle(bad)]),
+                    Err(StoreOpError::HandleNotFromModel { .. })
+                ),
+                "{bad}"
+            );
+        }
+        // Slot names: handle and class are optional, label is required.
+        assert!(parse(
+            "entity_find_or_create",
+            Some("e"),
+            Some(r#"{"label":"l","handle":"h","class":"c"}"#)
+        )
+        .is_ok());
+        assert!(matches!(
+            parse(
+                "entity_find_or_create",
+                Some("e"),
+                Some(r#"{"handle":"h"}"#)
+            ),
+            Err(StoreOpError::MissingSlot { slot: "label", .. })
+        ));
+        assert!(matches!(
+            parse(
+                "entity_find_or_create",
+                Some("e"),
+                Some(r#"{"label":"l","entity":"x"}"#)
+            ),
+            Err(StoreOpError::UnknownSlot { .. })
+        ));
+        // entity_fact_put takes no target and needs all three slots.
+        assert_eq!(
+            parse(
+                "entity_fact_put",
+                Some("t"),
+                Some(r#"{"entity":"e","field":"f","value":"v"}"#)
+            ),
+            Err(StoreOpError::TargetNotAllowed("entity_fact_put"))
+        );
+        assert!(matches!(
+            parse(
+                "entity_fact_put",
+                None,
+                Some(r#"{"entity":"e","field":"f"}"#)
+            ),
+            Err(StoreOpError::MissingSlot { slot: "value", .. })
+        ));
+    }
+
+    /// The new operations' own classification: both are entity writers, both
+    /// require consent, and the ones that carry an entity id are exactly the five.
+    #[test]
+    fn the_entity_classifications_are_exactly_these() {
+        let entity_ops: Vec<&str> = Op::ALL
+            .iter()
+            .filter(|o| o.is_entity_op())
+            .map(|o| o.as_str())
+            .collect();
+        assert_eq!(entity_ops, ["entity_find_or_create", "entity_fact_put"]);
+        let with_ids: Vec<&str> = Op::ALL
+            .iter()
+            .filter(|o| o.takes_entity_ids())
+            .map(|o| o.as_str())
+            .collect();
+        assert_eq!(
+            with_ids,
+            [
+                "case_open",
+                "delta_record",
+                "delta_changed",
+                "case_link",
+                "entity_fact_put"
+            ]
+        );
+        assert!(Op::EntityFindOrCreate.requires_collection_consent());
+        assert!(Op::EntityFactPut.requires_collection_consent());
+        assert!(!Op::EntityFindOrCreate.writes_case() && !Op::EntityFactPut.writes_case());
+        assert_eq!(Op::EntityFindOrCreate.as_str(), "entity_find_or_create");
+        assert_eq!(
+            parse("entity_find_or_create", Some("e"), Some(r#"{"label":"l"}"#))
+                .unwrap()
+                .published_var(),
+            Some("e")
+        );
     }
 }

@@ -27,8 +27,10 @@
 //                      confirmation of decisions.id=515).
 //   new issue          extract entity, label, affected entity and symptoms (four
 //                      local calls, the three that only feed writers run only
-//                      while the chat saves), open the case, make it the active
-//                      case, link the affected entity, reply.
+//                      while the chat saves), find or make the device and the
+//                      affected device (entity_find_or_create, items.id=891), open
+//                      the case, make it the active case, link the affected
+//                      device, reply.
 //   continue ticket    the model names a HANDLE from open_tickets_brief,
 //                      case_select resolves it store-side, reply.
 //   check in update    the model says whether an event happened on the device
@@ -217,11 +219,28 @@ pub fn rows(variant: Variant) -> Vec<DraftRow> {
             "Summarise the symptoms. Message: {user_input}",
             vec![nc, none],
         ),
+        // items.id=891: the device is an entity this Focus OWNS. A model never
+        // names an entity id: it says a device name, entity_find_or_create finds
+        // or makes the device and publishes its id, and the case names that id.
+        w(
+            "nc_find",
+            "entity_find_or_create",
+            Some("subject_ref"),
+            Some(r#"{"label":"entity_ref"}"#),
+            vec![nc, none, saves],
+        ),
+        w(
+            "aff_find",
+            "entity_find_or_create",
+            Some("affected_entity"),
+            Some(r#"{"label":"affected_ref"}"#),
+            vec![nc, none, ("affected_ref", "present", None), saves],
+        ),
         w(
             "open_case",
             "case_open",
             Some("new_case"),
-            Some(r#"{"entity":"entity_ref","label":"label","symptoms":"symptoms"}"#),
+            Some(r#"{"entity":"subject_ref","label":"label","symptoms":"symptoms"}"#),
             vec![nc, none, saves],
         ),
         w(
@@ -235,7 +254,7 @@ pub fn rows(variant: Variant) -> Vec<DraftRow> {
             "link_affected",
             "case_link",
             None,
-            Some(r#"{"case":"new_case","entity":"affected_ref"}"#),
+            Some(r#"{"case":"new_case","entity":"affected_entity"}"#),
             vec![
                 ("new_case", "present", None),
                 ("affected_ref", "present", None),

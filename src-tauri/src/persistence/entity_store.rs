@@ -471,7 +471,6 @@ const OWNER_FOCUS_MAX_CHARS: usize = 64;
 /// import and a plain create_entity all leave it NULL. There is no top-level
 /// parent, so a Focus-owned entity is always a root (relationships and
 /// hierarchy are deferred in R1, decisions.id=940 ruling 2).
-#[allow(dead_code)] // items.id=891 stage 3 (the entity writer) is the first non-test caller
 pub(crate) async fn create_owned_entity_conn(
     conn: &mut SqliteConnection,
     owner_focus: &str,
