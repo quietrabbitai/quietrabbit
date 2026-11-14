@@ -331,6 +331,15 @@ pub struct ActionDefinition {
     /// is database-only) and for a block row. Populated by the DB loader from
     /// focus_block_compositions.store_op/store_target/store_args.
     pub store_op: Option<StoreOp>,
+    /// items.id=894 (decisions.id=941 point 2): set only on a step that a MODEL
+    /// BLOCK (cb-12, cb-13, cb-14) expanded into at LOAD. It names the block and
+    /// what the step needs: task type, difficulty, output size, the allowed range
+    /// (quality floor, highest tier, destinations) already clamped to the Focus
+    /// ceiling, and an optional model-class preference, never a model id. The
+    /// step is otherwise ordinary (block_stable_id is None, so it never reaches a
+    /// pure handler). The executor does not read this field yet: model choice
+    /// stays on executor::select_model() until the resolver (B2) reads it.
+    pub requirement: Option<crate::conductor::model_block::config::ModelRequirement>,
 }
 
 impl ActionDefinition {
@@ -432,6 +441,7 @@ mod tests {
             declared_inputs: Vec::new(),
             store_op: None,
             and_guards: Vec::new(),
+            requirement: None,
         }
     }
 

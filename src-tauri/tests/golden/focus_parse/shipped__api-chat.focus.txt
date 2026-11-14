@@ -38,6 +38,7 @@ ActionDefinition {
         "user_input",
     ],
     store_op: None,
+    requirement: None,
 }
 field_requirements: {}
 options_override: {}

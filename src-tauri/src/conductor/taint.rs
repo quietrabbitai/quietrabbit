@@ -159,6 +159,7 @@ mod tests {
             declared_inputs: Vec::new(),
             store_op: None,
             and_guards: Vec::new(),
+            requirement: None,
         }
     }
 

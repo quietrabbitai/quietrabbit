@@ -57,9 +57,14 @@ pub struct BlockHandler {
     /// guard analysis needs it, because ActionDefinition.output_var is None for
     /// a block row. None when the customization does not name one.
     pub output_var: fn(&serde_json::Value) -> Option<String>,
+    /// A valid customization, for the admission test (items.id=894).
+    pub example: fn() -> serde_json::Value,
 }
 
-/// The registry. Handlers: cb-06 only (items.id=129 Stage 1).
+/// The pure-block registry. Handlers: cb-06 only (items.id=129 Stage 1).
+/// A MODEL block (cb-12, cb-13, cb-14, items.id=894) is not here on purpose: it
+/// has no handler and never reaches execute_block_step(). It expands at LOAD into
+/// an ordinary step. Use registered_block() to ask about every kind.
 pub fn block_handler(stable_id: &str) -> Option<&'static BlockHandler> {
     match stable_id {
         "cb-06" => Some(&CB06),
@@ -67,9 +72,36 @@ pub fn block_handler(stable_id: &str) -> Option<&'static BlockHandler> {
     }
 }
 
-/// Every stable_id that has a handler. Used by tests to hold the registry and
-/// the building_blocks mirror together.
-pub const REGISTERED_STABLE_IDS: &[&str] = &["cb-06"];
+/// Every stable_id that has a pure handler.
+pub const PURE_STABLE_IDS: &[&str] = &["cb-06"];
+
+/// Every registered stable_id of every kind (pure, model, seed). Used by tests to
+/// hold the registry and the building_blocks mirror together, and by the
+/// admission test (conductor::model_block::admission_tests).
+pub const REGISTERED_STABLE_IDS: &[&str] = &["cb-06", "cb-12", "cb-13", "cb-14"];
+
+pub use crate::conductor::model_block::BlockKind;
+
+/// One registry lookup for the loader (items.id=894): a pure handler, or a model
+/// block's spec. (BlockKind::Seed has no members yet: the first seeds are B7a's.)
+pub enum RegisteredBlock {
+    Pure(&'static BlockHandler),
+    Model(&'static crate::conductor::model_block::ModelBlockSpec),
+}
+
+pub fn registered_block(stable_id: &str) -> Option<RegisteredBlock> {
+    if let Some(h) = block_handler(stable_id) {
+        return Some(RegisteredBlock::Pure(h));
+    }
+    crate::conductor::model_block::model_block_spec(stable_id).map(RegisteredBlock::Model)
+}
+
+pub fn block_kind(stable_id: &str) -> Option<BlockKind> {
+    registered_block(stable_id).map(|b| match b {
+        RegisteredBlock::Pure(_) => BlockKind::Pure,
+        RegisteredBlock::Model(_) => BlockKind::Model,
+    })
+}
 
 // ---------------------------------------------------------------------------
 // cb-06 -- Quality/completeness assessment
@@ -80,7 +112,20 @@ static CB06: BlockHandler = BlockHandler {
     validate: cb06_validate,
     run: cb06_run,
     output_var: cb06_output_var,
+    example: cb06_example,
 };
+
+fn cb06_example() -> serde_json::Value {
+    serde_json::json!({
+        "input_var": "draft_output",
+        "output_var": "draft_quality_verdict",
+        "criteria": [
+            {"name": "draft_not_empty", "kind": "non_empty"},
+            {"name": "draft_min_length", "kind": "min_length", "min_length": 40}
+        ],
+        "on_fail": "advisory"
+    })
+}
 
 fn cb06_output_var(customization: &serde_json::Value) -> Option<String> {
     parse_cb06(customization).ok().map(|c| c.output_var)
@@ -288,12 +333,17 @@ mod tests {
     }
 
     #[test]
-    fn registry_knows_cb06_only() {
+    fn registry_knows_cb06_as_the_only_pure_handler() {
         assert!(block_handler("cb-06").is_some());
-        for id in ["cb-01", "cb-02", "cb-10", "pc-03", "pc-04", "nope", ""] {
-            assert!(block_handler(id).is_none(), "{id} must have no handler");
+        for id in [
+            "cb-01", "cb-02", "cb-10", "cb-12", "cb-13", "cb-14", "pc-03", "pc-04", "nope", "",
+        ] {
+            assert!(
+                block_handler(id).is_none(),
+                "{id} must have no pure handler"
+            );
         }
-        for id in REGISTERED_STABLE_IDS {
+        for id in PURE_STABLE_IDS {
             assert_eq!(block_handler(id).unwrap().stable_id, *id);
         }
     }

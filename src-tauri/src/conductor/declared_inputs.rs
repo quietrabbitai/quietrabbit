@@ -307,6 +307,7 @@ mod tests {
             declared_inputs: declared.iter().map(|d| (*d).to_owned()).collect(),
             store_op: None,
             and_guards: Vec::new(),
+            requirement: None,
         }
     }
 

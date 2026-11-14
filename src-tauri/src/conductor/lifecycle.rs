@@ -323,19 +323,18 @@ fn parse_offset(raw: &str) -> Result<Duration, String> {
 /// storage is string-native now (ExternalAccess::from_str()) -- this one
 /// exists solely because the .focus YAML authoring surface itself still
 /// uses the raw number (no YAML field-name/format change in this item's
-/// scope; AnonymousPreferred has no YAML-authorable form yet). Panics on an
-/// out-of-range value exactly as the retired ExternalAccess::from_legacy_tier()
-/// did -- .focus files are shipped/curated content, not user input.
-fn external_access_from_routing_tier_yaml(raw: u8) -> ExternalAccess {
+/// scope; AnonymousPreferred has no YAML-authorable form yet). An out-of-range
+/// value is a LOAD error (items.id=894 B0), not a panic: the same number also
+/// arrives through a shared.db customization row, which is unencrypted data.
+fn external_access_from_routing_tier_yaml(raw: u8) -> Result<ExternalAccess, String> {
     match raw {
-        1 => ExternalAccess::LocalOnly,
-        2 => ExternalAccess::AnonymousRequired,
-        3 => ExternalAccess::Unrestricted,
-        other => unreachable!(
-            "routing_tier/max_routing_tier value {other} is not 1, 2, or 3 -- \
-             .focus YAML authoring does not yet support AnonymousPreferred \
-             (items.id=529 scope item 4, unresolved)"
-        ),
+        1 => Ok(ExternalAccess::LocalOnly),
+        2 => Ok(ExternalAccess::AnonymousRequired),
+        3 => Ok(ExternalAccess::Unrestricted),
+        other => Err(format!(
+            "routing_tier value {other} is not 1, 2 or 3 (.focus authoring does not support \
+             anonymous_preferred)"
+        )),
     }
 }
 
@@ -411,7 +410,7 @@ fn build_action_definition(
     action_id: String,
     default_guide_id: &str,
     raw: NormalizedRawStep,
-) -> ActionDefinition {
+) -> Result<ActionDefinition, String> {
     let step_type = raw
         .step_type
         .as_deref()
@@ -425,7 +424,8 @@ fn build_action_definition(
     // this extraction.
     let raw_routing_tier = raw.routing_tier.unwrap_or(1);
     let requires_user_handoff = raw.requires_user_handoff.unwrap_or(raw_routing_tier == 3);
-    let routing_tier = external_access_from_routing_tier_yaml(raw_routing_tier);
+    let routing_tier = external_access_from_routing_tier_yaml(raw_routing_tier)
+        .map_err(|e| format!("step '{action_id}': {e}"))?;
     let external_access_override = if routing_tier == ExternalAccess::Unrestricted {
         None
     } else {
@@ -433,7 +433,7 @@ fn build_action_definition(
     };
     let revisitable = step_type.default_revisitable();
 
-    ActionDefinition {
+    Ok(ActionDefinition {
         display_name: raw.display_name.unwrap_or_else(|| action_id.clone()),
         guide_id: raw.guide_id.unwrap_or_else(|| default_guide_id.to_owned()),
         task_type: raw.task_type.unwrap_or_else(|| "general".to_owned()),
@@ -453,8 +453,17 @@ fn build_action_definition(
         declared_inputs: raw.declared_inputs.unwrap_or_default(),
         store_op: None,
         and_guards: Vec::new(),
+        requirement: None,
         action_id,
-    }
+    })
+}
+
+/// items.id=894 B0: the statuses at which focus_runs.user_input is cleared, because
+/// the run can no longer resume. Every writer of one of these statuses uses this
+/// list (write_focus_run_record, output_store::set_focus_run_status and
+/// cancel_run via output_store::USER_INPUT_CLEARED_STATUSES).
+pub(crate) fn user_input_is_cleared_at(status: &str) -> bool {
+    crate::persistence::output_store::USER_INPUT_CLEARED_STATUSES.contains(&status)
 }
 
 /// Convert RawFocusFile -> FocusDefinition.
@@ -565,28 +574,35 @@ fn parse_focus_definition(raw: RawFocusFile) -> Result<FocusDefinition, Lifecycl
             // path) -- external_access_override deliberately NOT gated on
             // requires_user_handoff (the two conditions used to always
             // coincide; see git blame for the full historical reasoning).
-            steps.push(build_action_definition(
-                action_id_key.clone(),
-                &default_guide_id,
-                NormalizedRawStep {
-                    display_name: raw_step.display_name,
-                    guide_id: raw_step.guide_id,
-                    task_type: raw_step.task_type,
-                    routing_tier: raw_step.routing_tier,
-                    requires_user_handoff: raw_step.requires_user_handoff,
-                    step_type: raw_step.step_type,
-                    output_var: raw_step.output_var,
-                    prompt_template: raw_step.prompt_template,
-                    field_requirements,
-                    options_override,
-                    declared_inputs: raw_step.declared_inputs,
-                },
-            ));
+            steps.push(
+                build_action_definition(
+                    action_id_key.clone(),
+                    &default_guide_id,
+                    NormalizedRawStep {
+                        display_name: raw_step.display_name,
+                        guide_id: raw_step.guide_id,
+                        task_type: raw_step.task_type,
+                        routing_tier: raw_step.routing_tier,
+                        requires_user_handoff: raw_step.requires_user_handoff,
+                        step_type: raw_step.step_type,
+                        output_var: raw_step.output_var,
+                        prompt_template: raw_step.prompt_template,
+                        field_requirements,
+                        options_override,
+                        declared_inputs: raw_step.declared_inputs,
+                    },
+                )
+                .map_err(|e| {
+                    LifecycleError::ValidationFailed(format!("Focus '{focus_id}': {e}"))
+                })?,
+            );
         }
     }
 
     let max_routing_tier =
-        external_access_from_routing_tier_yaml(raw.max_routing_tier.unwrap_or(1));
+        external_access_from_routing_tier_yaml(raw.max_routing_tier.unwrap_or(1)).map_err(|e| {
+            LifecycleError::ValidationFailed(format!("Focus '{focus_id}': max_routing_tier: {e}"))
+        })?;
 
     Ok(FocusDefinition {
         display_name: raw.display_name.unwrap_or_else(|| focus_id.clone()),
@@ -659,7 +675,7 @@ struct RawStepFromDb {
 ///
 /// The validated JSON is then carried on the step for execute_step(), which
 /// dispatches through the same block_handler() registry.
-async fn load_focus_definition_from_db(
+pub(crate) async fn load_focus_definition_from_db(
     pool: &sqlx::SqlitePool,
     focus_id: &str,
 ) -> Result<Option<FocusDefinition>, LifecycleError> {
@@ -812,6 +828,7 @@ async fn load_focus_definition_from_db(
                         declared_inputs: raw_step.declared_inputs,
                     },
                 )
+                .map_err(|e| LifecycleError::ValidationFailed(format!("Focus '{focus_id}': {e}")))?
             }
             Some(stable_id) => {
                 // Check 1: mirror membership.
@@ -825,9 +842,10 @@ async fn load_focus_definition_from_db(
                         row.action_id
                     )));
                 }
-                // Check 2: handler existence, distinct from membership.
-                let Some(handler) = crate::conductor::block_dispatch::block_handler(stable_id)
-                else {
+                // Check 2: registration, distinct from membership (items.id=894:
+                // one lookup for every kind of block).
+                use crate::conductor::block_dispatch::{registered_block, RegisteredBlock};
+                let Some(registered) = registered_block(stable_id) else {
                     return Err(LifecycleError::ValidationFailed(format!(
                         "Focus '{focus_id}' step '{}': block '{stable_id}' is cataloged but has \
                          no compiled-in handler",
@@ -841,39 +859,73 @@ async fn load_focus_definition_from_db(
                             row.action_id
                         ))
                     })?;
-                // Check 3: the handler's typed customization struct.
-                (handler.validate)(&block_customization).map_err(|e| {
-                    LifecycleError::ValidationFailed(format!(
-                        "Focus '{focus_id}' step '{}': block '{stable_id}' customization: {e}",
-                        row.action_id
-                    ))
-                })?;
-                // LLM-generate-shaped fields are unused for a real block
-                // (items.id=496 judgment call 5) -- execute_step()'s
-                // dispatch on block_stable_id short-circuits before any of
-                // them are read. routing_tier is LocalOnly with no
-                // external_access_override: a block step is never external.
-                ActionDefinition {
-                    action_id: row.action_id.clone(),
-                    display_name: row.action_id.clone(),
-                    guide_id: default_guide_id.to_owned(),
-                    task_type: "general".to_owned(),
-                    routing_tier: ExternalAccess::LocalOnly,
-                    step_type: StepType::default(),
-                    output_var: None,
-                    prompt_template: String::new(),
-                    field_requirements: HashMap::new(),
-                    options_override: HashMap::new(),
-                    external_access_override: None,
-                    requires_user_handoff: false,
-                    revisitable: false,
-                    block_stable_id: Some(stable_id.clone()),
-                    block_customization: Some(block_customization),
-                    schedule_trigger: None,
-                    guard: None,
-                    declared_inputs: Vec::new(),
-                    store_op: None,
-                    and_guards: Vec::new(),
+                match registered {
+                    RegisteredBlock::Pure(handler) => {
+                        // Check 3: the handler's typed customization struct.
+                        (handler.validate)(&block_customization).map_err(|e| {
+                            LifecycleError::ValidationFailed(format!(
+                                "Focus '{focus_id}' step '{}': block '{stable_id}' customization: {e}",
+                                row.action_id
+                            ))
+                        })?;
+                        // LLM-generate-shaped fields are unused for a real block
+                        // (items.id=496 judgment call 5) -- execute_step()'s
+                        // dispatch on block_stable_id short-circuits before any of
+                        // them are read. routing_tier is LocalOnly with no
+                        // external_access_override: a block step is never external.
+                        ActionDefinition {
+                            action_id: row.action_id.clone(),
+                            display_name: row.action_id.clone(),
+                            guide_id: default_guide_id.to_owned(),
+                            task_type: "general".to_owned(),
+                            routing_tier: ExternalAccess::LocalOnly,
+                            step_type: StepType::default(),
+                            output_var: None,
+                            prompt_template: String::new(),
+                            field_requirements: HashMap::new(),
+                            options_override: HashMap::new(),
+                            external_access_override: None,
+                            requires_user_handoff: false,
+                            revisitable: false,
+                            block_stable_id: Some(stable_id.clone()),
+                            block_customization: Some(block_customization),
+                            schedule_trigger: None,
+                            guard: None,
+                            declared_inputs: Vec::new(),
+                            store_op: None,
+                            and_guards: Vec::new(),
+                            requirement: None,
+                        }
+                    }
+                    RegisteredBlock::Model(spec) => {
+                        // items.id=894: a MODEL block is parsed (typed, no unknown
+                        // key, closed vocabularies, the EXTERNAL_MODEL_BLOCKS_ALLOWED
+                        // range rule) and EXPANDED into an ordinary step, which then
+                        // goes through every lint below like any other row. The step
+                        // is clamped to this Focus's own ceiling.
+                        let fail = |e: String| {
+                            LifecycleError::ValidationFailed(format!(
+                                "Focus '{focus_id}' step '{}': block '{stable_id}': {e}",
+                                row.action_id
+                            ))
+                        };
+                        let parsed = (spec.parse)(
+                            &block_customization,
+                            crate::conductor::model_block::EXTERNAL_MODEL_BLOCKS_ALLOWED,
+                        )
+                        .map_err(fail)?;
+                        (spec.expand)(
+                            &parsed,
+                            &crate::conductor::model_block::ExpandInput {
+                                action_id: &row.action_id,
+                                focus_ceiling: max_routing_tier,
+                                settings: None,
+                                external_allowed:
+                                    crate::conductor::model_block::EXTERNAL_MODEL_BLOCKS_ALLOWED,
+                            },
+                        )
+                        .map_err(fail)?
+                    }
                 }
             }
         };
@@ -1033,6 +1085,7 @@ fn store_writer_step(
         schedule_trigger: None,
         guard: None,
         and_guards: Vec::new(),
+        requirement: None,
         declared_inputs: Vec::new(),
         store_op: Some(op),
     })
@@ -2043,18 +2096,36 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             .await?
             .is_some();
 
+        // items.id=894 B0: the run's input is kept only while the run can still
+        // resume. It is the blended chat window (up to HISTORY_WINDOW lines of
+        // User and Assistant turns), so it is cleared in this one chokepoint when
+        // the status becomes terminal, and it is not kept at all for a one-time
+        // (latched) chat, where nothing is to persist (decisions.id=509). An
+        // unreadable latch counts as latched: the failure direction is not
+        // writing. A run that belongs to no chat has no latch to honour.
+        let keep_input =
+            !user_input_is_cleared_at(status) && !self.chat_is_latched(&mut conn).await;
+
         if existing {
-            sqlx::query("UPDATE focus_runs SET status = ? WHERE id = ?")
-                .bind(status)
-                .bind(focus_run_id)
-                .execute(&mut conn)
-                .await?;
+            if keep_input {
+                sqlx::query("UPDATE focus_runs SET status = ? WHERE id = ?")
+                    .bind(status)
+                    .bind(focus_run_id)
+                    .execute(&mut conn)
+                    .await?;
+            } else {
+                sqlx::query("UPDATE focus_runs SET status = ?, user_input = NULL WHERE id = ?")
+                    .bind(status)
+                    .bind(focus_run_id)
+                    .execute(&mut conn)
+                    .await?;
+            }
         } else {
             sqlx::query(
                 "INSERT INTO focus_runs
                  (id, focus_id, status, is_fast_lane, is_quick_ask,
-                  topic_id, started_at, notes)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                  topic_id, user_input, started_at, notes)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(focus_run_id)
             .bind(&self.focus_id)
@@ -2062,6 +2133,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             .bind(if self.is_fast_lane { 1i32 } else { 0i32 })
             .bind(if self.is_quick_ask { 1i32 } else { 0i32 })
             .bind(self.topic_id.as_deref())
+            .bind(keep_input.then_some(self.user_input.as_str()))
             .bind(now())
             .bind("{}")
             .execute(&mut conn)
@@ -2069,6 +2141,20 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         }
 
         Ok(())
+    }
+
+    /// items.id=894 B0: whether this run's chat carries the one-time write latch
+    /// (session_store::write_mode on the persona's outputs.db). Fails closed: a
+    /// context key that cannot be validated or a latch that cannot be read counts
+    /// as latched. No context key means the run belongs to no chat: not latched.
+    async fn chat_is_latched(&self, conn: &mut SqliteConnection) -> bool {
+        let Some(key) = self.context_key.as_deref() else {
+            return false;
+        };
+        !matches!(
+            crate::persistence::session_store::write_mode(conn, key).await,
+            Ok(crate::persistence::session_store::WriteMode::Open)
+        )
     }
 
     /// Bounded wrapper around write_focus_run_record() for the failure/
@@ -4770,6 +4856,33 @@ mod tests {
         );
     }
 
+    // items.id=894 B0: an out-of-range tier is a LOAD error, never a panic.
+    #[test]
+    fn out_of_range_routing_tier_is_a_load_error_not_a_panic() {
+        for bad in [0u8, 4, 7, 255] {
+            let mut steps_map = IndexMap::new();
+            steps_map.insert("step_a".to_owned(), single_step_raw(Some(bad), None));
+            let mut raw = minimal_raw();
+            raw.max_routing_tier = Some(3);
+            raw.steps = Some(steps_map);
+            match parse_focus_definition(raw) {
+                Err(LifecycleError::ValidationFailed(m)) => {
+                    assert!(m.contains("step_a"), "{m}");
+                    assert!(m.contains(&format!("routing_tier value {bad}")), "{m}");
+                }
+                other => panic!("tier {bad}: expected ValidationFailed, got {other:?}"),
+            }
+        }
+        let mut raw = minimal_raw();
+        raw.max_routing_tier = Some(9);
+        match parse_focus_definition(raw) {
+            Err(LifecycleError::ValidationFailed(m)) => {
+                assert!(m.contains("max_routing_tier"), "{m}")
+            }
+            other => panic!("expected ValidationFailed, got {other:?}"),
+        }
+    }
+
     // -- YAML parser parity (items.id=733) ----------------------------------
     //
     // The snapshots in tests/golden/focus_parse/ were generated with serde_yaml
@@ -6891,6 +7004,7 @@ mod tests {
                 declared_inputs: Vec::new(),
                 store_op: None,
                 and_guards: Vec::new(),
+                requirement: None,
             });
             run.focus_def = Some(def);
             let mut personal_track = PersonalTrack::new();
@@ -6970,6 +7084,7 @@ mod tests {
             declared_inputs: Vec::new(),
             store_op: None,
             and_guards: Vec::new(),
+            requirement: None,
         });
         run.focus_def = Some(def);
         let mut personal_track = PersonalTrack::new();
@@ -12356,6 +12471,326 @@ steps:
             assert_eq!(case.outcome.as_deref(), Some("restarted the router"));
         })
         .await;
+    }
+
+    // -------------------------------------------------------------------------
+    // items.id=894 B0: focus_runs.user_input is written with the row and cleared
+    // when the run can no longer resume.
+    // -------------------------------------------------------------------------
+
+    const WINDOW: &str = "User: hi\nAssistant: hello there\nUser: write me a letter\n";
+
+    async fn stored_user_input(run: &FocusRun) -> Option<String> {
+        let mut conn = open_outputs_db(&run.user_id, &run.persona_id, CRISIS_TEST_KEY_HEX)
+            .await
+            .expect("open_outputs_db");
+        sqlx::query_scalar("SELECT user_input FROM focus_runs WHERE id = ?")
+            .bind(run.focus_run_id.as_deref().unwrap())
+            .fetch_one(&mut conn)
+            .await
+            .expect("the focus_runs row exists")
+    }
+
+    fn run_with_input() -> FocusRun {
+        let mut run = failure_ready_run(false);
+        run.user_input = WINDOW.to_owned();
+        run
+    }
+
+    #[tokio::test]
+    async fn user_input_is_written_at_insert_and_kept_while_the_run_can_still_resume() {
+        with_temp_data_root(async {
+            let run = run_with_input();
+            run.write_focus_run_record("initializing").await.unwrap();
+            assert_eq!(stored_user_input(&run).await.as_deref(), Some(WINDOW));
+            // Every non-terminal status keeps it, awaiting_user above all.
+            for status in [
+                "running",
+                "awaiting_user",
+                "awaiting_schedule",
+                "paused",
+                "awaiting_extract_confirm",
+                "awaiting_feedback",
+            ] {
+                run.write_focus_run_record(status).await.unwrap();
+                assert_eq!(
+                    stored_user_input(&run).await.as_deref(),
+                    Some(WINDOW),
+                    "status {status} must keep user_input"
+                );
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn user_input_is_null_after_each_terminal_status_through_the_lifecycle_writer() {
+        with_temp_data_root(async {
+            for terminal in ["complete", "cancelled", "failed"] {
+                let run = run_with_input();
+                run.write_focus_run_record("running").await.unwrap();
+                run.write_focus_run_record("awaiting_user").await.unwrap();
+                assert_eq!(stored_user_input(&run).await.as_deref(), Some(WINDOW));
+                run.write_focus_run_record(terminal).await.unwrap();
+                assert_eq!(
+                    stored_user_input(&run).await,
+                    None,
+                    "{terminal} must clear user_input"
+                );
+            }
+            // A run inserted directly at a terminal status never stores it.
+            let run = run_with_input();
+            run.write_focus_run_record("failed").await.unwrap();
+            assert_eq!(stored_user_input(&run).await, None);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn the_other_writers_of_a_terminal_status_clear_user_input_too() {
+        with_temp_data_root(async {
+            // output_store::set_focus_run_status (submit_extract_confirm sets complete).
+            for terminal in ["complete", "cancelled", "failed"] {
+                let run = run_with_input();
+                run.write_focus_run_record("awaiting_user").await.unwrap();
+                crate::persistence::output_store::set_focus_run_status(
+                    &run.user_id,
+                    &run.persona_id,
+                    CRISIS_TEST_KEY_HEX,
+                    run.focus_run_id.as_deref().unwrap(),
+                    terminal,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    stored_user_input(&run).await,
+                    None,
+                    "set_focus_run_status {terminal}"
+                );
+            }
+            // A non-terminal status through the same writer keeps it.
+            let run = run_with_input();
+            run.write_focus_run_record("awaiting_user").await.unwrap();
+            crate::persistence::output_store::set_focus_run_status(
+                &run.user_id,
+                &run.persona_id,
+                CRISIS_TEST_KEY_HEX,
+                run.focus_run_id.as_deref().unwrap(),
+                "awaiting_extract_confirm",
+            )
+            .await
+            .unwrap();
+            assert_eq!(stored_user_input(&run).await.as_deref(), Some(WINDOW));
+
+            // cancel_focus_run, for a parked run.
+            let run = run_with_input();
+            run.write_focus_run_record("awaiting_user").await.unwrap();
+            crate::persistence::output_store::cancel_focus_run(
+                &run.user_id,
+                &run.persona_id,
+                CRISIS_TEST_KEY_HEX,
+                run.focus_run_id.as_deref().unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(stored_user_input(&run).await, None, "cancel_focus_run");
+        })
+        .await;
+    }
+
+    async fn latch(run: &FocusRun, chat: &str) {
+        let mut conn = open_outputs_db(&run.user_id, &run.persona_id, CRISIS_TEST_KEY_HEX)
+            .await
+            .unwrap();
+        crate::persistence::session_store::latch_write_suppressed(
+            &mut conn,
+            chat,
+            "tech-support",
+            run.focus_run_id.as_deref().unwrap(),
+        )
+        .await
+        .expect("latch must set");
+    }
+
+    /// decisions.id=509: a one-time (latched) chat persists nothing, so the run row
+    /// does not keep the chat window either.
+    #[tokio::test]
+    async fn a_latched_chat_never_stores_user_input_and_a_mid_run_latch_clears_it() {
+        with_temp_data_root(async {
+            // Latched before the run starts: the insert stores NULL.
+            let mut run = run_with_input();
+            run.context_key = Some("chat-latched".to_owned());
+            latch(&run, "chat-latched").await;
+            run.write_focus_run_record("initializing").await.unwrap();
+            assert_eq!(stored_user_input(&run).await, None);
+            run.write_focus_run_record("awaiting_user").await.unwrap();
+            assert_eq!(stored_user_input(&run).await, None);
+
+            // Latched DURING the run (the turn that declares the one-time session):
+            // stored at insert, cleared at the next status write.
+            let mut run = run_with_input();
+            run.context_key = Some("chat-mid".to_owned());
+            run.write_focus_run_record("initializing").await.unwrap();
+            assert_eq!(stored_user_input(&run).await.as_deref(), Some(WINDOW));
+            latch(&run, "chat-mid").await;
+            run.write_focus_run_record("awaiting_user").await.unwrap();
+            assert_eq!(stored_user_input(&run).await, None);
+
+            // An open chat keeps it; a run with no chat has no latch to honour.
+            let mut run = run_with_input();
+            run.context_key = Some("chat-open".to_owned());
+            run.write_focus_run_record("awaiting_user").await.unwrap();
+            assert_eq!(stored_user_input(&run).await.as_deref(), Some(WINDOW));
+            let run = run_with_input();
+            assert!(run.context_key.is_none());
+            run.write_focus_run_record("awaiting_user").await.unwrap();
+            assert_eq!(stored_user_input(&run).await.as_deref(), Some(WINDOW));
+
+            // A latch that cannot be read counts as latched: an invalid context key
+            // fails closed, so nothing is stored.
+            let mut run = run_with_input();
+            run.context_key = Some(String::new());
+            run.write_focus_run_record("awaiting_user").await.unwrap();
+            assert_eq!(stored_user_input(&run).await, None);
+        })
+        .await;
+    }
+
+    // -- items.id=894 B0 hand-check: does resuming a requires_user_handoff step
+    // re-park? Found by reading, pinned here by running it. -------------------
+
+    /// CHARACTERIZATION TEST of today's behaviour, not a statement of intent. A run
+    /// parked on a requires_user_handoff step resumes AT that step
+    /// (resume_index, status awaiting_user) and execute() checks
+    /// requires_user_handoff BEFORE execute_step() with no bypass, so a resumed run
+    /// parks again every time. B5 (manual hand-off on chat passes, not parked
+    /// steps) is where this changes; update this test then.
+    #[tokio::test]
+    async fn characterization_resuming_a_requires_user_handoff_step_parks_it_again() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let (user_id, persona_id, key) = ("handoff-user", "handoff-persona", RESUME_TEST_KEY_HEX);
+        let pool = setup_shared_and_persona_for_resume_test(user_id, persona_id).await;
+        crate::persistence::focus_settings_store::create_focus_settings(
+            &pool,
+            persona_id,
+            "handoff-focus",
+            "isolated",
+            "persona_hidden",
+            1,
+            ExternalAccess::LocalOnly,
+            "protected",
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO focuses
+                (focus_id, display_name, description, version, max_routing_tier,
+                 output_type, suggest_in_focuses, multi_source_validation,
+                 generic_title_template, status, created_at, updated_at)
+             VALUES ('handoff-focus', 'Handoff', '', '1.0', 'local_only', 'general', '[]', 0,
+                     'Hidden item', 'shipped', datetime('now'), datetime('now'))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO focus_block_compositions
+                (id, focus_id, action_id, block_stable_id, sequence_index, created_at, updated_at)
+             VALUES ('handoff:step_a', 'handoff-focus', 'step_a', NULL, 0,
+                     datetime('now'), datetime('now'))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO focus_block_customization
+                (id, composition_id, persona_id, customization, created_at, updated_at)
+             VALUES ('handoff:step_a:default', 'handoff:step_a', NULL, ?, datetime('now'), datetime('now'))",
+        )
+        .bind(
+            serde_json::json!({"routing_tier": 1, "requires_user_handoff": true,
+                               "task_type": "quick_response", "output_var": "result",
+                               "prompt_template": "Say hello to {user_input}"})
+            .to_string(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let focus_run_id = uuid::Uuid::new_v4().to_string();
+        {
+            let mut conn = open_outputs_db(user_id, persona_id, key).await.unwrap();
+            sqlx::query(
+                "INSERT INTO focus_runs
+                 (id, focus_id, status, is_fast_lane, is_quick_ask, topic_id, user_input, started_at)
+                 VALUES (?, 'handoff-focus', 'initializing', 0, 0, NULL, 'hello', ?)",
+            )
+            .bind(&focus_run_id)
+            .bind(now())
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+
+        let rehydrate = || async {
+            rehydrate_focus_run::<SqliteDisclosureLogger>(
+                user_id.to_owned(),
+                persona_id.to_owned(),
+                focus_run_id.clone(),
+                pool.clone(),
+                Arc::new(ConductorScheduler::new()),
+                Some(key.to_owned()),
+                std::collections::HashSet::new(),
+                None,
+            )
+            .await
+            .expect("rehydrate_focus_run")
+        };
+
+        // First pass: the run reaches the handoff step and parks.
+        let mut run = rehydrate().await;
+        assert!(run.focus_def.as_ref().unwrap().steps[0].requires_user_handoff);
+        let first = run.resume_execution().await.unwrap();
+        assert_eq!(first.status, "awaiting_user");
+
+        // The user resumes. The run comes back AT the same step (not after it) ...
+        let mut run = rehydrate().await;
+        assert_eq!(
+            run.current_step, 0,
+            "status awaiting_user resumes AT the parked step"
+        );
+        // ... and parks again, with no way past it.
+        let second = run.resume_execution().await.unwrap();
+        assert_eq!(
+            second.status, "awaiting_user",
+            "a resumed handoff step re-parks"
+        );
+        let mut run = rehydrate().await;
+        assert_eq!(run.current_step, 0);
+        assert_eq!(
+            run.resume_execution().await.unwrap().status,
+            "awaiting_user"
+        );
+
+        // The row keeps its input while it is parked (B0).
+        let mut conn = open_outputs_db(user_id, persona_id, key).await.unwrap();
+        let kept: Option<String> =
+            sqlx::query_scalar("SELECT user_input FROM focus_runs WHERE id = ?")
+                .bind(&focus_run_id)
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(kept.as_deref(), Some("hello"));
+
+        match saved_root {
+            Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+            None => std::env::remove_var("QR_DATA_ROOT"),
+        }
     }
 }
 

@@ -1029,8 +1029,10 @@ pub async fn cancel_focus_run(
     }
 
     // Update only if not already terminal — no-op on complete/cancelled/failed.
+    // items.id=894 B0: a cancelled run can no longer resume, so it keeps no copy
+    // of its input (USER_INPUT_CLEARED_STATUSES).
     let changed = sqlx::query(
-        "UPDATE focus_runs SET status = 'cancelled'
+        "UPDATE focus_runs SET status = 'cancelled', user_input = NULL
          WHERE id = ? AND status NOT IN ('complete','cancelled','failed')",
     )
     .bind(run_id)
@@ -1064,14 +1066,32 @@ pub async fn set_focus_run_status(
 ) -> Result<(), OutputStoreError> {
     let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
 
-    sqlx::query("UPDATE focus_runs SET status = ? WHERE id = ?")
-        .bind(status)
-        .bind(focus_run_id)
-        .execute(&mut conn)
-        .await?;
+    // items.id=894 B0: a terminal status clears the run's input in the same
+    // statement (see USER_INPUT_CLEARED_STATUSES).
+    if USER_INPUT_CLEARED_STATUSES.contains(&status) {
+        sqlx::query("UPDATE focus_runs SET status = ?, user_input = NULL WHERE id = ?")
+            .bind(status)
+            .bind(focus_run_id)
+            .execute(&mut conn)
+            .await?;
+    } else {
+        sqlx::query("UPDATE focus_runs SET status = ? WHERE id = ?")
+            .bind(status)
+            .bind(focus_run_id)
+            .execute(&mut conn)
+            .await?;
+    }
 
     Ok(())
 }
+
+/// items.id=894 B0: the statuses at which focus_runs.user_input is set to NULL.
+/// The column holds the blended chat window a run was started with, kept only so
+/// a parked or interrupted run can resume (rehydrate_focus_run). A run in one of
+/// these statuses can no longer resume. A run parked and never finished keeps its
+/// copy until items.id=681 (retention sweep) and items.id=888 (archive hook)
+/// clear it: neither does yet.
+pub const USER_INPUT_CLEARED_STATUSES: &[&str] = &["complete", "cancelled", "failed"];
 
 /// Record a Gate 3 consent decision for a paused focus run (D6-352).
 /// decision: "approved" | "declined"

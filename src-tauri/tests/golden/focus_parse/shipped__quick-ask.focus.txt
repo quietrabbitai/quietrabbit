@@ -42,6 +42,7 @@ ActionDefinition {
     and_guards: [],
     declared_inputs: [],
     store_op: None,
+    requirement: None,
 }
 field_requirements: {}
 options_override: {"num_predict":512,"temperature":0.4}

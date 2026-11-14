@@ -1,0 +1,66 @@
+{
+  "exported": "2026-11-14",
+  "note": "Checked-in export of the qr_docs.db building_blocks catalog for the registered blocks. cb-06 is copied from the live row. cb-12, cb-13 and cb-14 are proposed by Code (items.id=894) until Chat-PM writes the real rows and re-exports. The admission test (conductor/model_block/admission_tests.rs) reads this file.",
+  "rows": [
+    {
+      "stable_id": "cb-06",
+      "name": "Quality/completeness assessment",
+      "kind": "pure",
+      "block_kind": "infrastructure",
+      "invocation_mode": "inline_composable",
+      "catalog_status": "confirmed",
+      "description": "Evaluates a draft, candidate, or record set against stated criteria and produces a pass/fail-with-gaps signal, optionally triggering finalization prompt. Source-aware weighting is a toggle, not a separate block.",
+      "known_adopters": "Class, Cooking, Travel, Writing Assistant, Research & Purchase's Evaluate stage",
+      "second_adopter_status": "confirmed",
+      "floor_declaration": "Local-only block. It makes no provider call and never sees PersonalTrack or the disclosure buffer. It reads one named output variable from the TaskTrack and writes a verdict containing criterion names and counts only, never the assessed content. It is never placed last in a Focus and never directly before an external or handoff step (enforced at LOAD).",
+      "capability_toggles": "per-criterion weight (0 keeps a criterion visible but never failing), criteria kinds non_empty and min_length, on_fail is advisory only (any other value fails at LOAD), required_fields and Custom criteria are not exposed, output_var may not be a system token and must differ from input_var.",
+      "generic_customization_notes": "JSON {input_var, output_var, criteria:[{name, kind: non_empty|min_length, min_length (required for min_length, forbidden for non_empty), weight (default 1.0)}], on_fail:\"advisory\"}, deny_unknown_fields, validated at LOAD, a missing input_var yields a not-passed verdict not an error. Writing Assistant usage: input_var draft_output, output_var draft_quality_verdict, criteria draft_not_empty (non_empty) and draft_min_length (min_length 40), on_fail advisory. Source: items.id=129 Stage 1, commits c49e2c1 and 1ad7762 (handoff 622).",
+      "source": "qr_docs.db building_blocks, copied 2026-11-14"
+    },
+    {
+      "stable_id": "cb-12",
+      "name": "Draft document",
+      "kind": "model",
+      "block_kind": "promoted_from_focus",
+      "invocation_mode": "inline_composable",
+      "catalog_status": "promotion_candidate",
+      "description": "Writes a first draft of a document from a structured brief (a list of points and facts), optional sender details and optional writer background, shaped by a document type (form, format note, length target, latitude, drafting parameters). Polish belongs to the voice block.",
+      "known_adopters": "Writing Assistant (planned rebuild, items.id=892); Tech Support outputs (planned second adopter, decisions.id=520 and 521)",
+      "second_adopter_status": "planned_second_adopter",
+      "floor_declaration": "Model block: it expands at LOAD into an ordinary model-call step, so Gate 1, the spend gate, Gate 2, Gate 3 and the declared-inputs lint all apply on the one existing path, and the block itself never has provider access. While EXTERNAL_MODEL_BLOCKS_ALLOWED is false it loads only at highest_tier local_only with destination local. A block whose range allows hosted_api names neither {user_input} nor {persona_context}. Every sentence it emits is data (block_data/document_types.json) and contains no {token}. Overrides only tighten (highest tier, destinations, declared inputs, quality floor, through one tighten() function); latitude and the voice settings are the user's to move in either direction. It never names a model id.",
+      "capability_toggles": "document type (data: form, format note, length steps with word range and token limit, drafting parameters, sender fields, context fields, unsupplied-references flag), latitude strict|framed|free (a user setting that also derives the check policy: regenerate once then mark, mark only, off), length step, class_preference small|medium|large (a ranking hint, never a filter), range. Not exposed: any gate, step_type, a model id, polish.",
+      "generic_customization_notes": "JSON {common: {display_name, output_var, need: {task_type, difficulty, output_size}, declared_inputs, range: {quality_floor: {min, max}, highest_tier, destinations}, class_preference}, spec: {...}}, deny_unknown_fields at every level, validated at LOAD, closed vocabularies (task_type is one of the eight evaluation task types, quality bars basic|standard|high, destinations local|hosted_api|manual_handoff). declared_inputs must be exactly the names the generated template uses. spec: {document_type, brief_var, sender_var (set exactly when the type declares sender fields, else null), context_var (set exactly when the type declares context fields, else null)}. Example: strict RMA letter, document_type rma_letter, brief_var content_brief, sender_var sender_details.",
+      "source": "PROPOSED by Code (items.id=894): Chat-PM writes the real catalog row from the handoff and re-exports this file"
+    },
+    {
+      "stable_id": "cb-13",
+      "name": "Voice (apply or refine)",
+      "kind": "model",
+      "block_kind": "promoted_from_focus",
+      "invocation_mode": "inline_composable",
+      "catalog_status": "promotion_candidate",
+      "description": "Applies the writer's voice to a draft (apply) or turns the voice profile and the document type's voice settings into short guidance for a later draft (refine).",
+      "known_adopters": "Writing Assistant (planned rebuild, items.id=892); Tech Support outputs (planned second adopter, decisions.id=520 and 521)",
+      "second_adopter_status": "planned_second_adopter",
+      "floor_declaration": "Model block: it expands at LOAD into an ordinary model-call step, so Gate 1, the spend gate, Gate 2, Gate 3 and the declared-inputs lint all apply on the one existing path, and the block itself never has provider access. While EXTERNAL_MODEL_BLOCKS_ALLOWED is false it loads only at highest_tier local_only with destination local. A block whose range allows hosted_api names neither {user_input} nor {persona_context}. Every sentence it emits is data (block_data/document_types.json) and contains no {token}. Overrides only tighten (highest tier, destinations, declared inputs, quality floor, through one tighten() function); latitude and the voice settings are the user's to move in either direction. It never names a model id.",
+      "capability_toggles": "mode apply|refine, the document type's four voice settings (directness, formality, pacing, tone, each a named step with a plain phrase in the data file), class_preference, range. Not exposed: any gate, step_type, a model id.",
+      "generic_customization_notes": "JSON {common: {display_name, output_var, need: {task_type, difficulty, output_size}, declared_inputs, range: {quality_floor: {min, max}, highest_tier, destinations}, class_preference}, spec: {...}}, deny_unknown_fields at every level, validated at LOAD, closed vocabularies (task_type is one of the eight evaluation task types, quality bars basic|standard|high, destinations local|hosted_api|manual_handoff). declared_inputs must be exactly the names the generated template uses. spec: {document_type, mode, input_var (required for apply, null for refine)}. Template names {voice_profile} and, for apply, the draft variable.",
+      "source": "PROPOSED by Code (items.id=894): Chat-PM writes the real catalog row from the handoff and re-exports this file"
+    },
+    {
+      "stable_id": "cb-14",
+      "name": "Revise document",
+      "kind": "model",
+      "block_kind": "promoted_from_focus",
+      "invocation_mode": "inline_composable",
+      "catalog_status": "promotion_candidate",
+      "description": "Applies only the requested changes to an existing draft, respecting the document type's latitude.",
+      "known_adopters": "Writing Assistant (planned rebuild, items.id=892); Tech Support outputs (planned second adopter, decisions.id=520 and 521)",
+      "second_adopter_status": "planned_second_adopter",
+      "floor_declaration": "Model block: it expands at LOAD into an ordinary model-call step, so Gate 1, the spend gate, Gate 2, Gate 3 and the declared-inputs lint all apply on the one existing path, and the block itself never has provider access. While EXTERNAL_MODEL_BLOCKS_ALLOWED is false it loads only at highest_tier local_only with destination local. A block whose range allows hosted_api names neither {user_input} nor {persona_context}. Every sentence it emits is data (block_data/document_types.json) and contains no {token}. Overrides only tighten (highest tier, destinations, declared inputs, quality floor, through one tighten() function); latitude and the voice settings are the user's to move in either direction. It never names a model id.",
+      "capability_toggles": "document type (latitude and revise parameters), class_preference, range. Not exposed: any gate, step_type, a model id.",
+      "generic_customization_notes": "JSON {common: {display_name, output_var, need: {task_type, difficulty, output_size}, declared_inputs, range: {quality_floor: {min, max}, highest_tier, destinations}, class_preference}, spec: {...}}, deny_unknown_fields at every level, validated at LOAD, closed vocabularies (task_type is one of the eight evaluation task types, quality bars basic|standard|high, destinations local|hosted_api|manual_handoff). declared_inputs must be exactly the names the generated template uses. spec: {document_type, draft_var, change_var} (the two must differ).",
+      "source": "PROPOSED by Code (items.id=894): Chat-PM writes the real catalog row from the handoff and re-exports this file"
+    }
+  ]
+}

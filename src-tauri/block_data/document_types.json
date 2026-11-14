@@ -1,0 +1,172 @@
+{
+  "phrases": {
+    "draft": {
+      "lead": "Write a plain, complete %form% from the points below.",
+      "latitude_strict": "Use only the points and facts supplied here. Do not add any claim, number, name, place or date that is not given. If something is not supplied, leave it out; do not write a placeholder such as [Name] or [Date]. Do not try to make it polished or impressive: plain wording is wanted.",
+      "latitude_framed": "You may frame the supplied points persuasively and in your own words. Do not add any new fact, number, name, place or date that is not given. If something is not supplied, leave it out; do not write a placeholder such as [Name] or [Date].",
+      "latitude_free": "Use the points as a starting point and invent whatever the piece needs. Do not write a placeholder such as [Name] or [Date]; make up a suitable detail instead.",
+      "output_only": "Output only the %form% itself, with no opening or closing remarks about it, no notes and no questions.",
+      "format_label": "Format:",
+      "length": "Aim for between %min_words% and %max_words% words.",
+      "brief_label": "The brief:",
+      "sender_label": "Sender details (use only where the format or a point calls for them):",
+      "context_label": "Background about the writer (use only where a point calls for it):"
+    },
+    "voice": {
+      "apply_lead": "Rewrite the draft below so it reads in the writer's voice. Keep every fact and all of the meaning. Change wording, rhythm and tone only, and add nothing new.",
+      "apply_output_only": "Output only the rewritten text, with no opening or closing remarks, no notes and no questions.",
+      "refine_lead": "Write short guidance, as a few plain sentences, describing how the writer's voice should sound in the next draft. Do not write the draft itself.",
+      "refine_output_only": "Output only the guidance, with no opening or closing remarks.",
+      "draft_label": "Draft:",
+      "settings_label": "How it should sound:",
+      "directness_label": "Directness",
+      "formality_label": "Formality",
+      "pacing_label": "Pacing",
+      "tone_label": "Tone",
+      "voice_profile_label": "The writer's own voice preferences:"
+    },
+    "revise": {
+      "lead": "Revise the draft below by making only the changes requested. Keep everything else as it is.",
+      "latitude_strict": "Do not add any claim, number, name, place or date that is not already in the draft or in the requested changes.",
+      "latitude_framed": "You may reword for persuasion. Do not add any new fact, number, name, place or date.",
+      "latitude_free": "You may add invented detail where the requested changes call for it.",
+      "output_only": "Output only the revised text, with no opening or closing remarks, no notes and no questions.",
+      "draft_label": "Draft:",
+      "changes_label": "Requested changes:"
+    },
+    "brief": {
+      "task_label": "Task:",
+      "recipient_label": "Recipient:",
+      "points_label": "Points and facts to cover:"
+    }
+  },
+  "scales": {
+    "voice": {
+      "directness": [
+        { "id": "indirect", "phrase": "Ease into the main point and give a little context first." },
+        { "id": "balanced", "phrase": "Give the main point after a brief opening." },
+        { "id": "direct", "phrase": "State the main point plainly and early." }
+      ],
+      "formality": [
+        { "id": "casual", "phrase": "Write the way people talk: contractions and everyday words are fine." },
+        { "id": "neutral", "phrase": "Write in ordinary, courteous prose." },
+        { "id": "formal", "phrase": "Write formally: full sentences, no contractions, no slang." }
+      ],
+      "pacing": [
+        { "id": "brisk", "phrase": "Keep sentences short and move quickly from point to point." },
+        { "id": "measured", "phrase": "Use an even mix of short and medium sentences." },
+        { "id": "unhurried", "phrase": "Let sentences run a little longer and take time over each point." }
+      ],
+      "tone": [
+        { "id": "warm", "phrase": "Sound friendly and warm." },
+        { "id": "neutral", "phrase": "Sound calm and matter-of-fact." },
+        { "id": "firm", "phrase": "Sound firm and serious without being rude." }
+      ]
+    },
+    "length": ["short", "standard", "long"]
+  },
+  "types": [
+    {
+      "id": "rma_letter",
+      "name": "Return or warranty letter",
+      "form": "letter",
+      "format_note": "A short business letter with the sender's address and the date at the top.",
+      "settings": { "directness": "direct", "formality": "formal", "pacing": "brisk", "tone": "neutral", "length": "standard", "latitude": "strict" },
+      "length_words": {
+        "short": { "min_words": 80, "max_words": 150, "num_predict": 400 },
+        "standard": { "min_words": 150, "max_words": 250, "num_predict": 640 },
+        "long": { "min_words": 250, "max_words": 400, "num_predict": 1000 }
+      },
+      "params": { "draft": { "temperature": 0.2 }, "voice": { "temperature": 0.3 }, "revise": { "temperature": 0.2 } },
+      "sender": ["name", "address", "date"],
+      "context_fields": [],
+      "flag_unsupplied_references": false,
+      "based_on": null
+    },
+    {
+      "id": "complaint_email",
+      "name": "Complaint email",
+      "form": "email",
+      "format_note": "An email with a subject line, a greeting and a sign-off.",
+      "settings": { "directness": "direct", "formality": "neutral", "pacing": "brisk", "tone": "firm", "length": "standard", "latitude": "strict" },
+      "length_words": {
+        "short": { "min_words": 60, "max_words": 120, "num_predict": 320 },
+        "standard": { "min_words": 120, "max_words": 220, "num_predict": 560 },
+        "long": { "min_words": 220, "max_words": 350, "num_predict": 900 }
+      },
+      "params": { "draft": { "temperature": 0.2 }, "voice": { "temperature": 0.3 }, "revise": { "temperature": 0.2 } },
+      "sender": ["name"],
+      "context_fields": [],
+      "flag_unsupplied_references": false,
+      "based_on": null
+    },
+    {
+      "id": "personal_note",
+      "name": "Personal note",
+      "form": "note",
+      "format_note": "A short personal note in the first person with a greeting and a sign-off.",
+      "settings": { "directness": "balanced", "formality": "casual", "pacing": "measured", "tone": "warm", "length": "short", "latitude": "framed" },
+      "length_words": {
+        "short": { "min_words": 40, "max_words": 100, "num_predict": 260 },
+        "standard": { "min_words": 100, "max_words": 180, "num_predict": 480 },
+        "long": { "min_words": 180, "max_words": 300, "num_predict": 780 }
+      },
+      "params": { "draft": { "temperature": 0.4 }, "voice": { "temperature": 0.4 }, "revise": { "temperature": 0.3 } },
+      "sender": ["name"],
+      "context_fields": [],
+      "flag_unsupplied_references": false,
+      "based_on": null
+    },
+    {
+      "id": "cover_letter",
+      "name": "Cover letter",
+      "form": "cover letter",
+      "format_note": "A one-page cover letter addressed to the person who will read the application.",
+      "settings": { "directness": "balanced", "formality": "formal", "pacing": "measured", "tone": "warm", "length": "standard", "latitude": "framed" },
+      "length_words": {
+        "short": { "min_words": 150, "max_words": 220, "num_predict": 580 },
+        "standard": { "min_words": 220, "max_words": 350, "num_predict": 900 },
+        "long": { "min_words": 350, "max_words": 500, "num_predict": 1300 }
+      },
+      "params": { "draft": { "temperature": 0.4 }, "voice": { "temperature": 0.4 }, "revise": { "temperature": 0.3 } },
+      "sender": ["name", "address", "date"],
+      "context_fields": ["job_title", "employer"],
+      "flag_unsupplied_references": false,
+      "based_on": null
+    },
+    {
+      "id": "essay_section",
+      "name": "Essay section",
+      "form": "essay section",
+      "format_note": "One section of an essay in formal academic prose, without a title.",
+      "settings": { "directness": "direct", "formality": "formal", "pacing": "unhurried", "tone": "neutral", "length": "standard", "latitude": "strict" },
+      "length_words": {
+        "short": { "min_words": 150, "max_words": 250, "num_predict": 650 },
+        "standard": { "min_words": 300, "max_words": 500, "num_predict": 1300 },
+        "long": { "min_words": 500, "max_words": 800, "num_predict": 2000 }
+      },
+      "params": { "draft": { "temperature": 0.3 }, "voice": { "temperature": 0.3 }, "revise": { "temperature": 0.2 } },
+      "sender": [],
+      "context_fields": [],
+      "flag_unsupplied_references": true,
+      "based_on": null
+    },
+    {
+      "id": "creative_story",
+      "name": "Short story",
+      "form": "story",
+      "format_note": "A short story with a beginning, a middle and an end.",
+      "settings": { "directness": "indirect", "formality": "casual", "pacing": "unhurried", "tone": "warm", "length": "standard", "latitude": "free" },
+      "length_words": {
+        "short": { "min_words": 200, "max_words": 400, "num_predict": 1000 },
+        "standard": { "min_words": 400, "max_words": 800, "num_predict": 2000 },
+        "long": { "min_words": 800, "max_words": 1500, "num_predict": 3800 }
+      },
+      "params": { "draft": { "temperature": 0.8, "top_p": 0.95 }, "voice": { "temperature": 0.6 }, "revise": { "temperature": 0.6 } },
+      "sender": [],
+      "context_fields": [],
+      "flag_unsupplied_references": false,
+      "based_on": null
+    }
+  ]
+}

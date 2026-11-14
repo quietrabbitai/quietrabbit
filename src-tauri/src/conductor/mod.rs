@@ -12,6 +12,7 @@ pub mod failure;
 pub mod guard;
 pub mod lifecycle;
 pub mod memory_broker;
+pub mod model_block;
 pub mod model_selection;
 pub mod nightly_batch;
 pub mod privacy;

@@ -1,5 +1,6 @@
 # Quiet Rabbit — Claude Code Context
-# Last updated: November 8, 2026 (items.id=552: Naming Architecture Task->Action
+# Last updated: November 14, 2026 (items.id=894: new "Model blocks" section only).
+# Before that, November 8, 2026 (items.id=552: Naming Architecture Task->Action
 # row and intro only). Before that:
 # Last updated: November 3, 2026 (items.id=848: one bullet in the "Ollama"
 # section only). Before that, November 1, 2026 (items.id=678: new "Privacy model" section and
@@ -314,6 +315,43 @@ release tag privacy-filter-q8-935d868), paths.rs, marker.rs, install.rs, runtime
   free-space probe; items.id=700, 701). Accepted: no automatic in-session retry
   (a retry is a login or the retry command); two processes on one data directory
   are not coordinated (the release single-instance guard covers shipped builds).
+
+## Model blocks (items.id=894, decisions.id=941/942)
+Three block kinds share one registry (conductor/block_dispatch.rs,
+registered_block()): Pure (a BlockHandler over the TaskTrack, cb-06), Model
+(conductor/model_block/: cb-12 draft document, cb-13 voice apply or refine,
+cb-14 revise) and Seed (declared, none registered yet). A model block has no
+handler: at LOAD a composition row citing it is parsed (typed, deny_unknown_fields,
+configuration `{common, spec}`) and EXPANDED into an ordinary ActionDefinition with
+block_stable_id None and a `requirement` (task need, range clamped to the Focus
+ceiling, optional model-class preference, never a model id). Gate 1, the spend gate,
+Gate 2, Gate 3 and the declared-inputs lint all apply on that one path. The executor
+does not read `requirement` yet (select_model still decides, until the resolver B2).
+- EXTERNAL_MODEL_BLOCKS_ALLOWED = false (model_block/mod.rs): LOAD refuses any
+  destination but local and any tier above local_only. A block allowing hosted_api
+  names neither {user_input} nor {persona_context}. B10 flips the constant after the
+  outbound review (items.id=884).
+- tighten() (model_block/config.rs) is the one function that narrows an envelope
+  (quality floor, highest tier, destinations, declared inputs); only those four are
+  tighten-only. Latitude and the voice settings are the user's to move both ways
+  (document_type::resolve_settings). flag_unsupplied_references is tighten-only
+  against based_on (decisions.id=548).
+- Every sentence a block emits is DATA in src-tauri/block_data/document_types.json
+  (phrases, scales, shipped document types), validated by the same function a custom
+  type will use, with no {token} allowed. Rust holds only the template skeleton.
+  Tuning wording is a data edit.
+- Adding a block: register it, add its mirror row (a numbered data-only shared_*.sql),
+  and add its row to tests/fixtures/building_blocks_catalog.json (Chat-PM re-exports
+  it from qr_docs.db). conductor/model_block/admission_tests.rs checks the rest, and
+  PINNED_KEYS there fails on any new configuration key until it is reviewed.
+- focus_runs.user_input holds the blended chat window so a parked run can resume. It
+  is NULLed when the status becomes complete, cancelled or failed (output_store::
+  USER_INPUT_CLEARED_STATUSES) and is not written for a latched one-time chat. A run
+  parked and never finished keeps it until items.id=681 and 888 clear it.
+- Resuming a requires_user_handoff step re-parks it (pinned by a characterization
+  test in lifecycle.rs; B5 changes it).
+- The unsupported-additions measures live only in examples/focus_calibration.rs for
+  now. They move into one shipped module at B6b; do not add a second copy.
 
 ## Naming Architecture — term map
 

@@ -500,6 +500,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/shared_042.sql"),
     },
     SchemaFile {
+        prefix: "shared",
+        version: 43,
+        sql: include_str!("../../schema/shared_043.sql"),
+    },
+    SchemaFile {
         prefix: "tier3_cookies",
         version: 1,
         sql: include_str!("../../schema/tier3_cookies_001.sql"),
@@ -2386,15 +2391,15 @@ mod tests {
             .await
             .expect("shared migration chain must apply cleanly on a fresh db");
         assert_eq!(
-            applied, 42,
-            "expected all forty-two shared schema versions to apply"
+            applied, 43,
+            "expected all forty-three shared schema versions to apply"
         );
 
         let version: (i64,) = sqlx::query_as("SELECT MAX(version) FROM schema_version")
             .fetch_one(&mut conn)
             .await
             .unwrap();
-        assert_eq!(version.0, 42);
+        assert_eq!(version.0, 43);
     }
 
     /// items.id=708 / items.id=703 / items.id=724: shared_026.sql and
@@ -2963,8 +2968,8 @@ mod tests {
             .expect("drift-healing run must succeed");
 
         assert_eq!(
-            applied, 41,
-            "shared v2 through v42 should count as newly applied from a stale v1 database"
+            applied, 42,
+            "shared v2 through v43 should count as newly applied from a stale v1 database"
         );
 
         // items.id=427: shared_013.sql drops tier3_providers (generalized
@@ -4047,8 +4052,8 @@ mod tests {
             .await
             .unwrap();
         }
-        // A database at 038 has none of 039, 040, 041 and 042 (the runner applies
-        // what is above its highest recorded version), so forget all four, and
+        // A database at 038 has none of 039 through 043 (the runner applies
+        // what is above its highest recorded version), so forget all five, and
         // drop the columns 041 and 042 added.
         for col in ["store_op", "store_target", "store_args", "guard_clauses"] {
             sqlx::query(&format!(
@@ -4058,7 +4063,7 @@ mod tests {
             .await
             .unwrap();
         }
-        sqlx::query("DELETE FROM schema_version WHERE version IN (39, 40, 41, 42)")
+        sqlx::query("DELETE FROM schema_version WHERE version IN (39, 40, 41, 42, 43)")
             .execute(&mut conn)
             .await
             .unwrap();
@@ -4068,7 +4073,7 @@ mod tests {
             .unwrap();
         assert!(before.0 > 0, "the 038 seed rows are there");
 
-        assert_eq!(run_migrations(&mut conn, "shared", None).await.unwrap(), 4);
+        assert_eq!(run_migrations(&mut conn, "shared", None).await.unwrap(), 5);
 
         let after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM focus_block_compositions")
             .fetch_one(&mut conn)
@@ -4087,7 +4092,7 @@ mod tests {
             .fetch_one(&mut conn)
             .await
             .unwrap();
-        assert_eq!(v.0, 42);
+        assert_eq!(v.0, 43);
     }
 
     // items.id=879: shared_040.sql repairs the applied Writing Assistant
@@ -4154,7 +4159,7 @@ mod tests {
             .await
             .unwrap();
         }
-        sqlx::query("DELETE FROM schema_version WHERE version IN (40, 41, 42)")
+        sqlx::query("DELETE FROM schema_version WHERE version IN (40, 41, 42, 43)")
             .execute(&mut conn)
             .await
             .unwrap();
@@ -4165,7 +4170,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(run_migrations(&mut conn, "shared", None).await.unwrap(), 3);
+        assert_eq!(run_migrations(&mut conn, "shared", None).await.unwrap(), 4);
 
         assert_eq!(wa_draft_customization(&mut conn).await, fixed);
         let rows_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM focus_block_customization")
@@ -4177,7 +4182,7 @@ mod tests {
             .fetch_one(&mut conn)
             .await
             .unwrap();
-        assert_eq!(v.0, 42);
+        assert_eq!(v.0, 43);
     }
 
     // items.id=887: shared_041.sql adds three nullable store-writer columns to
@@ -4215,7 +4220,7 @@ mod tests {
             .fetch_one(&mut conn)
             .await
             .unwrap();
-        assert_eq!(v.0, 42);
+        assert_eq!(v.0, 43);
     }
 
     #[tokio::test]
@@ -4231,7 +4236,7 @@ mod tests {
             .await
             .unwrap();
         }
-        sqlx::query("DELETE FROM schema_version WHERE version IN (41, 42)")
+        sqlx::query("DELETE FROM schema_version WHERE version IN (41, 42, 43)")
             .execute(&mut conn)
             .await
             .unwrap();
@@ -4241,7 +4246,7 @@ mod tests {
             .unwrap();
         assert!(before.0 > 0, "the seed rows are there");
 
-        assert_eq!(run_migrations(&mut conn, "shared", None).await.unwrap(), 2);
+        assert_eq!(run_migrations(&mut conn, "shared", None).await.unwrap(), 3);
 
         let after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM focus_block_compositions")
             .fetch_one(&mut conn)
@@ -4260,7 +4265,7 @@ mod tests {
             .fetch_one(&mut conn)
             .await
             .unwrap();
-        assert_eq!(v.0, 42);
+        assert_eq!(v.0, 43);
     }
 
     // items.id=889: shared_042.sql adds one nullable clause-list column to
@@ -4304,7 +4309,7 @@ mod tests {
             .execute(&mut conn)
             .await
             .unwrap();
-        sqlx::query("DELETE FROM schema_version WHERE version = 42")
+        sqlx::query("DELETE FROM schema_version WHERE version IN (42, 43)")
             .execute(&mut conn)
             .await
             .unwrap();
@@ -4314,7 +4319,7 @@ mod tests {
             .unwrap();
         assert!(before.0 > 0, "the seed rows are there");
 
-        assert_eq!(run_migrations(&mut conn, "shared", None).await.unwrap(), 1);
+        assert_eq!(run_migrations(&mut conn, "shared", None).await.unwrap(), 2);
 
         let after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM focus_block_compositions")
             .fetch_one(&mut conn)
@@ -4333,7 +4338,7 @@ mod tests {
             .fetch_one(&mut conn)
             .await
             .unwrap();
-        assert_eq!(v.0, 42);
+        assert_eq!(v.0, 43);
     }
 
     // items.id=661: keys_006.sql and personal_009.sql are additive, so they
@@ -4341,7 +4346,7 @@ mod tests {
     // is a compile-time static, so the older database is hand-built: apply
     // everything, then remove what the new file added and forget its version.
     /// items.id=661: shared_008.sql no longer adds a column, but versions must
-    /// stay contiguous. Every version 1..=42 must have its row, 8 included,
+    /// stay contiguous. Every version 1..=43 must have its row, 8 included,
     /// recorded by the file's own INSERT.
     #[tokio::test]
     async fn every_shared_version_is_recorded_including_the_no_column_shared_008() {
@@ -4353,7 +4358,7 @@ mod tests {
                 .await
                 .unwrap();
         let versions: Vec<i64> = versions.into_iter().map(|v| v.0).collect();
-        assert_eq!(versions, (1..=42).collect::<Vec<i64>>());
+        assert_eq!(versions, (1..=43).collect::<Vec<i64>>());
         let description: String =
             sqlx::query_scalar("SELECT description FROM schema_version WHERE version = 8")
                 .fetch_one(&mut conn)
