@@ -55,6 +55,7 @@ pub mod auth;
 pub mod chat_stream;
 pub mod chats;
 pub mod cloud_chat_pane;
+pub mod collection_consent;
 pub mod consent;
 pub mod execution;
 pub mod focus_builder;

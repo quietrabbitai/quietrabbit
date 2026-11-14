@@ -3,6 +3,7 @@
 pub mod block_dispatch;
 pub mod bound_spec;
 pub mod checkin;
+pub mod collection_consent_text;
 pub mod concurrency;
 pub mod crisis;
 pub mod declared_inputs;

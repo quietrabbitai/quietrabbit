@@ -42,12 +42,6 @@ use crate::conductor::tokens::ExternalAccess;
 const VALID_CONTEXT_FLOWS: &[&str] = &["bidirectional", "receive_only", "isolated"];
 const VALID_LIBRARY_VISIBILITY: &[&str] = &["shared", "persona_visible", "persona_hidden"];
 const VALID_FOCUS_PROFILES: &[&str] = &["open", "organized", "protected"];
-/// The version of the collection-consent text the user is asked to agree to
-/// (items.id=920). The collection gate opens only while the stored
-/// collection_consent_version equals this, so a changed text asks again. Stage 1
-/// keeps the constant here, the simplest home next to the setter. Stage 2 moves
-/// it into a versioned data file with the consent text itself.
-pub const COLLECTION_CONSENT_TEXT_VERSION: i64 = 1;
 const TIER_MIN: i32 = 1;
 const TIER_MAX: i32 = 3;
 
@@ -76,7 +70,7 @@ pub enum FocusSettingsStoreError {
 
 /// Where a Persona stands on one Focus's silent collection. Stored as the
 /// CHECK-constrained text of focus_settings.collection_consent (shared_044.sql).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, specta::Type)]
 #[serde(rename_all = "snake_case")]
 pub enum CollectionConsent {
     NotAsked,
@@ -106,19 +100,27 @@ impl CollectionConsent {
     }
 }
 
-/// The consent state and the text version it was given for.
+/// The consent state and the text version it was given for. The current text
+/// version is data (conductor::collection_consent_text, block_data/
+/// collection_consent_text.json).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CollectionConsentState {
     pub consent: CollectionConsent,
     pub version: i64,
 }
 
+/// The version of the collection-consent text a Persona must have agreed to. It
+/// is data, not a constant (items.id=920 stage 2): see
+/// conductor::collection_consent_text.
+pub fn current_text_version() -> i64 {
+    crate::conductor::collection_consent_text::current_version()
+}
+
 impl CollectionConsentState {
     /// True only for a grant of the CURRENT text. Anything else, an old
     /// version included, is not a grant.
     pub fn is_current_grant(&self) -> bool {
-        self.consent == CollectionConsent::Granted
-            && self.version == COLLECTION_CONSENT_TEXT_VERSION
+        self.consent == CollectionConsent::Granted && self.version == current_text_version()
     }
 }
 
@@ -740,7 +742,6 @@ mod tests {
             assert_eq!(CollectionConsent::parse(c.as_str()), Some(c));
         }
         assert_eq!(CollectionConsent::parse("yes"), None);
-        assert_eq!(COLLECTION_CONSENT_TEXT_VERSION, 1);
     }
 
     #[tokio::test]
@@ -774,7 +775,7 @@ mod tests {
             PERSONA,
             FOCUS,
             CollectionConsent::Granted,
-            COLLECTION_CONSENT_TEXT_VERSION,
+            crate::conductor::collection_consent_text::current_version(),
         )
         .await
         .unwrap();
@@ -809,7 +810,7 @@ mod tests {
 
         // Withdrawn and NotAsked store 0 whatever version is passed.
         for c in [CollectionConsent::Withdrawn, CollectionConsent::NotAsked] {
-            set_collection_consent(&e.pool, PERSONA, FOCUS, c, COLLECTION_CONSENT_TEXT_VERSION)
+            set_collection_consent(&e.pool, PERSONA, FOCUS, c, 1)
                 .await
                 .unwrap();
             let s = get_collection_consent(&e.pool, PERSONA, FOCUS)

@@ -2276,10 +2276,12 @@ fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
     }
 }
 
-/// Only set_collection_consent writes the consent state, and until stage 2's
-/// command exists nothing outside tests calls it or the audit store's append.
+/// Only set_collection_consent writes the consent state, and the ONLY production
+/// callers of it and of the audit store are the user's own commands in
+/// commands/collection_consent.rs (stage 2). Nothing else names them: no
+/// conductor module, no model path, no other command.
 #[test]
-fn the_consent_setter_and_the_audit_append_have_no_production_caller_yet() {
+fn only_the_users_consent_commands_call_the_setter_and_the_audit_store() {
     let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
     rust_files(&src_dir, &mut files);
@@ -2291,7 +2293,8 @@ fn the_consent_setter_and_the_audit_append_have_no_production_caller_yet() {
             .to_string_lossy()
             .to_string();
         let own = rel == "persistence/focus_settings_store.rs"
-            || rel == "persistence/consent_audit_store.rs";
+            || rel == "persistence/consent_audit_store.rs"
+            || rel == "commands/collection_consent.rs";
         // Files that mod.rs includes under #[cfg(test)] only (this one included).
         let test_only = rel.ends_with("tests.rs") || rel == "test_support.rs";
         if own || test_only {

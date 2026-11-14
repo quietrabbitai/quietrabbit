@@ -9,9 +9,10 @@
 // and no DELETE, and a source-scan test below fails if one is ever added. A purge
 // is a separate, user-initiated function and is not part of this item.
 //
-// WHO WRITES. A model must never be able to record consent. append() has no
-// caller outside tests yet: stage 2's command (the user's own confirm) is its
-// only intended caller, together with focus_settings_store::set_collection_consent.
+// WHO WRITES. A model must never be able to record consent. append()'s only
+// production callers are the user's own commands in
+// commands/collection_consent.rs (grant and withdraw), which also hold the only
+// calls of focus_settings_store::set_collection_consent.
 // A source scan over conductor/store_writer.rs, store_op.rs and lifecycle.rs
 // (conductor/store_op_tests.rs) pins that nothing in the conductor names
 // the table.

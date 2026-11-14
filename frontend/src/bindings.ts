@@ -1020,6 +1020,19 @@ export const commands = {
 	cancelChatStream: (runId: string) => typedError<null, string>(__TAURI_INVOKE("cancel_chat_stream", { runId })),
 	createApiChat: (request: CreateApiChatRequest) => typedError<CreateApiChatResponse, string>(__TAURI_INVOKE("create_api_chat", { request })),
 	sendApiChatMessage: (request: SendApiChatRequest) => typedError<SendApiChatOutcome, string>(__TAURI_INVOKE("send_api_chat_message", { request })),
+	getCollectionConsentState: (personaId: string, focusId: string) => typedError<CollectionConsentState, string>(__TAURI_INVOKE("get_collection_consent_state", { personaId, focusId })),
+	/**
+	 *  `text_version` is the version of the text the user was SHOWN. A version that
+	 *  is not the current one is rejected with consent_text_stale.
+	 */
+	submitCollectionConsentDecision: (personaId: string, focusId: string, decision: CollectionConsentDecision, textVersion: number) => typedError<CollectionConsentState, string>(__TAURI_INVOKE("submit_collection_consent_decision", { personaId, focusId, decision, textVersion })),
+	/**
+	 *  Stops collection at once and records the withdrawal. What the Focus already
+	 *  collected stays until the user deletes it. An Err means the audit event was
+	 *  not written (collection is already off): call it again.
+	 */
+	withdrawCollectionConsent: (personaId: string, focusId: string) => typedError<CollectionConsentState, string>(__TAURI_INVOKE("withdraw_collection_consent", { personaId, focusId })),
+	listConsentAuditEvents: (personaId: string, focusId: string) => typedError<ConsentAuditEvent[], string>(__TAURI_INVOKE("list_consent_audit_events", { personaId, focusId })),
 };
 
 /* Types */
@@ -1250,7 +1263,41 @@ export type CloudChatProviderSummary = {
 	privacy_commitment_basis: PrivacyCommitmentBasis | null,
 };
 
+/**
+ *  Where a Persona stands on one Focus's silent collection. Stored as the
+ *  CHECK-constrained text of focus_settings.collection_consent (shared_044.sql).
+ */
+export type CollectionConsent = "not_asked" | "granted" | "declined" | "withdrawn";
+
+export type CollectionConsentDecision = "granted" | "declined";
+
+export type CollectionConsentState = {
+	consent: CollectionConsent,
+	/**  The text version the stored decision was given for (0 when none). */
+	stored_version: number,
+	/**  The text version in force now. */
+	current_text_version: number,
+	/**
+	 *  True when the user should be asked: not_asked, or granted or declined for
+	 *  a text version other than the current one. A withdrawn user is not asked
+	 *  again, and a declined user at the current version is not asked again.
+	 */
+	needs_decision: boolean,
+	/**  The promise ids the current text cites. Prose is i18n copy keyed by id. */
+	promises: string[],
+};
+
 export type ConsentAction = "consent" | "revoke";
+
+export type ConsentAuditEvent = {
+	id: string,
+	event_type: string,
+	text_version: number | null,
+	consent_reference_id: string | null,
+	content_summary: string,
+	document_type: string | null,
+	created_at: string,
+};
 
 export type ConsentResult = {
 	/**

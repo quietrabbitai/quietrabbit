@@ -12648,11 +12648,11 @@ steps:
     #[tokio::test]
     async fn the_gate_re_reads_consent_before_each_writer_op() {
         use crate::persistence::focus_settings_store::{
-            CollectionConsent, COLLECTION_CONSENT_TEXT_VERSION as V,
+            current_text_version as cv, CollectionConsent,
         };
         with_temp_data_root(async {
             let pool = consent_pool().await;
-            set_consent(&pool, CollectionConsent::Granted, V).await;
+            set_consent(&pool, CollectionConsent::Granted, cv()).await;
             let mut run = focus_level_writer_run(&pool, vec![]);
             let first = put_step("one", "v1");
             let second = put_step("two", "v2");
@@ -12665,7 +12665,7 @@ steps:
             assert_eq!(locked_intent(&run).await.as_deref(), Some("billing"));
 
             // Withdrawn between the two ops of the same pass.
-            set_consent(&pool, CollectionConsent::Withdrawn, V).await;
+            set_consent(&pool, CollectionConsent::Withdrawn, cv()).await;
             run.execute_store_writer(&second, &op_of(&second))
                 .await
                 .unwrap();
@@ -12676,13 +12676,13 @@ steps:
             );
 
             // Granted again, but for an older text: still not a grant.
-            set_consent(&pool, CollectionConsent::Granted, V + 1).await;
+            set_consent(&pool, CollectionConsent::Granted, cv() + 1).await;
             run.execute_store_writer(&second, &op_of(&second))
                 .await
                 .unwrap();
             assert_eq!(locked_intent(&run).await.as_deref(), Some("billing"));
 
-            set_consent(&pool, CollectionConsent::Granted, V).await;
+            set_consent(&pool, CollectionConsent::Granted, cv()).await;
             run.execute_store_writer(&second, &op_of(&second))
                 .await
                 .unwrap();
@@ -12698,7 +12698,7 @@ steps:
     #[tokio::test]
     async fn execute_saves_nothing_for_a_focus_level_focus_without_consent() {
         use crate::persistence::focus_settings_store::{
-            CollectionConsent, COLLECTION_CONSENT_TEXT_VERSION as V,
+            current_text_version as cv, CollectionConsent,
         };
         with_temp_data_root(async {
             let pool = consent_pool().await;
@@ -12717,9 +12717,9 @@ steps:
             // not_asked, declined, withdrawn, and a grant of another text version.
             for (state, version) in [
                 (CollectionConsent::NotAsked, 0),
-                (CollectionConsent::Declined, V),
+                (CollectionConsent::Declined, cv()),
                 (CollectionConsent::Withdrawn, 0),
-                (CollectionConsent::Granted, V + 1),
+                (CollectionConsent::Granted, cv() + 1),
             ] {
                 set_consent(&pool, state, version).await;
                 let mut run = focus_level_writer_run(&pool, steps());
@@ -12740,7 +12740,7 @@ steps:
                 );
             }
 
-            set_consent(&pool, CollectionConsent::Granted, V).await;
+            set_consent(&pool, CollectionConsent::Granted, cv()).await;
             let mut run = focus_level_writer_run(&pool, steps());
             assert!(run.execute().await.unwrap().is_none());
             assert_eq!(locked_intent(&run).await.as_deref(), Some("billing"));
@@ -12808,11 +12808,11 @@ steps:
     #[tokio::test]
     async fn an_unreadable_consent_state_counts_as_not_granted() {
         use crate::persistence::focus_settings_store::{
-            CollectionConsent, COLLECTION_CONSENT_TEXT_VERSION as V,
+            current_text_version as cv, CollectionConsent,
         };
         with_temp_data_root(async {
             let pool = consent_pool().await;
-            set_consent(&pool, CollectionConsent::Granted, V).await;
+            set_consent(&pool, CollectionConsent::Granted, cv()).await;
             // A Focus id with no focus_settings row.
             let mut run = focus_level_writer_run(&pool, vec![]);
             run.focus_id = "no-such-focus".to_owned();
@@ -12837,7 +12837,7 @@ steps:
     #[tokio::test]
     async fn user_input_is_not_kept_for_a_focus_level_focus_without_consent() {
         use crate::persistence::focus_settings_store::{
-            CollectionConsent, COLLECTION_CONSENT_TEXT_VERSION as V,
+            current_text_version as cv, CollectionConsent,
         };
         with_temp_data_root(async {
             let pool = consent_pool().await;
@@ -12856,17 +12856,17 @@ steps:
             assert_eq!(stored_user_input(&run).await, None);
 
             // Granted: kept while the run can resume.
-            set_consent(&pool, CollectionConsent::Granted, V).await;
+            set_consent(&pool, CollectionConsent::Granted, cv()).await;
             let run = focus_level_run(&pool);
             run.write_focus_run_record("initializing").await.unwrap();
             assert_eq!(stored_user_input(&run).await.as_deref(), Some(WINDOW));
             // Withdrawn meanwhile: cleared at the next status write.
-            set_consent(&pool, CollectionConsent::Withdrawn, V).await;
+            set_consent(&pool, CollectionConsent::Withdrawn, cv()).await;
             run.write_focus_run_record("awaiting_user").await.unwrap();
             assert_eq!(stored_user_input(&run).await, None);
 
             // A grant of an older text does not keep it.
-            set_consent(&pool, CollectionConsent::Granted, V + 1).await;
+            set_consent(&pool, CollectionConsent::Granted, cv() + 1).await;
             let run = focus_level_run(&pool);
             run.write_focus_run_record("awaiting_user").await.unwrap();
             assert_eq!(stored_user_input(&run).await, None);
@@ -12877,7 +12877,7 @@ steps:
             assert_eq!(stored_user_input(&run).await, None);
 
             // A per_field Focus keeps it whatever the consent row says.
-            set_consent(&pool, CollectionConsent::Declined, V).await;
+            set_consent(&pool, CollectionConsent::Declined, cv()).await;
             let mut run = focus_level_run(&pool);
             run.focus_def.as_mut().unwrap().collection_posture = CollectionPosture::PerField;
             run.write_focus_run_record("awaiting_user").await.unwrap();

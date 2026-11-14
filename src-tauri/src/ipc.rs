@@ -229,6 +229,12 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         // (items.id=716, decisions.id=874, 875)
         commands::api_chat::create_api_chat,
         commands::api_chat::send_api_chat_message,
+        // Group 31 -- Collection consent for a focus_level Focus (items.id=920,
+        // decisions.id=944)
+        commands::collection_consent::get_collection_consent_state,
+        commands::collection_consent::submit_collection_consent_decision,
+        commands::collection_consent::withdraw_collection_consent,
+        commands::collection_consent::list_consent_audit_events,
     ])
 }
 

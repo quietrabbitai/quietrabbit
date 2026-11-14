@@ -1,6 +1,6 @@
 # Quiet Rabbit — Claude Code Context
-# Last updated: November 14, 2026 (items.id=920 stage 1: new "Collection consent"
-# section only). Before that, November 14, 2026 (items.id=894: new "Model blocks"
+# Last updated: November 14, 2026 (items.id=920 stages 1 to 3: new "Collection
+# consent" section only). Before that, November 14, 2026 (items.id=894: new "Model blocks"
 # section only). Before that, November 8, 2026 (items.id=552: Naming Architecture Task->Action
 # row and intro only). Before that:
 # Last updated: November 3, 2026 (items.id=848: one bullet in the "Ollama"
@@ -356,8 +356,8 @@ does not read `requirement` yet (select_model still decides, until the resolver 
 
 ## Collection consent (items.id=920 stage 1, decisions.id=944, decisions.id=509)
 A focus_level Focus (Tech Support) collects silently after ONE informed consent at
-setup. Stage 1 is the store and the gate; the commands, the consent text file and
-the frontend are stages 2 and 3 (nothing calls the setter yet).
+setup. Stage 1 is the store and the gate, stage 2 the commands and the consent text
+data, stage 3 the frontend confirm.
 - State: focus_settings.collection_consent (not_asked, granted, declined, withdrawn)
   and collection_consent_version (shared_044.sql). Default not_asked, so a row never
   asked never opens the gate. focuses.collection_posture (per_field default,
@@ -370,8 +370,28 @@ the frontend are stages 2 and 3 (nothing calls the setter yet).
   submit_friction_gate_decision cannot move them. No model path records consent:
   source scans in conductor/store_op_tests.rs pin that store_writer.rs, store_op.rs
   and lifecycle.rs never name the audit table or the setter, and that nothing outside
-  tests calls either yet. COLLECTION_CONSENT_TEXT_VERSION = 1 lives in
-  focus_settings_store.rs for now; stage 2 moves it into the versioned text data file.
+  tests calls either except commands/collection_consent.rs. The set_collection_consent
+  version rule: Granted and Declined store the text version shown (1 or more), NotAsked
+  and Withdrawn store 0.
+- Text: block_data/collection_consent_text.json holds text_version and promise ids ONLY
+  (conductor/collection_consent_text.rs; the closed PROMISES list is what QR can keep
+  today, so editing reference sheets, per-case or per-output delete and cross-Focus use
+  are not promisable). Prose is placeholder i18n copy in the frontend, owned by
+  Chat-BRAND. Bumping text_version forces a new decision from every Persona.
+- Commands (commands/collection_consent.rs, Group 31): get_collection_consent_state,
+  submit_collection_consent_decision (granted or declined, with the version SHOWN; a
+  version that is not current is consent_text_stale), withdraw_collection_consent,
+  list_consent_audit_events. Each takes writer_gate::command first, derives the user and
+  key from the session (no user_id argument), checks the Persona id is a UUID the user
+  belongs to (private require_persona, for items.id=638 to lift) and has a *_for_session
+  body. Write order is fail-safe both ways: a GRANT appends the audit event FIRST and the
+  flag second (a crash leaves collection off, the retry reuses the event); a WITHDRAWAL
+  clears the flag FIRST and appends the event second, and errors if the event fails so the
+  frontend retries. A decline appends no event of its own, but on EVERY decline call, if the
+  newest collection event is still a grant it appends collection_consent_withdrawn
+  referencing it (retry semantics as withdraw). A withdrawal keeps what was collected and
+  deletes nothing. needs_decision is true for not_asked, and for granted or declined at a
+  version other than the current one; a withdrawn user is never re-asked.
 - Audit: consent_audit_records in each Persona's encrypted personal.db
   (personal_010.sql, next to disclosure_log; never shared.db, decisions.id=862).
   persistence/consent_audit_store.rs has append, list and latest_for_focus ONLY: no

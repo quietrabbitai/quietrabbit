@@ -1,0 +1,10 @@
+{
+  "text_version": 1,
+  "promises": [
+    "collects_listed_categories_only",
+    "never_shared_outside_qr_without_review",
+    "per_session_opt_out",
+    "withdraw_any_time",
+    "delete_device_and_linked_data"
+  ]
+}
